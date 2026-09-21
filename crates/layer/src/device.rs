@@ -100,6 +100,9 @@ pub struct NeuralForgeDeviceInfo {
 #[derive(Default)]
 struct State {
     swapchains: HashMap<vk::SwapchainKHR, SwapchainState>,
+    /// Per swapchain: when the layer may engage (see `swapchain::Warmup`), and how long the
+    /// layer spent in that swapchain's previous present.
+    warmup: HashMap<vk::SwapchainKHR, (swapchain::Warmup, std::time::Duration)>,
     shm: ShmClient,
     /// Which queue family a `VkQueue` handle belongs to -- learned by observing the
     /// app's own `vkGetDeviceQueue`/`vkGetDeviceQueue2` calls (see those hooks below),
@@ -830,6 +833,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         }
         {
             let mut state = self.state.lock().unwrap();
+            state.warmup.remove(&swapchain);
             if let Some(old) = state.swapchains.remove(&swapchain) {
                 {
                     let mut tracker = self.tracker.lock().unwrap();
@@ -902,6 +906,31 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             };
             let mut state = self.state.lock().unwrap();
             for (&sc, &image_index) in swapchains.iter().zip(image_indices) {
+                if !state.swapchains.contains_key(&sc) {
+                    continue;
+                }
+                // Stay completely out of the way (no relay, no capture, no compose) until the
+                // game has been rendering steadily; loading screens are where engaging froze it.
+                let layer_start = std::time::Instant::now();
+                let engaged = {
+                    let (warmup, last) = state.warmup.entry(sc).or_default();
+                    let ok = warmup.on_present(layer_start, *last);
+                    *last = std::time::Duration::ZERO;
+                    ok
+                };
+                {
+                    static ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if ENGAGED.swap(engaged, std::sync::atomic::Ordering::Relaxed) != engaged {
+                        crate::log!(
+                            "[layer] {}",
+                            if engaged { "game is rendering steadily; engaging" } else { "game not rendering steadily (loading?); passing frames through untouched" }
+                        );
+                        crate::logging::flush();
+                    }
+                }
+                if !engaged {
+                    break;
+                }
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
                 let Some(&image) = sw.images.get(image_index as usize) else { break };
                 if !swapchain::is_supported_format(sw.format) {
@@ -1103,6 +1132,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         // taken again (and the build retried) on the next present.
                         release_primary(self.device.handle(), sc);
                     }
+                }
+                if let Some(entry) = state.warmup.get_mut(&sc) {
+                    entry.1 = layer_start.elapsed();
                 }
                 break;
             }

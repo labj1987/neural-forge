@@ -22,6 +22,45 @@ pub struct SwapchainState {
     pub images: Vec<vk::Image>,
 }
 
+/// Decides when the layer may engage on a swapchain: only once the game itself has been
+/// rendering steadily, and never while it is on a loading screen.
+///
+/// Measured on GTA V (Proton, vkd3d): composing while the game was still loading froze it -- the
+/// game's GPU work stopped waiting on a fence that never signalled, and the game shut itself down
+/// about a minute later -- while the identical setup engaged once the game was in the world ran
+/// cleanly every time. Loading screens present slowly and in bursts; gameplay presents steadily.
+///
+/// The game's own frame time is the interval between presents minus the time the layer itself
+/// spent in the previous present, so the model's cost (the synchronous wait) can never make a
+/// healthy game look like a loading one.
+#[derive(Default)]
+pub struct Warmup {
+    last_present: Option<std::time::Instant>,
+    steady_since: Option<std::time::Instant>,
+}
+
+impl Warmup {
+    /// A game frame slower than this is not steady rendering (below ~15 fps native).
+    const STEADY_FRAME: std::time::Duration = std::time::Duration::from_millis(66);
+    /// How long the game must render steadily before the layer engages.
+    const HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Call on every present with the time the layer spent in the previous one. Returns whether
+    /// the layer may do anything with this present.
+    pub fn on_present(&mut self, now: std::time::Instant, layer_time_last: std::time::Duration) -> bool {
+        if let Some(last) = self.last_present {
+            let game_frame = now.saturating_duration_since(last).saturating_sub(layer_time_last);
+            if game_frame > Self::STEADY_FRAME {
+                self.steady_since = None;
+            } else if self.steady_since.is_none() {
+                self.steady_since = Some(last);
+            }
+        }
+        self.last_present = Some(now);
+        self.steady_since.is_some_and(|t| now.saturating_duration_since(t) >= Self::HOLD)
+    }
+}
+
 /// Exclude known-small compositor/overlay swapchains (the Steam overlay was
 /// observed at 1262x598). This is only a size heuristic; `ownership` separately
 /// enforces process eligibility and an exclusive cross-process channel lease.
@@ -84,6 +123,52 @@ pub fn detect_hdr_kind(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u3
         hdr_kind::PQ10
     } else {
         hdr_kind::NONE
+    }
+}
+
+#[cfg(test)]
+mod warmup_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn run(w: &mut Warmup, t0: Instant, frames: &[(u64, u64)]) -> Vec<bool> {
+        // (ms since t0, layer ms spent in the previous present)
+        frames.iter().map(|&(at, layer)| w.on_present(t0 + Duration::from_millis(at), Duration::from_millis(layer))).collect()
+    }
+
+    #[test]
+    fn engages_only_after_five_seconds_of_steady_rendering() {
+        let mut w = Warmup::default();
+        let t0 = Instant::now();
+        let frames: Vec<(u64, u64)> = (0..400).map(|i| (i * 16, 0)).collect(); // 60 fps
+        let out = run(&mut w, t0, &frames);
+        assert!(!out[..300].iter().any(|&b| b), "must not engage before 5 s");
+        assert!(out[330..].iter().all(|&b| b), "must engage after 5 s of steady frames");
+    }
+
+    #[test]
+    fn a_loading_screen_never_engages_and_a_hitch_resets() {
+        let mut w = Warmup::default();
+        let t0 = Instant::now();
+        // Loading: a present every 700 ms for a minute.
+        let loading: Vec<(u64, u64)> = (0..90).map(|i| (i * 700, 0)).collect();
+        assert!(!run(&mut w, t0, &loading).iter().any(|&b| b));
+        // Steady gameplay, then a loading hitch: disengages at once.
+        let base = 90 * 700;
+        let mut frames: Vec<(u64, u64)> = (0..400).map(|i| (base + i * 16, 0)).collect();
+        frames.push((base + 400 * 16 + 800, 0));
+        let out = run(&mut w, t0, &frames);
+        assert!(out[399]);
+        assert!(!out[400], "a loading-length gap must disengage immediately");
+    }
+
+    #[test]
+    fn the_layers_own_wait_does_not_count_against_the_game() {
+        let mut w = Warmup::default();
+        let t0 = Instant::now();
+        // 4K synchronous: 60 ms between presents, 45 ms of it inside the layer.
+        let frames: Vec<(u64, u64)> = (0..200).map(|i| (i * 60, 45)).collect();
+        assert!(*run(&mut w, t0, &frames).last().unwrap(), "slow because of the model is still steady");
     }
 }
 
