@@ -37,27 +37,49 @@ pub struct SwapchainState {
 pub struct Warmup {
     last_present: Option<std::time::Instant>,
     steady_since: Option<std::time::Instant>,
+    engaged: bool,
+    /// Consecutive loading-length frames seen while engaged.
+    long_frames: u32,
 }
 
 impl Warmup {
-    /// A game frame slower than this is not steady rendering (below ~15 fps native).
+    /// Before engaging: a game frame slower than this is not steady rendering (below ~15 fps).
     const STEADY_FRAME: std::time::Duration = std::time::Duration::from_millis(66);
-    /// How long the game must render steadily before the layer engages.
+    /// How long the game must render steadily before the layer first engages.
     const HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+    /// Once engaged, only loading-screen-length frames count against the game. Ordinary stutters
+    /// (streaming, shader compiles, a busy CPU) are shorter, and dropping out on them made the
+    /// effect vanish for seconds at random during play.
+    const LOADING_FRAME: std::time::Duration = std::time::Duration::from_millis(400);
+    /// And it takes several of them in a row: one long hitch is a stutter, a run is a loading screen.
+    const LOADING_RUN: u32 = 3;
 
     /// Call on every present with the time the layer spent in the previous one. Returns whether
     /// the layer may do anything with this present.
     pub fn on_present(&mut self, now: std::time::Instant, layer_time_last: std::time::Duration) -> bool {
-        if let Some(last) = self.last_present {
-            let game_frame = now.saturating_duration_since(last).saturating_sub(layer_time_last);
-            if game_frame > Self::STEADY_FRAME {
-                self.steady_since = None;
-            } else if self.steady_since.is_none() {
-                self.steady_since = Some(last);
-            }
-        }
+        let game_frame = self.last_present.map(|last| now.saturating_duration_since(last).saturating_sub(layer_time_last));
         self.last_present = Some(now);
-        self.steady_since.is_some_and(|t| now.saturating_duration_since(t) >= Self::HOLD)
+        let Some(game_frame) = game_frame else { return false };
+        if self.engaged {
+            if game_frame > Self::LOADING_FRAME {
+                self.long_frames += 1;
+                if self.long_frames >= Self::LOADING_RUN {
+                    self.engaged = false;
+                    self.steady_since = None;
+                    self.long_frames = 0;
+                }
+            } else {
+                self.long_frames = 0;
+            }
+            return self.engaged;
+        }
+        if game_frame > Self::STEADY_FRAME {
+            self.steady_since = None;
+        } else if self.steady_since.is_none() {
+            self.steady_since = Some(now);
+        }
+        self.engaged = self.steady_since.is_some_and(|t| now.saturating_duration_since(t) >= Self::HOLD);
+        self.engaged
     }
 }
 
@@ -147,19 +169,39 @@ mod warmup_tests {
     }
 
     #[test]
-    fn a_loading_screen_never_engages_and_a_hitch_resets() {
+    fn a_loading_screen_never_engages_and_disengages_a_running_game() {
         let mut w = Warmup::default();
         let t0 = Instant::now();
         // Loading: a present every 700 ms for a minute.
         let loading: Vec<(u64, u64)> = (0..90).map(|i| (i * 700, 0)).collect();
         assert!(!run(&mut w, t0, &loading).iter().any(|&b| b));
-        // Steady gameplay, then a loading hitch: disengages at once.
+        // Steady gameplay engages; then a loading screen (a run of long frames) disengages.
         let base = 90 * 700;
         let mut frames: Vec<(u64, u64)> = (0..400).map(|i| (base + i * 16, 0)).collect();
-        frames.push((base + 400 * 16 + 800, 0));
+        let end = base + 400 * 16;
+        frames.extend((1..=4).map(|k| (end + k * 700, 0)));
         let out = run(&mut w, t0, &frames);
         assert!(out[399]);
-        assert!(!out[400], "a loading-length gap must disengage immediately");
+        assert!(!out[403], "a run of loading-length frames must disengage");
+    }
+
+    #[test]
+    fn ordinary_stutters_during_play_do_not_disengage() {
+        let mut w = Warmup::default();
+        let t0 = Instant::now();
+        let mut frames: Vec<(u64, u64)> = (0..400).map(|i| (i * 16, 0)).collect();
+        // Stutters of 100 ms, 300 ms and a single 600 ms hitch, each followed by normal frames.
+        let mut t = 400 * 16;
+        for gap in [100u64, 300, 600, 150] {
+            t += gap;
+            frames.push((t, 0));
+            for _ in 0..30 {
+                t += 16;
+                frames.push((t, 0));
+            }
+        }
+        let out = run(&mut w, t0, &frames);
+        assert!(out[400..].iter().all(|&b| b), "stutters must not switch the effect off");
     }
 
     #[test]
