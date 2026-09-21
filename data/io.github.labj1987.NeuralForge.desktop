@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=NeuralForge
+Name=Neural Forge
 Comment=DLSS 5 Neural Rendering settings and helper manager
 Exec=neuralforge
 Icon=neuralforge

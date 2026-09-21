@@ -383,7 +383,7 @@ pub fn build_ui(app: &adw::Application) {
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("NeuralForge")
+        .title("Neural Forge")
         .default_width(620)
         .default_height(700)
         .content(&toasts)
@@ -416,7 +416,7 @@ pub fn build_ui(app: &adw::Application) {
         let window = window.clone();
         about_btn.connect_clicked(move |_| {
             let dialog = adw::AboutDialog::builder()
-                .application_name("NeuralForge")
+                .application_name("Neural Forge")
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
                 .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering on Linux/Proton games.")
@@ -987,7 +987,7 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
                 .heading("Reset all settings?")
                 .body("Every tuning value returns to its default. The running helper/layer \
                        session (frame counters, transport state) is not affected. Restart \
-                       NeuralForge afterward to see the reset values in this window.")
+                       Neural Forge afterward to see the reset values in this window.")
                 .default_response("cancel")
                 .close_response("cancel")
                 .build();
@@ -1007,7 +1007,7 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
                     cfg.settings.insert(name, value);
                 }
                 match cfg.save() {
-                    Ok(()) => toasts.add_toast(adw::Toast::new("Settings reset -- restart NeuralForge to see it reflected here")),
+                    Ok(()) => toasts.add_toast(adw::Toast::new("Settings reset -- restart Neural Forge to see it reflected here")),
                     Err(e) => toasts.add_toast(adw::Toast::new(&format!("Reset the live session, but saving config.ini failed: {e}"))),
                 }
             });
@@ -1076,7 +1076,7 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
             let mut cfg = neuralforge_supervisor::Config::load();
             cfg.settings = neuralforge_protocol::persist::snapshot(shm.header());
             let message = match cfg.save() {
-                Ok(()) => format!("Loaded profile \"{name}\" -- restart NeuralForge to see it reflected here"),
+                Ok(()) => format!("Loaded profile \"{name}\" -- restart Neural Forge to see it reflected here"),
                 Err(e) => format!("Applied to the running session, but saving config.ini failed: {e}"),
             };
             toasts.add_toast(adw::Toast::new(&message));
@@ -1133,7 +1133,7 @@ fn build_error_window(app: &adw::Application) {
         .title("Couldn't open the shared-memory mapping")
         .description("Check the helper's log; neuralforge-cli doctor may also help.")
         .build();
-    let window = adw::ApplicationWindow::builder().application(app).title("NeuralForge").content(&status).build();
+    let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();
     window.present();
 }
 

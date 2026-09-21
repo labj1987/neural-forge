@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <component type="desktop-application">
   <id>io.github.labj1987.NeuralForge</id>
-  <name>NeuralForge</name>
+  <name>Neural Forge</name>
   <summary>DLSS 5 Neural Rendering settings and helper manager</summary>
   <url type="homepage">https://github.com/labj1987/NeuralForge</url>
   <developer id="io.github.labj1987"><name>Alex Brown</name></developer>

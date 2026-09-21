@@ -1,6 +1,6 @@
-# NeuralForge
+# Neural Forge
 
-NeuralForge is a Linux Vulkan implicit layer plus Windows helper that forwards presented frames to
+Neural Forge is a Linux Vulkan implicit layer plus Windows helper that forwards presented frames to
 NVIDIA's DLSS 5 Neural Rendering model, running the model itself under Wine/Proton.
 Written in Rust with GTK4 and libadwaita. A from-scratch rebuild of
 [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer)'s architecture, not a fork —
@@ -17,7 +17,7 @@ Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
 
 | Settings | Setup |
 |---|---|
-| ![NeuralForge settings window with Model, Motion, Composition, Debug, Status, and Setup tabs](screenshots/settings.png) | ![Setup tab: NGX binaries status, compatibility tool picker, Steam install and launch-option generator](screenshots/setup.png) |
+| ![Neural Forge settings window with Model, Motion, Composition, Debug, Status, and Setup tabs](screenshots/settings.png) | ![Setup tab: NGX binaries status, compatibility tool picker, Steam install and launch-option generator](screenshots/setup.png) |
 
 ## What it does
 
@@ -71,7 +71,7 @@ python3 scripts/install.py install --appdir build-appimage/AppDir
 The GUI is `neuralforge`; the CLI is `neuralforge-cli`; the Windows helper is
 `neuralforge-helper.exe`. Config, data, state, runtime, control mapping and helper
 prefix use their own `neuralforge` locations. Upstream DLSS5VKLayer can remain
-installed; NeuralForge neither migrates ambiguous upstream state nor changes its
+installed; Neural Forge neither migrates ambiguous upstream state nor changes its
 files, configuration, launch options, helper, or runtime. See
 [docs/PHASE1.md](docs/PHASE1.md) for executable targeting, migration and uninstall.
 
@@ -117,7 +117,7 @@ and [NVIDIA/open-gpu-kernel-modules#1097](https://github.com/NVIDIA/open-gpu-ker
 affecting a wide range of GPUs (RTX 2080 through 5090) and a wide range of games with
 no DLSS/neural rendering involved at all (CS2, Elden Ring, Apex Legends, Path of Exile,
 Crimson Desert), across driver branches NVIDIA has not yet fixed. Check `journalctl -k`
-for a real `Xid` line before assuming NeuralForge caused a crash — see
+for a real `Xid` line before assuming Neural Forge caused a crash — see
 [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md)'s 2026-09-16 entry for how this was
 diagnosed and what other users report as partial workarounds (driver downgrade to the
 550.x branch, `PROTON_HIDE_NVIDIA_GPU=1 PROTON_ENABLE_NVAPI=1` with Pyroveil, or a

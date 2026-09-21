@@ -357,7 +357,7 @@ fn cmd_install(appdir: Option<&String>) -> ExitCode {
     };
     match neuralforge_supervisor::install::install(std::path::Path::new(appdir)) {
         Ok(report) => {
-            println!("Installed NeuralForge. CLI: {}", report.cli_path.display());
+            println!("Installed Neural Forge. CLI: {}", report.cli_path.display());
             ExitCode::SUCCESS
         }
         Err(e) => {
