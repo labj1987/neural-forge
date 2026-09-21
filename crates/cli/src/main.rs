@@ -30,7 +30,9 @@ fn usage() {
          \x20 install --appdir DIR install an extracted AppImage AppDir into\n\
          \x20                     persistent user storage (see scripts/install.py --\n\
          \x20                     same operation, same record, either tool works)\n\
-         \x20 uninstall            remove only unchanged tracked installed files\n\
+         \x20 uninstall [--purge]  remove unchanged tracked installed files; --purge also\n\
+         \x20                     removes config, data (imported DLLs, managed prefix),\n\
+         \x20                     state and /tmp/neural-forge-$UID\n\
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
@@ -373,7 +375,21 @@ fn cmd_install(appdir: Option<&String>) -> ExitCode {
     }
 }
 
-fn cmd_uninstall() -> ExitCode {
+fn cmd_uninstall(purge: bool) -> ExitCode {
+    if purge {
+        return match neural_forge_supervisor::install::purge() {
+            Ok(removed) => {
+                for path in &removed {
+                    println!("removed {}", path.display());
+                }
+                ExitCode::SUCCESS
+            }
+            Err(e) => {
+                eprintln!("purge failed: {e}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match neural_forge_supervisor::install::uninstall() {
         Ok(preserved) => {
             for path in &preserved {
@@ -449,7 +465,7 @@ fn main() -> ExitCode {
             let appdir = args.iter().position(|a| a == "--appdir").and_then(|i| args.get(i + 1));
             cmd_install(appdir)
         }
-        "uninstall" => cmd_uninstall(),
+        "uninstall" => cmd_uninstall(args.get(2).map(String::as_str) == Some("--purge")),
         "shmctl" => shmctl::run(&args[2..]),
         "profile" => cmd_profile(&args[2..]),
         "help" | "--help" | "-h" => {

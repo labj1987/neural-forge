@@ -4,7 +4,7 @@
 //! already shared code; everything else here is config/data/state, which has no
 //! Steam-container wrinkle to work around.
 
-fn home() -> String {
+pub(crate) fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
 

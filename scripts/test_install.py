@@ -131,4 +131,46 @@ class InstallTests(unittest.TestCase):
             self.assertTrue(all(Path(p).exists() and 'neuralforge' not in p for p in recorded), recorded)
             self.assertIn('migrated', result.stderr)
 
+    def test_purge_removes_everything_ours_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            data = root / 'data'
+            app = root / 'AppDir'
+            identity = 'io.github.labj1987.NeuralForge'
+            for name, text in {
+                'bin/neural-forge': 'gui', 'bin/neural-forge-cli': 'cli',
+                'lib/neural-forge/libneural_forge_layer.so': 'layer',
+                'lib/neural-forge/helper/neural-forge-helper.exe': 'helper',
+                f'share/applications/{identity}.desktop': '[Desktop Entry]\nExec=neural-forge\n',
+                'share/icons/hicolor/scalable/apps/neural-forge.svg': '<svg/>',
+                f'share/metainfo/{identity}.appdata.xml': '<component/>',
+                'share/vulkan/implicit_layer.d/neural_forge_layer.json': json.dumps({'layer': {'name': 'VK_LAYER_neuralforge_neural'}}),
+            }.items():
+                p = app / 'usr' / name
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(text)
+            upstream = data / 'vulkan/implicit_layer.d/VkLayer_DLSS5.json'
+            upstream.parent.mkdir(parents=True)
+            upstream.write_text('upstream sentinel')
+            env = scratch_env(root, data)
+            runtime = Path(f"/tmp/neural-forge-{env['NEURAL_FORGE_UID']}")
+            def cli(*args):
+                result = subprocess.run([str(CLI), *args], env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+            cli('install', '--appdir', str(app))
+            (data / 'neural-forge/binaries').mkdir(parents=True, exist_ok=True)
+            (data / 'neural-forge/binaries/nvngx_dlssnr.dll').write_text('dll')
+            (root / 'config/neural-forge').mkdir(parents=True, exist_ok=True)
+            (root / 'config/neural-forge/config.ini').write_text('set_intensity=1\n')
+            (root / 'state/neural-forge').mkdir(parents=True, exist_ok=True)
+            (root / 'state/neural-forge/helper.log').write_text('log')
+            runtime.mkdir(mode=0o700, exist_ok=True)
+            (runtime / 'shm.bin').write_text('shm')
+            cli('uninstall', '--purge')
+            for gone in [data / 'neural-forge', root / 'config/neural-forge', root / 'state/neural-forge', runtime,
+                         data / f'applications/{identity}.desktop', data / 'vulkan/implicit_layer.d/neural_forge_layer.json']:
+                self.assertFalse(gone.exists(), gone)
+            self.assertEqual(upstream.read_text(), 'upstream sentinel')
+            self.assertFalse((data / 'applications').exists(), 'an emptied directory we created should go too')
+
 if __name__ == '__main__': unittest.main()

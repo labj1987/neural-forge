@@ -280,6 +280,7 @@ pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
         let matches = path.is_file() && !path.is_symlink() && digest_file(&path).ok().as_ref() == Some(expected);
         if matches {
             std::fs::remove_file(&path)?;
+            remove_empty_parents(&path);
         } else {
             preserved.push(path);
         }
@@ -289,6 +290,52 @@ pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
         std::fs::remove_file(record)?;
     }
     Ok(preserved)
+}
+
+/// Removes `path`'s parent directories while they are empty, stopping at the XDG base
+/// directories themselves (never removes `~/.local/share` and the like).
+fn remove_empty_parents(path: &Path) {
+    let stops: Vec<PathBuf> = [crate::paths::data_home(), crate::paths::config_home(), crate::paths::home()]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect();
+    let mut dir = path.parent();
+    while let Some(d) = dir {
+        if stops.iter().any(|s| s == d) || std::fs::remove_dir(d).is_err() {
+            break; // a base dir, or not empty
+        }
+        dir = d.parent();
+    }
+}
+
+/// `uninstall`, then everything else Neural Forge ever wrote: its config, data (the imported
+/// NGX DLLs and the managed Wine prefix included), state and `/tmp/neural-forge-$UID`. Stops a
+/// running helper first. Each directory must be one of Neural Forge's own (named
+/// `neural-forge` or `neural-forge-<uid>`) or it is left alone. Returns what was removed.
+pub fn purge() -> std::io::Result<Vec<PathBuf>> {
+    let _ = crate::stop(std::time::Duration::from_secs(5));
+    let preserved = uninstall()?;
+    for path in &preserved {
+        if path.is_file() {
+            let _ = std::fs::remove_file(path);
+            remove_empty_parents(path);
+        }
+    }
+    let mut removed = Vec::new();
+    let runtime = neural_forge_protocol::shm_runtime_dir();
+    for dir in [crate::paths::config_dir(), crate::paths::data_dir(), crate::paths::state_dir(), runtime] {
+        let dir = PathBuf::from(dir);
+        let ours = dir
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n == "neural-forge" || n.starts_with("neural-forge-"));
+        if !ours || !dir.is_dir() || dir.is_symlink() {
+            continue;
+        }
+        std::fs::remove_dir_all(&dir)?;
+        removed.push(dir);
+    }
+    Ok(removed)
 }
 
 #[cfg(test)]
