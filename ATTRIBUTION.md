@@ -51,6 +51,7 @@ upstream file it came from. Nothing listed here lands in
 
 `third_party/` and `LICENSE` ship inside the AppImage (`usr/share/doc/neural-forge/`), together
 with `THIRD_PARTY_CRATES.md` (the statically linked Rust crates and their licences).
+| `crates/layer/src/hotkey.rs` (`key_code_from_name`, the key-name table, evdev keyboard discovery/drain, XInput2 raw-key selection, backend order and `NEURAL_FORGE_HOTKEY_BACKEND`/`NEURAL_FORGE_TOGGLE_KEY` overrides) | `layer_linux/src/hotkey.cpp`, `hotkey.h` (`KeyCodeFromName`, `Hotkeys::OpenEvdev`/`RescanEvdev`/`OpenX11`/`PressedEvdev`/`PressedX11`) |
 
 ## What was previously taken clean-room (still accurate, unaffected by the above)
 

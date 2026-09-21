@@ -47,7 +47,7 @@ fn evdev_keycode(hardware: u32) -> Option<u32> {
 
 fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
     let row = adw::ActionRow::builder().title("Toggle key")
-        .subtitle("Save a single key binding; in-game hotkey polling is not available yet") .build();
+        .subtitle("Toggles Neural Forge inside a running game. Needs read access to /dev/input (the 'input' group) or an X11/XWayland session.").build();
     let label = |code| if code == 0 { "Unbound".to_owned() } else { format!("Key {code}") };
     let button = gtk4::Button::with_label(&label(initial));
     button.set_valign(gtk4::Align::Center);
