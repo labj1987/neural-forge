@@ -69,6 +69,7 @@ fn cmd_status(header: &ShmHeader) {
     let layer_frames = (u64::from(header.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.layer_frames_lo.load(Ordering::Relaxed));
     println!("layer_frames={layer_frames}");
     println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
+    println!("layer_measured_white={}", f32::from_bits(header.layer_measured_white_bits.load(Ordering::Relaxed)));
     println!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed));
     println!("capture_request={}", header.capture_request.load(Ordering::Relaxed));
     println!("# settings (neural_forge_protocol::ShmHeader::persisted_settings)");

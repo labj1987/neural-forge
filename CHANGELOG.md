@@ -4,6 +4,30 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.80 — 2026-09-21
+
+Composition controls from upstream (section 9 of the parity work), each tested on a real GPU.
+
+- **Compare views.** Side by side (letterboxed, zoom 1-2) or a wipe with a movable split, and swap.
+  Both halves are the same frame, so this works in GTA V. Debug tab.
+- **Colour trust** (default 2) bounds how far the model may shift a pixel's colour: edge fringing
+  is shortened, never reversed. **Ratio smoothing** (default 100%) takes the relighting from a
+  five-pixel neighbourhood, removing speckle. Composition tab.
+- **Transfer modes** for a model working below 100%: classic, matched residual (default) and
+  native + edit (sharpest text and edges). Classic rings at edges; the other two do not. Identical
+  at 100%.
+- **White meter.** With White point source set to Measured, the proxy is normalised by the frame's
+  own measured white, so dark scenes reach the model well exposed. (Measured used to take the
+  manual slider's value.) `shmctl status` shows the reading.
+- **Frame hold.** Keeps working on one captured frame, so a settings change is judged against the
+  same picture.
+- **Highlights.** The composition now compares the model's answer with the frame encoded the same
+  way the model saw it; comparing with the raw frame dimmed every highlight above the knee.
+- **Settings survive.** Saved settings are re-applied whenever the shared memory was re-created by
+  the game or the helper (a game started first, or an upgrade); they used to reset to defaults.
+- The Game row shows the game's executable name while its frames are moving.
+- The shared-memory header is version 5; run matching layer, helper and app.
+
 ## 0.1.79 — 2026-09-21
 
 - **The app follows changes made elsewhere.** Every setting row updates within a second when a
