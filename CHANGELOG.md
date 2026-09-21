@@ -4,6 +4,43 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.78 — 2026-09-21
+
+Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
+
+- **No more ghosting.** Each frame now gets its own answer: the layer waits (at most 250 ms)
+  for the model's answer to the frame it captured and composites it onto that frame. The
+  pipelined mode, which applied answers to later frames and laid pale copies of old edges and
+  text over moving scenes, is available with `NEURAL_FORGE_PIPELINED=1`.
+- **No more freezes on launch.** Composing while GTA was on its loading screens froze the game.
+  The layer now engages only after 5 s of steady rendering and steps back out on loading
+  screens (ordinary stutters do not switch the effect off).
+- **Start order no longer matters.** Start the helper before or after the game, or restart it
+  mid-game; a helper whose heartbeat has stopped is never waited on.
+- **Tuning controls work.** Style, intensity and the local strengths are applied when the
+  model's feature is built (writing them each frame did nothing); changing one rebuilds the
+  feature after `rebuild_settle_ms`. `PerfQualityValue` is Balanced.
+- **Multiple passes.** One model feature per pass, each with its own tuning; a pass the driver
+  will not build holds the chain at what fits.
+- **Any resolution.** The model raster is capped at 3840x2160 pixels and always even; a failed
+  build is retried when the size changes instead of disabling the model for the session.
+- **Colour.** The model's hue is only trusted where it reported light, removing blue, green
+  and pink specks in dark areas (upstream's hue trust).
+- **Hotkey.** evdev plus XInput2 raw keys, loaded at run time (no libX11 link);
+  `NEURAL_FORGE_TOGGLE_KEY` and `NEURAL_FORGE_HOTKEY_BACKEND` overrides.
+- **Robustness.** Inert on non-NVIDIA devices and on a duplicate layer copy; latches off on
+  `VK_ERROR_DEVICE_LOST`; drains before freeing swapchain resources; releases the primary
+  swapchain claim when capture setup fails; a capture or debug request can no longer switch
+  the layer off. HDR and 10-bit swapchains present untouched (SDR 8-bit only for now).
+- **Helper.** Wine's `OutputDebugString` exceptions no longer count as faults; faults are
+  capped and logged with module offsets; the non-unwinding `_setjmp` is used; features below
+  64x64 are refused; `NEURAL_FORGE_SKIP_NVAPI` is honoured.
+- **Licensing.** `project_license` is AGPL-3.0-or-later; `third_party/` notices,
+  `THIRD_PARTY_CRATES.md` and `LICENSE` ship in the AppImage; the README's clean-room claim now
+  matches ATTRIBUTION.md.
+- The shared-memory header is version 4 (adds `ghost_guard`); run the matching layer, helper
+  and GUI together.
+
 ## 0.1.77 — 2026-09-21
 
 - **Runtime identifiers renamed to `neural-forge`.** Environment variables are now

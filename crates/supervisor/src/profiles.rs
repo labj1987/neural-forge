@@ -78,7 +78,6 @@ mod tests {
     // Guards every test here for the same reason `paths::tests` guards
     // `XDG_DATA_HOME`: `XDG_CONFIG_HOME` is a real process-wide env var, and Rust's
     // default test harness runs these in parallel threads within one process.
-    static XDG_CONFIG_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct ScratchConfigHome {
         _guard: std::sync::MutexGuard<'static, ()>,
@@ -88,7 +87,9 @@ mod tests {
 
     impl ScratchConfigHome {
         fn new(tag: &str) -> Self {
-            let guard = XDG_CONFIG_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            // The one lock every env-mutating test in this crate takes: `install`'s tests set
+            // XDG_CONFIG_HOME too, and a separate lock here did not exclude them.
+            let guard = crate::paths::tests::XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = std::env::temp_dir().join(format!("neural-forge-profiles-test-{tag}-{}", std::process::id()));
             let prev = std::env::var("XDG_CONFIG_HOME").ok();
             std::env::set_var("XDG_CONFIG_HOME", &dir);

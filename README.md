@@ -21,9 +21,17 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 ## What it does
 
-- A Vulkan implicit layer hooks presentation for native Linux and Proton games. It
-  sends bounded captured frames to a Windows helper over private shared memory and
-  presents untouched frames whenever an answer is not ready.
+- A Vulkan implicit layer hooks presentation for native Linux and Proton games. Each
+  presented frame is captured, answered by the model and composited back onto that same
+  frame before it is shown (synchronous present), so an answer is never pasted onto a later
+  frame -- which is what used to ghost whenever the camera moved. The wait is bounded
+  (250 ms): a slow, missing or restarting helper means that frame is shown untouched.
+  `NEURAL_FORGE_PIPELINED=1` restores the older pipelined mode (higher frame rate, ghosts).
+- Start order does not matter: the helper can be started before or after the game, and
+  stopped or restarted while it runs. The layer stays out of the way until the game has
+  rendered steadily for 5 seconds, and steps back out on loading screens.
+- Any resolution: the model never works on more than 3840x2160 pixels (anything larger is
+  scaled down for it and the answer scaled back up), and odd-sized frames are handled.
 - Fail-open: if the helper isn't running or the model fails to initialize, the layer
   just presents the original frame — nothing about the game's rendering depends on it.
 - The Windows-side helper runs NVIDIA's `nvngx_dlssnr.dll` (Feature 18) under Wine or a
@@ -33,12 +41,17 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
   baseline is SDR B8G8R8A8. HDR (PQ 10-bit) and float16 swapchains are recognised and logged
   but present untouched for now — the half-float compose path is a tracked follow-up.
 - A composition pass blends the model's output back into the frame — tone/structure/
-  skin/sharpness controls, a reversible neutral-axis proxy mode, and a choice of
+  skin/sharpness controls (applied when the model's feature is built; changing one rebuilds
+  it), multiple model passes, a reversible neutral-axis proxy mode, and a choice of
   resampling filters (Lanczos, Catmull-Rom, Mitchell-Netravali, Kaiser-windowed sinc)
   for the supersampling leg. The colour math in `composition/color.rs` is rederived
   independently from public sources (the one clean-room file); the proxy encode
   (`encode.comp`) and the composition guard in `compose.comp` are ported from
   DLSS5VKLayer's `dlssnr.hlsl` — see ATTRIBUTION.md.
+- An in-game toggle key (default F11; `NEURAL_FORGE_TOGGLE_KEY` overrides), read through
+  evdev when the user is in the `input` group and XInput2 raw keys otherwise.
+- Inert on non-NVIDIA GPUs (hybrid laptops' integrated GPU is left alone) and when a second
+  copy of the layer is loaded.
 - GTK4/libadwaita settings app for all of the above, live-bound to the running layer
   over the same shared-memory segment.
 - A CLI (`neural-forge-cli`) for runner discovery, starting/stopping the helper, status,
@@ -103,8 +116,10 @@ from a terminal.
 Validated on GTA V Enhanced (RTX 5070, driver `615.71.09`): the render tap correctly
 captures GTA's own render target while leaving Rockstar Launcher, Social Club, Wine
 Explorer, Xalia and overlays pass-through, and the full model/helper round-trip runs
-end to end. The current synchronous host-SHM transport is a correctness baseline, not
-a performance result — see [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) for
+end to end. Measured at 2560x1440 with the model at full resolution: about 35 fps with the
+effect on (the game alone runs at about 77). The limit is the game's and the model's GPU
+time on one card, not the layer (about 2 ms of its own per frame); lowering the model
+resolution (`working_scale`) trades detail for speed (44 fps at 75%, 57 at 50%) — see [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) for
 measurements, [docs/RENDER_TAP_DESIGN.md](docs/RENDER_TAP_DESIGN.md) for the capture
 constraints, and [docs/ASYNC_CAPTURE_DESIGN.md](docs/ASYNC_CAPTURE_DESIGN.md) and
 [docs/EXTERNAL_MEMORY_HOST_DESIGN.md](docs/EXTERNAL_MEMORY_HOST_DESIGN.md) for the zero-copy

@@ -72,6 +72,9 @@ pub fn claim(shm_path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// Held by the lease tests: one spawns a child process, and a fork taken while another
+    /// test holds a lease briefly shares that lease's open file description (and its lock).
+    static LEASE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
     fn launchers_cannot_claim_even_when_explicitly_targeted() {
         for exe in ["explorer.exe", "Xalia.exe", "Launcher.exe", "SocialClubHelper.exe", "RockstarService.exe", "Rockstar Games Launcher.exe", "Social Club Helper.exe"] {
@@ -85,6 +88,7 @@ mod tests {
     }
     #[test]
     fn crashed_process_releases_lease() {
+        let _serial = LEASE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
         let path = std::env::temp_dir().join(format!("neural-forge-crash-test-{}", std::process::id()));
@@ -106,6 +110,7 @@ mod tests {
     }
     #[test]
     fn lease_excludes_other_opens_and_recovers_after_close() {
+        let _serial = LEASE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let path = std::env::temp_dir().join(format!("neural-forge-owner-test-{}", std::process::id()));
         let path = path.to_str().unwrap();
         let first = acquire(path).unwrap();
