@@ -6,7 +6,7 @@
 //! see `CLAUDE.md` for what has and hasn't actually been verified on this dev machine.
 //!
 //! Milestone 4: watches `seq_req` for a change, ensures the NGX feature exists at
-//! that frame's real size (`ngx::ensure_feature`, deferred from startup since there's
+//! that frame's real size (`ngx::maintain_feature`, deferred from startup since there's
 //! no real size before the layer's first capture), runs `EvaluateFeature` through
 //! `frame::FrameResources`, and writes the result into the answer region -- or, if the
 //! feature isn't ready (still building, or the guarded `CreateFeature`/
@@ -332,11 +332,15 @@ fn process_request(
         *frame_resources = frame::FrameResources::new(device, instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
         neural_forge_helper::log!("[helper] slot {slot}: prewarmed {}x{} frame resources: {}", width, height, frame_resources.is_some());
     }
-    let ready = model_requested && ngx::ensure_feature(snippet, device, queue, width, height);
+    let tuning = hdr.resolve_pass(0);
+    let ready = model_requested
+        && ngx::maintain_feature(
+            snippet, device, queue, width, height, tuning.into(), hdr.rebuild_settle_ms.load(Ordering::Relaxed),
+        );
     if ready {
         hdr.model_up.store(1, Ordering::Relaxed);
     } else if model_requested && snippet.disabled {
-        // `ensure_feature` only ever disables the snippet after a real, one-shot
+        // `maintain_feature` only ever disables the snippet after a real, one-shot
         // `CreateFeature` attempt (see its own doc comment) -- worth surfacing in
         // status immediately rather than leaving `RUNNING` displayed forever after
         // the model is permanently unavailable.
@@ -392,8 +396,8 @@ fn process_request(
             }
             let f = frame_resources.as_ref()?;
             let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
-            let tuning = hdr.resolve_pass(0);
-            f.evaluate(device, queue, eval_fn, snippet.feature, params, proxy, &motion, motion_scale, hdr.mvec_enabled() && motion.is_empty(), tuning, answer)
+            let reset_history = ngx::take_needs_reset(snippet) || (hdr.mvec_enabled() && motion.is_empty());
+            f.evaluate(device, queue, eval_fn, snippet.feature, params, proxy, &motion, motion_scale, reset_history, tuning.sharpness, answer)
         })()
     } else {
         None

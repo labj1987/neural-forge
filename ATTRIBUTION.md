@@ -22,6 +22,18 @@ adapted, or taken from DLSS5VKLayer's real source, not just its documented behav
 | DLSS5VKLayer, `dlssnr.hlsl` — **ported** | **The composition guard** in `compose.comp`'s additive path: the `1/512` ratio floor applied above *and* below, plus the asymmetric `lift` (brightening room shrinking to none as a pixel approaches black) and `drop` (darkening room shrinking to none as it approaches white). Replaced a symmetric, epsilon-gated bound that upstream's source names as the cause of "the boiling: patches of lighter colour crawling over otherwise still geometry, worst where the picture is darkest". |
 | DLSS5VKLayer, same files | The overall two-leg structure (capture leg encodes a proxy and downloads it; a helper round trip happens in between; a compose leg uploads the answer and recomposes onto the swapchain image) and the general shape of the luminance-ratio transfer (`ratio = originalLuma / proxyLuma` below the proxy's level, a headroom-preserving inverse above it, blended via `lerp` with a saturated strength, hue corrected in OkLab) — NeuralForge already had an equivalent, independently-derived version of this exact ratio math (`composition::gpu::UpgradeToneMap`/the "classic" non-`carry_delta` dispatch path, built earlier from the RenoDX design below) that had simply never been wired into the live per-present hot path. Confirming DLSS5VKLayer's own resolve function uses the same shape of math is what justified routing the hot path through it instead of `carry_delta`, rather than porting new math wholesale. |
 
+## Ported functions (upstream parity work, from 0.3.1-1 / commit 117c953)
+
+Each function ported or re-implemented from DLSS5VKLayer's source is listed here with the
+upstream file it came from. Nothing listed here lands in
+`crates/layer/src/composition/color.rs`, which remains the one clean-room file.
+
+| Function here | Upstream file / function |
+|---|---|
+| `crates/helper/src/ngx.rs::NgxTuning`, `set_create_tuning` | `core/ngx_snippet.cpp` `NgxTuning`, `NgxSetCreateTuning` (create-time-only tuning block) |
+| `crates/helper/src/ngx.rs::maintain_feature` | `helper/main.cpp` `MaintainPasses` / `TuningFor` (compare by value, debounce by `rebuild_settle_ms`, destroy then recreate). Single-feature only until multipass lands. |
+| `crates/helper/src/ngx.rs` per-evaluate `Sharpness` write, `PerfQualityValue = 3`, `NEURAL_FORGE_SKIP_NVAPI` handling | `core/ngx_snippet.cpp` `NgxSetSharpness`, `NgxCreatePass`, `NgxLoadAndInit` |
+
 ## What was previously taken clean-room (still accurate, unaffected by the above)
 
 | Source | What's taken |

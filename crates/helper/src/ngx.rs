@@ -18,6 +18,7 @@
 //! de-risks evaluate too, even unwired.
 
 use std::ffi::{c_void, CString};
+use std::time::{Duration, Instant};
 
 use ash::vk;
 
@@ -38,6 +39,11 @@ const LOAD_LIBRARY_SEARCH_DEFAULT_DIRS: u32 = 0x0000_1000;
 
 fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
+}
+
+/// `NEURAL_FORGE_SKIP_NVAPI` semantics: set to anything that doesn't start with `0`.
+fn skip_nvapi() -> bool {
+    neural_forge_protocol::env::var("NEURAL_FORGE_SKIP_NVAPI").is_some_and(|v| !v.is_empty() && !v.starts_with('0'))
 }
 
 fn resolve_bin_dir() -> Option<String> {
@@ -74,8 +80,92 @@ pub struct NgxSnippet {
     /// this exact device, not a null placeholder.
     device: vk::Device,
 
+    /// `nvapi64.dll`, loaded only so a snippet that resolves NVAPI by name finds this
+    /// copy; never called into. Null when the runner supplies NVAPI (`NEURAL_FORGE_SKIP_NVAPI`)
+    /// or the load failed.
+    nvapi: *mut c_void,
+
     pub feature: abi::NgxHandle,
     pub disabled: bool,
+
+    /// What the live feature was built with -- the model latches these at creation, so a
+    /// difference from what the header asks for now means a rebuild, not a parameter write.
+    built_tuning: NgxTuning,
+    /// The most recent header value seen; a new value re-arms the settle wait so dragging a
+    /// slider debounces rather than rebuilding at every tick.
+    last_seen_tuning: NgxTuning,
+    tuning_changed: Option<Instant>,
+    /// Builds are spaced: NGX creation is expensive and back-to-back creation can exhaust
+    /// the driver's latches.
+    build_after: Option<Instant>,
+    rebuild_failures: u32,
+    /// Set by a rebuild so the next evaluate tells the model its history is gone.
+    needs_reset: bool,
+}
+
+/// The settings the model latches when a feature is created. Written into the parameter
+/// block immediately before `CreateFeature` and at no other time -- writing them at
+/// evaluate has no effect on a running feature and leaves the block holding stale values
+/// for whatever creates a feature next.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NgxTuning {
+    pub style: u32,
+    pub intensity: f32,
+    pub local_tone: f32,
+    pub local_structure: f32,
+    /// -1 follows local structure; it is not a strength of zero.
+    pub skin_structure: f32,
+    pub auto_mask: u32,
+    pub preset: u32,
+}
+
+impl Default for NgxTuning {
+    fn default() -> Self {
+        Self { style: 0, intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, auto_mask: 1, preset: 0 }
+    }
+}
+
+impl From<neural_forge_protocol::PassTuning> for NgxTuning {
+    fn from(p: neural_forge_protocol::PassTuning) -> Self {
+        Self {
+            style: p.style,
+            intensity: p.intensity.clamp(0.0, 4.0),
+            local_tone: p.local_tone.clamp(0.0, 4.0),
+            local_structure: p.local_structure.clamp(0.0, 4.0),
+            skin_structure: p.skin_structure.clamp(-1.0, 4.0),
+            auto_mask: u32::from(p.auto_mask != 0),
+            preset: p.preset,
+        }
+    }
+}
+
+/// Writes the create-time block. Must run immediately before `CreateFeature`.
+fn set_create_tuning(params: NgxParameter, t: &NgxTuning) -> u32 {
+    let name = |n: &str| CString::new(n).unwrap();
+    let ((), seh) = guarded(
+        || {
+            // SAFETY: `params` was allocated and validated in `load_and_init`.
+            unsafe {
+                abi::ngx_set_u32(params, name("DLSSNR.Hint.Render.Preset").as_ptr(), t.preset);
+                abi::ngx_set_u32(params, name("DLSSNR.Style").as_ptr(), t.style);
+                abi::ngx_set_f32(params, name("DLSSNR.Intensity").as_ptr(), t.intensity);
+                abi::ngx_set_f32(params, name("DLSSNR.LocalToneStrength").as_ptr(), t.local_tone);
+                abi::ngx_set_f32(params, name("DLSSNR.LocalStructureStrength").as_ptr(), t.local_structure);
+                abi::ngx_set_f32(params, name("DLSSNR.SkinStructureStrength").as_ptr(), t.skin_structure);
+                abi::ngx_set_u32(params, name("DLSSNR.UseAutoMask").as_ptr(), t.auto_mask);
+            }
+        },
+        (),
+    );
+    if seh != 0 {
+        crate::log!("[params] create tuning FAILED (seh={seh:#x})");
+    } else {
+        crate::log!(
+            "[params] create tuning: preset={} style={} intensity={:.2} tone={:.2} structure={:.2} skin={:.2} automask={}",
+            t.preset, t.style, t.intensity, t.local_tone, t.local_structure, t.skin_structure, t.auto_mask
+        );
+    }
+    seh
 }
 
 // SAFETY: every raw pointer/handle field here is either an opaque DLL/NGX handle
@@ -101,8 +191,15 @@ impl Default for NgxSnippet {
             params_destroy: None,
             self_params: false,
             device: vk::Device::null(),
+            nvapi: std::ptr::null_mut(),
             feature: std::ptr::null_mut(),
             disabled: false,
+            built_tuning: NgxTuning::default(),
+            last_seen_tuning: NgxTuning::default(),
+            tuning_changed: None,
+            build_after: None,
+            rebuild_failures: 0,
+            needs_reset: false,
         }
     }
 }
@@ -182,6 +279,37 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     }
     crate::log!("[ngx] caller-identity spoof installed, loading core (nvngx.dll) next");
     crate::logging::flush();
+
+    // NVAPI. Never called into -- `nvapi64.dll` is loaded only so a snippet that resolves NVAPI
+    // by name finds this copy. When the runner already supplies NVAPI (Proton's DXVK-NVAPI, which
+    // the supervisor announces with NEURAL_FORGE_SKIP_NVAPI) it is skipped outright: forcing the
+    // vendored copy in bypasses the DXVK-NVAPI override and can fault inside its DllMain. The
+    // load is guarded either way, so a bad nvapi64 degrades to "no NVAPI" instead of taking the
+    // helper down.
+    if skip_nvapi() {
+        crate::log!("[ngx] nvapi64.dll load skipped (runner supplies NVAPI)");
+    } else {
+        let path = utf16(&format!("{bin_dir}\\nvapi64.dll"));
+        let (module, seh) = guarded(
+            || {
+                // SAFETY: `path` is a valid NUL-terminated UTF-16 string.
+                unsafe {
+                    LoadLibraryExW(
+                        path.as_ptr(),
+                        std::ptr::null_mut(),
+                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
+                    )
+                }
+            },
+            std::ptr::null_mut(),
+        );
+        s.nvapi = module;
+        if s.nvapi.is_null() {
+            crate::log!("[ngx] nvapi64.dll not loaded (seh={seh:#x}); continuing without it");
+        } else {
+            crate::log!("[ngx] nvapi64.dll loaded");
+        }
+    }
 
     // Core (nvngx.dll) must be loaded for the snippet's own Vulkan exports to resolve
     // at all -- confirmed via a real bisection on `lordnikon` (2026-09-11): with Core
@@ -439,7 +567,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         crate::log!("[ngx] snippet has no VULKAN_GetFeatureRequirements export");
     }
 
-    // Feature creation is deferred to `ensure_feature`, called once the per-frame
+    // Feature creation is deferred to `maintain_feature`, called once the per-frame
     // loop (`main.rs`) knows a real width/height -- there is no real frame to build it
     // at the size of yet at this point in startup.
     s
@@ -459,39 +587,7 @@ impl NgxSnippet {
     }
 }
 
-/// Creates the feature at `width`x`height` if one doesn't already exist. A no-op
-/// (returns whatever [`NgxSnippet::has_feature`] already reports) once a feature
-/// exists -- this crate doesn't yet handle resizing/rebuilding on a size change (see
-/// `neural_forge_protocol::ShmHeader::tuning_seq`'s own doc comment for the debounced-rebuild
-/// design this would eventually hook into); most games never resize their swapchain
-/// mid-session, and a size change today is simply not picked up until the helper
-/// restarts.
-pub fn ensure_feature(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32) -> bool {
-    if s.disabled {
-        return false;
-    }
-    if s.has_feature() {
-        return true;
-    }
-    if width == 0 || height == 0 {
-        return false;
-    }
-    let ok = create_feature_at(s, device, queue, width, height);
-    if !ok {
-        // One attempt only: a failed `CreateFeature` here means either a real fault
-        // or a clean rejection from the DLL (see `main.rs`'s own doc comment on the
-        // caller-identity-gate result this currently returns) -- neither is the kind
-        // of transient condition retrying next frame would fix, and retrying anyway
-        // meant re-doing the full command pool/buffer/fence setup on every single
-        // captured frame forever, adding real per-frame Vulkan object churn for no
-        // chance of a different outcome (found while investigating the real-size
-        // CreateFeature hang this session already fixed separately).
-        s.disabled = true;
-    }
-    ok
-}
-
-fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32) -> bool {
+fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32, tuning: &NgxTuning) -> bool {
     let Some(create_feature) = s.create_feature else { return false };
     let name = |n: &str| CString::new(n).unwrap();
     let params = s.params;
@@ -515,12 +611,11 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 abi::ngx_set_u32(params, name("DLSSNR.Upscaling").as_ptr(), 0);
                 abi::ngx_set_f32(params, name("DLSSNR.Scale").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("DLSSNR.ScalingRatio").as_ptr(), 1.0);
-                // 0 = a conservative, always-valid choice among the real SDK's
-                // `NVSDK_NGX_PerfQuality_Value_*` enumerants (0=MaxPerf, 1=Balanced,
-                // 2=MaxQuality, ...) -- upstream sets this and this crate previously
-                // didn't set it at all.
-                abi::ngx_set_u32(params, name("DLSSNR.Hint.Render.Preset").as_ptr(), 0);
-                abi::ngx_set_u32(params, name("NVSDK_NGX_Parameter_PerfQualityValue").as_ptr(), 0);
+                // Balanced (`NVSDK_NGX_PerfQuality_Value_Balanced` = 3), under both the bare and the
+                // prefixed key: the model reads the bare one, and setting only the prefixed one
+                // left it at MaxPerf.
+                abi::ngx_set_u32(params, name("PerfQualityValue").as_ptr(), 3);
+                abi::ngx_set_u32(params, name("NVSDK_NGX_Parameter_PerfQualityValue").as_ptr(), 3);
                 // The rest of this block: real parameter names confirmed present in
                 // the DLL's own accepted-parameter string table (`objdump`/`strings`
                 // on the actual DLL and on a real, working reference implementation's
@@ -532,15 +627,9 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 // third-party reference and has been removed.
                 abi::ngx_set_u32(params, name("DLSSNR.Enabled").as_ptr(), 1);
                 abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), 1);
-                abi::ngx_set_u32(params, name("DLSSNR.Style").as_ptr(), 0);
-                abi::ngx_set_f32(params, name("DLSSNR.Intensity").as_ptr(), 1.0);
-                abi::ngx_set_f32(params, name("DLSSNR.LocalToneStrength").as_ptr(), 1.0);
-                abi::ngx_set_f32(params, name("DLSSNR.LocalStructureStrength").as_ptr(), 1.0);
-                // -1 follows local structure; it is not a strength of zero -- same
-                // convention `neural_forge_protocol::PassControl::reset_to_defaults`
-                // already documents for this exact field.
-                abi::ngx_set_f32(params, name("DLSSNR.SkinStructureStrength").as_ptr(), -1.0);
-                abi::ngx_set_u32(params, name("DLSSNR.UseAutoMask").as_ptr(), 1);
+                // Style, Intensity, the local strengths and UseAutoMask are deliberately absent:
+                // they are the create-time tuning block, written by `set_create_tuning` right
+                // before `CreateFeature` below so nothing later in this function can overwrite them.
                 abi::ngx_set_u32(params, name("DLSSNR.AutoExposure").as_ptr(), 1);
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_ExposureScale").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_PreExposure").as_ptr(), 1.0);
@@ -604,6 +693,13 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         return false;
     }
 
+    // Last, so nothing above can overwrite it.
+    if set_create_tuning(params, tuning) != 0 {
+        // SAFETY: `cmd` was begun above and never submitted; `pool` owns it.
+        unsafe { device.destroy_command_pool(pool, None) };
+        return false;
+    }
+
     let ((result, handle), seh) = guarded(
         || {
             let mut handle: abi::NgxHandle = std::ptr::null_mut();
@@ -662,7 +758,115 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         return false;
     }
     s.feature = handle;
+    s.built_tuning = *tuning;
+    s.last_seen_tuning = *tuning;
     true
+}
+
+/// Releases the live feature, if any. Callers drain the device first (nothing may be
+/// in flight against it).
+fn release_feature(s: &mut NgxSnippet) {
+    if s.feature.is_null() {
+        return;
+    }
+    if let Some(release) = s.release_feature {
+        let feature = s.feature;
+        let (result, seh) = guarded(|| unsafe { release(feature) }, abi::result::FAIL_SEH);
+        crate::log!("[ngx] ReleaseFeature -> {:#x} seh={:#x}", result as u32, seh);
+    }
+    s.feature = std::ptr::null_mut();
+}
+
+/// Consumes the "history is gone" flag a rebuild sets.
+pub fn take_needs_reset(s: &mut NgxSnippet) -> bool {
+    std::mem::take(&mut s.needs_reset)
+}
+
+/// Gives up on rebuilds after this many consecutive failures.
+const MAX_REBUILD_FAILURES: u32 = 3;
+
+/// Brings the live feature into line with what the header asks for, and builds it the
+/// first time. `wanted` is compared by value, not through `tuning_seq` (a hint that a
+/// header reset returns to zero, and that persisted config never bumps). A retuned
+/// feature keeps answering with the tuning it was built with until the replacement is
+/// ready; the replacement is built only after the wanted value has been stable for
+/// `settle_ms` and builds are spaced by the same interval.
+///
+/// Returns whether a feature exists afterwards. A failure to build the *first* feature is
+/// one-shot (`disabled`); a failed rebuild leaves no feature and retries after the spacing,
+/// up to [`MAX_REBUILD_FAILURES`] times.
+pub fn maintain_feature(
+    s: &mut NgxSnippet,
+    device: &ash::Device,
+    queue: vk::Queue,
+    width: u32,
+    height: u32,
+    wanted: NgxTuning,
+    settle_ms: u32,
+) -> bool {
+    if s.disabled {
+        return false;
+    }
+    if width == 0 || height == 0 {
+        return s.has_feature();
+    }
+    let now = Instant::now();
+    let spacing = Duration::from_millis(u64::from(settle_ms));
+
+    if wanted != s.last_seen_tuning {
+        s.last_seen_tuning = wanted;
+        s.tuning_changed = Some(now);
+    }
+
+    if !s.has_feature() {
+        // First build, or a retry after a failed rebuild: wait out the spacing between attempts
+        // but not the debounce -- there is no feature answering, so nothing to keep alive.
+        if s.build_after.is_some_and(|t| now < t) {
+            return false;
+        }
+        let first = s.rebuild_failures == 0 && s.build_after.is_none();
+        let ok = create_feature_at(s, device, queue, width, height, &wanted);
+        if ok {
+            s.rebuild_failures = 0;
+            s.needs_reset = true;
+        } else if first {
+            // One attempt only: a failed first `CreateFeature` means a real fault or a clean
+            // rejection, neither of which retrying next frame fixes (and retrying meant
+            // redoing the command pool/buffer/fence setup on every captured frame).
+            s.disabled = true;
+        } else {
+            s.rebuild_failures += 1;
+            s.build_after = Some(now + spacing);
+            if s.rebuild_failures >= MAX_REBUILD_FAILURES {
+                crate::log!("[helper] rebuild failed {} times; giving up on the model", s.rebuild_failures);
+                s.disabled = true;
+            }
+        }
+        return ok;
+    }
+
+    if wanted == s.built_tuning {
+        return true;
+    }
+    if s.tuning_changed.is_some_and(|t| now.duration_since(t) < spacing) || s.build_after.is_some_and(|t| now < t) {
+        return true; // keep answering with the old tuning until the replacement is due
+    }
+    crate::log!("[helper] retuned; rebuilding the feature (spacing {settle_ms} ms)");
+    // SAFETY: the helper submits and fences every evaluate, so this only guards against
+    // a stray submission; nothing may be in flight when the feature is destroyed.
+    let _ = unsafe { device.device_wait_idle() };
+    release_feature(s);
+    // Marks this as a rebuild, not a first attempt: a failure now retries instead of disabling.
+    s.build_after = Some(now + spacing);
+    let ok = create_feature_at(s, device, queue, width, height, &wanted);
+    if ok {
+        s.rebuild_failures = 0;
+        s.needs_reset = true;
+    } else {
+        s.rebuild_failures += 1;
+        crate::log!("[helper] feature rebuild failed; retrying after the spacing");
+    }
+    ok
 }
 
 /// Release the feature, shut down the snippet, restore the caller-identity spoof, and
@@ -701,6 +905,9 @@ pub fn teardown(mut s: NgxSnippet) {
     }
     if let Some(spoofed) = s.core_spoof.take() {
         unsafe { spoof::remove(spoofed) };
+    }
+    if !s.nvapi.is_null() {
+        unsafe { FreeLibrary(s.nvapi) };
     }
     if !s.core.is_null() {
         unsafe { FreeLibrary(s.core) };
