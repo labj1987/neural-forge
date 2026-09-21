@@ -1390,7 +1390,7 @@ impl GpuCompose {
 /// GPU needed, for exactly this kind of check). Shared by every `#[test]` below
 /// rather than each standing up its own instance/device.
 #[cfg(test)]
-fn test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
+pub(crate) fn test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
     // SAFETY: same reasoning as `examples/smoke.rs`'s identical call.
     let entry = unsafe { ash::Entry::load() }.ok()?;
     let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);

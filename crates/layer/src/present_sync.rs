@@ -15,6 +15,7 @@ impl PresentSemaphores {
         self.active.insert(image, sem);
         Some(sem)
     }
+    pub fn is_empty(&self) -> bool { self.active.is_empty() && self.retired.is_empty() }
     pub fn retire(&mut self, images: &[vk::Image]) {
         for image in images {
             if let Some(sem) = self.active.remove(image) { self.retired.push(sem); }

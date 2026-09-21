@@ -13,6 +13,9 @@ pub struct SwapchainState {
     /// larger than the protocol's ceiling (`neuralforge_protocol::{MAX_W,MAX_H}`) -- it
     /// presents untouched either way.
     pub pass_through: bool,
+    /// The `imageUsage` the swapchain was actually created with (the layer's enlarged
+    /// usage only when admission succeeded). The write-back path needs `TRANSFER_DST`.
+    pub image_usage: vk::ImageUsageFlags,
     /// The swapchain's own images, in `vkGetSwapchainImagesKHR` order -- index `i`
     /// here is exactly what `VkPresentInfoKHR::pImageIndices[i]` refers to. Fetched
     /// once at creation (see `device::NeuralForgeDeviceInfo::fetch_swapchain_images`).
