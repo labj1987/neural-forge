@@ -40,12 +40,3 @@ pub fn helper_exe() -> Option<PathBuf> {
     None
 }
 
-pub fn dxvk_dll() -> Option<PathBuf> {
-    for dir in candidate_install_dirs() {
-        let candidate = dir.join("dxvk/vulkan-1.dll");
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    None
-}

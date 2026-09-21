@@ -30,6 +30,8 @@ other's mapping.
 | White meter (tile peaks, 90th percentile, lit acceptance) and the Measured source | `capture::meter_white` on the CPU, smoothed (0.1.80) |
 | Frame hold | synchronous present + `composition/gpu.rs` held-frame input (0.1.80) |
 | `DEVELOPMENT.md` invariants | `CLAUDE.md`, "Composition invariants" |
+| System-Wine prefix: DXVK 3.1 `dxgi.dll` + DXVK-NVAPI 0.9.2 (supplied, from Proton, or SHA256-pinned download), `dxvk.conf`, native overrides | `supervisor::provision` (0.1.81); verified end to end under Wine 10 on the rig |
+| `answered_w`/`answered_h` guard against another swapchain's answer | helper echoes, synchronous present checks (0.1.81) |
 
 ## Deliberately not adopted
 
@@ -56,11 +58,18 @@ other's mapping.
   with the hardware blit, and supersampling above 100% is not offered.
 - **32-bit layer:** builds, but the 1.3 GB mapping does not reliably fit a 32-bit address space;
   needs per-region mapping before it can ship.
-- **System-Wine runner provisioning:** SHA256-pinned DXVK 3.1 `dxgi.dll` and dxvk-nvapi 0.9.2,
-  `dxvk.conf`, a vendored `vulkan-1.dll` (upstream's `dlssnr-helper`). Proton runners do not
-  need it. `cli doctor`'s DXVK check reports it missing until then.
-- **16-bit multipass intermediates**, the GPU motion-vector deadzone shader
-  (`mvec_deadzone.comp`, two compile-time variants), and a retest of the dma-buf export path.
+- **Upstream's vendored `vulkan-1.dll`** for system Wine: not carried; Wine's own `winevulkan`
+  worked in the end-to-end test.
+- **16-bit multipass intermediates** (passes are chained through 8-bit images today).
+- **Motion vectors:** the GPU deadzone shader (`mvec_deadzone.comp`, two compile-time variants).
+  Motion is off by default and the rig reports no optical-flow support, so it cannot be tested
+  there.
+- **dma-buf transport:** nothing reads `NEURAL_FORGE_DMABUF` any more; the path is not wired. A
+  retest against system Wine + DXVK-NVAPI is now possible, since that runner works.
+- **Frame generation:** with DLSS Frame Generation on, every presented frame -- generated ones
+  included -- waits for its own model answer, so generation adds no frames (and half the model's
+  work goes into generated frames). The fix is to enhance before frame generation (the game's
+  render target, not the swapchain), or to enhance alternate presents and carry the answer.
 - **Why compositing during GTA V's loading screens stalls the game** is unknown; the layer
   avoids it by waiting for 5 s of steady rendering (`swapchain::Warmup`).
 - **Running the model before the game's own upscaler** (on the internal render resolution)

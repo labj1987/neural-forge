@@ -4,7 +4,7 @@
 //! upstream's expression of it) reimplemented in Rust, sharing logic with the GUI
 //! through `neural_forge_protocol` instead of duplicating it in shell.
 
-mod gpu;
+use neural_forge_supervisor::gpu;
 mod shmctl;
 
 use std::process::ExitCode;
@@ -291,11 +291,19 @@ fn cmd_doctor() -> ExitCode {
         ok = false;
     }
 
-    print!("vendored dxvk dll: {}\n  ", install_dir::dxvk_dll().as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "missing".to_string()));
-    if install_dir::dxvk_dll().is_some() {
-        println!("ok");
+    if cfg.runner_type == "wine" {
+        for name in neural_forge_supervisor::provision::RUNTIME_DLLS {
+            let target = neural_forge_supervisor::provision::prefix_dll(name);
+            print!("prefix {name}: {}\n  ", target.display());
+            if neural_forge_supervisor::provision::prefix_dll_installed(name) {
+                println!("ok");
+            } else {
+                ok = false;
+                println!("missing or Wine's placeholder (run `neural-forge-cli setup`)");
+            }
+        }
     } else {
-        println!("missing (only needed for the system-Wine fallback runner)");
+        println!("DXVK/NVAPI prefix DLLs: not needed ({} runner supplies them)", cfg.runner_type);
     }
 
     print!("runtime dir: {}\n  ", neural_forge_protocol::shm_runtime_dir());
@@ -314,6 +322,14 @@ fn cmd_setup() -> ExitCode {
     let init_result = cmd_init();
     if init_result != ExitCode::SUCCESS {
         return init_result;
+    }
+    let cfg = Config::load();
+    match neural_forge_supervisor::provision::prepare_wine_prefix(&cfg) {
+        Ok(notes) => notes.iter().for_each(|n| println!("{n}")),
+        Err(e) => {
+            eprintln!("system-Wine prefix setup failed: {e}");
+            return ExitCode::FAILURE;
+        }
     }
     println!("setup complete");
     ExitCode::SUCCESS

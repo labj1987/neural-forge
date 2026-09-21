@@ -21,6 +21,14 @@ use nix::unistd::Pid;
 /// Spawns `program` with `args`/`envs`, in a new session (`setsid`) so it becomes its
 /// own process group leader, redirecting stdout/stderr to `log_path` (append). Writes
 /// the child's PID to `pid_file`. Returns the child's PID.
+/// Appends one line to the helper's log (for supervisor-side problems the helper never sees).
+pub(crate) fn append_log(log: &str, line: &str) {
+    use std::io::Write;
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(log) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
 pub fn start_detached(
     program: &str,
     args: &[String],

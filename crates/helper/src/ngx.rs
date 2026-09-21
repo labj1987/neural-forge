@@ -332,6 +332,13 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
             std::ptr::null_mut(),
         );
         s.nvapi = module;
+        if s.nvapi.is_null() {
+            // Not in the binaries folder: the normal search path, which under system Wine finds the
+            // DXVK-NVAPI copy the supervisor installed in the prefix (with its native override).
+            let by_name = utf16("nvapi64.dll");
+            let (module, _) = guarded(|| unsafe { LoadLibraryExW(by_name.as_ptr(), std::ptr::null_mut(), 0) }, std::ptr::null_mut());
+            s.nvapi = module;
+        }
         // SAFETY: a non-null result is a just-loaded PE image (a null one is ignored).
         unsafe { crate::guard::register_module(crate::guard::Module::Nvapi, s.nvapi) };
         if s.nvapi.is_null() {

@@ -5,11 +5,13 @@
 //! Linux-only: spawns child processes, reads XDG env vars.
 
 pub mod config;
+pub mod gpu;
 pub mod install;
 pub mod install_dir;
 pub mod migrate;
 pub mod paths;
 pub mod profiles;
+pub mod provision;
 mod process;
 pub mod runners;
 
@@ -202,6 +204,14 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
         }
         (cfg.runner_path.clone(), vec!["run".to_string(), helper.display().to_string()])
     } else {
+        if cfg.runner_type == "wine" {
+            // Plain Wine has no DXVK-NVAPI of its own: the managed prefix is given DXVK's dxgi and
+            // DXVK-NVAPI (see `provision`), and the helper loads NVAPI itself.
+            if let Err(e) = provision::prepare_wine_prefix(cfg) {
+                crate::process::append_log(&cfg.log, &format!("[neural-forge] system-Wine prefix setup failed: {e}"));
+            }
+            envs.extend(provision::wine_env());
+        }
         (cfg.runner_path.clone(), vec![helper.display().to_string()])
     };
 
