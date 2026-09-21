@@ -91,3 +91,23 @@ as-is; don't re-raise it without new information:
 old commands, measured failures and toolchain investigations as historical evidence.
 Those old deployment recipes are not current instructions. The historical GTA handoff
 is [docs/history/handoff-2026-09-12-fps-freeze-regression.md](docs/history/handoff-2026-09-12-fps-freeze-regression.md).
+
+## Composition invariants (checklist for every change to the pass)
+
+Adopted from upstream DLSS5VKLayer's `DEVELOPMENT.md`; check each before committing shader or
+composition changes.
+
+- **Default-identical toggles.** A new control's default must leave the shipped picture bit
+  for bit as it was (or the change says in its commit why the picture moves). Transfer modes
+  are identical at 100% model resolution; compare off is a no-op.
+- **Push constants append-only, struct == shader.** `composition::gpu::PushConstants` and
+  `compose.comp`'s `Params` block match field for field, and new fields go at the end of both.
+  The same for `ShmHeader`: append, bump `SHM_VERSION`, update the pinned offsets.
+- **The encode is reproduced wherever the proxy is compared.** Anything that compares the
+  model's answer with the frame must first put the frame through the same white divide and
+  knee the encode used (`SoftKneeLuminance(original / white_point)`), passthrough included.
+- **Drain before free.** Nothing the GPU may still read is destroyed until its fence (or the
+  device) has been waited on: slot resources, swapchain images, NGX features.
+- **Tested on lavapipe, and the test fails without the change.** Every composition behaviour has
+  a GPU test (`composition::gpu::tests::compose_once` makes one short); run it once with the
+  change reverted to see it fail.

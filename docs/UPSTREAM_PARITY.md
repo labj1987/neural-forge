@@ -24,6 +24,12 @@ other's mapping.
 | evdev + XInput2 hotkeys, `DLSSNR_TOGGLE_KEY`/`HOTKEY_BACKEND` | `hotkey.rs`, `NEURAL_FORGE_*` names |
 | Hue trust (`kQuantFloor`) | `compose.comp` mode 2 |
 | GUI: live reload, per-pass dialog, rebuild spacing, wider ranges | `crates/gui` |
+| Compare views (side by side, wipe, swap, zoom) | `compose.comp` (0.1.80) |
+| Colour trust and ratio smoothing, defaults 2 and 100% | `compose.comp` (0.1.80) |
+| Transfer modes 0/1/2 (classic, matched residual, native + edit) | `compose.comp` + small-proxy enlargement in `composition/gpu.rs` (0.1.80) |
+| White meter (tile peaks, 90th percentile, lit acceptance) and the Measured source | `capture::meter_white` on the CPU, smoothed (0.1.80) |
+| Frame hold | synchronous present + `composition/gpu.rs` held-frame input (0.1.80) |
+| `DEVELOPMENT.md` invariants | `CLAUDE.md`, "Composition invariants" |
 
 ## Deliberately not adopted
 
@@ -44,9 +50,10 @@ other's mapping.
 
 - **HDR / 10-bit / float16** swapchains: presented untouched. Needs the float16 proxy, PQ10
   transfer and half-float compose fallback (`composition.cpp` `Prepare`, `DetectHdrKind`).
-- **Composition controls** from `dlssnr.hlsl`: transfer modes 0/1/2, compare split/zoom/swap,
-  debug views 0-5, colour trust and ratio smooth, the GPU white-point meter, frame hold.
-  The GUI already has rows for some; they are not wired to the shader.
+- **Debug views 4 and 5** (colour-bound and pre-bound views) and a GPU-side meter: the meter
+  runs on the CPU over the captured frame instead, which the synchronous present already holds.
+- **The CPU downscale kernels** (`composition/downscale.rs`) remain unwired; the model is scaled
+  with the hardware blit, and supersampling above 100% is not offered.
 - **32-bit layer:** builds, but the 1.3 GB mapping does not reliably fit a 32-bit address space;
   needs per-region mapping before it can ship.
 - **System-Wine runner provisioning:** SHA256-pinned DXVK 3.1 `dxgi.dll` and dxvk-nvapi 0.9.2,

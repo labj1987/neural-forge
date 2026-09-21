@@ -891,6 +891,17 @@ fn meter_white(frame: &[u8], width: u32, height: u32, bgr: bool) -> Option<f32> 
     (white > 1e-4).then_some(white)
 }
 
+/// Frame hold: the captured frame (and the proxy sent for it) that every present keeps working on
+/// while `hold_frame` is on, so a settings change is judged against the same picture.
+struct HeldFrame {
+    width: u32,
+    height: u32,
+    original: Vec<u8>,
+    proxy: Vec<u8>,
+    sent: (u32, u32),
+}
+static HELD: std::sync::Mutex<Option<HeldFrame>> = std::sync::Mutex::new(None);
+
 /// The longest a present waits for its own frame's answer before going out untouched.
 const SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -1154,6 +1165,9 @@ pub unsafe fn run(
     // proxy it was shown is still in `model_scratch`, and the composition needs it for the
     // transfer modes.
     let mut compose_small_proxy = false;
+    // Set by the synchronous present while frame hold is on: the composition works on the held
+    // frame (`raw_answer_base`) instead of the live swapchain image.
+    let mut compose_held = false;
     if pipelined_present() {
         for slot in 0..2 {
             // Poll whatever was sent on some earlier frame *before* touching anything
@@ -1306,7 +1320,19 @@ pub unsafe fn run(
         };
         let t_start = std::time::Instant::now();
         let mut sent = None;
-        loop {
+        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+        if !settings.hold_frame || held.as_ref().is_some_and(|h| (h.width, h.height) != (width, height)) {
+            *held = None;
+        }
+        if let Some(h) = held.as_ref() {
+            // Holding: the model is shown the held proxy again, no capture.
+            original_scratch.clone_from(&h.original);
+            model_scratch.clone_from(&h.proxy);
+            shm.set_frame_info(SLOT, h.sent.0, h.sent.1, proxy_format);
+            shm.write_proxy(SLOT, &h.proxy);
+            sent = Some(h.sent);
+        }
+        while sent.is_none() {
             if let Some(dims) = poll_or_submit_capture(
                 SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
                 capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
@@ -1324,6 +1350,14 @@ pub unsafe fn run(
             shm.publish_frame_timing(pipeline_start.elapsed(), false);
             return None;
         };
+        let holding = held.is_some();
+        if settings.hold_frame && !holding {
+            // Start holding this frame. What was sent is the scaled, encoded scratch unless direct
+            // capture wrote the whole frame straight into shared memory.
+            let proxy = if (sent_w, sent_h) == (width, height) && use_direct { original_scratch.clone() } else { model_scratch.clone() };
+            *held = Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h) });
+        }
+        drop(held);
         let t_captured = std::time::Instant::now();
         // The white meter: every 8th frame, smoothed (about a second to settle) so the proxy's
         // brightness never jumps from one frame to the next -- a jumping divisor would make the
@@ -1331,7 +1365,7 @@ pub unsafe fn run(
         // so the GUI can show it; only used when the source is Measured.
         {
             static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
+            if !holding && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
                 if let Some(white) = meter_white(original_scratch, width, height, bgr_order) {
                     shm.publish_measured_white(white);
                 }
@@ -1367,6 +1401,7 @@ pub unsafe fn run(
         std::mem::swap(raw_answer_base, original_scratch);
         *last_answer_dims = (sent_w, sent_h);
         compose_small_proxy = (sent_w, sent_h) != (width, height) && model_scratch.len() >= answer_bytes;
+        compose_held = settings.hold_frame;
         SYNC_TIMING.with(|t| t.set(Some((t_captured - t_start, t_answered - t_captured, t_answered.elapsed()))));
         *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
     }
@@ -1400,6 +1435,7 @@ pub unsafe fn run(
             raw_answer_base,
             last_answer,
             compose_small_proxy.then_some(model_scratch.as_slice()),
+            compose_held.then_some(raw_answer_base.as_slice()),
             *raw_answer_generation,
             bgr_order,
             image,
