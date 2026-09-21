@@ -359,7 +359,9 @@ pub fn build_ui(app: &adw::Application) {
     hdr_group.add(&spin_row("White point trim", "Calibration multiplier", trim, 0.01, 100.0, 0.05, set_trim));
 
     let (transfer, set_transfer) = bind_u32(&shm, Some("transfer"), |h| &h.transfer);
-    comp_group.add(&combo_row("Transfer mode", &["Classic", "Matched residual", "Native + edit"], transfer, set_transfer));
+    let transfer_row = combo_row("Transfer mode", &["Classic", "Matched residual", "Native + edit"], transfer, set_transfer);
+    transfer_row.set_subtitle("How the answer comes back when model resolution is below 100% (identical at 100%). Native + edit keeps text and edges sharpest");
+    comp_group.add(&transfer_row);
 
     let (colour_trust, set_colour_trust) = bind_float(&shm, Some("colour_trust"), |h| &h.colour_trust_bits);
     comp_group.add(&spin_row(

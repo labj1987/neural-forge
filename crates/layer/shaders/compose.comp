@@ -84,6 +84,14 @@ layout(push_constant) uniform Params {
   // pixel (upstream `gRatioSmooth`, default 1). Removes pixel-to-pixel speckle from the ratio while
   // the frame keeps its own fine detail.
   float ratio_smooth;
+  // Mode 2, only when `model_small`: how the model's answer comes back when it worked below the
+  // frame's size (upstream `gTransfer`). The proxy input then holds the small proxy the model
+  // was shown, enlarged the same way as its answer, so `model - proxy` is its edit.
+  //   0 classic: the ratio of the enlarged answer to the enlarged proxy
+  //   1 matched residual: the edit laid on the frame's own full-resolution proxy
+  //   2 native + edit: the frame's own pixels plus the edit (sharpest for text and geometry)
+  uint transfer;
+  uint model_small;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -184,6 +192,33 @@ vec3 UpgradeToneMap(vec3 original, vec3 proxy, vec3 model, float colour_strength
   return mix(luminance_only, fully_upgraded, clamp(colour_strength, 0.0, 1.0));
 }
 
+// The proxy encode's luminance roll-off (`encode.comp`'s knee), to rebuild the frame's own proxy
+// at full resolution for the matched residual.
+vec3 SoftKneeLuminance(vec3 rgb) {
+  float l = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+  if (l > 0.75) {
+    float rolled = 0.75 + 0.25 * (1.0 - exp(-(l - 0.75) / 0.25));
+    rgb *= rolled / l;
+  }
+  return rgb;
+}
+
+// Moves from `p` toward `t` as far as the unit cube allows, along the same direction (hhkbble's
+// cube scaling, via upstream `CubeScaleResidual`): the residual never leaves the 8-bit proxy's
+// range, and is shortened rather than clipped per channel, which would shift hue.
+vec3 CubeScaleResidual(vec3 p, vec3 t) {
+  vec3 d = t - p;
+  float alpha = 1.0;
+  for (int c = 0; c < 3; ++c) {
+    if (d[c] > 1e-6) {
+      alpha = min(alpha, (1.0 - p[c]) / d[c]);
+    } else if (d[c] < -1e-6) {
+      alpha = min(alpha, (0.0 - p[c]) / d[c]);
+    }
+  }
+  return p + clamp(alpha, 0.0, 1.0) * d;
+}
+
 vec3 GamutCompressReversible(vec3 rgb) {
   vec3 lms = XYZ_TO_HPE_LMS * (LINEAR_SRGB_TO_XYZ * rgb);
   float y = Luminance(rgb);
@@ -274,6 +309,58 @@ void main() {
     // divide into an arbitrarily large number and the ratio is then built from
     // rounding noise, which crawls frame to frame".
     const float kRatioFloor = 1.0 / 512.0;
+
+    // Transfer modes (only when the model worked below the frame's size; at full size all three
+    // are the same, bit for bit). Each rewrites the pair the ratio below is taken from.
+    if (params.model_small != 0u && params.transfer != 0u) {
+      vec3 edit = model - proxy;
+      if (params.transfer == 1u) {
+        // Matched residual: the frame's own proxy, rebuilt at full resolution, plus only the
+        // model's difference -- so the enlargement's blur is not read as the model's edit.
+        vec3 full_proxy = clamp(SoftKneeLuminance(original), 0.0, 1.0);
+        proxy = full_proxy;
+        model = CubeScaleResidual(full_proxy, full_proxy + edit);
+      } else if (Luminance(model) > 1e-5) {
+        // Native + edit (xenmods' DLSSNR-Cost-Scaler technique via upstream; no code copied):
+        // the frame's own pixels with the edit laid on top, so everything the model had no
+        // opinion about keeps its native sharpness. An addition says nothing about where the sum
+        // lands, so it is bounded: the neighbourhood's light may move by the highlight guard, and
+        // a single pixel may depart from that level by a fixed 1.6x and no more.
+        const float kEditFloor = 1.0 / 512.0;
+        float m_lum = Luminance(model);
+        float p_lum = Luminance(proxy);
+        float edit_ratio_n = (m_lum + kEditFloor) / (p_lum + kEditFloor);
+        ivec2 last_px = size - ivec2(1);
+        float m_acc = m_lum;
+        float p_acc = p_lum;
+        const ivec2 kNTaps[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+        for (int k = 0; k < 4; ++k) {
+          ivec2 q = clamp(src + kNTaps[k], ivec2(0), last_px);
+          m_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb));
+          p_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb));
+        }
+        float gain_smooth_n = (m_acc / 5.0 + kEditFloor) / (p_acc / 5.0 + kEditFloor);
+        vec3 upgraded = max(original + edit * clamp(params.transfer_strength, 0.0, 1.0), vec3(0.0));
+        float o_lum = Luminance(original);
+        float sum_lum = Luminance(upgraded);
+        if (sum_lum > 1e-5 && p_lum > 1e-5) {
+          float guard_n = max(params.max_ratio, 1.0);
+          float broad = o_lum * clamp(gain_smooth_n, 1.0 / guard_n, guard_n);
+          const float kPixelBand = 1.6;
+          float max_l = max(broad * kPixelBand, o_lum * edit_ratio_n * 0.25 + 0.02);
+          float min_l = broad / kPixelBand;
+          if (sum_lum > max_l) {
+            upgraded *= max_l / sum_lum;
+          } else if (sum_lum < min_l) {
+            upgraded *= min_l / sum_lum;
+          }
+        }
+        // The ratio below is then taken against the frame itself.
+        proxy = original;
+        model = upgraded;
+      }
+    }
+
     float proxy_luminance = Luminance(proxy);
     float model_luminance = Luminance(model);
     float original_luminance = Luminance(original);

@@ -33,6 +33,8 @@ pub struct CompositionSettings {
     pub compare: crate::composition::gpu::Compare,
     pub colour_trust: f32,
     pub ratio_smooth: f32,
+    /// See `ShmHeader::transfer`: 0 classic, 1 matched residual, 2 native + edit.
+    pub transfer: u32,
     pub debug_view: u32,
     pub apply_model: bool,
     pub neural_enabled: bool,
@@ -232,6 +234,7 @@ impl ShmClient {
             transfer_strength: f32::from_bits(hdr.transfer_strength_bits.load(Ordering::Relaxed)),
             max_ratio: f32::from_bits(hdr.max_ratio_bits.load(Ordering::Relaxed)),
             ghost_guard: f32::from_bits(hdr.ghost_guard_bits.load(Ordering::Relaxed)),
+            transfer: hdr.transfer.load(Ordering::Relaxed),
             colour_trust: f32::from_bits(hdr.colour_trust_bits.load(Ordering::Relaxed)),
             ratio_smooth: f32::from_bits(hdr.ratio_smooth_bits.load(Ordering::Relaxed)),
             compare: crate::composition::gpu::Compare {

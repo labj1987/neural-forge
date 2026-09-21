@@ -39,6 +39,7 @@ upstream file it came from. Nothing listed here lands in
 | `crates/layer/src/capture.rs` synchronous present (capture, wait for this frame's answer, compose onto this frame) | `layer_linux/src/layer.cpp` `ProcessPresent`'s blocking round trip; the bounded wait, heartbeat liveness check and fail-open on a late answer are this project's |
 | `crates/layer/shaders/compose.comp` compare views (side by side with letterbox and zoom, wipe, swap, divider) | `layer_linux/src/dlssnr/dlssnr.hlsl` `gCompareMode`/`gCompareSplit`/`gCompareZoom`/`gCompareSwap` |
 | `crates/layer/shaders/compose.comp` mode 2 colour trust (`colour_trust`) and ratio smoothing (`ratio_smooth`) | `layer_linux/src/dlssnr/dlssnr.hlsl` `gColourTrust` (chroma-swing bound) and `gRatioSmooth` (`gainSmooth`/`gainSharp`); defaults 2 and 1 from `common/shm_protocol.h` |
+| `crates/layer/shaders/compose.comp` transfer modes (`transfer`, `model_small`), `CubeScaleResidual`, `SoftKneeLuminance`; the small-proxy upload and enlargement in `composition/gpu.rs` | `layer_linux/src/dlssnr/dlssnr.hlsl` `gTransfer` 0/1/2, `CubeScaleResidual`, `SoftKnee`. Matched residual and its cube scaling are hhkbble's; native + edit is xenmods' DLSSNR-Cost-Scaler technique (MIT, no code copied), via upstream |
 
 ## Credits carried with the ported material
 
@@ -49,7 +50,7 @@ upstream file it came from. Nothing listed here lands in
 - **RenoDX / clshortfuse** (MIT): the composition design; the notice that must ship with any
   build is `third_party/optiscaler/RenoDX_ATTRIBUTION.txt`.
 - **hhkbble**: the matched residual and its cube scaling (transfer mode 1), from a multi-pass
-  pull request against the OptiScaler fork. Credited here ahead of that mode being ported.
+  pull request against the OptiScaler fork.
 - **xenmods** ([DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost-Scaler), MIT): the
   native + edit technique (transfer mode 2). No code was copied.
 
@@ -70,11 +71,10 @@ with `THIRD_PARTY_CRATES.md` (the statically linked Rust crates and their licenc
 
 ## What's still not taken
 
-DLSS5VKLayer's own `dlssnr.hlsl` documents (inline, at its "native + edit" transfer
-mode) that one specific technique — an additive edit rule and a guard shape for it —
-comes from [xenmods/DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost-Scaler),
-MIT, "no code is copied." NeuralForge has not adopted that specific mode
-(`transfer == 2`/"native + edit") and this file will be updated if that changes. The
+Since 0.1.80 the "native + edit" transfer mode is adopted (see the table above); its additive
+rule and guard shape come from
+[xenmods/DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost-Scaler), MIT, "no code is
+copied", reached through DLSS5VKLayer's `dlssnr.hlsl`. The
 NGX caller-identity spoof (`crates/helper/src/spoof.rs`) remains an independent
 reimplementation of the same generic PE import-table-hook technique, not read from
 DLSS5VKLayer's C++ — see [README.md's Legal section](README.md#legal) for why that

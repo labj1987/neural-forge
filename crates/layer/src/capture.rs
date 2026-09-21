@@ -1099,6 +1099,10 @@ pub unsafe fn run(
     // the second one processed simply overwrites `last_answer`/`raw_answer_base` --
     // the same "whichever is freshest wins" bounded-staleness tradeoff `run`'s own
     // doc comment already documents for a single slot, not a new one v3 introduces.
+    // Set by the synchronous present when the model worked below the frame's size: the small
+    // proxy it was shown is still in `model_scratch`, and the composition needs it for the
+    // transfer modes.
+    let mut compose_small_proxy = false;
     if pipelined_present() {
         for slot in 0..2 {
             // Poll whatever was sent on some earlier frame *before* touching anything
@@ -1299,6 +1303,7 @@ pub unsafe fn run(
         shm.read_answer(SLOT, last_answer);
         std::mem::swap(raw_answer_base, original_scratch);
         *last_answer_dims = (sent_w, sent_h);
+        compose_small_proxy = (sent_w, sent_h) != (width, height) && model_scratch.len() >= answer_bytes;
         SYNC_TIMING.with(|t| t.set(Some((t_captured - t_start, t_answered - t_captured, t_answered.elapsed()))));
         *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
     }
@@ -1331,6 +1336,7 @@ pub unsafe fn run(
             last_answer_dims.1,
             raw_answer_base,
             last_answer,
+            compose_small_proxy.then_some(model_scratch.as_slice()),
             *raw_answer_generation,
             bgr_order,
             image,
@@ -1338,7 +1344,12 @@ pub unsafe fn run(
                 colour_strength: settings.colour_strength,
                 transfer_strength: settings.transfer_strength,
                 max_ratio: settings.max_ratio,
-                ghost_guard: settings.ghost_guard,
+                // The guard exists for the pipelined mode's late answers; in the synchronous mode
+                // the answer always matches the frame, and against a scaled-up proxy the guard
+                // would read the enlargement's blur as motion.
+                ghost_guard: if pipelined_present() { settings.ghost_guard } else { 0.0 },
+                transfer: settings.transfer,
+                model_small: false,
                 compare: settings.compare,
                 colour_trust: settings.colour_trust,
                 ratio_smooth: settings.ratio_smooth,
