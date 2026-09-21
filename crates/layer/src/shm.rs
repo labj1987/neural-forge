@@ -299,6 +299,14 @@ impl ShmClient {
         hdr.layer_height.store(height, Ordering::Relaxed);
         hdr.layer_format.store(proxy_format, Ordering::Relaxed);
         neural_forge_protocol::store64(&hdr.layer_frames_lo, &hdr.layer_frames_hi, frames);
+        // Restated now and then rather than once: a helper restart re-initialises the header and
+        // clears it. Rarely, because it is a seqlock-guarded string write.
+        if frames % 120 == 1 {
+            let name = crate::ownership::process_name();
+            if hdr.game_name() != name {
+                hdr.set_game_name(name);
+            }
+        }
     }
 
     /// Publishes the layer's host-observed cost for a frame. This is deliberately a

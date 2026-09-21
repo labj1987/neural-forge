@@ -1135,12 +1135,23 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     let sparkline_for_timer = sparkline.clone();
     let mut last_helper_frames: Option<u64> = None;
     let mut last_layer_frames: Option<u64> = None;
+    let mut layer_beat_seen = (0u32, std::time::Instant::now());
     glib::timeout_add_local(std::time::Duration::from_millis(u64::from(TELEMETRY_INTERVAL_MS)), move || {
         let hdr = shm_for_timer.header();
 
         model_row.set_subtitle(if hdr.model_up.load(Ordering::Relaxed) != 0 { "loaded" } else { "not loaded" });
+        // The name is only as current as the frames: a closed game leaves its name behind.
+        let beat = hdr.layer_heartbeat.load(Ordering::Relaxed);
+        if beat != layer_beat_seen.0 {
+            layer_beat_seen = (beat, std::time::Instant::now());
+        }
         let game = hdr.game_name();
-        game_row.set_subtitle(if game.is_empty() { "none attached" } else { &game });
+        let active = layer_beat_seen.1.elapsed() < std::time::Duration::from_secs(2) && layer_beat_seen.0 != 0;
+        game_row.set_subtitle(&match (game.is_empty(), active) {
+            (_, false) => "none attached".to_string(),
+            (true, true) => "attached".to_string(),
+            (false, true) => game,
+        });
 
         let helper_frames = (u64::from(hdr.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(hdr.helper_frames_lo.load(Ordering::Relaxed));
         let layer_frames = (u64::from(hdr.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(hdr.layer_frames_lo.load(Ordering::Relaxed));

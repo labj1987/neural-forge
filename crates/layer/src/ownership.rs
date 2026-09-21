@@ -38,6 +38,19 @@ static ELIGIBLE: LazyLock<bool> = LazyLock::new(|| {
 
 pub fn eligible() -> bool { *ELIGIBLE }
 
+/// This process's executable name as the target filter sees it (the Windows `.exe` for a Proton
+/// game), for the GUI's "Game" row.
+pub fn process_name() -> &'static str {
+    static NAME: LazyLock<String> = LazyLock::new(|| {
+        let args = std::fs::read("/proc/self/cmdline").unwrap_or_default()
+            .split(|b| *b == 0).filter(|s| !s.is_empty())
+            .map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
+        args.iter().find(|s| s.to_ascii_lowercase().ends_with(".exe")).or_else(|| args.first())
+            .map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s).to_owned()).unwrap_or_default()
+    });
+    &NAME
+}
+
 fn acquire(path: &str) -> std::io::Result<File> {
     let file = OpenOptions::new().read(true).write(true).create(true)
         .mode(0o600).custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC).open(path)?;

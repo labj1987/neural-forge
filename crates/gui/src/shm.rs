@@ -59,7 +59,9 @@ pub struct Shm(pub Arc<Mapping>);
 impl Shm {
     pub fn open() -> Option<Self> {
         let mapping = neural_forge_protocol::mapping::open()?;
-        if mapping.freshly_created {
+        // Not only when this call created the file: the layer or helper may have initialised it
+        // with defaults first (see `neural_forge_supervisor::apply_saved_settings`).
+        if mapping.freshly_created || mapping.header().tuning_seq.load(Ordering::Relaxed) == 0 {
             let cfg = neural_forge_supervisor::Config::load();
             neural_forge_protocol::persist::apply(mapping.header(), &cfg.settings);
         }
@@ -178,6 +180,24 @@ mod tests {
         let shm = Shm::open().expect("second open should succeed and create another fresh mapping");
         let intensity_after = f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed));
         assert_eq!(intensity_after, 1.75, "persisted value should have been applied on the fresh mapping");
+
+        // The layer or helper re-initialising the header (a game started first, or a version
+        // change) must not lose the saved settings either: the next open puts them back.
+        shm.0.header().init_defaults();
+        assert_eq!(f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed)), 1.0);
+        drop(shm);
+        let shm = Shm::open().expect("third open");
+        assert_eq!(
+            f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed)),
+            1.75,
+            "a header someone else re-initialised must get the saved settings back"
+        );
+        // And only once: a value changed live afterwards is not overwritten by the next open.
+        shm.0.header().intensity_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+        drop(shm);
+        let shm = Shm::open().expect("fourth open");
+        assert_eq!(f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed)), 0.5);
+        drop(shm);
 
         match prev_xdg_config {
             Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),

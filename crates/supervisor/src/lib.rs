@@ -132,6 +132,21 @@ pub struct StartedHelper {
 /// building the same environment variables (`WINEPREFIX`, `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID`,
 /// the Proton-specific NVAPI/compat-data ones) either front end needs -- this is the
 /// one place that construction happens.
+/// Applies the saved settings (`config.ini`) to the live header if nothing has applied them
+/// since it was last initialised. The header is re-initialised with defaults by whichever of the
+/// layer, helper or GUI finds it missing or at another version -- a game started first, or an
+/// upgrade -- and before this only the GUI, and only when it had created the file itself, put
+/// the user's settings back. `init_defaults` leaves `tuning_seq` at 0 and `persist::apply` bumps
+/// it, which is what "not yet applied" is read from.
+pub fn apply_saved_settings(cfg: &Config) {
+    let Some(mapping) = neural_forge_protocol::mapping::open() else { return };
+    let hdr = mapping.header();
+    if hdr.tuning_seq.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+        neural_forge_protocol::persist::apply(hdr, &cfg.settings);
+        hdr.control_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
     if let Some(pid) = is_running() {
         return Err(StartError::AlreadyRunning(pid));
@@ -139,6 +154,7 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
     let Some(helper) = install_dir::helper_exe() else {
         return Err(StartError::HelperNotFound);
     };
+    apply_saved_settings(cfg);
     if cfg.runner_path.is_empty() {
         return Err(StartError::NoRunnerConfigured);
     }
