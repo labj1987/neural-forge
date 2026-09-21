@@ -1084,6 +1084,12 @@ pub unsafe fn run(
     // encode a storage image to dispatch over. `None` only when the proxy format
     // itself cannot be scratched at all, which is the same condition as before.
     let model_request = model_scratch_format(proxy_format, bgr_order).map(|format| (model_width, model_height, format));
+    // Direct capture writes the whole frame straight into shared memory: no resize, no encode.
+    // It is only correct when the model works on exactly the frame, which rules it out for any
+    // working_scale, the model pixel cap, and odd-sized frames (rounded to even above). Missing
+    // this sent full-size and odd-size frames past every one of those limits on devices that
+    // support host-memory import, and the helper rejected them.
+    let use_direct = use_direct && (model_width, model_height) == (width, height);
 
     // Protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`): the same poll-then-maybe-submit sequence
     // as before, just run once per wire slot instead of once total. Each slot is
