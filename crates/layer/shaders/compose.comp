@@ -319,7 +319,15 @@ void main() {
         float rescaled_chroma = length(rescaled_oklab.yz);
         vec3 corrected_oklab = vec3(rescaled_oklab.x, chroma_dir * rescaled_chroma);
         vec3 fully_upgraded = LinearSrgbFromOklab(corrected_oklab);
-        result = GamutCompressReversible(mix(luminance_only, fully_upgraded, clamp(params.colour_strength, 0.0, 1.0)));
+        // The answer crosses as 8-bit, so in a near-black region its hue is decided by which
+        // channel happened to round up, and the step above would carry that noise onto the frame
+        // at the frame's own brightness: the blue, green and pink specks and patches on dark,
+        // detailed content. The model's colour is therefore trusted in proportion to the light it
+        // reported, tapering to none below 25/255 (sRGB) -- upstream's `hueTrust`
+        // (dlssnr.hlsl, `kQuantFloor`). Above that floor nothing changes.
+        const float kQuantFloor = 0.0097; // SrgbDecode(25/255)
+        float hue_trust = smoothstep(0.0, kQuantFloor, model_luminance);
+        result = GamutCompressReversible(mix(luminance_only, fully_upgraded, clamp(params.colour_strength, 0.0, 1.0) * hue_trust));
       }
     }
   } else if (params.mode == 1u) {
