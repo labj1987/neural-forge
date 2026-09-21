@@ -561,11 +561,13 @@ impl ShmClient {
         hdr.seq_req.store(req, Ordering::Relaxed);
 
         let helper_present = hdr.helper_state.load(Ordering::Relaxed) != helper_state::STOPPED;
-        let warming_up = !self.ever_answered;
+        // This blocks inside `vkQueuePresentKHR` (the debug-view/capture-request path),
+        // so it is capped at one second even while the helper is still warming up --
+        // the game's presents must never stall for ten. A slow first answer costs a
+        // timeout that the retry logic below absorbs; the async path (`begin_async_request`)
+        // keeps the longer warm-up allowance because it never blocks.
         let budget = if !helper_present {
             Duration::from_millis(20)
-        } else if warming_up {
-            Duration::from_secs(10)
         } else {
             Duration::from_secs(1)
         };

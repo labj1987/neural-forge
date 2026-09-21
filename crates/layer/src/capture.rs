@@ -2236,26 +2236,33 @@ unsafe fn run_sync(
     // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes (the memory
     // type/size `ensure` just built or confirmed already satisfies this call's own
     // `frame_bytes`).
-    let captured = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
     // Composition (below) needs the pre-edit frame after `read_answer` has already
     // overwritten `r.ptr` in place, so it has to be copied out now, before that
     // happens -- one extra `frame_bytes`-sized allocation/copy per frame, on top of
     // the two Vulkan transfers this function already does; not yet worth avoiding
     // ahead of proving the composition path correct at all.
-    let t_snapshot_start = std::time::Instant::now();
-    original_scratch.clear();
-    original_scratch.extend_from_slice(captured);
-    let original: &[u8] = original_scratch.as_slice();
-    let t_snapshot = t_snapshot_start.elapsed();
-    let t_write_proxy_start = std::time::Instant::now();
-    // `run_sync` is the synchronous debug/one-shot path (debug_view, a one-shot
-    // capture_request dump) -- deliberately always slot 0, paired with
-    // `try_round_trip`'s own blocking wait, never protocol v3's second slot.
+    //
+    // `captured` (a shared view of `r.ptr`) lives only inside this block, so it is
+    // provably dead before the `&mut` view of the same memory is created for
+    // `answer_dst` further down -- the two never coexist.
     const SLOT: usize = 0;
-    shm.set_frame_info(SLOT, width, height, proxy_format);
-    shm.write_proxy(SLOT, captured);
-    shm.prepare_motion(instance, physical_device, width, height, proxy_format, captured);
-    let t_write_proxy = t_write_proxy_start.elapsed();
+    let t_snapshot_start = std::time::Instant::now();
+    let (t_snapshot, t_write_proxy) = {
+        // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes (see above).
+        let captured = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
+        original_scratch.clear();
+        original_scratch.extend_from_slice(captured);
+        let t_snapshot = t_snapshot_start.elapsed();
+        let t_write_proxy_start = std::time::Instant::now();
+        // `run_sync` is the synchronous debug/one-shot path (debug_view, a one-shot
+        // capture_request dump) -- deliberately always slot 0, paired with
+        // `try_round_trip`'s own blocking wait, never protocol v3's second slot.
+        shm.set_frame_info(SLOT, width, height, proxy_format);
+        shm.write_proxy(SLOT, captured);
+        shm.prepare_motion(instance, physical_device, width, height, proxy_format, captured);
+        (t_snapshot, t_write_proxy_start.elapsed())
+    };
+    let original: &[u8] = original_scratch.as_slice();
     let t_roundtrip_start = std::time::Instant::now();
     let answered = shm.try_round_trip();
     let t_roundtrip = t_roundtrip_start.elapsed();
