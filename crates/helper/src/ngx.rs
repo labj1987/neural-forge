@@ -167,6 +167,8 @@ fn set_create_tuning(params: NgxParameter, t: &NgxTuning) -> u32 {
             t.preset, t.style, t.intensity, t.local_tone, t.local_structure, t.skin_structure, t.auto_mask
         );
     }
+    // A one-shot milestone, not the per-frame hot path: flushed so a killed helper still shows it.
+    crate::logging::flush();
     seh
 }
 
@@ -766,6 +768,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     if !abi::succeeded(result) || handle.is_null() {
         return false;
     }
+    crate::logging::flush();
     s.feature = handle;
     s.built_tuning = *tuning;
     s.built_size = (width, height);
@@ -895,6 +898,7 @@ pub fn maintain_feature(
         return true; // keep answering with the old tuning until the replacement is due
     }
     crate::log!("[helper] retuned; rebuilding the feature (spacing {settle_ms} ms)");
+    crate::logging::flush();
     // SAFETY: the helper submits and fences every evaluate, so this only guards against
     // a stray submission; nothing may be in flight when the feature is destroyed.
     let _ = unsafe { device.device_wait_idle() };

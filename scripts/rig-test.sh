@@ -35,7 +35,7 @@ say() { printf '\n== %s\n' "$*"; }
 # The CLI ships inside the AppImage mount, whose path changes on every app launch.
 # Resolved once, remotely, rather than hardcoded.
 remote_cli() {
-    ssh "$HOST" 'ls -d /tmp/.mount_neural*/usr/bin/neural-forge-cli 2>/dev/null | head -1'
+    ssh "$HOST" 'ls -d /tmp/.mount_neural*/usr/bin/neural-forge-cli ~/.local/share/neural-forge/bin/neural-forge-cli 2>/dev/null | head -1'
 }
 
 sh_remote() { ssh "$HOST" "$@"; }
@@ -58,7 +58,7 @@ sha256sum target/release/libneural_forge_layer.so target/x86_64-pc-windows-gnu/r
 
 CLI="$(remote_cli)"
 if [ -z "$CLI" ]; then
-    echo "!! no neural-forge-cli found in any AppImage mount -- is the app running on $HOST?" >&2
+    echo "!! no neural-forge-cli found in any AppImage mount -- is Neural Forge installed on $HOST?" >&2
     exit 1
 fi
 
