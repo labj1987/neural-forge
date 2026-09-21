@@ -579,6 +579,37 @@ pub struct Inflight {
 /// or close enough to `1.0` that scaling would buy nothing) -- callers comparing the
 /// result against `(width, height)` for equality get exactly the "skip the entire
 /// `working_scale` code path" behavior every caller had before it existed.
+/// The most pixels the model is ever asked to work on: 4K-equivalent. Above this the model
+/// either cannot be built at all (VRAM with a game already resident, or the model's own limits --
+/// a 5760x3240 request failed to build on a 12 GB card) or is so slow that every answer is stale
+/// on arrival. A game rendering above it is simply scaled down for the model, and the answer is
+/// blitted back up, exactly as `working_scale` below 1.0 already is -- so any game resolution
+/// works. `NEURAL_FORGE_MAX_MODEL_PIXELS` overrides it.
+const DEFAULT_MAX_MODEL_PIXELS: u64 = 3840 * 2160;
+
+fn max_model_pixels() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        neural_forge_protocol::env::var("NEURAL_FORGE_MAX_MODEL_PIXELS")
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&v| v >= 64 * 64)
+            .unwrap_or(DEFAULT_MAX_MODEL_PIXELS)
+    })
+}
+
+/// The scale the model raster is actually built at: the requested `working_scale`, never above
+/// 1.0 (the compose path rejects an answer larger than the frame, so supersampling is not
+/// available), and never so large that the model input exceeds [`max_model_pixels`].
+fn effective_working_scale(width: u32, height: u32, requested: f32) -> f32 {
+    let mut scale = if requested.is_finite() && requested > 0.0 { requested.min(1.0) } else { 1.0 };
+    let frame_pixels = (u64::from(width) * u64::from(height)).max(1) as f64;
+    let cap = max_model_pixels() as f64;
+    if frame_pixels * f64::from(scale) * f64::from(scale) > cap {
+        scale = (cap / frame_pixels).sqrt() as f32;
+    }
+    scale
+}
+
 fn scaled_dims(width: u32, height: u32, scale: f32) -> (u32, u32) {
     if !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() < 0.01 {
         return (width, height);
@@ -1013,7 +1044,7 @@ pub unsafe fn run(
     // case, and every path below behaves exactly as it did before `working_scale`
     // existed. Computed once per call, shared by every slot below (the swapchain's
     // resolution and the settings are the same for all of them this frame).
-    let (model_width, model_height) = scaled_dims(width, height, settings.working_scale);
+    let (model_width, model_height) = scaled_dims(width, height, effective_working_scale(width, height, settings.working_scale));
     // Requested unconditionally, not only when the scale actually reduces the raster:
     // the scratch is now also where the proxy encode runs (leg 1's `ENCODE`), and the
     // encode has to happen at every working scale, including exactly 1.0. At 1.0 the
@@ -3275,5 +3306,41 @@ mod tests {
             device.destroy_device(None);
             instance.destroy_instance(None);
         }
+    }
+}
+
+#[cfg(test)]
+mod model_size_tests {
+    use super::*;
+
+    #[test]
+    fn scale_never_exceeds_one_and_bad_values_mean_one() {
+        assert_eq!(effective_working_scale(1920, 1080, 1.5), 1.0);
+        assert_eq!(effective_working_scale(1920, 1080, 0.0), 1.0);
+        assert_eq!(effective_working_scale(1920, 1080, f32::NAN), 1.0);
+        assert_eq!(effective_working_scale(1920, 1080, 0.5), 0.5);
+    }
+
+    #[test]
+    fn any_resolution_is_brought_under_the_model_pixel_cap() {
+        for (w, h) in [(1280, 720), (2560, 1440), (3840, 2160), (5760, 3240), (7680, 4320), (5120, 1440), (3440, 1440), (7680, 2160)] {
+            for requested in [0.5f32, 0.75, 1.0, 1.5, 2.0] {
+                let (mw, mh) = scaled_dims(w, h, effective_working_scale(w, h, requested));
+                assert!(
+                    u64::from(mw) * u64::from(mh) <= DEFAULT_MAX_MODEL_PIXELS + u64::from(mw) + u64::from(mh),
+                    "{w}x{h} at {requested} gave a {mw}x{mh} model raster, over the cap"
+                );
+                assert!(mw <= w && mh <= h, "{w}x{h} at {requested}: model raster {mw}x{mh} is larger than the frame");
+                assert!(mw >= 64 && mh >= 64 && mw % 2 == 0 && mh % 2 == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn a_frame_under_the_cap_is_left_alone() {
+        assert_eq!(scaled_dims(2560, 1440, effective_working_scale(2560, 1440, 1.0)), (2560, 1440));
+        assert_eq!(scaled_dims(3840, 2160, effective_working_scale(3840, 2160, 1.0)), (3840, 2160));
+        // The 8K frame that would not build: brought down to 4K-equivalent.
+        assert_eq!(scaled_dims(5760, 3240, effective_working_scale(5760, 3240, 1.5)), (3840, 2160));
     }
 }

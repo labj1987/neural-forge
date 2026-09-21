@@ -102,9 +102,16 @@ pub struct NgxSnippet {
     build_after: Option<Instant>,
     /// The header values seen on the previous call, per pass.
     last_seen: Vec<NgxTuning>,
-    /// A first build that has never succeeded is one-shot (the model is disabled if it fails);
-    /// everything after is a retry.
     ever_built: bool,
+    /// The first feature failed to build at this size (and when). Not fatal: the model is
+    /// unavailable *at that size* and is retried when the size changes, or after
+    /// [`RETRY_FAILED_SIZE_AFTER`] -- the likely causes (not enough VRAM while the game is still
+    /// loading, a size too large for the model) pass. Failing once used to disable the model for
+    /// the rest of the session, so lowering the resolution scale afterwards did nothing.
+    create_failed: Option<((u32, u32), Instant)>,
+    /// A human-readable account of the latest failure, for the header's reason string. Taken by
+    /// the main loop.
+    failure_note: Option<String>,
 }
 
 /// One live (or holed) pass of the chain.
@@ -217,6 +224,8 @@ impl Default for NgxSnippet {
             build_after: None,
             last_seen: Vec::new(),
             ever_built: false,
+            create_failed: None,
+            failure_note: None,
         }
     }
 }
@@ -605,6 +614,17 @@ impl NgxSnippet {
         self.params
     }
 
+    /// Whether the model is unavailable at the current size because its first feature failed to
+    /// build (as opposed to `disabled`, which is fatal for the session).
+    pub fn create_failed(&self) -> bool {
+        self.create_failed.is_some()
+    }
+
+    /// The latest failure note, once.
+    pub fn take_failure_note(&mut self) -> Option<String> {
+        self.failure_note.take()
+    }
+
     /// The number of passes currently built (holes excluded).
     pub fn live_passes(&self) -> usize {
         self.passes.iter().filter(|p| !p.handle.is_null()).count()
@@ -793,10 +813,10 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         device.destroy_command_pool(pool, None);
     }
 
+    crate::logging::flush();
     if !abi::succeeded(result) || handle.is_null() {
         return None;
     }
-    crate::logging::flush();
     Some(handle)
 }
 
@@ -834,6 +854,9 @@ fn release_all(s: &mut NgxSnippet) {
         release_handle(s, slot.handle, i);
     }
 }
+
+/// How long a failed first build at one size blocks retrying that same size.
+const RETRY_FAILED_SIZE_AFTER: Duration = Duration::from_secs(30);
 
 /// Gives up on a pass after this many consecutive failed builds.
 const MAX_BUILD_FAILURES: u32 = 3;
@@ -873,6 +896,16 @@ pub fn maintain_passes(
         return 0;
     }
     let spacing = Duration::from_millis(u64::from(settle_ms));
+
+    if let Some((size, when)) = s.create_failed {
+        if size == (width, height) && when.elapsed() < RETRY_FAILED_SIZE_AFTER {
+            return 0; // still blocked at this size; the frame just passes through
+        }
+        // A different size, or long enough: try again from scratch.
+        s.create_failed = None;
+        s.ever_built = false;
+        s.build_after = None;
+    }
 
     if s.live_passes() > 0 && s.built_size != (width, height) {
         crate::log!(
@@ -954,9 +987,13 @@ pub fn maintain_passes(
                 }
             }
             None if first_build => {
-                // One attempt only: a failed first `CreateFeature` means a real fault or a clean
-                // rejection, neither of which retrying next frame fixes.
-                s.disabled = true;
+                // Not retried every frame (that would redo the whole command pool/fence setup
+                // per captured frame), and not fatal either: blocked at this size until it
+                // changes or the retry interval passes.
+                crate::log!("[helper] the model would not build at {width}x{height}; passing frames through, retrying when the size changes or in {}s", RETRY_FAILED_SIZE_AFTER.as_secs());
+                crate::logging::flush();
+                s.failure_note = Some(format!("model would not build at {width}x{height}; lower the resolution scale"));
+                s.create_failed = Some(((width, height), Instant::now()));
                 return 0;
             }
             None if pass >= s.passes.len() => {

@@ -367,6 +367,16 @@ fn process_request(
         0
     };
     let ready = live_passes > 0;
+    if let Some(note) = snippet.take_failure_note() {
+        hdr.set_helper_reason(&note);
+    } else if ready {
+        static CLEARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        // Clears a stale failure reason once the model builds; a plain store per frame would churn
+        // the seqlock for nothing.
+        if !CLEARED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            hdr.set_helper_reason("");
+        }
+    }
     hdr.helper_features.store(live_passes as u32, Ordering::Relaxed);
     if let Some(ceiling) = snippet.pass_ceiling() {
         hdr.helper_pass_ceiling.store(ceiling as u32, Ordering::Relaxed);
