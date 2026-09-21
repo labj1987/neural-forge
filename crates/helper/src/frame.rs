@@ -517,19 +517,18 @@ impl FrameResources {
         device: &ash::Device,
         queue: vk::Queue,
         evaluate_feature: abi::FnVkEvaluateFeature,
-        feature: abi::NgxHandle,
+        chain: &[ChainPass],
         params: abi::NgxParameter,
         proxy: &[u8],
         motion: &[u8],
         motion_scale: [f32; 2],
         reset_history: bool,
-        sharpness: f32,
         answer_out: &mut [u8],
     ) -> Option<FrameTiming> {
         static EVALUATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let evaluate_no = EVALUATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pixel_count = (self.width as usize) * (self.height as usize);
-        if proxy.len() < pixel_count * 4 || answer_out.len() < pixel_count * 4 {
+        if chain.is_empty() || proxy.len() < pixel_count * 4 || answer_out.len() < pixel_count * 4 {
             return None;
         }
 
@@ -568,8 +567,12 @@ impl FrameResources {
         // below are confirmed present in the real DLL's own string table (`strings`,
         // 2026-09-10) -- not new guesses, the first ones checked against real evidence.
         let name = |n: &str| std::ffi::CString::new(n).unwrap();
+        // The first evaluate on this set of resources tells every pass its history is gone.
+        let first = !self.reset_done.replace(true);
+        let mut t_eval = std::time::Duration::ZERO;
+        for (k, pass) in chain.iter().enumerate() {
         // SAFETY: `params` was allocated and validated by the caller (`ngx::load_and_init`).
-        let t_eval = unsafe {
+        let t_pass = unsafe {
             let mut color = NgxResourceVk::from_image_view(color_info, false);
             abi::ngx_set_ptr(params, name("DLSSNR.Color").as_ptr(), std::ptr::from_mut(&mut color).cast());
             let mut output = NgxResourceVk::from_image_view(output_info, true);
@@ -580,7 +583,7 @@ impl FrameResources {
             // the per-frame amount it applies. Style, intensity, the local strengths and auto mask
             // are latched by the model at creation (`ngx::set_create_tuning`); writing them here
             // does nothing to a running feature and poisons the block for the next create.
-            abi::ngx_set_f32(params, name("Sharpness").as_ptr(), sharpness.clamp(0.0, 1.0));
+            abi::ngx_set_f32(params, name("Sharpness").as_ptr(), pass.sharpness.clamp(0.0, 1.0));
             let mut mvec = NgxResourceVk::from_image_view(mvec_info, false);
             abi::ngx_set_ptr(params, name("DLSSNR.MVec").as_ptr(), std::ptr::from_mut(&mut mvec).cast());
             let mut depth = NgxResourceVk::from_image_view(depth_info, false);
@@ -606,7 +609,7 @@ impl FrameResources {
             // history-dependent answer would only ever appear from the second frame
             // set to `Reset = 0` onward, which never happened before this. `1` only on
             // this feature's actual first `evaluate` call, `0` on every one after.
-            let reset = u32::from(!self.reset_done.replace(true) || reset_history);
+            let reset = u32::from(first || reset_history || pass.reset);
             abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), reset);
 
             let t_eval_start = std::time::Instant::now();
@@ -615,7 +618,7 @@ impl FrameResources {
             // success while recording no output work, which leaves Output untouched.
             let Some(result) = self.run_evaluate(device, queue, || {
                 crate::guard::guarded(
-                    || evaluate_feature(self.cmd, feature, params, std::ptr::null()),
+                    || evaluate_feature(self.cmd, pass.handle, params, std::ptr::null()),
                     abi::result::FAIL_SEH,
                 )
             }) else {
@@ -625,13 +628,19 @@ impl FrameResources {
             let failed = !abi::succeeded(result.0) || result.1 != 0;
             // Bounded: one line per evaluate, forever, is real time under Wine. Failures always log.
             if failed || crate::logging::sampled(evaluate_no) {
-                crate::log!("[ngx] EvaluateFeature -> {:#x} seh={:#x} took={:?}", result.0 as u32, result.1, t_eval);
+                crate::log!("[ngx] EvaluateFeature pass {k} -> {:#x} seh={:#x} took={:?}", result.0 as u32, result.1, t_eval);
             }
             if failed {
                 return None;
             }
             t_eval
         };
+        t_eval += t_pass;
+        // Between passes the answer becomes the next pass's input.
+        if k + 1 < chain.len() && !self.run_transfer(device, queue, TransferKind::Chain) {
+            return None;
+        }
+        }
 
         // Stage 3: download Output -> answer_out.
         let t_download_start = std::time::Instant::now();
@@ -852,6 +861,74 @@ impl FrameResources {
                     );
                 }
             }
+            TransferKind::Chain => {
+                // Output (written by the model, GENERAL) -> Color (its next input, sampled).
+                let out_to_src = img_barrier(
+                    self.output_image,
+                    vk::ImageLayout::GENERAL,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::AccessFlags::SHADER_WRITE,
+                    vk::AccessFlags::TRANSFER_READ,
+                );
+                let color_to_dst = img_barrier(
+                    self.color_image,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::AccessFlags::SHADER_READ,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                );
+                let color_to_shader = img_barrier(
+                    self.color_image,
+                    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                    vk::AccessFlags::TRANSFER_WRITE,
+                    vk::AccessFlags::SHADER_READ,
+                );
+                let out_to_general = img_barrier(
+                    self.output_image,
+                    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                    vk::ImageLayout::GENERAL,
+                    vk::AccessFlags::TRANSFER_READ,
+                    vk::AccessFlags::SHADER_WRITE,
+                );
+                let copy = vk::ImageCopy::builder()
+                    .src_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1).build())
+                    .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1).build())
+                    .extent(vk::Extent3D { width: self.width, height: self.height, depth: 1 })
+                    .build();
+                // SAFETY: `self.cmd` is recording; Color and Output are this frame's own images, in
+                // the layouts the upload stage and the preceding evaluate left them in. Color and
+                // Output have the same format and extent, and Color has TRANSFER_DST, Output
+                // TRANSFER_SRC, usage.
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[out_to_src, color_to_dst],
+                    );
+                    device.cmd_copy_image(
+                        self.cmd,
+                        self.output_image,
+                        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+                        self.color_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &[copy],
+                    );
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::TRANSFER,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[color_to_shader, out_to_general],
+                    );
+                }
+            }
             TransferKind::Download => {
                 let to_src = img_barrier(
                     self.output_image,
@@ -940,7 +1017,17 @@ impl FrameResources {
     }
 }
 
+/// One pass of the chain handed to [`FrameResources::evaluate`].
+#[derive(Clone, Copy)]
+pub struct ChainPass {
+    pub handle: abi::NgxHandle,
+    /// This feature was just (re)built and has no history.
+    pub reset: bool,
+    pub sharpness: f32,
+}
+
 enum TransferKind {
+    Chain,
     Upload,
     Download,
 }

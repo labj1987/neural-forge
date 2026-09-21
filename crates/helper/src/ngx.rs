@@ -85,24 +85,37 @@ pub struct NgxSnippet {
     /// or the load failed.
     nvapi: *mut c_void,
 
-    pub feature: abi::NgxHandle,
     pub disabled: bool,
 
-    /// What the live feature was built with -- the model latches these at creation, so a
-    /// difference from what the header asks for now means a rebuild, not a parameter write.
-    built_tuning: NgxTuning,
-    /// The frame size the live feature was built for; a different incoming size means a rebuild.
+    /// One NGX feature per pass, in chain order. A slot with a null handle is a hole: a pass
+    /// that failed to rebuild and is skipped by the chain until it builds again.
+    passes: Vec<PassSlot>,
+    /// The frame size every live feature was built for; a different incoming size rebuilds all.
     built_size: (u32, u32),
-    /// The most recent header value seen; a new value re-arms the settle wait so dragging a
-    /// slider debounces rather than rebuilding at every tick.
-    last_seen_tuning: NgxTuning,
+    /// The highest pass count the model would actually build at this size, once a later pass has
+    /// failed to build. Not a fault: the chain simply runs at what fits.
+    ceiling: Option<usize>,
+    /// Builds are spaced: NGX creation is expensive and back-to-back creation can exhaust the
+    /// driver's latches. `tuning_changed` re-arms on every new header value, so dragging a slider
+    /// debounces rather than rebuilding at each tick.
     tuning_changed: Option<Instant>,
-    /// Builds are spaced: NGX creation is expensive and back-to-back creation can exhaust
-    /// the driver's latches.
     build_after: Option<Instant>,
-    rebuild_failures: u32,
-    /// Set by a rebuild so the next evaluate tells the model its history is gone.
+    /// The header values seen on the previous call, per pass.
+    last_seen: Vec<NgxTuning>,
+    /// A first build that has never succeeded is one-shot (the model is disabled if it fails);
+    /// everything after is a retry.
+    ever_built: bool,
+}
+
+/// One live (or holed) pass of the chain.
+struct PassSlot {
+    handle: abi::NgxHandle,
+    /// What this feature was built with; the model latches these at creation, so a difference
+    /// from what the header asks for now means a rebuild, not a parameter write.
+    built: NgxTuning,
+    /// Set on (re)build so the next evaluate tells the model its history is gone.
     needs_reset: bool,
+    failures: u32,
 }
 
 /// The settings the model latches when a feature is created. Written into the parameter
@@ -196,15 +209,14 @@ impl Default for NgxSnippet {
             self_params: false,
             device: vk::Device::null(),
             nvapi: std::ptr::null_mut(),
-            feature: std::ptr::null_mut(),
             disabled: false,
-            built_tuning: NgxTuning::default(),
+            passes: Vec::new(),
             built_size: (0, 0),
-            last_seen_tuning: NgxTuning::default(),
+            ceiling: None,
             tuning_changed: None,
             build_after: None,
-            rebuild_failures: 0,
-            needs_reset: false,
+            last_seen: Vec::new(),
+            ever_built: false,
         }
     }
 }
@@ -593,13 +605,29 @@ impl NgxSnippet {
         self.params
     }
 
-    pub fn has_feature(&self) -> bool {
-        !self.feature.is_null()
+    /// The number of passes currently built (holes excluded).
+    pub fn live_passes(&self) -> usize {
+        self.passes.iter().filter(|p| !p.handle.is_null()).count()
+    }
+
+    /// The pass count the model would build at, once a later pass failed to (see `ceiling`).
+    pub fn pass_ceiling(&self) -> Option<usize> {
+        self.ceiling
+    }
+
+    /// The built passes' feature handles, in chain order.
+    pub fn chain_handles(&self) -> Vec<abi::NgxHandle> {
+        self.passes.iter().filter(|p| !p.handle.is_null()).map(|p| p.handle).collect()
+    }
+
+    /// Consumes the "history is gone" flag of the pass owning `handle`.
+    pub fn take_needs_reset(&mut self, handle: abi::NgxHandle) -> bool {
+        self.passes.iter_mut().find(|p| p.handle == handle).is_some_and(|p| std::mem::take(&mut p.needs_reset))
     }
 }
 
-fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32, tuning: &NgxTuning) -> bool {
-    let Some(create_feature) = s.create_feature else { return false };
+fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32, tuning: &NgxTuning) -> Option<abi::NgxHandle> {
+    let Some(create_feature) = s.create_feature else { return None };
     let name = |n: &str| CString::new(n).unwrap();
     let params = s.params;
     // Guarded like every other real call into the DLL below: `params`'s vtable is a
@@ -663,7 +691,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     );
     crate::log!("[ngx] set DLSSNR parameters seh={:#x}", seh);
     if seh != 0 {
-        return false;
+        return None;
     }
 
     // `NVSDK_NGX_VULKAN_CreateFeature`'s first parameter is a real, currently-
@@ -681,7 +709,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     // SAFETY: `device` is the live device this snippet was initialized against.
     let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else {
         crate::log!("[ngx] CreateFeature: failed to create the setup command pool");
-        return false;
+        return None;
     };
     let alloc_info =
         vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
@@ -692,7 +720,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
             crate::log!("[ngx] CreateFeature: failed to allocate the setup command buffer");
             // SAFETY: `pool` owns no other resources yet.
             unsafe { device.destroy_command_pool(pool, None) };
-            return false;
+            return None;
         }
     };
     let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -701,14 +729,14 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         crate::log!("[ngx] CreateFeature: failed to begin the setup command buffer");
         // SAFETY: `pool` owns `cmd`; nothing else references either.
         unsafe { device.destroy_command_pool(pool, None) };
-        return false;
+        return None;
     }
 
     // Last, so nothing above can overwrite it.
     if set_create_tuning(params, tuning) != 0 {
         // SAFETY: `cmd` was begun above and never submitted; `pool` owns it.
         unsafe { device.destroy_command_pool(pool, None) };
-        return false;
+        return None;
     }
 
     let ((result, handle), seh) = guarded(
@@ -734,7 +762,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         // corrupted -- abandon it rather than risk submitting garbage GPU work.
         // SAFETY: `cmd` was never submitted; `pool` owns it and nothing else.
         unsafe { device.destroy_command_pool(pool, None) };
-        return false;
+        return None;
     }
     // SAFETY: `cmd` was successfully recorded into above (the guarded call above
     // returned without faulting, regardless of `result`'s own success/failure code --
@@ -743,14 +771,14 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     if unsafe { device.end_command_buffer(cmd) }.is_err() {
         crate::log!("[ngx] CreateFeature: failed to end the setup command buffer");
         unsafe { device.destroy_command_pool(pool, None) };
-        return false;
+        return None;
     }
     let fence_info = vk::FenceCreateInfo::builder();
     // SAFETY: `fence_info` is valid.
     let Ok(fence) = (unsafe { device.create_fence(&fence_info, None) }) else {
         crate::log!("[ngx] CreateFeature: failed to create the setup fence");
         unsafe { device.destroy_command_pool(pool, None) };
-        return false;
+        return None;
     };
     let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build();
     // SAFETY: `cmd` was just ended above; `queue` is the caller's own, live queue.
@@ -766,168 +794,205 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     }
 
     if !abi::succeeded(result) || handle.is_null() {
-        return false;
+        return None;
     }
     crate::logging::flush();
-    s.feature = handle;
-    s.built_tuning = *tuning;
-    s.built_size = (width, height);
-    s.last_seen_tuning = *tuning;
-    true
+    Some(handle)
 }
 
-/// Releases the live feature, if any. Callers drain the device first (nothing may be
-/// in flight against it).
-fn release_feature(s: &mut NgxSnippet) {
-    if s.feature.is_null() {
+/// Releases one feature handle. Callers drain the device first (nothing may be in flight).
+fn release_handle(s: &NgxSnippet, handle: abi::NgxHandle, pass: usize) {
+    if handle.is_null() {
         return;
     }
     if let Some(release) = s.release_feature {
-        let feature = s.feature;
-        let (result, seh) = guarded(|| unsafe { release(feature) }, abi::result::FAIL_SEH);
-        crate::log!("[ngx] ReleaseFeature -> {:#x} seh={:#x}", result as u32, seh);
+        let (result, seh) = guarded(|| unsafe { release(handle) }, abi::result::FAIL_SEH);
+        crate::log!("[ngx] ReleaseFeature pass {pass} -> {:#x} seh={:#x}", result as u32, seh);
     }
-    s.feature = std::ptr::null_mut();
-}
-
-/// Consumes the "history is gone" flag a rebuild sets.
-pub fn take_needs_reset(s: &mut NgxSnippet) -> bool {
-    std::mem::take(&mut s.needs_reset)
 }
 
 /// The smallest frame the model is asked to build a feature for. A 1x1 request hung the driver
 /// (Xid 109); nothing that small is a real game frame anyway.
 pub const MIN_FEATURE_DIM: u32 = 64;
 
-/// Drops the live feature so the next frame rebuilds it from scratch (a header re-initialisation
-/// invalidates whatever the feature was built against). The rebuild is not a "first attempt", so
-/// a failure retries rather than disabling the model.
-pub fn discard_feature(s: &mut NgxSnippet, device: &ash::Device) {
-    if !s.has_feature() {
+/// Drops every live feature so the next frame rebuilds from scratch (a header re-initialisation
+/// invalidates whatever they were built against). Rebuilds after this are retries, not a first
+/// attempt, so a failure never disables the model.
+pub fn discard_features(s: &mut NgxSnippet, device: &ash::Device) {
+    if s.live_passes() == 0 {
         return;
     }
-    // SAFETY: nothing may be in flight when the feature is destroyed.
+    // SAFETY: nothing may be in flight when a feature is destroyed.
     let _ = unsafe { device.device_wait_idle() };
-    release_feature(s);
+    release_all(s);
     s.build_after = Some(Instant::now());
 }
 
-/// Gives up on rebuilds after this many consecutive failures.
-const MAX_REBUILD_FAILURES: u32 = 3;
+fn release_all(s: &mut NgxSnippet) {
+    let slots = std::mem::take(&mut s.passes);
+    for (i, slot) in slots.iter().enumerate() {
+        release_handle(s, slot.handle, i);
+    }
+}
 
-/// Brings the live feature into line with what the header asks for, and builds it the
-/// first time. `wanted` is compared by value, not through `tuning_seq` (a hint that a
-/// header reset returns to zero, and that persisted config never bumps). A retuned
-/// feature keeps answering with the tuning it was built with until the replacement is
-/// ready; the replacement is built only after the wanted value has been stable for
-/// `settle_ms` and builds are spaced by the same interval.
+/// Gives up on a pass after this many consecutive failed builds.
+const MAX_BUILD_FAILURES: u32 = 3;
+
+/// Brings the chain of features into line with what the header asks for: one feature per
+/// wanted pass, each built with that pass's own tuning.
 ///
-/// Returns whether a feature exists afterwards. A failure to build the *first* feature is
-/// one-shot (`disabled`); a failed rebuild leaves no feature and retries after the spacing,
-/// up to [`MAX_REBUILD_FAILURES`] times.
-pub fn maintain_feature(
+/// `wanted` is compared by value, not through `tuning_seq` (a hint that a header reset returns
+/// to zero and that persisted config never bumps). A retuned pass keeps answering with the tuning
+/// it was built with until its replacement is due, and only that pass is replaced. Builds are
+/// spaced by `settle_ms`; a value that keeps changing keeps postponing the rebuild. With a spacing
+/// of 0 everything pending is built within this call.
+///
+/// A failure to build the very first feature is one-shot (`disabled`). A later pass that will not
+/// build sets the ceiling instead: the chain runs at what fits. A pass that fails to *rebuild* is
+/// left a hole (skipped) and retried after the spacing.
+///
+/// Returns the number of built passes afterwards.
+pub fn maintain_passes(
     s: &mut NgxSnippet,
     device: &ash::Device,
     queue: vk::Queue,
     width: u32,
     height: u32,
-    wanted: NgxTuning,
+    wanted: &[NgxTuning],
     settle_ms: u32,
-) -> bool {
+) -> usize {
     if s.disabled {
-        return false;
+        return 0;
     }
     if width < MIN_FEATURE_DIM || height < MIN_FEATURE_DIM {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             crate::log!("[ngx] refusing feature at {width}x{height}: below the {MIN_FEATURE_DIM}x{MIN_FEATURE_DIM} floor");
         }
-        // The live feature (if any) is for a different size and must not answer this frame.
-        return false;
+        // Whatever is live is for a different size and must not answer this frame.
+        return 0;
     }
-    let now = Instant::now();
     let spacing = Duration::from_millis(u64::from(settle_ms));
 
-    if s.has_feature() && s.built_size != (width, height) {
+    if s.live_passes() > 0 && s.built_size != (width, height) {
         crate::log!(
-            "[helper] frame size {}x{} -> {width}x{height}; rebuilding the feature",
-            s.built_size.0, s.built_size.1
+            "[helper] frame size {}x{} -> {width}x{height}; rebuilding {} pass(es)",
+            s.built_size.0, s.built_size.1, s.live_passes()
         );
-        // SAFETY: nothing may be in flight when the feature is destroyed.
+        // SAFETY: nothing may be in flight when a feature is destroyed.
         let _ = unsafe { device.device_wait_idle() };
-        release_feature(s);
-        s.build_after = Some(now + spacing);
+        release_all(s);
+        s.ceiling = None;
+        s.build_after = Some(Instant::now() + spacing);
     }
 
-    if wanted != s.last_seen_tuning {
-        s.last_seen_tuning = wanted;
-        s.tuning_changed = Some(now);
-    }
-
-    if !s.has_feature() {
-        // First build, or a retry after a failed rebuild: wait out the spacing between attempts
-        // but not the debounce -- there is no feature answering, so nothing to keep alive.
-        if s.build_after.is_some_and(|t| now < t) {
-            return false;
-        }
-        let first = s.rebuild_failures == 0 && s.build_after.is_none();
-        let ok = create_feature_at(s, device, queue, width, height, &wanted);
-        if ok {
-            s.rebuild_failures = 0;
-            s.needs_reset = true;
-        } else if first {
-            // One attempt only: a failed first `CreateFeature` means a real fault or a clean
-            // rejection, neither of which retrying next frame fixes (and retrying meant
-            // redoing the command pool/buffer/fence setup on every captured frame).
-            s.disabled = true;
-        } else {
-            s.rebuild_failures += 1;
-            s.build_after = Some(now + spacing);
-            if s.rebuild_failures >= MAX_REBUILD_FAILURES {
-                crate::log!("[helper] rebuild failed {} times; giving up on the model", s.rebuild_failures);
-                s.disabled = true;
+    s.last_seen.resize(wanted.len(), NgxTuning::default());
+    // One action per call when spaced; every pending action when the spacing is 0.
+    for _ in 0..(2 * wanted.len() + 2) {
+        let now = Instant::now();
+        for (i, w) in wanted.iter().enumerate() {
+            if *w != s.last_seen[i] {
+                s.last_seen[i] = *w;
+                s.tuning_changed = Some(now);
             }
         }
-        return ok;
-    }
+        let target = wanted.len().min(s.ceiling.unwrap_or(usize::MAX)).max(1);
 
-    if wanted == s.built_tuning {
-        return true;
+        // Extra passes the header no longer wants.
+        if s.passes.len() > target {
+            // SAFETY: nothing may be in flight when a feature is destroyed.
+            let _ = unsafe { device.device_wait_idle() };
+            for i in (target..s.passes.len()).rev() {
+                let slot = s.passes.remove(i);
+                release_handle(s, slot.handle, i);
+            }
+            s.build_after = Some(now + spacing);
+            continue;
+        }
+
+        let due = s.build_after.is_none_or(|t| now >= t);
+        let settled = s.tuning_changed.is_none_or(|t| now.duration_since(t) >= spacing);
+
+        // The first feature is never debounced -- nothing is answering, so nothing to keep alive.
+        let first_build = s.live_passes() == 0 && !s.ever_built;
+        if !first_build && !due {
+            break;
+        }
+
+        // A pass to (re)build: a hole first, then the first that differs from what it was built
+        // with (only once the header value has settled), then the next missing one.
+        let hole = s.passes.iter().position(|p| p.handle.is_null());
+        let stale = if settled { s.passes.iter().enumerate().position(|(i, p)| !p.handle.is_null() && p.built != wanted[i]) } else { None };
+        let missing = (s.passes.len() < target).then_some(s.passes.len());
+        let Some(pass) = hole.or(stale).or(missing) else { break };
+        // A stale pass keeps answering until its replacement is due, so it waits for the settle;
+        // holes and missing passes have nothing to keep alive and go on the spacing alone.
+        if Some(pass) == stale && !settled {
+            break;
+        }
+
+        if pass < s.passes.len() && !s.passes[pass].handle.is_null() {
+            crate::log!("[helper] pass {pass} retuned; rebuilding it (spacing {settle_ms} ms)");
+            crate::logging::flush();
+            // SAFETY: nothing may be in flight when a feature is destroyed.
+            let _ = unsafe { device.device_wait_idle() };
+            let old = std::mem::replace(&mut s.passes[pass].handle, std::ptr::null_mut());
+            release_handle(s, old, pass);
+        }
+
+        let created = create_feature_at(s, device, queue, width, height, &wanted[pass]);
+        s.build_after = Some(Instant::now() + spacing);
+        match created {
+            Some(handle) => {
+                s.ever_built = true;
+                s.built_size = (width, height);
+                let slot = PassSlot { handle, built: wanted[pass], needs_reset: true, failures: 0 };
+                if pass < s.passes.len() {
+                    s.passes[pass] = slot;
+                } else {
+                    s.passes.push(slot);
+                }
+            }
+            None if first_build => {
+                // One attempt only: a failed first `CreateFeature` means a real fault or a clean
+                // rejection, neither of which retrying next frame fixes.
+                s.disabled = true;
+                return 0;
+            }
+            None if pass >= s.passes.len() => {
+                // A later pass would not build: a ceiling, not a fault.
+                crate::log!("[helper] pass {pass} would not build; holding the chain at {}", s.passes.len());
+                crate::logging::flush();
+                s.ceiling = Some(s.passes.len());
+            }
+            None => {
+                let slot = &mut s.passes[pass];
+                slot.failures += 1;
+                crate::log!("[helper] pass {pass} rebuild failed ({}); skipping it until it builds", slot.failures);
+                if slot.failures >= MAX_BUILD_FAILURES {
+                    if pass == 0 {
+                        crate::log!("[helper] pass 0 failed {} times; giving up on the model", slot.failures);
+                        s.disabled = true;
+                        return 0;
+                    }
+                    // Not coming back: drop the tail from here and hold the chain short.
+                    s.passes.truncate(pass);
+                    s.ceiling = Some(pass);
+                }
+            }
+        }
+        if settle_ms != 0 {
+            break;
+        }
     }
-    if s.tuning_changed.is_some_and(|t| now.duration_since(t) < spacing) || s.build_after.is_some_and(|t| now < t) {
-        return true; // keep answering with the old tuning until the replacement is due
-    }
-    crate::log!("[helper] retuned; rebuilding the feature (spacing {settle_ms} ms)");
-    crate::logging::flush();
-    // SAFETY: the helper submits and fences every evaluate, so this only guards against
-    // a stray submission; nothing may be in flight when the feature is destroyed.
-    let _ = unsafe { device.device_wait_idle() };
-    release_feature(s);
-    // Marks this as a rebuild, not a first attempt: a failure now retries instead of disabling.
-    s.build_after = Some(now + spacing);
-    let ok = create_feature_at(s, device, queue, width, height, &wanted);
-    if ok {
-        s.rebuild_failures = 0;
-        s.needs_reset = true;
-    } else {
-        s.rebuild_failures += 1;
-        crate::log!("[helper] feature rebuild failed; retrying after the spacing");
-    }
-    ok
+    s.live_passes()
 }
 
 /// Release the feature, shut down the snippet, restore the caller-identity spoof, and
 /// unload both modules — in that order, matching upstream's verified teardown
 /// sequence.
 pub fn teardown(mut s: NgxSnippet) {
-    if !s.feature.is_null() {
-        if let Some(release) = s.release_feature {
-            let feature = s.feature;
-            let (result, seh) = guarded(|| unsafe { release(feature) }, abi::result::FAIL_SEH);
-            crate::log!("[ngx] ReleaseFeature -> {:#x} seh={:#x}", result as u32, seh);
-        }
-        s.feature = std::ptr::null_mut();
-    }
+    release_all(&mut s);
     if let Some(shutdown1) = s.shutdown1 {
         let device = s.device;
         let (result, seh) = guarded(|| unsafe { shutdown1(device) }, abi::result::FAIL_SEH);

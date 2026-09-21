@@ -568,7 +568,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 36] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 37] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -606,6 +606,7 @@ impl ShmHeader {
             ("colour_mode", false, self.colour_mode.load(Ordering::Relaxed)),
             ("hold_frame", false, self.hold_frame.load(Ordering::Relaxed)),
             ("unlock_passes", false, self.unlock_passes.load(Ordering::Relaxed)),
+            ("rebuild_settle_ms", false, self.rebuild_settle_ms.load(Ordering::Relaxed)),
             ("apply_model", false, self.apply_model.load(Ordering::Relaxed)),
             ("debug_view", false, self.debug_view.load(Ordering::Relaxed)),
         ]
@@ -651,6 +652,7 @@ impl ShmHeader {
             "colour_mode" => &self.colour_mode,
             "hold_frame" => &self.hold_frame,
             "unlock_passes" => &self.unlock_passes,
+            "rebuild_settle_ms" => &self.rebuild_settle_ms,
             "apply_model" => &self.apply_model,
             "debug_view" => &self.debug_view,
             _ => return,

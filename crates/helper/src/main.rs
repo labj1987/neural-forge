@@ -243,7 +243,7 @@ fn main() {
                     "[helper] slot {slot}: seq_req went backwards ({} -> {seq_req}); header reinitialised, resetting the feature",
                     last_seq_req[slot]
                 );
-                ngx::discard_feature(&mut snippet, &device);
+                ngx::discard_features(&mut snippet, &device);
             }
             last_seq_req[slot] = seq_req;
             process_request(
@@ -356,11 +356,21 @@ fn process_request(
         *frame_resources = frame::FrameResources::new(device, instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
         neural_forge_helper::log!("[helper] slot {slot}: prewarmed {}x{} frame resources: {}", width, height, frame_resources.is_some());
     }
-    let tuning = hdr.resolve_pass(0);
-    let ready = model_requested
-        && ngx::maintain_feature(
-            snippet, device, queue, width, height, tuning.into(), hdr.rebuild_settle_ms.load(Ordering::Relaxed),
-        );
+    // One tuning per wanted pass; the chain builds a feature for each, so the header's pass count
+    // (and per-pass overrides) decide how many times the model runs over the frame.
+    let wanted_tunings: Vec<ngx::NgxTuning> = (0..hdr.resolved_passes() as usize).map(|i| hdr.resolve_pass(i).into()).collect();
+    let live_passes = if model_requested {
+        ngx::maintain_passes(
+            snippet, device, queue, width, height, &wanted_tunings, hdr.rebuild_settle_ms.load(Ordering::Relaxed),
+        )
+    } else {
+        0
+    };
+    let ready = live_passes > 0;
+    hdr.helper_features.store(live_passes as u32, Ordering::Relaxed);
+    if let Some(ceiling) = snippet.pass_ceiling() {
+        hdr.helper_pass_ceiling.store(ceiling as u32, Ordering::Relaxed);
+    }
     if ready {
         hdr.model_up.store(1, Ordering::Relaxed);
     } else if model_requested && snippet.disabled {
@@ -420,8 +430,21 @@ fn process_request(
             }
             let f = frame_resources.as_ref()?;
             let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
-            let reset_history = ngx::take_needs_reset(snippet) || (hdr.mvec_enabled() && motion.is_empty());
-            f.evaluate(device, queue, eval_fn, snippet.feature, params, proxy, &motion, motion_scale, reset_history, tuning.sharpness, answer)
+            let reset_history = hdr.mvec_enabled() && motion.is_empty();
+            // Sharpness is per pass (the model reads it at evaluate); the header index of a pass
+            // is its position in the chain, holes excluded only from the *built* handles, so the
+            // pass numbers here are the first `live_passes` of the header's list.
+            let chain: Vec<frame::ChainPass> = snippet
+                .chain_handles()
+                .into_iter()
+                .enumerate()
+                .map(|(i, handle)| frame::ChainPass {
+                    handle,
+                    reset: snippet.take_needs_reset(handle),
+                    sharpness: hdr.resolve_pass(i).sharpness,
+                })
+                .collect();
+            f.evaluate(device, queue, eval_fn, &chain, params, proxy, &motion, motion_scale, reset_history, answer)
         })()
     } else {
         None
@@ -447,7 +470,10 @@ fn process_request(
     *frames += 1;
     neural_forge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, *frames);
     if neural_forge_helper::logging::sampled(*frames) || !evaluated {
-        neural_forge_helper::log!("[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated}");
+        neural_forge_helper::log!(
+            "[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated} passes={live_passes}/{} ceiling={:?}",
+            wanted_tunings.len(), snippet.pass_ceiling()
+        );
     }
 }
 
