@@ -50,6 +50,8 @@ pub struct ComposeParams {
     pub colour_strength: f32,
     pub transfer_strength: f32,
     pub max_ratio: f32,
+    /// `compose.comp`'s ghost guard strength (mode 2 only). 0 leaves the ratio per pixel.
+    pub ghost_guard: f32,
     /// True when the proxy that produced this answer went through
     /// [`crate::composition::encode_pass`]. False means the proxy is a bit-identical
     /// copy of the frame and the ratio transfer would self-cancel on it.
@@ -68,6 +70,8 @@ struct PushConstants {
     /// (`UpgradeToneMap`), 1 selects the guarded-additive formula the async
     /// held-answer path needs instead -- see that shader's own doc comment on why.
     mode: u32,
+    /// Matches `compose.comp`'s `params.ghost_guard` (mode 2 only).
+    ghost_guard: f32,
 }
 
 struct Image {
@@ -533,7 +537,7 @@ impl ComposeSlot {
 
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0 };
+            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -747,6 +751,7 @@ impl ComposeSlot {
                 max_ratio: compose.max_ratio,
                 bgr_order: bgr_order as u32,
                 mode: if compose.proxy_encoded { 2 } else { 1 },
+                ghost_guard: compose.ghost_guard,
             };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
@@ -1635,6 +1640,107 @@ mod tests {
         (buffer, memory)
     }
 
+    /// Mode 2, on a real (lavapipe) device: the model brightened a dark stroke at x=20..22 of
+    /// the frame it was shown. When the current frame has moved on (the stroke is now at
+    /// x=40..42), the per-pixel ratio would lay a pale copy of the old stroke at x=21 --
+    /// `ghost_guard` must remove that. When nothing has moved, the guard must leave the
+    /// model's detail exactly as it was.
+    #[test]
+    fn ghost_guard_suppresses_a_stale_detail_edit_and_keeps_static_detail() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("ghost_guard test: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (width, height) = (64u32, 32u32);
+
+        // Grey 120 with a 3px dark (30) vertical stroke starting at `stroke_x`.
+        let frame = |stroke_x: u32| -> Vec<u8> {
+            (0..width * height)
+                .flat_map(|i| {
+                    let x = i % width;
+                    let v = if (stroke_x..stroke_x + 3).contains(&x) { 30u8 } else { 120u8 };
+                    [v, v, v, 255]
+                })
+                .collect()
+        };
+        let proxy = frame(20); // what the model was shown
+        let mut answer = proxy.clone(); // the model brightened the stroke: 30 -> 60
+        for i in 0..(width * height) {
+            let x = i % width;
+            if (20..23).contains(&x) {
+                let o = (i * 4) as usize;
+                answer[o] = 60;
+                answer[o + 1] = 60;
+                answer[o + 2] = 60;
+            }
+        }
+
+        let run = |current: &[u8], guard: f32| -> Vec<u8> {
+            let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
+            let target = make_target_image(&device, &mem_props, width, height);
+            let staging = build_upload_staging(&device, &mem_props, current);
+            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            unsafe {
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+                device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+                let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+                device.end_command_buffer(cmd).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+                device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+                device.destroy_buffer(staging.0, None);
+                device.free_memory(staging.1, None);
+            }
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, proxy_encoded: true };
+            let sem = gpu
+                .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, &proxy, &answer, 1, false, target.image, params)
+                .expect("compose");
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+            unsafe {
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                device.destroy_fence(wait_fence, None);
+            }
+            let out = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
+            unsafe {
+                device.destroy_fence(fence, None);
+                gpu.destroy(&device);
+            }
+            out
+        };
+        let px = |out: &[u8], x: u32| out[((16 * width + x) * 4) as usize];
+
+        // The frame has moved: the stroke is now at x=40, and x=21 (the old stroke) is plain grey.
+        let moved = frame(40);
+        let ghost = px(&run(&moved, 0.0), 21);
+        let guarded = px(&run(&moved, 1.0), 21);
+        assert!(ghost > 150, "without the guard a stale brightening should lift plain grey (got {ghost}, expected > 150)");
+        assert!(guarded < ghost - 20 && guarded < 140, "the guard must remove most of the ghost: unguarded {ghost}, guarded {guarded}");
+
+        // Nothing has moved: the frame still has the stroke where the model saw it. The model's
+        // brightening of it must survive the guard exactly.
+        let still = frame(20);
+        let unguarded_static = px(&run(&still, 0.0), 21);
+        let guarded_static = px(&run(&still, 1.0), 21);
+        assert!(
+            (i32::from(unguarded_static) - i32::from(guarded_static)).abs() <= 2,
+            "static detail must be untouched by the guard: unguarded {unguarded_static}, guarded {guarded_static}"
+        );
+
+        unsafe {
+            device.destroy_command_pool(pool, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
     #[test]
     fn present_temporal_delta_async_upscales_a_smaller_answer_and_rejects_an_oversized_one() {
         // `working_scale`'s compose-side counterpart to `capture.rs`'s own
@@ -1689,7 +1795,7 @@ mod tests {
         }
 
         // (1) A smaller answer must still be accepted and actually change the output.
-        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, proxy_encoded: false });
+        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, proxy_encoded: false });
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
@@ -1715,7 +1821,7 @@ mod tests {
         // for this function -- see its own doc comment) must be rejected, not
         // overflow the shared staging buffer.
         let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
-        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, proxy_encoded: false });
+        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, proxy_encoded: false });
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
 
         unsafe {

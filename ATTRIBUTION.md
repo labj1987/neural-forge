@@ -53,6 +53,7 @@ upstream file it came from. Nothing listed here lands in
 with `THIRD_PARTY_CRATES.md` (the statically linked Rust crates and their licences).
 | `crates/layer/src/hotkey.rs` (`key_code_from_name`, the key-name table, evdev keyboard discovery/drain, XInput2 raw-key selection, backend order and `NEURAL_FORGE_HOTKEY_BACKEND`/`NEURAL_FORGE_TOGGLE_KEY` overrides) | `layer_linux/src/hotkey.cpp`, `hotkey.h` (`KeyCodeFromName`, `Hotkeys::OpenEvdev`/`RescanEvdev`/`OpenX11`/`PressedEvdev`/`PressedX11`) |
 | `crates/layer/src/device.rs` NVIDIA vendor gate; `crates/layer/src/lib.rs` `duplicate_copy`, `note_vk`/`device_lost` | `layer_linux/src/layer.cpp` device creation vendor check (~l.914), `DuplicateLayerCopy` (~l.619), `NoteVk` (~l.1375). Swapchain admission (`surface_usage.rs`) is deliberately not upstream's: it does not OR `TRANSFER_SRC|DST` unconditionally. |
+| `crates/layer/shaders/compose.comp` mode 2 ghost guard (`ghost_guard`) | The idea of taking the relighting ratio from the neighbourhood instead of the pixel is `dlssnr.hlsl`'s `gRatioSmooth`/`gainSmooth` (five taps, off by default). The stale-answer motion weighting around it (5x5 stride-3 worst-mismatch mask against the proxy, soft-thresholded) and the wider neighbourhood are this project's own, designed against measured doubling of sign text in GTA V at 4K. |
 
 ## What was previously taken clean-room (still accurate, unaffected by the above)
 

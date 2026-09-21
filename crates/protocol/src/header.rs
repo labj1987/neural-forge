@@ -297,6 +297,12 @@ pub struct ShmHeader {
     pub width_b: AtomicU32,
     pub height_b: AtomicU32,
     pub proxy_format_b: AtomicU32,
+
+    // --- v4: appended after everything else, for the same reason as the v3 slot above -----
+    /// 0..1: how much the composition's ghost guard is applied. 0 is off (the relighting
+    /// ratio is taken per pixel, so a stale answer can paste its detail onto content that
+    /// has moved); 1 is the full guard. See `compose.comp`'s mode 2. Default 1.
+    pub ghost_guard_bits: AtomicU32,
 }
 
 // The whole point of a shared, memory-mapped struct like this is that every writer
@@ -328,7 +334,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1980, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1984, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -341,6 +347,7 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1932, "layout
 // v3's second slot, appended after everything else -- same reasoning as `pass`'s own
 // comment above about why a new field belongs at the end, not inserted higher up.
 const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1960, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1980, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_valid) == 1952, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_scale_mode) == 1956, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
@@ -397,6 +404,7 @@ impl ShmHeader {
         self.reversible_mode.store(crate::enums::reversible_mode::KNEE, Ordering::Relaxed);
         self.apply_model.store(1, Ordering::Relaxed);
         self.hold_frame.store(0, Ordering::Relaxed);
+        self.ghost_guard_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.scaling_downscaler.store(crate::enums::downscaler::LANCZOS3, Ordering::Relaxed);
 
         self.helper_state.store(crate::enums::helper_state::STOPPED, Ordering::Relaxed);
@@ -568,7 +576,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 37] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 38] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -605,6 +613,7 @@ impl ShmHeader {
             ("compare_swap", false, self.compare_swap.load(Ordering::Relaxed)),
             ("colour_mode", false, self.colour_mode.load(Ordering::Relaxed)),
             ("hold_frame", false, self.hold_frame.load(Ordering::Relaxed)),
+            ("ghost_guard", true, self.ghost_guard_bits.load(Ordering::Relaxed)),
             ("unlock_passes", false, self.unlock_passes.load(Ordering::Relaxed)),
             ("rebuild_settle_ms", false, self.rebuild_settle_ms.load(Ordering::Relaxed)),
             ("apply_model", false, self.apply_model.load(Ordering::Relaxed)),
@@ -651,6 +660,7 @@ impl ShmHeader {
             "compare_swap" => &self.compare_swap,
             "colour_mode" => &self.colour_mode,
             "hold_frame" => &self.hold_frame,
+            "ghost_guard" => &self.ghost_guard_bits,
             "unlock_passes" => &self.unlock_passes,
             "rebuild_settle_ms" => &self.rebuild_settle_ms,
             "apply_model" => &self.apply_model,

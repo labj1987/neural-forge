@@ -897,8 +897,31 @@ pub unsafe fn run(
     // throughput for either, and both are rare, deliberately-triggered cases (a
     // developer toggling a debug view, or a one-shot dump request), not the normal
     // per-frame path this function otherwise replaces.
-    if capture_image != image && (settings.debug_view != 0 || shm.capture_request_pending()) { return None; }
-    if settings.debug_view != 0 || shm.capture_request_pending() {
+    // A game that renders into its own image and blits into the swapchain (`capture_image !=
+    // image`, e.g. GTA V through vkd3d) has no same-frame original to dump or compare against.
+    // Those requests cannot be served here, and they must never stop the layer either: returning
+    // early with the request still pending switched the whole pipeline off, on every present,
+    // until something cleared it -- a single `shmctl capture` (or the GUI's capture button) was
+    // enough. So the request is consumed and reported once, and the debug view is ignored.
+    let sync_debug = capture_image == image;
+    if !sync_debug {
+        if shm.capture_request_pending() {
+            shm.take_capture_request();
+            static SAID_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID_CAPTURE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!("[layer] capture request dropped: this game blits into the swapchain, so there is no same-frame original to dump");
+                crate::logging::flush();
+            }
+        }
+        if settings.debug_view != 0 {
+            static SAID_DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID_DEBUG.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!("[layer] debug view {} ignored: it needs a same-frame original, which a blitting game does not have", settings.debug_view);
+                crate::logging::flush();
+            }
+        }
+    }
+    if sync_debug && (settings.debug_view != 0 || shm.capture_request_pending()) {
         return unsafe {
             run_sync(
                 device,
@@ -1159,6 +1182,7 @@ pub unsafe fn run(
                 colour_strength: settings.colour_strength,
                 transfer_strength: settings.transfer_strength,
                 max_ratio: settings.max_ratio,
+                ghost_guard: settings.ghost_guard,
                 proxy_encoded,
             },
         ) {

@@ -63,6 +63,11 @@ layout(push_constant) uniform Params {
   // encode (the normal path on hardware that supports it)
   // where it's read, below, for why that path needs a different formula.
   uint mode;
+  // Mode 2 only. 0 = off (the ratio is taken per pixel, as before), 1 = full guard: where the
+  // frame has moved since the one the model answered, the relighting ratio comes from the
+  // neighbourhood instead of the pixel, so a stale answer cannot paste its detail (a pale
+  // copy of old edges and text) onto content that has since moved. See the ghost-guard block.
+  float ghost_guard;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -237,6 +242,51 @@ void main() {
       result = original;
     } else {
       float edit_ratio = (model_luminance + kRatioFloor) / (proxy_luminance + kRatioFloor);
+
+      // Ghost guard.
+      //
+      // The answer is for the frame the model was shown, and this pass runs on a later one --
+      // at 4K the model takes tens of milliseconds, so the camera has usually moved. The ratio
+      // above is the model's per-pixel verdict *at the old positions*: where it brightened a
+      // dark stroke, the ratio is high at the stroke's old position, and multiplying the new
+      // frame there lays a pale copy of the old stroke over whatever now occupies the spot
+      // (measured on GTA V: doubled sign lettering, offset by the camera's travel).
+      //
+      // Where the frame has changed since the proxy was made, keep only the broad relighting:
+      // take the ratio of the neighbourhood's mean model and proxy luminance instead of the
+      // pixel's own. Where it has not changed, the full per-pixel ratio stands, so static
+      // detail keeps everything the model added.
+      //
+      // "Changed" is the worst mismatch between the current frame and the proxy over a 5x5
+      // neighbourhood at a stride of 3 pixels -- a stroke three pixels wide always has a tap
+      // on it -- read as a fraction of the local light, with a floor so sensor-level noise in
+      // dark areas is not motion. The proxy is the frame itself below the encode's knee, so the
+      // comparison is only meaningful there; taps over highlights, where the encode
+      // legitimately differs, are ignored. The mask is soft, not a hard threshold, so a
+      // pixel hovering near it does not flicker between the two ratios.
+      if (params.ghost_guard > 0.0) {
+        const int kGhostStep = 3;
+        ivec2 last = size - ivec2(1);
+        float proxy_sum = 0.0;
+        float model_sum = 0.0;
+        float worst = 0.0;
+        for (int j = -2; j <= 2; ++j) {
+          for (int i = -2; i <= 2; ++i) {
+            ivec2 q = clamp(pixel + ivec2(i, j) * kGhostStep, ivec2(0), last);
+            vec3 pq = SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb);
+            vec3 mq = SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb);
+            vec3 oq = SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb);
+            float pl = Luminance(pq);
+            proxy_sum += pl;
+            model_sum += Luminance(mq);
+            float valid = 1.0 - smoothstep(0.5, 0.7, pl);
+            worst = max(worst, valid * abs(Luminance(oq) - pl) / (0.03 + 0.5 * pl));
+          }
+        }
+        float smooth_ratio = (model_sum / 25.0 + kRatioFloor) / (proxy_sum / 25.0 + kRatioFloor);
+        float moved = smoothstep(0.35, 1.2, worst);
+        edit_ratio = mix(edit_ratio, smooth_ratio, moved * clamp(params.ghost_guard, 0.0, 1.0));
+      }
       // Detail strength above 1 as a power on the ratio, not an extended blend: it
       // cannot go negative, leaves an unchanged pixel alone (one to any power is one),
       // moves brightening and darkening by the same factor, and stays a ratio, so the

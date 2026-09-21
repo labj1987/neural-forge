@@ -28,6 +28,8 @@ pub struct CompositionSettings {
     pub colour_strength: f32,
     pub transfer_strength: f32,
     pub max_ratio: f32,
+    /// See `ShmHeader::ghost_guard_bits`.
+    pub ghost_guard: f32,
     pub debug_view: u32,
     pub apply_model: bool,
     pub neural_enabled: bool,
@@ -221,6 +223,7 @@ impl ShmClient {
             colour_strength: f32::from_bits(hdr.colour_strength_bits.load(Ordering::Relaxed)),
             transfer_strength: f32::from_bits(hdr.transfer_strength_bits.load(Ordering::Relaxed)),
             max_ratio: f32::from_bits(hdr.max_ratio_bits.load(Ordering::Relaxed)),
+            ghost_guard: f32::from_bits(hdr.ghost_guard_bits.load(Ordering::Relaxed)),
             debug_view: hdr.debug_view.load(Ordering::Relaxed),
             apply_model: hdr.apply_model.load(Ordering::Relaxed) != 0,
             neural_enabled: hdr.neural_enabled(),
