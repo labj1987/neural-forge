@@ -16,6 +16,42 @@ use std::sync::atomic::Ordering;
 
 use neural_forge_protocol::mapping::Mapping;
 
+/// How a bound field's raw bits are to be read back.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FieldKind {
+    Float,
+    Int,
+}
+
+/// A way to read a bound field's current raw bits, so a widget can follow changes made by
+/// something other than itself (`shmctl`, loading a profile, Reset, another GUI).
+pub type Reader = Box<dyn Fn() -> u32>;
+
+thread_local! {
+    /// The reader of the most recent `bind_*` call. Every row builder in `ui.rs` is called
+    /// immediately after the binding it displays and takes it from here.
+    static PENDING_READER: std::cell::RefCell<Option<(FieldKind, Reader)>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Takes the reader the last `bind_*` call left for the row being built now.
+pub fn take_pending_reader() -> Option<(FieldKind, Reader)> {
+    PENDING_READER.with(|p| p.borrow_mut().take())
+}
+
+fn leave_reader(
+    shm: &Arc<Mapping>,
+    kind: FieldKind,
+    get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
+) -> impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static {
+    let get = std::rc::Rc::new(get);
+    let reader_get = std::rc::Rc::clone(&get);
+    let reader_shm = Arc::clone(shm);
+    PENDING_READER.with(|p| {
+        *p.borrow_mut() = Some((kind, Box::new(move || reader_get(reader_shm.header()).load(Ordering::Relaxed))));
+    });
+    move |h| get(h)
+}
+
 /// Wraps the open mapping so the UI module can pass one `Arc` around to every
 /// callback instead of re-opening or re-threading raw pointers everywhere.
 pub struct Shm(pub Arc<Mapping>);
@@ -54,6 +90,7 @@ pub fn bind_float(
     name: Option<&'static str>,
     get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (f32, impl Fn(f32) + 'static) {
+    let get = leave_reader(shm, FieldKind::Float, get);
     let initial = f32::from_bits(get(shm.header()).load(Ordering::Relaxed));
     let shm = Arc::clone(shm);
     let setter = move |value: f32| {
@@ -73,6 +110,7 @@ pub fn bind_u32(
     name: Option<&'static str>,
     get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (u32, impl Fn(u32) + 'static) {
+    let get = leave_reader(shm, FieldKind::Int, get);
     let initial = get(shm.header()).load(Ordering::Relaxed);
     let shm = Arc::clone(shm);
     let setter = move |value: u32| {

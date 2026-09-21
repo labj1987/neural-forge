@@ -12,12 +12,62 @@ use libadwaita::prelude::*;
 
 use crate::shm::{bind_bool, bind_float, bind_u32, Shm};
 
+thread_local! {
+    /// Set while a refresh is writing header values into widgets, so the widgets' own change
+    /// handlers do not write the same values straight back (and re-persist them).
+    static REFRESHING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// One closure per bound row that brings the row up to date with the header.
+    static REFRESHERS: std::cell::RefCell<Vec<Box<dyn Fn()>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn refreshing() -> bool {
+    REFRESHING.with(std::cell::Cell::get)
+}
+
+fn register_refresher(f: impl Fn() + 'static) {
+    REFRESHERS.with(|r| r.borrow_mut().push(Box::new(f)));
+}
+
+/// Brings every bound row up to date with the header -- run once a second, so a change made
+/// with `shmctl`, a loaded profile or Reset shows up without restarting the app.
+fn refresh_all_rows() {
+    REFRESHING.with(|f| f.set(true));
+    REFRESHERS.with(|r| r.borrow().iter().for_each(|f| f()));
+    REFRESHING.with(|f| f.set(false));
+}
+
 fn spin_row(title: &str, subtitle: &str, value: f32, lower: f64, upper: f64, step: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
-    let adjustment = gtk4::Adjustment::new(value as f64, lower, upper, step, step * 10.0, 0.0);
-    let row = adw::SpinRow::new(Some(&adjustment), step, 2);
+    spin_row_scaled(title, subtitle, value, lower, upper, step, 1.0, setter)
+}
+
+/// A spin row that shows the field multiplied by `scale` (100.0 shows a fraction as a percent).
+/// `lower`/`upper`/`step` are in displayed units; the setter still receives the stored value.
+#[allow(clippy::too_many_arguments)]
+fn spin_row_scaled(title: &str, subtitle: &str, value: f32, lower: f64, upper: f64, step: f64, scale: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
+    let adjustment = gtk4::Adjustment::new(f64::from(value) * scale, lower, upper, step, step * 10.0, 0.0);
+    let digits = if step >= 1.0 { 0 } else if step >= 0.1 { 1 } else { 2 };
+    let row = adw::SpinRow::new(Some(&adjustment), step, digits);
     row.set_title(title);
     row.set_subtitle(subtitle);
-    adjustment.connect_value_changed(move |adj| setter(adj.value() as f32));
+    adjustment.connect_value_changed(move |adj| {
+        if !refreshing() {
+            setter((adj.value() / scale) as f32);
+        }
+    });
+    if let Some((kind, read)) = crate::shm::take_pending_reader() {
+        let adjustment = adjustment.clone();
+        register_refresher(move || {
+            let bits = read();
+            let v = scale
+                * match kind {
+                    crate::shm::FieldKind::Float => f64::from(f32::from_bits(bits)),
+                    crate::shm::FieldKind::Int => f64::from(bits),
+                };
+            if v.is_finite() && (adjustment.value() - v).abs() > 1e-6 {
+                adjustment.set_value(v);
+            }
+        });
+    }
     row
 }
 
@@ -26,7 +76,22 @@ fn switch_row(title: &str, subtitle: &str, active: bool, setter: impl Fn(bool) +
     row.set_title(title);
     row.set_subtitle(subtitle);
     row.set_active(active);
-    row.connect_active_notify(move |row| setter(row.is_active()));
+    row.connect_active_notify(move |row| {
+        if !refreshing() {
+            setter(row.is_active());
+        }
+    });
+    if let Some((_, read)) = crate::shm::take_pending_reader() {
+        let row = row.downgrade();
+        register_refresher(move || {
+            if let Some(row) = row.upgrade() {
+                let on = read() != 0;
+                if row.is_active() != on {
+                    row.set_active(on);
+                }
+            }
+        });
+    }
     row
 }
 
@@ -35,8 +100,24 @@ fn combo_row(title: &str, options: &[&str], selected: u32, setter: impl Fn(u32) 
     let row = adw::ComboRow::new();
     row.set_title(title);
     row.set_model(Some(&model));
-    row.set_selected(selected.min(options.len() as u32 - 1));
-    row.connect_selected_notify(move |row| setter(row.selected()));
+    let last = options.len() as u32 - 1;
+    row.set_selected(selected.min(last));
+    row.connect_selected_notify(move |row| {
+        if !refreshing() {
+            setter(row.selected());
+        }
+    });
+    if let Some((_, read)) = crate::shm::take_pending_reader() {
+        let row = row.downgrade();
+        register_refresher(move || {
+            if let Some(row) = row.upgrade() {
+                let v = read().min(last);
+                if row.selected() != v {
+                    row.set_selected(v);
+                }
+            }
+        });
+    }
     row
 }
 
@@ -46,6 +127,7 @@ fn evdev_keycode(hardware: u32) -> Option<u32> {
 }
 
 fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
+    let _ = crate::shm::take_pending_reader();
     let row = adw::ActionRow::builder().title("Toggle key")
         .subtitle("Toggles Neural Forge inside a running game. Needs read access to /dev/input (the 'input' group) or an X11/XWayland session.").build();
     let label = |code| if code == 0 { "Unbound".to_owned() } else { format!("Key {code}") };
@@ -128,19 +210,19 @@ pub fn build_ui(app: &adw::Application) {
     model_group.add(&combo_row("Style", &["Default", "Natural", "Cinematic"], style, set_style));
 
     let (preset, set_preset) = bind_u32(&shm, Some("preset"), |h| &h.preset);
-    model_group.add(&spin_row("Preset", "0-3, model-defined presets", preset as f32, 0.0, 3.0, 1.0, move |v| set_preset(v as u32)));
+    model_group.add(&spin_row("Preset", "Model-defined preset, 0-15", preset as f32, 0.0, 15.0, 1.0, move |v| set_preset(v as u32)));
 
     let (intensity, set_intensity) = bind_float(&shm, Some("intensity"), |h| &h.intensity_bits);
-    model_group.add(&spin_row("Intensity", "", intensity, 0.0, 2.0, 0.05, set_intensity));
+    model_group.add(&spin_row("Intensity", "Applied when the model is rebuilt (after a short pause)", intensity, 0.0, 4.0, 0.05, set_intensity));
 
     let (local_tone, set_local_tone) = bind_float(&shm, Some("local_tone"), |h| &h.local_tone_bits);
-    model_group.add(&spin_row("Local tone", "", local_tone, 0.0, 2.0, 0.05, set_local_tone));
+    model_group.add(&spin_row("Local tone", "", local_tone, 0.0, 4.0, 0.05, set_local_tone));
 
     let (local_structure, set_local_structure) = bind_float(&shm, Some("local_structure"), |h| &h.local_structure_bits);
-    model_group.add(&spin_row("Local structure", "", local_structure, 0.0, 2.0, 0.05, set_local_structure));
+    model_group.add(&spin_row("Local structure", "", local_structure, 0.0, 4.0, 0.05, set_local_structure));
 
     let (skin_structure, set_skin_structure) = bind_float(&shm, Some("skin_structure"), |h| &h.skin_structure_bits);
-    model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, -1.0, 2.0, 0.05, set_skin_structure));
+    model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, -1.0, 4.0, 0.05, set_skin_structure));
 
     let (sharpness, set_sharpness) = bind_float(&shm, Some("sharpness"), |h| &h.sharpness_bits);
     model_group.add(&spin_row("Sharpness", "", sharpness, 0.0, 1.0, 0.05, set_sharpness));
@@ -150,6 +232,17 @@ pub fn build_ui(app: &adw::Application) {
 
     let (passes, set_passes) = bind_u32(&shm, Some("passes"), |h| &h.passes);
     model_group.add(&spin_row("Passes", "How many times the model runs over one frame", passes as f32, 1.0, 30.0, 1.0, move |v| set_passes(v as u32)));
+
+    let (settle, set_settle) = bind_u32(&shm, Some("rebuild_settle_ms"), |h| &h.rebuild_settle_ms);
+    model_group.add(&spin_row(
+        "Rebuild spacing",
+        "Milliseconds to wait after a tuning change before the model is rebuilt with it",
+        settle as f32,
+        0.0,
+        5000.0,
+        50.0,
+        move |v| set_settle(v as u32),
+    ));
 
     let (toggle_key, set_toggle_key) = bind_u32(&shm, Some("toggle_key"), |h| &h.toggle_key);
     model_group.add(&hotkey_row(toggle_key, set_toggle_key));
@@ -200,24 +293,29 @@ pub fn build_ui(app: &adw::Application) {
     comp_group.add(&switch_row("Bypass composition", "On: the model's raw answer is the presented frame", bypass, set_bypass));
 
     let (transfer_strength, set_transfer_strength) = bind_float(&shm, Some("transfer_strength"), |h| &h.transfer_strength_bits);
-    comp_group.add(&spin_row("Transfer strength", "How much of the model's edit reaches the frame", transfer_strength, 0.0, 1.0, 0.05, set_transfer_strength));
+    comp_group.add(&spin_row("Detail strength", "How much of the model's edit reaches the frame; above 1 amplifies it", transfer_strength, 0.0, 4.0, 0.05, set_transfer_strength));
 
     let (colour_strength, set_colour_strength) = bind_float(&shm, Some("colour_strength"), |h| &h.colour_strength_bits);
     comp_group.add(&spin_row("Colour strength", "How much of the transfer is allowed to be colour, not just luminance", colour_strength, 0.0, 1.0, 0.05, set_colour_strength));
 
     let (max_ratio, set_max_ratio) = bind_float(&shm, Some("max_ratio"), |h| &h.max_ratio_bits);
-    comp_group.add(&spin_row("Max ratio", "The most the pass may multiply/divide a pixel by", max_ratio, 1.0, 8.0, 0.1, set_max_ratio));
+    comp_group.add(&spin_row("Highlight guard", "The most the pass may brighten or darken a pixel by (x)", max_ratio, 1.0, 30.0, 0.1, set_max_ratio));
 
     let (working_scale, set_working_scale) = bind_float(&shm, Some("working_scale"), |h| &h.working_scale_bits);
-    comp_group.add(&spin_row("Working scale", "Above 1.0 is supersampling", working_scale, 0.25, 2.0, 0.05, set_working_scale));
+    comp_group.add(&spin_row_scaled("Model resolution", "Percent of the frame the model works at; lower is faster and softer", working_scale, 25.0, 100.0, 5.0, 100.0, set_working_scale));
 
     let (downscaler_v, set_downscaler) = bind_u32(&shm, Some("scaling_downscaler"), |h| &h.scaling_downscaler);
-    comp_group.add(&combo_row(
+    let filter_row = combo_row(
         "Supersampling filter",
         &["FSR1 (unsupported)", "Bicubic", "Catmull-Rom", "Lanczos2", "Lanczos3", "Kaiser2", "Kaiser3", "Magic"],
         downscaler_v,
         set_downscaler,
-    ));
+    );
+    // Supersampling (model resolution above 100%) is not available: the answer would be larger
+    // than the frame, which the composition rejects. Kept so the saved value round-trips.
+    filter_row.set_subtitle("Unavailable: model resolution cannot go above 100%");
+    filter_row.set_sensitive(false);
+    comp_group.add(&filter_row);
     debug_assert_eq!(downscaler::LANCZOS3, 4);
 
     let (reversible, set_reversible) = bind_u32(&shm, Some("reversible_mode"), |h| &h.reversible_mode);
@@ -251,6 +349,17 @@ pub fn build_ui(app: &adw::Application) {
     let (transfer, set_transfer) = bind_u32(&shm, Some("transfer"), |h| &h.transfer);
     comp_group.add(&combo_row("Transfer mode", &["Classic", "Matched residual", "Native + edit"], transfer, set_transfer));
 
+    let (ghost_guard, set_ghost_guard) = bind_float(&shm, Some("ghost_guard"), |h| &h.ghost_guard_bits);
+    comp_group.add(&spin_row(
+        "Ghost guard",
+        "Only matters in pipelined mode (NEURAL_FORGE_PIPELINED=1): hides a late answer's detail where the frame has moved",
+        ghost_guard,
+        0.0,
+        1.0,
+        0.05,
+        set_ghost_guard,
+    ));
+
     let (unlock_passes, set_unlock_passes) = bind_bool(&shm, Some("unlock_passes"), |h| &h.unlock_passes);
     comp_group.add(&switch_row("Unlock pass limit", "Allow more passes than the normal ceiling", unlock_passes, set_unlock_passes));
 
@@ -274,7 +383,7 @@ pub fn build_ui(app: &adw::Application) {
     debug_group.add(&spin_row("Compare split", "Wipe position, 0=left edge, 1=right edge", compare_split, 0.0, 1.0, 0.05, set_compare_split));
 
     let (compare_zoom, set_compare_zoom) = bind_float(&shm, Some("compare_zoom"), |h| &h.compare_zoom_bits);
-    debug_group.add(&spin_row("Compare zoom", "", compare_zoom, 0.1, 8.0, 0.1, set_compare_zoom));
+    debug_group.add(&spin_row("Compare zoom", "", compare_zoom, 1.0, 2.0, 0.1, set_compare_zoom));
 
     let (compare_swap, set_compare_swap) = bind_bool(&shm, Some("compare_swap"), |h| &h.compare_swap);
     debug_group.add(&switch_row("Swap compare sides", "", compare_swap, set_compare_swap));
@@ -380,6 +489,13 @@ pub fn build_ui(app: &adw::Application) {
     toolbar_view.set_content(Some(&view_stack));
     toolbar_view.add_bottom_bar(&switcher_bar);
     toasts.set_child(Some(&toolbar_view));
+
+    // Follow the header: a change made with `shmctl`, a loaded profile, Reset or another
+    // instance appears here within a second instead of needing an app restart.
+    glib::timeout_add_seconds_local(1, || {
+        refresh_all_rows();
+        glib::ControlFlow::Continue
+    });
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -1016,7 +1132,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
                     cfg.settings.insert(name, value);
                 }
                 match cfg.save() {
-                    Ok(()) => toasts.add_toast(adw::Toast::new("Settings reset -- restart Neural Forge to see it reflected here")),
+                    Ok(()) => toasts.add_toast(adw::Toast::new("Settings reset")),
                     Err(e) => toasts.add_toast(adw::Toast::new(&format!("Reset the live session, but saving config.ini failed: {e}"))),
                 }
             });
@@ -1085,7 +1201,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             let mut cfg = neural_forge_supervisor::Config::load();
             cfg.settings = neural_forge_protocol::persist::snapshot(shm.header());
             let message = match cfg.save() {
-                Ok(()) => format!("Loaded profile \"{name}\" -- restart Neural Forge to see it reflected here"),
+                Ok(()) => format!("Loaded profile \"{name}\""),
                 Err(e) => format!("Applied to the running session, but saving config.ini failed: {e}"),
             };
             toasts.add_toast(adw::Toast::new(&message));

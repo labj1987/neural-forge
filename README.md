@@ -42,9 +42,8 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
   but present untouched for now — the half-float compose path is a tracked follow-up.
 - A composition pass blends the model's output back into the frame — tone/structure/
   skin/sharpness controls (applied when the model's feature is built; changing one rebuilds
-  it), multiple model passes, a reversible neutral-axis proxy mode, and a choice of
-  resampling filters (Lanczos, Catmull-Rom, Mitchell-Netravali, Kaiser-windowed sinc)
-  for the supersampling leg. The colour math in `composition/color.rs` is rederived
+  it), multiple model passes, and a reversible neutral-axis proxy mode. The model can work
+  below the frame's resolution (faster, softer); supersampling above it is not available. The colour math in `composition/color.rs` is rederived
   independently from public sources (the one clean-room file); the proxy encode
   (`encode.comp`) and the composition guard in `compose.comp` are ported from
   DLSS5VKLayer's `dlssnr.hlsl` — see ATTRIBUTION.md.
