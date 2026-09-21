@@ -79,6 +79,9 @@ pub struct ShmClient {
     retry_after: Option<Instant>,
     last_control_seq: u32,
     last_heartbeat: u32,
+    /// The helper heartbeat as last sampled by [`Self::helper_alive`], and when it last moved.
+    alive_heartbeat: u32,
+    alive_since: Option<Instant>,
     dead: bool,
     frames: u64,
     /// Per-slot: the request number and send time of a round trip issued via
@@ -116,6 +119,8 @@ impl Default for ShmClient {
             retry_after: None,
             last_control_seq: 0,
             last_heartbeat: 0,
+            alive_heartbeat: 0,
+            alive_since: None,
             dead: false,
             frames: 0,
             pending: [None, None],
@@ -712,6 +717,27 @@ impl ShmClient {
             );
         }
         None
+    }
+
+    /// Whether a helper is actually running right now: its heartbeat (bumped every loop,
+    /// thousands of times a second) has moved within the last 500 ms. `helper_state` is not
+    /// enough -- a helper that is killed never writes STOPPED, so the header keeps saying
+    /// RUNNING -- and waiting on a dead helper is a stall on every frame that asks.
+    pub fn helper_alive(&mut self) -> bool {
+        let Some(hdr) = self.header() else { return false };
+        let hb = hdr.heartbeat.load(Ordering::Relaxed);
+        let now = Instant::now();
+        if hb != self.alive_heartbeat || self.alive_since.is_none() {
+            let first = self.alive_since.is_none();
+            self.alive_heartbeat = hb;
+            self.alive_since = Some(now);
+            if first {
+                // Nothing to compare against yet: one sample cannot show movement.
+                return false;
+            }
+            return true;
+        }
+        self.alive_since.is_some_and(|t| now.duration_since(t) < Duration::from_millis(500))
     }
 
     fn should_retry(&mut self) -> bool {

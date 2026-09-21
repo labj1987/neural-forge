@@ -1213,6 +1213,12 @@ pub unsafe fn run(
         // warming-up, restarted or missing helper can delay a frame by at most the budget and
         // can never hang the game.
         const SLOT: usize = 0;
+        // No live helper (never started, stopped, killed, restarting): present untouched and
+        // do not wait for anything. This is what keeps a missing helper from costing a stall.
+        if !shm.helper_alive() {
+            shm.publish_frame_timing(pipeline_start.elapsed(), false);
+            return None;
+        }
         let deadline = std::time::Instant::now() + SYNC_BUDGET;
         // Left over from a frame that ran out of time (or from pipelined mode): its answer
         // belongs to an old frame. Discard it when it lands; never block on it.
@@ -2958,6 +2964,7 @@ mod tests {
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = 0u32;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
+                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
                 if req != 0 && req != last_seen {
                     last_seen = req;
@@ -3080,9 +3087,9 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(got_semaphore, "synchronous present must composite the answer");
-        // Synchronous present composites this frame's own answer on the same call: the very first
-        // present (nothing is ever carried to a later frame).
-        assert_eq!(iteration, 1, "the answer must land on the present that captured it, not a later one");
+        // The first present only samples the helper's heartbeat (one sample cannot show it is
+        // alive); the second captures, waits for that frame's own answer and composites it.
+        assert!(iteration <= 2, "the answer must land on the present that captured it (took {iteration} presents)");
 
         stop.store(true, AtomicOrdering::Relaxed);
         helper.join().unwrap();
