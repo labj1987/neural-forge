@@ -20,7 +20,7 @@ fn allowed(args: &[String], target: Option<&str>) -> bool {
     if exe.is_empty() || ["explorer.exe", "xalia.exe", "launcher.exe",
         "launcherpatcher.exe", "rockstarservice.exe", "rockstarlauncher.exe",
         "socialclubhelper.exe", "socialclub.exe", "steam.exe", "steamwebhelper.exe",
-        "gameoverlayui.exe", "neuralforge-helper.exe", "winedevice.exe", "services.exe"]
+        "gameoverlayui.exe", "neural-forge-helper.exe", "neuralforge-helper.exe", "winedevice.exe", "services.exe"]
         .contains(&exe.as_str()) { return false; }
     target.map(|names| names.split(',').any(|name| basename(name.trim()) == exe))
         .unwrap_or(true)

@@ -4,6 +4,25 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.76 — 2026-09-21
+
+- **Rename to Neural Forge naming.** Repo, Cargo packages (`neural-forge-*`), executables
+  (`neural-forge`, `neural-forge-cli`, `neural-forge-helper.exe`), the icon
+  (`neural-forge.svg`) and the AppImage (`neural-forge-<version>-x86_64.AppImage`) now use
+  hyphenated lowercase. Frozen on purpose: the app ID `io.github.labj1987.NeuralForge`
+  (and its `.desktop`/appdata filenames), the layer `VK_LAYER_neuralforge_neural`, its
+  manifest and `libneuralforge_layer.so` (under `lib/neuralforge/`), all `NEURALFORGE_*`
+  variables, and the `neuralforge` config/data/state/`/tmp` paths. See CLAUDE.md
+  "Naming convention".
+- **Upgrading from an older install.** Installing this release removes the old
+  `bin/neuralforge`, `bin/neuralforge-cli`, `neuralforge-helper.exe` and `neuralforge.svg`
+  (only if unchanged since they were installed) and rewrites the desktop entry to launch
+  `bin/neural-forge`. Helper lookup, stop and the layer's own-process exclusion accept
+  both helper names. Anything of yours that launches the old `neuralforge` /
+  `neuralforge-cli` path (shell aliases, symlinks, custom launchers) must be pointed at
+  the new names. The release also publishes a `NeuralForge-<version>` copy of the AppImage
+  so already-installed AppImages can still self-update by zsync.
+
 ## 0.1.75 — 2026-09-21
 
 - **Synchronization fixes in the present path (likely relevant to the Xid 109 hangs).**

@@ -1,6 +1,6 @@
 //! The shared-memory round trip with the helper.
 //!
-//! This is the seam: everything here only ever touches `neuralforge_protocol::ShmHeader`'s
+//! This is the seam: everything here only ever touches `neural_forge_protocol::ShmHeader`'s
 //! atomics, never anything Windows/NGX-specific. What answers on the other end of the
 //! mapping — a Wine-wrapped helper today, a native one later — is none of this
 //! module's business.
@@ -10,7 +10,7 @@
 //! `ShmProcessFrame`.
 //!
 //! Milestone 4 adds [`ShmClient::write_proxy`]/[`ShmClient::read_answer`]: the mapping
-//! now covers the full `neuralforge_protocol::shm_total_bytes()` region (header plus both
+//! now covers the full `neural_forge_protocol::shm_total_bytes()` region (header plus both
 //! `MAX_FRAME`-sized pixel buffers), not just the header, so the proxy/answer bytes
 //! live in the same `mmap` this type already owns rather than a second one.
 
@@ -19,11 +19,11 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use neuralforge_protocol::{enums::helper_state, shm_default_path, MAX_FRAME, SHM_MAGIC};
+use neural_forge_protocol::{enums::helper_state, shm_default_path, MAX_FRAME, SHM_MAGIC};
 
 /// The subset of `ShmHeader`'s composition fields `composition::apply::apply_rgba8`
 /// needs, decoded once per frame from the raw atomics. See that field's own doc
-/// comment in `neuralforge_protocol::header::ShmHeader` for what each one means.
+/// comment in `neural_forge_protocol::header::ShmHeader` for what each one means.
 pub struct CompositionSettings {
     pub colour_strength: f32,
     pub transfer_strength: f32,
@@ -32,7 +32,7 @@ pub struct CompositionSettings {
     pub apply_model: bool,
     pub neural_enabled: bool,
     /// What fraction of the frame's resolution the model works at -- see
-    /// [`neuralforge_protocol::ShmHeader::working_scale_bits`]'s own doc comment.
+    /// [`neural_forge_protocol::ShmHeader::working_scale_bits`]'s own doc comment.
     /// `1.0` (the default) means "model resolution == frame resolution", the only
     /// value this pipeline supported before 2026-09-17 -- callers that skip scaling
     /// whenever this is exactly `1.0` get the identical, unmodified code path.
@@ -57,7 +57,7 @@ pub struct CompositionSettings {
     /// the manual value times the scale, times the trim when the reading came from a
     /// meter rather than the slider. Clamped away from zero so the divide is safe.
     pub white_point: f32,
-    /// Which curve the encode uses -- [`neuralforge_protocol::enums::reversible_mode`].
+    /// Which curve the encode uses -- [`neural_forge_protocol::enums::reversible_mode`].
     pub reversible_mode: u32,
 }
 
@@ -70,7 +70,7 @@ pub struct ShmClient {
     motion_last: Option<Instant>,
     motion_format: u32,
     fd: Option<OwnedFd>,
-    header: *mut neuralforge_protocol::ShmHeader,
+    header: *mut neural_forge_protocol::ShmHeader,
     path: String,
     timeouts: u32,
     ever_answered: bool,
@@ -93,7 +93,7 @@ pub struct ShmClient {
 // SAFETY: `header` points at a `MAP_SHARED` mapping that stays valid for the process's
 // lifetime once opened (never unmapped or reallocated by this type), and every access
 // through it goes through `ShmHeader`'s own atomics/seqlock-guarded accessors -- the
-// same invariant that makes `ShmHeader` itself `Sync` (see `neuralforge_protocol::header`).
+// same invariant that makes `ShmHeader` itself `Sync` (see `neural_forge_protocol::header`).
 // `ShmClient` is always accessed from behind a `Mutex`, so only `Send` is needed, never
 // concurrent access from two threads at once.
 unsafe impl Send for ShmClient {}
@@ -132,7 +132,7 @@ impl ShmClient {
         return;
         #[allow(unreachable_code)]
         let Some(h) = self.header() else { return };
-        if !h.mvec_enabled() || !neuralforge_protocol::enums::proxy_format::is_8bit(format) || self.motion.is_some() { return; }
+        if !h.mvec_enabled() || !neural_forge_protocol::enums::proxy_format::is_8bit(format) || self.motion.is_some() { return; }
         let quality = h.mvec_quality();
         match crate::optical_flow::OpticalFlow::new(instance, pd, width, height, quality) {
             Ok(m) => { self.motion = Some(m); self.motion_format = format; }
@@ -157,16 +157,16 @@ impl ShmClient {
         self.open_at(path)
     }
 
-    fn header(&self) -> Option<&neuralforge_protocol::ShmHeader> {
+    fn header(&self) -> Option<&neural_forge_protocol::ShmHeader> {
         // SAFETY: non-null only after a successful `open()`, which mmaps
-        // `neuralforge_protocol::shm_total_bytes()` at this address and never unmaps it for
+        // `neural_forge_protocol::shm_total_bytes()` at this address and never unmaps it for
         // the lifetime of the process.
         (!self.header.is_null()).then(|| unsafe { &*self.header })
     }
 
     /// Whether it's worth paying for a real capture this frame at all. `false` once
     /// the helper has reported the model permanently unavailable (see
-    /// `neuralforge_helper::ngx::ensure_feature`'s own one-shot-then-disable design) --
+    /// `neural_forge_helper::ngx::ensure_feature`'s own one-shot-then-disable design) --
     /// capturing and writing back a frame nobody will ever evaluate is pure overhead
     /// (a full image<->buffer round trip plus a `memcpy` of the whole frame, every
     /// single present call) for zero chance of a different outcome. Reads a single
@@ -179,7 +179,7 @@ impl ShmClient {
     }
 
     /// Consumes a pending "dump one matched before/after frame pair" request (see
-    /// `neuralforge_protocol::header::ShmHeader::capture_request`'s own doc comment) --
+    /// `neural_forge_protocol::header::ShmHeader::capture_request`'s own doc comment) --
     /// `true` at most once per request, since this resets it to 0 in the same atomic
     /// operation, so the very next present doesn't dump again for a request that was
     /// already served.
@@ -232,7 +232,7 @@ impl ShmClient {
                 let trim = f32::from_bits(hdr.white_point_trim_bits.load(Ordering::Relaxed));
                 // The trim belongs to a measured reading, not to the slider -- keeping
                 // them apart is upstream's own fix for sharing one stored value.
-                let measured = hdr.white_point_source.load(Ordering::Relaxed) != neuralforge_protocol::enums::white_point_source::MANUAL;
+                let measured = hdr.white_point_source.load(Ordering::Relaxed) != neural_forge_protocol::enums::white_point_source::MANUAL;
                 let combined = manual * scale * if measured { trim } else { 1.0 };
                 if combined.is_finite() && combined > 1e-4 { combined } else { 1.0 }
             },
@@ -260,7 +260,7 @@ impl ShmClient {
         hdr.proxy_format_slot(slot).store(proxy_format, Ordering::Relaxed);
 
         // The layer's own "I am alive and capturing" telemetry -- mirrors what
-        // `neuralforge_helper::main`'s loop already does for `hdr.helper_*`/`heartbeat`.
+        // `neural_forge_helper::main`'s loop already does for `hdr.helper_*`/`heartbeat`.
         // Nothing else in this crate ever wrote these fields before this (confirmed by
         // grep, 2026-09-10): `layer_attached` was declared, reset to 0 by
         // `ShmHeader::init_defaults`, and read by the GUI (`ui.rs`'s "not attached"
@@ -279,7 +279,7 @@ impl ShmClient {
         hdr.layer_width.store(width, Ordering::Relaxed);
         hdr.layer_height.store(height, Ordering::Relaxed);
         hdr.layer_format.store(proxy_format, Ordering::Relaxed);
-        neuralforge_protocol::store64(&hdr.layer_frames_lo, &hdr.layer_frames_hi, frames);
+        neural_forge_protocol::store64(&hdr.layer_frames_lo, &hdr.layer_frames_hi, frames);
     }
 
     /// Publishes the layer's host-observed cost for a frame. This is deliberately a
@@ -313,7 +313,7 @@ impl ShmClient {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                base.add(neuralforge_protocol::proxy_offset_slot(slot)),
+                base.add(neural_forge_protocol::proxy_offset_slot(slot)),
                 n,
             );
         }
@@ -330,7 +330,7 @@ impl ShmClient {
         #[allow(unreachable_code)]
         let Some(h) = self.header() else { return };
         h.frame_mvec_valid.store(0, Ordering::Relaxed);
-        let enabled = h.mvec_enabled() && neuralforge_protocol::enums::proxy_format::is_8bit(format);
+        let enabled = h.mvec_enabled() && neural_forge_protocol::enums::proxy_format::is_8bit(format);
         let quality = h.mvec_quality();
         let mode = h.mvec_scale_mode();
         if !enabled { self.motion = None; self.motion_last = None; self.motion_failed = None; self.motion_luma.clear(); return; }
@@ -352,13 +352,13 @@ impl ShmClient {
         let cut = luma.len() == self.motion_luma.len() && !luma.is_empty()
             && luma.iter().zip(&self.motion_luma).map(|(&a,&b)| a.abs_diff(b) as u64).sum::<u64>() > luma.len() as u64 * 64;
         self.motion_luma = luma;
-        let bgr = format == neuralforge_protocol::enums::proxy_format::BGRA8;
+        let bgr = format == neural_forge_protocol::enums::proxy_format::BGRA8;
         match self.motion.as_mut().unwrap().estimate(bytes,bgr) {
             Ok(Some(vectors)) if !cut => {
-                let payload = neuralforge_protocol::motion::encode(&vectors,neuralforge_protocol::motion::scales(mode,width,height));
+                let payload = neural_forge_protocol::motion::encode(&vectors,neural_forge_protocol::motion::scales(mode,width,height));
                 if let Some(base) = self.pixel_base() {
                     // Same single-request ownership and bounds as write_proxy.
-                    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(),base.add(neuralforge_protocol::motion_offset()),payload.len()); }
+                    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(),base.add(neural_forge_protocol::motion_offset()),payload.len()); }
                     let h = self.header().unwrap();
                     h.frame_mvec_scale_mode.store(mode,Ordering::Relaxed);
                     h.frame_mvec_valid.store(1,Ordering::Relaxed);
@@ -384,7 +384,7 @@ impl ShmClient {
         // SAFETY: same reasoning as `write_proxy`, mirrored for the answer region.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                base.add(neuralforge_protocol::answer_offset_slot(slot)),
+                base.add(neural_forge_protocol::answer_offset_slot(slot)),
                 out.as_mut_ptr(),
                 n,
             );
@@ -406,7 +406,7 @@ impl ShmClient {
         // SAFETY: `pixel_base` plus `proxy_offset_slot(slot)` stays within the
         // `shm_total_bytes()` mapping `open_at` established, same reasoning as
         // `write_proxy`'s own pointer arithmetic.
-        self.pixel_base().map(|base| (unsafe { base.add(neuralforge_protocol::proxy_offset_slot(slot)) }, neuralforge_protocol::MAX_FRAME))
+        self.pixel_base().map(|base| (unsafe { base.add(neural_forge_protocol::proxy_offset_slot(slot)) }, neural_forge_protocol::MAX_FRAME))
     }
 
     /// Opens (or creates) the mapping if not already attached. Idempotent.
@@ -416,7 +416,7 @@ impl ShmClient {
             .ok()
             .filter(|s| !s.is_empty())
             .unwrap_or_else(shm_default_path);
-        if !neuralforge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) || !crate::ownership::claim(&path) { return false; }
+        if !neural_forge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) || !crate::ownership::claim(&path) { return false; }
         self.open_at(&path)
     }
 
@@ -452,7 +452,7 @@ impl ShmClient {
         // owned anywhere else yet.
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
-        let total = neuralforge_protocol::shm_total_bytes();
+        let total = neural_forge_protocol::shm_total_bytes();
         // SAFETY: `stat` is a plain out-parameter; zero-initializing it is always valid
         // and `fstat` either fully populates it or returns an error we check.
         let mut st: libc::stat = unsafe { std::mem::zeroed() };
@@ -488,9 +488,9 @@ impl ShmClient {
             return false;
         }
 
-        let header = map as *mut neuralforge_protocol::ShmHeader;
+        let header = map as *mut neural_forge_protocol::ShmHeader;
         // SAFETY: just mapped above, `HEADER_BYTES` is large enough for `ShmHeader`
-        // (enforced at compile time in `neuralforge_protocol`).
+        // (enforced at compile time in `neural_forge_protocol`).
         let hdr = unsafe { &*header };
         if hdr.magic.load(Ordering::Relaxed) != SHM_MAGIC || !hdr.is_valid() {
             // A magic mismatch is some other mapping entirely (or garbage); a version
@@ -773,7 +773,7 @@ fn ensure_private_parent_dir(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neuralforge_protocol::ShmHeader;
+    use neural_forge_protocol::ShmHeader;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicU64;
 
@@ -867,7 +867,7 @@ mod tests {
         // one rather than the short "nobody's listening" one -- doesn't matter here
         // since the echo thread answers almost immediately either way, but matches
         // what a real run looks like.
-        header_of(&client).helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+        header_of(&client).helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = std::sync::Arc::clone(&stop);
@@ -913,7 +913,7 @@ mod tests {
         let path = scratch_path();
         let mut client = ShmClient::default();
         assert!(client.open_at(&path));
-        header_of(&client).helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+        header_of(&client).helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
 
         assert!(client.begin_async_request(0));
         assert!(client.begin_async_request(1));
@@ -999,7 +999,7 @@ mod motion_transport_tests {
         assert!(client.open_at(&path));
         let mut pixels = vec![0u8;512*512*4];
         for (i,p) in pixels.chunks_exact_mut(4).enumerate() { let v = ((i as u32).wrapping_mul(747796405) >> 24) as u8; p.copy_from_slice(&[v,v,v,255]); }
-        let format = neuralforge_protocol::enums::proxy_format::BGRA8;
+        let format = neural_forge_protocol::enums::proxy_format::BGRA8;
         client.set_frame_info(0,512,512,format);
         client.write_proxy(0,&pixels);
         client.prepare_motion(&instance,pd,512,512,format,&pixels);
@@ -1008,8 +1008,8 @@ mod motion_transport_tests {
         let hdr = client.header().unwrap();
         assert_eq!(hdr.frame_mvec_valid.load(Ordering::Relaxed),1);
         assert_eq!(hdr.proxy_format.load(Ordering::Relaxed),format);
-        assert_eq!(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),neuralforge_protocol::enums::mvec_scale_mode::PIXELS);
-        let payload = unsafe {std::slice::from_raw_parts(client.pixel_base().unwrap().add(neuralforge_protocol::motion_offset()),512*512*4)};
+        assert_eq!(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),neural_forge_protocol::enums::mvec_scale_mode::PIXELS);
+        let payload = unsafe {std::slice::from_raw_parts(client.pixel_base().unwrap().add(neural_forge_protocol::motion_offset()),512*512*4)};
         assert!(payload.iter().filter(|&&x| x == 0).count() > payload.len()*95/100,"stationary motion should be near zero after the deadzone");
         hdr.mvec_enabled.store(0,Ordering::Relaxed);
         client.prepare_motion(&instance,pd,512,512,format,&pixels);

@@ -1,6 +1,6 @@
 # NeuralForge Phase 1
 
-NeuralForge is the Rust application in `labj1987/NeuralForge`. The GitHub repository
+NeuralForge is the Rust application in `labj1987/neural-forge`. The GitHub repository
 has been renamed from `labj1987/dlssnr`. Historical handoffs are evidence, not deployment instructions.
 No installed upstream package or game setting is changed by this work.
 See [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the current RTX 5070
@@ -10,8 +10,8 @@ validation evidence before GTA benchmarking.
 
 | Surface | NeuralForge |
 |---|---|
-| GUI / CLI / Windows helper | `neuralforge`, `neuralforge-cli`, `neuralforge-helper.exe` |
-| Vulkan identity / library | `VK_LAYER_neuralforge_neural`, `libneuralforge_layer.so` |
+| GUI / CLI / Windows helper | `neural-forge`, `neural-forge-cli`, `neural-forge-helper.exe` |
+| Vulkan identity / library (frozen) | `VK_LAYER_neuralforge_neural`, `libneuralforge_layer.so` |
 | Activation / opt-out | `NEURALFORGE_ENABLE=1`, `NEURALFORGE_DISABLE=1` |
 | Other private environment variables | `NEURALFORGE_*`; no `DLSSNR_*` aliases |
 | Desktop / application ID | `io.github.labj1987.NeuralForge` |
@@ -20,7 +20,7 @@ validation evidence before GTA benchmarking.
 | State | `$XDG_STATE_HOME/neuralforge/helper.log` |
 | Runtime / control / lease | `/tmp/neuralforge-$UID/{shm.bin,helper.pid,shm.bin.owner}` |
 | Wire magic | `NFR1` (layout v2 retained) |
-| AppImage | `NeuralForge-0.1.54-x86_64.AppImage` |
+| AppImage | `neural-forge-0.1.54-x86_64.AppImage` |
 
 XDG variables fall back to the usual directories under HOME. Shared memory stays
 under /tmp for Steam pressure-vessel visibility. Old runtime/config paths are not
@@ -57,7 +57,7 @@ python3 scripts/install.py archive-legacy-manifest --legacy-manifest /explicit/p
 It saves a `.disabled` backup in NeuralForge's data directory. It does not migrate
 shared `~/.config/dlssnr`, old `/tmp/dlssnr-*`, Wine prefixes, DLLs, or desktop files.
 No ownership evidence exists for those shared files. Import NVIDIA binaries explicitly
-using `neuralforge-cli import-binaries DIR`. There are no old-name executable aliases.
+using `neural-forge-cli import-binaries DIR`. There are no old-name executable aliases.
 
 ## Target ownership
 

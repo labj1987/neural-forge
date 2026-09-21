@@ -1,6 +1,6 @@
 //! XDG-aware paths, matching upstream's own reasoning (see the plan's `layer`
 //! section and upstream's README for why the runtime/SHM path specifically lives
-//! under `/tmp`, not `$XDG_RUNTIME_DIR` — that one's `neuralforge_protocol::shm_runtime_dir`,
+//! under `/tmp`, not `$XDG_RUNTIME_DIR` — that one's `neural_forge_protocol::shm_runtime_dir`,
 //! already shared code; everything else here is config/data/state, which has no
 //! Steam-container wrinkle to work around.
 
@@ -72,7 +72,7 @@ pub fn ensure_dirs() -> std::io::Result<()> {
 /// The real Steam client install root (the directory containing `steamapps/`,
 /// `compatibilitytools.d/`, etc.) -- what `STEAM_COMPAT_CLIENT_INSTALL_PATH` needs to
 /// point at for Proton's own launch script to run at all (`start()`'s own doc comment
-/// explains why this has to be set). Same candidate list `neuralforge-cli`'s own Proton
+/// explains why this has to be set). Same candidate list `neural-forge-cli`'s own Proton
 /// discovery (`runners.rs::candidate_dirs`) already scans for
 /// `compatibilitytools.d` -- this just checks the *parent* of each and returns the
 /// first that's a real directory, since a real Steam install is what actually creates

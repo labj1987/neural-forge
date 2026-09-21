@@ -12,7 +12,7 @@
 //! values come back from a DLL we don't control, and reinterpreting an arbitrary `i32`
 //! as a `#[repr(i32)] enum` via transmute is immediate undefined behavior the moment
 //! the bytes don't match a declared variant (same reasoning as
-//! `neuralforge_protocol::enums`). Check with [`succeeded`] or compare against the named
+//! `neural_forge_protocol::enums`). Check with [`succeeded`] or compare against the named
 //! constants in [`result`] instead of matching on a constructed enum.
 //!
 //! Most of this module's ABI surface (the `NgxResourceVk` family, most of the

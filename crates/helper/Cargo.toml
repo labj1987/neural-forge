@@ -1,5 +1,5 @@
 [package]
-name = "neuralforge-helper"
+name = "neural-forge-helper"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,16 +7,16 @@ license.workspace = true
 description = "Windows-side NGX service: owns the DLSS 5 Neural Rendering model, runs under Wine/Proton"
 
 [lib]
-name = "neuralforge_helper"
+name = "neural_forge_helper"
 path = "src/lib.rs"
 
 [[bin]]
-name = "neuralforge-helper"
+name = "neural-forge-helper"
 path = "src/main.rs"
 
 [dependencies]
-neuralforge-protocol = { path = "../protocol" }
-# Same exact version as neuralforge-layer, for the same reason: ash's own types (vk::Device,
+neural-forge-protocol = { path = "../protocol" }
+# Same exact version as neural-forge-layer, for the same reason: ash's own types (vk::Device,
 # vk::Instance, ...) have to be the identical crate instance/version wherever this
 # helper and the layer's SHM/dma-buf contract need to agree on a Vulkan type shape.
 ash = "=0.37.3"

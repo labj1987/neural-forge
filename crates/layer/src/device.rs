@@ -560,8 +560,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         };
         let eligible = crate::layer_enabled() && crate::ownership::eligible()
             && swapchain::is_supported_format(create_info.image_format)
-            && create_info.image_extent.width <= neuralforge_protocol::MAX_W
-            && create_info.image_extent.height <= neuralforge_protocol::MAX_H
+            && create_info.image_extent.width <= neural_forge_protocol::MAX_W
+            && create_info.image_extent.height <= neural_forge_protocol::MAX_H
             && swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height);
         let adjusted = if eligible {
             self.instance.as_deref().and_then(|instance|

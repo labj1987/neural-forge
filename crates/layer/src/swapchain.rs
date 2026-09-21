@@ -2,7 +2,7 @@
 //! it carries.
 
 use ash::vk;
-use neuralforge_protocol::enums::hdr_kind;
+use neural_forge_protocol::enums::hdr_kind;
 
 pub struct SwapchainState {
     pub format: vk::Format,
@@ -10,7 +10,7 @@ pub struct SwapchainState {
     pub height: u32,
     pub hdr_kind: u32,
     /// True when this swapchain's format isn't one the pass can work with, or it's
-    /// larger than the protocol's ceiling (`neuralforge_protocol::{MAX_W,MAX_H}`) -- it
+    /// larger than the protocol's ceiling (`neural_forge_protocol::{MAX_W,MAX_H}`) -- it
     /// presents untouched either way.
     pub pass_through: bool,
     /// The `imageUsage` the swapchain was actually created with (the layer's enlarged
@@ -50,16 +50,16 @@ pub fn is_supported_format(format: vk::Format) -> bool {
     )
 }
 
-/// The `neuralforge_protocol::enums::proxy_format` this swapchain's raw
+/// The `neural_forge_protocol::enums::proxy_format` this swapchain's raw
 /// `vkCmdCopyImageToBuffer` dump actually is -- only meaningful for formats
 /// [`is_supported_format`] already accepted. `proxy_format::bytes_per_pixel` is the
 /// single source of truth for the byte count that goes with this; nothing here
 /// duplicates it.
 pub fn proxy_format_for(format: vk::Format) -> u32 {
     match format {
-        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => neuralforge_protocol::enums::proxy_format::BGRA8,
-        vk::Format::R16G16B16A16_SFLOAT => neuralforge_protocol::enums::proxy_format::RGBA16F,
-        _ => neuralforge_protocol::enums::proxy_format::RGBA8,
+        vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB => neural_forge_protocol::enums::proxy_format::BGRA8,
+        vk::Format::R16G16B16A16_SFLOAT => neural_forge_protocol::enums::proxy_format::RGBA16F,
+        _ => neural_forge_protocol::enums::proxy_format::RGBA8,
     }
 }
 
@@ -93,7 +93,7 @@ pub fn detect_hdr_kind(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u3
 #[cfg(test)]
 mod format_tests {
     use super::*;
-    use neuralforge_protocol::enums::proxy_format;
+    use neural_forge_protocol::enums::proxy_format;
     #[test]
     fn raw_formats_preserve_channel_order_and_size() {
         for f in [vk::Format::B8G8R8A8_UNORM,vk::Format::B8G8R8A8_SRGB] {

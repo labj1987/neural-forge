@@ -47,5 +47,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
-          files: NeuralForge-*-x86_64.AppImage*
+          files: |
+            neural-forge-*-x86_64.AppImage*
+            NeuralForge-*-x86_64.AppImage*
           generate_release_notes: true

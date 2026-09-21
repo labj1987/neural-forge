@@ -11,7 +11,7 @@ This is experimental, personal-use software. It works around an authorization ch
 NVIDIA's proprietary NGX DLL to run the model outside its intended integration path —
 see [Legal](#legal) before you use it.
 
-Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
+Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 ## Screenshots
 
@@ -38,7 +38,7 @@ Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
   not ported from any GPL-licensed code — see ATTRIBUTION.md.
 - GTK4/libadwaita settings app for all of the above, live-bound to the running layer
   over the same shared-memory segment.
-- A CLI (`neuralforge-cli`) for runner discovery, starting/stopping the helper, status,
+- A CLI (`neural-forge-cli`) for runner discovery, starting/stopping the helper, status,
   diagnostics, importing the NVIDIA NGX DLLs, and raw settings introspection
   (`shmctl status`/`set`/`toggle`/`capture`) — no bash script, no root step.
 - Everything lives under `~/.local/share`, `~/.config`, and `/tmp/neuralforge-$UID/`. No
@@ -54,11 +54,11 @@ Repository: [labj1987/NeuralForge](https://github.com/labj1987/NeuralForge).
 
 ## Install
 
-Download the AppImage from [Releases](https://github.com/labj1987/NeuralForge/releases):
+Download the AppImage from [Releases](https://github.com/labj1987/neural-forge/releases):
 
 ```bash
-chmod +x NeuralForge-*-x86_64.AppImage
-./NeuralForge-*-x86_64.AppImage
+chmod +x neural-forge-*-x86_64.AppImage
+./neural-forge-*-x86_64.AppImage
 ```
 
 For Steam games launched separately from the GUI, install the extracted AppDir into
@@ -68,9 +68,9 @@ persistent user storage so Vulkan can find the layer after the AppImage exits:
 python3 scripts/install.py install --appdir build-appimage/AppDir
 ```
 
-The GUI is `neuralforge`; the CLI is `neuralforge-cli`; the Windows helper is
-`neuralforge-helper.exe`. Config, data, state, runtime, control mapping and helper
-prefix use their own `neuralforge` locations. Upstream DLSS5VKLayer can remain
+The GUI is `neural-forge`; the CLI is `neural-forge-cli`; the Windows helper is
+`neural-forge-helper.exe`. Config, data, state, runtime, control mapping and helper
+prefix keep their `neuralforge` locations (unchanged by the 0.1.76 rename). Upstream DLSS5VKLayer can remain
 installed; Neural Forge neither migrates ambiguous upstream state nor changes its
 files, configuration, launch options, helper, or runtime. See
 [docs/PHASE1.md](docs/PHASE1.md) for executable targeting, migration and uninstall.
@@ -81,7 +81,7 @@ files, configuration, launch options, helper, or runtime. See
 from your own NVIDIA driver/SDK install and import it with:
 
 ```bash
-neuralforge-cli import-binaries /path/to/dlls
+neural-forge-cli import-binaries /path/to/dlls
 ```
 
 or from the GUI's binaries import flow. Files are copied into
@@ -90,7 +90,7 @@ or from the GUI's binaries import flow. Files are copied into
 Add `NEURALFORGE_ENABLE=1` (and, for a specific target executable in a multi-process
 game, `NEURALFORGE_TARGET_EXE=<name>.exe`) to a game's Steam launch options to
 activate the layer. GUI and layer share live settings over the same shared-memory
-segment; `neuralforge-cli shmctl status/set/toggle/capture` covers the same controls
+segment; `neural-forge-cli shmctl status/set/toggle/capture` covers the same controls
 from a terminal.
 
 ## Status
@@ -127,7 +127,7 @@ lower in-game resolution).
 
 ```bash
 cargo build --release          # protocol, layer, gui, cli (native Linux)
-cargo +stable build --release --target x86_64-pc-windows-gnu -p neuralforge-helper
+cargo +stable build --release --target x86_64-pc-windows-gnu -p neural-forge-helper
 ./build-appimage.sh            # packs everything into an AppImage
 ```
 

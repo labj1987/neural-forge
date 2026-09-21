@@ -12,7 +12,7 @@
 //! resource, then tries `vkImportMemoryWin32HandleKHR` with it.
 //!
 //! This process just exports and holds -- prints its own pid and fd, then sleeps.
-//! Run: `cargo run --example dmabuf_export_probe -p neuralforge-layer`
+//! Run: `cargo run --example dmabuf_export_probe -p neural-forge-layer`
 //!
 //! **Real-hardware result** (`lordnikon`, RTX 5070, driver 615.71.09): the pairing
 //! `dmabuf_import_probe.rs`'s `CreateFileW` on `Z:\proc\<pid>\fd\<fd>` failed outright.

@@ -1,4 +1,4 @@
-//! Library half of `neuralforge-helper`, existing so `examples/`/tests can exercise
+//! Library half of `neural-forge-helper`, existing so `examples/`/tests can exercise
 //! individual modules (the SEH guard, the caller-identity spoof) directly under Wine
 //! without needing a real `nvngx_dlssnr.dll` or a full helper run. `main.rs` is a thin
 //! binary wrapper around this.

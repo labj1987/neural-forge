@@ -167,7 +167,7 @@ from a game that has one" — confirming real engine motion vectors were never o
 table for either project; NVOF estimation is the actual technique either way.
 
 **What this changes about the plan:** step 4 (motion vectors) is now the best-scoped,
-lowest-risk item left — build it in `neuralforge-helper` (Rust, Windows-side), lazily,
+lowest-risk item left — build it in `neural-forge-helper` (Rust, Windows-side), lazily,
 fail-soft, exactly mirroring this proven pattern; it never needs to touch the game
 process or the layer's own device at all. Step 2 (synchronous mode) is also more
 realistic than earlier estimated: tonight's `working_scale` fix already brought eval
@@ -198,7 +198,7 @@ independently reimplementing the same technique DLSS5VKLayer's `DetectSceneCut`
 uses), and feeds real vectors into `frame::evaluate`'s existing `motion`/
 `reset_history` parameters -- infrastructure that already existed and was already
 wired, just never had a real producer before now. The vector→bytes packing reuses
-`neuralforge_protocol::motion::encode` (already real, already tested) rather than
+`neural_forge_protocol::motion::encode` (already real, already tested) rather than
 duplicating it.
 
 **Deliberately gated behind an explicit `NEURALFORGE_MVEC_HELPER=1` environment
@@ -214,9 +214,9 @@ for anyone who doesn't set the variable.
   compile, dev and release).
 - 8 real unit tests (upsampling/grid-edge-cases/scene-cut/the integration point with
   `motion::encode`) pass, executed for real under Wine (`wine
-  target/.../neuralforge_helper-*.exe`, the same binary CI would produce) -- not just
+  target/.../neural_forge_helper-*.exe`, the same binary CI would produce) -- not just
   compiled.
-- The real `neuralforge-helper.exe`, run under Wine on this dev machine (no real
+- The real `neural-forge-helper.exe`, run under Wine on this dev machine (no real
   NVIDIA GPU, no `nvngx_dlssnr.dll`), starts cleanly and correctly reports `[mvec]
   optical flow queue: unavailable` with zero effect on the rest of the helper -- NGX
   loading, its own fail-open, everything else proceeds exactly as it always did. This

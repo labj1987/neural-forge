@@ -20,12 +20,12 @@
 //! reliably reach the invoking shell through `proton run`, confirmed while writing the
 //! forward-direction probe. Run under Wine, with the exporter already running and its
 //! pid/fd in hand:
-//! `cargo run --example dmabuf_import_probe --target x86_64-pc-windows-gnu -p neuralforge-helper -- <pid> <fd>`
+//! `cargo run --example dmabuf_import_probe --target x86_64-pc-windows-gnu -p neural-forge-helper -- <pid> <fd>`
 
 use std::ffi::c_void;
 
 use ash::vk;
-use neuralforge_helper::{log, logging};
+use neural_forge_helper::{log, logging};
 
 #[link(name = "kernel32")]
 extern "system" {

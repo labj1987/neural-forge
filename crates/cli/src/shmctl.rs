@@ -1,13 +1,13 @@
-//! `neuralforge-cli shmctl` — raw status/set/toggle/capture against the live SHM header,
-//! the real equivalent of upstream's own separate `neuralforge-shmctl` debug/introspection
+//! `neural-forge-cli shmctl` — raw status/set/toggle/capture against the live SHM header,
+//! the real equivalent of upstream's own separate `neural-forge-shmctl` debug/introspection
 //! tool (see the workspace `CLAUDE.md`'s "compared against a real, installed upstream
 //! instance" entry: this project had no equivalent of it before now). Deliberately a
-//! subcommand of `neuralforge-cli` rather than its own binary -- one fewer thing to build,
+//! subcommand of `neural-forge-cli` rather than its own binary -- one fewer thing to build,
 //! package, and document for what is fundamentally the same "attach to the mapping and
 //! poke it" job `cmd_config`/the GUI's settings binding already do.
 //!
 //! `status`/`set`/`toggle` operate on the same 21-setting surface
-//! `neuralforge_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` already
+//! `neural_forge_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` already
 //! define (so a value changed here also gets written to `config.ini` on the GUI's next
 //! save, the same as changing it from the GUI would), plus a handful of real,
 //! genuinely useful fields that aren't user-facing "settings" in that sense --
@@ -15,12 +15,12 @@
 //! tool this project first used to visually confirm the composition pipeline produces
 //! correct output (see `CLAUDE.md`'s "First confirmed *correct visual output*" entry).
 
-use neuralforge_protocol::ShmHeader;
+use neural_forge_protocol::ShmHeader;
 use std::sync::atomic::Ordering;
 
 fn usage() {
     eprintln!(
-        "usage: neuralforge-cli shmctl <status|set|toggle|capture|reset>\n\n\
+        "usage: neural-forge-cli shmctl <status|set|toggle|capture|reset>\n\n\
          \x20 status              print every setting and live status field\n\
          \x20 set <name> <value>  set one setting (float fields take a decimal value)\n\
          \x20 toggle <name>       flip a 0/1-valued setting\n\
@@ -45,7 +45,7 @@ fn extra_field<'a>(header: &'a ShmHeader, name: &str) -> Option<(&'a std::sync::
 }
 
 fn helper_state_name(v: u32) -> &'static str {
-    use neuralforge_protocol::enums::helper_state::*;
+    use neural_forge_protocol::enums::helper_state::*;
     match v {
         STARTING => "starting",
         NO_VULKAN => "no_vulkan",
@@ -71,7 +71,7 @@ fn cmd_status(header: &ShmHeader) {
     println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
     println!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed));
     println!("capture_request={}", header.capture_request.load(Ordering::Relaxed));
-    println!("# settings (neuralforge_protocol::ShmHeader::persisted_settings)");
+    println!("# settings (neural_forge_protocol::ShmHeader::persisted_settings)");
     for (name, is_float, bits) in header.persisted_settings() {
         if is_float {
             println!("{name}={}", f32::from_bits(bits));
@@ -238,7 +238,7 @@ mod tests {
 
     #[test]
     fn helper_state_name_covers_every_real_state() {
-        use neuralforge_protocol::enums::helper_state::*;
+        use neural_forge_protocol::enums::helper_state::*;
         for state in [STARTING, NO_VULKAN, NO_BINARIES, MODEL_FAILED, RUNNING, STOPPED] {
             assert_ne!(helper_state_name(state), "unknown");
         }
@@ -247,7 +247,7 @@ mod tests {
 }
 
 pub fn run(args: &[String]) -> std::process::ExitCode {
-    let Some(mapping) = neuralforge_protocol::mapping::open() else {
+    let Some(mapping) = neural_forge_protocol::mapping::open() else {
         eprintln!("shmctl: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
         return std::process::ExitCode::FAILURE;
     };
@@ -261,14 +261,14 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         Some("set") => match (args.get(1), args.get(2)) {
             (Some(name), Some(value)) => cmd_set(header, name, value),
             _ => {
-                eprintln!("usage: neuralforge-cli shmctl set <name> <value>");
+                eprintln!("usage: neural-forge-cli shmctl set <name> <value>");
                 false
             }
         },
         Some("toggle") => match args.get(1) {
             Some(name) => cmd_toggle(header, name),
             None => {
-                eprintln!("usage: neuralforge-cli shmctl toggle <name>");
+                eprintln!("usage: neural-forge-cli shmctl toggle <name>");
                 false
             }
         },

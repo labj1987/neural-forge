@@ -1,5 +1,5 @@
 [package]
-name = "neuralforge-cli"
+name = "neural-forge-cli"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,10 +7,10 @@ license.workspace = true
 description = "Helper-manager CLI: init/start/stop/status/doctor/runner-discovery/import-binaries"
 
 [[bin]]
-name = "neuralforge-cli"
+name = "neural-forge-cli"
 path = "src/main.rs"
 
 [dependencies]
-neuralforge-protocol = { path = "../protocol" }
-neuralforge-supervisor = { path = "../supervisor" }
+neural-forge-protocol = { path = "../protocol" }
+neural-forge-supervisor = { path = "../supervisor" }
 anyhow = "1"

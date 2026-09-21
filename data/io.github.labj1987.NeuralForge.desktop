@@ -2,8 +2,8 @@
 Type=Application
 Name=Neural Forge
 Comment=DLSS 5 Neural Rendering settings and helper manager
-Exec=neuralforge
-Icon=neuralforge
+Exec=neural-forge
+Icon=neural-forge
 Categories=Utility;
 Terminal=false
 StartupWMClass=io.github.labj1987.NeuralForge

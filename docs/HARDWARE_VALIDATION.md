@@ -145,7 +145,7 @@ DMA-BUF constraints remain in force; later optimization features are unimplement
 
 ## 2026-09-15 — eleven validation warnings: not reproduced; root cause identified
 
-Repository renamed to `labj1987/NeuralForge` on GitHub; local checkout's remote and
+Repository renamed to `labj1987/neural-forge` on GitHub; local checkout's remote and
 directory were updated to match, confirmed against the renamed repository. The Phase 1
 PR above is merged.
 
@@ -209,13 +209,13 @@ itself (now dead once `run`'s two call sites moved to the pipeline) was removed;
 command-recording sequence was factored into `record_capture_commands`, shared with
 the new pipeline's submit path.
 
-Also added `NEURALFORGE_HELPER_DELAY_MS` (test-only) to `neuralforge-helper`: an
+Also added `NEURALFORGE_HELPER_DELAY_MS` (test-only) to `neural-forge-helper`: an
 artificial per-response delay, read once at startup, applied right before
 `seq_resp` is published -- the real-hardware equivalent of the existing Rust
 integration test's fake in-process helper thread.
 
 **Validated on `lordnikon`:**
-- `cargo test -p neuralforge-layer` (all 45 native tests, 1 ignored) passes unchanged
+- `cargo test -p neural-forge-layer` (all 45 native tests, 1 ignored) passes unchanged
   on the dev machine.
 - The layer crate's release test binary was copied to `lordnikon` and run directly
   against the real NVIDIA driver with `VK_LAYER_KHRONOS_validation` and
@@ -229,7 +229,7 @@ integration test's fake in-process helper thread.
   artifact of this test's own minimal device (created without `VK_KHR_swapchain`) --
   confirmed pre-existing and unrelated to this phase's change, not a synchronization
   hazard: no `SYNC-HAZARD-*` message appeared anywhere in either run.
-- `neuralforge-helper.exe` with `NEURALFORGE_HELPER_DELAY_MS=250` set was run alone
+- `neural-forge-helper.exe` with `NEURALFORGE_HELPER_DELAY_MS=250` set was run alone
   against `lordnikon`'s real Proton/Wine runner for 20+ seconds with no crash.
   A separate attempt earlier the same session, run immediately after starting a
   *second* helper instance against the same Wine prefix while the first was still
@@ -367,7 +367,7 @@ See `PROTOCOL_V3_DESIGN.md` for the design; this entry is the real-hardware evid
 `lordnikon`, RTX 5070, driver 615.71.09, a fresh `git clone` of each commit (not just
 this dev machine's own software ICD):
 
-- `cargo test -p neuralforge-layer` (48 tests): clean and deterministic across several
+- `cargo test -p neural-forge-layer` (48 tests): clean and deterministic across several
   repeated runs.
 - `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1` against
   `capture::` tests: the same pre-existing cosmetic `VUID-VkImageMemoryBarrier-*`

@@ -1,5 +1,5 @@
 [package]
-name = "neuralforge-protocol"
+name = "neural-forge-protocol"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -7,7 +7,7 @@ license.workspace = true
 description = "Shared-memory wire format between the NeuralForge layer, helper, GUI and CLI"
 
 [lib]
-name = "neuralforge_protocol"
+name = "neural_forge_protocol"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

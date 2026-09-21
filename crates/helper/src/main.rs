@@ -1,4 +1,4 @@
-//! `neuralforge-helper.exe` — Windows-side NGX service.
+//! `neural-forge-helper.exe` — Windows-side NGX service.
 //!
 //! Owns its own Vulkan device and the `nvngx_dlssnr.dll` model, waits on the
 //! shared-memory frame queue the layer writes to, runs the neural pass, and returns
@@ -21,13 +21,13 @@
 //! `Option` just get overwritten would leak its images/memory/command pool every time,
 //! not free them (`ash` handles are not `Drop`).
 //!
-//! This is a thin wrapper around the `neuralforge_helper` library crate (see `lib.rs`) --
+//! This is a thin wrapper around the `neural_forge_helper` library crate (see `lib.rs`) --
 //! that split exists so `examples/` can exercise individual modules directly.
 
 // Suppresses the console window Wine/Windows would otherwise pop up for this
 // process -- a plain Rust binary links as a CONSOLE-subsystem PE by default, and
 // this helper never has anything to print to one that matters: real deployments
-// always set `NEURALFORGE_LOG` (`neuralforge_supervisor::start()`, confirmed by grep), so
+// always set `NEURALFORGE_LOG` (`neural_forge_supervisor::start()`, confirmed by grep), so
 // `crate::logging`'s own `Stderr` fallback is already unreachable in practice --
 // see that module's own doc comment. Found real, reported by the user, 2026-09-11:
 // this window shows up on every real launch and does nothing (no input, no output
@@ -38,7 +38,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ash::vk;
-use neuralforge_helper::{frame, guard, ngx, optical_flow, shm};
+use neural_forge_helper::{frame, guard, ngx, optical_flow, shm};
 
 /// Real motion vectors for this frame, or an empty `Vec` when they're unavailable
 /// for any reason (structurally, a transient failure, a scene cut, or simply the
@@ -63,7 +63,7 @@ fn estimate_motion(
     // Structurally unavailable (no extension/feature/queue-family support at all,
     // decided once in `create_vulkan_context`) -- never worth attempting.
     let Some(flow_queue) = flow_queue else { return Vec::new() };
-    let bgr = proxy_format == neuralforge_protocol::enums::proxy_format::BGRA8;
+    let bgr = proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8;
 
     let needs_rebuild = !flow.as_ref().is_some_and(|f| f.width == width && f.height == height);
     if needs_rebuild {
@@ -82,7 +82,7 @@ fn estimate_motion(
                 // can't do it at this size" doesn't improve by retrying every 200us.
                 static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                 if !LOGGED.swap(true, Ordering::Relaxed) {
-                    neuralforge_helper::log!("[mvec] optical flow session unavailable at {width}x{height}: {e}");
+                    neural_forge_helper::log!("[mvec] optical flow session unavailable at {width}x{height}: {e}");
                 }
                 return Vec::new();
             }
@@ -102,7 +102,7 @@ fn estimate_motion(
         unsafe { f.destroy(device) };
         *flow = None;
         prev_proxy.clear();
-        neuralforge_helper::log!("[mvec] scene cut detected, resetting motion history");
+        neural_forge_helper::log!("[mvec] scene cut detected, resetting motion history");
         return Vec::new();
     }
 
@@ -115,7 +115,7 @@ fn estimate_motion(
         Err(e) => {
             static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
-                neuralforge_helper::log!("[mvec] estimate failed, disabling for this session: {e}");
+                neural_forge_helper::log!("[mvec] estimate failed, disabling for this session: {e}");
             }
             // A real failure, not just "no answer yet" -- drop the session so this
             // doesn't retry (and potentially fail the same way) every single frame
@@ -132,7 +132,7 @@ fn estimate_motion(
     if vectors.is_empty() {
         return Vec::new();
     }
-    neuralforge_protocol::motion::encode(&vectors, motion_scale)
+    neural_forge_protocol::motion::encode(&vectors, motion_scale)
 }
 
 fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
@@ -160,40 +160,40 @@ fn main() {
         .unwrap_or_default();
 
     let Some(shm) = shm::open() else {
-        neuralforge_helper::log!("[helper] failed to open the shared-memory mapping");
+        neural_forge_helper::log!("[helper] failed to open the shared-memory mapping");
         return;
     };
     // SAFETY: `shm.header` was just validated by `shm::open`.
     let hdr = unsafe { &*shm.header };
-    hdr.helper_state.store(neuralforge_protocol::enums::helper_state::STARTING, Ordering::Relaxed);
+    hdr.helper_state.store(neural_forge_protocol::enums::helper_state::STARTING, Ordering::Relaxed);
     hdr.control_seq.fetch_add(1, Ordering::Relaxed);
     hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
-    neuralforge_helper::log!("[helper] shm attached");
-    neuralforge_helper::logging::flush();
+    neural_forge_helper::log!("[helper] shm attached");
+    neural_forge_helper::logging::flush();
 
     let Some((entry, instance, physical_device, device, queue, flow_queue)) = create_vulkan_context() else {
-        neuralforge_helper::log!("[helper] failed to create a Vulkan context");
-        neuralforge_helper::logging::flush();
-        hdr.helper_state.store(neuralforge_protocol::enums::helper_state::NO_VULKAN, Ordering::Relaxed);
+        neural_forge_helper::log!("[helper] failed to create a Vulkan context");
+        neural_forge_helper::logging::flush();
+        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::NO_VULKAN, Ordering::Relaxed);
         // SAFETY: nothing else references `shm` after this; it owns its own handles.
         unsafe { shm.close() };
         return;
     };
-    neuralforge_helper::log!("[helper] Vulkan context created, loading NGX next");
-    neuralforge_helper::logging::flush();
+    neural_forge_helper::log!("[helper] Vulkan context created, loading NGX next");
+    neural_forge_helper::logging::flush();
 
     let mut snippet = ngx::load_and_init(instance.handle(), physical_device, device.handle());
     hdr.helper_state.store(
         if snippet.disabled {
-            neuralforge_protocol::enums::helper_state::MODEL_FAILED
+            neural_forge_protocol::enums::helper_state::MODEL_FAILED
         } else {
-            neuralforge_protocol::enums::helper_state::RUNNING
+            neural_forge_protocol::enums::helper_state::RUNNING
         },
         Ordering::Relaxed,
     );
-    neuralforge_helper::log!("[helper] NGX snippet disabled={}", snippet.disabled);
-    neuralforge_helper::log!("[mvec] optical flow queue: {}", if flow_queue.is_some() { "available" } else { "unavailable (no extension/feature/queue-family support)" });
-    neuralforge_helper::logging::flush();
+    neural_forge_helper::log!("[helper] NGX snippet disabled={}", snippet.disabled);
+    neural_forge_helper::log!("[mvec] optical flow queue: {}", if flow_queue.is_some() { "available" } else { "unavailable (no extension/feature/queue-family support)" });
+    neural_forge_helper::logging::flush();
 
     // Protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`): one persistent `FrameResources` per wire
     // slot, each importing (or staging into) that slot's own disjoint proxy/answer
@@ -249,7 +249,7 @@ fn main() {
         unsafe { f.destroy(&device) };
     }
     ngx::teardown(snippet);
-    hdr.helper_state.store(neuralforge_protocol::enums::helper_state::STOPPED, Ordering::Relaxed);
+    hdr.helper_state.store(neural_forge_protocol::enums::helper_state::STOPPED, Ordering::Relaxed);
     // SAFETY: destroyed in the reverse order of creation; nothing else holds a
     // reference to `device`/`instance` past this point.
     unsafe {
@@ -277,7 +277,7 @@ fn main() {
 /// nothing to race by having both slots write the same dead field.
 #[allow(clippy::too_many_arguments)]
 fn process_request(
-    hdr: &neuralforge_protocol::ShmHeader,
+    hdr: &neural_forge_protocol::ShmHeader,
     shm: &shm::ShmMapping,
     device: &ash::Device,
     instance: &ash::Instance,
@@ -296,20 +296,20 @@ fn process_request(
     let width = hdr.width_slot(slot).load(Ordering::Relaxed);
     let height = hdr.height_slot(slot).load(Ordering::Relaxed);
     let proxy_format = hdr.proxy_format_slot(slot).load(Ordering::Relaxed);
-    let bytes = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format)
+    let bytes = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format)
         .saturating_mul(width as usize)
         .saturating_mul(height as usize)
-        .min(neuralforge_protocol::MAX_FRAME);
+        .min(neural_forge_protocol::MAX_FRAME);
     // These three values come from shared memory another process writes -- never
     // size a Vulkan image from them unchecked. A rejected frame still completes its
     // round trip (fail-open echo below), it just never reaches `FrameResources::new`,
     // NGX, or optical flow.
-    let dims_ok = neuralforge_protocol::frame_dims_valid(width, height, proxy_format);
+    let dims_ok = neural_forge_protocol::frame_dims_valid(width, height, proxy_format);
     if !dims_ok {
-        neuralforge_helper::log!("[helper] slot {slot}: rejecting out-of-range frame {width}x{height} format={proxy_format}");
+        neural_forge_helper::log!("[helper] slot {slot}: rejecting out-of-range frame {width}x{height} format={proxy_format}");
     }
     let n = if dims_ok { bytes } else { 0 };
-    let motion_scale = neuralforge_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed), width, height);
+    let motion_scale = neural_forge_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed), width, height);
     // Fixed addresses/capacity regardless of this frame's own width/height --
     // `FrameResources::new` decides for itself (per its own doc comment) whether
     // they're actually importable.
@@ -324,14 +324,14 @@ fn process_request(
     // performs no model work or write-back.
     if dims_ok
         && !model_requested
-        && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
+        && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
         && !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format))
     {
         if let Some(old) = frame_resources.take() {
             unsafe { old.destroy(device) };
         }
         *frame_resources = frame::FrameResources::new(device, instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
-        neuralforge_helper::log!("[helper] slot {slot}: prewarmed {}x{} frame resources: {}", width, height, frame_resources.is_some());
+        neural_forge_helper::log!("[helper] slot {slot}: prewarmed {}x{} frame resources: {}", width, height, frame_resources.is_some());
     }
     let ready = model_requested && ngx::ensure_feature(snippet, device, queue, width, height);
     if ready {
@@ -341,7 +341,7 @@ fn process_request(
         // `CreateFeature` attempt (see its own doc comment) -- worth surfacing in
         // status immediately rather than leaving `RUNNING` displayed forever after
         // the model is permanently unavailable.
-        hdr.helper_state.store(neuralforge_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
+        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
     }
     // SAFETY: this helper exclusively owns this slot's request after observing its
     // own `seq_req`; slot 0's and slot 1's regions are disjoint fixed regions in the
@@ -361,7 +361,7 @@ fn process_request(
     let motion = if slot == 0
         && dims_ok
         && hdr.mvec_enabled()
-        && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
+        && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
         && std::env::var_os("NEURALFORGE_MVEC_HELPER").is_some()
     {
         estimate_motion(flow_queue, flow, prev_proxy, instance, device, physical_device, proxy, width, height, proxy_format, motion_scale, hdr.mvec_quality.load(Ordering::Relaxed))
@@ -379,7 +379,7 @@ fn process_request(
         Vec::new()
     };
 
-    let timing = if ready && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+    let timing = if ready && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         (|| {
             if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format)) {
                 // SAFETY: any previous resources are no longer referenced by in-flight
@@ -418,8 +418,8 @@ fn process_request(
     }
     hdr.seq_resp_slot(slot).store(seq_req, Ordering::Release);
     *frames += 1;
-    neuralforge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, *frames);
-    neuralforge_helper::log!("[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated}");
+    neural_forge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, *frames);
+    neural_forge_helper::log!("[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated}");
 }
 
 /// A minimal Vulkan instance + device — just enough to hand NGX a live
@@ -443,7 +443,7 @@ fn process_request(
 /// upstream's own eventual roadmap target -- see the crate-level doc comment) --
 /// `VK_EXT_external_memory_dma_buf`/`VK_KHR_external_memory_fd` are POSIX-specific
 /// external-memory handle types that a real Linux Vulkan ICD legitimately exposes and
-/// that reference binary legitimately used. `neuralforge-helper.exe` is not that: it is a
+/// that reference binary legitimately used. `neural-forge-helper.exe` is not that: it is a
 /// Windows binary running under Wine/Proton (this crate's current, documented, interim
 /// architecture), and Wine's Vulkan implementation for Windows guest apps exposes the
 /// Windows-shaped `VK_KHR_external_memory_win32` handle type, never the Linux `_fd`
@@ -537,7 +537,7 @@ fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDev
         })
         .collect();
     let enabled: Vec<&str> = WANTED_DEVICE_EXTENSIONS.iter().copied().filter(|e| available_names.contains(*e)).collect();
-    neuralforge_helper::log!(
+    neural_forge_helper::log!(
         "[helper] device extensions: {}/{} of the wanted set available: {:?}",
         enabled.len(),
         WANTED_DEVICE_EXTENSIONS.len(),

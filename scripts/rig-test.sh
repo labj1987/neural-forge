@@ -35,30 +35,30 @@ say() { printf '\n== %s\n' "$*"; }
 # The CLI ships inside the AppImage mount, whose path changes on every app launch.
 # Resolved once, remotely, rather than hardcoded.
 remote_cli() {
-    ssh "$HOST" 'ls -d /tmp/.mount_neural*/usr/bin/neuralforge-cli 2>/dev/null | head -1'
+    ssh "$HOST" 'ls -d /tmp/.mount_neural*/usr/bin/neural-forge-cli 2>/dev/null | head -1'
 }
 
 sh_remote() { ssh "$HOST" "$@"; }
 
 say "building both halves"
-cargo build --release -p neuralforge-layer || exit 1
+cargo build --release -p neural-forge-layer || exit 1
 cargo +stable-x86_64-unknown-linux-gnu build --release --target x86_64-pc-windows-gnu \
-    -p neuralforge-helper --bin neuralforge-helper || exit 1
+    -p neural-forge-helper --bin neural-forge-helper || exit 1
 
 say "deploying both halves (atomic: write .new, then rename)"
 # A plain overwrite of a mapped .so can corrupt a live process -- rename is atomic and
 # leaves any running process on its own inode.
 scp -q target/release/libneuralforge_layer.so "$HOST:$INSTALL_LIB/libneuralforge_layer.so.new" || exit 1
-scp -q target/x86_64-pc-windows-gnu/release/neuralforge-helper.exe "$HOST:$INSTALL_LIB/helper/neuralforge-helper.exe.new" || exit 1
+scp -q target/x86_64-pc-windows-gnu/release/neural-forge-helper.exe "$HOST:$INSTALL_LIB/helper/neural-forge-helper.exe.new" || exit 1
 sh_remote "mv -f '$INSTALL_LIB/libneuralforge_layer.so.new' '$INSTALL_LIB/libneuralforge_layer.so' &&
-           mv -f '$INSTALL_LIB/helper/neuralforge-helper.exe.new' '$INSTALL_LIB/helper/neuralforge-helper.exe' &&
-           sha256sum '$INSTALL_LIB/libneuralforge_layer.so' '$INSTALL_LIB/helper/neuralforge-helper.exe'" || exit 1
+           mv -f '$INSTALL_LIB/helper/neural-forge-helper.exe.new' '$INSTALL_LIB/helper/neural-forge-helper.exe' &&
+           sha256sum '$INSTALL_LIB/libneuralforge_layer.so' '$INSTALL_LIB/helper/neural-forge-helper.exe'" || exit 1
 say "local hashes, for comparison with the above"
-sha256sum target/release/libneuralforge_layer.so target/x86_64-pc-windows-gnu/release/neuralforge-helper.exe
+sha256sum target/release/libneuralforge_layer.so target/x86_64-pc-windows-gnu/release/neural-forge-helper.exe
 
 CLI="$(remote_cli)"
 if [ -z "$CLI" ]; then
-    echo "!! no neuralforge-cli found in any AppImage mount -- is the app running on $HOST?" >&2
+    echo "!! no neural-forge-cli found in any AppImage mount -- is the app running on $HOST?" >&2
     exit 1
 fi
 

@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use neuralforge_protocol::enums::{colour_mode, downscaler, mvec_quality, mvec_scale_mode, reversible_mode};
+use neural_forge_protocol::enums::{colour_mode, downscaler, mvec_quality, mvec_scale_mode, reversible_mode};
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -420,7 +420,7 @@ pub fn build_ui(app: &adw::Application) {
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
                 .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering on Linux/Proton games.")
-                .website("https://github.com/labj1987/NeuralForge")
+                .website("https://github.com/labj1987/neural-forge")
                 // Matches Cargo.toml's `AGPL-3.0-or-later`; the upstream project's own
                 // license is AGPL-3.0, which is what requires it for the adapted code.
                 .license_type(gtk4::License::Agpl30)
@@ -442,10 +442,10 @@ pub fn build_ui(app: &adw::Application) {
 ///
 /// The one exception is the "NGX binaries" row's Import button: unlike everything
 /// else here, it's an action, not a live readout, because it's the only place besides
-/// `neuralforge-cli import-binaries` to get NVIDIA's DLLs into `binaries_dir()` -- there's
+/// `neural-forge-cli import-binaries` to get NVIDIA's DLLs into `binaries_dir()` -- there's
 /// no separate menu for it.
 fn profile_names() -> Vec<String> {
-    let mut names: Vec<String> = neuralforge_supervisor::profiles::load_all().into_keys().collect();
+    let mut names: Vec<String> = neural_forge_supervisor::profiles::load_all().into_keys().collect();
     names.sort();
     names
 }
@@ -525,11 +525,11 @@ fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     group.set_description(Some("Needs DXVK-NVAPI (Proton-CachyOS, Proton-GE) or a system Wine with it installed -- \
                             Valve's stock Proton builds don't bundle it"));
 
-    let mut options: Vec<(String, String)> = neuralforge_supervisor::runners::discover_proton()
+    let mut options: Vec<(String, String)> = neural_forge_supervisor::runners::discover_proton()
         .into_iter()
         .map(|runner| (runner.name, runner.path.to_string_lossy().into_owned()))
         .collect();
-    if let Some(wine) = neuralforge_supervisor::runners::find_wine() {
+    if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
         options.push(("System Wine".to_string(), wine.to_string_lossy().into_owned()));
     }
 
@@ -539,7 +539,7 @@ fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
         combo.set_model(Some(&gtk4::StringList::new(&["No compatibility tool found"])));
         combo.set_sensitive(false);
     } else {
-        let cfg = neuralforge_supervisor::Config::load();
+        let cfg = neural_forge_supervisor::Config::load();
         let names: Vec<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
         combo.set_model(Some(&gtk4::StringList::new(&names)));
         let selected = options.iter().position(|(_, path)| *path == cfg.runner_path).unwrap_or(0);
@@ -551,7 +551,7 @@ fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
         let toasts = toasts.clone();
         combo.connect_selected_notify(move |combo| {
             let Some((name, path)) = options.get(combo.selected() as usize) else { return };
-            let mut cfg = neuralforge_supervisor::Config::load();
+            let mut cfg = neural_forge_supervisor::Config::load();
             cfg.runner_type = if name == "System Wine" { "wine".to_string() } else { "proton".to_string() };
             cfg.runner_path = path.clone();
             match cfg.save() {
@@ -593,7 +593,7 @@ fn build_install_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
 
     if let Some(dir) = appdir {
         let toasts = toasts.clone();
-        install_button.connect_clicked(move |_| match neuralforge_supervisor::install::install(std::path::Path::new(&dir)) {
+        install_button.connect_clicked(move |_| match neural_forge_supervisor::install::install(std::path::Path::new(&dir)) {
             Ok(report) => toasts.add_toast(adw::Toast::new(&format!("Installed to {}", report.root.display()))),
             Err(e) => toasts.add_toast(adw::Toast::new(&format!("Install failed: {e}"))),
         });
@@ -670,7 +670,7 @@ fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
 }
 
 /// One sample of the three timing series the sparkline plots, all already published
-/// by the layer/helper for `neuralforge-cli shmctl status` -- this just samples them
+/// by the layer/helper for `neural-forge-cli shmctl status` -- this just samples them
 /// on a faster timer than the once-a-second status labels above need, and keeps the
 /// last few seconds of them for the drawing area to plot.
 #[derive(Clone, Copy)]
@@ -741,7 +741,7 @@ fn legend_label(text: &str, rgb: (f64, f64, f64)) -> gtk4::Box {
     row
 }
 
-fn build_telemetry_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
+fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Telemetry");
     group.set_description(Some("Live from the running helper/layer -- all zero until a targeted game attaches"));
@@ -846,7 +846,7 @@ fn build_telemetry_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Map
     group
 }
 
-fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Status");
 
@@ -874,7 +874,7 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
         // should reflect what clicking it will actually do, not the helper's own
         // self-reported state.
         if start_stop_button_for_timer.is_sensitive() {
-            start_stop_button_for_timer.set_label(if neuralforge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
+            start_stop_button_for_timer.set_label(if neural_forge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
         }
         glib::ControlFlow::Continue
     });
@@ -894,10 +894,10 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
     // state was visible without opening the Status tab and noticing the button still
     // said "Start". `enabled=1` meaning "the layer should try" without the helper
     // that makes trying meaningful actually running is exactly the gap this closes.
-    if shm.header().enabled.load(Ordering::Relaxed) != 0 && neuralforge_supervisor::is_running().is_none() {
-        let cfg = neuralforge_supervisor::Config::load();
+    if shm.header().enabled.load(Ordering::Relaxed) != 0 && neural_forge_supervisor::is_running().is_none() {
+        let cfg = neural_forge_supervisor::Config::load();
         let toasts = toasts.clone();
-        match neuralforge_supervisor::start(&cfg) {
+        match neural_forge_supervisor::start(&cfg) {
             Ok(started) => toasts.add_toast(adw::Toast::new(&format!("Helper auto-started (pid {})", started.pid))),
             Err(e) => toasts.add_toast(adw::Toast::new(&format!("Neural rendering is on, but the helper failed to auto-start: {e}"))),
         }
@@ -907,10 +907,10 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
         let toasts = toasts.clone();
         start_stop_button.connect_clicked(move |button| {
             let toasts = toasts.clone();
-            if neuralforge_supervisor::is_running().is_some() {
+            if neural_forge_supervisor::is_running().is_some() {
                 // Stopping waits up to 5s for a graceful exit before escalating to
                 // SIGKILL, then shells out to `wineserver -k` (see
-                // neuralforge_supervisor::stop). Run on a worker thread: doing it inline
+                // neural_forge_supervisor::stop). Run on a worker thread: doing it inline
                 // blocked the main loop, so the "Stopping…" label below never painted.
                 // The button stays insensitive until the result is back on the main
                 // thread (which the one-second status timer also relies on).
@@ -918,18 +918,18 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
                 button.set_label("Stopping…");
                 let button = button.clone();
                 glib::spawn_future_local(async move {
-                    let result = gio::spawn_blocking(|| neuralforge_supervisor::stop(std::time::Duration::from_secs(5))).await;
+                    let result = gio::spawn_blocking(|| neural_forge_supervisor::stop(std::time::Duration::from_secs(5))).await;
                     match result {
                         Ok(Ok(())) => toasts.add_toast(adw::Toast::new("Helper stopped")),
                         Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Stop failed: {e}"))),
                         Err(_) => toasts.add_toast(adw::Toast::new("Stop failed: the stop worker panicked")),
                     }
-                    button.set_label(if neuralforge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
+                    button.set_label(if neural_forge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
                     button.set_sensitive(true);
                 });
             } else {
-                let cfg = neuralforge_supervisor::Config::load();
-                match neuralforge_supervisor::start(&cfg) {
+                let cfg = neural_forge_supervisor::Config::load();
+                match neural_forge_supervisor::start(&cfg) {
                     Ok(started) => toasts.add_toast(adw::Toast::new(&format!("Helper started (pid {})", started.pid))),
                     Err(e) => toasts.add_toast(adw::Toast::new(&format!("Start failed: {e}"))),
                 }
@@ -1002,8 +1002,8 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
                 // same two places `persist_one` already keeps in sync for a single
                 // setting, done here for all of them at once.
                 shm.header().reset_persisted_settings();
-                let mut cfg = neuralforge_supervisor::Config::load();
-                for (name, value) in neuralforge_protocol::persist::snapshot(shm.header()) {
+                let mut cfg = neural_forge_supervisor::Config::load();
+                for (name, value) in neural_forge_protocol::persist::snapshot(shm.header()) {
                     cfg.settings.insert(name, value);
                 }
                 match cfg.save() {
@@ -1045,8 +1045,8 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
                 toasts.add_toast(adw::Toast::new("Enter a name before saving"));
                 return;
             }
-            let settings = neuralforge_protocol::persist::snapshot(shm.header());
-            match neuralforge_supervisor::profiles::save_profile(&name, settings) {
+            let settings = neural_forge_protocol::persist::snapshot(shm.header());
+            match neural_forge_supervisor::profiles::save_profile(&name, settings) {
                 Ok(()) => {
                     toasts.add_toast(adw::Toast::new(&format!("Saved profile \"{name}\"")));
                     save_profile_row.set_text("");
@@ -1067,14 +1067,14 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
                 toasts.add_toast(adw::Toast::new("No profile selected"));
                 return;
             };
-            let profiles = neuralforge_supervisor::profiles::load_all();
+            let profiles = neural_forge_supervisor::profiles::load_all();
             let Some(settings) = profiles.get(name) else { return };
-            neuralforge_protocol::persist::apply(shm.header(), settings);
+            neural_forge_protocol::persist::apply(shm.header(), settings);
             // Same reasoning as the reset button above: applying to the live header
             // only affects the running session, so also fold the result into
             // config.ini via a fresh snapshot so it survives a reboot too.
-            let mut cfg = neuralforge_supervisor::Config::load();
-            cfg.settings = neuralforge_protocol::persist::snapshot(shm.header());
+            let mut cfg = neural_forge_supervisor::Config::load();
+            cfg.settings = neural_forge_protocol::persist::snapshot(shm.header());
             let message = match cfg.save() {
                 Ok(()) => format!("Loaded profile \"{name}\" -- restart Neural Forge to see it reflected here"),
                 Err(e) => format!("Applied to the running session, but saving config.ini failed: {e}"),
@@ -1092,7 +1092,7 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
                 toasts.add_toast(adw::Toast::new("No profile selected"));
                 return;
             };
-            match neuralforge_supervisor::profiles::delete_profile(&name) {
+            match neural_forge_supervisor::profiles::delete_profile(&name) {
                 Ok(true) => {
                     toasts.add_toast(adw::Toast::new(&format!("Deleted profile \"{name}\"")));
                     refresh_profile_combo(&profile_combo);
@@ -1115,7 +1115,7 @@ fn binaries_status_subtitle() -> String {
 }
 
 fn helper_state_label(state: u32) -> &'static str {
-    use neuralforge_protocol::enums::helper_state::*;
+    use neural_forge_protocol::enums::helper_state::*;
     match state {
         STARTING => "starting",
         NO_VULKAN => "no NVIDIA Vulkan device",
@@ -1131,7 +1131,7 @@ fn build_error_window(app: &adw::Application) {
     let status = adw::StatusPage::builder()
         .icon_name("dialog-error-symbolic")
         .title("Couldn't open the shared-memory mapping")
-        .description("Check the helper's log; neuralforge-cli doctor may also help.")
+        .description("Check the helper's log; neural-forge-cli doctor may also help.")
         .build();
     let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();
     window.present();

@@ -1,18 +1,18 @@
 [package]
-name = "neuralforge"
+name = "neural-forge"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "GTK4 + libadwaita settings GUI for NeuralForge"
+description = "GTK4 + libadwaita settings GUI for Neural Forge"
 
 [[bin]]
-name = "neuralforge"
+name = "neural-forge"
 path = "src/main.rs"
 
 [dependencies]
-neuralforge-protocol = { path = "../protocol" }
-neuralforge-supervisor = { path = "../supervisor" }
+neural-forge-protocol = { path = "../protocol" }
+neural-forge-supervisor = { path = "../supervisor" }
 gtk4 = { version = "0.11", features = ["v4_12"] }
 libadwaita = { version = "0.9", features = ["v1_4", "v1_5"] }
 glib = "0.22"

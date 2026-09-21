@@ -14,7 +14,7 @@ identity = 'io.github.labj1987.NeuralForge'
 meta = ET.parse(root / f'data/{identity}.appdata.xml').getroot()
 assert meta.find('id').text == identity
 assert meta.find('launchable').text == f'{identity}.desktop'
-assert '\nExec=neuralforge\n' in (root / f'data/{identity}.desktop').read_text()
+assert '\nExec=neural-forge\n' in (root / f'data/{identity}.desktop').read_text()
 for path in (root / 'crates').rglob('*.rs'):
     code = path.read_text()
     assert not re.search(r'(?:var|var_os|set_var)\("(?:DLSSNR_|VKLayer_DLSS5)', code), path
@@ -22,6 +22,6 @@ for path in (root / 'crates').rglob('*.rs'):
     assert 'NEURALFORGE.Color' not in code, path
 assert (root / 'README.md').read_text().startswith('# Neural Forge\n')
 assert '`dlssnr` is a from-scratch' not in (root / 'ATTRIBUTION.md').read_text()
-assert '|labj1987|NeuralForge|latest|' in (root / 'build-appimage.sh').read_text()
-assert 'https://github.com/labj1987/NeuralForge' in (root / 'README.md').read_text()
+assert '|labj1987|neural-forge|latest|' in (root / 'build-appimage.sh').read_text()
+assert 'https://github.com/labj1987/neural-forge' in (root / 'README.md').read_text()
 print('Namespace contract: OK')

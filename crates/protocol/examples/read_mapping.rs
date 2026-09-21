@@ -10,7 +10,7 @@ fn main() {
     let map = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
-            neuralforge_protocol::HEADER_BYTES,
+            neural_forge_protocol::HEADER_BYTES,
             libc::PROT_READ | libc::PROT_WRITE,
             libc::MAP_SHARED,
             file.as_raw_fd(),
@@ -18,10 +18,10 @@ fn main() {
         )
     };
     assert_ne!(map, libc::MAP_FAILED);
-    let hdr = unsafe { &*(map as *const neuralforge_protocol::ShmHeader) };
+    let hdr = unsafe { &*(map as *const neural_forge_protocol::ShmHeader) };
     println!("is_valid: {}", hdr.is_valid());
-    println!("magic: {:#x} (expected {:#x})", hdr.magic.load(std::sync::atomic::Ordering::Relaxed), neuralforge_protocol::SHM_MAGIC);
-    println!("version: {} (expected {})", hdr.version.load(std::sync::atomic::Ordering::Relaxed), neuralforge_protocol::SHM_VERSION);
+    println!("magic: {:#x} (expected {:#x})", hdr.magic.load(std::sync::atomic::Ordering::Relaxed), neural_forge_protocol::SHM_MAGIC);
+    println!("version: {} (expected {})", hdr.version.load(std::sync::atomic::Ordering::Relaxed), neural_forge_protocol::SHM_VERSION);
     println!("helper_state: {}", hdr.helper_state.load(std::sync::atomic::Ordering::Relaxed));
     println!("heartbeat: {}", hdr.heartbeat.load(std::sync::atomic::Ordering::Relaxed));
     println!("enabled: {}", hdr.enabled.load(std::sync::atomic::Ordering::Relaxed));

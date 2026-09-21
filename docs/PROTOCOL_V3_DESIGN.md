@@ -78,7 +78,7 @@ comment for the aliasing/write-hazard reasoning this mirrors.
 
 ## The helper side: two `FrameResources`, still one evaluate at a time
 
-`neuralforge_helper::main`'s loop builds two `FrameResources` instances instead of
+`neural_forge_helper::main`'s loop builds two `FrameResources` instances instead of
 one -- one importing (or staging into) `proxy_region`/`answer_region`, the other
 `proxy_b_region`/`answer_b_region`. Each loop iteration checks both `seq_req` and
 `seq_req_b` for new work and processes whichever have changed, in the order noticed,
@@ -91,7 +91,7 @@ occupying.
 Real hardware, `lordnikon`, RTX 5070, driver 615.71.09 -- a fresh clone at each
 commit, not just this dev machine's own software ICD:
 
-- `cargo test -p neuralforge-layer` (48 tests, including the new
+- `cargo test -p neural-forge-layer` (48 tests, including the new
   `the_two_slots_are_fully_independent`): clean, deterministic, ~0.5s, run several
   times in a row with no flakes.
 - `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation VK_LAYER_VALIDATE_SYNC=1 cargo
@@ -105,7 +105,7 @@ commit, not just this dev machine's own software ICD:
   clean, `external_memory_host: true`, no abort, clean teardown.
 - `crates/protocol/examples/trigger_helper_roundtrip.rs`, extended with the slot
   argument this design called for, against a real running helper
-  (`neuralforge-cli start`, Proton-CachyOS, the real `nvngx_dlssnr.dll`): both slots
+  (`neural-forge-cli start`, Proton-CachyOS, the real `nvngx_dlssnr.dll`): both slots
   answered correctly when triggered *concurrently* (two processes launched at once,
   slot 0 and slot 1), completing in well under a second total across six separate
   concurrent runs at two resolutions. `seq_resp`/`seq_resp_b` always resolved

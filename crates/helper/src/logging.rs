@@ -53,7 +53,7 @@ fn sink() -> &'static Mutex<Sink> {
     SINK.get_or_init(|| {
         let sink = std::env::var("NEURALFORGE_LOG")
             .ok()
-            .filter(|p| !p.is_empty() && neuralforge_protocol::isolated_path(p))
+            .filter(|p| !p.is_empty() && neural_forge_protocol::isolated_path(p))
             .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
             .map(|f| Sink::File(BufWriter::new(f)))
             .unwrap_or_else(|| Sink::Stderr(BufWriter::new(std::io::stderr())));

@@ -1,4 +1,4 @@
-//! Real implementation of `neuralforge_protocol::ShmHeader::capture_request`: "writes one
+//! Real implementation of `neural_forge_protocol::ShmHeader::capture_request`: "writes one
 //! set of matched before/after frames per session when the layer next presents" --
 //! defined in the protocol from early on but never acted on anywhere until now.
 //! Doubles as the tool this project first used to visually confirm

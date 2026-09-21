@@ -40,7 +40,7 @@
 //! `abi::FnVkInitExt` (UTF-16) is not portable to this call as-is; this probe encodes
 //! its own UTF-32 buffer instead of reusing that type.
 //!
-//! Run: `cargo run --example native_ngx_probe -p neuralforge-layer`
+//! Run: `cargo run --example native_ngx_probe -p neural-forge-layer`
 
 use std::ffi::{c_char, c_int, c_void, CString};
 
@@ -48,7 +48,7 @@ use ash::vk;
 
 const NGX_CORE_LIBRARY_NAME: &str = "libnvidia-ngx.so.1";
 /// `abi::FEATURE_DLSSNR` / `NVSDK_NGX_Feature_Reserved18`, duplicated here rather than
-/// depending on `neuralforge-helper` (a Windows-only crate this native Linux example
+/// depending on `neural-forge-helper` (a Windows-only crate this native Linux example
 /// can't link against).
 const FEATURE_DLSSNR: i32 = 18;
 const SIGNED_SNIPPET_APPLICATION_ID: u64 = 0x0876_232C;

@@ -1,7 +1,7 @@
 //! Sets `ShmHeader::capture_request` on an already-running instance's mapping, so the
 //! layer's very next present writes a matched before/after PNG pair to
 //! `$XDG_DATA_HOME/neuralforge/captures` (see `neuralforge_layer::dump`). A manual trigger for
-//! the same real feature the GUI/a future `neuralforge-shmctl` would expose as a button --
+//! the same real feature the GUI/a future `neural-forge-shmctl` would expose as a button --
 //! useful stand-alone for exactly this: confirming what the layer just wrote to the
 //! screen actually looks right, from the outside, with no GUI needed.
 //!
@@ -10,7 +10,7 @@
 //! point `vkcube`/the layer at it.
 
 fn main() {
-    let Some(mapping) = neuralforge_protocol::mapping::open() else {
+    let Some(mapping) = neural_forge_protocol::mapping::open() else {
         eprintln!("trigger_capture: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
         std::process::exit(1);
     };

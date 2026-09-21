@@ -1,9 +1,9 @@
-//! Binds GTK widgets to `neuralforge_protocol::ShmHeader` fields — this crate's equivalent
+//! Binds GTK widgets to `neural_forge_protocol::ShmHeader` fields — this crate's equivalent
 //! of upstream's `shm_binder.h/.cpp`, written fresh against the protocol crate's Rust
 //! types (there's no logic in a per-field binder worth porting either way, just a
 //! mechanical widget<->field mapping).
 //!
-//! Also persists every [`neuralforge_protocol::ShmHeader::persisted_settings`] value to
+//! Also persists every [`neural_forge_protocol::ShmHeader::persisted_settings`] value to
 //! `config.ini` on change, and applies whatever was last persisted when this call is
 //! the one that created the mapping fresh (see `Shm::open`) -- the SHM mapping itself
 //! lives under `/tmp` and does not survive a reboot, so without this, every tuning
@@ -14,7 +14,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use neuralforge_protocol::mapping::Mapping;
+use neural_forge_protocol::mapping::Mapping;
 
 /// Wraps the open mapping so the UI module can pass one `Arc` around to every
 /// callback instead of re-opening or re-threading raw pointers everywhere.
@@ -22,10 +22,10 @@ pub struct Shm(pub Arc<Mapping>);
 
 impl Shm {
     pub fn open() -> Option<Self> {
-        let mapping = neuralforge_protocol::mapping::open()?;
+        let mapping = neural_forge_protocol::mapping::open()?;
         if mapping.freshly_created {
-            let cfg = neuralforge_supervisor::Config::load();
-            neuralforge_protocol::persist::apply(mapping.header(), &cfg.settings);
+            let cfg = neural_forge_supervisor::Config::load();
+            neural_forge_protocol::persist::apply(mapping.header(), &cfg.settings);
         }
         Some(Shm(Arc::new(mapping)))
     }
@@ -37,7 +37,7 @@ impl Shm {
 /// stale copy of some other field) matters more than avoiding a few extra syscalls on
 /// a settings change a human just triggered by hand.
 fn persist_one(name: &str, is_float: bool, bits: u32) {
-    let mut cfg = neuralforge_supervisor::Config::load();
+    let mut cfg = neural_forge_supervisor::Config::load();
     let value = if is_float { f32::from_bits(bits).to_string() } else { bits.to_string() };
     cfg.settings.insert(format!("set_{name}"), value);
     let _ = cfg.save();
@@ -52,7 +52,7 @@ fn persist_one(name: &str, is_float: bool, bits: u32) {
 pub fn bind_float(
     shm: &Arc<Mapping>,
     name: Option<&'static str>,
-    get: impl Fn(&neuralforge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
+    get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (f32, impl Fn(f32) + 'static) {
     let initial = f32::from_bits(get(shm.header()).load(Ordering::Relaxed));
     let shm = Arc::clone(shm);
@@ -71,7 +71,7 @@ pub fn bind_float(
 pub fn bind_u32(
     shm: &Arc<Mapping>,
     name: Option<&'static str>,
-    get: impl Fn(&neuralforge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
+    get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (u32, impl Fn(u32) + 'static) {
     let initial = get(shm.header()).load(Ordering::Relaxed);
     let shm = Arc::clone(shm);
@@ -89,7 +89,7 @@ pub fn bind_u32(
 pub fn bind_bool(
     shm: &Arc<Mapping>,
     name: Option<&'static str>,
-    get: impl Fn(&neuralforge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
+    get: impl Fn(&neural_forge_protocol::ShmHeader) -> &std::sync::atomic::AtomicU32 + 'static,
 ) -> (bool, impl Fn(bool) + 'static) {
     let (initial, setter) = bind_u32(shm, name, get);
     (initial != 0, move |value: bool| setter(if value { 1 } else { 0 }))

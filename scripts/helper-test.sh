@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Cross-compiles neuralforge-helper and its examples for x86_64-pc-windows-gnu, then runs
+# Cross-compiles neural-forge-helper and its examples for x86_64-pc-windows-gnu, then runs
 # the example tests under Wine. See crates/helper/examples/*.rs for what each one
 # actually checks, and CLAUDE.md's "helper gotchas" for the bug this already caught.
 #
@@ -13,9 +13,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 TOOLCHAIN="+stable-x86_64-unknown-linux-gnu"
 TARGET="x86_64-pc-windows-gnu"
 
-echo "==> cross-compiling neuralforge-helper + examples"
-cargo "$TOOLCHAIN" build --target "$TARGET" -p neuralforge-helper \
-    --bin neuralforge-helper --example guard_test --example spoof_test --example spoof_install_test
+echo "==> cross-compiling neural-forge-helper + examples"
+cargo "$TOOLCHAIN" build --target "$TARGET" -p neural-forge-helper \
+    --bin neural-forge-helper --example guard_test --example spoof_test --example spoof_install_test
 
 SCRATCH="$(mktemp -d)"
 export WINEPREFIX="$SCRATCH/prefix"
@@ -34,13 +34,13 @@ for example in guard_test spoof_test spoof_install_test; do
 done
 
 echo
-echo "==> running the full neuralforge-helper.exe binary for a few seconds (expect a clean"
+echo "==> running the full neural-forge-helper.exe binary for a few seconds (expect a clean"
 echo "    fail-open: no nvngx_dlssnr.dll is available on this dev machine)"
 NEURALFORGE_LOG="$SCRATCH/helper.log" NEURALFORGE_UID="helper-test-$$" \
-    timeout 8 wine "$BIN_DIR/neuralforge-helper.exe" > "$SCRATCH/stdout.log" 2>&1 || true
+    timeout 8 wine "$BIN_DIR/neural-forge-helper.exe" > "$SCRATCH/stdout.log" 2>&1 || true
 echo "--- helper log ---"
 cat "$SCRATCH/helper.log" 2>/dev/null || echo "(no log written)"
-rm -rf "/tmp/neuralforge-helper-test-$$"
+rm -rf "/tmp/neural-forge-helper-test-$$"
 
 if [ "$FAIL" -ne 0 ]; then
     echo

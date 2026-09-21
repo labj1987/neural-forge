@@ -77,7 +77,7 @@ thread_local! {
     // `UnsafeCell`, not a plain `JmpBuf`: `setjmp` writes through the raw pointer this
     // hands out, and mutating through a pointer derived from a `&JmpBuf` with nothing
     // in between would be exactly the kind of aliasing violation `UnsafeCell` exists to
-    // make legal -- same reasoning as `neuralforge_protocol::ShmHeader`'s seqlock-guarded
+    // make legal -- same reasoning as `neural_forge_protocol::ShmHeader`'s seqlock-guarded
     // fields for the same underlying reason (shared, externally-written memory).
     static GUARD_JMP: UnsafeCell<JmpBuf> = UnsafeCell::new(JmpBuf([0; 256]));
     static GUARD_ACTIVE: Cell<bool> = const { Cell::new(false) };

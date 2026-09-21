@@ -1,5 +1,5 @@
 [package]
-name = "neuralforge-layer"
+name = "neural-forge-layer"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
@@ -11,7 +11,7 @@ name = "neuralforge_layer"
 crate-type = ["cdylib"]
 
 [dependencies]
-neuralforge-protocol = { path = "../protocol" }
+neural-forge-protocol = { path = "../protocol" }
 # Pinned to the exact commit vulkan-layer itself was built against, and ash pinned to
 # the exact version vulkan-layer depends on (0.37.3): vulkan-layer's public API is
 # expressed in terms of `ash::vk` types, and Cargo treats different 0.x versions of the

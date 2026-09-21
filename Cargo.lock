@@ -608,59 +608,59 @@ dependencies = [
 ]
 
 [[package]]
-name = "neuralforge"
-version = "0.1.75"
+name = "neural-forge"
+version = "0.1.76"
 dependencies = [
  "anyhow",
  "gio",
  "glib",
  "gtk4",
  "libadwaita",
- "neuralforge-protocol",
- "neuralforge-supervisor",
+ "neural-forge-protocol",
+ "neural-forge-supervisor",
 ]
 
 [[package]]
-name = "neuralforge-cli"
-version = "0.1.75"
+name = "neural-forge-cli"
+version = "0.1.76"
 dependencies = [
  "anyhow",
- "neuralforge-protocol",
- "neuralforge-supervisor",
+ "neural-forge-protocol",
+ "neural-forge-supervisor",
 ]
 
 [[package]]
-name = "neuralforge-helper"
-version = "0.1.75"
+name = "neural-forge-helper"
+version = "0.1.76"
 dependencies = [
  "ash",
- "neuralforge-protocol",
+ "neural-forge-protocol",
 ]
 
 [[package]]
-name = "neuralforge-layer"
-version = "0.1.75"
+name = "neural-forge-layer"
+version = "0.1.76"
 dependencies = [
  "ash",
  "libc",
- "neuralforge-protocol",
+ "neural-forge-protocol",
  "png",
  "vulkan-layer",
 ]
 
 [[package]]
-name = "neuralforge-protocol"
-version = "0.1.75"
+name = "neural-forge-protocol"
+version = "0.1.76"
 dependencies = [
  "libc",
 ]
 
 [[package]]
-name = "neuralforge-supervisor"
-version = "0.1.75"
+name = "neural-forge-supervisor"
+version = "0.1.76"
 dependencies = [
  "libc",
- "neuralforge-protocol",
+ "neural-forge-protocol",
  "nix",
  "serde_json",
  "sha2",

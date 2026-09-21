@@ -4,11 +4,11 @@
 //! own loaded image is a real, self-contained PE import table to test the parser
 //! against.
 //!
-//! Run under Wine: `cargo run --example spoof_test --target x86_64-pc-windows-gnu -p neuralforge-helper`
+//! Run under Wine: `cargo run --example spoof_test --target x86_64-pc-windows-gnu -p neural-forge-helper`
 
 use std::ffi::c_void;
 
-use neuralforge_helper::spoof;
+use neural_forge_helper::spoof;
 
 #[link(name = "kernel32")]
 extern "system" {

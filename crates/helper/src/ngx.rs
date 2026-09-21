@@ -462,7 +462,7 @@ impl NgxSnippet {
 /// Creates the feature at `width`x`height` if one doesn't already exist. A no-op
 /// (returns whatever [`NgxSnippet::has_feature`] already reports) once a feature
 /// exists -- this crate doesn't yet handle resizing/rebuilding on a size change (see
-/// `neuralforge_protocol::ShmHeader::tuning_seq`'s own doc comment for the debounced-rebuild
+/// `neural_forge_protocol::ShmHeader::tuning_seq`'s own doc comment for the debounced-rebuild
 /// design this would eventually hook into); most games never resize their swapchain
 /// mid-session, and a size change today is simply not picked up until the helper
 /// restarts.
@@ -537,7 +537,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 abi::ngx_set_f32(params, name("DLSSNR.LocalToneStrength").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("DLSSNR.LocalStructureStrength").as_ptr(), 1.0);
                 // -1 follows local structure; it is not a strength of zero -- same
-                // convention `neuralforge_protocol::PassControl::reset_to_defaults`
+                // convention `neural_forge_protocol::PassControl::reset_to_defaults`
                 // already documents for this exact field.
                 abi::ngx_set_f32(params, name("DLSSNR.SkinStructureStrength").as_ptr(), -1.0);
                 abi::ngx_set_u32(params, name("DLSSNR.UseAutoMask").as_ptr(), 1);

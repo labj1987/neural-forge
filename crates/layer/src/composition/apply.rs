@@ -30,7 +30,7 @@ use super::color;
 /// (`answer` is overwritten with `original`); `2` the model's raw answer, unmodified
 /// (this function is a no-op); `3` the composited result's difference from `original`,
 /// amplified 4x and re-centered at mid-gray, so a subtle real edit is visible without
-/// needing to A/B two screenshots. Matches `neuralforge_protocol::ShmHeader::debug_view`'s
+/// needing to A/B two screenshots. Matches `neural_forge_protocol::ShmHeader::debug_view`'s
 /// own doc comment.
 ///
 /// Both buffers must be `RGBA8` (4 bytes/pixel, sRGB-encoded, same length) -- callers

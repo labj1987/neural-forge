@@ -136,7 +136,7 @@ impl OpticalFlow {
 
     /// Returns full-resolution signed pixel displacements, current -> previous, one
     /// `[dx, dy]` per pixel in raster order -- exactly the shape
-    /// `neuralforge_protocol::motion::encode` already takes (that function, and the
+    /// `neural_forge_protocol::motion::encode` already takes (that function, and the
     /// `DLSSNR.MVec` upload path in `frame.rs` it feeds, have existed since before
     /// this module; this is simply the first real producer of the vectors they
     /// expect, so callers convert with `motion::encode(&vectors, motion_scale)`
@@ -281,15 +281,15 @@ pub fn is_scene_cut(previous: &[u8], current: &[u8], width: u32, height: u32, th
     (sum_delta / samples) as u8 >= threshold
 }
 
-/// `quality` is [`neuralforge_protocol::enums::mvec_quality`]'s own raw value
+/// `quality` is [`neural_forge_protocol::enums::mvec_quality`]'s own raw value
 /// (`main.rs`'s caller passes `hdr.mvec_quality()` straight through) -- matched here
 /// by value rather than importing the constants, since this is the only place in
 /// this crate that needs them and the values are stable, documented protocol
 /// constants (0 fast, 1 balanced, 2 quality), not a magic number guessed locally.
 fn level_for(quality: u32) -> vk::OpticalFlowPerformanceLevelNV {
     match quality {
-        neuralforge_protocol::enums::mvec_quality::FAST => vk::OpticalFlowPerformanceLevelNV::FAST,
-        neuralforge_protocol::enums::mvec_quality::QUALITY => vk::OpticalFlowPerformanceLevelNV::SLOW,
+        neural_forge_protocol::enums::mvec_quality::FAST => vk::OpticalFlowPerformanceLevelNV::FAST,
+        neural_forge_protocol::enums::mvec_quality::QUALITY => vk::OpticalFlowPerformanceLevelNV::SLOW,
         _ => vk::OpticalFlowPerformanceLevelNV::MEDIUM,
     }
 }
@@ -316,7 +316,7 @@ fn region(width: u32, height: u32) -> vk::BufferImageCopy {
 /// vector repeated across every pixel it covers, matching the deadzone/upscale
 /// compute pass DLSS5VKLayer's own `helper/shaders/mvec_deadzone.comp` does on the
 /// GPU, done here on the CPU for a first, simple, correct version) into one `[dx, dy]`
-/// per pixel, raster order -- exactly what `neuralforge_protocol::motion::encode`
+/// per pixel, raster order -- exactly what `neural_forge_protocol::motion::encode`
 /// takes, so the actual `R16G16_SFLOAT` byte-packing (including that function's own
 /// deadzone and scale handling) is that already-tested code, not duplicated here.
 fn upsample_flow_grid(raw: &[u8], grid_w: usize, width: u32, height: u32, grid: u32) -> Vec<[f32; 2]> {
@@ -375,12 +375,12 @@ mod tests {
     #[test]
     fn upsampled_vectors_feed_directly_into_the_already_tested_motion_encode() {
         // The actual integration point: this module's own output, run through
-        // `neuralforge_protocol::motion::encode` exactly as `main.rs` will call it,
+        // `neural_forge_protocol::motion::encode` exactly as `main.rs` will call it,
         // must produce real, non-degenerate R16G16_SFLOAT bytes -- confirms the two
         // modules' shapes genuinely agree, not just that each compiles alone.
         let raw = [64i16.to_le_bytes(), 0i16.to_le_bytes()].concat(); // dx=2.0, dy=0.0
         let vectors = upsample_flow_grid(&raw, 1, 2, 2, 2);
-        let bytes = neuralforge_protocol::motion::encode(&vectors, [1.0, 1.0]);
+        let bytes = neural_forge_protocol::motion::encode(&vectors, [1.0, 1.0]);
         assert_eq!(bytes.len(), vectors.len() * 4);
         // dx=2.0 at scale 1.0 -> half(2.0) = 0x4000, little-endian.
         assert_eq!(&bytes[0..2], &0x4000u16.to_le_bytes());

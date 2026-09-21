@@ -3,7 +3,7 @@
   <id>io.github.labj1987.NeuralForge</id>
   <name>Neural Forge</name>
   <summary>DLSS 5 Neural Rendering settings and helper manager</summary>
-  <url type="homepage">https://github.com/labj1987/NeuralForge</url>
+  <url type="homepage">https://github.com/labj1987/neural-forge</url>
   <developer id="io.github.labj1987"><name>Linnard Alex Brown Jr.</name></developer>
   <metadata_license>MIT</metadata_license>
   <project_license>MIT</project_license>
@@ -17,19 +17,20 @@
   <launchable type="desktop-id">io.github.labj1987.NeuralForge.desktop</launchable>
   <provides>
     <binary>neuralforge</binary>
-    <binary>neuralforge-cli</binary>
+    <binary>neural-forge-cli</binary>
   </provides>
   <screenshots>
     <screenshot type="default">
       <caption>Settings window with Model, Motion, Composition, Debug, Status, and Setup tabs</caption>
-      <image>https://raw.githubusercontent.com/labj1987/NeuralForge/main/screenshots/settings.png</image>
+      <image>https://raw.githubusercontent.com/labj1987/neural-forge/main/screenshots/settings.png</image>
     </screenshot>
     <screenshot>
       <caption>Setup tab: NGX binaries status, compatibility tool picker, Steam install and launch-option generator</caption>
-      <image>https://raw.githubusercontent.com/labj1987/NeuralForge/main/screenshots/setup.png</image>
+      <image>https://raw.githubusercontent.com/labj1987/neural-forge/main/screenshots/setup.png</image>
     </screenshot>
   </screenshots>
   <releases>
+    <release version="0.1.76" date="2026-09-21"/>
     <release version="0.1.75" date="2026-09-21"/>
     <release version="0.1.74" date="2026-09-17"/>
     <release version="0.1.70" date="2026-09-17"/>

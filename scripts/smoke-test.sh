@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-cargo build -p neuralforge-layer
+cargo build -p neural-forge-layer
 
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
@@ -30,7 +30,7 @@ echo "==> manifest: $SCRATCH/VK_LAYER_neuralforge_neural.json"
 echo "==> layer library: $SO_PATH"
 echo
 
-cargo run --example smoke -p neuralforge-layer
+cargo run --example smoke -p neural-forge-layer
 
 echo
 echo "==> layer log ($NEURALFORGE_LOG):"

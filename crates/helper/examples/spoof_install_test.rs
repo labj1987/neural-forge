@@ -3,11 +3,11 @@
 //! module now reports the spoofed `"nvngx.dll"`, confirms a call about something else
 //! is unaffected, then removes the spoof and confirms the real name comes back.
 //!
-//! Run under Wine: `cargo run --example spoof_install_test --target x86_64-pc-windows-gnu -p neuralforge-helper`
+//! Run under Wine: `cargo run --example spoof_install_test --target x86_64-pc-windows-gnu -p neural-forge-helper`
 
 use std::ffi::c_void;
 
-use neuralforge_helper::spoof;
+use neural_forge_helper::spoof;
 
 #[link(name = "kernel32")]
 extern "system" {

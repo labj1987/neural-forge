@@ -8,7 +8,7 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).with_name('install.py')
-CLI = Path(os.environ.get('NEURALFORGE_CLI', Path(__file__).resolve().parent.parent / 'target/debug/neuralforge-cli'))
+CLI = Path(os.environ.get('NEURALFORGE_CLI', Path(__file__).resolve().parent.parent / 'target/debug/neural-forge-cli'))
 class InstallTests(unittest.TestCase):
     def test_coexistence_and_owned_removal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -17,11 +17,11 @@ class InstallTests(unittest.TestCase):
             app = root / 'AppDir'
             identity = 'io.github.labj1987.NeuralForge'
             contents = {
-                'bin/neuralforge': 'gui', 'bin/neuralforge-cli': 'cli',
+                'bin/neural-forge': 'gui', 'bin/neural-forge-cli': 'cli',
                 'lib/neuralforge/libneuralforge_layer.so': 'layer',
-                'lib/neuralforge/helper/neuralforge-helper.exe': 'helper',
-                f'share/applications/{identity}.desktop': '[Desktop Entry]\nExec=neuralforge\n',
-                'share/icons/hicolor/scalable/apps/neuralforge.svg': '<svg/>',
+                'lib/neuralforge/helper/neural-forge-helper.exe': 'helper',
+                f'share/applications/{identity}.desktop': '[Desktop Entry]\nExec=neural-forge\n',
+                'share/icons/hicolor/scalable/apps/neural-forge.svg': '<svg/>',
                 f'share/metainfo/{identity}.appdata.xml': '<component/>',
                 'share/vulkan/implicit_layer.d/VK_LAYER_neuralforge_neural.json': json.dumps({'layer': {'name': 'VK_LAYER_neuralforge_neural'}}),
             }
@@ -37,9 +37,9 @@ class InstallTests(unittest.TestCase):
                 self.assertEqual(result.returncode == 0, ok, result.stderr)
             run('install', '--appdir', str(app))
             run('install', '--appdir', str(app))
-            binary = data / 'neuralforge/bin/neuralforge'
+            binary = data / 'neuralforge/bin/neural-forge'
             with binary.open('rb') as running_image:
-                (app / 'usr/bin/neuralforge').write_text('updated gui')
+                (app / 'usr/bin/neural-forge').write_text('updated gui')
                 run('install', '--appdir', str(app))
                 self.assertEqual(running_image.read(), b'gui')
                 self.assertEqual(binary.read_text(), 'updated gui')
@@ -48,7 +48,7 @@ class InstallTests(unittest.TestCase):
             run('uninstall')
             self.assertEqual(binary.read_text(), 'user changed')
             self.assertEqual(upstream.read_text(), 'upstream sentinel')
-            self.assertFalse((data / 'neuralforge/bin/neuralforge-cli').exists())
+            self.assertFalse((data / 'neuralforge/bin/neural-forge-cli').exists())
             legacy = root / 'legacy.json'
             legacy.write_text(json.dumps({'layer': {'name': 'VK_LAYER_NV_dlssnr'}}))
             run('archive-legacy-manifest', '--legacy-manifest', str(legacy), ok=False)

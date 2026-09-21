@@ -90,7 +90,7 @@ pub struct FrameResources {
 unsafe impl Send for FrameResources {}
 
 fn color_format(proxy: u32) -> Option<vk::Format> {
-    use neuralforge_protocol::enums::proxy_format;
+    use neural_forge_protocol::enums::proxy_format;
     match proxy {
         proxy_format::RGBA8 => Some(vk::Format::R8G8B8A8_UNORM),
         proxy_format::BGRA8 => Some(vk::Format::B8G8R8A8_UNORM),
@@ -523,7 +523,7 @@ impl FrameResources {
         motion: &[u8],
         motion_scale: [f32; 2],
         reset_history: bool,
-        tuning: neuralforge_protocol::PassTuning,
+        tuning: neural_forge_protocol::PassTuning,
         answer_out: &mut [u8],
     ) -> Option<FrameTiming> {
         let pixel_count = (self.width as usize) * (self.height as usize);
@@ -944,7 +944,7 @@ enum TransferKind {
 
 #[cfg(test)] mod format_tests {
     use super::*;
-    use neuralforge_protocol::enums::proxy_format;
+    use neural_forge_protocol::enums::proxy_format;
     #[test]
     #[ignore = "requires Vulkan under Wine on real hardware"]
     fn rgba_and_bgra_resources_recreate_on_format_change() {

@@ -12,7 +12,7 @@ directly as device memory via `VK_EXT_external_memory_host`. That still means ev
 frame crosses through system RAM. DMA-BUF transport is the next lever: share the
 *actual GPU-resident image* between the layer's device and the helper's device, with
 no host round trip at all -- the theoretical ceiling for this pipeline's transport
-cost. `neuralforge_protocol::ShmHeader` already reserves the fields this would need
+cost. `neural_forge_protocol::ShmHeader` already reserves the fields this would need
 (`proxy_export_seq`/`proxy_pid`/`proxy_fd`/`proxy_gen` and the `answer_*` equivalents,
 plus `layer_proxy_seq`/`layer_answer_seq` as the importer's echo) -- written
 speculatively in an earlier session, before anyone had confirmed the underlying

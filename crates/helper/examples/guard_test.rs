@@ -12,8 +12,8 @@
 //! reaches a real hardware page fault, which is what this test needs to prove
 //! anything about `guard::guarded` at all.
 //!
-//! Run under Wine: `cargo run --example guard_test --target x86_64-pc-windows-gnu -p neuralforge-helper`
-use neuralforge_helper::guard;
+//! Run under Wine: `cargo run --example guard_test --target x86_64-pc-windows-gnu -p neural-forge-helper`
+use neural_forge_helper::guard;
 
 fn main() {
     guard::install();

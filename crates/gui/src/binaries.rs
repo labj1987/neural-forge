@@ -1,12 +1,12 @@
-//! Importing NVIDIA's NGX DLLs into `neuralforge_supervisor::paths::binaries_dir()` --
-//! the same destination `neuralforge-cli import-binaries` uses. The path itself now comes
-//! from the shared `neuralforge-supervisor` crate; only the actual file-copy loop is kept
+//! Importing NVIDIA's NGX DLLs into `neural_forge_supervisor::paths::binaries_dir()` --
+//! the same destination `neural-forge-cli import-binaries` uses. The path itself now comes
+//! from the shared `neural-forge-supervisor` crate; only the actual file-copy loop is kept
 //! here, since it's a handful of lines with nothing else in `supervisor` needing it.
 
 const NGX_FILES: [&str; 3] = ["nvngx_dlssnr.dll", "nvngx.dll", "nvapi64.dll"];
 
 pub fn dir() -> std::path::PathBuf {
-    std::path::PathBuf::from(neuralforge_supervisor::paths::binaries_dir())
+    std::path::PathBuf::from(neural_forge_supervisor::paths::binaries_dir())
 }
 
 /// Every known NGX file, and whether it's currently present in [`dir`] -- the

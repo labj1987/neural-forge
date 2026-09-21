@@ -29,7 +29,7 @@
 //! the GLSL in `shaders/encode.comp` can be checked against it with plain `#[test]`s.
 //! The two are hand-kept in sync; GLSL and Rust cannot share source.
 
-use neuralforge_protocol::enums::reversible_mode;
+use neural_forge_protocol::enums::reversible_mode;
 
 /// The knee point shared by the soft knee and the hybrid curve.
 const KNEE: f32 = 0.75;

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# build-appimage.sh — build the neuralforge AppImage.
+# build-appimage.sh — build the Neural Forge AppImage.
 # Run from the repo root on Ubuntu (matches GreenLight/KernelPop/SteamPunk's own CI
 # assumption). Run as root in CI.
 #
@@ -8,7 +8,10 @@
 # user-owned, so AppRun just execs the GUI directly.
 set -euo pipefail
 
+# APP is the layer's frozen identity (VK_LAYER_neuralforge_neural, libneuralforge_layer.so,
+# lib/neuralforge/); NAME is the user-facing binary/AppImage name. See CLAUDE.md "Naming convention".
 APP="neuralforge"
+NAME="neural-forge"
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 ARCH="x86_64"
 BUILD_DIR="build-appimage"
@@ -23,7 +26,7 @@ WIN_TARGET="x86_64-pc-windows-gnu"
 # instead -- override CARGO_HELPER via the environment if building there.
 CARGO_HELPER="${CARGO_HELPER:-cargo}"
 
-echo "==> Building $APP $VERSION AppImage"
+echo "==> Building $NAME $VERSION AppImage"
 
 # ── Build dependencies ────────────────────────────────────────────────
 if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null; then
@@ -59,8 +62,8 @@ fi
 echo "==> cargo build --release (protocol/layer/gui/cli)"
 cargo build --release
 
-echo "==> $CARGO_HELPER build --release --target $WIN_TARGET -p neuralforge-helper"
-$CARGO_HELPER build --release --target "$WIN_TARGET" -p neuralforge-helper
+echo "==> $CARGO_HELPER build --release --target $WIN_TARGET -p neural-forge-helper"
+$CARGO_HELPER build --release --target "$WIN_TARGET" -p neural-forge-helper
 
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
@@ -71,14 +74,14 @@ mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/metainfo" \
          "$APPDIR/usr/share/vulkan/implicit_layer.d"
 
-cp "target/release/$APP"                       "$APPDIR/usr/bin/"
-cp "target/release/$APP-cli"                       "$APPDIR/usr/bin/"
+cp "target/release/$NAME"                      "$APPDIR/usr/bin/"
+cp "target/release/$NAME-cli"                       "$APPDIR/usr/bin/"
 cp "target/release/lib${APP}_layer.so"             "$APPDIR/usr/lib/$APP/"
-cp "target/$WIN_TARGET/release/${APP}-helper.exe"  "$APPDIR/usr/lib/$APP/helper/"
+cp "target/$WIN_TARGET/release/${NAME}-helper.exe"  "$APPDIR/usr/lib/$APP/helper/"
 sed "s#\./lib${APP}_layer\.so#../../../lib/$APP/lib${APP}_layer.so#" \
     "data/VK_LAYER_${APP}_neural.json" > "$APPDIR/usr/share/vulkan/implicit_layer.d/VK_LAYER_${APP}_neural.json"
 cp data/io.github.labj1987.NeuralForge.desktop                               "$APPDIR/usr/share/applications/"
-cp data/icon.svg                                   "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP.svg"
+cp data/icon.svg                                   "$APPDIR/usr/share/icons/hicolor/scalable/apps/$NAME.svg"
 # The <releases> list is generated from CHANGELOG.md's version headings, and fails the
 # build if the newest one is not this workspace version.
 python3 scripts/sync_appdata_releases.py
@@ -86,7 +89,7 @@ cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/meta
 
 # Top-level AppImage requirements
 cp data/io.github.labj1987.NeuralForge.desktop "$APPDIR/"
-cp data/icon.svg "$APPDIR/$APP.svg"
+cp data/icon.svg "$APPDIR/$NAME.svg"
 
 # ── AppRun ────────────────────────────────────────────────────────────
 cat > "$APPDIR/AppRun" << 'APPRUN'
@@ -97,7 +100,7 @@ export PATH="$HERE/usr/bin:$PATH"
 # loader needs an explicit path to it -- there is no writable implicit_layer.d this
 # install owns to drop it into (this app needs no root/install step at all).
 export VK_ADD_LAYER_PATH="$HERE/usr/share/vulkan/implicit_layer.d${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
-exec "$HERE/usr/bin/neuralforge" "$@"
+exec "$HERE/usr/bin/neural-forge" "$@"
 APPRUN
 chmod 755 "$APPDIR/AppRun"
 
@@ -122,10 +125,10 @@ if [[ ! -f "$TOOL" ]] || ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --s
 fi
 
 echo "==> Packing AppImage"
-OUT="NeuralForge-$VERSION-$ARCH.AppImage"
+OUT="neural-forge-$VERSION-$ARCH.AppImage"
 
 # Use the canonical renamed repository for release updates.
-UPDATE_INFORMATION="gh-releases-zsync|labj1987|NeuralForge|latest|NeuralForge-*-x86_64.AppImage.zsync"
+UPDATE_INFORMATION="gh-releases-zsync|labj1987|neural-forge|latest|neural-forge-*-x86_64.AppImage.zsync"
 VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
     -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
 
@@ -143,10 +146,25 @@ ls -lh "$OUT"
 # only resolves correctly if a client does real relative-URL resolution against
 # wherever it fetched this .zsync from -- not guaranteed. Point it at this exact
 # release's real, absolute GitHub download URL instead of relying on that.
-ZSYNC_URL="https://github.com/labj1987/NeuralForge/releases/download/v$VERSION/$OUT"
+ZSYNC_URL="https://github.com/labj1987/neural-forge/releases/download/v$VERSION/$OUT"
 echo "==> Generating .zsync sidecar"
 if zsyncmake -u "$ZSYNC_URL" "$OUT"; then
     echo "==> .zsync generated: $OUT.zsync"
 else
     echo "==> WARNING: zsyncmake failed — continuing without .zsync"
+fi
+
+# ── Legacy-name compatibility assets ──────────────────────────────────
+# AppImages released before the rename embed update information that matches
+# `NeuralForge-*-x86_64.AppImage.zsync` on this repo's releases (GitHub redirects the
+# old repo name). Publish a byte-identical copy under the legacy name, with its own
+# .zsync, so those installs can still find and fetch this release. Drop once no
+# pre-rename installs remain.
+LEGACY="NeuralForge-$VERSION-$ARCH.AppImage"
+cp "$OUT" "$LEGACY"
+LEGACY_URL="https://github.com/labj1987/neural-forge/releases/download/v$VERSION/$LEGACY"
+if zsyncmake -u "$LEGACY_URL" "$LEGACY"; then
+    echo "==> legacy-name copy + .zsync generated: $LEGACY"
+else
+    echo "==> WARNING: zsyncmake failed for the legacy-name copy"
 fi

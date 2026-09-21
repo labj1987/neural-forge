@@ -2,7 +2,7 @@
 //! (Lanczos, Catmull-Rom, Mitchell-Netravali/"bicubic", Kaiser-windowed sinc), each
 //! implemented directly from its mathematical definition — none of this needs, or
 //! reads, upstream's `.spv`/`.h` pairs. Matches
-//! [`neuralforge_protocol::enums::downscaler`]'s numbering (kept because it's a settings
+//! [`neural_forge_protocol::enums::downscaler`]'s numbering (kept because it's a settings
 //! contract, not an algorithm — see that module's doc comment).
 //!
 //! Each filter here is a 1D kernel; a 2D resample separably applies it along each
@@ -11,7 +11,7 @@
 //! reference the shader is translated from and the thing `#[test]`s below check
 //! against known closed-form values.
 
-use neuralforge_protocol::enums::downscaler;
+use neural_forge_protocol::enums::downscaler;
 
 /// `sinc(x) = sin(pi*x) / (pi*x)`, with the removable singularity at 0 filled in.
 fn sinc(x: f32) -> f32 {
@@ -93,7 +93,7 @@ fn bessel_i0(x: f32) -> f32 {
 }
 
 /// The 1D kernel value at offset `x` (in samples) for the given
-/// [`neuralforge_protocol::enums::downscaler`] value. Unsupported/unknown values (`FSR1`,
+/// [`neural_forge_protocol::enums::downscaler`] value. Unsupported/unknown values (`FSR1`,
 /// or anything out of range) fall back to `LANCZOS3`, matching the protocol's own
 /// documented fallback behavior for a value this pipeline can't run.
 pub fn kernel(x: f32, downscaler_kind: u32) -> f32 {
@@ -178,7 +178,7 @@ fn plan_axis(src_len: u32, dst_len: u32, downscaler_kind: u32) -> AxisPlan {
 }
 
 /// Resamples an interleaved RGBA8 buffer from `(src_w, src_h)` to `(dst_w, dst_h)`
-/// using the [`neuralforge_protocol::enums::downscaler`] kernel named by
+/// using the [`neural_forge_protocol::enums::downscaler`] kernel named by
 /// `downscaler_kind`, applied separably (horizontal pass, then vertical) exactly as
 /// this module's own doc comment says every kernel here is meant to be used. Works in
 /// either direction -- minifying (sending a smaller proxy to the model) or magnifying

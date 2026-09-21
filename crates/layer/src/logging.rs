@@ -11,7 +11,7 @@ use std::sync::{Mutex, OnceLock};
 // `set_frame_info`/`capture::run` log unconditionally once (now twice, with the added
 // timing line) per frame, from inside the game's own `vkQueuePresentKHR` override --
 // truly the hottest of hot paths. `NEURALFORGE_LOG` is only ever set for
-// `neuralforge-helper.exe` by `neuralforge_supervisor::start()` (confirmed by grep) -- nothing
+// `neural-forge-helper.exe` by `neural_forge_supervisor::start()` (confirmed by grep) -- nothing
 // sets it for the game's own launch environment, so in every real deployment this
 // crate has ever run in, `sink()` falls into `Stderr`, never `File`. A 2026-09-10
 // `strace -e trace=write` on a live game process on `lordnikon` confirmed the
@@ -52,7 +52,7 @@ fn sink() -> &'static Mutex<Sink> {
     SINK.get_or_init(|| {
         let sink = std::env::var("NEURALFORGE_LOG")
             .ok()
-            .filter(|p| !p.is_empty() && neuralforge_protocol::isolated_path(p))
+            .filter(|p| !p.is_empty() && neural_forge_protocol::isolated_path(p))
             .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
             .map(|f| Sink::File(BufWriter::new(f)))
             .unwrap_or_else(|| Sink::Stderr(BufWriter::new(std::io::stderr())));

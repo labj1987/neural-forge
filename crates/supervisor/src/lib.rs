@@ -1,5 +1,5 @@
 //! Shared helper-process supervision: config, XDG paths, and start/stop, used by
-//! both `neuralforge-cli` and `neuralforge` so "how to launch the helper" (runner type,
+//! both `neural-forge-cli` and `neuralforge` so "how to launch the helper" (runner type,
 //! environment variables, the Proton-vs-Wine command line) exists in exactly one
 //! place instead of being duplicated and risking drift between the two front ends.
 //! Linux-only: spawns child processes, reads XDG env vars.
@@ -17,7 +17,7 @@ pub use config::Config;
 use std::time::Duration;
 
 pub fn pid_file() -> String {
-    format!("{}/helper.pid", neuralforge_protocol::shm_runtime_dir())
+    format!("{}/helper.pid", neural_forge_protocol::shm_runtime_dir())
 }
 
 /// The helper's PID if a process is actually alive at the PID in the pid file.
@@ -28,7 +28,7 @@ pub fn is_running() -> Option<i32> {
 /// Graceful-then-forced stop of the whole helper process group.
 ///
 /// Real, confirmed bug on `lordnikon` (2026-09-11): `process::stop`'s process-group
-/// kill can report success while the actual Wine-hosted `neuralforge-helper.exe` survives
+/// kill can report success while the actual Wine-hosted `neural-forge-helper.exe` survives
 /// anyway, once wineserver has taken it over -- Wine's own internal process
 /// management doesn't reliably keep every process inside the group the original
 /// `setsid()` created. Confirmed via a real, orphaned helper left running after a
@@ -42,9 +42,11 @@ pub fn is_running() -> Option<i32> {
 /// surfacing), run after the normal group kill so a routine stop/restart no longer
 /// needs a human to notice and clean this up by hand.
 pub fn stop(timeout: Duration) -> std::io::Result<()> {
+    // "forge-helper" matches both `neural-forge-helper.exe` and the pre-0.1.76 name
+    // `neuralforge-helper.exe`, so a helper started by an older install is still stopped.
     // Both runners (plain Wine, Proton) carry the helper's path in their own command
     // line, which is what guards against signaling a process that reused the PID.
-    process::stop_matching(&pid_file(), timeout, Some("neuralforge-helper"))?;
+    process::stop_matching(&pid_file(), timeout, Some("forge-helper"))?;
     let cfg = Config::load();
     if let Some(wineserver) = wineserver_binary(&cfg) {
         let _ = std::process::Command::new(wineserver).arg("-k").env("WINEPREFIX", real_wineprefix(&cfg, &paths::prefix_dir())).status();
@@ -102,8 +104,8 @@ impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             StartError::AlreadyRunning(pid) => write!(f, "helper already running (pid {pid})"),
-            StartError::HelperNotFound => write!(f, "neuralforge-helper.exe not found"),
-            StartError::NoRunnerConfigured => write!(f, "no runner configured (run `neuralforge-cli init` first)"),
+            StartError::HelperNotFound => write!(f, "neural-forge-helper.exe not found"),
+            StartError::NoRunnerConfigured => write!(f, "no runner configured (run `neural-forge-cli init` first)"),
             StartError::Spawn(e) => write!(f, "failed to start helper: {e}"),
         }
     }

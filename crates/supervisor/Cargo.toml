@@ -1,13 +1,13 @@
 [package]
-name = "neuralforge-supervisor"
+name = "neural-forge-supervisor"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Shared helper-process supervision (config, paths, start/stop) for neuralforge-cli and neuralforge"
+description = "Shared helper-process supervision (config, paths, start/stop) for neural-forge-cli and neuralforge"
 
 [dependencies]
-neuralforge-protocol = { path = "../protocol" }
+neural-forge-protocol = { path = "../protocol" }
 libc = "0.2"
 # Process-group supervision (setsid, signaling a whole group) -- see process.rs's
 # doc comment for why this needed care to actually replicate upstream's bash script's

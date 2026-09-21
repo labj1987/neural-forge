@@ -2,7 +2,7 @@
 //!
 //! Hooks the swapchain lifecycle (`vkCreateSwapchainKHR`/`vkDestroySwapchainKHR`/
 //! `vkQueuePresentKHR`) and exchanges frames with the helper over the shared-memory
-//! transport defined in `neuralforge_protocol`. This crate never knows or cares whether the
+//! transport defined in `neural_forge_protocol`. This crate never knows or cares whether the
 //! helper on the other end of that mapping is running under Wine/Proton today or a
 //! native Linux process later — that's the whole point of the seam.
 //!

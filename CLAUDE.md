@@ -1,18 +1,38 @@
-# NeuralForge developer guidance
+# Neural Forge developer guidance
 
-Repository: https://github.com/labj1987/NeuralForge
+Repository: https://github.com/labj1987/neural-forge
 
 Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
 benchmark plan. The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
 
+## Naming convention
+
+- Display name (anything a person reads: window titles, About, docs prose): **Neural Forge**.
+- Hyphenated lowercase `neural-forge` for everything a machine or filesystem names: the
+  repo, Cargo package names (`neural-forge-cli`, `neural-forge-protocol`, ...), binaries
+  (`neural-forge`, `neural-forge-cli`, `neural-forge-helper.exe`), the AppImage
+  (`neural-forge-<version>-x86_64.AppImage`), the icon (`neural-forge.svg`).
+- **Frozen, never rename** (renaming breaks layer registration and users' env/config): the
+  app ID `io.github.labj1987.NeuralForge` (and the `.desktop`/appdata files named after it),
+  the Vulkan layer `VK_LAYER_neuralforge_neural`, its manifest `VK_LAYER_neuralforge_neural.json`,
+  the layer library `libneuralforge_layer.so` (`[lib] name = "neuralforge_layer"` pinned in
+  `crates/layer/Cargo.toml`) and its `lib/neuralforge/` install dir, all `NEURALFORGE_*`
+  environment variables, the `neuralforge` XDG config/data/state dirs, `/tmp/neuralforge-$UID`
+  and the shared-memory names, and the `[neuralforge-layer]`/`[neuralforge-helper]` log prefixes.
+- Where an installed executable name changed, the installer's record-based stale-file
+  removal cleans the old files, and code that looks up or matches the helper accepts both
+  `neural-forge-helper.exe` and the legacy `neuralforge-helper.exe`. The release also
+  publishes a legacy-named `NeuralForge-*` AppImage copy so pre-rename installs' zsync
+  update info still resolves.
+
 ## Build and test
 
 - `cargo test` and `cargo build --release` build the native default members.
 - Do not use `--workspace` on Linux: the helper targets Windows only.
-- `cargo +stable build --release --target x86_64-pc-windows-gnu -p neuralforge-helper`
+- `cargo +stable build --release --target x86_64-pc-windows-gnu -p neural-forge-helper`
   builds the helper when the cross target is installed in the stable toolchain.
-- `CARGO_HELPER='cargo +stable' bash build-appimage.sh` packages NeuralForge.
+- `CARGO_HELPER='cargo +stable' bash build-appimage.sh` packages Neural Forge.
 - Run `python3 scripts/check_namespace.py`, `python3 scripts/test_install.py`,
   and `bash scripts/smoke-test.sh` for namespace, installation and Vulkan checks.
 

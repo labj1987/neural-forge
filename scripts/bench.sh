@@ -15,7 +15,7 @@
 # Needs: steam, nvidia-smi, xdotool (to trigger MangoHud's own toggle_logging hotkey
 # on the game window -- this repo does not control MangoHud, so it drives the exact
 # hotkey already configured in ~/.config/MangoHud/MangoHud.conf rather than guessing
-# at an autostart config key). For upstream/neuralforge modes, neuralforge-cli must
+# at an autostart config key). For upstream/neuralforge modes, neural-forge-cli must
 # already be on PATH (see docs/PHASE1.md's install step) for the layer-side telemetry
 # sample; native mode skips that half.
 #
@@ -117,8 +117,8 @@ START="$(date +%s.%N)"
 for ((i = 0; i < DURATION; i++)); do
     GPU="$(nvidia-smi --query-gpu=utilization.gpu,memory.used,power.draw,temperature.gpu \
         --format=csv,noheader,nounits 2>/dev/null || echo "")"
-    if [ "$MODE" != "native" ] && command -v neuralforge-cli >/dev/null 2>&1; then
-        STATUS="$(neuralforge-cli shmctl status 2>/dev/null || echo "")"
+    if [ "$MODE" != "native" ] && command -v neural-forge-cli >/dev/null 2>&1; then
+        STATUS="$(neural-forge-cli shmctl status 2>/dev/null || echo "")"
     else
         STATUS=""
     fi

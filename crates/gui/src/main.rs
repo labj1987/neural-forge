@@ -31,8 +31,8 @@ fn main() {
     // synchronous: the window is already gone, and the process must not exit before
     // the helper has been stopped.
     app.connect_shutdown(|_| {
-        if neuralforge_supervisor::is_running().is_some() {
-            let _ = neuralforge_supervisor::stop(std::time::Duration::from_secs(5));
+        if neural_forge_supervisor::is_running().is_some() {
+            let _ = neural_forge_supervisor::stop(std::time::Duration::from_secs(5));
         }
     });
 

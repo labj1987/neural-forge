@@ -5,7 +5,7 @@
 //! machine, which the GUI/CLI have no reason to duplicate or depend on).
 //!
 //! Linux-only (`cfg(unix)`, though in practice only ever built for Linux in this
-//! workspace) — the Windows-side equivalent is `neuralforge_helper::shm`, a different
+//! workspace) — the Windows-side equivalent is `neural_forge_helper::shm`, a different
 //! enough set of Win32 APIs that sharing this module across the OS boundary would
 //! cost more in `cfg` noise than it would save in shared logic.
 

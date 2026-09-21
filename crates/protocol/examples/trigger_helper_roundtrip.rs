@@ -11,7 +11,7 @@
 //!
 //! Respects `$NEURALFORGE_SHM`/`$NEURALFORGE_UID`, same as every other tool in this
 //! workspace. Maps the *full* `shm_total_bytes()` region (unlike
-//! `neuralforge_protocol::mapping::open`, which only maps the header -- the GUI/CLI's own
+//! `neural_forge_protocol::mapping::open`, which only maps the header -- the GUI/CLI's own
 //! use case never needs the pixel regions) -- same reasoning `read_mapping.rs` already
 //! uses for going around the library's own (header-only) `mapping` module.
 //!
@@ -26,7 +26,7 @@ use std::os::fd::AsRawFd;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use neuralforge_protocol::{answer_offset_slot, proxy_offset_slot, shm_default_path, shm_total_bytes, ShmHeader};
+use neural_forge_protocol::{answer_offset_slot, proxy_offset_slot, shm_default_path, shm_total_bytes, ShmHeader};
 
 fn main() {
     let path = std::env::var("NEURALFORGE_SHM").ok().filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
@@ -47,9 +47,9 @@ fn main() {
     let hdr = unsafe { &*map.cast::<ShmHeader>() };
     assert!(hdr.is_valid(), "not a valid NeuralForge mapping at {path}");
 
-    let proxy_format = neuralforge_protocol::enums::proxy_format::RGBA8;
+    let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
     let frame_bytes = (width as usize) * (height as usize) * 4;
-    assert!(frame_bytes <= neuralforge_protocol::MAX_FRAME, "requested frame too large for MAX_FRAME");
+    assert!(frame_bytes <= neural_forge_protocol::MAX_FRAME, "requested frame too large for MAX_FRAME");
 
     // A real, checkable, non-zero pattern -- not just zero-filled, so a real
     // (as opposed to a silently-echoed-back) evaluation is at least plausible from

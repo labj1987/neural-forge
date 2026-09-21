@@ -2,7 +2,7 @@
 """Install an extracted NeuralForge AppDir; remove only unchanged tracked files.
 No system package, upstream path, config, runtime file or Wine prefix is removed.
 
-install/uninstall delegate to `neuralforge-cli` (the single implementation, in
+install/uninstall delegate to `neural-forge-cli` (the single implementation, in
 crates/supervisor/src/install.rs); archive-legacy-manifest is handled here.
 """
 import argparse
@@ -18,7 +18,7 @@ def main():
     parser.add_argument('command', choices=['install', 'uninstall', 'archive-legacy-manifest'])
     parser.add_argument('--appdir', type=Path)
     parser.add_argument('--legacy-manifest', type=Path)
-    parser.add_argument('--cli', type=Path, help='neuralforge-cli to delegate install/uninstall to')
+    parser.add_argument('--cli', type=Path, help='neural-forge-cli to delegate install/uninstall to')
     args = parser.parse_args()
     data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
     root = data / 'neuralforge'
@@ -43,7 +43,7 @@ def main():
         print(f'Archived {src} to {archive}; config, runtime and libraries untouched')
         return
     # `install` and `uninstall` are implemented once, in Rust
-    # (crates/supervisor/src/install.rs), and reached through `neuralforge-cli`. This
+    # (crates/supervisor/src/install.rs), and reached through `neural-forge-cli`. This
     # script used to carry a second copy of the same on-disk format; CI only exercised
     # that copy, so the one users actually run (the GUI's Setup tab) could drift.
     cli = find_cli(args)
@@ -53,17 +53,17 @@ def main():
     os.execv(str(cli), command)
 
 def find_cli(args):
-    """The neuralforge-cli to delegate to: --cli, $NEURALFORGE_CLI, the AppDir being
+    """The neural-forge-cli to delegate to: --cli, $NEURALFORGE_CLI, the AppDir being
     installed, an already-installed copy, then a local cargo build."""
     repo = Path(__file__).resolve().parent.parent
     data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
     candidates = [args.cli, os.environ.get('NEURALFORGE_CLI') and Path(os.environ['NEURALFORGE_CLI'])]
     if args.appdir is not None:
-        candidates.append(args.appdir / 'usr/bin/neuralforge-cli')
-    candidates += [data / 'neuralforge/bin/neuralforge-cli', repo / 'target/release/neuralforge-cli', repo / 'target/debug/neuralforge-cli']
+        candidates.append(args.appdir / 'usr/bin/neural-forge-cli')
+    candidates += [data / 'neuralforge/bin/neural-forge-cli', repo / 'target/release/neural-forge-cli', repo / 'target/debug/neural-forge-cli']
     for candidate in candidates:
         if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
             return Path(candidate)
-    raise SystemExit('neuralforge-cli not found; build it (cargo build -p neuralforge-cli) or pass --cli')
+    raise SystemExit('neural-forge-cli not found; build it (cargo build -p neural-forge-cli) or pass --cli')
 
 if __name__ == '__main__': main()

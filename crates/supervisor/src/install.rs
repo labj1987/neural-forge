@@ -145,7 +145,7 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         files.insert(root.join("lib/neuralforge").join(rel), std::fs::read(&src)?);
     }
 
-    for binary in ["neuralforge", "neuralforge-cli"] {
+    for binary in ["neural-forge", "neural-forge-cli"] {
         files.insert(root.join("bin").join(binary), std::fs::read(usr.join("bin").join(binary))?);
     }
 
@@ -161,11 +161,11 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     files.insert(data_home.join(format!("vulkan/implicit_layer.d/{LAYER}.json")), manifest_out.into_bytes());
 
     let desktop_src = usr.join(format!("share/applications/{APP_ID}.desktop"));
-    let exec_line = format!("Exec=\"{}\"", root.join("bin/neuralforge").display());
-    let desktop_text = std::fs::read_to_string(&desktop_src)?.replace("Exec=neuralforge", &exec_line);
+    let exec_line = format!("Exec=\"{}\"", root.join("bin/neural-forge").display());
+    let desktop_text = std::fs::read_to_string(&desktop_src)?.replace("Exec=neural-forge", &exec_line);
     files.insert(data_home.join(format!("applications/{APP_ID}.desktop")), desktop_text.into_bytes());
 
-    for (sub, name) in [("icons/hicolor/scalable/apps", "neuralforge.svg".to_string()), ("metainfo", format!("{APP_ID}.appdata.xml"))] {
+    for (sub, name) in [("icons/hicolor/scalable/apps", "neural-forge.svg".to_string()), ("metainfo", format!("{APP_ID}.appdata.xml"))] {
         let src = usr.join("share").join(sub).join(&name);
         files.insert(data_home.join(sub).join(&name), std::fs::read(&src)?);
     }
@@ -215,7 +215,7 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         save_record(&record)?;
     }
 
-    Ok(InstallReport { root: root.clone(), gui_path: root.join("bin/neuralforge"), cli_path: root.join("bin/neuralforge-cli") })
+    Ok(InstallReport { root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") })
 }
 
 /// Removes every tracked file whose on-disk content still matches this installer's
@@ -279,12 +279,12 @@ mod tests {
     /// implementations are exercised against the same shape of AppDir.
     fn write_fixture_appdir(appdir: &Path) {
         let files = [
-            ("usr/bin/neuralforge", "gui"),
-            ("usr/bin/neuralforge-cli", "cli"),
+            ("usr/bin/neural-forge", "gui"),
+            ("usr/bin/neural-forge-cli", "cli"),
             ("usr/lib/neuralforge/libneuralforge_layer.so", "layer"),
-            ("usr/lib/neuralforge/helper/neuralforge-helper.exe", "helper"),
-            (&format!("usr/share/applications/{APP_ID}.desktop"), "[Desktop Entry]\nExec=neuralforge\n"),
-            ("usr/share/icons/hicolor/scalable/apps/neuralforge.svg", "<svg/>"),
+            ("usr/lib/neuralforge/helper/neural-forge-helper.exe", "helper"),
+            (&format!("usr/share/applications/{APP_ID}.desktop"), "[Desktop Entry]\nExec=neural-forge\n"),
+            ("usr/share/icons/hicolor/scalable/apps/neural-forge.svg", "<svg/>"),
             (&format!("usr/share/metainfo/{APP_ID}.appdata.xml"), "<component/>"),
             (&format!("usr/share/vulkan/implicit_layer.d/{LAYER}.json"), r#"{"layer": {"name": "VK_LAYER_neuralforge_neural"}}"#),
         ];
@@ -304,10 +304,10 @@ mod tests {
         let report = install(&appdir).expect("install should succeed against a well-formed AppDir");
         let root = PathBuf::from(paths::data_dir());
         assert_eq!(report.root, root);
-        assert_eq!(std::fs::read_to_string(root.join("bin/neuralforge")).unwrap(), "gui");
-        assert_eq!(std::fs::read_to_string(root.join("bin/neuralforge-cli")).unwrap(), "cli");
+        assert_eq!(std::fs::read_to_string(root.join("bin/neural-forge")).unwrap(), "gui");
+        assert_eq!(std::fs::read_to_string(root.join("bin/neural-forge-cli")).unwrap(), "cli");
         assert_eq!(std::fs::read_to_string(root.join("lib/neuralforge/libneuralforge_layer.so")).unwrap(), "layer");
-        assert_eq!(std::fs::read_to_string(root.join("lib/neuralforge/helper/neuralforge-helper.exe")).unwrap(), "helper");
+        assert_eq!(std::fs::read_to_string(root.join("lib/neuralforge/helper/neural-forge-helper.exe")).unwrap(), "helper");
 
         let manifest_path = PathBuf::from(paths::data_home()).join(format!("vulkan/implicit_layer.d/{LAYER}.json"));
         let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
@@ -316,7 +316,7 @@ mod tests {
 
         let desktop_path = PathBuf::from(paths::data_home()).join(format!("applications/{APP_ID}.desktop"));
         let desktop = std::fs::read_to_string(desktop_path).unwrap();
-        assert!(desktop.contains(&format!("Exec=\"{}\"", root.join("bin/neuralforge").display())));
+        assert!(desktop.contains(&format!("Exec=\"{}\"", root.join("bin/neural-forge").display())));
 
         assert!(record_path().exists());
     }
@@ -390,18 +390,51 @@ mod tests {
     }
 
     #[test]
+    fn install_removes_files_left_by_a_pre_rename_install() {
+        let scratch = ScratchDataHome::new("pre-rename");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+
+        // Turn the fresh install into what a pre-0.1.76 one left behind: same content,
+        // legacy executable/icon names, recorded under those names.
+        let root = PathBuf::from(paths::data_dir());
+        let icons = PathBuf::from(paths::data_home()).join("icons/hicolor/scalable/apps");
+        let moves = [
+            (root.join("bin/neural-forge"), root.join("bin/neuralforge")),
+            (root.join("bin/neural-forge-cli"), root.join("bin/neuralforge-cli")),
+            (root.join("lib/neuralforge/helper/neural-forge-helper.exe"), root.join("lib/neuralforge/helper/neuralforge-helper.exe")),
+            (icons.join("neural-forge.svg"), icons.join("neuralforge.svg")),
+        ];
+        let mut record = load_record();
+        for (new, legacy) in &moves {
+            std::fs::rename(new, legacy).unwrap();
+            let digest = record.remove(&new.to_string_lossy().into_owned()).unwrap();
+            record.insert(legacy.to_string_lossy().into_owned(), digest);
+        }
+        save_record(&record).unwrap();
+
+        install(&appdir).unwrap();
+        for (new, legacy) in &moves {
+            assert!(new.is_file(), "{} should be installed", new.display());
+            assert!(!legacy.exists(), "{} should have been cleaned up", legacy.display());
+            assert!(!load_record().contains_key(&legacy.to_string_lossy().into_owned()));
+        }
+    }
+
+    #[test]
     fn reinstall_replaces_by_rename_not_in_place_truncation() {
         let scratch = ScratchDataHome::new("rename-replace");
         let appdir = scratch.dir.join("AppDir");
         write_fixture_appdir(&appdir);
         install(&appdir).unwrap();
 
-        let binary = PathBuf::from(paths::data_dir()).join("bin/neuralforge");
+        let binary = PathBuf::from(paths::data_dir()).join("bin/neural-forge");
         // Stands in for an already-running process with the old inode mapped --
         // opening it for read before the reinstall, then confirming it still reads
         // the pre-update bytes after the reinstall's write lands.
         let running = std::fs::File::open(&binary).unwrap();
-        std::fs::write(appdir.join("usr/bin/neuralforge"), "updated gui").unwrap();
+        std::fs::write(appdir.join("usr/bin/neural-forge"), "updated gui").unwrap();
         install(&appdir).unwrap();
 
         use std::io::Read;
@@ -418,7 +451,7 @@ mod tests {
         write_fixture_appdir(&appdir);
         install(&appdir).unwrap();
 
-        let binary = PathBuf::from(paths::data_dir()).join("bin/neuralforge");
+        let binary = PathBuf::from(paths::data_dir()).join("bin/neural-forge");
         std::fs::write(&binary, "user changed").unwrap();
 
         let err = install(&appdir).expect_err("install must refuse once a tracked file no longer matches its record");
@@ -447,8 +480,8 @@ mod tests {
         write_fixture_appdir(&appdir);
         install(&appdir).unwrap();
 
-        let cli = PathBuf::from(paths::data_dir()).join("bin/neuralforge-cli");
-        let binary = PathBuf::from(paths::data_dir()).join("bin/neuralforge");
+        let cli = PathBuf::from(paths::data_dir()).join("bin/neural-forge-cli");
+        let binary = PathBuf::from(paths::data_dir()).join("bin/neural-forge");
         std::fs::write(&binary, "user changed").unwrap();
 
         let preserved = uninstall().unwrap();

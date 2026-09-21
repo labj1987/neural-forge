@@ -168,7 +168,7 @@ mod tests {
     }
 
     fn scratch_path(name: &str) -> String {
-        format!("{}/neuralforge-cli-test-{}-{name}", std::env::temp_dir().display(), std::process::id())
+        format!("{}/neural-forge-cli-test-{}-{name}", std::env::temp_dir().display(), std::process::id())
     }
 
     // Ignored in this dev sandbox specifically: confirmed by direct reproduction that

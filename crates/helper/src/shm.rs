@@ -9,7 +9,7 @@
 
 use std::ffi::c_void;
 
-use neuralforge_protocol::{answer_offset, answer_offset_slot, proxy_offset, proxy_offset_slot, shm_default_path, shm_total_bytes, MAX_FRAME};
+use neural_forge_protocol::{answer_offset, answer_offset_slot, proxy_offset, proxy_offset_slot, shm_default_path, shm_total_bytes, MAX_FRAME};
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -60,7 +60,7 @@ const INVALID_HANDLE_VALUE: *mut c_void = -1isize as *mut c_void;
 pub struct ShmMapping {
     file: *mut c_void,
     mapping: *mut c_void,
-    pub header: *mut neuralforge_protocol::ShmHeader,
+    pub header: *mut neural_forge_protocol::ShmHeader,
 }
 
 // SAFETY: same reasoning as `neuralforge_layer::shm::ShmClient` (see its `unsafe impl Send`)
@@ -94,7 +94,7 @@ fn parent_dir_utf16(path_utf16: &[u16]) -> Option<Vec<u16>> {
 /// value owns and closes on [`ShmMapping::close`].
 pub fn open() -> Option<ShmMapping> {
     let posix_path = std::env::var("NEURALFORGE_SHM").ok().filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
-    if !neuralforge_protocol::isolated_path(&posix_path) { return None; }
+    if !neural_forge_protocol::isolated_path(&posix_path) { return None; }
     let win_path = windows_path(&posix_path);
 
     if let Some(dir) = parent_dir_utf16(&win_path) {
@@ -125,7 +125,7 @@ pub fn open() -> Option<ShmMapping> {
         return None;
     }
 
-    let total = neuralforge_protocol::shm_total_bytes() as i64;
+    let total = neural_forge_protocol::shm_total_bytes() as i64;
     // SAFETY: `file` is a valid, open, writable file handle from the call above.
     let sized = unsafe {
         SetFilePointerEx(file, total, std::ptr::null_mut(), FILE_BEGIN) != 0 && SetEndOfFile(file) != 0
@@ -181,9 +181,9 @@ pub fn open() -> Option<ShmMapping> {
         return None;
     }
 
-    let header = base.cast::<neuralforge_protocol::ShmHeader>();
+    let header = base.cast::<neural_forge_protocol::ShmHeader>();
     // SAFETY: just mapped above, `shm_total_bytes()` is large enough for `ShmHeader`
-    // (enforced at compile time in `neuralforge_protocol`) plus both pixel regions.
+    // (enforced at compile time in `neural_forge_protocol`) plus both pixel regions.
     let hdr = unsafe { &*header };
     if !hdr.is_valid() {
         hdr.init_defaults();
@@ -201,7 +201,7 @@ impl ShmMapping {
     /// the frame the layer captured, waiting to be evaluated.
     pub fn read_motion(&self, out: &mut [u8]) {
         let n = out.len().min(MAX_FRAME);
-        unsafe { std::ptr::copy_nonoverlapping(self.pixel_base().add(neuralforge_protocol::motion_offset()),out.as_mut_ptr(),n); }
+        unsafe { std::ptr::copy_nonoverlapping(self.pixel_base().add(neural_forge_protocol::motion_offset()),out.as_mut_ptr(),n); }
     }
 
     pub fn read_proxy(&self, out: &mut [u8]) -> usize {

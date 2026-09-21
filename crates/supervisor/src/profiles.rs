@@ -1,5 +1,5 @@
 //! Named settings profiles: `[name]` sections of the same `set_<field>=<value>` lines
-//! `config.ini` itself stores (`neuralforge_protocol::persist::snapshot`/`apply`
+//! `config.ini` itself stores (`neural_forge_protocol::persist::snapshot`/`apply`
 //! already define that shape), saved to their own `profiles.ini` next to it rather
 //! than as extra sections inside `config.ini` -- keeps `Config::load`'s flat parser
 //! untouched and the upstream-compatible `config.ini` format exactly as it was.

@@ -38,7 +38,7 @@ extern "system" {
     fn SetLastError(code: u32);
 }
 
-/// This process's own main-executable module handle (`neuralforge-helper.exe`'s), resolved
+/// This process's own main-executable module handle (`neural-forge-helper.exe`'s), resolved
 /// once via `GetModuleHandleW(NULL)` — the same value the Win32 convention "pass NULL
 /// for the calling process's own module" refers to, and the value equivalent to
 /// upstream's `g_layerModule` (upstream is a DLL and gets this from `DllMain`; this

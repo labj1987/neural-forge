@@ -16,7 +16,7 @@ jobs:
       # libgtk-4-dev/libadwaita-1-dev for the gui crate (glib-sys and friends need the
       # real system libraries via pkg-config, not just a Rust toolchain), mingw for the
       # Windows-only helper crate, and a software Vulkan ICD (lavapipe) so
-      # neuralforge-layer's real-device tests (the GPU compose dispatch's own
+      # neural-forge-layer's real-device tests (the GPU compose dispatch's own
       # gpu_dispatch_matches_the_cpu_reference in particular) actually run here instead
       # of just skipping -- this is exactly the test that caught a real shader bug
       # before it ever reached real hardware (see CLAUDE.md), so it's worth CI
@@ -41,7 +41,7 @@ jobs:
           EOF
 
       # Plain `cargo test`/`cargo check` respect the workspace's `default-members`
-      # (see root Cargo.toml), which deliberately excludes `neuralforge-helper` -- a
+      # (see root Cargo.toml), which deliberately excludes `neural-forge-helper` -- a
       # Windows-only crate that must never be built for the host. See the project's
       # CLAUDE.md "Workspace layout" section for why `--workspace`/`--all` must not be
       # used here.
@@ -49,12 +49,12 @@ jobs:
         run: cargo test
 
       - name: cargo check (helper, cross-compiled)
-        run: cargo check --target x86_64-pc-windows-gnu -p neuralforge-helper
+        run: cargo check --target x86_64-pc-windows-gnu -p neural-forge-helper
 
-      # scripts/install.py delegates install/uninstall to neuralforge-cli (the single
+      # scripts/install.py delegates install/uninstall to neural-forge-cli (the single
       # implementation), so this exercises the same code the GUI's Setup tab runs.
       - name: Build the CLI for the installation tests
-        run: cargo build -p neuralforge-cli
+        run: cargo build -p neural-forge-cli
 
       - name: Installation coexistence tests
         run: python3 scripts/test_install.py

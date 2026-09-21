@@ -598,7 +598,7 @@ fn scaled_dims(width: u32, height: u32, scale: f32) -> (u32, u32) {
 /// it (matches the same `is_8bit` gate several other advanced paths in this crate and
 /// the helper already use).
 fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format> {
-    if !neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+    if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         return None;
     }
     Some(if bgr_order { vk::Format::B8G8R8A8_UNORM } else { vk::Format::R8G8B8A8_UNORM })
@@ -709,7 +709,7 @@ fn poll_or_submit_capture(
         // SAFETY: `host_ptr`/`capacity` describe `shm`'s own live proxy region for
         // this slot, valid for as long as `shm` stays open (the life of this process,
         // since the mapping is never unmapped -- see
-        // `neuralforge_protocol::mapping::Mapping::header`'s own doc comment on the
+        // `neural_forge_protocol::mapping::Mapping::header`'s own doc comment on the
         // equivalent GUI/CLI mapping); nothing else writes to it except through
         // `ShmClient::write_proxy`, which this branch never calls, and slot 0's/slot
         // 1's regions are disjoint (`docs/PROTOCOL_V3_DESIGN.md`), so the other slot's own
@@ -912,9 +912,9 @@ pub unsafe fn run(
     // included here too -- a real bug, found 2026-09-11: `ShmHeader::neural_enabled()`
     // existed and the GUI wrote to it, but nothing in this crate ever read it back,
     // so turning "Enabled" off in the GUI had no effect on anything real at all.
-    let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
+    let bytes_per_pixel = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
-    if frame_bytes == 0 || frame_bytes as usize > neuralforge_protocol::MAX_FRAME {
+    if frame_bytes == 0 || frame_bytes as usize > neural_forge_protocol::MAX_FRAME {
         return None;
     }
 
@@ -1065,7 +1065,7 @@ pub unsafe fn run(
             }
         }
 
-        if have_answer && inflight[slot].dims == Some((width, height, proxy_format)) && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+        if have_answer && inflight[slot].dims == Some((width, height, proxy_format)) && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
             // Retain the model's raw answer for continuous re-presentation below --
             // deliberately *not* run through `composition::gpu`/`composition::apply`'s
             // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
@@ -1524,7 +1524,7 @@ fn poll_pipeline_capture(
     // same command buffer), so one status query covers both.
     match unsafe { device.get_fence_status(slot.buf.fence) } {
         Ok(true) => {
-            let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
+            let bytes_per_pixel = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
             let frame_bytes = (u64::from(width) * u64::from(height) * bytes_per_pixel) as usize;
             // SAFETY: `slot.buf.ptr` is a live host-coherent mapping of at least
             // `frame_bytes` bytes (`submit_pipeline_capture` only ever submits
@@ -2119,9 +2119,9 @@ unsafe fn run_sync(
     original_scratch: &mut Vec<u8>,
     _last_answer: &mut Vec<u8>,
 ) -> Option<vk::Semaphore> {
-    let bytes_per_pixel = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
+    let bytes_per_pixel = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
-    if frame_bytes == 0 || frame_bytes as usize > neuralforge_protocol::MAX_FRAME {
+    if frame_bytes == 0 || frame_bytes as usize > neural_forge_protocol::MAX_FRAME {
         return None;
     }
     if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {
@@ -2227,7 +2227,7 @@ unsafe fn run_sync(
     // answered, overwrite `r.ptr` in place with that answer -- stage 2 below copies
     // whatever is sitting in `r.ptr` back into `image`, so this is what makes the
     // helper's answer (a real NGX evaluation, or the helper's own proxy-echo fallback
-    // when the model isn't ready -- `neuralforge_helper::main`'s per-frame loop guarantees
+    // when the model isn't ready -- `neural_forge_helper::main`'s per-frame loop guarantees
     // the answer region is always the same size/format as the proxy either way)
     // actually reach the screen. A helper that never answers (not running, or the
     // round trip timed out) leaves `r.ptr` untouched -- it still holds the bytes
@@ -2282,8 +2282,8 @@ unsafe fn run_sync(
         shm.read_answer(SLOT, answer_dst);
         // Only `RGBA8` is handled -- `RGBA16F` still passes the helper's raw answer
         // through untouched (see `composition::apply`'s own doc comment for why, and
-        // `neuralforge_protocol::enums::proxy_format` for the format codes).
-        if neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+        // `neural_forge_protocol::enums::proxy_format` for the format codes).
+        if neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
             if let Some(settings) = shm.composition_settings() {
                 if settings.apply_model && settings.neural_enabled {
                     // GPU dispatch (`composition::gpu`) only implements the normal
@@ -2404,7 +2404,7 @@ unsafe fn run_sync(
     // (identical) matched pair rather than silently doing nothing -- `write_pair`
     // itself is the only place that would need to special-case a format it can't
     // encode, and today it always gets `RGBA8` bytes either way.
-    if shm.take_capture_request() && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+    if shm.take_capture_request() && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         // SAFETY: same reasoning as every other read of `r.ptr` in this function --
         // still a live mapping of at least `frame_bytes` bytes, and stage 2 below
         // hasn't started overwriting it yet.
@@ -2723,14 +2723,14 @@ mod tests {
             "ensure_direct_capture should succeed with a supported, correctly aligned host pointer"
         );
         let d = direct.as_mut().unwrap();
-        assert!(submit_direct_capture(d, &device, queue, image, vk::ImageLayout::PRESENT_SRC_KHR, width, height, neuralforge_protocol::enums::proxy_format::RGBA8));
+        assert!(submit_direct_capture(d, &device, queue, image, vk::ImageLayout::PRESENT_SRC_KHR, width, height, neural_forge_protocol::enums::proxy_format::RGBA8));
         // A real wait (not `poll_direct_capture`'s own non-blocking check) is correct
         // here: this test cares whether the capture is *correct*, not whether `run`'s
         // own present-hook discipline of never blocking holds -- that's
         // `run_never_blocks_on_a_slow_helper_and_eventually_composites`'s job, not
         // this test's.
         unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }.expect("capture fence wait failed");
-        assert_eq!(poll_direct_capture(d, &device), Some((width, height, neuralforge_protocol::enums::proxy_format::RGBA8)));
+        assert_eq!(poll_direct_capture(d, &device), Some((width, height, neural_forge_protocol::enums::proxy_format::RGBA8)));
 
         // SAFETY: the fence wait above confirms the GPU's writes to `host_ptr` are
         // complete and visible to the CPU (host-coherent memory).
@@ -2775,7 +2775,7 @@ mod tests {
         // A live helper (matters for `poll_async_request`'s timeout budget: the long
         // "steady state" one, not the short "nobody's listening" one, since this test
         // deliberately answers slower than that short budget).
-        unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) }.helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
 
         // A fake helper that only answers `HELPER_DELAY` after it sees a new request --
         // long enough that if `run` ever blocked waiting for it, a handful of calls
@@ -2785,7 +2785,7 @@ mod tests {
         let stop_clone = Arc::clone(&stop);
         let helper = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
-            let hdr = unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) };
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = 0u32;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
@@ -2799,7 +2799,7 @@ mod tests {
         });
 
         let (width, height) = (8u32, 8u32);
-        let proxy_format = neuralforge_protocol::enums::proxy_format::RGBA8;
+        let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
@@ -2973,8 +2973,8 @@ mod tests {
         let hdr_ptr = shm.test_header_ptr();
         // SAFETY: `hdr_ptr` is this test's own live mapping, same technique the
         // sibling test above already uses.
-        let hdr = unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) };
-        hdr.helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
         // 0.5 -- comfortably clear of `scaled_dims`' own 64px floor at this test's
         // resolution, so the assertions below are testing the scale factor, not the
         // floor.
@@ -2994,7 +2994,7 @@ mod tests {
         let (stop_clone, wrong_clone) = (Arc::clone(&stop), Arc::clone(&sent_wrong_size));
         let helper = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
-            let hdr = unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) };
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = [0u32; 2];
             while !stop_clone.load(AtomicOrdering::Relaxed) {
                 for slot in 0..2 {
@@ -3012,7 +3012,7 @@ mod tests {
             }
         });
 
-        let proxy_format = neuralforge_protocol::enums::proxy_format::RGBA8;
+        let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
@@ -3121,7 +3121,7 @@ mod tests {
         let mut shm = ShmClient::default();
         assert!(shm.test_open_at(&path));
         let hdr_ptr = shm.test_header_ptr();
-        unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) }.helper_state.store(neuralforge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
 
         // A fake helper that answers as fast as it can see the request -- the real
         // steady state, where the layer has a fresh answer nearly every present and so
@@ -3130,7 +3130,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         let helper = std::thread::spawn(move || {
-            let hdr = unsafe { &*(hdr_ptr as *mut neuralforge_protocol::ShmHeader) };
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last = [0u32; 2];
             while !stop_clone.load(AtomicOrdering::Relaxed) {
                 for slot in 0..2 {
@@ -3145,7 +3145,7 @@ mod tests {
         });
 
         let (width, height) = (2560u32, 1440u32);
-        let proxy_format = neuralforge_protocol::enums::proxy_format::BGRA8;
+        let proxy_format = neural_forge_protocol::enums::proxy_format::BGRA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("bench command pool");

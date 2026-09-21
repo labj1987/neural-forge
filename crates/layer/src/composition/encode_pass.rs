@@ -28,7 +28,7 @@ pub struct EncodePush {
     /// `rgba8` qualifier is spec-correct against the view), and this says what the
     /// channels actually mean. Same contract as `compose.comp`'s own `bgr_order`.
     pub bgr_order: u32,
-    /// `neuralforge_protocol::enums::reversible_mode`.
+    /// `neural_forge_protocol::enums::reversible_mode`.
     pub reversible_mode: u32,
 }
 

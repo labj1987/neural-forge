@@ -9,7 +9,7 @@ members = [
     "crates/cli",
 ]
 # `helper` targets x86_64-pc-windows-gnu only and is built explicitly
-# (`cargo build --target x86_64-pc-windows-gnu -p neuralforge-helper`), never as
+# (`cargo build --target x86_64-pc-windows-gnu -p neural-forge-helper`), never as
 # part of a plain `cargo build --workspace` on the host.
 default-members = [
     "crates/protocol",
@@ -20,14 +20,14 @@ default-members = [
 ]
 
 [workspace.package]
-version = "0.1.75"
+version = "0.1.76"
 edition = "2021"
 authors = ["Linnard Alex Brown Jr."]
 license = "AGPL-3.0-or-later"
 
 # Workspace-wide because Cargo profiles (other than a few per-package-overridable
 # knobs, and `panic` isn't one of them) apply to the whole build, not one member.
-# `neuralforge-layer` is a cdylib the Vulkan loader calls back into across a plain C ABI
+# `neural-forge-layer` is a cdylib the Vulkan loader calls back into across a plain C ABI
 # boundary (vkGetInstanceProcAddr and friends) -- an unwinding panic crossing that
 # boundary is undefined behavior, not a clean error, so it needs `abort`. Every other
 # crate in the workspace is fine with `abort` too (no code here relies on

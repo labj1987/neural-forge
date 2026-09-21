@@ -1,8 +1,8 @@
-//! `neuralforge-cli` — the helper-manager: init/setup/start/stop/restart/status/doctor/
+//! `neural-forge-cli` — the helper-manager: init/setup/start/stop/restart/status/doctor/
 //! config/runners/detect-gpu/import-binaries. Replaces upstream's ~900-line bash
-//! `neuralforge-helper` script with the same command surface (a CLI contract, not
+//! `neural-forge-helper` script with the same command surface (a CLI contract, not
 //! upstream's expression of it) reimplemented in Rust, sharing logic with the GUI
-//! through `neuralforge_protocol` instead of duplicating it in shell.
+//! through `neural_forge_protocol` instead of duplicating it in shell.
 
 mod gpu;
 mod shmctl;
@@ -10,11 +10,11 @@ mod shmctl;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use neuralforge_supervisor::{install_dir, paths, Config};
+use neural_forge_supervisor::{install_dir, paths, Config};
 
 fn usage() {
     eprintln!(
-        "usage: neuralforge-cli <command>\n\n\
+        "usage: neural-forge-cli <command>\n\n\
          commands:\n\
          \x20 init                 create default config\n\
          \x20 setup                init config, dxvk config, and managed prefix if needed\n\
@@ -40,7 +40,7 @@ fn usage() {
 
 fn profile_usage() {
     eprintln!(
-        "usage: neuralforge-cli profile <list|save|load|delete>\n\n\
+        "usage: neural-forge-cli profile <list|save|load|delete>\n\n\
          \x20 list          print every saved profile name\n\
          \x20 save <name>   snapshot the running instance's current settings as <name>\n\
          \x20 load <name>   apply <name>'s settings to the running instance and persist\n\
@@ -53,9 +53,9 @@ fn profile_usage() {
 }
 
 fn cmd_profile_list() -> ExitCode {
-    let profiles = neuralforge_supervisor::profiles::load_all();
+    let profiles = neural_forge_supervisor::profiles::load_all();
     if profiles.is_empty() {
-        println!("no saved profiles ({})", neuralforge_supervisor::profiles::profiles_file());
+        println!("no saved profiles ({})", neural_forge_supervisor::profiles::profiles_file());
         return ExitCode::SUCCESS;
     }
     for name in profiles.keys() {
@@ -65,41 +65,41 @@ fn cmd_profile_list() -> ExitCode {
 }
 
 fn cmd_profile_save(name: &str) -> ExitCode {
-    let Some(mapping) = neuralforge_protocol::mapping::open() else {
+    let Some(mapping) = neural_forge_protocol::mapping::open() else {
         eprintln!("profile save: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
         return ExitCode::FAILURE;
     };
-    let settings = neuralforge_protocol::persist::snapshot(mapping.header());
-    match neuralforge_supervisor::profiles::save_profile(name, settings) {
+    let settings = neural_forge_protocol::persist::snapshot(mapping.header());
+    match neural_forge_supervisor::profiles::save_profile(name, settings) {
         Ok(()) => {
-            println!("saved profile {name:?} to {}", neuralforge_supervisor::profiles::profiles_file());
+            println!("saved profile {name:?} to {}", neural_forge_supervisor::profiles::profiles_file());
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("profile save: failed to write {}: {e}", neuralforge_supervisor::profiles::profiles_file());
+            eprintln!("profile save: failed to write {}: {e}", neural_forge_supervisor::profiles::profiles_file());
             ExitCode::FAILURE
         }
     }
 }
 
 fn cmd_profile_load(name: &str) -> ExitCode {
-    let profiles = neuralforge_supervisor::profiles::load_all();
+    let profiles = neural_forge_supervisor::profiles::load_all();
     let Some(settings) = profiles.get(name) else {
         eprintln!("profile load: no such profile {name:?} (see `profile list`)");
         return ExitCode::FAILURE;
     };
-    let Some(mapping) = neuralforge_protocol::mapping::open() else {
+    let Some(mapping) = neural_forge_protocol::mapping::open() else {
         eprintln!("profile load: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
         return ExitCode::FAILURE;
     };
     let header = mapping.header();
-    neuralforge_protocol::persist::apply(header, settings);
+    neural_forge_protocol::persist::apply(header, settings);
     // Matches the GUI's own reset-settings flow: applying to the live header alone
     // only affects the running session, so also fold the new values into config.ini
     // via a fresh snapshot (picks up every persisted setting, not just what this
     // profile happened to list) so the change survives a reboot too.
     let mut cfg = Config::load();
-    cfg.settings = neuralforge_protocol::persist::snapshot(header);
+    cfg.settings = neural_forge_protocol::persist::snapshot(header);
     if let Err(e) = cfg.save() {
         eprintln!("profile load: applied to the running instance, but saving config.ini failed: {e}");
         return ExitCode::FAILURE;
@@ -109,7 +109,7 @@ fn cmd_profile_load(name: &str) -> ExitCode {
 }
 
 fn cmd_profile_delete(name: &str) -> ExitCode {
-    match neuralforge_supervisor::profiles::delete_profile(name) {
+    match neural_forge_supervisor::profiles::delete_profile(name) {
         Ok(true) => {
             println!("deleted profile {name:?}");
             ExitCode::SUCCESS
@@ -119,7 +119,7 @@ fn cmd_profile_delete(name: &str) -> ExitCode {
             ExitCode::FAILURE
         }
         Err(e) => {
-            eprintln!("profile delete: failed to write {}: {e}", neuralforge_supervisor::profiles::profiles_file());
+            eprintln!("profile delete: failed to write {}: {e}", neural_forge_supervisor::profiles::profiles_file());
             ExitCode::FAILURE
         }
     }
@@ -144,10 +144,10 @@ fn cmd_profile(args: &[String]) -> ExitCode {
 
 fn default_config() -> Config {
     let mut cfg = Config::default();
-    if let Some(proton) = neuralforge_supervisor::runners::best_proton() {
+    if let Some(proton) = neural_forge_supervisor::runners::best_proton() {
         cfg.runner_type = "proton".to_string();
         cfg.runner_path = proton.path.to_string_lossy().into_owned();
-    } else if let Some(wine) = neuralforge_supervisor::runners::find_wine() {
+    } else if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
         cfg.runner_type = "wine".to_string();
         cfg.runner_path = wine.to_string_lossy().into_owned();
     } else {
@@ -158,7 +158,7 @@ fn default_config() -> Config {
         cfg.dxvk_vendor = format!("{vendor:04x}");
         cfg.dxvk_device = format!("{device:04x}");
     }
-    cfg.shm = neuralforge_protocol::shm_default_path();
+    cfg.shm = neural_forge_protocol::shm_default_path();
     cfg.log = paths::log_file();
     cfg
 }
@@ -202,9 +202,9 @@ fn cmd_config() -> ExitCode {
 }
 
 fn cmd_runners() -> ExitCode {
-    let found = neuralforge_supervisor::runners::discover_proton();
+    let found = neural_forge_supervisor::runners::discover_proton();
     if found.is_empty() {
-        if let Some(wine) = neuralforge_supervisor::runners::find_wine() {
+        if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
             println!("wine\t{}", wine.display());
             return ExitCode::SUCCESS;
         }
@@ -231,12 +231,12 @@ fn cmd_detect_gpu() -> ExitCode {
 }
 
 fn cmd_status() -> ExitCode {
-    match neuralforge_supervisor::is_running() {
+    match neural_forge_supervisor::is_running() {
         Some(pid) => println!("helper running (pid {pid})"),
         None => println!("helper not running"),
     }
     println!("  config: {}", paths::config_file());
-    println!("  runtime: {}", neuralforge_protocol::shm_runtime_dir());
+    println!("  runtime: {}", neural_forge_protocol::shm_runtime_dir());
     println!("  state: {}", paths::state_dir());
     ExitCode::SUCCESS
 }
@@ -249,7 +249,7 @@ fn cmd_doctor() -> ExitCode {
     if std::path::Path::new(&paths::config_file()).exists() {
         println!("ok");
     } else {
-        println!("missing (run `neuralforge-cli init`)");
+        println!("missing (run `neural-forge-cli init`)");
         ok = false;
     }
 
@@ -264,9 +264,9 @@ fn cmd_doctor() -> ExitCode {
 
     let (runner_type, runner_path) = if !cfg.runner_path.is_empty() {
         (cfg.runner_type.clone(), cfg.runner_path.clone())
-    } else if let Some(proton) = neuralforge_supervisor::runners::best_proton() {
+    } else if let Some(proton) = neural_forge_supervisor::runners::best_proton() {
         ("proton".to_string(), proton.path.display().to_string())
-    } else if let Some(wine) = neuralforge_supervisor::runners::find_wine() {
+    } else if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
         ("wine".to_string(), wine.display().to_string())
     } else {
         ("none".to_string(), String::new())
@@ -285,7 +285,7 @@ fn cmd_doctor() -> ExitCode {
     if ngx_dll.exists() {
         println!("ok");
     } else {
-        println!("error -- missing (required; see `neuralforge-cli import-binaries DIR`)");
+        println!("error -- missing (required; see `neural-forge-cli import-binaries DIR`)");
         ok = false;
     }
 
@@ -296,7 +296,7 @@ fn cmd_doctor() -> ExitCode {
         println!("missing (only needed for the system-Wine fallback runner)");
     }
 
-    print!("runtime dir: {}\n  ", neuralforge_protocol::shm_runtime_dir());
+    print!("runtime dir: {}\n  ", neural_forge_protocol::shm_runtime_dir());
     match paths::ensure_dirs() {
         Ok(()) => println!("ok"),
         Err(e) => {
@@ -319,14 +319,14 @@ fn cmd_setup() -> ExitCode {
 
 fn cmd_start() -> ExitCode {
     let cfg = Config::load();
-    match neuralforge_supervisor::start(&cfg) {
+    match neural_forge_supervisor::start(&cfg) {
         Ok(started) => {
             println!("helper started (pid {})", started.pid);
             println!("  runner: {} {}", started.runner_type, started.runner_path);
             println!("  log: {}", started.log);
             ExitCode::SUCCESS
         }
-        Err(neuralforge_supervisor::StartError::AlreadyRunning(_)) => {
+        Err(neural_forge_supervisor::StartError::AlreadyRunning(_)) => {
             println!("helper already running");
             ExitCode::SUCCESS
         }
@@ -338,7 +338,7 @@ fn cmd_start() -> ExitCode {
 }
 
 fn cmd_stop() -> ExitCode {
-    match neuralforge_supervisor::stop(Duration::from_secs(5)) {
+    match neural_forge_supervisor::stop(Duration::from_secs(5)) {
         Ok(()) => {
             println!("helper stopped");
             ExitCode::SUCCESS
@@ -352,10 +352,10 @@ fn cmd_stop() -> ExitCode {
 
 fn cmd_install(appdir: Option<&String>) -> ExitCode {
     let Some(appdir) = appdir else {
-        eprintln!("usage: neuralforge-cli install --appdir DIR");
+        eprintln!("usage: neural-forge-cli install --appdir DIR");
         return ExitCode::FAILURE;
     };
-    match neuralforge_supervisor::install::install(std::path::Path::new(appdir)) {
+    match neural_forge_supervisor::install::install(std::path::Path::new(appdir)) {
         Ok(report) => {
             println!("Installed Neural Forge. CLI: {}", report.cli_path.display());
             ExitCode::SUCCESS
@@ -368,7 +368,7 @@ fn cmd_install(appdir: Option<&String>) -> ExitCode {
 }
 
 fn cmd_uninstall() -> ExitCode {
-    match neuralforge_supervisor::install::uninstall() {
+    match neural_forge_supervisor::install::uninstall() {
         Ok(preserved) => {
             for path in &preserved {
                 println!("preserved changed/missing file: {}", path.display());
@@ -384,7 +384,7 @@ fn cmd_uninstall() -> ExitCode {
 
 fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
     let Some(dir) = dir else {
-        eprintln!("usage: neuralforge-cli import-binaries DIR");
+        eprintln!("usage: neural-forge-cli import-binaries DIR");
         return ExitCode::FAILURE;
     };
     let src = std::path::Path::new(dir);
