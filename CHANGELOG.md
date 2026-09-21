@@ -4,6 +4,16 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.81 — 2026-09-21
+
+- **System Wine works as a runner.** With `runner_type=wine`, `neural-forge-cli setup` (and every
+  helper start) prepares the managed prefix: DXVK's `dxgi.dll` and DXVK-NVAPI's `nvapi64.dll`
+  from your binaries folder, an installed Proton, or SHA256-pinned DXVK 3.1 / DXVK-NVAPI 0.9.2
+  downloads (`NEURAL_FORGE_AUTO_DOWNLOAD=0` to forbid), plus `dxvk.conf` with your GPU's IDs.
+  Verified end to end under Wine 10. `doctor` checks the prefix's DLLs.
+- **Answers are checked against the frame they are for.** The helper echoes the size it answered
+  and the layer refuses a mismatched answer (another swapchain's, or from before a resize).
+
 ## 0.1.80 — 2026-09-21
 
 Composition controls from upstream (section 9 of the parity work), each tested on a real GPU.
