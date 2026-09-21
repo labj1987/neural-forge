@@ -33,6 +33,8 @@ upstream file it came from. Nothing listed here lands in
 | `crates/helper/src/ngx.rs::NgxTuning`, `set_create_tuning` | `core/ngx_snippet.cpp` `NgxTuning`, `NgxSetCreateTuning` (create-time-only tuning block) |
 | `crates/helper/src/ngx.rs::maintain_feature` | `helper/main.cpp` `MaintainPasses` / `TuningFor` (compare by value, debounce by `rebuild_settle_ms`, destroy then recreate). Single-feature only until multipass lands. |
 | `crates/helper/src/ngx.rs` per-evaluate `Sharpness` write, `PerfQualityValue = 3`, `NEURAL_FORGE_SKIP_NVAPI` handling | `core/ngx_snippet.cpp` `NgxSetSharpness`, `NgxCreatePass`, `NgxLoadAndInit` |
+| `crates/helper/src/guard.rs`: DBG_PRINTEXCEPTION exclusion, guarded-hit cap (24), rip/fault/module-range logging (`register_module`, `describe`) | `core/guard.cpp` `GuardVeh`, `RegisterModuleRange`, `DescribeRange`. The setjmp side deliberately differs: upstream's unwinding `setjmp` form is not used here (`_setjmp(buf, NULL)`). |
+| `crates/helper/src/ngx.rs`: 64x64 minimum feature size (`MIN_FEATURE_DIM`), rebuild on size change | `core/ngx_snippet.cpp` `kMinW`/`kMinH`; `helper/main.cpp` `EnsureNeural`. Upstream's re-run of `NgxLoadAndInit` on resize is not copied. |
 
 ## What was previously taken clean-room (still accurate, unaffected by the above)
 

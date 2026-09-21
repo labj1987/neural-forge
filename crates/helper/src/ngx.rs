@@ -91,6 +91,8 @@ pub struct NgxSnippet {
     /// What the live feature was built with -- the model latches these at creation, so a
     /// difference from what the header asks for now means a rebuild, not a parameter write.
     built_tuning: NgxTuning,
+    /// The frame size the live feature was built for; a different incoming size means a rebuild.
+    built_size: (u32, u32),
     /// The most recent header value seen; a new value re-arms the settle wait so dragging a
     /// slider debounces rather than rebuilding at every tick.
     last_seen_tuning: NgxTuning,
@@ -195,6 +197,7 @@ impl Default for NgxSnippet {
             feature: std::ptr::null_mut(),
             disabled: false,
             built_tuning: NgxTuning::default(),
+            built_size: (0, 0),
             last_seen_tuning: NgxTuning::default(),
             tuning_changed: None,
             build_after: None,
@@ -246,6 +249,8 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         s.disabled = true;
         return s;
     }
+    // SAFETY: `s.snippet` is a just-loaded PE image.
+    unsafe { crate::guard::register_module(crate::guard::Module::Snippet, s.snippet) };
     crate::log!("[ngx] nvngx_dlssnr.dll loaded at {:?}", s.snippet);
     crate::logging::flush();
 
@@ -304,6 +309,8 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
             std::ptr::null_mut(),
         );
         s.nvapi = module;
+        // SAFETY: a non-null result is a just-loaded PE image (a null one is ignored).
+        unsafe { crate::guard::register_module(crate::guard::Module::Nvapi, s.nvapi) };
         if s.nvapi.is_null() {
             crate::log!("[ngx] nvapi64.dll not loaded (seh={seh:#x}); continuing without it");
         } else {
@@ -338,6 +345,8 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
             LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
         )
     };
+    // SAFETY: a non-null result is a just-loaded PE image (a null one is ignored).
+    unsafe { crate::guard::register_module(crate::guard::Module::Core, s.core) };
     crate::log!("[ngx] core (nvngx.dll) load: {}", if s.core.is_null() { "not found, degrading to snippet allocator" } else { "loaded" });
     crate::logging::flush();
     if !s.core.is_null() {
@@ -759,6 +768,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     }
     s.feature = handle;
     s.built_tuning = *tuning;
+    s.built_size = (width, height);
     s.last_seen_tuning = *tuning;
     true
 }
@@ -780,6 +790,23 @@ fn release_feature(s: &mut NgxSnippet) {
 /// Consumes the "history is gone" flag a rebuild sets.
 pub fn take_needs_reset(s: &mut NgxSnippet) -> bool {
     std::mem::take(&mut s.needs_reset)
+}
+
+/// The smallest frame the model is asked to build a feature for. A 1x1 request hung the driver
+/// (Xid 109); nothing that small is a real game frame anyway.
+pub const MIN_FEATURE_DIM: u32 = 64;
+
+/// Drops the live feature so the next frame rebuilds it from scratch (a header re-initialisation
+/// invalidates whatever the feature was built against). The rebuild is not a "first attempt", so
+/// a failure retries rather than disabling the model.
+pub fn discard_feature(s: &mut NgxSnippet, device: &ash::Device) {
+    if !s.has_feature() {
+        return;
+    }
+    // SAFETY: nothing may be in flight when the feature is destroyed.
+    let _ = unsafe { device.device_wait_idle() };
+    release_feature(s);
+    s.build_after = Some(Instant::now());
 }
 
 /// Gives up on rebuilds after this many consecutive failures.
@@ -807,11 +834,27 @@ pub fn maintain_feature(
     if s.disabled {
         return false;
     }
-    if width == 0 || height == 0 {
-        return s.has_feature();
+    if width < MIN_FEATURE_DIM || height < MIN_FEATURE_DIM {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[ngx] refusing feature at {width}x{height}: below the {MIN_FEATURE_DIM}x{MIN_FEATURE_DIM} floor");
+        }
+        // The live feature (if any) is for a different size and must not answer this frame.
+        return false;
     }
     let now = Instant::now();
     let spacing = Duration::from_millis(u64::from(settle_ms));
+
+    if s.has_feature() && s.built_size != (width, height) {
+        crate::log!(
+            "[helper] frame size {}x{} -> {width}x{height}; rebuilding the feature",
+            s.built_size.0, s.built_size.1
+        );
+        // SAFETY: nothing may be in flight when the feature is destroyed.
+        let _ = unsafe { device.device_wait_idle() };
+        release_feature(s);
+        s.build_after = Some(now + spacing);
+    }
 
     if wanted != s.last_seen_tuning {
         s.last_seen_tuning = wanted;

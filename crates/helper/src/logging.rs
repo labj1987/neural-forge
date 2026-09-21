@@ -85,6 +85,13 @@ pub fn flush() {
     let _ = sink.flush();
 }
 
+/// Whether the `n`th occurrence of a per-frame event should be logged: the first few, so a
+/// session's start is fully visible, then one in every 300. Unbounded per-frame logging costs
+/// real time under Wine (see the buffering notes above) and buries everything else in the file.
+pub fn sampled(n: u64) -> bool {
+    n < 8 || n % 300 == 0
+}
+
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {

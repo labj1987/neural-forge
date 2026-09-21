@@ -15,6 +15,11 @@
 //! Run under Wine: `cargo run --example guard_test --target x86_64-pc-windows-gnu -p neural-forge-helper`
 use neural_forge_helper::guard;
 
+#[link(name = "kernel32")]
+extern "system" {
+    fn OutputDebugStringA(s: *const std::ffi::c_char);
+}
+
 fn main() {
     guard::install();
 
@@ -36,6 +41,37 @@ fn main() {
     // EXCEPTION_ACCESS_VIOLATION = 0xC0000005.
     assert_eq!(fault_result, -1, "the guard should have returned the fail value, not a real read");
     assert_eq!(fault_seh, 0xC000_0005, "expected EXCEPTION_ACCESS_VIOLATION");
+
+    // Wine raises DBG_PRINTEXCEPTION_C for every OutputDebugString. It must pass straight
+    // through the guard: no jump, the closure runs to completion, and no fault is reported.
+    let (dbg_result, dbg_seh) = guard::guarded(
+        || {
+            // SAFETY: a NUL-terminated string.
+            unsafe { OutputDebugStringA(c"guard_test: OutputDebugString inside a guarded call".as_ptr()) };
+            7
+        },
+        -1,
+    );
+    println!("OutputDebugString call: result={dbg_result} seh={dbg_seh:#x} (expect 7, 0x0)");
+    assert_eq!((dbg_result, dbg_seh), (7, 0), "a debug-print exception must not be treated as a fault");
+
+    // The non-unwinding longjmp must survive many faults through the same buffer, a fault
+    // nested a few frames below the guard, and a fault after a clean call.
+    #[inline(never)]
+    fn deep(n: u32) -> i32 {
+        if n == 0 {
+            // SAFETY: none -- deliberate fault.
+            unsafe { std::ptr::read_volatile(0xdead_beef_0000usize as *const i32) }
+        } else {
+            deep(n - 1) + 1
+        }
+    }
+    for i in 0..10 {
+        let (r, seh) = guard::guarded(|| deep(5), -1);
+        assert_eq!((r, seh), (-1, 0xC000_0005), "fault {i}");
+        let (r, seh) = guard::guarded(|| 1, -1);
+        assert_eq!((r, seh), (1, 0), "clean call after fault {i}");
+    }
 
     println!("PASS: the process survived a real access violation inside guard::guarded");
 }

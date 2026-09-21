@@ -526,6 +526,8 @@ impl FrameResources {
         sharpness: f32,
         answer_out: &mut [u8],
     ) -> Option<FrameTiming> {
+        static EVALUATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let evaluate_no = EVALUATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pixel_count = (self.width as usize) * (self.height as usize);
         if proxy.len() < pixel_count * 4 || answer_out.len() < pixel_count * 4 {
             return None;
@@ -620,8 +622,12 @@ impl FrameResources {
                 return None;
             };
             let t_eval = t_eval_start.elapsed();
-            crate::log!("[ngx] EvaluateFeature -> {:#x} seh={:#x} took={:?}", result.0 as u32, result.1, t_eval);
-            if !abi::succeeded(result.0) || result.1 != 0 {
+            let failed = !abi::succeeded(result.0) || result.1 != 0;
+            // Bounded: one line per evaluate, forever, is real time under Wine. Failures always log.
+            if failed || crate::logging::sampled(evaluate_no) {
+                crate::log!("[ngx] EvaluateFeature -> {:#x} seh={:#x} took={:?}", result.0 as u32, result.1, t_eval);
+            }
+            if failed {
                 return None;
             }
             t_eval
@@ -633,13 +639,15 @@ impl FrameResources {
             return None;
         }
         let t_download = t_download_start.elapsed();
-        crate::log!(
-            "[frame] timing upload={:?} eval={:?} download={:?} total={:?}",
-            t_upload,
-            t_eval,
-            t_download,
-            t_upload + t_eval + t_download
-        );
+        if crate::logging::sampled(evaluate_no) {
+            crate::log!(
+                "[frame] timing upload={:?} eval={:?} download={:?} total={:?}",
+                t_upload,
+                t_eval,
+                t_download,
+                t_upload + t_eval + t_download
+            );
+        }
         // Skipped when `imported_answer` is set: `run_transfer`'s download copy just
         // wrote Output directly into the exact memory `answer_out` is a view of.
         if self.imported_answer.is_none() {

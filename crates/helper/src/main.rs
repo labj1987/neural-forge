@@ -219,10 +219,31 @@ fn main() {
         if hdr.quit.load(Ordering::Relaxed) != 0 {
             break;
         }
+        // Restated every iteration, not once at startup: the layer or the GUI re-initialising the
+        // header resets `helper_state` to zero, and a state stated only once stays wrong (reading
+        // as stopped) for the rest of the session.
+        hdr.helper_state.store(
+            if snippet.disabled {
+                neural_forge_protocol::enums::helper_state::MODEL_FAILED
+            } else {
+                neural_forge_protocol::enums::helper_state::RUNNING
+            },
+            Ordering::Relaxed,
+        );
         for slot in 0..2 {
             let seq_req = hdr.seq_req_slot(slot).load(Ordering::Acquire);
             if seq_req == last_seq_req[slot] {
                 continue;
+            }
+            // A value behind the last one seen means the header was reinitialised under us
+            // (wrapping distance, so a genuine u32 wrap is not mistaken for it). Whatever the
+            // feature was built against is stale: drop it and let the next frame rebuild.
+            if seq_req.wrapping_sub(last_seq_req[slot]) > u32::MAX / 2 {
+                neural_forge_helper::log!(
+                    "[helper] slot {slot}: seq_req went backwards ({} -> {seq_req}); header reinitialised, resetting the feature",
+                    last_seq_req[slot]
+                );
+                ngx::discard_feature(&mut snippet, &device);
             }
             last_seq_req[slot] = seq_req;
             process_request(
@@ -314,7 +335,9 @@ fn process_request(
     // they're actually importable.
     let (proxy_region, answer_region) = shm.proxy_and_answer_regions(slot);
 
-    let model_requested = dims_ok && hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0;
+    // Nothing below the model's floor reaches NGX (or a prewarm): such a frame just echoes.
+    let big_enough = width >= ngx::MIN_FEATURE_DIM && height >= ngx::MIN_FEATURE_DIM;
+    let model_requested = dims_ok && big_enough && hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0;
     // Reserve the frame-sized Vulkan images as soon as the layer sees the game's real
     // swapchain, but do not enter the proprietary NGX runtime while NR is switched
     // off.  GTA is still bringing up its own GPU work at that point; calling
@@ -322,6 +345,7 @@ fn process_request(
     // is safe, makes later activation possible even after GTA fills VRAM, and
     // performs no model work or write-back.
     if dims_ok
+        && big_enough
         && !model_requested
         && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
         && !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format))
@@ -422,7 +446,9 @@ fn process_request(
     hdr.seq_resp_slot(slot).store(seq_req, Ordering::Release);
     *frames += 1;
     neural_forge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, *frames);
-    neural_forge_helper::log!("[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated}");
+    if neural_forge_helper::logging::sampled(*frames) || !evaluated {
+        neural_forge_helper::log!("[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated}");
+    }
 }
 
 /// A minimal Vulkan instance + device — just enough to hand NGX a live
