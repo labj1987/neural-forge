@@ -35,6 +35,8 @@ upstream file it came from. Nothing listed here lands in
 | `crates/helper/src/ngx.rs` per-evaluate `Sharpness` write, `PerfQualityValue = 3`, `NEURAL_FORGE_SKIP_NVAPI` handling | `core/ngx_snippet.cpp` `NgxSetSharpness`, `NgxCreatePass`, `NgxLoadAndInit` |
 | `crates/helper/src/guard.rs`: DBG_PRINTEXCEPTION exclusion, guarded-hit cap (24), rip/fault/module-range logging (`register_module`, `describe`) | `core/guard.cpp` `GuardVeh`, `RegisterModuleRange`, `DescribeRange`. The setjmp side deliberately differs: upstream's unwinding `setjmp` form is not used here (`_setjmp(buf, NULL)`). |
 | `crates/helper/src/ngx.rs`: 64x64 minimum feature size (`MIN_FEATURE_DIM`), rebuild on size change | `core/ngx_snippet.cpp` `kMinW`/`kMinH`; `helper/main.cpp` `EnsureNeural`. Upstream's re-run of `NgxLoadAndInit` on resize is not copied. |
+| `crates/layer/shaders/compose.comp` mode 2 `hue_trust` | `layer_linux/src/dlssnr/dlssnr.hlsl` `hueTrust` / `kQuantFloor` |
+| `crates/layer/src/capture.rs` synchronous present (capture, wait for this frame's answer, compose onto this frame) | `layer_linux/src/layer.cpp` `ProcessPresent`'s blocking round trip; the bounded wait, heartbeat liveness check and fail-open on a late answer are this project's |
 
 ## Credits carried with the ported material
 
