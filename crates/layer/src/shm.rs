@@ -30,6 +30,7 @@ pub struct CompositionSettings {
     pub max_ratio: f32,
     /// See `ShmHeader::ghost_guard_bits`.
     pub ghost_guard: f32,
+    pub compare: crate::composition::gpu::Compare,
     pub debug_view: u32,
     pub apply_model: bool,
     pub neural_enabled: bool,
@@ -229,6 +230,12 @@ impl ShmClient {
             transfer_strength: f32::from_bits(hdr.transfer_strength_bits.load(Ordering::Relaxed)),
             max_ratio: f32::from_bits(hdr.max_ratio_bits.load(Ordering::Relaxed)),
             ghost_guard: f32::from_bits(hdr.ghost_guard_bits.load(Ordering::Relaxed)),
+            compare: crate::composition::gpu::Compare {
+                mode: hdr.compare_mode.load(Ordering::Relaxed),
+                split: f32::from_bits(hdr.compare_split_bits.load(Ordering::Relaxed)),
+                zoom: f32::from_bits(hdr.compare_zoom_bits.load(Ordering::Relaxed)),
+                swap: hdr.compare_swap.load(Ordering::Relaxed),
+            },
             debug_view: hdr.debug_view.load(Ordering::Relaxed),
             apply_model: hdr.apply_model.load(Ordering::Relaxed) != 0,
             neural_enabled: hdr.neural_enabled(),

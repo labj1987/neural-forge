@@ -1339,6 +1339,7 @@ pub unsafe fn run(
                 transfer_strength: settings.transfer_strength,
                 max_ratio: settings.max_ratio,
                 ghost_guard: settings.ghost_guard,
+                compare: settings.compare,
                 proxy_encoded,
             },
         ) {

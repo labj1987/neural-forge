@@ -68,6 +68,14 @@ layout(push_constant) uniform Params {
   // neighbourhood instead of the pixel, so a stale answer cannot paste its detail (a pale
   // copy of old edges and text) onto content that has since moved. See the ghost-guard block.
   float ghost_guard;
+  // Comparison views (upstream `dlssnr.hlsl` gCompare*): 0 off, 1 side by side (each half shows
+  // the whole frame, letterboxed; zoom 1 fits, 2 fills), 2 wipe at `compare_split` (0..1).
+  // `compare_swap` puts the original on the other side. Both halves are the same frame: the
+  // present is synchronous, so the answer and the frame it is composed onto match.
+  uint compare_mode;
+  float compare_split;
+  float compare_zoom;
+  uint compare_swap;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -205,9 +213,35 @@ void main() {
   // BGR order (see `params.bgr_order`'s doc comment) -- everything below this point
   // only ever deals in canonical `[r, g, b]`.
   bool bgr = params.bgr_order != 0u;
-  vec3 original = SrgbDecode(bgr ? imageLoad(u_original, pixel).bgr : imageLoad(u_original, pixel).rgb);
-  vec3 proxy = SrgbDecode(bgr ? imageLoad(u_proxy, pixel).bgr : imageLoad(u_proxy, pixel).rgb);
-  vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, pixel).bgr : imageLoad(u_model_answer, pixel).rgb);
+
+  // Comparison: decided first, because side by side changes which part of the frame this pixel
+  // shows, not only which version of it. Everything below reads at `src`; the result is stored at
+  // `pixel`.
+  vec2 uv = (vec2(pixel) + 0.5) / vec2(size);
+  ivec2 src = pixel;
+  bool show_original = false;
+  bool on_divider = false;
+  bool outside_frame = false;
+  bool swap_sides = params.compare_swap != 0u;
+  if (params.compare_mode == 1u) {
+    show_original = (uv.x < 0.5) != swap_sides;
+    // Each half is half as wide as the frame and as tall, so fitting the whole frame keeps its
+    // shape with bars above and below (zoom 1); zoom 2 fills the half and crops the sides.
+    float zoom = clamp(params.compare_zoom, 1.0, 2.0);
+    vec2 half_uv = vec2(uv.x < 0.5 ? uv.x * 2.0 : (uv.x - 0.5) * 2.0, uv.y) - 0.5;
+    vec2 cmp = vec2(0.5 + half_uv.x / zoom, 0.5 + half_uv.y * 2.0 / zoom);
+    outside_frame = any(lessThan(cmp, vec2(0.0))) || any(greaterThan(cmp, vec2(1.0)));
+    src = clamp(ivec2(cmp * vec2(size)), ivec2(0), size - ivec2(1));
+    on_divider = abs(uv.x - 0.5) < 1.0 / float(size.x);
+  } else if (params.compare_mode == 2u) {
+    float split = clamp(params.compare_split, 0.0, 1.0);
+    show_original = (uv.x < split) != swap_sides;
+    on_divider = abs(uv.x - split) < 1.0 / float(size.x);
+  }
+
+  vec3 original = SrgbDecode(bgr ? imageLoad(u_original, src).bgr : imageLoad(u_original, src).rgb);
+  vec3 proxy = SrgbDecode(bgr ? imageLoad(u_proxy, src).bgr : imageLoad(u_proxy, src).rgb);
+  vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, src).bgr : imageLoad(u_model_answer, src).rgb);
 
   vec3 result;
   if (params.mode == 2u) {
@@ -272,7 +306,7 @@ void main() {
         float worst = 0.0;
         for (int j = -2; j <= 2; ++j) {
           for (int i = -2; i <= 2; ++i) {
-            ivec2 q = clamp(pixel + ivec2(i, j) * kGhostStep, ivec2(0), last);
+            ivec2 q = clamp(src + ivec2(i, j) * kGhostStep, ivec2(0), last);
             vec3 pq = SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb);
             vec3 mq = SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb);
             vec3 oq = SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb);
@@ -429,6 +463,16 @@ void main() {
 
     vec3 blended = mix(original, transferred, clamp(params.transfer_strength, 0.0, 1.0));
     result = GamutCompressReversible(blended);
+  }
+
+  if (show_original) {
+    result = original;
+  }
+  if (outside_frame) {
+    result = vec3(0.0); // the letterbox bars
+  }
+  if (on_divider) {
+    result = vec3(1.0); // a hairline, so the two sides are never mistaken for one picture
   }
 
   vec3 encoded = SrgbEncode(result);
