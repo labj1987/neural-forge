@@ -7,8 +7,8 @@ motion_quality=0. No upstream config, package, library, manifest, prefix or Stea
 launch option was modified. Upstream config and both layer manifests passed a
 before/after SHA-256 comparison.
 
-NeuralForge is installed separately in `~/.local/share/neuralforge`, with its own
-config, prefix, helper and `/tmp/neuralforge-1000/shm.bin`. The helper was started
+NeuralForge is installed separately in `~/.local/share/neural-forge`, with its own
+config, prefix, helper and `/tmp/neural-forge-1000/shm.bin`. The helper was started
 and remains running. Its live settings retain working_scale=1, passes=1,
 mvec_enabled=0, mvec_quality=0 and apply_model=1. The required NVIDIA DLLs were
 copied by the explicit binary importer; nothing was moved from upstream.
@@ -51,7 +51,7 @@ No fence wait, queue timing or model setting was changed.
 Reference: [Khronos loader interface, Creating New Dispatchable Objects](https://github.com/KhronosGroup/Vulkan-Loader/blob/main/docs/LoaderLayerInterface.md#creating-new-dispatchable-objects).
 
 After this fix, the same NVIDIA `vkcube` test exits 0. Process maps confirm it loaded
-only `libneuralforge_layer.so`, not upstream's `libVkLayer_NV_dlssnr.so`.
+only `libneural_forge_layer.so`, not upstream's `libVkLayer_NV_dlssnr.so`.
 This confirms the abort is resolved; it does **not** establish valid end-to-end rendering.
 
 ## Correctness follow-up
@@ -72,12 +72,12 @@ swapchain semaphores remain alive until device teardown. This follows Khronos's
 [swapchain semaphore reuse guidance](https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html).
 
 On `lordnikon`, a 1,800-frame 2560x1440 Wayland `vkcube` run with NeuralForge,
-the full model, host SHM, and `NEURALFORGE_DMABUF=0` exited normally in 19.6 seconds.
+the full model, host SHM, and `NEURAL_FORGE_DMABUF=0` exited normally in 19.6 seconds.
 Khronos validation reported zero errors. The helper reported `model_up=1` and had
 processed 192 frames at the time of the status capture. A separate 900-frame run
 with synchronization validation enabled also exited normally with zero validation
 errors and zero synchronization hazards. Both runs loaded only
-`libneuralforge_layer.so`; upstream's NR layer was absent. The upstream config and
+`libneural_forge_layer.so`; upstream's NR layer was absent. The upstream config and
 both installed upstream layer manifests still match their initial SHA-256 hashes.
 
 Eleven non-fatal validation warnings remain from the pinned layer framework asking
@@ -93,8 +93,8 @@ second); mean GPU utilization was 94.9%, mean VRAM allocation 5,851 MiB, mean bo
 power 232.3 W, and peak temperature 75 C. These counters are useful pipeline evidence,
 but are not game FPS or a 1%-low result.
 
-For the NeuralForge-only launch, Steam was restarted with `NEURALFORGE_ENABLE=1`,
-`NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe`, `NEURALFORGE_DMABUF=0`, its isolated
+For the NeuralForge-only launch, Steam was restarted with `NEURAL_FORGE_ENABLE=1`,
+`NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe`, `NEURAL_FORGE_DMABUF=0`, its isolated
 implicit-layer path, and a per-session loader disable for `VK_LAYER_NV_dlssnr`.
 NeuralForge loaded into the Rockstar processes and passed their swapchains through;
 the explicit ownership filter did not let those processes acquire the session.
@@ -116,7 +116,7 @@ through Synchronization2 barriers as `GENERAL -> TRANSFER_SRC_OPTIMAL -> GENERAL
 NeuralForge captures only after the source has returned to `GENERAL`, transitions it
 to `TRANSFER_SRC_OPTIMAL` for its private copy, and restores `GENERAL`; the swapchain
 remains a `TRANSFER_DST` output. Helper frames advanced from 219 to 336 on first use,
-with `model_up=1` and `NEURALFORGE_DMABUF=0` throughout.
+with `model_up=1` and `NEURAL_FORGE_DMABUF=0` throughout.
 
 An initial 61.413-second NeuralForge interval advanced 475 layer frames (7.73 layer
 frames per second), with 34.9% average GPU utilization, 5,235 MiB VRAM, 77.1 W mean
@@ -133,7 +133,7 @@ limit is reproducible rather than startup warm-up behavior.
 The ownership filter was exercised with two temporary names for the same `vkcube`
 binary. A process launched as `explorer.exe` was excluded, created only pass-through
 swapchains, and left `helper_frames` unchanged. A process launched as
-`GTA5_Enhanced.exe` with `NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe` acquired the
+`GTA5_Enhanced.exe` with `NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe` acquired the
 NeuralForge lease, used a non-pass-through swapchain, and advanced helper frames
 from 484 to 530. These are process-filter tests, not a GTA launch. They confirm the
 intended launcher exclusion and explicit-target path without touching Steam, GTA, or
@@ -150,7 +150,7 @@ directory were updated to match, confirmed against the renamed repository. The P
 PR above is merged.
 
 Attempted to reproduce and fix the eleven non-fatal validation warnings from Phase 1
-item 4 before continuing. A freshly built `libneuralforge_layer.so` was deployed
+item 4 before continuing. A freshly built `libneural_forge_layer.so` was deployed
 alongside the already-installed one (`~/nf-validate` via `VK_ADD_LAYER_PATH`, not
 `VK_LAYER_PATH` -- the latter replaces rather than extends the default search path
 and hides the system's own `VK_LAYER_KHRONOS_validation` manifest, which is why an
@@ -209,7 +209,7 @@ itself (now dead once `run`'s two call sites moved to the pipeline) was removed;
 command-recording sequence was factored into `record_capture_commands`, shared with
 the new pipeline's submit path.
 
-Also added `NEURALFORGE_HELPER_DELAY_MS` (test-only) to `neural-forge-helper`: an
+Also added `NEURAL_FORGE_HELPER_DELAY_MS` (test-only) to `neural-forge-helper`: an
 artificial per-response delay, read once at startup, applied right before
 `seq_resp` is published -- the real-hardware equivalent of the existing Rust
 integration test's fake in-process helper thread.
@@ -229,7 +229,7 @@ integration test's fake in-process helper thread.
   artifact of this test's own minimal device (created without `VK_KHR_swapchain`) --
   confirmed pre-existing and unrelated to this phase's change, not a synchronization
   hazard: no `SYNC-HAZARD-*` message appeared anywhere in either run.
-- `neural-forge-helper.exe` with `NEURALFORGE_HELPER_DELAY_MS=250` set was run alone
+- `neural-forge-helper.exe` with `NEURAL_FORGE_HELPER_DELAY_MS=250` set was run alone
   against `lordnikon`'s real Proton/Wine runner for 20+ seconds with no crash.
   A separate attempt earlier the same session, run immediately after starting a
   *second* helper instance against the same Wine prefix while the first was still
@@ -240,7 +240,7 @@ integration test's fake in-process helper thread.
   covers it.
 - `vkcube` itself -- both before and after this phase's change, confirmed against the
   unmodified Phase 1 binaries as a control -- never advances `layer_frames` at all
-  (`shmctl status` stays at 0) under `NEURALFORGE_ENABLE=1` regardless of which code is
+  (`shmctl status` stays at 0) under `NEURAL_FORGE_ENABLE=1` regardless of which code is
   installed. This matches `RENDER_TAP_DESIGN.md`: `vkcube` never performs the
   `TRANSFER_SRC_OPTIMAL` -> swapchain blit the render tap looks for, so capture never
   engages for it, old pipeline or new. `vkcube` is therefore only useful here for
@@ -435,7 +435,7 @@ likely NVIDIA-internal-shared-surface explanation for why there may be no real
 from a Wine process launched via `proton run` did not reach the invoking shell at all,
 even piped to a file, across 20+ real seconds of the process legitimately running
 (confirmed via `user`/`sys` time in the shell's own `time` output) -- switching the
-probe to this crate's own `log!`/`logging::flush()` (writing through `NEURALFORGE_LOG`
+probe to this crate's own `log!`/`logging::flush()` (writing through `NEURAL_FORGE_LOG`
 instead of stdout) fixed it immediately. This project's own `logging.rs` module
 already exists for exactly this class of problem ("whenever this binary's stdout/
 stderr isn't a real terminal... Proton/Steam has redirected it") -- use it for any
@@ -480,7 +480,7 @@ positive signal -- the lower fps itself "feels like it should," not laggy the wa
 earlier (pre-Phase-2) testing did, matching Phase 2's own design goal (the two-slot
 non-blocking capture pipeline removing the present-hook's own fence wait).
 
-**Real telemetry from that session** (`~/.local/state/neuralforge/helper.log`, both
+**Real telemetry from that session** (`~/.local/state/neural-forge/helper.log`, both
 protocol-v3 wire slots actively alternating -- frame numbers in the 1600s, confirming
 Phase 3's double buffering was genuinely live, not just idle): `NVSDK_NGX_VULKAN_
 EvaluateFeature` itself took a very consistent **~19-22ms per frame** end to end
@@ -555,14 +555,14 @@ rewritten so the reasoning trail stays honest:
 **Upstream comparison, finally done properly (and it overturns the "inherent to the
 model" read above -- item 2 is a real NeuralForge bug, not a law of physics).** Every
 earlier "upstream" run that day was invalid two ways at once: the Steam client was
-never restarted between tests (it kept the first launch's `NEURALFORGE_ENABLE`
+never restarted between tests (it kept the first launch's `NEURAL_FORGE_ENABLE`
 environment -- the `scripts/bench.sh` gotcha this file documents), *and* GTA's saved
-Steam launch options bake in `NEURALFORGE_ENABLE=1 ... %command%`, which Steam applies
-per-game regardless of the client environment. The fix was `NEURALFORGE_DISABLE=1`
+Steam launch options bake in `NEURAL_FORGE_ENABLE=1 ... %command%`, which Steam applies
+per-game regardless of the client environment. The fix was `NEURAL_FORGE_DISABLE=1`
 (the layer manifest's own `disable_environment`, honored at the Vulkan-loader level
 over any launch option) plus a genuine full Steam restart. Confirmed isolated via
 Steam's own `console-linux.txt`: `[dlssnr-layer] ... RTX 5070 (inert=0 enabled=1)`,
-zero `[neuralforge-layer]` lines for the whole session.
+zero `[neural-forge-layer]` lines for the whole session.
 
 Real result, Alex's own eyes plus telemetry: **upstream has no ghosting and much
 better fps.** The hard number that explains it -- upstream during real gameplay sat at
@@ -590,7 +590,7 @@ item 2 above is superseded.
 
 **Measured it, found the real culprit, and fixed most of it (v0.1.64).** Added a
 resolution-realistic benchmark (`capture::tests::capture_hot_path_cost_per_present`,
-env-gated behind `NEURALFORGE_BENCH`, runs on real hardware via the release test
+env-gated behind `NEURAL_FORGE_BENCH`, runs on real hardware via the release test
 binary) that drives `capture::run` at 2560x1440 with a keeping-up fake helper and
 separately times the CPU cost (the `run` call on the game's present thread) and the GPU
 cost (queue drain). Baseline on `lordnikon`:

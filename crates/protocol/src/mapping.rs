@@ -1,6 +1,6 @@
 //! Opens (or creates) the mapping on Linux and hands back a live `&ShmHeader` — the
 //! "just attach and read/write settings" case the GUI and CLI both need, as opposed
-//! to `neuralforge_layer`'s own copy of this same open/create/mmap dance (kept separate
+//! to `neural_forge_layer`'s own copy of this same open/create/mmap dance (kept separate
 //! there because it's entangled with that crate's request/response round-trip state
 //! machine, which the GUI/CLI have no reason to duplicate or depend on).
 //!
@@ -41,11 +41,11 @@ impl Mapping {
     }
 }
 
-/// Opens the mapping at `$NEURALFORGE_SHM` (or the default runtime path), creating it if
+/// Opens the mapping at `$NEURAL_FORGE_SHM` (or the default runtime path), creating it if
 /// necessary. Returns `None` on any I/O failure (permissions, disk full, etc.) — there
 /// is nothing a caller can usefully do about those beyond reporting them.
 pub fn open() -> Option<Mapping> {
-    let path = std::env::var("NEURALFORGE_SHM").ok().filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
+    let path = crate::env::var("NEURAL_FORGE_SHM").filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
     open_at(&path)
 }
 
@@ -58,14 +58,14 @@ pub(crate) fn open_at(path: &str) -> Option<Mapping> {
             // Real bug, found 2026-09-12: `create_dir_all` alone leaves the directory's
             // mode at `0o777 & !umask` -- whatever the *first* process to ever create it
             // (typically the CLI/supervisor at login, starting the helper) happened to
-            // have as its own umask, not necessarily private. `neuralforge_layer`'s own
+            // have as its own umask, not necessarily private. `neural_forge_layer`'s own
             // `ensure_private_parent_dir` (a real, deliberate security check --
             // `crates/layer/src/shm.rs`) refuses to use a mapping whose parent directory
             // isn't private, and has no way to fix it, only to permanently refuse it for
             // the rest of that process's life -- so a permissive first-creation silently
             // disabled every game's neural rendering for the whole session, with no
             // error visible anywhere except the layer's own log (which nothing sets
-            // `NEURALFORGE_LOG` to see, for a real game launch). `set_permissions` runs
+            // `NEURAL_FORGE_LOG` to see, for a real game launch). `set_permissions` runs
             // unconditionally here, every call, not just on first creation, so it also
             // self-heals a directory a previous, buggy version of this function already
             // created with the wrong mode -- no manual `chmod` should ever be needed
@@ -112,6 +112,7 @@ pub(crate) fn open_at(path: &str) -> Option<Mapping> {
         hdr.init_defaults();
     }
 
+    crate::compat::link_legacy_runtime(path);
     Some(Mapping { _fd: fd, header, freshly_created })
 }
 
@@ -123,7 +124,7 @@ mod tests {
     fn scratch_path() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("{}/neuralforge-mapping-test-{}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
+        format!("{}/neural-forge-mapping-test-{}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
     }
 
     #[test]

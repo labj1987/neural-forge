@@ -12,11 +12,11 @@
 //! four resources) this crate never bound before -- a real, plausible cause of a first
 //! real visual check (see `CLAUDE.md`) turning up a solid-white `EvaluateFeature`
 //! answer despite a `0x1` success code. There is no real depth buffer to
-//! give it yet (`neuralforge_layer::capture` only ever captures the presented color image),
+//! give it yet (`neural_forge_layer::capture` only ever captures the presented color image),
 //! so this hands the model a constant, synthetic "far plane, no real depth" value --
 //! an honest stand-in, not a real per-pixel depth buffer.
 //!
-//! Same staging-copy discipline as `neuralforge_layer::capture`: images are populated via
+//! Same staging-copy discipline as `neural_forge_layer::capture`: images are populated via
 //! an explicit host-visible-buffer upload/download, not a zero-copy import.
 
 use ash::vk;
@@ -57,7 +57,7 @@ pub struct FrameResources {
 
     /// Host-visible staging, sized to the larger of upload (Color/MVec) or download
     /// (Output) -- one buffer, reused sequentially, same simplification
-    /// `neuralforge_layer::capture` makes for its own single staging buffer. Still used
+    /// `neural_forge_layer::capture` makes for its own single staging buffer. Still used
     /// for MVec/Depth always, and for Color/Output too whenever `imported_proxy`/
     /// `imported_answer` below aren't available.
     staging_buffer: vk::Buffer,
@@ -102,7 +102,7 @@ const MVEC_FORMAT: vk::Format = vk::Format::R16G16_SFLOAT;
 // (`EvaluateFeature Color=%p MVec=%p Depth=%p Output=%p` -- confirmed present via
 // `strings` against the real binary, 2026-09-10) but were never bound here before --
 // this crate had no depth buffer to give it and the real capture path
-// (`neuralforge_layer::capture`) only ever captures the presented color image, never a
+// (`neural_forge_layer::capture`) only ever captures the presented color image, never a
 // depth attachment. A color-aspect (not a real `D32_SFLOAT` depth-aspect image, to
 // avoid the different layout/aspect-mask rules those need) constant-far-plane image is
 // a synthetic stand-in -- "no usable depth" as honestly as this crate can currently
@@ -113,7 +113,7 @@ fn find_memory_type(props: &vk::PhysicalDeviceMemoryProperties, type_bits: u32, 
     (0..props.memory_type_count).find(|&i| (type_bits & (1 << i)) != 0 && props.memory_types[i as usize].property_flags.contains(wanted))
 }
 
-/// Mirrors `neuralforge_layer::capture`'s own function of the same name -- see
+/// Mirrors `neural_forge_layer::capture`'s own function of the same name -- see
 /// `docs/EXTERNAL_MEMORY_HOST_DESIGN.md` for why this needs checking on *this* device too,
 /// not assumed from the Linux side's own query.
 fn min_imported_host_pointer_alignment(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Option<vk::DeviceSize> {
@@ -129,7 +129,7 @@ fn min_imported_host_pointer_alignment(instance: &ash::Instance, physical_device
 /// `TRANSFER_SRC | TRANSFER_DST` buffer -- `None` on any failure, including the
 /// device simply not exporting a compatible memory type for this exact pointer.
 /// Callers already treat `None` as "keep using the staging path for this resource",
-/// the same fail-open discipline `neuralforge_layer::capture`'s own import helper uses.
+/// the same fail-open discipline `neural_forge_layer::capture`'s own import helper uses.
 ///
 /// # Safety
 /// `host_ptr` must be valid for `bytes` bytes, already aligned/sized to whatever
@@ -141,7 +141,7 @@ unsafe fn build_imported_buffer(device: &ash::Device, instance: &ash::Instance, 
     // necessarily the same memory-type set as) the plain HOST_VISIBLE|HOST_COHERENT
     // search `FrameResources::new`'s own staging buffer already does. Resolved by
     // hand (never `vk::ExtExternalMemoryHostFn::load`, which *panics* if the function
-    // doesn't resolve -- see `neuralforge_layer::capture::build_imported_capture_buffer`'s
+    // doesn't resolve -- see `neural_forge_layer::capture::build_imported_capture_buffer`'s
     // identical fix, found the same way, live on real hardware).
     // SAFETY: `device` is live; the name is a valid, NUL-terminated C string.
     let get_memory_host_pointer_properties_ext = unsafe { instance.get_device_proc_addr(device.handle(), c"vkGetMemoryHostPointerPropertiesEXT".as_ptr()) }?;
@@ -348,7 +348,7 @@ impl Drop for PartialResources<'_> {
 impl FrameResources {
     /// Builds every resource `EvaluateFeature` needs for a `width`x`height` frame.
     /// `None` on any failure -- callers treat that as "skip evaluate this frame",
-    /// mirroring `neuralforge_layer::capture`'s own fail-open discipline.
+    /// mirroring `neural_forge_layer::capture`'s own fail-open discipline.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         device: &ash::Device,
@@ -459,7 +459,7 @@ impl FrameResources {
             // else writes to the answer region except this same buffer's own download
             // copy -- the single-reader/single-writer discipline the wire protocol's
             // "one outstanding request at a time" rule already guarantees, the same
-            // reasoning `neuralforge_layer::capture::DirectCapture` relies on for its own
+            // reasoning `neural_forge_layer::capture::DirectCapture` relies on for its own
             // single slot.
             unsafe { build_imported_buffer(device, instance, physical_device, ptr, capacity as vk::DeviceSize) }
         };

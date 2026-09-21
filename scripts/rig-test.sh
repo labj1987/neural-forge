@@ -6,7 +6,7 @@
 # wasted because the two halves of the system came from different builds -- the layer
 # hand-copied to the installed path while the helper ran from whatever stale AppImage
 # happened to be mounted. This script builds both halves, installs both halves,
-# forces the helper to come from the installed path (NEURALFORGE_INSTALL_DIR wins in
+# forces the helper to come from the installed path (NEURAL_FORGE_INSTALL_DIR wins in
 # `supervisor::install_dir`'s search order), runs the game, and reads the answers out
 # of the shared-memory header and the layer's own log.
 #
@@ -27,8 +27,8 @@ set -uo pipefail
 HOST="${1:-lordnikon}"
 SAMPLE="${2:-20}"
 APP_ID=3240220
-INSTALL_LIB="/home/alex/.local/share/neuralforge/lib/neuralforge"
-SHM="/tmp/neuralforge-1000/shm.bin"
+INSTALL_LIB="/home/alex/.local/share/neural-forge/lib/neural-forge"
+SHM="/tmp/neural-forge-1000/shm.bin"
 
 say() { printf '\n== %s\n' "$*"; }
 
@@ -48,13 +48,13 @@ cargo +stable-x86_64-unknown-linux-gnu build --release --target x86_64-pc-window
 say "deploying both halves (atomic: write .new, then rename)"
 # A plain overwrite of a mapped .so can corrupt a live process -- rename is atomic and
 # leaves any running process on its own inode.
-scp -q target/release/libneuralforge_layer.so "$HOST:$INSTALL_LIB/libneuralforge_layer.so.new" || exit 1
+scp -q target/release/libneural_forge_layer.so "$HOST:$INSTALL_LIB/libneural_forge_layer.so.new" || exit 1
 scp -q target/x86_64-pc-windows-gnu/release/neural-forge-helper.exe "$HOST:$INSTALL_LIB/helper/neural-forge-helper.exe.new" || exit 1
-sh_remote "mv -f '$INSTALL_LIB/libneuralforge_layer.so.new' '$INSTALL_LIB/libneuralforge_layer.so' &&
+sh_remote "mv -f '$INSTALL_LIB/libneural_forge_layer.so.new' '$INSTALL_LIB/libneural_forge_layer.so' &&
            mv -f '$INSTALL_LIB/helper/neural-forge-helper.exe.new' '$INSTALL_LIB/helper/neural-forge-helper.exe' &&
-           sha256sum '$INSTALL_LIB/libneuralforge_layer.so' '$INSTALL_LIB/helper/neural-forge-helper.exe'" || exit 1
+           sha256sum '$INSTALL_LIB/libneural_forge_layer.so' '$INSTALL_LIB/helper/neural-forge-helper.exe'" || exit 1
 say "local hashes, for comparison with the above"
-sha256sum target/release/libneuralforge_layer.so target/x86_64-pc-windows-gnu/release/neural-forge-helper.exe
+sha256sum target/release/libneural_forge_layer.so target/x86_64-pc-windows-gnu/release/neural-forge-helper.exe
 
 CLI="$(remote_cli)"
 if [ -z "$CLI" ]; then
@@ -67,16 +67,16 @@ say "stopping the previous game and helper"
 # match this very command's own argv, which is how an earlier run of this killed its
 # own ssh session. Kill by PID, never `pkill -f`.
 sh_remote "P=\$(pgrep -f 'GTA5_Enhanced[.]exe' | head -1); [ -n \"\$P\" ] && { kill -TERM \$P; sleep 6; kill -KILL \$P 2>/dev/null; }; true"
-sh_remote "export NEURALFORGE_SHM=$SHM NEURALFORGE_UID=1000; '$CLI' stop >/dev/null 2>&1; true"
+sh_remote "export NEURAL_FORGE_SHM=$SHM NEURAL_FORGE_UID=1000; '$CLI' stop >/dev/null 2>&1; true"
 
 say "starting the helper from the INSTALLED path (not the AppImage's own copy)"
-sh_remote "export NEURALFORGE_SHM=$SHM NEURALFORGE_UID=1000 NEURALFORGE_INSTALL_DIR=$INSTALL_LIB; '$CLI' start 2>&1 | head -5"
+sh_remote "export NEURAL_FORGE_SHM=$SHM NEURAL_FORGE_UID=1000 NEURAL_FORGE_INSTALL_DIR=$INSTALL_LIB; '$CLI' start 2>&1 | head -5"
 
 say "test settings"
 # working_scale 1.0 is required for the encode self-check: the proxy is only
 # pixel-aligned with the frame at exactly 1.0, and the check refuses to compare
 # different rasters rather than reporting nonsense.
-sh_remote "export NEURALFORGE_SHM=$SHM NEURALFORGE_UID=1000; for kv in 'enabled 1' 'apply_model 1' 'working_scale 1.0'; do '$CLI' shmctl set \$kv; done"
+sh_remote "export NEURAL_FORGE_SHM=$SHM NEURAL_FORGE_UID=1000; for kv in 'enabled 1' 'apply_model 1' 'working_scale 1.0'; do '$CLI' shmctl set \$kv; done"
 
 say "launching the game"
 sh_remote "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/1000 \
@@ -97,7 +97,7 @@ say "waiting for the layer to actually present frames (up to 10 minutes from gam
 # The layer's own frame counter moving is the only reliable "we are really rendering and
 # really capturing" signal -- the game can be up, windowed and burning CPU while capture
 # never triggers (see the pass_through/GENERAL gate in device.rs).
-sh_remote "export NEURALFORGE_SHM=$SHM NEURALFORGE_UID=1000
+sh_remote "export NEURAL_FORGE_SHM=$SHM NEURAL_FORGE_UID=1000
   start=\$('$CLI' shmctl status | awk -F= '/^layer_frames=/{print \$2}')
   for i in \$(seq 1 120); do
     sleep 5
@@ -108,7 +108,7 @@ sh_remote "export NEURALFORGE_SHM=$SHM NEURALFORGE_UID=1000
 FRAMES_OK=$?
 
 say "sampling for ${SAMPLE}s"
-sh_remote "export NEURALFORGE_SHM=$SHM NEURALFORGE_UID=1000
+sh_remote "export NEURAL_FORGE_SHM=$SHM NEURAL_FORGE_UID=1000
   a=\$('$CLI' shmctl status | awk -F= '/^layer_frames=/{print \$2}')
   h0=\$('$CLI' shmctl status | awk -F= '/^helper_frames=/{print \$2}')
   sleep $SAMPLE

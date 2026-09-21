@@ -1,5 +1,5 @@
 //! Shared helper-process supervision: config, XDG paths, and start/stop, used by
-//! both `neural-forge-cli` and `neuralforge` so "how to launch the helper" (runner type,
+//! both `neural-forge-cli` and `neural-forge` so "how to launch the helper" (runner type,
 //! environment variables, the Proton-vs-Wine command line) exists in exactly one
 //! place instead of being duplicated and risking drift between the two front ends.
 //! Linux-only: spawns child processes, reads XDG env vars.
@@ -7,6 +7,7 @@
 pub mod config;
 pub mod install;
 pub mod install_dir;
+pub mod migrate;
 pub mod paths;
 pub mod profiles;
 mod process;
@@ -20,9 +21,15 @@ pub fn pid_file() -> String {
     format!("{}/helper.pid", neural_forge_protocol::shm_runtime_dir())
 }
 
-/// The helper's PID if a process is actually alive at the PID in the pid file.
+/// The pid file a helper started by a pre-0.1.77 install wrote (`/tmp/neuralforge-<uid>/`).
+fn legacy_pid_file() -> Option<String> {
+    neural_forge_protocol::compat::legacy_runtime_dir().map(|dir| format!("{}/helper.pid", dir.display()))
+}
+
+/// The helper's PID if a process is actually alive at the PID in the pid file (or in the
+/// pre-0.1.77 one, so a helper started by an older install still counts as running).
 pub fn is_running() -> Option<i32> {
-    process::running_pid(&pid_file())
+    process::running_pid(&pid_file()).or_else(|| legacy_pid_file().and_then(|f| process::running_pid(&f)))
 }
 
 /// Graceful-then-forced stop of the whole helper process group.
@@ -47,6 +54,9 @@ pub fn stop(timeout: Duration) -> std::io::Result<()> {
     // Both runners (plain Wine, Proton) carry the helper's path in their own command
     // line, which is what guards against signaling a process that reused the PID.
     process::stop_matching(&pid_file(), timeout, Some("forge-helper"))?;
+    if let Some(legacy) = legacy_pid_file() {
+        process::stop_matching(&legacy, timeout, Some("forge-helper"))?;
+    }
     let cfg = Config::load();
     if let Some(wineserver) = wineserver_binary(&cfg) {
         let _ = std::process::Command::new(wineserver).arg("-k").env("WINEPREFIX", real_wineprefix(&cfg, &paths::prefix_dir())).status();
@@ -119,7 +129,7 @@ pub struct StartedHelper {
 }
 
 /// Starts the helper under `cfg`'s configured runner (Proton or plain Wine),
-/// building the same environment variables (`WINEPREFIX`, `NEURALFORGE_SHM`, `NEURALFORGE_UID`,
+/// building the same environment variables (`WINEPREFIX`, `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID`,
 /// the Proton-specific NVAPI/compat-data ones) either front end needs -- this is the
 /// one place that construction happens.
 pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
@@ -146,22 +156,22 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
 
     let mut envs = vec![
         ("WINEPREFIX".to_string(), paths::prefix_dir()),
-        ("NEURALFORGE_SHM".to_string(), cfg.shm.clone()),
-        ("NEURALFORGE_LOG".to_string(), cfg.log.clone()),
-        ("NEURALFORGE_BIN_DIR".to_string(), format!("Z:{}", cfg.binaries)),
+        ("NEURAL_FORGE_SHM".to_string(), cfg.shm.clone()),
+        ("NEURAL_FORGE_LOG".to_string(), cfg.log.clone()),
+        ("NEURAL_FORGE_BIN_DIR".to_string(), format!("Z:{}", cfg.binaries)),
         ("WINEDEBUG".to_string(), "-all".to_string()),
     ];
     // SAFETY-relevant only in the "matches a real deployment" sense, not memory
-    // safety: NEURALFORGE_UID has to be the same value the layer computes
+    // safety: NEURAL_FORGE_UID has to be the same value the layer computes
     // `shm_runtime_dir()` from, which reads it from the environment too -- passing it
     // explicitly here is what keeps both sides pointed at the same file.
     // SAFETY: getuid() takes no arguments and cannot fail.
     let uid = unsafe { libc::getuid() };
-    envs.push(("NEURALFORGE_UID".to_string(), uid.to_string()));
+    envs.push(("NEURAL_FORGE_UID".to_string(), uid.to_string()));
 
     let (program, args): (String, Vec<String>) = if cfg.runner_type == "proton" {
         envs.push(("PROTON_ENABLE_NVAPI".to_string(), "1".to_string()));
-        envs.push(("NEURALFORGE_SKIP_NVAPI".to_string(), "1".to_string()));
+        envs.push(("NEURAL_FORGE_SKIP_NVAPI".to_string(), "1".to_string()));
         envs.push(("STEAM_COMPAT_DATA_PATH".to_string(), paths::prefix_dir()));
         // Proton's own launch script reads this directly out of the environment
         // (`os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]`, no fallback) during
@@ -195,7 +205,7 @@ mod tests {
 
     #[test]
     fn wineserver_binary_finds_a_real_sibling_next_to_a_proton_runner() {
-        let dir = std::env::temp_dir().join(format!("neuralforge-wineserver-test-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("neural-forge-wineserver-test-{}", std::process::id()));
         let wineserver_dir = dir.join("files/bin");
         std::fs::create_dir_all(&wineserver_dir).unwrap();
         let wineserver_path = wineserver_dir.join("wineserver");
@@ -228,12 +238,12 @@ mod tests {
     #[test]
     fn real_wineprefix_appends_pfx_for_proton() {
         let cfg = Config { runner_type: "proton".to_string(), ..Config::default() };
-        assert_eq!(real_wineprefix(&cfg, "/home/alex/.local/share/neuralforge/prefix"), "/home/alex/.local/share/neuralforge/prefix/pfx");
+        assert_eq!(real_wineprefix(&cfg, "/home/alex/.local/share/neural-forge/prefix"), "/home/alex/.local/share/neural-forge/prefix/pfx");
     }
 
     #[test]
     fn real_wineprefix_is_unchanged_for_plain_wine() {
         let cfg = Config { runner_type: "wine".to_string(), ..Config::default() };
-        assert_eq!(real_wineprefix(&cfg, "/home/alex/.local/share/neuralforge/prefix"), "/home/alex/.local/share/neuralforge/prefix");
+        assert_eq!(real_wineprefix(&cfg, "/home/alex/.local/share/neural-forge/prefix"), "/home/alex/.local/share/neural-forge/prefix");
     }
 }

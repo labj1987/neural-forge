@@ -27,7 +27,7 @@
 // Suppresses the console window Wine/Windows would otherwise pop up for this
 // process -- a plain Rust binary links as a CONSOLE-subsystem PE by default, and
 // this helper never has anything to print to one that matters: real deployments
-// always set `NEURALFORGE_LOG` (`neural_forge_supervisor::start()`, confirmed by grep), so
+// always set `NEURAL_FORGE_LOG` (`neural_forge_supervisor::start()`, confirmed by grep), so
 // `crate::logging`'s own `Stderr` fallback is already unreachable in practice --
 // see that module's own doc comment. Found real, reported by the user, 2026-09-11:
 // this window shows up on every real launch and does nothing (no input, no output
@@ -153,8 +153,7 @@ fn main() {
     // section and docs/PHASE1.md's Phase 2 item 6 for why this exists: proving the layer's
     // present hook never blocks needs a helper slow enough that blocking would be
     // obvious, not just "usually fast".
-    let helper_delay: Duration = std::env::var("NEURALFORGE_HELPER_DELAY_MS")
-        .ok()
+    let helper_delay: Duration = neural_forge_protocol::env::var("NEURAL_FORGE_HELPER_DELAY_MS")
         .and_then(|s| s.parse::<u64>().ok())
         .map(Duration::from_millis)
         .unwrap_or_default();
@@ -351,7 +350,7 @@ fn process_request(
     // Real motion vectors, estimated here in the helper -- see `optical_flow.rs`'s
     // own doc comment for the architecture and why this replaced the layer-side
     // stub. Slot 0 only, matching the pre-existing convention (protocol v3 never
-    // duplicated the motion payload for slot 1). `NEURALFORGE_MVEC_HELPER` is a
+    // duplicated the motion payload for slot 1). `NEURAL_FORGE_MVEC_HELPER` is a
     // deliberate, explicit opt-in on top of the header's own `mvec_enabled` toggle:
     // this is genuinely unvalidated on real hardware as of the commit that adds it
     // (see docs/GHOSTING_PLAN.md step 4) -- some users' persisted config already has
@@ -362,7 +361,7 @@ fn process_request(
         && dims_ok
         && hdr.mvec_enabled()
         && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
-        && std::env::var_os("NEURALFORGE_MVEC_HELPER").is_some()
+        && neural_forge_protocol::env::is_set("NEURAL_FORGE_MVEC_HELPER")
     {
         estimate_motion(flow_queue, flow, prev_proxy, instance, device, physical_device, proxy, width, height, proxy_format, motion_scale, hdr.mvec_quality.load(Ordering::Relaxed))
     } else {
@@ -556,7 +555,7 @@ fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDev
     // NVIDIA parts expose optical flow on their main graphics/compute family) is
     // handled by not adding a second entry for it, only chaining the extra features.
     //
-    // Gated on `NEURALFORGE_MVEC_HELPER` here, not just in `estimate_motion`'s caller:
+    // Gated on `NEURAL_FORGE_MVEC_HELPER` here, not just in `estimate_motion`'s caller:
     // this is device-creation time, before any per-frame opt-in check runs, so on
     // hardware that genuinely exposes an optical-flow queue (real NVOF-capable
     // GPUs) this used to run unconditionally regardless of the env var -- silently
@@ -567,7 +566,7 @@ fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDev
     // hardware. Checking the env var here makes device creation byte-identical to
     // pre-optical-flow behavior for anyone who hasn't explicitly opted in, which is
     // the actual invariant this feature was supposed to guarantee from the start.
-    let flow_family = if std::env::var_os("NEURALFORGE_MVEC_HELPER").is_some() {
+    let flow_family = if neural_forge_protocol::env::is_set("NEURAL_FORGE_MVEC_HELPER") {
         find_flow_family(&instance, physical_device, &enabled)
     } else {
         None

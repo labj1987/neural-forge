@@ -6,7 +6,7 @@
 //!
 //! Run via `scripts/smoke-test.sh`, which builds the layer, writes a manifest pointing
 //! at the just-built `.so`, and sets the env vars this needs
-//! (`VK_LAYER_PATH`/`NEURALFORGE_ENABLE`/`NEURALFORGE_LOG`) before running it. Running this
+//! (`VK_LAYER_PATH`/`NEURAL_FORGE_ENABLE`/`NEURAL_FORGE_LOG`) before running it. Running this
 //! directly without that setup will simply not find the layer -- which is a fine
 //! outcome too (it means the layer opted out cleanly), not a crash.
 

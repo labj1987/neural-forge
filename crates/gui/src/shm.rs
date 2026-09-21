@@ -106,15 +106,15 @@ mod tests {
     /// instead of leaving the hardcoded default.
     #[test]
     fn a_setting_changed_through_bind_float_survives_a_simulated_reboot() {
-        let scratch = std::env::temp_dir().join(format!("neuralforge-shm-persist-test-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("neural-forge-shm-persist-test-{}", std::process::id()));
         let config_home = scratch.join("config");
         let shm_path = scratch.join("shm.bin");
         std::fs::create_dir_all(&config_home).unwrap();
 
         let prev_xdg_config = std::env::var("XDG_CONFIG_HOME").ok();
-        let prev_shm = std::env::var("NEURALFORGE_SHM").ok();
+        let prev_shm = std::env::var("NEURAL_FORGE_SHM").ok();
         std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::set_var("NEURALFORGE_SHM", &shm_path);
+        std::env::set_var("NEURAL_FORGE_SHM", &shm_path);
 
         {
             let shm = Shm::open().expect("first open should succeed and create a fresh mapping");
@@ -123,7 +123,7 @@ mod tests {
             set_intensity(1.75);
         }
 
-        let saved = std::fs::read_to_string(config_home.join("neuralforge/config.ini")).expect("config.ini should exist");
+        let saved = std::fs::read_to_string(config_home.join("neural-forge/config.ini")).expect("config.ini should exist");
         assert!(saved.contains("set_intensity=1.75"), "config.ini should have the new value:\n{saved}");
 
         // Simulate a reboot: the SHM file is what actually goes away (/tmp), not the
@@ -138,8 +138,8 @@ mod tests {
             None => std::env::remove_var("XDG_CONFIG_HOME"),
         }
         match prev_shm {
-            Some(v) => std::env::set_var("NEURALFORGE_SHM", v),
-            None => std::env::remove_var("NEURALFORGE_SHM"),
+            Some(v) => std::env::set_var("NEURAL_FORGE_SHM", v),
+            None => std::env::remove_var("NEURAL_FORGE_SHM"),
         }
         std::fs::remove_dir_all(&scratch).ok();
     }

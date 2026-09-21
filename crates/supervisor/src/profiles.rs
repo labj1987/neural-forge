@@ -89,7 +89,7 @@ mod tests {
     impl ScratchConfigHome {
         fn new(tag: &str) -> Self {
             let guard = XDG_CONFIG_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let dir = std::env::temp_dir().join(format!("neuralforge-profiles-test-{tag}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("neural-forge-profiles-test-{tag}-{}", std::process::id()));
             let prev = std::env::var("XDG_CONFIG_HOME").ok();
             std::env::set_var("XDG_CONFIG_HOME", &dir);
             Self { _guard: guard, prev, dir }

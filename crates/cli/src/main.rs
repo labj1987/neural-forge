@@ -46,9 +46,9 @@ fn profile_usage() {
          \x20 load <name>   apply <name>'s settings to the running instance and persist\n\
          \x20               them to config.ini\n\
          \x20 delete <name> remove a saved profile\n\n\
-         Profiles live in $XDG_CONFIG_HOME/neuralforge/profiles.ini. `save`/`load`\n\
+         Profiles live in $XDG_CONFIG_HOME/neural-forge/profiles.ini. `save`/`load`\n\
          attach to the live SHM mapping the same way `shmctl` does (see\n\
-         $NEURALFORGE_SHM/$NEURALFORGE_UID)."
+         $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)."
     );
 }
 
@@ -66,7 +66,7 @@ fn cmd_profile_list() -> ExitCode {
 
 fn cmd_profile_save(name: &str) -> ExitCode {
     let Some(mapping) = neural_forge_protocol::mapping::open() else {
-        eprintln!("profile save: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
+        eprintln!("profile save: failed to open the SHM mapping (see $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)");
         return ExitCode::FAILURE;
     };
     let settings = neural_forge_protocol::persist::snapshot(mapping.header());
@@ -89,7 +89,7 @@ fn cmd_profile_load(name: &str) -> ExitCode {
         return ExitCode::FAILURE;
     };
     let Some(mapping) = neural_forge_protocol::mapping::open() else {
-        eprintln!("profile load: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
+        eprintln!("profile load: failed to open the SHM mapping (see $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)");
         return ExitCode::FAILURE;
     };
     let header = mapping.header();
@@ -358,6 +358,12 @@ fn cmd_install(appdir: Option<&String>) -> ExitCode {
     match neural_forge_supervisor::install::install(std::path::Path::new(appdir)) {
         Ok(report) => {
             println!("Installed Neural Forge. CLI: {}", report.cli_path.display());
+            for path in &report.removed_legacy {
+                println!("removed old-layout file: {}", path.display());
+            }
+            for warning in &report.warnings {
+                eprintln!("warning: {warning}");
+            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -413,6 +419,11 @@ fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
 }
 
 fn main() -> ExitCode {
+    // Move pre-0.1.77 `neuralforge` config/data/state dirs before anything reads them.
+    let migration = neural_forge_supervisor::migrate::migrate();
+    if !migration.is_empty() {
+        eprintln!("neural-forge-cli: {}", migration.summary());
+    }
     let args: Vec<String> = std::env::args().collect();
     let Some(command) = args.get(1) else {
         usage();

@@ -44,7 +44,7 @@ fn resolve_bin_dir() -> Option<String> {
     // `std::env::var` already goes through the real `GetEnvironmentVariableW` on this
     // target -- no reason to hand-rolled that call the way `spoof.rs`'s PE parsing
     // genuinely needs to hand-roll PE-specific things.
-    let dir = std::env::var("NEURALFORGE_BIN_DIR").ok()?;
+    let dir = neural_forge_protocol::env::var("NEURAL_FORGE_BIN_DIR")?;
     if dir.is_empty() {
         return None;
     }
@@ -130,7 +130,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     s.device = device;
 
     let Some(bin_dir) = resolve_bin_dir() else {
-        crate::log!("[ngx] NEURALFORGE_BIN_DIR not set or nvngx_dlssnr.dll not found there");
+        crate::log!("[ngx] NEURAL_FORGE_BIN_DIR not set or nvngx_dlssnr.dll not found there");
         s.disabled = true;
         return s;
     };
@@ -545,7 +545,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_ExposureScale").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_PreExposure").as_ptr(), 1.0);
                 // This helper always captures the swapchain as a plain 8-bit UNORM
-                // proxy today (see `neuralforge_layer::capture`) regardless of the
+                // proxy today (see `neural_forge_layer::capture`) regardless of the
                 // swapchain's own HDR-ness -- SDR is the only honest hint to give
                 // until the real HDR float16 path (mentioned in the project's own
                 // README, not yet implemented) exists.

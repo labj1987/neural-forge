@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Repeatable GTA V Enhanced benchmark for the matched native/upstream/neuralforge
+# Repeatable GTA V Enhanced benchmark for the matched native/upstream/neural-forge
 # comparison required by docs/PHASE1.md ("Preserved baseline and benchmark gate", item 2).
 # Run this ON THE TARGET MACHINE (lordnikon), not the dev box that builds the layer --
 # it needs the real Steam client, the real GPU, and the real game.
@@ -15,7 +15,7 @@
 # Needs: steam, nvidia-smi, xdotool (to trigger MangoHud's own toggle_logging hotkey
 # on the game window -- this repo does not control MangoHud, so it drives the exact
 # hotkey already configured in ~/.config/MangoHud/MangoHud.conf rather than guessing
-# at an autostart config key). For upstream/neuralforge modes, neural-forge-cli must
+# at an autostart config key). For upstream/neural-forge modes, neural-forge-cli must
 # already be on PATH (see docs/PHASE1.md's install step) for the layer-side telemetry
 # sample; native mode skips that half.
 #
@@ -33,15 +33,15 @@ MANGOHUD_OUT="$HOME" # matches output_folder=/home/alex in MangoHud.conf
 
 case "$MODE" in
     native)
-        LAUNCH_ENV=(env -u NEURALFORGE_ENABLE -u VKLayer_DLSS5 NEURALFORGE_DISABLE=1)
+        LAUNCH_ENV=(env -u NEURAL_FORGE_ENABLE -u VKLayer_DLSS5 NEURAL_FORGE_DISABLE=1)
         ;;
     upstream)
         # docs/PHASE1.md's preserved baseline. Do not change this launch option.
-        LAUNCH_ENV=(env -u NEURALFORGE_ENABLE VKLayer_DLSS5=1 DLSSNR_DMABUF=0)
+        LAUNCH_ENV=(env -u NEURAL_FORGE_ENABLE VKLayer_DLSS5=1 DLSSNR_DMABUF=0)
         ;;
     neuralforge)
-        LAUNCH_ENV=(env -u VKLayer_DLSS5 NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 \
-            "NEURALFORGE_TARGET_EXE=$GAME_EXE")
+        LAUNCH_ENV=(env -u VKLayer_DLSS5 NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 \
+            "NEURAL_FORGE_TARGET_EXE=$GAME_EXE")
         ;;
     *)
         echo "unknown mode: $MODE (want native|upstream|neuralforge)" >&2

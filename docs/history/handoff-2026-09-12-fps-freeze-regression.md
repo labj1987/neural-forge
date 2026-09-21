@@ -6,7 +6,7 @@
 
 ## Current state
 
-Historical checkout: `/home/alex/Projects/dlssnr`. Current repository: `labj1987/NeuralForge`.
+Historical checkout: `/home/alex/Projects/dlssnr` (now `/home/alex/Projects/neural-forge`). Current repository: `labj1987/neural-forge`.
 Latest release: **v0.1.35** — https://github.com/labj1987/NeuralForge/releases/tag/v0.1.35
 This is a **rollback release**. The underlying bug is still open.
 
@@ -224,7 +224,7 @@ Xwayland-session auth file, find via `ls /run/user/1000/.mutter-Xwaylandauth.*`>
 
 ## Full narrative writeup
 
-`/home/alex/Projects/dlssnr/CLAUDE.md` has the complete, dated, in-depth writeup of
+`/home/alex/Projects/neural-forge/CLAUDE.md` (formerly `/home/alex/Projects/dlssnr/CLAUDE.md`) has the complete, dated, in-depth writeup of
 every finding this session (and prior sessions) made, in far more detail than this
 handoff — read the top few sections (2026-09-12 entries) for the full reasoning
 trail behind everything summarized above, including the exact code-level detail of

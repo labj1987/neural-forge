@@ -412,16 +412,20 @@ impl ShmClient {
     /// Opens (or creates) the mapping if not already attached. Idempotent.
     pub fn open(&mut self) -> bool {
         if self.header().is_some() { return true; }
-        let path = std::env::var("NEURALFORGE_SHM")
-            .ok()
+        let path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM")
             .filter(|s| !s.is_empty())
             .unwrap_or_else(shm_default_path);
         if !neural_forge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) || !crate::ownership::claim(&path) { return false; }
-        self.open_at(&path)
+        let opened = self.open_at(&path);
+        if opened {
+            // Bridge the pre-0.1.77 runtime dir for any old-layer game (see `compat`).
+            neural_forge_protocol::compat::link_legacy_runtime(&path);
+        }
+        opened
     }
 
     /// The actual implementation, taking the path explicitly so tests can point it at a
-    /// scratch directory instead of `$NEURALFORGE_SHM`/the real `/tmp/neuralforge-$UID/` -- mutating
+    /// scratch directory instead of `$NEURAL_FORGE_SHM`/the real `/tmp/neural-forge-$UID/` -- mutating
     /// process-wide environment variables from parallel `#[test]`s would race.
     fn open_at(&mut self, path: &str) -> bool {
         if self.header().is_some() {
@@ -529,7 +533,7 @@ impl ShmClient {
     }
 
     /// Same as [`Self::try_round_trip`], but against an explicit path rather than
-    /// `$NEURALFORGE_SHM`/the real runtime dir -- so tests can point it at a scratch
+    /// `$NEURAL_FORGE_SHM`/the real runtime dir -- so tests can point it at a scratch
     /// directory without racing on process-wide environment variables.
     #[cfg(test)]
     fn try_round_trip_at(&mut self, path: &str) -> bool {
@@ -777,14 +781,14 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicU64;
 
-    /// A fresh, private scratch path per test -- never `$TMPDIR/neuralforge-*` or anything
+    /// A fresh, private scratch path per test -- never `$TMPDIR/neural-forge-*` or anything
     /// `open()`'s real env-var path would touch, so these can run in parallel with each
     /// other (and with a real layer, if one happened to be running) without colliding.
     fn scratch_path() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        format!("{}/neuralforge-shm-test-{pid}-{n}/shm.bin", std::env::temp_dir().display())
+        format!("{}/neural-forge-shm-test-{pid}-{n}/shm.bin", std::env::temp_dir().display())
     }
 
     fn header_of<'a>(client: &'a ShmClient) -> &'a ShmHeader {
@@ -994,7 +998,7 @@ mod motion_transport_tests {
         let instance = unsafe {entry.create_instance(&ash::vk::InstanceCreateInfo::builder().application_info(&app),None)}.unwrap();
         let pd = unsafe {instance.enumerate_physical_devices()}.unwrap().into_iter().find(|&p|
             unsafe {instance.get_physical_device_properties(p)}.vendor_id == 0x10de).expect("NVIDIA GPU required");
-        let path = format!("/tmp/neuralforge-motion-transport-{}/shm.bin",std::process::id());
+        let path = format!("/tmp/neural-forge-motion-transport-{}/shm.bin",std::process::id());
         let mut client = ShmClient::default();
         assert!(client.open_at(&path));
         let mut pixels = vec![0u8;512*512*4];

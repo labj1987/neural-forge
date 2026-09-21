@@ -609,9 +609,9 @@ fn launch_option(target_exe: &str, dmabuf: bool) -> String {
     let dmabuf = u32::from(dmabuf);
     let target_exe = target_exe.trim();
     if target_exe.is_empty() {
-        format!("NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF={dmabuf} %command%")
+        format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF={dmabuf} %command%")
     } else {
-        format!("NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF={dmabuf} NEURALFORGE_TARGET_EXE={target_exe} %command%")
+        format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF={dmabuf} NEURAL_FORGE_TARGET_EXE={target_exe} %command%")
     }
 }
 
@@ -1154,26 +1154,26 @@ mod launch_option_tests {
 
     #[test]
     fn matches_the_documented_baseline_with_no_target_exe() {
-        assert_eq!(launch_option("", false), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 %command%");
+        assert_eq!(launch_option("", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 %command%");
     }
 
     #[test]
     fn includes_target_exe_when_given() {
-        assert_eq!(launch_option("GTA5_Enhanced.exe", false), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
+        assert_eq!(launch_option("GTA5_Enhanced.exe", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
     }
 
     #[test]
     fn dmabuf_toggle_changes_only_that_field() {
-        assert_eq!(launch_option("", true), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=1 %command%");
+        assert_eq!(launch_option("", true), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=1 %command%");
     }
 
     #[test]
     fn trims_whitespace_around_target_exe() {
-        assert_eq!(launch_option("  GTA5_Enhanced.exe  ", false), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
+        assert_eq!(launch_option("  GTA5_Enhanced.exe  ", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
     }
 
     #[test]
     fn whitespace_only_target_exe_is_treated_as_empty() {
-        assert_eq!(launch_option("   ", false), "NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 %command%");
+        assert_eq!(launch_option("   ", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 %command%");
     }
 }

@@ -12,17 +12,27 @@ fn xdg(var: &str, fallback_under_home: &str) -> String {
     std::env::var(var).ok().filter(|s| !s.is_empty()).unwrap_or_else(|| format!("{}/{fallback_under_home}", home()))
 }
 
-/// The raw `XDG_DATA_HOME` itself (not the `neuralforge` subdirectory [`data_dir`]
+/// The raw `XDG_DATA_HOME` itself (not the `neural-forge` subdirectory [`data_dir`]
 /// returns) -- `install.rs` needs it as-is, matching `scripts/install.py`'s own
 /// `data` variable: several installed files (the Vulkan manifest, `.desktop` file,
 /// icon, AppStream metainfo) live under the shared per-user data hierarchy's own
-/// well-known subdirectories, siblings of `neuralforge/` rather than inside it.
+/// well-known subdirectories, siblings of `neural-forge/` rather than inside it.
 pub fn data_home() -> String {
     xdg("XDG_DATA_HOME", ".local/share")
 }
 
+/// The raw `XDG_CONFIG_HOME` (see [`data_home`]).
+pub fn config_home() -> String {
+    xdg("XDG_CONFIG_HOME", ".config")
+}
+
+/// The raw `XDG_STATE_HOME` (see [`data_home`]).
+pub fn state_home() -> String {
+    xdg("XDG_STATE_HOME", ".local/state")
+}
+
 pub fn config_dir() -> String {
-    format!("{}/neuralforge", xdg("XDG_CONFIG_HOME", ".config"))
+    format!("{}/neural-forge", xdg("XDG_CONFIG_HOME", ".config"))
 }
 
 pub fn config_file() -> String {
@@ -30,11 +40,11 @@ pub fn config_file() -> String {
 }
 
 pub fn data_dir() -> String {
-    format!("{}/neuralforge", xdg("XDG_DATA_HOME", ".local/share"))
+    format!("{}/neural-forge", xdg("XDG_DATA_HOME", ".local/share"))
 }
 
 pub fn state_dir() -> String {
-    format!("{}/neuralforge", xdg("XDG_STATE_HOME", ".local/state"))
+    format!("{}/neural-forge", xdg("XDG_STATE_HOME", ".local/state"))
 }
 
 pub fn log_file() -> String {
@@ -45,11 +55,11 @@ pub fn binaries_dir() -> String {
     format!("{}/binaries", data_dir())
 }
 
-/// The managed Wine/Proton prefix `neuralforge` creates and owns, distinct from any
+/// The managed Wine/Proton prefix `neural-forge` creates and owns, distinct from any
 /// prefix a game or Steam manages -- so importing NGX DLLs into it, or a bad prefix
 /// state, never touches anything else.
 pub fn prefix_dir() -> String {
-    format!("{}/neuralforge/prefix", xdg("XDG_DATA_HOME", ".local/share"))
+    format!("{}/neural-forge/prefix", xdg("XDG_DATA_HOME", ".local/share"))
 }
 
 pub fn ensure_dirs() -> std::io::Result<()> {
@@ -118,7 +128,7 @@ pub(crate) mod tests {
     #[test]
     fn finds_a_real_steam_install_under_xdg_data_home() {
         let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = std::env::temp_dir().join(format!("neuralforge-steam-detect-test-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("neural-forge-steam-detect-test-{}", std::process::id()));
         let steam_dir = scratch.join("Steam");
         std::fs::create_dir_all(&steam_dir).unwrap();
 
@@ -138,7 +148,7 @@ pub(crate) mod tests {
     #[test]
     fn returns_none_when_no_candidate_exists() {
         let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = std::env::temp_dir().join(format!("neuralforge-steam-detect-test-none-{}", std::process::id()));
+        let scratch = std::env::temp_dir().join(format!("neural-forge-steam-detect-test-none-{}", std::process::id()));
         // Deliberately do not create `scratch` itself -- every candidate under it is
         // real-but-nonexistent, the case this function must fail open on.
 

@@ -201,7 +201,7 @@ wired, just never had a real producer before now. The vector→bytes packing reu
 `neural_forge_protocol::motion::encode` (already real, already tested) rather than
 duplicating it.
 
-**Deliberately gated behind an explicit `NEURALFORGE_MVEC_HELPER=1` environment
+**Deliberately gated behind an explicit `NEURAL_FORGE_MVEC_HELPER=1` environment
 variable**, on top of the header's own `mvec_enabled` toggle: this is genuinely
 unvalidated on real optical-flow hardware, and some users' persisted config
 (including lordnikon's own `config.ini`, from when the toggle was a no-op) already
@@ -238,7 +238,7 @@ for anyone who doesn't set the variable.
   "doesn't do the thing that caused the old crash" is a design argument, not a
   measurement.
 
-Next step, once lordnikon is back: deploy, set `NEURALFORGE_MVEC_HELPER=1`, watch
+Next step, once lordnikon is back: deploy, set `NEURAL_FORGE_MVEC_HELPER=1`, watch
 `journalctl -k` for Xid errors the same way every other hardware validation in this
 project has, and check the helper log for `[mvec]` lines confirming a real session
 came up (`optical flow queue: available`, no `session unavailable` line).
@@ -247,7 +247,7 @@ came up (`optical flow queue: available`, no `session unavailable` line).
 same day, live during Alex's testing)
 
 The "nothing changes for anyone who doesn't set the variable" claim in §4a was false.
-`NEURALFORGE_MVEC_HELPER` only gated the *runtime* `estimate_motion()` call inside
+`NEURAL_FORGE_MVEC_HELPER` only gated the *runtime* `estimate_motion()` call inside
 `process_request`. It did not gate `find_flow_family()`, the second
 `DeviceQueueCreateInfo`, or the `VkPhysicalDeviceOpticalFlowFeaturesNV`/
 `Synchronization2Features` chain in `create_vulkan_context()` -- all of that ran
@@ -269,7 +269,7 @@ composited frame -- which is exactly what Alex saw: ~10fps and a static ghost im
 that didn't respond to movement, identical whether the enhancement was on or off,
 since the synchronous per-frame call happens either way.
 
-Fixed by moving the `NEURALFORGE_MVEC_HELPER` check to wrap `find_flow_family()`
+Fixed by moving the `NEURAL_FORGE_MVEC_HELPER` check to wrap `find_flow_family()`
 itself, so `flow_family` is unconditionally `None` without the opt-in and device
 creation takes the exact pre-v0.1.69 shape regardless of what the driver supports.
 Cross-compiled (release), re-ran the Wine test suite (can't exercise the real hang
@@ -441,11 +441,11 @@ crash; every run on lordnikon with `journalctl -k` watched for Xid lines.
 ### Step 5 — Housekeeping found tonight
 
 - **Layer deploy gap.** AppImage/Gear Lever updates never refresh
-  `~/.local/share/neuralforge/lib/neuralforge/libneuralforge_layer.so`, which is what the
+  `~/.local/share/neural-forge/lib/neural-forge/libneural_forge_layer.so`, which is what the
   game actually loads. That is why v0.1.64 "did nothing" until the .so was copied by hand.
   The GUI should re-install the layer on launch whenever the bundled hash differs (upstream's
   `install.sh` overwrites in place and its README says to relaunch the game).
-- **Steam env gotcha.** Document `NEURALFORGE_DISABLE=1` + a full Steam restart as the way
+- **Steam env gotcha.** Document `NEURAL_FORGE_DISABLE=1` + a full Steam restart as the way
   to A/B against upstream, and that Steam bakes its launch environment into every game.
 - v0.1.65 ships the v2 mask (done tonight).
 

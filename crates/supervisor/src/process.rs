@@ -71,6 +71,7 @@ pub fn start_detached(
 fn isolate_helper_layers(command: &mut Command, layers: Option<&str>) {
     command.env_remove("VKLayer_DLSS5")
         .env_remove("DLSSNR_ENABLE")
+        .env_remove("NEURAL_FORGE_ENABLE")
         .env_remove("NEURALFORGE_ENABLE");
     if let Some(layers) = layers {
         let kept = layers.split(':').filter(|name| !matches!(*name,
@@ -161,9 +162,9 @@ mod tests {
     fn helper_drops_game_injection_but_keeps_validation_layers() {
         let mut command = Command::new("sh");
         command.env_clear().env("VKLayer_DLSS5", "1")
-            .env("DLSSNR_ENABLE", "1").env("NEURALFORGE_ENABLE", "1");
+            .env("DLSSNR_ENABLE", "1").env("NEURAL_FORGE_ENABLE", "1").env("NEURALFORGE_ENABLE", "1");
         isolate_helper_layers(&mut command, Some("VK_LAYER_NV_dlssnr:VK_LAYER_KHRONOS_validation:VK_LAYER_neuralforge_neural:VK_LAYER_NV_present"));
-        let result = command.args(["-c", "test -z \"$VKLayer_DLSS5$DLSSNR_ENABLE$NEURALFORGE_ENABLE\" && test \"$VK_INSTANCE_LAYERS\" = VK_LAYER_KHRONOS_validation:VK_LAYER_NV_present"]).status().unwrap();
+        let result = command.args(["-c", "test -z \"$VKLayer_DLSS5$DLSSNR_ENABLE$NEURAL_FORGE_ENABLE$NEURALFORGE_ENABLE\" && test \"$VK_INSTANCE_LAYERS\" = VK_LAYER_KHRONOS_validation:VK_LAYER_NV_present"]).status().unwrap();
         assert!(result.success());
     }
 

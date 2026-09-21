@@ -1,4 +1,4 @@
-//! A minimal logging sink: `NEURALFORGE_LOG` names a file to append to, otherwise stderr.
+//! A minimal logging sink: `NEURAL_FORGE_LOG` names a file to append to, otherwise stderr.
 //! One handle for the process, not one per call site -- opening (or looking up) the
 //! sink on every log line would be wasteful on a hot path like the present hook.
 
@@ -10,7 +10,7 @@ use std::sync::{Mutex, OnceLock};
 // Both variants are wrapped in `BufWriter`, not just the file one: this crate's own
 // `set_frame_info`/`capture::run` log unconditionally once (now twice, with the added
 // timing line) per frame, from inside the game's own `vkQueuePresentKHR` override --
-// truly the hottest of hot paths. `NEURALFORGE_LOG` is only ever set for
+// truly the hottest of hot paths. `NEURAL_FORGE_LOG` is only ever set for
 // `neural-forge-helper.exe` by `neural_forge_supervisor::start()` (confirmed by grep) -- nothing
 // sets it for the game's own launch environment, so in every real deployment this
 // crate has ever run in, `sink()` falls into `Stderr`, never `File`. A 2026-09-10
@@ -50,8 +50,7 @@ static FLUSH_COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU3
 
 fn sink() -> &'static Mutex<Sink> {
     SINK.get_or_init(|| {
-        let sink = std::env::var("NEURALFORGE_LOG")
-            .ok()
+        let sink = neural_forge_protocol::env::var("NEURAL_FORGE_LOG")
             .filter(|p| !p.is_empty() && neural_forge_protocol::isolated_path(p))
             .and_then(|path| OpenOptions::new().create(true).append(true).open(path).ok())
             .map(|f| Sink::File(BufWriter::new(f)))
@@ -60,11 +59,11 @@ fn sink() -> &'static Mutex<Sink> {
     })
 }
 
-/// Writes one `[neuralforge-layer] ...` line. Never called directly -- use the
+/// Writes one `[neural-forge-layer] ...` line. Never called directly -- use the
 /// [`crate::log!`] macro so every call site gets the same prefix and newline handling.
 pub fn log(args: Arguments<'_>) {
     let Ok(mut sink) = sink().lock() else { return };
-    let _ = writeln!(sink, "[neuralforge-layer] {args}");
+    let _ = writeln!(sink, "[neural-forge-layer] {args}");
     if FLUSH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 {
         let _ = sink.flush();
     }

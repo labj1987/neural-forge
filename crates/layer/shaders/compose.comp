@@ -12,7 +12,7 @@
 // Bindings match the transport this pass reads/writes: the original frame (capture),
 // the proxy the model was shown, the model's raw answer, and the composed output.
 // `rgba8`, not `rgba16f`: the real, default, only-currently-supported proxy format is
-// `RGBA8` (see `neuralforge_protocol::enums::proxy_format`) -- storage-image `imageLoad`/
+// `RGBA8` (see `neural_forge_protocol::enums::proxy_format`) -- storage-image `imageLoad`/
 // `imageStore` never apply an sRGB curve regardless of format (that is exclusively a
 // sampled-image-plus-sampler feature per the Vulkan spec), so this shader does the
 // same explicit sRGB decode/encode `composition::apply` already does on the CPU,
@@ -364,7 +364,7 @@ void main() {
     vec3 upgraded = UpgradeToneMap(original, proxy, model, params.colour_strength);
     // The transfer is a ratio against the proxy's own pixel, guarded by max_ratio so a
     // near-black proxy pixel can't produce an unbounded multiply/divide (see
-    // neuralforge_protocol::ShmHeader::max_ratio_bits's doc comment).
+    // neural_forge_protocol::ShmHeader::max_ratio_bits's doc comment).
     vec3 safe_proxy = max(proxy, vec3(1e-4));
     vec3 transfer_ratio = clamp(upgraded / safe_proxy, 1.0 / params.max_ratio, params.max_ratio);
     vec3 transferred = original * transfer_ratio;

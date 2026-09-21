@@ -4,13 +4,15 @@
 # assumption). Run as root in CI.
 #
 # Unlike GreenLight/KernelPop, this app needs no polkit/pkexec step at all -- every
-# path it touches (~/.local/share, ~/.config, /tmp/neuralforge-$UID/) is already
+# path it touches (~/.local/share, ~/.config, /tmp/neural-forge-$UID/) is already
 # user-owned, so AppRun just execs the GUI directly.
 set -euo pipefail
 
-# APP is the layer's frozen identity (VK_LAYER_neuralforge_neural, libneuralforge_layer.so,
-# lib/neuralforge/); NAME is the user-facing binary/AppImage name. See CLAUDE.md "Naming convention".
-APP="neuralforge"
+# LIBDIR/LIB/MANIFEST are the layer's install identity (VK_LAYER_neuralforge_neural, libneural_forge_layer.so,
+# lib/neural-forge/); NAME is the user-facing binary/AppImage name. See CLAUDE.md "Naming convention".
+LIBDIR="neural-forge"
+LIB="libneural_forge_layer.so"
+MANIFEST="neural_forge_layer.json"
 NAME="neural-forge"
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 ARCH="x86_64"
@@ -68,7 +70,7 @@ $CARGO_HELPER build --release --target "$WIN_TARGET" -p neural-forge-helper
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
 mkdir -p "$APPDIR/usr/bin" \
-         "$APPDIR/usr/lib/$APP/helper" \
+         "$APPDIR/usr/lib/$LIBDIR/helper" \
          "$APPDIR/usr/share/applications" \
          "$APPDIR/usr/share/icons/hicolor/scalable/apps" \
          "$APPDIR/usr/share/metainfo" \
@@ -76,10 +78,10 @@ mkdir -p "$APPDIR/usr/bin" \
 
 cp "target/release/$NAME"                      "$APPDIR/usr/bin/"
 cp "target/release/$NAME-cli"                       "$APPDIR/usr/bin/"
-cp "target/release/lib${APP}_layer.so"             "$APPDIR/usr/lib/$APP/"
-cp "target/$WIN_TARGET/release/${NAME}-helper.exe"  "$APPDIR/usr/lib/$APP/helper/"
-sed "s#\./lib${APP}_layer\.so#../../../lib/$APP/lib${APP}_layer.so#" \
-    "data/VK_LAYER_${APP}_neural.json" > "$APPDIR/usr/share/vulkan/implicit_layer.d/VK_LAYER_${APP}_neural.json"
+cp "target/release/$LIB"                            "$APPDIR/usr/lib/$LIBDIR/"
+cp "target/$WIN_TARGET/release/${NAME}-helper.exe"  "$APPDIR/usr/lib/$LIBDIR/helper/"
+sed "s#\./libneural_forge_layer\.so#../../../lib/$LIBDIR/$LIB#" \
+    "data/$MANIFEST" > "$APPDIR/usr/share/vulkan/implicit_layer.d/$MANIFEST"
 cp data/io.github.labj1987.NeuralForge.desktop                               "$APPDIR/usr/share/applications/"
 cp data/icon.svg                                   "$APPDIR/usr/share/icons/hicolor/scalable/apps/$NAME.svg"
 # The <releases> list is generated from CHANGELOG.md's version headings, and fails the

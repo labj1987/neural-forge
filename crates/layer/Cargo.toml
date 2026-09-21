@@ -7,7 +7,7 @@ license.workspace = true
 description = "Vulkan implicit layer: captures presented frames, runs the composition, talks to the helper over shared memory"
 
 [lib]
-name = "neuralforge_layer"
+name = "neural_forge_layer"
 crate-type = ["cdylib"]
 
 [dependencies]

@@ -39,8 +39,8 @@ mod tests {
 
     #[test]
     fn import_from_copies_known_files_and_skips_unknown_ones() {
-        let src = std::env::temp_dir().join(format!("neuralforge-binaries-test-src-{}", std::process::id()));
-        let dest_home = std::env::temp_dir().join(format!("neuralforge-binaries-test-home-{}", std::process::id()));
+        let src = std::env::temp_dir().join(format!("neural-forge-binaries-test-src-{}", std::process::id()));
+        let dest_home = std::env::temp_dir().join(format!("neural-forge-binaries-test-home-{}", std::process::id()));
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("nvngx_dlssnr.dll"), b"model").unwrap();
         std::fs::write(src.join("nvapi64.dll"), b"nvapi").unwrap();

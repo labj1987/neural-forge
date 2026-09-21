@@ -28,7 +28,7 @@ source images are the only currently demonstrated legal capture candidates.
 ## Validation gate
 
 Validate the feature first with Khronos synchronization validation at 2560x1440,
-`NEURALFORGE_DMABUF=0`, the full helper and model-resolution baseline. Confirm that
+`NEURAL_FORGE_DMABUF=0`, the full helper and model-resolution baseline. Confirm that
 Rockstar, Social Club, Xalia, Explorer, and overlays remain pass-through and that
 only `GTA5_Enhanced.exe` acquires the NeuralForge lease. Only then collect a matched
 upstream/NeuralForge layer-throughput sample; it is still not a substitute for a

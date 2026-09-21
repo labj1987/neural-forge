@@ -41,7 +41,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 - A CLI (`neural-forge-cli`) for runner discovery, starting/stopping the helper, status,
   diagnostics, importing the NVIDIA NGX DLLs, and raw settings introspection
   (`shmctl status`/`set`/`toggle`/`capture`) — no bash script, no root step.
-- Everything lives under `~/.local/share`, `~/.config`, and `/tmp/neuralforge-$UID/`. No
+- Everything lives under `~/.local/share`, `~/.config`, and `/tmp/neural-forge-$UID/`. No
   polkit, no pkexec, no privileged install step at all.
 
 ## Requirements
@@ -70,7 +70,9 @@ python3 scripts/install.py install --appdir build-appimage/AppDir
 
 The GUI is `neural-forge`; the CLI is `neural-forge-cli`; the Windows helper is
 `neural-forge-helper.exe`. Config, data, state, runtime, control mapping and helper
-prefix keep their `neuralforge` locations (unchanged by the 0.1.76 rename). Upstream DLSS5VKLayer can remain
+prefix live under `neural-forge` locations (`~/.config/neural-forge`,
+`~/.local/share/neural-forge`, `~/.local/state/neural-forge`, `/tmp/neural-forge-$UID/`);
+an install from before 0.1.77 is migrated automatically on first start. Upstream DLSS5VKLayer can remain
 installed; Neural Forge neither migrates ambiguous upstream state nor changes its
 files, configuration, launch options, helper, or runtime. See
 [docs/PHASE1.md](docs/PHASE1.md) for executable targeting, migration and uninstall.
@@ -85,10 +87,10 @@ neural-forge-cli import-binaries /path/to/dlls
 ```
 
 or from the GUI's binaries import flow. Files are copied into
-`$XDG_DATA_HOME/neuralforge/binaries`; restart the helper afterward.
+`$XDG_DATA_HOME/neural-forge/binaries`; restart the helper afterward.
 
-Add `NEURALFORGE_ENABLE=1` (and, for a specific target executable in a multi-process
-game, `NEURALFORGE_TARGET_EXE=<name>.exe`) to a game's Steam launch options to
+Add `NEURAL_FORGE_ENABLE=1` (and, for a specific target executable in a multi-process
+game, `NEURAL_FORGE_TARGET_EXE=<name>.exe`) to a game's Steam launch options to
 activate the layer. GUI and layer share live settings over the same shared-memory
 segment; `neural-forge-cli shmctl status/set/toggle/capture` covers the same controls
 from a terminal.

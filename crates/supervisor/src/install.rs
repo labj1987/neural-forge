@@ -18,6 +18,11 @@ use crate::paths;
 
 pub const APP_ID: &str = "io.github.labj1987.NeuralForge";
 pub const LAYER: &str = "VK_LAYER_neuralforge_neural";
+/// The installed manifest's file name (the loader reads every `*.json` in
+/// `implicit_layer.d`, so it need not match the layer name). Named after the layer library.
+pub const MANIFEST: &str = "neural_forge_layer.json";
+/// The manifest file name used up to 0.1.76.
+const LEGACY_MANIFEST: &str = "VK_LAYER_neuralforge_neural.json";
 
 #[derive(Debug)]
 pub enum InstallError {
@@ -54,6 +59,10 @@ impl From<serde_json::Error> for InstallError {
 
 #[derive(Debug)]
 pub struct InstallReport {
+    /// Old-layout files this install removed beyond its own record's stale entries.
+    pub removed_legacy: Vec<PathBuf>,
+    /// Old-layout files it could not safely remove (still present).
+    pub warnings: Vec<String>,
     pub root: PathBuf,
     pub gui_path: PathBuf,
     pub cli_path: PathBuf,
@@ -107,7 +116,7 @@ fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
     std::fs::create_dir_all(parent)?;
     let mut attempt = 0u32;
     let staged = loop {
-        let candidate = parent.join(format!(".neuralforge-{}-{attempt}.tmp", std::process::id()));
+        let candidate = parent.join(format!(".neural-forge-{}-{attempt}.tmp", std::process::id()));
         match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&candidate) {
             Ok(mut file) => {
                 file.write_all(content)?;
@@ -130,6 +139,9 @@ fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
 /// wrote there -- the same "never touch a file this didn't put there" guarantee
 /// `install.py` makes.
 pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
+    // Move any pre-0.1.77 `neuralforge` directories first, so the record loaded below is
+    // the one that describes what is actually on disk.
+    let _ = crate::migrate::migrate();
     let data_home = PathBuf::from(paths::data_home());
     let root = PathBuf::from(paths::data_dir());
     let old = load_record();
@@ -137,28 +149,28 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
 
     let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
 
-    let lib_src_root = usr.join("lib/neuralforge");
+    let lib_src_root = usr.join("lib/neural-forge");
     let mut lib_files = Vec::new();
     collect_files(&lib_src_root, &mut lib_files)?;
     for src in lib_files {
         let rel = src.strip_prefix(&lib_src_root).expect("collect_files only yields paths under lib_src_root");
-        files.insert(root.join("lib/neuralforge").join(rel), std::fs::read(&src)?);
+        files.insert(root.join("lib/neural-forge").join(rel), std::fs::read(&src)?);
     }
 
     for binary in ["neural-forge", "neural-forge-cli"] {
         files.insert(root.join("bin").join(binary), std::fs::read(usr.join("bin").join(binary))?);
     }
 
-    let manifest_src = usr.join(format!("share/vulkan/implicit_layer.d/{LAYER}.json"));
+    let manifest_src = usr.join(format!("share/vulkan/implicit_layer.d/{MANIFEST}"));
     let mut manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest_src)?)?;
     let layer_name = manifest.get("layer").and_then(|l| l.get("name")).and_then(|n| n.as_str()).map(str::to_owned);
     if layer_name.as_deref() != Some(LAYER) {
         return Err(InstallError::InvalidManifest(format!("{}: expected layer.name {LAYER:?}, found {layer_name:?}", manifest_src.display())));
     }
-    let library_path = root.join("lib/neuralforge/libneuralforge_layer.so");
+    let library_path = root.join("lib/neural-forge/libneural_forge_layer.so");
     manifest["layer"]["library_path"] = serde_json::Value::String(library_path.to_string_lossy().into_owned());
     let manifest_out = serde_json::to_string_pretty(&manifest)? + "\n";
-    files.insert(data_home.join(format!("vulkan/implicit_layer.d/{LAYER}.json")), manifest_out.into_bytes());
+    files.insert(data_home.join(format!("vulkan/implicit_layer.d/{MANIFEST}")), manifest_out.into_bytes());
 
     let desktop_src = usr.join(format!("share/applications/{APP_ID}.desktop"));
     let exec_line = format!("Exec=\"{}\"", root.join("bin/neural-forge").display());
@@ -213,15 +225,54 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         }
         record.remove(&name);
         save_record(&record)?;
+        if let Some(parent) = path.parent() {
+            prune_empty_dirs(parent, &root);
+        }
     }
 
-    Ok(InstallReport { root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") })
+    let (removed_legacy, warnings) = remove_legacy_manifest(&data_home, &root, &mut record)?;
+
+    Ok(InstallReport { removed_legacy, warnings, root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") })
+}
+
+/// Removes now-empty directories from `dir` upward, stopping at (and keeping) `stop`.
+fn prune_empty_dirs(dir: &Path, stop: &Path) {
+    let mut current = dir;
+    while current != stop && current.starts_with(stop) && std::fs::remove_dir(current).is_ok() {
+        match current.parent() {
+            Some(parent) => current = parent,
+            None => break,
+        }
+    }
+}
+
+/// Two manifests for the same layer name would leave the Vulkan loader choosing between
+/// them, so the pre-0.1.77 `VK_LAYER_neuralforge_neural.json` must not survive an install of
+/// `neural_forge_layer.json`. The record-based stale removal already handles the normal
+/// case; this covers a lost or edited record, but only for a manifest that is
+/// unmistakably ours: this layer's name and a `library_path` inside our own data dir.
+fn remove_legacy_manifest(data_home: &Path, root: &Path, record: &mut BTreeMap<String, String>) -> Result<(Vec<PathBuf>, Vec<String>), InstallError> {
+    let path = data_home.join("vulkan/implicit_layer.d").join(LEGACY_MANIFEST);
+    let Ok(meta) = std::fs::symlink_metadata(&path) else { return Ok((vec![], vec![])) };
+    let ours = meta.is_file()
+        && std::fs::read_to_string(&path).ok().and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok()).is_some_and(|m| {
+            m["layer"]["name"] == LAYER && m["layer"]["library_path"].as_str().is_some_and(|p| Path::new(p).starts_with(root))
+        });
+    if !ours {
+        let why = format!("{} names {LAYER} but is not ours (symlink, or library_path outside {}); remove it by hand or the loader sees two manifests", path.display(), root.display());
+        return Ok((vec![], vec![why]));
+    }
+    std::fs::remove_file(&path)?;
+    record.remove(&path.to_string_lossy().into_owned());
+    save_record(record)?;
+    Ok((vec![path], vec![]))
 }
 
 /// Removes every tracked file whose on-disk content still matches this installer's
 /// own record (a file the user or another program has since changed is left alone,
 /// reported as preserved rather than silently deleted), then clears the record.
 pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
+    let _ = crate::migrate::migrate();
     let old = load_record();
     let mut preserved = Vec::new();
     for (name, expected) in &old {
@@ -247,6 +298,7 @@ mod tests {
     struct ScratchDataHome {
         _guard: std::sync::MutexGuard<'static, ()>,
         prev: Option<String>,
+        prev_extra: Vec<(&'static str, Option<String>)>,
         dir: PathBuf,
     }
 
@@ -257,11 +309,22 @@ mod tests {
             // env var don't actually exclude each other. See that lock's own doc
             // comment for the real race this guards against.
             let guard = crate::paths::tests::XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            let dir = std::env::temp_dir().join(format!("neuralforge-install-test-{tag}-{}", std::process::id()));
+            let dir = std::env::temp_dir().join(format!("neural-forge-install-test-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&dir).unwrap();
             let prev = std::env::var("XDG_DATA_HOME").ok();
             std::env::set_var("XDG_DATA_HOME", &dir);
-            Self { _guard: guard, prev, dir }
+            // Keep `migrate` (run by `install`) away from the real config/state dirs and from
+            // any real helper's pid file: a unique uid names a runtime dir that cannot exist.
+            let mut prev_extra = Vec::new();
+            for (var, value) in [
+                ("XDG_CONFIG_HOME", dir.join("config-home").display().to_string()),
+                ("XDG_STATE_HOME", dir.join("state-home").display().to_string()),
+                ("NEURAL_FORGE_UID", format!("installtest-{}", std::process::id())),
+            ] {
+                prev_extra.push((var, std::env::var(var).ok()));
+                std::env::set_var(var, value);
+            }
+            Self { _guard: guard, prev, prev_extra, dir }
         }
     }
 
@@ -270,6 +333,12 @@ mod tests {
             match self.prev.take() {
                 Some(v) => std::env::set_var("XDG_DATA_HOME", v),
                 None => std::env::remove_var("XDG_DATA_HOME"),
+            }
+            for (var, value) in self.prev_extra.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }
@@ -281,12 +350,12 @@ mod tests {
         let files = [
             ("usr/bin/neural-forge", "gui"),
             ("usr/bin/neural-forge-cli", "cli"),
-            ("usr/lib/neuralforge/libneuralforge_layer.so", "layer"),
-            ("usr/lib/neuralforge/helper/neural-forge-helper.exe", "helper"),
+            ("usr/lib/neural-forge/libneural_forge_layer.so", "layer"),
+            ("usr/lib/neural-forge/helper/neural-forge-helper.exe", "helper"),
             (&format!("usr/share/applications/{APP_ID}.desktop"), "[Desktop Entry]\nExec=neural-forge\n"),
             ("usr/share/icons/hicolor/scalable/apps/neural-forge.svg", "<svg/>"),
             (&format!("usr/share/metainfo/{APP_ID}.appdata.xml"), "<component/>"),
-            (&format!("usr/share/vulkan/implicit_layer.d/{LAYER}.json"), r#"{"layer": {"name": "VK_LAYER_neuralforge_neural"}}"#),
+            (&format!("usr/share/vulkan/implicit_layer.d/{MANIFEST}"), r#"{"layer": {"name": "VK_LAYER_neuralforge_neural"}}"#),
         ];
         for (rel, content) in files {
             let path = appdir.join(rel);
@@ -306,13 +375,13 @@ mod tests {
         assert_eq!(report.root, root);
         assert_eq!(std::fs::read_to_string(root.join("bin/neural-forge")).unwrap(), "gui");
         assert_eq!(std::fs::read_to_string(root.join("bin/neural-forge-cli")).unwrap(), "cli");
-        assert_eq!(std::fs::read_to_string(root.join("lib/neuralforge/libneuralforge_layer.so")).unwrap(), "layer");
-        assert_eq!(std::fs::read_to_string(root.join("lib/neuralforge/helper/neural-forge-helper.exe")).unwrap(), "helper");
+        assert_eq!(std::fs::read_to_string(root.join("lib/neural-forge/libneural_forge_layer.so")).unwrap(), "layer");
+        assert_eq!(std::fs::read_to_string(root.join("lib/neural-forge/helper/neural-forge-helper.exe")).unwrap(), "helper");
 
-        let manifest_path = PathBuf::from(paths::data_home()).join(format!("vulkan/implicit_layer.d/{LAYER}.json"));
+        let manifest_path = PathBuf::from(paths::data_home()).join(format!("vulkan/implicit_layer.d/{MANIFEST}"));
         let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
         assert_eq!(manifest["layer"]["name"], LAYER);
-        assert_eq!(manifest["layer"]["library_path"], root.join("lib/neuralforge/libneuralforge_layer.so").to_string_lossy().into_owned());
+        assert_eq!(manifest["layer"]["library_path"], root.join("lib/neural-forge/libneural_forge_layer.so").to_string_lossy().into_owned());
 
         let desktop_path = PathBuf::from(paths::data_home()).join(format!("applications/{APP_ID}.desktop"));
         let desktop = std::fs::read_to_string(desktop_path).unwrap();
@@ -326,10 +395,10 @@ mod tests {
         let scratch = ScratchDataHome::new("stale-cleanup");
         let appdir = scratch.dir.join("AppDir");
         write_fixture_appdir(&appdir);
-        let extra = appdir.join("usr/lib/neuralforge/helper/old-only.dll");
+        let extra = appdir.join("usr/lib/neural-forge/helper/old-only.dll");
         std::fs::write(&extra, "old").unwrap();
         install(&appdir).unwrap();
-        let installed = PathBuf::from(paths::data_dir()).join("lib/neuralforge/helper/old-only.dll");
+        let installed = PathBuf::from(paths::data_dir()).join("lib/neural-forge/helper/old-only.dll");
         assert!(installed.exists());
 
         std::fs::remove_file(&extra).unwrap();
@@ -343,10 +412,10 @@ mod tests {
         let scratch = ScratchDataHome::new("stale-edited");
         let appdir = scratch.dir.join("AppDir");
         write_fixture_appdir(&appdir);
-        let extra = appdir.join("usr/lib/neuralforge/helper/old-only.dll");
+        let extra = appdir.join("usr/lib/neural-forge/helper/old-only.dll");
         std::fs::write(&extra, "old").unwrap();
         install(&appdir).unwrap();
-        let installed = PathBuf::from(paths::data_dir()).join("lib/neuralforge/helper/old-only.dll");
+        let installed = PathBuf::from(paths::data_dir()).join("lib/neural-forge/helper/old-only.dll");
         std::fs::write(&installed, "edited by hand").unwrap();
 
         std::fs::remove_file(&extra).unwrap();
@@ -366,7 +435,7 @@ mod tests {
         // up-front validation passes (nothing exists at the destination itself) but
         // the write fails, after earlier files (BTreeMap order) have already landed.
         let root = PathBuf::from(paths::data_dir());
-        let blocked = root.join("lib/neuralforge/helper");
+        let blocked = root.join("lib/neural-forge/helper");
         std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
         std::fs::write(&blocked, "in the way").unwrap();
         let err = install(&appdir);
@@ -403,7 +472,7 @@ mod tests {
         let moves = [
             (root.join("bin/neural-forge"), root.join("bin/neuralforge")),
             (root.join("bin/neural-forge-cli"), root.join("bin/neuralforge-cli")),
-            (root.join("lib/neuralforge/helper/neural-forge-helper.exe"), root.join("lib/neuralforge/helper/neuralforge-helper.exe")),
+            (root.join("lib/neural-forge/helper/neural-forge-helper.exe"), root.join("lib/neural-forge/helper/neuralforge-helper.exe")),
             (icons.join("neural-forge.svg"), icons.join("neuralforge.svg")),
         ];
         let mut record = load_record();
@@ -420,6 +489,91 @@ mod tests {
             assert!(!legacy.exists(), "{} should have been cleaned up", legacy.display());
             assert!(!load_record().contains_key(&legacy.to_string_lossy().into_owned()));
         }
+    }
+
+    /// The whole 0.1.76 -> 0.1.77 layout change: `neuralforge` config/data/state dirs, the
+    /// `lib/neuralforge/libneuralforge_layer.so` install dir and the `VK_LAYER_neuralforge_neural.json`
+    /// manifest, all recorded in `installation.json`, upgraded in place.
+    #[test]
+    fn install_upgrades_a_0_1_76_layout() {
+        use std::os::unix::fs::MetadataExt;
+        let scratch = ScratchDataHome::new("upgrade-0-1-76");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        let data_home = PathBuf::from(paths::data_home());
+        let old_root = data_home.join("neuralforge");
+        let old_lib_dir = old_root.join("lib/neuralforge");
+        let old_manifest = data_home.join("vulkan/implicit_layer.d/VK_LAYER_neuralforge_neural.json");
+        let other_layer = data_home.join("vulkan/implicit_layer.d/steamoverlay_x86_64.json");
+        let config = scratch.dir.join("config-home/neuralforge/config.ini");
+        let prefix_reg = old_root.join("prefix/pfx/user.reg");
+        let old_files: Vec<(PathBuf, String, u32)> = vec![
+            (old_root.join("bin/neural-forge"), "old gui".into(), 0o755),
+            (old_root.join("bin/neural-forge-cli"), "old cli".into(), 0o755),
+            (old_lib_dir.join("libneuralforge_layer.so"), "old layer".into(), 0o644),
+            (old_lib_dir.join("helper/neural-forge-helper.exe"), "old helper".into(), 0o644),
+            (old_manifest.clone(), format!("{{\"layer\": {{\"name\": \"{LAYER}\", \"library_path\": \"{}\"}}}}", old_lib_dir.join("libneuralforge_layer.so").display()), 0o644),
+        ];
+        let mut record = BTreeMap::new();
+        for (path, content, mode) in &old_files {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, content).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(*mode)).unwrap();
+            record.insert(path.to_string_lossy().into_owned(), digest(content.as_bytes()));
+        }
+        std::fs::write(&other_layer, "not ours").unwrap();
+        std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+        std::fs::write(&config, format!("binaries={}/binaries\n", old_root.display())).unwrap();
+        std::fs::create_dir_all(prefix_reg.parent().unwrap()).unwrap();
+        std::fs::write(&prefix_reg, "wine registry").unwrap();
+        let prefix_inode = std::fs::metadata(old_root.join("prefix")).unwrap().ino();
+        std::fs::write(old_root.join("installation.json"), serde_json::to_string(&record).unwrap()).unwrap();
+
+        let report = install(&appdir).expect("upgrading a 0.1.76 layout must succeed");
+
+        let new_root = PathBuf::from(paths::data_dir());
+        assert_eq!(new_root, data_home.join("neural-forge"));
+        assert!(!old_root.exists(), "the old data dir must be gone");
+        assert!(!scratch.dir.join("config-home/neuralforge").exists());
+        assert_eq!(std::fs::read_to_string(scratch.dir.join("config-home/neural-forge/config.ini")).unwrap(), format!("binaries={}/binaries\n", new_root.display()));
+        assert_eq!(std::fs::metadata(new_root.join("prefix")).unwrap().ino(), prefix_inode, "the prefix is renamed, never copied");
+        assert_eq!(std::fs::read_to_string(new_root.join("prefix/pfx/user.reg")).unwrap(), "wine registry");
+
+        assert_eq!(std::fs::read_to_string(new_root.join("bin/neural-forge")).unwrap(), "gui");
+        assert_eq!(std::fs::read_to_string(new_root.join("lib/neural-forge/libneural_forge_layer.so")).unwrap(), "layer");
+        assert!(!new_root.join("lib/neuralforge").exists(), "old lib dir (files and empty dirs) must be removed");
+        assert!(!old_manifest.exists(), "the old manifest must be removed");
+        let manifest_path = data_home.join(format!("vulkan/implicit_layer.d/{MANIFEST}"));
+        let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
+        assert_eq!(manifest["layer"]["library_path"], new_root.join("lib/neural-forge/libneural_forge_layer.so").to_string_lossy().into_owned());
+        assert_eq!(std::fs::read_to_string(&other_layer).unwrap(), "not ours");
+        assert!(report.warnings.is_empty(), "{:?}", report.warnings);
+
+        // The record now describes only the new layout.
+        let rec = load_record();
+        assert!(rec.keys().all(|k| !k.contains("neuralforge") || k.contains("neural-forge")), "{rec:?}");
+        assert!(rec.keys().all(|k| Path::new(k).exists()), "{rec:?}");
+        install(&appdir).expect("and a second install is a clean no-op upgrade");
+    }
+
+    /// Lost record (or hand-edited) but an unmistakably-ours old manifest: still removed.
+    #[test]
+    fn a_stray_legacy_manifest_pointing_into_our_dir_is_removed_and_a_foreign_one_is_reported() {
+        let scratch = ScratchDataHome::new("stray-manifest");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        let root = PathBuf::from(paths::data_dir());
+        let legacy = PathBuf::from(paths::data_home()).join(format!("vulkan/implicit_layer.d/{LEGACY_MANIFEST}"));
+        std::fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        std::fs::write(&legacy, format!("{{\"layer\": {{\"name\": \"{LAYER}\", \"library_path\": \"{}/lib/x.so\"}}}}", root.display())).unwrap();
+        let report = install(&appdir).unwrap();
+        assert!(!legacy.exists());
+        assert_eq!(report.removed_legacy, vec![legacy.clone()]);
+
+        std::fs::write(&legacy, format!("{{\"layer\": {{\"name\": \"{LAYER}\", \"library_path\": \"/opt/elsewhere/x.so\"}}}}")).unwrap();
+        let report = install(&appdir).unwrap();
+        assert!(legacy.exists(), "a manifest pointing outside our dir is not ours to delete");
+        assert_eq!(report.warnings.len(), 1);
     }
 
     #[test]
@@ -497,7 +651,7 @@ mod tests {
         let scratch = ScratchDataHome::new("wrong-layer-name");
         let appdir = scratch.dir.join("AppDir");
         write_fixture_appdir(&appdir);
-        std::fs::write(appdir.join(format!("usr/share/vulkan/implicit_layer.d/{LAYER}.json")), r#"{"layer": {"name": "VK_LAYER_something_else"}}"#).unwrap();
+        std::fs::write(appdir.join(format!("usr/share/vulkan/implicit_layer.d/{MANIFEST}")), r#"{"layer": {"name": "VK_LAYER_something_else"}}"#).unwrap();
 
         let err = install(&appdir).expect_err("a manifest with the wrong layer name must be rejected");
         assert!(matches!(err, InstallError::InvalidManifest(_)), "unexpected error: {err}");

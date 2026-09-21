@@ -5,18 +5,27 @@ from pathlib import Path
 import re
 import xml.etree.ElementTree as ET
 root = Path(__file__).resolve().parents[1]
-manifest = json.loads((root / 'data/VK_LAYER_neuralforge_neural.json').read_text())['layer']
-assert manifest['enable_environment'] == {'NEURALFORGE_ENABLE': '1'}
-assert manifest['disable_environment'] == {'NEURALFORGE_DISABLE': '1'}
+manifest = json.loads((root / 'data/neural_forge_layer.json').read_text())['layer']
+assert manifest['enable_environment'] == {'NEURAL_FORGE_ENABLE': '1'}
+assert manifest['disable_environment'] == {'NEURAL_FORGE_DISABLE': '1'}
+assert manifest['name'] == 'VK_LAYER_neuralforge_neural'
 assert manifest['name'] in (root / 'crates/layer/src/lib.rs').read_text()
-assert manifest['library_path'] == './libneuralforge_layer.so'
+assert manifest['library_path'] == './libneural_forge_layer.so'
 identity = 'io.github.labj1987.NeuralForge'
 meta = ET.parse(root / f'data/{identity}.appdata.xml').getroot()
 assert meta.find('id').text == identity
 assert meta.find('launchable').text == f'{identity}.desktop'
 assert '\nExec=neural-forge\n' in (root / f'data/{identity}.desktop').read_text()
+# The pre-0.1.77 spelling may only appear where it is deliberately honoured or migrated.
+LEGACY_OK = {'crates/protocol/src/env.rs', 'crates/protocol/src/compat.rs', 'crates/supervisor/src/migrate.rs',
+             'crates/supervisor/src/install.rs', 'crates/supervisor/src/install_dir.rs', 'crates/supervisor/src/lib.rs',
+             'crates/supervisor/src/config.rs', 'crates/supervisor/src/process.rs', 'crates/layer/src/ownership.rs'}
 for path in (root / 'crates').rglob('*.rs'):
     code = path.read_text()
+    rel = path.relative_to(root).as_posix()
+    if rel not in LEGACY_OK:
+        assert 'NEURALFORGE_' not in code, path
+        assert not re.search(r'(?<![A-Za-z_])neuralforge[-_/]', code.replace('VK_LAYER_neuralforge_neural', '')), path
     assert not re.search(r'(?:var|var_os|set_var)\("(?:DLSSNR_|VKLayer_DLSS5)', code), path
     assert 'nvngx_neuralforge' not in code, path
     assert 'NEURALFORGE.Color' not in code, path

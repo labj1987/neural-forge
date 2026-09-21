@@ -9,6 +9,11 @@ fn main() {
     // GApplication ID, not prgname; on X11 it's prgname. Setting both prgname and
     // StartupWMClass (in the .desktop file) to the application ID makes the running
     // window match the desktop file on either backend.
+    // Move pre-0.1.77 `neuralforge` config/data/state dirs before anything reads them.
+    let migration = neural_forge_supervisor::migrate::migrate();
+    if !migration.is_empty() {
+        eprintln!("neural-forge: {}", migration.summary());
+    }
     glib::set_prgname(Some("io.github.labj1987.NeuralForge"));
     glib::set_application_name("Neural Forge");
 

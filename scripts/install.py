@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 APP_ID = 'io.github.labj1987.NeuralForge'
-LAYER = 'VK_LAYER_neuralforge_neural'
+LAYER = 'VK_LAYER_neuralforge_neural'  # the Vulkan layer name is frozen
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -21,7 +21,7 @@ def main():
     parser.add_argument('--cli', type=Path, help='neural-forge-cli to delegate install/uninstall to')
     args = parser.parse_args()
     data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
-    root = data / 'neuralforge'
+    root = data / 'neural-forge'
     record = root / 'installation.json'
     if args.command == 'archive-legacy-manifest':
         # This exact identity belongs to this Rust repository; upstream's NV
@@ -53,14 +53,14 @@ def main():
     os.execv(str(cli), command)
 
 def find_cli(args):
-    """The neural-forge-cli to delegate to: --cli, $NEURALFORGE_CLI, the AppDir being
+    """The neural-forge-cli to delegate to: --cli, $NEURAL_FORGE_CLI, the AppDir being
     installed, an already-installed copy, then a local cargo build."""
     repo = Path(__file__).resolve().parent.parent
     data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
-    candidates = [args.cli, os.environ.get('NEURALFORGE_CLI') and Path(os.environ['NEURALFORGE_CLI'])]
+    candidates = [args.cli, os.environ.get('NEURAL_FORGE_CLI') and Path(os.environ['NEURAL_FORGE_CLI'])]
     if args.appdir is not None:
         candidates.append(args.appdir / 'usr/bin/neural-forge-cli')
-    candidates += [data / 'neuralforge/bin/neural-forge-cli', repo / 'target/release/neural-forge-cli', repo / 'target/debug/neural-forge-cli']
+    candidates += [data / 'neural-forge/bin/neural-forge-cli', repo / 'target/release/neural-forge-cli', repo / 'target/debug/neural-forge-cli']
     for candidate in candidates:
         if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
             return Path(candidate)

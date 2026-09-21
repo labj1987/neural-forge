@@ -1,4 +1,4 @@
-//! Hardware release check. Requires the candidate helper on the same NEURALFORGE_SHM,
+//! Hardware release check. Requires the candidate helper on the same NEURAL_FORGE_SHM,
 //! a gameplay PNG argument, and an output directory argument. Never use the live SHM.
 #[path = "../src/optical_flow.rs"]
 mod optical_flow;
@@ -28,7 +28,7 @@ fn main() {
     let mut flow=optical_flow::OpticalFlow::new(&instance,pd,w,h,1).unwrap();
     println!("motion quality={}",flow.quality);
     let m=mapping::open().unwrap();let hdr=m.header();
-    let file=std::fs::OpenOptions::new().read(true).write(true).open(std::env::var("NEURALFORGE_SHM").unwrap()).unwrap();
+    let file=std::fs::OpenOptions::new().read(true).write(true).open(neural_forge_protocol::env::var("NEURAL_FORGE_SHM").unwrap()).unwrap();
     let deadline=Instant::now()+Duration::from_secs(30);
     while hdr.helper_state.load(Ordering::Acquire)!=neural_forge_protocol::enums::helper_state::RUNNING {
         assert!(Instant::now()<deadline,"helper did not start");std::thread::sleep(Duration::from_millis(25));

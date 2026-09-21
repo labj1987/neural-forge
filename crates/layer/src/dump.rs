@@ -12,7 +12,7 @@ fn captures_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
         format!("{}/.local/share", std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
     });
-    PathBuf::from(base).join("neuralforge").join("captures")
+    PathBuf::from(base).join("neural-forge").join("captures")
 }
 
 /// Writes `original`/`composited` (both `RGBA8`, `width`x`height`, same length) as a

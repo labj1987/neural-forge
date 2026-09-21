@@ -9,7 +9,7 @@
 //! and this is the only other way to make the helper actually build `FrameResources`
 //! against a real proxy/answer region and log whether the import succeeded.
 //!
-//! Respects `$NEURALFORGE_SHM`/`$NEURALFORGE_UID`, same as every other tool in this
+//! Respects `$NEURAL_FORGE_SHM`/`$NEURAL_FORGE_UID`, same as every other tool in this
 //! workspace. Maps the *full* `shm_total_bytes()` region (unlike
 //! `neural_forge_protocol::mapping::open`, which only maps the header -- the GUI/CLI's own
 //! use case never needs the pixel regions) -- same reasoning `read_mapping.rs` already
@@ -19,7 +19,7 @@
 //! (`docs/PROTOCOL_V3_DESIGN.md`) -- defaults to 0, matching this tool's pre-v3 behavior.
 //! Run it twice concurrently with different slots to confirm the helper answers both
 //! independently against real hardware, the same thing
-//! `neuralforge_layer::shm::tests::the_two_slots_are_fully_independent` already proves
+//! `neural_forge_layer::shm::tests::the_two_slots_are_fully_independent` already proves
 //! against a fake helper.
 
 use std::os::fd::AsRawFd;
@@ -29,13 +29,13 @@ use std::time::{Duration, Instant};
 use neural_forge_protocol::{answer_offset_slot, proxy_offset_slot, shm_default_path, shm_total_bytes, ShmHeader};
 
 fn main() {
-    let path = std::env::var("NEURALFORGE_SHM").ok().filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
+    let path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM").filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
     let width: u32 = std::env::args().nth(1).and_then(|s| s.parse().ok()).unwrap_or(64);
     let height: u32 = std::env::args().nth(2).and_then(|s| s.parse().ok()).unwrap_or(64);
     let slot: usize = std::env::args().nth(3).and_then(|s| s.parse().ok()).unwrap_or(0);
 
     let file = std::fs::OpenOptions::new().read(true).write(true).open(&path)
-        .unwrap_or_else(|e| panic!("failed to open {path}: {e} -- is a helper actually running against this NEURALFORGE_UID?"));
+        .unwrap_or_else(|e| panic!("failed to open {path}: {e} -- is a helper actually running against this NEURAL_FORGE_UID?"));
     let total = shm_total_bytes();
     // SAFETY: `file` is open read/write; mapping the full region a real helper/layer
     // would map is exactly this tool's point.

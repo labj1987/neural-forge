@@ -40,7 +40,7 @@ mod tests {
 
     #[test]
     fn snapshot_then_apply_round_trips_every_setting() {
-        let path = format!("{}/neuralforge-persist-test-{}/shm.bin", std::env::temp_dir().display(), std::process::id());
+        let path = format!("{}/neural-forge-persist-test-{}/shm.bin", std::env::temp_dir().display(), std::process::id());
         let m = mapping::open_at(&path).expect("failed to create test mapping");
         let h = m.header();
 
@@ -73,7 +73,7 @@ mod tests {
 
     #[test]
     fn apply_ignores_unknown_and_unparsable_keys() {
-        let path = format!("{}/neuralforge-persist-test2-{}/shm.bin", std::env::temp_dir().display(), std::process::id());
+        let path = format!("{}/neural-forge-persist-test2-{}/shm.bin", std::env::temp_dir().display(), std::process::id());
         let m = mapping::open_at(&path).expect("failed to create test mapping");
         let h = m.header();
 

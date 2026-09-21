@@ -27,6 +27,6 @@ signaled.
 
 First exercise this with `vkcube`, Khronos synchronization validation, and an
 artificially delayed helper. Then validate the GTA render tap at 2560x1440 with
-`NEURALFORGE_DMABUF=0`, full helper/model resolution, explicit GTA ownership, and
+`NEURAL_FORGE_DMABUF=0`, full helper/model resolution, explicit GTA ownership, and
 launcher pass-through. Compare layer throughput only after the same scene and timing
 route are repeatable.

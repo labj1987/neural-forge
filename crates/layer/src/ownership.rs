@@ -30,7 +30,7 @@ static ELIGIBLE: LazyLock<bool> = LazyLock::new(|| {
     let args = std::fs::read("/proc/self/cmdline").unwrap_or_default()
         .split(|b| *b == 0).filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
-    let target = std::env::var("NEURALFORGE_TARGET_EXE").ok();
+    let target = neural_forge_protocol::env::var("NEURAL_FORGE_TARGET_EXE");
     let ok = allowed(&args, target.as_deref());
     if !ok { crate::log!("[ownership] process excluded from NeuralForge session"); }
     ok
@@ -87,7 +87,7 @@ mod tests {
     fn crashed_process_releases_lease() {
         use std::io::{BufRead, BufReader};
         use std::process::{Command, Stdio};
-        let path = std::env::temp_dir().join(format!("neuralforge-crash-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("neural-forge-crash-test-{}", std::process::id()));
         // Create with the same private permissions as production, then let an
         // independent process acquire the actual kernel lock.
         drop(acquire(path.to_str().unwrap()).unwrap());
@@ -106,7 +106,7 @@ mod tests {
     }
     #[test]
     fn lease_excludes_other_opens_and_recovers_after_close() {
-        let path = std::env::temp_dir().join(format!("neuralforge-owner-test-{}", std::process::id()));
+        let path = std::env::temp_dir().join(format!("neural-forge-owner-test-{}", std::process::id()));
         let path = path.to_str().unwrap();
         let first = acquire(path).unwrap();
         assert!(acquire(path).is_err());

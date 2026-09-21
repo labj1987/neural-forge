@@ -1,4 +1,4 @@
-//! The on-disk config file (`~/.config/neuralforge/config.ini`): the same flat
+//! The on-disk config file (`~/.config/neural-forge/config.ini`): the same flat
 //! `key=value` format upstream's shell script used (a contract other tooling/the
 //! user's own scripts might already read, and there's no reason to invent a new
 //! format for the same handful of fields), read/written with plain string parsing --
@@ -56,10 +56,12 @@ impl Config {
         // (see neural_forge_protocol's own doc comment on this) -- treat that one value as
         // unset rather than let it silently reintroduce the bug it exists to avoid.
         if let Ok(runtime_dir) = std::env::var("XDG_RUNTIME_DIR") {
-            if cfg.shm == format!("{runtime_dir}/neuralforge/shm.bin") {
+            if cfg.shm == format!("{runtime_dir}/neural-forge/shm.bin") || cfg.shm == format!("{runtime_dir}/neuralforge/shm.bin") {
                 cfg.shm.clear();
             }
         }
+        // The pre-0.1.77 runtime dir name, if `migrate` has not (or could not) rewrite it.
+        cfg.shm = cfg.shm.replacen("/tmp/neuralforge-", "/tmp/neural-forge-", 1);
         if cfg.shm.is_empty() || !neural_forge_protocol::isolated_path(&cfg.shm) {
             cfg.shm = neural_forge_protocol::shm_default_path();
         }

@@ -4,7 +4,7 @@
 //! directory, never the real one, unless you actually mean to install:
 //!
 //! ```bash
-//! XDG_DATA_HOME=/tmp/neuralforge-install-try cargo run -p neural-forge-supervisor \
+//! XDG_DATA_HOME=/tmp/neural-forge-install-try cargo run -p neural-forge-supervisor \
 //!     --example try_install -- build-appimage/AppDir
 //! ```
 

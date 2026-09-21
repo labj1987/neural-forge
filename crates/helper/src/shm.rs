@@ -63,12 +63,12 @@ pub struct ShmMapping {
     pub header: *mut neural_forge_protocol::ShmHeader,
 }
 
-// SAFETY: same reasoning as `neuralforge_layer::shm::ShmClient` (see its `unsafe impl Send`)
+// SAFETY: same reasoning as `neural_forge_layer::shm::ShmClient` (see its `unsafe impl Send`)
 // -- every access through `header` goes through `ShmHeader`'s own atomics.
 unsafe impl Send for ShmMapping {}
 
-/// `NEURALFORGE_SHM` holds the POSIX path the Linux layer uses; Wine exposes the host
-/// filesystem under `Z:\`, so `/tmp/neuralforge-1000/shm.bin` becomes `Z:\tmp\neuralforge-1000\shm.bin`.
+/// `NEURAL_FORGE_SHM` holds the POSIX path the Linux layer uses; Wine exposes the host
+/// filesystem under `Z:\`, so `/tmp/neural-forge-1000/shm.bin` becomes `Z:\tmp\neural-forge-1000\shm.bin`.
 fn windows_path(posix_path: &str) -> Vec<u16> {
     let translated: String = std::iter::once('Z').chain(std::iter::once(':')).chain(
         posix_path.chars().map(|c| if c == '/' { '\\' } else { c })
@@ -93,7 +93,7 @@ fn parent_dir_utf16(path_utf16: &[u16]) -> Option<Vec<u16>> {
 /// Must only be called once per `ShmMapping` — this creates OS handles the returned
 /// value owns and closes on [`ShmMapping::close`].
 pub fn open() -> Option<ShmMapping> {
-    let posix_path = std::env::var("NEURALFORGE_SHM").ok().filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
+    let posix_path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM").filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
     if !neural_forge_protocol::isolated_path(&posix_path) { return None; }
     let win_path = windows_path(&posix_path);
 

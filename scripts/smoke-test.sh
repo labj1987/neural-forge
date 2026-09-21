@@ -10,28 +10,28 @@ cargo build -p neural-forge-layer
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
-SO_PATH="$(pwd)/target/debug/libneuralforge_layer.so"
-sed "s#\./libneuralforge_layer\.so#$SO_PATH#" data/VK_LAYER_neuralforge_neural.json \
-    > "$SCRATCH/VK_LAYER_neuralforge_neural.json"
+SO_PATH="$(pwd)/target/debug/libneural_forge_layer.so"
+sed "s#\./libneural_forge_layer\.so#$SO_PATH#" data/neural_forge_layer.json \
+    > "$SCRATCH/neural_forge_layer.json"
 
 # VK_LAYER_PATH only makes the loader consider a manifest for *explicit* enabling --
 # it does not add it to the implicit_layer.d search path, so an implicit-type layer
 # found this way still needs to be named explicitly to actually get inserted into the
 # call chain. That's a test-harness-only difference: a real install drops this manifest
 # into an actual implicit_layer.d directory instead, where enable_environment alone is
-# enough (see data/VK_LAYER_neuralforge_neural.json and build-appimage.sh once that exists).
+# enough (see data/neural_forge_layer.json and build-appimage.sh once that exists).
 export VK_LAYER_PATH="$SCRATCH"
 export VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural
-export NEURALFORGE_ENABLE=1
-export NEURALFORGE_UID="smoketest-$$"
-export NEURALFORGE_LOG="$SCRATCH/layer.log"
+export NEURAL_FORGE_ENABLE=1
+export NEURAL_FORGE_UID="smoketest-$$"
+export NEURAL_FORGE_LOG="$SCRATCH/layer.log"
 
-echo "==> manifest: $SCRATCH/VK_LAYER_neuralforge_neural.json"
+echo "==> manifest: $SCRATCH/neural_forge_layer.json"
 echo "==> layer library: $SO_PATH"
 echo
 
 cargo run --example smoke -p neural-forge-layer
 
 echo
-echo "==> layer log ($NEURALFORGE_LOG):"
-cat "$NEURALFORGE_LOG" 2>/dev/null || echo "(no log written -- the layer never ran)"
+echo "==> layer log ($NEURAL_FORGE_LOG):"
+cat "$NEURAL_FORGE_LOG" 2>/dev/null || echo "(no log written -- the layer never ran)"

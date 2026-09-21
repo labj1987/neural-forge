@@ -1,5 +1,5 @@
 //! One-off: opens an existing mapping at the path given as argv[1] and reports
-//! whether it's a valid neuralforge mapping. Used to verify true cross-toolchain interop --
+//! whether it's a valid neural-forge mapping. Used to verify true cross-toolchain interop --
 //! a mapping created by the Windows-side helper (built with mingw-w64, running under
 //! Wine) read back correctly by Linux-side code (built with the system toolchain).
 use std::os::fd::AsRawFd;

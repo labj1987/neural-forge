@@ -13,13 +13,20 @@ separate application and must not be modified or uninstalled by this project.
   repo, Cargo package names (`neural-forge-cli`, `neural-forge-protocol`, ...), binaries
   (`neural-forge`, `neural-forge-cli`, `neural-forge-helper.exe`), the AppImage
   (`neural-forge-<version>-x86_64.AppImage`), the icon (`neural-forge.svg`).
-- **Frozen, never rename** (renaming breaks layer registration and users' env/config): the
-  app ID `io.github.labj1987.NeuralForge` (and the `.desktop`/appdata files named after it),
-  the Vulkan layer `VK_LAYER_neuralforge_neural`, its manifest `VK_LAYER_neuralforge_neural.json`,
-  the layer library `libneuralforge_layer.so` (`[lib] name = "neuralforge_layer"` pinned in
-  `crates/layer/Cargo.toml`) and its `lib/neuralforge/` install dir, all `NEURALFORGE_*`
-  environment variables, the `neuralforge` XDG config/data/state dirs, `/tmp/neuralforge-$UID`
-  and the shared-memory names, and the `[neuralforge-layer]`/`[neuralforge-helper]` log prefixes.
+- **Frozen, never rename** (renaming breaks layer registration): the app ID
+  `io.github.labj1987.NeuralForge` (and the `.desktop`/appdata files named after it) and the
+  Vulkan layer name `VK_LAYER_neuralforge_neural`.
+- Since 0.1.77 everything else is hyphenated/underscored `neural-forge`: `NEURAL_FORGE_*` env
+  vars (read through `neural_forge_protocol::env`, which still honours the old `NEURALFORGE_*`
+  spelling as a fallback), `/tmp/neural-forge-$UID`, the `neural-forge` XDG config/data/state
+  dirs, `lib/neural-forge/`, `libneural_forge_layer.so` (`[lib] name = "neural_forge_layer"`),
+  its manifest `neural_forge_layer.json`, and the `[neural-forge-layer]`/`[neural-forge-helper]`
+  log prefixes. The manifest's `enable_environment` is `NEURAL_FORGE_ENABLE`.
+- Upgrade path: `neural_forge_supervisor::migrate` (run by the GUI, every CLI command and
+  `install`) renames the old `neuralforge` dirs (Wine prefix included, atomically) and rewrites
+  recorded absolute paths; `protocol::compat` hard-links the old `/tmp/neuralforge-$UID`
+  `shm.bin`/`shm.bin.owner` so an old-layer game still reaches the new helper. Never run the
+  CLI or `install` against real XDG dirs in tests: point `XDG_*_HOME` at a scratch dir.
 - Where an installed executable name changed, the installer's record-based stale-file
   removal cleans the old files, and code that looks up or matches the helper accepts both
   `neural-forge-helper.exe` and the legacy `neuralforge-helper.exe`. The release also
@@ -38,7 +45,7 @@ separate application and must not be modified or uninstalled by this project.
 
 ## Runtime constraints
 
-Use only NeuralForge-owned paths, `NEURALFORGE_*` variables, and the
+Use only NeuralForge-owned paths, `NEURAL_FORGE_*` variables, and the
 `VK_LAYER_neuralforge_neural` identity. Keep NVIDIA DLL names, NGX exports and
 `DLSSNR.*` parameters unchanged. Do not copy or move ambiguous upstream config,
 shared memory, or Wine prefixes. Import DLLs explicitly into NeuralForge's data dir.

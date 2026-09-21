@@ -16,7 +16,7 @@
 //! driver accepts a handle that did not come from its own `vkGetMemoryWin32HandleKHR`
 //! export.
 //!
-//! Logs via `NEURALFORGE_LOG` (`log!`/`logging::flush()`) -- plain stdout does not
+//! Logs via `NEURAL_FORGE_LOG` (`log!`/`logging::flush()`) -- plain stdout does not
 //! reliably reach the invoking shell through `proton run`, confirmed while writing the
 //! forward-direction probe. Run under Wine, with the exporter already running and its
 //! pid/fd in hand:

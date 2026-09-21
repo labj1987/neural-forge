@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Shared helper-process supervision (config, paths, start/stop) for neural-forge-cli and neuralforge"
+description = "Shared helper-process supervision (config, paths, start/stop) for neural-forge-cli and neural-forge"
 
 [dependencies]
 neural-forge-protocol = { path = "../protocol" }

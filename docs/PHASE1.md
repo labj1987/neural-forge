@@ -11,14 +11,14 @@ validation evidence before GTA benchmarking.
 | Surface | NeuralForge |
 |---|---|
 | GUI / CLI / Windows helper | `neural-forge`, `neural-forge-cli`, `neural-forge-helper.exe` |
-| Vulkan identity / library (frozen) | `VK_LAYER_neuralforge_neural`, `libneuralforge_layer.so` |
-| Activation / opt-out | `NEURALFORGE_ENABLE=1`, `NEURALFORGE_DISABLE=1` |
-| Other private environment variables | `NEURALFORGE_*`; no `DLSSNR_*` aliases |
+| Vulkan identity / library (frozen) | `VK_LAYER_neuralforge_neural`, `libneural_forge_layer.so` |
+| Activation / opt-out | `NEURAL_FORGE_ENABLE=1`, `NEURAL_FORGE_DISABLE=1` |
+| Other private environment variables | `NEURAL_FORGE_*`; no `DLSSNR_*` aliases |
 | Desktop / application ID | `io.github.labj1987.NeuralForge` |
-| Configuration | `$XDG_CONFIG_HOME/neuralforge/config.ini` |
-| Data / managed prefix | `$XDG_DATA_HOME/neuralforge/{binaries,prefix}` |
-| State | `$XDG_STATE_HOME/neuralforge/helper.log` |
-| Runtime / control / lease | `/tmp/neuralforge-$UID/{shm.bin,helper.pid,shm.bin.owner}` |
+| Configuration | `$XDG_CONFIG_HOME/neural-forge/config.ini` |
+| Data / managed prefix | `$XDG_DATA_HOME/neural-forge/{binaries,prefix}` |
+| State | `$XDG_STATE_HOME/neural-forge/helper.log` |
+| Runtime / control / lease | `/tmp/neural-forge-$UID/{shm.bin,helper.pid,shm.bin.owner}` |
 | Wire magic | `NFR1` (layout v2 retained) |
 | AppImage | `neural-forge-0.1.54-x86_64.AppImage` |
 
@@ -39,7 +39,7 @@ AppDir into persistent user storage (an AppImage mount alone cannot do that):
 python3 scripts/install.py install --appdir build-appimage/AppDir
 ```
 
-The installer places binaries under `$XDG_DATA_HOME/neuralforge/bin`; use that full
+The installer places binaries under `$XDG_DATA_HOME/neural-forge/bin`; use that full
 path or add it to PATH. It writes a persistent manifest with an absolute library path,
 plus the desktop/icon/metainfo files. It refuses unknown or modified destinations.
 Updates replace files atomically, preserving mapped binaries in running processes.
@@ -62,7 +62,7 @@ using `neural-forge-cli import-binaries DIR`. There are no old-name executable a
 ## Target ownership
 
 Known Wine desktop, Xalia, Rockstar, Social Club, Steam and helper executables are
-excluded before swapchain setup. `NEURALFORGE_TARGET_EXE` accepts a case-insensitive,
+excluded before swapchain setup. `NEURAL_FORGE_TARGET_EXE` accepts a case-insensitive,
 comma-separated list of executable basenames; configure it for the actual game exe.
 For GTA Enhanced use `GTA5_Enhanced.exe` after confirming that process name locally.
 The Steam AppID alone is insufficient: launchers inherit it too. The helper launcher
@@ -89,10 +89,10 @@ VKLayer_DLSS5=1 DLSSNR_DMABUF=0 %command%
 Do not change this saved baseline. A separate NeuralForge test launch uses:
 
 ```text
-NEURALFORGE_ENABLE=1 NEURALFORGE_DMABUF=0 NEURALFORGE_TARGET_EXE=GTA5_Enhanced.exe %command%
+NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%
 ```
 
-NeuralForge currently uses host SHM transport; `NEURALFORGE_DMABUF` is reserved and
+NeuralForge currently uses host SHM transport; `NEURAL_FORGE_DMABUF` is reserved and
 has no zero-copy implementation -- and, per `DMABUF_TRANSPORT_DESIGN.md`, real
 hardware evidence this session says the underlying mechanism the current Wine-hosted
 helper would need is blocked at the driver/Wine level, not just unbuilt. DMA-BUF

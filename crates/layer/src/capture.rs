@@ -2579,7 +2579,7 @@ mod tests {
     fn scratch_path(tag: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        format!("{}/neuralforge-capture-test-{}-{tag}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
+        format!("{}/neural-forge-capture-test-{}-{tag}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
     }
 
     /// Same shape as `test_device`, except the device is created with
@@ -3092,9 +3092,9 @@ mod tests {
     ///
     /// Not an assertion test and not a CI test: it needs a real GPU (a software ICD
     /// would report meaningless numbers) and is a benchmark, so it only runs when
-    /// `NEURALFORGE_BENCH` is set in the environment, and only prints. The established
+    /// `NEURAL_FORGE_BENCH` is set in the environment, and only prints. The established
     /// way to use it (see `docs/HARDWARE_VALIDATION.md`) is to build the release test binary,
-    /// copy it to `lordnikon`, and run it there with `NEURALFORGE_BENCH=1
+    /// copy it to `lordnikon`, and run it there with `NEURAL_FORGE_BENCH=1
     /// <bin> capture_hot_path_cost_per_present --nocapture --exact`.
     ///
     /// Why this is the right metric: `run` submits its capture copy and its compose onto
@@ -3108,8 +3108,8 @@ mod tests {
     /// at 2560x1440 it is the real cost the hot-path fix has to bring down.
     #[test]
     fn capture_hot_path_cost_per_present() {
-        if std::env::var_os("NEURALFORGE_BENCH").is_none() {
-            eprintln!("capture_hot_path_cost_per_present: set NEURALFORGE_BENCH=1 to run this GPU benchmark, skipping");
+        if !neural_forge_protocol::env::is_set("NEURAL_FORGE_BENCH") {
+            eprintln!("capture_hot_path_cost_per_present: set NEURAL_FORGE_BENCH=1 to run this GPU benchmark, skipping");
             return;
         }
         let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {

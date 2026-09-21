@@ -63,19 +63,19 @@ static CURRENT_INSTANCE: Mutex<Option<InstanceContext>> = Mutex::new(None);
 
 pub const LAYER_NAME: &str = "VK_LAYER_neuralforge_neural";
 
-/// Whether the pass should do anything at all. Off by default (`NEURALFORGE_ENABLE` unset)
+/// Whether the pass should do anything at all. Off by default (`NEURAL_FORGE_ENABLE` unset)
 /// so the layer is a true no-op for every game that hasn't opted in via its launch
 /// options — checked once and cached, same as upstream, since it can't change for the
 /// life of the process.
 pub(crate) fn layer_enabled() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        env_flag("NEURALFORGE_ENABLE") && !env_flag("NEURALFORGE_DISABLE")
+        env_flag("NEURAL_FORGE_ENABLE") && !env_flag("NEURAL_FORGE_DISABLE")
     });
     *ENABLED
 }
 
 fn env_flag(name: &str) -> bool {
-    std::env::var(name).is_ok_and(|v| v == "1")
+    neural_forge_protocol::env::flag(name)
 }
 
 /// Works around a crash inside Mesa's `device_select` implicit layer, confirmed

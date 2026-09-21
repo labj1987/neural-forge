@@ -29,7 +29,7 @@
 //! the same way every other externally-supplied, not-fully-trusted call in this crate
 //! is.
 //!
-//! Logs its own PID and the resulting fd (if any) via `NEURALFORGE_LOG` -- plain
+//! Logs its own PID and the resulting fd (if any) via `NEURAL_FORGE_LOG` -- plain
 //! `println!`/stdout does not reliably reach the invoking shell through
 //! `proton run` (confirmed empirically writing this probe: zero output arrived on a
 //! piped stdout across 20+ real seconds of a successfully-running process; switching
@@ -38,7 +38,7 @@
 //! inspect `/proc/<pid>/fd/<fd>` (readlink, `file`, or an actual
 //! `VK_EXT_external_memory_dma_buf` import attempt) while this is still alive and the
 //! memory is still allocated -- moot given the result above, but left in for whatever
-//! variant is tried next. Run under Wine (needs `NEURALFORGE_LOG` set to see anything):
+//! variant is tried next. Run under Wine (needs `NEURAL_FORGE_LOG` set to see anything):
 //! `cargo run --example dmabuf_probe --target x86_64-pc-windows-gnu -p neural-forge-helper`
 
 use std::ffi::c_void;

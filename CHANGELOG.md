@@ -4,6 +4,29 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.77 — 2026-09-21
+
+- **Runtime identifiers renamed to `neural-forge`.** Environment variables are now
+  `NEURAL_FORGE_*` (the old `NEURALFORGE_*` spelling is still read as a fallback, by the
+  layer, helper, GUI and CLI alike), the runtime dir is `/tmp/neural-forge-$UID`, config, data and
+  state live in `neural-forge` directories, the install dir is `lib/neural-forge/`, the layer
+  library is `libneural_forge_layer.so` and its manifest `neural_forge_layer.json`, and the log
+  prefixes are `[neural-forge-layer]`/`[neural-forge-helper]`. The Vulkan layer name
+  `VK_LAYER_neuralforge_neural` and the app ID are unchanged.
+- **Automatic migration.** The GUI, every CLI command and `install` first rename the old
+  `neuralforge` config/data/state directories (atomically, so the Wine prefix is moved, not
+  copied; merged without overwriting if a new dir already exists) and rewrite recorded absolute
+  paths (`config.ini`, `installation.json`, the installed manifest and `.desktop`, the Wine
+  prefix registry and symlinks). A helper still running from the old layout is stopped first.
+  Installing then removes the old `lib/neuralforge/` files, empty dirs and the old
+  `VK_LAYER_neuralforge_neural.json` manifest.
+- **Old layers keep working.** The old `/tmp/neuralforge-$UID` `shm.bin` and `shm.bin.owner` are
+  hard-linked to the new ones, so a game that loaded an older layer still reaches the new helper.
+- **Action needed:** the manifest now enables the layer with `NEURAL_FORGE_ENABLE=1` (the
+  Vulkan loader honours only one variable). Update Steam launch options that still say
+  `NEURALFORGE_ENABLE=1`; the GUI shows the new string. Restart games that were running during
+  the upgrade.
+
 ## 0.1.76 — 2026-09-21
 
 - **Rename to Neural Forge naming.** Repo, Cargo packages (`neural-forge-*`), executables

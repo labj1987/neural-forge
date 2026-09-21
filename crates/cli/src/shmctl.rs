@@ -25,10 +25,10 @@ fn usage() {
          \x20 set <name> <value>  set one setting (float fields take a decimal value)\n\
          \x20 toggle <name>       flip a 0/1-valued setting\n\
          \x20 capture [view]      dump the next frame's original+composited PNGs\n\
-         \x20                     (see neuralforge_layer::dump); optional debug_view 0-3\n\
+         \x20                     (see neural_forge_layer::dump); optional debug_view 0-3\n\
          \x20 reset               reset every setting to its default; preserves the\n\
          \x20                     live helper/layer session (see ShmHeader::reset_persisted_settings)\n\n\
-         Respects $NEURALFORGE_SHM/$NEURALFORGE_UID, same as every other tool in this workspace."
+         Respects $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID, same as every other tool in this workspace."
     );
 }
 
@@ -154,7 +154,7 @@ fn cmd_capture(header: &ShmHeader, view: Option<&str>) -> bool {
         header.debug_view.store(mode, Ordering::Relaxed);
     }
     header.capture_request.store(1, Ordering::Relaxed);
-    println!("capture_request set -- check $XDG_DATA_HOME/neuralforge/captures on the layer's next present");
+    println!("capture_request set -- check $XDG_DATA_HOME/neural-forge/captures on the layer's next present");
     true
 }
 
@@ -248,7 +248,7 @@ mod tests {
 
 pub fn run(args: &[String]) -> std::process::ExitCode {
     let Some(mapping) = neural_forge_protocol::mapping::open() else {
-        eprintln!("shmctl: failed to open the SHM mapping (see $NEURALFORGE_SHM/$NEURALFORGE_UID)");
+        eprintln!("shmctl: failed to open the SHM mapping (see $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)");
         return std::process::ExitCode::FAILURE;
     };
     let header = mapping.header();

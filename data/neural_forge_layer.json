@@ -3,11 +3,11 @@
   "layer": {
     "name": "VK_LAYER_neuralforge_neural",
     "type": "GLOBAL",
-    "library_path": "./libneuralforge_layer.so",
+    "library_path": "./libneural_forge_layer.so",
     "api_version": "1.3.277",
     "implementation_version": "1",
     "description": "NeuralForge neural rendering injection layer (Linux side)",
-    "enable_environment": { "NEURALFORGE_ENABLE": "1" },
-    "disable_environment": { "NEURALFORGE_DISABLE": "1" }
+    "enable_environment": { "NEURAL_FORGE_ENABLE": "1" },
+    "disable_environment": { "NEURAL_FORGE_DISABLE": "1" }
   }
 }

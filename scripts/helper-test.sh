@@ -36,7 +36,7 @@ done
 echo
 echo "==> running the full neural-forge-helper.exe binary for a few seconds (expect a clean"
 echo "    fail-open: no nvngx_dlssnr.dll is available on this dev machine)"
-NEURALFORGE_LOG="$SCRATCH/helper.log" NEURALFORGE_UID="helper-test-$$" \
+NEURAL_FORGE_LOG="$SCRATCH/helper.log" NEURAL_FORGE_UID="helper-test-$$" \
     timeout 8 wine "$BIN_DIR/neural-forge-helper.exe" > "$SCRATCH/stdout.log" 2>&1 || true
 echo "--- helper log ---"
 cat "$SCRATCH/helper.log" 2>/dev/null || echo "(no log written)"
