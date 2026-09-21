@@ -3036,6 +3036,8 @@ mod tests {
         // `HELPER_DELAY`-long round trips) is exhausted, not a fixed iteration count.
         while Instant::now() < deadline {
             iteration += 1;
+            let hdr_now = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            let req_before = hdr_now.seq_req.load(AtomicOrdering::Relaxed);
             let call_start = Instant::now();
             // SAFETY: `image` is this test's own, currently `PRESENT_SRC_KHR`; `queue`
             // is used from this one thread only, exactly like `run`'s own contract
@@ -3097,6 +3099,12 @@ mod tests {
                 slow_calls.push(call_time);
             }
             if let Some(sem) = sem {
+                // The present that composited is the one that asked, and it left nothing in
+                // flight: the answer it composited can only be for the frame it captured. (The
+                // pipelined mode always leaves the next request outstanding.)
+                let req_after = hdr_now.seq_req.load(AtomicOrdering::Relaxed);
+                assert!(req_after > req_before, "the compositing present must itself have sent the request");
+                assert_eq!(hdr_now.seq_resp.load(AtomicOrdering::Relaxed), req_after, "no request may be left in flight");
                 got_semaphore = true;
                 // Stand in for what the real present call does: wait on the semaphore
                 // before the image is considered final, exactly like
@@ -3118,9 +3126,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(got_semaphore, "synchronous present must composite the answer");
-        // The first present only samples the helper's heartbeat (one sample cannot show it is
-        // alive); the second captures, waits for that frame's own answer and composites it.
-        assert!(iteration <= 2, "the answer must land on the present that captured it (took {iteration} presents)");
+        let _ = iteration;
 
         stop.store(true, AtomicOrdering::Relaxed);
         helper.join().unwrap();
