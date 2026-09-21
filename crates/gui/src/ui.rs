@@ -361,6 +361,29 @@ pub fn build_ui(app: &adw::Application) {
     let (transfer, set_transfer) = bind_u32(&shm, Some("transfer"), |h| &h.transfer);
     comp_group.add(&combo_row("Transfer mode", &["Classic", "Matched residual", "Native + edit"], transfer, set_transfer));
 
+    let (colour_trust, set_colour_trust) = bind_float(&shm, Some("colour_trust"), |h| &h.colour_trust_bits);
+    comp_group.add(&spin_row(
+        "Colour trust",
+        "How far the model may change a pixel's colour; larger changes (edge fringing) are shortened. 0 = no model colour",
+        colour_trust,
+        0.0,
+        4.0,
+        0.1,
+        set_colour_trust,
+    ));
+
+    let (ratio_smooth, set_ratio_smooth) = bind_float(&shm, Some("ratio_smooth"), |h| &h.ratio_smooth_bits);
+    comp_group.add(&spin_row_scaled(
+        "Ratio smoothing",
+        "Percent of the relighting taken from the neighbourhood rather than each pixel; removes speckle",
+        ratio_smooth,
+        0.0,
+        100.0,
+        5.0,
+        100.0,
+        set_ratio_smooth,
+    ));
+
     let (ghost_guard, set_ghost_guard) = bind_float(&shm, Some("ghost_guard"), |h| &h.ghost_guard_bits);
     comp_group.add(&spin_row(
         "Ghost guard",

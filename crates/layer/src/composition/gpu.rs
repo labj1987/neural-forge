@@ -54,6 +54,9 @@ pub struct ComposeParams {
     pub ghost_guard: f32,
     /// Comparison view: see `compose.comp`'s `compare_*` push constants.
     pub compare: Compare,
+    /// `compose.comp`'s colour trust and ratio smoothing (mode 2).
+    pub colour_trust: f32,
+    pub ratio_smooth: f32,
     /// True when the proxy that produced this answer went through
     /// [`crate::composition::encode_pass`]. False means the proxy is a bit-identical
     /// copy of the frame and the ratio transfer would self-cancel on it.
@@ -87,6 +90,8 @@ struct PushConstants {
     compare_split: f32,
     compare_zoom: f32,
     compare_swap: u32,
+    colour_trust: f32,
+    ratio_smooth: f32,
 }
 
 struct Image {
@@ -552,7 +557,7 @@ impl ComposeSlot {
 
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0 };
+            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0, colour_trust: 2.0, ratio_smooth: 0.0 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -771,6 +776,8 @@ impl ComposeSlot {
                 compare_split: compose.compare.split,
                 compare_zoom: compose.compare.zoom,
                 compare_swap: compose.compare.swap,
+                colour_trust: compose.colour_trust,
+                ratio_smooth: compose.ratio_smooth,
             };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
@@ -1659,6 +1666,89 @@ mod tests {
         (buffer, memory)
     }
 
+    /// Composes `answer` (and `proxy`, the frame the model was shown) onto a target holding
+    /// `current` through the real async path on lavapipe, and reads the result back. `None` when
+    /// no Vulkan device is available.
+    fn compose_once(width: u32, height: u32, current: &[u8], proxy: &[u8], answer: &[u8], params: ComposeParams) -> Option<Vec<u8>> {
+        let (_entry, instance, physical_device, device, queue, queue_family) = test_device()?;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
+        let target = make_target_image(&device, &mem_props, width, height);
+        let staging = build_upload_staging(&device, &mem_props, current);
+        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        unsafe {
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+            device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+            let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+            device.end_command_buffer(cmd).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_buffer(staging.0, None);
+            device.free_memory(staging.1, None);
+        }
+        let sem = gpu
+            .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, proxy, answer, 1, false, target.image, params)
+            .expect("compose");
+        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+        unsafe {
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+            device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+            device.destroy_fence(wait_fence, None);
+        }
+        let out = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
+        unsafe {
+            device.destroy_fence(fence, None);
+            gpu.destroy(&device);
+            device.destroy_command_pool(pool, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+        Some(out)
+    }
+
+    /// Ratio smoothing flattens a lone bright pixel in the model's answer to its neighbourhood;
+    /// colour trust shortens a large colour swing without reversing it.
+    #[test]
+    fn ratio_smoothing_and_colour_trust() {
+        let (w, h) = (16u32, 16u32);
+        let grey: Vec<u8> = (0..w * h).flat_map(|_| [120u8, 120, 120, 255]).collect();
+        let mut speckle = grey.clone();
+        let centre = ((8 * w + 8) * 4) as usize;
+        speckle[centre..centre + 3].copy_from_slice(&[200, 200, 200]);
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, proxy_encoded: true };
+        let Some(sharp) = compose_once(w, h, &grey, &grey, &speckle, base) else {
+            eprintln!("ratio smoothing test: no Vulkan device, skipping");
+            return;
+        };
+        let smooth = compose_once(w, h, &grey, &grey, &speckle, ComposeParams { ratio_smooth: 1.0, ..base }).unwrap();
+        let (s_px, m_px) = (sharp[centre], smooth[centre]);
+        assert!(s_px > 155, "without smoothing the speckle comes through, capped by the 2x guard ({s_px}, ~165)");
+        assert!(m_px < s_px - 15, "smoothing must flatten the speckle toward its neighbours: {s_px} -> {m_px}");
+        let neighbour = ((8 * w + 9) * 4) as usize;
+        assert!(smooth[neighbour] > sharp[neighbour], "and spread a little of it to the neighbours");
+
+        // The model turns a bluish frame red. (The composition takes the model's hue *direction* at
+        // the frame's own saturation, so the frame needs some colour to rotate.) Trust 0: the frame's
+        // hue; a small trust shortens the swing; more trust moves further the same way, never back.
+        let blue: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 120, 160, 255]).collect();
+        let red: Vec<u8> = (0..w * h).flat_map(|_| [170u8, 110, 100, 255]).collect();
+        let coloured = ComposeParams { colour_strength: 1.0, ..base };
+        let none = compose_once(w, h, &blue, &blue, &red, ComposeParams { colour_trust: 0.0, ..coloured }).unwrap();
+        let little = compose_once(w, h, &blue, &blue, &red, ComposeParams { colour_trust: 0.1, ..coloured }).unwrap();
+        let lots = compose_once(w, h, &blue, &blue, &red, ComposeParams { colour_trust: 4.0, ..coloured }).unwrap();
+        let chroma = |px: &[u8]| i32::from(px[0]) - i32::from(px[1]);
+        let (c0, c1, c2) = (chroma(&none[centre..]), chroma(&little[centre..]), chroma(&lots[centre..]));
+        assert!(c0 < 0, "trust 0 keeps the frame's own (blue) hue: {c0}");
+        assert!(c1 > c0 && c2 > c1, "more trust, more of the model's red, never reversed: {c0} {c1} {c2}");
+    }
+
     /// Compare views on a real (lavapipe) device: the wipe shows the untouched frame on one side,
     /// the composition on the other and a white hairline at the split; side by side letterboxes.
     #[test]
@@ -1692,7 +1782,7 @@ mod tests {
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, proxy_encoded: true };
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, proxy_encoded: true };
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, &frame, &answer, 1, false, target.image, params)
                 .expect("compose");
@@ -1792,7 +1882,7 @@ mod tests {
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), proxy_encoded: true };
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, proxy_encoded: true };
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, &proxy, &answer, 1, false, target.image, params)
                 .expect("compose");
@@ -1890,7 +1980,7 @@ mod tests {
         }
 
         // (1) A smaller answer must still be accepted and actually change the output.
-        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), proxy_encoded: false });
+        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, proxy_encoded: false });
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
@@ -1916,7 +2006,7 @@ mod tests {
         // for this function -- see its own doc comment) must be rejected, not
         // overflow the shared staging buffer.
         let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
-        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), proxy_encoded: false });
+        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, proxy_encoded: false });
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
 
         unsafe {

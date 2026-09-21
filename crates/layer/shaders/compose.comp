@@ -76,6 +76,14 @@ layout(push_constant) uniform Params {
   float compare_split;
   float compare_zoom;
   uint compare_swap;
+  // Mode 2. How far the model may move a pixel's colour, as a fraction of the pixel's own
+  // luminance (upstream `gColourTrust`, default 2): corrections within it pass whole, larger ones
+  // (edge fringing) are shortened, never reversed. 0 turns the model's colour off.
+  float colour_trust;
+  // Mode 2. 0..1: how much of the relighting ratio is taken from the neighbourhood instead of the
+  // pixel (upstream `gRatioSmooth`, default 1). Removes pixel-to-pixel speckle from the ratio while
+  // the frame keeps its own fine detail.
+  float ratio_smooth;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -277,6 +285,24 @@ void main() {
     } else {
       float edit_ratio = (model_luminance + kRatioFloor) / (proxy_luminance + kRatioFloor);
 
+      // Ratio smoothing: the ratio's high-frequency part replaced by the neighbourhood's (five
+      // taps). What the model has a real opinion about at this scale is how much light belongs
+      // here, not which pixel is brighter than its neighbour -- the frame already knows that and is
+      // about to be multiplied by this. Where the ratio is already smooth this is the identity.
+      if (params.ratio_smooth > 0.0) {
+        ivec2 last_px = size - ivec2(1);
+        float m_acc = model_luminance;
+        float p_acc = proxy_luminance;
+        const ivec2 kTaps[4] = ivec2[4](ivec2(-1, 0), ivec2(1, 0), ivec2(0, -1), ivec2(0, 1));
+        for (int k = 0; k < 4; ++k) {
+          ivec2 q = clamp(src + kTaps[k], ivec2(0), last_px);
+          m_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb));
+          p_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb));
+        }
+        float gain_smooth = (m_acc / 5.0 + kRatioFloor) / (p_acc / 5.0 + kRatioFloor);
+        edit_ratio = mix(edit_ratio, gain_smooth, clamp(params.ratio_smooth, 0.0, 1.0));
+      }
+
       // Ghost guard.
       //
       // The answer is for the frame the model was shown, and this pass runs on a later one --
@@ -361,7 +387,14 @@ void main() {
         // (dlssnr.hlsl, `kQuantFloor`). Above that floor nothing changes.
         const float kQuantFloor = 0.0097; // SrgbDecode(25/255)
         float hue_trust = smoothstep(0.0, kQuantFloor, model_luminance);
-        result = GamutCompressReversible(mix(luminance_only, fully_upgraded, clamp(params.colour_strength, 0.0, 1.0) * hue_trust));
+        // Colour trust: bound the colour difference rather than switch it off. A correction of
+        // ordinary size passes whole; fringing, larger still, is shortened along its own direction,
+        // so more disagreement can never mean less colour, only the same amount of it.
+        vec3 colour_dev = fully_upgraded - luminance_only;
+        float chroma_swing = length(colour_dev) / max(Luminance(luminance_only), 1e-4);
+        float colour_allow = params.colour_trust <= 0.0 ? 0.0 : min(1.0, params.colour_trust / max(chroma_swing, 1e-6));
+        vec3 bounded_colour = luminance_only + colour_dev * colour_allow;
+        result = GamutCompressReversible(mix(luminance_only, bounded_colour, clamp(params.colour_strength, 0.0, 1.0) * hue_trust));
       }
     }
   } else if (params.mode == 1u) {

@@ -1340,6 +1340,8 @@ pub unsafe fn run(
                 max_ratio: settings.max_ratio,
                 ghost_guard: settings.ghost_guard,
                 compare: settings.compare,
+                colour_trust: settings.colour_trust,
+                ratio_smooth: settings.ratio_smooth,
                 proxy_encoded,
             },
         ) {

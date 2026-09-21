@@ -38,6 +38,7 @@ upstream file it came from. Nothing listed here lands in
 | `crates/layer/shaders/compose.comp` mode 2 `hue_trust` | `layer_linux/src/dlssnr/dlssnr.hlsl` `hueTrust` / `kQuantFloor` |
 | `crates/layer/src/capture.rs` synchronous present (capture, wait for this frame's answer, compose onto this frame) | `layer_linux/src/layer.cpp` `ProcessPresent`'s blocking round trip; the bounded wait, heartbeat liveness check and fail-open on a late answer are this project's |
 | `crates/layer/shaders/compose.comp` compare views (side by side with letterbox and zoom, wipe, swap, divider) | `layer_linux/src/dlssnr/dlssnr.hlsl` `gCompareMode`/`gCompareSplit`/`gCompareZoom`/`gCompareSwap` |
+| `crates/layer/shaders/compose.comp` mode 2 colour trust (`colour_trust`) and ratio smoothing (`ratio_smooth`) | `layer_linux/src/dlssnr/dlssnr.hlsl` `gColourTrust` (chroma-swing bound) and `gRatioSmooth` (`gainSmooth`/`gainSharp`); defaults 2 and 1 from `common/shm_protocol.h` |
 
 ## Credits carried with the ported material
 
