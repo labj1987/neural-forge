@@ -79,6 +79,14 @@ fn persist_one(name: &str, is_float: bool, bits: u32) {
     let _ = cfg.save();
 }
 
+/// Saves every persisted value, per-pass overrides included, into `config.ini`. Used by the
+/// per-pass dialog, whose fields are not individual `persisted_settings` entries.
+pub fn persist_all(header: &neural_forge_protocol::ShmHeader) {
+    let mut cfg = neural_forge_supervisor::Config::load();
+    cfg.settings.extend(neural_forge_protocol::persist::snapshot(header));
+    let _ = cfg.save();
+}
+
 /// Binds a GTK `Scale`/`SpinButton`-shaped float control to one `f32`-bits field:
 /// reads the current value to initialize the widget, and writes back (bumping
 /// `control_seq` so the layer/helper notice) whenever the widget changes. `name` must

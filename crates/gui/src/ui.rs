@@ -233,6 +233,18 @@ pub fn build_ui(app: &adw::Application) {
     let (passes, set_passes) = bind_u32(&shm, Some("passes"), |h| &h.passes);
     model_group.add(&spin_row("Passes", "How many times the model runs over one frame", passes as f32, 1.0, 30.0, 1.0, move |v| set_passes(v as u32)));
 
+    let pass_row = adw::ActionRow::new();
+    pass_row.set_title("Per-pass settings");
+    pass_row.set_subtitle("Give individual passes their own values");
+    let pass_button = gtk4::Button::with_label("Edit…");
+    pass_button.set_valign(gtk4::Align::Center);
+    pass_row.add_suffix(&pass_button);
+    {
+        let shm = std::sync::Arc::clone(&shm);
+        pass_button.connect_clicked(move |b| open_pass_dialog(&shm, b.upcast_ref()));
+    }
+    model_group.add(&pass_row);
+
     let (settle, set_settle) = bind_u32(&shm, Some("rebuild_settle_ms"), |h| &h.rebuild_settle_ms);
     model_group.add(&spin_row(
         "Rebuild spacing",
@@ -490,6 +502,14 @@ pub fn build_ui(app: &adw::Application) {
     toolbar_view.add_bottom_bar(&switcher_bar);
     toasts.set_child(Some(&toolbar_view));
 
+    // Developer aid: `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog at startup, so it
+    // can be screenshotted where synthetic input cannot reach the window.
+    if neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() == Some("passes") {
+        let shm = std::sync::Arc::clone(&shm);
+        let view = view_stack.clone();
+        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || open_pass_dialog(&shm, view.upcast_ref()));
+    }
+
     // Follow the header: a change made with `shmctl`, a loaded profile, Reset or another
     // instance appears here within a second instead of needing an app restart.
     glib::timeout_add_seconds_local(1, || {
@@ -569,6 +589,168 @@ pub fn build_ui(app: &adw::Application) {
 /// else here, it's an action, not a live readout, because it's the only place besides
 /// `neural-forge-cli import-binaries` to get NVIDIA's DLLs into `binaries_dir()` -- there's
 /// no separate menu for it.
+
+/// One per-pass field in the per-pass dialog.
+struct PassField {
+    title: &'static str,
+    bit: u32,
+    kind: PassFieldKind,
+    get: fn(&neural_forge_protocol::PassControl) -> &std::sync::atomic::AtomicU32,
+}
+
+enum PassFieldKind {
+    Float { lower: f64, upper: f64, step: f64 },
+    Int { lower: f64, upper: f64 },
+    Choice(&'static [&'static str]),
+    Toggle,
+}
+
+/// Per-pass overrides: each pass of the chain can replace any of the Model tab's values with
+/// its own. A pass that overrides nothing follows the Model tab. Written straight into the
+/// header's pass array and saved as `set_pass_<n>_*`.
+fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, parent: &gtk4::Widget) {
+    use neural_forge_protocol::enums::pass_override as po;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    const FIELDS: &[PassField] = &[
+        PassField { title: "Intensity", bit: po::INTENSITY, kind: PassFieldKind::Float { lower: 0.0, upper: 4.0, step: 0.05 }, get: |p| &p.intensity_bits },
+        PassField { title: "Local tone", bit: po::LOCAL_TONE, kind: PassFieldKind::Float { lower: 0.0, upper: 4.0, step: 0.05 }, get: |p| &p.local_tone_bits },
+        PassField { title: "Local structure", bit: po::LOCAL_STRUCTURE, kind: PassFieldKind::Float { lower: 0.0, upper: 4.0, step: 0.05 }, get: |p| &p.local_structure_bits },
+        PassField { title: "Skin structure", bit: po::SKIN_STRUCTURE, kind: PassFieldKind::Float { lower: -1.0, upper: 4.0, step: 0.05 }, get: |p| &p.skin_structure_bits },
+        PassField { title: "Sharpness", bit: po::SHARPNESS, kind: PassFieldKind::Float { lower: 0.0, upper: 1.0, step: 0.05 }, get: |p| &p.sharpness_bits },
+        PassField { title: "Style", bit: po::STYLE, kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]), get: |p| &p.style },
+        PassField { title: "Preset", bit: po::PRESET, kind: PassFieldKind::Int { lower: 0.0, upper: 15.0 }, get: |p| &p.preset },
+        PassField { title: "Auto mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |p| &p.auto_mask },
+    ];
+
+    let dialog = adw::PreferencesDialog::new();
+    dialog.set_title("Per-pass settings");
+    let page = adw::PreferencesPage::new();
+    let pick = adw::PreferencesGroup::new();
+    pick.set_description(Some(
+        "Each pass of the model can override any Model-tab value with its own. A pass that \
+         overrides nothing follows the Model tab. Changes rebuild that pass after the rebuild spacing.",
+    ));
+    let pass_adj = gtk4::Adjustment::new(1.0, 1.0, neural_forge_protocol::MAX_PASSES as f64, 1.0, 5.0, 0.0);
+    let pass_row = adw::SpinRow::new(Some(&pass_adj), 1.0, 0);
+    pass_row.set_title("Pass");
+    pick.add(&pass_row);
+    page.add(&pick);
+    let fields_group = adw::PreferencesGroup::new();
+    page.add(&fields_group);
+
+    let loading = Rc::new(Cell::new(false));
+    let current_pass = move |adj: &gtk4::Adjustment| (adj.value() as usize).saturating_sub(1).min(neural_forge_protocol::MAX_PASSES - 1);
+    // Each field's "load this pass into the widgets" closure.
+    let mut reloads: Vec<Box<dyn Fn(usize)>> = Vec::new();
+
+    for field in FIELDS {
+        let expander = adw::ExpanderRow::new();
+        expander.set_title(field.title);
+        expander.set_subtitle("Override for this pass");
+        expander.set_show_enable_switch(true);
+        let write = {
+            let shm = std::sync::Arc::clone(shm);
+            let pass_adj = pass_adj.clone();
+            let loading = Rc::clone(&loading);
+            let get = field.get;
+            Rc::new(move |bits: u32| {
+                if loading.get() {
+                    return;
+                }
+                let h = shm.header();
+                get(&h.pass[current_pass(&pass_adj)]).store(bits, Ordering::Relaxed);
+                h.tuning_seq.fetch_add(1, Ordering::Relaxed);
+                h.control_seq.fetch_add(1, Ordering::Relaxed);
+                crate::shm::persist_all(h);
+            })
+        };
+        let set_widget: Box<dyn Fn(u32)> = match &field.kind {
+            PassFieldKind::Float { lower, upper, step } => {
+                let adj = gtk4::Adjustment::new(0.0, *lower, *upper, *step, step * 10.0, 0.0);
+                let row = adw::SpinRow::new(Some(&adj), *step, 2);
+                row.set_title("Value");
+                let w = Rc::clone(&write);
+                adj.connect_value_changed(move |a| w((a.value() as f32).to_bits()));
+                expander.add_row(&row);
+                Box::new(move |bits| adj.set_value(f64::from(f32::from_bits(bits))))
+            }
+            PassFieldKind::Int { lower, upper } => {
+                let adj = gtk4::Adjustment::new(0.0, *lower, *upper, 1.0, 5.0, 0.0);
+                let row = adw::SpinRow::new(Some(&adj), 1.0, 0);
+                row.set_title("Value");
+                let w = Rc::clone(&write);
+                adj.connect_value_changed(move |a| w(a.value() as u32));
+                expander.add_row(&row);
+                Box::new(move |bits| adj.set_value(f64::from(bits)))
+            }
+            PassFieldKind::Choice(options) => {
+                let row = adw::ComboRow::new();
+                row.set_title("Value");
+                row.set_model(Some(&gtk4::StringList::new(options)));
+                let w = Rc::clone(&write);
+                row.connect_selected_notify(move |r| w(r.selected()));
+                expander.add_row(&row);
+                let last = options.len() as u32 - 1;
+                Box::new(move |bits| row.set_selected(bits.min(last)))
+            }
+            PassFieldKind::Toggle => {
+                let row = adw::SwitchRow::new();
+                row.set_title("On");
+                let w = Rc::clone(&write);
+                row.connect_active_notify(move |r| w(u32::from(r.is_active())));
+                expander.add_row(&row);
+                Box::new(move |bits| row.set_active(bits != 0))
+            }
+        };
+        {
+            let shm = std::sync::Arc::clone(shm);
+            let pass_adj = pass_adj.clone();
+            let loading = Rc::clone(&loading);
+            let bit = field.bit;
+            expander.connect_enable_expansion_notify(move |e| {
+                if loading.get() {
+                    return;
+                }
+                let h = shm.header();
+                let mask = &h.pass[current_pass(&pass_adj)].override_mask;
+                if e.enables_expansion() {
+                    mask.fetch_or(bit, Ordering::Relaxed);
+                } else {
+                    mask.fetch_and(!bit, Ordering::Relaxed);
+                }
+                h.tuning_seq.fetch_add(1, Ordering::Relaxed);
+                h.control_seq.fetch_add(1, Ordering::Relaxed);
+                crate::shm::persist_all(h);
+            });
+        }
+        fields_group.add(&expander);
+        let shm = std::sync::Arc::clone(shm);
+        let get = field.get;
+        let bit = field.bit;
+        reloads.push(Box::new(move |pass| {
+            let p = &shm.header().pass[pass];
+            expander.set_enable_expansion(p.override_mask.load(Ordering::Relaxed) & bit != 0);
+            set_widget(get(p).load(Ordering::Relaxed));
+        }));
+    }
+
+    let reload = {
+        let loading = Rc::clone(&loading);
+        let reloads = Rc::new(reloads);
+        move |pass: usize| {
+            loading.set(true);
+            reloads.iter().for_each(|r| r(pass));
+            loading.set(false);
+        }
+    };
+    reload(0);
+    pass_adj.connect_value_changed(move |a| reload(current_pass(a)));
+
+    dialog.add(&page);
+    dialog.present(Some(parent));
+}
+
 fn profile_names() -> Vec<String> {
     let mut names: Vec<String> = neural_forge_supervisor::profiles::load_all().into_keys().collect();
     names.sort();
@@ -985,14 +1167,56 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     group.add(&helper_row);
     group.add(&layer_row);
 
+    let log_button = gtk4::Button::from_icon_name("text-x-generic-symbolic");
+    log_button.set_tooltip_text(Some("Open the helper log"));
+    log_button.set_valign(gtk4::Align::Center);
+    helper_row.add_suffix(&log_button);
+    log_button.connect_clicked(|_| {
+        let log = neural_forge_supervisor::Config::load().log;
+        let _ = gio::AppInfo::launch_default_for_uri(&gio::File::for_path(&log).uri(), None::<&gio::AppLaunchContext>);
+    });
+
     let shm_for_timer = std::sync::Arc::clone(shm);
     let start_stop_button_for_timer = start_stop_button.clone();
+    // Liveness is read from the heartbeats, not the state fields: a killed helper never writes
+    // STOPPED and a closed game never clears `layer_attached`, so those fields alone go on
+    // claiming "running" and "attached" forever.
+    let helper_beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
+    let layer_beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
+    let fresh = |cell: &std::cell::Cell<(u32, std::time::Instant)>, now_value: u32| {
+        let (seen, at) = cell.get();
+        if now_value != seen {
+            cell.set((now_value, std::time::Instant::now()));
+            true
+        } else {
+            at.elapsed() < std::time::Duration::from_secs(2)
+        }
+    };
     glib::timeout_add_seconds_local(1, move || {
         let hdr = shm_for_timer.header();
-        let helper_state = hdr.helper_state.load(Ordering::Relaxed);
-        helper_row.set_subtitle(helper_state_label(helper_state));
-        let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
-        layer_row.set_subtitle(if attached { "attached" } else { "not attached" });
+        let version = hdr.version.load(Ordering::Relaxed);
+        if version != neural_forge_protocol::SHM_VERSION {
+            helper_row.set_subtitle(&format!(
+                "shared memory is version {version}, this app speaks {} -- restart the helper and the game on the same Neural Forge version",
+                neural_forge_protocol::SHM_VERSION
+            ));
+            layer_row.set_subtitle("unknown (version mismatch)");
+        } else {
+            let helper_alive = fresh(&helper_beat, hdr.heartbeat.load(Ordering::Relaxed));
+            let helper_state = hdr.helper_state.load(Ordering::Relaxed);
+            let reason = hdr.helper_reason();
+            let state = if helper_alive || neural_forge_supervisor::is_running().is_some() { helper_state_label(helper_state) } else { "not running" };
+            helper_row.set_subtitle(&if reason.is_empty() { state.to_string() } else { format!("{state} -- {reason}") });
+            let layer_active = fresh(&layer_beat, hdr.layer_heartbeat.load(Ordering::Relaxed));
+            let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
+            layer_row.set_subtitle(if layer_active {
+                "active: processing the game's frames"
+            } else if attached {
+                "idle: a game attached, but no frames are being processed (loading screen, paused, closed, or no helper)"
+            } else {
+                "no game attached yet"
+            });
+        }
         // Keyed off the actual OS-level pid-file check (what start/stop manage), not
         // the SHM helper_state above -- those can briefly disagree right after a
         // start/stop (e.g. STARTING vs. the process not existing yet) and the button
@@ -1111,8 +1335,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             let dialog = adw::AlertDialog::builder()
                 .heading("Reset all settings?")
                 .body("Every tuning value returns to its default. The running helper/layer \
-                       session (frame counters, transport state) is not affected. Restart \
-                       Neural Forge afterward to see the reset values in this window.")
+                       session (frame counters, transport state) is not affected.")
                 .default_response("cancel")
                 .close_response("cancel")
                 .build();
