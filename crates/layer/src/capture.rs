@@ -830,6 +830,28 @@ fn poll_or_submit_capture(
     }
 }
 
+/// The longest a present waits for its own frame's answer before going out untouched.
+const SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// `NEURAL_FORGE_PIPELINED=1` restores the old pipelined present: never waits for the model,
+/// higher frame rate, but each answer is applied to a later frame than the one it was computed
+/// for, which ghosts whenever the camera moves.
+fn pipelined_present() -> bool {
+    #[cfg(test)]
+    if TEST_PIPELINED.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static P: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *P.get_or_init(|| neural_forge_protocol::env::flag("NEURAL_FORGE_PIPELINED"))
+}
+
+/// Lets the pipelined-mode tests run that mode without touching the process environment.
+#[cfg(test)]
+static TEST_PIPELINED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Held by every test that depends on the present mode, so they never see each other's.
+#[cfg(test)]
+static TEST_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Set when capture resource creation failed during the last [`run`]. The present hook reads
 /// it with [`take_setup_failure`] to release this swapchain's primary claim: a claim held by
 /// a swapchain that cannot drive the channel would keep every peer of equal or smaller area
@@ -1061,123 +1083,201 @@ pub unsafe fn run(
     // the second one processed simply overwrites `last_answer`/`raw_answer_base` --
     // the same "whichever is freshest wins" bounded-staleness tradeoff `run`'s own
     // doc comment already documents for a single slot, not a new one v3 introduces.
-    for slot in 0..2 {
-        // Poll whatever was sent on some earlier frame *before* touching anything
-        // else -- `inflight[slot]`'s current contents correspond to it, and must be
-        // read (below) before a new capture this same frame (if one happens) is
-        // allowed to replace them.
-        let mut have_answer = false;
-        // Captured *before* the submit branch below can overwrite
-        // `inflight[slot].proxy_dims` with a brand-new request's own dims -- reading
-        // it again after that point would describe the wrong request. `(width,
-        // height)` is a safe placeholder while `have_answer` is `false`; nothing below
-        // reads `answer_dims` unless `have_answer` is `true`, at which point it was
-        // always actually set from the branch just below.
-        let mut answer_dims = (width, height);
-        if shm.has_pending_request(slot) {
-            if shm.poll_async_request(slot) == Some(true) {
-                // The answer comes back at whatever resolution *this outstanding
-                // request* was actually sent at (`inflight[slot].proxy_dims`), not
-                // necessarily this frame's own `(width, height)` -- see
-                // `Inflight::proxy_dims`'s own doc comment. Falls back to the
-                // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
-                // possibility before `working_scale` existed.
-                answer_dims = inflight[slot].proxy_dims.unwrap_or((width, height));
-                let (aw, ah) = answer_dims;
-                let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
-                answer_scratch.resize(answer_bytes, 0);
-                shm.read_answer(slot, answer_scratch);
-                // Preserve the exact game frame supplied to the model before the next
-                // request replaces `inflight[slot].original`; the temporal GPU path
-                // uses it to carry only the model's enhancement delta onto current
-                // frames.
-                raw_answer_base.clear();
-                raw_answer_base.extend_from_slice(&inflight[slot].original);
-                have_answer = true;
+    if pipelined_present() {
+        for slot in 0..2 {
+            // Poll whatever was sent on some earlier frame *before* touching anything
+            // else -- `inflight[slot]`'s current contents correspond to it, and must be
+            // read (below) before a new capture this same frame (if one happens) is
+            // allowed to replace them.
+            let mut have_answer = false;
+            // Captured *before* the submit branch below can overwrite
+            // `inflight[slot].proxy_dims` with a brand-new request's own dims -- reading
+            // it again after that point would describe the wrong request. `(width,
+            // height)` is a safe placeholder while `have_answer` is `false`; nothing below
+            // reads `answer_dims` unless `have_answer` is `true`, at which point it was
+            // always actually set from the branch just below.
+            let mut answer_dims = (width, height);
+            if shm.has_pending_request(slot) {
+                if shm.poll_async_request(slot) == Some(true) {
+                    // The answer comes back at whatever resolution *this outstanding
+                    // request* was actually sent at (`inflight[slot].proxy_dims`), not
+                    // necessarily this frame's own `(width, height)` -- see
+                    // `Inflight::proxy_dims`'s own doc comment. Falls back to the
+                    // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
+                    // possibility before `working_scale` existed.
+                    answer_dims = inflight[slot].proxy_dims.unwrap_or((width, height));
+                    let (aw, ah) = answer_dims;
+                    let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
+                    answer_scratch.resize(answer_bytes, 0);
+                    shm.read_answer(slot, answer_scratch);
+                    // Preserve the exact game frame supplied to the model before the next
+                    // request replaces `inflight[slot].original`; the temporal GPU path
+                    // uses it to carry only the model's enhancement delta onto current
+                    // frames.
+                    raw_answer_base.clear();
+                    raw_answer_base.extend_from_slice(&inflight[slot].original);
+                    have_answer = true;
+                }
+            }
+
+            // Non-blocking capture (`docs/ASYNC_CAPTURE_DESIGN.md`, `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`):
+            // poll whatever capture is already in flight for this slot -- never a queue/
+            // fence wait -- before deciding whether to submit a new one on it. Same
+            // per-slot wire-protocol constraint as before: only start a new round trip on
+            // this slot (and only bother keeping a just-finished capture's bytes at all)
+            // when nothing is already outstanding on it. A capture that finishes while a
+            // request is *already* in flight on this slot is still polled here (freeing
+            // its GPU buffer for reuse) but its bytes are simply not consumed -- the same
+            // bounded temporal-staleness tradeoff `run`'s own doc comment already
+            // accepts, not a new one. `poll_or_submit_capture` never submits in the same
+            // call it successfully polls, so a single check here (rather than the two
+            // separate ones a poll-then-maybe-submit split would need) already correctly
+            // skips submitting a redundant capture on the same call a round trip just
+            // started.
+            if !shm.has_pending_request(slot) {
+                if let Some((sent_w, sent_h)) = poll_or_submit_capture(
+                    slot, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+                    capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
+                crate::composition::encode_pass::EncodePush {
+                    white_point: settings.white_point,
+                    bgr_order: u32::from(bgr_order),
+                    reversible_mode: settings.reversible_mode,
+                },
+                shm, original_scratch, model_scratch,
+                ) {
+                    shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+                    if shm.begin_async_request(slot) {
+                        std::mem::swap(&mut inflight[slot].original, original_scratch);
+                        inflight[slot].dims = Some((width, height, proxy_format));
+                        // The proxy's *actual* sent dims, straight from
+                        // `poll_or_submit_capture`'s own return -- not re-derived from
+                        // `model_request` here, which would be wrong whenever that
+                        // function fell back to full-resolution (a scratch build/resize
+                        // failure, or `use_direct`) despite scaling being requested.
+                        inflight[slot].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
+                    }
+                }
+            }
+
+            if have_answer && inflight[slot].dims == Some((width, height, proxy_format)) && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+                // Retain the model's raw answer for continuous re-presentation below --
+                // deliberately *not* run through `composition::gpu`/`composition::apply`'s
+                // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
+                // own luminance exactly whenever `original <= proxy`; this pipeline's `proxy
+                // == original` (no real downscaled proxy exists yet -- see this crate's other
+                // doc comments) makes that true on every pixel, which doesn't just dilute the
+                // model's edit but actively fights it: a *stronger* raw answer gets *more*
+                // aggressively cancelled by the same ratio-based rescale, confirmed by direct
+                // measurement on `lordnikon` 2026-09-12 (maxing every tuning parameter nearly
+                // doubled the raw model's own delta from original, then the compositor's
+                // output delta *dropped* below the unmodified baseline). No tuning knob fixes
+                // that; it's this pipeline's proxy/original conflation actively working
+                // against the model's answer, not merely muting it.
+                last_answer.clear();
+                last_answer.extend_from_slice(answer_scratch);
+                *last_answer_dims = answer_dims;
+                *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
             }
         }
 
-        // Non-blocking capture (`docs/ASYNC_CAPTURE_DESIGN.md`, `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`):
-        // poll whatever capture is already in flight for this slot -- never a queue/
-        // fence wait -- before deciding whether to submit a new one on it. Same
-        // per-slot wire-protocol constraint as before: only start a new round trip on
-        // this slot (and only bother keeping a just-finished capture's bytes at all)
-        // when nothing is already outstanding on it. A capture that finishes while a
-        // request is *already* in flight on this slot is still polled here (freeing
-        // its GPU buffer for reuse) but its bytes are simply not consumed -- the same
-        // bounded temporal-staleness tradeoff `run`'s own doc comment already
-        // accepts, not a new one. `poll_or_submit_capture` never submits in the same
-        // call it successfully polls, so a single check here (rather than the two
-        // separate ones a poll-then-maybe-submit split would need) already correctly
-        // skips submitting a redundant capture on the same call a round trip just
-        // started.
-        if !shm.has_pending_request(slot) {
-            if let Some((sent_w, sent_h)) = poll_or_submit_capture(
-                slot, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+        // Re-present the most recently retained answer on *every* call, not only the
+        // rare one a round trip happens to resolve on. Compositing only on that rare
+        // frame (`image` left completely untouched every other frame, this function's
+        // very first design) alternates "native" and "one processed frame" -- the
+        // flicker this project has fought since v0.1.49/v0.1.50 (see this crate's other
+        // doc comments) -- independently of whether that processed frame is stale.
+        // Re-blitting the same held answer every frame instead removes the alternation:
+        // displayed content is always "the model's edit," refreshed at the round trip's
+        // own cadence rather than toggling against untouched frames in between.
+        //
+        // What that composite *does* with a stale answer against a moved current frame
+        // changed 2026-09-17: `composition::gpu::record_temporal_delta_into_image` used
+        // to carry the stale delta forward with a motion-based suppression mask
+        // (`compose.comp`'s deleted `carry_delta` branch) -- this crate independently
+        // arrived at the same reprojection-with-suppression technique DLSS5VKLayer's own
+        // AGPL-3.0 source documents trying and measuring as a dead end. It now
+        // re-anchors to the current frame with a plain ratio-transfer, no suppression,
+        // matching upstream's own resolve function directly -- see
+        // `ATTRIBUTION.md`/`docs/GHOSTING_PLAN.md`. The real fix for genuine motion-driven
+        // staleness is still a downscaled-proxy-plus-motion-vector pipeline (this
+        // crate's own doc comment on motion vectors being disabled), not attempted here.
+    } else {
+        // Synchronous present (the default): this frame is captured, the model answers *this*
+        // frame, and the answer is composed onto *this* frame before it is presented -- the
+        // way upstream works. An answer is therefore never applied to a frame the camera has
+        // moved on from, which is what produced the ghosting (a pale copy of the old frame's
+        // edges and text laid over the new one) in the pipelined mode.
+        //
+        // The wait is bounded: a frame whose answer is not back within `SYNC_BUDGET` is
+        // presented untouched, and the late request is never waited on again, so a slow,
+        // warming-up, restarted or missing helper can delay a frame by at most the budget and
+        // can never hang the game.
+        const SLOT: usize = 0;
+        let deadline = std::time::Instant::now() + SYNC_BUDGET;
+        // Left over from a frame that ran out of time (or from pipelined mode): its answer
+        // belongs to an old frame. Discard it when it lands; never block on it.
+        for slot in 0..2 {
+            if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(false) && slot == SLOT {
+                shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                return None;
+            }
+        }
+        let encode_push = crate::composition::encode_pass::EncodePush {
+            white_point: settings.white_point,
+            bgr_order: u32::from(bgr_order),
+            reversible_mode: settings.reversible_mode,
+        };
+        let mut sent = None;
+        loop {
+            if let Some(dims) = poll_or_submit_capture(
+                SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
                 capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
-            crate::composition::encode_pass::EncodePush {
-                white_point: settings.white_point,
-                bgr_order: u32::from(bgr_order),
-                reversible_mode: settings.reversible_mode,
-            },
-            shm, original_scratch, model_scratch,
+                encode_push, shm, original_scratch, model_scratch,
             ) {
-                shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-                if shm.begin_async_request(slot) {
-                    std::mem::swap(&mut inflight[slot].original, original_scratch);
-                    inflight[slot].dims = Some((width, height, proxy_format));
-                    // The proxy's *actual* sent dims, straight from
-                    // `poll_or_submit_capture`'s own return -- not re-derived from
-                    // `model_request` here, which would be wrong whenever that
-                    // function fell back to full-resolution (a scratch build/resize
-                    // failure, or `use_direct`) despite scaling being requested.
-                    inflight[slot].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
+                sent = Some(dims);
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(100));
+        }
+        let Some((sent_w, sent_h)) = sent else {
+            shm.publish_frame_timing(pipeline_start.elapsed(), false);
+            return None;
+        };
+        shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+        if !shm.begin_async_request(SLOT) {
+            shm.publish_frame_timing(pipeline_start.elapsed(), false);
+            return None;
+        }
+        inflight[SLOT].dims = Some((width, height, proxy_format));
+        inflight[SLOT].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
+        loop {
+            match shm.poll_async_request(SLOT) {
+                Some(true) => break,
+                Some(false) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_micros(100)),
+                // Out of time, or the helper is gone: this frame goes out untouched.
+                _ => {
+                    shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                    return None;
                 }
             }
         }
-
-        if have_answer && inflight[slot].dims == Some((width, height, proxy_format)) && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
-            // Retain the model's raw answer for continuous re-presentation below --
-            // deliberately *not* run through `composition::gpu`/`composition::apply`'s
-            // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
-            // own luminance exactly whenever `original <= proxy`; this pipeline's `proxy
-            // == original` (no real downscaled proxy exists yet -- see this crate's other
-            // doc comments) makes that true on every pixel, which doesn't just dilute the
-            // model's edit but actively fights it: a *stronger* raw answer gets *more*
-            // aggressively cancelled by the same ratio-based rescale, confirmed by direct
-            // measurement on `lordnikon` 2026-09-12 (maxing every tuning parameter nearly
-            // doubled the raw model's own delta from original, then the compositor's
-            // output delta *dropped* below the unmodified baseline). No tuning knob fixes
-            // that; it's this pipeline's proxy/original conflation actively working
-            // against the model's answer, not merely muting it.
-            last_answer.clear();
-            last_answer.extend_from_slice(answer_scratch);
-            *last_answer_dims = answer_dims;
-            *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
+        if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+            return None;
         }
+        let answer_bytes = (u64::from(sent_w) * u64::from(sent_h) * bytes_per_pixel) as usize;
+        answer_scratch.resize(answer_bytes, 0);
+        shm.read_answer(SLOT, answer_scratch);
+        raw_answer_base.clear();
+        raw_answer_base.extend_from_slice(original_scratch);
+        last_answer.clear();
+        last_answer.extend_from_slice(answer_scratch);
+        *last_answer_dims = (sent_w, sent_h);
+        *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
     }
 
-    // Re-present the most recently retained answer on *every* call, not only the
-    // rare one a round trip happens to resolve on. Compositing only on that rare
-    // frame (`image` left completely untouched every other frame, this function's
-    // very first design) alternates "native" and "one processed frame" -- the
-    // flicker this project has fought since v0.1.49/v0.1.50 (see this crate's other
-    // doc comments) -- independently of whether that processed frame is stale.
-    // Re-blitting the same held answer every frame instead removes the alternation:
-    // displayed content is always "the model's edit," refreshed at the round trip's
-    // own cadence rather than toggling against untouched frames in between.
-    //
-    // What that composite *does* with a stale answer against a moved current frame
-    // changed 2026-09-17: `composition::gpu::record_temporal_delta_into_image` used
-    // to carry the stale delta forward with a motion-based suppression mask
-    // (`compose.comp`'s deleted `carry_delta` branch) -- this crate independently
-    // arrived at the same reprojection-with-suppression technique DLSS5VKLayer's own
-    // AGPL-3.0 source documents trying and measuring as a dead end. It now
-    // re-anchors to the current frame with a plain ratio-transfer, no suppression,
-    // matching upstream's own resolve function directly -- see
-    // `ATTRIBUTION.md`/`docs/GHOSTING_PLAN.md`. The real fix for genuine motion-driven
-    // staleness is still a downscaled-proxy-plus-motion-vector pipeline (this
-    // crate's own doc comment on motion vectors being disabled), not attempted here.
     if last_answer.is_empty() {
         return None;
     }
@@ -2828,6 +2928,192 @@ mod tests {
         }
     }
 
+    /// Synchronous present (the default): with a helper that answers within the budget, the
+    /// first present call captures, waits for that frame's own answer and composites it.
+    #[test]
+    fn synchronous_present_composites_the_same_frame_it_captured() {
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("run_never_blocks_on_a_slow_helper_and_eventually_composites: no Vulkan loader/ICD, skipping");
+            return;
+        };
+
+        let path = scratch_path("sync");
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path), "test-only open_at should always succeed against a scratch path");
+        let hdr_ptr = shm.test_header_ptr();
+        // A live helper (matters for `poll_async_request`'s timeout budget: the long
+        // "steady state" one, not the short "nobody's listening" one, since this test
+        // deliberately answers slower than that short budget).
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+
+        // A fake helper that only answers `HELPER_DELAY` after it sees a new request --
+        // long enough that if `run` ever blocked waiting for it, a handful of calls
+        // spaced much closer together than that would visibly take just as long.
+        const HELPER_DELAY: Duration = Duration::from_millis(30);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let helper = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined before the test ends).
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            let mut last_seen = 0u32;
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
+                if req != 0 && req != last_seen {
+                    last_seen = req;
+                    std::thread::sleep(HELPER_DELAY);
+                    hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let (width, height) = (8u32, 8u32);
+        let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+
+        let mut resources: Option<CaptureResources> = None;
+        let mut pipeline: Option<CapturePipeline> = None;
+        let mut direct: [Option<DirectCapture>; 2] = [None, None];
+        let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+        let mut original_scratch = Vec::new();
+        let mut model_scratch = Vec::new();
+        let mut answer_scratch = Vec::new();
+        let mut raw_answer_base = Vec::new();
+        let mut raw_answer_generation = 0u64;
+        let mut last_answer = Vec::new();
+        let mut last_answer_dims = (0u32, 0u32);
+        let mut inflight: [Inflight; 2] = Default::default();
+        let mut bootstrap_complete = false;
+
+        let mut got_semaphore = false;
+        let mut iteration = 0u32;
+        let mut slow_calls: Vec<Duration> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        // Real usage calls this once per present, indefinitely -- loop until either a
+        // real composited result shows up or the deadline (comfortably several
+        // `HELPER_DELAY`-long round trips) is exhausted, not a fixed iteration count.
+        while Instant::now() < deadline {
+            iteration += 1;
+            let call_start = Instant::now();
+            // SAFETY: `image` is this test's own, currently `PRESENT_SRC_KHR`; `queue`
+            // is used from this one thread only, exactly like `run`'s own contract
+            // requires of the real present hook.
+            let sem = unsafe {
+                run(
+                    &device,
+                    &instance,
+                    physical_device,
+                    queue,
+                    queue_family,
+                    image,
+                    vk::ImageLayout::PRESENT_SRC_KHR,
+                    image,
+                    width,
+                    height,
+                    proxy_format,
+                    false,
+                    &mut resources,
+                    &mut pipeline,
+                    &mut direct,
+                    // This test's own device never enables `VK_EXT_external_memory_host`
+                    // (see `test_device`'s minimal `DeviceCreateInfo`), so this must be
+                    // `false` -- exercising `CapturePipeline`, the path this test
+                    // actually validates. A `DirectCapture` equivalent needs its own
+                    // test with the extension genuinely enabled, not this one lying
+                    // about it.
+                    false,
+                    &mut gpu_compose,
+                    &mut shm,
+                    &mut original_scratch,
+                    &mut model_scratch,
+                    &mut inflight,
+                    &mut bootstrap_complete,
+                    &mut answer_scratch,
+                    &mut raw_answer_base,
+                    &mut raw_answer_generation,
+                    &mut last_answer,
+                    &mut last_answer_dims,
+                )
+            };
+            let call_time = call_start.elapsed();
+            // Skip the very first call: it pays real one-time setup cost this test
+            // doesn't otherwise isolate (`CapturePipeline`/`GpuCompose` first-use
+            // allocation, first-touch driver/shader-cache warmup).
+            //
+            // The real invariant this guards is "`run()` never synchronously waits
+            // for the helper's own answer". A single call occasionally running long
+            // is not, by itself, evidence of that: GitHub's shared runners saw calls
+            // up to 466ms (nearly *double* `HELPER_DELAY`) with no code change
+            // involved, purely from real scheduler/software-rasterizer contention on
+            // that infra -- worse than this test's own fake helper thread's sleep, so
+            // no fixed per-call ceiling can both reject that noise and still allow a
+            // real hardware/local run through. What a genuine synchronous-wait
+            // regression looks like instead is *every* call converging near
+            // `HELPER_DELAY`, not one noisy outlier -- so tally slow calls across the
+            // whole loop and judge the pattern, not any single sample, below.
+            if iteration > 1 && call_time >= HELPER_DELAY * 9 / 10 {
+                slow_calls.push(call_time);
+            }
+            if let Some(sem) = sem {
+                got_semaphore = true;
+                // Stand in for what the real present call does: wait on the semaphore
+                // before the image is considered final, exactly like
+                // `composition::gpu::tests`' own async tests already establish.
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+                let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
+                let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
+                unsafe {
+                    device.queue_submit(queue, &[submit], wait_fence).unwrap();
+                    device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                    device.destroy_fence(wait_fence, None);
+                }
+                break;
+            }
+            if !last_answer.is_empty() {
+                got_semaphore = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_semaphore, "synchronous present must composite the answer");
+        // Synchronous present composites this frame's own answer on the same call: the very first
+        // present (nothing is ever carried to a later frame).
+        assert_eq!(iteration, 1, "the answer must land on the present that captured it, not a later one");
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        helper.join().unwrap();
+
+        // A capture pipeline slot can legitimately still be `pending` here (the test
+        // loop can exit as soon as `last_answer` is non-empty, with no guarantee the
+        // *next* speculative capture submission already resolved) -- wait for the
+        // whole device idle first, the same real teardown precondition
+        // `destroy_private_resources` relies on in production, before either
+        // `destroy` call below touches anything.
+        unsafe { device.device_wait_idle() }.unwrap();
+        // SAFETY: every semaphore this test waited on has a completed, waited-for
+        // fence behind it (the explicit wait above); the idle wait just above
+        // confirms every capture-pipeline slot's own fence too; nothing else touched
+        // `image`.
+        unsafe {
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy(resources, &device);
+            destroy_pipeline(pipeline, &device);
+            for slot in direct {
+                destroy_direct_capture(slot, &device);
+            }
+            if let Some(gpu) = gpu_compose {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
     /// The real point of the pipelined redesign, exercised end to end against a real
     /// (if software) Vulkan device: `run` must never block a present call waiting on
     /// the helper, even when the helper genuinely takes far longer than one frame to
@@ -2835,6 +3121,15 @@ mod tests {
     /// a real, verifiable composited write (not just "a semaphore came back").
     #[test]
     fn run_never_blocks_on_a_slow_helper_and_eventually_composites() {
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        TEST_PIPELINED.store(true, std::sync::atomic::Ordering::Relaxed);
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_PIPELINED.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let _reset = Reset;
         let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
             eprintln!("run_never_blocks_on_a_slow_helper_and_eventually_composites: no Vulkan loader/ICD, skipping");
             return;
