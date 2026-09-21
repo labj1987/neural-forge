@@ -717,6 +717,7 @@ fn poll_or_submit_capture(
         if !unsafe {
             ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, capacity as vk::DeviceSize)
         } {
+            note_setup_failure();
             return None;
         }
         let d = direct[slot].as_mut().expect("just ensured above");
@@ -736,6 +737,7 @@ fn poll_or_submit_capture(
         None
     } else {
         if !ensure_pipeline(pipeline, device, instance, physical_device, queue_family, frame_bytes) {
+            note_setup_failure();
             return None;
         }
         let p = pipeline.as_mut().expect("just ensured above");
@@ -795,6 +797,21 @@ fn poll_or_submit_capture(
         );
         None
     }
+}
+
+/// Set when capture resource creation failed during the last [`run`]. The present hook reads
+/// it with [`take_setup_failure`] to release this swapchain's primary claim: a claim held by
+/// a swapchain that cannot drive the channel would keep every peer of equal or smaller area
+/// from taking over.
+static SETUP_FAILED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn note_setup_failure() {
+    SETUP_FAILED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether capture resource creation failed since the last call. Clears the flag.
+pub fn take_setup_failure() -> bool {
+    SETUP_FAILED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// # Safety

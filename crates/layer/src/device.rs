@@ -797,6 +797,16 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             return LayerResult::Unhandled;
         };
         release_primary(self.device.handle(), swapchain);
+        // Drain before anything per-swapchain is freed: a capture or compose the layer submitted
+        // for one of this swapchain's images may still be in flight, and must not be left
+        // referencing an image the driver is about to destroy. The layer's own submissions are
+        // fenced but those fences are not tracked here per swapchain, so wait for the device
+        // (the application already has to have stopped using the swapchain to destroy it).
+        let known = self.state.lock().unwrap().swapchains.contains_key(&swapchain);
+        if known {
+            // SAFETY: `self.device` is the live device this swapchain belongs to.
+            let _ = unsafe { self.device.device_wait_idle() };
+        }
         {
             let mut state = self.state.lock().unwrap();
             if let Some(old) = state.swapchains.remove(&swapchain) {
@@ -1053,6 +1063,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             last_answer,
                             last_answer_dims,
                         );
+                    }
+                    if capture::take_setup_failure() {
+                        // Capture resources could not be built for this swapchain. It holds the
+                        // primary claim but cannot drive the channel, which would keep every peer
+                        // of equal or smaller area from taking over; give the claim up. It is
+                        // taken again (and the build retried) on the next present.
+                        release_primary(self.device.handle(), sc);
                     }
                 }
                 break;
