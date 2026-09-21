@@ -4,6 +4,26 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.79 — 2026-09-21
+
+- **The app follows changes made elsewhere.** Every setting row updates within a second when a
+  value is changed with `neural-forge-cli shmctl`, a loaded profile, Reset or another window; no
+  more "restart Neural Forge to see it".
+- **Per-pass settings.** A dialog (Model tab, Per-pass settings) lets each pass of the model
+  override any Model value; overrides are saved (`set_pass_<n>_*` in `config.ini`).
+- **Honest status.** Helper running / not running and the game's active / idle / not attached
+  come from live heartbeats (a killed helper or closed game used to keep showing as running);
+  the helper's reason is shown, and a version mismatch is called out. A button opens the helper
+  log.
+- **Upstream ranges.** Preset 0-15, intensity and local strengths 0-4, detail strength 0-4,
+  highlight guard 1-30, compare zoom 1-2; model resolution is a percentage (25-100). New rows:
+  rebuild spacing and ghost guard. The supersampling filter row is disabled (model resolution
+  cannot exceed 100%).
+- **`neural-forge-cli uninstall --purge`** also removes the config, imported DLLs, managed
+  prefix, logs and `/tmp/neural-forge-$UID`.
+- README: environment variable, CLI, file and troubleshooting reference;
+  `docs/UPSTREAM_PARITY.md` records what was and was not carried over from upstream 0.3.1-1.
+
 ## 0.1.78 — 2026-09-21
 
 Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.

@@ -126,6 +126,9 @@ transport work in progress.
 
 ## Known issues
 
+What is and is not yet carried over from upstream DLSS5VKLayer is tracked in
+[docs/UPSTREAM_PARITY.md](docs/UPSTREAM_PARITY.md).
+
 **A GPU hang with an NVIDIA `Xid 109` (`CTX_SWITCH_TIMEOUT`) or `Xid 119` error.**
 Versions before 0.1.61 had a real bug that could plausibly cause exactly this (a
 render-tap bookkeeping leak that could act on a reused image handle) — update first.
@@ -141,6 +144,75 @@ for a real `Xid` line before assuming Neural Forge caused a crash — see
 diagnosed and what other users report as partial workarounds (driver downgrade to the
 550.x branch, `PROTON_HIDE_NVIDIA_GPU=1 PROTON_ENABLE_NVAPI=1` with Pyroveil, or a
 lower in-game resolution).
+
+## Reference
+
+### Environment variables
+
+Set on a game (Steam launch options) unless noted. Every `NEURAL_FORGE_*` name is also
+read under its pre-0.1.77 spelling `NEURALFORGE_*`.
+
+| Variable | Effect |
+|---|---|
+| `NEURAL_FORGE_ENABLE=1` | Turns the layer on for this game (the layer manifest's enable switch). |
+| `NEURAL_FORGE_DISABLE=1` | Forces it off, overriding `ENABLE`. |
+| `NEURAL_FORGE_TARGET_EXE=a.exe,b.exe` | Only these executables may use the layer (for games that start several processes). |
+| `NEURAL_FORGE_PIPELINED=1` | Old pipelined present: higher frame rate, but answers land on later frames and ghost. |
+| `NEURAL_FORGE_TOGGLE_KEY=F10` | In-game toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
+| `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | Forces one keyboard backend (default: evdev, then XInput2). |
+| `NEURAL_FORGE_MAX_MODEL_PIXELS=N` | Largest raster the model is given (default 3840x2160 = 8294400). |
+| `NEURAL_FORGE_LOG=/path` | Layer log file (default: stderr). Also the helper's log when set for it. |
+| `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID` | Shared-memory path / the uid its directory is named after; normally left alone. |
+| `NEURAL_FORGE_DMABUF=0` | Written by the GUI's launch-option builder; currently has no effect. |
+| `NEURAL_FORGE_SKIP_NVAPI=1` | Helper, set by the supervisor for Proton: do not load the vendored `nvapi64.dll`. |
+| `NEURAL_FORGE_INSTALL_DIR` | Supervisor: where to find the helper (default: the installed copy, then the AppImage's). |
+| `NEURAL_FORGE_MVEC_HELPER=1` | Helper: experimental optical-flow motion vectors (off; unverified). |
+| `NEURAL_FORGE_HELPER_DELAY_MS`, `NEURAL_FORGE_BENCH`, `NEURAL_FORGE_GUI_OPEN` | Testing aids. |
+
+### CLI
+
+`neural-forge-cli <command>`: `init`, `setup`, `start`, `stop`, `restart`, `status`,
+`doctor`, `config`, `runners`, `detect-gpu`, `import-binaries DIR`, `install --appdir DIR`,
+`uninstall [--purge]`, `profile list|save|load|delete NAME`, and `shmctl
+status|set NAME VALUE|toggle NAME|capture|reset` for the live settings. `neural-forge-cli
+help` has the details.
+
+### Files
+
+| Path | What |
+|---|---|
+| `~/.config/neural-forge/config.ini` | Runner, paths, and every setting as `set_<name>=` (per-pass overrides as `set_pass_<n>_<field>=`). |
+| `~/.config/neural-forge/profiles.ini` | Named profiles. |
+| `~/.local/share/neural-forge/` | Installed binaries and layer, imported NGX DLLs (`binaries/`), the managed Wine prefix (`prefix/`). |
+| `~/.local/state/neural-forge/helper.log` | Helper log (the GUI's Status tab opens it). |
+| `/tmp/neural-forge-$UID/shm.bin` | The shared memory the layer, helper and GUI talk through. |
+
+Runners are found in `~/.local/share/Steam/compatibilitytools.d`, the Flatpak and Snap Steam
+equivalents, `$XDG_DATA_DIRS/steam/compatibilitytools.d` and `/usr/share/steam/compatibilitytools.d`
+(user copies first), with system Wine as the fallback.
+
+### Uninstall
+
+`neural-forge-cli uninstall` removes the installed files it put there (any you changed are
+kept). `neural-forge-cli uninstall --purge` also removes the config, the imported DLLs, the
+managed prefix, the logs and `/tmp/neural-forge-$UID`.
+
+### Troubleshooting
+
+- **No effect in game:** check the launch option has `NEURAL_FORGE_ENABLE=1`, the helper is
+  running (Status tab), and give the game about 5 s of normal play: the layer stays out of the
+  way on loading screens.
+- **The helper shuts down or reports the model failed:** open the helper log. A model that will
+  not build at the game's size is retried when the size changes; lowering Model resolution
+  helps on cards short of video memory.
+- **Steam overlay crashes or misbehaves:** the overlay has its own small swapchain, which the
+  layer leaves alone; if a game still conflicts, set `NEURAL_FORGE_TARGET_EXE` to the game's
+  executable.
+- **Smooth Motion (`VK_LAYER_NV_present`):** the layer must run before it. If they conflict, set
+  `VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present` for that game.
+- **Steam Linux Runtime / pressure-vessel:** the game must see `/tmp/neural-forge-$UID`. If it
+  does not, add `PRESSURE_VESSEL_FILESYSTEMS_RW=/tmp/neural-forge-$UID` to the launch options.
+- **32-bit games:** not supported yet (only a 64-bit layer ships).
 
 ## Building from source
 
