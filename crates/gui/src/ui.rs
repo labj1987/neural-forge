@@ -420,7 +420,12 @@ pub fn build_ui(app: &adw::Application) {
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
                 .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering on Linux/Proton games.")
+                .website("https://github.com/labj1987/NeuralForge")
+                // Matches Cargo.toml's `AGPL-3.0-or-later`; the upstream project's own
+                // license is AGPL-3.0, which is what requires it for the adapted code.
+                .license_type(gtk4::License::Agpl30)
                 .build();
+            dialog.add_link("Based on DLSS5VKLayer by bmitch87", "https://github.com/bmitch87/DLSS5VKLayer");
             dialog.add_acknowledgement_section(
                 Some("Built with"),
                 &["Claude Code (Anthropic)", "Codex (OpenAI)"],

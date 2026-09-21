@@ -150,8 +150,9 @@ As of 2026-09-17 this project directly reads and adapts source from
 [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) (AGPL-3.0) — see
 [ATTRIBUTION.md](ATTRIBUTION.md) for what's taken and from where. Earlier versions of
 this composition pipeline were clean-room (no GPL/AGPL code read or ported); that
-boundary no longer holds, which is why the project's own license changed to match
-(below).
+boundary no longer holds. Upstream's own license is AGPL-3.0, which is why this
+project's license is AGPL-3.0-or-later as well: a requirement for the adapted code, not
+just a preference (below).
 
 ## License
 

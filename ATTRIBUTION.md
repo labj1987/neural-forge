@@ -6,9 +6,11 @@ versions of NeuralForge deliberately avoided reading DLSS5VKLayer's own source (
 anything GPL/AGPL-licensed) specifically to keep this project MIT-licensed. That
 boundary produced a worse result — months of re-deriving fixes from behavior and docs
 alone, repeatedly landing on techniques upstream had already tried and rejected — for
-no benefit anyone actually wanted, so it was dropped. This project's own license
-changed to **AGPL-3.0-or-later** to match (see [LICENSE](LICENSE) and
-[README.md](README.md#license)), and this file now records what is actually read,
+no benefit anyone actually wanted, so it was dropped. DLSS5VKLayer's own `LICENSE`
+file is AGPL-3.0, so once its source is read and adapted, AGPL-3.0 is a requirement of
+that upstream license for the derived code, not merely a preference of this project.
+This project's own license is therefore **AGPL-3.0-or-later** (see [LICENSE](LICENSE)
+and [README.md](README.md#license)), and this file now records what is actually read,
 adapted, or taken from DLSS5VKLayer's real source, not just its documented behavior.
 
 ## What's taken, and how
@@ -46,7 +48,8 @@ license.
 
 This project's own code is AGPL-3.0-or-later — see [LICENSE](LICENSE). DLSS5VKLayer is
 AGPL-3.0; adapting its composition strategy and confirming its transfer math directly
-is why this project's license now matches. RenoDX's MIT license applies to the design
+is why this project's license has to be AGPL-3.0 (upstream's own license requires it
+for the derived code). RenoDX's MIT license applies to the design
 this project's color composition math is independently derived from; xenmods'
 DLSSNR-Cost-Scaler (MIT) is referenced above for provenance only, matching
 DLSS5VKLayer's own attribution of it, and no code from it appears in this repository.
