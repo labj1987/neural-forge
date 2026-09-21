@@ -36,6 +36,22 @@ upstream file it came from. Nothing listed here lands in
 | `crates/helper/src/guard.rs`: DBG_PRINTEXCEPTION exclusion, guarded-hit cap (24), rip/fault/module-range logging (`register_module`, `describe`) | `core/guard.cpp` `GuardVeh`, `RegisterModuleRange`, `DescribeRange`. The setjmp side deliberately differs: upstream's unwinding `setjmp` form is not used here (`_setjmp(buf, NULL)`). |
 | `crates/helper/src/ngx.rs`: 64x64 minimum feature size (`MIN_FEATURE_DIM`), rebuild on size change | `core/ngx_snippet.cpp` `kMinW`/`kMinH`; `helper/main.cpp` `EnsureNeural`. Upstream's re-run of `NgxLoadAndInit` on resize is not copied. |
 
+## Credits carried with the ported material
+
+- **OptiScaler / Dagherbou** (GPL-3.0): upstream assigns `dlssnr.hlsl`'s lineage to
+  [OptiScaler](https://github.com/cdozdil/OptiScaler) and
+  [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR). The GPL-3.0
+  text is `third_party/optiscaler/LICENSE`.
+- **RenoDX / clshortfuse** (MIT): the composition design; the notice that must ship with any
+  build is `third_party/optiscaler/RenoDX_ATTRIBUTION.txt`.
+- **hhkbble**: the matched residual and its cube scaling (transfer mode 1), from a multi-pass
+  pull request against the OptiScaler fork. Credited here ahead of that mode being ported.
+- **xenmods** ([DLSSNR-Cost-Scaler](https://github.com/xenmods/DLSSNR-Cost-Scaler), MIT): the
+  native + edit technique (transfer mode 2). No code was copied.
+
+`third_party/` and `LICENSE` ship inside the AppImage (`usr/share/doc/neural-forge/`), together
+with `THIRD_PARTY_CRATES.md` (the statically linked Rust crates and their licences).
+
 ## What was previously taken clean-room (still accurate, unaffected by the above)
 
 | Source | What's taken |

@@ -89,6 +89,15 @@ cp data/icon.svg                                   "$APPDIR/usr/share/icons/hico
 python3 scripts/sync_appdata_releases.py
 cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/metainfo/"
 
+# Licence notices that must ship with any build: this project's own AGPL text, the GPL-3.0 text
+# and RenoDX MIT notice for the OptiScaler-derived shader lineage, and the statically linked
+# crates' licence listing (regenerated here so it cannot drift from Cargo.lock).
+DOCDIR="$APPDIR/usr/share/doc/$NAME"
+mkdir -p "$DOCDIR"
+python3 scripts/gen_third_party_crates.py
+cp LICENSE ATTRIBUTION.md THIRD_PARTY_CRATES.md "$DOCDIR/"
+cp -r third_party "$DOCDIR/"
+
 # Top-level AppImage requirements
 cp data/io.github.labj1987.NeuralForge.desktop "$APPDIR/"
 cp data/icon.svg "$APPDIR/$NAME.svg"

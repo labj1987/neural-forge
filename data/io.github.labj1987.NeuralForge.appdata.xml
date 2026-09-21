@@ -5,8 +5,8 @@
   <summary>DLSS 5 Neural Rendering settings and helper manager</summary>
   <url type="homepage">https://github.com/labj1987/neural-forge</url>
   <developer id="io.github.labj1987"><name>Linnard Alex Brown Jr.</name></developer>
-  <metadata_license>MIT</metadata_license>
-  <project_license>MIT</project_license>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-or-later</project_license>
   <description>
     <p>
       A Vulkan implicit layer and settings GUI for running NVIDIA DLSS 5 Neural

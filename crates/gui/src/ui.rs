@@ -427,6 +427,15 @@ pub fn build_ui(app: &adw::Application) {
                 .build();
             dialog.add_link("Based on DLSS5VKLayer by bmitch87", "https://github.com/bmitch87/DLSS5VKLayer");
             dialog.add_acknowledgement_section(
+                Some("Design and technique credits"),
+                &[
+                    "clshortfuse (RenoDX) — the colour composition design",
+                    "hhkbble — the matched-residual transfer mode",
+                    "xenmods (DLSSNR-Cost-Scaler) — the native + edit technique",
+                    "Dagherbou and cdozdil (OptiScaler) — the DLSS-NR shader lineage",
+                ],
+            );
+            dialog.add_acknowledgement_section(
                 Some("Built with"),
                 &["Claude Code (Anthropic)", "Codex (OpenAI)"],
             );

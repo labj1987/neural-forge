@@ -34,8 +34,10 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 - A composition pass blends the model's output back into the frame — tone/structure/
   skin/sharpness controls, a reversible neutral-axis proxy mode, and a choice of
   resampling filters (Lanczos, Catmull-Rom, Mitchell-Netravali, Kaiser-windowed sinc)
-  for the supersampling leg. This math is rederived independently from public sources,
-  not ported from any GPL-licensed code — see ATTRIBUTION.md.
+  for the supersampling leg. The colour math in `composition/color.rs` is rederived
+  independently from public sources (the one clean-room file); the proxy encode
+  (`encode.comp`) and the composition guard in `compose.comp` are ported from
+  DLSS5VKLayer's `dlssnr.hlsl` — see ATTRIBUTION.md.
 - GTK4/libadwaita settings app for all of the above, live-bound to the running layer
   over the same shared-memory segment.
 - A CLI (`neural-forge-cli`) for runner discovery, starting/stopping the helper, status,
