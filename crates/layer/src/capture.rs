@@ -1453,7 +1453,7 @@ fn ensure_pipeline(
             // before any destroy below touches the resources it guards, is exactly
             // what makes that destroy sound -- the "drain before rebuilding on a live
             // device" this pipeline's own design doc calls for.
-            if unsafe { device.wait_for_fences(&[slot.buf.fence], true, u64::MAX) }.is_err() {
+            if crate::note_vk(unsafe { device.wait_for_fences(&[slot.buf.fence], true, u64::MAX) }).is_err() {
                 // A real device error, not a timeout (there is no timeout above).
                 // Leave the existing pipeline exactly as it was rather than guess it's
                 // safe to destroy -- next frame's `ensure_pipeline` call tries again.
@@ -1539,7 +1539,7 @@ fn poll_pipeline_capture(
     // whether the submission this fence guards has actually completed yet. The same
     // fence guards `slot.model`'s blit/copy too (recorded into and submitted on the
     // same command buffer), so one status query covers both.
-    match unsafe { device.get_fence_status(slot.buf.fence) } {
+    match crate::note_vk(unsafe { device.get_fence_status(slot.buf.fence) }) {
         Ok(true) => {
             let bytes_per_pixel = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
             let frame_bytes = (u64::from(width) * u64::from(height) * bytes_per_pixel) as usize;
@@ -1667,7 +1667,7 @@ fn submit_pipeline_capture(
     // `poll_pipeline_capture` call picks up the result once this fence actually
     // signals, exactly like `vkQueuePresentKHR` itself never waits on the work it
     // submits either.
-    if unsafe { device.queue_submit(queue, &[submit], slot.buf.fence) }.is_err() {
+    if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], slot.buf.fence) }).is_err() {
         return false;
     }
     slot.pending = Some((width, height, proxy_format, model_dims.map(|(_, _, w, h)| (w, h))));
@@ -1761,7 +1761,7 @@ unsafe fn ensure_direct_capture(
             // any destroy below touches the resources it guards is exactly what makes
             // that destroy sound. Unbounded, like every other rebuild wait in this
             // module -- rare, not latency sensitive, and there is no timeout to guess.
-            if unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }.is_err() {
+            if crate::note_vk(unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }).is_err() {
                 return false;
             }
         }
@@ -1787,7 +1787,7 @@ fn poll_direct_capture(direct: &mut DirectCapture, device: &ash::Device) -> Opti
     // SAFETY: `direct.buf.fence` belongs to this slot; a status query never touches
     // command-buffer/buffer/memory state, so it's sound regardless of whether the
     // submission this fence guards has actually completed yet.
-    match unsafe { device.get_fence_status(direct.buf.fence) } {
+    match crate::note_vk(unsafe { device.get_fence_status(direct.buf.fence) }) {
         Ok(true) => {
             direct.pending = None;
             Some(dims)
@@ -1828,7 +1828,7 @@ fn submit_direct_capture(
     let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&direct.buf.cmd)).build();
     // SAFETY: `direct.buf.cmd` was just recorded and ended above. Deliberately not
     // waited on -- same reasoning as `submit_pipeline_capture`.
-    if unsafe { device.queue_submit(queue, &[submit], direct.buf.fence) }.is_err() {
+    if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], direct.buf.fence) }).is_err() {
         return false;
     }
     direct.pending = Some((width, height, proxy_format));
@@ -2078,10 +2078,10 @@ fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Q
         return;
     }
     let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
-    if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
+    if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], r.fence) }).is_err() {
         return;
     }
-    let _ = unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) };
+    let _ = crate::note_vk(unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) });
 }
 
 /// Captures `image` into the proxy region, runs the shared-memory round trip, and
@@ -2230,11 +2230,11 @@ unsafe fn run_sync(
     let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
     let t_stage1_start = std::time::Instant::now();
     // SAFETY: `r.cmd` was just recorded and ended above.
-    if unsafe { device.queue_submit(queue, &[submit], r.fence) }.is_err() {
+    if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], r.fence) }).is_err() {
         return None;
     }
     // SAFETY: `r.fence` was just submitted against above.
-    if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
+    if crate::note_vk(unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }).is_err() {
         return None;
     }
     let t_stage1 = t_stage1_start.elapsed();
@@ -2477,14 +2477,14 @@ unsafe fn run_sync(
     let submit2 = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&r.cmd)).build();
     let t_stage2_start = std::time::Instant::now();
     // SAFETY: `r.cmd` was just recorded and ended above.
-    if unsafe { device.queue_submit(queue, &[submit2], r.fence) }.is_err() {
+    if crate::note_vk(unsafe { device.queue_submit(queue, &[submit2], r.fence) }).is_err() {
         return None;
     }
     // SAFETY: `r.fence` was just submitted against above. Waiting here (rather than
     // deferring to the next frame) keeps `image` fully write-back-complete and back in
     // `PRESENT_SRC_KHR` before this function returns, which is what the caller's own
     // immediately-following real present call requires.
-    if unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }.is_err() {
+    if crate::note_vk(unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }).is_err() {
         return None;
     }
     let t_stage2 = t_stage2_start.elapsed();
@@ -2746,7 +2746,7 @@ mod tests {
         // own present-hook discipline of never blocking holds -- that's
         // `run_never_blocks_on_a_slow_helper_and_eventually_composites`'s job, not
         // this test's.
-        unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }.expect("capture fence wait failed");
+        crate::note_vk(unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }).expect("capture fence wait failed");
         assert_eq!(poll_direct_capture(d, &device), Some((width, height, neural_forge_protocol::enums::proxy_format::RGBA8)));
 
         // SAFETY: the fence wait above confirms the GPU's writes to `host_ptr` are

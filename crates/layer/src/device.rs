@@ -81,6 +81,12 @@ pub struct NeuralForgeDeviceInfo {
     instance: Option<Arc<ash::Instance>>,
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
     physical_device: vk::PhysicalDevice,
+    /// False on any non-NVIDIA physical device: Neural Rendering is an NGX feature and the helper
+    /// only ever creates its own device on an NVIDIA GPU, so on anything else there is nothing for
+    /// the layer to do but cost a round trip. Hybrid machines are the case that matters -- an
+    /// implicit layer is loaded for every device the loader builds, including the integrated one
+    /// a game may be running on.
+    nvidia: bool,
     next_create_swapchain_khr: Option<vk::PFN_vkCreateSwapchainKHR>,
     next_destroy_swapchain_khr: Option<vk::PFN_vkDestroySwapchainKHR>,
     next_queue_present_khr: Option<vk::PFN_vkQueuePresentKHR>,
@@ -458,6 +464,20 @@ impl NeuralForgeDeviceInfo {
         crate::logging::flush();
         let state = Arc::new(Mutex::new(State { external_memory_host, ..State::default() }));
         CLEANUP.lock().unwrap().insert(handle, (device.clone(), state.clone()));
+        let nvidia = match &instance {
+            // SAFETY: `physical_device` is the handle this device was just created from.
+            Some(instance) => {
+                let props = unsafe { instance.get_physical_device_properties(physical_device) };
+                let nvidia = props.vendor_id == 0x10DE;
+                if !nvidia {
+                    let name = unsafe { CStr::from_ptr(props.device_name.as_ptr()) }.to_string_lossy();
+                    crate::log!("[layer] inert on non-NVIDIA device (vendor {:#x}): {name}", props.vendor_id);
+                }
+                nvidia
+            }
+            // Cannot ask, so do not gate: same fail-open stance as everywhere else.
+            None => true,
+        };
         Self {
             // SAFETY: create_info is the loader chain for this newly created device.
             _loader_data: unsafe { crate::loader_data::register(handle, create_info) },
@@ -465,6 +485,7 @@ impl NeuralForgeDeviceInfo {
             instance,
             surface_caps,
             physical_device,
+            nvidia,
             next_create_swapchain_khr: create,
             next_destroy_swapchain_khr: destroy,
             next_queue_present_khr: present,
@@ -558,7 +579,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next_create) = self.next_create_swapchain_khr else {
             return LayerResult::Unhandled;
         };
-        let eligible = crate::layer_enabled() && crate::ownership::eligible()
+        let eligible = crate::layer_enabled() && self.nvidia && crate::ownership::eligible()
             && swapchain::is_supported_format(create_info.image_format)
             && create_info.image_extent.width <= neural_forge_protocol::MAX_W
             && create_info.image_extent.height <= neural_forge_protocol::MAX_H
@@ -869,7 +890,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // layer-submitted relay batch (see below); the real present must then wait on
         // this instead of them.
         let mut relay_semaphore: Option<vk::Semaphore> = None;
-        if crate::layer_enabled() {
+        if crate::layer_enabled() && self.nvidia && !crate::device_lost() {
             // SAFETY: `p_swapchains`/`p_image_indices`/`swapchain_count` are a valid,
             // parallel pair of slices for the duration of this call -- part of the
             // `VkPresentInfoKHR` the loader just handed us.

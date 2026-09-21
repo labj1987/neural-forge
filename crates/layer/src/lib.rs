@@ -69,9 +69,67 @@ pub const LAYER_NAME: &str = "VK_LAYER_neuralforge_neural";
 /// life of the process.
 pub(crate) fn layer_enabled() -> bool {
     static ENABLED: LazyLock<bool> = LazyLock::new(|| {
-        env_flag("NEURAL_FORGE_ENABLE") && !env_flag("NEURAL_FORGE_DISABLE")
+        env_flag("NEURAL_FORGE_ENABLE") && !env_flag("NEURAL_FORGE_DISABLE") && !duplicate_copy()
     });
     *ENABLED
+}
+
+/// The path of the shared object this code is running from.
+fn layer_object_path() -> Option<String> {
+    // SAFETY: `dladdr` only reads the address it is given; `info` is zero-initialised and
+    // filled in on success, and `dli_fname` (when non-null) is a NUL-terminated string owned by
+    // the loader for the life of the mapping.
+    unsafe {
+        let mut info: libc::Dl_info = std::mem::zeroed();
+        if libc::dladdr(layer_object_path as *const std::ffi::c_void, &mut info) == 0 || info.dli_fname.is_null() {
+            return None;
+        }
+        Some(CStr::from_ptr(info.dli_fname).to_string_lossy().into_owned())
+    }
+}
+
+/// True when a *different* copy of this layer is already loaded in the process.
+///
+/// A development manifest pointing at the build tree and an installed one pointing at the
+/// install prefix are both honoured by the loader: two copies, two present hooks, two full
+/// round trips and one shared-memory file with two writers racing on one sequence number. Only
+/// the first copy stays live; the rest go inert with one warning line. The claim is the
+/// object's own path rather than a bare flag, so a second call into the *same* copy (legal: the
+/// loader may negotiate more than once) is told apart from a second copy.
+fn duplicate_copy() -> bool {
+    const CLAIM: &str = "NEURAL_FORGE_LAYER_OBJECT";
+    let Some(own) = layer_object_path() else { return false };
+    match std::env::var(CLAIM) {
+        Ok(claimed) if !claimed.is_empty() => {
+            if claimed == own {
+                return false;
+            }
+            crate::log!("[layer] another copy is already loaded from {claimed}; this copy ({own}) stays inert. Remove one of the implicit-layer manifests.");
+            true
+        }
+        _ => {
+            std::env::set_var(CLAIM, &own);
+            false
+        }
+    }
+}
+
+/// Latched by [`note_vk`] the first time a layer-issued Vulkan call reports `VK_ERROR_DEVICE_LOST`.
+/// After that every call fails the same way, so the layer takes the fail-open path directly:
+/// present untouched, submit nothing, log nothing more.
+static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn device_lost() -> bool {
+    DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Passes a Vulkan result through unchanged, latching the layer inert on `DEVICE_LOST`.
+pub(crate) fn note_vk<T>(result: ash::prelude::VkResult<T>) -> ash::prelude::VkResult<T> {
+    if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) && !DEVICE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::log!("[layer] VK_ERROR_DEVICE_LOST; layer inert from here on");
+        crate::logging::flush();
+    }
+    result
 }
 
 fn env_flag(name: &str) -> bool {
@@ -329,3 +387,18 @@ impl Layer for NeuralForgeLayer {
 }
 
 declare_introspection_queries!(entry_points::EntryPoints);
+
+#[cfg(test)]
+mod device_lost_tests {
+    use super::*;
+
+    #[test]
+    fn note_vk_passes_results_through_and_latches_only_device_lost() {
+        assert_eq!(note_vk::<()>(Ok(())), Ok(()));
+        assert_eq!(note_vk::<()>(Err(vk::Result::ERROR_OUT_OF_DATE_KHR)), Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
+        assert!(!device_lost(), "an ordinary error must not latch the layer inert");
+        assert_eq!(note_vk::<u32>(Err(vk::Result::ERROR_DEVICE_LOST)), Err(vk::Result::ERROR_DEVICE_LOST));
+        assert!(device_lost());
+        DEVICE_LOST.store(false, std::sync::atomic::Ordering::Relaxed); // other tests share the process
+    }
+}

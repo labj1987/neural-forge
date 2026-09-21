@@ -1051,11 +1051,11 @@ impl GpuCompose {
         }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.sync.cmd)).build();
         // SAFETY: `self.sync.cmd` was just recorded and ended above.
-        if unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }.is_err() {
+        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }).is_err() {
             return false;
         }
         // SAFETY: `self.sync.fence` was just submitted against above.
-        if unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }.is_err() {
+        if crate::note_vk(unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }).is_err() {
             return false;
         }
 
@@ -1145,11 +1145,11 @@ impl GpuCompose {
         }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.sync.cmd)).build();
         // SAFETY: `self.sync.cmd` was just recorded and ended above.
-        if unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }.is_err() {
+        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }).is_err() {
             return false;
         }
         // SAFETY: `self.sync.fence` was just submitted against above.
-        unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }.is_ok()
+        crate::note_vk(unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }).is_ok()
     }
 
     /// `answer_width`/`answer_height` are `answer`'s own resolution -- pass
@@ -1173,7 +1173,7 @@ impl GpuCompose {
         })?;
         let idx = self.next_async_slot; self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let slot = &mut self.async_slots[idx];
-        if unsafe { device.wait_for_fences(&[slot.slot.fence], true, u64::MAX) }.is_err() { return None; }
+        if crate::note_vk(unsafe { device.wait_for_fences(&[slot.slot.fence], true, u64::MAX) }).is_err() { return None; }
         let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
         if generation == 0 || base.len() < bytes || answer.len() < answer_bytes || answer_bytes > bytes { return None; }
@@ -1192,7 +1192,7 @@ impl GpuCompose {
         unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, bgr_order, target_image, compose); }
         if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
-        if unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }.is_err() { return None; }
+        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }).is_err() { return None; }
         if update { slot.slot.cached_generation = generation; }
         Some(semaphore)
     }
@@ -1219,7 +1219,7 @@ impl GpuCompose {
         let idx = self.next_async_slot;
         self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let async_slot = &mut self.async_slots[idx];
-        if unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, u64::MAX) }.is_err() {
+        if crate::note_vk(unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, u64::MAX) }).is_err() {
             return None;
         }
         let frame_bytes = (u64::from(width) * u64::from(height) * 4) as usize;
@@ -1247,7 +1247,7 @@ impl GpuCompose {
             .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
             .signal_semaphores(std::slice::from_ref(&semaphore))
             .build();
-        if unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }.is_err() { return None; }
+        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }).is_err() { return None; }
         Some(semaphore)
     }
 
@@ -1304,7 +1304,7 @@ impl GpuCompose {
         // block only ever happens `ASYNC_SLOTS` dispatches later, immediately before
         // this specific slot's resources are touched again, never on the frame that
         // just submitted them.
-        if unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, u64::MAX) }.is_err() {
+        if crate::note_vk(unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, u64::MAX) }).is_err() {
             return None;
         }
 
@@ -1353,7 +1353,7 @@ impl GpuCompose {
         // SAFETY: `async_slot.slot.cmd` was just recorded and ended above. Not waiting
         // on `async_slot.slot.fence` here is the entire point of this method -- see
         // its own doc comment for why that's still sound.
-        if unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }.is_err() {
+        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }).is_err() {
             return None;
         }
         Some(semaphore)
