@@ -1382,8 +1382,9 @@ pub unsafe fn run(
             match shm.poll_async_request(SLOT) {
                 Some(true) => {
                     // Only this frame's own answer: the helper echoes the raster it answered.
-                    // A mismatch is someone else's (or a stale) answer; present untouched.
-                    if shm.answered_dims() != Some((sent_w, sent_h)) {
+                    // A mismatch is someone else's (or a stale) answer; present untouched. No echo
+                    // at all is a helper from before 0.1.81, which is trusted as before.
+                    if shm.answered_dims().is_some_and(|d| d != (sent_w, sent_h)) {
                         shm.publish_frame_timing(pipeline_start.elapsed(), false);
                         return None;
                     }

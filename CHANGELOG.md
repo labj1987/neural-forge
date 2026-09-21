@@ -4,6 +4,12 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.82 — 2026-09-21
+
+- A 0.1.81 layer refused every answer from an older helper (which does not report the size it
+  answered), silently switching the effect off until the helper was updated. A helper that does
+  not report is trusted again; a reported size that does not match is still refused.
+
 ## 0.1.81 — 2026-09-21
 
 - **System Wine works as a runner.** With `runner_type=wine`, `neural-forge-cli setup` (and every
