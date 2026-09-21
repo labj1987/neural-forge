@@ -612,7 +612,11 @@ fn effective_working_scale(width: u32, height: u32, requested: f32) -> f32 {
 
 fn scaled_dims(width: u32, height: u32, scale: f32) -> (u32, u32) {
     if !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() < 0.01 {
-        return (width, height);
+        // Full size, but never odd: the helper (and the model) only take even dimensions, and an
+        // odd-width window (measured: a 2493x1408 window) was rejected outright, silently
+        // presenting every frame without the effect. Dropping one row or column hands the model
+        // a raster one pixel smaller, and the answer is scaled back to the exact frame size.
+        return (width & !1, height & !1);
     }
     let axis = |v: u32| {
         let scaled = ((v as f32 * scale).round()).max(64.0) as u32;
@@ -3655,6 +3659,19 @@ mod model_size_tests {
                 );
                 assert!(mw <= w && mh <= h, "{w}x{h} at {requested}: model raster {mw}x{mh} is larger than the frame");
                 assert!(mw >= 64 && mh >= 64 && mw % 2 == 0 && mh % 2 == 0);
+            }
+        }
+    }
+
+    #[test]
+    fn odd_frames_get_an_even_model_raster() {
+        assert_eq!(scaled_dims(2493, 1408, effective_working_scale(2493, 1408, 1.0)), (2492, 1408));
+        assert_eq!(scaled_dims(1365, 767, effective_working_scale(1365, 767, 1.0)), (1364, 766));
+        for (w, h) in [(2493u32, 1408u32), (1365, 767), (3441, 1441)] {
+            for scale in [0.5f32, 0.75, 1.0] {
+                let (mw, mh) = scaled_dims(w, h, effective_working_scale(w, h, scale));
+                assert!(mw % 2 == 0 && mh % 2 == 0, "{w}x{h} at {scale}: {mw}x{mh}");
+                assert!(neural_forge_protocol::frame_dims_valid(mw, mh, neural_forge_protocol::enums::proxy_format::RGBA8));
             }
         }
     }
