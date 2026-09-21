@@ -29,14 +29,14 @@ pub fn is_plausible_game_size(width: u32, height: u32) -> bool {
     u64::from(width) * u64::from(height) >= 1280 * 720
 }
 
-/// Whether this is a format the composition pass can work in. Every one has an 8-bit
-/// UNORM twin the pass can normalize to; the 10-bit and float entries are what let an
-/// HDR game reach the model at all.
+/// Whether this is a format the pass can capture, compose onto and present. SDR 8-bit only:
+/// the 10-bit and float formats are *recognised* (see [`detect_hdr_kind`]) but not yet handled.
+/// RGBA16F is captured but never composed back (there is no half-float compose fallback), and
+/// the PQ transfer is not ported, so letting them through would hand the model an unencoded HDR
+/// frame and write an SDR result over it. They present untouched instead.
 ///
-/// This is a starting list covering the common presentable formats, not a claim of
-/// completeness -- widen it if a real game surfaces a swapchain format outside this
-/// set (the layer already fails safely closed: an unrecognized format means
-/// `pass_through`, never a wrong read).
+/// Widen this list only together with the matching compose path (the tracked follow-up:
+/// the float16 proxy, PQ10 transfer and half-float compose fallback).
 pub fn is_supported_format(format: vk::Format) -> bool {
     matches!(
         format,
@@ -44,9 +44,6 @@ pub fn is_supported_format(format: vk::Format) -> bool {
             | vk::Format::B8G8R8A8_SRGB
             | vk::Format::R8G8B8A8_UNORM
             | vk::Format::R8G8B8A8_SRGB
-            | vk::Format::A2B10G10R10_UNORM_PACK32
-            | vk::Format::A2R10G10B10_UNORM_PACK32
-            | vk::Format::R16G16B16A16_SFLOAT
     )
 }
 
@@ -94,6 +91,15 @@ pub fn detect_hdr_kind(format: vk::Format, color_space: vk::ColorSpaceKHR) -> u3
 mod format_tests {
     use super::*;
     use neural_forge_protocol::enums::proxy_format;
+    #[test]
+    fn only_sdr_8bit_swapchains_are_composable() {
+        for f in [vk::Format::B8G8R8A8_UNORM, vk::Format::R8G8B8A8_SRGB] {
+            assert!(is_supported_format(f));
+        }
+        for f in [vk::Format::A2B10G10R10_UNORM_PACK32, vk::Format::A2R10G10B10_UNORM_PACK32, vk::Format::R16G16B16A16_SFLOAT] {
+            assert!(!is_supported_format(f), "{f:?} must present untouched until a compose path exists");
+        }
+    }
     #[test]
     fn raw_formats_preserve_channel_order_and_size() {
         for f in [vk::Format::B8G8R8A8_UNORM,vk::Format::B8G8R8A8_SRGB] {

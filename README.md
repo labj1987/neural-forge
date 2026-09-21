@@ -29,8 +29,9 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 - The Windows-side helper runs NVIDIA's `nvngx_dlssnr.dll` (Feature 18) under Wine or a
   Proton build. The experimental `VK_NV_optical_flow` motion path is disabled in
   the known-good baseline.
-- HDR-aware capture and composition support float16/PQ paths when a compatible
-  swapchain exposes them; the validated GTA baseline is SDR B8G8R8A8.
+- SDR 8-bit swapchains only (B8G8R8A8 / R8G8B8A8, UNORM or sRGB); the validated GTA
+  baseline is SDR B8G8R8A8. HDR (PQ 10-bit) and float16 swapchains are recognised and logged
+  but present untouched for now — the half-float compose path is a tracked follow-up.
 - A composition pass blends the model's output back into the frame — tone/structure/
   skin/sharpness controls, a reversible neutral-axis proxy mode, and a choice of
   resampling filters (Lanczos, Catmull-Rom, Mitchell-Netravali, Kaiser-windowed sinc)

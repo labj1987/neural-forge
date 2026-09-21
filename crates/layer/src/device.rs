@@ -883,6 +883,17 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             for (&sc, &image_index) in swapchains.iter().zip(image_indices) {
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
                 let Some(&image) = sw.images.get(image_index as usize) else { break };
+                if !swapchain::is_supported_format(sw.format) {
+                    // Not merely `pass_through`: a pass-through swapchain can still be composed
+                    // onto from a tracked render source, which is exactly what must not happen
+                    // to a 10-bit or float swapchain (see `swapchain::is_supported_format`).
+                    static SAID_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    if !SAID_FORMAT.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                        crate::log!("[layer] present skipped: swapchain format {:?} is not SDR 8-bit; HDR/10-bit swapchains present untouched", sw.format);
+                        crate::logging::flush();
+                    }
+                    continue;
+                }
                 let tap = self.tracker.lock().unwrap().tap_for(image);
                 if sw.pass_through && !sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
                     // The compose/write-back path lands its result with
