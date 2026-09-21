@@ -347,8 +347,11 @@ pub fn build_ui(app: &adw::Application) {
     debug_assert_eq!(colour_mode::AUTO, 0);
 
     let hdr_group = adw::PreferencesGroup::new();
-    hdr_group.set_title("HDR white point");
-    hdr_group.set_description(Some("Saved for HDR processing. The current capture pipeline does not yet apply these controls."));
+    hdr_group.set_title("White point");
+    hdr_group.set_description(Some(
+        "What the model is shown as white. Manual uses the slider; Measured reads the frame's own white \
+         level (so dark scenes reach the model well exposed) times the trim. Both are times the scale.",
+    ));
     let (source, set_source) = bind_u32(&shm, Some("white_point_source"), |h| &h.white_point_source);
     hdr_group.add(&combo_row("White point source", &["Manual", "Measured"], source, set_source));
     let (white, set_white) = bind_float(&shm, Some("white_point"), |h| &h.white_point_bits);

@@ -227,6 +227,14 @@ impl ShmClient {
         }
     }
 
+    /// Folds a new white-meter reading into the published, smoothed value.
+    pub fn publish_measured_white(&self, reading: f32) {
+        let Some(hdr) = self.header() else { return };
+        let prev = f32::from_bits(hdr.layer_measured_white_bits.load(Ordering::Relaxed));
+        let next = if prev.is_finite() && prev > 1e-4 { prev + (reading - prev) * 0.3 } else { reading };
+        hdr.layer_measured_white_bits.store(next.to_bits(), Ordering::Relaxed);
+    }
+
     pub fn composition_settings(&self) -> Option<CompositionSettings> {
         let hdr = self.header()?;
         Some(CompositionSettings {
@@ -254,8 +262,13 @@ impl ShmClient {
                 let trim = f32::from_bits(hdr.white_point_trim_bits.load(Ordering::Relaxed));
                 // The trim belongs to a measured reading, not to the slider -- keeping
                 // them apart is upstream's own fix for sharing one stored value.
-                let measured = hdr.white_point_source.load(Ordering::Relaxed) != neural_forge_protocol::enums::white_point_source::MANUAL;
-                let combined = manual * scale * if measured { trim } else { 1.0 };
+                // Measured: the meter's reading times the trim; manual: the slider. Either way times
+                // the scale. (The measured source used to take the slider's value as well.)
+                let measured_white = f32::from_bits(hdr.layer_measured_white_bits.load(Ordering::Relaxed));
+                let measured = hdr.white_point_source.load(Ordering::Relaxed) != neural_forge_protocol::enums::white_point_source::MANUAL
+                    && measured_white.is_finite()
+                    && measured_white > 1e-4;
+                let combined = if measured { measured_white * trim } else { manual } * scale;
                 if combined.is_finite() && combined > 1e-4 { combined } else { 1.0 }
             },
             reversible_mode: hdr.reversible_mode.load(Ordering::Relaxed),

@@ -840,6 +840,57 @@ thread_local! {
     static SYNC_TIMING: std::cell::Cell<Option<(std::time::Duration, std::time::Duration, std::time::Duration)>> = const { std::cell::Cell::new(None) };
 }
 
+/// The frame's white level, for the proxy encode's divisor (upstream's meter: `dlssnr.hlsl`
+/// mode 4 plus `meter_reduce.comp`). The peak linear luminance of each tile of a 64x64 grid,
+/// then the 90th percentile across tiles: not the frame's mean, which is scene brightness and would
+/// hand a dark scene a divisor that blows it out, and not its maximum, which one specular hit
+/// decides. Refused (`None`) unless enough of the frame is lit (20% of tiles above a tenth of
+/// the brightest) to say where white is. Sampled 8x8 per tile: this runs on the CPU over the
+/// captured frame, every few frames.
+fn meter_white(frame: &[u8], width: u32, height: u32, bgr: bool) -> Option<f32> {
+    const GRID: u32 = 64;
+    const SAMPLES: u32 = 8;
+    static LUT: std::sync::LazyLock<[f32; 256]> = std::sync::LazyLock::new(|| {
+        std::array::from_fn(|i| {
+            let c = i as f32 / 255.0;
+            if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+        })
+    });
+    if width < GRID || height < GRID || frame.len() < (width * height * 4) as usize {
+        return None;
+    }
+    let (ri, bi) = if bgr { (2, 0) } else { (0, 2) };
+    let mut peaks = Vec::with_capacity((GRID * GRID) as usize);
+    for ty in 0..GRID {
+        let (y0, y1) = (ty * height / GRID, (ty + 1) * height / GRID);
+        for tx in 0..GRID {
+            let (x0, x1) = (tx * width / GRID, (tx + 1) * width / GRID);
+            let mut peak = 0.0f32;
+            for sy in 0..SAMPLES {
+                let y = y0 + (y1 - y0) * (2 * sy + 1) / (2 * SAMPLES);
+                for sx in 0..SAMPLES {
+                    let x = x0 + (x1 - x0) * (2 * sx + 1) / (2 * SAMPLES);
+                    let o = ((y * width + x) * 4) as usize;
+                    let l = 0.2126 * LUT[frame[o + ri] as usize] + 0.7152 * LUT[frame[o + 1] as usize] + 0.0722 * LUT[frame[o + bi] as usize];
+                    peak = peak.max(l);
+                }
+            }
+            peaks.push(peak);
+        }
+    }
+    let top = peaks.iter().copied().fold(0.0f32, f32::max);
+    if top <= 1e-6 {
+        return None;
+    }
+    let lit = peaks.iter().filter(|&&p| p > top * 0.10).count();
+    if lit * 5 < peaks.len() {
+        return None;
+    }
+    peaks.sort_by(f32::total_cmp);
+    let white = peaks[(peaks.len() - 1) * 9 / 10];
+    (white > 1e-4).then_some(white)
+}
+
 /// The longest a present waits for its own frame's answer before going out untouched.
 const SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -1274,6 +1325,18 @@ pub unsafe fn run(
             return None;
         };
         let t_captured = std::time::Instant::now();
+        // The white meter: every 8th frame, smoothed (about a second to settle) so the proxy's
+        // brightness never jumps from one frame to the next -- a jumping divisor would make the
+        // model's input, and therefore its answer, flicker. Published whatever the source setting,
+        // so the GUI can show it; only used when the source is Measured.
+        {
+            static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
+                if let Some(white) = meter_white(original_scratch, width, height, bgr_order) {
+                    shm.publish_measured_white(white);
+                }
+            }
+        }
         shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
         if !shm.begin_async_request(SLOT) {
             shm.publish_frame_timing(pipeline_start.elapsed(), false);
@@ -1350,6 +1413,7 @@ pub unsafe fn run(
                 ghost_guard: if pipelined_present() { settings.ghost_guard } else { 0.0 },
                 transfer: settings.transfer,
                 model_small: false,
+                white_point: settings.white_point,
                 compare: settings.compare,
                 colour_trust: settings.colour_trust,
                 ratio_smooth: settings.ratio_smooth,
@@ -3687,6 +3751,24 @@ mod model_size_tests {
                 assert!(mw >= 64 && mh >= 64 && mw % 2 == 0 && mh % 2 == 0);
             }
         }
+    }
+
+    fn frame_of(w: u32, h: u32, f: impl Fn(u32, u32) -> u8) -> Vec<u8> {
+        (0..w * h).flat_map(|i| { let v = f(i % w, i / w); [v, v, v, 255] }).collect()
+    }
+
+    #[test]
+    fn the_white_meter_reads_the_scene_not_a_highlight_or_the_dark() {
+        let (w, h) = (256u32, 128u32);
+        // A dim scene: every tile peaks at sRGB 150 (linear ~0.305), with one specular dot at 255.
+        let mut dim = frame_of(w, h, |_, _| 150);
+        let o = ((10 * w + 10) * 4) as usize;
+        dim[o..o + 3].copy_from_slice(&[255, 255, 255]);
+        let white = meter_white(&dim, w, h, false).expect("a lit scene is measured");
+        assert!((white - 0.305).abs() < 0.01, "the dim scene's white, not the highlight: {white}");
+        // Nearly all black, one lit corner: not enough of the frame to say where white is.
+        let dark = frame_of(w, h, |x, y| if x < 20 && y < 20 { 200 } else { 0 });
+        assert_eq!(meter_white(&dark, w, h, false), None);
     }
 
     #[test]

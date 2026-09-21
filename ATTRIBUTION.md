@@ -40,6 +40,7 @@ upstream file it came from. Nothing listed here lands in
 | `crates/layer/shaders/compose.comp` compare views (side by side with letterbox and zoom, wipe, swap, divider) | `layer_linux/src/dlssnr/dlssnr.hlsl` `gCompareMode`/`gCompareSplit`/`gCompareZoom`/`gCompareSwap` |
 | `crates/layer/shaders/compose.comp` mode 2 colour trust (`colour_trust`) and ratio smoothing (`ratio_smooth`) | `layer_linux/src/dlssnr/dlssnr.hlsl` `gColourTrust` (chroma-swing bound) and `gRatioSmooth` (`gainSmooth`/`gainSharp`); defaults 2 and 1 from `common/shm_protocol.h` |
 | `crates/layer/shaders/compose.comp` transfer modes (`transfer`, `model_small`), `CubeScaleResidual`, `SoftKneeLuminance`; the small-proxy upload and enlargement in `composition/gpu.rs` | `layer_linux/src/dlssnr/dlssnr.hlsl` `gTransfer` 0/1/2, `CubeScaleResidual`, `SoftKnee`. Matched residual and its cube scaling are hhkbble's; native + edit is xenmods' DLSSNR-Cost-Scaler technique (MIT, no code copied), via upstream |
+| `crates/layer/src/capture.rs` `meter_white` (tile peak luminance on a 64x64 grid, 90th percentile, lit-fraction acceptance) | `layer_linux/src/dlssnr/dlssnr.hlsl` mode 4 and `layer_linux/src/shaders/meter_reduce.comp`. Runs on the CPU over the synchronous present's captured frame, sampled 8x8 per tile every 8th frame, with smoothing upstream does not have |
 
 ## Credits carried with the ported material
 

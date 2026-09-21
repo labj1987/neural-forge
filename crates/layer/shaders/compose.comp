@@ -92,6 +92,10 @@ layout(push_constant) uniform Params {
   //   2 native + edit: the frame's own pixels plus the edit (sharpest for text and geometry)
   uint transfer;
   uint model_small;
+  // The divisor the proxy encode used (manual or measured white point). The model answered in
+  // that encoded space -- frame / white_point, then the knee -- so the proxy it is compared with
+  // must be in the same space.
+  float white_point;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -309,6 +313,15 @@ void main() {
     // divide into an arbitrarily large number and the ratio is then built from
     // rounding noise, which crawls frame to frame".
     const float kRatioFloor = 1.0 / 512.0;
+    float wp = max(params.white_point, 1e-4);
+
+    // The proxy input holds the raw frame unless the model ran small (then it is the encoded small
+    // proxy, enlarged). Put the raw frame through the same white divide and knee the encode used,
+    // so model / proxy is the model's verdict and not the encode's own roll-off: comparing an
+    // encoded answer with the raw frame dimmed every highlight above the knee.
+    if (params.model_small == 0u) {
+      proxy = clamp(SoftKneeLuminance(proxy / wp), 0.0, 1.0);
+    }
 
     // Transfer modes (only when the model worked below the frame's size; at full size all three
     // are the same, bit for bit). Each rewrites the pair the ratio below is taken from.
@@ -317,7 +330,7 @@ void main() {
       if (params.transfer == 1u) {
         // Matched residual: the frame's own proxy, rebuilt at full resolution, plus only the
         // model's difference -- so the enlargement's blur is not read as the model's edit.
-        vec3 full_proxy = clamp(SoftKneeLuminance(original), 0.0, 1.0);
+        vec3 full_proxy = clamp(SoftKneeLuminance(original / wp), 0.0, 1.0);
         proxy = full_proxy;
         model = CubeScaleResidual(full_proxy, full_proxy + edit);
       } else if (Luminance(model) > 1e-5) {
@@ -340,7 +353,7 @@ void main() {
           p_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb));
         }
         float gain_smooth_n = (m_acc / 5.0 + kEditFloor) / (p_acc / 5.0 + kEditFloor);
-        vec3 upgraded = max(original + edit * clamp(params.transfer_strength, 0.0, 1.0), vec3(0.0));
+        vec3 upgraded = max(original + edit * wp * clamp(params.transfer_strength, 0.0, 1.0), vec3(0.0));
         float o_lum = Luminance(original);
         float sum_lum = Luminance(upgraded);
         if (sum_lum > 1e-5 && p_lum > 1e-5) {
