@@ -2,7 +2,7 @@
 
 Repository: https://github.com/labj1987/NeuralForge
 
-Read [PHASE1.md](PHASE1.md) for the current namespace, installation contract and
+Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
 benchmark plan. The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
 
@@ -29,10 +29,10 @@ passes=1, model_resolution=1, motion disabled/quality 0, host SHM transport.
 DMA-BUF remains experimental, and both transport directions tried so far are blocked
 on real, confirmed-on-hardware constraints (a Wine/NVIDIA-driver handle-type mismatch
 one way, a plain Linux anon-inode-fd limitation the other), not just unimplemented --
-see `DMABUF_TRANSPORT_DESIGN.md` before touching it again. The "skip Wine with a native
+see `docs/DMABUF_TRANSPORT_DESIGN.md` before touching it again. The "skip Wine with a native
 Linux NGX helper" idea that would have sidestepped both is also closed, for an
 unrelated reason (no native Linux implementation of this project's target NGX feature
-exists anywhere, confirmed on real hardware) -- see `NATIVE_NGX_HELPER_DESIGN.md`
+exists anywhere, confirmed on real hardware) -- see `docs/NATIVE_NGX_HELPER_DESIGN.md`
 before touching that either. Do not lower model resolution or disable the helper
 without explicit user authorization.
 
@@ -41,7 +41,7 @@ operations and establish matched upstream/NeuralForge measurements before perfor
 changes. Keep the Rust implementation independent; review licenses before source reuse.
 
 Current target-machine evidence and unresolved Vulkan errors are in
-[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md).
+[docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
 
 ## Deliberately not done
 

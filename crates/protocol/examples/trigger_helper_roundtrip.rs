@@ -3,9 +3,9 @@
 //! `seq_req`, waits for `seq_resp`, and reports what came back. No game, no layer,
 //! no capture -- just this process and the helper on the other end of the mapping.
 //!
-//! Built to validate `EXTERNAL_MEMORY_HOST_DESIGN.md`'s helper-side import without a
+//! Built to validate `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`'s helper-side import without a
 //! live GTA session: `vkcube` can never exercise it (the render tap never engages for
-//! it, so the layer never advances `seq_req` either -- see `HARDWARE_VALIDATION.md`),
+//! it, so the layer never advances `seq_req` either -- see `docs/HARDWARE_VALIDATION.md`),
 //! and this is the only other way to make the helper actually build `FrameResources`
 //! against a real proxy/answer region and log whether the import succeeded.
 //!
@@ -16,7 +16,7 @@
 //! uses for going around the library's own (header-only) `mapping` module.
 //!
 //! Takes an optional third argument, 0 or 1, for which protocol v3 wire slot to drive
-//! (`PROTOCOL_V3_DESIGN.md`) -- defaults to 0, matching this tool's pre-v3 behavior.
+//! (`docs/PROTOCOL_V3_DESIGN.md`) -- defaults to 0, matching this tool's pre-v3 behavior.
 //! Run it twice concurrently with different slots to confirm the helper answers both
 //! independently against real hardware, the same thing
 //! `neuralforge_layer::shm::tests::the_two_slots_are_fully_independent` already proves

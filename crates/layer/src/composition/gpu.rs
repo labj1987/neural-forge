@@ -642,7 +642,7 @@ impl ComposeSlot {
     /// image into device-local storage, applies the cached model delta, then writes
     /// the result back; no per-frame CPU readback or upload is involved.
     /// Despite the name (kept to avoid a bigger rename tonight -- see
-    /// `ATTRIBUTION.md`/`GHOSTING_PLAN.md`), this no longer carries a "delta" across
+    /// `ATTRIBUTION.md`/`docs/GHOSTING_PLAN.md`), this no longer carries a "delta" across
     /// frames: `compose.comp`'s `carry_delta` branch was deleted 2026-09-17 after
     /// reading DLSS5VKLayer's own resolve function (AGPL-3.0), which documents trying
     /// exactly that reprojection technique and measuring it a dead end. What this

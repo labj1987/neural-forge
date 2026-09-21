@@ -20,11 +20,11 @@
 //!   `[HEADER_BYTES, +MAX_FRAME)`                slot 0's proxy (the layer's capture)
 //!   `[HEADER_BYTES + MAX_FRAME, +MAX_FRAME)`    slot 0's answer (the model's output)
 //!   `[HEADER_BYTES + MAX_FRAME*2, +MAX_FRAME)`  the motion payload (shared, slot 0 only —
-//!                                                see `PROTOCOL_V3_DESIGN.md`)
+//!                                                see `docs/PROTOCOL_V3_DESIGN.md`)
 //!   `[HEADER_BYTES + MAX_FRAME*3, +MAX_FRAME)`  slot 1's proxy
 //!   `[HEADER_BYTES + MAX_FRAME*4, +MAX_FRAME)`  slot 1's answer
 //!
-//! v3 (`PROTOCOL_V3_DESIGN.md`) added the second slot so the layer can have two
+//! v3 (`docs/PROTOCOL_V3_DESIGN.md`) added the second slot so the layer can have two
 //! requests outstanding at once — never blocked with an idle wire slot while a
 //! GPU-captured frame is ready to send, even though the helper still drains both
 //! slots' NGX evaluation one at a time (see that doc for why the model side stays
@@ -54,7 +54,7 @@ pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 
 /// The wire contract version (v2 added BGRA8 and a motion payload region; v3 adds a
-/// second independent request/response slot — see `PROTOCOL_V3_DESIGN.md`).
+/// second independent request/response slot — see `docs/PROTOCOL_V3_DESIGN.md`).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; callers should log loudly and
 /// reinitialize rather than half-read a header laid out differently than they expect.
@@ -117,11 +117,11 @@ pub const fn answer_offset() -> usize {
 /// Shared, not duplicated per slot: motion vectors are disabled in this project's
 /// current known-good baseline (see `ShmHeader::mvec_enabled`'s own doc comment), so
 /// there is no live per-slot motion payload to race on today — see
-/// `PROTOCOL_V3_DESIGN.md` for the rest of that reasoning.
+/// `docs/PROTOCOL_V3_DESIGN.md` for the rest of that reasoning.
 pub const fn motion_offset() -> usize { HEADER_BYTES + MAX_FRAME * 2 }
 
 /// Byte offset of slot 1's proxy region — the second, independent in-flight request
-/// v3 adds. See `PROTOCOL_V3_DESIGN.md`.
+/// v3 adds. See `docs/PROTOCOL_V3_DESIGN.md`.
 pub const fn proxy_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 3 }
 
 /// Byte offset of slot 1's answer region.

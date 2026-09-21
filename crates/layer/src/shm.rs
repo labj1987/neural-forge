@@ -47,7 +47,7 @@ pub struct CompositionSettings {
     /// sub-millisecond) wired into `CapturePipeline`'s capture-side buffer and
     /// `composition::gpu`'s answer-upload step -- real Vulkan surgery in this project's
     /// most crash-prone area, deliberately not attempted unsupervised overnight. See
-    /// `GHOSTING_PLAN.md`'s step 1 for the full account and the corrected plan.
+    /// `docs/GHOSTING_PLAN.md`'s step 1 for the full account and the corrected plan.
     #[allow(dead_code)]
     pub working_scale: f32,
     #[allow(dead_code)]
@@ -83,7 +83,7 @@ pub struct ShmClient {
     /// [`Self::begin_async_request`] that [`Self::poll_async_request`] hasn't yet
     /// resolved (answered or timed out). `None` means that slot has no request in
     /// flight -- callers use this to decide whether it's time to capture and send a
-    /// new frame on that slot. Protocol v3 (`PROTOCOL_V3_DESIGN.md`) gives the wire
+    /// new frame on that slot. Protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`) gives the wire
     /// two fully independent request/response slots instead of one, so this is an
     /// array of two, not a single value -- each slot still only ever has one
     /// outstanding request at a time.
@@ -608,7 +608,7 @@ impl ShmClient {
     /// Callers use this to decide whether it's worth capturing and sending a new
     /// frame on this slot this present call -- each slot still only ever supports one
     /// outstanding request at a time (its own `seq_req`/`seq_resp` pair, not a
-    /// queue); protocol v3 (`PROTOCOL_V3_DESIGN.md`) is what makes there be two
+    /// queue); protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`) is what makes there be two
     /// slots to ask this about instead of one.
     pub fn has_pending_request(&self, slot: usize) -> bool {
         self.pending[slot].is_some()
@@ -905,7 +905,7 @@ mod tests {
 
     #[test]
     fn the_two_slots_are_fully_independent() {
-        // The actual point of protocol v3 (PROTOCOL_V3_DESIGN.md): slot 1 can have a
+        // The actual point of protocol v3 (docs/PROTOCOL_V3_DESIGN.md): slot 1 can have a
         // request outstanding while slot 0's is still pending, and each resolves on
         // its own seq_req/seq_resp pair without disturbing the other -- proven here
         // with a helper that only ever answers slot 0, confirming slot 1 staying

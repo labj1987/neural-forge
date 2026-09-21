@@ -8,6 +8,7 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).with_name('install.py')
+CLI = Path(os.environ.get('NEURALFORGE_CLI', Path(__file__).resolve().parent.parent / 'target/debug/neuralforge-cli'))
 class InstallTests(unittest.TestCase):
     def test_coexistence_and_owned_removal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -32,7 +33,7 @@ class InstallTests(unittest.TestCase):
             upstream.parent.mkdir(parents=True)
             upstream.write_text('upstream sentinel')
             def run(*args, ok=True):
-                result = subprocess.run(['python3', str(SCRIPT), *args], env={**os.environ, 'XDG_DATA_HOME': str(data)}, capture_output=True, text=True)
+                result = subprocess.run(['python3', str(SCRIPT), '--cli', str(CLI), *args], env={**os.environ, 'XDG_DATA_HOME': str(data)}, capture_output=True, text=True)
                 self.assertEqual(result.returncode == 0, ok, result.stderr)
             run('install', '--appdir', str(app))
             run('install', '--appdir', str(app))

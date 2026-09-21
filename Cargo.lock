@@ -644,7 +644,6 @@ dependencies = [
  "ash",
  "libc",
  "neuralforge-protocol",
- "once_cell",
  "png",
  "vulkan-layer",
 ]

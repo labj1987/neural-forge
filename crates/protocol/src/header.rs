@@ -289,7 +289,7 @@ pub struct ShmHeader {
     // --- v3: the second, independent request/response slot ---------------------------
     // Appended after everything else on purpose, same reasoning as `pass` above: a
     // new field inserted higher up would move every field below it. See
-    // `PROTOCOL_V3_DESIGN.md` for why only these five are duplicated (not, say,
+    // `docs/PROTOCOL_V3_DESIGN.md` for why only these five are duplicated (not, say,
     // `format`/`hdr_encode`/`answered_w`/`answered_h`, which are dead fields on slot 0
     // too -- nothing in this workspace reads or writes them today).
     pub seq_req_b: AtomicU32,
@@ -535,7 +535,7 @@ impl ShmHeader {
         self.magic.load(Ordering::Relaxed) == SHM_MAGIC && self.version.load(Ordering::Relaxed) == SHM_VERSION
     }
 
-    /// v3's two request/response slots (`PROTOCOL_V3_DESIGN.md`) share every field
+    /// v3's two request/response slots (`docs/PROTOCOL_V3_DESIGN.md`) share every field
     /// name and type; these are the one place that picks slot 0's or slot 1's field
     /// by an actual `usize` index, so the layer and the helper -- both of which poll
     /// both slots -- never have to hand-write their own `if slot == 0 { .. } else { .. }`

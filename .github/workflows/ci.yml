@@ -10,7 +10,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Same package list build-appimage.sh installs on a from-scratch image --
       # libgtk-4-dev/libadwaita-1-dev for the gui crate (glib-sys and friends need the
@@ -51,8 +51,19 @@ jobs:
       - name: cargo check (helper, cross-compiled)
         run: cargo check --target x86_64-pc-windows-gnu -p neuralforge-helper
 
+      # scripts/install.py delegates install/uninstall to neuralforge-cli (the single
+      # implementation), so this exercises the same code the GUI's Setup tab runs.
+      - name: Build the CLI for the installation tests
+        run: cargo build -p neuralforge-cli
+
       - name: Installation coexistence tests
         run: python3 scripts/test_install.py
+
+      - name: Shader sources match committed SPIR-V
+        run: python3 scripts/check_shaders.py
+
+      - name: AppStream releases match the changelog
+        run: python3 scripts/sync_appdata_releases.py --check
 
       - name: Vulkan loader smoke test
         run: bash scripts/smoke-test.sh

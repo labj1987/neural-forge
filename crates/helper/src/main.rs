@@ -149,8 +149,8 @@ fn main() {
     // simulating a helper that genuinely takes far longer than one frame to answer.
     // Read once at startup (this never needs to change mid-run) so the per-frame loop
     // below pays nothing but a single `Duration` comparison when it's unset -- the
-    // default, real, deployed case. See `ASYNC_CAPTURE_DESIGN.md`'s own validation
-    // section and PHASE1.md's Phase 2 item 6 for why this exists: proving the layer's
+    // default, real, deployed case. See `docs/ASYNC_CAPTURE_DESIGN.md`'s own validation
+    // section and docs/PHASE1.md's Phase 2 item 6 for why this exists: proving the layer's
     // present hook never blocks needs a helper slow enough that blocking would be
     // obvious, not just "usually fast".
     let helper_delay: Duration = std::env::var("NEURALFORGE_HELPER_DELAY_MS")
@@ -195,7 +195,7 @@ fn main() {
     neuralforge_helper::log!("[mvec] optical flow queue: {}", if flow_queue.is_some() { "available" } else { "unavailable (no extension/feature/queue-family support)" });
     neuralforge_helper::logging::flush();
 
-    // Protocol v3 (`PROTOCOL_V3_DESIGN.md`): one persistent `FrameResources` per wire
+    // Protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`): one persistent `FrameResources` per wire
     // slot, each importing (or staging into) that slot's own disjoint proxy/answer
     // region -- so slot 1's upload never has to wait on slot 0's own resources being
     // free. `snippet` (the single NGX feature/model) is deliberately *not*
@@ -262,7 +262,7 @@ fn main() {
 
 /// Handles one newly-observed request on the given wire slot: reads its width/
 /// height/proxy_format (via the header's own `*_slot` accessors -- see
-/// `PROTOCOL_V3_DESIGN.md`), prewarms or evaluates against `frame_resources` (that
+/// `docs/PROTOCOL_V3_DESIGN.md`), prewarms or evaluates against `frame_resources` (that
 /// slot's own, independent from the other slot's), and publishes the answer plus
 /// this slot's `seq_resp`. Exactly the per-request body `main`'s loop used to run
 /// inline for the single slot v2 had; pulled out so both slots run the identical
@@ -345,7 +345,7 @@ fn process_request(
     }
     // SAFETY: this helper exclusively owns this slot's request after observing its
     // own `seq_req`; slot 0's and slot 1's regions are disjoint fixed regions in the
-    // mapping (`PROTOCOL_V3_DESIGN.md`).
+    // mapping (`docs/PROTOCOL_V3_DESIGN.md`).
     let (proxy, answer) = unsafe { shm.frame_regions(slot, n) };
 
     // Real motion vectors, estimated here in the helper -- see `optical_flow.rs`'s
@@ -354,7 +354,7 @@ fn process_request(
     // duplicated the motion payload for slot 1). `NEURALFORGE_MVEC_HELPER` is a
     // deliberate, explicit opt-in on top of the header's own `mvec_enabled` toggle:
     // this is genuinely unvalidated on real hardware as of the commit that adds it
-    // (see GHOSTING_PLAN.md step 4) -- some users' persisted config already has
+    // (see docs/GHOSTING_PLAN.md step 4) -- some users' persisted config already has
     // `mvec_enabled=1` from when this toggle was a no-op, and this crate should not
     // silently start doing something new and untested just because an old, inert
     // setting happens to already be on.

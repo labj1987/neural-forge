@@ -101,16 +101,16 @@ struct State {
     /// to build a command pool for whatever queue `queue_present_khr` hands us.
     queue_families: HashMap<vk::Queue, u32>,
     capture: Option<capture::CaptureResources>,
-    /// The Phase 2 non-blocking capture pipeline (`ASYNC_CAPTURE_DESIGN.md`) `capture::run`
+    /// The Phase 2 non-blocking capture pipeline (`docs/ASYNC_CAPTURE_DESIGN.md`) `capture::run`
     /// uses for its own hot-path captures. Kept separate from `capture` above (which
     /// stays the single synchronous resource `run_sync` and `run`'s CPU-only
     /// write-back fallback still use) rather than sharing one resource type across
     /// both purposes -- a slot mid-flight for one would otherwise have to be safe to
     /// borrow for the other's completely different, fully-synchronous contract.
     capture_pipeline: Option<capture::CapturePipeline>,
-    /// The Phase 3 zero-copy capture path (`EXTERNAL_MEMORY_HOST_DESIGN.md`) --
+    /// The Phase 3 zero-copy capture path (`docs/EXTERNAL_MEMORY_HOST_DESIGN.md`) --
     /// mutually exclusive with `capture_pipeline` above, never both active for the
-    /// same device. One per protocol v3 wire slot (`PROTOCOL_V3_DESIGN.md`), each
+    /// same device. One per protocol v3 wire slot (`docs/PROTOCOL_V3_DESIGN.md`), each
     /// importing that slot's own disjoint proxy region -- no write-write hazard
     /// between them (unlike two of the same slot, which `DirectCapture`'s own doc
     /// comment still explains). `capture::run` decides `DirectCapture` vs.
@@ -325,8 +325,8 @@ fn prune_orphaned_tap_source(state: &mut TapTracker, source: vk::Image) {
 }
 
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
-static CLEANUP: once_cell::sync::Lazy<Mutex<HashMap<vk::Device, CleanupState>>> =
-    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// Called only from vkDestroyDevice, before downstream device destruction.
 /// Vulkan requires the caller to externally synchronize this device AND all its
@@ -441,7 +441,7 @@ impl NeuralForgeDeviceInfo {
         // the app's *original*, un-injected request regardless of what actually got
         // enabled. Stored on `State` below; `capture::run` reads it every call to
         // decide between `DirectCapture` and `CapturePipeline` (see
-        // EXTERNAL_MEMORY_HOST_DESIGN.md).
+        // docs/EXTERNAL_MEMORY_HOST_DESIGN.md).
         let external_memory_host = crate::take_external_memory_host_enabled(handle);
         crate::log!(
             "[layer] hooked device {:?} (swapchain support: {}, external_memory_host: {})",

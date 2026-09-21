@@ -79,6 +79,9 @@ sed "s#\./lib${APP}_layer\.so#../../../lib/$APP/lib${APP}_layer.so#" \
     "data/VK_LAYER_${APP}_neural.json" > "$APPDIR/usr/share/vulkan/implicit_layer.d/VK_LAYER_${APP}_neural.json"
 cp data/io.github.labj1987.NeuralForge.desktop                               "$APPDIR/usr/share/applications/"
 cp data/icon.svg                                   "$APPDIR/usr/share/icons/hicolor/scalable/apps/$APP.svg"
+# The <releases> list is generated from CHANGELOG.md's version headings, and fails the
+# build if the newest one is not this workspace version.
+python3 scripts/sync_appdata_releases.py
 cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/metainfo/"
 
 # Top-level AppImage requirements
@@ -99,11 +102,22 @@ APPRUN
 chmod 755 "$APPDIR/AppRun"
 
 # ── appimagetool ──────────────────────────────────────────────────────
-TOOL="$BUILD_DIR/appimagetool"
-if [[ ! -f "$TOOL" ]]; then
-    echo "==> Downloading appimagetool"
+# Pinned to a released version and verified by checksum (the `continuous` tag moves
+# under us, so two builds of the same commit could use different tools). To bump:
+# pick a release at https://github.com/AppImage/appimagetool/releases, and take the
+# x86_64 asset's sha256 from that release page.
+APPIMAGETOOL_VERSION="1.9.1"
+APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
+TOOL="$BUILD_DIR/appimagetool-$APPIMAGETOOL_VERSION"
+if [[ ! -f "$TOOL" ]] || ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --status; then
+    echo "==> Downloading appimagetool $APPIMAGETOOL_VERSION"
     wget -q -O "$TOOL" \
-        "https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage"
+        "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
+    if ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --status; then
+        echo "error: appimagetool $APPIMAGETOOL_VERSION does not match the pinned checksum" >&2
+        rm -f "$TOOL"
+        exit 1
+    fi
     chmod +x "$TOOL"
 fi
 

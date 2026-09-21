@@ -1,5 +1,5 @@
 //! Phase 4 feasibility probe, reverse direction, Wine/helper half
-//! (`DMABUF_TRANSPORT_DESIGN.md`). Pairs with
+//! (`docs/DMABUF_TRANSPORT_DESIGN.md`). Pairs with
 //! `crates/layer/examples/dmabuf_export_probe.rs`, which must already be running
 //! (its own doc comment covers the forward-direction result this is following up on).
 //!
@@ -119,7 +119,7 @@ fn main() {
 
     // Resolved manually, not via a panicking `::load()` helper -- same reasoning as
     // every other manually-resolved extension function in this project since
-    // `EXTERNAL_MEMORY_HOST_DESIGN.md`.
+    // `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`.
     let get_props_name = c"vkGetMemoryWin32HandlePropertiesKHR";
     let get_props_fp = unsafe { instance.get_device_proc_addr(device.handle(), get_props_name.as_ptr()) };
     let Some(get_props_fp) = get_props_fp else {

@@ -1,221 +1,12 @@
-# NeuralForge changelog
+# Neural Forge changelog
 
-## Unreleased — NeuralForge Phase 1
+One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
+previously filed under "Unreleased" phase headings and are grouped by the release that
+first shipped them; their phase is kept as a subheading.
 
-- Rename the application and GitHub repository to NeuralForge; update binaries,
-  Vulkan identity, private environment variables, paths, desktop metadata and releases.
-- Isolate process ownership and add explicit game targeting; preserve upstream installs.
-- Add safe installation/removal and identity-checked legacy manifest archival.
-- Keep the host-transport GTA baseline; document benchmarks before later optimizations.
-- Validate the host-SHM/full-model path at 2560x1440 on the RTX 5070: swapchain
-  transfer usage is admitted only after capability checks, private device resources
-  are released before device destruction, and present semaphores are image-scoped.
-  The longer Vulkan and synchronization-validation smoke runs completed without
-  validation errors. This is a correctness gate, not a GTA performance claim.
-- Verify the target-process filter on the RTX 5070 with a real Vulkan test process:
-  an `explorer.exe` name is excluded without advancing helper frames, while an
-  explicitly targeted `GTA5_Enhanced.exe` name acquires the lease and advances them.
-- Add pipeline timing telemetry and record the first GTA comparison gate: the upstream
-  layer processed 4,540 frames in 61.5 seconds, while NeuralForge safely passed GTA
-  through because its surface exposes `TRANSFER_DST | COLOR_ATTACHMENT`, not the
-  `TRANSFER_SRC` usage required for legal capture. This is not a performance comparison.
-- Add `scripts/bench.sh`, the repeatable native/upstream/neuralforge benchmark
-  driver Phase 1 still needs run for real; it restarts Steam per mode and waits for a
-  human to confirm the saved route before timing. Investigated the eleven Vulkan
-  validation warnings Phase 1 flagged as outstanding; could not reproduce them on this
-  machine's current validation-layer version under `vkcube`, so left unresolved rather
-  than guessed at.
+## 0.1.74 — 2026-09-17
 
-## Unreleased — NeuralForge Phase 2
-
-- Implement the non-blocking two-slot capture pipeline (`ASYNC_CAPTURE_DESIGN.md`):
-  `run`'s present-hook capture submission no longer blocks on its own GPU fence --
-  only a resize/queue-family change still takes a real (bounded to that rare event)
-  wait. Validated on the RTX 5070 by running the layer crate's own test suite
-  directly against the real driver with Khronos validation and synchronization
-  validation active: 45/45 tests pass, zero synchronization hazards. Add
-  `NEURALFORGE_HELPER_DELAY_MS` (test-only) to simulate a slow helper for this kind
-  of validation. GTA fps has not yet been measured against this change -- `vkcube`
-  cannot exercise the render tap at all (see `HARDWARE_VALIDATION.md`), so this still
-  needs a real session before Phase 2 can be called done.
-- First real GTA sessions against this pipeline (see `HARDWARE_VALIDATION.md`'s
-  2026-09-16 entries, including the correction at the end of the first): real
-  telemetry shows `EvaluateFeature` taking a consistent ~15-25ms/frame -- the model's
-  own eval cost, not transport, dominates. Real ghosting during motion; its actual
-  mechanism is the deliberate "re-present the held answer every frame" design in
-  `capture::run` (one answer's delta re-applied across ~8-10 real frames at native
-  rate), not the motion-vector default -- motion-vector estimation has been stubbed
-  out in `shm.rs` since 2026-09-14 and never ran. Alex's read of the longer session was
-  "input lag and stuttering". Phase 1's own "~10% of native" fps gate is not met and
-  stays open; upstream is still not validly compared (every same-day attempt was
-  either accidentally still NeuralForge or crashed before gameplay).
-- A repeat GTA crash (`Xid 109 CTX_SWITCH_TIMEOUT` -> `Xid 119` GSP firmware
-  timeout -> full-chip GPU reset required). First read as a purely external NVIDIA
-  driver bug (it is a widely reported one -- see `README.md`'s "Known issues"), but a
-  real NeuralForge bug that could plausibly produce exactly this was then found and
-  fixed in v0.1.61 (the render-tap source-image leak below), and a ~20-minute session
-  on the fix ran clean. Treat the external-bug theory as unproven, not established.
-
-## Unreleased — NeuralForge Phase 6
-
-- Migrated off the deprecated `AdwViewSwitcherTitle`/`AdwViewSwitcherBar` pairing to
-  `AdwViewSwitcher` + `AdwToolbarView` + `AdwBreakpoint`, now that CI's real
-  libadwaita version (1.5.0, confirmed against a real CI run's own build log) is
-  past the v1.4 this needs -- closes the "Deliberately not done" item in `CLAUDE.md`.
-  A real screenshot caught the first pass shipping a genuine layout bug (all six tab
-  labels truncated to one character at the app's own natural window size); fixed by
-  raising the breakpoint threshold, re-verified both states with real screenshots. See
-  `HARDWARE_VALIDATION.md`'s 2026-09-16 entry for the full detail.
-- Fixed a stale GUI label: "Estimate motion vectors" said "On by default", the real
-  default is off (`mvec_enabled=0`), matching `PHASE1.md`'s documented baseline.
-- Release Cargo profile: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`,
-  `strip = true`. Measured on `libneuralforge_layer.so`: 1,774,464 -> 1,184,760 bytes
-  (~33% smaller); full test suite still green.
-- Add `ShmHeader::reset_persisted_settings` (`neuralforge-cli shmctl reset`, and a
-  "Reset…" button on the GUI's Status tab): resets every user-tunable setting to its
-  default while preserving the live helper/layer session -- seq words, status
-  counters, DMA-BUF transport fields, HDR detection, motion-vector validity, the
-  free-text reason/name fields. Upstream shipped a real bug here (PR #16), wiping the
-  live session out from under a running process on every settings reset; a test
-  (`reset_persisted_settings_changes_settings_but_preserves_the_live_session`) guards
-  against reintroducing it.
-- Add named settings profiles: `neuralforge-cli profile <list|save|load|delete>` and a
-  "Save current as" / "Load profile" pair on the GUI's Status tab. Profiles are
-  `[name]` sections of the same `set_<field>=<value>` lines `config.ini` itself
-  stores, kept in their own `profiles.ini` so the flat, upstream-compatible
-  `config.ini` format is untouched. `load` applies to the live session and re-snapshots
-  the full setting set into `config.ini` so it survives a reboot too, the same pattern
-  `reset_persisted_settings` already established.
-- Move `HANDOFF_2026-09-12.md` into `docs/history/` alongside the other pre-rename
-  archival record; trim `README.md` to what it does, requirements, install, usage,
-  status, building and legal -- raw measurement evidence stays in
-  `HARDWARE_VALIDATION.md`.
-- Fix a real CI-only flake in `run_never_blocks_on_a_slow_helper_and_eventually_composites`:
-  a fixed per-call timing ceiling (tuned against local/real-hardware timing) failed
-  three times running on GitHub's shared runners, once on a call nearly *double* the
-  helper's own simulated delay -- not evidence of a real blocking regression, just
-  scheduler/software-rasterizer jitter this infra has and this machine doesn't. Now
-  judges the pattern across the whole loop (few calls near the delay is noise, most
-  of them is the real regression) instead of any single sample.
-- Add a screenshot and the current release entry to the AppStream metainfo.
-- Port `scripts/install.py`'s install/uninstall to Rust
-  (`neuralforge_supervisor::install`; `neuralforge-cli install --appdir DIR` /
-  `uninstall`) -- same hash-tracked, symlink-refusing, atomic-rename installer and
-  `installation.json` record, confirmed to interoperate with `install.py` itself in
-  both directions against a real `build-appimage.sh` output, not just a fixture.
-  Runner discovery (Proton/Wine) moved from the CLI crate into
-  `neuralforge-supervisor` so the GUI can reuse it too.
-- Add the Setup tab: per-file NGX binaries status, a compatibility-tool picker, an
-  "Install for Steam games" button (sourced from `$APPDIR` when running as an
-  AppImage), and a Steam launch-option generator (target exe + DMA-BUF toggle -> the
-  exact `NEURALFORGE_ENABLE=1 ... %command%` string, with a copy button).
-- First-run flow: with `nvngx_dlssnr.dll` missing, the window now opens directly on
-  Setup (instead of Model) with a dismissible banner explaining why, rather than a
-  silently fail-open app that never says why neural rendering isn't doing anything.
-- Refresh `screenshots/` for the new Setup tab and update the README screenshot table
-  and AppStream metainfo to match.
-- Add a Telemetry group to the Status tab: model/game/frame-rate rows and a live
-  sparkline (last 5s of layer/helper-round-trip/model-eval time), all from fields
-  already on `ShmHeader` -- no layer/Vulkan changes.
-
-## Unreleased — NeuralForge Phase 3
-
-- Add device-extension injection (`NeuralForgeInstanceHooks::create_device`,
-  see `EXTERNAL_MEMORY_HOST_DESIGN.md`): adds `VK_EXT_external_memory_host` to the
-  game's own `vkCreateDevice` call when the physical device supports it and the app
-  hasn't already requested it, the precondition Phase 3's zero-copy capture path
-  needs. Falls back to the framework's default, unmodified path whenever there's
-  nothing safe to add, and retries with the original request if the extended one is
-  refused. Validated on the RTX 5070 at both 1280x720 and GTA's real 2560x1440 under
-  Khronos validation + synchronization validation: injection confirmed active, zero
-  hazards, no regression. The actual host-memory import this unblocks is not wired up
-  yet -- this commit only adds the mechanism for getting the extension enabled.
-- Implement the actual zero-copy import (`DirectCapture`, see
-  `EXTERNAL_MEMORY_HOST_DESIGN.md`): a capture's `vkCmdCopyImageToBuffer` now writes
-  straight into the SHM proxy region when the device extension is available, no
-  staging buffer. A new test that checks captured bytes are exactly correct (not just
-  "didn't crash") found two real bugs on its first real-hardware run: a missing
-  `VkExternalMemoryBufferCreateInfo` on the buffer, and a misaligned allocation size --
-  neither caught by this project's local software Vulkan ICD. Both fixed; the test now
-  passes on both, on `lordnikon` under full synchronization validation. GTA fps still
-  unmeasured -- the real payoff of this phase needs a live session.
-- Add the helper-side half of the zero-copy import (`FrameResources::imported_proxy`/
-  `imported_answer`, see `EXTERNAL_MEMORY_HOST_DESIGN.md`): `EvaluateFeature`'s
-  Color/Output now read from and write to the live SHM regions directly when the
-  device extension is available, no staging-buffer copy either direction. Confirmed
-  live on `lordnikon` via a new `trigger_helper_roundtrip` tool that drives a real
-  request/response round trip with no game involved.
-- **Fixed two real, live bugs found only after everything above had already validated
-  clean** (see `HARDWARE_VALIDATION.md`'s own account): real undefined behavior in the
-  device-extension-injection hook (`slice::from_raw_parts` on a pointer that's
-  legitimately null when zero extensions are requested -- every earlier release-mode
-  `vkcube` validation run this session had this same UB and simply never visibly
-  crashed), and a real crash from `vk::ExtExternalMemoryHostFn::load(...)` panicking
-  instead of failing open when a function doesn't resolve. Neither was caught by
-  Vulkan validation layers or `cargo test` -- only `scripts/smoke-test.sh`'s
-  debug-mode UB checker and a live `vkcube` crash surfaced them.
-- Add protocol v3 (see `PROTOCOL_V3_DESIGN.md`): a second, fully independent
-  request/response wire slot, so the layer can have a captured frame already sent to
-  the helper instead of idling a single wire slot while the previous answer is still
-  pending. `CapturePipeline`/`DirectCapture` on the layer side and `FrameResources` on
-  the helper side both become slot-indexed (one dedicated GPU resource set per wire
-  slot); the single NGX feature/model stays deliberately serialized across both slots
-  rather than betting on undocumented concurrent-evaluate safety for a
-  reverse-engineered feature. Validated on `lordnikon`: `cargo test` (48/48, including
-  a new test proving the two slots are fully independent), Khronos validation +
-  synchronization validation (no new warnings versus the pre-v3 commit),
-  `scripts/smoke-test.sh`, and a real running helper answering both slots correctly
-  when triggered concurrently, repeatedly, in well under a second total. GTA fps
-  against this change is not measured as part of this work.
-
-## Unreleased — NeuralForge Phase 4
-
-- Investigated DMA-BUF transport (see `DMABUF_TRANSPORT_DESIGN.md`): real hardware
-  evidence (`lordnikon`, RTX 5070, driver 615.71.09) that a Wine-hosted Windows guest's
-  `vkGetMemoryWin32HandleKHR` handle cannot be converted to a real Unix fd via Wine's
-  own `wine_server_handle_to_fd` -- a well-formed `STATUS_OBJECT_TYPE_MISMATCH`, not a
-  crash or a wrong-signature guess. This blocks the specific mechanism the protocol's
-  already-reserved `proxy_pid`/`proxy_fd`/`answer_pid`/`answer_fd` fields imply, on a
-  real Wine/NVIDIA-driver constraint, not a gap in this project's own code. No
-  production code changed; `crates/helper/examples/dmabuf_probe.rs` (the diagnostic
-  that found this) is kept for whatever's tried next.
-- Investigated the reverse direction too (layer exports a dma-buf fd, helper opens it
-  via `Z:\proc\<pid>\fd\<fd>`): also blocked, but for a different, more fundamental
-  reason confirmed independent of Wine -- dma-buf fds are anon-inode-backed and Linux
-  does not support re-opening one via `/proc/<pid>/fd/<N>` from any process (`ENXIO`),
-  confirmed with a plain, non-Wine `cat`/`os.open()` before Wine was ever blamed. Both
-  directions this document considered are now empirically closed, not just judged
-  unlikely; a working transport would need real `SCM_RIGHTS` fd-passing over a Unix
-  socket instead. No production code changed; `crates/layer/examples/dmabuf_export_probe.rs`
-  and `crates/helper/examples/dmabuf_import_probe.rs` (the diagnostics that found this)
-  are kept alongside `dmabuf_probe.rs`.
-- Investigated the "skip Wine with a native Linux NGX helper" idea named as this
-  project's longer-term direction (see `NATIVE_NGX_HELPER_DESIGN.md`): NVIDIA does ship
-  a genuine native Linux NGX runtime (`libnvidia-ngx.so.1`) that boots cleanly on real
-  hardware with no caller-identity workaround needed, but no native Linux
-  implementation of this project's target feature (DLSS 5 Neural Rendering,
-  `NVSDK_NGX_Feature_Reserved18`) exists anywhere -- confirmed reserved/unallocated in
-  NVIDIA's own current public SDK header, and the identical, well-known
-  `FAIL_UNABLE_TO_INITIALIZE_FEATURE` result this project already recognized from the
-  Windows side came back from the real native library too. A control experiment against
-  a genuinely public feature (Super Resolution) confirmed this machine has no NGX
-  snippet installed for anything, and a follow-up attempt to point Core at NVIDIA's own
-  official redistributable Super Resolution `.so` via the documented `__NGX_CONF_FILE`
-  mechanism didn't change the result either -- Core needs more than a file in the right
-  directory to load a feature, not fully reverse-engineered this session. No production
-  code changed; `crates/layer/examples/native_ngx_probe.rs` (the diagnostic that found
-  this, including a small native `sigsetjmp`/`siglongjmp` signal guard, this project's
-  Linux-native counterpart to the Windows helper's VEH-based one) is kept in the repo.
-
-## Historical releases before the NeuralForge rename
-
-> Historical record: pre-NeuralForge names and deployment instructions below are
-> archival, not current instructions. Do not remove or modify upstream installations.
-> See PHASE1.md for current paths, safety constraints and the benchmark plan.
-
-# Changelog
-
-- **v0.1.74 — the layer was inert on real games, and now isn't.** Admission refused any
+- **the layer was inert on real games, and now isn't.** Admission refused any
   swapchain whose create info carried a `pNext` chain or non-empty flags, left as a
   "validate extended creation semantics later" placeholder. Both games on the test rig
   hit it: DXVK and vkd3d-proton each attach an extension struct (sType 1000505007,
@@ -261,7 +52,9 @@
   wasted on the layer being hand-copied to the installed path while the helper ran from
   a stale AppImage.
 
-- **v0.1.70 — fix: real motion-vector device setup was NOT actually gated behind
+## 0.1.70 — 2026-09-17
+
+- **fix: real motion-vector device setup was NOT actually gated behind
   `NEURALFORGE_MVEC_HELPER`, and it hung the helper on real NVOF hardware.** v0.1.69
   claimed device creation was a no-op without the opt-in env var; it wasn't. Only the
   runtime `estimate_motion()` call checked the env var --
@@ -278,9 +71,11 @@
   extension unavailable, so this exact code path never actually ran under test.
   Fixed in `crates/helper/src/main.rs` by gating `find_flow_family()` itself behind
   `NEURALFORGE_MVEC_HELPER`, so device creation is now genuinely byte-identical to
-  pre-v0.1.69 behavior for anyone who hasn't opted in. See `GHOSTING_PLAN.md` §4a.
+  pre-v0.1.69 behavior for anyone who hasn't opted in. See `docs/GHOSTING_PLAN.md` §4a.
 
-- **v0.1.69 — real motion vectors, built and cross-compiled, opt-in pending real-hardware
+## 0.1.69 — 2026-09-17
+
+- **real motion vectors, built and cross-compiled, opt-in pending real-hardware
   validation.** New `crates/helper/src/optical_flow.rs`: `VK_NV_optical_flow` estimated
   between consecutive proxy frames, on the helper's own already-created device (never a
   private one, never touching the game process) -- the architecture DLSS5VKLayer's own
@@ -296,7 +91,9 @@
   starts cleanly and correctly falls back with zero effect on NGX -- which is exactly
   why Wine testing didn't catch the device-creation gap.
 
-- **v0.1.67 — `working_scale` is wired in, real: run the model at a fraction of the
+## 0.1.67 — 2026-09-17
+
+- **`working_scale` is wired in, real: run the model at a fraction of the
   frame's resolution.** The earlier CPU-resample attempt (below) was measured too slow
   for the present thread and shelved; this is the GPU-blit version instead
   (`vkCmdBlitImage`, a hardware resize unit, sub-millisecond): `CapturePipeline` blits
@@ -315,9 +112,11 @@
   oversized answer is safely rejected rather than overflowing the staging buffer).
   Visual correctness (does the enhancement still look right at the blit-upscaled
   resolution) still needs a live look, same as every visual check this project has
-  ever needed. Full account in `GHOSTING_PLAN.md` §1c.
+  ever needed. Full account in `docs/GHOSTING_PLAN.md` §1c.
 
-- **v0.1.66 — step 1/step 4 investigation, no behavior change (superseded above).** Attempted to wire
+## 0.1.66 — 2026-09-16
+
+- **step 1/step 4 investigation, no behavior change (superseded above).** Attempted to wire
   `working_scale` (run the model at a fraction of the frame's resolution) into
   `capture::run`'s hot path via a CPU resample. Built and tested a real, separable
   resize (`composition::downscale::resample_rgba8`, finally putting the project's
@@ -330,23 +129,275 @@
   motion vectors (`optical_flow.rs`): confirmed the documented crash trigger is a
   *second Vulkan device created from within the game's own process during its
   swapchain transition*, not motion vectors themselves being unsafe — so the
-  helper-side design in `GHOSTING_PLAN.md` (compute flow in the separate Windows
+  helper-side design in `docs/GHOSTING_PLAN.md` (compute flow in the separate Windows
   helper process, which already owns its own independent device) is the right target,
   now for a verified reason. Both findings, and the corrected plan, are in
-  `GHOSTING_PLAN.md`.
+  `docs/GHOSTING_PLAN.md`.
 
-- **v0.1.65 — ghosting mitigation and the plan for the real fix.** Live GTA testing on
+## 0.1.65 — 2026-09-16
+
+- **ghosting mitigation and the plan for the real fix.** Live GTA testing on
   v0.1.64 confirmed the fps fix ("great performance", 120s) with the enhancement applied,
   and ghosting still present. Tightened `compose.comp`'s `carry_delta` motion mask
   (0.005..0.032 threshold, cubic falloff) — the best of three variants tried live against
   GTA's built-in benchmark ("closer to upstream"); a variant scaling the threshold by the
   model's own edit strength made the picture worse and was reverted. This is a band-aid:
   the ghost is structural (an answer computed ~26 ms ago re-applied onto frames that have
-  since moved). `GHOSTING_PLAN.md` records what upstream does instead — synchronous
+  since moved). `docs/GHOSTING_PLAN.md` records what upstream does instead — synchronous
   per-frame presentation, the model at ~0.75 scale, optical-flow motion vectors with
   history — and the proposed steps (wire `working_scale`, a synchronous "Quality" mode,
   an explicit `DLSSNR.Reset` policy, real motion vectors, and closing the layer-deploy
   gap where AppImage updates never refresh the installed layer `.so`).
+
+## 0.1.63 — 2026-09-16
+
+
+### Phase 2
+
+- First real GTA sessions against this pipeline (see `docs/HARDWARE_VALIDATION.md`'s
+  2026-09-16 entries, including the correction at the end of the first): real
+  telemetry shows `EvaluateFeature` taking a consistent ~15-25ms/frame -- the model's
+  own eval cost, not transport, dominates. Real ghosting during motion; its actual
+  mechanism is the deliberate "re-present the held answer every frame" design in
+  `capture::run` (one answer's delta re-applied across ~8-10 real frames at native
+  rate), not the motion-vector default -- motion-vector estimation has been stubbed
+  out in `shm.rs` since 2026-09-14 and never ran. Alex's read of the longer session was
+  "input lag and stuttering". Phase 1's own "~10% of native" fps gate is not met and
+  stays open; upstream is still not validly compared (every same-day attempt was
+  either accidentally still NeuralForge or crashed before gameplay).
+- A repeat GTA crash (`Xid 109 CTX_SWITCH_TIMEOUT` -> `Xid 119` GSP firmware
+  timeout -> full-chip GPU reset required). First read as a purely external NVIDIA
+  driver bug (it is a widely reported one -- see `README.md`'s "Known issues"), but a
+  real NeuralForge bug that could plausibly produce exactly this was then found and
+  fixed in v0.1.61 (the render-tap source-image leak below), and a ~20-minute session
+  on the fix ran clean. Treat the external-bug theory as unproven, not established.
+
+## 0.1.60 — 2026-09-16
+
+
+### Phase 6
+
+- Migrated off the deprecated `AdwViewSwitcherTitle`/`AdwViewSwitcherBar` pairing to
+  `AdwViewSwitcher` + `AdwToolbarView` + `AdwBreakpoint`, now that CI's real
+  libadwaita version (1.5.0, confirmed against a real CI run's own build log) is
+  past the v1.4 this needs -- closes the "Deliberately not done" item in `CLAUDE.md`.
+  A real screenshot caught the first pass shipping a genuine layout bug (all six tab
+  labels truncated to one character at the app's own natural window size); fixed by
+  raising the breakpoint threshold, re-verified both states with real screenshots. See
+  `docs/HARDWARE_VALIDATION.md`'s 2026-09-16 entry for the full detail.
+- Fixed a stale GUI label: "Estimate motion vectors" said "On by default", the real
+  default is off (`mvec_enabled=0`), matching `docs/PHASE1.md`'s documented baseline.
+
+### Phase 4
+
+- Investigated DMA-BUF transport (see `docs/DMABUF_TRANSPORT_DESIGN.md`): real hardware
+  evidence (`lordnikon`, RTX 5070, driver 615.71.09) that a Wine-hosted Windows guest's
+  `vkGetMemoryWin32HandleKHR` handle cannot be converted to a real Unix fd via Wine's
+  own `wine_server_handle_to_fd` -- a well-formed `STATUS_OBJECT_TYPE_MISMATCH`, not a
+  crash or a wrong-signature guess. This blocks the specific mechanism the protocol's
+  already-reserved `proxy_pid`/`proxy_fd`/`answer_pid`/`answer_fd` fields imply, on a
+  real Wine/NVIDIA-driver constraint, not a gap in this project's own code. No
+  production code changed; `crates/helper/examples/dmabuf_probe.rs` (the diagnostic
+  that found this) is kept for whatever's tried next.
+- Investigated the reverse direction too (layer exports a dma-buf fd, helper opens it
+  via `Z:\proc\<pid>\fd\<fd>`): also blocked, but for a different, more fundamental
+  reason confirmed independent of Wine -- dma-buf fds are anon-inode-backed and Linux
+  does not support re-opening one via `/proc/<pid>/fd/<N>` from any process (`ENXIO`),
+  confirmed with a plain, non-Wine `cat`/`os.open()` before Wine was ever blamed. Both
+  directions this document considered are now empirically closed, not just judged
+  unlikely; a working transport would need real `SCM_RIGHTS` fd-passing over a Unix
+  socket instead. No production code changed; `crates/layer/examples/dmabuf_export_probe.rs`
+  and `crates/helper/examples/dmabuf_import_probe.rs` (the diagnostics that found this)
+  are kept alongside `dmabuf_probe.rs`.
+- Investigated the "skip Wine with a native Linux NGX helper" idea named as this
+  project's longer-term direction (see `docs/NATIVE_NGX_HELPER_DESIGN.md`): NVIDIA does ship
+  a genuine native Linux NGX runtime (`libnvidia-ngx.so.1`) that boots cleanly on real
+  hardware with no caller-identity workaround needed, but no native Linux
+  implementation of this project's target feature (DLSS 5 Neural Rendering,
+  `NVSDK_NGX_Feature_Reserved18`) exists anywhere -- confirmed reserved/unallocated in
+  NVIDIA's own current public SDK header, and the identical, well-known
+  `FAIL_UNABLE_TO_INITIALIZE_FEATURE` result this project already recognized from the
+  Windows side came back from the real native library too. A control experiment against
+  a genuinely public feature (Super Resolution) confirmed this machine has no NGX
+  snippet installed for anything, and a follow-up attempt to point Core at NVIDIA's own
+  official redistributable Super Resolution `.so` via the documented `__NGX_CONF_FILE`
+  mechanism didn't change the result either -- Core needs more than a file in the right
+  directory to load a feature, not fully reverse-engineered this session. No production
+  code changed; `crates/layer/examples/native_ngx_probe.rs` (the diagnostic that found
+  this, including a small native `sigsetjmp`/`siglongjmp` signal guard, this project's
+  Linux-native counterpart to the Windows helper's VEH-based one) is kept in the repo.
+
+## 0.1.59 — 2026-09-15
+
+
+### Phase 3
+
+- Add protocol v3 (see `docs/PROTOCOL_V3_DESIGN.md`): a second, fully independent
+  request/response wire slot, so the layer can have a captured frame already sent to
+  the helper instead of idling a single wire slot while the previous answer is still
+  pending. `CapturePipeline`/`DirectCapture` on the layer side and `FrameResources` on
+  the helper side both become slot-indexed (one dedicated GPU resource set per wire
+  slot); the single NGX feature/model stays deliberately serialized across both slots
+  rather than betting on undocumented concurrent-evaluate safety for a
+  reverse-engineered feature. Validated on `lordnikon`: `cargo test` (48/48, including
+  a new test proving the two slots are fully independent), Khronos validation +
+  synchronization validation (no new warnings versus the pre-v3 commit),
+  `scripts/smoke-test.sh`, and a real running helper answering both slots correctly
+  when triggered concurrently, repeatedly, in well under a second total. GTA fps
+  against this change is not measured as part of this work.
+
+## 0.1.58 — 2026-09-15
+
+
+### Phase 6
+
+- Add a Telemetry group to the Status tab: model/game/frame-rate rows and a live
+  sparkline (last 5s of layer/helper-round-trip/model-eval time), all from fields
+  already on `ShmHeader` -- no layer/Vulkan changes.
+
+## 0.1.57 — 2026-09-15
+
+
+### Phase 6
+
+- First-run flow: with `nvngx_dlssnr.dll` missing, the window now opens directly on
+  Setup (instead of Model) with a dismissible banner explaining why, rather than a
+  silently fail-open app that never says why neural rendering isn't doing anything.
+- Refresh `screenshots/` for the new Setup tab and update the README screenshot table
+  and AppStream metainfo to match.
+
+## 0.1.56 — 2026-09-15
+
+
+### Phase 6
+
+- Fix a real CI-only flake in `run_never_blocks_on_a_slow_helper_and_eventually_composites`:
+  a fixed per-call timing ceiling (tuned against local/real-hardware timing) failed
+  three times running on GitHub's shared runners, once on a call nearly *double* the
+  helper's own simulated delay -- not evidence of a real blocking regression, just
+  scheduler/software-rasterizer jitter this infra has and this machine doesn't. Now
+  judges the pattern across the whole loop (few calls near the delay is noise, most
+  of them is the real regression) instead of any single sample.
+- Add a screenshot and the current release entry to the AppStream metainfo.
+- Port `scripts/install.py`'s install/uninstall to Rust
+  (`neuralforge_supervisor::install`; `neuralforge-cli install --appdir DIR` /
+  `uninstall`) -- same hash-tracked, symlink-refusing, atomic-rename installer and
+  `installation.json` record, confirmed to interoperate with `install.py` itself in
+  both directions against a real `build-appimage.sh` output, not just a fixture.
+  Runner discovery (Proton/Wine) moved from the CLI crate into
+  `neuralforge-supervisor` so the GUI can reuse it too.
+- Add the Setup tab: per-file NGX binaries status, a compatibility-tool picker, an
+  "Install for Steam games" button (sourced from `$APPDIR` when running as an
+  AppImage), and a Steam launch-option generator (target exe + DMA-BUF toggle -> the
+  exact `NEURALFORGE_ENABLE=1 ... %command%` string, with a copy button).
+
+## 0.1.55 — 2026-09-15
+
+
+### Phase 1
+
+- Rename the application and GitHub repository to NeuralForge; update binaries,
+  Vulkan identity, private environment variables, paths, desktop metadata and releases.
+- Isolate process ownership and add explicit game targeting; preserve upstream installs.
+- Add safe installation/removal and identity-checked legacy manifest archival.
+- Keep the host-transport GTA baseline; document benchmarks before later optimizations.
+- Validate the host-SHM/full-model path at 2560x1440 on the RTX 5070: swapchain
+  transfer usage is admitted only after capability checks, private device resources
+  are released before device destruction, and present semaphores are image-scoped.
+  The longer Vulkan and synchronization-validation smoke runs completed without
+  validation errors. This is a correctness gate, not a GTA performance claim.
+- Verify the target-process filter on the RTX 5070 with a real Vulkan test process:
+  an `explorer.exe` name is excluded without advancing helper frames, while an
+  explicitly targeted `GTA5_Enhanced.exe` name acquires the lease and advances them.
+- Add pipeline timing telemetry and record the first GTA comparison gate: the upstream
+  layer processed 4,540 frames in 61.5 seconds, while NeuralForge safely passed GTA
+  through because its surface exposes `TRANSFER_DST | COLOR_ATTACHMENT`, not the
+  `TRANSFER_SRC` usage required for legal capture. This is not a performance comparison.
+- Add `scripts/bench.sh`, the repeatable native/upstream/neuralforge benchmark
+  driver Phase 1 still needs run for real; it restarts Steam per mode and waits for a
+  human to confirm the saved route before timing. Investigated the eleven Vulkan
+  validation warnings Phase 1 flagged as outstanding; could not reproduce them on this
+  machine's current validation-layer version under `vkcube`, so left unresolved rather
+  than guessed at.
+
+### Phase 2
+
+- Implement the non-blocking two-slot capture pipeline (`docs/ASYNC_CAPTURE_DESIGN.md`):
+  `run`'s present-hook capture submission no longer blocks on its own GPU fence --
+  only a resize/queue-family change still takes a real (bounded to that rare event)
+  wait. Validated on the RTX 5070 by running the layer crate's own test suite
+  directly against the real driver with Khronos validation and synchronization
+  validation active: 45/45 tests pass, zero synchronization hazards. Add
+  `NEURALFORGE_HELPER_DELAY_MS` (test-only) to simulate a slow helper for this kind
+  of validation. GTA fps has not yet been measured against this change -- `vkcube`
+  cannot exercise the render tap at all (see `docs/HARDWARE_VALIDATION.md`), so this still
+  needs a real session before Phase 2 can be called done.
+
+### Phase 6
+
+- Release Cargo profile: `opt-level = 3`, `lto = "fat"`, `codegen-units = 1`,
+  `strip = true`. Measured on `libneuralforge_layer.so`: 1,774,464 -> 1,184,760 bytes
+  (~33% smaller); full test suite still green.
+- Add `ShmHeader::reset_persisted_settings` (`neuralforge-cli shmctl reset`, and a
+  "Reset…" button on the GUI's Status tab): resets every user-tunable setting to its
+  default while preserving the live helper/layer session -- seq words, status
+  counters, DMA-BUF transport fields, HDR detection, motion-vector validity, the
+  free-text reason/name fields. Upstream shipped a real bug here (PR #16), wiping the
+  live session out from under a running process on every settings reset; a test
+  (`reset_persisted_settings_changes_settings_but_preserves_the_live_session`) guards
+  against reintroducing it.
+- Add named settings profiles: `neuralforge-cli profile <list|save|load|delete>` and a
+  "Save current as" / "Load profile" pair on the GUI's Status tab. Profiles are
+  `[name]` sections of the same `set_<field>=<value>` lines `config.ini` itself
+  stores, kept in their own `profiles.ini` so the flat, upstream-compatible
+  `config.ini` format is untouched. `load` applies to the live session and re-snapshots
+  the full setting set into `config.ini` so it survives a reboot too, the same pattern
+  `reset_persisted_settings` already established.
+- Move `HANDOFF_2026-09-12.md` into `docs/history/` alongside the other pre-rename
+  archival record; trim `README.md` to what it does, requirements, install, usage,
+  status, building and legal -- raw measurement evidence stays in
+  `docs/HARDWARE_VALIDATION.md`.
+
+### Phase 3
+
+- Add device-extension injection (`NeuralForgeInstanceHooks::create_device`,
+  see `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`): adds `VK_EXT_external_memory_host` to the
+  game's own `vkCreateDevice` call when the physical device supports it and the app
+  hasn't already requested it, the precondition Phase 3's zero-copy capture path
+  needs. Falls back to the framework's default, unmodified path whenever there's
+  nothing safe to add, and retries with the original request if the extended one is
+  refused. Validated on the RTX 5070 at both 1280x720 and GTA's real 2560x1440 under
+  Khronos validation + synchronization validation: injection confirmed active, zero
+  hazards, no regression. The actual host-memory import this unblocks is not wired up
+  yet -- this commit only adds the mechanism for getting the extension enabled.
+- Implement the actual zero-copy import (`DirectCapture`, see
+  `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`): a capture's `vkCmdCopyImageToBuffer` now writes
+  straight into the SHM proxy region when the device extension is available, no
+  staging buffer. A new test that checks captured bytes are exactly correct (not just
+  "didn't crash") found two real bugs on its first real-hardware run: a missing
+  `VkExternalMemoryBufferCreateInfo` on the buffer, and a misaligned allocation size --
+  neither caught by this project's local software Vulkan ICD. Both fixed; the test now
+  passes on both, on `lordnikon` under full synchronization validation. GTA fps still
+  unmeasured -- the real payoff of this phase needs a live session.
+- Add the helper-side half of the zero-copy import (`FrameResources::imported_proxy`/
+  `imported_answer`, see `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`): `EvaluateFeature`'s
+  Color/Output now read from and write to the live SHM regions directly when the
+  device extension is available, no staging-buffer copy either direction. Confirmed
+  live on `lordnikon` via a new `trigger_helper_roundtrip` tool that drives a real
+  request/response round trip with no game involved.
+- **Fixed two real, live bugs found only after everything above had already validated
+  clean** (see `docs/HARDWARE_VALIDATION.md`'s own account): real undefined behavior in the
+  device-extension-injection hook (`slice::from_raw_parts` on a pointer that's
+  legitimately null when zero extensions are requested -- every earlier release-mode
+  `vkcube` validation run this session had this same UB and simply never visibly
+  crashed), and a real crash from `vk::ExtExternalMemoryHostFn::load(...)` panicking
+  instead of failing open when a function doesn't resolve. Neither was caught by
+  Vulkan validation layers or `cargo test` -- only `scripts/smoke-test.sh`'s
+  debug-mode UB checker and a live `vkcube` crash surfaced them.
+
+> Historical record: pre-NeuralForge names and deployment instructions below are
+> archival, not current instructions. Do not remove or modify upstream installations.
+> See docs/PHASE1.md for current paths, safety constraints and the benchmark plan.
 
 ## 0.1.30 — 2026-09-11
 

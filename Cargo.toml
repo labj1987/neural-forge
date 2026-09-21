@@ -41,7 +41,7 @@ panic = "abort"
 # any iteration loop. `strip = true` doesn't lose anything a release build needs (this
 # project debugs from `NEURALFORGE_LOG`, not a debugger against a shipped binary), and
 # `libneuralforge_layer.so`'s own size matters more than most since it's a real DLL
-# Steam maps into every targeted game process. See CHANGELOG.md/HARDWARE_VALIDATION.md
+# Steam maps into every targeted game process. See CHANGELOG.md/docs/HARDWARE_VALIDATION.md
 # for the measured size and confirmation this didn't regress any hot-path timing.
 opt-level = 3
 lto = "fat"

@@ -12,7 +12,7 @@
 //! This is the architecture DLSS5VKLayer's own AGPL-3.0 helper (`helper/main.cpp`)
 //! actually uses: one `VkCtx`, created once at helper startup, doing both NGX
 //! evaluation and optical flow -- read directly, not from docs, 2026-09-17 (see
-//! `ATTRIBUTION.md`, `GHOSTING_PLAN.md` step 4). This module is an independent
+//! `ATTRIBUTION.md`, `docs/GHOSTING_PLAN.md` step 4). This module is an independent
 //! reimplementation of that same, generic `VK_NV_optical_flow` usage pattern (session
 //! creation, grid negotiation, execute, NVIDIA's own documented signed-5.5
 //! fixed-point flow-vector decode) -- not a port of their C++.

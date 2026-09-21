@@ -13,18 +13,34 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
-        uses: actions/checkout@v7
+        uses: actions/checkout@v7 # verified: v7 is a published major tag
 
       - name: Set up Rust Toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@v1
         with:
+          toolchain: stable
           targets: x86_64-pc-windows-gnu
+
+      # The release used to build and publish without running a single test. Same
+      # dependencies and checks as ci.yml, before anything gets packaged.
+      - name: Install test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools
+
+      - name: cargo test (native crates)
+        run: cargo test
+
+      - name: Shader sources match committed SPIR-V
+        run: python3 scripts/check_shaders.py
 
       # See build-appimage.sh's own comment: it self-installs its apt dependencies
       # (gtk4/libadwaita dev headers, mingw, zsync) when they're missing, so this
       # step alone is enough on a from-scratch runner -- CARGO_HELPER picks the
       # rustup-managed "stable" toolchain dtolnay/rust-toolchain just set up, matching
-      # PHASE1.md's own documented CI-appropriate invocation.
+      # docs/PHASE1.md's own documented CI-appropriate invocation.
       - name: Build AppImage
         run: sudo -E env "PATH=$PATH" CARGO_HELPER='cargo +stable' bash build-appimage.sh
 

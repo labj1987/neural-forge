@@ -73,7 +73,7 @@ The GUI is `neuralforge`; the CLI is `neuralforge-cli`; the Windows helper is
 prefix use their own `neuralforge` locations. Upstream DLSS5VKLayer can remain
 installed; NeuralForge neither migrates ambiguous upstream state nor changes its
 files, configuration, launch options, helper, or runtime. See
-[PHASE1.md](PHASE1.md) for executable targeting, migration and uninstall.
+[docs/PHASE1.md](docs/PHASE1.md) for executable targeting, migration and uninstall.
 
 ## Usage
 
@@ -99,10 +99,10 @@ Validated on GTA V Enhanced (RTX 5070, driver `615.71.09`): the render tap corre
 captures GTA's own render target while leaving Rockstar Launcher, Social Club, Wine
 Explorer, Xalia and overlays pass-through, and the full model/helper round-trip runs
 end to end. The current synchronous host-SHM transport is a correctness baseline, not
-a performance result — see [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for
-measurements, [RENDER_TAP_DESIGN.md](RENDER_TAP_DESIGN.md) for the capture
-constraints, and [ASYNC_CAPTURE_DESIGN.md](ASYNC_CAPTURE_DESIGN.md) and
-[EXTERNAL_MEMORY_HOST_DESIGN.md](EXTERNAL_MEMORY_HOST_DESIGN.md) for the zero-copy
+a performance result — see [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) for
+measurements, [docs/RENDER_TAP_DESIGN.md](docs/RENDER_TAP_DESIGN.md) for the capture
+constraints, and [docs/ASYNC_CAPTURE_DESIGN.md](docs/ASYNC_CAPTURE_DESIGN.md) and
+[docs/EXTERNAL_MEMORY_HOST_DESIGN.md](docs/EXTERNAL_MEMORY_HOST_DESIGN.md) for the zero-copy
 transport work in progress.
 
 ## Known issues
@@ -118,7 +118,7 @@ affecting a wide range of GPUs (RTX 2080 through 5090) and a wide range of games
 no DLSS/neural rendering involved at all (CS2, Elden Ring, Apex Legends, Path of Exile,
 Crimson Desert), across driver branches NVIDIA has not yet fixed. Check `journalctl -k`
 for a real `Xid` line before assuming NeuralForge caused a crash — see
-[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md)'s 2026-09-16 entry for how this was
+[docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md)'s 2026-09-16 entry for how this was
 diagnosed and what other users report as partial workarounds (driver downgrade to the
 550.x branch, `PROTON_HIDE_NVIDIA_GPU=1 PROTON_ENABLE_NVAPI=1` with Pyroveil, or a
 lower in-game resolution).

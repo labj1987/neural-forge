@@ -65,7 +65,7 @@ pub struct FrameResources {
     staging_ptr: *mut u8,
 
     /// `VK_EXT_external_memory_host` imports of the SHM proxy/answer regions
-    /// (`EXTERNAL_MEMORY_HOST_DESIGN.md`'s helper-side half) -- when present,
+    /// (`docs/EXTERNAL_MEMORY_HOST_DESIGN.md`'s helper-side half) -- when present,
     /// `run_transfer` copies Color directly from `imported_proxy`'s buffer and Output
     /// directly into `imported_answer`'s, skipping the staging-buffer CPU copies
     /// `evaluate` would otherwise do for those two. `None` (the common fallback, e.g.
@@ -114,7 +114,7 @@ fn find_memory_type(props: &vk::PhysicalDeviceMemoryProperties, type_bits: u32, 
 }
 
 /// Mirrors `neuralforge_layer::capture`'s own function of the same name -- see
-/// `EXTERNAL_MEMORY_HOST_DESIGN.md` for why this needs checking on *this* device too,
+/// `docs/EXTERNAL_MEMORY_HOST_DESIGN.md` for why this needs checking on *this* device too,
 /// not assumed from the Linux side's own query.
 fn min_imported_host_pointer_alignment(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Option<vk::DeviceSize> {
     let mut ext_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
@@ -160,7 +160,7 @@ unsafe fn build_imported_buffer(device: &ash::Device, instance: &ash::Instance, 
 
     // A buffer that will be bound to imported memory must declare that handle type up
     // front (VUID-vkBindBufferMemory-memory-02985) -- see
-    // EXTERNAL_MEMORY_HOST_DESIGN.md for where this was first found missing, on the
+    // docs/EXTERNAL_MEMORY_HOST_DESIGN.md for where this was first found missing, on the
     // Linux side, via real-hardware validation.
     let mut external_info = vk::ExternalMemoryBufferCreateInfo::builder().handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
     let buf_info = vk::BufferCreateInfo::builder()

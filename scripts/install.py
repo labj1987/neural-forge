@@ -1,26 +1,24 @@
 #!/usr/bin/env python3
 """Install an extracted NeuralForge AppDir; remove only unchanged tracked files.
 No system package, upstream path, config, runtime file or Wine prefix is removed.
+
+install/uninstall delegate to `neuralforge-cli` (the single implementation, in
+crates/supervisor/src/install.rs); archive-legacy-manifest is handled here.
 """
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
-import shutil
-import tempfile
 
 APP_ID = 'io.github.labj1987.NeuralForge'
 LAYER = 'VK_LAYER_neuralforge_neural'
-
-def digest(path):
-    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', choices=['install', 'uninstall', 'archive-legacy-manifest'])
     parser.add_argument('--appdir', type=Path)
     parser.add_argument('--legacy-manifest', type=Path)
+    parser.add_argument('--cli', type=Path, help='neuralforge-cli to delegate install/uninstall to')
     args = parser.parse_args()
     data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
     root = data / 'neuralforge'
@@ -44,55 +42,28 @@ def main():
         src.unlink()
         print(f'Archived {src} to {archive}; config, runtime and libraries untouched')
         return
-    old = json.loads(record.read_text()) if record.exists() else {}
-    if args.command == 'uninstall':
-        for name, expected in old.items():
-            path = Path(name)
-            if path.is_file() and not path.is_symlink() and digest(path) == expected:
-                path.unlink()
-            else:
-                print(f'Preserved changed/missing file: {path}')
-        if record.exists(): record.unlink()
-        return
-    if args.appdir is None: parser.error('install requires --appdir')
-    usr = args.appdir / 'usr'
-    files = {}
-    for src in (usr / 'lib/neuralforge').rglob('*'):
-        if src.is_file(): files[root / 'lib/neuralforge' / src.relative_to(usr / 'lib/neuralforge')] = src.read_bytes()
-    for binary in ['neuralforge', 'neuralforge-cli']:
-        files[root / 'bin' / binary] = (usr / 'bin' / binary).read_bytes()
-    manifest = json.loads((usr / f'share/vulkan/implicit_layer.d/{LAYER}.json').read_text())
-    assert manifest['layer']['name'] == LAYER
-    manifest['layer']['library_path'] = str(root / 'lib/neuralforge/libneuralforge_layer.so')
-    files[data / f'vulkan/implicit_layer.d/{LAYER}.json'] = json.dumps(manifest, indent=2).encode()
-    desktop = (usr / f'share/applications/{APP_ID}.desktop').read_text()
-    desktop = desktop.replace('Exec=neuralforge', f'Exec="{root / "bin/neuralforge"}"')
-    files[data / f'applications/{APP_ID}.desktop'] = desktop.encode()
-    for sub, name in [('icons/hicolor/scalable/apps', 'neuralforge.svg'), ('metainfo', f'{APP_ID}.appdata.xml')]:
-        files[data / sub / name] = (usr / 'share' / sub / name).read_bytes()
-    # Validate all destinations before writing any file.
-    for path in files:
-        if any(parent.is_symlink() for parent in [path, *path.parents]):
-            parser.error(f'refusing symlink destination: {path}')
-        if path.exists() and old.get(str(path)) != digest(path):
-            parser.error(f'refusing to overwrite unowned or changed file: {path}')
-    new = {}
-    for path, content in files.items():
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Replace the inode atomically: never truncate an executable/library
-        # that an already-running GUI, game or Wine helper may have mapped.
-        fd, staged = tempfile.mkstemp(prefix='.neuralforge-', dir=path.parent)
-        try:
-            with os.fdopen(fd, 'wb') as output:
-                output.write(content)
-                output.flush()
-                os.fsync(output.fileno())
-            os.chmod(staged, 0o755 if path.parent == root / 'bin' else 0o644)
-            os.replace(staged, path)
-        finally:
-            if os.path.exists(staged): os.unlink(staged)
-        new[str(path)] = digest(path)
-    record.write_text(json.dumps(new, indent=2) + '\n')
-    print(f'Installed NeuralForge. CLI: {root / "bin/neuralforge-cli"}')
+    # `install` and `uninstall` are implemented once, in Rust
+    # (crates/supervisor/src/install.rs), and reached through `neuralforge-cli`. This
+    # script used to carry a second copy of the same on-disk format; CI only exercised
+    # that copy, so the one users actually run (the GUI's Setup tab) could drift.
+    cli = find_cli(args)
+    if args.command == 'install' and args.appdir is None:
+        parser.error('install requires --appdir')
+    command = [str(cli), args.command] + (['--appdir', str(args.appdir)] if args.command == 'install' else [])
+    os.execv(str(cli), command)
+
+def find_cli(args):
+    """The neuralforge-cli to delegate to: --cli, $NEURALFORGE_CLI, the AppDir being
+    installed, an already-installed copy, then a local cargo build."""
+    repo = Path(__file__).resolve().parent.parent
+    data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
+    candidates = [args.cli, os.environ.get('NEURALFORGE_CLI') and Path(os.environ['NEURALFORGE_CLI'])]
+    if args.appdir is not None:
+        candidates.append(args.appdir / 'usr/bin/neuralforge-cli')
+    candidates += [data / 'neuralforge/bin/neuralforge-cli', repo / 'target/release/neuralforge-cli', repo / 'target/debug/neuralforge-cli']
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return Path(candidate)
+    raise SystemExit('neuralforge-cli not found; build it (cargo build -p neuralforge-cli) or pass --cli')
 
 if __name__ == '__main__': main()

@@ -1,6 +1,6 @@
 //! Native Linux NGX feasibility probe -- the first real experiment for the "native
-//! Linux NGX helper" idea `DMABUF_TRANSPORT_DESIGN.md` mentioned as a longer-term
-//! direction. See `NATIVE_NGX_HELPER_DESIGN.md` for the full writeup this probe's
+//! Linux NGX helper" idea `docs/DMABUF_TRANSPORT_DESIGN.md` mentioned as a longer-term
+//! direction. See `docs/NATIVE_NGX_HELPER_DESIGN.md` for the full writeup this probe's
 //! result feeds into; this comment covers only what the probe itself does.
 //!
 //! NVIDIA's driver ships a genuine native Linux ELF library implementing the same

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # Repeatable GTA V Enhanced benchmark for the matched native/upstream/neuralforge
-# comparison required by PHASE1.md ("Preserved baseline and benchmark gate", item 2).
+# comparison required by docs/PHASE1.md ("Preserved baseline and benchmark gate", item 2).
 # Run this ON THE TARGET MACHINE (lordnikon), not the dev box that builds the layer --
 # it needs the real Steam client, the real GPU, and the real game.
 #
 # This script cannot drive the car. It launches Steam with the right mode's
 # environment, waits for the real game process, then STOPS AND WAITS for you to
-# confirm you have reached the saved route/scene (see HARDWARE_VALIDATION.md for
+# confirm you have reached the saved route/scene (see docs/HARDWARE_VALIDATION.md for
 # which one) before it starts the timed sample. Only the sample window itself needs
 # to be unattended.
 #
@@ -16,7 +16,7 @@
 # on the game window -- this repo does not control MangoHud, so it drives the exact
 # hotkey already configured in ~/.config/MangoHud/MangoHud.conf rather than guessing
 # at an autostart config key). For upstream/neuralforge modes, neuralforge-cli must
-# already be on PATH (see PHASE1.md's install step) for the layer-side telemetry
+# already be on PATH (see docs/PHASE1.md's install step) for the layer-side telemetry
 # sample; native mode skips that half.
 #
 # Output: scripts/../bench-out/<mode>-<timestamp>/ containing raw samples and a
@@ -36,7 +36,7 @@ case "$MODE" in
         LAUNCH_ENV=(env -u NEURALFORGE_ENABLE -u VKLayer_DLSS5 NEURALFORGE_DISABLE=1)
         ;;
     upstream)
-        # PHASE1.md's preserved baseline. Do not change this launch option.
+        # docs/PHASE1.md's preserved baseline. Do not change this launch option.
         LAUNCH_ENV=(env -u NEURALFORGE_ENABLE VKLayer_DLSS5=1 DLSSNR_DMABUF=0)
         ;;
     neuralforge)
@@ -57,7 +57,7 @@ echo "==> mode=$MODE duration=${DURATION}s out=$OUT_DIR"
 # Steam only applies a launch-time environment to processes it spawns AFTER it itself
 # was started with that environment -- re-exporting vars in this shell does nothing to
 # an already-running Steam client (confirmed the hard way in the 2026-09-14 session;
-# see HARDWARE_VALIDATION.md's "GTA comparison gate"). So always restart Steam fresh
+# see docs/HARDWARE_VALIDATION.md's "GTA comparison gate"). So always restart Steam fresh
 # under the mode's environment rather than assuming inheritance.
 echo "==> stopping any running Steam client"
 steam -shutdown >/dev/null 2>&1 || true
@@ -95,7 +95,7 @@ echo "==> $GAME_EXE is up (pid $GAME_PID)"
 
 echo
 echo "==> reach the saved benchmark route now, then press Enter to start the ${DURATION}s sample"
-echo "    (see HARDWARE_VALIDATION.md for which saved scene/route this run must match)"
+echo "    (see docs/HARDWARE_VALIDATION.md for which saved scene/route this run must match)"
 read -r _
 
 WINDOW_ID="$(xdotool search --name "Grand Theft Auto" | head -1 || true)"

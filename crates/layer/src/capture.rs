@@ -95,7 +95,7 @@ impl CaptureBuffer {
 /// capture's own. [`submit_pipeline_capture`] blits the full-resolution `capture_image`
 /// down into `image` -- a hardware resize unit (`vkCmdBlitImage`, `VK_FILTER_LINEAR`),
 /// sub-millisecond, unlike the CPU resample this replaces (measured 315-546ms at GTA's
-/// resolution on 2026-09-17, unusable on the present thread; see `GHOSTING_PLAN.md`
+/// resolution on 2026-09-17, unusable on the present thread; see `docs/GHOSTING_PLAN.md`
 /// step 1). `image` then copies into `buffer`, which is what actually crosses SHM as
 /// the proxy -- smaller proxy, smaller `DLSSNR.Width`/`Height` at `CreateFeature`,
 /// faster model evaluation, the whole point of `working_scale`.
@@ -545,7 +545,7 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
 /// detected (and the stale pair discarded) rather than composited against a
 /// mismatched frame size.
 ///
-/// Protocol v3 (`PROTOCOL_V3_DESIGN.md`) gives the wire two independent slots, so
+/// Protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`) gives the wire two independent slots, so
 /// `run` carries `[Inflight; 2]`, one per slot -- each slot's own in-flight capture is
 /// completely independent of the other's. What *isn't* per-slot (moved out to `run`'s
 /// own parameters instead, alongside `last_answer`): the single currently-presented
@@ -665,7 +665,7 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 /// ignores `model` and always sends the full-resolution proxy, same as before
 /// `working_scale` existed -- that path is unverified to even be live on real hardware
 /// (alignment checks fail it back to `CapturePipeline` on every device tested so far,
-/// see `HARDWARE_VALIDATION.md`), so it is not worth the same surgery until it is.
+/// see `docs/HARDWARE_VALIDATION.md`), so it is not worth the same surgery until it is.
 /// `original_scratch` is always the full-resolution capture regardless of `model` --
 /// callers still swap it into `inflight[slot].original` unchanged; `model_scratch`
 /// receives the scaled bytes only when `model` was requested and actually available
@@ -712,7 +712,7 @@ fn poll_or_submit_capture(
         // `neuralforge_protocol::mapping::Mapping::header`'s own doc comment on the
         // equivalent GUI/CLI mapping); nothing else writes to it except through
         // `ShmClient::write_proxy`, which this branch never calls, and slot 0's/slot
-        // 1's regions are disjoint (`PROTOCOL_V3_DESIGN.md`), so the other slot's own
+        // 1's regions are disjoint (`docs/PROTOCOL_V3_DESIGN.md`), so the other slot's own
         // `DirectCapture` never touches these same bytes.
         if !unsafe {
             ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, capacity as vk::DeviceSize)
@@ -982,7 +982,7 @@ pub unsafe fn run(
     // itself cannot be scratched at all, which is the same condition as before.
     let model_request = model_scratch_format(proxy_format, bgr_order).map(|format| (model_width, model_height, format));
 
-    // Protocol v3 (`PROTOCOL_V3_DESIGN.md`): the same poll-then-maybe-submit sequence
+    // Protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`): the same poll-then-maybe-submit sequence
     // as before, just run once per wire slot instead of once total. Each slot is
     // completely independent -- slot 1 submitting a new capture never waits on slot
     // 0's own pending request, and vice versa, which is the entire point of having
@@ -1026,7 +1026,7 @@ pub unsafe fn run(
             }
         }
 
-        // Non-blocking capture (`ASYNC_CAPTURE_DESIGN.md`, `EXTERNAL_MEMORY_HOST_DESIGN.md`):
+        // Non-blocking capture (`docs/ASYNC_CAPTURE_DESIGN.md`, `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`):
         // poll whatever capture is already in flight for this slot -- never a queue/
         // fence wait -- before deciding whether to submit a new one on it. Same
         // per-slot wire-protocol constraint as before: only start a new round trip on
@@ -1104,7 +1104,7 @@ pub unsafe fn run(
     // AGPL-3.0 source documents trying and measuring as a dead end. It now
     // re-anchors to the current frame with a plain ratio-transfer, no suppression,
     // matching upstream's own resolve function directly -- see
-    // `ATTRIBUTION.md`/`GHOSTING_PLAN.md`. The real fix for genuine motion-driven
+    // `ATTRIBUTION.md`/`docs/GHOSTING_PLAN.md`. The real fix for genuine motion-driven
     // staleness is still a downscaled-proxy-plus-motion-vector pipeline (this
     // crate's own doc comment on motion vectors being disabled), not attempted here.
     if last_answer.is_empty() {
@@ -1164,7 +1164,7 @@ pub unsafe fn run(
 /// Records "copy `image` (in `initial_layout`) into `buffer`, restore `initial_layout`"
 /// into `cmd` -- reset, begin, both barriers, the copy, end. Does not submit or wait;
 /// [`submit_pipeline_capture`] (the only caller now that the old fully-synchronous
-/// single-shot capture path is gone -- see `ASYNC_CAPTURE_DESIGN.md`) does that
+/// single-shot capture path is gone -- see `docs/ASYNC_CAPTURE_DESIGN.md`) does that
 /// itself, deliberately without waiting. Pulled out on its own so a future second
 /// caller shares the exact same recorded commands rather than a copy that could
 /// drift apart -- not, today, because there already is one.
@@ -1358,7 +1358,7 @@ fn record_capture_commands(
     unsafe { device.end_command_buffer(cmd) }.is_ok()
 }
 
-/// Phase 2 (`ASYNC_CAPTURE_DESIGN.md`): two [`CaptureBuffer`] slots so a new capture
+/// Phase 2 (`docs/ASYNC_CAPTURE_DESIGN.md`): two [`CaptureBuffer`] slots so a new capture
 /// submission never has to wait on the previous one's fence first. `run` only ever
 /// calls [`poll_pipeline_capture`] (non-blocking: did an earlier submission finish?)
 /// and [`submit_pipeline_capture`] (non-blocking: start a new one if a slot is free)
@@ -1500,7 +1500,7 @@ fn build_pipeline(
 /// slot's fence reported a real error (left `pending` forever rather than guessed
 /// safe to reuse).
 ///
-/// Indexed by `slot`, not pooled: protocol v3 (`PROTOCOL_V3_DESIGN.md`) dedicates
+/// Indexed by `slot`, not pooled: protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`) dedicates
 /// `pipeline.slots[0]` to wire slot 0's captures and `pipeline.slots[1]` to wire slot
 /// 1's, one-to-one, rather than handing either wire slot whichever GPU buffer happens
 /// to be free. That mapping is sound precisely because a caller only ever submits a
@@ -1692,7 +1692,7 @@ fn min_imported_host_pointer_alignment(instance: &ash::Instance, physical_device
     (ext_props.min_imported_host_pointer_alignment > 0).then_some(ext_props.min_imported_host_pointer_alignment)
 }
 
-/// The Phase 3 zero-copy capture path (`EXTERNAL_MEMORY_HOST_DESIGN.md`): a single
+/// The Phase 3 zero-copy capture path (`docs/EXTERNAL_MEMORY_HOST_DESIGN.md`): a single
 /// [`CaptureBuffer`] whose device memory is *imported* directly from the live SHM
 /// proxy region (`ShmClient::proxy_region`), so `vkCmdCopyImageToBuffer` writes
 /// straight into shared memory -- no staging buffer, no CPU copy on the way there.
@@ -1928,7 +1928,7 @@ unsafe fn build_imported_capture_buffer(
     // VUID-vkBindBufferMemory-memory-02985 requires the external handle type used at
     // import time to already be set in the buffer's own `VkExternalMemoryBufferCreateInfo`
     // at creation -- found live, on real hardware, via `VK_LAYER_VALIDATE_SYNC=1`
-    // (see EXTERNAL_MEMORY_HOST_DESIGN.md), not caught by the local software ICD this
+    // (see docs/EXTERNAL_MEMORY_HOST_DESIGN.md), not caught by the local software ICD this
     // crate's tests otherwise run against.
     let mut external_info = vk::ExternalMemoryBufferCreateInfo::builder().handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
     let buf_info = vk::BufferCreateInfo::builder()
@@ -2661,7 +2661,7 @@ mod tests {
         (image, memory)
     }
 
-    /// The actual point of `EXTERNAL_MEMORY_HOST_DESIGN.md`, exercised end to end
+    /// The actual point of `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`, exercised end to end
     /// against a real (if software) device: a capture submitted against a
     /// `DirectCapture` slot must land its bytes directly in the imported host
     /// pointer -- not a staging buffer, not something that merely runs without
@@ -2960,7 +2960,7 @@ mod tests {
         // software) Vulkan device: the proxy that actually reaches the wire is at the
         // scaled resolution (not the swapchain's own), and the whole pipeline still
         // reaches a real composited answer without crashing, hanging, or leaking --
-        // the objective checkpoint `GHOSTING_PLAN.md` step 1 calls for before this
+        // the objective checkpoint `docs/GHOSTING_PLAN.md` step 1 calls for before this
         // lands on real hardware.
         let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
             eprintln!("working_scale_sends_a_genuinely_smaller_proxy_and_still_composites: no Vulkan loader/ICD, skipping");
@@ -3093,7 +3093,7 @@ mod tests {
     /// Not an assertion test and not a CI test: it needs a real GPU (a software ICD
     /// would report meaningless numbers) and is a benchmark, so it only runs when
     /// `NEURALFORGE_BENCH` is set in the environment, and only prints. The established
-    /// way to use it (see `HARDWARE_VALIDATION.md`) is to build the release test binary,
+    /// way to use it (see `docs/HARDWARE_VALIDATION.md`) is to build the release test binary,
     /// copy it to `lordnikon`, and run it there with `NEURALFORGE_BENCH=1
     /// <bin> capture_hot_path_cost_per_present --nocapture --exact`.
     ///

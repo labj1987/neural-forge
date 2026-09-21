@@ -242,7 +242,7 @@ impl ShmMapping {
     /// helper owns each request from observing that slot's `seq_req` until publishing
     /// its `seq_resp`, so it can write the answer directly into shared memory instead
     /// of copying through a second process-local frame buffer. Protocol v3
-    /// (`PROTOCOL_V3_DESIGN.md`) gives slot 0 and slot 1 disjoint regions, so this is
+    /// (`docs/PROTOCOL_V3_DESIGN.md`) gives slot 0 and slot 1 disjoint regions, so this is
     /// still sound when the helper is processing both slots, one after another.
     ///
     /// # Safety

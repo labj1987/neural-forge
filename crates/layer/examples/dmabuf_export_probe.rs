@@ -1,10 +1,10 @@
-//! Phase 4 feasibility probe, reverse direction (`DMABUF_TRANSPORT_DESIGN.md`) --
+//! Phase 4 feasibility probe, reverse direction (`docs/DMABUF_TRANSPORT_DESIGN.md`) --
 //! the native-Linux half. Pairs with `crates/helper/examples/dmabuf_import_probe.rs`.
 //!
 //! The forward direction (a Wine-hosted `vkGetMemoryWin32HandleKHR` handle -> a real
 //! Unix fd via `wine_server_handle_to_fd`) failed with `STATUS_OBJECT_TYPE_MISMATCH`
 //! on real hardware -- see `crates/helper/examples/dmabuf_probe.rs`'s own doc comment
-//! and `DMABUF_TRANSPORT_DESIGN.md`. This is the untried reverse direction from that
+//! and `docs/DMABUF_TRANSPORT_DESIGN.md`. This is the untried reverse direction from that
 //! doc's "not yet tried" section: the *layer* (full, native `VK_EXT_external_memory_dma_buf`
 //! access) creates a real dma-buf fd and holds it open; a separate probe on the
 //! helper side opens `Z:\proc\<this pid>\fd\<this fd>` via `CreateFileW` (Wine already
@@ -22,7 +22,7 @@
 //! `/dmabuf:` -- dma-buf fds are anon-inode-backed (like `epoll`/`eventfd`), and Linux
 //! does not support re-opening an anon-inode fd via `/proc/<pid>/fd/<N>`; only
 //! `dup()` or `SCM_RIGHTS` fd-passing over a Unix socket can hand one to another
-//! process. See `DMABUF_TRANSPORT_DESIGN.md` for the full writeup.
+//! process. See `docs/DMABUF_TRANSPORT_DESIGN.md` for the full writeup.
 
 use ash::vk;
 
@@ -93,7 +93,7 @@ fn main() {
 
     // Resolved manually, not via `ash::extensions::khr::ExternalMemoryFd::new` (whose
     // `KhrExternalMemoryFdFn::load` panics on a resolution failure instead of
-    // returning `None` -- the exact class of bug `EXTERNAL_MEMORY_HOST_DESIGN.md`
+    // returning `None` -- the exact class of bug `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`
     // already found and fixed for a different extension's `::load()` helper).
     let get_fd_name = c"vkGetMemoryFdKHR";
     // SAFETY: `instance` is valid and live; the name is a real, NUL-terminated function name.

@@ -16,7 +16,7 @@
 //! Host shared-memory capture and GPU composition are implemented. Cross-process
 //! ownership and executable filtering guard the channel; the swapchain size filter
 //! additionally excludes small overlays. DMA-BUF remains experimental. See
-//! HARDWARE_VALIDATION.md for presentation-validation failures still under review.
+//! docs/HARDWARE_VALIDATION.md for presentation-validation failures still under review.
 
 mod capture;
 mod optical_flow;
@@ -39,7 +39,7 @@ use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 
 use ash::vk;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use vulkan_layer::{
     auto_globalhooksinfo_impl, declare_introspection_queries, Global, GlobalHooks, InstanceHooks, InstanceInfo,
     Layer, LayerManifest, LayerResult, LayerVulkanCommand, VkLayerDeviceLink, VkLayerInstanceLink,
@@ -68,7 +68,7 @@ pub const LAYER_NAME: &str = "VK_LAYER_neuralforge_neural";
 /// options — checked once and cached, same as upstream, since it can't change for the
 /// life of the process.
 pub(crate) fn layer_enabled() -> bool {
-    static ENABLED: Lazy<bool> = Lazy::new(|| {
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
         env_flag("NEURALFORGE_ENABLE") && !env_flag("NEURALFORGE_DISABLE")
     });
     *ENABLED
@@ -129,7 +129,7 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
 }
 
 /// The one device extension this layer ever asks a game's own device creation to add,
-/// for Phase 3's zero-copy capture path (`ASYNC_CAPTURE_DESIGN.md`): importing the SHM
+/// for Phase 3's zero-copy capture path (`docs/ASYNC_CAPTURE_DESIGN.md`): importing the SHM
 /// proxy region directly as device memory needs it on whichever device the layer's own
 /// capture commands submit against -- the game's, not a private one, since the image
 /// being copied is the game's own swapchain/render-tap source.
@@ -276,7 +276,7 @@ impl Layer for NeuralForgeLayer {
     type DeviceInfoContainer = NeuralForgeDeviceInfo;
 
     fn global_instance() -> impl Deref<Target = Global<Self>> + 'static {
-        static GLOBAL: Lazy<Global<NeuralForgeLayer>> = Lazy::new(Default::default);
+        static GLOBAL: LazyLock<Global<NeuralForgeLayer>> = LazyLock::new(Default::default);
         &*GLOBAL
     }
 

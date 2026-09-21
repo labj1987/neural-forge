@@ -1,4 +1,4 @@
-//! Phase 4 feasibility probe (`DMABUF_TRANSPORT_DESIGN.md`) -- not production code.
+//! Phase 4 feasibility probe (`docs/DMABUF_TRANSPORT_DESIGN.md`) -- not production code.
 //!
 //! **Result, real hardware, `lordnikon`, 2026-09-15: this specific mechanism does not
 //! work.** `wine_server_handle_to_fd` (called against a real `vkGetMemoryWin32HandleKHR`
@@ -6,7 +6,7 @@
 //! returns `STATUS_OBJECT_TYPE_MISMATCH` (`0xC0000024`) -- a real, well-formed NTSTATUS,
 //! not a crash or a guessed-wrong-signature fault (`guard::guarded` reported `seh=0`).
 //! Read literally: the object behind this handle is not a type wineserver's generic
-//! fd/handle bridge knows how to unwrap. See `DMABUF_TRANSPORT_DESIGN.md` for the full
+//! fd/handle bridge knows how to unwrap. See `docs/DMABUF_TRANSPORT_DESIGN.md` for the full
 //! writeup and why this most likely means NVIDIA's own `OPAQUE_WIN32` external-memory
 //! implementation for a Wine guest does not route through the kernel `dma_buf`
 //! subsystem at all (a driver-private shared-surface token instead), not a fixable
@@ -169,7 +169,7 @@ fn main() {
 
     // Resolved manually, not via `ash::extensions::khr::ExternalMemoryWin32::new`
     // (whose `KhrExternalMemoryWin32Fn::load` panics on a resolution failure instead
-    // of returning `None` -- the exact class of bug `EXTERNAL_MEMORY_HOST_DESIGN.md`
+    // of returning `None` -- the exact class of bug `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`
     // already found and fixed for a different extension's `::load()` helper).
     let get_win32_handle_name = c"vkGetMemoryWin32HandleKHR";
     // SAFETY: `entry`/`instance` are valid and live; the name is a real, NUL-terminated function name.
