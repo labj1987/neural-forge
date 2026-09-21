@@ -229,6 +229,13 @@ impl ShmClient {
         }
     }
 
+    /// The raster the helper says its last slot-0 answer was for (`None` before any).
+    pub fn answered_dims(&self) -> Option<(u32, u32)> {
+        let hdr = self.header()?;
+        let dims = (hdr.answered_w.load(Ordering::Relaxed), hdr.answered_h.load(Ordering::Relaxed));
+        (dims != (0, 0)).then_some(dims)
+    }
+
     /// Folds a new white-meter reading into the published, smoothed value.
     pub fn publish_measured_white(&self, reading: f32) {
         let Some(hdr) = self.header() else { return };

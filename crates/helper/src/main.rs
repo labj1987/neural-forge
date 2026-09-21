@@ -473,6 +473,13 @@ fn process_request(
         answer.copy_from_slice(proxy);
     }
     hdr.seq_ok.store(seq_req, Ordering::Relaxed);
+    // The raster this answer is for, echoed before `seq_resp` so the layer can refuse an answer
+    // for a different size (another swapchain's request, or one from before a resize) instead of
+    // reading the wrong number of bytes. Slot 0 only: slot 1 has no such field.
+    if slot == 0 {
+        hdr.answered_w.store(if dims_ok { width } else { 0 }, Ordering::Relaxed);
+        hdr.answered_h.store(if dims_ok { height } else { 0 }, Ordering::Relaxed);
+    }
     if !helper_delay.is_zero() {
         std::thread::sleep(helper_delay);
     }

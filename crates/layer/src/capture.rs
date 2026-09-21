@@ -1380,7 +1380,15 @@ pub unsafe fn run(
         inflight[SLOT].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
         loop {
             match shm.poll_async_request(SLOT) {
-                Some(true) => break,
+                Some(true) => {
+                    // Only this frame's own answer: the helper echoes the raster it answered.
+                    // A mismatch is someone else's (or a stale) answer; present untouched.
+                    if shm.answered_dims() != Some((sent_w, sent_h)) {
+                        shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                        return None;
+                    }
+                    break;
+                }
                 Some(false) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_micros(100)),
                 // Out of time, or the helper is gone: this frame goes out untouched.
                 _ => {
@@ -3114,6 +3122,8 @@ mod tests {
                 if req != 0 && req != last_seen {
                     last_seen = req;
                     std::thread::sleep(HELPER_DELAY);
+                    hdr.answered_w.store(hdr.width.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    hdr.answered_h.store(hdr.height.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
                     hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
                 }
                 std::thread::sleep(Duration::from_millis(2));
