@@ -830,6 +830,12 @@ fn poll_or_submit_capture(
     }
 }
 
+thread_local! {
+    /// The synchronous present's stage timings for the frame being composed (capture, wait for
+    /// the answer, read-back), consumed by the timing log after the compose.
+    static SYNC_TIMING: std::cell::Cell<Option<(std::time::Duration, std::time::Duration, std::time::Duration)>> = const { std::cell::Cell::new(None) };
+}
+
 /// The longest a present waits for its own frame's answer before going out untouched.
 const SYNC_BUDGET: std::time::Duration = std::time::Duration::from_millis(250);
 
@@ -1233,6 +1239,7 @@ pub unsafe fn run(
             bgr_order: u32::from(bgr_order),
             reversible_mode: settings.reversible_mode,
         };
+        let t_start = std::time::Instant::now();
         let mut sent = None;
         loop {
             if let Some(dims) = poll_or_submit_capture(
@@ -1252,6 +1259,7 @@ pub unsafe fn run(
             shm.publish_frame_timing(pipeline_start.elapsed(), false);
             return None;
         };
+        let t_captured = std::time::Instant::now();
         shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
         if !shm.begin_async_request(SLOT) {
             shm.publish_frame_timing(pipeline_start.elapsed(), false);
@@ -1273,14 +1281,15 @@ pub unsafe fn run(
         if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
             return None;
         }
+        let t_answered = std::time::Instant::now();
         let answer_bytes = (u64::from(sent_w) * u64::from(sent_h) * bytes_per_pixel) as usize;
-        answer_scratch.resize(answer_bytes, 0);
-        shm.read_answer(SLOT, answer_scratch);
-        raw_answer_base.clear();
-        raw_answer_base.extend_from_slice(original_scratch);
-        last_answer.clear();
-        last_answer.extend_from_slice(answer_scratch);
+        // Swapped rather than copied: these are full frames (15 MB at 1440p), and nothing reads
+        // the scratch buffers again before the next capture refills them.
+        last_answer.resize(answer_bytes, 0);
+        shm.read_answer(SLOT, last_answer);
+        std::mem::swap(raw_answer_base, original_scratch);
         *last_answer_dims = (sent_w, sent_h);
+        SYNC_TIMING.with(|t| t.set(Some((t_captured - t_start, t_answered - t_captured, t_answered.elapsed()))));
         *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
     }
 
@@ -1323,6 +1332,18 @@ pub unsafe fn run(
                 proxy_encoded,
             },
         ) {
+            if let Some((capture, answer, _)) = SYNC_TIMING.with(|t| t.take()) {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n % 300 == 5 {
+                    let total = pipeline_start.elapsed();
+                    crate::log!(
+                        "[sync] {width}x{height}: total={total:.1?} capture={capture:.1?} wait_answer={answer:.1?} rest(copy+compose)={:.1?}",
+                        total.saturating_sub(capture + answer)
+                    );
+                    crate::logging::flush();
+                }
+            }
             shm.publish_frame_timing(pipeline_start.elapsed(), true);
             return Some(sem);
         }
