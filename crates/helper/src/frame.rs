@@ -231,8 +231,13 @@ fn create_image(
     let image = unsafe { device.create_image(&info, None) }.ok()?;
     // SAFETY: `image` was just created and has no memory bound yet.
     let reqs = unsafe { device.get_image_memory_requirements(image) };
-    let type_index = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-        .or_else(|| find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))?;
+    let Some(type_index) = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+        .or_else(|| find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+    else {
+        // SAFETY: `image` has no memory bound and is not referenced anywhere else.
+        unsafe { device.destroy_image(image, None) };
+        return None;
+    };
     let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
     // SAFETY: `alloc` is valid; `type_index` satisfies `reqs`.
     let memory = unsafe { device.allocate_memory(&alloc, None) }.ok().or_else(|| {
@@ -277,6 +282,69 @@ fn create_image(
     Some((image, view, memory))
 }
 
+/// Owns every Vulkan object `FrameResources::new` has created so far, so an early `?`
+/// return frees them instead of leaking. `new` is retried on every capture tick while
+/// it keeps failing (typically under memory pressure), so a leak on the failure path
+/// compounds into exactly the VRAM exhaustion that caused the failure. `disarm` once
+/// the fully built value takes ownership.
+struct PartialResources<'a> {
+    device: &'a ash::Device,
+    undo: Vec<Undo>,
+}
+
+enum Undo {
+    Image(vk::Image),
+    View(vk::ImageView),
+    Memory(vk::DeviceMemory),
+    Buffer(vk::Buffer),
+    Pool(vk::CommandPool),
+    Fence(vk::Fence),
+}
+
+impl<'a> PartialResources<'a> {
+    fn new(device: &'a ash::Device) -> Self {
+        Self { device, undo: Vec::new() }
+    }
+
+    /// Takes ownership of an `(image, view, memory)` triple from `create_image`.
+    fn track_image(&mut self, (image, view, memory): (vk::Image, vk::ImageView, vk::DeviceMemory)) -> (vk::Image, vk::ImageView, vk::DeviceMemory) {
+        // Pushed memory-first so the reverse-order drop destroys view, image, memory.
+        self.undo.push(Undo::Memory(memory));
+        self.undo.push(Undo::Image(image));
+        self.undo.push(Undo::View(view));
+        (image, view, memory)
+    }
+
+    fn track(&mut self, item: Undo) {
+        self.undo.push(item);
+    }
+
+    /// Ownership moves to the finished `FrameResources`; nothing is freed on drop.
+    fn disarm(mut self) {
+        self.undo.clear();
+    }
+}
+
+impl Drop for PartialResources<'_> {
+    fn drop(&mut self) {
+        // SAFETY: each object was created on `device` by `new`, has never been
+        // submitted to a queue (the only work `new` does is creation and binding), and
+        // is destroyed exactly once, newest first.
+        unsafe {
+            for item in self.undo.drain(..).rev() {
+                match item {
+                    Undo::Image(h) => self.device.destroy_image(h, None),
+                    Undo::View(h) => self.device.destroy_image_view(h, None),
+                    Undo::Memory(h) => self.device.free_memory(h, None),
+                    Undo::Buffer(h) => self.device.destroy_buffer(h, None),
+                    Undo::Pool(h) => self.device.destroy_command_pool(h, None),
+                    Undo::Fence(h) => self.device.destroy_fence(h, None),
+                }
+            }
+        }
+    }
+}
+
 impl FrameResources {
     /// Builds every resource `EvaluateFeature` needs for a `width`x`height` frame.
     /// `None` on any failure -- callers treat that as "skip evaluate this frame",
@@ -296,44 +364,46 @@ impl FrameResources {
         let color_format = color_format(proxy_format)?;
         // SAFETY: `physical_device` is the device everything below is built against.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let mut partial = PartialResources::new(device);
 
-        let (color_image, color_view, color_memory) = create_image(
+        let (color_image, color_view, color_memory) = partial.track_image(create_image(
             device,
             &mem_props,
             width,
             height,
             color_format,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-        )?;
-        let (output_image, output_view, output_memory) = create_image(
+        )?);
+        let (output_image, output_view, output_memory) = partial.track_image(create_image(
             device,
             &mem_props,
             width,
             height,
             color_format,
             vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
-        )?;
-        let (mvec_image, mvec_view, mvec_memory) = create_image(
+        )?);
+        let (mvec_image, mvec_view, mvec_memory) = partial.track_image(create_image(
             device,
             &mem_props,
             width,
             height,
             MVEC_FORMAT,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-        )?;
-        let (depth_image, depth_view, depth_memory) = create_image(
+        )?);
+        let (depth_image, depth_view, depth_memory) = partial.track_image(create_image(
             device,
             &mem_props,
             width,
             height,
             DEPTH_FORMAT,
             vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
-        )?;
+        )?);
 
         let pool_info =
             vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         // SAFETY: `pool_info` is valid.
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.ok()?;
+        partial.track(Undo::Pool(pool));
         let alloc_info =
             vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         // SAFETY: `pool` was just created above.
@@ -341,6 +411,7 @@ impl FrameResources {
         let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
         // SAFETY: `fence_info` is valid.
         let fence = unsafe { device.create_fence(&fence_info, None) }.ok()?;
+        partial.track(Undo::Fence(fence));
 
         // Upload holds Color plus R16G16_SFLOAT motion (4 bytes/pixel each).
         let staging_size = u64::from(width) * u64::from(height) * 8;
@@ -350,6 +421,7 @@ impl FrameResources {
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `buf_info` is valid.
         let staging_buffer = unsafe { device.create_buffer(&buf_info, None) }.ok()?;
+        partial.track(Undo::Buffer(staging_buffer));
         // SAFETY: `staging_buffer` was just created, not yet bound to memory.
         let reqs = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
         let type_index = find_memory_type(
@@ -360,6 +432,7 @@ impl FrameResources {
         let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
         // SAFETY: `alloc` is valid; `type_index` satisfies `reqs`.
         let staging_memory = unsafe { device.allocate_memory(&alloc, None) }.ok()?;
+        partial.track(Undo::Memory(staging_memory));
         // SAFETY: `staging_buffer`/`staging_memory` were each just created, sized/typed
         // for each other.
         unsafe { device.bind_buffer_memory(staging_buffer, staging_memory, 0) }.ok()?;
@@ -398,6 +471,9 @@ impl FrameResources {
             imported_answer.is_some()
         );
 
+        // Nothing below can fail: the imports above already clean up after themselves
+        // and report `None` for "not available".
+        partial.disarm();
         Some(Self {
             color_format,
             width,

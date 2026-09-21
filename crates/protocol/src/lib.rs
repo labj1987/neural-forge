@@ -68,6 +68,22 @@ pub const MAX_H: u32 = 4320;
 /// SDR session never commits the second half.
 pub const MAX_FRAME: usize = MAX_W as usize * MAX_H as usize * 8;
 
+/// Whether a `(width, height, proxy_format)` triple read out of shared memory is one
+/// the helper may size image resources from. The mapping is written by another
+/// process, so none of it is trusted: dimensions must be non-zero, within
+/// `MAX_W`/`MAX_H`, and even (the proxy's chroma-friendly grid), and the format one the
+/// protocol defines.
+pub fn frame_dims_valid(width: u32, height: u32, proxy_format: u32) -> bool {
+    use enums::proxy_format::{BGRA8, RGBA16F, RGBA8};
+    width != 0
+        && height != 0
+        && width <= MAX_W
+        && height <= MAX_H
+        && width % 2 == 0
+        && height % 2 == 0
+        && matches!(proxy_format, RGBA8 | RGBA16F | BGRA8)
+}
+
 pub const HEADER_BYTES: usize = 65536;
 
 /// The ceiling on how many times the model runs over one frame, and what the slider
@@ -126,6 +142,21 @@ pub const fn answer_offset_slot(slot: usize) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn frame_dims_validation_rejects_hostile_headers() {
+        use super::*;
+        assert!(frame_dims_valid(1920, 1080, enums::proxy_format::RGBA8));
+        assert!(frame_dims_valid(MAX_W, MAX_H, enums::proxy_format::RGBA16F));
+        assert!(!frame_dims_valid(0, 1080, enums::proxy_format::RGBA8));
+        assert!(!frame_dims_valid(1920, 0, enums::proxy_format::RGBA8));
+        assert!(!frame_dims_valid(MAX_W + 2, 1080, enums::proxy_format::RGBA8));
+        assert!(!frame_dims_valid(1920, MAX_H + 2, enums::proxy_format::RGBA8));
+        assert!(!frame_dims_valid(1921, 1080, enums::proxy_format::RGBA8));
+        assert!(!frame_dims_valid(1920, 1081, enums::proxy_format::RGBA8));
+        assert!(!frame_dims_valid(1920, 1080, enums::proxy_format::UNKNOWN));
+        assert!(!frame_dims_valid(1920, 1080, 99));
+    }
+
     use super::*;
 
     #[test]

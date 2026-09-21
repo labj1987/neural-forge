@@ -904,16 +904,24 @@ fn build_status_group(shm: &std::sync::Arc<neuralforge_protocol::mapping::Mappin
             let toasts = toasts.clone();
             if neuralforge_supervisor::is_running().is_some() {
                 // Stopping waits up to 5s for a graceful exit before escalating to
-                // SIGKILL (see neuralforge_supervisor::stop) -- a brief, bounded main-thread
-                // block on an explicit user click, not worth the async plumbing this
-                // small a GUI doesn't otherwise need.
+                // SIGKILL, then shells out to `wineserver -k` (see
+                // neuralforge_supervisor::stop). Run on a worker thread: doing it inline
+                // blocked the main loop, so the "Stopping…" label below never painted.
+                // The button stays insensitive until the result is back on the main
+                // thread (which the one-second status timer also relies on).
                 button.set_sensitive(false);
                 button.set_label("Stopping…");
-                match neuralforge_supervisor::stop(std::time::Duration::from_secs(5)) {
-                    Ok(()) => toasts.add_toast(adw::Toast::new("Helper stopped")),
-                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Stop failed: {e}"))),
-                }
-                button.set_sensitive(true);
+                let button = button.clone();
+                glib::spawn_future_local(async move {
+                    let result = gio::spawn_blocking(|| neuralforge_supervisor::stop(std::time::Duration::from_secs(5))).await;
+                    match result {
+                        Ok(Ok(())) => toasts.add_toast(adw::Toast::new("Helper stopped")),
+                        Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Stop failed: {e}"))),
+                        Err(_) => toasts.add_toast(adw::Toast::new("Stop failed: the stop worker panicked")),
+                    }
+                    button.set_label(if neuralforge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
+                    button.set_sensitive(true);
+                });
             } else {
                 let cfg = neuralforge_supervisor::Config::load();
                 match neuralforge_supervisor::start(&cfg) {

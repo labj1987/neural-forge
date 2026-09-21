@@ -296,23 +296,34 @@ fn process_request(
     let width = hdr.width_slot(slot).load(Ordering::Relaxed);
     let height = hdr.height_slot(slot).load(Ordering::Relaxed);
     let proxy_format = hdr.proxy_format_slot(slot).load(Ordering::Relaxed);
-    let bytes = (neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) * (width as usize) * (height as usize))
+    let bytes = neuralforge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format)
+        .saturating_mul(width as usize)
+        .saturating_mul(height as usize)
         .min(neuralforge_protocol::MAX_FRAME);
-    let n = bytes;
+    // These three values come from shared memory another process writes -- never
+    // size a Vulkan image from them unchecked. A rejected frame still completes its
+    // round trip (fail-open echo below), it just never reaches `FrameResources::new`,
+    // NGX, or optical flow.
+    let dims_ok = neuralforge_protocol::frame_dims_valid(width, height, proxy_format);
+    if !dims_ok {
+        neuralforge_helper::log!("[helper] slot {slot}: rejecting out-of-range frame {width}x{height} format={proxy_format}");
+    }
+    let n = if dims_ok { bytes } else { 0 };
     let motion_scale = neuralforge_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed), width, height);
     // Fixed addresses/capacity regardless of this frame's own width/height --
     // `FrameResources::new` decides for itself (per its own doc comment) whether
     // they're actually importable.
     let (proxy_region, answer_region) = shm.proxy_and_answer_regions(slot);
 
-    let model_requested = hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0;
+    let model_requested = dims_ok && hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0;
     // Reserve the frame-sized Vulkan images as soon as the layer sees the game's real
     // swapchain, but do not enter the proprietary NGX runtime while NR is switched
     // off.  GTA is still bringing up its own GPU work at that point; calling
     // CreateFeature there has been observed to hang.  The resource reservation itself
     // is safe, makes later activation possible even after GTA fills VRAM, and
     // performs no model work or write-back.
-    if !model_requested
+    if dims_ok
+        && !model_requested
         && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
         && !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format))
     {
@@ -348,6 +359,7 @@ fn process_request(
     // silently start doing something new and untested just because an old, inert
     // setting happens to already be on.
     let motion = if slot == 0
+        && dims_ok
         && hdr.mvec_enabled()
         && neuralforge_protocol::enums::proxy_format::is_8bit(proxy_format)
         && std::env::var_os("NEURALFORGE_MVEC_HELPER").is_some()

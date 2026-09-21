@@ -770,42 +770,70 @@ impl ShmHeader {
 }
 
 /// Reads a lo/hi `AtomicU32` pair as one `u64` frame counter.
+///
+/// The two halves are separate atomics, so a plain pair of loads can straddle a
+/// concurrent [`store64`]. `store64` writes the high half first, so retrying until the
+/// high half is unchanged across the low-half read removes every torn read except the
+/// instant a counter carries past 2^32 (about 2.3 years of frames at 60 fps), which
+/// this layout cannot distinguish without a third word.
 pub fn load64(lo: &AtomicU32, hi: &AtomicU32) -> u64 {
-    (u64::from(hi.load(Ordering::Relaxed)) << 32) | u64::from(lo.load(Ordering::Relaxed))
+    loop {
+        let high = hi.load(Ordering::Acquire);
+        let low = lo.load(Ordering::Acquire);
+        if hi.load(Ordering::Acquire) == high {
+            return (u64::from(high) << 32) | u64::from(low);
+        }
+        std::hint::spin_loop();
+    }
 }
 
 pub fn store64(lo: &AtomicU32, hi: &AtomicU32, v: u64) {
-    hi.store((v >> 32) as u32, Ordering::Relaxed);
-    lo.store(v as u32, Ordering::Relaxed);
+    hi.store((v >> 32) as u32, Ordering::Release);
+    lo.store(v as u32, Ordering::Release);
 }
 
-/// Writes a fixed-size text field guarded by a sequence number: the field is zeroed,
-/// the bytes are copied in (truncated to fit, always NUL-terminated), then the sequence
-/// is bumped — a reader that observes an unchanged sequence before and after its own
-/// read saw one consistent string, never half of an old one and half of a new one.
+/// Writes a fixed-size text field guarded by a sequence lock. The sequence is made odd
+/// *before* the field is touched and even again after, so a reader can tell "a write is
+/// in progress" (odd) from "a write finished between my two looks" (changed). Bumping
+/// only after the write, as this used to, let a reader see `before == after` while the
+/// writer was mid-copy and return a torn string.
+///
+/// There is exactly one writer per field. If a previous writer died mid-write and left
+/// the sequence odd, it is simply carried through to the next even value.
 fn store_seq_guarded<const N: usize>(seq: &AtomicU32, cell: &UnsafeCell<[u8; N]>, s: &str) {
     let bytes = s.as_bytes();
     let n = bytes.len().min(N - 1);
+    let odd = seq.load(Ordering::Relaxed) | 1;
+    seq.store(odd, Ordering::Relaxed);
+    // Keeps the odd store ordered before the data writes below, as far as a reader
+    // that pairs it with an acquire fence is concerned.
+    std::sync::atomic::fence(Ordering::Release);
     // SAFETY: this is the only place that writes through `cell`, and every reader goes
-    // through `load_seq_guarded`, which never dereferences the cell's contents as a str
-    // without having first confirmed (via the sequence number) that no write is/was in
-    // progress across its read.
+    // through `load_seq_guarded`, which never trusts the cell's contents without having
+    // first confirmed (via the sequence number) that no write is/was in progress across
+    // its read.
     unsafe {
-        let buf = &mut *cell.get();
-        buf.fill(0);
-        buf[..n].copy_from_slice(&bytes[..n]);
+        let buf = cell.get().cast::<u8>();
+        for i in 0..N {
+            buf.add(i).write_volatile(if i < n { bytes[i] } else { 0 });
+        }
     }
-    seq.fetch_add(1, Ordering::Release);
+    seq.store(odd.wrapping_add(1), Ordering::Release);
 }
 
 fn load_seq_guarded<const N: usize>(seq: &AtomicU32, cell: &UnsafeCell<[u8; N]>) -> String {
-    for _ in 0..4 {
+    for _ in 0..16 {
         let before = seq.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            // A write is in progress.
+            std::hint::spin_loop();
+            continue;
+        }
         // SAFETY: see `store_seq_guarded`. The bytes read here are only trusted below,
         // after confirming the sequence number did not change across the read.
-        let snapshot = unsafe { *cell.get() };
-        let after = seq.load(Ordering::Acquire);
-        if before == after {
+        let snapshot = unsafe { cell.get().cast::<[u8; N]>().read_volatile() };
+        std::sync::atomic::fence(Ordering::Acquire);
+        if seq.load(Ordering::Relaxed) == before {
             let end = snapshot.iter().position(|&b| b == 0).unwrap_or(N);
             return String::from_utf8_lossy(&snapshot[..end]).into_owned();
         }
@@ -817,6 +845,44 @@ fn load_seq_guarded<const N: usize>(seq: &AtomicU32, cell: &UnsafeCell<[u8; N]>)
 mod tests {
     use super::*;
     use crate::enums::pass_override;
+
+    #[test]
+    fn seqlock_is_odd_only_while_writing_and_readers_never_see_a_torn_string() {
+        let h = std::sync::Arc::new(ShmHeader::default());
+        h.set_helper_reason("first");
+        assert_eq!(h.helper_reason_seq.load(Ordering::Relaxed) & 1, 0, "idle sequence must be even");
+        assert_eq!(h.helper_reason(), "first");
+        // A reader arriving while a (simulated, stalled) write holds the sequence odd
+        // must refuse to return the half-written field rather than trust it.
+        h.helper_reason_seq.store(1, Ordering::Release);
+        assert_eq!(h.helper_reason(), "");
+        h.helper_reason_seq.store(2, Ordering::Release);
+        assert_eq!(h.helper_reason(), "first");
+
+        let writer = {
+            let h = h.clone();
+            std::thread::spawn(move || {
+                for i in 0..20_000 {
+                    h.set_helper_reason(if i % 2 == 0 { "aaaaaaaaaaaaaaaaaaaa" } else { "bbbbbbbbbbbbbbbbbbbb" });
+                }
+            })
+        };
+        for _ in 0..20_000 {
+            let s = h.helper_reason();
+            assert!(s.is_empty() || s.chars().all(|c| c == 'a') || s.chars().all(|c| c == 'b') || s == "first", "torn read: {s:?}");
+        }
+        writer.join().unwrap();
+        assert_eq!(h.helper_reason_seq.load(Ordering::Relaxed) & 1, 0);
+    }
+
+    #[test]
+    fn load64_round_trips_across_the_halves() {
+        let (lo, hi) = (AtomicU32::new(0), AtomicU32::new(0));
+        for v in [0u64, 1, 0xFFFF_FFFF, 0x1_0000_0000, 0xDEAD_BEEF_CAFE_F00D] {
+            store64(&lo, &hi, v);
+            assert_eq!(load64(&lo, &hi), v);
+        }
+    }
 
     #[test]
     fn default_is_all_zero() {

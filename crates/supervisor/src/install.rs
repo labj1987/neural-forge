@@ -79,7 +79,7 @@ fn load_record() -> BTreeMap<String, String> {
 
 fn save_record(record: &BTreeMap<String, String>) -> std::io::Result<()> {
     let text = serde_json::to_string_pretty(record).expect("a string-keyed map always serializes") + "\n";
-    std::fs::write(record_path(), text)
+    write_atomic(&record_path(), text.as_bytes(), 0o644)
 }
 
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
@@ -187,14 +187,33 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         }
     }
 
+    // Ownership is recorded *as files land*, not once at the end: a failure partway
+    // through must leave every file already written tracked (otherwise the next run
+    // sees them as unowned and refuses to touch them). Each file's record entry is
+    // saved before the next file is written, so an interruption can orphan at most the
+    // single file in flight.
     let bin_dir = root.join("bin");
-    let mut new_record = BTreeMap::new();
+    let mut record = old.clone();
     for (path, content) in &files {
         let mode = if path.parent() == Some(bin_dir.as_path()) { 0o755 } else { 0o644 };
         write_atomic(path, content, mode)?;
-        new_record.insert(path.to_string_lossy().into_owned(), digest(content));
+        record.insert(path.to_string_lossy().into_owned(), digest(content));
+        save_record(&record)?;
     }
-    save_record(&new_record)?;
+
+    // Anything an older install shipped that this one no longer does is stale: remove
+    // it if it is still exactly what this installer wrote, and stop tracking it either
+    // way (a file someone has since edited is theirs now, left in place).
+    let current: std::collections::BTreeSet<String> = files.keys().map(|p| p.to_string_lossy().into_owned()).collect();
+    let stale: Vec<(String, String)> = old.iter().filter(|(name, _)| !current.contains(*name)).map(|(n, d)| (n.clone(), d.clone())).collect();
+    for (name, recorded) in stale {
+        let path = PathBuf::from(&name);
+        if path.is_file() && !path.is_symlink() && digest_file(&path).ok().as_ref() == Some(&recorded) {
+            std::fs::remove_file(&path)?;
+        }
+        record.remove(&name);
+        save_record(&record)?;
+    }
 
     Ok(InstallReport { root: root.clone(), gui_path: root.join("bin/neuralforge"), cli_path: root.join("bin/neuralforge-cli") })
 }
@@ -300,6 +319,65 @@ mod tests {
         assert!(desktop.contains(&format!("Exec=\"{}\"", root.join("bin/neuralforge").display())));
 
         assert!(record_path().exists());
+    }
+
+    #[test]
+    fn install_removes_files_a_newer_version_no_longer_ships() {
+        let scratch = ScratchDataHome::new("stale-cleanup");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        let extra = appdir.join("usr/lib/neuralforge/helper/old-only.dll");
+        std::fs::write(&extra, "old").unwrap();
+        install(&appdir).unwrap();
+        let installed = PathBuf::from(paths::data_dir()).join("lib/neuralforge/helper/old-only.dll");
+        assert!(installed.exists());
+
+        std::fs::remove_file(&extra).unwrap();
+        install(&appdir).unwrap();
+        assert!(!installed.exists(), "a file the new install no longer ships must be removed");
+        assert!(!load_record().contains_key(&installed.to_string_lossy().into_owned()));
+    }
+
+    #[test]
+    fn stale_file_the_user_edited_is_left_alone_but_untracked() {
+        let scratch = ScratchDataHome::new("stale-edited");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        let extra = appdir.join("usr/lib/neuralforge/helper/old-only.dll");
+        std::fs::write(&extra, "old").unwrap();
+        install(&appdir).unwrap();
+        let installed = PathBuf::from(paths::data_dir()).join("lib/neuralforge/helper/old-only.dll");
+        std::fs::write(&installed, "edited by hand").unwrap();
+
+        std::fs::remove_file(&extra).unwrap();
+        install(&appdir).unwrap();
+        assert_eq!(std::fs::read_to_string(&installed).unwrap(), "edited by hand");
+        assert!(!load_record().contains_key(&installed.to_string_lossy().into_owned()));
+    }
+
+    /// A failure partway through writing must leave the files already written tracked,
+    /// so the next attempt can proceed instead of refusing them as unowned.
+    #[test]
+    fn a_failure_partway_leaves_written_files_tracked_and_the_retry_succeeds() {
+        let scratch = ScratchDataHome::new("partial");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        // Put a regular file where a destination's parent directory must go: the
+        // up-front validation passes (nothing exists at the destination itself) but
+        // the write fails, after earlier files (BTreeMap order) have already landed.
+        let root = PathBuf::from(paths::data_dir());
+        let blocked = root.join("lib/neuralforge/helper");
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, "in the way").unwrap();
+        let err = install(&appdir);
+        assert!(err.is_err(), "the blocked destination must fail the install");
+        let record = load_record();
+        assert!(!record.is_empty(), "files written before the failure must be recorded");
+        for (name, digest_recorded) in &record {
+            assert_eq!(&digest_file(Path::new(name)).unwrap(), digest_recorded, "{name}");
+        }
+        std::fs::remove_file(&blocked).unwrap();
+        install(&appdir).expect("the retry must not refuse its own earlier files");
     }
 
     #[test]

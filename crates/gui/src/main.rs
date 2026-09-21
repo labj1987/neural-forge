@@ -27,7 +27,9 @@ fn main() {
 
     // The helper is launched as a detached Proton/Wine process tree. Shut it
     // down when the GUI exits so AppImage launchers such as Gear Lever do not
-    // keep reporting the application as still running.
+    // keep reporting the application as still running. This one is deliberately
+    // synchronous: the window is already gone, and the process must not exit before
+    // the helper has been stopped.
     app.connect_shutdown(|_| {
         if neuralforge_supervisor::is_running().is_some() {
             let _ = neuralforge_supervisor::stop(std::time::Duration::from_secs(5));

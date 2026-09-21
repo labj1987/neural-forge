@@ -42,7 +42,9 @@ pub fn is_running() -> Option<i32> {
 /// surfacing), run after the normal group kill so a routine stop/restart no longer
 /// needs a human to notice and clean this up by hand.
 pub fn stop(timeout: Duration) -> std::io::Result<()> {
-    process::stop(&pid_file(), timeout)?;
+    // Both runners (plain Wine, Proton) carry the helper's path in their own command
+    // line, which is what guards against signaling a process that reused the PID.
+    process::stop_matching(&pid_file(), timeout, Some("neuralforge-helper"))?;
     let cfg = Config::load();
     if let Some(wineserver) = wineserver_binary(&cfg) {
         let _ = std::process::Command::new(wineserver).arg("-k").env("WINEPREFIX", real_wineprefix(&cfg, &paths::prefix_dir())).status();

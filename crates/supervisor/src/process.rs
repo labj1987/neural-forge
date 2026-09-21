@@ -49,10 +49,20 @@ pub fn start_detached(
         std::fs::create_dir_all(dir)?;
     }
     std::fs::write(pid_file, pid.to_string())?;
-    // Deliberately not waiting on `child`: it's meant to keep running after this
-    // process exits, and reaping it would either block until it does or require a
-    // background thread this short-lived CLI invocation has no use for.
-    std::mem::forget(child);
+    // The child is meant to keep running after this process exits, so it is never
+    // waited on inline. But a long-lived parent (the GUI) that just dropped or
+    // forgot it would leave a zombie once the helper exits, and a zombie still
+    // answers `kill(pid, 0)`. A reaper thread blocks in `wait()` and collects the
+    // exit status; in a short-lived CLI it simply dies with the process, leaving the
+    // child running exactly as before.
+    let mut child = child;
+    let reaper = std::thread::Builder::new().name("helper-reaper".into()).spawn(move || {
+        let _ = child.wait();
+    });
+    if let Err(error) = reaper {
+        // Out of threads: nothing sensible to do but let the child run unreaped.
+        eprintln!("could not start the helper reaper thread: {error}");
+    }
     Ok(pid)
 }
 
@@ -76,8 +86,31 @@ pub fn running_pid(pid_file: &str) -> Option<i32> {
     let pid: i32 = text.trim().parse().ok()?;
     // SAFETY: signal 0 sends nothing, just checks whether the process (or process
     // group, for a negative pid -- not used here) exists and is signalable by us.
-    let alive = signal::kill(Pid::from_raw(pid), None).is_ok();
+    let alive = signal::kill(Pid::from_raw(pid), None).is_ok() && !is_zombie(pid);
     alive.then_some(pid)
+}
+
+/// Whether `pid` has exited but not yet been reaped by its parent. A zombie still
+/// passes `kill(pid, 0)`, so without this a dead helper would read as running forever.
+fn is_zombie(pid: i32) -> bool {
+    let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else { return false };
+    zombie_state(&stat)
+}
+
+/// The state field of a `/proc/<pid>/stat` line. The command name is parenthesised and
+/// may itself contain spaces or parentheses, so the state is the first field after the
+/// *last* `)`.
+fn zombie_state(stat: &str) -> bool {
+    stat.rsplit_once(')').and_then(|(_, rest)| rest.split_whitespace().next()) == Some("Z")
+}
+
+/// Whether `/proc/<pid>/cmdline` mentions `needle`. Used before signaling a PID read
+/// from a file: the PID may have been reused by an unrelated process since it was
+/// written, and the process *group* signal below would hit that process's group.
+fn cmdline_contains(pid: i32, needle: &str) -> bool {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .map(|raw| String::from_utf8_lossy(&raw).contains(needle))
+        .unwrap_or(false)
 }
 
 /// Sends `signal` to the whole process *group* `pid` leads (the negative-pid `kill(2)`
@@ -89,11 +122,21 @@ fn signal_group(pid: i32, sig: Signal) -> nix::Result<()> {
 
 /// Graceful-then-forced stop: `SIGTERM` the process group, wait up to `timeout` for
 /// it to exit, `SIGKILL` it if it hasn't.
-pub fn stop(pid_file: &str, timeout: Duration) -> std::io::Result<()> {
+///
+/// When `expected_cmdline` is given the process at the recorded PID must
+/// have it in its command line, or it is presumed to be an unrelated process that
+/// inherited a reused PID: nothing is signaled and the stale pid file is dropped.
+pub fn stop_matching(pid_file: &str, timeout: Duration, expected_cmdline: Option<&str>) -> std::io::Result<()> {
     let Some(pid) = running_pid(pid_file) else {
         let _ = std::fs::remove_file(pid_file);
         return Ok(());
     };
+    if let Some(needle) = expected_cmdline {
+        if !cmdline_contains(pid, needle) {
+            let _ = std::fs::remove_file(pid_file);
+            return Ok(());
+        }
+    }
     let _ = signal_group(pid, Signal::SIGTERM);
 
     let deadline = Instant::now() + timeout;
@@ -142,6 +185,44 @@ mod tests {
     // this for real outside this sandbox before shipping if that ever feels
     // load-bearing enough to double-check again.
     #[test]
+    fn zombie_state_reads_the_field_after_the_last_paren() {
+        assert!(zombie_state("123 (helper) Z 1 123 123 0"));
+        assert!(!zombie_state("123 (helper) S 1 123 123 0"));
+        // A command name containing spaces and parentheses must not confuse it.
+        assert!(zombie_state("123 (we ird) Z) Z 1 1"));
+        assert!(!zombie_state("123 (a) Z) S 1 1"));
+        assert!(!zombie_state("garbage"));
+    }
+
+    #[test]
+    fn a_helper_that_exits_is_reaped_and_reported_not_running() {
+        let pid_file = scratch_path("reap.pid");
+        let log = scratch_path("reap.log");
+        let pid = start_detached("/bin/sh", &["-c".to_string(), "exit 0".to_string()], &[], &log, &pid_file).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while running_pid(&pid_file).is_some() {
+            assert!(Instant::now() < deadline, "pid {pid} still reported running after it exited");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // Reaped, not merely hidden from `running_pid`.
+        assert!(signal::kill(Pid::from_raw(pid), None).is_err(), "exited child was left as a zombie");
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
+    fn stop_matching_leaves_an_unrelated_process_alone() {
+        let pid_file = scratch_path("reuse.pid");
+        let log = scratch_path("reuse.log");
+        let pid = start_detached("/bin/sleep", &["30".to_string()], &[], &log, &pid_file).unwrap();
+        stop_matching(&pid_file, Duration::from_millis(300), Some("definitely-not-this-process")).unwrap();
+        assert!(signal::kill(Pid::from_raw(pid), None).is_ok(), "an unrelated process must not be signaled");
+        assert!(!Path::new(&pid_file).exists(), "stale pid file should be dropped");
+        let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        let _ = std::fs::remove_file(&log);
+    }
+
+    #[test]
     #[ignore = "signal delivery to Command-spawned children is broken in this dev sandbox specifically -- see comment"]
     fn stop_kills_the_whole_process_group_not_just_the_leader() {
         let pid_file = scratch_path("pgroup.pid");
@@ -174,7 +255,7 @@ mod tests {
         assert!(signal::kill(Pid::from_raw(leader_pid), None).is_ok(), "leader should be running");
         assert!(signal::kill(Pid::from_raw(child_pid), None).is_ok(), "child should be running");
 
-        stop(&pid_file, Duration::from_secs(2)).expect("stop should succeed");
+        stop_matching(&pid_file, Duration::from_secs(2), None).expect("stop should succeed");
 
         assert!(signal::kill(Pid::from_raw(leader_pid), None).is_err(), "leader should be gone after stop");
         assert!(signal::kill(Pid::from_raw(child_pid), None).is_err(), "child should be gone after stop -- this is the real point of this test");
