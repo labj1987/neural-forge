@@ -245,6 +245,17 @@ pub fn build_ui(app: &adw::Application) {
     }
     model_group.add(&pass_row);
 
+    let (interval, set_interval) = bind_u32(&shm, Some("model_interval"), |h| &h.model_interval);
+    model_group.add(&spin_row(
+        "Model every Nth frame",
+        "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own",
+        interval as f32,
+        1.0,
+        4.0,
+        1.0,
+        move |v| set_interval(v as u32),
+    ));
+
     let (settle, set_settle) = bind_u32(&shm, Some("rebuild_settle_ms"), |h| &h.rebuild_settle_ms);
     model_group.add(&spin_row(
         "Rebuild spacing",

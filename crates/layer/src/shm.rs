@@ -37,6 +37,8 @@ pub struct CompositionSettings {
     pub transfer: u32,
     /// Frame hold: keep working on the same captured frame.
     pub hold_frame: bool,
+    /// Run the model on every Nth present (see `ShmHeader::model_interval`).
+    pub model_interval: u32,
     pub debug_view: u32,
     pub apply_model: bool,
     pub neural_enabled: bool,
@@ -253,6 +255,7 @@ impl ShmClient {
             ghost_guard: f32::from_bits(hdr.ghost_guard_bits.load(Ordering::Relaxed)),
             transfer: hdr.transfer.load(Ordering::Relaxed),
             hold_frame: hdr.hold_frame.load(Ordering::Relaxed) != 0,
+            model_interval: hdr.model_interval.load(Ordering::Relaxed).clamp(1, 4),
             colour_trust: f32::from_bits(hdr.colour_trust_bits.load(Ordering::Relaxed)),
             ratio_smooth: f32::from_bits(hdr.ratio_smooth_bits.load(Ordering::Relaxed)),
             compare: crate::composition::gpu::Compare {

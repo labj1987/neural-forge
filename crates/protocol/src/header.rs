@@ -311,6 +311,12 @@ pub struct ShmHeader {
     /// 0..1: how much of the relighting ratio comes from the neighbourhood rather than the pixel
     /// (upstream ratio smooth). Default 1.
     pub ratio_smooth_bits: AtomicU32,
+
+    // --- v6 ------------------------------------------------------------------------------
+    /// Run the model on every Nth presented frame (1 = every frame). With frame generation on,
+    /// 2 skips the model on roughly the generated half and carries the last answer onto them
+    /// (ghost guard applied), instead of making every generated frame wait for its own answer.
+    pub model_interval: AtomicU32,
 }
 
 // The whole point of a shared, memory-mapped struct like this is that every writer
@@ -342,7 +348,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1992, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1996, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -357,6 +363,7 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1932, "layout
 const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1960, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1980, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1988, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1992, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_valid) == 1952, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_scale_mode) == 1956, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
@@ -416,6 +423,7 @@ impl ShmHeader {
         self.ghost_guard_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.colour_trust_bits.store(2.0f32.to_bits(), Ordering::Relaxed);
         self.ratio_smooth_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.model_interval.store(1, Ordering::Relaxed);
         self.scaling_downscaler.store(crate::enums::downscaler::LANCZOS3, Ordering::Relaxed);
 
         self.helper_state.store(crate::enums::helper_state::STOPPED, Ordering::Relaxed);
@@ -587,7 +595,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 40] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 41] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -627,6 +635,7 @@ impl ShmHeader {
             ("ghost_guard", true, self.ghost_guard_bits.load(Ordering::Relaxed)),
             ("colour_trust", true, self.colour_trust_bits.load(Ordering::Relaxed)),
             ("ratio_smooth", true, self.ratio_smooth_bits.load(Ordering::Relaxed)),
+            ("model_interval", false, self.model_interval.load(Ordering::Relaxed)),
             ("unlock_passes", false, self.unlock_passes.load(Ordering::Relaxed)),
             ("rebuild_settle_ms", false, self.rebuild_settle_ms.load(Ordering::Relaxed)),
             ("apply_model", false, self.apply_model.load(Ordering::Relaxed)),
@@ -676,6 +685,7 @@ impl ShmHeader {
             "ghost_guard" => &self.ghost_guard_bits,
             "colour_trust" => &self.colour_trust_bits,
             "ratio_smooth" => &self.ratio_smooth_bits,
+            "model_interval" => &self.model_interval,
             "unlock_passes" => &self.unlock_passes,
             "rebuild_settle_ms" => &self.rebuild_settle_ms,
             "apply_model" => &self.apply_model,

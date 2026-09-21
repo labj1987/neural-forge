@@ -556,6 +556,8 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
 #[derive(Default)]
 pub struct Inflight {
     original: Vec<u8>,
+    /// Synchronous presents seen on this device (slot 0's counter), for the model interval.
+    presents: u64,
     dims: Option<(u32, u32, u32)>,
     /// The proxy's own `(width, height)` at the moment this slot's outstanding request
     /// was actually sent -- `working_scale`'s answer comes back at whatever resolution
@@ -1168,6 +1170,8 @@ pub unsafe fn run(
     // Set by the synchronous present while frame hold is on: the composition works on the held
     // frame (`raw_answer_base`) instead of the live swapchain image.
     let mut compose_held = false;
+    // Set when this present reuses the previous answer (model interval above 1).
+    let mut carried_answer = false;
     if pipelined_present() {
         for slot in 0..2 {
             // Poll whatever was sent on some earlier frame *before* touching anything
@@ -1298,121 +1302,142 @@ pub unsafe fn run(
         // warming-up, restarted or missing helper can delay a frame by at most the budget and
         // can never hang the game.
         const SLOT: usize = 0;
+        // Model interval: on the presents between model runs, carry the last answer onto this
+        // frame instead of capturing and waiting (the pipelined mode's way, for one frame at a
+        // time). With frame generation this spares the generated frames the model's wait.
+        let present_no = inflight[SLOT].presents;
+        inflight[SLOT].presents = present_no.wrapping_add(1);
+        let carry = settings.model_interval > 1
+            && present_no % u64::from(settings.model_interval) != 0
+            && !settings.hold_frame
+            && !last_answer.is_empty()
+            && inflight[SLOT].dims == Some((width, height, proxy_format));
+        if carry {
+            carried_answer = true;
+        }
         // No live helper (never started, stopped, killed, restarting): present untouched and
         // do not wait for anything. This is what keeps a missing helper from costing a stall.
-        if !shm.helper_alive() {
+        if !carry && !shm.helper_alive() {
             shm.publish_frame_timing(pipeline_start.elapsed(), false);
             return None;
         }
-        let deadline = std::time::Instant::now() + SYNC_BUDGET;
-        // Left over from a frame that ran out of time (or from pipelined mode): its answer
-        // belongs to an old frame. Discard it when it lands; never block on it.
-        for slot in 0..2 {
-            if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(false) && slot == SLOT {
-                shm.publish_frame_timing(pipeline_start.elapsed(), false);
-                return None;
-            }
-        }
-        let encode_push = crate::composition::encode_pass::EncodePush {
-            white_point: settings.white_point,
-            bgr_order: u32::from(bgr_order),
-            reversible_mode: settings.reversible_mode,
-        };
-        let t_start = std::time::Instant::now();
-        let mut sent = None;
-        let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
-        if !settings.hold_frame || held.as_ref().is_some_and(|h| (h.width, h.height) != (width, height)) {
-            *held = None;
-        }
-        if let Some(h) = held.as_ref() {
-            // Holding: the model is shown the held proxy again, no capture.
-            original_scratch.clone_from(&h.original);
-            model_scratch.clone_from(&h.proxy);
-            shm.set_frame_info(SLOT, h.sent.0, h.sent.1, proxy_format);
-            shm.write_proxy(SLOT, &h.proxy);
-            sent = Some(h.sent);
-        }
-        while sent.is_none() {
-            if let Some(dims) = poll_or_submit_capture(
-                SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
-                capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
-                encode_push, shm, original_scratch, model_scratch,
-            ) {
-                sent = Some(dims);
-                break;
-            }
-            if std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_micros(100));
-        }
-        let Some((sent_w, sent_h)) = sent else {
-            shm.publish_frame_timing(pipeline_start.elapsed(), false);
-            return None;
-        };
-        let holding = held.is_some();
-        if settings.hold_frame && !holding {
-            // Start holding this frame. What was sent is the scaled, encoded scratch unless direct
-            // capture wrote the whole frame straight into shared memory.
-            let proxy = if (sent_w, sent_h) == (width, height) && use_direct { original_scratch.clone() } else { model_scratch.clone() };
-            *held = Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h) });
-        }
-        drop(held);
-        let t_captured = std::time::Instant::now();
-        // The white meter: every 8th frame, smoothed (about a second to settle) so the proxy's
-        // brightness never jumps from one frame to the next -- a jumping divisor would make the
-        // model's input, and therefore its answer, flicker. Published whatever the source setting,
-        // so the GUI can show it; only used when the source is Measured.
-        {
-            static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-            if !holding && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
-                if let Some(white) = meter_white(original_scratch, width, height, bgr_order) {
-                    shm.publish_measured_white(white);
-                }
-            }
-        }
-        shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
-        if !shm.begin_async_request(SLOT) {
-            shm.publish_frame_timing(pipeline_start.elapsed(), false);
-            return None;
-        }
-        inflight[SLOT].dims = Some((width, height, proxy_format));
-        inflight[SLOT].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
-        loop {
-            match shm.poll_async_request(SLOT) {
-                Some(true) => {
-                    // Only this frame's own answer: the helper echoes the raster it answered.
-                    // A mismatch is someone else's (or a stale) answer; present untouched. No echo
-                    // at all is a helper from before 0.1.81, which is trusted as before.
-                    if shm.answered_dims().is_some_and(|d| d != (sent_w, sent_h)) {
-                        shm.publish_frame_timing(pipeline_start.elapsed(), false);
-                        return None;
-                    }
-                    break;
-                }
-                Some(false) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_micros(100)),
-                // Out of time, or the helper is gone: this frame goes out untouched.
-                _ => {
+        if !carry {
+            let deadline = std::time::Instant::now() + SYNC_BUDGET;
+            // Left over from a frame that ran out of time (or from pipelined mode): its answer
+            // belongs to an old frame. Discard it when it lands; never block on it.
+            for slot in 0..2 {
+                if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(false) && slot == SLOT {
                     shm.publish_frame_timing(pipeline_start.elapsed(), false);
                     return None;
                 }
             }
+            let encode_push = crate::composition::encode_pass::EncodePush {
+                white_point: settings.white_point,
+                bgr_order: u32::from(bgr_order),
+                reversible_mode: settings.reversible_mode,
+            };
+            let t_start = std::time::Instant::now();
+            let mut sent = None;
+            let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
+            if !settings.hold_frame || held.as_ref().is_some_and(|h| (h.width, h.height) != (width, height)) {
+                *held = None;
+            }
+            if let Some(h) = held.as_ref() {
+                // Holding: the model is shown the held proxy again, no capture.
+                original_scratch.clone_from(&h.original);
+                model_scratch.clone_from(&h.proxy);
+                shm.set_frame_info(SLOT, h.sent.0, h.sent.1, proxy_format);
+                shm.write_proxy(SLOT, &h.proxy);
+                sent = Some(h.sent);
+            }
+            while sent.is_none() {
+                if let Some(dims) = poll_or_submit_capture(
+                    SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+                    capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
+                    encode_push, shm, original_scratch, model_scratch,
+                ) {
+                    sent = Some(dims);
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_micros(100));
+            }
+            let Some((sent_w, sent_h)) = sent else {
+                shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                return None;
+            };
+            let holding = held.is_some();
+            if settings.hold_frame && !holding {
+                // Start holding this frame. What was sent is the scaled, encoded scratch unless direct
+                // capture wrote the whole frame straight into shared memory.
+                let proxy = if (sent_w, sent_h) == (width, height) && use_direct { original_scratch.clone() } else { model_scratch.clone() };
+                *held = Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h) });
+            }
+            drop(held);
+            let t_captured = std::time::Instant::now();
+            // The white meter: every 8th frame, smoothed (about a second to settle) so the proxy's
+            // brightness never jumps from one frame to the next -- a jumping divisor would make the
+            // model's input, and therefore its answer, flicker. Published whatever the source setting,
+            // so the GUI can show it; only used when the source is Measured.
+            {
+                static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+                if !holding && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
+                    if let Some(white) = meter_white(original_scratch, width, height, bgr_order) {
+                        shm.publish_measured_white(white);
+                    }
+                }
+            }
+            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
+            if !shm.begin_async_request(SLOT) {
+                shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                return None;
+            }
+            inflight[SLOT].dims = Some((width, height, proxy_format));
+            inflight[SLOT].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
+            loop {
+                match shm.poll_async_request(SLOT) {
+                    Some(true) => {
+                        // Only this frame's own answer: the helper echoes the raster it answered.
+                        // A mismatch is someone else's (or a stale) answer; present untouched. No echo
+                        // at all is a helper from before 0.1.81, which is trusted as before.
+                        if shm.answered_dims().is_some_and(|d| d != (sent_w, sent_h)) {
+                            shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                            return None;
+                        }
+                        break;
+                    }
+                    Some(false) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_micros(100)),
+                    // Out of time, or the helper is gone: this frame goes out untouched.
+                    _ => {
+                        shm.publish_frame_timing(pipeline_start.elapsed(), false);
+                        return None;
+                    }
+                }
+            }
+            if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+                return None;
+            }
+            let t_answered = std::time::Instant::now();
+            let answer_bytes = (u64::from(sent_w) * u64::from(sent_h) * bytes_per_pixel) as usize;
+            // Swapped rather than copied: these are full frames (15 MB at 1440p), and nothing reads
+            // the scratch buffers again before the next capture refills them.
+            last_answer.resize(answer_bytes, 0);
+            shm.read_answer(SLOT, last_answer);
+            std::mem::swap(raw_answer_base, original_scratch);
+            *last_answer_dims = (sent_w, sent_h);
+            compose_small_proxy = (sent_w, sent_h) != (width, height) && model_scratch.len() >= answer_bytes;
+            compose_held = settings.hold_frame;
+            SYNC_TIMING.with(|t| t.set(Some((t_captured - t_start, t_answered - t_captured, t_answered.elapsed()))));
         }
-        if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
-            return None;
+        if carry {
+            let answer_bytes = (u64::from(last_answer_dims.0) * u64::from(last_answer_dims.1) * bytes_per_pixel) as usize;
+            compose_small_proxy = *last_answer_dims != (width, height) && model_scratch.len() >= answer_bytes;
+        } else {
+            // A new answer: the composition uploads it (a carried one is already on the GPU).
+            *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
         }
-        let t_answered = std::time::Instant::now();
-        let answer_bytes = (u64::from(sent_w) * u64::from(sent_h) * bytes_per_pixel) as usize;
-        // Swapped rather than copied: these are full frames (15 MB at 1440p), and nothing reads
-        // the scratch buffers again before the next capture refills them.
-        last_answer.resize(answer_bytes, 0);
-        shm.read_answer(SLOT, last_answer);
-        std::mem::swap(raw_answer_base, original_scratch);
-        *last_answer_dims = (sent_w, sent_h);
-        compose_small_proxy = (sent_w, sent_h) != (width, height) && model_scratch.len() >= answer_bytes;
-        compose_held = settings.hold_frame;
-        SYNC_TIMING.with(|t| t.set(Some((t_captured - t_start, t_answered - t_captured, t_answered.elapsed()))));
-        *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
     }
 
     if last_answer.is_empty() {
@@ -1455,7 +1480,7 @@ pub unsafe fn run(
                 // The guard exists for the pipelined mode's late answers; in the synchronous mode
                 // the answer always matches the frame, and against a scaled-up proxy the guard
                 // would read the enlargement's blur as motion.
-                ghost_guard: if pipelined_present() { settings.ghost_guard } else { 0.0 },
+                ghost_guard: if pipelined_present() || carried_answer { settings.ghost_guard } else { 0.0 },
                 transfer: settings.transfer,
                 model_small: false,
                 white_point: settings.white_point,
@@ -3252,6 +3277,36 @@ mod tests {
         }
         assert!(got_semaphore, "synchronous present must composite the answer");
         let _ = iteration;
+
+        // Model interval 2: the next present carries that answer instead of asking again -- no new
+        // request, but still a composited frame -- and the one after asks again.
+        let hdr_now = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+        hdr_now.model_interval.store(2, AtomicOrdering::Relaxed);
+        let mut asked = Vec::new();
+        for _ in 0..4 {
+            let before = hdr_now.seq_req.load(AtomicOrdering::Relaxed);
+            let sem = unsafe {
+                run(
+                    &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
+                    width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, false, &mut gpu_compose,
+                    &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
+                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
+                )
+            };
+            assert!(sem.is_some(), "every present is composited, carried or not");
+            let sem = sem.unwrap();
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+            unsafe {
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                device.destroy_fence(wait_fence, None);
+            }
+            asked.push(hdr_now.seq_req.load(AtomicOrdering::Relaxed) != before);
+        }
+        assert_eq!(asked.iter().filter(|&&a| a).count(), 2, "every other present asks the model: {asked:?}");
+        assert!(asked.windows(2).all(|w| w[0] != w[1]), "asking and carrying alternate: {asked:?}");
+        hdr_now.model_interval.store(1, AtomicOrdering::Relaxed);
 
         stop.store(true, AtomicOrdering::Relaxed);
         helper.join().unwrap();
