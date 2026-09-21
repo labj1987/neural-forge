@@ -4,6 +4,42 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.75 — 2026-09-21
+
+- **Synchronization fixes in the present path (likely relevant to the Xid 109 hangs).**
+  The layer's capture/compose submissions no longer race the game's own rendering: the
+  application's present wait semaphores are relayed through a wait-only batch on the
+  presenting queue ahead of any layer work, and the real present waits on the layer's
+  semaphore(s) instead. Render-tap source layouts are now tracked at
+  `vkQueueSubmit`/`vkQueueSubmit2` time (recorded per command buffer, applied in
+  submission order) rather than at recording time, so the barrier issued at present no
+  longer uses a guessed `oldLayout`. A pass-through swapchain is only written to when it
+  was actually created with `TRANSFER_DST`. Tap bookkeeping moved out of the per-device
+  mutex (which present holds across fence waits) and the per-barrier logging was
+  dropped. **Verified with unit tests and lavapipe only. This synchronization change,
+  the encode and mode 2 are all still unverified on real hardware.**
+- **Resource lifecycle and correctness.** The spawned helper is reaped (a helper that
+  exited used to read as running forever as a zombie); the stop path checks the PID's
+  command line before signaling its process group. The helper rejects zero, oversized,
+  odd or unknown-format frame dimensions read from shared memory, and
+  `FrameResources::new` frees everything it created on every early return (it used to
+  leak VRAM on each failed retry). The shared-memory seqlock is now a real one (odd while
+  writing) and `load64` no longer tears. Stopping the helper from the GUI no longer
+  blocks the main thread. Installs record ownership as files land and remove files an
+  older install shipped that the new one does not.
+- The blocking round trip inside `vkQueuePresentKHR` is capped at one second; the hotkey
+  poll runs at most every 50 ms and closes its X display; a shared and a mutable view of
+  the mapped capture frame no longer coexist.
+- **Packaging.** Design documents moved to `docs/`; committed SPIR-V is tied to its GLSL
+  by a hash manifest checked in CI (`scripts/check_shaders.py`); `scripts/install.py`
+  delegates to `neuralforge-cli` so there is a single install implementation; `once_cell`
+  dropped; the release workflow runs the tests first; `appimagetool` is pinned to 1.9.1
+  and checksum-verified; AppStream `<releases>` is generated from this changelog.
+- The display name is now "Neural Forge" wherever it is shown to a person; internal
+  identifiers are unchanged. Credits use the full name, the About dialog credits
+  DLSS5VKLayer and states the license, and `ATTRIBUTION.md` now says AGPL-3.0 is
+  required by upstream's own license.
+
 ## 0.1.74 — 2026-09-17
 
 - **the layer was inert on real games, and now isn't.** Admission refused any
