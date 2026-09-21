@@ -5,7 +5,7 @@ Compared against DLSS5VKLayer (bmitch87) **0.3.1-1**, commit `117c953`, shared-m
 Every ported function is listed in [ATTRIBUTION.md](../ATTRIBUTION.md).
 
 The two shared-memory protocols are **not wire-compatible and are not meant to be**. Neural
-Forge's header is its own (version 4 as of 0.1.78). That both headers once happened to share a
+Forge's header is its own (version 5 as of 0.1.80). That both headers once happened to share a
 1948-byte prefix is a coincidence, not a contract: never point one project's helper at the
 other's mapping.
 
