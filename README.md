@@ -115,10 +115,11 @@ from a terminal.
 Validated on GTA V Enhanced (RTX 5070, driver `615.71.09`): the render tap correctly
 captures GTA's own render target while leaving Rockstar Launcher, Social Club, Wine
 Explorer, Xalia and overlays pass-through, and the full model/helper round-trip runs
-end to end. Measured at 2560x1440 with the model at full resolution: about 35 fps with the
-effect on (the game alone runs at about 77). The limit is the game's and the model's GPU
+end to end. Measured on GTA V Enhanced with the effect on and the model at full resolution:
+about 70 fps at 1920x1080, 35-47 fps at 2560x1440 (the game alone runs at about 77) and 22 fps at
+3840x2160; at 4K a 75% model resolution gives 34 and 50% gives 55. The limit is the game's and the model's GPU
 time on one card, not the layer (about 2 ms of its own per frame); lowering the model
-resolution (`working_scale`) trades detail for speed (44 fps at 75%, 57 at 50%) — see [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) for
+resolution (`working_scale`) trades detail for speed (at 1440p: 44 fps at 75%, 57 at 50%) — see [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) for
 measurements, [docs/RENDER_TAP_DESIGN.md](docs/RENDER_TAP_DESIGN.md) for the capture
 constraints, and [docs/ASYNC_CAPTURE_DESIGN.md](docs/ASYNC_CAPTURE_DESIGN.md) and
 [docs/EXTERNAL_MEMORY_HOST_DESIGN.md](docs/EXTERNAL_MEMORY_HOST_DESIGN.md) for the zero-copy
