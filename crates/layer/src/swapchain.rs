@@ -45,8 +45,16 @@ pub struct Warmup {
 impl Warmup {
     /// Before engaging: a game frame slower than this is not steady rendering (below ~15 fps).
     const STEADY_FRAME: std::time::Duration = std::time::Duration::from_millis(66);
-    /// How long the game must render steadily before the layer first engages.
-    const HOLD: std::time::Duration = std::time::Duration::from_secs(5);
+    /// How long the game must render steadily before the layer first engages
+    /// (`NEURAL_FORGE_WARMUP_SECS` overrides; 0 engages at once, which is how the loading-screen
+    /// freeze was reproduced).
+    fn hold() -> std::time::Duration {
+        static HOLD: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+        *HOLD.get_or_init(|| {
+            let secs = neural_forge_protocol::env::var("NEURAL_FORGE_WARMUP_SECS").and_then(|v| v.parse::<u64>().ok()).unwrap_or(5);
+            std::time::Duration::from_secs(secs)
+        })
+    }
     /// Once engaged, only loading-screen-length frames count against the game. Ordinary stutters
     /// (streaming, shader compiles, a busy CPU) are shorter, and dropping out on them made the
     /// effect vanish for seconds at random during play.
@@ -73,12 +81,16 @@ impl Warmup {
             }
             return self.engaged;
         }
+        if Self::hold().is_zero() {
+            self.engaged = true;
+            return true;
+        }
         if game_frame > Self::STEADY_FRAME {
             self.steady_since = None;
         } else if self.steady_since.is_none() {
             self.steady_since = Some(now);
         }
-        self.engaged = self.steady_since.is_some_and(|t| now.saturating_duration_since(t) >= Self::HOLD);
+        self.engaged = self.steady_since.is_some_and(|t| now.saturating_duration_since(t) >= Self::hold());
         self.engaged
     }
 }
