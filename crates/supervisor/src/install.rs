@@ -172,6 +172,16 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     let manifest_out = serde_json::to_string_pretty(&manifest)? + "\n";
     files.insert(data_home.join(format!("vulkan/implicit_layer.d/{MANIFEST}")), manifest_out.into_bytes());
 
+    // The 32-bit layer's own manifest (its own layer name), when the AppDir carries it.
+    let manifest32_src = usr.join("share/vulkan/implicit_layer.d/neural_forge_layer_i686.json");
+    if manifest32_src.is_file() {
+        let mut manifest32: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest32_src)?)?;
+        let library32 = root.join("lib/neural-forge/i686/libneural_forge_layer.so");
+        manifest32["layer"]["library_path"] = serde_json::Value::String(library32.to_string_lossy().into_owned());
+        let out = serde_json::to_string_pretty(&manifest32)? + "\n";
+        files.insert(data_home.join("vulkan/implicit_layer.d/neural_forge_layer_i686.json"), out.into_bytes());
+    }
+
     let desktop_src = usr.join(format!("share/applications/{APP_ID}.desktop"));
     let exec_line = format!("Exec=\"{}\"", root.join("bin/neural-forge").display());
     let desktop_text = std::fs::read_to_string(&desktop_src)?.replace("Exec=neural-forge", &exec_line);

@@ -74,6 +74,44 @@ pub struct CompositionSettings {
 
 /// One process's connection to the mapping. Not `Clone` — there is exactly one of these
 /// per device, guarded by a `Mutex` in [`crate::device::NeuralForgeDeviceInfo`].
+/// How many bytes of each pixel region this process maps: the protocol's full `MAX_FRAME` on
+/// 64-bit; on 32-bit a 4K 8-bit frame, so the whole set fits a 32-bit address space (a larger
+/// frame is simply passed through, see [`region_capacity`]).
+const REGION_CAP: usize = if cfg!(target_pointer_width = "64") { MAX_FRAME } else { 3840 * 2160 * 4 };
+
+/// The largest frame this process can send or receive.
+pub fn region_capacity() -> usize {
+    REGION_CAP
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Region {
+    Proxy0 = 0,
+    Answer0 = 1,
+    Motion = 2,
+    Proxy1 = 3,
+    Answer1 = 4,
+}
+
+impl Region {
+    const ALL: [Region; 5] = [Region::Proxy0, Region::Answer0, Region::Motion, Region::Proxy1, Region::Answer1];
+    fn proxy(slot: usize) -> Self {
+        if slot == 0 { Region::Proxy0 } else { Region::Proxy1 }
+    }
+    fn answer(slot: usize) -> Self {
+        if slot == 0 { Region::Answer0 } else { Region::Answer1 }
+    }
+    fn offset(self) -> usize {
+        match self {
+            Region::Proxy0 => neural_forge_protocol::proxy_offset_slot(0),
+            Region::Answer0 => neural_forge_protocol::answer_offset_slot(0),
+            Region::Motion => neural_forge_protocol::motion_offset(),
+            Region::Proxy1 => neural_forge_protocol::proxy_offset_slot(1),
+            Region::Answer1 => neural_forge_protocol::answer_offset_slot(1),
+        }
+    }
+}
+
 pub struct ShmClient {
     motion: Option<crate::optical_flow::OpticalFlow>,
     motion_failed: Option<(u32,u32,u32,u32)>,
@@ -82,6 +120,10 @@ pub struct ShmClient {
     motion_format: u32,
     fd: Option<OwnedFd>,
     header: *mut neural_forge_protocol::ShmHeader,
+    /// Where each pixel region is mapped in this process (proxy 0, answer 0, motion, proxy 1,
+    /// answer 1), `REGION_CAP` bytes each. One contiguous mapping on 64-bit; separate small
+    /// mappings on 32-bit, where the protocol's full 1.3 GB would not fit the address space.
+    regions: [*mut u8; 5],
     path: String,
     timeouts: u32,
     ever_answered: bool,
@@ -122,6 +164,7 @@ impl Default for ShmClient {
             motion_format: 0,
             fd: None,
             header: std::ptr::null_mut(),
+            regions: [std::ptr::null_mut(); 5],
             path: String::new(),
             timeouts: 0,
             ever_answered: false,
@@ -360,8 +403,8 @@ impl ShmClient {
     /// # Safety
     /// Must only be called after a successful [`Self::open`]/[`Self::try_round_trip`].
     pub fn write_proxy(&self, slot: usize, bytes: &[u8]) {
-        let Some(base) = self.pixel_base() else { return };
-        let n = bytes.len().min(MAX_FRAME);
+        let Some((dst, cap)) = self.region(Region::proxy(slot)) else { return };
+        let n = bytes.len().min(cap);
         // SAFETY: `base` is the start of this process's own mapping of the full
         // `shm_total_bytes()` region (see `open_at`); `proxy_offset_slot(slot)..+n` is
         // in bounds for any `n <= MAX_FRAME` and `slot < 2` by that region's own
@@ -369,7 +412,7 @@ impl ShmClient {
         unsafe {
             std::ptr::copy_nonoverlapping(
                 bytes.as_ptr(),
-                base.add(neural_forge_protocol::proxy_offset_slot(slot)),
+                dst,
                 n,
             );
         }
@@ -412,9 +455,9 @@ impl ShmClient {
         match self.motion.as_mut().unwrap().estimate(bytes,bgr) {
             Ok(Some(vectors)) if !cut => {
                 let payload = neural_forge_protocol::motion::encode(&vectors,neural_forge_protocol::motion::scales(mode,width,height));
-                if let Some(base) = self.pixel_base() {
+                if let Some((motion, _)) = self.region(Region::Motion) {
                     // Same single-request ownership and bounds as write_proxy.
-                    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(),base.add(neural_forge_protocol::motion_offset()),payload.len()); }
+                    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(),motion,payload.len()); }
                     let h = self.header().unwrap();
                     h.frame_mvec_scale_mode.store(mode,Ordering::Relaxed);
                     h.frame_mvec_valid.store(1,Ordering::Relaxed);
@@ -435,12 +478,12 @@ impl ShmClient {
     /// already knows from the round trip's own return value whether there is a real
     /// answer to read.
     pub fn read_answer(&self, slot: usize, out: &mut [u8]) -> usize {
-        let Some(base) = self.pixel_base() else { return 0 };
-        let n = out.len().min(MAX_FRAME);
+        let Some((src, cap)) = self.region(Region::answer(slot)) else { return 0 };
+        let n = out.len().min(cap);
         // SAFETY: same reasoning as `write_proxy`, mirrored for the answer region.
         unsafe {
             std::ptr::copy_nonoverlapping(
-                base.add(neural_forge_protocol::answer_offset_slot(slot)),
+                src,
                 out.as_mut_ptr(),
                 n,
             );
@@ -448,8 +491,10 @@ impl ShmClient {
         n
     }
 
-    fn pixel_base(&self) -> Option<*mut u8> {
-        (!self.header.is_null()).then_some(self.header as *mut u8)
+    /// A mapped pixel region and how many bytes of it this process can reach.
+    fn region(&self, which: Region) -> Option<(*mut u8, usize)> {
+        let p = self.regions[which as usize];
+        (!p.is_null()).then_some((p, REGION_CAP))
     }
 
     /// The given slot's proxy region address and capacity within this process's
@@ -462,7 +507,7 @@ impl ShmClient {
         // SAFETY: `pixel_base` plus `proxy_offset_slot(slot)` stays within the
         // `shm_total_bytes()` mapping `open_at` established, same reasoning as
         // `write_proxy`'s own pointer arithmetic.
-        self.pixel_base().map(|base| (unsafe { base.add(neural_forge_protocol::proxy_offset_slot(slot)) }, neural_forge_protocol::MAX_FRAME))
+        self.region(Region::proxy(slot))
     }
 
     /// Opens (or creates) the mapping if not already attached. Idempotent.
@@ -533,20 +578,36 @@ impl ShmClient {
         // proxy/answer slices below) is used. A `MAP_SHARED` file mapping is a sparse,
         // page-cache-backed region -- reserving the full `MAX_FRAME*2` up front costs
         // no real memory beyond whatever pages an SDR session actually touches.
-        let map = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                total,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                fd.as_raw_fd(),
-                0,
-            )
+        let map_at = |offset: usize, len: usize| unsafe {
+            let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), offset as libc::off_t);
+            (p != libc::MAP_FAILED).then_some(p.cast::<u8>())
         };
-        if map == libc::MAP_FAILED {
-            crate::log!("[shm] mmap {path} failed");
-            return false;
-        }
+        // 64-bit: the whole file in one mapping. 32-bit: the header, then each region on its own
+        // at its fixed offset, capped (the offsets are page-aligned by construction).
+        let (map, regions) = if cfg!(target_pointer_width = "64") {
+            let Some(base) = map_at(0, total) else {
+                crate::log!("[shm] mmap {path} failed");
+                return false;
+            };
+            // SAFETY: every offset is inside the `total`-byte mapping just made.
+            let regions = Region::ALL.map(|r| unsafe { base.add(r.offset()) });
+            (base.cast::<libc::c_void>(), regions)
+        } else {
+            let Some(base) = map_at(0, neural_forge_protocol::HEADER_BYTES) else {
+                crate::log!("[shm] mmap {path} (header) failed");
+                return false;
+            };
+            let mut regions = [std::ptr::null_mut(); 5];
+            for r in Region::ALL {
+                let Some(p) = map_at(r.offset(), REGION_CAP) else {
+                    crate::log!("[shm] mmap {path} region {r:?} failed");
+                    return false;
+                };
+                regions[r as usize] = p;
+            }
+            (base.cast::<libc::c_void>(), regions)
+        };
+        self.regions = regions;
 
         let header = map as *mut neural_forge_protocol::ShmHeader;
         // SAFETY: just mapped above, `HEADER_BYTES` is large enough for `ShmHeader`
@@ -1090,7 +1151,7 @@ mod motion_transport_tests {
         assert_eq!(hdr.frame_mvec_valid.load(Ordering::Relaxed),1);
         assert_eq!(hdr.proxy_format.load(Ordering::Relaxed),format);
         assert_eq!(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),neural_forge_protocol::enums::mvec_scale_mode::PIXELS);
-        let payload = unsafe {std::slice::from_raw_parts(client.pixel_base().unwrap().add(neural_forge_protocol::motion_offset()),512*512*4)};
+        let payload = unsafe {std::slice::from_raw_parts(client.region(Region::Motion).unwrap().0,512*512*4)};
         assert!(payload.iter().filter(|&&x| x == 0).count() > payload.len()*95/100,"stationary motion should be near zero after the deadzone");
         hdr.mvec_enabled.store(0,Ordering::Relaxed);
         client.prepare_motion(&instance,pd,512,512,format,&pixels);

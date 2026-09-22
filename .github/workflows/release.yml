@@ -19,7 +19,7 @@ jobs:
         uses: dtolnay/rust-toolchain@v1
         with:
           toolchain: stable
-          targets: x86_64-pc-windows-gnu
+          targets: x86_64-pc-windows-gnu, i686-unknown-linux-gnu
 
       # The release used to build and publish without running a single test. Same
       # dependencies and checks as ci.yml, before anything gets packaged.
@@ -27,7 +27,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib \
             libvulkan1 mesa-vulkan-drivers vulkan-tools
 
       - name: cargo test (native crates)

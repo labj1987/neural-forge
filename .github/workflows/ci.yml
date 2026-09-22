@@ -25,11 +25,11 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 \
+            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib \
             libvulkan1 mesa-vulkan-drivers vulkan-tools
 
       - name: Install Rust
-        run: rustup target add x86_64-pc-windows-gnu
+        run: rustup target add x86_64-pc-windows-gnu i686-unknown-linux-gnu
 
       - name: Configure the mingw linker
         run: |
@@ -50,6 +50,9 @@ jobs:
 
       - name: cargo check (helper, cross-compiled)
         run: cargo check --target x86_64-pc-windows-gnu -p neural-forge-helper
+
+      - name: 32-bit layer tests
+        run: cargo test --target i686-unknown-linux-gnu -p neural-forge-layer
 
       # scripts/install.py delegates install/uninstall to neural-forge-cli (the single
       # implementation), so this exercises the same code the GUI's Setup tab runs.

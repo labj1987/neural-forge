@@ -1081,7 +1081,7 @@ pub unsafe fn run(
     // so turning "Enabled" off in the GUI had no effect on anything real at all.
     let bytes_per_pixel = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
-    if frame_bytes == 0 || frame_bytes as usize > neural_forge_protocol::MAX_FRAME {
+    if frame_bytes == 0 || frame_bytes as usize > crate::shm::region_capacity() {
         return None;
     }
 
@@ -2478,7 +2478,7 @@ unsafe fn run_sync(
 ) -> Option<vk::Semaphore> {
     let bytes_per_pixel = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
-    if frame_bytes == 0 || frame_bytes as usize > neural_forge_protocol::MAX_FRAME {
+    if frame_bytes == 0 || frame_bytes as usize > crate::shm::region_capacity() {
         return None;
     }
     if !ensure(resources, device, instance, physical_device, queue_family, frame_bytes) {

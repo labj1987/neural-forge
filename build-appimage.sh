@@ -40,7 +40,7 @@ if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null;
     apt-get update -qq || true
     apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
         pkg-config libssl-dev wget file desktop-file-utils zsync \
-        mingw-w64 gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64
+        mingw-w64 gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib
 fi
 # Add the target to whichever toolchain `$CARGO_HELPER` will actually invoke, not
 # necessarily the default one -- on a clean CI image there's exactly one toolchain and
@@ -55,6 +55,12 @@ for word in $CARGO_HELPER; do
         +*) rustup_toolchain_arg="--toolchain ${word#+}" ;;
     esac
 done
+# The 32-bit layer, for 32-bit games (a separate layer name and manifest, as upstream does).
+I686_TARGET="i686-unknown-linux-gnu"
+if ! rustup target list --installed ${rustup_toolchain_arg:+$rustup_toolchain_arg} 2>/dev/null | grep -q "$I686_TARGET"; then
+    # shellcheck disable=SC2086
+    rustup target add $rustup_toolchain_arg "$I686_TARGET"
+fi
 if ! rustup target list --installed ${rustup_toolchain_arg:+$rustup_toolchain_arg} 2>/dev/null | grep -q "$WIN_TARGET"; then
     # shellcheck disable=SC2086 -- word-splitting $rustup_toolchain_arg is intentional here.
     rustup target add $rustup_toolchain_arg "$WIN_TARGET"
@@ -66,6 +72,9 @@ cargo build --release
 
 echo "==> $CARGO_HELPER build --release --target $WIN_TARGET -p neural-forge-helper"
 $CARGO_HELPER build --release --target "$WIN_TARGET" -p neural-forge-helper
+
+echo "==> $CARGO_HELPER build --release --target $I686_TARGET -p neural-forge-layer"
+$CARGO_HELPER build --release --target "$I686_TARGET" -p neural-forge-layer
 
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
@@ -80,6 +89,10 @@ cp "target/release/$NAME"                      "$APPDIR/usr/bin/"
 cp "target/release/$NAME-cli"                       "$APPDIR/usr/bin/"
 cp "target/release/$LIB"                            "$APPDIR/usr/lib/$LIBDIR/"
 cp "target/$WIN_TARGET/release/${NAME}-helper.exe"  "$APPDIR/usr/lib/$LIBDIR/helper/"
+mkdir -p "$APPDIR/usr/lib/$LIBDIR/i686"
+cp "target/$I686_TARGET/release/$LIB" "$APPDIR/usr/lib/$LIBDIR/i686/"
+sed "s#\./i686/libneural_forge_layer\.so#../../../lib/$LIBDIR/i686/$LIB#" \
+    data/neural_forge_layer_i686.json > "$APPDIR/usr/share/vulkan/implicit_layer.d/neural_forge_layer_i686.json"
 sed "s#\./libneural_forge_layer\.so#../../../lib/$LIBDIR/$LIB#" \
     "data/$MANIFEST" > "$APPDIR/usr/share/vulkan/implicit_layer.d/$MANIFEST"
 cp data/io.github.labj1987.NeuralForge.desktop                               "$APPDIR/usr/share/applications/"

@@ -213,7 +213,8 @@ managed prefix, the logs and `/tmp/neural-forge-$UID`.
   `VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present` for that game.
 - **Steam Linux Runtime / pressure-vessel:** the game must see `/tmp/neural-forge-$UID`. If it
   does not, add `PRESSURE_VESSEL_FILESYSTEMS_RW=/tmp/neural-forge-$UID` to the launch options.
-- **32-bit games:** not supported yet (only a 64-bit layer ships).
+- **32-bit games:** a separate 32-bit layer ships (`VK_LAYER_neuralforge_neural_32`, same
+  `NEURAL_FORGE_ENABLE=1`); it handles frames up to 3840x2160 at 8 bits and passes larger ones through.
 
 ## Building from source
 
