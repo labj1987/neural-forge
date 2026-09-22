@@ -40,7 +40,7 @@ case "$MODE" in
         LAUNCH_ENV=(env -u NEURAL_FORGE_ENABLE VKLayer_DLSS5=1 DLSSNR_DMABUF=0)
         ;;
     neuralforge)
-        LAUNCH_ENV=(env -u VKLayer_DLSS5 NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 \
+        LAUNCH_ENV=(env -u VKLayer_DLSS5 NEURAL_FORGE_ENABLE=1 \
             "NEURAL_FORGE_TARGET_EXE=$GAME_EXE")
         ;;
     *)

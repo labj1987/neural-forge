@@ -163,7 +163,7 @@ read under its pre-0.1.77 spelling `NEURALFORGE_*`.
 | `NEURAL_FORGE_MAX_MODEL_PIXELS=N` | Largest raster the model is given (default 3840x2160 = 8294400). |
 | `NEURAL_FORGE_LOG=/path` | Layer log file (default: stderr). Also the helper's log when set for it. |
 | `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID` | Shared-memory path / the uid its directory is named after; normally left alone. |
-| `NEURAL_FORGE_DMABUF=0` | Written by the GUI's launch-option builder; currently has no effect. |
+| `NEURAL_FORGE_DMABUF` | No effect (the DMA-BUF transport is not wired); older launch options may still carry it harmlessly. |
 | `NEURAL_FORGE_SKIP_NVAPI=1` | Helper, set by the supervisor for Proton: do not load the vendored `nvapi64.dll`. |
 | `NEURAL_FORGE_AUTO_DOWNLOAD=0` | Supervisor, system-Wine runner: never download DXVK / DXVK-NVAPI (supply them in the binaries folder). |
 | `NEURAL_FORGE_INSTALL_DIR` | Supervisor: where to find the helper (default: the installed copy, then the AppImage's). |

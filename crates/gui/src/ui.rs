@@ -951,13 +951,15 @@ fn build_install_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
 /// The exact Steam launch-option string for these settings -- pulled out of the
 /// closure below so it's a plain, unit-testable function instead of only ever being
 /// exercised live through GTK signal handlers.
-fn launch_option(target_exe: &str, dmabuf: bool) -> String {
-    let dmabuf = u32::from(dmabuf);
+///
+/// There is no DMA-BUF switch: nothing reads `NEURAL_FORGE_DMABUF` (the transport is not wired),
+/// and a switch that does nothing was worse than none.
+fn launch_option(target_exe: &str) -> String {
     let target_exe = target_exe.trim();
     if target_exe.is_empty() {
-        format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF={dmabuf} %command%")
+        "NEURAL_FORGE_ENABLE=1 %command%".to_string()
     } else {
-        format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF={dmabuf} NEURAL_FORGE_TARGET_EXE={target_exe} %command%")
+        format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE={target_exe} %command%")
     }
 }
 
@@ -970,10 +972,6 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     exe_row.set_title("Target executable (optional, for a multi-process game)");
     group.add(&exe_row);
 
-    let dmabuf_row = adw::SwitchRow::new();
-    dmabuf_row.set_title("DMA-BUF transport");
-    dmabuf_row.set_subtitle("Off is the known-good baseline");
-    group.add(&dmabuf_row);
 
     let preview_row = adw::ActionRow::new();
     preview_row.set_title("Launch option");
@@ -984,8 +982,7 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     group.add(&preview_row);
 
     let exe_row_for_build = exe_row.clone();
-    let dmabuf_row_for_build = dmabuf_row.clone();
-    let build_option = std::rc::Rc::new(move || launch_option(&exe_row_for_build.text(), dmabuf_row_for_build.is_active()));
+    let build_option = std::rc::Rc::new(move || launch_option(&exe_row_for_build.text()));
 
     preview_row.set_subtitle(&build_option());
 
@@ -993,11 +990,6 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
         let preview_row = preview_row.clone();
         let build_option = std::rc::Rc::clone(&build_option);
         exe_row.connect_changed(move |_| preview_row.set_subtitle(&build_option()));
-    }
-    {
-        let preview_row = preview_row.clone();
-        let build_option = std::rc::Rc::clone(&build_option);
-        dmabuf_row.connect_active_notify(move |_| preview_row.set_subtitle(&build_option()));
     }
     copy_button.connect_clicked(move |button| {
         button.display().clipboard().set_text(&build_option());
@@ -1552,26 +1544,21 @@ mod launch_option_tests {
 
     #[test]
     fn matches_the_documented_baseline_with_no_target_exe() {
-        assert_eq!(launch_option("", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 %command%");
+        assert_eq!(launch_option(""), "NEURAL_FORGE_ENABLE=1 %command%");
     }
 
     #[test]
     fn includes_target_exe_when_given() {
-        assert_eq!(launch_option("GTA5_Enhanced.exe", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
-    }
-
-    #[test]
-    fn dmabuf_toggle_changes_only_that_field() {
-        assert_eq!(launch_option("", true), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=1 %command%");
+        assert_eq!(launch_option("GTA5_Enhanced.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
     }
 
     #[test]
     fn trims_whitespace_around_target_exe() {
-        assert_eq!(launch_option("  GTA5_Enhanced.exe  ", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
+        assert_eq!(launch_option("  GTA5_Enhanced.exe  "), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
     }
 
     #[test]
     fn whitespace_only_target_exe_is_treated_as_empty() {
-        assert_eq!(launch_option("   ", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 %command%");
+        assert_eq!(launch_option("   "), "NEURAL_FORGE_ENABLE=1 %command%");
     }
 }
