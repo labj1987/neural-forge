@@ -18,6 +18,7 @@
 //! additionally excludes small overlays. DMA-BUF remains experimental. See
 //! docs/HARDWARE_VALIDATION.md for presentation-validation failures still under review.
 
+mod breadcrumbs;
 mod capture;
 mod optical_flow;
 mod composition;
@@ -147,11 +148,15 @@ pub(crate) fn note_vk<T>(result: ash::prelude::VkResult<T>) -> ash::prelude::VkR
 /// `ATTRIBUTION.md`.
 pub(crate) const FENCE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Wraps a bounded (`FENCE_WAIT_TIMEOUT`) `wait_for_fences` result: passes it through
-/// [`note_vk`] as usual, and additionally logs once per process, by name, the first
-/// time one of these waits actually times out -- so a real occurrence is diagnosable
-/// ("this site stalled") instead of indistinguishable from any other Vulkan error.
-pub(crate) fn note_fence_wait(result: ash::prelude::VkResult<()>, site: &str) -> ash::prelude::VkResult<()> {
+/// Wraps a bounded (`FENCE_WAIT_TIMEOUT`) `wait_for_fences` result: marks `site` in
+/// `breadcrumbs` (every call, not just failures -- these calls are rare enough per
+/// frame that the trail is cheap and worth having regardless of outcome), passes the
+/// result through [`note_vk`] as usual, and additionally logs once per process, by
+/// name, plus a full breadcrumb dump, the first time one of these waits actually times
+/// out -- so a real occurrence is diagnosable ("this site stalled, and here is what led
+/// up to it") instead of indistinguishable from any other Vulkan error.
+pub(crate) fn note_fence_wait(result: ash::prelude::VkResult<()>, site: &'static str) -> ash::prelude::VkResult<()> {
+    crate::breadcrumbs::mark(site);
     if matches!(result, Err(vk::Result::TIMEOUT)) {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -159,7 +164,7 @@ pub(crate) fn note_fence_wait(result: ash::prelude::VkResult<()>, site: &str) ->
                 "[layer] fence wait timed out after {FENCE_WAIT_TIMEOUT:?} at {site} -- \
                  driver stall without device loss; failing open and continuing rather than hanging"
             );
-            crate::logging::flush();
+            crate::breadcrumbs::dump("fence wait timeout");
         }
     }
     note_vk(result)

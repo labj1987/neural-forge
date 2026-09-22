@@ -975,6 +975,10 @@ pub unsafe fn run(
     last_answer: &mut Vec<u8>,
     last_answer_dims: &mut (u32, u32),
 ) -> Option<vk::Semaphore> {
+    // Cheap enough to leave on every frame: this is what turns the bounded fence-wait
+    // markers in `note_fence_wait` into a trail with frame boundaries in it, not just
+    // an undated list of wait completions. See `breadcrumbs`' own doc comment.
+    crate::breadcrumbs::mark("capture::run enter");
     let pipeline_start = std::time::Instant::now();
     // `composition_settings()` (and everything else below) only ever reads through an
     // already-open mapping -- nothing about it opens one. Every real path that DOES
@@ -1407,6 +1411,12 @@ pub unsafe fn run(
                     }
                     Some(false) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_micros(100)),
                     // Out of time, or the helper is gone: this frame goes out untouched.
+                    // Deliberately no breadcrumb dump here, unlike the bounded fence
+                    // waits: a slow/warming-up/restarting helper routinely exceeds
+                    // `SYNC_BUDGET` (see this function's own comment above), so this
+                    // path is expected and already explained -- dumping on every
+                    // occurrence would spam the log instead of flagging something
+                    // unusual, which is what `breadcrumbs` exists for.
                     _ => {
                         shm.publish_frame_timing(pipeline_start.elapsed(), false);
                         return None;

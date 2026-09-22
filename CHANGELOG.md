@@ -4,6 +4,25 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.86 — 2026-09-22
+
+- **The helper's own NGX feature-build wait is bounded too, and a breadcrumb trail now
+  survives a stall.** 0.1.85 bounded every fence wait the *layer* can hit on the game's own
+  present thread; this does the layer-process counterpart and adds a diagnostic. The helper's
+  `CreateFeature` setup wait (`crates/helper/src/ngx.rs`) also used to pass `u64::MAX` -- bounded
+  to the same 5s budget, but with its own recovery: a real timeout there means GPU work may still
+  be in flight, so the setup command pool and fence are deliberately leaked (a rare, anomalous
+  leak, not a routine cost) rather than freed out from under it. Several other unbounded waits in
+  the helper (`device_wait_idle` in `ngx.rs`/`optical_flow.rs`, and `frame.rs`'s own per-frame
+  evaluate wait) were deliberately **not** touched this pass: fixing them safely means changing a
+  documented cross-file invariant ("nothing is in flight when a feature is destroyed"), not
+  swapping a timeout value, and that's a bigger design decision than this pass was scoped for.
+  New: `crates/layer/src/breadcrumbs.rs`, a small always-on ring of the last 64 pipeline-stage
+  markers on the game's present thread (`capture::run` entry, every bounded fence wait), dumped to
+  `nf-layer.log` only when one of those fence waits actually times out -- so a real stall is
+  diagnosable from the log afterward instead of just "the game stopped responding". Idea from PR
+  #22 against DLSS5VKLayer (bmitch87), commits `4aa730c0` and `0b41c98c`; see ATTRIBUTION.md.
+
 ## 0.1.85 — 2026-09-22
 
 - **Every fence wait the layer can hit on the game's own present thread is now bounded (5s),

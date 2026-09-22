@@ -41,6 +41,15 @@ fn utf16(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+/// Generous-but-finite budget for the one `wait_for_fences` in this module that used
+/// to pass `u64::MAX` (the setup command buffer in `create_feature_at`). A lost device
+/// already returns `VK_ERROR_DEVICE_LOST` rather than hanging, so this was never
+/// guarding against that; it was guarding against a driver stall that doesn't lose the
+/// device, where the wait simply never returns. Same value and reasoning as
+/// `neural_forge_layer`'s own `FENCE_WAIT_TIMEOUT`, ported here from PR #22 against
+/// DLSS5VKLayer (bmitch87), commit `4aa730c0` -- see `ATTRIBUTION.md`.
+const FENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// `NEURAL_FORGE_SKIP_NVAPI` semantics: set to anything that doesn't start with `0`.
 fn skip_nvapi() -> bool {
     neural_forge_protocol::env::var("NEURAL_FORGE_SKIP_NVAPI").is_some_and(|v| !v.is_empty() && !v.starts_with('0'))
@@ -810,11 +819,26 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build();
     // SAFETY: `cmd` was just ended above; `queue` is the caller's own, live queue.
     let submitted = unsafe { device.queue_submit(queue, &[submit], fence) }.is_ok();
-    let waited = submitted && unsafe { device.wait_for_fences(&[fence], true, u64::MAX) }.is_ok();
+    // Bounded, not `u64::MAX`: a driver that stalls here without losing the device
+    // used to park this thread forever, with nothing to log -- see
+    // `FENCE_WAIT_TIMEOUT`'s own doc comment.
+    let wait = submitted.then(|| unsafe { device.wait_for_fences(&[fence], true, FENCE_WAIT_TIMEOUT.as_nanos() as u64) });
+    let waited = matches!(wait, Some(Ok(())));
     crate::log!("[ngx] CreateFeature: setup command buffer submitted={submitted} waited={waited}");
-    // SAFETY: either the fence was just waited on (work complete), or submission
-    // itself failed (nothing in flight to wait for) -- both cases make destroying
-    // these handles now sound.
+    if submitted && matches!(wait, Some(Err(vk::Result::TIMEOUT))) {
+        // The wait timed out with real work possibly still in flight: destroying the
+        // fence or freeing `cmd` (by destroying the pool that owns it) right now would
+        // race that work, which is exactly the hazard the old unbounded wait existed
+        // to prevent. Leak both -- a one-time, anomalous leak in a process that will
+        // usually just retry or eventually exit, not a routine cost -- and let this
+        // build fail like any other `CreateFeature` failure below.
+        crate::log!("[ngx] CreateFeature: setup fence wait timed out after {FENCE_WAIT_TIMEOUT:?}; abandoning the setup command pool and fence rather than risk freeing in-flight work");
+        crate::logging::flush();
+        return None;
+    }
+    // SAFETY: either the fence was just waited on successfully (work complete), or
+    // submission itself failed (nothing in flight to wait for) -- both cases make
+    // destroying these handles now sound. A timeout returns early above instead.
     unsafe {
         device.destroy_fence(fence, None);
         device.destroy_command_pool(pool, None);
