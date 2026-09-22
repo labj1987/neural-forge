@@ -132,6 +132,39 @@ pub(crate) fn note_vk<T>(result: ash::prelude::VkResult<T>) -> ash::prelude::VkR
     result
 }
 
+/// Generous-but-finite budget for a fence wait that guards this project's own GPU
+/// work (compose dispatches, and the rare rebuild-drain waits in `capture.rs`). Every
+/// such wait used to pass `u64::MAX`: a lost device already returns
+/// `VK_ERROR_DEVICE_LOST` from the wait rather than hanging, so the case this bounds
+/// is a driver that stalls *without* losing the device -- the call never returns, the
+/// game's present thread parks, and nothing is logged, because there is no result for
+/// `note_vk` to see. Five seconds is long enough that a genuinely busy dispatch (4K,
+/// mode 2, several passes) never trips it, but short enough that a real stall becomes
+/// a bounded, diagnosable stutter instead of an unexplained freeze.
+///
+/// Pattern and budget from PR #22 against DLSS5VKLayer (bmitch87), commit `4aa730c0`
+/// ("Bound the fence waits, including the two in the game's present path") -- see
+/// `ATTRIBUTION.md`.
+pub(crate) const FENCE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Wraps a bounded (`FENCE_WAIT_TIMEOUT`) `wait_for_fences` result: passes it through
+/// [`note_vk`] as usual, and additionally logs once per process, by name, the first
+/// time one of these waits actually times out -- so a real occurrence is diagnosable
+/// ("this site stalled") instead of indistinguishable from any other Vulkan error.
+pub(crate) fn note_fence_wait(result: ash::prelude::VkResult<()>, site: &str) -> ash::prelude::VkResult<()> {
+    if matches!(result, Err(vk::Result::TIMEOUT)) {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!(
+                "[layer] fence wait timed out after {FENCE_WAIT_TIMEOUT:?} at {site} -- \
+                 driver stall without device loss; failing open and continuing rather than hanging"
+            );
+            crate::logging::flush();
+        }
+    }
+    note_vk(result)
+}
+
 fn env_flag(name: &str) -> bool {
     neural_forge_protocol::env::flag(name)
 }

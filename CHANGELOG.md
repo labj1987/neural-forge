@@ -4,6 +4,23 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.85 — 2026-09-22
+
+- **Every fence wait the layer can hit on the game's own present thread is now bounded (5s),
+  instead of passing `u64::MAX`.** A lost device already returns `VK_ERROR_DEVICE_LOST` from an
+  unbounded wait rather than hanging, so this never guarded against that; it guarded against a
+  driver that stalls *without* losing the device, where the wait simply never returns, the game's
+  present thread parks, and nothing gets logged because there is no result for anything to see.
+  Seven call sites across `capture.rs` and `composition/gpu.rs` (the compose dispatches, their
+  async-slot reuse waits, and the rare pipeline/direct-capture rebuild-on-resize drains) are
+  affected; every one already had a safe fail-open return for an ordinary Vulkan error, so a
+  timeout now takes that exact same path instead of blocking forever, and is logged once by site
+  name if it ever actually happens. Prompted by reading PR #22 against DLSS5VKLayer (bmitch87),
+  which documents the identical failure mode and fixes it the same way; a real occurrence here
+  would be the first solid lead on why compositing during GTA V's loading screens has stalled the
+  game in the past (`docs/UPSTREAM_PARITY.md`, "Not done yet") -- not confirmed as the cause, but
+  no longer silently unrecoverable if it is.
+
 ## 0.1.84 — 2026-09-22
 
 - **Debug views work in GTA V (and any other game that blits into its swapchain).** They used to

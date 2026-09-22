@@ -1782,9 +1782,9 @@ fn ensure_pipeline(
     }
     // A rebuild is needed (capacity grew or the queue family changed -- the same two
     // triggers `ensure` already has). Resize/teardown is rare and not latency
-    // sensitive, so this is the one place in the pipeline that takes a real, blocking
-    // (unbounded, like every other fence wait this project keeps unbounded rather
-    // than guessing a safe timeout) wait -- never on the steady-state per-frame path.
+    // sensitive, so this is one of the places in the pipeline that takes a real,
+    // blocking wait -- never on the steady-state per-frame path. Bounded rather than
+    // truly unbounded: see `crate::FENCE_WAIT_TIMEOUT`.
     let p = existing.as_ref().expect("checked above");
     for slot in &p.slots {
         if slot.pending.is_some() {
@@ -1792,10 +1792,12 @@ fn ensure_pipeline(
             // before any destroy below touches the resources it guards, is exactly
             // what makes that destroy sound -- the "drain before rebuilding on a live
             // device" this pipeline's own design doc calls for.
-            if crate::note_vk(unsafe { device.wait_for_fences(&[slot.buf.fence], true, u64::MAX) }).is_err() {
-                // A real device error, not a timeout (there is no timeout above).
-                // Leave the existing pipeline exactly as it was rather than guess it's
-                // safe to destroy -- next frame's `ensure_pipeline` call tries again.
+            let wait = unsafe { device.wait_for_fences(&[slot.buf.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+            if crate::note_fence_wait(wait, "capture::ensure_pipeline rebuild drain").is_err() {
+                // A real device error, or the bounded wait above finally timed out.
+                // Either way, leave the existing pipeline exactly as it was rather
+                // than guess it's safe to destroy -- next frame's `ensure_pipeline`
+                // call tries again.
                 return false;
             }
         }
@@ -2098,9 +2100,11 @@ unsafe fn ensure_direct_capture(
         if d.pending.is_some() {
             // SAFETY: `d.buf.fence` is this slot's own fence; waiting for it before
             // any destroy below touches the resources it guards is exactly what makes
-            // that destroy sound. Unbounded, like every other rebuild wait in this
-            // module -- rare, not latency sensitive, and there is no timeout to guess.
-            if crate::note_vk(unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }).is_err() {
+            // that destroy sound. Bounded, like every other rebuild wait in this
+            // module -- rare, not latency sensitive, but not worth risking forever
+            // over: see `crate::FENCE_WAIT_TIMEOUT`.
+            let wait = unsafe { device.wait_for_fences(&[d.buf.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+            if crate::note_fence_wait(wait, "capture::ensure_direct_capture rebuild drain").is_err() {
                 return false;
             }
         }
@@ -2420,7 +2424,8 @@ fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Q
     if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], r.fence) }).is_err() {
         return;
     }
-    let _ = crate::note_vk(unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) });
+    let wait = unsafe { device.wait_for_fences(&[r.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    let _ = crate::note_fence_wait(wait, "capture::write_bytes_to_image");
 }
 
 /// Captures `image` into the proxy region, runs the shared-memory round trip, and
@@ -2572,8 +2577,10 @@ unsafe fn run_sync(
     if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], r.fence) }).is_err() {
         return None;
     }
-    // SAFETY: `r.fence` was just submitted against above.
-    if crate::note_vk(unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }).is_err() {
+    // SAFETY: `r.fence` was just submitted against above. Bounded, not truly
+    // unbounded: see `crate::FENCE_WAIT_TIMEOUT`.
+    let wait = unsafe { device.wait_for_fences(&[r.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    if crate::note_fence_wait(wait, "capture::run_sync stage1").is_err() {
         return None;
     }
     let t_stage1 = t_stage1_start.elapsed();
@@ -2823,7 +2830,8 @@ unsafe fn run_sync(
     // deferring to the next frame) keeps `image` fully write-back-complete and back in
     // `PRESENT_SRC_KHR` before this function returns, which is what the caller's own
     // immediately-following real present call requires.
-    if crate::note_vk(unsafe { device.wait_for_fences(&[r.fence], true, u64::MAX) }).is_err() {
+    let wait = unsafe { device.wait_for_fences(&[r.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    if crate::note_fence_wait(wait, "capture::run_sync stage2").is_err() {
         return None;
     }
     let t_stage2 = t_stage2_start.elapsed();

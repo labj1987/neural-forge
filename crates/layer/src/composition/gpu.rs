@@ -1155,8 +1155,10 @@ impl GpuCompose {
         if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }).is_err() {
             return false;
         }
-        // SAFETY: `self.sync.fence` was just submitted against above.
-        if crate::note_vk(unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }).is_err() {
+        // SAFETY: `self.sync.fence` was just submitted against above. Bounded, not
+        // truly unbounded: see `crate::FENCE_WAIT_TIMEOUT`.
+        let wait = unsafe { device.wait_for_fences(&[self.sync.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        if crate::note_fence_wait(wait, "gpu::dispatch").is_err() {
             return false;
         }
 
@@ -1249,8 +1251,10 @@ impl GpuCompose {
         if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }).is_err() {
             return false;
         }
-        // SAFETY: `self.sync.fence` was just submitted against above.
-        crate::note_vk(unsafe { device.wait_for_fences(&[self.sync.fence], true, u64::MAX) }).is_ok()
+        // SAFETY: `self.sync.fence` was just submitted against above. Bounded, not
+        // truly unbounded: see `crate::FENCE_WAIT_TIMEOUT`.
+        let wait = unsafe { device.wait_for_fences(&[self.sync.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        crate::note_fence_wait(wait, "gpu::dispatch_into_image").is_ok()
     }
 
     /// `answer_width`/`answer_height` are `answer`'s own resolution -- pass
@@ -1274,7 +1278,8 @@ impl GpuCompose {
         })?;
         let idx = self.next_async_slot; self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let slot = &mut self.async_slots[idx];
-        if crate::note_vk(unsafe { device.wait_for_fences(&[slot.slot.fence], true, u64::MAX) }).is_err() { return None; }
+        let wait = unsafe { device.wait_for_fences(&[slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        if crate::note_fence_wait(wait, "gpu::present_temporal_delta_async slot reuse").is_err() { return None; }
         let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
         if generation == 0 || base.len() < bytes || answer.len() < answer_bytes || answer_bytes > bytes { return None; }
@@ -1336,7 +1341,8 @@ impl GpuCompose {
         let idx = self.next_async_slot;
         self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let async_slot = &mut self.async_slots[idx];
-        if crate::note_vk(unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, u64::MAX) }).is_err() {
+        let wait = unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        if crate::note_fence_wait(wait, "gpu::present_cached_raw_async slot reuse").is_err() {
             return None;
         }
         let frame_bytes = (u64::from(width) * u64::from(height) * 4) as usize;
@@ -1420,8 +1426,10 @@ impl GpuCompose {
         // previous dispatch's own result) is exactly what makes this "async": the
         // block only ever happens `ASYNC_SLOTS` dispatches later, immediately before
         // this specific slot's resources are touched again, never on the frame that
-        // just submitted them.
-        if crate::note_vk(unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, u64::MAX) }).is_err() {
+        // just submitted them. Bounded, not truly unbounded: see
+        // `crate::FENCE_WAIT_TIMEOUT`.
+        let wait = unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        if crate::note_fence_wait(wait, "gpu::dispatch_into_image_async slot reuse").is_err() {
             return None;
         }
 
