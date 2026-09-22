@@ -4,6 +4,18 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.83 — 2026-09-21
+
+- **Frame generation now adds frames.** "Model every Nth frame" (Model tab; header v6): at 2 the
+  model runs on every other presented frame and the frames between reuse its last answer (with the
+  ghost guard). With DLSS Frame Generation on in GTA V at 1440p: about 54 presented frames per
+  second against 42.
+- **Multipass keeps its precision.** Chains of passes go through 16-bit working images instead of
+  8-bit ones between passes (falls back to 8-bit if the model refuses them).
+- **32-bit games.** A 32-bit layer ships alongside the 64-bit one (`VK_LAYER_neuralforge_neural_32`,
+  same `NEURAL_FORGE_ENABLE=1`), for frames up to 3840x2160.
+- The launch-option builder no longer offers a DMA-BUF switch that did nothing.
+
 ## 0.1.82 — 2026-09-21
 
 - A 0.1.81 layer refused every answer from an older helper (which does not report the size it
