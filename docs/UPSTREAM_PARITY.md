@@ -73,15 +73,18 @@ other's mapping.
   rig. The full fix is to enhance before frame generation (the game's render target, not the
   swapchain).
 - **Why compositing during GTA V's loading screens stalls the game** is still unknown; the layer
-  avoids it by waiting for 5 s of steady rendering (`swapchain::Warmup`). v0.1.85/0.1.86 found and
-  fixed one concrete way this *class* of stall could happen (every `wait_for_fences` the layer or
-  helper can hit on the game's own present/build path used to pass `u64::MAX` -- a driver that
-  stalls without losing the device would park the thread forever with nothing logged; now bounded
-  to 5s and logged via a breadcrumb trail, `crates/layer/src/breadcrumbs.rs`, see PR #22 against
-  DLSS5VKLayer and `ATTRIBUTION.md`). Not confirmed as *the* cause -- if `nf-layer.log` ever shows
-  a `fence wait timed out` line, that confirms it; if the freeze recurs with no such line, the
-  cause is elsewhere (the helper's several `device_wait_idle()` calls and `frame.rs`'s per-frame
-  evaluate wait are the next suspects, deliberately left unbounded in 0.1.86 -- see that version's
-  changelog entry for why).
+  avoids it by waiting for 5 s of steady rendering (`swapchain::Warmup`). v0.1.85-0.1.87 found and
+  fixed one concrete way this *class* of stall could happen: every `wait_for_fences` the layer or
+  helper can hit on the game's own present/build/evaluate path used to pass `u64::MAX` -- a driver
+  that stalls without losing the device would park the thread forever with nothing logged. All of
+  them are now bounded (5s) and logged via a breadcrumb trail on the layer side
+  (`crates/layer/src/breadcrumbs.rs`); see PR #22 against DLSS5VKLayer and `ATTRIBUTION.md`. Not
+  confirmed as *the* cause -- if `nf-layer.log` ever shows a `fence wait timed out` line, that
+  confirms it. If the freeze recurs with no such line, the one remaining unbounded class is the
+  helper's `device_wait_idle()` calls (`ngx.rs`, `optical_flow.rs`): that Vulkan API has no
+  timeout parameter at all, so bounding it needs a different mechanism (e.g. a watchdog thread)
+  and a decision about whether it's safe to keep using a device once one such call is considered
+  abandoned -- not attempted, deliberately, pending that decision. Lower priority in practice: the
+  only caller of `optical_flow.rs`'s is motion vectors, off by default and untested on the rig.
 - **Running the model before the game's own upscaler** (on the internal render resolution)
   rather than on the upscaled output: a later performance idea.
