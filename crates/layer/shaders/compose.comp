@@ -96,6 +96,20 @@ layout(push_constant) uniform Params {
   // that encoded space -- frame / white_point, then the knee -- so the proxy it is compared with
   // must be in the same space.
   float white_point;
+  // neural_forge_protocol::ShmHeader::debug_view -- upstream dlssnr.hlsl's own debug views,
+  // 0-3 matching composition::apply's CPU reference exactly, 4 and 5 ported from upstream
+  // (gDebugView == 4/5): 0 normal, 1 the original frame unmodified, 2 the model's raw answer
+  // unmodified, 3 the composited result's difference from the original (amplified 4x, recentered
+  // at mid-gray), 4 the colour trust bound's engagement (green passes whole, red is held back --
+  // a fault shows green if the bound is not engaging (look upstream in UpgradeToneMap/colour_dev)
+  // or red if it is (the fault is `colour_allow` itself)), 5 the composed colour before the
+  // colour trust bound is applied, so 5 and the normal view can be compared frame by frame.
+  // 4 and 5 only differ from the normal result where colour is actually computed (mode 2,
+  // colour_strength > 0); elsewhere they fall back to the normal composited result.
+  uint debug_view;
+  // View 5 only: multiplies the pre-bound colour before display, so a subtle difference from
+  // the normal result is easier to see (upstream gDebugScale). 1.0 = no amplification.
+  float debug_scale;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -291,6 +305,10 @@ void main() {
   vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, src).bgr : imageLoad(u_model_answer, src).rgb);
 
   vec3 result;
+  // Sentinels for debug views 4/5: negative x means "not computed for this pixel" (outside the
+  // mode-2, colour_strength>0 branch), so the override below falls back to the normal result.
+  vec3 colour_allow_debug = vec3(-1.0);
+  vec3 pre_bound_debug = vec3(-1.0);
   if (params.mode == 2u) {
     // Mode 2: the encoded-proxy ratio transfer. Only valid when the capture leg
     // actually ran the encode (`composition::encode_pass`), which is why it is a
@@ -494,6 +512,10 @@ void main() {
         float chroma_swing = length(colour_dev) / max(Luminance(luminance_only), 1e-4);
         float colour_allow = params.colour_trust <= 0.0 ? 0.0 : min(1.0, params.colour_trust / max(chroma_swing, 1e-6));
         vec3 bounded_colour = luminance_only + colour_dev * colour_allow;
+        // Debug view 4: green where the bound lets the correction through whole, red where it is
+        // shortened. Debug view 5: the composed colour as it stood before that bound.
+        colour_allow_debug = vec3(1.0 - colour_allow, colour_allow, 0.0);
+        pre_bound_debug = fully_upgraded;
         result = GamutCompressReversible(mix(luminance_only, bounded_colour, clamp(params.colour_strength, 0.0, 1.0) * hue_trust));
       }
     }
@@ -596,6 +618,22 @@ void main() {
 
     vec3 blended = mix(original, transferred, clamp(params.transfer_strength, 0.0, 1.0));
     result = GamutCompressReversible(blended);
+  }
+
+  // Debug views (neural_forge_protocol::ShmHeader::debug_view). Matches
+  // composition::apply::compose_pixel's CPU semantics exactly for 1/2/3; 4 and 5 are upstream's
+  // own colour-trust diagnostic views, only meaningful where colour_allow_debug/pre_bound_debug
+  // were actually computed above (elsewhere they leave `result` as the normal composited output).
+  if (params.debug_view == 1u) {
+    result = original;
+  } else if (params.debug_view == 2u) {
+    result = model;
+  } else if (params.debug_view == 3u) {
+    result = vec3(0.5) + (result - original) * 4.0;
+  } else if (params.debug_view == 4u && colour_allow_debug.x >= 0.0) {
+    result = colour_allow_debug;
+  } else if (params.debug_view == 5u && pre_bound_debug.x >= 0.0) {
+    result = pre_bound_debug * params.debug_scale;
   }
 
   if (show_original) {

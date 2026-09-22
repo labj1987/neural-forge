@@ -64,6 +64,10 @@ pub struct ComposeParams {
     pub model_small: bool,
     /// The white point the proxy encode divided by.
     pub white_point: f32,
+    /// See `compose.comp`'s own `debug_view` push constant doc comment.
+    pub debug_view: u32,
+    /// View 5 only: see `ShmHeader::debug_scale_bits`.
+    pub debug_scale: f32,
     /// True when the proxy that produced this answer went through
     /// [`crate::composition::encode_pass`]. False means the proxy is a bit-identical
     /// copy of the frame and the ratio transfer would self-cancel on it.
@@ -102,6 +106,8 @@ struct PushConstants {
     transfer: u32,
     model_small: u32,
     white_point: f32,
+    debug_view: u32,
+    debug_scale: f32,
 }
 
 struct Image {
@@ -590,7 +596,7 @@ impl ComposeSlot {
 
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: 0, white_point: 1.0 };
+            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: 0, white_point: 1.0, debug_view: 0, debug_scale: 1.0 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -837,6 +843,8 @@ impl ComposeSlot {
                 transfer: compose.transfer,
                 model_small: u32::from(compose.model_small),
                 white_point: compose.white_point,
+                debug_view: compose.debug_view,
+                debug_scale: compose.debug_scale,
             };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
@@ -1807,7 +1815,7 @@ mod tests {
         let mut speckle = grey.clone();
         let centre = ((8 * w + 8) * 4) as usize;
         speckle[centre..centre + 3].copy_from_slice(&[200, 200, 200]);
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
         let Some(sharp) = compose_once(w, h, &grey, &grey, &speckle, base) else {
             eprintln!("ratio smoothing test: no Vulkan device, skipping");
             return;
@@ -1834,6 +1842,76 @@ mod tests {
         assert!(c1 > c0 && c2 > c1, "more trust, more of the model's red, never reversed: {c0} {c1} {c2}");
     }
 
+    /// Debug views on a real device. 1/2/3 match the CPU reference's semantics exactly (original,
+    /// raw answer, amplified diff); 4 is the colour-trust bound shown as green (passing)/red (held
+    /// back); 5 is the colour before that bound, which upstream's own doc comment says should not
+    /// itself depend on how much of it the bound lets through.
+    #[test]
+    fn debug_views() {
+        let (w, h) = (16u32, 16u32);
+        let blue: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 120, 160, 255]).collect();
+        let red: Vec<u8> = (0..w * h).flat_map(|_| [170u8, 110, 100, 255]).collect();
+        let centre = ((8 * w + 8) * 4) as usize;
+        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 0.5, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+
+        let Some(normal) = compose_once(w, h, &blue, &blue, &red, base) else {
+            eprintln!("debug_views test: no Vulkan device, skipping");
+            return;
+        };
+        let original = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 1, ..base }).unwrap();
+        let raw_answer = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 2, ..base }).unwrap();
+        let diff = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 3, ..base }).unwrap();
+        let trust_view = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 4, ..base }).unwrap();
+        let pre_bound = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 5, ..base }).unwrap();
+
+        let px = |out: &[u8]| (out[centre], out[centre + 1], out[centre + 2]);
+        let (ob, og, obl) = px(&original);
+        assert!((i32::from(ob) - 100).abs() <= 2 && (i32::from(og) - 120).abs() <= 2 && (i32::from(obl) - 160).abs() <= 2, "view 1 is the original frame: got ({ob},{og},{obl})");
+
+        let (rr, rg, rb) = px(&raw_answer);
+        assert!((i32::from(rr) - 170).abs() <= 2 && (i32::from(rg) - 110).abs() <= 2 && (i32::from(rb) - 100).abs() <= 2, "view 2 is the model's raw answer: got ({rr},{rg},{rb})");
+
+        // View 3 is 0.5 + (normal - original) * 4: it must actually move away from mid-gray here
+        // (there is a real composited edit to show), and in the direction the real edit moved.
+        let (dr, _dg, _db) = px(&diff);
+        let (nr, _ng, _nb) = px(&normal);
+        assert!(i32::from(dr) != 128, "view 3 must show something other than flat mid-gray when there is a real edit");
+        assert!((i32::from(dr) > 128) == (i32::from(nr) > 100), "view 3's direction must match the real edit's direction");
+
+        // View 4: colour_trust 0.5 against this swing does not let the correction through whole
+        // (asserted by the colour_trust test already), so red (held back) must dominate green.
+        let (tr, tg, _tb) = px(&trust_view);
+        assert!(tr > tg, "view 4 must show red (held back) where the bound is actually engaging: r={tr} g={tg}");
+
+        // View 5 is the colour before the bound -- it must not depend on colour_trust at all.
+        let pre_bound_low_trust = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 5, colour_trust: 0.0, ..base }).unwrap();
+        let pre_bound_high_trust = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 5, colour_trust: 4.0, ..base }).unwrap();
+        assert_eq!(px(&pre_bound), px(&pre_bound_low_trust), "view 5 must not move with colour_trust");
+        assert_eq!(px(&pre_bound), px(&pre_bound_high_trust), "view 5 must not move with colour_trust");
+        // And it must differ from the normal (bounded) result, since the bound is actually engaging.
+        assert_ne!(px(&pre_bound), px(&normal), "view 5 (pre-bound) must differ from the normal composited result when the bound engages");
+
+        // debug_scale amplifies view 5 alone: at 1.0 it must match the unscaled pre_bound above,
+        // and a larger scale must push the (already above mid-tone) red channel higher still.
+        let pre_bound_scale1 = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 5, debug_scale: 1.0, ..base }).unwrap();
+        let pre_bound_scale3 = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 5, debug_scale: 3.0, ..base }).unwrap();
+        assert_eq!(px(&pre_bound), px(&pre_bound_scale1), "debug_scale 1.0 must match the default (unscaled)");
+        let (r1, _, _) = px(&pre_bound_scale1);
+        let (r3, _, _) = px(&pre_bound_scale3);
+        assert!(r3 > r1, "a larger debug_scale must push the amplified colour further: r1={r1} r3={r3}");
+        // debug_scale must not leak into any other view.
+        let normal_scale3 = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_scale: 3.0, ..base }).unwrap();
+        assert_eq!(px(&normal), px(&normal_scale3), "debug_scale must only affect view 5");
+
+        // colour_strength 0 (luminance-only, no colour ever computed): 4/5 fall back to the
+        // normal result rather than a stale sentinel, since colour_allow_debug/pre_bound_debug
+        // are only set inside mode 2's colour_strength > 0 branch.
+        let no_colour = ComposeParams { colour_strength: 0.0, ..base };
+        let no_colour_normal = compose_once(w, h, &blue, &blue, &red, no_colour).unwrap();
+        let no_colour_view4 = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 4, ..no_colour }).unwrap();
+        assert_eq!(px(&no_colour_normal), px(&no_colour_view4), "view 4 falls back to the normal result where colour is never computed");
+    }
+
     /// Transfer modes with the model at half size. With no edit every mode hands back the frame;
     /// with a uniform brightening, native + edit keeps the frame's own sharp edge (the enlarged
     /// answer is blurred across it) and still brightens both sides.
@@ -1845,7 +1923,7 @@ mod tests {
         let frame: Vec<u8> = (0..w * h).flat_map(|i| if i % w < 16 { [60u8, 60, 60, 255] } else { [180u8, 180, 180, 255] }).collect();
         let small: Vec<u8> = (0..sw * sh).flat_map(|i| if i % sw < 8 { [60u8, 60, 60, 255] } else { [180u8, 180, 180, 255] }).collect();
         let brighter: Vec<u8> = small.chunks(4).flat_map(|p| [p[0] + 25, p[1] + 25, p[2] + 25, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
         let px = |out: &[u8], x: u32| i32::from(out[((4 * w + x) * 4) as usize]);
         for transfer in [0u32, 1, 2] {
             let Some(out) = compose_once_scaled(w, h, &frame, &frame, &small, (sw, sh), Some(&small), None, ComposeParams { transfer, ..base }) else {
@@ -1882,7 +1960,7 @@ mod tests {
         let lin_to_srgb = |l: f32| { let l = l.clamp(0.0, 1.0); let c = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }; (c * 255.0).round() as u8 };
         let knee = |l: f32| if l > 0.75 { 0.75 + 0.25 * (1.0 - (-(l - 0.75) / 0.25).exp()) } else { l };
         let (w, h) = (16u32, 16u32);
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
         for (value, wp) in [(90u8, 1.0f32), (90, 0.5), (230, 1.0), (240, 1.0)] {
             let frame: Vec<u8> = (0..w * h).flat_map(|_| [value, value, value, 255]).collect();
             let encoded = lin_to_srgb(knee(srgb_to_lin(value) / wp));
@@ -1903,7 +1981,7 @@ mod tests {
         let (w, h) = (16u32, 16u32);
         let live: Vec<u8> = (0..w * h).flat_map(|_| [30u8, 30, 30, 255]).collect();
         let held: Vec<u8> = (0..w * h).flat_map(|_| [140u8, 140, 140, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
         // No edit: the answer is the held frame's own proxy.
         let Some(out) = compose_once_scaled(w, h, &live, &held, &held, (w, h), None, Some(&held), base) else {
             eprintln!("frame hold test: no Vulkan device, skipping");
@@ -1948,7 +2026,7 @@ mod tests {
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, proxy_encoded: true };
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, &frame, &answer, None, None, 1, false, target.image, params)
                 .expect("compose");
@@ -2048,7 +2126,7 @@ mod tests {
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, proxy_encoded: true };
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, &proxy, &answer, None, None, 1, false, target.image, params)
                 .expect("compose");
@@ -2146,7 +2224,7 @@ mod tests {
         }
 
         // (1) A smaller answer must still be accepted and actually change the output.
-        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, None, None, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, proxy_encoded: false });
+        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, None, None, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
@@ -2172,7 +2250,7 @@ mod tests {
         // for this function -- see its own doc comment) must be rejected, not
         // overflow the shared staging buffer.
         let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
-        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, None, None, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, proxy_encoded: false });
+        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, None, None, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
 
         unsafe {

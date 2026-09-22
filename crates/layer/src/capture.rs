@@ -1018,37 +1018,34 @@ pub unsafe fn run(
             })
         });
     let Some(settings) = shm.composition_settings() else { return None };
-    // `debug_view`'s compare/split views and a pending `capture_request`'s dump both
-    // need *this* frame's own original and answer, not whatever the async pipeline
-    // below happens to have on hand -- same-frame correctness matters more than
-    // throughput for either, and both are rare, deliberately-triggered cases (a
-    // developer toggling a debug view, or a one-shot dump request), not the normal
-    // per-frame path this function otherwise replaces.
+    // A pending `capture_request` (a real PNG dump to disk) needs *this* frame's own original
+    // and answer read back onto the CPU -- same-frame correctness matters more than throughput
+    // for a rare, deliberately-triggered one-shot dump, not the normal per-frame path this
+    // function otherwise replaces.
+    //
     // A game that renders into its own image and blits into the swapchain (`capture_image !=
-    // image`, e.g. GTA V through vkd3d) has no same-frame original to dump or compare against.
-    // Those requests cannot be served here, and they must never stop the layer either: returning
-    // early with the request still pending switched the whole pipeline off, on every present,
-    // until something cleared it -- a single `shmctl capture` (or the GUI's capture button) was
-    // enough. So the request is consumed and reported once, and the debug view is ignored.
+    // image`, e.g. GTA V through vkd3d) has no same-frame original to dump: the dump would be
+    // read back from someone else's memory. Those requests cannot be served here, and they must
+    // never stop the layer either: returning early with the request still pending switched the
+    // whole pipeline off, on every present, until something cleared it -- a single `shmctl
+    // capture` (or the GUI's capture button) was enough. So the request is consumed and reported
+    // once instead.
+    //
+    // `debug_view` has no such limitation any more: it flows through the normal
+    // synchronous-present path below instead (that path already guarantees this frame's own
+    // answer via the answered_w/h check), which works whether or not the game blits into its
+    // swapchain and gives every debug view the full mode-2 pipeline (colour trust, ratio
+    // smoothing) rather than `run_sync`'s classic-only one.
     let sync_debug = capture_image == image;
-    if !sync_debug {
-        if shm.capture_request_pending() {
-            shm.take_capture_request();
-            static SAID_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID_CAPTURE.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                crate::log!("[layer] capture request dropped: this game blits into the swapchain, so there is no same-frame original to dump");
-                crate::logging::flush();
-            }
-        }
-        if settings.debug_view != 0 {
-            static SAID_DEBUG: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-            if !SAID_DEBUG.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                crate::log!("[layer] debug view {} ignored: it needs a same-frame original, which a blitting game does not have", settings.debug_view);
-                crate::logging::flush();
-            }
+    if !sync_debug && shm.capture_request_pending() {
+        shm.take_capture_request();
+        static SAID_CAPTURE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID_CAPTURE.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[layer] capture request dropped: this game blits into the swapchain, so there is no same-frame original to dump");
+            crate::logging::flush();
         }
     }
-    if sync_debug && (settings.debug_view != 0 || shm.capture_request_pending()) {
+    if sync_debug && shm.capture_request_pending() {
         return unsafe {
             run_sync(
                 device,
@@ -1487,6 +1484,8 @@ pub unsafe fn run(
                 compare: settings.compare,
                 colour_trust: settings.colour_trust,
                 ratio_smooth: settings.ratio_smooth,
+                debug_view: settings.debug_view,
+                debug_scale: settings.debug_scale,
                 proxy_encoded,
             },
         ) {

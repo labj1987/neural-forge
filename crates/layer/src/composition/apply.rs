@@ -31,7 +31,9 @@ use super::color;
 /// (this function is a no-op); `3` the composited result's difference from `original`,
 /// amplified 4x and re-centered at mid-gray, so a subtle real edit is visible without
 /// needing to A/B two screenshots. Matches `neural_forge_protocol::ShmHeader::debug_view`'s
-/// own doc comment.
+/// own doc comment. Values `4`/`5` (upstream's colour-trust diagnostic views) are GPU-only --
+/// see `compose.comp` -- and this CPU reference (only reached by `run_sync`'s narrower fallback
+/// path) treats them the same as `0`, the normal composite.
 ///
 /// Both buffers must be `RGBA8` (4 bytes/pixel, sRGB-encoded, same length) -- callers
 /// must not call this for any other `proxy_format`. A length mismatch processes

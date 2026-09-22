@@ -34,6 +34,7 @@ other's mapping.
 | 32-bit layer (`VK_LAYER_neuralforge_neural_32`, its own manifest) | per-region shared-memory mapping capped at a 4K 8-bit frame on 32-bit; built and packaged by `build-appimage.sh`, tested in CI (0.1.83) |
 | 16-bit multipass intermediates (`sdr16_multipass`) | `frame.rs` RGBA16F working images, falls back to 8-bit if refused (0.1.83) |
 | `answered_w`/`answered_h` guard against another swapchain's answer | helper echoes, synchronous present checks (0.1.81) |
+| Debug views 4/5 (colour-trust engagement, pre-bound colour) | `compose.comp` `debug_view`; views 0-3 (this project's own) and 4/5 now reach the GPU path, so they work for a game that blits into its swapchain too (0.1.84) |
 
 ## Deliberately not adopted
 
@@ -54,8 +55,8 @@ other's mapping.
 
 - **HDR / 10-bit / float16** swapchains: presented untouched. Needs the float16 proxy, PQ10
   transfer and half-float compose fallback (`composition.cpp` `Prepare`, `DetectHdrKind`).
-- **Debug views 4 and 5** (colour-bound and pre-bound views) and a GPU-side meter: the meter
-  runs on the CPU over the captured frame instead, which the synchronous present already holds.
+- **A GPU-side white meter**: the meter runs on the CPU over the captured frame instead, which
+  the synchronous present already holds -- measured fast enough in practice not to need the GPU.
 - **The CPU downscale kernels** (`composition/downscale.rs`) remain unwired; the model is scaled
   with the hardware blit, and supersampling above 100% is not offered.
 - **Upstream's vendored `vulkan-1.dll`** for system Wine: not carried; Wine's own `winevulkan`

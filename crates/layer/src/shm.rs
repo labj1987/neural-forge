@@ -40,6 +40,8 @@ pub struct CompositionSettings {
     /// Run the model on every Nth present (see `ShmHeader::model_interval`).
     pub model_interval: u32,
     pub debug_view: u32,
+    /// View 5 only (see `ShmHeader::debug_scale_bits`).
+    pub debug_scale: f32,
     pub apply_model: bool,
     pub neural_enabled: bool,
     /// What fraction of the frame's resolution the model works at -- see
@@ -308,6 +310,7 @@ impl ShmClient {
                 swap: hdr.compare_swap.load(Ordering::Relaxed),
             },
             debug_view: hdr.debug_view.load(Ordering::Relaxed),
+            debug_scale: f32::from_bits(hdr.debug_scale_bits.load(Ordering::Relaxed)),
             apply_model: hdr.apply_model.load(Ordering::Relaxed) != 0,
             neural_enabled: hdr.neural_enabled(),
             working_scale: f32::from_bits(hdr.working_scale_bits.load(Ordering::Relaxed)),

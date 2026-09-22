@@ -440,11 +440,31 @@ pub fn build_ui(app: &adw::Application) {
     debug_group.add(&switch_row("Swap compare sides", "", compare_swap, set_compare_swap));
 
     let (debug_view, set_debug_view) = bind_u32(&shm, Some("debug_view"), |h| &h.debug_view);
-    debug_group.add(&combo_row(
+    let debug_view_row = combo_row(
         "Debug view",
-        &["Off", "Original / proxy", "Model's raw answer", "Amplified diff"],
+        &[
+            "Off",
+            "Original / proxy",
+            "Model's raw answer",
+            "Amplified diff",
+            "Colour trust (green passes, red held back)",
+            "Pre-colour-trust composite",
+        ],
         debug_view,
         set_debug_view,
+    );
+    debug_view_row.set_subtitle("The last two only differ from the composited picture where colour trust is actually engaged");
+    debug_group.add(&debug_view_row);
+
+    let (debug_scale, set_debug_scale) = bind_float(&shm, Some("debug_scale"), |h| &h.debug_scale_bits);
+    debug_group.add(&spin_row(
+        "Debug view 5 amplification",
+        "Multiplies the pre-colour-trust colour view 5 shows, to make a subtle difference easier to see",
+        debug_scale,
+        0.1,
+        10.0,
+        0.1,
+        set_debug_scale,
     ));
 
     let toasts = adw::ToastOverlay::new();

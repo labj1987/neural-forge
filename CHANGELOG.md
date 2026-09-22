@@ -4,6 +4,16 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.84 — 2026-09-22
+
+- **Debug views work in GTA V (and any other game that blits into its swapchain).** They used to
+  be silently ignored there, gated behind a fallback path that only ever served games with no
+  blit step -- the exact case GTA V isn't. All six now run through the same GPU pipeline compare
+  views already use, so they get colour trust and ratio smoothing too, not just the classic
+  formula. Two new views ported from upstream: colour trust's engagement (green passes whole, red
+  held back) and the colour before that bound is applied, for comparing frame by frame -- plus a
+  new "Debug view 5 amplification" slider (Debug tab) to make a subtle difference easier to see.
+
 ## 0.1.83 — 2026-09-21
 
 - **Frame generation now adds frames.** "Model every Nth frame" (Model tab; header v6): at 2 the

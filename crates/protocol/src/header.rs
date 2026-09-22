@@ -154,8 +154,13 @@ pub struct ShmHeader {
     /// How a model that worked below the frame's size is brought back. 0 classic, 1
     /// matched residual, 2 native + edit.
     pub transfer: AtomicU32,
-    /// 0 off, 1 the picture the model was shown, 2 its raw answer, 3 what it changed, amplified.
+    /// 0 normal, 1 original/proxy, 2 the model's raw answer, 3 amplified diff, 4 colour trust
+    /// engagement, 5 pre-colour-trust composite -- see `compose.comp`'s own `debug_view` push
+    /// constant doc comment for the exact meaning of each (0-3 match
+    /// `composition::apply::compose_pixel`'s CPU reference; 4/5 are GPU-only, from upstream).
     pub debug_view: AtomicU32,
+    /// View 5 only: multiplies the pre-colour-trust colour before display, so a subtle
+    /// difference from the normal (view 0) result is easier to see. 1.0 = no amplification.
     pub debug_scale_bits: AtomicU32,
     pub white_point_bits: AtomicU32,
     pub white_point_scale_bits: AtomicU32,
@@ -595,7 +600,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 41] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 42] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -640,6 +645,7 @@ impl ShmHeader {
             ("rebuild_settle_ms", false, self.rebuild_settle_ms.load(Ordering::Relaxed)),
             ("apply_model", false, self.apply_model.load(Ordering::Relaxed)),
             ("debug_view", false, self.debug_view.load(Ordering::Relaxed)),
+            ("debug_scale", true, self.debug_scale_bits.load(Ordering::Relaxed)),
         ]
     }
 
@@ -690,6 +696,7 @@ impl ShmHeader {
             "rebuild_settle_ms" => &self.rebuild_settle_ms,
             "apply_model" => &self.apply_model,
             "debug_view" => &self.debug_view,
+            "debug_scale" => &self.debug_scale_bits,
             _ => return,
         };
         field.store(bits, Ordering::Relaxed);
