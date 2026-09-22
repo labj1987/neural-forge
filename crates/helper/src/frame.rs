@@ -95,6 +95,15 @@ pub struct FrameResources {
     /// `&mut` to use), so this is the one piece of real per-frame state that needs
     /// interior mutability to track from there.
     reset_done: std::cell::Cell<bool>,
+
+    /// Set once a bounded fence wait on `cmd`/`fence` (`run_evaluate`/`run_transfer`)
+    /// times out. `cmd`/`fence` are reused every call on this single instance (there is
+    /// no double-buffering here, unlike the layer's own async slots), so a timeout
+    /// means the GPU work they guard might still be running -- every later call must
+    /// refuse to touch either again (`evaluate` checks this first), and whoever would
+    /// otherwise call `destroy` on this instance must leak it instead. See
+    /// `matches`, `evaluate`, and `main.rs`'s two rebuild-on-resize call sites.
+    stalled: std::cell::Cell<bool>,
 }
 
 // SAFETY: every field is a plain Vulkan handle or a `vkMapMemory` pointer into memory
@@ -513,13 +522,28 @@ impl FrameResources {
             imported_proxy,
             imported_answer,
             reset_done: std::cell::Cell::new(false),
+            stalled: std::cell::Cell::new(false),
             work: std::cell::OnceCell::new(),
             mem_props,
         })
     }
 
+    /// `false` once `stalled` -- the same signal `main.rs`'s two rebuild-on-resize call
+    /// sites already read as "build a fresh one instead", so a stalled instance forces
+    /// exactly that without needing its own check at every caller.
     pub fn matches(&self, queue_family: u32, width: u32, height: u32, proxy_format: u32) -> bool {
-        Some(self.color_format) == color_format(proxy_format) && self.queue_family == queue_family && self.width == width && self.height == height
+        !self.stalled.get()
+            && Some(self.color_format) == color_format(proxy_format)
+            && self.queue_family == queue_family
+            && self.width == width
+            && self.height == height
+    }
+
+    /// Whether a bounded fence wait on this instance's `cmd`/`fence` has already timed
+    /// out -- see `stalled`'s own doc comment. Callers that would otherwise call
+    /// `destroy` must check this first and leak instead.
+    pub fn stalled(&self) -> bool {
+        self.stalled.get()
     }
 
     /// Uploads `proxy` and motion, runs `EvaluateFeature`, downloads
@@ -540,6 +564,14 @@ impl FrameResources {
         reset_history: bool,
         answer_out: &mut [u8],
     ) -> Option<FrameTiming> {
+        // A previous call already timed out waiting on `self.cmd`/`self.fence`: that
+        // work may still be running, so touching either again (even just
+        // `reset_command_buffer`) would race it. The caller is expected to notice
+        // `matches` now returning `false` and build a fresh instance instead -- this
+        // is a backstop for any caller that doesn't, not the normal path off it.
+        if self.stalled.get() {
+            return None;
+        }
         static EVALUATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let evaluate_no = EVALUATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pixel_count = (self.width as usize) * (self.height as usize);
@@ -768,7 +800,15 @@ impl FrameResources {
         if unsafe { device.queue_submit(queue, &[submit], self.fence) }.is_err() {
             return None;
         }
-        if unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }.is_err() {
+        // Bounded, not `u64::MAX`: see `stalled`'s own doc comment for what a timeout
+        // here means and why it latches this instance rather than just failing once.
+        let wait = unsafe { device.wait_for_fences(&[self.fence], true, crate::ngx::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        if matches!(wait, Err(vk::Result::TIMEOUT)) {
+            crate::log!("[frame] EvaluateFeature's own fence wait timed out after {:?}; this frame-resource instance is now permanently stalled", crate::ngx::FENCE_WAIT_TIMEOUT);
+            crate::logging::flush();
+            self.stalled.set(true);
+        }
+        if wait.is_err() {
             return None;
         }
         Some(result)
@@ -1069,8 +1109,15 @@ impl FrameResources {
         if unsafe { device.queue_submit(queue, &[submit], self.fence) }.is_err() {
             return false;
         }
-        // SAFETY: `self.fence` was just submitted against above.
-        unsafe { device.wait_for_fences(&[self.fence], true, u64::MAX) }.is_ok()
+        // SAFETY: `self.fence` was just submitted against above. Bounded, not
+        // `u64::MAX`: see `stalled`'s own doc comment.
+        let wait = unsafe { device.wait_for_fences(&[self.fence], true, crate::ngx::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        if matches!(wait, Err(vk::Result::TIMEOUT)) {
+            crate::log!("[frame] a transfer's own fence wait timed out after {:?}; this frame-resource instance is now permanently stalled", crate::ngx::FENCE_WAIT_TIMEOUT);
+            crate::logging::flush();
+            self.stalled.set(true);
+        }
+        wait.is_ok()
     }
 
     /// # Safety

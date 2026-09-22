@@ -16,10 +16,13 @@
 //! `frame_resources` is rebuilt whenever the observed width/height changes (e.g. two
 //! separate Vulkan processes -- the game and the Steam overlay -- both driving this
 //! same helper before `swapchain::is_plausible_game_size` existed to filter the
-//! overlay's own swapchain out on the layer side) -- the *old* `FrameResources` is
-//! always explicitly destroyed first via `FrameResources::destroy`, since letting the
-//! `Option` just get overwritten would leak its images/memory/command pool every time,
-//! not free them (`ash` handles are not `Drop`).
+//! overlay's own swapchain out on the layer side) -- the *old* `FrameResources` goes
+//! through `retire_frame_resources` first, which explicitly destroys it via
+//! `FrameResources::destroy` (letting the `Option` just get overwritten would leak its
+//! images/memory/command pool every time, not free them -- `ash` handles are not
+//! `Drop`) unless its own bounded fence wait already timed out, in which case it is
+//! deliberately leaked instead of destroyed (see `FrameResources::stalled`'s doc
+//! comment for why).
 //!
 //! This is a thin wrapper around the `neural_forge_helper` library crate (see `lib.rs`) --
 //! that split exists so `examples/` can exercise individual modules directly.
@@ -280,6 +283,27 @@ fn main() {
     drop(entry);
 }
 
+/// Destroys `old`, unless a bounded fence wait on it already timed out (`stalled`) --
+/// see `frame::FrameResources::stalled`'s own doc comment for why that case must leak
+/// instead: the GPU work the timeout gave up waiting on may still be running, and
+/// freeing images/memory/a command pool out from under it would be unsound. A leak
+/// here is a one-time, anomalous cost in a process that will usually just keep running
+/// at the new size on a freshly built instance, not a routine one -- logged once so a
+/// real occurrence is visible without repeating on every later resize.
+fn retire_frame_resources(old: frame::FrameResources, device: &ash::Device) {
+    if old.stalled() {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            neural_forge_helper::log!("[helper] leaking a stalled frame-resource instance instead of destroying it (its own fence wait never returned)");
+        }
+        return;
+    }
+    // SAFETY: not stalled, so `FrameResources::evaluate` waited on its own fences
+    // (bounded, but successfully) before returning every time it was called -- nothing
+    // is still submitted.
+    unsafe { old.destroy(device) };
+}
+
 /// Handles one newly-observed request on the given wire slot: reads its width/
 /// height/proxy_format (via the header's own `*_slot` accessors -- see
 /// `docs/PROTOCOL_V3_DESIGN.md`), prewarms or evaluates against `frame_resources` (that
@@ -351,7 +375,7 @@ fn process_request(
         && !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format))
     {
         if let Some(old) = frame_resources.take() {
-            unsafe { old.destroy(device) };
+            retire_frame_resources(old, device);
         }
         *frame_resources = frame::FrameResources::new(device, instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
         neural_forge_helper::log!("[helper] slot {slot}: prewarmed {}x{} frame resources: {}", width, height, frame_resources.is_some());
@@ -429,12 +453,13 @@ fn process_request(
     let timing = if ready && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         (|| {
             if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format)) {
-                // SAFETY: any previous resources are no longer referenced by in-flight
-                // work -- `FrameResources::evaluate` always waits on its own fences
-                // before returning, so by the time we're back here (a later loop
-                // iteration) nothing is still submitted.
+                // `matches` returns `false` for a stalled instance too, so this branch
+                // also catches "the previous instance's own fence wait timed out" --
+                // `retire_frame_resources` leaks rather than destroys in exactly that
+                // case, since a timeout no longer guarantees nothing is still
+                // submitted the way an ordinary successful wait does.
                 if let Some(old) = frame_resources.take() {
-                    unsafe { old.destroy(device) };
+                    retire_frame_resources(old, device);
                 }
                 *frame_resources = frame::FrameResources::new(device, instance, physical_device, 0, width, height, proxy_format, proxy_region, answer_region);
             }

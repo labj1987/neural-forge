@@ -4,6 +4,23 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.87 — 2026-09-22
+
+- **The helper's per-frame evaluate/transfer waits are bounded too, closing the gap 0.1.86 left
+  open.** `crates/helper/src/frame.rs::FrameResources` reuses a single `cmd`/`fence` pair across
+  every frame at a given size (no double-buffering, unlike the layer's own async slots), so
+  bounding its two `wait_for_fences` calls needed more than a timeout swap: a genuine timeout now
+  latches a new `stalled` flag on that instance, which `evaluate` checks before touching `cmd`
+  again (refusing rather than racing whatever the abandoned wait was guarding), and which
+  `matches` folds into its own answer so the normal resize-rebuild path in `main.rs` picks it up
+  for free. The one new piece, `retire_frame_resources` (`main.rs`), destroys the old instance on
+  a resize as before -- unless it was stalled, in which case it's deliberately leaked (a one-time,
+  anomalous cost) rather than freed out from under GPU work that might still be running. Motion
+  vectors' `device_wait_idle` calls (`ngx.rs`, `optical_flow.rs`) remain deliberately unbounded:
+  `device_wait_idle` has no timeout in the Vulkan API at all, and motion vectors are off by
+  default and untested on the rig (`docs/UPSTREAM_PARITY.md`), so that gap is real but lower
+  priority. Continues v0.1.85/0.1.86; see ATTRIBUTION.md.
+
 ## 0.1.86 — 2026-09-22
 
 - **The helper's own NGX feature-build wait is bounded too, and a breadcrumb trail now

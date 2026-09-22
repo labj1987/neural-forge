@@ -48,7 +48,7 @@ fn utf16(s: &str) -> Vec<u16> {
 /// device, where the wait simply never returns. Same value and reasoning as
 /// `neural_forge_layer`'s own `FENCE_WAIT_TIMEOUT`, ported here from PR #22 against
 /// DLSS5VKLayer (bmitch87), commit `4aa730c0` -- see `ATTRIBUTION.md`.
-const FENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+pub(crate) const FENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// `NEURAL_FORGE_SKIP_NVAPI` semantics: set to anything that doesn't start with `0`.
 fn skip_nvapi() -> bool {
