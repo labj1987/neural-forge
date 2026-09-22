@@ -33,7 +33,20 @@ pub struct FrameTiming {
     pub download: std::time::Duration,
 }
 
+/// The format of the multipass working images: 16-bit float, so a chain of passes does not lose
+/// precision to an 8-bit round trip between every pair (upstream `sdr16_multipass`).
+const WORK_FORMAT: vk::Format = vk::Format::R16G16B16A16_SFLOAT;
+
+/// Set once the model refuses 16-bit working images; the chain then goes through 8 bits as before.
+static WORK16_REFUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+type WorkImage = (vk::Image, vk::ImageView, vk::DeviceMemory);
+
 pub struct FrameResources {
+    /// The two multipass working images, built the first time a chain of more than one pass
+    /// runs (`None` inside if they could not be built).
+    work: std::cell::OnceCell<Option<[WorkImage; 2]>>,
+    mem_props: vk::PhysicalDeviceMemoryProperties,
     color_format: vk::Format,
     width: u32,
     height: u32,
@@ -500,6 +513,8 @@ impl FrameResources {
             imported_proxy,
             imported_answer,
             reset_done: std::cell::Cell::new(false),
+            work: std::cell::OnceCell::new(),
+            mem_props,
         })
     }
 
@@ -570,7 +585,43 @@ impl FrameResources {
         // The first evaluate on this set of resources tells every pass its history is gone.
         let first = !self.reset_done.replace(true);
         let mut t_eval = std::time::Duration::ZERO;
+        // Chains of more than one pass go through the 16-bit working images: pass 0 reads Color and
+        // writes work[0], the middle passes alternate, the last writes Output.
+        let work = if chain.len() > 1 && !WORK16_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
+            self.work
+                .get_or_init(|| {
+                    let usage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+                    let a = create_image(device, &self.mem_props, self.width, self.height, WORK_FORMAT, usage)?;
+                    let Some(b) = create_image(device, &self.mem_props, self.width, self.height, WORK_FORMAT, usage) else {
+                        // SAFETY: `a` was just created and is not referenced by anything.
+                        unsafe {
+                            device.destroy_image_view(a.1, None);
+                            device.destroy_image(a.0, None);
+                            device.free_memory(a.2, None);
+                        }
+                        return None;
+                    };
+                    Some([a, b])
+                })
+                .as_ref()
+                .copied()
+        } else {
+            None
+        };
+        if let Some(w) = work {
+            if !self.run_transfer(device, queue, TransferKind::WorkInit(w[0].0, w[1].0)) {
+                return None;
+            }
+        }
+        let last = chain.len() - 1;
         for (k, pass) in chain.iter().enumerate() {
+        let (color_info, output_info) = match work {
+            Some(w) => (
+                if k == 0 { color_info } else { self.resource_info(w[(k - 1) % 2].1, w[(k - 1) % 2].0, WORK_FORMAT) },
+                if k == last { output_info } else { self.resource_info(w[k % 2].1, w[k % 2].0, WORK_FORMAT) },
+            ),
+            None => (color_info, output_info),
+        };
         // SAFETY: `params` was allocated and validated by the caller (`ngx::load_and_init`).
         let t_pass = unsafe {
             let mut color = NgxResourceVk::from_image_view(color_info, false);
@@ -631,13 +682,19 @@ impl FrameResources {
                 crate::log!("[ngx] EvaluateFeature pass {k} -> {:#x} seh={:#x} took={:?}", result.0 as u32, result.1, t_eval);
             }
             if failed {
+                if work.is_some() && !WORK16_REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log!("[frame] the model refused 16-bit working images; multipass goes through 8 bits from now on");
+                    crate::logging::flush();
+                }
                 return None;
             }
             t_eval
         };
         t_eval += t_pass;
-        // Between passes the answer becomes the next pass's input.
-        if k + 1 < chain.len() && !self.run_transfer(device, queue, TransferKind::Chain) {
+        // Between passes the answer becomes the next pass's input: a barrier on the 16-bit path
+        // (it already sits in the next pass's input image), a copy through Color on the 8-bit one.
+        let step = if work.is_some() { TransferKind::ComputeBarrier } else { TransferKind::Chain };
+        if k + 1 < chain.len() && !self.run_transfer(device, queue, step) {
             return None;
         }
         }
@@ -861,6 +918,39 @@ impl FrameResources {
                     );
                 }
             }
+            TransferKind::WorkInit(a, b) => {
+                let to_general = |image| img_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+                // SAFETY: `self.cmd` is recording; both images belong to this resource set.
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::TOP_OF_PIPE,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[],
+                        &[],
+                        &[to_general(a), to_general(b)],
+                    );
+                }
+            }
+            TransferKind::ComputeBarrier => {
+                let barrier = vk::MemoryBarrier::builder()
+                    .src_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+                    .build();
+                // SAFETY: `self.cmd` is recording.
+                unsafe {
+                    device.cmd_pipeline_barrier(
+                        self.cmd,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::PipelineStageFlags::ALL_COMMANDS,
+                        vk::DependencyFlags::empty(),
+                        &[barrier],
+                        &[],
+                        &[],
+                    );
+                }
+            }
             TransferKind::Chain => {
                 // Output (written by the model, GENERAL) -> Color (its next input, sampled).
                 let out_to_src = img_barrier(
@@ -989,6 +1079,13 @@ impl FrameResources {
     pub unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
+            if let Some(Some(work)) = self.work.get() {
+                for (image, view, memory) in work {
+                    device.destroy_image_view(*view, None);
+                    device.destroy_image(*image, None);
+                    device.free_memory(*memory, None);
+                }
+            }
             device.destroy_fence(self.fence, None);
             device.destroy_buffer(self.staging_buffer, None);
             device.free_memory(self.staging_memory, None);
@@ -1027,6 +1124,11 @@ pub struct ChainPass {
 }
 
 enum TransferKind {
+    /// Both working images to GENERAL (their contents are discarded: every pass writes before it
+    /// reads).
+    WorkInit(vk::Image, vk::Image),
+    /// One pass's writes made visible to the next pass's reads.
+    ComputeBarrier,
     Chain,
     Upload,
     Download,

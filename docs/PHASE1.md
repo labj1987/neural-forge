@@ -89,7 +89,7 @@ VKLayer_DLSS5=1 DLSSNR_DMABUF=0 %command%
 Do not change this saved baseline. A separate NeuralForge test launch uses:
 
 ```text
-NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_DMABUF=0 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%
+NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%
 ```
 
 NeuralForge currently uses host SHM transport; `NEURAL_FORGE_DMABUF` is reserved and
