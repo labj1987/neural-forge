@@ -561,12 +561,20 @@ pub fn build_ui(app: &adw::Application) {
     toolbar_view.add_bottom_bar(&switcher_bar);
     toasts.set_child(Some(&toolbar_view));
 
-    // Developer aid: `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog at startup, so it
-    // can be screenshotted where synthetic input cannot reach the window.
-    if neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() == Some("passes") {
-        let shm = std::sync::Arc::clone(&shm);
-        let view = view_stack.clone();
-        glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || open_pass_dialog(&shm, view.upcast_ref()));
+    // Developer aid: `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog at startup, and
+    // `NEURAL_FORGE_GUI_OPEN=<tab id>` (model/motion/composition/debug/status/setup) selects that
+    // tab at startup, so either can be screenshotted where synthetic input cannot reliably reach
+    // a page navigated to after the window opens.
+    match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
+        Some("passes") => {
+            let shm = std::sync::Arc::clone(&shm);
+            let view = view_stack.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || open_pass_dialog(&shm, view.upcast_ref()));
+        }
+        Some(tab @ ("model" | "motion" | "composition" | "debug" | "status" | "setup")) => {
+            view_stack.set_visible_child_name(tab);
+        }
+        _ => {}
     }
 
     // Follow the header: a change made with `shmctl`, a loaded profile, Reset or another
