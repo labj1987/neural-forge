@@ -4,6 +4,18 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.89 — 2026-09-23
+
+- **GTA San Andreas – The Definitive Edition now gets the effect.** DXVK creates that game's
+  swapchain with `MUTABLE_FORMAT` and a view-format list (UNORM storage, sRGB views) plus the
+  Reflex latency struct. The capture admission check refused any mutable-format swapchain,
+  so the game's window stayed pass-through; it renders straight into the swapchain, so there was
+  no render source to tap either. The layer attached to nothing and the GUI showed no game. A
+  mutable-format swapchain is now admitted when it carries the format list the spec requires,
+  and the enlarged TRANSFER usage is checked against every listed view format with
+  `MUTABLE_FORMAT` image creation. The copies move raw bytes, so the view formats don't change
+  what is captured. Device groups and exclusive full-screen swapchains are still refused.
+
 ## 0.1.88 — 2026-09-23
 
 - **The layer now logs the real presented frame rate every 5 s, effect on or off**

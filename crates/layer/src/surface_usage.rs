@@ -21,10 +21,9 @@ fn chain_is_understood(info: &vk::SwapchainCreateInfoKHR) -> bool {
         // the Vulkan spec, and this chain is the application's own, valid for this call.
         let base = unsafe { &*next.cast::<vk::BaseInStructure>() };
         match base.s_type {
-            // Stereo/multiview, protected content, and format lists all describe images
-            // whose creation parameters interact with usage. Not admitted.
-            vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO
-            | vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR
+            // Multi-device layouts and exclusive full-screen control change how the
+            // images are owned and presented. Not admitted.
+            vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR
             | vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT => return false,
             _ => {}
         }
@@ -33,19 +32,42 @@ fn chain_is_understood(info: &vk::SwapchainCreateInfoKHR) -> bool {
     true
 }
 
+/// The view formats a `MUTABLE_FORMAT` swapchain declares, from its
+/// `VkImageFormatListCreateInfo`. `None` when the chain has no such list.
+fn view_formats(info: &vk::SwapchainCreateInfoKHR) -> Option<&[vk::Format]> {
+    let mut next = info.p_next;
+    while !next.is_null() {
+        // SAFETY: as in `chain_is_understood`.
+        let base = unsafe { &*next.cast::<vk::BaseInStructure>() };
+        if base.s_type == vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO {
+            // SAFETY: the sType identifies this struct; its array is the application's
+            // own and valid for this call.
+            let list = unsafe { &*next.cast::<vk::ImageFormatListCreateInfo>() };
+            if list.view_format_count == 0 || list.p_view_formats.is_null() {
+                return None;
+            }
+            return Some(unsafe { std::slice::from_raw_parts(list.p_view_formats, list.view_format_count as usize) });
+        }
+        next = base.p_next.cast();
+    }
+    None
+}
+
 pub fn candidate(info: &vk::SwapchainCreateInfoKHR) -> bool {
-    // Flags that change the images themselves. `MUTABLE_FORMAT` needs a format list to
-    // be meaningful (refused above), `PROTECTED` images cannot be read back at all, and
-    // `SPLIT_INSTANCE_BIND_REGIONS` is a multi-device layout. Unknown bits are allowed:
-    // this module rewrites only `image_usage`, and a newer extension's flag is not a
-    // reason to make the whole layer inert -- the surface-capability and
-    // image-format-properties checks below still have to pass for the enlarged usage,
-    // and `device.rs` falls back to the application's own unmodified creation if the
-    // adjusted one is rejected.
+    // Flags that change the images themselves. `PROTECTED` images cannot be read back
+    // at all, and `SPLIT_INSTANCE_BIND_REGIONS` is a multi-device layout. `MUTABLE_FORMAT`
+    // is admitted only with the format list the spec requires for it: DXVK sets it on
+    // every swapchain whose game renders through an sRGB view (GTA San Andreas DE), and
+    // refusing it left that game untouched. The added TRANSFER usage copies raw bytes, so
+    // the view formats do not change what is captured; `prepare` still checks every
+    // listed format supports the enlarged usage. Unknown bits are allowed: this module
+    // rewrites only `image_usage`, and the surface-capability and image-format-properties
+    // checks below still have to pass for the enlarged usage.
     let unsupported_flags = vk::SwapchainCreateFlagsKHR::PROTECTED
-        | vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT
         | vk::SwapchainCreateFlagsKHR::SPLIT_INSTANCE_BIND_REGIONS;
+    let mutable_ok = !info.flags.contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT) || view_formats(info).is_some();
     !info.flags.intersects(unsupported_flags)
+        && mutable_ok
         && chain_is_understood(info)
         && info.image_array_layers == 1
         && matches!(info.present_mode, vk::PresentModeKHR::FIFO | vk::PresentModeKHR::FIFO_RELAXED
@@ -69,15 +91,26 @@ pub fn prepare(instance: &ash::Instance, query: vk::PFN_vkGetPhysicalDeviceSurfa
     unsafe { query(physical, info.surface, &mut caps) }.result().ok()?;
     let usage = requested_usage(info.image_usage, caps.supported_usage_flags)?;
     // Surface usage alone does not guarantee this format's implied image creation
-    // parameters support the enlarged usage combination (VUID-imageFormat-01778).
-    let props = unsafe { instance.get_physical_device_image_format_properties(
-        physical, info.image_format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL,
-        usage, vk::ImageCreateFlags::empty(),
-    ) }.ok()?;
-    if info.image_extent.width > props.max_extent.width
-        || info.image_extent.height > props.max_extent.height
-        || props.max_array_layers < 1 || !props.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
-    { return None; }
+    // parameters support the enlarged usage combination (VUID-imageFormat-01778). A
+    // mutable-format swapchain implies MUTABLE_FORMAT image creation, and every view
+    // format it lists is checked too.
+    let mutable = info.flags.contains(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT);
+    let create_flags = if mutable { vk::ImageCreateFlags::MUTABLE_FORMAT } else { vk::ImageCreateFlags::empty() };
+    let mut formats = vec![info.image_format];
+    if mutable {
+        formats.extend(view_formats(info)?.iter().copied().filter(|f| *f != info.image_format));
+    }
+    for format in formats {
+        // SAFETY: plain query on the same physical device the swapchain is created for.
+        let props = unsafe { instance.get_physical_device_image_format_properties(
+            physical, format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL,
+            usage, create_flags,
+        ) }.ok()?;
+        if info.image_extent.width > props.max_extent.width
+            || info.image_extent.height > props.max_extent.height
+            || props.max_array_layers < 1 || !props.sample_counts.contains(vk::SampleCountFlags::TYPE_1)
+        { return None; }
+    }
     let mut adjusted = *info;
     adjusted.image_usage = usage;
     Some(adjusted)
@@ -110,10 +143,35 @@ mod tests {
         // Protected images cannot be read back at all.
         info.flags = vk::SwapchainCreateFlagsKHR::PROTECTED;
         assert!(!candidate(&info));
-        // A mutable format needs the format list that is itself refused below.
+        // A mutable format without the format list the spec requires for it.
         info.flags = vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT;
         assert!(!candidate(&info));
         info.flags = vk::SwapchainCreateFlagsKHR::empty();
+    }
+
+    #[test]
+    fn a_mutable_format_swapchain_with_its_format_list_is_admitted() {
+        // DXVK creates GTA San Andreas DE's swapchain like this (UNORM storage, sRGB
+        // views, plus the Reflex latency struct). Refusing it left the game untouched.
+        let formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
+        let list = vk::ImageFormatListCreateInfo::builder().view_formats(&formats).build();
+        let reflex = vk::BaseInStructure {
+            s_type: vk::StructureType::from_raw(1_000_505_007),
+            p_next: std::ptr::from_ref(&list).cast(),
+        };
+        let mut info = vk::SwapchainCreateInfoKHR::builder()
+            .image_array_layers(1)
+            .present_mode(vk::PresentModeKHR::IMMEDIATE)
+            .image_format(vk::Format::B8G8R8A8_UNORM)
+            .flags(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
+            .build();
+        info.p_next = std::ptr::from_ref(&reflex).cast();
+        assert!(candidate(&info));
+        assert_eq!(view_formats(&info), Some(&formats[..]));
+
+        let empty = vk::ImageFormatListCreateInfo::default();
+        info.p_next = std::ptr::from_ref(&empty).cast();
+        assert!(!candidate(&info), "an empty format list does not make a mutable format valid");
     }
 
     #[test]
@@ -135,7 +193,6 @@ mod tests {
     fn structures_that_change_what_the_images_are_still_disqualify_the_chain() {
         let mut info = vk::SwapchainCreateInfoKHR::builder().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO).build();
         for s_type in [
-            vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO,
             vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR,
             vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT,
         ] {
@@ -149,7 +206,7 @@ mod tests {
     fn the_whole_chain_is_walked_not_just_its_first_link() {
         // A refused struct hiding behind an allowed one still has to be found.
         let mut info = vk::SwapchainCreateInfoKHR::builder().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO).build();
-        let deep = vk::BaseInStructure { s_type: vk::StructureType::IMAGE_FORMAT_LIST_CREATE_INFO, p_next: std::ptr::null() };
+        let deep = vk::BaseInStructure { s_type: vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR, p_next: std::ptr::null() };
         let shallow = vk::BaseInStructure { s_type: vk::StructureType::from_raw(1_000_505_007), p_next: std::ptr::from_ref(&deep) };
         info.p_next = std::ptr::from_ref(&shallow).cast();
         assert!(!candidate(&info), "a refused struct deeper in the chain was missed");
