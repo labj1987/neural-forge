@@ -4,6 +4,18 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.88 — 2026-09-23
+
+- **The layer now logs the real presented frame rate every 5 s, effect on or off**
+  (`[present] N fps (M/s composited by the effect)` in `nf-layer.log`). The existing
+  `layer_frames` counter only counts captured frames, so it stops when the effect is off and
+  could not show whether turning it off gave the frames back. First use, on the rig at 1440p
+  with DLSS Frame Generation and Reflex on: GTA V runs at 37 fps with the effect on and ~100 fps
+  with it off. The effect's off switch does restore the frame rate; watching over a
+  remote-desktop stream hides the difference. Each presenting process gets its own line, so the
+  Rockstar Social Club overlay (a separate process presenting ~50 fps, never composited) shows up
+  as a second, unaffected rate.
+
 ## 0.1.87 — 2026-09-22
 
 - **The helper's per-frame evaluate/transfer waits are bounded too, closing the gap 0.1.86 left

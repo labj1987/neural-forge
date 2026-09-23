@@ -383,6 +383,31 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
 /// # Safety
 /// `queue` must be the queue the present was requested on, externally synchronized for
 /// the duration of the call, and `app_waits` the present's own wait semaphores.
+/// Logs the real presented frame rate every 5 s, whether or not the effect is on --
+/// `layer_frames` only counts captured frames, so it stops when the effect is off and
+/// cannot say whether turning it off actually gave the frames back.
+fn note_present_rate(composited: bool) {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+    static RATE: std::sync::Mutex<Option<(std::time::Instant, u32, u32)>> = std::sync::Mutex::new(None);
+    let Ok(mut rate) = RATE.lock() else { return };
+    let now = std::time::Instant::now();
+    let (start, presents, composed) = rate.get_or_insert((now, 0, 0));
+    *presents += 1;
+    *composed += u32::from(composited);
+    let elapsed = now.duration_since(*start);
+    if elapsed >= WINDOW {
+        let secs = elapsed.as_secs_f64();
+        crate::log!(
+            "[present] {:.1} fps ({:.1}/s composited by the effect) over {:.1}s",
+            f64::from(*presents) / secs,
+            f64::from(*composed) / secs,
+            secs
+        );
+        crate::logging::flush();
+        *rate = Some((now, 0, 0));
+    }
+}
+
 unsafe fn relay_app_waits(
     device: &ash::Device,
     queue: vk::Queue,
@@ -1139,6 +1164,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 break;
             }
         }
+
+        note_present_rate(wait_semaphore.is_some());
 
         // SAFETY: `present_info` is valid for the duration of this call; `next_present`
         // was resolved from the next layer/driver's own proc-addr table.
