@@ -192,7 +192,7 @@ fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
     row
 }
 
-pub fn build_ui(app: &adw::Application) {
+pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let Some(shm) = Shm::open() else {
         build_error_window(app);
         return;
@@ -453,6 +453,9 @@ pub fn build_ui(app: &adw::Application) {
     ));
 
     let toasts = adw::ToastOverlay::new();
+    if let Some(message) = install_error {
+        toasts.add_toast(adw::Toast::builder().title(message).timeout(0).build());
+    }
 
     // Tabbed like upstream's Qt GUI, rather than one long scrolling page -- each tab
     // is still an AdwPreferencesPage, which scrolls internally on its own if its
@@ -923,44 +926,6 @@ fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     group
 }
 
-fn build_install_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::new();
-    group.set_title("Steam games");
-    group.set_description(Some("Copies this AppImage's own layer and binaries into persistent user storage, so Vulkan \
-                            can still find them once the AppImage itself isn't running"));
-
-    let row = adw::ActionRow::new();
-    row.set_title("Install layer for Steam games");
-    let install_button = gtk4::Button::with_label("Install…");
-    install_button.set_valign(gtk4::Align::Center);
-    install_button.add_css_class("suggested-action");
-
-    // `APPDIR` is the AppImage runtime's own env var for the live mounted AppDir --
-    // only set when this GUI is actually running from inside an AppImage, which is
-    // also the only case this button makes sense in (a `cargo run` dev build has no
-    // AppDir to install from).
-    let appdir = std::env::var("APPDIR").ok();
-    row.set_subtitle(match &appdir {
-        Some(dir) => dir.as_str(),
-        None => "Only available when running from the AppImage",
-    });
-    if appdir.is_none() {
-        install_button.set_sensitive(false);
-    }
-    row.add_suffix(&install_button);
-    group.add(&row);
-
-    if let Some(dir) = appdir {
-        let toasts = toasts.clone();
-        install_button.connect_clicked(move |_| match neural_forge_supervisor::install::install(std::path::Path::new(&dir)) {
-            Ok(report) => toasts.add_toast(adw::Toast::new(&format!("Installed to {}", report.root.display()))),
-            Err(e) => toasts.add_toast(adw::Toast::new(&format!("Install failed: {e}"))),
-        });
-    }
-
-    group
-}
-
 /// The exact Steam launch-option string for these settings -- pulled out of the
 /// closure below so it's a plain, unit-testable function instead of only ever being
 /// exercised live through GTK signal handlers.
@@ -1015,7 +980,6 @@ fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.add(&build_ngx_group(toasts));
     page.add(&build_runner_group(toasts));
-    page.add(&build_install_group(toasts));
     page.add(&build_launch_option_group());
     page
 }

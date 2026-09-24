@@ -4,6 +4,14 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.94 — 2026-09-24
+
+- **The layer installs itself.** Every launch from the AppImage now copies its Vulkan layer and
+  helper into `~/.local/share/neural-forge` when they differ from what is installed, so an
+  updated AppImage never runs against a stale installed layer (which 0.1.93's shared-memory
+  change would break). When everything is already current it writes nothing. The Setup tab's
+  "Install layer for Steam games" button is gone; a failed install shows a message instead.
+
 ## 0.1.93 — 2026-09-24
 
 - **The model's temporal history was reset on every frame.** With "Estimate motion vectors"

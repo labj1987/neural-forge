@@ -3,9 +3,9 @@
 //! provenance record format (a flat `path -> sha256` map, refusing to touch any file
 //! that record doesn't say this installer itself last wrote), and the same
 //! atomic-replace-never-truncate file writes as `scripts/install.py`. Reimplemented
-//! in Rust so the GUI's Setup tab can offer an "Install for Steam games" button
-//! without a `python3` dependency; both tools read/write the exact same record on
-//! purpose, so either can pick up after the other left off.
+//! in Rust so the GUI can run it on every launch from an AppImage (a no-op when the
+//! installed copy is already current) without a `python3` dependency; both tools
+//! read/write the exact same record on purpose, so either can pick up after the other.
 
 use std::collections::BTreeMap;
 use std::io::Write;
@@ -57,6 +57,8 @@ impl From<serde_json::Error> for InstallError {
 
 #[derive(Debug)]
 pub struct InstallReport {
+    /// False when every installed file already matched the AppDir, so nothing was written.
+    pub changed: bool,
     pub root: PathBuf,
     pub gui_path: PathBuf,
     pub cli_path: PathBuf,
@@ -196,6 +198,14 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         }
     }
 
+    // Already current (the GUI runs this on every launch from an AppImage): every file is
+    // in place with exactly this content, and nothing stale is left to remove.
+    let up_to_date = files.iter().all(|(path, content)| path.is_file() && old.get(&path.to_string_lossy().into_owned()) == Some(&digest(content)))
+        && old.keys().all(|name| files.contains_key(Path::new(name)));
+    if up_to_date {
+        return Ok(InstallReport { changed: false, root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") });
+    }
+
     // Ownership is recorded *as files land*, not once at the end: a failure partway
     // through must leave every file already written tracked (otherwise the next run
     // sees them as unowned and refuses to touch them). Each file's record entry is
@@ -227,7 +237,7 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         }
     }
 
-    Ok(InstallReport { root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") })
+    Ok(InstallReport { changed: true, root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") })
 }
 
 /// Removes now-empty directories from `dir` upward, stopping at (and keeping) `stop`.
@@ -492,8 +502,16 @@ mod tests {
         let scratch = ScratchDataHome::new("idempotent");
         let appdir = scratch.dir.join("AppDir");
         write_fixture_appdir(&appdir);
-        install(&appdir).unwrap();
-        install(&appdir).expect("reinstalling the exact same AppDir should succeed");
+        assert!(install(&appdir).unwrap().changed);
+        let layer = PathBuf::from(paths::data_dir()).join("lib/neural-forge/libneural_forge_layer.so");
+        let inode = std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&layer).unwrap());
+        let again = install(&appdir).expect("reinstalling the exact same AppDir should succeed");
+        assert!(!again.changed, "an up-to-date install must not rewrite anything");
+        assert_eq!(std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(&layer).unwrap()), inode, "the layer must not be replaced");
+
+        std::fs::write(appdir.join("usr/lib/neural-forge/libneural_forge_layer.so"), "new layer").unwrap();
+        assert!(install(&appdir).unwrap().changed, "a changed AppDir file must be installed");
+        assert_eq!(std::fs::read_to_string(&layer).unwrap(), "new layer");
     }
 
     #[test]

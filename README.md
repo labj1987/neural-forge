@@ -17,7 +17,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Settings | Setup |
 |---|---|
-| ![Neural Forge settings window with Model, Motion, Composition, Debug, Status, and Setup tabs](screenshots/settings.png) | ![Setup tab: NGX binaries status, compatibility tool picker, Steam install and launch-option generator](screenshots/setup.png) |
+| ![Neural Forge settings window with Model, Motion, Composition, Debug, Status, and Setup tabs](screenshots/settings.png) | ![Setup tab: NGX binaries status, compatibility tool picker and Steam launch-option generator](screenshots/setup.png) |
 
 ## What it does
 
@@ -76,8 +76,11 @@ chmod +x neural-forge-*-x86_64.AppImage
 ./neural-forge-*-x86_64.AppImage
 ```
 
-For Steam games launched separately from the GUI, install the extracted AppDir into
-persistent user storage so Vulkan can find the layer after the AppImage exits:
+Each time it starts, the AppImage copies its Vulkan layer and helper into
+`~/.local/share/neural-forge` (and the layer manifest into
+`~/.local/share/vulkan/implicit_layer.d`) when they differ from what is installed, so Steam
+games launched separately still find the layer after the AppImage exits. From a source
+build, install the AppDir the same way with:
 
 ```bash
 python3 scripts/install.py install --appdir build-appimage/AppDir

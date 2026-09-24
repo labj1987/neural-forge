@@ -17,12 +17,16 @@ fn main() {
         .flags(gio::ApplicationFlags::FLAGS_NONE)
         .build();
 
-    app.connect_activate(|app| {
+    // Keep the persistent layer/helper copy (what Steam games load) in step with this
+    // AppImage on every launch, so an updated AppImage never runs against a stale layer.
+    let install_error = auto_install();
+
+    app.connect_activate(move |app| {
         if let Some(window) = app.windows().first() {
             window.present();
             return;
         }
-        ui::build_ui(app);
+        ui::build_ui(app, install_error.clone());
     });
 
     // The helper is launched as a detached Proton/Wine process tree. Shut it
@@ -37,4 +41,23 @@ fn main() {
     });
 
     std::process::exit(app.run().get() as i32);
+}
+
+/// Installs this AppImage's layer and helper into persistent user storage when they
+/// differ from what is installed (a no-op otherwise). `APPDIR` is set by the AppImage
+/// runtime only, so a `cargo run` build never installs. Returns the error to show, if any.
+fn auto_install() -> Option<String> {
+    let appdir = std::env::var("APPDIR").ok()?;
+    match neural_forge_supervisor::install::install(std::path::Path::new(&appdir)) {
+        Ok(report) => {
+            if report.changed {
+                eprintln!("neural-forge: installed the layer and helper to {}", report.root.display());
+            }
+            None
+        }
+        Err(e) => {
+            eprintln!("neural-forge: installing the layer for Steam games failed: {e}");
+            Some(format!("Installing the layer for Steam games failed: {e}"))
+        }
+    }
 }
