@@ -14,9 +14,8 @@ fn xdg(var: &str, fallback_under_home: &str) -> String {
 
 /// The raw `XDG_DATA_HOME` itself (not the `neural-forge` subdirectory [`data_dir`]
 /// returns) -- `install.rs` needs it as-is, matching `scripts/install.py`'s own
-/// `data` variable: several installed files (the Vulkan manifest, `.desktop` file,
-/// icon, AppStream metainfo) live under the shared per-user data hierarchy's own
-/// well-known subdirectories, siblings of `neural-forge/` rather than inside it.
+/// `data` variable: the installed Vulkan manifests live under the shared per-user data
+/// hierarchy's own well-known subdirectory, a sibling of `neural-forge/` rather than inside it.
 pub fn data_home() -> String {
     xdg("XDG_DATA_HOME", ".local/share")
 }

@@ -182,15 +182,11 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         files.insert(data_home.join("vulkan/implicit_layer.d/neural_forge_layer_i686.json"), out.into_bytes());
     }
 
-    let desktop_src = usr.join(format!("share/applications/{APP_ID}.desktop"));
-    let exec_line = format!("Exec=\"{}\"", root.join("bin/neural-forge").display());
-    let desktop_text = std::fs::read_to_string(&desktop_src)?.replace("Exec=neural-forge", &exec_line);
-    files.insert(data_home.join(format!("applications/{APP_ID}.desktop")), desktop_text.into_bytes());
-
-    for (sub, name) in [("icons/hicolor/scalable/apps", "neural-forge.svg".to_string()), ("metainfo", format!("{APP_ID}.appdata.xml"))] {
-        let src = usr.join("share").join(sub).join(&name);
-        files.insert(data_home.join(sub).join(&name), std::fs::read(&src)?);
-    }
+    // No `.desktop` file, icon or AppStream metainfo: every install comes from an
+    // AppImage, and menu integration belongs to whatever integrates that AppImage
+    // (Gear Lever, AppImageLauncher, ...). Installing a second entry here gave users two
+    // "Neural Forge" launchers. Older installs that did write them get them removed by
+    // the stale-entry pass below, as long as they are still exactly what was written.
 
     // Validate every destination before writing any of them, exactly like
     // `install.py`: a failure partway through must leave nothing changed, not a
@@ -440,11 +436,30 @@ mod tests {
         assert_eq!(manifest["layer"]["name"], LAYER);
         assert_eq!(manifest["layer"]["library_path"], root.join("lib/neural-forge/libneural_forge_layer.so").to_string_lossy().into_owned());
 
-        let desktop_path = PathBuf::from(paths::data_home()).join(format!("applications/{APP_ID}.desktop"));
-        let desktop = std::fs::read_to_string(desktop_path).unwrap();
-        assert!(desktop.contains(&format!("Exec=\"{}\"", root.join("bin/neural-forge").display())));
+        let data_home = PathBuf::from(paths::data_home());
+        for integration in [format!("applications/{APP_ID}.desktop"), "icons/hicolor/scalable/apps/neural-forge.svg".into(), format!("metainfo/{APP_ID}.appdata.xml")] {
+            assert!(!data_home.join(&integration).exists(), "{integration}: menu integration belongs to the AppImage, not the install");
+        }
 
         assert!(record_path().exists());
+    }
+
+    #[test]
+    fn install_removes_a_desktop_entry_an_older_install_wrote() {
+        let scratch = ScratchDataHome::new("old-desktop-entry");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        let desktop = PathBuf::from(paths::data_home()).join(format!("applications/{APP_ID}.desktop"));
+        let old_text = "[Desktop Entry]\nExec=\"/old/bin/neural-forge\"\n";
+        std::fs::create_dir_all(desktop.parent().unwrap()).unwrap();
+        std::fs::write(&desktop, old_text).unwrap();
+        let mut record = BTreeMap::new();
+        record.insert(desktop.to_string_lossy().into_owned(), digest(old_text.as_bytes()));
+        save_record(&record).unwrap();
+
+        install(&appdir).unwrap();
+        assert!(!desktop.exists(), "the entry an older install wrote must go, leaving the AppImage's own entry as the only one");
+        assert!(!load_record().contains_key(&desktop.to_string_lossy().into_owned()));
     }
 
     #[test]
@@ -523,14 +538,14 @@ mod tests {
         install(&appdir).unwrap();
 
         // Turn the fresh install into what a pre-0.1.76 one left behind: same content,
-        // legacy executable/icon names, recorded under those names.
+        // legacy executable names, recorded under those names -- plus the legacy-named
+        // icon those installs also wrote (installs no longer write any icon).
         let root = PathBuf::from(paths::data_dir());
         let icons = PathBuf::from(paths::data_home()).join("icons/hicolor/scalable/apps");
         let moves = [
             (root.join("bin/neural-forge"), root.join("bin/neuralforge")),
             (root.join("bin/neural-forge-cli"), root.join("bin/neuralforge-cli")),
             (root.join("lib/neural-forge/helper/neural-forge-helper.exe"), root.join("lib/neural-forge/helper/neuralforge-helper.exe")),
-            (icons.join("neural-forge.svg"), icons.join("neuralforge.svg")),
         ];
         let mut record = load_record();
         for (new, legacy) in &moves {
@@ -538,6 +553,10 @@ mod tests {
             let digest = record.remove(&new.to_string_lossy().into_owned()).unwrap();
             record.insert(legacy.to_string_lossy().into_owned(), digest);
         }
+        let legacy_icon = icons.join("neuralforge.svg");
+        std::fs::create_dir_all(&icons).unwrap();
+        std::fs::write(&legacy_icon, "<svg/>").unwrap();
+        record.insert(legacy_icon.to_string_lossy().into_owned(), digest(b"<svg/>"));
         save_record(&record).unwrap();
 
         install(&appdir).unwrap();
@@ -546,6 +565,8 @@ mod tests {
             assert!(!legacy.exists(), "{} should have been cleaned up", legacy.display());
             assert!(!load_record().contains_key(&legacy.to_string_lossy().into_owned()));
         }
+        assert!(!legacy_icon.exists() && !icons.join("neural-forge.svg").exists());
+        assert!(!load_record().contains_key(&legacy_icon.to_string_lossy().into_owned()));
     }
 
     /// The whole 0.1.76 -> 0.1.77 layout change: `neuralforge` config/data/state dirs, the

@@ -4,6 +4,16 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.90 — 2026-09-24
+
+- **Only one Neural Forge entry in the app menu.** Installing the layer for Steam games (the
+  Setup tab's Install button, `neural-forge-cli install`, `scripts/install.py`) also wrote its
+  own `.desktop` file, icon and AppStream metainfo pointing at the installed copy of the GUI,
+  so anyone who had integrated the AppImage into their menu got a second, identical "Neural
+  Forge" launcher. The install now copies only what Vulkan and the helper need; launching stays
+  with the AppImage and whatever integrated it. The entry, icon and metainfo an older install
+  wrote are removed on the next install, provided they are still exactly as it wrote them.
+
 ## 0.1.89 — 2026-09-23
 
 - **GTA San Andreas – The Definitive Edition now gets the effect.** DXVK creates that game's

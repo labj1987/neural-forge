@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Builds the AppImage from the working tree and puts exactly that build where the rig runs it:
 # the launcher copy (~/AppImages/neuralforge.appimage) and the installed layer/helper, then
-# proves the installed files are byte-identical to the ones inside the AppImage.
+# proves the installed files are byte-identical to the ones inside the AppImage. Leaves nothing
+# behind: no backup of the previous AppImage (releases are the rollback) and no temp files.
 #
 # Usage: scripts/deploy-rig.sh [host]
 set -euo pipefail
@@ -17,7 +18,6 @@ echo "==> copying to $HOST"
 scp -q "$APPIMAGE" "$HOST:/tmp/nf-deploy.AppImage"
 ssh "$HOST" 'set -e
   mkdir -p ~/AppImages
-  [ -f ~/AppImages/neuralforge.appimage ] && cp -p ~/AppImages/neuralforge.appimage ~/AppImages/neuralforge.appimage.prev
   cp /tmp/nf-deploy.AppImage ~/AppImages/neuralforge.appimage.new && chmod +x ~/AppImages/neuralforge.appimage.new
   mv -f ~/AppImages/neuralforge.appimage.new ~/AppImages/neuralforge.appimage
   cd /tmp && rm -rf squashfs-root && ~/AppImages/neuralforge.appimage --appimage-extract >/dev/null
@@ -28,5 +28,8 @@ ssh "$HOST" 'set -e
     a=$(sha256sum "$L/$f" | cut -d" " -f1); b=$(sha256sum "$S/$f" | cut -d" " -f1)
     if [ "$a" = "$b" ]; then echo "  $f  ${a:0:12}  installed == AppImage"; else echo "  $f MISMATCH"; ok=0; fi
   done
+  rm -rf /tmp/squashfs-root /tmp/nf-deploy.AppImage
+  update-desktop-database ~/.local/share/applications 2>/dev/null || true
   [ $ok = 1 ]'
+rm -f /tmp/deploy-rig-build.log
 echo "==> deployed and verified"
