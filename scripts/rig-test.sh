@@ -40,21 +40,10 @@ remote_cli() {
 
 sh_remote() { ssh "$HOST" "$@"; }
 
-say "building both halves"
-cargo build --release -p neural-forge-layer || exit 1
-cargo +stable-x86_64-unknown-linux-gnu build --release --target x86_64-pc-windows-gnu \
-    -p neural-forge-helper --bin neural-forge-helper || exit 1
-
-say "deploying both halves (atomic: write .new, then rename)"
-# A plain overwrite of a mapped .so can corrupt a live process -- rename is atomic and
-# leaves any running process on its own inode.
-scp -q target/release/libneural_forge_layer.so "$HOST:$INSTALL_LIB/libneural_forge_layer.so.new" || exit 1
-scp -q target/x86_64-pc-windows-gnu/release/neural-forge-helper.exe "$HOST:$INSTALL_LIB/helper/neural-forge-helper.exe.new" || exit 1
-sh_remote "mv -f '$INSTALL_LIB/libneural_forge_layer.so.new' '$INSTALL_LIB/libneural_forge_layer.so' &&
-           mv -f '$INSTALL_LIB/helper/neural-forge-helper.exe.new' '$INSTALL_LIB/helper/neural-forge-helper.exe' &&
-           sha256sum '$INSTALL_LIB/libneural_forge_layer.so' '$INSTALL_LIB/helper/neural-forge-helper.exe'" || exit 1
-say "local hashes, for comparison with the above"
-sha256sum target/release/libneural_forge_layer.so target/x86_64-pc-windows-gnu/release/neural-forge-helper.exe
+say "building and installing both halves through the installer (scripts/deploy-rig.sh)"
+# Never copy files into the installed path directly: the installer refuses to overwrite
+# files its record says it didn't write, so a direct copy breaks the next real install.
+bash "$(dirname "${BASH_SOURCE[0]}")/deploy-rig.sh" "$HOST" || exit 1
 
 CLI="$(remote_cli)"
 if [ -z "$CLI" ]; then
@@ -93,7 +82,9 @@ sh_remote "for i in \$(seq 1 120); do
     sleep 5
   done; echo 'TIMED OUT: the launcher never started the game'; exit 1"
 
-say "waiting for the layer to actually present frames (up to 10 minutes from game start)"
+say "waiting for the layer to present frames (up to 10 minutes from game start)"
+# Frames flow in GTA's menu too: this does NOT mean gameplay. Gameplay needs someone at
+# the rig to choose Story Mode, so treat unattended numbers as menu numbers.
 # The layer's own frame counter moving is the only reliable "we are really rendering and
 # really capturing" signal -- the game can be up, windowed and burning CPU while capture
 # never triggers (see the pass_through/GENERAL gate in device.rs).
@@ -104,7 +95,7 @@ sh_remote "export NEURAL_FORGE_SHM=$SHM NEURAL_FORGE_UID=1000
     now=\$('$CLI' shmctl status | awk -F= '/^layer_frames=/{print \$2}')
     if [ \"\$now\" != \"\$start\" ]; then echo \"frames flowing after \$((i*5))s (layer_frames \$start -> \$now)\"; exit 0; fi
   done
-  echo 'TIMED OUT: no presented frames -- the game never reached gameplay'; exit 1"
+  echo 'TIMED OUT: no presented frames'; exit 1"
 FRAMES_OK=$?
 
 say "sampling for ${SAMPLE}s"
