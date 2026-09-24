@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.92 — 2026-09-24
+
+- **New `scripts/check-stalls.sh [LOG]`** checks a layer log (default `$NEURAL_FORGE_LOG`, then
+  `~/nf-layer.log`) for the bounded fence-wait timeouts and breadcrumb dumps, and summarizes
+  engage/disengage transitions and the `[present]` frame rate. It exits 0 when no stalls are
+  found, 1 when stalls are found and 2 when there is no log.
+- Cleanup, not a bug fix: removed a dead assignment at the end of a swapchain-admission unit
+  test (a leftover since 0.1.73) that caused the only compiler warning in the workspace.
+
 ## 0.1.91 — 2026-09-24
 
 - **Removed all compatibility with the app's former names.** Releases no longer publish a

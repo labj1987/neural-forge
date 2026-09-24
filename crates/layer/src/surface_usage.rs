@@ -146,7 +146,6 @@ mod tests {
         // A mutable format without the format list the spec requires for it.
         info.flags = vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT;
         assert!(!candidate(&info));
-        info.flags = vk::SwapchainCreateFlagsKHR::empty();
     }
 
     #[test]
