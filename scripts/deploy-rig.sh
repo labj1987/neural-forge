@@ -16,7 +16,10 @@ CARGO_HELPER="${CARGO_HELPER:-cargo +stable}" bash build-appimage.sh >/tmp/deplo
 
 echo "==> copying to $HOST"
 scp -q "$APPIMAGE" "$HOST:/tmp/nf-deploy.AppImage"
-ssh "$HOST" 'set -e
+# The local build only exists to be copied; releases come from CI, so don't let builds pile up here.
+rm -rf "$APPIMAGE" "$APPIMAGE.zsync" "NeuralForge-$VERSION-x86_64.AppImage" "NeuralForge-$VERSION-x86_64.AppImage.zsync" build-appimage
+ssh "$HOST" "VERSION=$VERSION bash -s" <<'REMOTE'
+set -e
   mkdir -p ~/AppImages
   cp /tmp/nf-deploy.AppImage ~/AppImages/neuralforge.appimage.new && chmod +x ~/AppImages/neuralforge.appimage.new
   mv -f ~/AppImages/neuralforge.appimage.new ~/AppImages/neuralforge.appimage
@@ -29,7 +32,11 @@ ssh "$HOST" 'set -e
     if [ "$a" = "$b" ]; then echo "  $f  ${a:0:12}  installed == AppImage"; else echo "  $f MISMATCH"; ok=0; fi
   done
   rm -rf /tmp/squashfs-root /tmp/nf-deploy.AppImage
+  # Keep the menu entry's version metadata (written when the AppImage was integrated) in step.
+  E=~/.local/share/applications/neuralforge.desktop
+  [ -f "$E" ] && sed -i "s/^X-AppImage-Version=.*/X-AppImage-Version=$VERSION/" "$E"
   update-desktop-database ~/.local/share/applications 2>/dev/null || true
-  [ $ok = 1 ]'
+  [ $ok = 1 ]
+REMOTE
 rm -f /tmp/deploy-rig-build.log
 echo "==> deployed and verified"
