@@ -3,7 +3,7 @@
 //! (motion vectors), and Depth -- and the upload/evaluate/download sequence that binds
 //! them.
 //!
-//! Motion comes from the native layer's optical-flow stage via shared memory.
+//! Motion comes from the helper's own optical-flow session (`optical_flow.rs`).
 //! A missing/reset history produces zero vectors; valid history is R16G16_SFLOAT.
 //!
 //! Depth scope, added 2026-09-10: `DLSSNR.Depth`/`DLSSNR.DepthInverted` are real,

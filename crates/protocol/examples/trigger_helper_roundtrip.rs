@@ -69,7 +69,6 @@ fn main() {
     hdr.proxy_format_slot(slot).store(proxy_format, Ordering::Relaxed);
     hdr.apply_model.store(1, Ordering::Relaxed);
     hdr.enabled.store(1, Ordering::Relaxed);
-    hdr.frame_mvec_valid.store(0, Ordering::Relaxed);
 
     let seq = hdr.seq_req_slot(slot).load(Ordering::Relaxed).wrapping_add(1).max(1);
     println!("trigger_helper_roundtrip: slot {slot}: {width}x{height}, requesting seq={seq}");

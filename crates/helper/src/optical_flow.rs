@@ -6,8 +6,7 @@
 //! `vkCreateDevice` call, nothing created from inside the game's own process at a
 //! swapchain-transition moment. That specific combination ("a private optical-flow
 //! device created during a live game's swapchain transition") was the documented
-//! trigger for a real driver crash the layer-side version was stubbed to avoid
-//! (`crates/layer/src/shm.rs`'s `prepare_motion_resources`, still stubbed).
+//! trigger for a real driver crash in the old layer-side version, which was removed.
 //!
 //! This is the architecture DLSS5VKLayer's own AGPL-3.0 helper (`helper/main.cpp`)
 //! actually uses: one `VkCtx`, created once at helper startup, doing both NGX
@@ -47,6 +46,10 @@ pub struct OpticalFlow {
     current: usize,
     previous: bool,
     grid: u32,
+    fence: vk::Fence,
+    /// Set when a wait timed out: the GPU may still own this session's resources, so
+    /// `destroy` leaks them rather than risk freeing (or waiting on) in-flight work.
+    stalled: bool,
 }
 // Access is serialized by the helper's own single-threaded per-frame loop.
 unsafe impl Send for OpticalFlow {}
@@ -73,6 +76,7 @@ impl OpticalFlow {
             api, sync, queue: flow_queue.queue, pool: vk::CommandPool::null(), cmd: vk::CommandBuffer::null(),
             session: vk::OpticalFlowSessionNV::null(), images: vec![], buffer: vk::Buffer::null(), memory: vk::DeviceMemory::null(),
             mapped: std::ptr::null_mut(), width, height, current: 0, previous: false, grid,
+            fence: vk::Fence::null(), stalled: false,
         };
         // This type intentionally has no `Drop` impl (it doesn't own `device`, unlike
         // the private-device version this is adapted from -- see this module's own
@@ -127,10 +131,17 @@ impl OpticalFlow {
         flow.buffer = device.create_buffer(&vk::BufferCreateInfo::builder().size(u64::from(width) * u64::from(height) * 4)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST), None)?;
         let req = device.get_buffer_memory_requirements(flow.buffer);
+        // The flow vectors are read back through this mapping every frame, so it must be
+        // host-cached: the first merely HOST_VISIBLE type on NVIDIA is uncached, where the
+        // readback alone cost ~200 ms per frame on an RTX 5070.
+        let coherent = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+        let type_index = memory_type(&mem, req.memory_type_bits, coherent | vk::MemoryPropertyFlags::HOST_CACHED)
+            .or_else(|_| memory_type(&mem, req.memory_type_bits, coherent))?;
         flow.memory = device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(req.size)
-            .memory_type_index(memory_type(&mem, req.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT)?), None)?;
+            .memory_type_index(type_index), None)?;
         device.bind_buffer_memory(flow.buffer, flow.memory, 0)?;
         flow.mapped = device.map_memory(flow.memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())?.cast();
+        flow.fence = device.create_fence(&vk::FenceCreateInfo::default(), None)?;
         Ok(())
     }
 
@@ -187,16 +198,27 @@ impl OpticalFlow {
         }
         device.end_command_buffer(self.cmd)?;
         let cmds = [self.cmd];
-        device.queue_submit(self.queue, &[vk::SubmitInfo::builder().command_buffers(&cmds).build()], vk::Fence::null())?;
-        device.queue_wait_idle(self.queue)?;
+        device.reset_fences(&[self.fence])?;
+        device.queue_submit(self.queue, &[vk::SubmitInfo::builder().command_buffers(&cmds).build()], self.fence)?;
+        // Bounded, like every other GPU wait in the helper: the layer waits on the helper
+        // every frame, so an unbounded wait here would freeze the game on a driver stall.
+        if let Err(e) = device.wait_for_fences(&[self.fence], true, crate::ngx::FENCE_WAIT_TIMEOUT.as_nanos() as u64) {
+            if e == vk::Result::TIMEOUT {
+                self.stalled = true;
+                crate::log!("[mvec] optical-flow fence wait timed out after {:?}; motion vectors off for this session", crate::ngx::FENCE_WAIT_TIMEOUT);
+            }
+            return Err(e);
+        }
         let output = if self.previous {
             let grid_w = self.width.div_ceil(self.grid) as usize;
             // SAFETY: `self.mapped` is a live host-coherent mapping of at least
             // `grid_w * grid_h * 4` bytes (this buffer was sized for the full,
-            // un-gridded frame, always >= the gridded flow output); the fence-free
-            // `queue_wait_idle` above already confirmed the GPU's writes landed.
-            let raw = std::slice::from_raw_parts(self.mapped, grid_w * self.height.div_ceil(self.grid) as usize * 4);
-            Some(upsample_flow_grid(raw, grid_w, self.width, self.height, self.grid))
+            // un-gridded frame, always >= the gridded flow output); the fence wait
+            // above already confirmed the GPU's writes landed.
+            // One bulk copy out of the mapping, then decode from ordinary memory: the
+            // upsample reads each cell once per covered pixel, which must not hit mapped memory.
+            let raw = std::slice::from_raw_parts(self.mapped, grid_w * self.height.div_ceil(self.grid) as usize * 4).to_vec();
+            Some(upsample_flow_grid(&raw, grid_w, self.width, self.height, self.grid))
         } else {
             None
         };
@@ -218,12 +240,15 @@ impl OpticalFlow {
     /// # Safety
     /// `device` must be the same live device this session was created against; no
     /// submitted work referencing this session's handles may still be in flight
-    /// (the last `estimate` call's own `queue_wait_idle` already guarantees that for
+    /// (the last `estimate` call's own fence wait already guarantees that for
     /// every caller in this codebase, which never calls this concurrently with an
     /// in-flight `estimate`).
     pub unsafe fn destroy(&self, device: &ash::Device) {
+        if self.stalled {
+            return;
+        }
         unsafe {
-            let _ = device.device_wait_idle();
+            device.destroy_fence(self.fence, None);
             if self.session != vk::OpticalFlowSessionNV::null() {
                 (self.api.destroy_optical_flow_session_nv)(device.handle(), self.session, std::ptr::null());
             }

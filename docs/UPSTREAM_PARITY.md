@@ -62,8 +62,8 @@ other's mapping.
 - **Upstream's vendored `vulkan-1.dll`** for system Wine: not carried; Wine's own `winevulkan`
   worked in the end-to-end test.
 - **Motion vectors:** the GPU deadzone shader (`mvec_deadzone.comp`, two compile-time variants).
-  Motion is off by default and the rig reports no optical-flow support, so it cannot be tested
-  there.
+  Motion estimation itself is carried and validated on the rig (RTX 5070 under Proton:
+  `crates/helper/examples/optical_flow_rig_check.rs`); the deadzone filtering is not.
 - **dma-buf transport:** not wired (the GUI no longer offers the switch). A retest against system
   Wine + DXVK-NVAPI is now possible, since that runner works.
 - **Frame generation:** with DLSS Frame Generation on, every presented frame -- generated ones
@@ -81,10 +81,11 @@ other's mapping.
   (`crates/layer/src/breadcrumbs.rs`); see PR #22 against DLSS5VKLayer and `ATTRIBUTION.md`. Not
   confirmed as *the* cause -- if `nf-layer.log` ever shows a `fence wait timed out` line, that
   confirms it. If the freeze recurs with no such line, the one remaining unbounded class is the
-  helper's `device_wait_idle()` calls (`ngx.rs`, `optical_flow.rs`): that Vulkan API has no
+  helper's `device_wait_idle()` calls (`ngx.rs`): that Vulkan API has no
   timeout parameter at all, so bounding it needs a different mechanism (e.g. a watchdog thread)
   and a decision about whether it's safe to keep using a device once one such call is considered
-  abandoned -- not attempted, deliberately, pending that decision. Lower priority in practice: the
-  only caller of `optical_flow.rs`'s is motion vectors, off by default and untested on the rig.
+  abandoned -- not attempted, deliberately, pending that decision. (`optical_flow.rs` no longer
+  has one: its per-frame wait is a fence with `FENCE_WAIT_TIMEOUT`, and a stalled session is
+  leaked rather than waited on.)
 - **Running the model before the game's own upscaler** (on the internal render resolution)
   rather than on the upscaled output: a later performance idea.

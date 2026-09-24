@@ -708,13 +708,6 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let mut layer_state = self.state.lock().unwrap();
         self.tracker.lock().unwrap().swapchain_images.extend(state.images.iter().copied());
         layer_state.swapchains.insert(swapchain, state);
-        if !pass_through {
-            if let Some(instance) = self.instance.as_deref() {
-                layer_state.shm.prepare_motion_resources(instance, self.physical_device,
-                    create_info.image_extent.width, create_info.image_extent.height,
-                    swapchain::proxy_format_for(create_info.image_format));
-            }
-        }
         // Explicit flush, same reasoning as `new()`'s -- a one-time-per-swapchain
         // milestone, not the per-frame hot path.
         crate::logging::flush();

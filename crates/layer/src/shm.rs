@@ -90,13 +90,12 @@ pub fn region_capacity() -> usize {
 enum Region {
     Proxy0 = 0,
     Answer0 = 1,
-    Motion = 2,
-    Proxy1 = 3,
-    Answer1 = 4,
+    Proxy1 = 2,
+    Answer1 = 3,
 }
 
 impl Region {
-    const ALL: [Region; 5] = [Region::Proxy0, Region::Answer0, Region::Motion, Region::Proxy1, Region::Answer1];
+    const ALL: [Region; 4] = [Region::Proxy0, Region::Answer0, Region::Proxy1, Region::Answer1];
     fn proxy(slot: usize) -> Self {
         if slot == 0 { Region::Proxy0 } else { Region::Proxy1 }
     }
@@ -107,7 +106,6 @@ impl Region {
         match self {
             Region::Proxy0 => neural_forge_protocol::proxy_offset_slot(0),
             Region::Answer0 => neural_forge_protocol::answer_offset_slot(0),
-            Region::Motion => neural_forge_protocol::motion_offset(),
             Region::Proxy1 => neural_forge_protocol::proxy_offset_slot(1),
             Region::Answer1 => neural_forge_protocol::answer_offset_slot(1),
         }
@@ -115,17 +113,12 @@ impl Region {
 }
 
 pub struct ShmClient {
-    motion: Option<crate::optical_flow::OpticalFlow>,
-    motion_failed: Option<(u32,u32,u32,u32)>,
-    motion_luma: Vec<u8>,
-    motion_last: Option<Instant>,
-    motion_format: u32,
     fd: Option<OwnedFd>,
     header: *mut neural_forge_protocol::ShmHeader,
-    /// Where each pixel region is mapped in this process (proxy 0, answer 0, motion, proxy 1,
+    /// Where each pixel region is mapped in this process (proxy 0, answer 0, proxy 1,
     /// answer 1), `REGION_CAP` bytes each. One contiguous mapping on 64-bit; separate small
-    /// mappings on 32-bit, where the protocol's full 1.3 GB would not fit the address space.
-    regions: [*mut u8; 5],
+    /// mappings on 32-bit, where the protocol's full ~1.1 GB would not fit the address space.
+    regions: [*mut u8; 4],
     path: String,
     timeouts: u32,
     ever_answered: bool,
@@ -159,14 +152,9 @@ unsafe impl Send for ShmClient {}
 impl Default for ShmClient {
     fn default() -> Self {
         Self {
-            motion: None,
-            motion_failed: None,
-            motion_luma: Vec::new(),
-            motion_last: None,
-            motion_format: 0,
             fd: None,
             header: std::ptr::null_mut(),
-            regions: [std::ptr::null_mut(); 5],
+            regions: [std::ptr::null_mut(); 4],
             path: String::new(),
             timeouts: 0,
             ever_answered: false,
@@ -183,24 +171,6 @@ impl Default for ShmClient {
 }
 
 impl ShmClient {
-    /// Prepare the optical-flow session before the present hot path.
-    pub fn prepare_motion_resources(&mut self, instance: &ash::Instance, pd: ash::vk::PhysicalDevice,
-        width: u32, height: u32, format: u32) {
-        // The NVIDIA driver still crashes when this private optical-flow device
-        // is created during a live game's swapchain transition. Keep motion
-        // vectors disabled; neural rendering itself does not require this path.
-        let _ = (instance, pd, width, height, format);
-        return;
-        #[allow(unreachable_code)]
-        let Some(h) = self.header() else { return };
-        if !h.mvec_enabled() || !neural_forge_protocol::enums::proxy_format::is_8bit(format) || self.motion.is_some() { return; }
-        let quality = h.mvec_quality();
-        match crate::optical_flow::OpticalFlow::new(instance, pd, width, height, quality) {
-            Ok(m) => { self.motion = Some(m); self.motion_format = format; }
-            Err(e) => { crate::log!("[mvec] unavailable during swapchain setup: {e}"); }
-        }
-    }
-
     /// Cross-module test access to the raw header pointer -- `capture::tests` needs
     /// to poke `helper_state`/`seq_resp` directly to stand in for a fake helper, the
     /// same way this module's own tests do, but `header` is private to this module
@@ -421,57 +391,6 @@ impl ShmClient {
         }
     }
 
-    pub fn prepare_motion(&mut self, instance: &ash::Instance, pd: ash::vk::PhysicalDevice,
-        width: u32, height: u32, format: u32, bytes: &[u8]) {
-        // The experimental optical-flow implementation creates a private
-        // Vulkan device from inside the present hook. NVIDIA drivers can crash
-        // during that device creation, so keep this path disabled until its
-        // device lifecycle is made safe. Capture and composition still work.
-        let _ = (instance, pd, width, height, format, bytes);
-        return;
-        #[allow(unreachable_code)]
-        let Some(h) = self.header() else { return };
-        h.frame_mvec_valid.store(0, Ordering::Relaxed);
-        let enabled = h.mvec_enabled() && neural_forge_protocol::enums::proxy_format::is_8bit(format);
-        let quality = h.mvec_quality();
-        let mode = h.mvec_scale_mode();
-        if !enabled { self.motion = None; self.motion_last = None; self.motion_failed = None; self.motion_luma.clear(); return; }
-        if self.motion.as_ref().is_some_and(|m| m.width != width || m.height != height || m.quality != quality)
-            || self.motion_format != format || self.motion_last.is_some_and(|t| t.elapsed() > Duration::from_secs(1)) {
-            self.motion = None;
-        }
-        let key = (width,height,quality,format);
-        if self.motion_failed == Some(key) { return; }
-        if self.motion.is_none() {
-            // Session creation is deliberately restricted to swapchain setup;
-            // never create a Vulkan device from the present callback.
-            let _ = (instance, pd);
-            return;
-        }
-        // Sample luminance to discard motion across a scene cut. Motion is not
-        // meaningful when the two captured frames depict unrelated scenes.
-        let luma: Vec<u8> = bytes.chunks_exact(4).step_by(64).map(|p| ((p[0] as u32 + 2*p[1] as u32 + p[2] as u32)/4) as u8).collect();
-        let cut = luma.len() == self.motion_luma.len() && !luma.is_empty()
-            && luma.iter().zip(&self.motion_luma).map(|(&a,&b)| a.abs_diff(b) as u64).sum::<u64>() > luma.len() as u64 * 64;
-        self.motion_luma = luma;
-        let bgr = format == neural_forge_protocol::enums::proxy_format::BGRA8;
-        match self.motion.as_mut().unwrap().estimate(bytes,bgr) {
-            Ok(Some(vectors)) if !cut => {
-                let payload = neural_forge_protocol::motion::encode(&vectors,neural_forge_protocol::motion::scales(mode,width,height));
-                if let Some((motion, _)) = self.region(Region::Motion) {
-                    // Same single-request ownership and bounds as write_proxy.
-                    unsafe { std::ptr::copy_nonoverlapping(payload.as_ptr(),motion,payload.len()); }
-                    let h = self.header().unwrap();
-                    h.frame_mvec_scale_mode.store(mode,Ordering::Relaxed);
-                    h.frame_mvec_valid.store(1,Ordering::Relaxed);
-                }
-            },
-            Ok(_) => {},
-            Err(e) => { crate::log!("[mvec] failed: {e}"); self.motion = None; self.motion_failed = Some(key); },
-        }
-        self.motion_last = Some(Instant::now());
-    }
-
     /// Reads up to `out.len()` (capped at `MAX_FRAME`) bytes back from the given
     /// slot's answer region into `out`, returning the number of bytes copied.
     /// Meaningful only after [`Self::poll_async_request`]/[`Self::try_round_trip`] has
@@ -595,7 +514,7 @@ impl ShmClient {
                 crate::log!("[shm] mmap {path} (header) failed");
                 return false;
             };
-            let mut regions = [std::ptr::null_mut(); 5];
+            let mut regions = [std::ptr::null_mut(); 4];
             for r in Region::ALL {
                 let Some(p) = map_at(r.offset(), REGION_CAP) else {
                     crate::log!("[shm] mmap {path} region {r:?} failed");
@@ -1120,44 +1039,5 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(!ensure_private_parent_dir(&format!("{dir}/shm.bin")));
-    }
-}
-
-#[cfg(test)]
-mod motion_transport_tests {
-    use super::*;
-    #[test]
-    #[ignore = "requires a real NVIDIA optical-flow GPU"]
-    fn real_motion_payload_is_published_with_the_frame() {
-        let entry = unsafe { ash::Entry::load() }.unwrap();
-        let app = ash::vk::ApplicationInfo::builder().api_version(ash::vk::API_VERSION_1_3);
-        let instance = unsafe {entry.create_instance(&ash::vk::InstanceCreateInfo::builder().application_info(&app),None)}.unwrap();
-        let pd = unsafe {instance.enumerate_physical_devices()}.unwrap().into_iter().find(|&p|
-            unsafe {instance.get_physical_device_properties(p)}.vendor_id == 0x10de).expect("NVIDIA GPU required");
-        let path = format!("/tmp/neural-forge-motion-transport-{}/shm.bin",std::process::id());
-        let mut client = ShmClient::default();
-        assert!(client.open_at(&path));
-        let mut pixels = vec![0u8;512*512*4];
-        for (i,p) in pixels.chunks_exact_mut(4).enumerate() { let v = ((i as u32).wrapping_mul(747796405) >> 24) as u8; p.copy_from_slice(&[v,v,v,255]); }
-        let format = neural_forge_protocol::enums::proxy_format::BGRA8;
-        client.set_frame_info(0,512,512,format);
-        client.write_proxy(0,&pixels);
-        client.prepare_motion(&instance,pd,512,512,format,&pixels);
-        assert_eq!(client.header().unwrap().frame_mvec_valid.load(Ordering::Relaxed),0);
-        client.prepare_motion(&instance,pd,512,512,format,&pixels);
-        let hdr = client.header().unwrap();
-        assert_eq!(hdr.frame_mvec_valid.load(Ordering::Relaxed),1);
-        assert_eq!(hdr.proxy_format.load(Ordering::Relaxed),format);
-        assert_eq!(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed),neural_forge_protocol::enums::mvec_scale_mode::PIXELS);
-        let payload = unsafe {std::slice::from_raw_parts(client.region(Region::Motion).unwrap().0,512*512*4)};
-        assert!(payload.iter().filter(|&&x| x == 0).count() > payload.len()*95/100,"stationary motion should be near zero after the deadzone");
-        hdr.mvec_enabled.store(0,Ordering::Relaxed);
-        client.prepare_motion(&instance,pd,512,512,format,&pixels);
-        assert_eq!(client.header().unwrap().frame_mvec_valid.load(Ordering::Relaxed),0);
-        assert!(client.motion.is_none());
-        drop(client);
-        unsafe {instance.destroy_instance(None)};
-        std::fs::remove_file(&path).ok();
-        std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).ok();
     }
 }

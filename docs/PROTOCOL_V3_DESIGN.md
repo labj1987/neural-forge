@@ -57,15 +57,10 @@ migration; both processes always ship from the same build.
 - `hdr_encode`, `answered_w`, `answered_h` -- declared, defaulted, round-tripped by
   `reset_persisted_settings`, but (also confirmed by grep) never actually read or
   written by any live layer/helper code path today. Same reasoning as `format`.
-- `frame_mvec_valid`, `frame_mvec_scale_mode` -- real fields with real read/write
-  code, but that code (`ShmClient::prepare_motion`,
-  `ShmClient::prepare_motion_resources`) is itself unconditionally disabled (`return`
-  as the first line, `#[allow(unreachable_code)]` below it) — motion vectors are off
-  in this project's known-good baseline (see `mvec_enabled`'s own doc comment) because
-  of a real NVIDIA driver crash during private-device creation, unrelated to this
-  feature. Re-enabling motion and wiring a per-slot motion payload is a separate,
-  future change; nothing here forecloses it (the fields still exist, singular, and a
-  slot-1 motion payload can be added the same way slot 1's proxy/answer were, later).
+- `frame_mvec_valid`, `frame_mvec_scale_mode` -- existed only for the old layer-side
+  motion path, which was disabled at the time. Both fields and the motion region were
+  removed in `SHM_VERSION` 7 (0.1.93): motion vectors are now estimated inside the helper
+  and handed straight to the model, so nothing crosses shared memory for them.
 
 ## `DirectCapture` becomes two slots
 

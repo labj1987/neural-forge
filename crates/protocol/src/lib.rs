@@ -19,10 +19,12 @@
 //!   `[0, HEADER_BYTES)`                        `ShmHeader`
 //!   `[HEADER_BYTES, +MAX_FRAME)`                slot 0's proxy (the layer's capture)
 //!   `[HEADER_BYTES + MAX_FRAME, +MAX_FRAME)`    slot 0's answer (the model's output)
-//!   `[HEADER_BYTES + MAX_FRAME*2, +MAX_FRAME)`  the motion payload (shared, slot 0 only —
-//!                                                see `docs/PROTOCOL_V3_DESIGN.md`)
-//!   `[HEADER_BYTES + MAX_FRAME*3, +MAX_FRAME)`  slot 1's proxy
-//!   `[HEADER_BYTES + MAX_FRAME*4, +MAX_FRAME)`  slot 1's answer
+//!   `[HEADER_BYTES + MAX_FRAME*2, +MAX_FRAME)`  slot 1's proxy
+//!   `[HEADER_BYTES + MAX_FRAME*3, +MAX_FRAME)`  slot 1's answer
+//!
+//! v7 dropped the old layer->helper motion payload region (and its per-request header
+//! fields): motion vectors are now estimated entirely inside the helper, on its own
+//! device, from consecutive proxies.
 //!
 //! v3 (`docs/PROTOCOL_V3_DESIGN.md`) added the second slot so the layer can have two
 //! requests outstanding at once — never blocked with an idle wire slot while a
@@ -55,11 +57,13 @@ pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 
 /// The wire contract version (v2 added BGRA8 and a motion payload region; v3 adds a
-/// second independent request/response slot — see `docs/PROTOCOL_V3_DESIGN.md`).
+/// second independent request/response slot — see `docs/PROTOCOL_V3_DESIGN.md`; v7
+/// removes the motion payload region and `frame_mvec_valid` again, since motion is now
+/// estimated inside the helper).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; callers should log loudly and
 /// reinitialize rather than half-read a header laid out differently than they expect.
-pub const SHM_VERSION: u32 = 6;
+pub const SHM_VERSION: u32 = 7;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;
@@ -95,10 +99,9 @@ pub const DEFAULT_MAX_PASSES: u32 = 5;
 pub const REASON_BYTES: usize = 192;
 pub const NAME_BYTES: usize = 128;
 
-/// Total size of the mapping: header, slot 0's proxy/answer, the motion region, and
-/// slot 1's proxy/answer.
+/// Total size of the mapping: header, slot 0's proxy/answer, and slot 1's proxy/answer.
 pub const fn shm_total_bytes() -> usize {
-    HEADER_BYTES + MAX_FRAME * 5
+    HEADER_BYTES + MAX_FRAME * 4
 }
 
 /// Byte offset of slot 0's proxy region (the frame the layer hands the model) within
@@ -114,19 +117,12 @@ pub const fn answer_offset() -> usize {
     HEADER_BYTES + MAX_FRAME
 }
 
-/// Full-resolution R16G16_SFLOAT motion for the same seq_req as slot 0's proxy.
-/// Shared, not duplicated per slot: motion vectors are disabled in this project's
-/// current known-good baseline (see `ShmHeader::mvec_enabled`'s own doc comment), so
-/// there is no live per-slot motion payload to race on today — see
-/// `docs/PROTOCOL_V3_DESIGN.md` for the rest of that reasoning.
-pub const fn motion_offset() -> usize { HEADER_BYTES + MAX_FRAME * 2 }
-
 /// Byte offset of slot 1's proxy region — the second, independent in-flight request
 /// v3 adds. See `docs/PROTOCOL_V3_DESIGN.md`.
-pub const fn proxy_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 3 }
+pub const fn proxy_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 2 }
 
 /// Byte offset of slot 1's answer region.
-pub const fn answer_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 4 }
+pub const fn answer_b_offset() -> usize { HEADER_BYTES + MAX_FRAME * 3 }
 
 /// `proxy_offset()`/`proxy_b_offset()` picked by an actual slot index, the same
 /// `slot: usize` the layer and helper already use for `ShmHeader::seq_req_slot` and
@@ -174,7 +170,6 @@ mod tests {
             ("header", 0, HEADER_BYTES),
             ("proxy", proxy_offset(), MAX_FRAME),
             ("answer", answer_offset(), MAX_FRAME),
-            ("motion", motion_offset(), MAX_FRAME),
             ("proxy_b", proxy_b_offset(), MAX_FRAME),
             ("answer_b", answer_b_offset(), MAX_FRAME),
         ];

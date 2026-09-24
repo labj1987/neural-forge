@@ -43,11 +43,11 @@ use std::time::Duration;
 use ash::vk;
 use neural_forge_helper::{frame, guard, ngx, optical_flow, shm};
 
-/// Real motion vectors for this frame, or an empty `Vec` when they're unavailable
-/// for any reason (structurally, a transient failure, a scene cut, or simply the
-/// first frame after the session was just (re)built) -- the caller already treats
-/// empty motion as "no vectors this frame", the same fail-open contract this crate
-/// uses everywhere else. See `optical_flow.rs`'s own doc comment for the mechanism.
+/// Real motion vectors for this frame (empty when unavailable for any reason: no
+/// optical-flow queue, a transient failure, or the first frame after the session was
+/// (re)built -- the caller treats empty motion as "no vectors this frame"), plus
+/// whether this frame is a scene cut. Only a scene cut resets the model's temporal
+/// history; missing motion alone must not. See `optical_flow.rs` for the mechanism.
 #[allow(clippy::too_many_arguments)]
 fn estimate_motion(
     flow_queue: Option<&optical_flow::FlowQueue>,
@@ -62,17 +62,23 @@ fn estimate_motion(
     proxy_format: u32,
     motion_scale: [f32; 2],
     quality: u32,
-) -> Vec<u8> {
-    // Structurally unavailable (no extension/feature/queue-family support at all,
-    // decided once in `create_vulkan_context`) -- never worth attempting.
-    let Some(flow_queue) = flow_queue else { return Vec::new() };
+) -> (Vec<u8>, bool) {
+    // No optical-flow queue (unsupported, or the toggle was off when the helper started
+    // and the device was created without one) -- never worth attempting.
+    let Some(flow_queue) = flow_queue else {
+        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !LOGGED.swap(true, Ordering::Relaxed) {
+            neural_forge_helper::log!("[mvec] motion vectors are on but this helper has no optical-flow queue; they take effect the next time the helper starts");
+        }
+        return (Vec::new(), false);
+    };
     let bgr = proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8;
 
     let needs_rebuild = !flow.as_ref().is_some_and(|f| f.width == width && f.height == height);
     if needs_rebuild {
         if let Some(old) = flow.take() {
             // SAFETY: the last `estimate` call on this session (if any) already
-            // drained its queue (`estimate`'s own `queue_wait_idle`); nothing is
+            // drained its queue (`estimate`'s own fence wait); nothing is
             // in flight.
             unsafe { old.destroy(device) };
         }
@@ -87,11 +93,11 @@ fn estimate_motion(
                 if !LOGGED.swap(true, Ordering::Relaxed) {
                     neural_forge_helper::log!("[mvec] optical flow session unavailable at {width}x{height}: {e}");
                 }
-                return Vec::new();
+                return (Vec::new(), false);
             }
         }
     }
-    let Some(f) = flow.as_mut() else { return Vec::new() };
+    let Some(f) = flow.as_mut() else { return (Vec::new(), false) };
 
     // A scene cut invalidates whatever history the session's own images hold --
     // reset (by rebuilding) rather than let a stale reference frame produce a flow
@@ -106,7 +112,7 @@ fn estimate_motion(
         *flow = None;
         prev_proxy.clear();
         neural_forge_helper::log!("[mvec] scene cut detected, resetting motion history");
-        return Vec::new();
+        return (Vec::new(), true);
     }
 
     let vectors = match f.estimate(device, proxy, bgr) {
@@ -127,15 +133,15 @@ fn estimate_motion(
             unsafe { f.destroy(device) };
             *flow = None;
             prev_proxy.clear();
-            return Vec::new();
+            return (Vec::new(), false);
         }
     };
     prev_proxy.clear();
     prev_proxy.extend_from_slice(proxy);
     if vectors.is_empty() {
-        return Vec::new();
+        return (Vec::new(), false);
     }
-    neural_forge_protocol::motion::encode(&vectors, motion_scale)
+    (neural_forge_protocol::motion::encode(&vectors, motion_scale), false)
 }
 
 fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
@@ -173,7 +179,7 @@ fn main() {
     neural_forge_helper::log!("[helper] shm attached");
     neural_forge_helper::logging::flush();
 
-    let Some((entry, instance, physical_device, device, queue, flow_queue)) = create_vulkan_context() else {
+    let Some((entry, instance, physical_device, device, queue, flow_queue, flow_status)) = create_vulkan_context(hdr.mvec_enabled()) else {
         neural_forge_helper::log!("[helper] failed to create a Vulkan context");
         neural_forge_helper::logging::flush();
         hdr.helper_state.store(neural_forge_protocol::enums::helper_state::NO_VULKAN, Ordering::Relaxed);
@@ -194,7 +200,7 @@ fn main() {
         Ordering::Relaxed,
     );
     neural_forge_helper::log!("[helper] NGX snippet disabled={}", snippet.disabled);
-    neural_forge_helper::log!("[mvec] optical flow queue: {}", if flow_queue.is_some() { "available" } else { "unavailable (no extension/feature/queue-family support)" });
+    neural_forge_helper::log!("[mvec] optical flow queue: {flow_status}");
     neural_forge_helper::logging::flush();
 
     // Protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`): one persistent `FrameResources` per wire
@@ -207,9 +213,7 @@ fn main() {
     // reasoning). Each slot is still processed to completion, one at a time, before
     // the other is even checked this same loop tick.
     let mut frame_resources: [Option<frame::FrameResources>; 2] = [None, None];
-    // Slot-0-only, same as the `motion`/`frame_mvec_valid` convention it replaces --
-    // protocol v3 never duplicated the motion payload for slot 1 (see
-    // `process_request`'s own doc comment on why).
+    // Slot 0 only: slot 1 always evaluates with empty motion (see `process_request`).
     let mut flow: Option<optical_flow::OpticalFlow> = None;
     let mut prev_proxy: Vec<u8> = Vec::new();
     // Resized (not reallocated fresh every frame) to whatever the current frame's
@@ -266,7 +270,7 @@ fn main() {
             unsafe { f.destroy(&device) };
         }
     }
-    // SAFETY: same reasoning -- `estimate`'s own `queue_wait_idle` already drained
+    // SAFETY: same reasoning -- `estimate`'s own fence wait already drained
     // whatever this session last submitted, and the loop above just stopped.
     if let Some(f) = flow {
         unsafe { f.destroy(&device) };
@@ -312,10 +316,8 @@ fn retire_frame_resources(old: frame::FrameResources, device: &ash::Device) {
 /// inline for the single slot v2 had; pulled out so both slots run the identical
 /// logic instead of a copy that could drift, not because either slot is special.
 ///
-/// The motion payload (`frame_mvec_valid`/`frame_mvec_scale_mode`) is deliberately
-/// only ever read for slot 0 -- v3 did not duplicate those fields (see that design
-/// doc's own reasoning: the only code that ever writes them is itself unconditionally
-/// disabled today), so slot 1 always evaluates with empty motion, same as slot 0 does
+/// Motion vectors are estimated for slot 0 only (the optical-flow session holds one
+/// history), so slot 1 always evaluates with empty motion, same as slot 0 does
 /// whenever motion is off. `hdr.seq_ok` is likewise shared, not per-slot: nothing
 /// anywhere in this workspace ever reads it back (confirmed by grep), so there is
 /// nothing to race by having both slots write the same dead field.
@@ -353,7 +355,7 @@ fn process_request(
         neural_forge_helper::log!("[helper] slot {slot}: rejecting out-of-range frame {width}x{height} format={proxy_format}");
     }
     let n = if dims_ok { bytes } else { 0 };
-    let motion_scale = neural_forge_protocol::motion::scales(hdr.frame_mvec_scale_mode.load(Ordering::Relaxed), width, height);
+    let motion_scale = neural_forge_protocol::motion::scales(hdr.mvec_scale_mode(), width, height);
     // Fixed addresses/capacity regardless of this frame's own width/height --
     // `FrameResources::new` decides for itself (per its own doc comment) whether
     // they're actually importable.
@@ -420,34 +422,27 @@ fn process_request(
     let (proxy, answer) = unsafe { shm.frame_regions(slot, n) };
 
     // Real motion vectors, estimated here in the helper -- see `optical_flow.rs`'s
-    // own doc comment for the architecture and why this replaced the layer-side
-    // stub. Slot 0 only, matching the pre-existing convention (protocol v3 never
-    // duplicated the motion payload for slot 1). `NEURAL_FORGE_MVEC_HELPER` is a
-    // deliberate, explicit opt-in on top of the header's own `mvec_enabled` toggle:
-    // this is genuinely unvalidated on real hardware as of the commit that adds it
-    // (see docs/GHOSTING_PLAN.md step 4) -- some users' persisted config already has
-    // `mvec_enabled=1` from when this toggle was a no-op, and this crate should not
-    // silently start doing something new and untested just because an old, inert
-    // setting happens to already be on.
-    let motion = if slot == 0
+    // own doc comment for the architecture. Slot 0 only (protocol v3 never duplicated
+    // the motion payload for slot 1). The GUI's "Estimate motion vectors" toggle is the
+    // only switch.
+    let (motion, scene_cut) = if slot == 0
         && dims_ok
         && hdr.mvec_enabled()
         && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
-        && neural_forge_protocol::env::is_set("NEURAL_FORGE_MVEC_HELPER")
     {
         estimate_motion(flow_queue, flow, prev_proxy, instance, device, physical_device, proxy, width, height, proxy_format, motion_scale, hdr.mvec_quality.load(Ordering::Relaxed))
     } else {
-        // Toggled off (or the opt-in isn't set): drop any live session so the next
+        // Toggled off: drop any live session so the next
         // time it's turned on starts clean (matches `DestroyOpticalFlow`/
         // `userDisabled` in DLSS5VKLayer's own helper -- an explicit off state, not
         // just "stop calling estimate" while a session silently idles).
         if let Some(f) = flow.take() {
-            // SAFETY: `estimate`'s own `queue_wait_idle` (the last call this session
+            // SAFETY: `estimate`'s own fence wait (the last call this session
             // was used for, if ever) already guarantees nothing is in flight.
             unsafe { f.destroy(device) };
         }
         prev_proxy.clear();
-        Vec::new()
+        (Vec::new(), false)
     };
 
     let timing = if ready && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
@@ -465,7 +460,10 @@ fn process_request(
             }
             let f = frame_resources.as_ref()?;
             let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
-            let reset_history = hdr.mvec_enabled() && motion.is_empty();
+            // Only a scene cut invalidates the model's history. Resetting whenever motion
+            // was missing told the model "frame one" on every frame while motion was
+            // unavailable, so its temporal history was never used.
+            let reset_history = scene_cut;
             // Sharpness is per pass (the model reads it at evaluate); the header index of a pass
             // is its position in the chain, holes excluded only from the *built* handles, so the
             // pass numbers here are the first `live_passes` of the header's list.
@@ -567,7 +565,7 @@ const WANTED_DEVICE_EXTENSIONS: &[&str] = &[
     // `VK_KHR_format_feature_flags2` is the extended format-query struct optical
     // flow's own image-format negotiation uses). Requested only when actually
     // present, exactly like every other entry in this list -- their absence just
-    // means `ensure_flow_queue` below never finds a usable combination, not that
+    // means `find_flow_family` below reports why there is no usable combination, not that
     // device creation itself is affected.
     "VK_KHR_synchronization2",
     "VK_KHR_format_feature_flags2",
@@ -584,9 +582,12 @@ const WANTED_DEVICE_EXTENSIONS: &[&str] = &[
 /// upstream's own `helper/main.cpp` checks too, not just extension enumeration), or
 /// no queue family exposing `VK_QUEUE_OPTICAL_FLOW_BIT_NV`. Every caller treats that
 /// exactly like a disabled feature -- this crate never fails to start NGX over it.
-fn find_flow_family(instance: &ash::Instance, pd: vk::PhysicalDevice, enabled_extension_names: &[&str]) -> Option<u32> {
-    if !enabled_extension_names.contains(&"VK_NV_optical_flow") || !enabled_extension_names.contains(&"VK_KHR_synchronization2") {
-        return None;
+fn find_flow_family(instance: &ash::Instance, pd: vk::PhysicalDevice, enabled_extension_names: &[&str]) -> Result<u32, &'static str> {
+    if !enabled_extension_names.contains(&"VK_NV_optical_flow") {
+        return Err("VK_NV_optical_flow not exposed");
+    }
+    if !enabled_extension_names.contains(&"VK_KHR_synchronization2") {
+        return Err("VK_KHR_synchronization2 not exposed");
     }
     let mut optical_features = vk::PhysicalDeviceOpticalFlowFeaturesNV::default();
     let mut sync_features = vk::PhysicalDeviceSynchronization2Features::default();
@@ -595,15 +596,23 @@ fn find_flow_family(instance: &ash::Instance, pd: vk::PhysicalDevice, enabled_ex
     unsafe {
         instance.get_physical_device_features2(pd, &mut vk::PhysicalDeviceFeatures2::builder().push_next(&mut optical_features).push_next(&mut sync_features));
     }
-    if optical_features.optical_flow == 0 || sync_features.synchronization2 == 0 {
-        return None;
+    if optical_features.optical_flow == 0 {
+        return Err("opticalFlow feature not supported");
+    }
+    if sync_features.synchronization2 == 0 {
+        return Err("synchronization2 feature not supported");
     }
     // SAFETY: `pd` is a handle this process already enumerated.
     let families = unsafe { instance.get_physical_device_queue_family_properties(pd) };
     families.iter().position(|p| p.queue_flags.contains(vk::QueueFlags::OPTICAL_FLOW_NV | vk::QueueFlags::TRANSFER)).map(|i| i as u32)
+        .ok_or("no optical-flow queue family")
 }
 
-fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, Option<optical_flow::FlowQueue>)> {
+/// `want_flow`: the motion-vector toggle as it stood at helper start. The optical-flow
+/// queue and features are only requested then, so with the toggle off device creation
+/// has exactly its pre-optical-flow shape. The last element says why there is or isn't
+/// a flow queue, for the startup log.
+fn create_vulkan_context(want_flow: bool) -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, Option<optical_flow::FlowQueue>, String)> {
     // SAFETY: dynamically loads `vulkan-1.dll` via the `loaded` feature; the usual
     // caveats of loading an arbitrary shared library apply and are accepted here the
     // same way every other `ash` consumer accepts them.
@@ -653,21 +662,16 @@ fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDev
     // NVIDIA parts expose optical flow on their main graphics/compute family) is
     // handled by not adding a second entry for it, only chaining the extra features.
     //
-    // Gated on `NEURAL_FORGE_MVEC_HELPER` here, not just in `estimate_motion`'s caller:
-    // this is device-creation time, before any per-frame opt-in check runs, so on
-    // hardware that genuinely exposes an optical-flow queue (real NVOF-capable
-    // GPUs) this used to run unconditionally regardless of the env var -- silently
-    // requesting a second queue and chaining `VkPhysicalDeviceOpticalFlowFeaturesNV`/
-    // `Synchronization2Features` into `vkCreateDevice` on every launch, on real
-    // hardware, never exercised under Wine (which always reports the extension
-    // unavailable). Found 2026-09-17 after this caused a live hang on real
-    // hardware. Checking the env var here makes device creation byte-identical to
-    // pre-optical-flow behavior for anyone who hasn't explicitly opted in, which is
-    // the actual invariant this feature was supposed to guarantee from the start.
-    let flow_family = if neural_forge_protocol::env::is_set("NEURAL_FORGE_MVEC_HELPER") {
-        find_flow_family(&instance, physical_device, &enabled)
+    // Only when motion vectors are on: an unconditional second queue plus these features
+    // were suspected (never proven) in a 2026-09-17 helper hang, so with the toggle off
+    // device creation stays exactly as it was before optical flow existed.
+    let (flow_family, flow_status) = if want_flow {
+        match find_flow_family(&instance, physical_device, &enabled) {
+            Ok(family) => (Some(family), format!("available (queue family {family})")),
+            Err(why) => (None, format!("unavailable: {why}")),
+        }
     } else {
-        None
+        (None, "off (motion vectors disabled at helper start)".to_string())
     };
     let mut queue_infos = vec![vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
     if let Some(family) = flow_family {
@@ -699,5 +703,5 @@ fn create_vulkan_context() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDev
         queue: unsafe { device.get_device_queue(family, 0) },
     });
 
-    Some((entry, instance, physical_device, device, queue, flow_queue))
+    Some((entry, instance, physical_device, device, queue, flow_queue, flow_status))
 }

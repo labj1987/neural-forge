@@ -691,9 +691,10 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 /// the GPU write already landed the bytes in the proxy region directly -- no
 /// `write_proxy` call needed, that copy is exactly what importing the region as device
 /// memory removes -- but `original_scratch` still needs its own stable copy (read back
-/// out of the now-written proxy region), because `inflight.original`/`prepare_motion`
-/// need bytes that survive whatever capture starts next and overwrites that region,
-/// which the live proxy region itself can't provide once it's shared, imported memory.
+/// out of the now-written proxy region), because `inflight.original` (and the frame
+/// hold/white-point meter) need bytes that survive whatever capture starts next and
+/// overwrites that region, which the live proxy region itself can't provide once it's
+/// shared, imported memory.
 #[allow(clippy::too_many_arguments)]
 /// `model`, when `Some((model_width, model_height, format))`, additionally requests a
 /// scaled proxy at that resolution (`working_scale`) -- see [`ModelScratch`]'s own doc
@@ -1126,7 +1127,6 @@ pub unsafe fn run(
             },
             shm, original_scratch, model_scratch,
         ).is_some() {
-            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
             if shm.begin_async_request(SLOT) {
                 inflight[SLOT].dims = Some((width, height, proxy_format));
                 inflight[SLOT].proxy_dims = None;
@@ -1235,7 +1235,6 @@ pub unsafe fn run(
                 },
                 shm, original_scratch, model_scratch,
                 ) {
-                    shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
                     if shm.begin_async_request(slot) {
                         std::mem::swap(&mut inflight[slot].original, original_scratch);
                         inflight[slot].dims = Some((width, height, proxy_format));
@@ -1390,7 +1389,6 @@ pub unsafe fn run(
                     }
                 }
             }
-            shm.prepare_motion(instance, physical_device, width, height, proxy_format, original_scratch);
             if !shm.begin_async_request(SLOT) {
                 shm.publish_frame_timing(pipeline_start.elapsed(), false);
                 return None;
@@ -2632,7 +2630,6 @@ unsafe fn run_sync(
         // `try_round_trip`'s own blocking wait, never protocol v3's second slot.
         shm.set_frame_info(SLOT, width, height, proxy_format);
         shm.write_proxy(SLOT, captured);
-        shm.prepare_motion(instance, physical_device, width, height, proxy_format, captured);
         (t_snapshot, t_write_proxy_start.elapsed())
     };
     let original: &[u8] = original_scratch.as_slice();

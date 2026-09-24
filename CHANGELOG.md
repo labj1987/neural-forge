@@ -4,6 +4,32 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.93 — 2026-09-24
+
+- **The model's temporal history was reset on every frame.** With "Estimate motion vectors"
+  on but no motion available (which was always the case), the helper sent `DLSSNR.Reset = 1`
+  with every evaluate, so the model treated each frame as the first and never used its
+  history. History now resets only on a detected scene cut.
+- **Motion vectors work, from the helper.** The "Estimate motion vectors" switch is now the
+  only switch (the `NEURAL_FORGE_MVEC_HELPER` variable is gone), and the Motion page's
+  controls are live again with an accurate description. The switch takes effect the next
+  time the helper starts: the optical-flow queue is only requested then.
+- **Optical flow was ~50x slower than it needed to be.** Its readback buffer used uncached
+  memory and was read byte by byte; it is now host-cached and copied out in one piece.
+  Measured on an RTX 5070 under Proton: 216 ms -> 4.2 ms per estimate at 1280x720,
+  16.6 ms at 2560x1440, with the vectors exact on synthetic motion.
+- The optical-flow wait is now bounded (`FENCE_WAIT_TIMEOUT`) instead of `queue_wait_idle`;
+  a stalled session turns motion off for that session instead of freezing the game.
+- The "Motion units" setting was ignored (the helper read an internal field that was always
+  "Pixels"); it is now honoured.
+- The helper's startup log says exactly why optical flow is or isn't available.
+- Removed the old layer-side motion path (disabled since 0.1.5x) and the shared-memory motion
+  region and fields it used (`SHM_VERSION` 7).
+- New `crates/helper/examples/optical_flow_rig_check.rs`: runs the helper's optical-flow path
+  on real hardware under the helper's runner and checks the vectors and for stalls.
+- Not yet measured in gameplay: whether motion vectors reduce ghosting, and their frame-rate
+  cost at gameplay resolutions.
+
 ## 0.1.92 — 2026-09-24
 
 - **New `scripts/check-stalls.sh [LOG]`** checks a layer log (default `$NEURAL_FORGE_LOG`, then

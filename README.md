@@ -35,8 +35,8 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 - Fail-open: if the helper isn't running or the model fails to initialize, the layer
   just presents the original frame — nothing about the game's rendering depends on it.
 - The Windows-side helper runs NVIDIA's `nvngx_dlssnr.dll` (Feature 18) under Wine or a
-  Proton build. The experimental `VK_NV_optical_flow` motion path is disabled in
-  the known-good baseline.
+  Proton build. With "Estimate motion vectors" on, the helper also estimates motion
+  between frames with `VK_NV_optical_flow` and passes it to the model.
 - SDR 8-bit swapchains only (B8G8R8A8 / R8G8B8A8, UNORM or sRGB); the validated GTA
   baseline is SDR B8G8R8A8. HDR (PQ 10-bit) and float16 swapchains are recognised and logged
   but present untouched for now — the half-float compose path is a tracked follow-up.
@@ -167,7 +167,6 @@ Set on a game (Steam launch options) unless noted.
 | `NEURAL_FORGE_SKIP_NVAPI=1` | Helper, set by the supervisor for Proton: do not load the vendored `nvapi64.dll`. |
 | `NEURAL_FORGE_AUTO_DOWNLOAD=0` | Supervisor, system-Wine runner: never download DXVK / DXVK-NVAPI (supply them in the binaries folder). |
 | `NEURAL_FORGE_INSTALL_DIR` | Supervisor: where to find the helper (default: the installed copy, then the AppImage's). |
-| `NEURAL_FORGE_MVEC_HELPER=1` | Helper: experimental optical-flow motion vectors (off; unverified). |
 | `NEURAL_FORGE_HELPER_DELAY_MS`, `NEURAL_FORGE_BENCH`, `NEURAL_FORGE_GUI_OPEN` | Testing aids. |
 
 ### CLI

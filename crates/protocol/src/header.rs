@@ -286,10 +286,6 @@ pub struct ShmHeader {
     /// made: the layer writes this immediately before `seq_req`, so the helper reads
     /// the width from the same statement that announced the pixels.
     pub hdr_encode: AtomicU32,
-    /// Motion payload is valid for this request; published before seq_req.
-    pub frame_mvec_valid: AtomicU32,
-    /// Snapshot of units used to encode this request, independent of GUI changes.
-    pub frame_mvec_scale_mode: AtomicU32,
 
     // --- v3: the second, independent request/response slot ---------------------------
     // Appended after everything else on purpose, same reasoning as `pass` above: a
@@ -353,7 +349,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1996, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1988, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -365,12 +361,10 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, mvec_enabled) == 1860, "la
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1932, "layout changed -- bump SHM_VERSION");
 // v3's second slot, appended after everything else -- same reasoning as `pass`'s own
 // comment above about why a new field belongs at the end, not inserted higher up.
-const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1960, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1980, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1988, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1992, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_valid) == 1952, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, frame_mvec_scale_mode) == 1956, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1952, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1972, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1980, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1984, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
 
 impl ShmHeader {
@@ -489,8 +483,6 @@ impl ShmHeader {
         self.hdr_active.store(0, Ordering::Relaxed);
         self.proxy_format.store(crate::enums::proxy_format::RGBA8, Ordering::Relaxed);
         self.hdr_encode.store(0, Ordering::Relaxed);
-        self.frame_mvec_valid.store(0, Ordering::Relaxed);
-        self.frame_mvec_scale_mode.store(mvec_scale_mode::PIXELS, Ordering::Relaxed);
 
         self.seq_req_b.store(0, Ordering::Relaxed);
         self.seq_resp_b.store(0, Ordering::Relaxed);
@@ -505,7 +497,7 @@ impl ShmHeader {
     /// [`Self::init_defaults`] (which this is built on top of): upstream shipped a
     /// real bug here (PR #16), where its own "reset settings" wiped the live session
     /// out from under a running helper/layer -- seq words, helper/layer status and
-    /// counters, the DMA-BUF transport fields, HDR detection, motion-vector validity,
+    /// counters, the DMA-BUF transport fields, HDR detection, the per-request motion scale,
     /// the free-text reason/name fields -- not just the tuning knobs a user actually
     /// meant to reset. This never touches the ownership lease either; that lives in a
     /// separate file (`shm.bin.owner`), entirely outside this struct.
@@ -532,8 +524,8 @@ impl ShmHeader {
         let (rebuild_settle_ms, answered_w, answered_h) = snapshot!(rebuild_settle_ms, answered_w, answered_h);
         let (proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq) =
             snapshot!(proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq);
-        let (hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode) =
-            snapshot!(hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode);
+        let (hdr_detected, hdr_active, hdr_encode, proxy_format) =
+            snapshot!(hdr_detected, hdr_active, hdr_encode, proxy_format);
         // Slot 1 (v3): a live in-flight second request must survive a settings reset
         // exactly like slot 0's already does -- this is the same class of bug PR #16
         // (see this function's own doc comment) already burned upstream on once.
@@ -555,7 +547,7 @@ impl ShmHeader {
         restore!(layer_attached, layer_frames_lo, layer_frames_hi, layer_width, layer_height, layer_format, layer_composition_up, layer_ms_bits, layer_measured_white_bits, layer_heartbeat);
         restore!(rebuild_settle_ms, answered_w, answered_h);
         restore!(proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq);
-        restore!(hdr_detected, hdr_active, hdr_encode, proxy_format, frame_mvec_valid, frame_mvec_scale_mode);
+        restore!(hdr_detected, hdr_active, hdr_encode, proxy_format);
         restore!(seq_req_b, seq_resp_b, width_b, height_b, proxy_format_b);
         self.set_helper_reason(&helper_reason);
         self.set_layer_reason(&layer_reason);
@@ -1007,7 +999,6 @@ mod tests {
         h.proxy_fd.store(17, Ordering::Relaxed);
         h.proxy_pid.store(99, Ordering::Relaxed);
         h.hdr_active.store(1, Ordering::Relaxed);
-        h.frame_mvec_valid.store(1, Ordering::Relaxed);
         h.set_helper_reason("model ready");
         h.set_game_name("GTA5_Enhanced.exe");
 
@@ -1035,7 +1026,6 @@ mod tests {
         assert_eq!(h.proxy_fd.load(Ordering::Relaxed), 17);
         assert_eq!(h.proxy_pid.load(Ordering::Relaxed), 99);
         assert_eq!(h.hdr_active.load(Ordering::Relaxed), 1);
-        assert_eq!(h.frame_mvec_valid.load(Ordering::Relaxed), 1);
         assert_eq!(h.helper_reason(), "model ready");
         assert_eq!(h.game_name(), "GTA5_Enhanced.exe");
     }

@@ -20,7 +20,6 @@
 
 mod breadcrumbs;
 mod capture;
-mod optical_flow;
 mod composition;
 mod device;
 mod ownership;
