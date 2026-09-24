@@ -4,6 +4,16 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.96 — 2026-09-24
+
+- **Zero-copy capture and composition now work in DirectX 12 games (vkd3d-proton), such as
+  GTA V.** vkd3d-proton enables `VK_EXT_external_memory_host` on its own, so the layer's
+  device-creation hook correctly stood aside, but the layer only recognised the extension when
+  it had added it itself; those devices were treated as not having it and fell back to the
+  CPU-copy path (`[sync] ... zc=false`). The layer now also reads the application's own request.
+  Measured on 0.1.95 in GTA V at 2560x1440, the copies this removes were ~4.6 ms of the ~24 ms
+  per frame. If adding the extension is ever refused by the driver, the layer now says so once.
+
 ## 0.1.95 — 2026-09-24
 
 - **Frames stay on the GPU between capture and composition.** When the direct capture path is

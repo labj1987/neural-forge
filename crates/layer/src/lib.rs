@@ -239,6 +239,19 @@ pub(crate) const EXTERNAL_MEMORY_HOST_EXTENSION: &CStr = c"VK_EXT_external_memor
 /// mutex-guarded side table, not a source of truth kept around indefinitely.
 static EXTERNAL_MEMORY_HOST_DEVICES: Mutex<Option<HashSet<vk::Device>>> = Mutex::new(None);
 
+/// Whether a `VkDeviceCreateInfo` itself requests the extension `name`. A request with zero
+/// extensions may legitimately leave `pp_enabled_extension_names` null (`vkcube` does), which
+/// `slice::from_raw_parts` must never see.
+pub(crate) fn requests_extension(create_info: &vk::DeviceCreateInfo, name: &CStr) -> bool {
+    if create_info.enabled_extension_count == 0 || create_info.pp_enabled_extension_names.is_null() {
+        return false;
+    }
+    // SAFETY: a non-null `pp_enabled_extension_names` is an array of `enabled_extension_count`
+    // valid, NUL-terminated C strings per `VkDeviceCreateInfo`'s own contract.
+    let requested = unsafe { std::slice::from_raw_parts(create_info.pp_enabled_extension_names, create_info.enabled_extension_count as usize) };
+    requested.iter().any(|&requested| unsafe { CStr::from_ptr(requested) } == name)
+}
+
 /// Checks and clears whether `device` is one [`NeuralForgeInstanceHooks::create_device`]
 /// added [`EXTERNAL_MEMORY_HOST_EXTENSION`] to.
 pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
@@ -286,9 +299,9 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             // `VkDeviceCreateInfo`, `enabled_extension_count` just confirmed > 0.
             unsafe { std::slice::from_raw_parts(create_info.pp_enabled_extension_names, create_info.enabled_extension_count as usize) }
         };
-        // SAFETY: every element of `requested` is a valid, NUL-terminated C string for
-        // the same reason as the slice itself.
-        if requested.iter().any(|&name| unsafe { CStr::from_ptr(name) } == EXTERNAL_MEMORY_HOST_EXTENSION) {
+        // The application already enables it (vkd3d-proton does): nothing to add.
+        // `NeuralForgeDeviceInfo::new` reads the request itself to learn it is enabled.
+        if requests_extension(create_info, EXTERNAL_MEMORY_HOST_EXTENSION) {
             return LayerResult::Unhandled;
         }
         // SAFETY: `physical_device` is the one this exact `vkCreateDevice` call is
@@ -340,6 +353,10 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         // the earlier query didn't predict. Retry with the caller's own, completely
         // unmodified request -- this optimization attempt must never be the reason a
         // device creation that would otherwise have succeeded now fails.
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::log!("[layer] adding {EXTERNAL_MEMORY_HOST_EXTENSION:?} was refused ({result:?}); creating the device as requested, without zero-copy capture");
+        }
         // SAFETY: same reasoning as the call above, with `create_info` (the original,
         // borrowed, unmodified request) this time.
         let result = unsafe { next_create_device(physical_device, create_info, allocator_ptr, p_device.as_mut_ptr()) };
@@ -424,6 +441,23 @@ impl Layer for NeuralForgeLayer {
 }
 
 declare_introspection_queries!(entry_points::EntryPoints);
+
+#[cfg(test)]
+mod requests_extension_tests {
+    use super::*;
+
+    #[test]
+    fn finds_an_extension_the_application_requested_and_tolerates_a_null_list() {
+        let other = c"VK_KHR_swapchain";
+        let names = [other.as_ptr(), EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()];
+        let with = vk::DeviceCreateInfo { enabled_extension_count: 2, pp_enabled_extension_names: names.as_ptr(), ..Default::default() };
+        assert!(requests_extension(&with, EXTERNAL_MEMORY_HOST_EXTENSION));
+        let without = vk::DeviceCreateInfo { enabled_extension_count: 1, pp_enabled_extension_names: names.as_ptr(), ..Default::default() };
+        assert!(!requests_extension(&without, EXTERNAL_MEMORY_HOST_EXTENSION));
+        // Zero extensions with a null list, as `vkcube` passes it.
+        assert!(!requests_extension(&vk::DeviceCreateInfo::default(), EXTERNAL_MEMORY_HOST_EXTENSION));
+    }
+}
 
 #[cfg(test)]
 mod device_lost_tests {
