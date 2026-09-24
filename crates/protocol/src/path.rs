@@ -41,8 +41,8 @@ fn fallback_runtime_dir() -> String {
     "/tmp/neural-forge".to_string()
 }
 
-/// Refuse legacy/upstream namespaces even when supplied as explicit overrides.
-/// Tests and custom channels may use other private paths, but never legacy ones.
+/// Refuse upstream DLSS5VKLayer's `dlssnr` namespace even when supplied as an explicit
+/// override. Tests and custom channels may use other private paths, but never upstream's.
 pub fn isolated_path(path: &str) -> bool {
     !path.replace('\\', "/").split('/').any(|part| {
         let part = part.to_ascii_lowercase();

@@ -177,18 +177,3 @@ if zsyncmake -u "$ZSYNC_URL" "$OUT"; then
 else
     echo "==> WARNING: zsyncmake failed — continuing without .zsync"
 fi
-
-# ── Legacy-name compatibility assets ──────────────────────────────────
-# AppImages released before the rename embed update information that matches
-# `NeuralForge-*-x86_64.AppImage.zsync` on this repo's releases (GitHub redirects the
-# old repo name). Publish a byte-identical copy under the legacy name, with its own
-# .zsync, so those installs can still find and fetch this release. Drop once no
-# pre-rename installs remain.
-LEGACY="NeuralForge-$VERSION-$ARCH.AppImage"
-cp "$OUT" "$LEGACY"
-LEGACY_URL="https://github.com/labj1987/neural-forge/releases/download/v$VERSION/$LEGACY"
-if zsyncmake -u "$LEGACY_URL" "$LEGACY"; then
-    echo "==> legacy-name copy + .zsync generated: $LEGACY"
-else
-    echo "==> WARNING: zsyncmake failed for the legacy-name copy"
-fi

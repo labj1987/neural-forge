@@ -17,7 +17,7 @@ CARGO_HELPER="${CARGO_HELPER:-cargo +stable}" bash build-appimage.sh >/tmp/deplo
 echo "==> copying to $HOST"
 scp -q "$APPIMAGE" "$HOST:/tmp/nf-deploy.AppImage"
 # The local build only exists to be copied; releases come from CI, so don't let builds pile up here.
-rm -rf "$APPIMAGE" "$APPIMAGE.zsync" "NeuralForge-$VERSION-x86_64.AppImage" "NeuralForge-$VERSION-x86_64.AppImage.zsync" build-appimage
+rm -rf "$APPIMAGE" "$APPIMAGE.zsync" build-appimage
 ssh "$HOST" "VERSION=$VERSION bash -s" <<'REMOTE'
 set -e
   mkdir -p ~/AppImages

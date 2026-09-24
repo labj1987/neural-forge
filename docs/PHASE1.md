@@ -24,11 +24,11 @@ validation evidence before GTA benchmarking.
 
 XDG variables fall back to the usual directories under HOME. Shared memory stays
 under /tmp for Steam pressure-vessel visibility. Old runtime/config paths are not
-imported. Explicit legacy SHM/log paths are refused or reset to NeuralForge defaults.
+imported. Explicit upstream (`dlssnr`) SHM/log paths are refused or reset to NeuralForge defaults.
 External `nvngx_dlssnr.dll`, other NVIDIA DLL names, exported NGX functions,
 `DLSSNR.*` parameters and driver environment variables keep their original spelling.
 
-## Installation and safe legacy handling
+## Installation
 
 Build with `CARGO_HELPER='cargo +stable' bash build-appimage.sh` when the Windows
 cross target lives in the stable toolchain. The AppImage launches the GUI directly.
@@ -47,15 +47,8 @@ Updates replace files atomically, preserving mapped binaries in running processe
 it retains config, binaries imported by the user, prefix, logs and runtime data.
 It never calls a package manager or stops another app.
 
-An optional, explicit migration archives only this repository's old manifest after
-checking its unique layer name, library basename, and activation/disable keys:
-
-```sh
-python3 scripts/install.py archive-legacy-manifest --legacy-manifest /explicit/path/to/VK_LAYER_dlssnr_neural.json
-```
-
-It saves a `.disabled` backup in NeuralForge's data directory. It does not migrate
-shared `~/.config/dlssnr`, old `/tmp/dlssnr-*`, Wine prefixes, DLLs, or desktop files.
+Neural Forge does not migrate or touch upstream's shared `~/.config/dlssnr`,
+`/tmp/dlssnr-*`, Wine prefixes, DLLs, or desktop files.
 No ownership evidence exists for those shared files. Import NVIDIA binaries explicitly
 using `neural-forge-cli import-binaries DIR`. There are no old-name executable aliases.
 

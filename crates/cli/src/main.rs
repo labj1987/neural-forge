@@ -376,12 +376,6 @@ fn cmd_install(appdir: Option<&String>) -> ExitCode {
     match neural_forge_supervisor::install::install(std::path::Path::new(appdir)) {
         Ok(report) => {
             println!("Installed Neural Forge. CLI: {}", report.cli_path.display());
-            for path in &report.removed_legacy {
-                println!("removed old-layout file: {}", path.display());
-            }
-            for warning in &report.warnings {
-                eprintln!("warning: {warning}");
-            }
             ExitCode::SUCCESS
         }
         Err(e) => {
@@ -451,11 +445,6 @@ fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    // Move pre-0.1.77 `neuralforge` config/data/state dirs before anything reads them.
-    let migration = neural_forge_supervisor::migrate::migrate();
-    if !migration.is_empty() {
-        eprintln!("neural-forge-cli: {}", migration.summary());
-    }
     let args: Vec<String> = std::env::args().collect();
     let Some(command) = args.get(1) else {
         usage();

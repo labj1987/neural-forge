@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.91 — 2026-09-24
+
+- **Removed all compatibility with the app's former names.** Releases no longer publish a
+  legacy-named `NeuralForge-*` AppImage copy; `NEURALFORGE_*` environment variables are no
+  longer read (use `NEURAL_FORGE_*`); the pre-0.1.77 `neuralforge` directory migration, the
+  `/tmp/neuralforge-$UID` runtime link, the old `neuralforge-helper.exe` name, the legacy
+  Vulkan manifest cleanup and `install.py archive-legacy-manifest` are gone. The guards that
+  keep this app away from the upstream project's own files, variables and shared memory stay.
+
 ## 0.1.90 — 2026-09-24
 
 - **Only one Neural Forge entry in the app menu.** Installing the layer for Steam games (the

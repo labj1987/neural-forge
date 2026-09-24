@@ -8,7 +8,6 @@ pub mod config;
 pub mod gpu;
 pub mod install;
 pub mod install_dir;
-pub mod migrate;
 pub mod paths;
 pub mod profiles;
 pub mod provision;
@@ -23,15 +22,9 @@ pub fn pid_file() -> String {
     format!("{}/helper.pid", neural_forge_protocol::shm_runtime_dir())
 }
 
-/// The pid file a helper started by a pre-0.1.77 install wrote (`/tmp/neuralforge-<uid>/`).
-fn legacy_pid_file() -> Option<String> {
-    neural_forge_protocol::compat::legacy_runtime_dir().map(|dir| format!("{}/helper.pid", dir.display()))
-}
-
-/// The helper's PID if a process is actually alive at the PID in the pid file (or in the
-/// pre-0.1.77 one, so a helper started by an older install still counts as running).
+/// The helper's PID if a process is actually alive at the PID in the pid file.
 pub fn is_running() -> Option<i32> {
-    process::running_pid(&pid_file()).or_else(|| legacy_pid_file().and_then(|f| process::running_pid(&f)))
+    process::running_pid(&pid_file())
 }
 
 /// Graceful-then-forced stop of the whole helper process group.
@@ -51,14 +44,9 @@ pub fn is_running() -> Option<i32> {
 /// surfacing), run after the normal group kill so a routine stop/restart no longer
 /// needs a human to notice and clean this up by hand.
 pub fn stop(timeout: Duration) -> std::io::Result<()> {
-    // "forge-helper" matches both `neural-forge-helper.exe` and the pre-0.1.76 name
-    // `neuralforge-helper.exe`, so a helper started by an older install is still stopped.
     // Both runners (plain Wine, Proton) carry the helper's path in their own command
     // line, which is what guards against signaling a process that reused the PID.
-    process::stop_matching(&pid_file(), timeout, Some("forge-helper"))?;
-    if let Some(legacy) = legacy_pid_file() {
-        process::stop_matching(&legacy, timeout, Some("forge-helper"))?;
-    }
+    process::stop_matching(&pid_file(), timeout, Some("neural-forge-helper"))?;
     let cfg = Config::load();
     if let Some(wineserver) = wineserver_binary(&cfg) {
         let _ = std::process::Command::new(wineserver).arg("-k").env("WINEPREFIX", real_wineprefix(&cfg, &paths::prefix_dir())).status();

@@ -41,8 +41,6 @@ pub mod enums;
 mod header;
 #[cfg(unix)]
 pub mod mapping;
-#[cfg(unix)]
-pub mod compat;
 pub mod env;
 mod path;
 pub mod persist;

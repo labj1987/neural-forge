@@ -3,10 +3,9 @@
 No system package, upstream path, config, runtime file or Wine prefix is removed.
 
 install/uninstall delegate to `neural-forge-cli` (the single implementation, in
-crates/supervisor/src/install.rs); archive-legacy-manifest is handled here.
+crates/supervisor/src/install.rs).
 """
 import argparse
-import json
 import os
 from pathlib import Path
 
@@ -15,33 +14,10 @@ LAYER = 'VK_LAYER_neuralforge_neural'  # the Vulkan layer name is frozen
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('command', choices=['install', 'uninstall', 'archive-legacy-manifest'])
+    parser.add_argument('command', choices=['install', 'uninstall'])
     parser.add_argument('--appdir', type=Path)
-    parser.add_argument('--legacy-manifest', type=Path)
     parser.add_argument('--cli', type=Path, help='neural-forge-cli to delegate install/uninstall to')
     args = parser.parse_args()
-    data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
-    root = data / 'neural-forge'
-    record = root / 'installation.json'
-    if args.command == 'archive-legacy-manifest':
-        # This exact identity belongs to this Rust repository; upstream's NV
-        # layer identity is different. Never infer ownership from directory names.
-        src = args.legacy_manifest
-        if src is None or src.is_symlink():
-            parser.error('provide a regular --legacy-manifest file')
-        layer = json.loads(src.read_text()).get('layer', {})
-        if (layer.get('name') != 'VK_LAYER_dlssnr_neural'
-                or Path(layer.get('library_path', '')).name != 'libdlssnr_layer.so'
-                or layer.get('enable_environment') != {'VKLayer_DLSS5': '1'}
-                or layer.get('disable_environment') != {'DLSSNR_DISABLE': '1'}):
-            parser.error('manifest does not match this repository’s legacy identity')
-        archive = root / 'legacy' / 'VK_LAYER_dlssnr_neural.json.disabled'
-        archive.parent.mkdir(parents=True, exist_ok=True)
-        with archive.open('xb') as output:
-            output.write(src.read_bytes())
-        src.unlink()
-        print(f'Archived {src} to {archive}; config, runtime and libraries untouched')
-        return
     # `install` and `uninstall` are implemented once, in Rust
     # (crates/supervisor/src/install.rs), and reached through `neural-forge-cli`. This
     # script used to carry a second copy of the same on-disk format; CI only exercised

@@ -86,11 +86,11 @@ python3 scripts/install.py install --appdir build-appimage/AppDir
 The GUI is `neural-forge`; the CLI is `neural-forge-cli`; the Windows helper is
 `neural-forge-helper.exe`. Config, data, state, runtime, control mapping and helper
 prefix live under `neural-forge` locations (`~/.config/neural-forge`,
-`~/.local/share/neural-forge`, `~/.local/state/neural-forge`, `/tmp/neural-forge-$UID/`);
-an install from before 0.1.77 is migrated automatically on first start. Upstream DLSS5VKLayer can remain
+`~/.local/share/neural-forge`, `~/.local/state/neural-forge`, `/tmp/neural-forge-$UID/`).
+Upstream DLSS5VKLayer can remain
 installed; Neural Forge neither migrates ambiguous upstream state nor changes its
 files, configuration, launch options, helper, or runtime. See
-[docs/PHASE1.md](docs/PHASE1.md) for executable targeting, migration and uninstall.
+[docs/PHASE1.md](docs/PHASE1.md) for executable targeting and uninstall.
 
 ## Usage
 
@@ -150,8 +150,7 @@ lower in-game resolution).
 
 ### Environment variables
 
-Set on a game (Steam launch options) unless noted. Every `NEURAL_FORGE_*` name is also
-read under its pre-0.1.77 spelling `NEURALFORGE_*`.
+Set on a game (Steam launch options) unless noted.
 
 | Variable | Effect |
 |---|---|

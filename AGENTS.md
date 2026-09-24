@@ -17,21 +17,15 @@ separate application and must not be modified or uninstalled by this project.
   `io.github.labj1987.NeuralForge` (and the `.desktop`/appdata files named after it) and the
   Vulkan layer name `VK_LAYER_neuralforge_neural`.
 - Since 0.1.77 everything else is hyphenated/underscored `neural-forge`: `NEURAL_FORGE_*` env
-  vars (read through `neural_forge_protocol::env`, which still honours the old `NEURALFORGE_*`
-  spelling as a fallback), `/tmp/neural-forge-$UID`, the `neural-forge` XDG config/data/state
+  vars (read through `neural_forge_protocol::env`), `/tmp/neural-forge-$UID`, the `neural-forge` XDG config/data/state
   dirs, `lib/neural-forge/`, `libneural_forge_layer.so` (`[lib] name = "neural_forge_layer"`),
   its manifest `neural_forge_layer.json`, and the `[neural-forge-layer]`/`[neural-forge-helper]`
   log prefixes. The manifest's `enable_environment` is `NEURAL_FORGE_ENABLE`.
-- Upgrade path: `neural_forge_supervisor::migrate` (run by the GUI, every CLI command and
-  `install`) renames the old `neuralforge` dirs (Wine prefix included, atomically) and rewrites
-  recorded absolute paths; `protocol::compat` hard-links the old `/tmp/neuralforge-$UID`
-  `shm.bin`/`shm.bin.owner` so an old-layer game still reaches the new helper. Never run the
-  CLI or `install` against real XDG dirs in tests: point `XDG_*_HOME` at a scratch dir.
-- Where an installed executable name changed, the installer's record-based stale-file
-  removal cleans the old files, and code that looks up or matches the helper accepts both
-  `neural-forge-helper.exe` and the legacy `neuralforge-helper.exe`. The release also
-  publishes a legacy-named `NeuralForge-*` AppImage copy so pre-rename installs' zsync
-  update info still resolves.
+- No backward compatibility with the old names (`dlssnr`, `neuralforge`, `NEURALFORGE_*`,
+  `NeuralForge-*` AppImages): every install already uses the current ones. Files a previous
+  install shipped but this one no longer does are cleaned by the installer's record-based
+  stale-file removal. Never run the CLI or `install` against real XDG dirs in tests: point
+  `XDG_*_HOME` at a scratch dir.
 
 ## Build and test
 

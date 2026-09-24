@@ -520,12 +520,7 @@ impl ShmClient {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(shm_default_path);
         if !neural_forge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) || !crate::ownership::claim(&path) { return false; }
-        let opened = self.open_at(&path);
-        if opened {
-            // Bridge the pre-0.1.77 runtime dir for any old-layer game (see `compat`).
-            neural_forge_protocol::compat::link_legacy_runtime(&path);
-        }
-        opened
+        self.open_at(&path)
     }
 
     /// The actual implementation, taking the path explicitly so tests can point it at a

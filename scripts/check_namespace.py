@@ -16,16 +16,11 @@ meta = ET.parse(root / f'data/{identity}.appdata.xml').getroot()
 assert meta.find('id').text == identity
 assert meta.find('launchable').text == f'{identity}.desktop'
 assert '\nExec=neural-forge\n' in (root / f'data/{identity}.desktop').read_text()
-# The pre-0.1.77 spelling may only appear where it is deliberately honoured or migrated.
-LEGACY_OK = {'crates/protocol/src/env.rs', 'crates/protocol/src/compat.rs', 'crates/supervisor/src/migrate.rs',
-             'crates/supervisor/src/install.rs', 'crates/supervisor/src/install_dir.rs', 'crates/supervisor/src/lib.rs',
-             'crates/supervisor/src/config.rs', 'crates/supervisor/src/process.rs', 'crates/layer/src/ownership.rs'}
+# The pre-0.1.77 spelling (`NEURALFORGE_*`, `neuralforge` paths) is gone everywhere.
 for path in (root / 'crates').rglob('*.rs'):
     code = path.read_text()
-    rel = path.relative_to(root).as_posix()
-    if rel not in LEGACY_OK:
-        assert 'NEURALFORGE_' not in code, path
-        assert not re.search(r'(?<![A-Za-z_])neuralforge[-_/]', code.replace('VK_LAYER_neuralforge_neural', '')), path
+    assert 'NEURALFORGE_' not in code, path
+    assert not re.search(r'(?<![A-Za-z_])neuralforge[-_/]', code.replace('VK_LAYER_neuralforge_neural', '')), path
     assert not re.search(r'(?:var|var_os|set_var)\("(?:DLSSNR_|VKLayer_DLSS5)', code), path
     assert 'nvngx_neuralforge' not in code, path
     assert 'NEURALFORGE.Color' not in code, path

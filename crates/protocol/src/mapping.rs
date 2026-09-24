@@ -112,7 +112,6 @@ pub(crate) fn open_at(path: &str) -> Option<Mapping> {
         hdr.init_defaults();
     }
 
-    crate::compat::link_legacy_runtime(path);
     Some(Mapping { _fd: fd, header, freshly_created })
 }
 
