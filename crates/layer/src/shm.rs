@@ -432,6 +432,23 @@ impl ShmClient {
         self.region(Region::proxy(slot))
     }
 
+    /// The given slot's answer region address and capacity, mirroring
+    /// [`Self::proxy_region`]. For `composition::gpu::GpuCompose`'s zero-copy compose, which
+    /// imports it as device memory so the GPU reads the helper's answer where it landed instead
+    /// of [`Self::read_answer`] copying it out first.
+    pub fn answer_region(&self, slot: usize) -> Option<(*mut u8, usize)> {
+        self.region(Region::answer(slot))
+    }
+
+    /// What the helper says its last evaluation cost it (upload + evaluate + readback, in
+    /// milliseconds), as published in the header before it answered. 0 before any answer.
+    pub fn helper_stage_ms(&self) -> f32 {
+        let Some(hdr) = self.header() else { return 0.0 };
+        let ms = |bits: &std::sync::atomic::AtomicU32| f32::from_bits(bits.load(Ordering::Relaxed));
+        let total = ms(&hdr.helper_upload_ms_bits) + ms(&hdr.helper_eval_ms_bits) + ms(&hdr.helper_readback_ms_bits);
+        if total.is_finite() && total > 0.0 { total } else { 0.0 }
+    }
+
     /// Opens (or creates) the mapping if not already attached. Idempotent.
     pub fn open(&mut self) -> bool {
         if self.header().is_some() { return true; }

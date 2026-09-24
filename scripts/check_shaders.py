@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Ties the committed SPIR-V binaries to the GLSL sources they were built from.
 
-`crates/layer/shaders/*.spv` are committed binaries (embedded with `include_bytes!`);
+`crates/layer/shaders/*.spv` and `crates/helper/shaders/*.spv` are committed binaries (embedded
+with `include_bytes!`);
 nothing builds them, so an edited `.comp` could silently ship a stale `.spv`.
-`shaders.sha256` records the SHA-256 of each source and of the binary compiled from it.
+Each folder's `shaders.sha256` records the SHA-256 of each source and of the binary compiled from it.
 
   check_shaders.py            verify: every source hash and binary hash matches the
                               manifest, and each binary passes spirv-val when available.
@@ -21,7 +22,10 @@ import sys
 import tempfile
 from pathlib import Path
 
-SHADERS = Path(__file__).resolve().parent.parent / "crates/layer/shaders"
+ROOT = Path(__file__).resolve().parent.parent
+DIRS = [ROOT / "crates/layer/shaders", ROOT / "crates/helper/shaders"]
+# Set per folder by the loop at the bottom; the functions below read them.
+SHADERS = DIRS[0]
 MANIFEST = SHADERS / "shaders.sha256"
 
 
@@ -96,4 +100,8 @@ def verify() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(update() if "--update" in sys.argv[1:] else verify())
+    status = 0
+    for SHADERS in DIRS:
+        MANIFEST = SHADERS / "shaders.sha256"
+        status |= update() if "--update" in sys.argv[1:] else verify()
+    sys.exit(status)

@@ -43,105 +43,92 @@ use std::time::Duration;
 use ash::vk;
 use neural_forge_helper::{frame, guard, ngx, optical_flow, shm};
 
-/// Real motion vectors for this frame (empty when unavailable for any reason: no
-/// optical-flow queue, a transient failure, or the first frame after the session was
-/// (re)built -- the caller treats empty motion as "no vectors this frame"), plus
-/// whether this frame is a scene cut. Only a scene cut resets the model's temporal
-/// history; missing motion alone must not. See `optical_flow.rs` for the mechanism.
-#[allow(clippy::too_many_arguments)]
-fn estimate_motion(
-    flow_queue: Option<&optical_flow::FlowQueue>,
-    flow: &mut Option<optical_flow::OpticalFlow>,
-    prev_proxy: &mut Vec<u8>,
-    instance: &ash::Instance,
-    device: &ash::Device,
-    physical_device: vk::PhysicalDevice,
-    proxy: &[u8],
-    width: u32,
-    height: u32,
-    proxy_format: u32,
-    motion_scale: [f32; 2],
-    quality: u32,
-) -> (Vec<u8>, bool) {
-    // No optical-flow queue (unsupported, or the toggle was off when the helper started
-    // and the device was created without one) -- never worth attempting.
-    let Some(flow_queue) = flow_queue else {
-        static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        if !LOGGED.swap(true, Ordering::Relaxed) {
-            neural_forge_helper::log!("[mvec] motion vectors are on but this helper has no optical-flow queue; they take effect the next time the helper starts");
-        }
-        return (Vec::new(), false);
-    };
-    let bgr = proxy_format == neural_forge_protocol::enums::proxy_format::BGRA8;
+/// The helper's motion-vector state across frames: the GPU flow session (rebuilt when the
+/// model's frame size or the quality changes), a small luma thumbnail of the last frame for
+/// scene-cut detection, and a latch that stops retrying after a failure until the toggle is
+/// switched off and on again.
+#[derive(Default)]
+struct MotionState {
+    flow: Option<optical_flow::GpuFlow>,
+    thumb: Vec<u8>,
+    blocked: bool,
+    frames: u64,
+}
 
-    let needs_rebuild = !flow.as_ref().is_some_and(|f| f.width == width && f.height == height);
-    if needs_rebuild {
-        if let Some(old) = flow.take() {
-            // SAFETY: the last `estimate` call on this session (if any) already
-            // drained its queue (`estimate`'s own fence wait); nothing is
-            // in flight.
-            unsafe { old.destroy(device) };
-        }
-        prev_proxy.clear(); // a rebuilt session has no history to compare against either.
-        match optical_flow::OpticalFlow::new(instance, device, physical_device, flow_queue, width, height, quality) {
-            Ok(f) => *flow = Some(f),
-            Err(e) => {
-                // Logged once, not every frame this keeps failing at the same
-                // resolution -- a genuine, structural "this GPU/driver combination
-                // can't do it at this size" doesn't improve by retrying every 200us.
-                static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if !LOGGED.swap(true, Ordering::Relaxed) {
-                    neural_forge_helper::log!("[mvec] optical flow session unavailable at {width}x{height}: {e}");
-                }
-                return (Vec::new(), false);
+impl MotionState {
+    /// Per frame, before evaluating: drops everything when motion is off (an explicit off
+    /// state, freeing the session), otherwise updates the thumbnail and returns whether this
+    /// frame is a scene cut.
+    fn prepare(&mut self, device: &ash::Device, want: bool, proxy: &[u8], width: u32, height: u32) -> bool {
+        if !want {
+            if let Some(f) = self.flow.take() {
+                // SAFETY: every `estimate` waits for its own work before returning.
+                unsafe { f.destroy(device) };
             }
+            self.thumb.clear();
+            self.blocked = false;
+            return false;
         }
-    }
-    let Some(f) = flow.as_mut() else { return (Vec::new(), false) };
-
-    // A scene cut invalidates whatever history the session's own images hold --
-    // reset (by rebuilding) rather than let a stale reference frame produce a flow
-    // field describing content that's no longer on screen. DLSS5VKLayer's own
-    // `helper/main.cpp` runs the same kind of check (`DetectSceneCut`) for the same
-    // reason -- independent reimplementation of the same generic technique, not a
-    // port (see `optical_flow::is_scene_cut`'s own doc comment).
-    let cut = prev_proxy.len() == proxy.len() && optical_flow::is_scene_cut(prev_proxy, proxy, width, height, 40);
-    if cut {
-        // SAFETY: same reasoning as the rebuild path above.
-        unsafe { f.destroy(device) };
-        *flow = None;
-        prev_proxy.clear();
-        neural_forge_helper::log!("[mvec] scene cut detected, resetting motion history");
-        return (Vec::new(), true);
+        let thumb = optical_flow::luma_thumbnail(proxy, width, height);
+        let cut = optical_flow::is_scene_cut(&self.thumb, &thumb, 40);
+        self.thumb = thumb;
+        cut
     }
 
-    let vectors = match f.estimate(device, proxy, bgr) {
-        Ok(Some(v)) => v,
-        // First frame after a (re)build: this call just seeded history, no vectors
-        // to report yet -- not a failure, `prev_proxy` still needs updating below so
-        // the *next* call has something to compare against.
-        Ok(None) => Vec::new(),
-        Err(e) => {
+    /// The flow session for this frame, (re)built as needed, or `None` when motion can't run.
+    #[allow(clippy::too_many_arguments)]
+    fn session(&mut self, instance: &ash::Instance, device: &ash::Device, physical_device: vk::PhysicalDevice, flow_queue: Option<&optical_flow::FlowQueue>, width: u32, height: u32, quality: u32, scene_cut: bool) -> Option<&mut optical_flow::GpuFlow> {
+        if self.blocked {
+            return None;
+        }
+        let Some(flow_queue) = flow_queue else {
             static LOGGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
             if !LOGGED.swap(true, Ordering::Relaxed) {
-                neural_forge_helper::log!("[mvec] estimate failed, disabling for this session: {e}");
+                neural_forge_helper::log!("[mvec] motion vectors are on but this helper has no optical-flow queue; they take effect the next time the helper starts");
             }
-            // A real failure, not just "no answer yet" -- drop the session so this
-            // doesn't retry (and potentially fail the same way) every single frame
-            // forever; the caller's own enabled/opt-in check still runs every frame,
-            // so turning the toggle off and back on (or a helper restart) tries fresh.
-            unsafe { f.destroy(device) };
-            *flow = None;
-            prev_proxy.clear();
-            return (Vec::new(), false);
+            return None;
+        };
+        if !self.flow.as_ref().is_some_and(|f| (f.width, f.height, f.quality) == (width, height, quality)) {
+            if let Some(old) = self.flow.take() {
+                // SAFETY: every `estimate` waits for its own work before returning.
+                unsafe { old.destroy(device) };
+            }
+            // Family 0: the model's images and main queue (`FrameResources::new(.., 0, ..)`).
+            match optical_flow::GpuFlow::new(instance, device, physical_device, 0, flow_queue, width, height, quality) {
+                Ok(f) => self.flow = Some(f),
+                Err(e) => {
+                    neural_forge_helper::log!("[mvec] optical flow session unavailable at {width}x{height}: {e}");
+                    self.blocked = true;
+                    return None;
+                }
+            }
         }
-    };
-    prev_proxy.clear();
-    prev_proxy.extend_from_slice(proxy);
-    if vectors.is_empty() {
-        return (Vec::new(), false);
+        let flow = self.flow.as_mut()?;
+        if scene_cut {
+            neural_forge_helper::log!("[mvec] scene cut detected, resetting motion history");
+            flow.reset();
+        }
+        Some(flow)
     }
-    (neural_forge_protocol::motion::encode(&vectors, motion_scale), false)
+
+    /// After evaluating: drops a failed session (and stops retrying), and logs the estimate
+    /// time now and then.
+    fn finished(&mut self, device: &ash::Device, timing: &frame::FrameTiming) {
+        if timing.motion_failed {
+            if let Some(f) = self.flow.take() {
+                // SAFETY: a failed `estimate` either waited for its work or marked itself
+                // stalled, in which case `destroy` leaks instead.
+                unsafe { f.destroy(device) };
+            }
+            self.blocked = true;
+        }
+        if let Some(t) = timing.motion {
+            self.frames += 1;
+            if self.frames % 300 == 1 {
+                neural_forge_helper::log!("[mvec] estimate {:.2} ms", t.as_secs_f64() * 1000.0);
+            }
+        }
+    }
 }
 
 fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
@@ -214,8 +201,7 @@ fn main() {
     // the other is even checked this same loop tick.
     let mut frame_resources: [Option<frame::FrameResources>; 2] = [None, None];
     // Slot 0 only: slot 1 always evaluates with empty motion (see `process_request`).
-    let mut flow: Option<optical_flow::OpticalFlow> = None;
-    let mut prev_proxy: Vec<u8> = Vec::new();
+    let mut motion = MotionState::default();
     // Resized (not reallocated fresh every frame) to whatever the current frame's
     // real byte count is -- never the full `MAX_FRAME` reservation, which is sized for
     // the protocol's absolute ceiling (7680x4320 float16), not a typical frame.
@@ -255,7 +241,7 @@ fn main() {
             last_seq_req[slot] = seq_req;
             process_request(
                 hdr, &shm, &device, &instance, physical_device, queue, &mut snippet,
-                &mut frame_resources[slot], flow_queue.as_ref(), &mut flow, &mut prev_proxy,
+                &mut frame_resources[slot], flow_queue.as_ref(), &mut motion,
                 slot, seq_req, helper_delay, &mut frames,
             );
         }
@@ -272,7 +258,7 @@ fn main() {
     }
     // SAFETY: same reasoning -- `estimate`'s own fence wait already drained
     // whatever this session last submitted, and the loop above just stopped.
-    if let Some(f) = flow {
+    if let Some(f) = motion.flow {
         unsafe { f.destroy(&device) };
     }
     ngx::teardown(snippet);
@@ -332,8 +318,7 @@ fn process_request(
     snippet: &mut ngx::NgxSnippet,
     frame_resources: &mut Option<frame::FrameResources>,
     flow_queue: Option<&optical_flow::FlowQueue>,
-    flow: &mut Option<optical_flow::OpticalFlow>,
-    prev_proxy: &mut Vec<u8>,
+    motion: &mut MotionState,
     slot: usize,
     seq_req: u32,
     helper_delay: Duration,
@@ -421,29 +406,11 @@ fn process_request(
     // mapping (`docs/PROTOCOL_V3_DESIGN.md`).
     let (proxy, answer) = unsafe { shm.frame_regions(slot, n) };
 
-    // Real motion vectors, estimated here in the helper -- see `optical_flow.rs`'s
-    // own doc comment for the architecture. Slot 0 only (protocol v3 never duplicated
-    // the motion payload for slot 1). The GUI's "Estimate motion vectors" toggle is the
-    // only switch.
-    let (motion, scene_cut) = if slot == 0
-        && dims_ok
-        && hdr.mvec_enabled()
-        && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
-    {
-        estimate_motion(flow_queue, flow, prev_proxy, instance, device, physical_device, proxy, width, height, proxy_format, motion_scale, hdr.mvec_quality.load(Ordering::Relaxed))
-    } else {
-        // Toggled off: drop any live session so the next
-        // time it's turned on starts clean (matches `DestroyOpticalFlow`/
-        // `userDisabled` in DLSS5VKLayer's own helper -- an explicit off state, not
-        // just "stop calling estimate" while a session silently idles).
-        if let Some(f) = flow.take() {
-            // SAFETY: `estimate`'s own fence wait (the last call this session
-            // was used for, if ever) already guarantees nothing is in flight.
-            unsafe { f.destroy(device) };
-        }
-        prev_proxy.clear();
-        (Vec::new(), false)
-    };
+    // Real motion vectors, estimated on the GPU inside `evaluate` -- see `optical_flow.rs`.
+    // Slot 0 only (protocol v3 never duplicated the motion payload for slot 1). The GUI's
+    // "Estimate motion vectors" toggle is the only switch.
+    let want_motion = slot == 0 && dims_ok && hdr.mvec_enabled() && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format);
+    let scene_cut = motion.prepare(device, want_motion, proxy, width, height);
 
     let timing = if ready && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         (|| {
@@ -477,12 +444,16 @@ fn process_request(
                     sharpness: hdr.resolve_pass(i).sharpness,
                 })
                 .collect();
-            f.evaluate(device, queue, eval_fn, &chain, params, proxy, &motion, motion_scale, reset_history, answer)
+            let flow = if want_motion { motion.session(instance, device, physical_device, flow_queue, width, height, hdr.mvec_quality.load(Ordering::Relaxed), scene_cut) } else { None };
+            f.evaluate(device, queue, eval_fn, &chain, params, proxy, flow, motion_scale, reset_history, answer)
         })()
     } else {
         None
     };
     let evaluated = timing.is_some();
+    if let Some(timing) = timing.as_ref() {
+        motion.finished(device, timing);
+    }
     if let Some(timing) = timing {
         store_ms(&hdr.helper_upload_ms_bits, timing.upload);
         store_ms(&hdr.helper_eval_ms_bits, timing.evaluate);

@@ -247,6 +247,112 @@ fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, s
         .build()
 }
 
+/// Where [`GpuCompose::present_temporal_delta_async`] takes the answer pair from.
+#[derive(Clone, Copy)]
+pub enum ComposeInputs<'a> {
+    /// CPU copies: the frame the model was shown (`base`), its answer, and optionally the small
+    /// proxy (the model ran below the frame's size) and the held frame (frame hold). Uploaded
+    /// through the slot's staging buffer.
+    Cpu { base: &'a [u8], answer: &'a [u8], proxy_small: Option<&'a [u8]>, held_original: Option<&'a [u8]> },
+    /// The zero-copy pair already on the GPU (see [`ZeroCopy`]). `fresh` is the present that
+    /// received this answer: it copies the capture target and the imported answer region into
+    /// `gen_base`/`gen_answer` first. Every other present of the same generation (a carried
+    /// frame, the other async slot) reads `gen_*` only. Full-size answers only.
+    Gpu { fresh: bool },
+}
+
+/// A plain device-local buffer.
+struct DeviceBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl DeviceBuffer {
+    fn new(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, bytes: u64) -> Option<Self> {
+        let info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: `info` is valid.
+        let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
+        // SAFETY: `buffer` was just created, not yet bound to memory.
+        let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        let Some(type_index) = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+            .or_else(|| find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()))
+        else {
+            // SAFETY: `buffer` has no memory bound.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return None;
+        };
+        let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
+        // SAFETY: `alloc` is valid; `type_index` satisfies `reqs`.
+        let Ok(memory) = (unsafe { device.allocate_memory(&alloc, None) }) else {
+            // SAFETY: `buffer` has no memory bound.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return None;
+        };
+        // SAFETY: `buffer`/`memory` were each just created, sized/typed for each other.
+        if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
+            // SAFETY: neither is aliased anywhere else yet.
+            unsafe {
+                device.free_memory(memory, None);
+                device.destroy_buffer(buffer, None);
+            }
+            return None;
+        }
+        Some(Self { buffer, memory })
+    }
+
+    /// # Safety
+    /// No GPU work referencing the buffer may still be in flight.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded from this function's own contract.
+        unsafe {
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// The frame-sized device-local buffers of the zero-copy compose, all `frame_bytes` long.
+struct ZeroCopyFrames {
+    frame_bytes: u64,
+    /// Written by `capture::DirectCapture` in the same submission as the proxy region: the
+    /// frame the model is shown, kept on the GPU instead of copied out to the CPU.
+    capture_target: DeviceBuffer,
+    /// The current generation's base and answer, copied from `capture_target` and the imported
+    /// answer region by the present that received it. Everything after that reads these, so
+    /// nothing depends on how long the proxy/answer regions stay untouched.
+    gen_base: DeviceBuffer,
+    gen_answer: DeviceBuffer,
+}
+
+/// The helper's slot-0 answer region, imported as device memory (`VK_EXT_external_memory_host`).
+struct AnswerImport {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+    ptr: *mut u8,
+    bytes: u64,
+}
+
+/// The synchronous present's zero-copy compose (`docs/EXTERNAL_MEMORY_HOST_DESIGN.md`): the
+/// answer pair reaches the compose without the three per-frame CPU frame copies (capture
+/// readback, answer readback, staging upload). Empty until `capture::run` asks for it.
+#[derive(Default)]
+struct ZeroCopy {
+    frames: Option<ZeroCopyFrames>,
+    answer_import: Option<AnswerImport>,
+    /// A pointer/size the import already failed for, so it is not retried every present.
+    failed_import: Option<(*mut u8, u64)>,
+    /// The generation `gen_*` hold (0: none).
+    generation: u64,
+    /// The fence of the async slot whose submission read the answer region (the fresh copy),
+    /// until it has been seen signaled. The helper, another process on another device, may only
+    /// write the region again after that: see [`GpuCompose::wait_answer_region_reads`].
+    answer_reader: Option<vk::Fence>,
+    /// The queue the last zero-copy compose was submitted on. Queue order is what orders the
+    /// capture target's and `gen_*`'s reads and writes; on a different queue every async slot is
+    /// waited instead.
+    last_queue: Option<vk::Queue>,
+}
+
 struct Sized_ {
     width: u32,
     height: u32,
@@ -728,17 +834,42 @@ impl ComposeSlot {
     /// the rest of this function, and the compute shader it dispatches, reads
     /// `s.model_answer` exactly as it always has, completely unaware scaling
     /// happened at all.
+    ///
+    /// `update_src` is `(base_buffer, base_offset, answer_buffer, answer_offset)`, where a
+    /// full-size update reads the pair from: the staging buffer (`(staging, 0, staging,
+    /// frame_bytes)`) for CPU inputs, `gen_base`/`gen_answer` for the zero-copy compose. The
+    /// small proxy/answer uploads stay staging-only (CPU inputs only). `fresh_copy`, when
+    /// `Some([(capture_target, gen_base), (imported_answer, gen_answer)])`, first copies the
+    /// new zero-copy pair into `gen_*` (`frame_bytes` each).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, answer_width: u32, answer_height: u32, frame_bytes: u64, update_cache: bool, small_proxy: bool, held: bool, bgr_order: bool, target_image: vk::Image, compose: ComposeParams) {
+    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, answer_width: u32, answer_height: u32, frame_bytes: u64, update_cache: bool, small_proxy: bool, held: bool, bgr_order: bool, target_image: vk::Image, compose: ComposeParams, update_src: (vk::Buffer, u64, vk::Buffer, u64), fresh_copy: Option<[(vk::Buffer, vk::Buffer); 2]>) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         let cached_before = self.cached_generation != 0;
         let scaled_answer = answer_width != width || answer_height != height;
+        let (base_src, base_offset, answer_src, answer_offset) = update_src;
         unsafe {
+            // Its `ALL_COMMANDS` first scope is also what orders the fresh copy below after every
+            // earlier read of `gen_*` on this queue (the other slot's carried compose).
             let target_to_src = image_barrier(target_image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[target_to_src]);
             device.cmd_copy_image_to_buffer(self.cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.current_buffer, &[image_copy_region(width, height, 0)]);
             let current_ready = vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.current_buffer).offset(0).size(frame_bytes).build();
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[current_ready], &[]);
+
+            if let Some(copies) = fresh_copy {
+                // The capture's own closing barrier made the capture target's write visible to
+                // this read; submission made the helper's host writes to the answer region
+                // visible. The barriers after the copies cover this slot's reads below and every
+                // later submission's (the other slot's carried frames).
+                let copy = vk::BufferCopy::builder().src_offset(0).dst_offset(0).size(frame_bytes).build();
+                for (src, dst) in copies {
+                    device.cmd_copy_buffer(self.cmd, src, dst, &[copy]);
+                }
+                let ready = copies.map(|(_, dst)| {
+                    vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(dst).offset(0).size(frame_bytes).build()
+                });
+                device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &ready, &[]);
+            }
 
             if update_cache {
                 let old = if cached_before { vk::ImageLayout::GENERAL } else { vk::ImageLayout::UNDEFINED };
@@ -766,7 +897,7 @@ impl ComposeSlot {
                         .build();
                     device.cmd_blit_image(self.cmd, sp.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
                 } else {
-                    device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+                    device.cmd_copy_buffer_to_image(self.cmd, base_src, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, base_offset)]);
                 }
                 if scaled_answer {
                     // `self.small_answer` was already ensured sized to
@@ -790,7 +921,7 @@ impl ComposeSlot {
                     // is the same layout the direct-copy branch below would have used.
                     device.cmd_blit_image(self.cmd, small.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
                 } else {
-                    device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, frame_bytes)]);
+                    device.cmd_copy_buffer_to_image(self.cmd, answer_src, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, answer_offset)]);
                 }
                 let to_general = [
                     image_barrier(s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
@@ -911,6 +1042,7 @@ pub struct GpuCompose {
     async_slots: [AsyncSlot; ASYNC_SLOTS],
     next_async_slot: usize,
     present_semaphores: crate::present_sync::PresentSemaphores,
+    zc: ZeroCopy,
 }
 
 // SAFETY: every field is either a plain Vulkan handle or (inside a slot's own
@@ -1084,6 +1216,7 @@ impl GpuCompose {
             async_slots: async_slots.try_into().unwrap_or_else(|_| unreachable!("pushed exactly ASYNC_SLOTS elements above")),
             next_async_slot: 0,
             present_semaphores: Default::default(),
+            zc: ZeroCopy::default(),
         })
     }
 
@@ -1257,8 +1390,8 @@ impl GpuCompose {
         crate::note_fence_wait(wait, "gpu::dispatch_into_image").is_ok()
     }
 
-    /// `answer_width`/`answer_height` are `answer`'s own resolution -- pass
-    /// `(width, height)` for the pre-`working_scale` behavior (`answer` must then be
+    /// `answer_width`/`answer_height` are the answer's own resolution -- pass
+    /// `(width, height)` for the pre-`working_scale` behavior (a CPU `answer` must then be
     /// exactly `width*height*4` bytes, same as always); a smaller pair triggers the
     /// GPU-blit upscale in `record_temporal_delta_into_image`. Deliberately does not
     /// support `answer_width*answer_height > width*height` (a `working_scale` above
@@ -1268,11 +1401,45 @@ impl GpuCompose {
     /// composite this frame" rather than risking that. `working_scale` below `1.0` is
     /// unaffected; only the above-`1.0` (supersampling) direction is out of scope for
     /// this compose-side path tonight.
+    ///
+    /// `inputs` says where the answer pair comes from (see [`ComposeInputs`]). The zero-copy
+    /// inputs are refused (`None`) unless the answer is full size and `gen_*` can serve this
+    /// `generation`: a fresh present needs the capture target and the answer import, a later one
+    /// needs `gen_*` to already hold `generation` -- never a read of the shared regions after
+    /// the present that received the answer.
     #[allow(clippy::too_many_arguments)]
     pub fn present_temporal_delta_async(
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue,
-        width: u32, height: u32, answer_width: u32, answer_height: u32, base: &[u8], answer: &[u8], proxy_small: Option<&[u8]>, held_original: Option<&[u8]>, generation: u64, bgr_order: bool, target_image: vk::Image, compose: ComposeParams,
+        width: u32, height: u32, answer_width: u32, answer_height: u32, inputs: ComposeInputs, generation: u64, bgr_order: bool, target_image: vk::Image, compose: ComposeParams,
     ) -> Option<vk::Semaphore> {
+        let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
+        let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
+        // The zero-copy sources, `(capture_target, gen_base, gen_answer, fresh_source)`, resolved
+        // before a slot is taken.
+        let zero_copy = match inputs {
+            ComposeInputs::Gpu { fresh } => {
+                let frames = self.zc.frames.as_ref()?;
+                if generation == 0 || (answer_width, answer_height) != (width, height) || frames.frame_bytes != bytes as u64 {
+                    return None;
+                }
+                let fresh_source = if fresh {
+                    let import = self.zc.answer_import.as_ref().filter(|a| a.bytes >= bytes as u64)?;
+                    Some(import.buffer)
+                } else if self.zc.generation != generation {
+                    return None;
+                } else {
+                    None
+                };
+                let sources = (frames.capture_target.buffer, frames.gen_base.buffer, frames.gen_answer.buffer, fresh_source);
+                // Another queue: nothing orders this compose against the previous one's reads and
+                // writes of `gen_*`, so wait them out.
+                if self.zc.last_queue.is_some_and(|q| q != queue) && !self.wait_async_slots(device) {
+                    return None;
+                }
+                Some(sources)
+            }
+            ComposeInputs::Cpu { .. } => None,
+        };
         let semaphore = self.present_semaphores.get(target_image, || unsafe {
             device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
         })?;
@@ -1280,43 +1447,188 @@ impl GpuCompose {
         let slot = &mut self.async_slots[idx];
         let wait = unsafe { device.wait_for_fences(&[slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
         if crate::note_fence_wait(wait, "gpu::present_temporal_delta_async slot reuse").is_err() { return None; }
-        let bytes = (u64::from(width) * u64::from(height) * 4) as usize;
-        let answer_bytes = (u64::from(answer_width) * u64::from(answer_height) * 4) as usize;
-        if generation == 0 || base.len() < bytes || answer.len() < answer_bytes || answer_bytes > bytes { return None; }
+        if self.zc.answer_reader == Some(slot.slot.fence) { self.zc.answer_reader = None; }
+        if generation == 0 || answer_bytes > bytes { return None; }
         let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        if !slot.slot.ensure_sized(device, &props, width, height) { return None; }
-        let scaled_answer = answer_width != width || answer_height != height;
-        if scaled_answer && !slot.slot.ensure_small_answer(device, &props, answer_width, answer_height) { return None; }
-        // The small proxy stands in for the full frame in the proxy input only when the model ran
-        // small and the caller has it (the synchronous present does; the pipelined one does not).
-        let small_proxy = scaled_answer && proxy_small.is_some_and(|p| p.len() >= answer_bytes) && slot.slot.ensure_small_proxy(device, &props, answer_width, answer_height);
-        let update = slot.slot.cached_generation != generation;
-        if update {
-            let s = slot.slot.sized.as_ref().expect("ensured");
-            unsafe {
-                match proxy_small.filter(|_| small_proxy) {
-                    Some(p) => std::ptr::copy_nonoverlapping(p.as_ptr(), s.staging_ptr, answer_bytes),
-                    None => std::ptr::copy_nonoverlapping(base.as_ptr(), s.staging_ptr, bytes),
+        let (update_src, fresh_copy, small_proxy, held) = match inputs {
+            ComposeInputs::Cpu { base, answer, proxy_small, held_original } => {
+                if base.len() < bytes || answer.len() < answer_bytes { return None; }
+                if !slot.slot.ensure_sized(device, &props, width, height) { return None; }
+                let scaled_answer = answer_width != width || answer_height != height;
+                if scaled_answer && !slot.slot.ensure_small_answer(device, &props, answer_width, answer_height) { return None; }
+                // The small proxy stands in for the full frame in the proxy input only when the model ran
+                // small and the caller has it (the synchronous present does; the pipelined one does not).
+                let small_proxy = scaled_answer && proxy_small.is_some_and(|p| p.len() >= answer_bytes) && slot.slot.ensure_small_proxy(device, &props, answer_width, answer_height);
+                let s = slot.slot.sized.as_ref().expect("ensured");
+                if slot.slot.cached_generation != generation {
+                    unsafe {
+                        match proxy_small.filter(|_| small_proxy) {
+                            Some(p) => std::ptr::copy_nonoverlapping(p.as_ptr(), s.staging_ptr, answer_bytes),
+                            None => std::ptr::copy_nonoverlapping(base.as_ptr(), s.staging_ptr, bytes),
+                        }
+                        std::ptr::copy_nonoverlapping(answer.as_ptr(), s.staging_ptr.add(bytes), answer_bytes);
+                    }
                 }
-                std::ptr::copy_nonoverlapping(answer.as_ptr(), s.staging_ptr.add(bytes), answer_bytes);
+                let held = held_original.is_some_and(|h| h.len() >= bytes) && (s.staging_capacity as usize) >= bytes * 3;
+                if let Some(h) = held_original.filter(|_| held) {
+                    // SAFETY: capacity checked just above; the slot's fence was waited on before reuse.
+                    unsafe { std::ptr::copy_nonoverlapping(h.as_ptr(), s.staging_ptr.add(bytes * 2), bytes) };
+                }
+                ((s.staging_buffer, 0, s.staging_buffer, bytes as u64), None, small_proxy, held)
             }
-        }
-        let held = held_original.is_some_and(|h| h.len() >= bytes) && (slot.slot.sized.as_ref().expect("ensured").staging_capacity as usize) >= bytes * 3;
-        if let Some(h) = held_original.filter(|_| held) {
-            let s = slot.slot.sized.as_ref().expect("ensured");
-            // SAFETY: capacity checked just above; the slot's fence was waited on before reuse.
-            unsafe { std::ptr::copy_nonoverlapping(h.as_ptr(), s.staging_ptr.add(bytes * 2), bytes) };
-        }
+            ComposeInputs::Gpu { .. } => {
+                let (capture_target, gen_base, gen_answer, fresh_source) = zero_copy.expect("resolved above");
+                if !slot.slot.ensure_sized(device, &props, width, height) { return None; }
+                ((gen_base, 0, gen_answer, 0), fresh_source.map(|answer| [(capture_target, gen_base), (answer, gen_answer)]), false, false)
+            }
+        };
+        let update = slot.slot.cached_generation != generation;
         let compose = ComposeParams { model_small: small_proxy, ..compose };
         if unsafe { device.reset_command_buffer(slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
         let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() { return None; }
-        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, small_proxy, held, bgr_order, target_image, compose); }
+        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, small_proxy, held, bgr_order, target_image, compose, update_src, fresh_copy); }
         if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
         if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }).is_err() { return None; }
         if update { slot.slot.cached_generation = generation; }
+        if zero_copy.is_some() {
+            self.zc.last_queue = Some(queue);
+            if fresh_copy.is_some() {
+                self.zc.generation = generation;
+                self.zc.answer_reader = Some(slot.slot.fence);
+            }
+        }
         Some(semaphore)
+    }
+
+    /// Waits for every async slot's last submission. Used before anything a slot's submission
+    /// may still read or write is replaced, and when a zero-copy compose changes queue.
+    fn wait_async_slots(&self, device: &ash::Device) -> bool {
+        let fences = self.async_slots.each_ref().map(|s| s.slot.fence);
+        // SAFETY: every fence belongs to this `GpuCompose`; starts signaled, so never-used slots
+        // do not block. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
+        let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        crate::note_fence_wait(wait, "gpu::zero-copy drain").is_ok()
+    }
+
+    /// Imports the helper's answer region (`host_ptr`, `bytes`: aligned and sized to the driver's
+    /// `minImportedHostPointerAlignment` by the caller) for the zero-copy compose, or confirms the
+    /// existing import already covers it. `false` when it cannot be imported: that present, and
+    /// every later one with the same region, takes the CPU path. A replaced import is only freed
+    /// once every async slot is done with it (never unmapped: the mapping is `ShmClient`'s).
+    pub fn ensure_answer_import(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, host_ptr: *mut u8, bytes: u64) -> bool {
+        if self.zc.answer_import.as_ref().is_some_and(|a| a.ptr == host_ptr && a.bytes == bytes) {
+            return true;
+        }
+        if self.zc.failed_import == Some((host_ptr, bytes)) {
+            return false;
+        }
+        if let Some(old) = &self.zc.answer_import {
+            if !self.wait_async_slots(device) {
+                return false;
+            }
+            // SAFETY: every async slot (the only submissions reading the import) was just waited.
+            unsafe {
+                device.destroy_buffer(old.buffer, None);
+                device.free_memory(old.memory, None);
+            }
+            self.zc.answer_import = None;
+            self.zc.answer_reader = None;
+        }
+        // SAFETY: the caller hands over `ShmClient`'s answer region, mapped for the life of the
+        // process and aligned/sized as `import_host_buffer` requires.
+        match unsafe { crate::capture::import_host_buffer(device, instance, physical_device, host_ptr, bytes) } {
+            Some((buffer, memory)) => {
+                self.zc.answer_import = Some(AnswerImport { buffer, memory, ptr: host_ptr, bytes });
+                static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                    crate::log!("[zc] answer region imported ({bytes} bytes): synchronous presents compose without CPU frame copies");
+                    crate::logging::flush();
+                }
+                true
+            }
+            None => {
+                self.zc.failed_import = Some((host_ptr, bytes));
+                crate::log!("[zc] answer region import failed ({bytes} bytes): synchronous presents keep the CPU copies");
+                crate::logging::flush();
+                false
+            }
+        }
+    }
+
+    /// The device-local capture target `capture::DirectCapture` copies the frame into for the
+    /// zero-copy compose, (re)building it and `gen_*` at `frame_bytes`. A rebuild needs
+    /// `capture_idle` (no direct capture pending, since it may be writing the old target) and
+    /// every async slot waited (a compose may be reading any of the three); without those this
+    /// present gets `None` and takes the CPU path. On a queue other than the last zero-copy
+    /// compose's, every async slot is waited first: the capture about to be submitted is not
+    /// ordered against that compose's read of the target.
+    #[allow(clippy::too_many_arguments)]
+    pub fn zero_copy_capture_target(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue, frame_bytes: u64, capture_idle: bool) -> Option<vk::Buffer> {
+        if self.zc.last_queue.is_some_and(|q| q != queue) {
+            if !self.wait_async_slots(device) {
+                return None;
+            }
+            self.zc.last_queue = Some(queue);
+        }
+        if let Some(f) = self.zc.frames.as_ref().filter(|f| f.frame_bytes == frame_bytes) {
+            return Some(f.capture_target.buffer);
+        }
+        if !capture_idle || !self.wait_async_slots(device) {
+            return None;
+        }
+        if let Some(old) = self.zc.frames.take() {
+            // SAFETY: no capture is pending against the target (`capture_idle`) and every async
+            // slot was just waited.
+            unsafe {
+                old.capture_target.destroy(device);
+                old.gen_base.destroy(device);
+                old.gen_answer.destroy(device);
+            }
+        }
+        self.zc.generation = 0;
+        // SAFETY: `physical_device` is the device this instance was created against.
+        let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let capture_target = DeviceBuffer::new(device, &props, frame_bytes)?;
+        let Some(gen_base) = DeviceBuffer::new(device, &props, frame_bytes) else {
+            // SAFETY: nothing has used it yet.
+            unsafe { capture_target.destroy(device) };
+            return None;
+        };
+        let Some(gen_answer) = DeviceBuffer::new(device, &props, frame_bytes) else {
+            // SAFETY: nothing has used either yet.
+            unsafe {
+                capture_target.destroy(device);
+                gen_base.destroy(device);
+            }
+            return None;
+        };
+        let target = capture_target.buffer;
+        self.zc.frames = Some(ZeroCopyFrames { frame_bytes, capture_target, gen_base, gen_answer });
+        Some(target)
+    }
+
+    /// Waits until no submission still reads the helper's answer region. Called before every new
+    /// request is handed to the helper, which writes that region from another process the GPU's
+    /// own ordering cannot reach. Normally already signaled (the capture that precedes a request
+    /// was queued behind the compose that read the region). `false` if the wait failed: the
+    /// request must not be sent.
+    pub fn wait_answer_region_reads(&mut self, device: &ash::Device) -> bool {
+        let Some(fence) = self.zc.answer_reader else { return true };
+        // SAFETY: `fence` is one of this `GpuCompose`'s own async slot fences.
+        let wait = unsafe { device.wait_for_fences(&[fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        if crate::note_fence_wait(wait, "gpu::wait_answer_region_reads").is_err() {
+            return false;
+        }
+        self.zc.answer_reader = None;
+        true
+    }
+
+    /// Whether `gen_*` hold this answer generation, so a zero-copy compose can present it again
+    /// (a carried frame) with no CPU copy of the answer anywhere.
+    pub fn holds_generation(&self, generation: u64) -> bool {
+        generation != 0 && self.zc.generation == generation && self.zc.frames.is_some()
     }
 
     /// Presents a raw helper answer every frame while uploading it only when the
@@ -1344,6 +1656,9 @@ impl GpuCompose {
         let wait = unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
         if crate::note_fence_wait(wait, "gpu::present_cached_raw_async slot reuse").is_err() {
             return None;
+        }
+        if self.zc.answer_reader == Some(async_slot.slot.fence) {
+            self.zc.answer_reader = None;
         }
         let frame_bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         if raw_answer.len() < frame_bytes || generation == 0 {
@@ -1432,6 +1747,9 @@ impl GpuCompose {
         if crate::note_fence_wait(wait, "gpu::dispatch_into_image_async slot reuse").is_err() {
             return None;
         }
+        if self.zc.answer_reader == Some(async_slot.slot.fence) {
+            self.zc.answer_reader = None;
+        }
 
         // SAFETY: `physical_device` is the device this instance was created against.
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
@@ -1500,6 +1818,16 @@ impl GpuCompose {
                 async_slot.slot.destroy(device);
 
             }
+            if let Some(f) = &self.zc.frames {
+                f.capture_target.destroy(device);
+                f.gen_base.destroy(device);
+                f.gen_answer.destroy(device);
+            }
+            // Freeing imported memory never unmaps it: the mapping is `ShmClient`'s.
+            if let Some(a) = &self.zc.answer_import {
+                device.destroy_buffer(a.buffer, None);
+                device.free_memory(a.memory, None);
+            }
             device.destroy_command_pool(self.pool, None);
             device.destroy_descriptor_pool(self.descriptor_pool, None);
             device.destroy_pipeline(self.pipeline, None);
@@ -1531,6 +1859,32 @@ pub(crate) fn test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDe
     // (the Vulkan spec guarantees at least one queue family).
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
     // SAFETY: `device`/family/index 0 match what `device_create_info` just requested.
+    let queue = unsafe { device.get_device_queue(queue_family, 0) };
+    Some((entry, instance, physical_device, device, queue, queue_family))
+}
+
+/// [`test_device`] with `VK_EXT_external_memory_host` enabled -- `None` when there is no
+/// Vulkan device, or it does not advertise the extension (the zero-copy tests skip then).
+#[cfg(test)]
+pub(crate) fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
+    // SAFETY: same reasoning as `test_device`.
+    let entry = unsafe { ash::Entry::load() }.ok()?;
+    let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
+    let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
+    let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
+    let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
+    let supported = unsafe { instance.enumerate_device_extension_properties(physical_device) }.is_ok_and(|extensions| {
+        extensions.iter().any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == crate::EXTERNAL_MEMORY_HOST_EXTENSION)
+    });
+    if !supported {
+        unsafe { instance.destroy_instance(None) };
+        return None;
+    }
+    let queue_family = 0;
+    let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
+    let extension_names = [crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()];
+    let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
+    let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
     Some((entry, instance, physical_device, device, queue, queue_family))
 }
@@ -1794,7 +2148,7 @@ mod tests {
             device.free_memory(staging.1, None);
         }
         let sem = gpu
-            .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_dims.0, answer_dims.1, proxy, answer, proxy_small, held, 1, false, target.image, params)
+            .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_dims.0, answer_dims.1, ComposeInputs::Cpu { base: proxy, answer, proxy_small, held_original: held }, 1, false, target.image, params)
             .expect("compose");
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
         let stage = vk::PipelineStageFlags::ALL_COMMANDS;
@@ -2036,7 +2390,7 @@ mod tests {
             }
             let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
             let sem = gpu
-                .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, &frame, &answer, None, None, 1, false, target.image, params)
+                .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &frame, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
                 .expect("compose");
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
@@ -2136,7 +2490,7 @@ mod tests {
             }
             let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
             let sem = gpu
-                .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, &proxy, &answer, None, None, 1, false, target.image, params)
+                .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &proxy, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
                 .expect("compose");
             let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
@@ -2232,7 +2586,7 @@ mod tests {
         }
 
         // (1) A smaller answer must still be accepted and actually change the output.
-        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, &base, &answer, None, None, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
+        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, ComposeInputs::Cpu { base: &base, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
@@ -2258,7 +2612,7 @@ mod tests {
         // for this function -- see its own doc comment) must be rejected, not
         // overflow the shared staging buffer.
         let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
-        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, &base, &big_answer, None, None, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
+        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, ComposeInputs::Cpu { base: &base, answer: &big_answer, proxy_small: None, held_original: None }, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
 
         unsafe {
@@ -2269,6 +2623,111 @@ mod tests {
             gpu.destroy(&device);
             device.destroy_device(None);
             instance.destroy_instance(None);
+        }
+    }
+
+    /// The zero-copy inputs compose exactly what the CPU inputs do for the same pair: the fresh
+    /// present copies the capture target and the imported answer region into `gen_*`, and a later
+    /// present of the same generation on the other async slot reads only `gen_*` -- the answer
+    /// region can be overwritten in between (a late answer, the next request) without touching
+    /// the picture. A generation `gen_*` do not hold is refused rather than read from shm.
+    #[test]
+    fn gpu_inputs_compose_identically_to_cpu_inputs() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device_with_external_memory_host() else {
+            eprintln!("gpu_inputs_compose_identically_to_cpu_inputs: no Vulkan device with VK_EXT_external_memory_host, skipping");
+            return;
+        };
+        let (width, height) = (16u32, 16u32);
+        let frame_bytes = u64::from(width * height * 4);
+        let current: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 29 % 200) as u8; [t + 20, t + 10, 200 - t, 255] }).collect();
+        let base: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 37 % 200) as u8; [t + 30, 220 - t, t + 5, 255] }).collect();
+        let answer: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 53 % 200) as u8; [t + 40, t, 180 - t / 2, 255] }).collect();
+        let params = ComposeParams { colour_strength: 0.8, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.5, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false };
+        let expected = compose_once(width, height, &current, &base, &answer, params).expect("the CPU reference composes");
+
+        let alignment = crate::capture::min_imported_host_pointer_alignment(&instance, physical_device).expect("alignment query");
+        let region_len = frame_bytes.div_ceil(alignment) * alignment;
+        // SAFETY: a plain anonymous mapping standing in for the answer region, unmapped at the end.
+        let region = unsafe { libc::mmap(std::ptr::null_mut(), region_len as usize, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE | libc::MAP_ANONYMOUS, -1, 0) };
+        assert_ne!(region, libc::MAP_FAILED);
+        let region = region.cast::<u8>();
+        unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
+
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
+        assert!(gpu.ensure_answer_import(&device, &instance, physical_device, region, region_len), "lavapipe imports anonymous host memory");
+        let capture_target = gpu.zero_copy_capture_target(&device, &instance, physical_device, queue, frame_bytes, true).expect("capture target");
+        let target = make_target_image(&device, &mem_props, width, height);
+
+        // One-shot uploads: `bytes` into the capture target (what the direct capture's second copy
+        // does), or into the target image (the live frame the compose reads).
+        let upload = |bytes: &[u8], into_image: bool| {
+            let staging = build_upload_staging(&device, &mem_props, bytes);
+            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            unsafe {
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                if into_image {
+                    let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
+                    device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
+                    let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
+                } else {
+                    device.cmd_copy_buffer(cmd, staging.0, capture_target, &[vk::BufferCopy::builder().size(frame_bytes).build()]);
+                    let ready = vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(capture_target).offset(0).size(frame_bytes).build();
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[ready], &[]);
+                }
+                device.end_command_buffer(cmd).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+                device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+                device.destroy_fence(fence, None);
+                device.free_command_buffers(pool, &[cmd]);
+                device.destroy_buffer(staging.0, None);
+                device.free_memory(staging.1, None);
+            }
+        };
+        let present = |gpu: &mut GpuCompose, fresh: bool, generation: u64| -> Option<Vec<u8>> {
+            let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Gpu { fresh }, generation, false, target.image, params)?;
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+            unsafe {
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                device.destroy_fence(wait_fence, None);
+            }
+            Some(read_back_image(&device, &mem_props, queue, pool, target.image, width, height))
+        };
+
+        upload(&base, false);
+        upload(&current, true);
+        assert!(!gpu.holds_generation(1));
+        let fresh = present(&mut gpu, true, 1).expect("the fresh zero-copy present composes");
+        assert_eq!(fresh, expected, "the zero-copy fresh present must match the CPU inputs byte for byte");
+        assert!(gpu.holds_generation(1));
+        assert!(gpu.wait_answer_region_reads(&device));
+
+        // The helper answers the next request (or a late one) into the region, and the next capture
+        // overwrites the capture target. The carried present (the other async slot, which has never
+        // seen this generation) must still compose the pair it was given.
+        unsafe { std::ptr::write_bytes(region, 0x5a, region_len as usize) };
+        upload(&vec![7u8; frame_bytes as usize], false);
+        upload(&current, true);
+        let carried = present(&mut gpu, false, 1).expect("a carried zero-copy present composes");
+        assert_eq!(carried, expected, "a carried present reads the generation's own copy, not the shared regions");
+
+        assert!(present(&mut gpu, false, 2).is_none(), "a generation gen_* do not hold must be refused, not read from shm");
+
+        unsafe {
+            device.device_wait_idle().unwrap();
+            target.destroy(&device);
+            gpu.destroy(&device);
+            device.destroy_command_pool(pool, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+            libc::munmap(region.cast(), region_len as usize);
         }
     }
 

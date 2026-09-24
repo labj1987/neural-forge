@@ -4,6 +4,27 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.95 — 2026-09-24
+
+- **Frames stay on the GPU between capture and composition.** When the direct capture path is
+  active, the layer no longer copies each full frame through the CPU four times (the captured
+  original, the helper's answer, and both again into the composition's staging buffer). The
+  capture also copies the game's frame into a device-local image, the answer region is imported
+  as Vulkan memory, and composition reads both on the GPU, including for frames that reuse an
+  answer. Every other case keeps the previous path. Measured in GTA San Andreas DE at 2560x1440
+  on an RTX 5070, model every frame: 43.8 -> 53.3 fps.
+- **Motion vectors run entirely on the GPU.** The helper scales its already-uploaded frame to
+  half resolution, runs optical flow on the flow queue, and converts the result into the model's
+  motion image with a compute shader (`flow_to_mvec.comp`), with no frame copied through the CPU.
+  0.75 ms per estimate at 2560x1440 instead of 16+ ms. San Andreas with motion vectors, model
+  every frame: 18.2 -> 51.4 fps; every 2nd frame: 32.5 -> 83.5 fps.
+- The helper no longer zero-fills and uploads a full frame of empty motion when motion vectors
+  are off; it clears the motion image on the GPU. Scene cuts are detected from a small luma
+  thumbnail instead of a copy of the previous frame.
+- The layer's `[sync]` log line now splits the time: `capture_gpu`, `copy_out`, `meter`,
+  `wait_answer`, `helper` (the helper's own stages) and `zc` (whether zero-copy was used).
+- The layer's capture tests no longer leave shared-memory files in `/tmp`.
+
 ## 0.1.94 — 2026-09-24
 
 - **The layer installs itself.** Every launch from the AppImage now copies its Vulkan layer and

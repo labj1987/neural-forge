@@ -61,9 +61,12 @@ other's mapping.
   with the hardware blit, and supersampling above 100% is not offered.
 - **Upstream's vendored `vulkan-1.dll`** for system Wine: not carried; Wine's own `winevulkan`
   worked in the end-to-end test.
-- **Motion vectors:** the GPU deadzone shader (`mvec_deadzone.comp`, two compile-time variants).
-  Motion estimation itself is carried and validated on the rig (RTX 5070 under Proton:
-  `crates/helper/examples/optical_flow_rig_check.rs`); the deadzone filtering is not.
+- **Motion vectors:** upstream's `mvec_deadzone.comp` variants. Neural Forge estimates motion
+  entirely on the GPU (`crates/helper/src/optical_flow.rs`: half-resolution optical flow, then
+  `crates/helper/shaders/flow_to_mvec.comp` with a plain 0.5 px deadzone), validated on the rig
+  (RTX 5070 under Proton, 0.78 ms per estimate at 2560x1440:
+  `crates/helper/examples/optical_flow_rig_check.rs`); upstream's finer deadzone variants are not
+  carried.
 - **dma-buf transport:** not wired (the GUI no longer offers the switch). A retest against system
   Wine + DXVK-NVAPI is now possible, since that runner works.
 - **Frame generation:** with DLSS Frame Generation on, every presented frame -- generated ones

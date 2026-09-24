@@ -178,6 +178,72 @@ all, since neither VUID nor SYNC-HAZARD checking has anything to say about a Rus
 panic) caught. Re-run `scripts/smoke-test.sh` specifically (not just `cargo test` or a
 validated `vkcube` run) after touching anything in this file going forward.
 
+## Zero-copy compose: the synchronous present without CPU frame copies
+
+`DirectCapture` still left three full-frame CPU copies on every synchronous present: the
+proxy region copied out into `original_scratch`, `ShmClient::read_answer` into
+`last_answer`, and both copied again into `GpuCompose`'s staging buffer (about 59 MB per
+frame at 1440p). When the synchronous present runs on direct capture with the model at the
+frame's own size, frame hold off, an 8-bit format, a `GpuCompose`, and a slot-0 answer
+region the driver can import, `capture::run` now skips all three:
+
+- **Capture.** `record_capture_commands` records a second copy of the game image into a
+  device-local *capture target* owned by `GpuCompose`, in the same command buffer that
+  writes the proxy region. It ends with a `TRANSFER_WRITE -> TRANSFER_READ` buffer barrier.
+  That barrier's second scope carries into later submissions on the queue, so the compose
+  that reads the target needs nothing of its own. `original_scratch` is left empty. The
+  white meter reads the proxy region directly: the capture fence has signaled, the memory is
+  host-coherent, and the helper only ever reads it.
+- **Answer.** `GpuCompose::ensure_answer_import` imports slot 0's answer region through
+  `capture::import_host_buffer`, the query/buffer/import sequence extracted from
+  `build_imported_capture_buffer`. Only the frame is imported, rounded up to
+  `minImportedHostPointerAlignment`, not the whole 265 MB region. `read_answer` is skipped,
+  and `last_answer` is cleared so no stale CPU answer can ever be presented.
+- **Compose.** On the present that receives the answer (`ComposeInputs::Gpu { fresh: true }`),
+  the compose command buffer copies the capture target into `gen_base` and the imported
+  answer into `gen_answer`. Both are device-local and followed by their own buffer barriers.
+  Every later compose of that generation reads only `gen_*`: a carried frame at
+  `model_interval > 1`, or the other async slot. A late answer, the next capture or
+  `run_sync` can overwrite the shared regions without changing the picture. A zero-copy
+  compose for a generation `gen_*` do not hold returns `None`; it never reads shm.
+- **Helper handoff.** The helper writes the answer region from another process on another
+  `VkDevice`, which GPU ordering cannot reach. `GpuCompose` remembers the fence of the
+  submission that read the region (`answer_reader`). `capture::run` waits on that fence
+  before every `begin_async_request` and before `run_sync`. It is normally already signaled,
+  because the next capture was queued behind that compose.
+- **Resizes and queues.** The capture target and `gen_*` are rebuilt only when no direct
+  capture is pending and both async compose slots have been waited. The import is replaced
+  only after both slots have been waited. If a zero-copy compose or capture lands on a
+  different queue than the last one, both slots are waited first. Otherwise the present takes
+  the CPU path for that frame. Teardown already idles the device before `GpuCompose::destroy`,
+  which frees the buffers and the import but never unmaps the region.
+
+Anything that falls outside those conditions takes the CPU path exactly as before: pipelined
+mode, working scale, frame hold, a failed import, a capture submitted without the target, or
+a pending resize. The `[sync]` log line (every 300 composed frames) reports `zc=true/false`.
+It splits the old `capture=` into `capture_gpu=` (submit to completion observed) and
+`copy_out=` (0 on zero-copy frames). It reports the white meter as `meter=` instead of
+counting it in `wait_answer=`, and adds `helper=`, the helper's published
+upload + evaluate + readback, so `wait_answer - helper` is the handoff overhead.
+
+Tests (lavapipe supports the extension, as does the Intel ANV driver on the dev machine):
+
+- `composition::gpu::tests::gpu_inputs_compose_identically_to_cpu_inputs`: the fresh and
+  carried zero-copy composes match the CPU inputs byte for byte, even after the imported
+  region and the capture target have been overwritten.
+- `capture::tests::synchronous_present_zero_copy_matches_cpu_path`: `run` end to end, with
+  model interval 1 and 2, compared against the same direct-capture present with the CPU
+  copies. The answer and proxy regions are scribbled before every carried frame.
+- `capture::tests::frame_hold_uses_the_cpu_path_where_zero_copy_is_available`.
+
+Direct capture imports the whole proxy region, which a driver may back with real pages
+(about 250 MB of tmpfs per shm file on Intel ANV). The tests therefore share one shm file
+per test and delete it afterwards.
+
+**Not yet validated on hardware.** Before trusting it, run `scripts/smoke-test.sh`, `vkcube`
+under `VK_LAYER_KHRONOS_validation` with sync validation, and GTA, where the `[sync]` line
+should show `zc=true`.
+
 ## Validation
 
 Real hardware, `lordnikon`, RTX 5070, driver 615.71.09, both via `vkcube` and via

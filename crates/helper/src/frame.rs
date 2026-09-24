@@ -31,6 +31,10 @@ pub struct FrameTiming {
     pub upload: std::time::Duration,
     pub evaluate: std::time::Duration,
     pub download: std::time::Duration,
+    /// Time spent estimating motion vectors, when they were requested.
+    pub motion: Option<std::time::Duration>,
+    /// Motion estimation failed this frame; the caller should drop the flow session.
+    pub motion_failed: bool,
 }
 
 /// The format of the multipass working images: 16-bit float, so a chain of passes does not lose
@@ -435,8 +439,10 @@ impl FrameResources {
         let fence = unsafe { device.create_fence(&fence_info, None) }.ok()?;
         partial.track(Undo::Fence(fence));
 
-        // Upload holds Color plus R16G16_SFLOAT motion (4 bytes/pixel each).
-        let staging_size = u64::from(width) * u64::from(height) * 8;
+        // Holds one 8-bit frame: Color on upload, Output on download, each only when that
+        // shared-memory region could not be imported. Motion never goes through it: it is
+        // estimated on the GPU (`optical_flow.rs`) or cleared there.
+        let staging_size = u64::from(width) * u64::from(height) * 4;
         let buf_info = vk::BufferCreateInfo::builder()
             .size(staging_size)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
@@ -546,7 +552,8 @@ impl FrameResources {
         self.stalled.get()
     }
 
-    /// Uploads `proxy` and motion, runs `EvaluateFeature`, downloads
+    /// Uploads `proxy`, estimates motion into MVec with `motion` when given (otherwise MVec is
+    /// cleared), runs `EvaluateFeature`, downloads
     /// Output into `answer_out`. Returns timings for a completed evaluation, or `None`
     /// (leaving `answer_out` untouched) on a failure, including a guarded fault inside
     /// `EvaluateFeature` itself.
@@ -559,7 +566,7 @@ impl FrameResources {
         chain: &[ChainPass],
         params: abi::NgxParameter,
         proxy: &[u8],
-        motion: &[u8],
+        motion: Option<&mut crate::optical_flow::GpuFlow>,
         motion_scale: [f32; 2],
         reset_history: bool,
         answer_out: &mut [u8],
@@ -579,7 +586,7 @@ impl FrameResources {
             return None;
         }
 
-        // Stage 1: upload proxy -> Color and motion -> MVec. Skipped for proxy when
+        // Stage 1: upload proxy -> Color and clear MVec. The proxy copy is skipped when
         // `imported_proxy` is set: `proxy` is already a view into the exact memory
         // that buffer is imported from (`ShmMapping::frame_regions`/`proxy_and_answer_regions`
         // share the same base), so `run_transfer` below reads directly from it instead.
@@ -588,16 +595,28 @@ impl FrameResources {
             // bytes (this type's own construction sized it to exactly that).
             unsafe { std::ptr::copy_nonoverlapping(proxy.as_ptr(), self.staging_ptr, pixel_count * 4) };
         }
-        unsafe {
-            let dst = self.staging_ptr.add(pixel_count * 4);
-            if motion.len() == pixel_count * 4 { std::ptr::copy_nonoverlapping(motion.as_ptr(),dst,motion.len()); }
-            else { std::ptr::write_bytes(dst,0,pixel_count*4); }
-        }
         let t_upload_start = std::time::Instant::now();
         if !self.run_transfer(device, queue, TransferKind::Upload) {
             return None;
         }
         let t_upload = t_upload_start.elapsed();
+
+        // Stage 1b: motion vectors, on the GPU from the Color image just uploaded.
+        let mut motion_time = None;
+        let mut motion_failed = false;
+        if let Some(flow) = motion {
+            let t = std::time::Instant::now();
+            match flow.estimate(device, queue, self.color_image, self.mvec_image, motion_scale) {
+                Ok(_) => motion_time = Some(t.elapsed()),
+                // A timed-out estimate may still be using Color/MVec on the GPU: skip this
+                // frame's evaluation (fail open) rather than race it.
+                Err(vk::Result::TIMEOUT) => return None,
+                Err(e) => {
+                    crate::log!("[mvec] estimate failed, dropping the flow session: {e:?}");
+                    motion_failed = true;
+                }
+            }
+        }
 
         // Stage 2: the real NGX call, guarded the same way every other DLL call in
         // this crate already is.
@@ -756,6 +775,8 @@ impl FrameResources {
             upload: t_upload,
             evaluate: t_eval,
             download: t_download,
+            motion: motion_time,
+            motion_failed,
         })
     }
 
@@ -904,10 +925,14 @@ impl FrameResources {
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &[region(self.width, self.height)],
                     );
-                    let mut motion_region = region(self.width,self.height);
-                    motion_region.buffer_offset = u64::from(self.width)*u64::from(self.height)*4;
-                    device.cmd_copy_buffer_to_image(self.cmd,self.staging_buffer,self.mvec_image,
-                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,&[motion_region]);
+                    // No motion unless `evaluate`'s own motion stage writes some after this.
+                    device.cmd_clear_color_image(
+                        self.cmd,
+                        self.mvec_image,
+                        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+                        &vk::ClearColorValue { float32: [0.0; 4] },
+                        &[sub(vk::ImageAspectFlags::COLOR)],
+                    );
                     // Depth: no real depth buffer captured yet either (see module doc
                     // comment) -- a constant 1.0 ("far plane", standard non-reversed-Z
                     // convention, matching `DLSSNR.DepthInverted = 0` below) rather

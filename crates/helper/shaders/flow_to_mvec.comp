@@ -1,0 +1,33 @@
+#version 450
+// Converts VK_NV_optical_flow's gridded output into the model's full-resolution motion
+// vectors, entirely on the GPU. Input: the flow image copied to a buffer, one
+// R16G16_S10_5 vector (signed 16-bit x then y, 5 fractional bits) per grid cell, tightly
+// packed rows. The flow ran on a scaled-down copy of the frame, so each vector is scaled
+// back up to full-resolution pixels. Output: one packed R16G16_SFLOAT per pixel, raster
+// order, which the caller copies into the MVec image. Matches
+// `neural_forge_protocol::motion::encode`: current -> previous, a 0.5 px deadzone, then
+// divided by the units scale (at least 1), which the model is told as `DLSSNR.MVecScaleX/Y`.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, set = 0, binding = 0) readonly buffer Flow { int cells[]; } flow;
+layout(std430, set = 0, binding = 1) writeonly buffer Motion { uint pixels[]; } motion;
+
+layout(push_constant) uniform Params {
+    uvec2 full;       // output size in pixels
+    uvec2 grid_dims;  // flow cells per row / rows
+    vec2 to_cell;     // full-resolution pixel -> flow cell (flow size / full size / grid)
+    vec2 factor;      // full-resolution pixels per flow pixel
+    vec2 inv_scale;   // 1 / max(units scale, 1)
+} p;
+
+void main() {
+    uvec2 xy = gl_GlobalInvocationID.xy;
+    if (any(greaterThanEqual(xy, p.full))) {
+        return;
+    }
+    uvec2 cell = min(uvec2(vec2(xy) * p.to_cell), p.grid_dims - 1u);
+    int packed = flow.cells[cell.y * p.grid_dims.x + cell.x];
+    vec2 v = vec2(float(bitfieldExtract(packed, 0, 16)), float(bitfieldExtract(packed, 16, 16))) / 32.0 * p.factor;
+    v = mix(v, vec2(0.0), lessThan(abs(v), vec2(0.5)));
+    motion.pixels[xy.y * p.full.x + xy.x] = packHalf2x16(v * p.inv_scale);
+}
