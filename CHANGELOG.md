@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.98 — 2026-09-24
+
+- **Motion vectors are on by default.** Estimated on the GPU they now cost about 2-3% of the
+  frame rate: in GTA V at 2560x1440 on an RTX 5070 (FG off, zero-copy active), 44.9 -> 43.4 fps
+  with the model every frame and 62.4 -> 61.0 every 2nd frame, 0.65 ms per estimate. The switch
+  on the Motion page still turns them off (effective the next time the helper starts).
+- For reference, 0.1.97 in GTA V against 0.1.95 (which fell back to CPU copies there): 36.0 ->
+  44.9 fps every frame, 50.4 -> 62.4 every 2nd frame.
+
 ## 0.1.97 — 2026-09-24
 
 - **Fixed: 0.1.96 stopped the Rockstar Games Launcher (GTA V) from starting.** 0.1.96 learned

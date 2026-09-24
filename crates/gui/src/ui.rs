@@ -280,7 +280,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     ));
 
     let (mvec_enabled, set_mvec_enabled) = bind_bool(&shm, Some("mvec_enabled"), |h| &h.mvec_enabled);
-    let mvec_switch = switch_row("Estimate motion vectors", "Off by default. Needs an NVIDIA GPU with optical-flow hardware", mvec_enabled, set_mvec_enabled);
+    let mvec_switch = switch_row("Estimate motion vectors", "On by default. Needs an NVIDIA GPU with optical-flow hardware", mvec_enabled, set_mvec_enabled);
     motion_group.add(&mvec_switch);
 
     let (mvec_scale, set_mvec_scale) = bind_u32(&shm, Some("mvec_scale_mode"), |h| &h.mvec_scale_mode);

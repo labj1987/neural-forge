@@ -455,8 +455,9 @@ impl ShmHeader {
             p.reset_to_defaults();
         }
 
-        // GTA host-transport baseline: motion disabled, quality 0.
-        self.mvec_enabled.store(0, Ordering::Relaxed);
+        // Motion vectors on: estimated on the GPU they cost ~2-3% fps (0.65 ms per frame at
+        // 2560x1440 on an RTX 5070). Quality FAST.
+        self.mvec_enabled.store(1, Ordering::Relaxed);
         self.mvec_scale_mode.store(mvec_scale_mode::PIXELS, Ordering::Relaxed);
         self.mvec_quality.store(mvec_quality::FAST, Ordering::Relaxed);
         self.seq_ok.store(0, Ordering::Relaxed);
