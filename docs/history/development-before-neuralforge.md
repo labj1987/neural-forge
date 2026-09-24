@@ -333,9 +333,9 @@ change when that happens). Distributed as a single AppImage, same as GreenLight/
 KernelPop/SteamPunk — but unlike those two, this app needs **no root/pkexec step at
 all**: everything lives under `~/.local/share`, `~/.config`, `/tmp/dlssnr-$UID/`.
 
-**Full implementation plan**: `/home/alex/.claude/plans/breezy-napping-waffle.md` — read
-that before touching anything below. It covers the licensing ground rules (upstream has
-no LICENSE file and admits GPL-3.0 contamination in parts of its own tree — nothing here
+**Original implementation plan** (a design document kept outside the repo, since
+retired; its conclusions are recorded here and in `ATTRIBUTION.md`). It covered the
+licensing ground rules (upstream has no LICENSE file and admits GPL-3.0 contamination in parts of its own tree — nothing here
 may be produced by reading upstream's source and translating it), the NGX
 authorization-bypass mechanism this rebuild knowingly carries forward (accepted risk,
 isolate it, never disguise it), and the per-crate design.

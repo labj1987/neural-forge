@@ -8,10 +8,10 @@
 //! `"nvngx.dll"` back to them instead of this helper's own name, defeating that check.
 //!
 //! **This is the piece Alex explicitly accepted the legal exposure on** (DMCA §1201 /
-//! NGX SDK EULA — see the review and
-//! `/home/alex/.claude/plans/breezy-napping-waffle.md`). It is implemented here exactly
-//! as designed, isolated in its own module with this comment stating plainly what it
-//! does and why, so it is never mistaken for anything else during later maintenance —
+//! NGX SDK EULA — a risk the original design review weighed and accepted). It is
+//! implemented here exactly as designed, isolated in its own module with this comment
+//! stating plainly what it does and why, so it is never mistaken for anything else
+//! during later maintenance —
 //! not to disguise it, but so nobody has to re-derive what this file is for from the
 //! bytes alone.
 //!
