@@ -253,7 +253,8 @@ pub(crate) fn requests_extension(create_info: &vk::DeviceCreateInfo, name: &CStr
 }
 
 /// Checks and clears whether `device` is one [`NeuralForgeInstanceHooks::create_device`]
-/// added [`EXTERNAL_MEMORY_HOST_EXTENSION`] to.
+/// created with [`EXTERNAL_MEMORY_HOST_EXTENSION`] enabled (added by the hook, or already
+/// requested by the application).
 pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
     EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().as_mut().is_some_and(|set| set.remove(&device))
 }
@@ -299,10 +300,35 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             // `VkDeviceCreateInfo`, `enabled_extension_count` just confirmed > 0.
             unsafe { std::slice::from_raw_parts(create_info.pp_enabled_extension_names, create_info.enabled_extension_count as usize) }
         };
-        // The application already enables it (vkd3d-proton does): nothing to add.
-        // `NeuralForgeDeviceInfo::new` reads the request itself to learn it is enabled.
+        // SAFETY: resolved exactly like the framework's own default `create_device`
+        // path resolves it (see `vulkan_layer::Global::create_device`) -- the next
+        // layer/driver's real `vkCreateDevice`, through the instance this physical
+        // device belongs to.
+        let next_create_device: vk::PFN_vkCreateDevice = match unsafe {
+            (layer_device_link.pfnNextGetInstanceProcAddr)(instance.instance.handle(), c"vkCreateDevice".as_ptr())
+        } {
+            // SAFETY: a non-null `vkGetInstanceProcAddr(instance, "vkCreateDevice")`
+            // result is guaranteed by the Vulkan spec to have this exact signature.
+            Some(f) => unsafe { std::mem::transmute(f) },
+            None => return LayerResult::Unhandled,
+        };
+        let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // The application already enables it (vkd3d-proton does): nothing to add, but the
+        // device is created here, unmodified, so it can be recorded like one this hook
+        // extended. `NeuralForgeDeviceInfo::new` must not look at the request's extension
+        // list itself: on the framework's own (`Unhandled`) path that list has already been
+        // freed by the time it is called, and reading it crashed the Rockstar launcher's GPU
+        // process (0.1.96).
         if requests_extension(create_info, EXTERNAL_MEMORY_HOST_EXTENSION) {
-            return LayerResult::Unhandled;
+            // SAFETY: `create_info` is the application's own request, unmodified;
+            // `p_device` is the framework's out-parameter, valid for this call.
+            let result = unsafe { next_create_device(physical_device, create_info, allocator_ptr, p_device.as_mut_ptr()) };
+            if result.result().is_ok() {
+                // SAFETY: `p_device` was just written by the successful call above.
+                let device = unsafe { p_device.assume_init() };
+                EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().get_or_insert_default().insert(device);
+            }
+            return LayerResult::Handled(result.result());
         }
         // SAFETY: `physical_device` is the one this exact `vkCreateDevice` call is
         // for; `instance.instance` is its owning instance (the only kind
@@ -326,19 +352,6 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         extended.enabled_extension_count = names.len() as u32;
         extended.pp_enabled_extension_names = names.as_ptr();
 
-        // SAFETY: resolved exactly like the framework's own default `create_device`
-        // path resolves it (see `vulkan_layer::Global::create_device`) -- the next
-        // layer/driver's real `vkCreateDevice`, through the instance this physical
-        // device belongs to.
-        let next_create_device: vk::PFN_vkCreateDevice = match unsafe {
-            (layer_device_link.pfnNextGetInstanceProcAddr)(instance.instance.handle(), c"vkCreateDevice".as_ptr())
-        } {
-            // SAFETY: a non-null `vkGetInstanceProcAddr(instance, "vkCreateDevice")`
-            // result is guaranteed by the Vulkan spec to have this exact signature.
-            Some(f) => unsafe { std::mem::transmute(f) },
-            None => return LayerResult::Unhandled,
-        };
-        let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: `extended` borrows `names`, which outlives this call; `p_device` is
         // the framework's own out-parameter, valid for this call; `physical_device`
         // was validated above via a successful query against it.

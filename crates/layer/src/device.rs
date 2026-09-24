@@ -476,10 +476,10 @@ impl NeuralForgeDeviceInfo {
         // enabled. Stored on `State` below; `capture::run` reads it every call to
         // decide between `DirectCapture` and `CapturePipeline` (see
         // docs/EXTERNAL_MEMORY_HOST_DESIGN.md).
-        // Enabled either by this layer's `create_device` hook or by the application itself
-        // (vkd3d-proton requests it on its own, so the hook stands aside for it).
-        let external_memory_host = crate::take_external_memory_host_enabled(handle)
-            || crate::requests_extension(create_info, crate::EXTERNAL_MEMORY_HOST_EXTENSION);
+        // Recorded by this layer's `create_device` hook, whether it added the extension or the
+        // application requested it itself (vkd3d-proton does). Never read from `create_info`:
+        // on the framework's own path its extension list is already freed here.
+        let external_memory_host = crate::take_external_memory_host_enabled(handle);
         crate::log!(
             "[layer] hooked device {:?} (swapchain support: {}, external_memory_host: {})",
             handle,

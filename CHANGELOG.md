@@ -4,6 +4,17 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.97 — 2026-09-24
+
+- **Fixed: 0.1.96 stopped the Rockstar Games Launcher (GTA V) from starting.** 0.1.96 learned
+  whether a device had `VK_EXT_external_memory_host` by reading the device's extension list in
+  its per-device setup, but on the layer framework's own device-creation path that list has
+  already been freed by then; reading it crashed the launcher's GPU process, and the launcher
+  exited with code 3 ("Unable to launch game"). The layer's device-creation hook now creates
+  and records a device that already requests the extension itself, exactly as it does one it
+  adds the extension to, and the per-device setup no longer reads the list at all. Verified by
+  starting the launcher under the game's own Proton prefix with the layer on and off.
+
 ## 0.1.96 — 2026-09-24
 
 - **Zero-copy capture and composition now work in DirectX 12 games (vkd3d-proton), such as
