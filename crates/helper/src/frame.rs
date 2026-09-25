@@ -375,7 +375,9 @@ impl FrameResources {
     /// Builds every resource `EvaluateFeature` needs for a `width`x`height` frame.
     /// `None` on any failure -- callers treat that as "skip evaluate this frame",
     /// mirroring `neural_forge_layer::capture`'s own fail-open discipline.
-    #[allow(clippy::too_many_arguments)]
+    // The raw region pointers are the helper's own shared-memory mapping, only ever imported,
+    // never dereferenced here.
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -481,7 +483,7 @@ impl FrameResources {
             let (ptr, capacity) = region;
             let alignment = alignment?;
             let size = staging_size.div_ceil(alignment).checked_mul(alignment)?;
-            if ptr.is_null() || size == 0 || size > capacity as u64 || (ptr as usize) % alignment as usize != 0 {
+            if ptr.is_null() || size == 0 || size > capacity as u64 || !(ptr as usize).is_multiple_of(alignment as usize) {
                 return None;
             }
             // SAFETY: `ptr`/`capacity` describe a live SHM region for as long as this
@@ -560,7 +562,9 @@ impl FrameResources {
     /// Output into `answer_out`. Returns timings for a completed evaluation, or `None`
     /// (leaving `answer_out` untouched) on a failure, including a guarded fault inside
     /// `EvaluateFeature` itself.
-    #[allow(clippy::too_many_arguments)]
+    // `params` is the opaque parameter block `ngx::load_and_init` validated; it is only passed
+    // back through the NGX parameter interface, never dereferenced by this crate.
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn evaluate(
         &self,
         device: &ash::Device,
@@ -736,9 +740,7 @@ impl FrameResources {
                     abi::ngx_set_ptr(params, name(key).as_ptr(), std::ptr::null_mut());
                 }
             }
-            let Some(result) = result else {
-                return None;
-            };
+            let result = result?;
             let t_eval = t_eval_start.elapsed();
             let failed = !abi::succeeded(result.0) || result.1 != 0;
             // Bounded: one line per evaluate, forever, is real time under Wine. Failures always log.

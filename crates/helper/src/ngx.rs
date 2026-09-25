@@ -262,8 +262,7 @@ unsafe fn resolve_export<F: Copy>(module: *mut c_void, name: &str) -> Option<F> 
 /// creates Feature 18. Every DLL call is wrapped in [`guarded`] — a fault anywhere in
 /// here latches `disabled` rather than taking the whole helper down with it.
 pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice, device: vk::Device) -> NgxSnippet {
-    let mut s = NgxSnippet::default();
-    s.device = device;
+    let mut s = NgxSnippet { device, ..NgxSnippet::default() };
 
     let Some(bin_dir) = resolve_bin_dir() else {
         return s.fail_no_binaries("NEURAL_FORGE_BIN_DIR is not set".to_string());
@@ -607,7 +606,7 @@ impl NgxSnippet {
 }
 
 fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32, tuning: &NgxTuning) -> Option<abi::NgxHandle> {
-    let Some(create_feature) = s.create_feature else { return None };
+    let create_feature = s.create_feature?;
     let name = |n: &str| CString::new(n).unwrap();
     let params = s.params;
     // Guarded like every other real call into the DLL below: `params`'s vtable is a

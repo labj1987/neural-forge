@@ -269,12 +269,10 @@ fn main() {
         std::thread::sleep(Duration::from_micros(200));
     }
 
-    // SAFETY: process is tearing down; nothing else can still be submitting work
-    // against `frame_resources`'s handles.
-    for f in frame_resources {
-        if let Some(f) = f {
-            unsafe { f.destroy(&device) };
-        }
+    // The process is tearing down; nothing else can still be submitting work against
+    // `frame_resources`'s handles. A stalled instance is still leaked rather than destroyed.
+    for f in frame_resources.into_iter().flatten() {
+        retire_frame_resources(f, &device);
     }
     // SAFETY: same reasoning -- `estimate`'s own fence wait already drained
     // whatever this session last submitted, and the loop above just stopped.
@@ -603,7 +601,9 @@ fn find_flow_family(instance: &ash::Instance, pd: vk::PhysicalDevice, enabled_ex
 /// queue and features are only requested then, so with the toggle off device creation
 /// has exactly its pre-optical-flow shape. The last element says why there is or isn't
 /// a flow queue, for the startup log.
-fn create_vulkan_context(want_flow: bool) -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, Option<optical_flow::FlowQueue>, String)> {
+type VulkanContext = (ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, Option<optical_flow::FlowQueue>, String);
+
+fn create_vulkan_context(want_flow: bool) -> Option<VulkanContext> {
     // SAFETY: dynamically loads `vulkan-1.dll` via the `loaded` feature; the usual
     // caveats of loading an arbitrary shared library apply and are accepted here the
     // same way every other `ash` consumer accepts them.

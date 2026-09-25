@@ -215,7 +215,7 @@ pub fn open() -> Result<ShmMapping, OpenError> {
         // trying several hints and moving on from any that fail is safe either way).
         let view = unsafe { MapViewOfFileEx(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, map_size, hint) };
         if !view.is_null() {
-            if (view as usize) % ALIGN == 0 {
+            if (view as usize).is_multiple_of(ALIGN) {
                 base = view;
                 break;
             }
@@ -307,6 +307,9 @@ impl ShmMapping {
     /// # Safety
     /// The caller must only use these views while it owns the current request on this
     /// slot.
+    // Shared memory: the mutable view is into the mapping, not into `self`, and the caller's
+    // ownership of the slot's request (the contract above) is what makes it exclusive.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn frame_regions(&self, slot: usize, bytes: usize) -> (&[u8], &mut [u8]) {
         let n = bytes.min(MAX_FRAME);
         let base = self.pixel_base();

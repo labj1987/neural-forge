@@ -108,6 +108,7 @@ impl GpuFlow {
     /// `device`/`instance`/`pd` are the helper's own live Vulkan context; `main_family` is the
     /// family the model's images and main queue belong to, `flow_queue` the optical-flow one.
     /// `width`/`height` are the model's (full) frame size.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(instance: &ash::Instance, device: &ash::Device, pd: vk::PhysicalDevice, main_family: u32, flow_queue: &FlowQueue, width: u32, height: u32, quality: u32) -> Result<Self, String> {
         let api = vk::NvOpticalFlowFn::load(|name| unsafe { std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr())) });
         let mut flow = Self {
