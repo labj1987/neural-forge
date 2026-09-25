@@ -131,6 +131,18 @@ impl MotionState {
     }
 }
 
+/// The `helper_state` the model's condition calls for.
+fn model_state(snippet: &ngx::NgxSnippet) -> u32 {
+    use neural_forge_protocol::enums::helper_state;
+    if snippet.no_binaries {
+        helper_state::NO_BINARIES
+    } else if snippet.disabled {
+        helper_state::MODEL_FAILED
+    } else {
+        helper_state::RUNNING
+    }
+}
+
 fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
     field.store(
         ((duration.as_secs_f64() * 1_000.0) as f32).to_bits(),
@@ -189,14 +201,12 @@ fn main() {
     neural_forge_helper::logging::flush();
 
     let mut snippet = ngx::load_and_init(instance.handle(), physical_device, device.handle());
-    hdr.helper_state.store(
-        if snippet.disabled {
-            neural_forge_protocol::enums::helper_state::MODEL_FAILED
-        } else {
-            neural_forge_protocol::enums::helper_state::RUNNING
-        },
-        Ordering::Relaxed,
-    );
+    // Why the model never started, kept to restate whenever the header is re-initialised.
+    let startup_note = snippet.take_failure_note();
+    hdr.helper_state.store(model_state(&snippet), Ordering::Relaxed);
+    if let Some(note) = &startup_note {
+        hdr.set_helper_reason(note);
+    }
     neural_forge_helper::log!("[helper] NGX snippet disabled={}", snippet.disabled);
     neural_forge_helper::log!("[mvec] optical flow queue: {flow_status}");
     neural_forge_helper::logging::flush();
@@ -226,14 +236,13 @@ fn main() {
         // Restated every iteration, not once at startup: the layer or the GUI re-initialising the
         // header resets `helper_state` to zero, and a state stated only once stays wrong (reading
         // as stopped) for the rest of the session.
-        hdr.helper_state.store(
-            if snippet.disabled {
-                neural_forge_protocol::enums::helper_state::MODEL_FAILED
-            } else {
-                neural_forge_protocol::enums::helper_state::RUNNING
-            },
-            Ordering::Relaxed,
-        );
+        let state = model_state(&snippet);
+        if hdr.helper_state.swap(state, Ordering::Relaxed) != state {
+            // Re-initialised (or changed): the reason went with it.
+            if let Some(note) = &startup_note {
+                hdr.set_helper_reason(note);
+            }
+        }
         for slot in 0..2 {
             let seq_req = hdr.seq_req_slot(slot).load(Ordering::Acquire);
             if seq_req == last_seq_req[slot] {
@@ -410,7 +419,7 @@ fn process_request(
         // `CreateFeature` attempt (see its own doc comment) -- worth surfacing in
         // status immediately rather than leaving `RUNNING` displayed forever after
         // the model is permanently unavailable.
-        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
+        hdr.helper_state.store(model_state(snippet), Ordering::Relaxed);
     }
     // SAFETY: this helper exclusively owns this slot's request after observing its
     // own `seq_req`; slot 0's and slot 1's regions are disjoint fixed regions in the

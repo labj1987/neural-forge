@@ -95,6 +95,9 @@ pub struct NgxSnippet {
     nvapi: *mut c_void,
 
     pub disabled: bool,
+    /// The NGX binaries are missing or unusable (no binaries folder, no `nvngx_dlssnr.dll` in it,
+    /// or a snippet the caller-identity spoof cannot be installed on). Implies `disabled`.
+    pub no_binaries: bool,
 
     /// One NGX feature per pass, in chain order. A slot with a null handle is a hole: a pass
     /// that failed to rebuild and is skipped by the chain until it builds again.
@@ -226,6 +229,7 @@ impl Default for NgxSnippet {
             device: vk::Device::null(),
             nvapi: std::ptr::null_mut(),
             disabled: false,
+            no_binaries: false,
             passes: Vec::new(),
             built_size: (0, 0),
             ceiling: None,
@@ -262,11 +266,13 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     s.device = device;
 
     let Some(bin_dir) = resolve_bin_dir() else {
-        crate::log!("[ngx] NEURAL_FORGE_BIN_DIR not set or nvngx_dlssnr.dll not found there");
-        s.disabled = true;
-        return s;
+        return s.fail_no_binaries("NEURAL_FORGE_BIN_DIR is not set".to_string());
     };
-    let dll_path = utf16(&format!("{bin_dir}\\nvngx_dlssnr.dll"));
+    let dll_file = format!("{bin_dir}\\nvngx_dlssnr.dll");
+    if !std::path::Path::new(&dll_file).is_file() {
+        return s.fail_no_binaries(format!("nvngx_dlssnr.dll not found in {bin_dir}"));
+    }
+    let dll_path = utf16(&dll_file);
     // SAFETY: `dll_path` is a valid NUL-terminated UTF-16 string.
     s.snippet = unsafe {
         LoadLibraryExW(
@@ -276,10 +282,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         )
     };
     if s.snippet.is_null() {
-        crate::log!("[ngx] LoadLibraryExW nvngx_dlssnr.dll failed");
-        crate::logging::flush();
-        s.disabled = true;
-        return s;
+        return s.fail("nvngx_dlssnr.dll failed to load".to_string());
     }
     // SAFETY: `s.snippet` is a just-loaded PE image.
     unsafe { crate::guard::register_module(crate::guard::Module::Snippet, s.snippet) };
@@ -296,12 +299,9 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     }
     if s.create_feature.is_none() || s.evaluate_feature.is_none() || s.release_feature.is_none() || s.shutdown1.is_none()
     {
-        crate::log!("[ngx] snippet Vulkan exports incomplete");
-        crate::logging::flush();
         unsafe { FreeLibrary(s.snippet) };
         s.snippet = std::ptr::null_mut();
-        s.disabled = true;
-        return s;
+        return s.fail("nvngx_dlssnr.dll lacks the NGX Vulkan exports".to_string());
     }
     crate::log!("[ngx] snippet Vulkan exports resolved, installing caller-identity spoof next");
     crate::logging::flush();
@@ -309,10 +309,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     // SAFETY: `s.snippet` is a valid, currently-loaded module.
     s.snippet_spoof = unsafe { spoof::install(s.snippet) };
     if s.snippet_spoof.is_none() {
-        crate::log!("[ngx] failed to install the caller-identity spoof on the snippet");
-        crate::logging::flush();
-        s.disabled = true;
-        return s;
+        return s.fail_no_binaries("could not install the caller-identity spoof on nvngx_dlssnr.dll (unexpected binaries)".to_string());
     }
     crate::log!("[ngx] caller-identity spoof installed, loading core (nvngx.dll) next");
     crate::logging::flush();
@@ -515,10 +512,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     }
 
     let Some(init_ext) = s.init_ext else {
-        crate::log!("[ngx] snippet has no VULKAN_Init_Ext export");
-        crate::logging::flush();
-        s.disabled = true;
-        return s;
+        return s.fail("nvngx_dlssnr.dll has no VULKAN_Init_Ext export".to_string());
     };
     crate::log!("[ngx] calling VULKAN_Init_Ext now");
     crate::logging::flush();
@@ -546,8 +540,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     crate::log!("[ngx] VULKAN_Init_Ext -> {:#x} seh={:#x}", init_result as u32, seh);
     crate::logging::flush();
     if !abi::succeeded(init_result) {
-        s.disabled = true;
-        return s;
+        return s.fail(format!("VULKAN_Init_Ext failed ({:#x}, seh={seh:#x})", init_result as u32));
     }
 
     // Feature creation is deferred to `maintain_feature`, called once the per-frame
@@ -557,6 +550,22 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
 }
 
 impl NgxSnippet {
+    /// Ends `load_and_init` with the model off for the session and `note` as the reason.
+    fn fail(mut self, note: String) -> Self {
+        crate::log!("[ngx] {note}");
+        crate::logging::flush();
+        self.failure_note = Some(note);
+        self.disabled = true;
+        self
+    }
+
+    /// [`Self::fail`], reported as missing binaries rather than a model failure.
+    fn fail_no_binaries(self, note: String) -> Self {
+        let mut s = self.fail(note);
+        s.no_binaries = true;
+        s
+    }
+
     pub fn evaluate_feature_fn(&self) -> Option<abi::FnVkEvaluateFeature> {
         self.evaluate_feature
     }
