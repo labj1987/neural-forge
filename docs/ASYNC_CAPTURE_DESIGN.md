@@ -15,7 +15,8 @@ signaled.
    its mapped bytes into SHM and begin the helper request only if no request is already
    outstanding.
 2. If a free slot exists and no capture is pending, record the legal
-   `GENERAL -> TRANSFER_SRC_OPTIMAL -> GENERAL` source copy and submit it. Return to
+   source copy (since 1.0.0 a `GENERAL` tap source is read in `GENERAL`
+   with no transition; see `RENDER_TAP_DESIGN.md`) and submit it. Return to
    the real present immediately.
 3. While the helper works, present the untouched game output. When its answer arrives,
    use the existing output write-back path and its completion semaphore.

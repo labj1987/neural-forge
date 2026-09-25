@@ -41,6 +41,10 @@ other's mapping.
 
 - Upstream ORs `TRANSFER_SRC|DST` into every swapchain unconditionally; Neural Forge keeps its
   admission checks (`surface_usage.rs`).
+- Tapping whatever image the game last blitted into the swapchain: Neural Forge captures an
+  admitted swapchain from its own image, and on a pass-through swapchain taps only a 1:1 copy or
+  blit whose source extent and format (recorded from `vkCreateImage`) match the swapchain.
+  Anything else presents untouched (1.0.0).
 - Re-running `NgxLoadAndInit` on every resize (re-hooks the import table, leaks parameters) and
   quitting after one bad evaluate: Neural Forge rebuilds only the feature and fails open per frame.
 - The meter's descriptor pool without a storage-buffer size, resetting a possibly unsignalled

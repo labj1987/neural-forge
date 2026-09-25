@@ -1,5 +1,19 @@
 # NeuralForge GTA render-tap design
 
+## Current state (1.0.0)
+
+This document records the original GTA investigation. Two things have changed since:
+
+- GTA's swapchain has been admitted since 0.1.73: the earlier refusal came from DXVK's
+  extension chain on the create info, not from missing usage, and the surface does
+  advertise `TRANSFER_SRC`. GTA renders straight into the swapchain image, so it never used
+  the tap. Admitted swapchains are always captured from their own image.
+- The tap is used only on pass-through swapchains, and only when the observed copy or blit
+  is a 1:1 write from the origin at the swapchain's extent with a matching format (a raw copy
+  also accepts the sRGB/UNORM twin). The layer records source extents and formats from
+  `vkCreateImage`. A `GENERAL` source is read in `GENERAL` with no layout transition. Any
+  other source presents untouched, as rule 5 below requires.
+
 GTA V Enhanced on the target system creates a 2560x1440 B8G8R8A8 swapchain with
 `TRANSFER_DST | COLOR_ATTACHMENT`. The surface does not advertise `TRANSFER_SRC`,
 so NeuralForge must not add it or read a swapchain image as a capture source.
