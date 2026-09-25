@@ -3183,7 +3183,7 @@ mod tests {
     fn scratch_path(tag: &str) -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, AtomicOrdering::Relaxed);
-        format!("{}/neural-forge-capture-test-{}-{tag}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
+        format!("{}/capture-{}-{tag}-{n}/shm.bin", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display(), std::process::id())
     }
 
     /// Same shape as `test_device`, except the device is created with

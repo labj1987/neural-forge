@@ -138,7 +138,7 @@ mod tests {
     fn scratch_path() -> String {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!("{}/neural-forge-mapping-test-{}-{n}/shm.bin", std::env::temp_dir().display(), std::process::id())
+        format!("{}/mapping-{}-{n}/shm.bin", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display(), std::process::id())
     }
 
     fn cleanup(path: &str) {

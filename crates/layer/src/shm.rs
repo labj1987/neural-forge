@@ -842,7 +842,7 @@ mod tests {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
         let pid = std::process::id();
-        format!("{}/neural-forge-shm-test-{pid}-{n}/shm.bin", std::env::temp_dir().display())
+        format!("{}/shm-{pid}-{n}/shm.bin", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display())
     }
 
     fn header_of<'a>(client: &'a ShmClient) -> &'a ShmHeader {
