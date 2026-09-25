@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Builds the AppImage from the working tree and puts exactly that build where the rig runs it:
-# the launcher copy (~/AppImages/neuralforge.appimage) and the installed layer/helper, then
+# the launcher copy (~/AppImages/neural-forge.appimage) and the installed layer/helper, then
 # proves the installed files are byte-identical to the ones inside the AppImage. Leaves nothing
 # behind: no backup of the previous AppImage (releases are the rollback) and no temp files.
 #
@@ -21,9 +21,9 @@ rm -rf "$APPIMAGE" "$APPIMAGE.zsync" build-appimage
 ssh "$HOST" "VERSION=$VERSION bash -s" <<'REMOTE'
 set -e
   mkdir -p ~/AppImages
-  cp /tmp/nf-deploy.AppImage ~/AppImages/neuralforge.appimage.new && chmod +x ~/AppImages/neuralforge.appimage.new
-  mv -f ~/AppImages/neuralforge.appimage.new ~/AppImages/neuralforge.appimage
-  cd /tmp && rm -rf squashfs-root && ~/AppImages/neuralforge.appimage --appimage-extract >/dev/null
+  cp /tmp/nf-deploy.AppImage ~/AppImages/neural-forge.appimage.new && chmod +x ~/AppImages/neural-forge.appimage.new
+  mv -f ~/AppImages/neural-forge.appimage.new ~/AppImages/neural-forge.appimage
+  cd /tmp && rm -rf squashfs-root && ~/AppImages/neural-forge.appimage --appimage-extract >/dev/null
   ./squashfs-root/usr/bin/neural-forge-cli install --appdir /tmp/squashfs-root | tail -1
   L=~/.local/share/neural-forge/lib/neural-forge; S=/tmp/squashfs-root/usr/lib/neural-forge
   ok=1
@@ -33,7 +33,7 @@ set -e
   done
   rm -rf /tmp/squashfs-root /tmp/nf-deploy.AppImage
   # Keep the menu entry's version metadata (written when the AppImage was integrated) in step.
-  E=~/.local/share/applications/neuralforge.desktop
+  E=~/.local/share/applications/neural-forge.desktop
   [ -f "$E" ] && sed -i "s/^X-AppImage-Version=.*/X-AppImage-Version=$VERSION/" "$E"
   update-desktop-database ~/.local/share/applications 2>/dev/null || true
   [ $ok = 1 ]
