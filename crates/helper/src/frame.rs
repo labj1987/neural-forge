@@ -375,7 +375,9 @@ impl FrameResources {
     /// Builds every resource `EvaluateFeature` needs for a `width`x`height` frame.
     /// `None` on any failure -- callers treat that as "skip evaluate this frame",
     /// mirroring `neural_forge_layer::capture`'s own fail-open discipline.
-    #[allow(clippy::too_many_arguments)]
+    // The raw region pointers are the helper's own shared-memory mapping, only ever imported,
+    // never dereferenced here.
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn new(
         device: &ash::Device,
         instance: &ash::Instance,
@@ -475,10 +477,13 @@ impl FrameResources {
         // attempt can fall back to an unaligned view, and this device might lack the
         // extension `WANTED_DEVICE_EXTENSIONS` only *requests*, never guarantees.
         let alignment = min_imported_host_pointer_alignment(instance, physical_device);
+        // Only this frame's bytes, rounded up to the import alignment: importing the region's
+        // whole `MAX_FRAME` capacity pinned the protocol's 7680x4320 float16 ceiling per slot.
         let try_import = |region: (*mut u8, usize)| {
             let (ptr, capacity) = region;
             let alignment = alignment?;
-            if ptr.is_null() || capacity == 0 || (ptr as usize) % alignment as usize != 0 || capacity as u64 % alignment != 0 {
+            let size = staging_size.div_ceil(alignment).checked_mul(alignment)?;
+            if ptr.is_null() || size == 0 || size > capacity as u64 || !(ptr as usize).is_multiple_of(alignment as usize) {
                 return None;
             }
             // SAFETY: `ptr`/`capacity` describe a live SHM region for as long as this
@@ -489,7 +494,7 @@ impl FrameResources {
             // "one outstanding request at a time" rule already guarantees, the same
             // reasoning `neural_forge_layer::capture::DirectCapture` relies on for its own
             // single slot.
-            unsafe { build_imported_buffer(device, instance, physical_device, ptr, capacity as vk::DeviceSize) }
+            unsafe { build_imported_buffer(device, instance, physical_device, ptr, size) }
         };
         let imported_proxy = try_import(proxy_region);
         let imported_answer = try_import(answer_region);
@@ -557,7 +562,9 @@ impl FrameResources {
     /// Output into `answer_out`. Returns timings for a completed evaluation, or `None`
     /// (leaving `answer_out` untouched) on a failure, including a guarded fault inside
     /// `EvaluateFeature` itself.
-    #[allow(clippy::too_many_arguments)]
+    // `params` is the opaque parameter block `ngx::load_and_init` validated; it is only passed
+    // back through the NGX parameter interface, never dereferenced by this crate.
+    #[allow(clippy::too_many_arguments, clippy::not_unsafe_ptr_arg_deref)]
     pub fn evaluate(
         &self,
         device: &ash::Device,
@@ -718,14 +725,22 @@ impl FrameResources {
             // NGX Vulkan evaluation records its GPU work into a caller-owned, live
             // command buffer, just as feature creation does. A null buffer can return
             // success while recording no output work, which leaves Output untouched.
-            let Some(result) = self.run_evaluate(device, queue, || {
+            let result = self.run_evaluate(device, queue, || {
                 crate::guard::guarded(
                     || evaluate_feature(self.cmd, pass.handle, params, std::ptr::null()),
                     abi::result::FAIL_SEH,
                 )
-            }) else {
-                return None;
-            };
+            });
+            // `color`/`output`/`mvec`/`depth` are locals of this block: once it ends, the block
+            // must not keep their addresses, or the next `CreateFeature` (a rebuild) reads
+            // dangling pointers out of it.
+            // (After a caught fault nothing may call into the DLLs again, this included.)
+            if crate::guard::faulted().is_none() {
+                for key in ["DLSSNR.Color", "DLSSNR.Output", "DLSSNR.MVec", "DLSSNR.Depth"] {
+                    abi::ngx_set_ptr(params, name(key).as_ptr(), std::ptr::null_mut());
+                }
+            }
+            let result = result?;
             let t_eval = t_eval_start.elapsed();
             let failed = !abi::succeeded(result.0) || result.1 != 0;
             // Bounded: one line per evaluate, forever, is real time under Wine. Failures always log.

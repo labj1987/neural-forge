@@ -9,7 +9,10 @@
 
 use std::ffi::c_void;
 
-use neural_forge_protocol::{answer_offset, answer_offset_slot, proxy_offset, proxy_offset_slot, shm_default_path, shm_total_bytes, MAX_FRAME};
+use neural_forge_protocol::{
+    answer_offset, answer_offset_slot, proxy_offset, proxy_offset_slot, shm_default_path, shm_total_bytes, MAX_FRAME, SHM_MAGIC,
+    SHM_VERSION,
+};
 
 #[link(name = "kernel32")]
 extern "system" {
@@ -25,6 +28,8 @@ extern "system" {
     fn CreateDirectoryW(path: *const u16, security: *const c_void) -> i32;
     fn SetFilePointerEx(file: *mut c_void, distance: i64, new_pointer: *mut i64, method: u32) -> i32;
     fn SetEndOfFile(file: *mut c_void) -> i32;
+    fn GetFileSizeEx(file: *mut c_void, size: *mut i64) -> i32;
+    fn ReadFile(file: *mut c_void, buffer: *mut c_void, to_read: u32, read: *mut u32, overlapped: *mut c_void) -> i32;
     fn CreateFileMappingW(
         file: *mut c_void,
         security: *const c_void,
@@ -87,14 +92,53 @@ fn parent_dir_utf16(path_utf16: &[u16]) -> Option<Vec<u16>> {
     Some(dir)
 }
 
-/// Opens (creating if necessary) the mapping and maps its header region.
+/// Why [`open`] gave up.
+#[derive(Debug)]
+pub enum OpenError {
+    /// The path, the file, its size or the view failed.
+    Io,
+    /// The mapping already holds a header from a different protocol version. Nothing was
+    /// written or resized: its peers are live and laid out differently, so re-initialising or
+    /// resizing it under them would corrupt their view (a shrink is a SIGBUS in the game).
+    VersionSkew { found: u32, expected: u32 },
+}
+
+/// The `(magic, version)` pair at the start of an open mapping file, or `None` when the file
+/// is shorter than that (new) or cannot be read.
+fn read_magic_version(file: *mut c_void) -> Option<(u32, u32)> {
+    let mut size: i64 = 0;
+    // SAFETY: `file` is a valid, open handle; `size` is a valid out-pointer.
+    if unsafe { GetFileSizeEx(file, &mut size) } == 0 || size < 8 {
+        return None;
+    }
+    let mut bytes = [0u8; 8];
+    let mut read = 0u32;
+    // SAFETY: `file` is open for reading at offset 0 (nothing has moved its pointer yet);
+    // `bytes` holds the 8 bytes asked for.
+    let ok = unsafe { ReadFile(file, bytes.as_mut_ptr().cast(), 8, &mut read, std::ptr::null_mut()) } != 0;
+    if !ok || read != 8 {
+        return None;
+    }
+    Some((u32::from_le_bytes(bytes[0..4].try_into().unwrap()), u32::from_le_bytes(bytes[4..8].try_into().unwrap())))
+}
+
+fn skew(found: u32) -> OpenError {
+    crate::log!("[helper] shared memory holds protocol version {found}, this helper speaks {SHM_VERSION}; leaving it untouched");
+    crate::logging::flush();
+    OpenError::VersionSkew { found, expected: SHM_VERSION }
+}
+
+/// Opens (creating if necessary) the mapping and maps it.
 ///
-/// # Safety
-/// Must only be called once per `ShmMapping` — this creates OS handles the returned
-/// value owns and closes on [`ShmMapping::close`].
-pub fn open() -> Option<ShmMapping> {
+/// A new or foreign file is sized and initialised. A file already holding this protocol's
+/// magic is only ever grown, never shrunk, and its header is initialised only when the magic
+/// is wrong: with the magic right and the version different, this returns
+/// [`OpenError::VersionSkew`] having changed nothing.
+pub fn open() -> Result<ShmMapping, OpenError> {
     let posix_path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM").filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
-    if !neural_forge_protocol::isolated_path(&posix_path) { return None; }
+    if !neural_forge_protocol::isolated_path(&posix_path) {
+        return Err(OpenError::Io);
+    }
     let win_path = windows_path(&posix_path);
 
     if let Some(dir) = parent_dir_utf16(&win_path) {
@@ -122,24 +166,35 @@ pub fn open() -> Option<ShmMapping> {
         )
     };
     if file == INVALID_HANDLE_VALUE {
-        return None;
+        return Err(OpenError::Io);
+    }
+
+    if let Some((magic, version)) = read_magic_version(file) {
+        if magic == SHM_MAGIC && version != SHM_VERSION {
+            // SAFETY: `file` is ours and nothing else references it.
+            unsafe { CloseHandle(file) };
+            return Err(skew(version));
+        }
     }
 
     let total = neural_forge_protocol::shm_total_bytes() as i64;
-    // SAFETY: `file` is a valid, open, writable file handle from the call above.
+    let mut current: i64 = 0;
+    // SAFETY: `file` is a valid, open, writable file handle from the call above; `current` is a
+    // valid out-pointer. Grown only: a peer may already map the file at its full size.
     let sized = unsafe {
-        SetFilePointerEx(file, total, std::ptr::null_mut(), FILE_BEGIN) != 0 && SetEndOfFile(file) != 0
+        GetFileSizeEx(file, &mut current) != 0
+            && (current >= total || (SetFilePointerEx(file, total, std::ptr::null_mut(), FILE_BEGIN) != 0 && SetEndOfFile(file) != 0))
     };
     if !sized {
         unsafe { CloseHandle(file) };
-        return None;
+        return Err(OpenError::Io);
     }
 
     // SAFETY: `file` is valid and now sized to at least `shm_total_bytes()`.
     let mapping = unsafe { CreateFileMappingW(file, std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null()) };
     if mapping.is_null() {
         unsafe { CloseHandle(file) };
-        return None;
+        return Err(OpenError::Io);
     }
 
     // Windows hands out views at the allocation granularity, but the API doesn't
@@ -160,7 +215,7 @@ pub fn open() -> Option<ShmMapping> {
         // trying several hints and moving on from any that fail is safe either way).
         let view = unsafe { MapViewOfFileEx(mapping, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, map_size, hint) };
         if !view.is_null() {
-            if (view as usize) % ALIGN == 0 {
+            if (view as usize).is_multiple_of(ALIGN) {
                 base = view;
                 break;
             }
@@ -178,18 +233,29 @@ pub fn open() -> Option<ShmMapping> {
             CloseHandle(mapping);
             CloseHandle(file);
         }
-        return None;
+        return Err(OpenError::Io);
     }
 
     let header = base.cast::<neural_forge_protocol::ShmHeader>();
     // SAFETY: just mapped above, `shm_total_bytes()` is large enough for `ShmHeader`
     // (enforced at compile time in `neural_forge_protocol`) plus both pixel regions.
     let hdr = unsafe { &*header };
-    if !hdr.is_valid() {
+    let magic = hdr.magic.load(std::sync::atomic::Ordering::Acquire);
+    let version = hdr.version.load(std::sync::atomic::Ordering::Acquire);
+    if magic != SHM_MAGIC {
         hdr.init_defaults();
+    } else if version != SHM_VERSION {
+        // A peer wrote a different version between the check above and the mapping.
+        // SAFETY: nothing else references this view or these handles yet.
+        unsafe {
+            UnmapViewOfFile(base);
+            CloseHandle(mapping);
+            CloseHandle(file);
+        }
+        return Err(skew(version));
     }
 
-    Some(ShmMapping { file, mapping, header })
+    Ok(ShmMapping { file, mapping, header })
 }
 
 impl ShmMapping {
@@ -241,6 +307,9 @@ impl ShmMapping {
     /// # Safety
     /// The caller must only use these views while it owns the current request on this
     /// slot.
+    // Shared memory: the mutable view is into the mapping, not into `self`, and the caller's
+    // ownership of the slot's request (the contract above) is what makes it exclusive.
+    #[allow(clippy::mut_from_ref)]
     pub unsafe fn frame_regions(&self, slot: usize, bytes: usize) -> (&[u8], &mut [u8]) {
         let n = bytes.min(MAX_FRAME);
         let base = self.pixel_base();

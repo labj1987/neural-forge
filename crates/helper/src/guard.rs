@@ -10,13 +10,23 @@
 //! down with it.
 //!
 //! Ported for shape from `core/guard.h`: the *mechanism*, and the reason for it
-//! (MinGW's missing SEH intrinsics), are upstream's; this is a fresh Rust
-//! implementation using `AddVectoredExceptionHandler` plus a hand-rolled `setjmp`/
-//! `longjmp` FFI boundary, declared directly against `kernel32.dll`/the mingw CRT
-//! rather than through a higher-level wrapper crate — these specific calls are old,
-//! extremely stable parts of the Win32 ABI, and declaring them directly keeps this
-//! module auditable without also depending on how some other crate happens to shape
-//! its own wrapper for them.
+//! (MinGW's missing SEH intrinsics), are upstream's; this is a fresh implementation
+//! using `AddVectoredExceptionHandler` declared directly against `kernel32.dll`.
+//!
+//! The `setjmp` site lives in C (`csrc/guard_shim.c`, built by `build.rs`), not Rust: a
+//! function that returns twice needs the compiler to know it does (`returns_twice`), and
+//! Rust has no way to say so. From Rust, `nf_guard_run` is an ordinary function that
+//! returns once, with 0 (the closure finished) or 1 (the handler jumped back). Everything
+//! that must survive the jump lives in memory the jump does not touch: the thread-locals
+//! below and the `Slot` in [`guarded`]'s own frame, which sits above the C frame.
+//!
+//! # After a fault, stop calling
+//!
+//! The jump abandons the faulting DLL mid-call: any lock it held (its own, or the loader
+//! lock) stays held. So the first caught fault latches [`faulted`] for the whole process,
+//! and every later [`guarded`] call returns its fail value without running at all. That
+//! includes teardown: `ngx::teardown` skips every DLL call and unload once the latch is
+//! set, because releasing a feature through a DLL whose locks are held can hang.
 //!
 //! # The one discipline this depends on
 //!
@@ -27,10 +37,13 @@
 //! Keep every [`guarded`] closure to what upstream's own `Guarded()` call sites are:
 //! a single FFI call plus `Copy` locals, nothing that owns a heap allocation or a lock
 //! that must be released for correctness.
+//!
+//! Never guard `LoadLibrary`: a fault inside a `DllMain` leaves the loader lock held, and
+//! the next load would deadlock instead of failing. Such a fault is fatal either way.
 
 use std::cell::{Cell, UnsafeCell};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use std::sync::Once;
 
 #[link(name = "kernel32")]
@@ -117,39 +130,33 @@ fn describe(addr: usize) -> (&'static str, usize) {
     ("exe/other", addr)
 }
 
-/// Opaque `jmp_buf` storage, deliberately over-sized: MinGW-w64's real `jmp_buf` on
-/// x86_64 is smaller than this, and a buffer larger than the real one is always safe
-/// (it just wastes a little thread-local storage) — smaller would not be. The exact
-/// size isn't pinned down more precisely than "generous" because that would need
-/// checking against the real `<setjmp.h>` on this toolchain, which isn't installed on
-/// this dev machine yet; `setjmp`/`longjmp` themselves are declared directly against
-/// the mingw CRT below, so a size mismatch here would show up immediately as memory
-/// corruption the first time this runs under Wine/Proton, not as a silent bug --
-/// exactly the kind of thing to check for in this crate's first real runtime test.
+/// Storage for the C runtime's `jmp_buf`. [`install`] checks the real size
+/// (`nf_guard_jmp_buf_size`, 256 bytes on x86_64 mingw-w64) fits.
 #[repr(C, align(16))]
 struct JmpBuf([u8; 256]);
 
+type GuardBody = unsafe extern "C" fn(*mut c_void);
+
 extern "C" {
-    /// The CRT's real `_setjmp(env, frame)`. The mingw `setjmp` macro passes
-    /// `__builtin_frame_address(0)` as `frame`, which makes the matching `longjmp` *unwind* to
-    /// that frame (running `RtlUnwindEx` over every frame in between). From inside a vectored
-    /// exception handler that is not safe, so this always passes a null frame: `longjmp` then
-    /// just restores registers.
-    fn _setjmp(env: *mut JmpBuf, frame: *mut c_void) -> i32;
-    fn longjmp(env: *mut JmpBuf, val: i32) -> !;
+    fn nf_guard_jmp_buf_size() -> usize;
+    /// `csrc/guard_shim.c`: sets the jump point in `env`, sets `*active`, runs `body(ctx)`,
+    /// clears `*active`. Returns 0 when `body` returned, 1 when [`nf_guard_jump`] came back.
+    fn nf_guard_run(env: *mut JmpBuf, active: *mut i32, body: GuardBody, ctx: *mut c_void) -> i32;
+    /// `longjmp(env, 1)`, without unwinding.
+    fn nf_guard_jump(env: *mut JmpBuf) -> !;
 }
 
 thread_local! {
-    // `UnsafeCell`, not a plain `JmpBuf`: `setjmp` writes through the raw pointer this
-    // hands out, and mutating through a pointer derived from a `&JmpBuf` with nothing
-    // in between would be exactly the kind of aliasing violation `UnsafeCell` exists to
-    // make legal -- same reasoning as `neural_forge_protocol::ShmHeader`'s seqlock-guarded
-    // fields for the same underlying reason (shared, externally-written memory).
-    static GUARD_JMP: UnsafeCell<JmpBuf> = UnsafeCell::new(JmpBuf([0; 256]));
-    static GUARD_ACTIVE: Cell<bool> = const { Cell::new(false) };
+    // `UnsafeCell`: the C shim writes the jump point through a raw pointer to it.
+    static GUARD_JMP: UnsafeCell<JmpBuf> = const { UnsafeCell::new(JmpBuf([0; 256])) };
+    // Written by the C shim through a raw pointer (hence `Cell`), read by the handler.
+    static GUARD_ACTIVE: Cell<i32> = const { Cell::new(0) };
     static GUARD_CODE: Cell<u32> = const { Cell::new(0) };
     static GUARD_HITS: Cell<u32> = const { Cell::new(0) };
 }
+
+/// The first caught fault's exception code, process-wide; 0 while nothing has faulted.
+static FAULTED: AtomicU32 = AtomicU32::new(0);
 
 static INSTALL: Once = Once::new();
 
@@ -158,6 +165,9 @@ static INSTALL: Once = Once::new();
 /// runs is not actually guarded at all — a fault would go uncaught.
 pub fn install() {
     INSTALL.call_once(|| {
+        // SAFETY: a plain query of a C constant.
+        let real = unsafe { nf_guard_jmp_buf_size() };
+        assert!(real <= std::mem::size_of::<JmpBuf>(), "jmp_buf is {real} bytes, JmpBuf too small");
         // SAFETY: `veh_handler` matches `VectoredHandler`'s signature exactly. `first =
         // 1` puts it first in the chain, so a fault during a `guarded` call is seen
         // here before any handler installed by NGX/the driver/anything else gets a
@@ -168,37 +178,73 @@ pub fn install() {
     });
 }
 
+/// The exception code of the first fault [`guarded`] caught in this process, if any. Once
+/// set, no further guarded call runs (see the module doc).
+pub fn faulted() -> Option<u32> {
+    match FAULTED.load(Ordering::Acquire) {
+        0 => None,
+        code => Some(code),
+    }
+}
+
+/// Clears the process-wide fault latch. Only for `examples/guard_test.rs`, which checks that
+/// the jump point survives many faults in a row; the helper itself never clears it.
+#[doc(hidden)]
+pub fn clear_fault_latch_for_test() {
+    FAULTED.store(0, Ordering::Release);
+}
+
+struct Slot<F, R> {
+    f: Option<F>,
+    out: Option<R>,
+}
+
+unsafe extern "C" fn trampoline<F: FnOnce() -> R, R>(ctx: *mut c_void) {
+    // SAFETY: `ctx` is the `Slot<F, R>` in `guarded`'s frame, live for this whole call.
+    let slot = unsafe { &mut *ctx.cast::<Slot<F, R>>() };
+    if let Some(f) = slot.f.take() {
+        slot.out = Some(f());
+    }
+}
+
 /// Runs `f`, catching any hardware exception (access violation, illegal instruction,
 /// stack overflow, division fault — whatever the CPU raises) that occurs anywhere
 /// inside it, including inside a call across the FFI boundary into `nvngx_dlssnr.dll`.
 /// Returns `(f(), 0)` on success, or `(fail_value, exception_code)` — the raw SEH
-/// `EXCEPTION_*` code — if a fault fired instead.
+/// `EXCEPTION_*` code — if a fault fired instead. Once any guarded call in the process
+/// has faulted, `f` is not run at all and this returns `(fail_value, first_fault_code)`.
 ///
 /// See the module doc comment for the one discipline this depends on: no local in `f`'s
 /// call frames may need `Drop` to run for correctness.
 pub fn guarded<F: FnOnce() -> R, R>(f: F, fail_value: R) -> (R, u32) {
-    GUARD_CODE.with(|c| c.set(0));
-    // SAFETY: `GUARD_JMP` is this thread's own thread-local storage, stable for the
-    // life of the thread and never touched by any other thread; getting a raw pointer
-    // to it and handing that pointer to `setjmp` is exactly what `setjmp` requires.
-    let jmp_ptr = GUARD_JMP.with(|j| j.get());
-    let did_jump = unsafe { _setjmp(jmp_ptr, std::ptr::null_mut()) };
-    if did_jump == 0 {
-        GUARD_ACTIVE.with(|a| a.set(true));
-        let result = f();
-        // Only reached if `f` returned normally -- a fault during `f` never gets here,
-        // it jumps straight to the `else` branch below via `longjmp` instead.
-        GUARD_ACTIVE.with(|a| a.set(false));
-        (result, 0)
-    } else {
-        (fail_value, GUARD_CODE.with(|c| c.get()))
+    if let Some(code) = faulted() {
+        return (fail_value, code);
     }
+    GUARD_CODE.with(|c| c.set(0));
+    let mut slot = Slot { f: Some(f), out: None };
+    let jmp_ptr = GUARD_JMP.with(|j| j.get());
+    let active_ptr = GUARD_ACTIVE.with(|a| a.as_ptr());
+    // SAFETY: both pointers are this thread's own thread-locals, stable for the thread's life;
+    // `slot` outlives the call and is only touched by `trampoline::<F, R>` on this thread.
+    let jumped = unsafe { nf_guard_run(jmp_ptr, active_ptr, trampoline::<F, R>, std::ptr::from_mut(&mut slot).cast()) };
+    match (jumped, slot.out) {
+        (0, Some(out)) => (out, 0),
+        _ => {
+            let code = GUARD_CODE.with(Cell::get);
+            // A jump always records a code; keep the result a failure even if it somehow did not.
+            (fail_value, if code == 0 { abi_fail_seh() } else { code })
+        }
+    }
+}
+
+fn abi_fail_seh() -> u32 {
+    crate::abi::result::FAIL_SEH as u32
 }
 
 unsafe extern "system" fn veh_handler(info: *mut ExceptionPointers) -> i32 {
     const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
 
-    if !GUARD_ACTIVE.with(Cell::get) {
+    if GUARD_ACTIVE.with(Cell::get) == 0 {
         // Nothing we're watching is running on this thread right now -- not our fault
         // to handle, let the normal search (the debugger, the process's default
         // handler, ultimately termination) continue.
@@ -217,9 +263,11 @@ unsafe extern "system" fn veh_handler(info: *mut ExceptionPointers) -> i32 {
         h.get()
     });
     if hits >= MAX_GUARDED_HITS {
-        GUARD_ACTIVE.with(|a| a.set(false));
+        GUARD_ACTIVE.with(|a| a.set(0));
         return EXCEPTION_CONTINUE_SEARCH;
     }
+    // Latched before anything else can run: from here on no guarded call enters a DLL.
+    let _ = FAULTED.compare_exchange(0, code, Ordering::AcqRel, Ordering::Acquire);
     // SAFETY: `context_record` is valid for this call; `Rsp`/`Rip` are at these fixed offsets.
     let (rip, rsp) = unsafe {
         let ctx = (*info).context_record.cast::<u8>();
@@ -238,11 +286,10 @@ unsafe extern "system" fn veh_handler(info: *mut ExceptionPointers) -> i32 {
         "[veh] code={code:#x} rip={rip:#x} ({rip_mod}+{rip_off:#x}) ret={ret:#x} ({ret_mod}+{ret_off:#x}) fault={fault:#x} rw={} hit={hits}",
         if record.number_parameters > 0 { record.exception_information[0] } else { 0 }
     );
-    GUARD_ACTIVE.with(|a| a.set(false));
+    GUARD_ACTIVE.with(|a| a.set(0));
     let jmp_ptr = GUARD_JMP.with(|j| j.get());
-    // SAFETY: `jmp_ptr` was set up by a `setjmp` call on this same thread earlier in
-    // this same call chain (guaranteed by `GUARD_ACTIVE` only being true between that
-    // `setjmp` and the matching `guarded()` call returning) -- exactly the precondition
-    // `longjmp` requires. This never returns; the thread resumes at that `setjmp` site.
-    unsafe { longjmp(jmp_ptr, 1) }
+    // SAFETY: `GUARD_ACTIVE` is only nonzero between `nf_guard_run`'s `_setjmp` and its return,
+    // on this same thread, so `jmp_ptr` holds a live jump point in a frame still on this stack.
+    // This never returns; the thread resumes inside `nf_guard_run`, which returns 1.
+    unsafe { nf_guard_jump(jmp_ptr) }
 }

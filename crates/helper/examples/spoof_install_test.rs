@@ -43,6 +43,12 @@ fn main() {
     println!("after install, this module's reported name: {spoofed_name}");
     assert_eq!(spoofed_name, "nvngx.dll", "FAIL: expected the spoofed name");
 
+    // Installing over an already-spoofed module must not capture the spoof as the "real"
+    // function (that would recurse forever on any pass-through query).
+    // SAFETY: as above.
+    let again = unsafe { spoof::install(this_module) };
+    assert!(again.is_none(), "FAIL: a second install patched slots that already held the spoof");
+
     // A query about a *different* module must be completely unaffected -- the spoof
     // only ever intercepts a query about this process's own module.
     let kernel32_name = get_module_file_name(kernel32);

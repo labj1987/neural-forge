@@ -131,12 +131,27 @@ impl MotionState {
     }
 }
 
+/// The `helper_state` the model's condition calls for.
+fn model_state(snippet: &ngx::NgxSnippet) -> u32 {
+    use neural_forge_protocol::enums::helper_state;
+    if snippet.no_binaries {
+        helper_state::NO_BINARIES
+    } else if snippet.disabled {
+        helper_state::MODEL_FAILED
+    } else {
+        helper_state::RUNNING
+    }
+}
+
 fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
     field.store(
         ((duration.as_secs_f64() * 1_000.0) as f32).to_bits(),
         Ordering::Relaxed,
     );
 }
+
+/// Exit status when the shared memory holds another protocol version's header.
+const EXIT_SHM_VERSION_SKEW: i32 = 3;
 
 fn main() {
     guard::install();
@@ -154,9 +169,17 @@ fn main() {
         .map(Duration::from_millis)
         .unwrap_or_default();
 
-    let Some(shm) = shm::open() else {
-        neural_forge_helper::log!("[helper] failed to open the shared-memory mapping");
-        return;
+    let shm = match shm::open() {
+        Ok(shm) => shm,
+        Err(shm::OpenError::VersionSkew { .. }) => {
+            // Already logged with both versions. Nothing in the header was touched (its layout is
+            // not ours to write), so the exit status is the only report the supervisor gets.
+            std::process::exit(EXIT_SHM_VERSION_SKEW);
+        }
+        Err(shm::OpenError::Io) => {
+            neural_forge_helper::log!("[helper] failed to open the shared-memory mapping");
+            return;
+        }
     };
     // SAFETY: `shm.header` was just validated by `shm::open`.
     let hdr = unsafe { &*shm.header };
@@ -178,14 +201,12 @@ fn main() {
     neural_forge_helper::logging::flush();
 
     let mut snippet = ngx::load_and_init(instance.handle(), physical_device, device.handle());
-    hdr.helper_state.store(
-        if snippet.disabled {
-            neural_forge_protocol::enums::helper_state::MODEL_FAILED
-        } else {
-            neural_forge_protocol::enums::helper_state::RUNNING
-        },
-        Ordering::Relaxed,
-    );
+    // Why the model never started, kept to restate whenever the header is re-initialised.
+    let startup_note = snippet.take_failure_note();
+    hdr.helper_state.store(model_state(&snippet), Ordering::Relaxed);
+    if let Some(note) = &startup_note {
+        hdr.set_helper_reason(note);
+    }
     neural_forge_helper::log!("[helper] NGX snippet disabled={}", snippet.disabled);
     neural_forge_helper::log!("[mvec] optical flow queue: {flow_status}");
     neural_forge_helper::logging::flush();
@@ -215,14 +236,13 @@ fn main() {
         // Restated every iteration, not once at startup: the layer or the GUI re-initialising the
         // header resets `helper_state` to zero, and a state stated only once stays wrong (reading
         // as stopped) for the rest of the session.
-        hdr.helper_state.store(
-            if snippet.disabled {
-                neural_forge_protocol::enums::helper_state::MODEL_FAILED
-            } else {
-                neural_forge_protocol::enums::helper_state::RUNNING
-            },
-            Ordering::Relaxed,
-        );
+        let state = model_state(&snippet);
+        if hdr.helper_state.swap(state, Ordering::Relaxed) != state {
+            // Re-initialised (or changed): the reason went with it.
+            if let Some(note) = &startup_note {
+                hdr.set_helper_reason(note);
+            }
+        }
         for slot in 0..2 {
             let seq_req = hdr.seq_req_slot(slot).load(Ordering::Acquire);
             if seq_req == last_seq_req[slot] {
@@ -249,12 +269,10 @@ fn main() {
         std::thread::sleep(Duration::from_micros(200));
     }
 
-    // SAFETY: process is tearing down; nothing else can still be submitting work
-    // against `frame_resources`'s handles.
-    for f in frame_resources {
-        if let Some(f) = f {
-            unsafe { f.destroy(&device) };
-        }
+    // The process is tearing down; nothing else can still be submitting work against
+    // `frame_resources`'s handles. A stalled instance is still leaked rather than destroyed.
+    for f in frame_resources.into_iter().flatten() {
+        retire_frame_resources(f, &device);
     }
     // SAFETY: same reasoning -- `estimate`'s own fence wait already drained
     // whatever this session last submitted, and the loop above just stopped.
@@ -399,7 +417,7 @@ fn process_request(
         // `CreateFeature` attempt (see its own doc comment) -- worth surfacing in
         // status immediately rather than leaving `RUNNING` displayed forever after
         // the model is permanently unavailable.
-        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::MODEL_FAILED, Ordering::Relaxed);
+        hdr.helper_state.store(model_state(snippet), Ordering::Relaxed);
     }
     // SAFETY: this helper exclusively owns this slot's request after observing its
     // own `seq_req`; slot 0's and slot 1's regions are disjoint fixed regions in the
@@ -583,7 +601,9 @@ fn find_flow_family(instance: &ash::Instance, pd: vk::PhysicalDevice, enabled_ex
 /// queue and features are only requested then, so with the toggle off device creation
 /// has exactly its pre-optical-flow shape. The last element says why there is or isn't
 /// a flow queue, for the startup log.
-fn create_vulkan_context(want_flow: bool) -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, Option<optical_flow::FlowQueue>, String)> {
+type VulkanContext = (ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, Option<optical_flow::FlowQueue>, String);
+
+fn create_vulkan_context(want_flow: bool) -> Option<VulkanContext> {
     // SAFETY: dynamically loads `vulkan-1.dll` via the `loaded` feature; the usual
     // caveats of loading an arbitrary shared library apply and are accepted here the
     // same way every other `ash` consumer accepts them.

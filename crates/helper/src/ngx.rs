@@ -95,6 +95,9 @@ pub struct NgxSnippet {
     nvapi: *mut c_void,
 
     pub disabled: bool,
+    /// The NGX binaries are missing or unusable (no binaries folder, no `nvngx_dlssnr.dll` in it,
+    /// or a snippet the caller-identity spoof cannot be installed on). Implies `disabled`.
+    pub no_binaries: bool,
 
     /// One NGX feature per pass, in chain order. A slot with a null handle is a hole: a pass
     /// that failed to rebuild and is skipped by the chain until it builds again.
@@ -226,6 +229,7 @@ impl Default for NgxSnippet {
             device: vk::Device::null(),
             nvapi: std::ptr::null_mut(),
             disabled: false,
+            no_binaries: false,
             passes: Vec::new(),
             built_size: (0, 0),
             ceiling: None,
@@ -240,8 +244,8 @@ impl Default for NgxSnippet {
 }
 
 /// # Safety
-/// `module`/`name` must be exactly what [`crate::spoof::find_imported_function_slot`]
-/// and `GetProcAddress` require.
+/// `module` must be a loaded module handle and `F` the function type matching `name`'s real
+/// signature.
 unsafe fn resolve_export<F: Copy>(module: *mut c_void, name: &str) -> Option<F> {
     let c_name = CString::new(name).ok()?;
     // SAFETY: `module` is a valid, loaded module handle (the caller's contract).
@@ -258,15 +262,16 @@ unsafe fn resolve_export<F: Copy>(module: *mut c_void, name: &str) -> Option<F> 
 /// creates Feature 18. Every DLL call is wrapped in [`guarded`] — a fault anywhere in
 /// here latches `disabled` rather than taking the whole helper down with it.
 pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice, device: vk::Device) -> NgxSnippet {
-    let mut s = NgxSnippet::default();
-    s.device = device;
+    let mut s = NgxSnippet { device, ..NgxSnippet::default() };
 
     let Some(bin_dir) = resolve_bin_dir() else {
-        crate::log!("[ngx] NEURAL_FORGE_BIN_DIR not set or nvngx_dlssnr.dll not found there");
-        s.disabled = true;
-        return s;
+        return s.fail_no_binaries("NEURAL_FORGE_BIN_DIR is not set".to_string());
     };
-    let dll_path = utf16(&format!("{bin_dir}\\nvngx_dlssnr.dll"));
+    let dll_file = format!("{bin_dir}\\nvngx_dlssnr.dll");
+    if !std::path::Path::new(&dll_file).is_file() {
+        return s.fail_no_binaries(format!("nvngx_dlssnr.dll not found in {bin_dir}"));
+    }
+    let dll_path = utf16(&dll_file);
     // SAFETY: `dll_path` is a valid NUL-terminated UTF-16 string.
     s.snippet = unsafe {
         LoadLibraryExW(
@@ -276,10 +281,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         )
     };
     if s.snippet.is_null() {
-        crate::log!("[ngx] LoadLibraryExW nvngx_dlssnr.dll failed");
-        crate::logging::flush();
-        s.disabled = true;
-        return s;
+        return s.fail("nvngx_dlssnr.dll failed to load".to_string());
     }
     // SAFETY: `s.snippet` is a just-loaded PE image.
     unsafe { crate::guard::register_module(crate::guard::Module::Snippet, s.snippet) };
@@ -296,12 +298,9 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     }
     if s.create_feature.is_none() || s.evaluate_feature.is_none() || s.release_feature.is_none() || s.shutdown1.is_none()
     {
-        crate::log!("[ngx] snippet Vulkan exports incomplete");
-        crate::logging::flush();
         unsafe { FreeLibrary(s.snippet) };
         s.snippet = std::ptr::null_mut();
-        s.disabled = true;
-        return s;
+        return s.fail("nvngx_dlssnr.dll lacks the NGX Vulkan exports".to_string());
     }
     crate::log!("[ngx] snippet Vulkan exports resolved, installing caller-identity spoof next");
     crate::logging::flush();
@@ -309,10 +308,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     // SAFETY: `s.snippet` is a valid, currently-loaded module.
     s.snippet_spoof = unsafe { spoof::install(s.snippet) };
     if s.snippet_spoof.is_none() {
-        crate::log!("[ngx] failed to install the caller-identity spoof on the snippet");
-        crate::logging::flush();
-        s.disabled = true;
-        return s;
+        return s.fail_no_binaries("could not install the caller-identity spoof on nvngx_dlssnr.dll (unexpected binaries)".to_string());
     }
     crate::log!("[ngx] caller-identity spoof installed, loading core (nvngx.dll) next");
     crate::logging::flush();
@@ -321,37 +317,27 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     // by name finds this copy. When the runner already supplies NVAPI (Proton's DXVK-NVAPI, which
     // the supervisor announces with NEURAL_FORGE_SKIP_NVAPI) it is skipped outright: forcing the
     // vendored copy in bypasses the DXVK-NVAPI override and can fault inside its DllMain. The
-    // load is guarded either way, so a bad nvapi64 degrades to "no NVAPI" instead of taking the
-    // helper down.
+    // load is deliberately not guarded: a fault inside a DllMain leaves the loader lock held, so
+    // jumping out of it would only turn the crash into a deadlock at the next LoadLibrary.
     if skip_nvapi() {
         crate::log!("[ngx] nvapi64.dll load skipped (runner supplies NVAPI)");
     } else {
         let path = utf16(&format!("{bin_dir}\\nvapi64.dll"));
-        let (module, seh) = guarded(
-            || {
-                // SAFETY: `path` is a valid NUL-terminated UTF-16 string.
-                unsafe {
-                    LoadLibraryExW(
-                        path.as_ptr(),
-                        std::ptr::null_mut(),
-                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-                    )
-                }
-            },
-            std::ptr::null_mut(),
-        );
-        s.nvapi = module;
+        // SAFETY: `path` is a valid NUL-terminated UTF-16 string.
+        s.nvapi = unsafe {
+            LoadLibraryExW(path.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+        };
         if s.nvapi.is_null() {
             // Not in the binaries folder: the normal search path, which under system Wine finds the
             // DXVK-NVAPI copy the supervisor installed in the prefix (with its native override).
             let by_name = utf16("nvapi64.dll");
-            let (module, _) = guarded(|| unsafe { LoadLibraryExW(by_name.as_ptr(), std::ptr::null_mut(), 0) }, std::ptr::null_mut());
-            s.nvapi = module;
+            // SAFETY: `by_name` is a valid NUL-terminated UTF-16 string.
+            s.nvapi = unsafe { LoadLibraryExW(by_name.as_ptr(), std::ptr::null_mut(), 0) };
         }
         // SAFETY: a non-null result is a just-loaded PE image (a null one is ignored).
         unsafe { crate::guard::register_module(crate::guard::Module::Nvapi, s.nvapi) };
         if s.nvapi.is_null() {
-            crate::log!("[ngx] nvapi64.dll not loaded (seh={seh:#x}); continuing without it");
+            crate::log!("[ngx] nvapi64.dll not loaded; continuing without it");
         } else {
             crate::log!("[ngx] nvapi64.dll loaded");
         }
@@ -493,42 +479,10 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     };
     s.params = params;
 
-    // Round-trip self-test: set a scratch value through the parameter vtable, then
-    // read it straight back, before this parameter block is used for anything real.
-    // Observed as a real step in a working reference implementation's own log output
-    // (run side by side on this machine, never its source -- see this session's
-    // investigation) right after its own successful AllocateParameters; this crate
-    // never did anything like it. Purely diagnostic for now: logs whether the
-    // written/read values match, doesn't gate anything on the result yet.
-    {
-        let probe_name = CString::new("DLSSNR.SelfTestProbe").unwrap();
-        let (test_result, seh) = guarded(
-            || {
-                // SAFETY: `params` was just validated above as a live, non-null
-                // parameter block from a successful `AllocateParameters`.
-                unsafe {
-                    abi::ngx_set_u32(params, probe_name.as_ptr(), 0x5a5a);
-                    let mut readback: u32 = 0;
-                    let r = abi::ngx_get_u32(params, probe_name.as_ptr(), &mut readback);
-                    (r, readback)
-                }
-            },
-            (abi::result::FAIL_SEH, 0),
-        );
-        crate::log!(
-            "[ngx] params round-trip self-test -> {:#x} seh={:#x} readback={:#x}",
-            test_result.0 as u32,
-            seh,
-            test_result.1
-        );
-        crate::logging::flush();
-    }
+    params_self_test(params);
 
     let Some(init_ext) = s.init_ext else {
-        crate::log!("[ngx] snippet has no VULKAN_Init_Ext export");
-        crate::logging::flush();
-        s.disabled = true;
-        return s;
+        return s.fail("nvngx_dlssnr.dll has no VULKAN_Init_Ext export".to_string());
     };
     crate::log!("[ngx] calling VULKAN_Init_Ext now");
     crate::logging::flush();
@@ -556,63 +510,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     crate::log!("[ngx] VULKAN_Init_Ext -> {:#x} seh={:#x}", init_result as u32, seh);
     crate::logging::flush();
     if !abi::succeeded(init_result) {
-        s.disabled = true;
-        return s;
-    }
-
-    // Experimental: `NVSDK_NGX_VULKAN_GetFeatureRequirements` is a real export in the
-    // DLL (confirmed via `objdump -p`) that nothing here has ever called. Real NGX
-    // integrations call this before `CreateFeature`; skipping it is the leading
-    // hypothesis for why `CreateFeature(18)` at a real size hangs indefinitely inside
-    // the driver (`libnvidia-glcore.so`, confirmed via gdb) rather than returning or
-    // faulting -- plausibly because some internal driver state this call would set up
-    // never gets set up. `abi::FnVkGetFeatureRequirements`'s signature is a guess (no
-    // `FeatureDiscoveryInfo`-shaped input, unlike NVIDIA's real public NGX SDK) since
-    // this is a fictional feature with no spec to check the guess against -- guarded
-    // the same as everything else here, purely to observe what it reports/does
-    // without gating anything on the result yet.
-    if let Some(get_requirements) =
-        unsafe { resolve_export::<abi::FnVkGetFeatureRequirements>(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements") }
-    {
-        let ((req_result, reqs), seh) = guarded(
-            || {
-                let mut reqs = abi::NgxFeatureRequirements {
-                    version: abi::NgxSdkVersion { major: 0, minor: 0 },
-                    feature_flags: 0,
-                    min_gpu_mode: 0,
-                    in_gpu_mode: 0,
-                    min_cs_major_version: 0,
-                    min_cs_minor_version: 0,
-                };
-                // SAFETY: `get_requirements` resolved above from the live snippet
-                // module; `instance`/`physical_device` are the caller's own, live
-                // handles; `&mut reqs` is a valid out-pointer for the call's duration.
-                let r = unsafe { get_requirements(instance, physical_device, &mut reqs) };
-                (r, reqs)
-            },
-            (abi::result::FAIL_SEH, abi::NgxFeatureRequirements {
-                version: abi::NgxSdkVersion { major: 0, minor: 0 },
-                feature_flags: 0,
-                min_gpu_mode: 0,
-                in_gpu_mode: 0,
-                min_cs_major_version: 0,
-                min_cs_minor_version: 0,
-            }),
-        );
-        crate::log!(
-            "[ngx] GetFeatureRequirements -> {:#x} seh={:#x} version={}.{} flags={:#x} min_gpu_mode={} in_gpu_mode={} min_cs={}.{}",
-            req_result as u32,
-            seh,
-            reqs.version.major,
-            reqs.version.minor,
-            reqs.feature_flags,
-            reqs.min_gpu_mode,
-            reqs.in_gpu_mode,
-            reqs.min_cs_major_version,
-            reqs.min_cs_minor_version
-        );
-    } else {
-        crate::log!("[ngx] snippet has no VULKAN_GetFeatureRequirements export");
+        return s.fail(format!("VULKAN_Init_Ext failed ({:#x}, seh={seh:#x})", init_result as u32));
     }
 
     // Feature creation is deferred to `maintain_feature`, called once the per-frame
@@ -621,7 +519,64 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     s
 }
 
+/// Round-trip self-test: sets scratch values of every type the helper writes through the
+/// parameter vtable, then reads each straight back, before the block is used for anything real.
+/// u32 alone passed under every candidate slot layout; f32, u64 and i32 only pass when the Set
+/// and Get halves of the table sit where the DLL's own object has them. Diagnostic: logged, not
+/// gated on.
+fn params_self_test(params: NgxParameter) {
+    let name = CString::new("DLSSNR.SelfTestProbe").unwrap();
+    let n = name.as_ptr();
+    let (results, seh) = guarded(
+        || {
+            // SAFETY: `params` is a live parameter block (a successful `AllocateParameters`, or
+            // our own object); `n` is a NUL-terminated string that outlives every call.
+            unsafe {
+                let mut u = 0u32;
+                abi::ngx_set_u32(params, n, 0x5a5a);
+                let ru = abi::ngx_get_u32(params, n, &mut u);
+                let mut f = 0f32;
+                abi::ngx_set_f32(params, n, 0.625);
+                let rf = abi::ngx_get_f32(params, n, &mut f);
+                let mut q = 0u64;
+                abi::ngx_set_u64(params, n, 0x1234_5678_9abc);
+                let rq = abi::ngx_get_u64(params, n, &mut q);
+                let mut i = 0i32;
+                abi::ngx_set_i32(params, n, -42);
+                let ri = abi::ngx_get_i32(params, n, &mut i);
+                [
+                    ("u32", ru, abi::succeeded(ru) && u == 0x5a5a),
+                    ("f32", rf, abi::succeeded(rf) && f == 0.625),
+                    ("u64", rq, abi::succeeded(rq) && q == 0x1234_5678_9abc),
+                    ("i32", ri, abi::succeeded(ri) && i == -42),
+                ]
+            }
+        },
+        [("u32", abi::result::FAIL_SEH, false), ("f32", abi::result::FAIL_SEH, false), ("u64", abi::result::FAIL_SEH, false), ("i32", abi::result::FAIL_SEH, false)],
+    );
+    let summary: Vec<String> = results.iter().map(|(t, r, ok)| format!("{t}={}({:#x})", if *ok { "ok" } else { "FAIL" }, *r as u32)).collect();
+    let all = seh == 0 && results.iter().all(|r| r.2);
+    crate::log!("[ngx] params round-trip self-test: {} seh={seh:#x} -> {}", summary.join(" "), if all { "PASS" } else { "FAIL" });
+    crate::logging::flush();
+}
+
 impl NgxSnippet {
+    /// Ends `load_and_init` with the model off for the session and `note` as the reason.
+    fn fail(mut self, note: String) -> Self {
+        crate::log!("[ngx] {note}");
+        crate::logging::flush();
+        self.failure_note = Some(note);
+        self.disabled = true;
+        self
+    }
+
+    /// [`Self::fail`], reported as missing binaries rather than a model failure.
+    fn fail_no_binaries(self, note: String) -> Self {
+        let mut s = self.fail(note);
+        s.no_binaries = true;
+        s
+    }
+
     pub fn evaluate_feature_fn(&self) -> Option<abi::FnVkEvaluateFeature> {
         self.evaluate_feature
     }
@@ -663,7 +618,7 @@ impl NgxSnippet {
 }
 
 fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32, tuning: &NgxTuning) -> Option<abi::NgxHandle> {
-    let Some(create_feature) = s.create_feature else { return None };
+    let create_feature = s.create_feature?;
     let name = |n: &str| CString::new(n).unwrap();
     let params = s.params;
     // Guarded like every other real call into the DLL below: `params`'s vtable is a
@@ -918,6 +873,16 @@ pub fn maintain_passes(
     if s.disabled {
         return 0;
     }
+    if let Some(code) = crate::guard::faulted() {
+        // Every DLL call is refused from here on (see `guard`'s module doc): the model is gone
+        // for this session, not merely unbuilt at this size.
+        crate::log!("[ngx] a call into NGX faulted ({code:#x}); the model is off for this session");
+        crate::logging::flush();
+        s.failure_note = Some(format!("a call into NGX faulted ({code:#x}); restart the helper"));
+        s.passes.clear();
+        s.disabled = true;
+        return 0;
+    }
     if width < MIN_FEATURE_DIM || height < MIN_FEATURE_DIM {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1059,7 +1024,21 @@ pub fn maintain_passes(
 /// Release the feature, shut down the snippet, restore the caller-identity spoof, and
 /// unload both modules — in that order, matching upstream's verified teardown
 /// sequence.
+///
+/// After a caught fault ([`crate::guard::faulted`]) nothing here calls into or unloads any
+/// NVIDIA module: the faulting call may have left their locks held, so a release, a shutdown
+/// or a `DllMain` detach could hang. The process is exiting anyway; only our own parameter
+/// object is freed.
 pub fn teardown(mut s: NgxSnippet) {
+    if let Some(code) = crate::guard::faulted() {
+        crate::log!("[ngx] teardown skipped after a caught fault ({code:#x}); leaving every NVIDIA module as it is");
+        if s.self_params && !s.params.is_null() {
+            // SAFETY: allocated by `selfparam::allocate` and never destroyed since. Nothing in the
+            // DLLs runs again, so nothing can still read it.
+            unsafe { selfparam::destroy(s.params) };
+        }
+        return;
+    }
     release_all(&mut s);
     if let Some(shutdown1) = s.shutdown1 {
         let device = s.device;
