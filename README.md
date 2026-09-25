@@ -211,8 +211,13 @@ managed prefix, the logs and `/tmp/neural-forge-$UID`.
 - **Steam overlay crashes or misbehaves:** the overlay has its own small swapchain, which the
   layer leaves alone; if a game still conflicts, set `NEURAL_FORGE_TARGET_EXE` to the game's
   executable.
-- **Smooth Motion (`VK_LAYER_NV_present`):** the layer must run before it. If they conflict, set
-  `VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present` for that game.
+- **Frame generation (Smooth Motion `VK_LAYER_NV_present`, lsfg-vk
+  `VK_LAYER_LSFGVK_frame_generation`):** the layer must run before the generator, so that
+  generated frames carry the effect and the model only runs on real frames. The Vulkan loader
+  does not order implicit layers, and both generators were measured landing above this layer.
+  Always set the order in the game's launch options, e.g.
+  `VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present`. See
+  `docs/FRAMEGEN_SPIKE.md`.
 - **Steam Linux Runtime / pressure-vessel:** the game must see `/tmp/neural-forge-$UID`. If it
   does not, add `PRESSURE_VESSEL_FILESYSTEMS_RW=/tmp/neural-forge-$UID` to the launch options.
 - **32-bit games:** a separate 32-bit layer ships (`VK_LAYER_neuralforge_neural_32`, same
