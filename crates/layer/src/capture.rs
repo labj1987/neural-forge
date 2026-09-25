@@ -420,7 +420,7 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
     // SAFETY: `buffer` was just created and is not yet bound to memory.
     let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
     // SAFETY: `physical_device` is the device this capture serves; `instance` is its
-    // owning instance (stored once at `vkCreateInstance`, see `crate::CURRENT_INSTANCE`).
+    // owning instance (recorded per physical device, see `crate::PHYSICAL_DEVICE_INSTANCES`).
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
     // This buffer is written by the GPU and then *read back by the CPU* on the game's
     // own present thread every capture -- see `pick_readback_memory_type`'s own doc
