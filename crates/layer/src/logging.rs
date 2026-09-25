@@ -64,7 +64,7 @@ fn sink() -> &'static Mutex<Sink> {
 pub fn log(args: Arguments<'_>) {
     let Ok(mut sink) = sink().lock() else { return };
     let _ = writeln!(sink, "[neural-forge-layer] {args}");
-    if FLUSH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 64 == 0 {
+    if FLUSH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(64) {
         let _ = sink.flush();
     }
 }

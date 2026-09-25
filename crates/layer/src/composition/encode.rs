@@ -180,8 +180,8 @@ pub fn compare_to_reference(
     let mut max_delta = 0u8;
     let mut total = 0u64;
     let mut channels = 0usize;
-    for (frame, got) in original_rgba.chunks_exact(4).zip(proxy_rgba.chunks_exact(4)) {
-        let want = reference_encode_pixel([frame[0], frame[1], frame[2], frame[3]], bgr_order, white_point, mode);
+    for (frame, got) in original_rgba.as_chunks::<4>().0.iter().zip(proxy_rgba.as_chunks::<4>().0) {
+        let want = reference_encode_pixel(*frame, bgr_order, white_point, mode);
         // Alpha is carried through untouched by both paths, so only colour is compared.
         for i in 0..3 {
             let delta = want[i].abs_diff(got[i]);

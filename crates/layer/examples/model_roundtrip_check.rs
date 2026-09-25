@@ -32,14 +32,14 @@ fn main() {
         for frame in 0..2 {
             let mut input=pixels.clone();
             if frame==1 {for y in 0..h {for x in 8..w {let dst=((y*w+x)*4) as usize;input[dst..dst+4].copy_from_slice(&pixels[dst-32..dst-28]);}}}
-            if format==proxy_format::BGRA8 {for p in input.chunks_exact_mut(4) {p.swap(0,2);}}
+            if format==proxy_format::BGRA8 {for p in input.as_chunks_mut::<4>().0 {p.swap(0,2);}}
             file.write_all_at(&input,neural_forge_protocol::proxy_offset() as u64).unwrap();
             hdr.width.store(w,Ordering::Relaxed);hdr.height.store(h,Ordering::Relaxed);hdr.proxy_format.store(format,Ordering::Relaxed);
             let req=hdr.seq_req.load(Ordering::Relaxed)+1;let start=Instant::now();hdr.seq_req.store(req,Ordering::Release);
             while hdr.seq_resp.load(Ordering::Acquire)!=req {assert!(start.elapsed()<Duration::from_secs(30),"request timed out");std::thread::sleep(Duration::from_millis(2));}
             assert_eq!(hdr.model_up.load(Ordering::Relaxed),1,"model not available");
             let mut answer=vec![0u8;input.len()];file.read_exact_at(&mut answer,neural_forge_protocol::answer_offset() as u64).unwrap();
-            if format==proxy_format::BGRA8 {for p in answer.chunks_exact_mut(4) {p.swap(0,2);}}
+            if format==proxy_format::BGRA8 {for p in answer.as_chunks_mut::<4>().0 {p.swap(0,2);}}
             println!("format={format} frame={frame} response={:?}",start.elapsed());
             save(&out.join(format!("output-{i}-{frame}.png")),&answer,w,h);
             if frame==0 {outputs.push(answer);}

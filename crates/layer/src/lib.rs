@@ -261,7 +261,7 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
         let create_instance: vk::PFN_vkCreateInstance = match create_instance {
             // SAFETY: a non-null `vkGetInstanceProcAddr(NULL, "vkCreateInstance")` result
             // is guaranteed by the Vulkan spec to have this exact signature.
-            Some(fp) => unsafe { std::mem::transmute(fp) },
+            Some(fp) => unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateInstance>(fp) },
             None => return LayerResult::Handled(Err(vk::Result::ERROR_INITIALIZATION_FAILED)),
         };
         let allocator = allocator.map_or(std::ptr::null(), |allocator| allocator as *const _);
@@ -381,7 +381,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         } {
             // SAFETY: a non-null `vkGetInstanceProcAddr(instance, "vkCreateDevice")`
             // result is guaranteed by the Vulkan spec to have this exact signature.
-            Some(f) => unsafe { std::mem::transmute(f) },
+            Some(f) => unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateDevice>(f) },
             None => return LayerResult::Unhandled,
         };
         let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);

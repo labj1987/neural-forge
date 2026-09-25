@@ -1065,7 +1065,7 @@ pub fn take_setup_failure() -> bool {
 /// Same contract as [`run_sync`]: `queue` must be the same queue `image`'s
 /// presentation was requested on, with no concurrent use of it from another thread
 /// for the duration of this call.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub unsafe fn run(
     device: &ash::Device,
     instance: &ash::Instance,
@@ -1137,11 +1137,11 @@ pub unsafe fn run(
             shm.proxy_region(slot).is_some_and(|(ptr, capacity)| {
                 min_imported_host_pointer_alignment(instance, physical_device).is_some_and(|alignment| {
                     let alignment = alignment as usize;
-                    alignment != 0 && (ptr as usize) % alignment == 0 && capacity % alignment == 0
+                    alignment != 0 && (ptr as usize).is_multiple_of(alignment) && capacity.is_multiple_of(alignment)
                 })
             })
         });
-    let Some(settings) = shm.composition_settings() else { return None };
+    let settings = shm.composition_settings()?;
     // A pending `capture_request` (a real PNG dump to disk) needs *this* frame's own original
     // and answer read back onto the CPU -- same-frame correctness matters more than throughput
     // for a rare, deliberately-triggered one-shot dump, not the normal per-frame path this
@@ -1285,7 +1285,7 @@ pub unsafe fn run(
         shm.answer_region(0).and_then(|(ptr, capacity)| {
             let alignment = min_imported_host_pointer_alignment(instance, physical_device)?;
             let bytes = frame_bytes.div_ceil(alignment) * alignment;
-            ((ptr as u64) % alignment == 0 && bytes <= capacity as u64).then_some((ptr, bytes))
+            ((ptr as u64).is_multiple_of(alignment) && bytes <= capacity as u64).then_some((ptr, bytes))
         })
     } else {
         None
@@ -1325,27 +1325,25 @@ pub unsafe fn run(
             // reads `answer_dims` unless `have_answer` is `true`, at which point it was
             // always actually set from the branch just below.
             let mut answer_dims = (width, height);
-            if shm.has_pending_request(slot) {
-                if shm.poll_async_request(slot) == Some(true) {
-                    // The answer comes back at whatever resolution *this outstanding
-                    // request* was actually sent at (`inflight[slot].proxy_dims`), not
-                    // necessarily this frame's own `(width, height)` -- see
-                    // `Inflight::proxy_dims`'s own doc comment. Falls back to the
-                    // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
-                    // possibility before `working_scale` existed.
-                    answer_dims = inflight[slot].proxy_dims.unwrap_or((width, height));
-                    let (aw, ah) = answer_dims;
-                    let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
-                    answer_scratch.resize(answer_bytes, 0);
-                    shm.read_answer(slot, answer_scratch);
-                    // Preserve the exact game frame supplied to the model before the next
-                    // request replaces `inflight[slot].original`; the temporal GPU path
-                    // uses it to carry only the model's enhancement delta onto current
-                    // frames.
-                    raw_answer_base.clear();
-                    raw_answer_base.extend_from_slice(&inflight[slot].original);
-                    have_answer = true;
-                }
+            if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(true) {
+                // The answer comes back at whatever resolution *this outstanding
+                // request* was actually sent at (`inflight[slot].proxy_dims`), not
+                // necessarily this frame's own `(width, height)` -- see
+                // `Inflight::proxy_dims`'s own doc comment. Falls back to the
+                // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
+                // possibility before `working_scale` existed.
+                answer_dims = inflight[slot].proxy_dims.unwrap_or((width, height));
+                let (aw, ah) = answer_dims;
+                let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
+                answer_scratch.resize(answer_bytes, 0);
+                shm.read_answer(slot, answer_scratch);
+                // Preserve the exact game frame supplied to the model before the next
+                // request replaces `inflight[slot].original`; the temporal GPU path
+                // uses it to carry only the model's enhancement delta onto current
+                // frames.
+                raw_answer_base.clear();
+                raw_answer_base.extend_from_slice(&inflight[slot].original);
+                have_answer = true;
             }
 
             // Non-blocking capture (`docs/ASYNC_CAPTURE_DESIGN.md`, `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`):
@@ -1449,7 +1447,7 @@ pub unsafe fn run(
         // An answer to carry is either the CPU pair or, after a zero-copy present, the GPU's.
         let answer_held = !last_answer.is_empty() || gpu_compose.as_ref().is_some_and(|gpu| gpu.holds_generation(*raw_answer_generation));
         let carry = settings.model_interval > 1
-            && present_no % u64::from(settings.model_interval) != 0
+            && !present_no.is_multiple_of(u64::from(settings.model_interval))
             && !settings.hold_frame
             && answer_held
             && inflight[SLOT].dims == Some((width, height, proxy_format));
@@ -1558,7 +1556,7 @@ pub unsafe fn run(
             // so the GUI can show it; only used when the source is Measured.
             {
                 static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if !holding && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
+                if !holding && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(8) {
                     let frame: &[u8] = if zero_copy {
                         // Zero-copy leaves `original_scratch` empty; the same frame is in the proxy
                         // region. SAFETY: the capture that wrote it was just seen complete (its fence,
@@ -2022,8 +2020,14 @@ struct PipelineSlot {
     /// `buf.cmd`/`buf.buffer`/`buf.memory`/`model` while this is `Some` -- the exact
     /// invariant whose violation caused the 2026-09-12 UB regression documented in
     /// this project's history (`docs/history/development-before-neuralforge.md`).
-    pending: Option<(u32, u32, u32, Option<(u32, u32)>, std::time::Instant)>,
+    pending: Option<PendingCapture>,
 }
+
+/// A submitted pipeline capture: `(width, height, proxy_format, model_dims, submitted_at)`.
+type PendingCapture = (u32, u32, u32, Option<(u32, u32)>, std::time::Instant);
+
+/// A completed pipeline capture's own `(width, height, proxy_format, submitted_at)`.
+type CompletedCapture = (u32, u32, u32, std::time::Instant);
 
 /// Builds both slots if `existing` is `None`; rebuilds both (same capacity/queue-
 /// family-change trigger as [`ensure`]) if either is undersized or the queue family
@@ -2138,7 +2142,7 @@ fn poll_pipeline_capture(
     device: &ash::Device,
     out: &mut Vec<u8>,
     out_model: &mut Vec<u8>,
-) -> (Option<(u32, u32, u32, std::time::Instant)>, Option<(u32, u32)>) {
+) -> (Option<CompletedCapture>, Option<(u32, u32)>) {
     let slot = &mut pipeline.slots[slot];
     let Some((width, height, proxy_format, model_dims, submitted)) = slot.pending else { return (None, None) };
     // SAFETY: `slot.buf.fence` belongs to this slot; a status query never touches
@@ -3020,7 +3024,7 @@ unsafe fn run_sync(
         // still a live mapping of at least `frame_bytes` bytes, and stage 2 below
         // hasn't started overwriting it yet.
         let current = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
-        crate::dump::write_pair(&original, current, width, height, bgr_order);
+        crate::dump::write_pair(original, current, width, height, bgr_order);
     }
 
     // Stage 2: staging buffer (now holding the answer, if there was one -- otherwise

@@ -1683,6 +1683,7 @@ impl GpuCompose {
     /// helper produces a newer generation.  The normal compose path remains for
     /// callers that need its math; this path is for the held-answer presentation
     /// policy in `capture::run`.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_cached_raw_async(
         &mut self,
         device: &ash::Device,

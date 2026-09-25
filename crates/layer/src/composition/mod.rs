@@ -12,6 +12,10 @@
 #![allow(dead_code)]
 
 pub mod apply;
+// The colour matrices are the published constants digit for digit (and match the GLSL twins in
+// `compose.comp`), more digits than an f32 holds. Kept as published so they can be checked
+// against their sources at a glance; the compiler rounds them the same way either way.
+#[allow(clippy::excessive_precision)]
 pub mod color;
 pub mod downscale;
 pub mod encode;

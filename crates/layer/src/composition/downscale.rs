@@ -226,8 +226,8 @@ pub fn resample_rgba8(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
             let mut acc = [0f32; 4];
             for (t, &w) in weights.iter().enumerate() {
                 let sx = first + t as i32;
-                for c in 0..4 {
-                    acc[c] += get(sx, y, c) * w;
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a += get(sx, y, c) * w;
                 }
             }
             let out_idx = (y as usize * dst_w as usize + x) * 4;
@@ -251,8 +251,8 @@ pub fn resample_rgba8(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32
             let mut acc = [0f32; 4];
             for (t, &w) in weights.iter().enumerate() {
                 let sy = first + t as i32;
-                for c in 0..4 {
-                    acc[c] += mid_get(x, sy, c) * w;
+                for (c, a) in acc.iter_mut().enumerate() {
+                    *a += mid_get(x, sy, c) * w;
                 }
             }
             let out_idx = (y * dst_w as usize + x) * 4;
