@@ -45,9 +45,11 @@ New `ShmHeader` fields (appended at the end, like every prior addition — see t
 struct's own layout comment): `seq_req_b`, `seq_resp_b`, `width_b`, `height_b`,
 `proxy_format_b`. New memory regions: `proxy_b_offset()`, `answer_b_offset()`,
 each `MAX_FRAME` bytes, appended after the existing motion region. `SHM_VERSION`
-bumped to 3 -- a mismatched-version mapping is rejected and reinitialized by both
-sides' existing `is_valid()`/`open()` contract, so this is a clean break, not a
-migration; both processes always ship from the same build.
+bumped to 3 -- a clean break, not a migration; both processes always ship from the
+same build. A mapping laid out by another version is refused, not reinitialized: the
+GUI, CLI and helper report the mismatch (`OpenError::WrongVersion`) and leave the header
+alone, since rewriting it would pull it out from under the process still using it. Only
+a file without the magic is initialized.
 
 **Not duplicated**, deliberately:
 

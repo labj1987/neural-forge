@@ -154,12 +154,9 @@ fn cmd_profile(args: &[String]) -> ExitCode {
 
 fn default_config() -> Config {
     let mut cfg = Config::default();
-    if let Some(proton) = neural_forge_supervisor::runners::best_proton() {
-        cfg.runner_type = "proton".to_string();
-        cfg.runner_path = proton.path.to_string_lossy().into_owned();
-    } else if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
-        cfg.runner_type = "wine".to_string();
-        cfg.runner_path = wine.to_string_lossy().into_owned();
+    if let Some((runner_type, path)) = neural_forge_supervisor::runners::default_runner() {
+        cfg.runner_type = runner_type.to_string();
+        cfg.runner_path = path.to_string_lossy().into_owned();
     } else {
         cfg.runner_type = "custom".to_string();
     }

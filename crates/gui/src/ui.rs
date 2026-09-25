@@ -126,11 +126,34 @@ fn evdev_keycode(hardware: u32) -> Option<u32> {
     hardware.checked_sub(8).filter(|&code| code > 0 && code <= 767)
 }
 
+/// The key's name on the current keyboard layout ("F11", "Scroll_Lock", "A") for an evdev
+/// code, falling back to the bare code when there is no display or no mapping.
+fn key_label(code: u32) -> String {
+    if code == 0 {
+        return "Unbound".to_owned();
+    }
+    let name = gtk4::gdk::Display::default()
+        .and_then(|display| display.map_keycode(code + 8))
+        // Prefer group 0, level 0 (the unshifted key); otherwise whatever came first.
+        .and_then(|entries| entries.iter().find(|(k, _)| k.group() == 0 && k.level() == 0).or(entries.first()).map(|(_, key)| *key))
+        .and_then(|key| key.name())
+        .map(|name| name.to_string());
+    format_key_label(code, name.as_deref())
+}
+
+fn format_key_label(code: u32, name: Option<&str>) -> String {
+    match name {
+        Some(name) if name.chars().count() == 1 => name.to_uppercase(),
+        Some(name) if !name.is_empty() => name.to_owned(),
+        _ => format!("Key {code}"),
+    }
+}
+
 fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
-    let _ = crate::shm::take_pending_reader();
+    let reader = crate::shm::take_pending_reader();
     let row = adw::ActionRow::builder().title("Toggle key")
         .subtitle("Toggles Neural Forge inside a running game. Needs read access to /dev/input (the 'input' group) or an X11/XWayland session.").build();
-    let label = |code| if code == 0 { "Unbound".to_owned() } else { format!("Key {code}") };
+    let label = key_label;
     let button = gtk4::Button::with_label(&label(initial));
     button.set_valign(gtk4::Align::Center);
     let clear = gtk4::Button::with_label("Clear");
@@ -179,6 +202,8 @@ fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
     }
     {
         let button = button.clone();
+        let capturing = capturing.clone();
+        let value = value.clone();
         clear.connect_clicked(move |_| {
             capturing.set(false);
             value.set(0);
@@ -187,15 +212,30 @@ fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
         });
     }
     button.add_controller(controller);
+    // Follow the header, so Reset, a loaded profile or `shmctl` shows up here too.
+    if let Some((_, read)) = reader {
+        let button = button.downgrade();
+        register_refresher(move || {
+            let Some(button) = button.upgrade() else { return };
+            let code = read();
+            if !capturing.get() && value.get() != code {
+                value.set(code);
+                button.set_label(&label(code));
+            }
+        });
+    }
     row.add_suffix(&button);
     row.add_suffix(&clear);
     row
 }
 
 pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
-    let Some(shm) = Shm::open() else {
-        build_error_window(app);
-        return;
+    let shm = match Shm::open() {
+        Ok(shm) => shm,
+        Err(e) => {
+            build_error_window(app, &e);
+            return;
+        }
     };
     let shm = shm.0;
 
@@ -336,10 +376,18 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     debug_assert_eq!(reversible_mode::KNEE, 0);
 
     let (hdr_mode, set_hdr_mode) = bind_u32(&shm, Some("hdr_mode"), |h| &h.hdr_mode);
-    comp_group.add(&combo_row("HDR input", &["Auto", "Off", "Force float16"], hdr_mode, set_hdr_mode));
+    let hdr_row = combo_row("HDR input", &["Auto", "Off", "Force float16"], hdr_mode, set_hdr_mode);
+    // Neither the layer nor the helper reads `hdr_mode` or `colour_mode` yet. Kept, like the
+    // supersampling filter, so the saved value round-trips.
+    hdr_row.set_subtitle("Unavailable: not used by the layer or helper yet");
+    hdr_row.set_sensitive(false);
+    comp_group.add(&hdr_row);
 
     let (colour_mode, set_colour_mode) = bind_u32(&shm, Some("colour_mode"), |h| &h.colour_mode);
-    comp_group.add(&combo_row("Colour mode", &["Auto", "Force display-referred", "Force linear HDR"], colour_mode, set_colour_mode));
+    let colour_mode_row = combo_row("Colour mode", &["Auto", "Force display-referred", "Force linear HDR"], colour_mode, set_colour_mode);
+    colour_mode_row.set_subtitle("Unavailable: not used by the layer or helper yet");
+    colour_mode_row.set_sensitive(false);
+    comp_group.add(&colour_mode_row);
     debug_assert_eq!(colour_mode::AUTO, 0);
 
     let hdr_group = adw::PreferencesGroup::new();
@@ -483,12 +531,16 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // and (like AdwPreferencesGroup::title) are Pango markup, so no bare "&" either.
     view_stack.add_titled_with_icon(&debug_page, Some("debug"), "Debug", "edit-find-symbolic");
 
+    // Built before the Status group: on a first run the Setup page saves the default runner,
+    // which the helper auto-start depends on.
+    let setup_page = build_setup_page(&toasts);
+
     let status_page = adw::PreferencesPage::new();
     status_page.add(&build_telemetry_group(&shm));
-    status_page.add(&build_status_group(&shm, &toasts));
+    let (status_group, start_stop_button) = build_status_group(&shm, &toasts);
+    status_page.add(&status_group);
     view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", "network-transmit-receive-symbolic");
 
-    let setup_page = build_setup_page(&toasts);
     view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", "preferences-system-symbolic");
 
     // First-run flow: `nvngx_dlssnr.dll` missing means neural rendering can't work at
@@ -635,15 +687,68 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     }
 
     window.present();
+
+    // Auto-start the helper when neural rendering is already enabled and it isn't running,
+    // instead of leaving that to an easy-to-miss manual Start click: `enabled=1` with no
+    // helper makes the layer pay per-frame capture overhead chasing a helper that never
+    // answers (found 2026-09-16 after a reboot). Queued for after the window is up, and
+    // run off the main thread by `start_helper`, so a slow first System Wine start
+    // (wineboot, a DXVK download) never keeps the window from appearing.
+    if shm.header().enabled.load(Ordering::Relaxed) != 0 {
+        let toasts = toasts.clone();
+        glib::idle_add_local_once(move || {
+            if neural_forge_supervisor::is_running().is_none() && start_stop_button.is_sensitive() {
+                start_helper(&start_stop_button, &toasts, true);
+            }
+        });
+    }
 }
 
-/// A read-only status group, refreshed on a timer -- helper/layer liveness, frame
-/// counts. Nothing here is a setting; it only ever reads.
-///
-/// The one exception is the "NGX binaries" row's Import button: unlike everything
-/// else here, it's an action, not a live readout, because it's the only place besides
-/// `neural-forge-cli import-binaries` to get NVIDIA's DLLs into `binaries_dir()` -- there's
-/// no separate menu for it.
+/// Pid of the helper this GUI instance started, 0 if none. Closing the window stops only
+/// this one: a helper started by `neural-forge-cli start` or an earlier session keeps
+/// running, so closing the settings mid-game doesn't drop the effect.
+pub static STARTED_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+
+/// Starts the helper on a worker thread. `supervisor::start` can take a while (for the
+/// System Wine runner it runs `wineboot --init` and may download DXVK), so doing it on
+/// the main thread froze the window. The button stays insensitive until the result is
+/// back, which the one-second status timer relies on.
+fn start_helper(button: &gtk4::Button, toasts: &adw::ToastOverlay, auto: bool) {
+    button.set_sensitive(false);
+    button.set_label("Starting…");
+    let wine = neural_forge_supervisor::Config::load().runner_type == "wine";
+    let progress = adw::Toast::builder()
+        .title(if wine {
+            "Starting the helper -- preparing the Wine prefix, which can take a minute the first time"
+        } else {
+            "Starting the helper…"
+        })
+        .timeout(0)
+        .build();
+    toasts.add_toast(progress.clone());
+    let button = button.clone();
+    let toasts = toasts.clone();
+    glib::spawn_future_local(async move {
+        let result = gio::spawn_blocking(|| {
+            let cfg = neural_forge_supervisor::Config::load();
+            neural_forge_supervisor::start(&cfg).map(|started| started.pid).map_err(|e| e.to_string())
+        })
+        .await;
+        progress.dismiss();
+        let message = match result {
+            Ok(Ok(pid)) => {
+                STARTED_PID.store(pid, Ordering::Relaxed);
+                if auto { format!("Helper auto-started (pid {pid})") } else { format!("Helper started (pid {pid})") }
+            }
+            Ok(Err(e)) if auto => format!("Neural rendering is on, but the helper failed to auto-start: {e}"),
+            Ok(Err(e)) => format!("Start failed: {e}"),
+            Err(_) => "Start failed: the start worker panicked".to_string(),
+        };
+        toasts.add_toast(adw::Toast::new(&message));
+        button.set_label(if neural_forge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
+        button.set_sensitive(true);
+    });
+}
 
 /// One per-pass field in the per-pass dialog.
 struct PassField {
@@ -827,6 +932,33 @@ fn refresh_profile_combo(combo: &adw::ComboRow) {
     }
 }
 
+/// Asks for a folder and imports the NGX DLLs from it on a worker thread (the DLLs are
+/// hundreds of megabytes). `on_imported` runs on the main thread after a successful
+/// import, to refresh whatever status the caller shows.
+fn import_ngx_binaries(button: &gtk4::Button, toasts: &adw::ToastOverlay, on_imported: impl Fn() + 'static) {
+    let toasts = toasts.clone();
+    let parent = button.root().and_downcast::<gtk4::Window>();
+    let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
+    dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+        let Ok(folder) = result else { return };
+        let Some(path) = folder.path() else {
+            toasts.add_toast(adw::Toast::new("That folder has no local path -- choose a folder on this computer"));
+            return;
+        };
+        glib::spawn_future_local(async move {
+            match gio::spawn_blocking(move || crate::binaries::import_from(&path)).await {
+                Ok(Ok(0)) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
+                Ok(Ok(n)) => {
+                    toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
+                    on_imported();
+                }
+                Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
+                Err(_) => toasts.add_toast(adw::Toast::new("Import failed: the import worker panicked")),
+            }
+        });
+    });
+}
+
 fn build_ngx_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("NVIDIA NGX binaries");
@@ -855,24 +987,12 @@ fn build_ngx_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     {
         let toasts = toasts.clone();
         import_button.connect_clicked(move |button| {
-            let toasts = toasts.clone();
             let status_rows = status_rows.clone();
-            let parent = button.root().and_downcast::<gtk4::Window>();
-            let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
-            dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
-                let Ok(folder) = result else { return };
-                let Some(path) = folder.path() else { return };
-                match crate::binaries::import_from(&path) {
-                    Ok(0) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
-                    Ok(n) => {
-                        toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
-                        for (name, row, icon) in &status_rows {
-                            let present = crate::binaries::dir().join(name).is_file();
-                            row.set_subtitle(if present { "present" } else { "missing" });
-                            icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
-                        }
-                    }
-                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
+            import_ngx_binaries(button, &toasts, move || {
+                for (name, row, icon) in &status_rows {
+                    let present = crate::binaries::dir().join(name).is_file();
+                    row.set_subtitle(if present { "present" } else { "missing" });
+                    icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
                 }
             });
         });
@@ -901,7 +1021,18 @@ fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
         combo.set_model(Some(&gtk4::StringList::new(&["No compatibility tool found"])));
         combo.set_sensitive(false);
     } else {
-        let cfg = neural_forge_supervisor::Config::load();
+        let mut cfg = neural_forge_supervisor::Config::load();
+        // First run: nothing is configured yet, so save the runner `neural-forge-cli init`
+        // would pick. Showing it selected without saving it left the helper with no runner.
+        if cfg.runner_path.is_empty() {
+            if let Some((runner_type, path)) = neural_forge_supervisor::runners::default_runner() {
+                cfg.runner_type = runner_type.to_string();
+                cfg.runner_path = path.to_string_lossy().into_owned();
+                if let Err(e) = cfg.save() {
+                    toasts.add_toast(adw::Toast::new(&format!("Failed to save the runner: {e}")));
+                }
+            }
+        }
         let names: Vec<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
         combo.set_model(Some(&gtk4::StringList::new(&names)));
         let selected = options.iter().position(|(_, path)| *path == cfg.runner_path).unwrap_or(0);
@@ -1184,8 +1315,8 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
             (false, true) => game,
         });
 
-        let helper_frames = (u64::from(hdr.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(hdr.helper_frames_lo.load(Ordering::Relaxed));
-        let layer_frames = (u64::from(hdr.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(hdr.layer_frames_lo.load(Ordering::Relaxed));
+        let helper_frames = neural_forge_protocol::load64(&hdr.helper_frames_lo, &hdr.helper_frames_hi);
+        let layer_frames = neural_forge_protocol::load64(&hdr.layer_frames_lo, &hdr.layer_frames_hi);
         let per_second = 1000.0 / f64::from(TELEMETRY_INTERVAL_MS);
         let helper_fps = last_helper_frames.map(|prev| (helper_frames.saturating_sub(prev)) as f64 * per_second);
         let layer_fps = last_layer_frames.map(|prev| (layer_frames.saturating_sub(prev)) as f64 * per_second);
@@ -1218,7 +1349,10 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     group
 }
 
-fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+/// The Status group -- helper/layer liveness refreshed on a timer, plus the helper
+/// Start/Stop, NGX import, reset and profile actions -- and its Start/Stop button (for
+/// the launch-time auto-start).
+fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> (adw::PreferencesGroup, gtk4::Button) {
     let group = adw::PreferencesGroup::new();
     group.set_title("Status");
 
@@ -1259,29 +1393,22 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     };
     glib::timeout_add_seconds_local(1, move || {
         let hdr = shm_for_timer.header();
-        let version = hdr.version.load(Ordering::Relaxed);
-        if version != neural_forge_protocol::SHM_VERSION {
-            helper_row.set_subtitle(&format!(
-                "shared memory is version {version}, this app speaks {} -- restart the helper and the game on the same Neural Forge version",
-                neural_forge_protocol::SHM_VERSION
-            ));
-            layer_row.set_subtitle("unknown (version mismatch)");
+        // A header laid out by another build is refused at open (see `Shm::open`), so the
+        // version needs no check here.
+        let helper_alive = fresh(&helper_beat, hdr.heartbeat.load(Ordering::Relaxed));
+        let helper_state = hdr.helper_state.load(Ordering::Relaxed);
+        let reason = hdr.helper_reason();
+        let state = if helper_alive || neural_forge_supervisor::is_running().is_some() { helper_state_label(helper_state) } else { "not running" };
+        helper_row.set_subtitle(&if reason.is_empty() { state.to_string() } else { format!("{state} -- {reason}") });
+        let layer_active = fresh(&layer_beat, hdr.layer_heartbeat.load(Ordering::Relaxed));
+        let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
+        layer_row.set_subtitle(if layer_active {
+            "active: processing the game's frames"
+        } else if attached {
+            "idle: a game attached, but no frames are being processed (loading screen, paused, closed, or no helper)"
         } else {
-            let helper_alive = fresh(&helper_beat, hdr.heartbeat.load(Ordering::Relaxed));
-            let helper_state = hdr.helper_state.load(Ordering::Relaxed);
-            let reason = hdr.helper_reason();
-            let state = if helper_alive || neural_forge_supervisor::is_running().is_some() { helper_state_label(helper_state) } else { "not running" };
-            helper_row.set_subtitle(&if reason.is_empty() { state.to_string() } else { format!("{state} -- {reason}") });
-            let layer_active = fresh(&layer_beat, hdr.layer_heartbeat.load(Ordering::Relaxed));
-            let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
-            layer_row.set_subtitle(if layer_active {
-                "active: processing the game's frames"
-            } else if attached {
-                "idle: a game attached, but no frames are being processed (loading screen, paused, closed, or no helper)"
-            } else {
-                "no game attached yet"
-            });
-        }
+            "no game attached yet"
+        });
         // Keyed off the actual OS-level pid-file check (what start/stop manage), not
         // the SHM helper_state above -- those can briefly disagree right after a
         // start/stop (e.g. STARTING vs. the process not existing yet) and the button
@@ -1292,30 +1419,6 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         }
         glib::ControlFlow::Continue
     });
-
-    // Auto-start the helper on launch when neural rendering is already enabled and
-    // it isn't running yet, instead of leaving that to a separate, easy-to-miss
-    // manual "Start" click.
-    //
-    // Real bug, found 2026-09-16: Alex reported NeuralForge "on" doing nothing (no
-    // visible enhancement) and feeling sluggish after a session where `lordnikon` had
-    // been rebooted. Traced to: `enabled=1` was already persisted in `config.ini` (so
-    // the layer's own capture path kept trying every frame), but the *helper* --
-    // always a separate, manually-launched process this GUI never started on its own
-    // -- had simply never been relaunched after the reboot. The layer paid real
-    // per-frame capture-submission overhead (the "sluggish" part) chasing a helper
-    // that could never answer (the "no enhancement" part), and nothing about that
-    // state was visible without opening the Status tab and noticing the button still
-    // said "Start". `enabled=1` meaning "the layer should try" without the helper
-    // that makes trying meaningful actually running is exactly the gap this closes.
-    if shm.header().enabled.load(Ordering::Relaxed) != 0 && neural_forge_supervisor::is_running().is_none() {
-        let cfg = neural_forge_supervisor::Config::load();
-        let toasts = toasts.clone();
-        match neural_forge_supervisor::start(&cfg) {
-            Ok(started) => toasts.add_toast(adw::Toast::new(&format!("Helper auto-started (pid {})", started.pid))),
-            Err(e) => toasts.add_toast(adw::Toast::new(&format!("Neural rendering is on, but the helper failed to auto-start: {e}"))),
-        }
-    }
 
     {
         let toasts = toasts.clone();
@@ -1334,7 +1437,14 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
                 glib::spawn_future_local(async move {
                     let result = gio::spawn_blocking(|| neural_forge_supervisor::stop(std::time::Duration::from_secs(5))).await;
                     match result {
-                        Ok(Ok(())) => toasts.add_toast(adw::Toast::new("Helper stopped")),
+                        Ok(Ok(())) => {
+                            STARTED_PID.store(0, Ordering::Relaxed);
+                            toasts.add_toast(adw::Toast::new("Helper stopped"));
+                        }
+                        // Another start or stop (the CLI, or another window) holds the helper lock.
+                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            toasts.add_toast(adw::Toast::new("The helper is being started or stopped elsewhere -- try again in a moment"));
+                        }
                         Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Stop failed: {e}"))),
                         Err(_) => toasts.add_toast(adw::Toast::new("Stop failed: the stop worker panicked")),
                     }
@@ -1342,11 +1452,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
                     button.set_sensitive(true);
                 });
             } else {
-                let cfg = neural_forge_supervisor::Config::load();
-                match neural_forge_supervisor::start(&cfg) {
-                    Ok(started) => toasts.add_toast(adw::Toast::new(&format!("Helper started (pid {})", started.pid))),
-                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Start failed: {e}"))),
-                }
+                start_helper(button, &toasts, false);
             }
         });
     }
@@ -1362,22 +1468,8 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     {
         let toasts = toasts.clone();
         import_button.connect_clicked(move |button| {
-            let toasts = toasts.clone();
             let binaries_row = binaries_row.clone();
-            let parent = button.root().and_downcast::<gtk4::Window>();
-            let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
-            dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
-                let Ok(folder) = result else { return };
-                let Some(path) = folder.path() else { return };
-                match crate::binaries::import_from(&path) {
-                    Ok(0) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
-                    Ok(n) => {
-                        toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
-                        binaries_row.set_subtitle(&binaries_status_subtitle());
-                    }
-                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
-                }
-            });
+            import_ngx_binaries(button, &toasts, move || binaries_row.set_subtitle(&binaries_status_subtitle()));
         });
     }
 
@@ -1516,7 +1608,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         });
     }
 
-    group
+    (group, start_stop_button)
 }
 
 fn binaries_status_subtitle() -> String {
@@ -1540,12 +1632,24 @@ fn helper_state_label(state: u32) -> &'static str {
     }
 }
 
-fn build_error_window(app: &adw::Application) {
-    let status = adw::StatusPage::builder()
-        .icon_name("dialog-error-symbolic")
-        .title("Couldn't open the shared-memory mapping")
-        .description("Check the helper's log; neural-forge-cli doctor may also help.")
-        .build();
+fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::mapping::OpenError) {
+    use neural_forge_protocol::mapping::OpenError;
+    let (title, description) = match error {
+        OpenError::WrongVersion { found } => (
+            "Another Neural Forge version is running",
+            format!(
+                "The shared memory was set up by a build that speaks version {found}; this app speaks {}. \
+                 Close the game and stop the helper (neural-forge-cli stop), then open Neural Forge again \
+                 so every part runs the same version.",
+                neural_forge_protocol::SHM_VERSION
+            ),
+        ),
+        OpenError::Unavailable => (
+            "Couldn't open the shared-memory mapping",
+            "Check the helper's log; neural-forge-cli doctor may also help.".to_string(),
+        ),
+    };
+    let status = adw::StatusPage::builder().icon_name("dialog-error-symbolic").title(title).description(description).build();
     let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();
     window.present();
 }
@@ -1558,6 +1662,13 @@ fn build_error_window(app: &adw::Application) {
         assert_eq!(evdev_keycode(0),None);
         assert_eq!(evdev_keycode(8),None);
         assert_eq!(evdev_keycode(u32::MAX),None);
+    }
+    #[test] fn key_labels_use_the_key_name_and_fall_back_to_the_code() {
+        assert_eq!(format_key_label(87, Some("F11")), "F11");
+        assert_eq!(format_key_label(30, Some("a")), "A");
+        assert_eq!(format_key_label(70, Some("Scroll_Lock")), "Scroll_Lock");
+        assert_eq!(format_key_label(87, None), "Key 87");
+        assert_eq!(key_label(0), "Unbound");
     }
 }
 

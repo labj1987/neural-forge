@@ -121,6 +121,16 @@ pub fn find_wine() -> Option<PathBuf> {
     None
 }
 
+/// The runner a first run selects when none is configured: the best discovered Proton build,
+/// else system Wine, as `(runner_type, runner_path)`. `neural-forge-cli init` and the GUI's
+/// Setup tab both call this, so they always pick the same one.
+pub fn default_runner() -> Option<(&'static str, PathBuf)> {
+    if let Some(proton) = best_proton() {
+        return Some(("proton", proton.path));
+    }
+    find_wine().map(|wine| ("wine", wine))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

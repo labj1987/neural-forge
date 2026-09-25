@@ -1842,8 +1842,26 @@ impl GpuCompose {
 /// `examples/smoke.rs` doc comment already establishes lavapipe is enough, no real
 /// GPU needed, for exactly this kind of check). Shared by every `#[test]` below
 /// rather than each standing up its own instance/device.
+///
+/// With `NEURAL_FORGE_REQUIRE_VULKAN=1` (set in CI) a missing device panics instead of
+/// letting every GPU test skip and pass. Each device handed out prints a
+/// `[neural-forge-gpu-test] device acquired` line straight to stderr (past libtest's
+/// capture) so CI can count the GPU tests that really ran.
 #[cfg(test)]
 pub(crate) fn test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
+    let device = open_test_device();
+    if device.is_none() && neural_forge_protocol::env::var("NEURAL_FORGE_REQUIRE_VULKAN").as_deref() == Some("1") {
+        panic!("NEURAL_FORGE_REQUIRE_VULKAN=1 but no Vulkan device could be created (check VK_DRIVER_FILES / the lavapipe ICD)");
+    }
+    if device.is_some() {
+        use std::io::Write;
+        let _ = std::io::stderr().write_all(b"[neural-forge-gpu-test] device acquired\n");
+    }
+    device
+}
+
+#[cfg(test)]
+fn open_test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
     // SAFETY: same reasoning as `examples/smoke.rs`'s identical call.
     let entry = unsafe { ash::Entry::load() }.ok()?;
     let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);

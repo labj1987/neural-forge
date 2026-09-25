@@ -57,15 +57,18 @@ fn leave_reader(
 pub struct Shm(pub Arc<Mapping>);
 
 impl Shm {
-    pub fn open() -> Option<Self> {
-        let mapping = neural_forge_protocol::mapping::open()?;
+    /// Opens the channel `config.ini` names (see `neural_forge_supervisor::channel_path`).
+    /// A header laid out by another build is never handed out or rewritten: that comes
+    /// back as `OpenError::WrongVersion` for the caller to show.
+    pub fn open() -> Result<Self, neural_forge_protocol::mapping::OpenError> {
+        let cfg = neural_forge_supervisor::Config::load();
+        let mapping = neural_forge_supervisor::open_channel(&cfg)?;
         // Not only when this call created the file: the layer or helper may have initialised it
         // with defaults first (see `neural_forge_supervisor::apply_saved_settings`).
         if mapping.freshly_created || mapping.header().tuning_seq.load(Ordering::Relaxed) == 0 {
-            let cfg = neural_forge_supervisor::Config::load();
             neural_forge_protocol::persist::apply(mapping.header(), &cfg.settings);
         }
-        Some(Shm(Arc::new(mapping)))
+        Ok(Shm(Arc::new(mapping)))
     }
 }
 
