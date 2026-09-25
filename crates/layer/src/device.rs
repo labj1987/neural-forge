@@ -1085,7 +1085,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next_present) = self.next_queue_present_khr else {
             return LayerResult::Unhandled;
         };
-        // Set by `capture::run` only when `composition::gpu::GpuCompose::dispatch_into_image_async`
+        // Set by `capture::run` only when `composition::gpu::GpuCompose::present_temporal_delta_async`
         // wrote this frame's composited result asynchronously -- see that function's
         // own doc comment. When `Some`, the real present call below *must* wait on it,
         // or the presentation engine could display the image before the GPU work that

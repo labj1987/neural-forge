@@ -22,7 +22,7 @@
 //!   one fence, fully synchronous (submit, then wait). Used for the rare cases that
 //!   need the CPU to see the result before moving on (a pending `capture_request`
 //!   dump) or as the correctness reference the async path below is checked against.
-//! - [`GpuCompose::dispatch_into_image_async`] (added 2026-09-10): the real per-frame
+//! - [`GpuCompose::present_temporal_delta_async`]: the real per-frame
 //!   fast path. Double-buffered (`async_slots`, 2 of them) so the CPU never has to
 //!   block on *this* frame's own compute work -- it submits with a signal semaphore
 //!   and returns immediately, leaving `capture::run`/`device.rs` to chain that
@@ -1028,7 +1028,7 @@ impl ComposeSlot {
 }
 
 /// One independently fenced command/resource slot. Two of these
-/// alternate in [`GpuCompose::dispatch_into_image_async`] so a slot is never reused
+/// alternate in [`GpuCompose::present_temporal_delta_async`] so a slot is never reused
 /// until its *previous* use (two dispatches ago) has genuinely finished.
 struct AsyncSlot {
     slot: ComposeSlot,
@@ -1235,7 +1235,7 @@ impl GpuCompose {
     ///
     /// Downloads the result to a CPU-visible slice and fully waits for it -- use this
     /// when something on the CPU actually needs to see the bytes (a pending
-    /// `capture_request` dump in particular). [`Self::dispatch_into_image_async`] is
+    /// `capture_request` dump in particular). [`Self::present_temporal_delta_async`] is
     /// the fast, non-blocking path for the common case where nothing does.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
@@ -1314,8 +1314,8 @@ impl GpuCompose {
     /// of downloading it to a CPU-visible slice, and in the *same* command
     /// buffer/submission as the compute dispatch itself, restoring `target_image` to
     /// `PRESENT_SRC_KHR` before returning. Still fully synchronous (blocks on this
-    /// dispatch's own fence) -- [`Self::dispatch_into_image_async`] is the same
-    /// write-into-image trick without that block.
+    /// dispatch's own fence) -- [`Self::present_temporal_delta_async`] writes into the
+    /// image without that block.
     ///
     /// Deliberately routes through the sync slot's own `staging_buffer` rather than a
     /// raw `vkCmdCopyImage` straight from `output`: a raw image-to-image copy between
@@ -1692,119 +1692,6 @@ impl GpuCompose {
             .signal_semaphores(std::slice::from_ref(&semaphore))
             .build();
         if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }).is_err() { return None; }
-        Some(semaphore)
-    }
-
-    /// The real per-frame fast path: same composition and same write-straight-into-
-    /// `target_image` trick as [`Self::dispatch_into_image`], but **does not block the
-    /// CPU** on this dispatch's own completion. Submits with a signal semaphore and
-    /// returns it immediately; the caller (`capture::run`, then `device.rs`'s present
-    /// hook) must add that semaphore to the *real* `vkQueuePresentKHR` call's own wait
-    /// list, so the presentation engine -- a GPU-side dependency, not a CPU one --
-    /// is what actually waits for this frame's compute work before displaying it.
-    ///
-    /// Double-buffered across [`ASYNC_SLOTS`] independent [`AsyncSlot`]s (own images,
-    /// staging buffer, command buffer, fence) specifically so that never
-    /// blocking on *this* call's own fence doesn't mean never blocking at all: the one
-    /// necessary wait is on the slot's *own* fence, from its *previous* use
-    /// ([`ASYNC_SLOTS`] dispatches ago) -- immediately before reusing its resources,
-    /// not before returning this frame's result. By the time a slot comes back around,
-    /// the GPU has almost always finished with it long ago (an entire other frame's
-    /// worth of capture + SHM round trip has elapsed on the CPU in between), so that
-    /// wait is normally instant; it exists purely so this can never race a slot's own
-    /// still-in-flight prior work, not to reintroduce the per-frame block this method
-    /// exists to remove.
-    ///
-    /// Presentation semaphores are keyed by acquired target image, independently
-    /// of these command slots. Reacquisition orders reuse after the previous
-    /// presentation's wait. Slot fences alone do not establish that ordering.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_into_image_async(
-        &mut self,
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        queue: vk::Queue,
-        width: u32,
-        height: u32,
-        original: &[u8],
-        model_answer: &[u8],
-        colour_strength: f32,
-        transfer_strength: f32,
-        max_ratio: f32,
-        bgr_order: bool,
-        target_image: vk::Image,
-    ) -> Option<vk::Semaphore> {
-        let semaphore = self.present_semaphores.get(target_image, || unsafe {
-            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
-        })?;
-        let idx = self.next_async_slot;
-        self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
-        let async_slot = &mut self.async_slots[idx];
-
-        // SAFETY: `async_slot.slot.fence` was signaled at creation, or by this same
-        // slot's own previous dispatch -- waiting here (not before returning that
-        // previous dispatch's own result) is exactly what makes this "async": the
-        // block only ever happens `ASYNC_SLOTS` dispatches later, immediately before
-        // this specific slot's resources are touched again, never on the frame that
-        // just submitted them. Bounded, not truly unbounded: see
-        // `crate::FENCE_WAIT_TIMEOUT`.
-        let wait = unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "gpu::dispatch_into_image_async slot reuse").is_err() {
-            return None;
-        }
-        if self.zc.answer_reader == Some(async_slot.slot.fence) {
-            self.zc.answer_reader = None;
-        }
-
-        // SAFETY: `physical_device` is the device this instance was created against.
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let Some(frame_bytes) = async_slot.slot.begin_ensured(device, &mem_props, width, height, original, model_answer) else { return None };
-
-        // SAFETY: `async_slot.slot.cmd` was allocated with `RESET_COMMAND_BUFFER`, and
-        // the fence wait above guarantees any previous use of it has completed.
-        if unsafe { device.reset_command_buffer(async_slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
-            return None;
-        }
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: `async_slot.slot.cmd` was just reset.
-        if unsafe { device.begin_command_buffer(async_slot.slot.cmd, &begin_info) }.is_err() {
-            return None;
-        }
-        // SAFETY: `async_slot.slot.cmd` was just begun above.
-        unsafe {
-            async_slot.slot.record_upload_and_compute(
-                device,
-                self.pipeline,
-                self.pipeline_layout,
-                width,
-                height,
-                frame_bytes,
-                colour_strength,
-                transfer_strength,
-                max_ratio,
-                bgr_order,
-            );
-            async_slot.slot.record_copy_into_image(device, width, height, frame_bytes, target_image);
-        }
-        if unsafe { device.end_command_buffer(async_slot.slot.cmd) }.is_err() {
-            return None;
-        }
-        // SAFETY: the fence wait above guarantees this fence is not in the signaled
-        // state from a still-pending wait -- safe to reset before resubmitting.
-        if unsafe { device.reset_fences(&[async_slot.slot.fence]) }.is_err() {
-            return None;
-        }
-        let submit = vk::SubmitInfo::builder()
-            .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
-            .signal_semaphores(std::slice::from_ref(&semaphore))
-            .build();
-        // SAFETY: `async_slot.slot.cmd` was just recorded and ended above. Not waiting
-        // on `async_slot.slot.fence` here is the entire point of this method -- see
-        // its own doc comment for why that's still sound.
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }).is_err() {
-            return None;
-        }
         Some(semaphore)
     }
 
@@ -2975,132 +2862,6 @@ mod tests {
         }
         unsafe {
             for target in &targets { target.destroy(&device); }
-            device.destroy_command_pool(pool, None);
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
-    }
-
-    /// The real point of `dispatch_into_image_async`: confirms that after explicitly
-    /// waiting on the semaphore it returns (standing in for what the real present call
-    /// does), the target image holds the same real composited result the synchronous
-    /// `dispatch_into_image` produces for identical inputs -- not just "returns a
-    /// semaphore", but "the semaphore actually gates real, correct, completed work."
-    #[test]
-    fn dispatch_into_image_async_matches_dispatch_into_image() {
-        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
-            eprintln!("dispatch_into_image_async_matches_dispatch_into_image: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
-            eprintln!("dispatch_into_image_async_matches_dispatch_into_image: GpuCompose::new failed, skipping");
-            // SAFETY: nothing was created past the device/instance.
-            unsafe {
-                device.destroy_device(None);
-                instance.destroy_instance(None);
-            }
-            return;
-        };
-
-        let (width, height) = (8u32, 8u32);
-        let pixel_count = (width * height) as usize;
-        let original: Vec<u8> = (0..pixel_count).flat_map(|i| { let t = (i * 29 % 256) as u8; [t, t.wrapping_add(50), t.wrapping_add(140), 255] }).collect();
-        let model_answer: Vec<u8> = (0..pixel_count).flat_map(|i| { let t = (i * 71 % 256) as u8; [t.wrapping_add(5), t, t.wrapping_add(220), 255] }).collect();
-        let (colour_strength, transfer_strength, max_ratio) = (0.5, 1.0, 2.0);
-
-        let mut expected = model_answer.clone();
-        assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut expected, colour_strength, transfer_strength, max_ratio, false));
-
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
-
-        let target = make_target_image(&device, &mem_props, width, height);
-        transition_to_present_src(&device, queue, pool, target.image);
-
-        let sem = gpu.dispatch_into_image_async(
-            &device, &instance, physical_device, queue, width, height, &original, &model_answer,
-            colour_strength, transfer_strength, max_ratio, false, target.image,
-        );
-        let Some(sem) = sem else { panic!("dispatch_into_image_async returned None") };
-
-        // Stand in for what the real present call does: wait on the returned
-        // semaphore before touching the image at all. A trivial submit with no
-        // command buffers, just a wait, is the simplest way to consume it here.
-        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-        let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
-        let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
-        unsafe {
-            device.queue_submit(queue, &[submit], wait_fence).unwrap();
-            device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
-            device.destroy_fence(wait_fence, None);
-        }
-
-        let actual = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
-        assert_eq!(actual, expected, "dispatch_into_image_async's target image content (after waiting on its semaphore) must match dispatch's result exactly");
-
-        // SAFETY: the explicit semaphore wait above (via `wait_fence`) guarantees the
-        // async dispatch's GPU work, including its own fence signal, has completed.
-        unsafe {
-            target.destroy(&device);
-            device.destroy_command_pool(pool, None);
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
-    }
-
-    /// Drives `dispatch_into_image_async` across more dispatches than there are async
-    /// slots, confirming slot reuse (waiting on a slot's own fence from its previous
-    /// use, two dispatches back) is actually safe against a real device -- not just
-    /// "the first two calls work."
-    #[test]
-    fn dispatch_into_image_async_survives_many_slot_reuses() {
-        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
-            eprintln!("dispatch_into_image_async_survives_many_slot_reuses: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
-            eprintln!("dispatch_into_image_async_survives_many_slot_reuses: GpuCompose::new failed, skipping");
-            // SAFETY: nothing was created past the device/instance.
-            unsafe {
-                device.destroy_device(None);
-                instance.destroy_instance(None);
-            }
-            return;
-        };
-
-        let (width, height) = (8u32, 8u32);
-        let pixel_count = (width * height) as usize;
-        let original = vec![120u8; pixel_count * 4];
-        let model_answer = vec![90u8; pixel_count * 4];
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
-
-        // Real code always chains each dispatch's semaphore into that same frame's
-        // present call before the next dispatch could ever reuse (and re-signal) it --
-        // reproduced here by waiting on each semaphore immediately, every iteration,
-        // same real discipline `device.rs` follows, just without a real swapchain.
-        for i in 0..(ASYNC_SLOTS * 3 + 1) {
-            let target = make_target_image(&device, &mem_props, width, height);
-            transition_to_present_src(&device, queue, pool, target.image);
-            let sem = gpu.dispatch_into_image_async(&device, &instance, physical_device, queue, width, height, &original, &model_answer, 1.0, 1.0, 2.0, false, target.image);
-            let Some(sem) = sem else { panic!("dispatch_into_image_async returned None on iteration {i}") };
-            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-            let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
-            let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
-            unsafe {
-                device.queue_submit(queue, &[submit], wait_fence).unwrap();
-                device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
-                device.destroy_fence(wait_fence, None);
-                target.destroy(&device);
-            }
-        }
-
-        // SAFETY: every iteration above already waited out its own GPU work.
-        unsafe {
             device.destroy_command_pool(pool, None);
             gpu.destroy(&device);
             device.destroy_device(None);

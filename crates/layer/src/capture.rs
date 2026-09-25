@@ -12,12 +12,10 @@
 //! Stage 1 (capture into a staging buffer) is one command buffer + one fence,
 //! synchronous -- the CPU needs those bytes before it can even start the SHM round
 //! trip, so there's no way around blocking on it. What happens after the round trip
-//! depends on the settings and what's available: the common case (real GPU compose,
-//! no debug dump pending) is `composition::gpu::GpuCompose::dispatch_into_image_async`
-//! (2026-09-10) -- non-blocking, its own doc comment covers why that's sound. Every
-//! other case (CPU compose, a pending `capture_request`, `RGBA16F`, no GPU available)
-//! still falls back to the original synchronous stage-2 write-back below, one more
-//! command buffer + fence wait, same as this whole function used to always do.
+//! is the original synchronous stage-2 write-back below (a synchronous GPU or CPU
+//! compose into the staging bytes, then one more command buffer + fence wait).
+//! The per-frame path (`run`) composes asynchronously through
+//! `composition::gpu::GpuCompose::present_temporal_delta_async` instead.
 
 use ash::vk;
 
@@ -2754,16 +2752,9 @@ fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Q
 /// whatever layout the caller found it in, `PRESENT_SRC_KHR`) if anything along the way
 /// doesn't work, so the caller can always fall back to presenting unmodified.
 ///
-/// Returns `Some(semaphore)` when (and only when)
-/// `composition::gpu::GpuCompose::dispatch_into_image_async` was used: `image` is
-/// already fully written with the composited result, but the GPU work that wrote it
-/// is not guaranteed *complete* yet (that is the entire point of the "async" in its
-/// name -- this function never blocks on it). The caller **must** add that semaphore
-/// to the real present call's own wait-semaphore list before presenting `image` --
-/// otherwise the presentation engine could display `image` before the compute work
-/// finishes writing it, a real, visible corruption/tearing bug, not merely a style
-/// preference. `None` in every other case means `image` is already fully complete and
-/// correctly laid out (`PRESENT_SRC_KHR`) -- safe to present with no extra wait.
+/// Always returns `None`: `image` is fully written and back in `PRESENT_SRC_KHR` when
+/// this returns, safe to present with no extra wait. (The return type matches [`run`],
+/// whose asynchronous compose does hand back a semaphore.)
 ///
 /// # Safety
 /// `queue` must be the same queue `image`'s presentation was requested on, with no
@@ -2860,24 +2851,26 @@ unsafe fn run_sync(
     unsafe {
         device.cmd_copy_image_to_buffer(r.cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, r.buffer, &[copy_out]);
     }
-    let to_transfer_dst = barrier(
+    // Stage 1 hands the image back in PRESENT_SRC_KHR, the layout it found it in, so
+    // every return between here and stage 2 (a failed wait, a failed stage-2 recording
+    // or submit) still leaves it presentable. Stage 2 takes it from there itself.
+    let back_to_present = barrier(
         image,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::PRESENT_SRC_KHR,
         vk::AccessFlags::TRANSFER_READ,
-        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::empty(),
     );
-    // SAFETY: same reasoning as the first barrier above, transitioning for the
-    // write-back this same command buffer will record in stage 2.
+    // SAFETY: same reasoning as the first barrier above.
     unsafe {
         device.cmd_pipeline_barrier(
             r.cmd,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &[to_transfer_dst],
+            &[back_to_present],
         );
     }
     if unsafe { device.end_command_buffer(r.cmd) }.is_err() {
@@ -2947,14 +2940,6 @@ unsafe fn run_sync(
     let answered = shm.try_round_trip();
     let t_roundtrip = t_roundtrip_start.elapsed();
     let t_compose_start = std::time::Instant::now();
-    // `Some(sem)` only when `composition::gpu::GpuCompose::dispatch_into_image_async`
-    // already wrote the fully composited result straight into `image` itself, on the
-    // GPU's own timeline -- skips the capture_request dump (nothing useful to dump:
-    // `r.ptr` still holds the *raw* answer, not the composited result, on this path)
-    // and stage 2 (there is nothing left for it to do) below, returning early instead.
-    // The caller (`device.rs`) must chain `sem` into the real present call -- see this
-    // function's own doc comment and `dispatch_into_image_async`'s for why.
-    let mut composed_async: Option<vk::Semaphore> = None;
     if answered {
         // SAFETY: same reasoning as the read above; `ShmClient::read_answer` never
         // writes past the slice's length, which is exactly `frame_bytes` here.
@@ -2972,70 +2957,34 @@ unsafe fn run_sync(
                     // (`composition::apply::apply_rgba8`, which every mode already
                     // handles) whenever the GPU path isn't applicable, isn't
                     // available, or fails, same fail-open discipline as every other
-                    // stage in this function.
+                    // stage in this function. Always the synchronous, CPU-visible
+                    // dispatch: this path exists for the capture dump, which needs the
+                    // composited bytes in `r.ptr`.
                     let mut composed_sync = false;
-                    // The helper's model output is the intended display-referred
-                    // neural result. The legacy tone-map compositor was built for
-                    // a clipped, downscaled proxy, but this pipeline feeds it the
-                    // full original frame; it therefore collapses most of the model
-                    // edit back toward the source image. Present the raw model result
-                    // for normal rendering until that proxy pipeline exists.
                     if settings.debug_view == 0 {
                         if gpu_compose.is_none() {
                             *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
                         }
-                        // Try the fast, non-blocking path first -- but only when
-                        // nothing on the CPU needs to see the result afterward. A
-                        // pending `capture_request` does (its dump needs real bytes
-                        // in `r.ptr`), so that specific, rare, deliberately-triggered
-                        // case still goes through the slower, fully-synchronous
-                        // CPU-visible `dispatch` below, same as before this path
-                        // existed.
-                        // The first neural frame after enabling the feature can
-                        // race the application's present transition on NVIDIA
-                        // drivers. Keep composition CPU-visible until the
-                        // async handoff is proven safe for live games.
-                        if false && !shm.capture_request_pending() {
-                            if let Some(gpu) = gpu_compose {
-                                composed_async = gpu.dispatch_into_image_async(
-                                    device,
-                                    instance,
-                                    physical_device,
-                                    queue,
-                                    width,
-                                    height,
-                                    &original,
-                                    answer_dst,
-                                    settings.colour_strength,
-                                    settings.transfer_strength,
-                                    settings.max_ratio,
-                                    bgr_order,
-                                    image,
-                                );
-                            }
-                        }
-                        if composed_async.is_none() {
-                            if let Some(gpu) = gpu_compose {
-                                composed_sync = gpu.dispatch(
-                                    device,
-                                    instance,
-                                    physical_device,
-                                    queue,
-                                    width,
-                                    height,
-                                    &original,
-                                    answer_dst,
-                                    settings.colour_strength,
-                                    settings.transfer_strength,
-                                    settings.max_ratio,
-                                    bgr_order,
-                                );
-                            }
+                        if let Some(gpu) = gpu_compose {
+                            composed_sync = gpu.dispatch(
+                                device,
+                                instance,
+                                physical_device,
+                                queue,
+                                width,
+                                height,
+                                original,
+                                answer_dst,
+                                settings.colour_strength,
+                                settings.transfer_strength,
+                                settings.max_ratio,
+                                bgr_order,
+                            );
                         }
                     }
-                    if composed_async.is_none() && !composed_sync {
+                    if !composed_sync {
                         crate::composition::apply::apply_rgba8(
-                            &original,
+                            original,
                             answer_dst,
                             settings.colour_strength,
                             settings.transfer_strength,
@@ -3047,36 +2996,12 @@ unsafe fn run_sync(
                 } else {
                     // "Off keeps the whole pass running... and simply presents the
                     // clean frame" -- ShmHeader::apply_model's own doc comment.
-                    answer_dst.copy_from_slice(&original);
+                    answer_dst.copy_from_slice(original);
                 }
             }
         }
     }
-    crate::log!(
-        "[capture] {}x{} {} bytes -> proxy; round trip answered={} composed_async={}",
-        width,
-        height,
-        frame_bytes,
-        answered,
-        composed_async.is_some()
-    );
-    if let Some(sem) = composed_async {
-        // `image` is already fully written (on the GPU's own timeline -- not
-        // necessarily *complete* yet, that's the entire point) and back in
-        // `PRESENT_SRC_KHR`. Nothing left to do this frame except hand `sem` up to
-        // the caller so the real present call waits on it.
-        crate::log!(
-            "[capture] timing stage1={:?} snapshot={:?} write_proxy={:?} roundtrip={:?} compose(async-dispatch-only)={:?} stage2=skipped total={:?}",
-            t_stage1,
-            t_snapshot,
-            t_write_proxy,
-            t_roundtrip,
-            t_compose_start.elapsed(),
-            t_stage1_start.elapsed(),
-        );
-        shm.publish_frame_timing(t_stage1_start.elapsed(), true);
-        return Some(sem);
-    }
+    crate::log!("[capture] {}x{} {} bytes -> proxy; round trip answered={}", width, height, frame_bytes, answered);
 
     // Real `ShmHeader::capture_request` support: dump this frame's original and
     // final (post-composition, if any ran above) bytes to disk. Checked regardless of
@@ -3103,11 +3028,19 @@ unsafe fn run_sync(
         return None;
     }
     let copy_in = copy_out;
-    // SAFETY: `image` is currently `TRANSFER_DST_OPTIMAL` from stage 1's own final
-    // barrier; `r.buffer` (same host-coherent memory as `r.ptr`, which the CPU-side
-    // block above may have just overwritten with the answer) holds exactly
-    // `frame_bytes` valid bytes either way, matching `copy_in`'s own extent.
+    let to_transfer_dst = barrier(
+        image,
+        vk::ImageLayout::PRESENT_SRC_KHR,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::AccessFlags::empty(),
+        vk::AccessFlags::TRANSFER_WRITE,
+    );
+    // SAFETY: `image` is `PRESENT_SRC_KHR` again after stage 1's final barrier (waited on
+    // above); `r.buffer` (same host-coherent memory as `r.ptr`, which the CPU-side block
+    // above may have just overwritten with the answer) holds exactly `frame_bytes` valid
+    // bytes either way, matching `copy_in`'s own extent.
     unsafe {
+        device.cmd_pipeline_barrier(r.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_transfer_dst]);
         device.cmd_copy_buffer_to_image(r.cmd, r.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy_in]);
     }
     let to_present = barrier(
@@ -3976,6 +3909,88 @@ mod tests {
             return;
         };
         assert!(held.iter().all(|p| p.composed && !p.cpu_pair_empty), "frame hold composes from the CPU copies");
+    }
+
+    /// The synchronous one-shot path (`run_sync`, used for a capture dump): captures, waits for
+    /// the helper's answer, composes it into the image and leaves the image presentable.
+    /// Stage 1 now hands the image back in PRESENT_SRC_KHR before stage 2 takes it again, so an
+    /// early return between the two can no longer leave it in TRANSFER_DST_OPTIMAL.
+    #[test]
+    fn run_sync_composes_and_leaves_the_image_presentable() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("run_sync_composes_and_leaves_the_image_presentable: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let path = scratch_path("run-sync");
+        let _cleanup = RemoveScratch(path.clone());
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path));
+        let hdr_ptr = shm.test_header_ptr();
+        let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        let (width, height) = (16u32, 16u32);
+        let frame_bytes = (width * height * 4) as usize;
+        let proxy_region = shm.proxy_region(0).unwrap().0 as usize;
+        let answer_region = shm.answer_region(0).unwrap().0 as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let helper = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined before the test ends).
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            let mut last_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
+                if req != 0 && req != last_seen {
+                    last_seen = req;
+                    std::sync::atomic::fence(AtomicOrdering::Acquire);
+                    // SAFETY: both regions hold at least `frame_bytes`; the layer waits for the answer.
+                    let proxy = unsafe { std::slice::from_raw_parts(proxy_region as *const u8, frame_bytes) };
+                    let answer = unsafe { std::slice::from_raw_parts_mut(answer_region as *mut u8, frame_bytes) };
+                    for (a, p) in answer.chunks_exact_mut(4).zip(proxy.chunks_exact(4)) {
+                        a.copy_from_slice(&[255 - p[0], 255 - p[1], 255 - p[2], p[3]]);
+                    }
+                    std::sync::atomic::fence(AtomicOrdering::Release);
+                    hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        });
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+        let game_frame = test_game_frame(width, height);
+        upload_present_src(&device, &mem_props, queue, pool, image, width, height, &game_frame);
+        let mut resources: Option<CaptureResources> = None;
+        let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+        let (mut original_scratch, mut last_answer) = (Vec::new(), Vec::new());
+        // SAFETY: `image` is the test's own, in PRESENT_SRC_KHR; one thread uses `queue`.
+        let sem = unsafe {
+            run_sync(
+                &device, &instance, physical_device, queue, queue_family, image, width, height,
+                neural_forge_protocol::enums::proxy_format::RGBA8, false, &mut resources, &mut gpu_compose, &mut shm,
+                &mut original_scratch, &mut last_answer,
+            )
+        };
+        assert!(sem.is_none(), "the synchronous path leaves nothing to wait on");
+        let presented = read_back_present_src(&device, &mem_props, queue, pool, image, width, height);
+        assert_ne!(presented, game_frame, "the answer was composed into the image");
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        helper.join().unwrap();
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy(resources, &device);
+            if let Some(gpu) = gpu_compose {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
     }
 
     /// A completed capture is only sent for the frame it was taken of: one at another size, or
