@@ -240,8 +240,8 @@ impl Default for NgxSnippet {
 }
 
 /// # Safety
-/// `module`/`name` must be exactly what [`crate::spoof::find_imported_function_slot`]
-/// and `GetProcAddress` require.
+/// `module` must be a loaded module handle and `F` the function type matching `name`'s real
+/// signature.
 unsafe fn resolve_export<F: Copy>(module: *mut c_void, name: &str) -> Option<F> {
     let c_name = CString::new(name).ok()?;
     // SAFETY: `module` is a valid, loaded module handle (the caller's contract).

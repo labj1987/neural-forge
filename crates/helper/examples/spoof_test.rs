@@ -1,4 +1,4 @@
-//! Real runtime test of `spoof::find_imported_function_slot`, needing no NVIDIA DLL at
+//! Real runtime test of `spoof::find_imported_function_slots`, needing no NVIDIA DLL at
 //! all: a compiled `x86_64-pc-windows-gnu` binary imports `GetModuleFileNameW` from
 //! `KERNEL32.dll` itself (indirectly, via the Rust standard library), so this binary's
 //! own loaded image is a real, self-contained PE import table to test the parser
@@ -24,16 +24,16 @@ fn main() {
 
     // SAFETY: `this_module` is a valid, currently-loaded module handle (this process's
     // own, per `GetModuleHandleW` above).
-    let slot = unsafe { spoof::find_imported_function_slot(this_module, "GetModuleFileNameW") };
-    println!("find_imported_function_slot(GetModuleFileNameW) = {slot:?}");
-    let Some(slot) = slot else {
+    let slots = unsafe { spoof::find_imported_function_slots(this_module, "GetModuleFileNameW") };
+    println!("find_imported_function_slots(GetModuleFileNameW) = {slots:?}");
+    let Some(&slot) = slots.first() else {
         panic!("FAIL: did not find GetModuleFileNameW in this binary's own import table");
     };
 
     // The slot must actually hold a real, callable function pointer -- i.e. the parser
     // found the *real* IAT entry (already resolved by the loader before main() ran),
     // not some other, coincidentally-zero or garbage location.
-    // SAFETY: `slot` was just returned by `find_imported_function_slot` as pointing at
+    // SAFETY: `slot` was just returned by `find_imported_function_slots` as pointing at
     // a valid, in-image, pointer-sized IAT entry.
     let resolved = unsafe { *slot };
     println!("resolved function pointer at slot: {resolved:#x}");
