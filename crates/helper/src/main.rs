@@ -138,6 +138,9 @@ fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
     );
 }
 
+/// Exit status when the shared memory holds another protocol version's header.
+const EXIT_SHM_VERSION_SKEW: i32 = 3;
+
 fn main() {
     guard::install();
 
@@ -154,9 +157,17 @@ fn main() {
         .map(Duration::from_millis)
         .unwrap_or_default();
 
-    let Some(shm) = shm::open() else {
-        neural_forge_helper::log!("[helper] failed to open the shared-memory mapping");
-        return;
+    let shm = match shm::open() {
+        Ok(shm) => shm,
+        Err(shm::OpenError::VersionSkew { .. }) => {
+            // Already logged with both versions. Nothing in the header was touched (its layout is
+            // not ours to write), so the exit status is the only report the supervisor gets.
+            std::process::exit(EXIT_SHM_VERSION_SKEW);
+        }
+        Err(shm::OpenError::Io) => {
+            neural_forge_helper::log!("[helper] failed to open the shared-memory mapping");
+            return;
+        }
     };
     // SAFETY: `shm.header` was just validated by `shm::open`.
     let hdr = unsafe { &*shm.header };
