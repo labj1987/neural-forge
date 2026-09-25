@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 pub struct Runner {
     pub name: String,
     pub path: PathBuf,
-    score: u64,
+    score: (u64, Vec<u64>),
 }
 
 fn candidate_dirs() -> Vec<PathBuf> {
@@ -36,45 +36,40 @@ fn candidate_dirs() -> Vec<PathBuf> {
     dirs
 }
 
+/// Matched case-insensitively: CachyOS packages its Proton as `proton-cachyos-slr`, and
+/// the community release tarballs extract to lowercase names too.
 fn is_known_pattern(name: &str) -> bool {
-    ["GE", "Cachy", "Sugar", "Tkg", "Wine-GE"].iter().any(|pat| name.contains(pat))
+    let name = name.to_ascii_lowercase();
+    ["ge", "cachy", "sugar", "tkg", "wine-ge"].iter().any(|pat| name.contains(pat))
 }
 
-/// Base score by naming pattern, then nudged by whatever version number the name
-/// itself contains (a higher point release should outrank a lower one with the same
-/// pattern) -- same shape as upstream's `proton_score`, reimplemented.
-fn score(name: &str) -> u64 {
-    let base: u64 = if name.contains("Cachy") {
+/// Base score by naming pattern, then every run of digits in the name as a version tuple
+/// (a higher release outranks a lower one with the same pattern: `GE-Proton9-12` over
+/// `GE-Proton9-2`, which a first-number-only score tied and left to directory order) --
+/// same shape as upstream's `proton_score`, reimplemented.
+fn score(name: &str) -> (u64, Vec<u64>) {
+    let lower = name.to_ascii_lowercase();
+    let base: u64 = if lower.contains("cachy") {
         1_000_000
-    } else if name.contains("Wine-GE") {
+    } else if lower.contains("wine-ge") {
         850_000
-    } else if name.contains("GE") {
+    } else if lower.contains("ge") {
         900_000
     } else {
         700_000
     };
+    let version = lower
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|run| !run.is_empty())
+        .map(|run| run.parse::<u64>().unwrap_or(u64::MAX))
+        .collect();
+    (base, version)
+}
 
-    // Pull out the first run of digits, and (if a '.' immediately follows it) the
-    // run of digits after that -- e.g. "Proton-CachyOS-9.0" -> major=9, minor=0.
-    let bytes = name.as_bytes();
-    let digit_start = bytes.iter().position(|b| b.is_ascii_digit());
-    let (major_num, minor_num) = match digit_start {
-        Some(start) => {
-            let major_end = bytes[start..].iter().take_while(|b| b.is_ascii_digit()).count() + start;
-            let major_num: u64 = name[start..major_end].parse().unwrap_or(0);
-            let minor_num = if bytes.get(major_end) == Some(&b'.') {
-                let minor_start = major_end + 1;
-                let minor_end = bytes[minor_start..].iter().take_while(|b| b.is_ascii_digit()).count() + minor_start;
-                name[minor_start..minor_end].parse().unwrap_or(0)
-            } else {
-                0
-            };
-            (major_num, minor_num)
-        }
-        None => (0, 0),
-    };
-
-    base + major_num * 1000 + minor_num
+/// Best first: by score, then by name, both descending, so the order never depends on
+/// the order `read_dir` happened to list the directories in.
+fn sort_best_first(runners: &mut [Runner]) {
+    runners.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| b.name.cmp(&a.name)));
 }
 
 /// Every discovered custom compatibility tool, best (highest-scored) first.
@@ -95,7 +90,7 @@ pub fn discover_proton() -> Vec<Runner> {
             found.push(Runner { name: name.clone(), path: proton, score: score(&name) });
         }
     }
-    found.sort_by(|a, b| b.score.cmp(&a.score));
+    sort_best_first(&mut found);
     found
 }
 
@@ -142,8 +137,46 @@ mod tests {
     }
 
     #[test]
+    fn every_version_number_counts_not_just_the_first() {
+        assert!(score("GE-Proton9-12") > score("GE-Proton9-2"));
+        assert!(score("GE-Proton10-1") > score("GE-Proton9-27"));
+        assert!(score("GE-Proton11-6-x86_64") > score("GE-Proton11-5-x86_64"));
+        assert!(score("proton-cachyos-10.0-20250725-slr-x86_64_v3") > score("proton-cachyos-10.0-20250601-slr-x86_64_v3"));
+    }
+
+    #[test]
+    fn lowercase_names_score_like_their_capitalised_forms() {
+        assert_eq!(score("proton-cachyos-slr").0, score("Proton-CachyOS-SLR").0);
+        assert!(score("proton-cachyos-slr") > score("GE-Proton11-6-x86_64"));
+        assert_eq!(score("ge-proton9-1"), score("GE-Proton9-1"));
+    }
+
+    #[test]
+    fn ties_are_broken_by_name_not_directory_order() {
+        let runner = |name: &str| Runner { name: name.to_string(), path: PathBuf::new(), score: score(name) };
+        let mut a = vec![runner("Proton-GE Latest"), runner("Proton-CachyOS Latest"), runner("GE-Proton11-6-x86_64"), runner("Proton-GE Beta")];
+        let mut b = vec![runner("Proton-GE Beta"), runner("GE-Proton11-6-x86_64"), runner("Proton-CachyOS Latest"), runner("Proton-GE Latest")];
+        sort_best_first(&mut a);
+        sort_best_first(&mut b);
+        let names = |v: &[Runner]| v.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&a), names(&b));
+        assert_eq!(a[0].name, "Proton-CachyOS Latest");
+    }
+
+    #[test]
     fn known_patterns_are_recognized() {
-        for name in ["GE-Proton9-1", "Proton-CachyOS-9.0", "Proton-Sugar", "Proton-Tkg", "Wine-GE-Proton9"] {
+        for name in [
+            "GE-Proton9-1",
+            "Proton-CachyOS-9.0",
+            "Proton-Sugar",
+            "Proton-Tkg",
+            "Wine-GE-Proton9",
+            "proton-cachyos-slr",
+            "proton-cachyos-10.0-20250725-slr-x86_64_v3",
+            "Proton-CachyOS Latest",
+            "GE-Proton11-6-x86_64",
+            "Proton-GE Latest",
+        ] {
             assert!(is_known_pattern(name), "{name} should be recognized");
         }
         assert!(!is_known_pattern("Proton Experimental"));
