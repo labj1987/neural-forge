@@ -37,14 +37,15 @@ other's mapping.
 | Debug views 4/5 (colour-trust engagement, pre-bound colour) | `compose.comp` `debug_view`; views 0-3 (this project's own) and 4/5 now reach the GPU path, so they work for a game that blits into its swapchain too (0.1.84) |
 | Reversible modes (soft knee, Neutwo, hybrid, and the two pure-inverse replace modes) | `encode.comp`; `compose.comp` rebuilds the frame's proxy with the encode's own curve (peak step included) and implements replace |
 
+Capture source (1.0.0): an admitted swapchain is captured from its own image. Neural Forge's
+render tap is used only on a pass-through swapchain, and only for a 1:1 copy or blit whose
+source extent and format (recorded from `vkCreateImage`) match the swapchain; anything else
+presents untouched. See `RENDER_TAP_DESIGN.md`.
+
 ## Deliberately not adopted
 
 - Upstream ORs `TRANSFER_SRC|DST` into every swapchain unconditionally; Neural Forge keeps its
   admission checks (`surface_usage.rs`).
-- Tapping whatever image the game last blitted into the swapchain: Neural Forge captures an
-  admitted swapchain from its own image, and on a pass-through swapchain taps only a 1:1 copy or
-  blit whose source extent and format (recorded from `vkCreateImage`) match the swapchain.
-  Anything else presents untouched (1.0.0).
 - Re-running `NgxLoadAndInit` on every resize (re-hooks the import table, leaks parameters) and
   quitting after one bad evaluate: Neural Forge rebuilds only the feature and fails open per frame.
 - The meter's descriptor pool without a storage-buffer size, resetting a possibly unsignalled
