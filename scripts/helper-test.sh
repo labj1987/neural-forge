@@ -26,8 +26,9 @@ FAIL=0
 for example in guard_test spoof_test spoof_install_test; do
     echo
     echo "==> running $example under wine"
-    if ! timeout 15 wine "$BIN_DIR/examples/$example.exe"; then
-        status=$?
+    status=0
+    timeout 15 wine "$BIN_DIR/examples/$example.exe" || status=$?
+    if [ "$status" -ne 0 ]; then
         echo "!!! $example FAILED (exit $status)"
         FAIL=1
     fi

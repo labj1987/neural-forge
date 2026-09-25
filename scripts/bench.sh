@@ -122,8 +122,9 @@ for ((i = 0; i < DURATION; i++)); do
     else
         STATUS=""
     fi
-    printf '{"t":%s,"gpu":"%s","status":"%s"}\n' \
-        "$(date +%s.%N)" "$GPU" "${STATUS//\"/\'}" >>"$SAMPLE_JSON"
+    # json.dumps escapes the multi-line status (newlines, quotes, backslashes) properly.
+    python3 -c 'import json, sys; print(json.dumps({"t": float(sys.argv[1]), "gpu": sys.argv[2], "status": sys.argv[3]}))' \
+        "$(date +%s.%N)" "$GPU" "$STATUS" >>"$SAMPLE_JSON"
     sleep 1
 done
 END="$(date +%s.%N)"
