@@ -74,6 +74,14 @@ impl Config {
         cfg
     }
 
+    /// Replaces every `set_*` tuning line with `tuning` (a fresh
+    /// `neural_forge_protocol::persist::snapshot`), keeping any other key -- such as the
+    /// GUI's launch-option switches -- that a wholesale `settings = snapshot` would drop.
+    pub fn replace_tuning(&mut self, tuning: BTreeMap<String, String>) {
+        self.settings.retain(|k, _| !k.starts_with("set_"));
+        self.settings.extend(tuning);
+    }
+
     pub fn save(&self) -> std::io::Result<()> {
         paths::ensure_dirs()?;
         let mut text = format!(
@@ -84,5 +92,22 @@ impl Config {
             text.push_str(&format!("{k}={v}\n"));
         }
         std::fs::write(paths::config_file(), text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn replace_tuning_swaps_set_keys_and_keeps_the_rest() {
+        let mut cfg = Config::default();
+        cfg.settings.insert("set_enabled".into(), "0".into());
+        cfg.settings.insert("set_stale".into(), "1".into());
+        cfg.settings.insert("launch_smooth_motion".into(), "1".into());
+        cfg.replace_tuning(BTreeMap::from([("set_enabled".to_string(), "1".to_string())]));
+        assert_eq!(cfg.settings.get("set_enabled").map(String::as_str), Some("1"));
+        assert!(!cfg.settings.contains_key("set_stale"));
+        assert_eq!(cfg.settings.get("launch_smooth_motion").map(String::as_str), Some("1"));
     }
 }

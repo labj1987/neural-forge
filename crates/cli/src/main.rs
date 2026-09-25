@@ -101,7 +101,7 @@ fn cmd_profile_load(name: &str) -> ExitCode {
     // via a fresh snapshot (picks up every persisted setting, not just what this
     // profile happened to list) so the change survives a reboot too.
     let mut cfg = Config::load();
-    cfg.settings = neural_forge_protocol::persist::snapshot(header);
+    cfg.replace_tuning(neural_forge_protocol::persist::snapshot(header));
     if let Err(e) = cfg.save() {
         eprintln!("profile load: applied to the running instance, but saving config.ini failed: {e}");
         return ExitCode::FAILURE;

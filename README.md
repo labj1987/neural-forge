@@ -109,9 +109,10 @@ or from the GUI's binaries import flow. Files are copied into
 
 Add `NEURAL_FORGE_ENABLE=1` (and, for a specific target executable in a multi-process
 game, `NEURAL_FORGE_TARGET_EXE=<name>.exe`) to a game's Steam launch options to
-activate the layer. GUI and layer share live settings over the same shared-memory
-segment; `neural-forge-cli shmctl status/set/toggle/capture` covers the same controls
-from a terminal.
+activate the layer; the GUI's Setup page builds the full string, Smooth Motion included.
+GUI and layer share live settings over the same shared-memory segment;
+`neural-forge-cli shmctl status/set/toggle/capture` covers the same controls from a
+terminal.
 
 ## Status
 
@@ -211,13 +212,18 @@ managed prefix, the logs and `/tmp/neural-forge-$UID`.
 - **Steam overlay crashes or misbehaves:** the overlay has its own small swapchain, which the
   layer leaves alone; if a game still conflicts, set `NEURAL_FORGE_TARGET_EXE` to the game's
   executable.
-- **Frame generation (Smooth Motion `VK_LAYER_NV_present`, lsfg-vk
-  `VK_LAYER_LSFGVK_frame_generation`):** the layer must run before the generator, so that
-  generated frames carry the effect and the model only runs on real frames. The Vulkan loader
-  does not order implicit layers, and both generators were measured landing above this layer.
-  Always set the order in the game's launch options, e.g.
-  `VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present`. See
-  `docs/FRAMEGEN_SPIKE.md`.
+- **Smooth Motion (`VK_LAYER_NV_present`, RTX 40 series or newer):** turn on the Smooth Motion
+  switch under Setup -> Steam launch option and copy the result. It adds
+  `NVPRESENT_ENABLE_SMOOTH_MOTION=1` and
+  `VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present:VK_LAYER_VALVE_steam_overlay_64`.
+  The Vulkan loader does not order implicit layers, and without that line Smooth Motion and the
+  Steam overlay were both measured landing above this layer. The order matters in two ways:
+  - Generated frames carry the effect, and the model only runs on real frames. In GTA V
+    Enhanced's benchmark this showed 116.4 fps against 60.9 without Smooth Motion.
+  - The Steam overlay's fps counter shows the displayed rate. Counters above the generator,
+    including the game's own, only count real frames.
+
+  See `docs/FRAMEGEN_SPIKE.md`.
 - **Steam Linux Runtime / pressure-vessel:** the game must see `/tmp/neural-forge-$UID`. If it
   does not, add `PRESSURE_VESSEL_FILESYSTEMS_RW=/tmp/neural-forge-$UID` to the launch options.
 - **32-bit games:** a separate 32-bit layer ships (`VK_LAYER_neuralforge_neural_32`, same

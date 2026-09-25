@@ -4,6 +4,20 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 0.1.99 — 2026-09-25
+
+- **Smooth Motion switch** on the Setup page's Steam launch option. When it's on, the copied
+  string adds `NVPRESENT_ENABLE_SMOOTH_MOTION=1` and
+  `VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present:VK_LAYER_VALVE_steam_overlay_64`.
+  - **Why the order line is needed:** the Vulkan loader does not order implicit layers, and
+    without it NVIDIA's generator and the Steam overlay both loaded above this layer. Generated
+    frames then skipped the effect, and the overlay's fps counter only counted real frames.
+  - **Measured** in GTA V Enhanced's own benchmark at 2560x1440 on an RTX 5070 (model every
+    2nd frame): 116.4 fps displayed against 60.9 without Smooth Motion, for 2.6 real fps.
+  - **Details:** the switch is on by default and saved in `config.ini`. Measurements are in
+    `docs/FRAMEGEN_SPIKE.md`.
+- Loading a settings profile no longer wipes `config.ini` entries that are not model settings.
+
 ## 0.1.98 — 2026-09-24
 
 - **Motion vectors are on by default.** Estimated on the GPU they now cost about 2-3% of the

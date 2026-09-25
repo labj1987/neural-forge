@@ -926,18 +926,46 @@ fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     group
 }
 
+/// Layer order for a Smooth Motion launch, application side first. The Vulkan loader does
+/// not order implicit layers, and without this both NVIDIA's generator and the Steam
+/// overlay were measured landing above this layer: generated frames then skip the effect,
+/// and the overlay's fps counter never sees them (docs/FRAMEGEN_SPIKE.md). Listing them
+/// here puts the effect first, Smooth Motion below it, and the overlay below both.
+const SMOOTH_MOTION_LAYERS: &str = "VK_LAYER_neuralforge_neural:VK_LAYER_NV_present:VK_LAYER_VALVE_steam_overlay_64";
+
+/// `config.ini` key remembering the Smooth Motion switch. Not a `set_*` key: it only
+/// shapes the launch option and never reaches the layer.
+const SMOOTH_MOTION_KEY: &str = "launch_smooth_motion";
+
 /// The exact Steam launch-option string for these settings -- pulled out of the
 /// closure below so it's a plain, unit-testable function instead of only ever being
 /// exercised live through GTK signal handlers.
 ///
 /// There is no DMA-BUF switch: nothing reads `NEURAL_FORGE_DMABUF` (the transport is not wired),
 /// and a switch that does nothing was worse than none.
-fn launch_option(target_exe: &str) -> String {
+fn launch_option(target_exe: &str, smooth_motion: bool) -> String {
+    let mut parts = vec!["NEURAL_FORGE_ENABLE=1".to_string()];
     let target_exe = target_exe.trim();
-    if target_exe.is_empty() {
-        "NEURAL_FORGE_ENABLE=1 %command%".to_string()
-    } else {
-        format!("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE={target_exe} %command%")
+    if !target_exe.is_empty() {
+        parts.push(format!("NEURAL_FORGE_TARGET_EXE={target_exe}"));
+    }
+    if smooth_motion {
+        parts.push("NVPRESENT_ENABLE_SMOOTH_MOTION=1".to_string());
+        parts.push(format!("VK_INSTANCE_LAYERS={SMOOTH_MOTION_LAYERS}"));
+    }
+    parts.push("%command%".to_string());
+    parts.join(" ")
+}
+
+fn smooth_motion_saved() -> bool {
+    neural_forge_supervisor::Config::load().settings.get(SMOOTH_MOTION_KEY).is_none_or(|v| v != "0")
+}
+
+fn save_smooth_motion(on: bool) {
+    let mut cfg = neural_forge_supervisor::Config::load();
+    cfg.settings.insert(SMOOTH_MOTION_KEY.to_string(), if on { "1" } else { "0" }.to_string());
+    if let Err(e) = cfg.save() {
+        eprintln!("[neural-forge] saving the Smooth Motion switch failed: {e}");
     }
 }
 
@@ -950,6 +978,14 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     exe_row.set_title("Target executable (optional, for a multi-process game)");
     group.add(&exe_row);
 
+    let smooth_row = adw::SwitchRow::new();
+    smooth_row.set_title("Smooth Motion");
+    smooth_row.set_subtitle(
+        "NVIDIA frame generation after the effect (RTX 40 series or newer): about twice the frames on screen, \
+         while the model only runs on the game's own frames. The Steam overlay's fps counter shows the displayed rate.",
+    );
+    smooth_row.set_active(smooth_motion_saved());
+    group.add(&smooth_row);
 
     let preview_row = adw::ActionRow::new();
     preview_row.set_title("Launch option");
@@ -960,7 +996,9 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     group.add(&preview_row);
 
     let exe_row_for_build = exe_row.clone();
-    let build_option = std::rc::Rc::new(move || launch_option(&exe_row_for_build.text()));
+    let smooth_row_for_build = smooth_row.clone();
+    let build_option =
+        std::rc::Rc::new(move || launch_option(&exe_row_for_build.text(), smooth_row_for_build.is_active()));
 
     preview_row.set_subtitle(&build_option());
 
@@ -968,6 +1006,14 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
         let preview_row = preview_row.clone();
         let build_option = std::rc::Rc::clone(&build_option);
         exe_row.connect_changed(move |_| preview_row.set_subtitle(&build_option()));
+    }
+    {
+        let preview_row = preview_row.clone();
+        let build_option = std::rc::Rc::clone(&build_option);
+        smooth_row.connect_active_notify(move |row| {
+            save_smooth_motion(row.is_active());
+            preview_row.set_subtitle(&build_option());
+        });
     }
     copy_button.connect_clicked(move |button| {
         button.display().clipboard().set_text(&build_option());
@@ -1441,7 +1487,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             // only affects the running session, so also fold the result into
             // config.ini via a fresh snapshot so it survives a reboot too.
             let mut cfg = neural_forge_supervisor::Config::load();
-            cfg.settings = neural_forge_protocol::persist::snapshot(shm.header());
+            cfg.replace_tuning(neural_forge_protocol::persist::snapshot(shm.header()));
             let message = match cfg.save() {
                 Ok(()) => format!("Loaded profile \"{name}\""),
                 Err(e) => format!("Applied to the running session, but saving config.ini failed: {e}"),
@@ -1521,21 +1567,43 @@ mod launch_option_tests {
 
     #[test]
     fn matches_the_documented_baseline_with_no_target_exe() {
-        assert_eq!(launch_option(""), "NEURAL_FORGE_ENABLE=1 %command%");
+        assert_eq!(launch_option("", false), "NEURAL_FORGE_ENABLE=1 %command%");
     }
 
     #[test]
     fn includes_target_exe_when_given() {
-        assert_eq!(launch_option("GTA5_Enhanced.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
+        assert_eq!(launch_option("GTA5_Enhanced.exe", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
     }
 
     #[test]
     fn trims_whitespace_around_target_exe() {
-        assert_eq!(launch_option("  GTA5_Enhanced.exe  "), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
+        assert_eq!(launch_option("  GTA5_Enhanced.exe  ", false), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
     }
 
     #[test]
     fn whitespace_only_target_exe_is_treated_as_empty() {
-        assert_eq!(launch_option("   "), "NEURAL_FORGE_ENABLE=1 %command%");
+        assert_eq!(launch_option("   ", false), "NEURAL_FORGE_ENABLE=1 %command%");
+    }
+
+    #[test]
+    fn smooth_motion_matches_the_measured_launch_option() {
+        assert_eq!(
+            launch_option("", true),
+            "NEURAL_FORGE_ENABLE=1 NVPRESENT_ENABLE_SMOOTH_MOTION=1 \
+             VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present:VK_LAYER_VALVE_steam_overlay_64 %command%"
+        );
+    }
+
+    #[test]
+    fn smooth_motion_keeps_target_exe_and_ends_with_command() {
+        let option = launch_option("GTA5_Enhanced.exe", true);
+        assert!(option.starts_with("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe NVPRESENT_ENABLE_SMOOTH_MOTION=1 "));
+        assert!(option.ends_with(" %command%"));
+    }
+
+    #[test]
+    fn smooth_motion_puts_the_effect_before_the_generator_and_the_overlay_last() {
+        let layers: Vec<&str> = SMOOTH_MOTION_LAYERS.split(':').collect();
+        assert_eq!(layers, ["VK_LAYER_neuralforge_neural", "VK_LAYER_NV_present", "VK_LAYER_VALVE_steam_overlay_64"]);
     }
 }
