@@ -13,6 +13,55 @@ first shipped them; their phase is kept as a subheading.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
+## 1.0.0 — 2026-09-25
+
+- **The game no longer stalls when capture setup fails.** If the layer cannot set up capture
+  for a frame (out of video memory, or the driver refusing the zero-copy import), it presents
+  the frame untouched at once instead of waiting out its 250 ms budget on every frame. A
+  refused zero-copy import falls back to the copy path for the rest of the session.
+- **No GPU stall on swapchain recreation.** Resizing, alt-tabbing or changing display mode no
+  longer waits for the whole GPU to go idle. The layer now waits only for its own work, and
+  only on swapchains it actually submitted work for.
+- **Fixed a crash on buffer-only pipeline barriers** (`vkCmdPipelineBarrier2` with no image
+  barriers) in debug builds, plus the same guard on every other array the layer reads from
+  the game.
+- **Safer capture source.** Admitted swapchains are always captured from their own image. On
+  swapchains the layer leaves alone, it reads the game's render target only when that target
+  matches the swapchain's size and format, and it no longer changes the target's layout.
+- **The picture now matches the proxy curve the model saw.** Composition rebuilds the proxy
+  with the same curve as the encode, including the peak normalisation and the Neutwo and hybrid
+  curves, and the two replace modes now work. The default soft-knee output is bit-identical
+  to 0.1.99.
+- **Corrected NGX calls in the helper.** It no longer calls
+  `NVSDK_NGX_VULKAN_GetFeatureRequirements` with the wrong signature. The parameter object now
+  uses the vtable layout NVIDIA's SDK header produces and converts between number types the
+  way NVIDIA's own object does. The fault guard no longer wraps DLL loading, and after a
+  caught fault it skips every further NGX call, including shutdown, instead of risking a hang.
+- **Clearer helper failures.** Missing NGX binaries, or a failed identity setup, now show as
+  "no binaries" with the cause instead of an unexplained model failure. The helper no longer
+  resets shared memory written by a different Neural Forge version: it exits, and the GUI and
+  `neural-forge-cli status` say which versions disagree.
+- **Only one helper at a time.** Starting and stopping take a lock, so a second start (the GUI
+  auto-start racing `neural-forge-cli start`, or a double click) no longer launches a second
+  helper, and a leftover pid file from another program no longer reads as "already running".
+- **The GUI stays responsive while the helper starts.** Starting runs in the background with
+  a "Starting…" state, and the window appears before the launch-time auto-start begins.
+- **The first-run runner is saved.** On a fresh install the runner shown on the Setup page is
+  written to `config.ini`, so auto-start works without running `neural-forge-cli init`.
+- **Closing the settings window leaves the helper running**, unless that window started it.
+- **"HDR input" and "Colour mode" are marked unavailable.** Nothing reads them yet.
+- **Other fixes:**
+  - Resetting settings no longer overwrites live status.
+  - Config files are written atomically.
+  - The runtime directory must be private to you.
+  - Proton runners are matched regardless of case and ranked by full version.
+  - Downloads time out.
+  - The toggle-key row shows key names such as "F11".
+  - Importing NGX files checks that they are Windows DLLs.
+- **CI runs the GPU tests for real** on lavapipe (64- and 32-bit), fails if no Vulkan device
+  is found, and runs the smoke test before release builds.
+- **Release builds now fail rather than publish without the AppImage's `.zsync` file.**
+
 ## 0.1.99 — 2026-09-25
 
 - **Smooth Motion switch** on the Setup page's Steam launch option. When it's on, the copied
