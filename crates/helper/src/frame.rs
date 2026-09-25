@@ -475,10 +475,13 @@ impl FrameResources {
         // attempt can fall back to an unaligned view, and this device might lack the
         // extension `WANTED_DEVICE_EXTENSIONS` only *requests*, never guarantees.
         let alignment = min_imported_host_pointer_alignment(instance, physical_device);
+        // Only this frame's bytes, rounded up to the import alignment: importing the region's
+        // whole `MAX_FRAME` capacity pinned the protocol's 7680x4320 float16 ceiling per slot.
         let try_import = |region: (*mut u8, usize)| {
             let (ptr, capacity) = region;
             let alignment = alignment?;
-            if ptr.is_null() || capacity == 0 || (ptr as usize) % alignment as usize != 0 || capacity as u64 % alignment != 0 {
+            let size = staging_size.div_ceil(alignment).checked_mul(alignment)?;
+            if ptr.is_null() || size == 0 || size > capacity as u64 || (ptr as usize) % alignment as usize != 0 {
                 return None;
             }
             // SAFETY: `ptr`/`capacity` describe a live SHM region for as long as this
@@ -489,7 +492,7 @@ impl FrameResources {
             // "one outstanding request at a time" rule already guarantees, the same
             // reasoning `neural_forge_layer::capture::DirectCapture` relies on for its own
             // single slot.
-            unsafe { build_imported_buffer(device, instance, physical_device, ptr, capacity as vk::DeviceSize) }
+            unsafe { build_imported_buffer(device, instance, physical_device, ptr, size) }
         };
         let imported_proxy = try_import(proxy_region);
         let imported_answer = try_import(answer_region);
@@ -718,12 +721,22 @@ impl FrameResources {
             // NGX Vulkan evaluation records its GPU work into a caller-owned, live
             // command buffer, just as feature creation does. A null buffer can return
             // success while recording no output work, which leaves Output untouched.
-            let Some(result) = self.run_evaluate(device, queue, || {
+            let result = self.run_evaluate(device, queue, || {
                 crate::guard::guarded(
                     || evaluate_feature(self.cmd, pass.handle, params, std::ptr::null()),
                     abi::result::FAIL_SEH,
                 )
-            }) else {
+            });
+            // `color`/`output`/`mvec`/`depth` are locals of this block: once it ends, the block
+            // must not keep their addresses, or the next `CreateFeature` (a rebuild) reads
+            // dangling pointers out of it.
+            // (After a caught fault nothing may call into the DLLs again, this included.)
+            if crate::guard::faulted().is_none() {
+                for key in ["DLSSNR.Color", "DLSSNR.Output", "DLSSNR.MVec", "DLSSNR.Depth"] {
+                    abi::ngx_set_ptr(params, name(key).as_ptr(), std::ptr::null_mut());
+                }
+            }
+            let Some(result) = result else {
                 return None;
             };
             let t_eval = t_eval_start.elapsed();
