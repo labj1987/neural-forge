@@ -173,6 +173,31 @@ The performance mode + flow 0.5 crash:
 
 Not measured: input latency and image quality.
 
+### Refresh rate: 120 Hz vs 288 Hz
+
+Every run above used the TV at 2560x1440, 119.998 Hz + VRR. The TV also runs 288.001 Hz + VRR,
+so the set was repeated there.
+
+vkcube under vsync with Smooth Motion:
+- at 120 Hz: 60 real / 120 displayed;
+- at 288 Hz: 144.2 real / 288.0 displayed.
+
+The ceiling is half the refresh rate.
+
+GTA benchmark, pass 4 at 288 Hz:
+
+| Config | Real fps | Displayed fps | GPU |
+|---|---|---|---|
+| No Neural Forge | 85.0 | 85.8 | 73%, 143 W |
+| NF only | 59.9 | 60.4 | 90%, 190 W |
+| NF + Smooth Motion, NR on | 59.7 | 119.8 | 93%, 195 W |
+| NF + Smooth Motion, NR off | 91.7 | 185.1 | 76%, 154 W |
+
+Neural Forge's ~60 real fps is its own limit, not refresh pacing: it is the same at 120 Hz
+(60.6) and 288 Hz (59.9). With NR on, the refresh rate makes no difference: Smooth Motion
+doubles about 60 to about 120 either way. With NR off, the 185 generated-plus-real frames only
+reach the screen at 288 Hz; at 120 Hz the display caps them at 120.
+
 ## What broke and why
 
 - **Wrong order by default.** Both generators sat above Neural Forge until
