@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
+  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
+  earlier needs proof that the presentation engine's wait on them has completed, which core
+  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
+- Deferred (layer): the unit-test target still carries clippy lints (mostly
+  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
+
 ## 0.1.99 — 2026-09-25
 
 - **Smooth Motion switch** on the Setup page's Steam launch option. When it's on, the copied
