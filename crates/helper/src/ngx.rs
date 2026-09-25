@@ -479,36 +479,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     };
     s.params = params;
 
-    // Round-trip self-test: set a scratch value through the parameter vtable, then
-    // read it straight back, before this parameter block is used for anything real.
-    // Observed as a real step in a working reference implementation's own log output
-    // (run side by side on this machine, never its source -- see this session's
-    // investigation) right after its own successful AllocateParameters; this crate
-    // never did anything like it. Purely diagnostic for now: logs whether the
-    // written/read values match, doesn't gate anything on the result yet.
-    {
-        let probe_name = CString::new("DLSSNR.SelfTestProbe").unwrap();
-        let (test_result, seh) = guarded(
-            || {
-                // SAFETY: `params` was just validated above as a live, non-null
-                // parameter block from a successful `AllocateParameters`.
-                unsafe {
-                    abi::ngx_set_u32(params, probe_name.as_ptr(), 0x5a5a);
-                    let mut readback: u32 = 0;
-                    let r = abi::ngx_get_u32(params, probe_name.as_ptr(), &mut readback);
-                    (r, readback)
-                }
-            },
-            (abi::result::FAIL_SEH, 0),
-        );
-        crate::log!(
-            "[ngx] params round-trip self-test -> {:#x} seh={:#x} readback={:#x}",
-            test_result.0 as u32,
-            seh,
-            test_result.1
-        );
-        crate::logging::flush();
-    }
+    params_self_test(params);
 
     let Some(init_ext) = s.init_ext else {
         return s.fail("nvngx_dlssnr.dll has no VULKAN_Init_Ext export".to_string());
@@ -546,6 +517,47 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     // loop (`main.rs`) knows a real width/height -- there is no real frame to build it
     // at the size of yet at this point in startup.
     s
+}
+
+/// Round-trip self-test: sets scratch values of every type the helper writes through the
+/// parameter vtable, then reads each straight back, before the block is used for anything real.
+/// u32 alone passed under every candidate slot layout; f32, u64 and i32 only pass when the Set
+/// and Get halves of the table sit where the DLL's own object has them. Diagnostic: logged, not
+/// gated on.
+fn params_self_test(params: NgxParameter) {
+    let name = CString::new("DLSSNR.SelfTestProbe").unwrap();
+    let n = name.as_ptr();
+    let (results, seh) = guarded(
+        || {
+            // SAFETY: `params` is a live parameter block (a successful `AllocateParameters`, or
+            // our own object); `n` is a NUL-terminated string that outlives every call.
+            unsafe {
+                let mut u = 0u32;
+                abi::ngx_set_u32(params, n, 0x5a5a);
+                let ru = abi::ngx_get_u32(params, n, &mut u);
+                let mut f = 0f32;
+                abi::ngx_set_f32(params, n, 0.625);
+                let rf = abi::ngx_get_f32(params, n, &mut f);
+                let mut q = 0u64;
+                abi::ngx_set_u64(params, n, 0x1234_5678_9abc);
+                let rq = abi::ngx_get_u64(params, n, &mut q);
+                let mut i = 0i32;
+                abi::ngx_set_i32(params, n, -42);
+                let ri = abi::ngx_get_i32(params, n, &mut i);
+                [
+                    ("u32", ru, abi::succeeded(ru) && u == 0x5a5a),
+                    ("f32", rf, abi::succeeded(rf) && f == 0.625),
+                    ("u64", rq, abi::succeeded(rq) && q == 0x1234_5678_9abc),
+                    ("i32", ri, abi::succeeded(ri) && i == -42),
+                ]
+            }
+        },
+        [("u32", abi::result::FAIL_SEH, false), ("f32", abi::result::FAIL_SEH, false), ("u64", abi::result::FAIL_SEH, false), ("i32", abi::result::FAIL_SEH, false)],
+    );
+    let summary: Vec<String> = results.iter().map(|(t, r, ok)| format!("{t}={}({:#x})", if *ok { "ok" } else { "FAIL" }, *r as u32)).collect();
+    let all = seh == 0 && results.iter().all(|r| r.2);
+    crate::log!("[ngx] params round-trip self-test: {} seh={seh:#x} -> {}", summary.join(" "), if all { "PASS" } else { "FAIL" });
+    crate::logging::flush();
 }
 
 impl NgxSnippet {

@@ -188,31 +188,34 @@ unsafe extern "system" fn get_u32(this: *mut c_void, name: *const i8, out: *mut 
 unsafe extern "system" fn get_i32(this: *mut c_void, name: *const i8, out: *mut i32) -> NgxResult {
     unsafe { get(this, name, out) }
 }
-/// Slots 9/10/13 in the real vtable are reserved padding — never called for real, but
-/// present so every later slot's offset matches the real interface.
-unsafe extern "system" fn get_reserved(_this: *mut c_void, _name: *const i8, _out: *mut c_void) -> NgxResult {
+/// The D3D11/D3D12 resource overloads: a Vulkan helper has no such resources, so a set is
+/// dropped and a get reports `FAIL_NOT_IMPLEMENTED`. Never aliased onto another slot.
+unsafe extern "system" fn set_d3d(_this: *mut c_void, _name: *const i8, _value: *mut c_void) {}
+unsafe extern "system" fn get_d3d(_this: *mut c_void, _name: *const i8, _out: *mut *mut c_void) -> NgxResult {
     abi::result::FAIL_NOT_IMPLEMENTED
 }
 unsafe extern "system" fn reset(this: *mut c_void) {
     unsafe { store(this) }.clear();
 }
 
+/// In MSVC's slot order for NVIDIA's header; see [`NgxParameterVtable`].
 static VTABLE: NgxParameterVtable = NgxParameterVtable {
     set_ptr,
-    set_u64,
-    set_f32,
-    set_f64,
-    set_u32,
+    set_d3d12: set_d3d,
+    set_d3d11: set_d3d,
     set_i32,
-    get_f64,
-    get_u64,
+    set_u32,
+    set_f64,
+    set_f32,
+    set_u64,
     get_ptr,
-    get_reserved9: get_reserved,
-    get_reserved10: get_reserved,
+    get_d3d12: get_d3d,
+    get_d3d11: get_d3d,
     get_i32,
     get_u32,
-    get_reserved13: get_reserved,
+    get_f64,
     get_f32,
+    get_u64,
     reset,
 };
 
@@ -270,6 +273,11 @@ mod tests {
             assert_eq!(abi::ngx_get_i32(p, n, &mut i), abi::result::SUCCESS);
             assert_eq!(i, -7);
 
+            abi::ngx_set_f64(p, n, -0.5);
+            let mut d = 0f64;
+            assert_eq!(abi::ngx_get_f64(p, n, &mut d), abi::result::SUCCESS);
+            assert_eq!(d, -0.5);
+
             let mut x = 5u8;
             abi::ngx_set_ptr(p, n, std::ptr::from_mut(&mut x).cast());
             let mut back: *mut c_void = std::ptr::null_mut();
@@ -294,5 +302,56 @@ mod tests {
             assert_eq!(abi::ngx_get_ptr(p, n, &mut back), abi::result::FAIL_INCOMPATIBLE_TYPES);
             assert_eq!(abi::ngx_get_u32(p, c"missing".as_ptr(), &mut u), abi::result::FAIL_INVALID_PARAMETER);
         });
+    }
+}
+
+#[cfg(test)]
+mod layout_tests {
+    use super::*;
+
+    /// Calls a slot by its index in NVIDIA's MSVC layout, the way the DLL does, rather than
+    /// by field name, so a table whose field order drifts from the real layout fails here.
+    unsafe fn slot<T: Copy>(p: NgxParameter, index: usize) -> T {
+        let table = unsafe { (*p).vtable }.cast::<*const ()>();
+        let f = unsafe { *table.add(index) };
+        unsafe { std::mem::transmute_copy::<*const (), T>(&f) }
+    }
+
+    #[test]
+    fn dll_side_calls_land_on_the_right_slots() {
+        let p = allocate();
+        let n = c"k".as_ptr();
+        unsafe {
+            // Set(float) is slot 6, Get(float*) slot 14.
+            slot::<unsafe extern "system" fn(*mut c_void, *const i8, f32)>(p, 6)(p.cast(), n, 0.75);
+            let mut f = 0f32;
+            assert_eq!(slot::<unsafe extern "system" fn(*mut c_void, *const i8, *mut f32) -> NgxResult>(p, 14)(p.cast(), n, &mut f), abi::result::SUCCESS);
+            assert_eq!(f, 0.75);
+            // Set(ULL) is slot 7, Get(ULL*) slot 15 -- which used to be Reset and wiped the store.
+            slot::<unsafe extern "system" fn(*mut c_void, *const i8, u64)>(p, 7)(p.cast(), n, 1 << 40);
+            let mut q = 0u64;
+            assert_eq!(slot::<unsafe extern "system" fn(*mut c_void, *const i8, *mut u64) -> NgxResult>(p, 15)(p.cast(), n, &mut q), abi::result::SUCCESS);
+            assert_eq!(q, 1 << 40);
+            // Set(int) is slot 3, Get(int*) slot 11.
+            slot::<unsafe extern "system" fn(*mut c_void, *const i8, i32)>(p, 3)(p.cast(), n, -3);
+            let mut i = 0i32;
+            assert_eq!(slot::<unsafe extern "system" fn(*mut c_void, *const i8, *mut i32) -> NgxResult>(p, 11)(p.cast(), n, &mut i), abi::result::SUCCESS);
+            assert_eq!(i, -3);
+            // Get(double*) is slot 13; the D3D getters (9, 10) are not implemented.
+            let mut d = 0f64;
+            assert_eq!(slot::<unsafe extern "system" fn(*mut c_void, *const i8, *mut f64) -> NgxResult>(p, 13)(p.cast(), n, &mut d), abi::result::SUCCESS);
+            assert_eq!(d, -3.0);
+            let mut r: *mut c_void = std::ptr::null_mut();
+            for index in [9, 10] {
+                assert_eq!(
+                    slot::<unsafe extern "system" fn(*mut c_void, *const i8, *mut *mut c_void) -> NgxResult>(p, index)(p.cast(), n, &mut r),
+                    abi::result::FAIL_NOT_IMPLEMENTED
+                );
+            }
+            // Reset is slot 16.
+            slot::<unsafe extern "system" fn(*mut c_void)>(p, 16)(p.cast());
+            assert_eq!(abi::ngx_get_i32(p, n, &mut i), abi::result::FAIL_INVALID_PARAMETER);
+            destroy(p);
+        }
     }
 }

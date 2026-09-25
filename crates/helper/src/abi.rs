@@ -156,32 +156,53 @@ impl NgxResourceVk {
 
 // ---------------------------------------------------------------------------------
 // NVSDK_NGX_Parameter — a C++ abstract interface (pure vtable), reached only via a
-// pointer NGX itself hands us from AllocateParameters. Slots 9/10/13 are reserved
-// padding in the real interface; they're named here so the slot numbering (and
-// therefore every other slot's offset) stays correct, not because anything calls them.
+// pointer NGX itself hands us from AllocateParameters.
+//
+// NVIDIA's public header (`include/nvsdk_ngx_params.h` in the NVIDIA/DLSS repo) declares
+// 17 pure virtuals, in this order: Set(ULL), Set(float), Set(double), Set(uint), Set(int),
+// Set(ID3D11Resource*), Set(ID3D12Resource*), Set(void*), the same eight Get overloads
+// taking pointers, then Reset(). No destructor. MSVC, which builds NVIDIA's DLLs, groups
+// overloads of one name together and lays each group out in *reverse* declaration order,
+// which gives the slots below. The Get half of the table this replaced already matched that
+// (void** at 8, int* at 11, uint* at 12, float* at 14), which is what the working rig
+// exercised; its Set half and slots 13/15 did not (Set(float) sat at 2, i.e.
+// Set(ID3D11Resource*), and slot 15, Get(ULL*), was Reset).
+//
+// NVIDIA's C helpers (`NVSDK_NGX_Parameter_SetF`, `_GetUI`, ...) would sidestep the vtable
+// entirely, but neither nvngx.dll nor nvngx_dlssnr.dll exports them (objdump -p,
+// 2026-09-25): in the SDK they live in the static library an application links.
 // ---------------------------------------------------------------------------------
-
-pub type CGetResult = unsafe extern "system" fn(*mut c_void, *const i8, *mut c_void) -> NgxResult;
 
 #[repr(C)]
 pub struct NgxParameterVtable {
     pub set_ptr: unsafe extern "system" fn(*mut c_void, *const i8, *mut c_void),
-    pub set_u64: unsafe extern "system" fn(*mut c_void, *const i8, u64),
-    pub set_f32: unsafe extern "system" fn(*mut c_void, *const i8, f32),
-    pub set_f64: unsafe extern "system" fn(*mut c_void, *const i8, f64),
-    pub set_u32: unsafe extern "system" fn(*mut c_void, *const i8, u32),
+    /// `Set(const char*, ID3D12Resource*)`: never called by this crate.
+    pub set_d3d12: unsafe extern "system" fn(*mut c_void, *const i8, *mut c_void),
+    /// `Set(const char*, ID3D11Resource*)`: never called by this crate.
+    pub set_d3d11: unsafe extern "system" fn(*mut c_void, *const i8, *mut c_void),
     pub set_i32: unsafe extern "system" fn(*mut c_void, *const i8, i32),
-    pub get_f64: unsafe extern "system" fn(*mut c_void, *const i8, *mut f64) -> NgxResult,
-    pub get_u64: unsafe extern "system" fn(*mut c_void, *const i8, *mut u64) -> NgxResult,
+    pub set_u32: unsafe extern "system" fn(*mut c_void, *const i8, u32),
+    pub set_f64: unsafe extern "system" fn(*mut c_void, *const i8, f64),
+    pub set_f32: unsafe extern "system" fn(*mut c_void, *const i8, f32),
+    pub set_u64: unsafe extern "system" fn(*mut c_void, *const i8, u64),
     pub get_ptr: unsafe extern "system" fn(*mut c_void, *const i8, *mut *mut c_void) -> NgxResult,
-    pub get_reserved9: CGetResult,
-    pub get_reserved10: CGetResult,
+    /// `Get(const char*, ID3D12Resource**)`: never called by this crate.
+    pub get_d3d12: unsafe extern "system" fn(*mut c_void, *const i8, *mut *mut c_void) -> NgxResult,
+    /// `Get(const char*, ID3D11Resource**)`: never called by this crate.
+    pub get_d3d11: unsafe extern "system" fn(*mut c_void, *const i8, *mut *mut c_void) -> NgxResult,
     pub get_i32: unsafe extern "system" fn(*mut c_void, *const i8, *mut i32) -> NgxResult,
     pub get_u32: unsafe extern "system" fn(*mut c_void, *const i8, *mut u32) -> NgxResult,
-    pub get_reserved13: CGetResult,
+    pub get_f64: unsafe extern "system" fn(*mut c_void, *const i8, *mut f64) -> NgxResult,
     pub get_f32: unsafe extern "system" fn(*mut c_void, *const i8, *mut f32) -> NgxResult,
+    pub get_u64: unsafe extern "system" fn(*mut c_void, *const i8, *mut u64) -> NgxResult,
     pub reset: unsafe extern "system" fn(*mut c_void),
 }
+
+const _: () = assert!(std::mem::size_of::<NgxParameterVtable>() == 17 * 8, "NVSDK_NGX_Parameter has 17 slots");
+const _: () = assert!(std::mem::offset_of!(NgxParameterVtable, set_f32) == 6 * 8);
+const _: () = assert!(std::mem::offset_of!(NgxParameterVtable, get_ptr) == 8 * 8);
+const _: () = assert!(std::mem::offset_of!(NgxParameterVtable, get_u64) == 15 * 8);
+const _: () = assert!(std::mem::offset_of!(NgxParameterVtable, reset) == 16 * 8);
 
 /// The object layout: a C++ object with no data members of its own, just the
 /// compiler-inserted vtable pointer every polymorphic C++ object starts with. This is
@@ -224,10 +245,12 @@ ngx_param_setter!(ngx_set_u64, set_u64, u64);
 ngx_param_setter!(ngx_set_f32, set_f32, f32);
 ngx_param_setter!(ngx_set_u32, set_u32, u32);
 ngx_param_setter!(ngx_set_i32, set_i32, i32);
+ngx_param_setter!(ngx_set_f64, set_f64, f64);
 ngx_param_getter!(ngx_get_u32, get_u32, u32);
 ngx_param_getter!(ngx_get_f32, get_f32, f32);
 ngx_param_getter!(ngx_get_u64, get_u64, u64);
 ngx_param_getter!(ngx_get_i32, get_i32, i32);
+ngx_param_getter!(ngx_get_f64, get_f64, f64);
 ngx_param_getter!(ngx_get_ptr, get_ptr, *mut c_void);
 
 /// # Safety
