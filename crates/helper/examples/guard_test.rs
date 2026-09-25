@@ -42,6 +42,22 @@ fn main() {
     assert_eq!(fault_result, -1, "the guard should have returned the fail value, not a real read");
     assert_eq!(fault_seh, 0xC000_0005, "expected EXCEPTION_ACCESS_VIOLATION");
 
+    // The fault latches process-wide: no later guarded call may run at all, because the
+    // faulting DLL may still hold its locks.
+    assert_eq!(guard::faulted(), Some(0xC000_0005));
+    let mut ran = false;
+    let (latched_result, latched_seh) = guard::guarded(
+        || {
+            ran = true;
+            5
+        },
+        -1,
+    );
+    println!("call after the fault: ran={ran} result={latched_result} seh={latched_seh:#x} (expect false, -1, 0xc0000005)");
+    assert!(!ran, "a guarded call ran after a caught fault");
+    assert_eq!((latched_result, latched_seh), (-1, 0xC000_0005));
+    guard::clear_fault_latch_for_test();
+
     // Wine raises DBG_PRINTEXCEPTION_C for every OutputDebugString. It must pass straight
     // through the guard: no jump, the closure runs to completion, and no fault is reported.
     let (dbg_result, dbg_seh) = guard::guarded(
@@ -54,6 +70,10 @@ fn main() {
     );
     println!("OutputDebugString call: result={dbg_result} seh={dbg_seh:#x} (expect 7, 0x0)");
     assert_eq!((dbg_result, dbg_seh), (7, 0), "a debug-print exception must not be treated as a fault");
+
+    // A result bigger than a register must come back intact through the C shim.
+    let (wide, wide_seh) = guard::guarded(|| [7u64; 8], [0u64; 8]);
+    assert_eq!((wide, wide_seh), ([7u64; 8], 0));
 
     // The non-unwinding longjmp must survive many faults through the same buffer, a fault
     // nested a few frames below the guard, and a fault after a clean call.
@@ -69,6 +89,7 @@ fn main() {
     for i in 0..10 {
         let (r, seh) = guard::guarded(|| deep(5), -1);
         assert_eq!((r, seh), (-1, 0xC000_0005), "fault {i}");
+        guard::clear_fault_latch_for_test();
         let (r, seh) = guard::guarded(|| 1, -1);
         assert_eq!((r, seh), (1, 0), "clean call after fault {i}");
     }

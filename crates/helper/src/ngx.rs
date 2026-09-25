@@ -321,37 +321,27 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     // by name finds this copy. When the runner already supplies NVAPI (Proton's DXVK-NVAPI, which
     // the supervisor announces with NEURAL_FORGE_SKIP_NVAPI) it is skipped outright: forcing the
     // vendored copy in bypasses the DXVK-NVAPI override and can fault inside its DllMain. The
-    // load is guarded either way, so a bad nvapi64 degrades to "no NVAPI" instead of taking the
-    // helper down.
+    // load is deliberately not guarded: a fault inside a DllMain leaves the loader lock held, so
+    // jumping out of it would only turn the crash into a deadlock at the next LoadLibrary.
     if skip_nvapi() {
         crate::log!("[ngx] nvapi64.dll load skipped (runner supplies NVAPI)");
     } else {
         let path = utf16(&format!("{bin_dir}\\nvapi64.dll"));
-        let (module, seh) = guarded(
-            || {
-                // SAFETY: `path` is a valid NUL-terminated UTF-16 string.
-                unsafe {
-                    LoadLibraryExW(
-                        path.as_ptr(),
-                        std::ptr::null_mut(),
-                        LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-                    )
-                }
-            },
-            std::ptr::null_mut(),
-        );
-        s.nvapi = module;
+        // SAFETY: `path` is a valid NUL-terminated UTF-16 string.
+        s.nvapi = unsafe {
+            LoadLibraryExW(path.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
+        };
         if s.nvapi.is_null() {
             // Not in the binaries folder: the normal search path, which under system Wine finds the
             // DXVK-NVAPI copy the supervisor installed in the prefix (with its native override).
             let by_name = utf16("nvapi64.dll");
-            let (module, _) = guarded(|| unsafe { LoadLibraryExW(by_name.as_ptr(), std::ptr::null_mut(), 0) }, std::ptr::null_mut());
-            s.nvapi = module;
+            // SAFETY: `by_name` is a valid NUL-terminated UTF-16 string.
+            s.nvapi = unsafe { LoadLibraryExW(by_name.as_ptr(), std::ptr::null_mut(), 0) };
         }
         // SAFETY: a non-null result is a just-loaded PE image (a null one is ignored).
         unsafe { crate::guard::register_module(crate::guard::Module::Nvapi, s.nvapi) };
         if s.nvapi.is_null() {
-            crate::log!("[ngx] nvapi64.dll not loaded (seh={seh:#x}); continuing without it");
+            crate::log!("[ngx] nvapi64.dll not loaded; continuing without it");
         } else {
             crate::log!("[ngx] nvapi64.dll loaded");
         }
@@ -863,6 +853,16 @@ pub fn maintain_passes(
     if s.disabled {
         return 0;
     }
+    if let Some(code) = crate::guard::faulted() {
+        // Every DLL call is refused from here on (see `guard`'s module doc): the model is gone
+        // for this session, not merely unbuilt at this size.
+        crate::log!("[ngx] a call into NGX faulted ({code:#x}); the model is off for this session");
+        crate::logging::flush();
+        s.failure_note = Some(format!("a call into NGX faulted ({code:#x}); restart the helper"));
+        s.passes.clear();
+        s.disabled = true;
+        return 0;
+    }
     if width < MIN_FEATURE_DIM || height < MIN_FEATURE_DIM {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -1004,7 +1004,21 @@ pub fn maintain_passes(
 /// Release the feature, shut down the snippet, restore the caller-identity spoof, and
 /// unload both modules — in that order, matching upstream's verified teardown
 /// sequence.
+///
+/// After a caught fault ([`crate::guard::faulted`]) nothing here calls into or unloads any
+/// NVIDIA module: the faulting call may have left their locks held, so a release, a shutdown
+/// or a `DllMain` detach could hang. The process is exiting anyway; only our own parameter
+/// object is freed.
 pub fn teardown(mut s: NgxSnippet) {
+    if let Some(code) = crate::guard::faulted() {
+        crate::log!("[ngx] teardown skipped after a caught fault ({code:#x}); leaving every NVIDIA module as it is");
+        if s.self_params && !s.params.is_null() {
+            // SAFETY: allocated by `selfparam::allocate` and never destroyed since. Nothing in the
+            // DLLs runs again, so nothing can still read it.
+            unsafe { selfparam::destroy(s.params) };
+        }
+        return;
+    }
     release_all(&mut s);
     if let Some(shutdown1) = s.shutdown1 {
         let device = s.device;

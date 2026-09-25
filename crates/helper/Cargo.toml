@@ -14,6 +14,10 @@ path = "src/lib.rs"
 name = "neural-forge-helper"
 path = "src/main.rs"
 
+[build-dependencies]
+# Compiles csrc/guard_shim.c, the setjmp site `guard.rs` needs (see that file).
+cc = "1"
+
 [dependencies]
 neural-forge-protocol = { path = "../protocol" }
 # Same exact version as neural-forge-layer, for the same reason: ash's own types (vk::Device,
