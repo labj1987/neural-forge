@@ -93,6 +93,7 @@ pub struct NeuralForgeDeviceInfo {
     next_get_swapchain_images_khr: Option<vk::PFN_vkGetSwapchainImagesKHR>,
     next_get_device_queue: Option<vk::PFN_vkGetDeviceQueue>,
     next_get_device_queue2: Option<vk::PFN_vkGetDeviceQueue2>,
+    next_create_image: Option<vk::PFN_vkCreateImage>,
     state: Arc<Mutex<State>>,
     tracker: Mutex<TapTracker>,
 }
@@ -243,6 +244,86 @@ struct TapTracker {
     /// Layouts recorded into each command buffer for tap sources, in recording order,
     /// awaiting submission.
     pending: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::ImageLayout)>>,
+    /// Extent and format of every image the game created that could be a tap source (2D,
+    /// single-sample, `TRANSFER_SRC` usage), from `vkCreateImage`; dropped on `vkDestroyImage`.
+    /// A copy or blit command says nothing about its source's own size or format, and the
+    /// capture needs both to be the swapchain's.
+    image_info: HashMap<vk::Image, ImageInfo>,
+    /// The shape of the most recent write into each swapchain image with a tap source.
+    tap_writes: HashMap<vk::Image, TapWrite>,
+}
+
+/// What `vkCreateImage` said about a possible tap source.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ImageInfo {
+    width: u32,
+    height: u32,
+    format: vk::Format,
+}
+
+/// The shape of a game's copy or blit into a swapchain image.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+struct TapWrite {
+    /// `Some((w, h))` when it was one region copying the source's top-left `w` x `h` block
+    /// 1:1 (no scaling, no flip, mip 0, layer 0) onto the destination's top-left; `None`
+    /// for anything else (a scaled blit, an offset, several regions).
+    unscaled_extent: Option<(u32, u32)>,
+    /// `vkCmdCopyImage` (raw bytes) rather than `vkCmdBlitImage` (format conversion).
+    copy: bool,
+}
+
+impl TapWrite {
+    fn from_copy(regions: &[vk::ImageCopy]) -> Self {
+        let unscaled_extent = match regions {
+            [r] if first_level_and_layer(r.src_subresource)
+                && first_level_and_layer(r.dst_subresource)
+                && r.src_offset == vk::Offset3D::default()
+                && r.dst_offset == vk::Offset3D::default()
+                && r.extent.depth == 1 =>
+            {
+                Some((r.extent.width, r.extent.height))
+            }
+            _ => None,
+        };
+        Self { unscaled_extent, copy: true }
+    }
+
+    fn from_blit(regions: &[vk::ImageBlit]) -> Self {
+        let unscaled_extent = match regions {
+            [r] if first_level_and_layer(r.src_subresource)
+                && first_level_and_layer(r.dst_subresource)
+                && r.src_offsets[0] == vk::Offset3D::default()
+                && r.dst_offsets[0] == vk::Offset3D::default()
+                && r.src_offsets[1] == r.dst_offsets[1]
+                && r.src_offsets[1].z == 1
+                && r.src_offsets[1].x > 0
+                && r.src_offsets[1].y > 0 =>
+            {
+                Some((r.src_offsets[1].x as u32, r.src_offsets[1].y as u32))
+            }
+            _ => None,
+        };
+        Self { unscaled_extent, copy: false }
+    }
+}
+
+fn first_level_and_layer(layers: vk::ImageSubresourceLayers) -> bool {
+    layers.aspect_mask == vk::ImageAspectFlags::COLOR && layers.mip_level == 0 && layers.base_array_layer == 0 && layers.layer_count == 1
+}
+
+/// Whether a source of `source` format, written into the swapchain the way `copy` says,
+/// leaves the source's own bytes meaning what the swapchain's `swapchain` format says they
+/// mean. The capture reads the source's raw bytes and labels them with the swapchain's
+/// format. A copy moves raw bytes, so an sRGB/UNORM twin of the same channel order is the
+/// same data; a blit converts, so only the identical format is.
+fn tap_format_matches(source: vk::Format, swapchain: vk::Format, copy: bool) -> bool {
+    use vk::Format as F;
+    let family = |f: vk::Format| match f {
+        F::B8G8R8A8_UNORM | F::B8G8R8A8_SRGB => Some(0),
+        F::R8G8B8A8_UNORM | F::R8G8B8A8_SRGB => Some(1),
+        _ => None,
+    };
+    source == swapchain || (copy && family(source).is_some() && family(source) == family(swapchain))
 }
 
 impl TapTracker {
@@ -254,6 +335,42 @@ impl TapTracker {
     fn tap_for(&self, destination: vk::Image) -> Option<(vk::Image, vk::ImageLayout)> {
         let source = *self.tap_sources_by_destination.get(&destination)?;
         self.tapped_source_layouts.get(&source).map(|layout| (source, *layout))
+    }
+
+    /// Whether `destination`'s tap source can stand in for a `width` x `height` swapchain of
+    /// `format`: its size and format are known and match, and the game wrote it into the
+    /// swapchain unscaled from the origin. The capture copies exactly the swapchain's extent
+    /// out of the source and reads the bytes as the swapchain's format, so anything else is
+    /// either an out-of-bounds copy (a smaller render target blitted up) or misread pixels.
+    fn tap_matches(&self, destination: vk::Image, width: u32, height: u32, format: vk::Format) -> Result<(), &'static str> {
+        let source = *self.tap_sources_by_destination.get(&destination).ok_or("no render source")?;
+        let info = self.image_info.get(&source).ok_or("the render source's size and format are unknown")?;
+        let write = self.tap_writes.get(&destination).ok_or("the write into the swapchain was not recorded")?;
+        if write.unscaled_extent != Some((width, height)) {
+            return Err("the game scales or offsets its render source into the swapchain");
+        }
+        if info.width < width || info.height < height {
+            return Err("the render source is smaller than the swapchain");
+        }
+        if !tap_format_matches(info.format, format, write.copy) {
+            return Err("the render source's format differs from the swapchain's");
+        }
+        Ok(())
+    }
+
+    fn record_image(&mut self, image: vk::Image, info: &vk::ImageCreateInfo) {
+        if info.image_type == vk::ImageType::TYPE_2D
+            && info.samples == vk::SampleCountFlags::TYPE_1
+            && info.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+        {
+            self.image_info.insert(image, ImageInfo { width: info.extent.width, height: info.extent.height, format: info.format });
+        }
+    }
+
+    fn note_write_shape(&mut self, dst: vk::Image, write: TapWrite) {
+        if self.swapchain_images.contains(&dst) {
+            self.tap_writes.insert(dst, write);
+        }
     }
 
     /// Returns `true` the first time a given swapchain image is seen as a destination.
@@ -515,6 +632,8 @@ impl NeuralForgeDeviceInfo {
         // Recorded by this layer's `create_device` hook, whether it added the extension or the
         // application requested it itself (vkd3d-proton does). Never read from `create_info`:
         // on the framework's own path its extension list is already freed here.
+        // SAFETY: as above.
+        let create_image = unsafe { resolve::<vk::PFN_vkCreateImage>(next_get_device_proc_addr, handle, c"vkCreateImage") };
         let external_memory_host = crate::take_external_memory_host_enabled(handle);
         crate::log!(
             "[layer] hooked device {:?} (swapchain support: {}, external_memory_host: {})",
@@ -559,6 +678,7 @@ impl NeuralForgeDeviceInfo {
             next_get_swapchain_images_khr: get_images,
             next_get_device_queue: get_queue,
             next_get_device_queue2: get_queue2,
+            next_create_image: create_image,
             state,
             tracker: Mutex::new(TapTracker::default()),
         }
@@ -592,11 +712,17 @@ impl NeuralForgeDeviceInfo {
     /// intentionally observational and always forwards the application command; the
     /// layout it learns is only *committed* when the command buffer is submitted
     /// (see [`TapTracker`]).
+    #[allow(clippy::too_many_arguments)]
     fn observe_swapchain_write(
         &self, kind: &str, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
-        dst: vk::Image, dst_layout: vk::ImageLayout, region_count: usize,
+        dst: vk::Image, dst_layout: vk::ImageLayout, region_count: usize, shape: TapWrite,
     ) {
-        let first = self.tracker.lock().unwrap().observe_write(command_buffer, src, src_layout, dst);
+        let first = {
+            let mut tracker = self.tracker.lock().unwrap();
+            let first = tracker.observe_write(command_buffer, src, src_layout, dst);
+            tracker.note_write_shape(dst, shape);
+            first
+        };
         if first == Some(true) {
             crate::log!("[layer] observed game {} into swapchain: src={:?} {:?} dst={:?} {:?} regions={}",
                 kind, src, src_layout, dst, dst_layout, region_count);
@@ -620,6 +746,7 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::CmdBlitImage,
             VulkanCommand::CmdPipelineBarrier,
             VulkanCommand::CmdPipelineBarrier2,
+            VulkanCommand::CreateImage,
             VulkanCommand::DestroyImage,
             VulkanCommand::BeginCommandBuffer,
             VulkanCommand::FreeCommandBuffers,
@@ -779,7 +906,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         &self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
         dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageCopy],
     ) -> LayerResult<()> {
-        self.observe_swapchain_write("copy", command_buffer, src, src_layout, dst, dst_layout, regions.len());
+        self.observe_swapchain_write("copy", command_buffer, src, src_layout, dst, dst_layout, regions.len(), TapWrite::from_copy(regions));
         LayerResult::Unhandled
     }
 
@@ -787,7 +914,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         &self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
         dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageBlit], _filter: vk::Filter,
     ) -> LayerResult<()> {
-        self.observe_swapchain_write("blit", command_buffer, src, src_layout, dst, dst_layout, regions.len());
+        self.observe_swapchain_write("blit", command_buffer, src, src_layout, dst, dst_layout, regions.len(), TapWrite::from_blit(regions));
         LayerResult::Unhandled
     }
 
@@ -895,6 +1022,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     for image in &old.images {
                         tracker.swapchain_images.remove(image);
                         tracker.observed_swapchain_writes.remove(image);
+                        tracker.tap_writes.remove(image);
                         if let Some(source) = tracker.tap_sources_by_destination.remove(image) {
                             prune_orphaned_tap_source(&mut tracker, source);
                         }
@@ -919,8 +1047,27 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     /// name it as a live source in a known layout. Dropping it the moment the game
     /// destroys it closes that window at the only point it can actually be closed.
     /// Purely observational -- the app's own destroy is always forwarded unchanged.
+    /// Records a possible tap source's extent and format (see `TapTracker::image_info`).
+    /// The application's call goes through unchanged.
+    fn create_image(
+        &self, create_info: &vk::ImageCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<ash::prelude::VkResult<vk::Image>> {
+        let Some(next) = self.next_create_image else { return LayerResult::Unhandled };
+        let mut image = vk::Image::null();
+        let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: `next` is the next layer/driver's own `vkCreateImage`; `create_info` (with
+        // its whole pNext chain) and the allocator are the application's, passed unchanged.
+        let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut image) };
+        if result != vk::Result::SUCCESS {
+            return LayerResult::Handled(Err(result));
+        }
+        self.tracker.lock().unwrap().record_image(image, create_info);
+        LayerResult::Handled(Ok(image))
+    }
+
     fn destroy_image(&self, image: vk::Image, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
         let mut tracker = self.tracker.lock().unwrap();
+        tracker.image_info.remove(&image);
         // A source can be registered (recorded) before any submission has committed a
         // layout for it, so check both.
         let had_layout = tracker.tapped_source_layouts.remove(&image).is_some();
@@ -1001,7 +1148,24 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     }
                     continue;
                 }
-                let tap = self.tracker.lock().unwrap().tap_for(image);
+                // Where the frame is read from. An admitted swapchain was created with
+                // TRANSFER_SRC (see `surface_usage::prepare`), so its own image -- known extent,
+                // format and PRESENT_SRC_KHR layout, ordered after the game's rendering by the
+                // relay below -- is the capture source, whatever the game blitted into it. Only a
+                // pass-through swapchain, which cannot be read, falls back to the game's own render
+                // source (docs/RENDER_TAP_DESIGN.md), and then only one whose size and format are
+                // known to be the swapchain's.
+                let (tap, tap_check) = if sw.pass_through {
+                    let tracker = self.tracker.lock().unwrap();
+                    (tracker.tap_for(image), tracker.tap_matches(image, sw.width, sw.height, sw.format))
+                } else {
+                    (None, Ok(()))
+                };
+                if !sw.pass_through && !sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST) {
+                    // Cannot happen (admission is exactly the enlarged usage), but reading an image
+                    // without TRANSFER_SRC would be undefined behaviour on the GPU.
+                    continue;
+                }
                 if sw.pass_through && !sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
                     // The compose/write-back path lands its result with
                     // `vkCmdCopyBufferToImage`, which is only legal on an image created
@@ -1051,6 +1215,20 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     }
                     continue;
                 }
+                if let Err(reason) = tap_check {
+                    // The render source is tracked and in GENERAL, but the capture would copy the
+                    // swapchain's extent out of it and read its bytes as the swapchain's format:
+                    // unless both are known to match, that is an out-of-bounds copy or misread
+                    // pixels. Logged once per distinct reason.
+                    static REPORTED_TAP: Mutex<&str> = Mutex::new("");
+                    let mut said = REPORTED_TAP.lock().unwrap();
+                    if *said != reason {
+                        *said = reason;
+                        crate::log!("[layer] present skipped: swapchain is pass_through and {reason} -- this frame is untouched");
+                        crate::logging::flush();
+                    }
+                    continue;
+                }
                 if !claim_primary(self.device.handle(), sc, sw.width, sw.height) {
                     // Another swapchain (or another device) already holds the session's
                     // primary claim -- normal when a game keeps a second swapchain
@@ -1087,7 +1265,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
-                let (capture_image, capture_layout) = tap.unwrap_or((image, vk::ImageLayout::PRESENT_SRC_KHR));
+                let (capture_image, capture_layout) = match tap {
+                    Some(source) if sw.pass_through => source,
+                    _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
+                };
                 let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
@@ -1478,6 +1659,167 @@ mod submit_order_tests {
         t.tap_sources_by_destination.clear(); // what destroy_image does to a source
         t.commit_submit([cb(1)].into_iter());
         assert!(t.tapped_source_layouts.is_empty());
+    }
+
+    fn color_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32, format: vk::Format) -> (vk::Image, vk::DeviceMemory, vk::ImageCreateInfo) {
+        let info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width, height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .initial_layout(vk::ImageLayout::UNDEFINED)
+            .build();
+        let image = unsafe { device.create_image(&info, None) }.unwrap();
+        let reqs = unsafe { device.get_image_memory_requirements(image) };
+        let type_index = (0..mem_props.memory_type_count)
+            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
+            .unwrap();
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
+        (image, memory, info)
+    }
+
+    fn layout_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout) -> vk::ImageMemoryBarrier {
+        vk::ImageMemoryBarrier::builder()
+            .old_layout(old)
+            .new_layout(new)
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
+            .build()
+    }
+
+    /// The render tap on a real (lavapipe) device, recorded through the same tracker calls the
+    /// hooks make: a game that blits a smaller render target up into the swapchain, or one in a
+    /// different format, must not be tapped (the capture would copy the swapchain's extent out
+    /// of a smaller image, or read its bytes as the wrong format); an unscaled copy of a
+    /// same-format target is, and the capture reads it in GENERAL without transitioning it.
+    #[test]
+    fn render_tap_is_used_only_when_its_source_matches_the_swapchain() {
+        let Some((_entry, instance, physical, device, queue, family)) = crate::composition::gpu::test_device() else {
+            eprintln!("render tap test: no Vulkan loader/ICD in this environment, skipping");
+            return;
+        };
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical) };
+        let (w, h) = (16u32, 16u32);
+        let swapchain_format = vk::Format::B8G8R8A8_UNORM;
+        let (swap, swap_mem, _) = color_image(&device, &mem_props, w, h, swapchain_format);
+        let (small, small_mem, small_info) = color_image(&device, &mem_props, w / 2, h / 2, swapchain_format);
+        let (rgba, rgba_mem, rgba_info) = color_image(&device, &mem_props, w, h, vk::Format::R8G8B8A8_UNORM);
+        let (good, good_mem, good_info) = color_image(&device, &mem_props, w, h, swapchain_format);
+        let fill = [40.0 / 255.0, 80.0 / 255.0, 120.0 / 255.0, 1.0];
+
+        let mut t = TapTracker::default();
+        t.swapchain_images.insert(swap);
+        for (image, info) in [(small, &small_info), (rgba, &rgba_info), (good, &good_info)] {
+            t.record_image(image, info);
+        }
+
+        let pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None) }.unwrap();
+        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+        let whole = |x: u32, y: u32| [vk::Offset3D::default(), vk::Offset3D { x: x as i32, y: y as i32, z: 1 }];
+        // Records `write` (the game's command) into a fresh command buffer, submits it, and tells
+        // the tracker exactly what the hooks would: the write, its shape, the source's return to
+        // GENERAL, and the submission.
+        let game_frame = |t: &mut TapTracker, source: vk::Image, write: &dyn Fn(vk::CommandBuffer) -> TapWrite| {
+            unsafe {
+                device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()).unwrap();
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder()).unwrap();
+                t.begin_recording(cmd);
+                let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[
+                    layout_barrier(source, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                    layout_barrier(swap, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
+                ]);
+                device.cmd_clear_color_image(cmd, source, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: fill }, &[range]);
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[
+                    layout_barrier(source, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL),
+                ]);
+                let shape = write(cmd);
+                t.observe_write(cmd, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap);
+                t.note_write_shape(swap, shape);
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[
+                    layout_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::GENERAL),
+                    layout_barrier(swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR),
+                ]);
+                t.record_barrier(cmd, source, vk::ImageLayout::GENERAL);
+                device.end_command_buffer(cmd).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], vk::Fence::null()).unwrap();
+                t.commit_submit([cmd].into_iter());
+                device.queue_wait_idle(queue).unwrap();
+            }
+            assert_eq!(t.tap_for(swap), Some((source, vk::ImageLayout::GENERAL)), "the tap source is tracked, in GENERAL");
+        };
+
+        // A render target at half size, blitted (scaled) up into the swapchain.
+        game_frame(&mut t, small, &|cmd| {
+            let blit = [vk::ImageBlit { src_subresource: layers, src_offsets: whole(w / 2, h / 2), dst_subresource: layers, dst_offsets: whole(w, h) }];
+            unsafe { device.cmd_blit_image(cmd, small, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &blit, vk::Filter::LINEAR) };
+            TapWrite::from_blit(&blit)
+        });
+        assert!(t.tap_matches(swap, w, h, swapchain_format).is_err(), "a scaled-up source must not be tapped");
+
+        // A full-size render target in another channel order, blitted 1:1 (the blit converts).
+        game_frame(&mut t, rgba, &|cmd| {
+            let blit = [vk::ImageBlit { src_subresource: layers, src_offsets: whole(w, h), dst_subresource: layers, dst_offsets: whole(w, h) }];
+            unsafe { device.cmd_blit_image(cmd, rgba, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &blit, vk::Filter::NEAREST) };
+            TapWrite::from_blit(&blit)
+        });
+        assert_eq!(t.tap_matches(swap, w, h, swapchain_format), Err("the render source's format differs from the swapchain's"));
+
+        // A same-format, full-size target copied 1:1: tapped, and captured as it is.
+        game_frame(&mut t, good, &|cmd| {
+            let copy = [vk::ImageCopy { src_subresource: layers, src_offset: vk::Offset3D::default(), dst_subresource: layers, dst_offset: vk::Offset3D::default(), extent: vk::Extent3D { width: w, height: h, depth: 1 } }];
+            unsafe { device.cmd_copy_image(cmd, good, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, swap, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &copy) };
+            TapWrite::from_copy(&copy)
+        });
+        assert_eq!(t.tap_matches(swap, w, h, swapchain_format), Ok(()));
+        let bytes = crate::capture::test_capture_once(&device, &instance, physical, queue, family, good, vk::ImageLayout::GENERAL, w, h).expect("capture");
+        // B8G8R8A8 memory order.
+        let expected: Vec<u8> = [fill[2], fill[1], fill[0], fill[3]].iter().map(|c| (c * 255.0f32).round() as u8).collect();
+        assert!(bytes.chunks_exact(4).all(|px| px == expected.as_slice()), "the capture reads the source's own pixels");
+        // And the same source written into the swapchain at an offset is refused again.
+        t.note_write_shape(swap, TapWrite { unscaled_extent: None, copy: true });
+        assert!(t.tap_matches(swap, w, h, swapchain_format).is_err());
+
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_command_pool(pool, None);
+            for (image, memory) in [(swap, swap_mem), (small, small_mem), (rgba, rgba_mem), (good, good_mem)] {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    #[test]
+    fn tap_write_shapes() {
+        let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
+        let at = |x: i32, y: i32| vk::Offset3D { x, y, z: 0 };
+        let end = |x: i32, y: i32| vk::Offset3D { x, y, z: 1 };
+        let blit = |src: [vk::Offset3D; 2], dst: [vk::Offset3D; 2]| TapWrite::from_blit(&[vk::ImageBlit { src_subresource: layers, src_offsets: src, dst_subresource: layers, dst_offsets: dst }]);
+        assert_eq!(blit([at(0, 0), end(64, 32)], [at(0, 0), end(64, 32)]).unscaled_extent, Some((64, 32)));
+        assert_eq!(blit([at(0, 0), end(32, 16)], [at(0, 0), end(64, 32)]).unscaled_extent, None, "scaled");
+        assert_eq!(blit([at(0, 32), end(64, 0)], [at(0, 0), end(64, 32)]).unscaled_extent, None, "flipped");
+        assert_eq!(blit([at(8, 0), end(72, 32)], [at(8, 0), end(72, 32)]).unscaled_extent, None, "offset");
+        let copy = |offset: vk::Offset3D, mip: u32| TapWrite::from_copy(&[vk::ImageCopy { src_subresource: vk::ImageSubresourceLayers { mip_level: mip, ..layers }, src_offset: offset, dst_subresource: layers, dst_offset: offset, extent: vk::Extent3D { width: 64, height: 32, depth: 1 } }]);
+        assert_eq!(copy(at(0, 0), 0), TapWrite { unscaled_extent: Some((64, 32)), copy: true });
+        assert_eq!(copy(at(4, 0), 0).unscaled_extent, None, "offset");
+        assert_eq!(copy(at(0, 0), 1).unscaled_extent, None, "another mip level");
+        assert!(tap_format_matches(vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM, true), "a copy moves raw bytes");
+        assert!(!tap_format_matches(vk::Format::B8G8R8A8_SRGB, vk::Format::B8G8R8A8_UNORM, false), "a blit converts sRGB");
+        assert!(!tap_format_matches(vk::Format::R8G8B8A8_UNORM, vk::Format::B8G8R8A8_UNORM, true), "channel order differs");
     }
 
     /// `vkDeviceWaitIdle` requires every queue of the device to be externally synchronized,

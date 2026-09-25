@@ -1749,7 +1749,7 @@ pub unsafe fn run(
 /// caller shares the exact same recorded commands rather than a copy that could
 /// drift apart -- not, today, because there already is one.
 /// `model`, when `Some((scratch_image, scratch_buffer, model_width, model_height))`,
-/// additionally blits `image` (already `TRANSFER_SRC_OPTIMAL` for the main copy below)
+/// additionally blits `image` (already in its read layout for the main copy below)
 /// down into `scratch_image` at `(model_width, model_height)` -- `VK_FILTER_LINEAR`, a
 /// hardware resize unit, not the CPU resample `working_scale` originally tried and
 /// measured too slow for this thread (see `ModelScratch`'s own doc comment) -- then
@@ -1788,10 +1788,18 @@ fn record_capture_commands(
     if unsafe { device.begin_command_buffer(cmd, &begin_info) }.is_err() {
         return false;
     }
+    // The layout `image` is read in. A render-tap source is only ever captured while its
+    // tracked layout is GENERAL, in which copies and blits may read it directly: it is read
+    // there, with a plain dependency and no layout transition at all, so the game's own image
+    // never has its layout rewritten by the layer -- even if the tracked layout were stale (a
+    // render pass's implicit transition is not tracked), nothing is transitioned from it.
+    // A swapchain image is presented in PRESENT_SRC_KHR, which a copy cannot read, so it goes
+    // to TRANSFER_SRC_OPTIMAL and back.
+    let read_layout = if initial_layout == vk::ImageLayout::GENERAL { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
     let to_transfer_src = barrier(
         image,
         initial_layout,
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        read_layout,
         vk::AccessFlags::empty(),
         vk::AccessFlags::TRANSFER_READ,
     );
@@ -1823,10 +1831,10 @@ fn record_capture_commands(
         .image_offset(vk::Offset3D::default())
         .image_extent(vk::Extent3D { width, height, depth: 1 })
         .build();
-    // SAFETY: `image` was just transitioned to `TRANSFER_SRC_OPTIMAL` above; `buffer`
-    // is sized to at least `width*height*bytes_per_pixel` by whichever caller built it.
+    // SAFETY: `image` is in `read_layout` after the barrier above; `buffer` is sized to
+    // at least `width*height*bytes_per_pixel` by whichever caller built it.
     unsafe {
-        device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
+        device.cmd_copy_image_to_buffer(cmd, image, read_layout, buffer, &[region]);
     }
     if let Some(extra_dst) = extra_dst {
         // Same source, same region, into device-local memory. The barrier after it is what a
@@ -1843,15 +1851,15 @@ fn record_capture_commands(
             .offset(0)
             .size(vk::WHOLE_SIZE)
             .build();
-        // SAFETY: `image` is still `TRANSFER_SRC_OPTIMAL`; `extra_dst` is sized for at least
+        // SAFETY: `image` is still in `read_layout`; `extra_dst` is sized for at least
         // `width*height*4` bytes by whoever handed it over.
         unsafe {
-            device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, extra_dst, &[region]);
+            device.cmd_copy_image_to_buffer(cmd, image, read_layout, extra_dst, &[region]);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[extra_ready], &[]);
         }
     }
     if let Some((scratch_image, scratch_buffer, model_width, model_height)) = model {
-        // `image` is still `TRANSFER_SRC_OPTIMAL` from the copy above -- read from it
+        // `image` is still in `read_layout` from the copy above -- read from it
         // again for the blit, same source, no extra barrier needed on this side.
         // `scratch_image` starts from `UNDEFINED` every call: a blit fully overwrites
         // the whole image, so there is never any prior content worth preserving, and
@@ -1866,9 +1874,9 @@ fn record_capture_commands(
             .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
             .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: model_width as i32, y: model_height as i32, z: 1 }])
             .build();
-        // SAFETY: `image` is `TRANSFER_SRC_OPTIMAL`; `scratch_image` was just
+        // SAFETY: `image` is in `read_layout`; `scratch_image` was just
         // transitioned to `TRANSFER_DST_OPTIMAL`; both are 2D, single-mip, single-layer.
-        unsafe { device.cmd_blit_image(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR) };
+        unsafe { device.cmd_blit_image(cmd, image, read_layout, scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR) };
         // The encode, in place over the scratch the blit just filled and before the
         // download below reads it -- this is leg 1's `ENCODE` step, and it is the whole
         // reason the proxy the model sees is not a bit-identical copy of the frame any
@@ -1948,7 +1956,7 @@ fn record_capture_commands(
     // own next use of a render-tap source, ran against it instead.
     let to_present = barrier(
         image,
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        read_layout,
         initial_layout,
         vk::AccessFlags::TRANSFER_READ,
         vk::AccessFlags::empty(),
@@ -2288,6 +2296,32 @@ pub fn wait_in_flight(pipeline: Option<&CapturePipeline>, direct: &[Option<Direc
     // after a successful submit), so the wait cannot hang on a never-submitted fence.
     let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
     crate::note_fence_wait(wait, "capture::wait_in_flight").is_ok()
+}
+
+/// One full-resolution capture of `image` (in `layout`) through the real capture pipeline,
+/// waited on: its bytes. For tests outside this module that need to check what the capture
+/// reads from an image.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn test_capture_once(
+    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue, queue_family: u32,
+    image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32,
+) -> Option<Vec<u8>> {
+    let bytes = u64::from(width) * u64::from(height) * 4;
+    let mut pipeline = None;
+    if !ensure_pipeline(&mut pipeline, device, instance, physical_device, queue_family, bytes) {
+        return None;
+    }
+    let p = pipeline.as_mut()?;
+    let push = crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: 0, reversible_mode: 0 };
+    let submitted = submit_pipeline_capture(p, 0, device, instance, physical_device, queue, image, layout, width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None, push);
+    // SAFETY: `queue` is the test's own; waiting for it idle completes the capture.
+    unsafe { device.queue_wait_idle(queue) }.ok()?;
+    let (mut out, mut model) = (Vec::new(), Vec::new());
+    let (full, _) = poll_pipeline_capture(p, 0, device, &mut out, &mut model);
+    // SAFETY: the queue is idle, so nothing references the pipeline any more.
+    unsafe { destroy_pipeline(pipeline, device) };
+    (submitted && full.is_some()).then_some(out)
 }
 
 /// # Safety
