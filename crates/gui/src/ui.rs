@@ -230,9 +230,12 @@ fn hotkey_row(initial: u32, setter: impl Fn(u32) + 'static) -> adw::ActionRow {
 }
 
 pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
-    let Some(shm) = Shm::open() else {
-        build_error_window(app);
-        return;
+    let shm = match Shm::open() {
+        Ok(shm) => shm,
+        Err(e) => {
+            build_error_window(app, &e);
+            return;
+        }
     };
     let shm = shm.0;
 
@@ -1390,29 +1393,22 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     };
     glib::timeout_add_seconds_local(1, move || {
         let hdr = shm_for_timer.header();
-        let version = hdr.version.load(Ordering::Relaxed);
-        if version != neural_forge_protocol::SHM_VERSION {
-            helper_row.set_subtitle(&format!(
-                "shared memory is version {version}, this app speaks {} -- restart the helper and the game on the same Neural Forge version",
-                neural_forge_protocol::SHM_VERSION
-            ));
-            layer_row.set_subtitle("unknown (version mismatch)");
+        // A header laid out by another build is refused at open (see `Shm::open`), so the
+        // version needs no check here.
+        let helper_alive = fresh(&helper_beat, hdr.heartbeat.load(Ordering::Relaxed));
+        let helper_state = hdr.helper_state.load(Ordering::Relaxed);
+        let reason = hdr.helper_reason();
+        let state = if helper_alive || neural_forge_supervisor::is_running().is_some() { helper_state_label(helper_state) } else { "not running" };
+        helper_row.set_subtitle(&if reason.is_empty() { state.to_string() } else { format!("{state} -- {reason}") });
+        let layer_active = fresh(&layer_beat, hdr.layer_heartbeat.load(Ordering::Relaxed));
+        let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
+        layer_row.set_subtitle(if layer_active {
+            "active: processing the game's frames"
+        } else if attached {
+            "idle: a game attached, but no frames are being processed (loading screen, paused, closed, or no helper)"
         } else {
-            let helper_alive = fresh(&helper_beat, hdr.heartbeat.load(Ordering::Relaxed));
-            let helper_state = hdr.helper_state.load(Ordering::Relaxed);
-            let reason = hdr.helper_reason();
-            let state = if helper_alive || neural_forge_supervisor::is_running().is_some() { helper_state_label(helper_state) } else { "not running" };
-            helper_row.set_subtitle(&if reason.is_empty() { state.to_string() } else { format!("{state} -- {reason}") });
-            let layer_active = fresh(&layer_beat, hdr.layer_heartbeat.load(Ordering::Relaxed));
-            let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
-            layer_row.set_subtitle(if layer_active {
-                "active: processing the game's frames"
-            } else if attached {
-                "idle: a game attached, but no frames are being processed (loading screen, paused, closed, or no helper)"
-            } else {
-                "no game attached yet"
-            });
-        }
+            "no game attached yet"
+        });
         // Keyed off the actual OS-level pid-file check (what start/stop manage), not
         // the SHM helper_state above -- those can briefly disagree right after a
         // start/stop (e.g. STARTING vs. the process not existing yet) and the button
@@ -1444,6 +1440,10 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
                         Ok(Ok(())) => {
                             STARTED_PID.store(0, Ordering::Relaxed);
                             toasts.add_toast(adw::Toast::new("Helper stopped"));
+                        }
+                        // Another start or stop (the CLI, or another window) holds the helper lock.
+                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            toasts.add_toast(adw::Toast::new("The helper is being started or stopped elsewhere -- try again in a moment"));
                         }
                         Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Stop failed: {e}"))),
                         Err(_) => toasts.add_toast(adw::Toast::new("Stop failed: the stop worker panicked")),
@@ -1632,12 +1632,24 @@ fn helper_state_label(state: u32) -> &'static str {
     }
 }
 
-fn build_error_window(app: &adw::Application) {
-    let status = adw::StatusPage::builder()
-        .icon_name("dialog-error-symbolic")
-        .title("Couldn't open the shared-memory mapping")
-        .description("Check the helper's log; neural-forge-cli doctor may also help.")
-        .build();
+fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::mapping::OpenError) {
+    use neural_forge_protocol::mapping::OpenError;
+    let (title, description) = match error {
+        OpenError::WrongVersion { found } => (
+            "Another Neural Forge version is running",
+            format!(
+                "The shared memory was set up by a build that speaks version {found}; this app speaks {}. \
+                 Close the game and stop the helper (neural-forge-cli stop), then open Neural Forge again \
+                 so every part runs the same version.",
+                neural_forge_protocol::SHM_VERSION
+            ),
+        ),
+        OpenError::Unavailable => (
+            "Couldn't open the shared-memory mapping",
+            "Check the helper's log; neural-forge-cli doctor may also help.".to_string(),
+        ),
+    };
+    let status = adw::StatusPage::builder().icon_name("dialog-error-symbolic").title(title).description(description).build();
     let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();
     window.present();
 }
