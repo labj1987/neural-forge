@@ -1444,7 +1444,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   shared `dlssnr-supervisor` crate (extracted from `dlssnr-cli`) so both the CLI and
   GUI start/stop the helper through the same code instead of duplicating it.
 - Adds an About dialog to the GUI (there wasn't one before) crediting Claude Code
-  (Anthropic) in its acknowledgements, matching GreenLight/KernelPop/SteamPunk.
+  (Anthropic) in its acknowledgements.
 - Adds a "NGX binaries" import button to the GUI's Status group — previously only
   `dlssnr-cli import-binaries` could do this.
 

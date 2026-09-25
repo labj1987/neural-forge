@@ -20,7 +20,7 @@ validation evidence before GTA benchmarking.
 | State | `$XDG_STATE_HOME/neural-forge/helper.log` |
 | Runtime / control / lease | `/tmp/neural-forge-$UID/{shm.bin,helper.pid,shm.bin.owner}` |
 | Wire magic | `NFR1` (layout v2 retained) |
-| AppImage | `neural-forge-0.1.54-x86_64.AppImage` |
+| AppImage | `neural-forge-<version>-x86_64.AppImage` |
 
 XDG variables fall back to the usual directories under HOME. Shared memory stays
 under /tmp for Steam pressure-vessel visibility. Old runtime/config paths are not
@@ -93,10 +93,12 @@ remains experimental and requires a separate explicit retest because upstream hu
 4K. Never enable both activation flags for
 one benchmark process. Co-installation does not mean double injection is useful.
 
-Keep helper enabled, passes=1, model_resolution=1, motion_enabled=0,
-motion_quality=0. New mappings default to motion disabled/quality 0 (`mvec_enabled=0`,
-`mvec_quality=0` in this Rust protocol). No model-resolution or helper enablement
-changes were made in Phase 1.
+Keep helper enabled, passes=1, model_resolution=1. Since 0.1.98 new mappings default
+to motion on at the Fast quality (`mvec_enabled=1`, `mvec_quality=0` in this Rust
+protocol): measured at about 2-3% of the frame rate in GTA V (see CHANGELOG.md's 0.1.98
+entry). Record the motion setting with every benchmark, since the Phase 1 baseline was
+taken with motion off. No model-resolution or helper enablement changes were made in
+Phase 1.
 Record RTX 5070 / driver 615.71.09, 2560x1440 at 288 Hz, GNOME scale 100%,
 Steam AppID 3240220, the exact Proton build, game build, and DLL hashes.
 

@@ -62,6 +62,9 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 ## Requirements
 
 - x86_64 Linux, NVIDIA GPU and driver, Vulkan loader.
+- GTK 4.12 or newer and libadwaita 1.5 or newer, from the system. The AppImage uses
+  the host's GTK and libadwaita and does not bundle them. Release builds are made
+  on Ubuntu 24.04 (GTK 4.14, libadwaita 1.5).
 - A Wine install or a Steam compatibility tool that bundles DXVK-NVAPI (e.g.
   Proton-CachyOS, Proton-GE) to run the Windows-side helper. Valve's stock Proton
   builds don't bundle DXVK-NVAPI, so they aren't a supported runner.
@@ -113,6 +116,12 @@ activate the layer; the GUI's Setup page builds the full string, Smooth Motion i
 GUI and layer share live settings over the same shared-memory segment;
 `neural-forge-cli shmctl status/set/toggle/capture` covers the same controls from a
 terminal.
+
+When neural rendering is on, opening the GUI starts the helper if it isn't already
+running. Closing the GUI stops only a helper that this GUI window started. A helper
+started with `neural-forge-cli start`, or by an earlier GUI session, keeps running after
+the window closes, so closing the settings mid-game doesn't turn the effect off. Stop it
+with the Status tab's Stop button or `neural-forge-cli stop`.
 
 ## Status
 

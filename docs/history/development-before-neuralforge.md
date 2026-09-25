@@ -329,8 +329,8 @@ layer + Windows NGX helper that runs NVIDIA DLSS 5 Neural Rendering on Linux/Pro
 games, forwarding frames to a Windows NGX helper running under Wine/Proton today (and,
 per upstream's own stated roadmap, a native-Linux helper once NVIDIA ships one — the
 whole point of the shared-memory seam below is that nothing on this side of it needs to
-change when that happens). Distributed as a single AppImage, same as GreenLight/
-KernelPop/SteamPunk — but unlike those two, this app needs **no root/pkexec step at
+change when that happens). Distributed as a single AppImage built with appimagetool
+directly against the system GTK 4/libadwaita, and it needs **no root/pkexec step at
 all**: everything lives under `~/.local/share`, `~/.config`, `/tmp/dlssnr-$UID/`.
 
 **Original implementation plan** (a design document kept outside the repo, since
@@ -401,8 +401,7 @@ crates/
   supervisor/ lib, x86_64-unknown-linux-gnu only. Config/paths/process-supervision
               shared between `gui` and `cli` (extracted 2026-09-09) so both start/stop
               the helper through the same code.
-  gui/        bin, gtk4 + libadwaita, flat src/*.rs modules (same convention as
-              GreenLight/KernelPop/SteamPunk).
+  gui/        bin, gtk4 + libadwaita, flat src/*.rs modules.
   cli/        bin, the `dlssnr-cli` helper-manager (init/start/stop/status/doctor/
               runners/detect-gpu/import-binaries).
 ```
@@ -1474,8 +1473,8 @@ trick used for the NGX-import button (real screenshot: row present, labeled "Sta
 matching the real "stopped" state) — **actual click-through is unverified**, same
 sandbox input-routing limitation as everywhere else in this GUI. `stop()` blocks the
 GTK main thread for up to 5s (graceful-then-SIGKILL) on click; deliberately not made
-async since this GUI has no async runtime wired up at all (no `tokio`, unlike the
-sibling apps) and adding one for one button wasn't judged worth it.
+async since this GUI has no async runtime wired up at all (no `tokio`)
+and adding one for one button wasn't judged worth it.
 
 ## `cli` (milestone 5, real and tested — including one real bug caught by an actual
 ## process-group kill test)
@@ -1517,16 +1516,16 @@ code upstream's own `ATTRIBUTION.md` admits it carries) and from the one place t
 project *does* knowingly reproduce upstream's approach on purpose (the NGX
 caller-identity spoof) — that section says so plainly rather than blending it in.
 `v0.1.0` tagged and pushed as a GitHub release with the AppImage + `.zsync` sidecar as
-assets — repo and release are both public, matching GreenLight/SteamPunk's convention
-(confirmed via `gh repo view` before creating it).
+assets — repo and release are both public (confirmed via `gh repo view` before
+creating it).
 
 ## Build process (milestone 6, real and verified end-to-end — this actually produced
 ## a working AppImage in this session)
 
 `build-appimage.sh` builds the release binaries (native `protocol`/`layer`/`gui`/`cli`,
 cross-compiled `helper`), assembles the `AppDir`, packs it with `appimagetool`, and
-generates the `.zsync` sidecar — modeled on GreenLight's own script, with **no
-polkit/pkexec step at all** (this app needs one nowhere) and a `CARGO_HELPER`
+generates the `.zsync` sidecar with `zsyncmake` run directly (appimagetool's own zsync
+generation silently no-ops on CI runners), with **no polkit/pkexec step at all** (this app needs one nowhere) and a `CARGO_HELPER`
 environment override for this dev machine's own multi-toolchain setup (see "Current
 state" above; a clean CI image needs no override, since it has only one toolchain to
 begin with). **Actually run successfully this session**: produced a real, valid
