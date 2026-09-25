@@ -28,7 +28,8 @@ fn usage() {
          \x20                     (see neural_forge_layer::dump); optional debug_view 0-3\n\
          \x20 reset               reset every setting to its default; preserves the\n\
          \x20                     live helper/layer session (see ShmHeader::reset_persisted_settings)\n\n\
-         Respects $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID, same as every other tool in this workspace."
+         Opens config.ini's shm= channel, else $NEURAL_FORGE_SHM, else the default under\n\
+         /tmp/neural-forge-$UID -- the same one `start` gives the helper."
     );
 }
 
@@ -92,13 +93,19 @@ fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
     extra_field(header, name).map(|(field, is_float)| (is_float, field.load(Ordering::Relaxed)))
 }
 
+/// Writes one setting and bumps the sequence numbers the helper and layer watch. The
+/// `tuning_seq` bump also marks the header as configured: left at 0 (a header nothing had
+/// applied `config.ini` to yet), the next `start()` would overwrite this value from it.
 fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
     if header.persisted_settings().iter().any(|(n, ..)| *n == name) {
         header.apply_persisted_setting(name, bits);
+        header.tuning_seq.fetch_add(1, Ordering::Relaxed);
+        header.control_seq.fetch_add(1, Ordering::Relaxed);
         return true;
     }
     if let Some((field, _)) = extra_field(header, name) {
         field.store(bits, Ordering::Relaxed);
+        header.control_seq.fetch_add(1, Ordering::Relaxed);
         return true;
     }
     false
@@ -204,6 +211,16 @@ mod tests {
     }
 
     #[test]
+    fn store_marks_an_untouched_header_as_configured() {
+        let header = ShmHeader::default();
+        header.init_defaults();
+        assert_eq!(header.tuning_seq.load(Ordering::Relaxed), 0);
+        assert!(cmd_set(&header, "intensity", "0.5"));
+        assert_ne!(header.tuning_seq.load(Ordering::Relaxed), 0, "the next start() must not overwrite this from config.ini");
+        assert_ne!(header.control_seq.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
     fn store_writes_through_extra_fields() {
         let header = ShmHeader::default();
         assert!(store(&header, "capture_request", 1));
@@ -248,9 +265,13 @@ mod tests {
 }
 
 pub fn run(args: &[String]) -> std::process::ExitCode {
-    let Some(mapping) = neural_forge_protocol::mapping::open() else {
-        eprintln!("shmctl: failed to open the SHM mapping (see $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)");
-        return std::process::ExitCode::FAILURE;
+    let cfg = neural_forge_supervisor::Config::load();
+    let mapping = match neural_forge_supervisor::open_channel(&cfg) {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            eprintln!("shmctl: {e}: {}", neural_forge_supervisor::channel_path(&cfg));
+            return std::process::ExitCode::FAILURE;
+        }
     };
     let header = mapping.header();
 

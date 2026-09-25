@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn per_pass_overrides_round_trip_and_a_cleared_override_stays_cleared() {
         let path = format!("{}/neural-forge-persist-pass-test-{}/shm.bin", std::env::temp_dir().display(), std::process::id());
-        let m = mapping::open_at(&path).expect("mapping");
+        let m = mapping::open_path(&path).expect("mapping");
         let h = m.header();
         use std::sync::atomic::Ordering::Relaxed;
         h.pass[1].intensity_bits.store(2.5f32.to_bits(), Relaxed);
@@ -113,31 +113,33 @@ mod tests {
     #[test]
     fn snapshot_then_apply_round_trips_every_setting() {
         let path = format!("{}/neural-forge-persist-test-{}/shm.bin", std::env::temp_dir().display(), std::process::id());
-        let m = mapping::open_at(&path).expect("failed to create test mapping");
+        let m = mapping::open_path(&path).expect("failed to create test mapping");
         let h = m.header();
 
-        h.intensity_bits.store(1.75f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        h.style.store(2, std::sync::atomic::Ordering::Relaxed);
-        h.auto_mask.store(0, std::sync::atomic::Ordering::Relaxed);
-
-        h.white_point_source.store(1, std::sync::atomic::Ordering::Relaxed);
-        h.white_point_bits.store(2.0f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        h.white_point_scale_bits.store(1.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        h.white_point_trim_bits.store(0.75f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        h.toggle_key.store(87, std::sync::atomic::Ordering::Relaxed);
+        // Every persisted field gets its own value, distinct from its default and from
+        // every other field's, so a name that `apply_persisted_setting` silently drops (or
+        // maps onto the wrong field) shows up as a mismatch below.
+        let defaults = h.persisted_settings();
+        for (i, (name, is_float, default_bits)) in defaults.iter().enumerate() {
+            let bits = if *is_float { (10.0 + i as f32 * 0.25).to_bits() } else { 100 + i as u32 };
+            assert_ne!(bits, *default_bits, "{name}");
+            h.apply_persisted_setting(name, bits);
+        }
+        for (i, (name, is_float, bits)) in h.persisted_settings().iter().enumerate() {
+            let expected = if *is_float { (10.0 + i as f32 * 0.25).to_bits() } else { 100 + i as u32 };
+            assert_eq!(*bits, expected, "{name} was not stored by apply_persisted_setting");
+        }
         let snap = snapshot(h);
-        assert_eq!(snap.get("set_intensity").map(String::as_str), Some("1.75"));
-        assert_eq!(snap.get("set_style").map(String::as_str), Some("2"));
-        assert_eq!(snap.get("set_auto_mask").map(String::as_str), Some("0"));
+        assert_eq!(snap.get("set_white_point").map(String::as_str), Some("10"));
 
         h.init_defaults();
-        assert_ne!(f32::from_bits(h.intensity_bits.load(std::sync::atomic::Ordering::Relaxed)), 1.75);
+        assert_eq!(h.persisted_settings(), defaults);
 
         apply(h, &snap);
-        assert_eq!(snapshot(h),snap,"every setting, including HDR and hotkey, must survive reinitialization");
-        assert_eq!(f32::from_bits(h.intensity_bits.load(std::sync::atomic::Ordering::Relaxed)), 1.75);
-        assert_eq!(h.style.load(std::sync::atomic::Ordering::Relaxed), 2);
-        assert_eq!(h.auto_mask.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(snapshot(h), snap, "every setting must survive reinitialization");
+        for ((name, _, restored), (_, _, default_bits)) in h.persisted_settings().iter().zip(defaults.iter()) {
+            assert_ne!(restored, default_bits, "{name} came back at its default");
+        }
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).ok();
@@ -146,7 +148,7 @@ mod tests {
     #[test]
     fn apply_ignores_unknown_and_unparsable_keys() {
         let path = format!("{}/neural-forge-persist-test2-{}/shm.bin", std::env::temp_dir().display(), std::process::id());
-        let m = mapping::open_at(&path).expect("failed to create test mapping");
+        let m = mapping::open_path(&path).expect("failed to create test mapping");
         let h = m.header();
 
         let mut raw = BTreeMap::new();

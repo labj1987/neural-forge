@@ -10,9 +10,12 @@
 //! point `vkcube`/the layer at it.
 
 fn main() {
-    let Some(mapping) = neural_forge_protocol::mapping::open() else {
-        eprintln!("trigger_capture: failed to open the SHM mapping (see $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)");
-        std::process::exit(1);
+    let mapping = match neural_forge_protocol::mapping::open() {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            eprintln!("trigger_capture: {e} (see $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)");
+            std::process::exit(1);
+        }
     };
     // Optional `debug_view` override (0-3, see ShmHeader::debug_view's doc comment) --
     // set before the request so the very next present both shows and dumps that mode.
