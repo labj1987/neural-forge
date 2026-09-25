@@ -226,6 +226,9 @@ ngx_param_setter!(ngx_set_u32, set_u32, u32);
 ngx_param_setter!(ngx_set_i32, set_i32, i32);
 ngx_param_getter!(ngx_get_u32, get_u32, u32);
 ngx_param_getter!(ngx_get_f32, get_f32, f32);
+ngx_param_getter!(ngx_get_u64, get_u64, u64);
+ngx_param_getter!(ngx_get_i32, get_i32, i32);
+ngx_param_getter!(ngx_get_ptr, get_ptr, *mut c_void);
 
 /// # Safety
 /// `param` must be a valid, live `NgxParameter`; `name` a valid NUL-terminated C
