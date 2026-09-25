@@ -2211,6 +2211,27 @@ fn submit_pipeline_capture(
     true
 }
 
+/// Waits for every capture the layer has submitted and not yet seen complete (the
+/// pipeline's and the direct captures' pending slots). Only the layer's own fences: a
+/// fence wait needs no queue synchronization, so this is legal from any hook on any
+/// thread, unlike `vkDeviceWaitIdle`. Bounded by [`crate::FENCE_WAIT_TIMEOUT`]; `false`
+/// if a wait failed or timed out. The slots stay pending, so the next poll consumes them
+/// as usual.
+pub fn wait_in_flight(pipeline: Option<&CapturePipeline>, direct: &[Option<DirectCapture>; 2], device: &ash::Device) -> bool {
+    let mut fences: Vec<vk::Fence> = Vec::new();
+    if let Some(p) = pipeline {
+        fences.extend(p.slots.iter().filter(|s| s.pending.is_some()).map(|s| s.buf.fence));
+    }
+    fences.extend(direct.iter().flatten().filter(|d| d.pending.is_some()).map(|d| d.buf.fence));
+    if fences.is_empty() {
+        return true;
+    }
+    // SAFETY: every fence is the layer's own and was submitted (a slot is only `pending`
+    // after a successful submit), so the wait cannot hang on a never-submitted fence.
+    let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    crate::note_fence_wait(wait, "capture::wait_in_flight").is_ok()
+}
+
 /// # Safety
 /// Must only be called at device-destruction time, with no submitted work referencing
 /// these handles still in flight -- same contract as [`destroy`].

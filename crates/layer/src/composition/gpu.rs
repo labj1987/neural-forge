@@ -1802,6 +1802,17 @@ impl GpuCompose {
         Some(semaphore)
     }
 
+    /// Waits for every compose this `GpuCompose` has submitted (the async slots and the
+    /// synchronous one). Only its own fences, so it is legal from any hook on any thread.
+    pub fn wait_in_flight(&self, device: &ash::Device) -> bool {
+        let mut fences: Vec<vk::Fence> = self.async_slots.iter().map(|s| s.slot.fence).collect();
+        fences.push(self.sync.fence);
+        // SAFETY: every fence belongs to this `GpuCompose` and starts signaled, so an
+        // unused slot does not block. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
+        let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        crate::note_fence_wait(wait, "gpu::wait_in_flight").is_ok()
+    }
+
     pub fn retire_present_images(&mut self, images: &[vk::Image]) {
         self.present_semaphores.retire(images);
     }

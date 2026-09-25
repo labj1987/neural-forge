@@ -183,6 +183,30 @@ struct State {
     /// why the application's present wait semaphores are relayed through the layer's
     /// own queue before any capture/compose work is submitted.
     relay_semaphores: crate::present_sync::PresentSemaphores,
+    /// Swapchains the layer has submitted capture or compose work for. Only these need
+    /// the layer's own in-flight work drained when they are destroyed (see
+    /// `destroy_swapchain_khr`); a pass-through or never-engaged swapchain is destroyed
+    /// without the layer waiting on anything.
+    engaged_swapchains: HashSet<vk::SwapchainKHR>,
+}
+
+impl State {
+    /// Whether destroying `swapchain` must first drain the layer's own GPU work, and
+    /// forgets it either way.
+    fn take_drain_needed(&mut self, swapchain: vk::SwapchainKHR) -> bool {
+        self.engaged_swapchains.remove(&swapchain)
+    }
+
+    /// Waits for the layer's own in-flight captures and composes, by their fences only.
+    /// Never `vkDeviceWaitIdle`: that needs every queue of the device externally
+    /// synchronized, which a swapchain hook cannot guarantee (a vkd3d-proton title may be
+    /// submitting on another queue from a worker thread while it recreates the
+    /// swapchain), and it stalls the whole GPU on every recreate.
+    fn drain_layer_work(&self, device: &ash::Device) -> bool {
+        let captures = capture::wait_in_flight(self.capture_pipeline.as_ref(), &self.direct_capture, device);
+        let composes = self.gpu_compose.as_ref().is_none_or(|gpu| gpu.wait_in_flight(device));
+        captures && composes
+    }
 }
 
 /// Render-tap bookkeeping, deliberately kept out of the per-device `Mutex<State>`.
@@ -854,18 +878,16 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             return LayerResult::Unhandled;
         };
         release_primary(self.device.handle(), swapchain);
-        // Drain before anything per-swapchain is freed: a capture or compose the layer submitted
-        // for one of this swapchain's images may still be in flight, and must not be left
-        // referencing an image the driver is about to destroy. The layer's own submissions are
-        // fenced but those fences are not tracked here per swapchain, so wait for the device
-        // (the application already has to have stopped using the swapchain to destroy it).
-        let known = self.state.lock().unwrap().swapchains.contains_key(&swapchain);
-        if known {
-            // SAFETY: `self.device` is the live device this swapchain belongs to.
-            let _ = unsafe { self.device.device_wait_idle() };
-        }
         {
             let mut state = self.state.lock().unwrap();
+            // Drain before anything per-swapchain is freed: a capture or compose the layer
+            // submitted for one of this swapchain's images may still be in flight, and must
+            // not be left referencing an image the driver is about to destroy. Only the
+            // layer's own fences, and only for a swapchain the layer actually worked on.
+            if state.take_drain_needed(swapchain) && !state.drain_layer_work(&self.device) {
+                crate::log!("[layer] could not confirm the layer's own work on swapchain {swapchain:?} finished before its destruction");
+                crate::logging::flush();
+            }
             state.warmup.remove(&swapchain);
             if let Some(old) = state.swapchains.remove(&swapchain) {
                 {
@@ -1066,7 +1088,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
                 let (capture_image, capture_layout) = tap.unwrap_or((image, vk::ImageLayout::PRESENT_SRC_KHR));
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, .. } = &mut *state;
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
                     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1122,6 +1144,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     }
                 }
                 if let Some(instance) = &self.instance {
+                    engaged_swapchains.insert(sc);
                     // SAFETY: `queue` is the same queue this present call was made on,
                     // externally synchronized for its duration by the same Vulkan rule
                     // that lets the caller call `vkQueuePresentKHR` on it at all right
@@ -1457,6 +1480,20 @@ mod submit_order_tests {
         assert!(t.tapped_source_layouts.is_empty());
     }
 
+    /// `vkDeviceWaitIdle` requires every queue of the device to be externally synchronized,
+    /// which only `vkDestroyDevice` guarantees. It must not be reachable from any per-frame or
+    /// swapchain hook: the one call in this file is the device-teardown drain.
+    #[test]
+    fn device_wait_idle_is_only_used_at_device_teardown() {
+        let source = include_str!("device.rs");
+        let code = &source[..source.find("#[cfg(test)]").expect("test modules follow the code")];
+        let calls: Vec<usize> = code.match_indices(".device_wait_idle()").map(|(at, _)| at).collect();
+        let teardown = code.find("unsafe fn destroy_private_resources").expect("teardown function");
+        let after_teardown = teardown + code[teardown..].find("\n}\n").expect("end of teardown function");
+        assert_eq!(calls.len(), 1, "exactly one device_wait_idle, at device teardown");
+        assert!(calls.iter().all(|&at| at > teardown && at < after_teardown), "device_wait_idle outside destroy_private_resources");
+    }
+
     /// Real (lavapipe) queue: the relay batch must consume the application's wait
     /// semaphore and hand back a semaphore that a later wait can consume, including
     /// when the same image is relayed again.
@@ -1485,6 +1522,25 @@ mod submit_order_tests {
             device.queue_wait_idle(queue).unwrap();
             relays.destroy(&device);
             device.destroy_fence(fence, None);
+
+            // Destroying a swapchain: a pass-through (never engaged) one drains nothing, and
+            // an engaged one drains only the layer's own fences, which on an idle queue
+            // returns at once.
+            let mut state = State::default();
+            let pass_through = vk::SwapchainKHR::from_raw(7);
+            let engaged = vk::SwapchainKHR::from_raw(8);
+            state.engaged_swapchains.insert(engaged);
+            assert!(!state.take_drain_needed(pass_through), "a pass-through swapchain must not drain anything");
+            state.gpu_compose = crate::composition::gpu::GpuCompose::new(&device, _family);
+            assert!(state.gpu_compose.is_some());
+            assert!(state.take_drain_needed(engaged));
+            let started = std::time::Instant::now();
+            assert!(state.drain_layer_work(&device));
+            assert!(started.elapsed() < std::time::Duration::from_secs(1));
+            assert!(!state.take_drain_needed(engaged), "drained once, forgotten");
+            if let Some(gpu) = state.gpu_compose.take() {
+                gpu.destroy(&device);
+            }
             device.destroy_device(None);
             instance.destroy_instance(None);
         }
