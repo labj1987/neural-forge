@@ -46,7 +46,7 @@ shared memory, or Wine prefixes. Import DLLs explicitly into NeuralForge's data 
 
 Target-process filtering and the kernel ownership lease must remain effective before
 any process can resize or write a channel. Preserve the GTA baseline: helper enabled,
-passes=1, model_resolution=1, motion disabled/quality 0, host SHM transport.
+passes=1, model_resolution=1, motion vectors on (quality FAST, the default since 0.1.98), host SHM transport.
 DMA-BUF remains experimental, and both transport directions tried so far are blocked
 on real, confirmed-on-hardware constraints (a Wine/NVIDIA-driver handle-type mismatch
 one way, a plain Linux anon-inode-fd limitation the other), not just unimplemented --
