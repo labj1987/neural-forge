@@ -119,20 +119,60 @@ gets ~120 fps while the model runs about half as often, so GPU load falls from 7
 ~42%. The GPU-load differences between lsfg-vk modes are within sampling noise at this load;
 use the benchmark costs above to rank them.
 
-### GTA V Enhanced (Neural Forge + Smooth Motion, correct order)
+### GTA V Enhanced: in-game benchmark, unattended
 
-Recorded 08:27–08:34 while the session was being streamed over GNOME Remote Desktop (one NVENC
-session, ~37 fps), which adds the same small load to every configuration.
+GTA was launched without Steam's launch options:
+- through the same SLR 4 `_v2-entry-point` and Proton-CachyOS that Steam uses, with Steam
+  running;
+- with a chosen environment per run;
+- with `-benchmark -benchmarkIterations 1 -benchmarkFrameTimes`
+  ([Rockstar's parameter list](https://support.rockstargames.com/articles/2VjbVziQCiTiiVhDbmnexc/full-list-of-command-line-parameters-for-grand-theft-auto-v-on-pc)).
 
-| | Real fps (NF `[present]`, above the generator) | NF `[sync]` total | GPU |
-|---|---|---|---|
-| NR on | mostly 55–60 (range 44–85) | 19–22 ms | 91%, 193 W average |
-| NR off (08:32:27–32) | 81–84 | — | — |
+The game writes `Documents\Rockstar Games\GTAV Enhanced\Benchmarks\Benchmark-*.txt` and
+per-pass frame times, then exits by itself. In-game settings were left as they were:
+2560x1440, `VSync=1`, `FrameLimit=0`, game frame generation off.
 
-Displayed fps in GTA was not captured. The Mesa counter's file is shared by the game and
-`SocialClubHelper.exe`, and the two processes overwrote each other. There is no same-scene
-GTA baseline without a generator, and no GTA run with lsfg-vk. Image quality and input
-latency were not measured.
+How the numbers were taken:
+- **Real fps:** pass-4 frame count ÷ the sum of its frame times, from GTA's own file.
+- **Displayed fps:** MangoHud placed *below* the generator, logging per frame. It writes one
+  file per process, so `GTA5_Enhanced_*.csv` is not clobbered by `SocialClubHelper.exe`.
+  The count is frames within pass 4's wall-clock window ÷ window length.
+- **Instantaneous fps:** not used. A generator presents a generated frame and a real frame
+  back to back, so averaging per-frame fps overstates the displayed rate.
+- **Alignment check:** with no generator, displayed matched real within 0.6 fps in every run.
+
+Pass 4 is the long free-roam pass (about 117 s).
+
+| Config | Real fps | Displayed fps | NF composites/s | GPU |
+|---|---|---|---|---|
+| No Neural Forge | 92.6 | 93.2 | — | 66%, 141 W |
+| NF only (run 1 / run 2) | 60.6 / 60.6 | 60.8 / 60.9 | 62.3 | 88%, 188 W |
+| **NF + Smooth Motion** | **58.0** | **116.4** | 59.0 | 91%, 189 W |
+| NF + lsfg-vk 2x | 54.1 | 109.0 | 54.6 | 87%, 188 W |
+| NF + lsfg-vk 2x performance | 55.6 | 112.1 | 55.8 | 89%, 186 W |
+| NF + lsfg-vk 2x flow 0.5 | 56.1 | 112.5 | 56.0 | 87%, 183 W |
+| NF + lsfg-vk 2x performance + flow 0.5 | — | — | — | crashes at Game Init, 3/3 |
+| lsfg-vk 2x performance + flow 0.5 alone | 59.1 | 118.6 | — | 47%, 111 W |
+
+Averages across all 5 passes follow the same order. Per-run files are kept on the rig under
+`~/nf-spike/gta/`.
+
+What these numbers show:
+- Neural Forge costs the game 32 real fps here (92.6 → 60.6).
+- A generator below it recovers the displayed rate. Smooth Motion gives the most: 116.4
+  displayed for 2.6 real fps.
+- Every working lsfg-vk mode costs 4.5–6.5 real fps with Neural Forge and ends up 4–7
+  displayed fps behind Smooth Motion. The per-frame costs measured on vkcube do not carry
+  over to this game with the model running.
+
+The performance mode + flow 0.5 crash:
+- Each setting runs fine with Neural Forge on its own, and the combination runs fine without
+  Neural Forge.
+- Together they crash GTA while it initialises, with no exception in the game process and a
+  "Game Init" crash context.
+- It was not investigated further, because that mode is not needed.
+
+Not measured: input latency and image quality.
 
 ## What broke and why
 
@@ -147,25 +187,29 @@ latency were not measured.
   until the next login.
 - **Shared log files.** `NVPRESENT_LOG_FILE` and the Mesa `output_file` are opened by every
   Vulkan process in the launch (game, Social Club helper) and overwrite each other.
-  Smooth Motion's log to stderr (journal) is reliable.
+  Smooth Motion's log to stderr (journal) and MangoHud's per-process logs are reliable.
+- **lsfg-vk performance mode + flow 0.5 with Neural Forge** crashes GTA at startup (see above).
+- `LSFGVK_ENV=1` switches lsfg-vk to reading every setting from environment variables, which
+  silently ignores the selected profile's values.
 
 ## Recommendation
 
-- Put a frame generator below Neural Forge. It removes most of the model's cost from the
-  displayed frame rate: at 120 Hz the model only has to keep up with 60 real fps.
-- Prefer **lsfg-vk 2x, performance mode, flow scale 0.5**. It is the cheapest measured mode
-  (0.36 ms per real frame at 1440p versus ~0.9 ms for Smooth Motion) and reached 119.9
-  displayed with Neural Forge on vkcube.
-- Smooth Motion is the no-install fallback.
-- Still to confirm in GTA with the two-counter method:
-  - displayed fps;
-  - a no-generator baseline in the same scene.
-
-Launch options (the order in `VK_INSTANCE_LAYERS` is required):
+**Use Smooth Motion below Neural Forge for GTA.** In the game's own benchmark it shows 116.4 fps
+against 60.9 for Neural Forge alone, for 2.6 real fps and no extra install. lsfg-vk works as
+well, but it trails Smooth Motion in every mode that runs, and its cheapest mode crashes
+alongside Neural Forge.
 
 ```text
-NEURAL_FORGE_ENABLE=1 LSFGVK_PROFILE=2x-perf-fs50 VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_LSFGVK_frame_generation %command%
 NEURAL_FORGE_ENABLE=1 NVPRESENT_ENABLE_SMOOTH_MOTION=1 VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present %command%
+```
+
+The order in `VK_INSTANCE_LAYERS` is required. Without it the generator sits above Neural
+Forge.
+
+lsfg-vk alternative (2x flow 0.5, the best working lsfg-vk mode):
+
+```text
+NEURAL_FORGE_ENABLE=1 LSFGVK_PROFILE=2x-fs50 VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_LSFGVK_frame_generation %command%
 ```
 
 lsfg-vk is inactive unless `LSFGVK_PROFILE` names a profile: every profile in
