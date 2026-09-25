@@ -29,13 +29,14 @@ fn main() {
         ui::build_ui(app, install_error.clone());
     });
 
-    // The helper is launched as a detached Proton/Wine process tree. Shut it
-    // down when the GUI exits so AppImage launchers such as Gear Lever do not
-    // keep reporting the application as still running. This one is deliberately
-    // synchronous: the window is already gone, and the process must not exit before
-    // the helper has been stopped.
+    // Stop the helper on exit only if this GUI instance started it and it is still that
+    // same process. A helper from `neural-forge-cli start` or an earlier session keeps
+    // running: closing the settings window mid-game must not drop the effect.
+    // Deliberately synchronous: the window is already gone, and the process must not exit
+    // before the helper has been stopped.
     app.connect_shutdown(|_| {
-        if neural_forge_supervisor::is_running().is_some() {
+        let ours = ui::STARTED_PID.load(std::sync::atomic::Ordering::Relaxed);
+        if ours != 0 && neural_forge_supervisor::is_running() == Some(ours) {
             let _ = neural_forge_supervisor::stop(std::time::Duration::from_secs(5));
         }
     });
