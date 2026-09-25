@@ -110,6 +110,12 @@ layout(push_constant) uniform Params {
   // View 5 only: multiplies the pre-bound colour before display, so a subtle difference from
   // the normal result is easier to see (upstream gDebugScale). 1.0 = no amplification.
   float debug_scale;
+  // The curve the proxy encode used (`encode.comp`'s `reversible_mode`): 0 the soft knee,
+  // 1/2 Neutwo, >= 3 the hybrid. Wherever this pass rebuilds the frame's own proxy it must use
+  // the same curve, or `model / proxy` measures the difference between two encodes instead of
+  // the model's verdict. 2 and 4 are the replace modes: in mode 2 the model's answer comes
+  // straight back through the exact inverse of its curve, with no composition.
+  uint reversible_mode;
 } params;
 
 float Luminance(vec3 rgb) {
@@ -210,15 +216,96 @@ vec3 UpgradeToneMap(vec3 original, vec3 proxy, vec3 model, float colour_strength
   return mix(luminance_only, fully_upgraded, clamp(colour_strength, 0.0, 1.0));
 }
 
-// The proxy encode's luminance roll-off (`encode.comp`'s knee), to rebuild the frame's own proxy
-// at full resolution for the matched residual.
-vec3 SoftKneeLuminance(vec3 rgb) {
+// The proxy encode's curves, exactly as `encode.comp` applies them, so the frame's own proxy can
+// be rebuilt here the way the model was shown it. Keep the two files in step.
+//
+// The soft knee: a luminance roll-off above 0.75, then the whole triple scaled down by its peak
+// channel if that is still above 1 (one scalar, so hue cannot move; clipping channels one by one
+// would shift it). Below a white point of 1 the peak step is what keeps a saturated pixel's hue.
+vec3 SoftKnee(vec3 rgb) {
   float l = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
   if (l > 0.75) {
     float rolled = 0.75 + 0.25 * (1.0 - exp(-(l - 0.75) / 0.25));
     rgb *= rolled / l;
   }
+  float peak = max(rgb.r, max(rgb.g, rgb.b));
+  if (peak > 1.0) {
+    rgb /= peak;
+  }
   return rgb;
+}
+
+float Neutwo(float x) {
+  return x * inversesqrt(x * x + 1.0);
+}
+
+vec3 NeutwoEncode(vec3 v) {
+  v = max(v, vec3(0.0));
+  float m = max(v.r, max(v.g, v.b));
+  if (m <= 1e-6) {
+    return v;
+  }
+  return v * (Neutwo(m) / m);
+}
+
+float HybridCurve(float m) {
+  const float k = 0.75;
+  if (m <= k) {
+    return m;
+  }
+  float e = (m - k) / (1.0 - k);
+  return k + (1.0 - k) * (e * inversesqrt(e * e + 1.0));
+}
+
+vec3 HybridEncode(vec3 v) {
+  v = max(v, vec3(0.0));
+  float m = max(v.r, max(v.g, v.b));
+  if (m <= 1e-6) {
+    return v;
+  }
+  return v * (HybridCurve(m) / m);
+}
+
+// The exact inverses of the two unclipped curves, for the replace modes. Both are applied as one
+// scalar on the peak channel, like the curves themselves, so hue is kept. The input is capped just
+// below 1, where the inverses diverge.
+float NeutwoInverse(float y) {
+  y = min(y, 0.999);
+  return y * inversesqrt(1.0 - y * y);
+}
+
+float HybridInverse(float m) {
+  const float k = 0.75;
+  if (m <= k) {
+    return m;
+  }
+  float e = min((m - k) / (1.0 - k), 0.999);
+  return k + (1.0 - k) * (e * inversesqrt(1.0 - e * e));
+}
+
+vec3 DecodeAnswer(vec3 v) {
+  v = max(v, vec3(0.0));
+  float m = max(v.r, max(v.g, v.b));
+  if (m <= 1e-6) {
+    return v;
+  }
+  float back = params.reversible_mode >= 3u ? HybridInverse(m) : NeutwoInverse(m);
+  return v * (back / m);
+}
+
+bool ReplaceMode() {
+  return params.reversible_mode == 2u || params.reversible_mode == 4u;
+}
+
+// `encode.comp`'s encode of a linear frame already divided by the white point, before its sRGB
+// encode (whose clamp the callers apply).
+vec3 EncodeProxy(vec3 normalized) {
+  if (params.reversible_mode == 0u) {
+    return SoftKnee(normalized);
+  } else if (params.reversible_mode >= 3u) {
+    return HybridEncode(normalized);
+  }
+  return NeutwoEncode(normalized);
 }
 
 // Moves from `p` toward `t` as far as the unit cube allows, along the same direction (hhkbble's
@@ -303,6 +390,8 @@ void main() {
   vec3 original = SrgbDecode(bgr ? imageLoad(u_original, src).bgr : imageLoad(u_original, src).rgb);
   vec3 proxy = SrgbDecode(bgr ? imageLoad(u_proxy, src).bgr : imageLoad(u_proxy, src).rgb);
   vec3 model = SrgbDecode(bgr ? imageLoad(u_model_answer, src).bgr : imageLoad(u_model_answer, src).rgb);
+  // The answer as it arrived; the transfer modes below may rewrite `model`.
+  vec3 model_answer = model;
 
   vec3 result;
   // Sentinels for debug views 4/5: negative x means "not computed for this pixel" (outside the
@@ -338,7 +427,7 @@ void main() {
     // so model / proxy is the model's verdict and not the encode's own roll-off: comparing an
     // encoded answer with the raw frame dimmed every highlight above the knee.
     if (params.model_small == 0u) {
-      proxy = clamp(SoftKneeLuminance(proxy / wp), 0.0, 1.0);
+      proxy = clamp(EncodeProxy(proxy / wp), 0.0, 1.0);
     }
 
     // Transfer modes (only when the model worked below the frame's size; at full size all three
@@ -348,7 +437,7 @@ void main() {
       if (params.transfer == 1u) {
         // Matched residual: the frame's own proxy, rebuilt at full resolution, plus only the
         // model's difference -- so the enlargement's blur is not read as the model's edit.
-        vec3 full_proxy = clamp(SoftKneeLuminance(original / wp), 0.0, 1.0);
+        vec3 full_proxy = clamp(EncodeProxy(original / wp), 0.0, 1.0);
         proxy = full_proxy;
         model = CubeScaleResidual(full_proxy, full_proxy + edit);
       } else if (Luminance(model) > 1e-5) {
@@ -613,11 +702,21 @@ void main() {
     // near-black proxy pixel can't produce an unbounded multiply/divide (see
     // neural_forge_protocol::ShmHeader::max_ratio_bits's doc comment).
     vec3 safe_proxy = max(proxy, vec3(1e-4));
-    vec3 transfer_ratio = clamp(upgraded / safe_proxy, 1.0 / params.max_ratio, params.max_ratio);
+    // At least just above 1, as `composition::apply` does: below 1 the bounds cross and clamp()
+    // is undefined.
+    float guard0 = max(params.max_ratio, 1.0001);
+    vec3 transfer_ratio = clamp(upgraded / safe_proxy, 1.0 / guard0, guard0);
     vec3 transferred = original * transfer_ratio;
 
     vec3 blended = mix(original, transferred, clamp(params.transfer_strength, 0.0, 1.0));
     result = GamutCompressReversible(blended);
+  }
+
+  if (params.mode == 2u && ReplaceMode()) {
+    // Replace: the model's answer is the picture, brought back out of the encoded space by the
+    // exact inverse of its curve and the white divide. Nothing of the frame is kept. (Only on an
+    // encoded proxy: an unencoded one was never put through the curve.)
+    result = DecodeAnswer(model_answer) * max(params.white_point, 1e-4);
   }
 
   // Debug views (neural_forge_protocol::ShmHeader::debug_view). Matches

@@ -72,6 +72,9 @@ pub struct ComposeParams {
     /// [`crate::composition::encode_pass`]. False means the proxy is a bit-identical
     /// copy of the frame and the ratio transfer would self-cancel on it.
     pub proxy_encoded: bool,
+    /// The curve the proxy encode used (`neural_forge_protocol::enums::reversible_mode`),
+    /// which the composition reproduces wherever it rebuilds the frame's proxy.
+    pub reversible_mode: u32,
 }
 
 /// The comparison view, straight from the header.
@@ -108,6 +111,8 @@ struct PushConstants {
     white_point: f32,
     debug_view: u32,
     debug_scale: f32,
+    /// Matches `compose.comp`'s `params.reversible_mode`: the encode's curve.
+    reversible_mode: u32,
 }
 
 struct Image {
@@ -702,7 +707,7 @@ impl ComposeSlot {
 
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: 0, white_point: 1.0, debug_view: 0, debug_scale: 1.0 };
+            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: 0, white_point: 1.0, debug_view: 0, debug_scale: 1.0, reversible_mode: 0 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -976,6 +981,7 @@ impl ComposeSlot {
                 white_point: compose.white_point,
                 debug_view: compose.debug_view,
                 debug_scale: compose.debug_scale,
+                reversible_mode: compose.reversible_mode,
             };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
@@ -1963,6 +1969,21 @@ mod tests {
         }
         assert!(max_diff <= 3, "GPU and CPU composition diverge by up to {max_diff} (expected <= 3): gpu={gpu_result:?} cpu={cpu_result:?}");
 
+        // A max_ratio below 1 (a corrupt or hand-edited header): the CPU reference raises it to
+        // just above 1; the shader's clamp() would otherwise get crossed bounds, which is
+        // undefined.
+        for max_ratio in [0.5f32, 1.0] {
+            let mut gpu_result = model_answer.clone();
+            assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut gpu_result, colour_strength, transfer_strength, max_ratio, false));
+            let mut cpu_result = model_answer.clone();
+            super::super::apply::apply_rgba8(&original, &mut cpu_result, colour_strength, transfer_strength, max_ratio, 0, false);
+            let max_diff = gpu_result.chunks_exact(4).zip(cpu_result.chunks_exact(4))
+                .flat_map(|(g, c)| (0..3).map(move |ch| (i32::from(g[ch]) - i32::from(c[ch])).abs()))
+                .max()
+                .unwrap_or(0);
+            assert!(max_diff <= 3, "max_ratio {max_ratio}: GPU and CPU diverge by up to {max_diff}");
+        }
+
         // SAFETY: `gpu`'s own fence wait inside `dispatch` guarantees no GPU work
         // is in flight; nothing else references `device`/`instance`.
         unsafe {
@@ -2188,7 +2209,7 @@ mod tests {
         let mut speckle = grey.clone();
         let centre = ((8 * w + 8) * 4) as usize;
         speckle[centre..centre + 3].copy_from_slice(&[200, 200, 200]);
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         let Some(sharp) = compose_once(w, h, &grey, &grey, &speckle, base) else {
             eprintln!("ratio smoothing test: no Vulkan device, skipping");
             return;
@@ -2225,7 +2246,7 @@ mod tests {
         let blue: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 120, 160, 255]).collect();
         let red: Vec<u8> = (0..w * h).flat_map(|_| [170u8, 110, 100, 255]).collect();
         let centre = ((8 * w + 8) * 4) as usize;
-        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 0.5, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 0.5, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
 
         let Some(normal) = compose_once(w, h, &blue, &blue, &red, base) else {
             eprintln!("debug_views test: no Vulkan device, skipping");
@@ -2296,7 +2317,7 @@ mod tests {
         let frame: Vec<u8> = (0..w * h).flat_map(|i| if i % w < 16 { [60u8, 60, 60, 255] } else { [180u8, 180, 180, 255] }).collect();
         let small: Vec<u8> = (0..sw * sh).flat_map(|i| if i % sw < 8 { [60u8, 60, 60, 255] } else { [180u8, 180, 180, 255] }).collect();
         let brighter: Vec<u8> = small.chunks(4).flat_map(|p| [p[0] + 25, p[1] + 25, p[2] + 25, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         let px = |out: &[u8], x: u32| i32::from(out[((4 * w + x) * 4) as usize]);
         for transfer in [0u32, 1, 2] {
             let Some(out) = compose_once_scaled(w, h, &frame, &frame, &small, (sw, sh), Some(&small), None, ComposeParams { transfer, ..base }) else {
@@ -2333,7 +2354,7 @@ mod tests {
         let lin_to_srgb = |l: f32| { let l = l.clamp(0.0, 1.0); let c = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }; (c * 255.0).round() as u8 };
         let knee = |l: f32| if l > 0.75 { 0.75 + 0.25 * (1.0 - (-(l - 0.75) / 0.25).exp()) } else { l };
         let (w, h) = (16u32, 16u32);
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         for (value, wp) in [(90u8, 1.0f32), (90, 0.5), (230, 1.0), (240, 1.0)] {
             let frame: Vec<u8> = (0..w * h).flat_map(|_| [value, value, value, 255]).collect();
             let encoded = lin_to_srgb(knee(srgb_to_lin(value) / wp));
@@ -2347,6 +2368,55 @@ mod tests {
         }
     }
 
+    /// The same, for every encode curve and a white point below 1, on saturated colours: the
+    /// composition must rebuild the frame's proxy with the curve the encode used (including the
+    /// knee's peak step, which keeps a saturated pixel's hue), or an unedited answer is read as
+    /// an edit and the frame shifts.
+    #[test]
+    fn no_edit_is_identity_for_every_encode_curve() {
+        use neural_forge_protocol::enums::reversible_mode;
+        let (w, h) = (16u32, 16u32);
+        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let colours: [[u8; 3]; 4] = [[250, 60, 20], [30, 90, 245], [200, 200, 200], [120, 140, 60]];
+        let frame: Vec<u8> = (0..w * h).flat_map(|i| { let c = colours[(i % 4) as usize]; [c[0], c[1], c[2], 255] }).collect();
+        for mode in [reversible_mode::KNEE, reversible_mode::NEUTWO, reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID, reversible_mode::HYBRID_REPLACE] {
+            for wp in [1.0f32, 0.8] {
+                let answer: Vec<u8> = frame.chunks_exact(4).flat_map(|p| crate::composition::encode::reference_encode_pixel([p[0], p[1], p[2], p[3]], false, wp, mode)).collect();
+                let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { white_point: wp, reversible_mode: mode, ..base }) else {
+                    eprintln!("encode curve test: no Vulkan device, skipping");
+                    return;
+                };
+                let worst = out.chunks_exact(4).zip(frame.chunks_exact(4))
+                    .flat_map(|(o, f)| (0..3).map(move |c| (i32::from(o[c]) - i32::from(f[c])).abs()))
+                    .max()
+                    .unwrap_or(0);
+                assert!(worst <= 3, "curve {mode} at white point {wp}: an unedited answer moved the frame by up to {worst}");
+            }
+        }
+    }
+
+    /// The replace modes bring the model's answer straight back (through the inverse of its
+    /// curve) instead of composing it: an answer far brighter than the frame arrives whole,
+    /// where the composition's relighting guard would hold it to at most twice the frame's light.
+    #[test]
+    fn replace_modes_bring_the_answer_back_whole() {
+        use neural_forge_protocol::enums::reversible_mode;
+        let (w, h) = (16u32, 16u32);
+        let frame: Vec<u8> = (0..w * h).flat_map(|_| [60u8, 60, 60, 255]).collect();
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let centre = ((8 * w + 8) * 4) as usize;
+        for (replace, composed) in [(reversible_mode::NEUTWO_REPLACE, reversible_mode::NEUTWO), (reversible_mode::HYBRID_REPLACE, reversible_mode::HYBRID)] {
+            let answer: Vec<u8> = (0..w * h).flat_map(|_| crate::composition::encode::reference_encode_pixel([200, 200, 200, 255], false, 1.0, replace)).collect();
+            let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { reversible_mode: replace, ..base }) else {
+                eprintln!("replace mode test: no Vulkan device, skipping");
+                return;
+            };
+            assert!((i32::from(out[centre]) - 200).abs() <= 3, "replace mode {replace}: the answer comes back whole ({})", out[centre]);
+            let guarded = compose_once(w, h, &frame, &frame, &answer, ComposeParams { reversible_mode: composed, ..base }).unwrap();
+            assert!(guarded[centre] < 100, "composition mode {composed} holds the same answer to the guard ({})", guarded[centre]);
+        }
+    }
+
     /// Frame hold: with a held frame supplied the composition works on it and replaces the live
     /// image, so the screen shows the held picture however the game has moved on.
     #[test]
@@ -2354,7 +2424,7 @@ mod tests {
         let (w, h) = (16u32, 16u32);
         let live: Vec<u8> = (0..w * h).flat_map(|_| [30u8, 30, 30, 255]).collect();
         let held: Vec<u8> = (0..w * h).flat_map(|_| [140u8, 140, 140, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         // No edit: the answer is the held frame's own proxy.
         let Some(out) = compose_once_scaled(w, h, &live, &held, &held, (w, h), None, Some(&held), base) else {
             eprintln!("frame hold test: no Vulkan device, skipping");
@@ -2399,7 +2469,7 @@ mod tests {
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &frame, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
                 .expect("compose");
@@ -2499,7 +2569,7 @@ mod tests {
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &proxy, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
                 .expect("compose");
@@ -2597,7 +2667,7 @@ mod tests {
         }
 
         // (1) A smaller answer must still be accepted and actually change the output.
-        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, ComposeInputs::Cpu { base: &base, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
+        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, ComposeInputs::Cpu { base: &base, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 });
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
@@ -2623,7 +2693,7 @@ mod tests {
         // for this function -- see its own doc comment) must be rejected, not
         // overflow the shared staging buffer.
         let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
-        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, ComposeInputs::Cpu { base: &base, answer: &big_answer, proxy_small: None, held_original: None }, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
+        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, ComposeInputs::Cpu { base: &base, answer: &big_answer, proxy_small: None, held_original: None }, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 });
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
 
         unsafe {
@@ -2653,7 +2723,7 @@ mod tests {
         let current: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 29 % 200) as u8; [t + 20, t + 10, 200 - t, 255] }).collect();
         let base: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 37 % 200) as u8; [t + 30, 220 - t, t + 5, 255] }).collect();
         let answer: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 53 % 200) as u8; [t + 40, t, 180 - t / 2, 255] }).collect();
-        let params = ComposeParams { colour_strength: 0.8, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.5, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false };
+        let params = ComposeParams { colour_strength: 0.8, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.5, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 };
         let expected = compose_once(width, height, &current, &base, &answer, params).expect("the CPU reference composes");
 
         let alignment = crate::capture::min_imported_host_pointer_alignment(&instance, physical_device).expect("alignment query");

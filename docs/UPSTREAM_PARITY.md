@@ -35,6 +35,7 @@ other's mapping.
 | 16-bit multipass intermediates (`sdr16_multipass`) | `frame.rs` RGBA16F working images, falls back to 8-bit if refused (0.1.83) |
 | `answered_w`/`answered_h` guard against another swapchain's answer | helper echoes, synchronous present checks (0.1.81) |
 | Debug views 4/5 (colour-trust engagement, pre-bound colour) | `compose.comp` `debug_view`; views 0-3 (this project's own) and 4/5 now reach the GPU path, so they work for a game that blits into its swapchain too (0.1.84) |
+| Reversible modes (soft knee, Neutwo, hybrid, and the two pure-inverse replace modes) | `encode.comp`; `compose.comp` rebuilds the frame's proxy with the encode's own curve (peak step included) and implements replace |
 
 ## Deliberately not adopted
 

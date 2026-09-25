@@ -1705,6 +1705,7 @@ pub unsafe fn run(
                 debug_view: settings.debug_view,
                 debug_scale: settings.debug_scale,
                 proxy_encoded,
+                reversible_mode: settings.reversible_mode,
             },
         ) {
             if let Some(t) = SYNC_TIMING.with(|t| t.take()) {
