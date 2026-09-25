@@ -333,6 +333,18 @@ fn prune_orphaned_tap_source(state: &mut TapTracker, source: vk::Image) {
     }
 }
 
+/// The image barriers of a `vkCmdPipelineBarrier2` call, or `None` when it has none
+/// (a zero count, or a null pointer, which is how buffer- and memory-only barriers
+/// arrive).
+fn barrier2_images(info: &vk::DependencyInfo) -> Option<&[vk::ImageMemoryBarrier2]> {
+    if info.image_memory_barrier_count == 0 || info.p_image_memory_barriers.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `pImageMemoryBarriers` is an array of `imageMemoryBarrierCount`
+    // valid structures for the duration of the application's call.
+    Some(unsafe { std::slice::from_raw_parts(info.p_image_memory_barriers, info.image_memory_barrier_count as usize) })
+}
+
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
 static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -773,10 +785,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     fn cmd_pipeline_barrier2(
         &self, command_buffer: vk::CommandBuffer, info: &vk::DependencyInfo,
     ) -> LayerResult<()> {
-        // SAFETY: the layer framework validated `info` for this application call;
-        // the count/pointer pair is valid for the hook's duration.
-        let images = unsafe { std::slice::from_raw_parts(info.p_image_memory_barriers,
-            info.image_memory_barrier_count as usize) };
+        // A buffer-only or memory-only barrier legally passes a zero count with a null
+        // pointer, and `slice::from_raw_parts` must never see a null pointer even for an
+        // empty slice (with debug assertions that is an immediate abort).
+        let Some(images) = barrier2_images(info) else { return LayerResult::Unhandled };
         let mut tracker = self.tracker.lock().unwrap();
         for barrier in images {
             tracker.record_barrier(command_buffer, barrier.image, barrier.new_layout);
@@ -810,7 +822,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         let mut tracker = self.tracker.lock().unwrap();
         for submit in submits {
-            if submit.command_buffer_count == 0 { continue; }
+            if submit.command_buffer_count == 0 || submit.p_command_buffers.is_null() { continue; }
             // SAFETY: `p_command_buffers` is valid for `command_buffer_count` elements
             // for the duration of the application's own `vkQueueSubmit` call.
             let buffers = unsafe { std::slice::from_raw_parts(submit.p_command_buffers, submit.command_buffer_count as usize) };
@@ -824,7 +836,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         let mut tracker = self.tracker.lock().unwrap();
         for submit in submits {
-            if submit.command_buffer_info_count == 0 { continue; }
+            if submit.command_buffer_info_count == 0 || submit.p_command_buffer_infos.is_null() { continue; }
             // SAFETY: `p_command_buffer_infos` is valid for `command_buffer_info_count`
             // elements for the duration of the application's own `vkQueueSubmit2` call.
             let infos = unsafe { std::slice::from_raw_parts(submit.p_command_buffer_infos, submit.command_buffer_info_count as usize) };
@@ -915,7 +927,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // layer-submitted relay batch (see below); the real present must then wait on
         // this instead of them.
         let mut relay_semaphore: Option<vk::Semaphore> = None;
-        if crate::layer_enabled() && self.nvidia && !crate::device_lost() {
+        if crate::layer_enabled() && self.nvidia && !crate::device_lost()
+            && present_info.swapchain_count > 0 && !present_info.p_swapchains.is_null() && !present_info.p_image_indices.is_null()
+        {
             // SAFETY: `p_swapchains`/`p_image_indices`/`swapchain_count` are a valid,
             // parallel pair of slices for the duration of this call -- part of the
             // `VkPresentInfoKHR` the loader just handed us.
@@ -1086,7 +1100,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // present waits on in their place.
                 // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count`
                 // elements for the duration of this call.
-                let app_waits: &[vk::Semaphore] = if present_info.wait_semaphore_count == 0 {
+                let app_waits: &[vk::Semaphore] = if present_info.wait_semaphore_count == 0 || present_info.p_wait_semaphores.is_null() {
                     &[]
                 } else {
                     unsafe { std::slice::from_raw_parts(present_info.p_wait_semaphores, present_info.wait_semaphore_count as usize) }
@@ -1173,7 +1187,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let mut combined: Vec<vk::Semaphore> = Vec::with_capacity(present_info.wait_semaphore_count as usize + 2);
             match relay_semaphore {
                 Some(relay) => combined.push(relay),
-                None if present_info.wait_semaphore_count > 0 => {
+                None if present_info.wait_semaphore_count > 0 && !present_info.p_wait_semaphores.is_null() => {
                     // SAFETY: `p_wait_semaphores` is a valid slice of `wait_semaphore_count`
                     // elements per `present_info`'s own contract, valid for this call's
                     // duration.
@@ -1388,6 +1402,25 @@ mod submit_order_tests {
         t.begin_recording(cb(1)); // buffer re-recorded: old contents are gone
         t.commit_submit([cb(1)].into_iter());
         assert_eq!(t.tap_for(image(100)), None);
+    }
+
+    /// A buffer-only `vkCmdPipelineBarrier2` passes no image barriers and a null pointer.
+    /// Building a slice from that null pointer aborted debug builds (and was silent UB in
+    /// release ones).
+    #[test]
+    fn a_buffer_only_barrier2_has_no_image_barriers_and_does_not_touch_the_null_pointer() {
+        let buffer_barrier = vk::BufferMemoryBarrier2::default();
+        let info = vk::DependencyInfo {
+            buffer_memory_barrier_count: 1,
+            p_buffer_memory_barriers: &buffer_barrier,
+            image_memory_barrier_count: 0,
+            p_image_memory_barriers: std::ptr::null(),
+            ..Default::default()
+        };
+        assert!(barrier2_images(&info).is_none());
+        let image_barrier = vk::ImageMemoryBarrier2 { image: image(5), new_layout: vk::ImageLayout::GENERAL, ..Default::default() };
+        let with_image = vk::DependencyInfo { image_memory_barrier_count: 1, p_image_memory_barriers: &image_barrier, ..info };
+        assert_eq!(barrier2_images(&with_image).map(|b| b[0].image), Some(image(5)));
     }
 
     #[test]
