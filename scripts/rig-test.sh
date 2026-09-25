@@ -11,6 +11,8 @@
 # of the shared-memory header and the layer's own log.
 #
 # What it can verify without anyone looking at a screen:
+#   * the helper's own self-tests, locally, before anything is deployed
+#     (scripts/helper-test.sh: native unit tests, guard_test, spoof_test, spoof_install_test)
 #   * whether the proxy encode is actually dispatching  ([encode] active)
 #   * whether the GPU encode matches the CPU reference  ([encode] self-check)
 #   * which composition mode the resolve picked
@@ -39,6 +41,10 @@ remote_cli() {
 }
 
 sh_remote() { ssh "$HOST" "$@"; }
+
+say "helper self-tests on this machine (native unit tests, then the SEH guard and the spoof under Wine)"
+# Local and cheap: a helper that fails these would only fail on the rig in a harder-to-read way.
+bash "$(dirname "${BASH_SOURCE[0]}")/helper-test.sh" || exit 1
 
 say "building and installing both halves through the installer (scripts/deploy-rig.sh)"
 # Never copy files into the installed path directly: the installer refuses to overwrite

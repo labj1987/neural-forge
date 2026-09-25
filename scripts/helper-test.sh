@@ -13,6 +13,9 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 TOOLCHAIN="+stable-x86_64-unknown-linux-gnu"
 TARGET="x86_64-pc-windows-gnu"
 
+echo "==> native unit tests of the helper's platform-independent modules (PE walker, parameter object)"
+cargo "$TOOLCHAIN" test --target x86_64-unknown-linux-gnu -p neural-forge-helper --lib
+
 echo "==> cross-compiling neural-forge-helper + examples"
 cargo "$TOOLCHAIN" build --target "$TARGET" -p neural-forge-helper \
     --bin neural-forge-helper --example guard_test --example spoof_test --example spoof_install_test
