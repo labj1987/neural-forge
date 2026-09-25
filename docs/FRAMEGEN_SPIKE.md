@@ -154,8 +154,7 @@ Pass 4 is the long free-roam pass (about 117 s).
 | NF + lsfg-vk 2x performance + flow 0.5 | — | — | — | crashes at Game Init, 3/3 |
 | lsfg-vk 2x performance + flow 0.5 alone | 59.1 | 118.6 | — | 47%, 111 W |
 
-Averages across all 5 passes follow the same order. Per-run files are kept on the rig under
-`~/nf-spike/gta/`.
+Averages across all 5 passes follow the same order.
 
 What these numbers show:
 - Neural Forge costs the game 32 real fps here (92.6 → 60.6).
