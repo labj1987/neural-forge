@@ -166,6 +166,54 @@ fn cmd_capture(header: &ShmHeader, view: Option<&str>) -> bool {
     true
 }
 
+pub fn run(args: &[String]) -> std::process::ExitCode {
+    let cfg = neural_forge_supervisor::Config::load();
+    let mapping = match neural_forge_supervisor::open_channel(&cfg) {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            eprintln!("shmctl: {e}: {}", neural_forge_supervisor::channel_path(&cfg));
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let header = mapping.header();
+
+    let ok = match args.first().map(String::as_str) {
+        Some("status") => {
+            cmd_status(header);
+            true
+        }
+        Some("set") => match (args.get(1), args.get(2)) {
+            (Some(name), Some(value)) => cmd_set(header, name, value),
+            _ => {
+                eprintln!("usage: neural-forge-cli shmctl set <name> <value>");
+                false
+            }
+        },
+        Some("toggle") => match args.get(1) {
+            Some(name) => cmd_toggle(header, name),
+            None => {
+                eprintln!("usage: neural-forge-cli shmctl toggle <name>");
+                false
+            }
+        },
+        Some("capture") => cmd_capture(header, args.get(1).map(String::as_str)),
+        Some("reset") => {
+            header.reset_persisted_settings();
+            println!("settings reset to defaults; helper/layer session preserved");
+            true
+        }
+        _ => {
+            usage();
+            false
+        }
+    };
+    if ok {
+        std::process::ExitCode::SUCCESS
+    } else {
+        std::process::ExitCode::FAILURE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -261,53 +309,5 @@ mod tests {
             assert_ne!(helper_state_name(state), "unknown");
         }
         assert_eq!(helper_state_name(9999), "unknown");
-    }
-}
-
-pub fn run(args: &[String]) -> std::process::ExitCode {
-    let cfg = neural_forge_supervisor::Config::load();
-    let mapping = match neural_forge_supervisor::open_channel(&cfg) {
-        Ok(mapping) => mapping,
-        Err(e) => {
-            eprintln!("shmctl: {e}: {}", neural_forge_supervisor::channel_path(&cfg));
-            return std::process::ExitCode::FAILURE;
-        }
-    };
-    let header = mapping.header();
-
-    let ok = match args.first().map(String::as_str) {
-        Some("status") => {
-            cmd_status(header);
-            true
-        }
-        Some("set") => match (args.get(1), args.get(2)) {
-            (Some(name), Some(value)) => cmd_set(header, name, value),
-            _ => {
-                eprintln!("usage: neural-forge-cli shmctl set <name> <value>");
-                false
-            }
-        },
-        Some("toggle") => match args.get(1) {
-            Some(name) => cmd_toggle(header, name),
-            None => {
-                eprintln!("usage: neural-forge-cli shmctl toggle <name>");
-                false
-            }
-        },
-        Some("capture") => cmd_capture(header, args.get(1).map(String::as_str)),
-        Some("reset") => {
-            header.reset_persisted_settings();
-            println!("settings reset to defaults; helper/layer session preserved");
-            true
-        }
-        _ => {
-            usage();
-            false
-        }
-    };
-    if ok {
-        std::process::ExitCode::SUCCESS
-    } else {
-        std::process::ExitCode::FAILURE
     }
 }

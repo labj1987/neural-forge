@@ -59,8 +59,8 @@ fn main() {
     // MAX_FRAME` by the mapping's own region layout.
     unsafe {
         let proxy = std::slice::from_raw_parts_mut(base.add(proxy_offset_slot(slot)), frame_bytes);
-        for (i, chunk) in proxy.chunks_exact_mut(4).enumerate() {
-            chunk.copy_from_slice(&[(i % 256) as u8, 100, 150, 255]);
+        for (i, chunk) in proxy.as_chunks_mut::<4>().0.iter_mut().enumerate() {
+            *chunk = [(i % 256) as u8, 100, 150, 255];
         }
     }
 
