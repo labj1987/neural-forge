@@ -97,6 +97,9 @@ pub struct GpuFlow {
     /// Set when a wait timed out: the GPU may still own this session's resources, so
     /// `destroy` leaks them rather than risk freeing (or waiting on) in-flight work.
     stalled: bool,
+    /// Set when a submission failed part-way: the session is drained (or `stalled`) and must not
+    /// be used again, only destroyed.
+    dead: bool,
 }
 // Access is serialized by the helper's own single-threaded per-frame loop.
 unsafe impl Send for GpuFlow {}
@@ -139,6 +142,7 @@ impl GpuFlow {
             current: 0,
             previous: false,
             stalled: false,
+            dead: false,
         };
         // Every fallible step goes through `build`; on any error everything created so far
         // is destroyed here in one place (`destroy` tolerates null handles).
@@ -271,6 +275,9 @@ impl GpuFlow {
         if self.stalled {
             return Err(vk::Result::TIMEOUT);
         }
+        if self.dead {
+            return Err(vk::Result::ERROR_UNKNOWN);
+        }
         let input = self.inputs[self.current];
         unsafe {
             // 1. Main queue: scale the model's input down into this frame's flow input.
@@ -297,6 +304,31 @@ impl GpuFlow {
                 self.current = 1 - self.current;
                 return Ok(false);
             }
+            // From the first semaphore-signalling submit on, a failure leaves work (and a signalled
+            // `sem_pre`) behind: drain both queues before reporting it, so nothing this session owns
+            // is still in use when the caller drops it.
+            if let Err(e) = self.submit_pair(device, main_queue, input, mvec, scale) {
+                if !self.stalled {
+                    let drained = device.queue_wait_idle(main_queue).is_ok() && device.queue_wait_idle(self.flow_queue).is_ok();
+                    if !drained {
+                        // Could not prove the queues idle: never touch or free this session again.
+                        self.stalled = true;
+                    }
+                }
+                self.dead = true;
+                crate::log!("[mvec] optical-flow submission failed ({e:?}); session closed");
+                return Err(e);
+            }
+        }
+        self.current = 1 - self.current;
+        Ok(true)
+    }
+
+    /// Steps 1b-3 of [`Self::estimate`]: everything from the first submit that signals `sem_pre`
+    /// to the wait on the final fence.
+    unsafe fn submit_pair(&mut self, device: &ash::Device, main_queue: vk::Queue, input: ImageRes, mvec: vk::Image, scale: [f32; 2]) -> Result<(), vk::Result> {
+        let pre = [self.cmd_pre];
+        unsafe {
             let signal_pre = [self.sem_pre];
             device.queue_submit(main_queue, &[vk::SubmitInfo::builder().command_buffers(&pre).signal_semaphores(&signal_pre).build()], vk::Fence::null())?;
 
@@ -364,10 +396,8 @@ impl GpuFlow {
             )?;
             // The post submission waits on the flow one, which waits on the pre one, so its
             // fence covers all three.
-            self.wait(device)?;
+            self.wait(device)
         }
-        self.current = 1 - self.current;
-        Ok(true)
     }
 
     /// Bounded, like every other GPU wait in the helper: the layer waits on the helper every
