@@ -560,61 +560,6 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         return s;
     }
 
-    // Experimental: `NVSDK_NGX_VULKAN_GetFeatureRequirements` is a real export in the
-    // DLL (confirmed via `objdump -p`) that nothing here has ever called. Real NGX
-    // integrations call this before `CreateFeature`; skipping it is the leading
-    // hypothesis for why `CreateFeature(18)` at a real size hangs indefinitely inside
-    // the driver (`libnvidia-glcore.so`, confirmed via gdb) rather than returning or
-    // faulting -- plausibly because some internal driver state this call would set up
-    // never gets set up. `abi::FnVkGetFeatureRequirements`'s signature is a guess (no
-    // `FeatureDiscoveryInfo`-shaped input, unlike NVIDIA's real public NGX SDK) since
-    // this is a fictional feature with no spec to check the guess against -- guarded
-    // the same as everything else here, purely to observe what it reports/does
-    // without gating anything on the result yet.
-    if let Some(get_requirements) =
-        unsafe { resolve_export::<abi::FnVkGetFeatureRequirements>(s.snippet, "NVSDK_NGX_VULKAN_GetFeatureRequirements") }
-    {
-        let ((req_result, reqs), seh) = guarded(
-            || {
-                let mut reqs = abi::NgxFeatureRequirements {
-                    version: abi::NgxSdkVersion { major: 0, minor: 0 },
-                    feature_flags: 0,
-                    min_gpu_mode: 0,
-                    in_gpu_mode: 0,
-                    min_cs_major_version: 0,
-                    min_cs_minor_version: 0,
-                };
-                // SAFETY: `get_requirements` resolved above from the live snippet
-                // module; `instance`/`physical_device` are the caller's own, live
-                // handles; `&mut reqs` is a valid out-pointer for the call's duration.
-                let r = unsafe { get_requirements(instance, physical_device, &mut reqs) };
-                (r, reqs)
-            },
-            (abi::result::FAIL_SEH, abi::NgxFeatureRequirements {
-                version: abi::NgxSdkVersion { major: 0, minor: 0 },
-                feature_flags: 0,
-                min_gpu_mode: 0,
-                in_gpu_mode: 0,
-                min_cs_major_version: 0,
-                min_cs_minor_version: 0,
-            }),
-        );
-        crate::log!(
-            "[ngx] GetFeatureRequirements -> {:#x} seh={:#x} version={}.{} flags={:#x} min_gpu_mode={} in_gpu_mode={} min_cs={}.{}",
-            req_result as u32,
-            seh,
-            reqs.version.major,
-            reqs.version.minor,
-            reqs.feature_flags,
-            reqs.min_gpu_mode,
-            reqs.in_gpu_mode,
-            reqs.min_cs_major_version,
-            reqs.min_cs_minor_version
-        );
-    } else {
-        crate::log!("[ngx] snippet has no VULKAN_GetFeatureRequirements export");
-    }
-
     // Feature creation is deferred to `maintain_feature`, called once the per-frame
     // loop (`main.rs`) knows a real width/height -- there is no real frame to build it
     // at the size of yet at this point in startup.

@@ -305,22 +305,3 @@ pub type FnVkInitProjectId = unsafe extern "system" fn(
     sdk_version: u32,
     feature_info: *const c_void,
 ) -> NgxResult;
-
-#[repr(C)]
-pub struct NgxSdkVersion {
-    pub major: u32,
-    pub minor: u32,
-}
-
-#[repr(C)]
-pub struct NgxFeatureRequirements {
-    pub version: NgxSdkVersion,
-    pub feature_flags: u32,
-    pub min_gpu_mode: u32,
-    pub in_gpu_mode: u32,
-    pub min_cs_major_version: u32,
-    pub min_cs_minor_version: u32,
-}
-
-pub type FnVkGetFeatureRequirements =
-    unsafe extern "system" fn(vk::Instance, vk::PhysicalDevice, *mut NgxFeatureRequirements) -> NgxResult;
