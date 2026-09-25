@@ -1169,7 +1169,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             capture,
                             capture_pipeline,
                             direct_capture,
-                            *external_memory_host,
+                            external_memory_host,
                             gpu_compose,
                             shm,
                             original_scratch,
