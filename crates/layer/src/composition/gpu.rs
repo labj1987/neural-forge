@@ -453,13 +453,22 @@ impl ComposeSlot {
 
         let usage_in = vk::ImageUsageFlags::TRANSFER_DST;
         let usage_out = vk::ImageUsageFlags::TRANSFER_SRC;
-        let (Some(original), Some(model_answer), Some(proxy), Some(output)) = (
-            create_storage_image(device, mem_props, width, height, usage_in),
-            create_storage_image(device, mem_props, width, height, usage_in),
-            create_storage_image(device, mem_props, width, height, usage_in),
-            create_storage_image(device, mem_props, width, height, usage_out),
-        ) else {
+        let images = [usage_in, usage_in, usage_in, usage_out].map(|usage| create_storage_image(device, mem_props, width, height, usage));
+        if images.iter().any(Option::is_none) {
+            // SAFETY: freshly created, never used by any submission.
+            for image in images.iter().flatten() {
+                unsafe { image.destroy(device) };
+            }
             return false;
+        }
+        let [Some(original), Some(model_answer), Some(proxy), Some(output)] = images else { return false };
+        // For the failure paths below, before the images are handed to `Sized_`.
+        // SAFETY (at each call): the images are freshly created and unused.
+        let release_images = || unsafe {
+            original.destroy(device);
+            model_answer.destroy(device);
+            proxy.destroy(device);
+            output.destroy(device);
         };
 
         let frame_bytes = u64::from(width) * u64::from(height) * 4;
@@ -470,7 +479,10 @@ impl ComposeSlot {
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `buf_info` is valid.
-        let Ok(staging_buffer) = (unsafe { device.create_buffer(&buf_info, None) }) else { return false };
+        let Ok(staging_buffer) = (unsafe { device.create_buffer(&buf_info, None) }) else {
+            release_images();
+            return false;
+        };
         // SAFETY: `staging_buffer` was just created, not yet bound to memory.
         let reqs = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
         let Some(type_index) =
@@ -478,6 +490,7 @@ impl ComposeSlot {
         else {
             // SAFETY: `staging_buffer` has no memory bound.
             unsafe { device.destroy_buffer(staging_buffer, None) };
+            release_images();
             return false;
         };
         let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
@@ -485,6 +498,7 @@ impl ComposeSlot {
         let Ok(staging_memory) = (unsafe { device.allocate_memory(&alloc, None) }) else {
             // SAFETY: same reasoning as above.
             unsafe { device.destroy_buffer(staging_buffer, None) };
+            release_images();
             return false;
         };
         // SAFETY: `staging_buffer`/`staging_memory` were each just created, sized/typed
@@ -495,6 +509,7 @@ impl ComposeSlot {
                 device.free_memory(staging_memory, None);
                 device.destroy_buffer(staging_buffer, None);
             }
+            release_images();
             return false;
         }
         // SAFETY: `staging_memory` is `HOST_VISIBLE`; mapping the whole allocation is
@@ -505,6 +520,7 @@ impl ComposeSlot {
                 device.free_memory(staging_memory, None);
                 device.destroy_buffer(staging_buffer, None);
             }
+            release_images();
             return false;
         };
 
@@ -572,13 +588,39 @@ impl ComposeSlot {
             .size(frame_bytes)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let Ok(current_buffer) = (unsafe { device.create_buffer(&current_info, None) }) else { return false };
-        let current_reqs = unsafe { device.get_buffer_memory_requirements(current_buffer) };
-        let Some(current_type) = find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            .or_else(|| find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty())) else { unsafe { device.destroy_buffer(current_buffer, None) }; return false };
-        let current_alloc = vk::MemoryAllocateInfo::builder().allocation_size(current_reqs.size).memory_type_index(current_type);
-        let Ok(current_memory) = (unsafe { device.allocate_memory(&current_alloc, None) }) else { unsafe { device.destroy_buffer(current_buffer, None) }; return false };
-        if unsafe { device.bind_buffer_memory(current_buffer, current_memory, 0) }.is_err() { unsafe { device.free_memory(current_memory, None); device.destroy_buffer(current_buffer, None) }; return false; }
+        let current = (|| {
+            let current_buffer = unsafe { device.create_buffer(&current_info, None) }.ok()?;
+            let current_reqs = unsafe { device.get_buffer_memory_requirements(current_buffer) };
+            let current_type = find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|| find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()));
+            let current_memory = current_type.and_then(|current_type| {
+                let current_alloc = vk::MemoryAllocateInfo::builder().allocation_size(current_reqs.size).memory_type_index(current_type);
+                unsafe { device.allocate_memory(&current_alloc, None) }.ok()
+            });
+            let Some(current_memory) = current_memory else {
+                unsafe { device.destroy_buffer(current_buffer, None) };
+                return None;
+            };
+            if unsafe { device.bind_buffer_memory(current_buffer, current_memory, 0) }.is_err() {
+                unsafe { device.free_memory(current_memory, None); device.destroy_buffer(current_buffer, None) };
+                return None;
+            }
+            Some((current_buffer, current_memory))
+        })();
+        let Some((current_buffer, current_memory)) = current else {
+            // Everything built above is released too; nothing has used any of it yet.
+            unsafe {
+                device.destroy_buffer(cached_buffer, None);
+                device.free_memory(cached_memory, None);
+                device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
+                original.destroy(device);
+                model_answer.destroy(device);
+                proxy.destroy(device);
+                output.destroy(device);
+            }
+            return false;
+        };
 
         let image_info = |view: vk::ImageView| vk::DescriptorImageInfo::builder().image_view(view).image_layout(vk::ImageLayout::GENERAL).build();
         let infos = [image_info(original.view), image_info(proxy.view), image_info(model_answer.view), image_info(output.view)];

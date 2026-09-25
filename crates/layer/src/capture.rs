@@ -774,9 +774,15 @@ fn poll_or_submit_capture(
         // equivalent GUI/CLI mapping); nothing else writes to it except through
         // `ShmClient::write_proxy`, which this branch never calls, and slot 0's/slot
         // 1's regions are disjoint (`docs/PROTOCOL_V3_DESIGN.md`), so the other slot's own
-        // `DirectCapture` never touches these same bytes.
+        // `DirectCapture` never touches these same bytes. Only the frame's own bytes are
+        // imported, rounded up to the driver's import alignment (as the answer import is),
+        // not the whole region: every imported page may be pinned. `run` only chooses
+        // `use_direct` when that alignment query succeeded and the region is aligned to it.
+        let import_bytes = min_imported_host_pointer_alignment(instance, physical_device)
+            .map_or(capacity as u64, |alignment| frame_bytes.div_ceil(alignment) * alignment)
+            .min(capacity as u64);
         if !unsafe {
-            ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, capacity as vk::DeviceSize)
+            ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, import_bytes)
         } {
             note_setup_failure();
             *external_memory_host = false;
@@ -3702,10 +3708,10 @@ mod tests {
     /// writes the shared regions between model runs. `hold` turns frame hold on. `None` when the
     /// device has no `VK_EXT_external_memory_host`.
     ///
-    /// `path` is the shm file, shared by every sequence of one test: the direct capture imports
-    /// the whole proxy region, which a driver may back with real pages (measured: about 250 MB of
-    /// tmpfs per file on Intel ANV, held until the process exits), so each test uses one file and
-    /// removes it.
+    /// `path` is the shm file, shared by every sequence of one test: imported host memory may be
+    /// backed with real pages that are held until the process exits (measured: about 250 MB of
+    /// tmpfs per file on Intel ANV when the whole proxy region was imported), so each test uses
+    /// one file and removes it.
     fn direct_present_sequence(path: &str, zero_copy: bool, model_interval: u32, presents: usize, scribble: bool, hold: bool) -> Option<Vec<Presented>> {
         let (_entry, instance, physical_device, device, queue, queue_family, supported) = test_device_with_external_memory_host()?;
         if !supported {
@@ -3836,6 +3842,12 @@ mod tests {
             });
         }
         assert_eq!(out.len(), presents + 1, "the sequence ran out of time");
+        let alignment = min_imported_host_pointer_alignment(&instance, physical_device).unwrap();
+        assert_eq!(
+            direct[0].as_ref().map(|d| d.buf.capacity),
+            Some((frame_bytes as u64).div_ceil(alignment) * alignment),
+            "the direct capture imports the frame's own bytes, not the whole region"
+        );
         if hold {
             assert!(HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|h| h.original.len() == frame_bytes), "frame hold holds the frame on the CPU");
             assert!(!last_answer.is_empty() && !raw_answer_base.is_empty(), "frame hold composes the CPU pair");
