@@ -10,17 +10,18 @@ pub fn detect_nvidia_gpu() -> Option<(u32, u32)> {
     let entries = std::fs::read_dir("/sys/bus/pci/devices").ok()?;
     for entry in entries.flatten() {
         let dir = entry.path();
-        let vendor = read_hex(&dir.join("vendor"))?;
+        // One unreadable entry skips that device, not the whole scan.
+        let Some(vendor) = read_hex(&dir.join("vendor")) else { continue };
         if vendor != 0x10de {
             continue;
         }
-        let class = read_hex(&dir.join("class"))?;
+        let Some(class) = read_hex(&dir.join("class")) else { continue };
         // Class codes are 0xCCSSPP (class, subclass, prog-if); 0x03 is "Display
         // controller".
         if (class >> 16) & 0xff != 0x03 {
             continue;
         }
-        let device = read_hex(&dir.join("device"))?;
+        let Some(device) = read_hex(&dir.join("device")) else { continue };
         return Some((vendor, device));
     }
     None

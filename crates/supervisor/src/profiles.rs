@@ -52,7 +52,7 @@ pub fn save_all(profiles: &BTreeMap<String, ProfileSettings>) -> std::io::Result
         }
         text.push('\n');
     }
-    std::fs::write(profiles_file(), text)
+    paths::write_atomic(std::path::Path::new(&profiles_file()), text.as_bytes(), 0o644)
 }
 
 pub fn save_profile(name: &str, settings: ProfileSettings) -> std::io::Result<()> {

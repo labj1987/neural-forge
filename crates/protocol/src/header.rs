@@ -1,4 +1,3 @@
-use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::enums::{mvec_quality, mvec_scale_mode};
@@ -90,7 +89,8 @@ impl PassTuning {
 /// The shared-memory header. See the crate-level docs for the mapping this sits at the
 /// front of.
 ///
-/// `#[repr(C)]` and built entirely from `AtomicU32` and `UnsafeCell<[u8; N]>` fields:
+/// `#[repr(C)]` and built entirely from `AtomicU32` fields (the free-text fields are
+/// arrays of them, holding the UTF-8 bytes little-endian four to a word):
 /// every field here has to land at the offset a same-order, same-width C struct would
 /// put it at, because the whole point is that two different toolchains (this crate on
 /// Linux, and whatever builds the Windows helper) agree on the layout without either
@@ -226,11 +226,11 @@ pub struct ShmHeader {
     // Bumped after the bytes are written, so a reader that sees an unchanged number is
     // looking at a whole string. See `store_seq_guarded`/`load_seq_guarded` below.
     pub helper_reason_seq: AtomicU32,
-    helper_reason: UnsafeCell<[u8; REASON_BYTES]>,
+    helper_reason: [AtomicU32; REASON_BYTES / 4],
     pub layer_reason_seq: AtomicU32,
-    layer_reason: UnsafeCell<[u8; REASON_BYTES]>,
+    layer_reason: [AtomicU32; REASON_BYTES / 4],
     pub game_name_seq: AtomicU32,
-    game_name: UnsafeCell<[u8; NAME_BYTES]>,
+    game_name: [AtomicU32; NAME_BYTES / 4],
 
     pub pass: [PassControl; MAX_PASSES],
 
@@ -246,7 +246,7 @@ pub struct ShmHeader {
 
     /// 0: the composition blends the model's edit onto the frame under the strength and
     /// guard limits. 1: no composition at all — the model's raw answer IS the presented
-    /// frame. Default 1: the composition is off until the user turns it on.
+    /// frame. Default 0: the composition is on; bypass is an explicit debug choice.
     pub composition_bypass: AtomicU32,
     /// Wall-clock milliseconds the helper waits after the last tuning change before it
     /// rebuilds a feature, and between one rebuild and the next.
@@ -320,20 +320,14 @@ pub struct ShmHeader {
     pub model_interval: AtomicU32,
 }
 
-// The whole point of a shared, memory-mapped struct like this is that every writer
-// synchronizes through its atomics (or, for the free-text fields, through the
-// sequence-number-guarded protocol in `store_seq_guarded`/`load_seq_guarded` below) —
-// never through Rust's own aliasing rules, which don't apply to memory another process
-// can write at any time regardless of what this process believes about it. That is
-// exactly the invariant that makes it safe to treat `&ShmHeader` as shareable across
-// threads within this process too.
-unsafe impl Sync for ShmHeader {}
+// Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
+// process writing the mapping at any time is exactly what atomics are for.
 
 impl Default for ShmHeader {
     fn default() -> Self {
-        // SAFETY: every field is either an `AtomicU32` (valid for any `u32` bit
-        // pattern, including all-zero) or an `UnsafeCell<[u8; N]>` (valid for any byte
-        // pattern) or an array of `PassControl`, itself made only of `AtomicU32`s — so
+        // SAFETY: every field is an `AtomicU32` (valid for any `u32` bit pattern,
+        // including all-zero), an array of them, or an array of `PassControl`, itself
+        // made only of `AtomicU32`s — so
         // the all-zero bit pattern `zeroed()` produces is a valid value of every field,
         // and therefore of the whole struct. This is exactly the value a fresh,
         // `ftruncate`d (zero-filled) mapping already holds before anyone touches it.
@@ -366,6 +360,12 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1972,
 const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1980, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1984, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
+// The free-text fields are whole words; their byte offsets are the ones they had as byte
+// arrays (every field before them is a word, so none gained padding).
+const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_of(4));
+const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_reason) == 260, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 456, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 652, "layout changed -- bump SHM_VERSION");
 
 impl ShmHeader {
     /// Resets every field to the defaults a freshly created mapping should hold. Takes
@@ -495,64 +495,32 @@ impl ShmHeader {
     /// Resets every user-tunable setting -- [`Self::persisted_settings`]'s own list,
     /// plus each pass's overrides -- to its default value, on a live mapping a
     /// helper/layer may be actively using. Deliberately narrower than
-    /// [`Self::init_defaults`] (which this is built on top of): upstream shipped a
-    /// real bug here (PR #16), where its own "reset settings" wiped the live session
-    /// out from under a running helper/layer -- seq words, helper/layer status and
-    /// counters, the DMA-BUF transport fields, HDR detection, the per-request motion scale,
-    /// the free-text reason/name fields -- not just the tuning knobs a user actually
-    /// meant to reset. This never touches the ownership lease either; that lives in a
-    /// separate file (`shm.bin.owner`), entirely outside this struct.
+    /// [`Self::init_defaults`]: upstream shipped a real bug here (PR #16), where its own
+    /// "reset settings" wiped the live session out from under a running helper/layer --
+    /// seq words, helper/layer status and counters, the DMA-BUF transport fields, HDR
+    /// detection, the free-text reason/name fields -- not just the tuning knobs a user
+    /// actually meant to reset. This never touches the ownership lease either; that lives
+    /// in a separate file (`shm.bin.owner`), entirely outside this struct.
     ///
-    /// Implemented as "snapshot everything `init_defaults` would otherwise clobber
-    /// that isn't a user-tunable setting, call it, restore the snapshot" rather than
-    /// hand-listing default values for the 36-odd settings a second time -- that
-    /// second list is exactly the kind of thing that can silently drift from
-    /// `init_defaults`'s own and reintroduce this same class of bug. `pass[]` is not
-    /// snapshotted: per-pass overrides are also user-tunable settings and are meant
-    /// to reset along with everything else `init_defaults` already resets them to.
+    /// The default values come from running `init_defaults` on a scratch header, so there
+    /// is no second list of defaults to drift from the first, and only the user-tunable
+    /// fields are then stored onto `self`. Nothing else in the live header is written at
+    /// all: an earlier version snapshotted the live fields, reinitialized everything and
+    /// restored the snapshot, which reverted any helper or layer write landing in between
+    /// and made this a second writer on the single-writer reason strings. Bumps
+    /// `tuning_seq` and `control_seq` so the helper and layer pick the change up and a
+    /// later `apply_saved_settings` does not read the header as never configured.
     pub fn reset_persisted_settings(&self) {
-        macro_rules! snapshot {
-            ($($field:ident),+ $(,)?) => {
-                ($(self.$field.load(Ordering::Relaxed)),+)
-            };
+        let defaults = ShmHeader::default();
+        defaults.init_defaults();
+        for (name, _, bits) in defaults.persisted_settings() {
+            self.apply_persisted_setting(name, bits);
         }
-        let (seq_req, seq_resp, seq_ok, width, height, format, quit, heartbeat, control_seq, tuning_seq, capture_request) =
-            snapshot!(seq_req, seq_resp, seq_ok, width, height, format, quit, heartbeat, control_seq, tuning_seq, capture_request);
-        let (helper_state, model_up, helper_frames_lo, helper_frames_hi, helper_eval_ms_bits, helper_upload_ms_bits, helper_readback_ms_bits, helper_vram_mb, helper_features, helper_pass_ceiling) =
-            snapshot!(helper_state, model_up, helper_frames_lo, helper_frames_hi, helper_eval_ms_bits, helper_upload_ms_bits, helper_readback_ms_bits, helper_vram_mb, helper_features, helper_pass_ceiling);
-        let (layer_attached, layer_frames_lo, layer_frames_hi, layer_width, layer_height, layer_format, layer_composition_up, layer_ms_bits, layer_measured_white_bits, layer_heartbeat) =
-            snapshot!(layer_attached, layer_frames_lo, layer_frames_hi, layer_width, layer_height, layer_format, layer_composition_up, layer_ms_bits, layer_measured_white_bits, layer_heartbeat);
-        let (rebuild_settle_ms, answered_w, answered_h) = snapshot!(rebuild_settle_ms, answered_w, answered_h);
-        let (proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq) =
-            snapshot!(proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq);
-        let (hdr_detected, hdr_active, hdr_encode, proxy_format) =
-            snapshot!(hdr_detected, hdr_active, hdr_encode, proxy_format);
-        // Slot 1 (v3): a live in-flight second request must survive a settings reset
-        // exactly like slot 0's already does -- this is the same class of bug PR #16
-        // (see this function's own doc comment) already burned upstream on once.
-        let (seq_req_b, seq_resp_b, width_b, height_b, proxy_format_b) =
-            snapshot!(seq_req_b, seq_resp_b, width_b, height_b, proxy_format_b);
-        let helper_reason = self.helper_reason();
-        let layer_reason = self.layer_reason();
-        let game_name = self.game_name();
-
-        self.init_defaults();
-
-        macro_rules! restore {
-            ($($field:ident),+ $(,)?) => {
-                $(self.$field.store($field, Ordering::Relaxed);)+
-            };
+        for p in &self.pass {
+            p.reset_to_defaults();
         }
-        restore!(seq_req, seq_resp, seq_ok, width, height, format, quit, heartbeat, control_seq, tuning_seq, capture_request);
-        restore!(helper_state, model_up, helper_frames_lo, helper_frames_hi, helper_eval_ms_bits, helper_upload_ms_bits, helper_readback_ms_bits, helper_vram_mb, helper_features, helper_pass_ceiling);
-        restore!(layer_attached, layer_frames_lo, layer_frames_hi, layer_width, layer_height, layer_format, layer_composition_up, layer_ms_bits, layer_measured_white_bits, layer_heartbeat);
-        restore!(rebuild_settle_ms, answered_w, answered_h);
-        restore!(proxy_export_seq, proxy_pid, proxy_fd, proxy_gen, answer_export_seq, answer_pid, answer_fd, answer_gen, layer_proxy_seq, layer_answer_seq);
-        restore!(hdr_detected, hdr_active, hdr_encode, proxy_format);
-        restore!(seq_req_b, seq_resp_b, width_b, height_b, proxy_format_b);
-        self.set_helper_reason(&helper_reason);
-        self.set_layer_reason(&layer_reason);
-        self.set_game_name(&game_name);
+        self.tuning_seq.fetch_add(1, Ordering::Relaxed);
+        self.control_seq.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Whether this mapping is one of ours and laid out the way this build expects.
@@ -835,30 +803,35 @@ pub fn store64(lo: &AtomicU32, hi: &AtomicU32, v: u64) {
 /// only after the write, as this used to, let a reader see `before == after` while the
 /// writer was mid-copy and return a torn string.
 ///
+/// The payload is atomic words (relaxed loads and stores inside the fences), not plain
+/// bytes: a reader racing the writer is then only ever a stale read the sequence check
+/// throws away, never a data race. The bytes sit little-endian four to a word, so the
+/// memory image is the same byte string it always was.
+///
 /// There is exactly one writer per field. If a previous writer died mid-write and left
 /// the sequence odd, it is simply carried through to the next even value.
-fn store_seq_guarded<const N: usize>(seq: &AtomicU32, cell: &UnsafeCell<[u8; N]>, s: &str) {
+fn store_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], s: &str) {
     let bytes = s.as_bytes();
-    let n = bytes.len().min(N - 1);
+    let n = bytes.len().min(W * 4 - 1);
     let odd = seq.load(Ordering::Relaxed) | 1;
     seq.store(odd, Ordering::Relaxed);
     // Keeps the odd store ordered before the data writes below, as far as a reader
     // that pairs it with an acquire fence is concerned.
     std::sync::atomic::fence(Ordering::Release);
-    // SAFETY: this is the only place that writes through `cell`, and every reader goes
-    // through `load_seq_guarded`, which never trusts the cell's contents without having
-    // first confirmed (via the sequence number) that no write is/was in progress across
-    // its read.
-    unsafe {
-        let buf = cell.get().cast::<u8>();
-        for i in 0..N {
-            buf.add(i).write_volatile(if i < n { bytes[i] } else { 0 });
+    for (i, word) in words.iter().enumerate() {
+        let mut chunk = [0u8; 4];
+        for (j, b) in chunk.iter_mut().enumerate() {
+            let k = i * 4 + j;
+            if k < n {
+                *b = bytes[k];
+            }
         }
+        word.store(u32::from_le_bytes(chunk), Ordering::Relaxed);
     }
     seq.store(odd.wrapping_add(1), Ordering::Release);
 }
 
-fn load_seq_guarded<const N: usize>(seq: &AtomicU32, cell: &UnsafeCell<[u8; N]>) -> String {
+fn load_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W]) -> String {
     for _ in 0..16 {
         let before = seq.load(Ordering::Acquire);
         if before & 1 != 0 {
@@ -866,12 +839,13 @@ fn load_seq_guarded<const N: usize>(seq: &AtomicU32, cell: &UnsafeCell<[u8; N]>)
             std::hint::spin_loop();
             continue;
         }
-        // SAFETY: see `store_seq_guarded`. The bytes read here are only trusted below,
-        // after confirming the sequence number did not change across the read.
-        let snapshot = unsafe { cell.get().cast::<[u8; N]>().read_volatile() };
+        let mut snapshot = Vec::with_capacity(W * 4);
+        for word in words {
+            snapshot.extend_from_slice(&word.load(Ordering::Relaxed).to_le_bytes());
+        }
         std::sync::atomic::fence(Ordering::Acquire);
         if seq.load(Ordering::Relaxed) == before {
-            let end = snapshot.iter().position(|&b| b == 0).unwrap_or(N);
+            let end = snapshot.iter().position(|&b| b == 0).unwrap_or(snapshot.len());
             return String::from_utf8_lossy(&snapshot[..end]).into_owned();
         }
     }
@@ -961,7 +935,7 @@ mod tests {
         assert!(h.neural_enabled());
         assert_eq!(h.resolved_passes(), 1);
         assert_eq!(f32::from_bits(h.intensity_bits.load(Ordering::Relaxed)), 1.0);
-        // Bypass is on until the user turns composition on.
+        // The composition is on by default; bypass is an explicit debug choice.
         assert_eq!(h.composition_bypass.load(Ordering::Relaxed), 0);
         // Slot 1 (v3) starts idle, same shape as slot 0.
         assert_eq!(h.seq_req_b.load(Ordering::Relaxed), 0);
@@ -1031,6 +1005,48 @@ mod tests {
         assert_eq!(h.game_name(), "GTA5_Enhanced.exe");
     }
 
+    /// A reset racing a live helper/layer must never revert what they write: the old
+    /// snapshot/init_defaults/restore sequence briefly zeroed every live field.
+    #[test]
+    fn reset_never_touches_live_fields_even_transiently() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+        let h = Arc::new(ShmHeader::default());
+        h.init_defaults();
+        h.seq_req.store(41, Ordering::Relaxed);
+        h.width.store(2560, Ordering::Relaxed);
+        h.helper_state.store(crate::enums::helper_state::RUNNING, Ordering::Relaxed);
+        let done = Arc::new(AtomicBool::new(false));
+        let reader = {
+            let (h, done) = (h.clone(), done.clone());
+            std::thread::spawn(move || {
+                let mut reads = 0u64;
+                while !done.load(Ordering::Relaxed) || reads == 0 {
+                    for (name, v) in [("seq_req", &h.seq_req), ("width", &h.width), ("helper_state", &h.helper_state)] {
+                        assert_ne!(v.load(Ordering::Relaxed), 0, "{name} observed as zero during a reset");
+                    }
+                    reads += 1;
+                }
+            })
+        };
+        for _ in 0..10_000 {
+            h.reset_persisted_settings();
+        }
+        done.store(true, Ordering::Relaxed);
+        reader.join().expect("a live field was reset under a running reader");
+    }
+
+    #[test]
+    fn text_fields_keep_their_byte_image() {
+        let h = ShmHeader::default();
+        h.set_game_name("GTA5.exe");
+        // SAFETY: `h` is a plain, fully initialized value; reading its bytes is sound.
+        let bytes = unsafe { std::slice::from_raw_parts((&h as *const ShmHeader).cast::<u8>(), std::mem::size_of::<ShmHeader>()) };
+        let at = std::mem::offset_of!(ShmHeader, game_name);
+        assert_eq!(&bytes[at..at + 9], b"GTA5.exe\0");
+        assert_eq!(h.game_name(), "GTA5.exe");
+    }
+
     #[test]
     fn seq_guarded_string_round_trips() {
         let h = ShmHeader::default();
@@ -1078,13 +1094,5 @@ mod tests {
         h.init_defaults();
         h.mvec_scale_mode.store(99, Ordering::Relaxed);
         assert_eq!(h.mvec_scale_mode(), crate::enums::mvec_scale_mode::NORMALIZED);
-    }
-
-    #[test]
-    fn load_store_64_round_trips() {
-        let lo = AtomicU32::new(0);
-        let hi = AtomicU32::new(0);
-        store64(&lo, &hi, 0x0001_0203_0405_0607);
-        assert_eq!(load64(&lo, &hi), 0x0001_0203_0405_0607);
     }
 }

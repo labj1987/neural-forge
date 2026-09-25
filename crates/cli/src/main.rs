@@ -49,8 +49,8 @@ fn profile_usage() {
          \x20               them to config.ini\n\
          \x20 delete <name> remove a saved profile\n\n\
          Profiles live in $XDG_CONFIG_HOME/neural-forge/profiles.ini. `save`/`load`\n\
-         attach to the live SHM mapping the same way `shmctl` does (see\n\
-         $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)."
+         attach to the live SHM mapping the same way `shmctl` does (config.ini's\n\
+         shm=, else $NEURAL_FORGE_SHM, else the default under /tmp/neural-forge-$UID)."
     );
 }
 
@@ -67,9 +67,13 @@ fn cmd_profile_list() -> ExitCode {
 }
 
 fn cmd_profile_save(name: &str) -> ExitCode {
-    let Some(mapping) = neural_forge_protocol::mapping::open() else {
-        eprintln!("profile save: failed to open the SHM mapping (see $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)");
-        return ExitCode::FAILURE;
+    let channel_cfg = Config::load();
+    let mapping = match neural_forge_supervisor::open_channel(&channel_cfg) {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            eprintln!("profile save: {e}: {}", neural_forge_supervisor::channel_path(&channel_cfg));
+            return ExitCode::FAILURE;
+        }
     };
     let settings = neural_forge_protocol::persist::snapshot(mapping.header());
     match neural_forge_supervisor::profiles::save_profile(name, settings) {
@@ -90,9 +94,13 @@ fn cmd_profile_load(name: &str) -> ExitCode {
         eprintln!("profile load: no such profile {name:?} (see `profile list`)");
         return ExitCode::FAILURE;
     };
-    let Some(mapping) = neural_forge_protocol::mapping::open() else {
-        eprintln!("profile load: failed to open the SHM mapping (see $NEURAL_FORGE_SHM/$NEURAL_FORGE_UID)");
-        return ExitCode::FAILURE;
+    let channel_cfg = Config::load();
+    let mapping = match neural_forge_supervisor::open_channel(&channel_cfg) {
+        Ok(mapping) => mapping,
+        Err(e) => {
+            eprintln!("profile load: {e}: {}", neural_forge_supervisor::channel_path(&channel_cfg));
+            return ExitCode::FAILURE;
+        }
     };
     let header = mapping.header();
     neural_forge_protocol::persist::apply(header, settings);
@@ -157,7 +165,8 @@ fn default_config() -> Config {
         cfg.dxvk_vendor = format!("{vendor:04x}");
         cfg.dxvk_device = format!("{device:04x}");
     }
-    cfg.shm = neural_forge_protocol::shm_default_path();
+    // `shm` stays unset: the channel then follows $NEURAL_FORGE_SHM or the default (see
+    // `neural_forge_supervisor::channel_path`) rather than pinning today's default for good.
     cfg.log = paths::log_file();
     cfg
 }
@@ -189,7 +198,7 @@ fn cmd_config() -> ExitCode {
     println!("runner_type={}", cfg.runner_type);
     println!("runner_path={}", cfg.runner_path);
     println!("binaries={}", cfg.binaries);
-    println!("shm={}", cfg.shm);
+    println!("shm={}", neural_forge_supervisor::channel_path(&cfg));
     println!("log={}", cfg.log);
     println!("dxvk_vendor={}", cfg.dxvk_vendor);
     println!("dxvk_device={}", cfg.dxvk_device);
@@ -236,6 +245,7 @@ fn cmd_status() -> ExitCode {
     }
     println!("  config: {}", paths::config_file());
     println!("  runtime: {}", neural_forge_protocol::shm_runtime_dir());
+    println!("  channel: {}", neural_forge_supervisor::channel_path(&Config::load()));
     println!("  state: {}", paths::state_dir());
     ExitCode::SUCCESS
 }
@@ -345,6 +355,10 @@ fn cmd_start() -> ExitCode {
             println!("helper already running");
             ExitCode::SUCCESS
         }
+        Err(e @ neural_forge_supervisor::StartError::Busy) => {
+            eprintln!("{e}; try again once it has finished");
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("error: {e}");
             ExitCode::FAILURE
@@ -442,7 +456,8 @@ fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
 }
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().collect();
+    // `args_os`: `args()` panics on an argument that is not valid UTF-8 (a path, say).
+    let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
     let Some(command) = args.get(1) else {
         usage();
         return ExitCode::FAILURE;

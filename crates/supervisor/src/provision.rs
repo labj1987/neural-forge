@@ -102,7 +102,14 @@ fn download(name: &str) -> Result<PathBuf, String> {
         r
     };
     let archive = tmp.join("archive.tar.gz");
-    let fetched = Command::new("curl").args(["--fail", "--location", "--silent", "--show-error", "--retry", "2", "--output"]).arg(&archive).arg(&url).status();
+    // Bounded: this runs inside `start()`, and a stalled connection must end in an error the
+    // caller reports, not a start that never returns.
+    let fetched = Command::new("curl")
+        .args(["--fail", "--location", "--silent", "--show-error", "--retry", "2"])
+        .args(["--connect-timeout", "15", "--max-time", "120", "--output"])
+        .arg(&archive)
+        .arg(&url)
+        .status();
     if !fetched.is_ok_and(|s| s.success()) {
         return cleanup(Err(format!("could not download {url} (curl is required)")));
     }
@@ -146,8 +153,7 @@ pub fn write_dxvk_conf(cfg: &Config) -> std::io::Result<()> {
         (String::new(), String::new())
     };
     let text = if vendor.is_empty() { String::new() } else { format!("dxgi.customVendorId = {vendor}\ndxgi.customDeviceId = {device}\n") };
-    std::fs::create_dir_all(paths::state_dir())?;
-    std::fs::write(dxvk_conf_path(), text)
+    paths::write_atomic(Path::new(&dxvk_conf_path()), text.as_bytes(), 0o644)
 }
 
 /// Prepares the managed prefix for `runner_type = "wine"` (a no-op for other runners): creates
@@ -212,8 +218,11 @@ mod tests {
     fn wine_env_overrides_exactly_the_provisioned_dlls() {
         let env = wine_env();
         let overrides = &env.iter().find(|(k, _)| k == "WINEDLLOVERRIDES").unwrap().1;
-        for name in RUNTIME_DLLS {
-            assert!(overrides.contains(&format!("{}=n,b", name.trim_end_matches(".dll"))));
-        }
+        // Exactly: every provisioned DLL native-first, and nothing else overridden.
+        let mut listed: Vec<&str> = overrides.split(';').collect();
+        let mut expected: Vec<String> = RUNTIME_DLLS.iter().map(|name| format!("{}=n,b", name.trim_end_matches(".dll"))).collect();
+        listed.sort_unstable();
+        expected.sort_unstable();
+        assert_eq!(listed, expected);
     }
 }

@@ -14,6 +14,8 @@ pub struct Config {
     pub runner_type: String,
     pub runner_path: String,
     pub binaries: String,
+    /// The channel path `config.ini` pins, or empty for none. Read it through
+    /// [`crate::channel_path`], which falls back to `NEURAL_FORGE_SHM` and then the default.
     pub shm: String,
     pub log: String,
     pub dxvk_vendor: String,
@@ -60,8 +62,8 @@ impl Config {
                 cfg.shm.clear();
             }
         }
-        if cfg.shm.is_empty() || !neural_forge_protocol::isolated_path(&cfg.shm) {
-            cfg.shm = neural_forge_protocol::shm_default_path();
+        if !neural_forge_protocol::isolated_path(&cfg.shm) {
+            cfg.shm.clear();
         }
         if cfg.log.is_empty() || !neural_forge_protocol::isolated_path(&cfg.log) {
             cfg.log = paths::log_file();
@@ -91,7 +93,7 @@ impl Config {
         for (k, v) in &self.settings {
             text.push_str(&format!("{k}={v}\n"));
         }
-        std::fs::write(paths::config_file(), text)
+        paths::write_atomic(std::path::Path::new(&paths::config_file()), text.as_bytes(), 0o644)
     }
 }
 

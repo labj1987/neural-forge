@@ -8,8 +8,8 @@
 //!
 //! Everything here is plain atomics in a file mapping, so no side needs the others'
 //! toolchain and a process dying leaves the others reading a consistent — if stale —
-//! picture. `ShmHeader` is `#[repr(C)]` and built entirely from `AtomicU32` and
-//! `UnsafeCell<[u8; N]>` fields specifically so its layout matches what a C11/C++
+//! picture. `ShmHeader` is `#[repr(C)]` and built entirely from `AtomicU32` fields (the
+//! free-text fields are arrays of them) specifically so its layout matches what a C11/C++
 //! `std::atomic<uint32_t>` of the same field, in the same position, would produce —
 //! that's what makes a single mmap'd region a valid contract between two different
 //! toolchains/processes in the first place.
@@ -46,6 +46,8 @@ pub mod mapping;
 pub mod env;
 mod path;
 pub mod persist;
+#[cfg(unix)]
+pub mod private_dir;
 pub mod motion;
 
 pub use header::{load64, store64, PassControl, PassTuning, ShmHeader};
@@ -61,8 +63,8 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// removes the motion payload region and `frame_mvec_valid` again, since motion is now
 /// estimated inside the helper).
 /// The header layout version. A mismatch (matching magic, different version) means
-/// another process in the chain is out of date; callers should log loudly and
-/// reinitialize rather than half-read a header laid out differently than they expect.
+/// another process in the chain is out of date; the GUI/CLI side refuses such a header
+/// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
 pub const SHM_VERSION: u32 = 7;
 
 pub const MAX_W: u32 = 7680;
@@ -84,8 +86,8 @@ pub fn frame_dims_valid(width: u32, height: u32, proxy_format: u32) -> bool {
         && height != 0
         && width <= MAX_W
         && height <= MAX_H
-        && width % 2 == 0
-        && height % 2 == 0
+        && width.is_multiple_of(2)
+        && height.is_multiple_of(2)
         && matches!(proxy_format, RGBA8 | RGBA16F | BGRA8)
 }
 

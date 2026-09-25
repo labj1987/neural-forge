@@ -807,43 +807,7 @@ impl ShmClient {
 /// world-writable `/tmp`, so this is the difference between "our socket" and "whatever
 /// another local user left in our way."
 fn ensure_private_parent_dir(path: &str) -> bool {
-    let Some(dir) = path.rfind('/').map(|i| &path[..i]) else {
-        return true;
-    };
-    if dir.is_empty() {
-        return true;
-    }
-
-    // mkdir -p, ignoring EEXIST at each level -- the same tolerant, idempotent
-    // create-if-missing upstream's shell version does.
-    let mut built = String::new();
-    for part in dir.split('/') {
-        if part.is_empty() {
-            continue;
-        }
-        built.push('/');
-        built.push_str(part);
-        if let Ok(c) = CString::new(built.as_str()) {
-            // SAFETY: `c` is a valid NUL-terminated C string for the call's duration.
-            // The return value is intentionally ignored: EEXIST (already there) and any
-            // other failure are both handled uniformly by the `lstat` check below.
-            unsafe {
-                libc::mkdir(c.as_ptr(), 0o700);
-            }
-        }
-    }
-
-    let Ok(c_dir) = CString::new(dir) else { return false };
-    // SAFETY: `c_dir` is valid for the call's duration; `st` is a plain out-parameter.
-    let mut st: libc::stat = unsafe { std::mem::zeroed() };
-    if unsafe { libc::lstat(c_dir.as_ptr(), &mut st) } != 0 {
-        return false;
-    }
-    let is_dir = (st.st_mode & libc::S_IFMT) == libc::S_IFDIR;
-    // SAFETY: getuid() takes no arguments and cannot fail.
-    let owned_by_us = st.st_uid == unsafe { libc::getuid() };
-    let no_group_other_perms = (st.st_mode & (libc::S_IRWXG | libc::S_IRWXO)) == 0;
-    is_dir && owned_by_us && no_group_other_perms
+    neural_forge_protocol::private_dir::ensure_private_parent_dir(path)
 }
 
 #[cfg(test)]

@@ -18,9 +18,6 @@ use std::time::{Duration, Instant};
 use nix::sys::signal::{self, Signal};
 use nix::unistd::Pid;
 
-/// Spawns `program` with `args`/`envs`, in a new session (`setsid`) so it becomes its
-/// own process group leader, redirecting stdout/stderr to `log_path` (append). Writes
-/// the child's PID to `pid_file`. Returns the child's PID.
 /// Appends one line to the helper's log (for supervisor-side problems the helper never sees).
 pub(crate) fn append_log(log: &str, line: &str) {
     use std::io::Write;
@@ -29,6 +26,12 @@ pub(crate) fn append_log(log: &str, line: &str) {
     }
 }
 
+/// Spawns `program` with `args`/`envs`, in a new session (`setsid`) so it becomes its
+/// own process group leader, redirecting stdout/stderr to `log_path` (append). Writes
+/// the child's PID to `pid_file`, whose directory must be private to this user (see
+/// `neural_forge_protocol::private_dir`); if that write fails the child's whole process
+/// group is killed before the error is returned, so no helper runs untracked. Returns the
+/// child's PID.
 pub fn start_detached(
     program: &str,
     args: &[String],
@@ -50,20 +53,22 @@ pub fn start_detached(
     unsafe {
         cmd.pre_exec(|| nix::unistd::setsid().map(|_| ()).map_err(std::io::Error::from));
     }
-    let child = cmd.spawn()?;
+    let mut child = cmd.spawn()?;
     let pid = child.id() as i32;
 
-    if let Some(dir) = Path::new(pid_file).parent() {
-        std::fs::create_dir_all(dir)?;
+    if let Err(error) = neural_forge_protocol::private_dir::write_private_file_atomic(pid_file, pid.to_string().as_bytes()) {
+        // `spawn()` returns only after the exec, so `setsid()` has already made the child a
+        // group leader: the negative-pid kill reaches everything it has started so far.
+        let _ = signal_group(pid, Signal::SIGKILL);
+        let _ = child.wait();
+        return Err(error);
     }
-    std::fs::write(pid_file, pid.to_string())?;
     // The child is meant to keep running after this process exits, so it is never
     // waited on inline. But a long-lived parent (the GUI) that just dropped or
     // forgot it would leave a zombie once the helper exits, and a zombie still
     // answers `kill(pid, 0)`. A reaper thread blocks in `wait()` and collects the
     // exit status; in a short-lived CLI it simply dies with the process, leaving the
     // child running exactly as before.
-    let mut child = child;
     let reaper = std::thread::Builder::new().name("helper-reaper".into()).spawn(move || {
         let _ = child.wait();
     });
@@ -89,13 +94,20 @@ fn isolate_helper_layers(command: &mut Command, layers: Option<&str>) {
     }
 }
 
-pub fn running_pid(pid_file: &str) -> Option<i32> {
+/// The PID in `pid_file` if that process is alive (not a zombie) and, when
+/// `expected_cmdline` is given, has it in its command line. A pid file can outlive its
+/// process -- a `/tmp` that is not a tmpfs keeps it across a reboot -- and an unrelated
+/// process that later got the same PID must not read as the helper.
+pub fn running_pid(pid_file: &str, expected_cmdline: Option<&str>) -> Option<i32> {
     let text = std::fs::read_to_string(pid_file).ok()?;
     let pid: i32 = text.trim().parse().ok()?;
-    // SAFETY: signal 0 sends nothing, just checks whether the process (or process
-    // group, for a negative pid -- not used here) exists and is signalable by us.
+    if pid <= 0 {
+        return None;
+    }
+    // Signal 0 sends nothing, just checks whether the process exists and is signalable by us.
     let alive = signal::kill(Pid::from_raw(pid), None).is_ok() && !is_zombie(pid);
-    alive.then_some(pid)
+    let matches = expected_cmdline.is_none_or(|needle| cmdline_contains(pid, needle));
+    (alive && matches).then_some(pid)
 }
 
 /// Whether `pid` has exited but not yet been reaped by its parent. A zombie still
@@ -135,16 +147,10 @@ fn signal_group(pid: i32, sig: Signal) -> nix::Result<()> {
 /// have it in its command line, or it is presumed to be an unrelated process that
 /// inherited a reused PID: nothing is signaled and the stale pid file is dropped.
 pub fn stop_matching(pid_file: &str, timeout: Duration, expected_cmdline: Option<&str>) -> std::io::Result<()> {
-    let Some(pid) = running_pid(pid_file) else {
+    let Some(pid) = running_pid(pid_file, expected_cmdline) else {
         let _ = std::fs::remove_file(pid_file);
         return Ok(());
     };
-    if let Some(needle) = expected_cmdline {
-        if !cmdline_contains(pid, needle) {
-            let _ = std::fs::remove_file(pid_file);
-            return Ok(());
-        }
-    }
     let _ = signal_group(pid, Signal::SIGTERM);
 
     let deadline = Instant::now() + timeout;
@@ -175,23 +181,22 @@ mod tests {
         assert!(result.success());
     }
 
+    /// A path inside a private per-process scratch directory (the pid file's directory
+    /// must be private to this user), never the real runtime directory.
     fn scratch_path(name: &str) -> String {
-        format!("{}/neural-forge-cli-test-{}-{name}", std::env::temp_dir().display(), std::process::id())
+        // One directory per test (named by the file stem), removed by the test when it ends.
+        let stem = name.split('.').next().unwrap_or(name);
+        let path = format!("{}/neural-forge-process-test-{}-{stem}/{name}", std::env::temp_dir().display(), std::process::id());
+        assert!(neural_forge_protocol::private_dir::ensure_private_parent_dir(&path));
+        path
     }
 
-    // Ignored in this dev sandbox specifically: confirmed by direct reproduction that
-    // `kill()` (any of: direct pid, negative-pid process-group, with or without a
-    // prior `setsid()`) reports `Ok(())` but never actually delivers to a child
-    // spawned via `std::process::Command` from a compiled Rust binary in this
-    // container -- while a plain shell background job (`sleep 30 &` from a bash tool
-    // call, no Rust involved) *does* receive and act on the identical signal
-    // correctly in the same environment. That isolates this to a sandbox-level
-    // restriction on signal delivery to `Command`-spawned children specifically, not
-    // a bug in `signal_group`/`stop` (which is the standard, portable POSIX pattern
-    // and needs no change for it to work in any real deployment target -- a real
-    // desktop running the actual helper.exe under Wine/Proton). Un-ignore and run
-    // this for real outside this sandbox before shipping if that ever feels
-    // load-bearing enough to double-check again.
+    /// Gone, or exited and waiting for its parent to reap it. `kill(pid, 0)` still
+    /// succeeds on a zombie, so "is_err" alone is not what "stopped" means.
+    fn gone(pid: i32) -> bool {
+        signal::kill(Pid::from_raw(pid), None).is_err() || is_zombie(pid)
+    }
+
     #[test]
     fn zombie_state_reads_the_field_after_the_last_paren() {
         assert!(zombie_state("123 (helper) Z 1 123 123 0"));
@@ -208,14 +213,14 @@ mod tests {
         let log = scratch_path("reap.log");
         let pid = start_detached("/bin/sh", &["-c".to_string(), "exit 0".to_string()], &[], &log, &pid_file).unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
-        while running_pid(&pid_file).is_some() {
+        while running_pid(&pid_file, None).is_some() {
             assert!(Instant::now() < deadline, "pid {pid} still reported running after it exited");
             std::thread::sleep(Duration::from_millis(50));
         }
         // Reaped, not merely hidden from `running_pid`.
         assert!(signal::kill(Pid::from_raw(pid), None).is_err(), "exited child was left as a zombie");
         let _ = std::fs::remove_file(&pid_file);
-        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_dir_all(Path::new(&log).parent().unwrap());
     }
 
     #[test]
@@ -227,11 +232,45 @@ mod tests {
         assert!(signal::kill(Pid::from_raw(pid), None).is_ok(), "an unrelated process must not be signaled");
         assert!(!Path::new(&pid_file).exists(), "stale pid file should be dropped");
         let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
-        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_dir_all(Path::new(&log).parent().unwrap());
     }
 
     #[test]
-    #[ignore = "signal delivery to Command-spawned children is broken in this dev sandbox specifically -- see comment"]
+    fn a_pid_file_naming_an_unrelated_process_is_not_running() {
+        let pid_file = scratch_path("unrelated.pid");
+        let log = scratch_path("unrelated.log");
+        let pid = start_detached("/bin/sleep", &["30".to_string()], &[], &log, &pid_file).unwrap();
+        assert_eq!(running_pid(&pid_file, None), Some(pid));
+        assert_eq!(running_pid(&pid_file, Some("neural-forge-helper")), None, "a live process that is not the helper must not count");
+        let _ = signal::kill(Pid::from_raw(pid), Signal::SIGKILL);
+        let _ = std::fs::remove_file(&pid_file);
+        let _ = std::fs::remove_dir_all(Path::new(&log).parent().unwrap());
+    }
+
+    #[test]
+    fn a_pid_file_that_cannot_be_written_kills_the_child() {
+        use std::os::unix::fs::PermissionsExt;
+        let shared = format!("{}/neural-forge-process-shared-{}", std::env::temp_dir().display(), std::process::id());
+        std::fs::create_dir_all(&shared).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let log = scratch_path("unwritable.log");
+        let token = format!("neural-forge-untracked-{}", std::process::id());
+        let script = format!("sleep 30; : {token}");
+        let err = start_detached("/bin/sh", &["-c".to_string(), script], &[], &log, &format!("{shared}/helper.pid"));
+        assert!(err.is_err(), "a pid file in a shared directory must be refused");
+        // The child was killed (and reaped) before the error came back.
+        let survivors: Vec<i32> = std::fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|e| e.file_name().to_str()?.parse::<i32>().ok())
+            .filter(|&pid| cmdline_contains(pid, &token) && !gone(pid))
+            .collect();
+        assert!(survivors.is_empty(), "untracked child left running: {survivors:?}");
+        let _ = std::fs::remove_dir_all(&shared);
+        let _ = std::fs::remove_dir_all(Path::new(&log).parent().unwrap());
+    }
+
+    #[test]
     fn stop_kills_the_whole_process_group_not_just_the_leader() {
         let pid_file = scratch_path("pgroup.pid");
         let log = scratch_path("pgroup.log");
@@ -265,11 +304,13 @@ mod tests {
 
         stop_matching(&pid_file, Duration::from_secs(2), None).expect("stop should succeed");
 
-        assert!(signal::kill(Pid::from_raw(leader_pid), None).is_err(), "leader should be gone after stop");
-        assert!(signal::kill(Pid::from_raw(child_pid), None).is_err(), "child should be gone after stop -- this is the real point of this test");
+        // The grandchild is reparented when the leader dies and may sit as a zombie until
+        // its new parent reaps it; that is stopped.
+        assert!(gone(leader_pid), "leader should be gone after stop");
+        assert!(gone(child_pid), "child should be gone after stop -- this is the real point of this test");
 
         let _ = std::fs::remove_file(&pid_file);
-        let _ = std::fs::remove_file(&log);
+        let _ = std::fs::remove_dir_all(Path::new(&log).parent().unwrap());
         let _ = std::fs::remove_file(&marker);
     }
 }
