@@ -6,27 +6,45 @@ on:
   pull_request:
     branches: [main]
 
+# An explicit `shell: bash` runs every step with `-eo pipefail`, so a failing `cargo test`
+# piped through `tee` still fails the step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # A GPU test that finds no Vulkan device panics instead of skipping, so a broken
+      # lavapipe install fails CI instead of passing it with nothing run.
+      NEURAL_FORGE_REQUIRE_VULKAN: "1"
     steps:
       - uses: actions/checkout@v7
 
       # Same package list build-appimage.sh installs on a from-scratch image --
       # libgtk-4-dev/libadwaita-1-dev for the gui crate (glib-sys and friends need the
       # real system libraries via pkg-config, not just a Rust toolchain), mingw for the
-      # Windows-only helper crate, and a software Vulkan ICD (lavapipe) so
-      # neural-forge-layer's real-device tests (the GPU compose dispatch's own
-      # gpu_dispatch_matches_the_cpu_reference in particular) actually run here instead
-      # of just skipping -- this is exactly the test that caught a real shader bug
-      # before it ever reached real hardware (see CLAUDE.md), so it's worth CI
-      # actually exercising it on every push, not only locally.
+      # Windows-only helper crate, and a software Vulkan ICD (lavapipe), 64- and 32-bit,
+      # so neural-forge-layer's real-device tests run in both the native and the i686
+      # test steps. NEURAL_FORGE_REQUIRE_VULKAN above makes that an assertion, not a hope.
       - name: Install build dependencies
         run: |
+          sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
             gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib \
-            libvulkan1 mesa-vulkan-drivers vulkan-tools
+            libvulkan1 mesa-vulkan-drivers vulkan-tools \
+            libvulkan1:i386 mesa-vulkan-drivers:i386
+
+      # Only lavapipe, never whatever other ICD the runner image happens to carry. The
+      # loader skips the manifest whose bitness does not match the test binary.
+      - name: Select the lavapipe Vulkan driver
+        run: |
+          icds="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:)"
+          test -n "$icds"
+          echo "VK_DRIVER_FILES=$icds" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icds"
 
       - name: Install Rust
         run: rustup target add x86_64-pc-windows-gnu i686-unknown-linux-gnu
@@ -46,13 +64,21 @@ jobs:
       # CLAUDE.md "Workspace layout" section for why `--workspace`/`--all` must not be
       # used here.
       - name: cargo test (native crates)
-        run: cargo test
+        run: |
+          cargo test 2>&1 | tee test-native.log
+          ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-native.log || true)"
+          echo "GPU tests that ran (native): $ran" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$ran" -gt 0
 
       - name: cargo check (helper, cross-compiled)
         run: cargo check --target x86_64-pc-windows-gnu -p neural-forge-helper
 
       - name: 32-bit layer tests
-        run: cargo test --target i686-unknown-linux-gnu -p neural-forge-layer
+        run: |
+          cargo test --target i686-unknown-linux-gnu -p neural-forge-layer 2>&1 | tee test-i686.log
+          ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-i686.log || true)"
+          echo "GPU tests that ran (i686): $ran" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$ran" -gt 0
 
       # scripts/install.py delegates install/uninstall to neural-forge-cli (the single
       # implementation), so this exercises the same code the GUI's Setup tab runs.

@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # build-appimage.sh — build the Neural Forge AppImage.
-# Run from the repo root on Ubuntu (matches GreenLight/KernelPop/SteamPunk's own CI
-# assumption). Run as root in CI.
+# Run from the repo root on Ubuntu (the GitHub Actions runner). Run as root in CI.
 #
-# Unlike GreenLight/KernelPop, this app needs no polkit/pkexec step at all -- every
-# path it touches (~/.local/share, ~/.config, /tmp/neural-forge-$UID/) is already
-# user-owned, so AppRun just execs the GUI directly.
+# Packaging is appimagetool run directly on a hand-built AppDir, plus zsyncmake for the
+# update sidecar. GTK 4 and libadwaita come from the host system and are not bundled.
+# This app needs no polkit/pkexec step at all -- every path it touches (~/.local/share,
+# ~/.config, /tmp/neural-forge-$UID/) is already user-owned, so AppRun just execs the
+# GUI directly.
 set -euo pipefail
 
 # LIBDIR/LIB/MANIFEST are the layer's install identity (VK_LAYER_neuralforge_neural, libneural_forge_layer.so,
@@ -159,8 +160,10 @@ VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
 echo "==> Done: $OUT"
 ls -lh "$OUT"
 
-# appimagetool's built-in zsync generation silently no-ops on some CI runners (see
-# KernelPop's CLAUDE.md); build the sidecar directly instead. Non-fatal.
+# appimagetool's built-in zsync generation silently no-ops on GitHub Actions runners,
+# so the sidecar is built directly instead. Fatal in CI (CI is set): the AppImage's
+# UPDATE_INFORMATION points at a .zsync, so a release without one cannot update. A
+# local build without zsyncmake only warns.
 #
 # `-u <url>` here is a *second*, different piece of update metadata than
 # `UPDATE_INFORMATION` above: it's the .zsync file's own internal "URL:" header,
@@ -172,8 +175,17 @@ ls -lh "$OUT"
 # release's real, absolute GitHub download URL instead of relying on that.
 ZSYNC_URL="https://github.com/labj1987/neural-forge/releases/download/v$VERSION/$OUT"
 echo "==> Generating .zsync sidecar"
-if zsyncmake -u "$ZSYNC_URL" "$OUT"; then
+if ! command -v zsyncmake >/dev/null 2>&1; then
+    if [[ -n "${CI:-}" ]]; then
+        echo "error: zsyncmake not found (install the zsync package)" >&2
+        exit 1
+    fi
+    echo "==> WARNING: zsyncmake not found — continuing without .zsync"
+elif zsyncmake -u "$ZSYNC_URL" -o "$OUT.zsync" "$OUT"; then
     echo "==> .zsync generated: $OUT.zsync"
+elif [[ -n "${CI:-}" ]]; then
+    echo "error: zsyncmake failed" >&2
+    exit 1
 else
     echo "==> WARNING: zsyncmake failed — continuing without .zsync"
 fi

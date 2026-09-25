@@ -3072,30 +3072,10 @@ mod tests {
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
-    /// Same shape as `composition::gpu::tests::test_device` -- a real (if software)
-    /// Vulkan device via whatever loader/ICD is on this machine, `None` if there
-    /// isn't one. Not shared with that module (private to it, and this crate has no
-    /// shared test-support module yet); small enough that duplicating it costs less
-    /// than inventing one.
+    /// The shared `composition::gpu::test_device`, which also enforces
+    /// `NEURAL_FORGE_REQUIRE_VULKAN=1`.
     fn test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
-        // SAFETY: loads the system Vulkan loader; the usual caveats of loading an
-        // arbitrary shared library apply and are accepted here the same way every
-        // other `ash` consumer in this crate already does.
-        let entry = unsafe { ash::Entry::load() }.ok()?;
-        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
-        let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
-        // SAFETY: `create_info` is valid.
-        let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
-        // SAFETY: `instance` was just created and outlives every use of `physical_device`.
-        let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
-        let queue_family = 0;
-        let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
-        let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
-        // SAFETY: `device_create_info` is valid; every physical device has a family 0.
-        let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
-        // SAFETY: `device`/family/index 0 match what `device_create_info` just requested.
-        let queue = unsafe { device.get_device_queue(queue_family, 0) };
-        Some((entry, instance, physical_device, device, queue, queue_family))
+        crate::composition::gpu::test_device()
     }
 
     /// A standalone image standing in for a real swapchain image, already in

@@ -8,9 +8,18 @@ on:
 permissions:
   contents: write
 
+# An explicit `shell: bash` runs every step with `-eo pipefail`, so a failing `cargo test`
+# piped through `tee` still fails the step.
+defaults:
+  run:
+    shell: bash
+
 jobs:
   build:
     runs-on: ubuntu-latest
+    env:
+      # A GPU test that finds no Vulkan device panics instead of skipping (see ci.yml).
+      NEURAL_FORGE_REQUIRE_VULKAN: "1"
     steps:
       - name: Checkout code
         uses: actions/checkout@v7 # verified: v7 is a published major tag
@@ -22,31 +31,57 @@ jobs:
           targets: x86_64-pc-windows-gnu, i686-unknown-linux-gnu
 
       # The release used to build and publish without running a single test. Same
-      # dependencies and checks as ci.yml, before anything gets packaged.
-      - name: Install test dependencies
+      # dependencies and checks as ci.yml, before anything gets packaged. zsync and
+      # desktop-file-utils are packaging tools build-appimage.sh needs: it only installs
+      # its own dependencies when cargo or gtk4 is missing, which is never the case here,
+      # and without zsyncmake the release would ship without its .zsync sidecar.
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
             gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib \
-            libvulkan1 mesa-vulkan-drivers vulkan-tools
+            libvulkan1 mesa-vulkan-drivers vulkan-tools \
+            zsync desktop-file-utils
+
+      - name: Select the lavapipe Vulkan driver
+        run: |
+          icds="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:)"
+          test -n "$icds"
+          echo "VK_DRIVER_FILES=$icds" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icds"
 
       - name: cargo test (native crates)
-        run: cargo test
+        run: |
+          cargo test 2>&1 | tee test-native.log
+          ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-native.log || true)"
+          echo "GPU tests that ran (native): $ran" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$ran" -gt 0
 
       - name: Shader sources match committed SPIR-V
         run: python3 scripts/check_shaders.py
 
-      # See build-appimage.sh's own comment: it self-installs its apt dependencies
-      # (gtk4/libadwaita dev headers, mingw, zsync) when they're missing, so this
-      # step alone is enough on a from-scratch runner -- CARGO_HELPER picks the
-      # rustup-managed "stable" toolchain dtolnay/rust-toolchain just set up, matching
-      # docs/PHASE1.md's own documented CI-appropriate invocation.
+      - name: Vulkan loader smoke test
+        run: bash scripts/smoke-test.sh
+
+      # CARGO_HELPER picks the rustup-managed "stable" toolchain dtolnay/rust-toolchain
+      # just set up, matching docs/PHASE1.md's own documented CI-appropriate invocation.
+      # CI=true (set by GitHub Actions, kept by `sudo -E`) makes a missing or failing
+      # zsyncmake fatal in build-appimage.sh.
       - name: Build AppImage
         run: sudo -E env "PATH=$PATH" CARGO_HELPER='cargo +stable' bash build-appimage.sh
+
+      - name: Check the release files
+        run: |
+          appimage="$(ls neural-forge-*-x86_64.AppImage)"
+          test -s "$appimage"
+          test -s "$appimage.zsync"
+          ls -l "$appimage" "$appimage.zsync"
 
       - name: Create Release
         uses: softprops/action-gh-release@v3
         with:
           files: |
-            neural-forge-*-x86_64.AppImage*
+            neural-forge-*-x86_64.AppImage
+            neural-forge-*-x86_64.AppImage.zsync
+          fail_on_unmatched_files: true
           generate_release_notes: true
