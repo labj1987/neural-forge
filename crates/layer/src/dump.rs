@@ -55,7 +55,7 @@ fn write_png(path: &std::path::Path, rgba: &[u8], width: u32, height: u32, bgr_o
     // uniform blue tint across an entire real capture, matching a real/blue channel
     // swap exactly, not a rendering bug in the game or the model itself).
     let mut opaque = rgba.to_vec();
-    for px in opaque.chunks_exact_mut(4) {
+    for px in opaque.as_chunks_mut::<4>().0 {
         if bgr_order {
             px.swap(0, 2);
         }

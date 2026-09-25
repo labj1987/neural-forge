@@ -129,6 +129,9 @@ pub struct ShmClient {
     alive_heartbeat: u32,
     alive_since: Option<Instant>,
     dead: bool,
+    /// Set when mapping the file failed (address space refused): not retried on every
+    /// present for the rest of the process, since nothing about the next attempt differs.
+    map_refused: bool,
     frames: u64,
     /// Per-slot: the request number and send time of a round trip issued via
     /// [`Self::begin_async_request`] that [`Self::poll_async_request`] hasn't yet
@@ -164,6 +167,7 @@ impl Default for ShmClient {
             alive_heartbeat: 0,
             alive_since: None,
             dead: false,
+            map_refused: false,
             frames: 0,
             pending: [None, None],
         }
@@ -466,6 +470,9 @@ impl ShmClient {
         if self.header().is_some() {
             return true;
         }
+        if self.map_refused {
+            return false;
+        }
         if !ensure_private_parent_dir(path) {
             crate::log!("[shm] refusing {path}: parent directory is not private");
             return false;
@@ -520,7 +527,8 @@ impl ShmClient {
         // at its fixed offset, capped (the offsets are page-aligned by construction).
         let (map, regions) = if cfg!(target_pointer_width = "64") {
             let Some(base) = map_at(0, total) else {
-                crate::log!("[shm] mmap {path} failed");
+                crate::log!("[shm] mmap {path} failed; not retrying");
+                self.map_refused = true;
                 return false;
             };
             // SAFETY: every offset is inside the `total`-byte mapping just made.
@@ -528,13 +536,23 @@ impl ShmClient {
             (base.cast::<libc::c_void>(), regions)
         } else {
             let Some(base) = map_at(0, neural_forge_protocol::HEADER_BYTES) else {
-                crate::log!("[shm] mmap {path} (header) failed");
+                crate::log!("[shm] mmap {path} (header) failed; not retrying");
+                self.map_refused = true;
                 return false;
             };
-            let mut regions = [std::ptr::null_mut(); 4];
+            let mut regions: [*mut u8; 4] = [std::ptr::null_mut(); 4];
             for r in Region::ALL {
                 let Some(p) = map_at(r.offset(), REGION_CAP) else {
-                    crate::log!("[shm] mmap {path} region {r:?} failed");
+                    crate::log!("[shm] mmap {path} region {r:?} failed; not retrying");
+                    // SAFETY: each of these was mapped just above with exactly this length and
+                    // nothing has used it yet.
+                    unsafe {
+                        libc::munmap(base.cast(), neural_forge_protocol::HEADER_BYTES);
+                        for mapped in regions.iter().filter(|p| !p.is_null()) {
+                            libc::munmap(mapped.cast(), REGION_CAP);
+                        }
+                    }
+                    self.map_refused = true;
                     return false;
                 };
                 regions[r as usize] = p;

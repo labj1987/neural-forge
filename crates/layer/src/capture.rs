@@ -12,12 +12,10 @@
 //! Stage 1 (capture into a staging buffer) is one command buffer + one fence,
 //! synchronous -- the CPU needs those bytes before it can even start the SHM round
 //! trip, so there's no way around blocking on it. What happens after the round trip
-//! depends on the settings and what's available: the common case (real GPU compose,
-//! no debug dump pending) is `composition::gpu::GpuCompose::dispatch_into_image_async`
-//! (2026-09-10) -- non-blocking, its own doc comment covers why that's sound. Every
-//! other case (CPU compose, a pending `capture_request`, `RGBA16F`, no GPU available)
-//! still falls back to the original synchronous stage-2 write-back below, one more
-//! command buffer + fence wait, same as this whole function used to always do.
+//! is the original synchronous stage-2 write-back below (a synchronous GPU or CPU
+//! compose into the staging bytes, then one more command buffer + fence wait).
+//! The per-frame path (`run`) composes asynchronously through
+//! `composition::gpu::GpuCompose::present_temporal_delta_async` instead.
 
 use ash::vk;
 
@@ -422,7 +420,7 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
     // SAFETY: `buffer` was just created and is not yet bound to memory.
     let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
     // SAFETY: `physical_device` is the device this capture serves; `instance` is its
-    // owning instance (stored once at `vkCreateInstance`, see `crate::CURRENT_INSTANCE`).
+    // owning instance (recorded per physical device, see `crate::PHYSICAL_DEVICE_INSTANCES`).
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
     // This buffer is written by the GPU and then *read back by the CPU* on the game's
     // own present thread every capture -- see `pick_readback_memory_type`'s own doc
@@ -695,7 +693,7 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 /// hold/white-point meter) need bytes that survive whatever capture starts next and
 /// overwrites that region, which the live proxy region itself can't provide once it's
 /// shared, imported memory.
-#[allow(clippy::too_many_arguments)]
+///
 /// `model`, when `Some((model_width, model_height, format))`, additionally requests a
 /// scaled proxy at that resolution (`working_scale`) -- see [`ModelScratch`]'s own doc
 /// comment for the mechanism. Only the [`CapturePipeline`] (non-`use_direct`) branch
@@ -711,14 +709,27 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 /// case this falls back to sending the full-resolution proxy that frame, same
 /// bounded-staleness fail-open discipline as everywhere else in this module).
 ///
-/// Returns `Some(Captured)` on a successful capture+send this call, `None` on "nothing to
-/// do this frame". `Captured::sent` is the proxy's *actual* resolution, which the caller
-/// must record (`Inflight::proxy_dims`) to size the eventual answer correctly. This is
-/// `model`'s own request dims only when a scaled send genuinely happened; every fallback
-/// above (an unavailable/failed scratch, `use_direct`, no `model` requested at all)
-/// correctly reports the full-resolution `(width, height)` instead, because it actually
-/// sent that -- callers must not re-derive this from `model` themselves, only ever trust
-/// this return value.
+/// Returns [`CaptureStep::Captured`] on a successful capture+send this call,
+/// [`CaptureStep::Pending`] while a capture is in flight or was just submitted, and
+/// [`CaptureStep::Failed`] when the capture resources could not be built or a submission
+/// failed -- a caller waiting for this frame's capture must stop waiting on `Failed`, since
+/// nothing is in flight that could ever complete. `Captured::sent` is the proxy's *actual*
+/// resolution, which the caller must record (`Inflight::proxy_dims`) to size the eventual
+/// answer correctly. This is `model`'s own request dims only when a scaled send genuinely
+/// happened; every fallback above (an unavailable/failed scratch, `use_direct`, no `model`
+/// requested at all) correctly reports the full-resolution `(width, height)` instead,
+/// because it actually sent that -- callers must not re-derive this from `model`
+/// themselves, only ever trust this return value.
+///
+/// A completed capture is only sent when it was taken at this frame's own `(width, height,
+/// proxy_format)` and, when `submitted_after` is `Some`, submitted no earlier than that
+/// instant (the synchronous present passes its own start: a capture a previous present
+/// left in flight is of an older frame). Anything else is dropped and a fresh capture is
+/// submitted in its place.
+///
+/// A direct-capture setup failure clears `external_memory_host`, so the rest of this
+/// device's life uses the always-correct [`CapturePipeline`] path: there is no per-call
+/// fallback, and retrying the import every present would only fail the same way.
 ///
 /// `zc_target`, when `Some` (the synchronous present's zero-copy compose, `use_direct`
 /// only), is the device-local capture target a newly submitted direct capture also copies
@@ -729,6 +740,7 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 fn poll_or_submit_capture(
     slot: usize,
     use_direct: bool,
+    external_memory_host: &mut bool,
     pipeline: &mut Option<CapturePipeline>,
     direct: &mut [Option<DirectCapture>; 2],
     device: &ash::Device,
@@ -748,9 +760,13 @@ fn poll_or_submit_capture(
     original_scratch: &mut Vec<u8>,
     model_scratch: &mut Vec<u8>,
     zc_target: Option<vk::Buffer>,
-) -> Option<Captured> {
+    submitted_after: Option<std::time::Instant>,
+) -> CaptureStep {
+    let usable = |w: u32, h: u32, f: u32, submitted: std::time::Instant| {
+        (w, h, f) == (width, height, proxy_format) && submitted_after.is_none_or(|after| submitted >= after)
+    };
     if use_direct {
-        let (host_ptr, capacity) = shm.proxy_region(slot)?;
+        let Some((host_ptr, capacity)) = shm.proxy_region(slot) else { return CaptureStep::Failed };
         // SAFETY: `host_ptr`/`capacity` describe `shm`'s own live proxy region for
         // this slot, valid for as long as `shm` stays open (the life of this process,
         // since the mapping is never unmapped -- see
@@ -758,45 +774,64 @@ fn poll_or_submit_capture(
         // equivalent GUI/CLI mapping); nothing else writes to it except through
         // `ShmClient::write_proxy`, which this branch never calls, and slot 0's/slot
         // 1's regions are disjoint (`docs/PROTOCOL_V3_DESIGN.md`), so the other slot's own
-        // `DirectCapture` never touches these same bytes.
+        // `DirectCapture` never touches these same bytes. Only the frame's own bytes are
+        // imported, rounded up to the driver's import alignment (as the answer import is),
+        // not the whole region: every imported page may be pinned. `run` only chooses
+        // `use_direct` when that alignment query succeeded and the region is aligned to it.
+        let import_bytes = min_imported_host_pointer_alignment(instance, physical_device)
+            .map_or(capacity as u64, |alignment| frame_bytes.div_ceil(alignment) * alignment)
+            .min(capacity as u64);
         if !unsafe {
-            ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, capacity as vk::DeviceSize)
+            ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, import_bytes)
         } {
             note_setup_failure();
-            return None;
+            *external_memory_host = false;
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!("[layer] zero-copy capture setup failed; using the staging-buffer capture for the rest of this device's life");
+                crate::logging::flush();
+            }
+            return CaptureStep::Failed;
         }
         let d = direct[slot].as_mut().expect("just ensured above");
-        if let Some((_, _, _, target)) = poll_direct_capture(d, device) {
-            if target.is_some() && target == zc_target {
-                // The same submission wrote the frame into the capture target the compose
-                // reads, so there is nothing to copy out here.
+        if let Some((w, h, f, target, submitted)) = poll_direct_capture(d, device) {
+            if usable(w, h, f, submitted) {
+                if target.is_some() && target == zc_target {
+                    // The same submission wrote the frame into the capture target the compose
+                    // reads, so there is nothing to copy out here.
+                    original_scratch.clear();
+                    shm.set_frame_info(slot, width, height, proxy_format);
+                    return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: true, copy_out: std::time::Duration::ZERO });
+                }
+                let t_copy = std::time::Instant::now();
+                let n = capacity.min(frame_bytes as usize);
                 original_scratch.clear();
+                // SAFETY: `host_ptr` is `shm`'s own live proxy region, valid for at least
+                // `capacity` bytes; `poll_direct_capture` returning `Some` just confirmed
+                // this slot's fence signaled, making the GPU's writes to it visible to the
+                // CPU (host-coherent memory backs every capture buffer in this module,
+                // imported or not).
+                original_scratch.extend_from_slice(unsafe { std::slice::from_raw_parts(host_ptr, n) });
                 shm.set_frame_info(slot, width, height, proxy_format);
-                return Some(Captured { sent: (width, height), gpu_original: true, copy_out: std::time::Duration::ZERO });
+                return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed() });
             }
-            let t_copy = std::time::Instant::now();
-            let n = capacity.min(frame_bytes as usize);
-            original_scratch.clear();
-            // SAFETY: `host_ptr` is `shm`'s own live proxy region, valid for at least
-            // `capacity` bytes; `poll_direct_capture` returning `Some` just confirmed
-            // this slot's fence signaled, making the GPU's writes to it visible to the
-            // CPU (host-coherent memory backs every capture buffer in this module,
-            // imported or not).
-            original_scratch.extend_from_slice(unsafe { std::slice::from_raw_parts(host_ptr, n) });
-            shm.set_frame_info(slot, width, height, proxy_format);
-            return Some(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed() });
+            // A capture of another frame size, or of an earlier frame: dropped, and a fresh
+            // one submitted below in its place.
         }
-        submit_direct_capture(d, device, queue, capture_image, capture_layout, width, height, proxy_format, zc_target);
-        None
+        if submit_direct_capture(d, device, queue, capture_image, capture_layout, width, height, proxy_format, zc_target) || d.pending.is_some() {
+            CaptureStep::Pending
+        } else {
+            CaptureStep::Failed
+        }
     } else {
         if !ensure_pipeline(pipeline, device, instance, physical_device, queue_family, frame_bytes) {
             note_setup_failure();
-            return None;
+            return CaptureStep::Failed;
         }
         let p = pipeline.as_mut().expect("just ensured above");
         let t_copy = std::time::Instant::now();
         let (full, model_dims) = poll_pipeline_capture(p, slot, device, original_scratch, model_scratch);
-        if full.is_some() {
+        if full.is_some_and(|(w, h, f, submitted)| usable(w, h, f, submitted)) {
             if let Some((mw, mh)) = model_dims {
                 // Encode self-check, once per process: the untouched frame and the
                 // GPU-encoded proxy are both sitting in CPU memory right here, so the
@@ -828,13 +863,15 @@ fn poll_or_submit_capture(
                 }
                 shm.set_frame_info(slot, mw, mh, proxy_format);
                 shm.write_proxy(slot, model_scratch);
-                return Some(Captured { sent: (mw, mh), gpu_original: false, copy_out: t_copy.elapsed() });
+                return CaptureStep::Captured(Captured { sent: (mw, mh), gpu_original: false, copy_out: t_copy.elapsed() });
             }
             shm.set_frame_info(slot, width, height, proxy_format);
             shm.write_proxy(slot, original_scratch);
-            return Some(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed() });
+            return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed() });
         }
-        submit_pipeline_capture(
+        // Nothing completed, or what completed was of another frame size or an earlier frame
+        // (dropped: its slot is free again and a fresh capture goes in below).
+        let submitted = submit_pipeline_capture(
             p,
             slot,
             device,
@@ -849,8 +886,22 @@ fn poll_or_submit_capture(
             model,
             encode_push,
         );
-        None
+        if submitted || p.slots[slot].pending.is_some() {
+            CaptureStep::Pending
+        } else {
+            CaptureStep::Failed
+        }
     }
+}
+
+/// What one [`poll_or_submit_capture`] call achieved.
+enum CaptureStep {
+    /// A capture completed and was sent this call.
+    Captured(Captured),
+    /// A capture is in flight (possibly submitted by this very call).
+    Pending,
+    /// Setup or submission failed: nothing is in flight that could complete.
+    Failed,
 }
 
 /// A capture [`poll_or_submit_capture`] completed and sent this call.
@@ -975,6 +1026,11 @@ static TEST_MODE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 #[cfg(test)]
 static TEST_NO_ZERO_COPY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Makes [`ensure_direct_capture`] fail, standing in for a driver that refuses the host
+/// pointer import.
+#[cfg(test)]
+static TEST_FAIL_DIRECT_SETUP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn zero_copy_allowed() -> bool {
     #[cfg(test)]
     if TEST_NO_ZERO_COPY.load(std::sync::atomic::Ordering::Relaxed) {
@@ -1009,7 +1065,7 @@ pub fn take_setup_failure() -> bool {
 /// Same contract as [`run_sync`]: `queue` must be the same queue `image`'s
 /// presentation was requested on, with no concurrent use of it from another thread
 /// for the duration of this call.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
 pub unsafe fn run(
     device: &ash::Device,
     instance: &ash::Instance,
@@ -1026,7 +1082,7 @@ pub unsafe fn run(
     resources: &mut Option<CaptureResources>,
     pipeline: &mut Option<CapturePipeline>,
     direct: &mut [Option<DirectCapture>; 2],
-    external_memory_host: bool,
+    external_memory_host: &mut bool,
     gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>,
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
@@ -1076,16 +1132,16 @@ pub unsafe fn run(
     // guess) -- `DirectCapture`/`CapturePipeline` are chosen once for the whole
     // device, never per-slot (see `direct_capture`'s own doc comment in `device.rs`),
     // so a single combined decision is what `run` actually needs here.
-    let use_direct = external_memory_host
+    let use_direct = *external_memory_host
         && (0..2).all(|slot| {
             shm.proxy_region(slot).is_some_and(|(ptr, capacity)| {
                 min_imported_host_pointer_alignment(instance, physical_device).is_some_and(|alignment| {
                     let alignment = alignment as usize;
-                    alignment != 0 && (ptr as usize) % alignment == 0 && capacity % alignment == 0
+                    alignment != 0 && (ptr as usize).is_multiple_of(alignment) && capacity.is_multiple_of(alignment)
                 })
             })
         });
-    let Some(settings) = shm.composition_settings() else { return None };
+    let settings = shm.composition_settings()?;
     // A pending `capture_request` (a real PNG dump to disk) needs *this* frame's own original
     // and answer read back onto the CPU -- same-frame correctness matters more than throughput
     // for a rare, deliberately-triggered one-shot dump, not the normal per-frame path this
@@ -1184,16 +1240,16 @@ pub unsafe fn run(
         // still need its own `CreateFeature` at the scaled resolution -- this bootstrap
         // only helps avoid the VRAM-full failure mode, it does not need to guess the
         // eventual real resolution correctly to do that.
-        if poll_or_submit_capture(
-            SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+        if let CaptureStep::Captured(_) = poll_or_submit_capture(
+            SLOT, use_direct, external_memory_host, pipeline, direct, device, instance, physical_device, queue, queue_family,
             capture_image, capture_layout, width, height, proxy_format, frame_bytes, None,
             crate::composition::encode_pass::EncodePush {
                 white_point: settings.white_point,
                 bgr_order: u32::from(bgr_order),
                 reversible_mode: settings.reversible_mode,
             },
-            shm, original_scratch, model_scratch, None,
-        ).is_some() {
+            shm, original_scratch, model_scratch, None, None,
+        ) {
             if answer_region_free(gpu_compose, device) && shm.begin_async_request(SLOT) {
                 inflight[SLOT].dims = Some((width, height, proxy_format));
                 inflight[SLOT].proxy_dims = None;
@@ -1229,7 +1285,7 @@ pub unsafe fn run(
         shm.answer_region(0).and_then(|(ptr, capacity)| {
             let alignment = min_imported_host_pointer_alignment(instance, physical_device)?;
             let bytes = frame_bytes.div_ceil(alignment) * alignment;
-            ((ptr as u64) % alignment == 0 && bytes <= capacity as u64).then_some((ptr, bytes))
+            ((ptr as u64).is_multiple_of(alignment) && bytes <= capacity as u64).then_some((ptr, bytes))
         })
     } else {
         None
@@ -1269,27 +1325,25 @@ pub unsafe fn run(
             // reads `answer_dims` unless `have_answer` is `true`, at which point it was
             // always actually set from the branch just below.
             let mut answer_dims = (width, height);
-            if shm.has_pending_request(slot) {
-                if shm.poll_async_request(slot) == Some(true) {
-                    // The answer comes back at whatever resolution *this outstanding
-                    // request* was actually sent at (`inflight[slot].proxy_dims`), not
-                    // necessarily this frame's own `(width, height)` -- see
-                    // `Inflight::proxy_dims`'s own doc comment. Falls back to the
-                    // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
-                    // possibility before `working_scale` existed.
-                    answer_dims = inflight[slot].proxy_dims.unwrap_or((width, height));
-                    let (aw, ah) = answer_dims;
-                    let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
-                    answer_scratch.resize(answer_bytes, 0);
-                    shm.read_answer(slot, answer_scratch);
-                    // Preserve the exact game frame supplied to the model before the next
-                    // request replaces `inflight[slot].original`; the temporal GPU path
-                    // uses it to carry only the model's enhancement delta onto current
-                    // frames.
-                    raw_answer_base.clear();
-                    raw_answer_base.extend_from_slice(&inflight[slot].original);
-                    have_answer = true;
-                }
+            if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(true) {
+                // The answer comes back at whatever resolution *this outstanding
+                // request* was actually sent at (`inflight[slot].proxy_dims`), not
+                // necessarily this frame's own `(width, height)` -- see
+                // `Inflight::proxy_dims`'s own doc comment. Falls back to the
+                // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
+                // possibility before `working_scale` existed.
+                answer_dims = inflight[slot].proxy_dims.unwrap_or((width, height));
+                let (aw, ah) = answer_dims;
+                let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
+                answer_scratch.resize(answer_bytes, 0);
+                shm.read_answer(slot, answer_scratch);
+                // Preserve the exact game frame supplied to the model before the next
+                // request replaces `inflight[slot].original`; the temporal GPU path
+                // uses it to carry only the model's enhancement delta onto current
+                // frames.
+                raw_answer_base.clear();
+                raw_answer_base.extend_from_slice(&inflight[slot].original);
+                have_answer = true;
             }
 
             // Non-blocking capture (`docs/ASYNC_CAPTURE_DESIGN.md`, `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`):
@@ -1307,15 +1361,15 @@ pub unsafe fn run(
             // skips submitting a redundant capture on the same call a round trip just
             // started.
             if !shm.has_pending_request(slot) {
-                if let Some(captured) = poll_or_submit_capture(
-                    slot, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+                if let CaptureStep::Captured(captured) = poll_or_submit_capture(
+                    slot, use_direct, external_memory_host, pipeline, direct, device, instance, physical_device, queue, queue_family,
                     capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
-                crate::composition::encode_pass::EncodePush {
-                    white_point: settings.white_point,
-                    bgr_order: u32::from(bgr_order),
-                    reversible_mode: settings.reversible_mode,
-                },
-                shm, original_scratch, model_scratch, None,
+                    crate::composition::encode_pass::EncodePush {
+                        white_point: settings.white_point,
+                        bgr_order: u32::from(bgr_order),
+                        reversible_mode: settings.reversible_mode,
+                    },
+                    shm, original_scratch, model_scratch, None, None,
                 ) {
                     let (sent_w, sent_h) = captured.sent;
                     if answer_region_free(gpu_compose, device) && shm.begin_async_request(slot) {
@@ -1393,7 +1447,7 @@ pub unsafe fn run(
         // An answer to carry is either the CPU pair or, after a zero-copy present, the GPU's.
         let answer_held = !last_answer.is_empty() || gpu_compose.as_ref().is_some_and(|gpu| gpu.holds_generation(*raw_answer_generation));
         let carry = settings.model_interval > 1
-            && present_no % u64::from(settings.model_interval) != 0
+            && !present_no.is_multiple_of(u64::from(settings.model_interval))
             && !settings.hold_frame
             && answer_held
             && inflight[SLOT].dims == Some((width, height, proxy_format));
@@ -1459,15 +1513,21 @@ pub unsafe fn run(
                 copy_out = t_copy.elapsed();
             }
             while sent.is_none() {
-                if let Some(captured) = poll_or_submit_capture(
-                    SLOT, use_direct, pipeline, direct, device, instance, physical_device, queue, queue_family,
+                match poll_or_submit_capture(
+                    SLOT, use_direct, external_memory_host, pipeline, direct, device, instance, physical_device, queue, queue_family,
                     capture_image, capture_layout, width, height, proxy_format, frame_bytes, model_request,
-                    encode_push, shm, original_scratch, model_scratch, zc_target,
+                    encode_push, shm, original_scratch, model_scratch, zc_target, Some(t_start),
                 ) {
-                    sent = Some(captured.sent);
-                    gpu_original = captured.gpu_original;
-                    copy_out = captured.copy_out;
-                    break;
+                    CaptureStep::Captured(captured) => {
+                        sent = Some(captured.sent);
+                        gpu_original = captured.gpu_original;
+                        copy_out = captured.copy_out;
+                        break;
+                    }
+                    // Nothing is in flight and nothing will be: waiting out the budget would
+                    // only cost this frame (and every later one) the whole budget for nothing.
+                    CaptureStep::Failed => break,
+                    CaptureStep::Pending => {}
                 }
                 if std::time::Instant::now() >= deadline {
                     break;
@@ -1496,7 +1556,7 @@ pub unsafe fn run(
             // so the GUI can show it; only used when the source is Measured.
             {
                 static METER_FRAME: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
-                if !holding && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed) % 8 == 0 {
+                if !holding && METER_FRAME.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(8) {
                     let frame: &[u8] = if zero_copy {
                         // Zero-copy leaves `original_scratch` empty; the same frame is in the proxy
                         // region. SAFETY: the capture that wrote it was just seen complete (its fence,
@@ -1647,6 +1707,7 @@ pub unsafe fn run(
                 debug_view: settings.debug_view,
                 debug_scale: settings.debug_scale,
                 proxy_encoded,
+                reversible_mode: settings.reversible_mode,
             },
         ) {
             if let Some(t) = SYNC_TIMING.with(|t| t.take()) {
@@ -1691,7 +1752,7 @@ pub unsafe fn run(
 /// caller shares the exact same recorded commands rather than a copy that could
 /// drift apart -- not, today, because there already is one.
 /// `model`, when `Some((scratch_image, scratch_buffer, model_width, model_height))`,
-/// additionally blits `image` (already `TRANSFER_SRC_OPTIMAL` for the main copy below)
+/// additionally blits `image` (already in its read layout for the main copy below)
 /// down into `scratch_image` at `(model_width, model_height)` -- `VK_FILTER_LINEAR`, a
 /// hardware resize unit, not the CPU resample `working_scale` originally tried and
 /// measured too slow for this thread (see `ModelScratch`'s own doc comment) -- then
@@ -1730,10 +1791,18 @@ fn record_capture_commands(
     if unsafe { device.begin_command_buffer(cmd, &begin_info) }.is_err() {
         return false;
     }
+    // The layout `image` is read in. A render-tap source is only ever captured while its
+    // tracked layout is GENERAL, in which copies and blits may read it directly: it is read
+    // there, with a plain dependency and no layout transition at all, so the game's own image
+    // never has its layout rewritten by the layer -- even if the tracked layout were stale (a
+    // render pass's implicit transition is not tracked), nothing is transitioned from it.
+    // A swapchain image is presented in PRESENT_SRC_KHR, which a copy cannot read, so it goes
+    // to TRANSFER_SRC_OPTIMAL and back.
+    let read_layout = if initial_layout == vk::ImageLayout::GENERAL { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
     let to_transfer_src = barrier(
         image,
         initial_layout,
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        read_layout,
         vk::AccessFlags::empty(),
         vk::AccessFlags::TRANSFER_READ,
     );
@@ -1765,10 +1834,10 @@ fn record_capture_commands(
         .image_offset(vk::Offset3D::default())
         .image_extent(vk::Extent3D { width, height, depth: 1 })
         .build();
-    // SAFETY: `image` was just transitioned to `TRANSFER_SRC_OPTIMAL` above; `buffer`
-    // is sized to at least `width*height*bytes_per_pixel` by whichever caller built it.
+    // SAFETY: `image` is in `read_layout` after the barrier above; `buffer` is sized to
+    // at least `width*height*bytes_per_pixel` by whichever caller built it.
     unsafe {
-        device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
+        device.cmd_copy_image_to_buffer(cmd, image, read_layout, buffer, &[region]);
     }
     if let Some(extra_dst) = extra_dst {
         // Same source, same region, into device-local memory. The barrier after it is what a
@@ -1785,15 +1854,15 @@ fn record_capture_commands(
             .offset(0)
             .size(vk::WHOLE_SIZE)
             .build();
-        // SAFETY: `image` is still `TRANSFER_SRC_OPTIMAL`; `extra_dst` is sized for at least
+        // SAFETY: `image` is still in `read_layout`; `extra_dst` is sized for at least
         // `width*height*4` bytes by whoever handed it over.
         unsafe {
-            device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, extra_dst, &[region]);
+            device.cmd_copy_image_to_buffer(cmd, image, read_layout, extra_dst, &[region]);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[extra_ready], &[]);
         }
     }
     if let Some((scratch_image, scratch_buffer, model_width, model_height)) = model {
-        // `image` is still `TRANSFER_SRC_OPTIMAL` from the copy above -- read from it
+        // `image` is still in `read_layout` from the copy above -- read from it
         // again for the blit, same source, no extra barrier needed on this side.
         // `scratch_image` starts from `UNDEFINED` every call: a blit fully overwrites
         // the whole image, so there is never any prior content worth preserving, and
@@ -1808,9 +1877,9 @@ fn record_capture_commands(
             .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
             .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: model_width as i32, y: model_height as i32, z: 1 }])
             .build();
-        // SAFETY: `image` is `TRANSFER_SRC_OPTIMAL`; `scratch_image` was just
+        // SAFETY: `image` is in `read_layout`; `scratch_image` was just
         // transitioned to `TRANSFER_DST_OPTIMAL`; both are 2D, single-mip, single-layer.
-        unsafe { device.cmd_blit_image(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR) };
+        unsafe { device.cmd_blit_image(cmd, image, read_layout, scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR) };
         // The encode, in place over the scratch the blit just filled and before the
         // download below reads it -- this is leg 1's `ENCODE` step, and it is the whole
         // reason the proxy the model sees is not a bit-identical copy of the frame any
@@ -1890,7 +1959,7 @@ fn record_capture_commands(
     // own next use of a render-tap source, ran against it instead.
     let to_present = barrier(
         image,
-        vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+        read_layout,
         initial_layout,
         vk::AccessFlags::TRANSFER_READ,
         vk::AccessFlags::empty(),
@@ -1951,8 +2020,14 @@ struct PipelineSlot {
     /// `buf.cmd`/`buf.buffer`/`buf.memory`/`model` while this is `Some` -- the exact
     /// invariant whose violation caused the 2026-09-12 UB regression documented in
     /// this project's history (`docs/history/development-before-neuralforge.md`).
-    pending: Option<(u32, u32, u32, Option<(u32, u32)>)>,
+    pending: Option<PendingCapture>,
 }
+
+/// A submitted pipeline capture: `(width, height, proxy_format, model_dims, submitted_at)`.
+type PendingCapture = (u32, u32, u32, Option<(u32, u32)>, std::time::Instant);
+
+/// A completed pipeline capture's own `(width, height, proxy_format, submitted_at)`.
+type CompletedCapture = (u32, u32, u32, std::time::Instant);
 
 /// Builds both slots if `existing` is `None`; rebuilds both (same capacity/queue-
 /// family-change trigger as [`ensure`]) if either is undersized or the queue family
@@ -2067,9 +2142,9 @@ fn poll_pipeline_capture(
     device: &ash::Device,
     out: &mut Vec<u8>,
     out_model: &mut Vec<u8>,
-) -> (Option<(u32, u32, u32)>, Option<(u32, u32)>) {
+) -> (Option<CompletedCapture>, Option<(u32, u32)>) {
     let slot = &mut pipeline.slots[slot];
-    let Some((width, height, proxy_format, model_dims)) = slot.pending else { return (None, None) };
+    let Some((width, height, proxy_format, model_dims, submitted)) = slot.pending else { return (None, None) };
     // SAFETY: `slot.buf.fence` belongs to this slot; a status query never touches
     // command-buffer/buffer/memory state, so it's sound to call regardless of
     // whether the submission this fence guards has actually completed yet. The same
@@ -2108,7 +2183,7 @@ fn poll_pipeline_capture(
                 _ => None,
             };
             slot.pending = None;
-            (Some((width, height, proxy_format)), model_result)
+            (Some((width, height, proxy_format, submitted)), model_result)
         }
         Ok(false) => (None, None), // still in flight -- leave `pending`, check again next call
         Err(_) => (None, None),    // real device error -- leave `pending`; never guess reuse is safe
@@ -2207,8 +2282,55 @@ fn submit_pipeline_capture(
     if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], slot.buf.fence) }).is_err() {
         return false;
     }
-    slot.pending = Some((width, height, proxy_format, model_dims.map(|(_, _, w, h)| (w, h))));
+    slot.pending = Some((width, height, proxy_format, model_dims.map(|(_, _, w, h)| (w, h)), std::time::Instant::now()));
     true
+}
+
+/// Waits for every capture the layer has submitted and not yet seen complete (the
+/// pipeline's and the direct captures' pending slots). Only the layer's own fences: a
+/// fence wait needs no queue synchronization, so this is legal from any hook on any
+/// thread, unlike `vkDeviceWaitIdle`. Bounded by [`crate::FENCE_WAIT_TIMEOUT`]; `false`
+/// if a wait failed or timed out. The slots stay pending, so the next poll consumes them
+/// as usual.
+pub fn wait_in_flight(pipeline: Option<&CapturePipeline>, direct: &[Option<DirectCapture>; 2], device: &ash::Device) -> bool {
+    let mut fences: Vec<vk::Fence> = Vec::new();
+    if let Some(p) = pipeline {
+        fences.extend(p.slots.iter().filter(|s| s.pending.is_some()).map(|s| s.buf.fence));
+    }
+    fences.extend(direct.iter().flatten().filter(|d| d.pending.is_some()).map(|d| d.buf.fence));
+    if fences.is_empty() {
+        return true;
+    }
+    // SAFETY: every fence is the layer's own and was submitted (a slot is only `pending`
+    // after a successful submit), so the wait cannot hang on a never-submitted fence.
+    let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    crate::note_fence_wait(wait, "capture::wait_in_flight").is_ok()
+}
+
+/// One full-resolution capture of `image` (in `layout`) through the real capture pipeline,
+/// waited on: its bytes. For tests outside this module that need to check what the capture
+/// reads from an image.
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn test_capture_once(
+    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue: vk::Queue, queue_family: u32,
+    image: vk::Image, layout: vk::ImageLayout, width: u32, height: u32,
+) -> Option<Vec<u8>> {
+    let bytes = u64::from(width) * u64::from(height) * 4;
+    let mut pipeline = None;
+    if !ensure_pipeline(&mut pipeline, device, instance, physical_device, queue_family, bytes) {
+        return None;
+    }
+    let p = pipeline.as_mut()?;
+    let push = crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: 0, reversible_mode: 0 };
+    let submitted = submit_pipeline_capture(p, 0, device, instance, physical_device, queue, image, layout, width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None, push);
+    // SAFETY: `queue` is the test's own; waiting for it idle completes the capture.
+    unsafe { device.queue_wait_idle(queue) }.ok()?;
+    let (mut out, mut model) = (Vec::new(), Vec::new());
+    let (full, _) = poll_pipeline_capture(p, 0, device, &mut out, &mut model);
+    // SAFETY: the queue is idle, so nothing references the pipeline any more.
+    unsafe { destroy_pipeline(pipeline, device) };
+    (submitted && full.is_some()).then_some(out)
 }
 
 /// # Safety
@@ -2264,7 +2386,7 @@ pub struct DirectCapture {
     buf: CaptureBuffer,
     /// Same meaning as `PipelineSlot::pending`, for this capture's own single slot, plus the
     /// zero-copy capture target the submission also copied the frame into, if any.
-    pending: Option<(u32, u32, u32, Option<vk::Buffer>)>,
+    pending: Option<(u32, u32, u32, Option<vk::Buffer>, std::time::Instant)>,
 }
 
 /// Builds (or rebuilds, on a capacity/queue-family change) the one slot
@@ -2286,6 +2408,10 @@ unsafe fn ensure_direct_capture(
     host_ptr: *mut u8,
     capacity: vk::DeviceSize,
 ) -> bool {
+    #[cfg(test)]
+    if TEST_FAIL_DIRECT_SETUP.load(std::sync::atomic::Ordering::Relaxed) {
+        return false;
+    }
     if let Some(d) = existing.as_ref() {
         if d.buf.capacity >= capacity && d.buf.ptr == host_ptr {
             return true;
@@ -2320,9 +2446,9 @@ unsafe fn ensure_direct_capture(
 /// Non-blocking, mirrors [`poll_pipeline_capture`] -- except there is nothing to copy
 /// out: a signaled fence here means the bytes are already sitting in the SHM proxy
 /// region this slot's memory was imported from. Returns the completed submission's own
-/// `(width, height, proxy_format, capture_target)`, or `None` if nothing is signaled yet (or
+/// `(width, height, proxy_format, capture_target, submitted_at)`, or `None` if nothing is signaled yet (or
 /// the fence reported a real error, left `pending` forever rather than guessed safe to reuse).
-fn poll_direct_capture(direct: &mut DirectCapture, device: &ash::Device) -> Option<(u32, u32, u32, Option<vk::Buffer>)> {
+fn poll_direct_capture(direct: &mut DirectCapture, device: &ash::Device) -> Option<(u32, u32, u32, Option<vk::Buffer>, std::time::Instant)> {
     let dims = direct.pending?;
     // SAFETY: `direct.buf.fence` belongs to this slot; a status query never touches
     // command-buffer/buffer/memory state, so it's sound regardless of whether the
@@ -2374,7 +2500,7 @@ fn submit_direct_capture(
     if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], direct.buf.fence) }).is_err() {
         return false;
     }
-    direct.pending = Some((width, height, proxy_format, original_dst));
+    direct.pending = Some((width, height, proxy_format, original_dst, std::time::Instant::now()));
     true
 }
 
@@ -2636,16 +2762,9 @@ fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Q
 /// whatever layout the caller found it in, `PRESENT_SRC_KHR`) if anything along the way
 /// doesn't work, so the caller can always fall back to presenting unmodified.
 ///
-/// Returns `Some(semaphore)` when (and only when)
-/// `composition::gpu::GpuCompose::dispatch_into_image_async` was used: `image` is
-/// already fully written with the composited result, but the GPU work that wrote it
-/// is not guaranteed *complete* yet (that is the entire point of the "async" in its
-/// name -- this function never blocks on it). The caller **must** add that semaphore
-/// to the real present call's own wait-semaphore list before presenting `image` --
-/// otherwise the presentation engine could display `image` before the compute work
-/// finishes writing it, a real, visible corruption/tearing bug, not merely a style
-/// preference. `None` in every other case means `image` is already fully complete and
-/// correctly laid out (`PRESENT_SRC_KHR`) -- safe to present with no extra wait.
+/// Always returns `None`: `image` is fully written and back in `PRESENT_SRC_KHR` when
+/// this returns, safe to present with no extra wait. (The return type matches [`run`],
+/// whose asynchronous compose does hand back a semaphore.)
 ///
 /// # Safety
 /// `queue` must be the same queue `image`'s presentation was requested on, with no
@@ -2742,24 +2861,26 @@ unsafe fn run_sync(
     unsafe {
         device.cmd_copy_image_to_buffer(r.cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, r.buffer, &[copy_out]);
     }
-    let to_transfer_dst = barrier(
+    // Stage 1 hands the image back in PRESENT_SRC_KHR, the layout it found it in, so
+    // every return between here and stage 2 (a failed wait, a failed stage-2 recording
+    // or submit) still leaves it presentable. Stage 2 takes it from there itself.
+    let back_to_present = barrier(
         image,
         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
-        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::ImageLayout::PRESENT_SRC_KHR,
         vk::AccessFlags::TRANSFER_READ,
-        vk::AccessFlags::TRANSFER_WRITE,
+        vk::AccessFlags::empty(),
     );
-    // SAFETY: same reasoning as the first barrier above, transitioning for the
-    // write-back this same command buffer will record in stage 2.
+    // SAFETY: same reasoning as the first barrier above.
     unsafe {
         device.cmd_pipeline_barrier(
             r.cmd,
             vk::PipelineStageFlags::TRANSFER,
-            vk::PipelineStageFlags::TRANSFER,
+            vk::PipelineStageFlags::ALL_COMMANDS,
             vk::DependencyFlags::empty(),
             &[],
             &[],
-            &[to_transfer_dst],
+            &[back_to_present],
         );
     }
     if unsafe { device.end_command_buffer(r.cmd) }.is_err() {
@@ -2829,14 +2950,6 @@ unsafe fn run_sync(
     let answered = shm.try_round_trip();
     let t_roundtrip = t_roundtrip_start.elapsed();
     let t_compose_start = std::time::Instant::now();
-    // `Some(sem)` only when `composition::gpu::GpuCompose::dispatch_into_image_async`
-    // already wrote the fully composited result straight into `image` itself, on the
-    // GPU's own timeline -- skips the capture_request dump (nothing useful to dump:
-    // `r.ptr` still holds the *raw* answer, not the composited result, on this path)
-    // and stage 2 (there is nothing left for it to do) below, returning early instead.
-    // The caller (`device.rs`) must chain `sem` into the real present call -- see this
-    // function's own doc comment and `dispatch_into_image_async`'s for why.
-    let mut composed_async: Option<vk::Semaphore> = None;
     if answered {
         // SAFETY: same reasoning as the read above; `ShmClient::read_answer` never
         // writes past the slice's length, which is exactly `frame_bytes` here.
@@ -2854,70 +2967,34 @@ unsafe fn run_sync(
                     // (`composition::apply::apply_rgba8`, which every mode already
                     // handles) whenever the GPU path isn't applicable, isn't
                     // available, or fails, same fail-open discipline as every other
-                    // stage in this function.
+                    // stage in this function. Always the synchronous, CPU-visible
+                    // dispatch: this path exists for the capture dump, which needs the
+                    // composited bytes in `r.ptr`.
                     let mut composed_sync = false;
-                    // The helper's model output is the intended display-referred
-                    // neural result. The legacy tone-map compositor was built for
-                    // a clipped, downscaled proxy, but this pipeline feeds it the
-                    // full original frame; it therefore collapses most of the model
-                    // edit back toward the source image. Present the raw model result
-                    // for normal rendering until that proxy pipeline exists.
                     if settings.debug_view == 0 {
                         if gpu_compose.is_none() {
                             *gpu_compose = crate::composition::gpu::GpuCompose::new(device, queue_family);
                         }
-                        // Try the fast, non-blocking path first -- but only when
-                        // nothing on the CPU needs to see the result afterward. A
-                        // pending `capture_request` does (its dump needs real bytes
-                        // in `r.ptr`), so that specific, rare, deliberately-triggered
-                        // case still goes through the slower, fully-synchronous
-                        // CPU-visible `dispatch` below, same as before this path
-                        // existed.
-                        // The first neural frame after enabling the feature can
-                        // race the application's present transition on NVIDIA
-                        // drivers. Keep composition CPU-visible until the
-                        // async handoff is proven safe for live games.
-                        if false && !shm.capture_request_pending() {
-                            if let Some(gpu) = gpu_compose {
-                                composed_async = gpu.dispatch_into_image_async(
-                                    device,
-                                    instance,
-                                    physical_device,
-                                    queue,
-                                    width,
-                                    height,
-                                    &original,
-                                    answer_dst,
-                                    settings.colour_strength,
-                                    settings.transfer_strength,
-                                    settings.max_ratio,
-                                    bgr_order,
-                                    image,
-                                );
-                            }
-                        }
-                        if composed_async.is_none() {
-                            if let Some(gpu) = gpu_compose {
-                                composed_sync = gpu.dispatch(
-                                    device,
-                                    instance,
-                                    physical_device,
-                                    queue,
-                                    width,
-                                    height,
-                                    &original,
-                                    answer_dst,
-                                    settings.colour_strength,
-                                    settings.transfer_strength,
-                                    settings.max_ratio,
-                                    bgr_order,
-                                );
-                            }
+                        if let Some(gpu) = gpu_compose {
+                            composed_sync = gpu.dispatch(
+                                device,
+                                instance,
+                                physical_device,
+                                queue,
+                                width,
+                                height,
+                                original,
+                                answer_dst,
+                                settings.colour_strength,
+                                settings.transfer_strength,
+                                settings.max_ratio,
+                                bgr_order,
+                            );
                         }
                     }
-                    if composed_async.is_none() && !composed_sync {
+                    if !composed_sync {
                         crate::composition::apply::apply_rgba8(
-                            &original,
+                            original,
                             answer_dst,
                             settings.colour_strength,
                             settings.transfer_strength,
@@ -2929,36 +3006,12 @@ unsafe fn run_sync(
                 } else {
                     // "Off keeps the whole pass running... and simply presents the
                     // clean frame" -- ShmHeader::apply_model's own doc comment.
-                    answer_dst.copy_from_slice(&original);
+                    answer_dst.copy_from_slice(original);
                 }
             }
         }
     }
-    crate::log!(
-        "[capture] {}x{} {} bytes -> proxy; round trip answered={} composed_async={}",
-        width,
-        height,
-        frame_bytes,
-        answered,
-        composed_async.is_some()
-    );
-    if let Some(sem) = composed_async {
-        // `image` is already fully written (on the GPU's own timeline -- not
-        // necessarily *complete* yet, that's the entire point) and back in
-        // `PRESENT_SRC_KHR`. Nothing left to do this frame except hand `sem` up to
-        // the caller so the real present call waits on it.
-        crate::log!(
-            "[capture] timing stage1={:?} snapshot={:?} write_proxy={:?} roundtrip={:?} compose(async-dispatch-only)={:?} stage2=skipped total={:?}",
-            t_stage1,
-            t_snapshot,
-            t_write_proxy,
-            t_roundtrip,
-            t_compose_start.elapsed(),
-            t_stage1_start.elapsed(),
-        );
-        shm.publish_frame_timing(t_stage1_start.elapsed(), true);
-        return Some(sem);
-    }
+    crate::log!("[capture] {}x{} {} bytes -> proxy; round trip answered={}", width, height, frame_bytes, answered);
 
     // Real `ShmHeader::capture_request` support: dump this frame's original and
     // final (post-composition, if any ran above) bytes to disk. Checked regardless of
@@ -2971,7 +3024,7 @@ unsafe fn run_sync(
         // still a live mapping of at least `frame_bytes` bytes, and stage 2 below
         // hasn't started overwriting it yet.
         let current = unsafe { std::slice::from_raw_parts(r.ptr, frame_bytes as usize) };
-        crate::dump::write_pair(&original, current, width, height, bgr_order);
+        crate::dump::write_pair(original, current, width, height, bgr_order);
     }
 
     // Stage 2: staging buffer (now holding the answer, if there was one -- otherwise
@@ -2985,11 +3038,19 @@ unsafe fn run_sync(
         return None;
     }
     let copy_in = copy_out;
-    // SAFETY: `image` is currently `TRANSFER_DST_OPTIMAL` from stage 1's own final
-    // barrier; `r.buffer` (same host-coherent memory as `r.ptr`, which the CPU-side
-    // block above may have just overwritten with the answer) holds exactly
-    // `frame_bytes` valid bytes either way, matching `copy_in`'s own extent.
+    let to_transfer_dst = barrier(
+        image,
+        vk::ImageLayout::PRESENT_SRC_KHR,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        vk::AccessFlags::empty(),
+        vk::AccessFlags::TRANSFER_WRITE,
+    );
+    // SAFETY: `image` is `PRESENT_SRC_KHR` again after stage 1's final barrier (waited on
+    // above); `r.buffer` (same host-coherent memory as `r.ptr`, which the CPU-side block
+    // above may have just overwritten with the answer) holds exactly `frame_bytes` valid
+    // bytes either way, matching `copy_in`'s own extent.
     unsafe {
+        device.cmd_pipeline_barrier(r.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_transfer_dst]);
         device.cmd_copy_buffer_to_image(r.cmd, r.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[copy_in]);
     }
     let to_present = barrier(
@@ -3213,6 +3274,8 @@ mod tests {
     /// `VK_EXT_external_memory_host` at all.
     #[test]
     fn direct_capture_writes_straight_into_imported_host_memory() {
+        // Held so `TEST_FAIL_DIRECT_SETUP` (set by another test) is never seen here.
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some((_entry, instance, physical_device, device, queue, queue_family, supported)) = test_device_with_external_memory_host() else {
             eprintln!("direct_capture_writes_straight_into_imported_host_memory: no Vulkan loader/ICD, skipping");
             return;
@@ -3273,7 +3336,7 @@ mod tests {
         // `run_never_blocks_on_a_slow_helper_and_eventually_composites`'s job, not
         // this test's.
         crate::note_vk(unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }).expect("capture fence wait failed");
-        assert_eq!(poll_direct_capture(d, &device), Some((width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None)));
+        assert_eq!(poll_direct_capture(d, &device).map(|(w, h, f, t, _)| (w, h, f, t)), Some((width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None)));
 
         // SAFETY: the fence wait above confirms the GPU's writes to `host_ptr` are
         // complete and visible to the CPU (host-coherent memory).
@@ -3403,7 +3466,7 @@ mod tests {
                     // actually validates. A `DirectCapture` equivalent needs its own
                     // test with the extension genuinely enabled, not this one lying
                     // about it.
-                    false,
+                    &mut false,
                     &mut gpu_compose,
                     &mut shm,
                     &mut original_scratch,
@@ -3476,7 +3539,7 @@ mod tests {
             let sem = unsafe {
                 run(
                     &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
-                    width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, false, &mut gpu_compose,
+                    width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, &mut false, &mut gpu_compose,
                     &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
                     &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
                 )
@@ -3629,10 +3692,10 @@ mod tests {
     /// writes the shared regions between model runs. `hold` turns frame hold on. `None` when the
     /// device has no `VK_EXT_external_memory_host`.
     ///
-    /// `path` is the shm file, shared by every sequence of one test: the direct capture imports
-    /// the whole proxy region, which a driver may back with real pages (measured: about 250 MB of
-    /// tmpfs per file on Intel ANV, held until the process exits), so each test uses one file and
-    /// removes it.
+    /// `path` is the shm file, shared by every sequence of one test: imported host memory may be
+    /// backed with real pages that are held until the process exits (measured: about 250 MB of
+    /// tmpfs per file on Intel ANV when the whole proxy region was imported), so each test uses
+    /// one file and removes it.
     fn direct_present_sequence(path: &str, zero_copy: bool, model_interval: u32, presents: usize, scribble: bool, hold: bool) -> Option<Vec<Presented>> {
         let (_entry, instance, physical_device, device, queue, queue_family, supported) = test_device_with_external_memory_host()?;
         if !supported {
@@ -3737,7 +3800,7 @@ mod tests {
             let sem = unsafe {
                 run(
                     &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
-                    width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, true, &mut gpu_compose,
+                    width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, &mut true, &mut gpu_compose,
                     &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
                     &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
                 )
@@ -3763,6 +3826,12 @@ mod tests {
             });
         }
         assert_eq!(out.len(), presents + 1, "the sequence ran out of time");
+        let alignment = min_imported_host_pointer_alignment(&instance, physical_device).unwrap();
+        assert_eq!(
+            direct[0].as_ref().map(|d| d.buf.capacity),
+            Some((frame_bytes as u64).div_ceil(alignment) * alignment),
+            "the direct capture imports the frame's own bytes, not the whole region"
+        );
         if hold {
             assert!(HELD.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|h| h.original.len() == frame_bytes), "frame hold holds the frame on the CPU");
             assert!(!last_answer.is_empty() && !raw_answer_base.is_empty(), "frame hold composes the CPU pair");
@@ -3836,6 +3905,282 @@ mod tests {
             return;
         };
         assert!(held.iter().all(|p| p.composed && !p.cpu_pair_empty), "frame hold composes from the CPU copies");
+    }
+
+    /// The synchronous one-shot path (`run_sync`, used for a capture dump): captures, waits for
+    /// the helper's answer, composes it into the image and leaves the image presentable.
+    /// Stage 1 now hands the image back in PRESENT_SRC_KHR before stage 2 takes it again, so an
+    /// early return between the two can no longer leave it in TRANSFER_DST_OPTIMAL.
+    #[test]
+    fn run_sync_composes_and_leaves_the_image_presentable() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("run_sync_composes_and_leaves_the_image_presentable: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let path = scratch_path("run-sync");
+        let _cleanup = RemoveScratch(path.clone());
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path));
+        let hdr_ptr = shm.test_header_ptr();
+        let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        let (width, height) = (16u32, 16u32);
+        let frame_bytes = (width * height * 4) as usize;
+        let proxy_region = shm.proxy_region(0).unwrap().0 as usize;
+        let answer_region = shm.answer_region(0).unwrap().0 as usize;
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let helper = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined before the test ends).
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            let mut last_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
+                if req != 0 && req != last_seen {
+                    last_seen = req;
+                    std::sync::atomic::fence(AtomicOrdering::Acquire);
+                    // SAFETY: both regions hold at least `frame_bytes`; the layer waits for the answer.
+                    let proxy = unsafe { std::slice::from_raw_parts(proxy_region as *const u8, frame_bytes) };
+                    let answer = unsafe { std::slice::from_raw_parts_mut(answer_region as *mut u8, frame_bytes) };
+                    for (a, p) in answer.chunks_exact_mut(4).zip(proxy.chunks_exact(4)) {
+                        a.copy_from_slice(&[255 - p[0], 255 - p[1], 255 - p[2], p[3]]);
+                    }
+                    std::sync::atomic::fence(AtomicOrdering::Release);
+                    hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        });
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+        let game_frame = test_game_frame(width, height);
+        upload_present_src(&device, &mem_props, queue, pool, image, width, height, &game_frame);
+        let mut resources: Option<CaptureResources> = None;
+        let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+        let (mut original_scratch, mut last_answer) = (Vec::new(), Vec::new());
+        // SAFETY: `image` is the test's own, in PRESENT_SRC_KHR; one thread uses `queue`.
+        let sem = unsafe {
+            run_sync(
+                &device, &instance, physical_device, queue, queue_family, image, width, height,
+                neural_forge_protocol::enums::proxy_format::RGBA8, false, &mut resources, &mut gpu_compose, &mut shm,
+                &mut original_scratch, &mut last_answer,
+            )
+        };
+        assert!(sem.is_none(), "the synchronous path leaves nothing to wait on");
+        let presented = read_back_present_src(&device, &mem_props, queue, pool, image, width, height);
+        assert_ne!(presented, game_frame, "the answer was composed into the image");
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        helper.join().unwrap();
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy(resources, &device);
+            if let Some(gpu) = gpu_compose {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    /// A completed capture is only sent for the frame it was taken of: one at another size, or
+    /// (for the synchronous present) one submitted before this present began, is dropped and a
+    /// fresh capture goes in its place.
+    #[test]
+    fn a_completed_capture_of_another_size_or_an_earlier_frame_is_not_sent() {
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("a_completed_capture_of_another_size_or_an_earlier_frame_is_not_sent: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let path = scratch_path("stale-capture");
+        let _cleanup = RemoveScratch(path.clone());
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path));
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (width, height) = (16u32, 16u32);
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+        let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
+        let frame_bytes = u64::from(width * height * 4);
+        let mut pipeline: Option<CapturePipeline> = None;
+        let mut direct: [Option<DirectCapture>; 2] = [None, None];
+        let (mut original, mut model) = (Vec::new(), Vec::new());
+        let mut step = |w: u32, h: u32, after: Option<Instant>| {
+            let step = poll_or_submit_capture(
+                0, false, &mut false, &mut pipeline, &mut direct, &device, &instance, physical_device, queue, queue_family,
+                image, vk::ImageLayout::PRESENT_SRC_KHR, w, h, proxy_format, frame_bytes, None,
+                crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: 0, reversible_mode: 0 },
+                &mut shm, &mut original, &mut model, None, after,
+            );
+            unsafe { device.queue_wait_idle(queue) }.unwrap();
+            match step {
+                CaptureStep::Captured(c) => Some(c.sent),
+                CaptureStep::Pending => None,
+                CaptureStep::Failed => panic!("capture setup failed on lavapipe"),
+            }
+        };
+        assert_eq!(step(8, 8, None), None, "submits an 8x8 capture");
+        assert_eq!(step(width, height, None), None, "the 8x8 capture is not sent for a 16x16 frame");
+        assert_eq!(step(width, height, None), Some((width, height)), "the replacement is");
+        assert_eq!(step(width, height, None), None, "submits again");
+        let present_began = Instant::now();
+        assert_eq!(step(width, height, Some(present_began)), None, "a capture from before this present is not sent");
+        assert_eq!(step(width, height, Some(present_began)), Some((width, height)), "the fresh one is");
+        unsafe {
+            device.device_wait_idle().unwrap();
+            destroy_pipeline(pipeline, &device);
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    /// A capture setup that fails (here: the driver refusing the zero-copy host import) must
+    /// not hold the synchronous present for its whole budget: nothing is in flight, so the
+    /// frame goes out untouched at once. The failed import is latched, and the next presents
+    /// capture through the staging-buffer pipeline and composite.
+    #[test]
+    fn a_failed_capture_setup_presents_at_once_and_falls_back_to_the_pipeline() {
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_entry, instance, physical_device, device, queue, queue_family, supported)) = test_device_with_external_memory_host() else {
+            eprintln!("a_failed_capture_setup_presents_at_once_and_falls_back_to_the_pipeline: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        if !supported {
+            eprintln!("a_failed_capture_setup_presents_at_once_and_falls_back_to_the_pipeline: VK_EXT_external_memory_host not supported here, skipping");
+            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
+            return;
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                TEST_FAIL_DIRECT_SETUP.store(false, AtomicOrdering::Relaxed);
+            }
+        }
+        let _reset = Reset;
+        TEST_FAIL_DIRECT_SETUP.store(true, AtomicOrdering::Relaxed);
+
+        let path = scratch_path("direct-setup-fails");
+        let _cleanup = RemoveScratch(path.clone());
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path));
+        let hdr_ptr = shm.test_header_ptr();
+        let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let helper = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined before the test ends).
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            let mut last_seen = 0u32;
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
+                if req != 0 && req != last_seen {
+                    last_seen = req;
+                    hdr.answered_w.store(hdr.width.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    hdr.answered_h.store(hdr.height.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        });
+
+        let (width, height) = (16u32, 16u32);
+        let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
+        upload_present_src(&device, &mem_props, queue, pool, image, width, height, &test_game_frame(width, height));
+
+        let mut resources: Option<CaptureResources> = None;
+        let mut pipeline: Option<CapturePipeline> = None;
+        let mut direct: [Option<DirectCapture>; 2] = [None, None];
+        let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+        let (mut original_scratch, mut model_scratch, mut answer_scratch, mut raw_answer_base, mut last_answer) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        let mut raw_answer_generation = 0u64;
+        let mut last_answer_dims = (0u32, 0u32);
+        let mut inflight: [Inflight; 2] = Default::default();
+        let mut bootstrap_complete = false;
+        let mut external_memory_host = true;
+
+        let mut present = |external_memory_host: &mut bool| unsafe {
+            run(
+                &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
+                width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, external_memory_host, &mut gpu_compose,
+                &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
+                &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
+            )
+        };
+        // Presents before the fake helper's first heartbeat go out untouched without trying
+        // to capture; the first present that tries is the one that meets the failed setup.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (first, took) = loop {
+            let started = Instant::now();
+            let first = present(&mut external_memory_host);
+            let took = started.elapsed();
+            if !external_memory_host || Instant::now() >= deadline {
+                break (first, took);
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        assert!(!external_memory_host, "a failed zero-copy import is latched off for the device");
+        assert!(first.is_none(), "a present whose capture could not be set up goes out untouched");
+        // That first attempt also paid one-time setup (the compose pipeline), which on a loaded
+        // software rasterizer can itself take hundreds of milliseconds. A setup that keeps
+        // failing on later presents pays nothing but the failed attempt: each must come back
+        // well inside the budget rather than waiting it out.
+        let _ = took;
+        for _ in 0..3 {
+            let started = Instant::now();
+            assert!(present(&mut true).is_none());
+            let took = started.elapsed();
+            assert!(took < SYNC_BUDGET / 2, "a failed capture setup must not wait out the {SYNC_BUDGET:?} budget (took {took:?})");
+        }
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut composed = None;
+        while composed.is_none() && Instant::now() < deadline {
+            composed = present(&mut external_memory_host);
+        }
+        let sem = composed.expect("the staging-buffer pipeline must take over and composite");
+        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+        unsafe {
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+            device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+            device.destroy_fence(wait_fence, None);
+        }
+        assert!(pipeline.is_some() && direct.iter().all(Option::is_none), "the fallback is the staging-buffer pipeline");
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        helper.join().unwrap();
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy(resources, &device);
+            destroy_pipeline(pipeline, &device);
+            for slot in direct {
+                destroy_direct_capture(slot, &device);
+            }
+            if let Some(gpu) = gpu_compose {
+                gpu.destroy(&device);
+            }
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
     }
 
     /// The real point of the pipelined redesign, exercised end to end against a real
@@ -3948,7 +4293,7 @@ mod tests {
                     // actually validates. A `DirectCapture` equivalent needs its own
                     // test with the extension genuinely enabled, not this one lying
                     // about it.
-                    false,
+                    &mut false,
                     &mut gpu_compose,
                     &mut shm,
                     &mut original_scratch,
@@ -4135,7 +4480,7 @@ mod tests {
             let sem = unsafe {
                 run(
                     &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image, width, height,
-                    proxy_format, false, &mut resources, &mut pipeline, &mut direct, false, &mut gpu_compose, &mut shm, &mut original_scratch,
+                    proxy_format, false, &mut resources, &mut pipeline, &mut direct, &mut false, &mut gpu_compose, &mut shm, &mut original_scratch,
                     &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch, &mut raw_answer_base, &mut raw_answer_generation,
                     &mut last_answer, &mut last_answer_dims,
                 )
@@ -4280,7 +4625,7 @@ mod tests {
             let sem = unsafe {
                 run(&device, &instance, physical_device, queue, queue_family, image,
                     vk::ImageLayout::PRESENT_SRC_KHR, image, width, height, proxy_format, false,
-                    &mut resources, &mut pipeline, &mut direct, false, &mut gpu_compose, &mut shm,
+                    &mut resources, &mut pipeline, &mut direct, &mut false, &mut gpu_compose, &mut shm,
                     &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
                     &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims)
             };

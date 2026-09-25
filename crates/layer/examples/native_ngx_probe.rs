@@ -115,7 +115,7 @@ struct KSigaction {
 }
 
 thread_local! {
-    static GUARD_JMP: std::cell::UnsafeCell<SigJmpBuf> = std::cell::UnsafeCell::new(SigJmpBuf([0; 512]));
+    static GUARD_JMP: std::cell::UnsafeCell<SigJmpBuf> = const { std::cell::UnsafeCell::new(SigJmpBuf([0; 512])) };
     static GUARD_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     static GUARD_SIGNAL: std::cell::Cell<c_int> = const { std::cell::Cell::new(0) };
 }

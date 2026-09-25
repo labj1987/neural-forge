@@ -22,7 +22,7 @@
 //!   one fence, fully synchronous (submit, then wait). Used for the rare cases that
 //!   need the CPU to see the result before moving on (a pending `capture_request`
 //!   dump) or as the correctness reference the async path below is checked against.
-//! - [`GpuCompose::dispatch_into_image_async`] (added 2026-09-10): the real per-frame
+//! - [`GpuCompose::present_temporal_delta_async`]: the real per-frame
 //!   fast path. Double-buffered (`async_slots`, 2 of them) so the CPU never has to
 //!   block on *this* frame's own compute work -- it submits with a signal semaphore
 //!   and returns immediately, leaving `capture::run`/`device.rs` to chain that
@@ -72,6 +72,9 @@ pub struct ComposeParams {
     /// [`crate::composition::encode_pass`]. False means the proxy is a bit-identical
     /// copy of the frame and the ratio transfer would self-cancel on it.
     pub proxy_encoded: bool,
+    /// The curve the proxy encode used (`neural_forge_protocol::enums::reversible_mode`),
+    /// which the composition reproduces wherever it rebuilds the frame's proxy.
+    pub reversible_mode: u32,
 }
 
 /// The comparison view, straight from the header.
@@ -108,6 +111,8 @@ struct PushConstants {
     white_point: f32,
     debug_view: u32,
     debug_scale: f32,
+    /// Matches `compose.comp`'s `params.reversible_mode`: the encode's curve.
+    reversible_mode: u32,
 }
 
 struct Image {
@@ -448,13 +453,22 @@ impl ComposeSlot {
 
         let usage_in = vk::ImageUsageFlags::TRANSFER_DST;
         let usage_out = vk::ImageUsageFlags::TRANSFER_SRC;
-        let (Some(original), Some(model_answer), Some(proxy), Some(output)) = (
-            create_storage_image(device, mem_props, width, height, usage_in),
-            create_storage_image(device, mem_props, width, height, usage_in),
-            create_storage_image(device, mem_props, width, height, usage_in),
-            create_storage_image(device, mem_props, width, height, usage_out),
-        ) else {
+        let images = [usage_in, usage_in, usage_in, usage_out].map(|usage| create_storage_image(device, mem_props, width, height, usage));
+        if images.iter().any(Option::is_none) {
+            // SAFETY: freshly created, never used by any submission.
+            for image in images.iter().flatten() {
+                unsafe { image.destroy(device) };
+            }
             return false;
+        }
+        let [Some(original), Some(model_answer), Some(proxy), Some(output)] = images else { return false };
+        // For the failure paths below, before the images are handed to `Sized_`.
+        // SAFETY (at each call): the images are freshly created and unused.
+        let release_images = || unsafe {
+            original.destroy(device);
+            model_answer.destroy(device);
+            proxy.destroy(device);
+            output.destroy(device);
         };
 
         let frame_bytes = u64::from(width) * u64::from(height) * 4;
@@ -465,7 +479,10 @@ impl ComposeSlot {
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `buf_info` is valid.
-        let Ok(staging_buffer) = (unsafe { device.create_buffer(&buf_info, None) }) else { return false };
+        let Ok(staging_buffer) = (unsafe { device.create_buffer(&buf_info, None) }) else {
+            release_images();
+            return false;
+        };
         // SAFETY: `staging_buffer` was just created, not yet bound to memory.
         let reqs = unsafe { device.get_buffer_memory_requirements(staging_buffer) };
         let Some(type_index) =
@@ -473,6 +490,7 @@ impl ComposeSlot {
         else {
             // SAFETY: `staging_buffer` has no memory bound.
             unsafe { device.destroy_buffer(staging_buffer, None) };
+            release_images();
             return false;
         };
         let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
@@ -480,6 +498,7 @@ impl ComposeSlot {
         let Ok(staging_memory) = (unsafe { device.allocate_memory(&alloc, None) }) else {
             // SAFETY: same reasoning as above.
             unsafe { device.destroy_buffer(staging_buffer, None) };
+            release_images();
             return false;
         };
         // SAFETY: `staging_buffer`/`staging_memory` were each just created, sized/typed
@@ -490,6 +509,7 @@ impl ComposeSlot {
                 device.free_memory(staging_memory, None);
                 device.destroy_buffer(staging_buffer, None);
             }
+            release_images();
             return false;
         }
         // SAFETY: `staging_memory` is `HOST_VISIBLE`; mapping the whole allocation is
@@ -500,6 +520,7 @@ impl ComposeSlot {
                 device.free_memory(staging_memory, None);
                 device.destroy_buffer(staging_buffer, None);
             }
+            release_images();
             return false;
         };
 
@@ -567,13 +588,39 @@ impl ComposeSlot {
             .size(frame_bytes)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
-        let Ok(current_buffer) = (unsafe { device.create_buffer(&current_info, None) }) else { return false };
-        let current_reqs = unsafe { device.get_buffer_memory_requirements(current_buffer) };
-        let Some(current_type) = find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
-            .or_else(|| find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty())) else { unsafe { device.destroy_buffer(current_buffer, None) }; return false };
-        let current_alloc = vk::MemoryAllocateInfo::builder().allocation_size(current_reqs.size).memory_type_index(current_type);
-        let Ok(current_memory) = (unsafe { device.allocate_memory(&current_alloc, None) }) else { unsafe { device.destroy_buffer(current_buffer, None) }; return false };
-        if unsafe { device.bind_buffer_memory(current_buffer, current_memory, 0) }.is_err() { unsafe { device.free_memory(current_memory, None); device.destroy_buffer(current_buffer, None) }; return false; }
+        let current = (|| {
+            let current_buffer = unsafe { device.create_buffer(&current_info, None) }.ok()?;
+            let current_reqs = unsafe { device.get_buffer_memory_requirements(current_buffer) };
+            let current_type = find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
+                .or_else(|| find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()));
+            let current_memory = current_type.and_then(|current_type| {
+                let current_alloc = vk::MemoryAllocateInfo::builder().allocation_size(current_reqs.size).memory_type_index(current_type);
+                unsafe { device.allocate_memory(&current_alloc, None) }.ok()
+            });
+            let Some(current_memory) = current_memory else {
+                unsafe { device.destroy_buffer(current_buffer, None) };
+                return None;
+            };
+            if unsafe { device.bind_buffer_memory(current_buffer, current_memory, 0) }.is_err() {
+                unsafe { device.free_memory(current_memory, None); device.destroy_buffer(current_buffer, None) };
+                return None;
+            }
+            Some((current_buffer, current_memory))
+        })();
+        let Some((current_buffer, current_memory)) = current else {
+            // Everything built above is released too; nothing has used any of it yet.
+            unsafe {
+                device.destroy_buffer(cached_buffer, None);
+                device.free_memory(cached_memory, None);
+                device.destroy_buffer(staging_buffer, None);
+                device.free_memory(staging_memory, None);
+                original.destroy(device);
+                model_answer.destroy(device);
+                proxy.destroy(device);
+                output.destroy(device);
+            }
+            return false;
+        };
 
         let image_info = |view: vk::ImageView| vk::DescriptorImageInfo::builder().image_view(view).image_layout(vk::ImageLayout::GENERAL).build();
         let infos = [image_info(original.view), image_info(proxy.view), image_info(model_answer.view), image_info(output.view)];
@@ -702,7 +749,7 @@ impl ComposeSlot {
 
             device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
             device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: 0, white_point: 1.0, debug_view: 0, debug_scale: 1.0 };
+            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: 0, white_point: 1.0, debug_view: 0, debug_scale: 1.0, reversible_mode: 0 };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
             device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
@@ -976,6 +1023,7 @@ impl ComposeSlot {
                 white_point: compose.white_point,
                 debug_view: compose.debug_view,
                 debug_scale: compose.debug_scale,
+                reversible_mode: compose.reversible_mode,
             };
             let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
             device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
@@ -1022,7 +1070,7 @@ impl ComposeSlot {
 }
 
 /// One independently fenced command/resource slot. Two of these
-/// alternate in [`GpuCompose::dispatch_into_image_async`] so a slot is never reused
+/// alternate in [`GpuCompose::present_temporal_delta_async`] so a slot is never reused
 /// until its *previous* use (two dispatches ago) has genuinely finished.
 struct AsyncSlot {
     slot: ComposeSlot,
@@ -1229,7 +1277,7 @@ impl GpuCompose {
     ///
     /// Downloads the result to a CPU-visible slice and fully waits for it -- use this
     /// when something on the CPU actually needs to see the bytes (a pending
-    /// `capture_request` dump in particular). [`Self::dispatch_into_image_async`] is
+    /// `capture_request` dump in particular). [`Self::present_temporal_delta_async`] is
     /// the fast, non-blocking path for the common case where nothing does.
     #[allow(clippy::too_many_arguments)]
     pub fn dispatch(
@@ -1308,8 +1356,8 @@ impl GpuCompose {
     /// of downloading it to a CPU-visible slice, and in the *same* command
     /// buffer/submission as the compute dispatch itself, restoring `target_image` to
     /// `PRESENT_SRC_KHR` before returning. Still fully synchronous (blocks on this
-    /// dispatch's own fence) -- [`Self::dispatch_into_image_async`] is the same
-    /// write-into-image trick without that block.
+    /// dispatch's own fence) -- [`Self::present_temporal_delta_async`] writes into the
+    /// image without that block.
     ///
     /// Deliberately routes through the sync slot's own `staging_buffer` rather than a
     /// raw `vkCmdCopyImage` straight from `output`: a raw image-to-image copy between
@@ -1635,6 +1683,7 @@ impl GpuCompose {
     /// helper produces a newer generation.  The normal compose path remains for
     /// callers that need its math; this path is for the held-answer presentation
     /// policy in `capture::run`.
+    #[allow(clippy::too_many_arguments)]
     pub fn present_cached_raw_async(
         &mut self,
         device: &ash::Device,
@@ -1689,117 +1738,15 @@ impl GpuCompose {
         Some(semaphore)
     }
 
-    /// The real per-frame fast path: same composition and same write-straight-into-
-    /// `target_image` trick as [`Self::dispatch_into_image`], but **does not block the
-    /// CPU** on this dispatch's own completion. Submits with a signal semaphore and
-    /// returns it immediately; the caller (`capture::run`, then `device.rs`'s present
-    /// hook) must add that semaphore to the *real* `vkQueuePresentKHR` call's own wait
-    /// list, so the presentation engine -- a GPU-side dependency, not a CPU one --
-    /// is what actually waits for this frame's compute work before displaying it.
-    ///
-    /// Double-buffered across [`ASYNC_SLOTS`] independent [`AsyncSlot`]s (own images,
-    /// staging buffer, command buffer, fence) specifically so that never
-    /// blocking on *this* call's own fence doesn't mean never blocking at all: the one
-    /// necessary wait is on the slot's *own* fence, from its *previous* use
-    /// ([`ASYNC_SLOTS`] dispatches ago) -- immediately before reusing its resources,
-    /// not before returning this frame's result. By the time a slot comes back around,
-    /// the GPU has almost always finished with it long ago (an entire other frame's
-    /// worth of capture + SHM round trip has elapsed on the CPU in between), so that
-    /// wait is normally instant; it exists purely so this can never race a slot's own
-    /// still-in-flight prior work, not to reintroduce the per-frame block this method
-    /// exists to remove.
-    ///
-    /// Presentation semaphores are keyed by acquired target image, independently
-    /// of these command slots. Reacquisition orders reuse after the previous
-    /// presentation's wait. Slot fences alone do not establish that ordering.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_into_image_async(
-        &mut self,
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        queue: vk::Queue,
-        width: u32,
-        height: u32,
-        original: &[u8],
-        model_answer: &[u8],
-        colour_strength: f32,
-        transfer_strength: f32,
-        max_ratio: f32,
-        bgr_order: bool,
-        target_image: vk::Image,
-    ) -> Option<vk::Semaphore> {
-        let semaphore = self.present_semaphores.get(target_image, || unsafe {
-            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
-        })?;
-        let idx = self.next_async_slot;
-        self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
-        let async_slot = &mut self.async_slots[idx];
-
-        // SAFETY: `async_slot.slot.fence` was signaled at creation, or by this same
-        // slot's own previous dispatch -- waiting here (not before returning that
-        // previous dispatch's own result) is exactly what makes this "async": the
-        // block only ever happens `ASYNC_SLOTS` dispatches later, immediately before
-        // this specific slot's resources are touched again, never on the frame that
-        // just submitted them. Bounded, not truly unbounded: see
-        // `crate::FENCE_WAIT_TIMEOUT`.
-        let wait = unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "gpu::dispatch_into_image_async slot reuse").is_err() {
-            return None;
-        }
-        if self.zc.answer_reader == Some(async_slot.slot.fence) {
-            self.zc.answer_reader = None;
-        }
-
-        // SAFETY: `physical_device` is the device this instance was created against.
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let Some(frame_bytes) = async_slot.slot.begin_ensured(device, &mem_props, width, height, original, model_answer) else { return None };
-
-        // SAFETY: `async_slot.slot.cmd` was allocated with `RESET_COMMAND_BUFFER`, and
-        // the fence wait above guarantees any previous use of it has completed.
-        if unsafe { device.reset_command_buffer(async_slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
-            return None;
-        }
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: `async_slot.slot.cmd` was just reset.
-        if unsafe { device.begin_command_buffer(async_slot.slot.cmd, &begin_info) }.is_err() {
-            return None;
-        }
-        // SAFETY: `async_slot.slot.cmd` was just begun above.
-        unsafe {
-            async_slot.slot.record_upload_and_compute(
-                device,
-                self.pipeline,
-                self.pipeline_layout,
-                width,
-                height,
-                frame_bytes,
-                colour_strength,
-                transfer_strength,
-                max_ratio,
-                bgr_order,
-            );
-            async_slot.slot.record_copy_into_image(device, width, height, frame_bytes, target_image);
-        }
-        if unsafe { device.end_command_buffer(async_slot.slot.cmd) }.is_err() {
-            return None;
-        }
-        // SAFETY: the fence wait above guarantees this fence is not in the signaled
-        // state from a still-pending wait -- safe to reset before resubmitting.
-        if unsafe { device.reset_fences(&[async_slot.slot.fence]) }.is_err() {
-            return None;
-        }
-        let submit = vk::SubmitInfo::builder()
-            .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
-            .signal_semaphores(std::slice::from_ref(&semaphore))
-            .build();
-        // SAFETY: `async_slot.slot.cmd` was just recorded and ended above. Not waiting
-        // on `async_slot.slot.fence` here is the entire point of this method -- see
-        // its own doc comment for why that's still sound.
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }).is_err() {
-            return None;
-        }
-        Some(semaphore)
+    /// Waits for every compose this `GpuCompose` has submitted (the async slots and the
+    /// synchronous one). Only its own fences, so it is legal from any hook on any thread.
+    pub fn wait_in_flight(&self, device: &ash::Device) -> bool {
+        let mut fences: Vec<vk::Fence> = self.async_slots.iter().map(|s| s.slot.fence).collect();
+        fences.push(self.sync.fence);
+        // SAFETY: every fence belongs to this `GpuCompose` and starts signaled, so an
+        // unused slot does not block. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
+        let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        crate::note_fence_wait(wait, "gpu::wait_in_flight").is_ok()
     }
 
     pub fn retire_present_images(&mut self, images: &[vk::Image]) {
@@ -1969,6 +1916,21 @@ mod tests {
             }
         }
         assert!(max_diff <= 3, "GPU and CPU composition diverge by up to {max_diff} (expected <= 3): gpu={gpu_result:?} cpu={cpu_result:?}");
+
+        // A max_ratio below 1 (a corrupt or hand-edited header): the CPU reference raises it to
+        // just above 1; the shader's clamp() would otherwise get crossed bounds, which is
+        // undefined.
+        for max_ratio in [0.5f32, 1.0] {
+            let mut gpu_result = model_answer.clone();
+            assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut gpu_result, colour_strength, transfer_strength, max_ratio, false));
+            let mut cpu_result = model_answer.clone();
+            super::super::apply::apply_rgba8(&original, &mut cpu_result, colour_strength, transfer_strength, max_ratio, 0, false);
+            let max_diff = gpu_result.chunks_exact(4).zip(cpu_result.chunks_exact(4))
+                .flat_map(|(g, c)| (0..3).map(move |ch| (i32::from(g[ch]) - i32::from(c[ch])).abs()))
+                .max()
+                .unwrap_or(0);
+            assert!(max_diff <= 3, "max_ratio {max_ratio}: GPU and CPU diverge by up to {max_diff}");
+        }
 
         // SAFETY: `gpu`'s own fence wait inside `dispatch` guarantees no GPU work
         // is in flight; nothing else references `device`/`instance`.
@@ -2195,7 +2157,7 @@ mod tests {
         let mut speckle = grey.clone();
         let centre = ((8 * w + 8) * 4) as usize;
         speckle[centre..centre + 3].copy_from_slice(&[200, 200, 200]);
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         let Some(sharp) = compose_once(w, h, &grey, &grey, &speckle, base) else {
             eprintln!("ratio smoothing test: no Vulkan device, skipping");
             return;
@@ -2232,7 +2194,7 @@ mod tests {
         let blue: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 120, 160, 255]).collect();
         let red: Vec<u8> = (0..w * h).flat_map(|_| [170u8, 110, 100, 255]).collect();
         let centre = ((8 * w + 8) * 4) as usize;
-        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 0.5, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 0.5, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
 
         let Some(normal) = compose_once(w, h, &blue, &blue, &red, base) else {
             eprintln!("debug_views test: no Vulkan device, skipping");
@@ -2303,7 +2265,7 @@ mod tests {
         let frame: Vec<u8> = (0..w * h).flat_map(|i| if i % w < 16 { [60u8, 60, 60, 255] } else { [180u8, 180, 180, 255] }).collect();
         let small: Vec<u8> = (0..sw * sh).flat_map(|i| if i % sw < 8 { [60u8, 60, 60, 255] } else { [180u8, 180, 180, 255] }).collect();
         let brighter: Vec<u8> = small.chunks(4).flat_map(|p| [p[0] + 25, p[1] + 25, p[2] + 25, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         let px = |out: &[u8], x: u32| i32::from(out[((4 * w + x) * 4) as usize]);
         for transfer in [0u32, 1, 2] {
             let Some(out) = compose_once_scaled(w, h, &frame, &frame, &small, (sw, sh), Some(&small), None, ComposeParams { transfer, ..base }) else {
@@ -2340,7 +2302,7 @@ mod tests {
         let lin_to_srgb = |l: f32| { let l = l.clamp(0.0, 1.0); let c = if l <= 0.0031308 { l * 12.92 } else { 1.055 * l.powf(1.0 / 2.4) - 0.055 }; (c * 255.0).round() as u8 };
         let knee = |l: f32| if l > 0.75 { 0.75 + 0.25 * (1.0 - (-(l - 0.75) / 0.25).exp()) } else { l };
         let (w, h) = (16u32, 16u32);
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         for (value, wp) in [(90u8, 1.0f32), (90, 0.5), (230, 1.0), (240, 1.0)] {
             let frame: Vec<u8> = (0..w * h).flat_map(|_| [value, value, value, 255]).collect();
             let encoded = lin_to_srgb(knee(srgb_to_lin(value) / wp));
@@ -2354,6 +2316,55 @@ mod tests {
         }
     }
 
+    /// The same, for every encode curve and a white point below 1, on saturated colours: the
+    /// composition must rebuild the frame's proxy with the curve the encode used (including the
+    /// knee's peak step, which keeps a saturated pixel's hue), or an unedited answer is read as
+    /// an edit and the frame shifts.
+    #[test]
+    fn no_edit_is_identity_for_every_encode_curve() {
+        use neural_forge_protocol::enums::reversible_mode;
+        let (w, h) = (16u32, 16u32);
+        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let colours: [[u8; 3]; 4] = [[250, 60, 20], [30, 90, 245], [200, 200, 200], [120, 140, 60]];
+        let frame: Vec<u8> = (0..w * h).flat_map(|i| { let c = colours[(i % 4) as usize]; [c[0], c[1], c[2], 255] }).collect();
+        for mode in [reversible_mode::KNEE, reversible_mode::NEUTWO, reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID, reversible_mode::HYBRID_REPLACE] {
+            for wp in [1.0f32, 0.8] {
+                let answer: Vec<u8> = frame.chunks_exact(4).flat_map(|p| crate::composition::encode::reference_encode_pixel([p[0], p[1], p[2], p[3]], false, wp, mode)).collect();
+                let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { white_point: wp, reversible_mode: mode, ..base }) else {
+                    eprintln!("encode curve test: no Vulkan device, skipping");
+                    return;
+                };
+                let worst = out.chunks_exact(4).zip(frame.chunks_exact(4))
+                    .flat_map(|(o, f)| (0..3).map(move |c| (i32::from(o[c]) - i32::from(f[c])).abs()))
+                    .max()
+                    .unwrap_or(0);
+                assert!(worst <= 3, "curve {mode} at white point {wp}: an unedited answer moved the frame by up to {worst}");
+            }
+        }
+    }
+
+    /// The replace modes bring the model's answer straight back (through the inverse of its
+    /// curve) instead of composing it: an answer far brighter than the frame arrives whole,
+    /// where the composition's relighting guard would hold it to at most twice the frame's light.
+    #[test]
+    fn replace_modes_bring_the_answer_back_whole() {
+        use neural_forge_protocol::enums::reversible_mode;
+        let (w, h) = (16u32, 16u32);
+        let frame: Vec<u8> = (0..w * h).flat_map(|_| [60u8, 60, 60, 255]).collect();
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let centre = ((8 * w + 8) * 4) as usize;
+        for (replace, composed) in [(reversible_mode::NEUTWO_REPLACE, reversible_mode::NEUTWO), (reversible_mode::HYBRID_REPLACE, reversible_mode::HYBRID)] {
+            let answer: Vec<u8> = (0..w * h).flat_map(|_| crate::composition::encode::reference_encode_pixel([200, 200, 200, 255], false, 1.0, replace)).collect();
+            let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { reversible_mode: replace, ..base }) else {
+                eprintln!("replace mode test: no Vulkan device, skipping");
+                return;
+            };
+            assert!((i32::from(out[centre]) - 200).abs() <= 3, "replace mode {replace}: the answer comes back whole ({})", out[centre]);
+            let guarded = compose_once(w, h, &frame, &frame, &answer, ComposeParams { reversible_mode: composed, ..base }).unwrap();
+            assert!(guarded[centre] < 100, "composition mode {composed} holds the same answer to the guard ({})", guarded[centre]);
+        }
+    }
+
     /// Frame hold: with a held frame supplied the composition works on it and replaces the live
     /// image, so the screen shows the held picture however the game has moved on.
     #[test]
@@ -2361,7 +2372,7 @@ mod tests {
         let (w, h) = (16u32, 16u32);
         let live: Vec<u8> = (0..w * h).flat_map(|_| [30u8, 30, 30, 255]).collect();
         let held: Vec<u8> = (0..w * h).flat_map(|_| [140u8, 140, 140, 255]).collect();
-        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         // No edit: the answer is the held frame's own proxy.
         let Some(out) = compose_once_scaled(w, h, &live, &held, &held, (w, h), None, Some(&held), base) else {
             eprintln!("frame hold test: no Vulkan device, skipping");
@@ -2406,7 +2417,7 @@ mod tests {
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &frame, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
                 .expect("compose");
@@ -2506,7 +2517,7 @@ mod tests {
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
             }
-            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true };
+            let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: guard, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &proxy, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
                 .expect("compose");
@@ -2604,7 +2615,7 @@ mod tests {
         }
 
         // (1) A smaller answer must still be accepted and actually change the output.
-        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, ComposeInputs::Cpu { base: &base, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
+        let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, ComposeInputs::Cpu { base: &base, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 });
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
@@ -2630,7 +2641,7 @@ mod tests {
         // for this function -- see its own doc comment) must be rejected, not
         // overflow the shared staging buffer.
         let big_answer = vec![200u8; ((width + 8) * (height + 8) * 4) as usize];
-        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, ComposeInputs::Cpu { base: &base, answer: &big_answer, proxy_small: None, held_original: None }, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false });
+        let oversized = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width + 8, height + 8, ComposeInputs::Cpu { base: &base, answer: &big_answer, proxy_small: None, held_original: None }, 2, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 });
         assert!(oversized.is_none(), "an answer larger than the frame must be safely rejected, not overflow the staging buffer");
 
         unsafe {
@@ -2660,7 +2671,7 @@ mod tests {
         let current: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 29 % 200) as u8; [t + 20, t + 10, 200 - t, 255] }).collect();
         let base: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 37 % 200) as u8; [t + 30, 220 - t, t + 5, 255] }).collect();
         let answer: Vec<u8> = (0..width * height).flat_map(|i| { let t = (i * 53 % 200) as u8; [t + 40, t, 180 - t / 2, 255] }).collect();
-        let params = ComposeParams { colour_strength: 0.8, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.5, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false };
+        let params = ComposeParams { colour_strength: 0.8, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.5, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 };
         let expected = compose_once(width, height, &current, &base, &answer, params).expect("the CPU reference composes");
 
         let alignment = crate::capture::min_imported_host_pointer_alignment(&instance, physical_device).expect("alignment query");
@@ -2912,132 +2923,6 @@ mod tests {
         }
         unsafe {
             for target in &targets { target.destroy(&device); }
-            device.destroy_command_pool(pool, None);
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
-    }
-
-    /// The real point of `dispatch_into_image_async`: confirms that after explicitly
-    /// waiting on the semaphore it returns (standing in for what the real present call
-    /// does), the target image holds the same real composited result the synchronous
-    /// `dispatch_into_image` produces for identical inputs -- not just "returns a
-    /// semaphore", but "the semaphore actually gates real, correct, completed work."
-    #[test]
-    fn dispatch_into_image_async_matches_dispatch_into_image() {
-        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
-            eprintln!("dispatch_into_image_async_matches_dispatch_into_image: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
-            eprintln!("dispatch_into_image_async_matches_dispatch_into_image: GpuCompose::new failed, skipping");
-            // SAFETY: nothing was created past the device/instance.
-            unsafe {
-                device.destroy_device(None);
-                instance.destroy_instance(None);
-            }
-            return;
-        };
-
-        let (width, height) = (8u32, 8u32);
-        let pixel_count = (width * height) as usize;
-        let original: Vec<u8> = (0..pixel_count).flat_map(|i| { let t = (i * 29 % 256) as u8; [t, t.wrapping_add(50), t.wrapping_add(140), 255] }).collect();
-        let model_answer: Vec<u8> = (0..pixel_count).flat_map(|i| { let t = (i * 71 % 256) as u8; [t.wrapping_add(5), t, t.wrapping_add(220), 255] }).collect();
-        let (colour_strength, transfer_strength, max_ratio) = (0.5, 1.0, 2.0);
-
-        let mut expected = model_answer.clone();
-        assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut expected, colour_strength, transfer_strength, max_ratio, false));
-
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
-
-        let target = make_target_image(&device, &mem_props, width, height);
-        transition_to_present_src(&device, queue, pool, target.image);
-
-        let sem = gpu.dispatch_into_image_async(
-            &device, &instance, physical_device, queue, width, height, &original, &model_answer,
-            colour_strength, transfer_strength, max_ratio, false, target.image,
-        );
-        let Some(sem) = sem else { panic!("dispatch_into_image_async returned None") };
-
-        // Stand in for what the real present call does: wait on the returned
-        // semaphore before touching the image at all. A trivial submit with no
-        // command buffers, just a wait, is the simplest way to consume it here.
-        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-        let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
-        let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
-        unsafe {
-            device.queue_submit(queue, &[submit], wait_fence).unwrap();
-            device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
-            device.destroy_fence(wait_fence, None);
-        }
-
-        let actual = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
-        assert_eq!(actual, expected, "dispatch_into_image_async's target image content (after waiting on its semaphore) must match dispatch's result exactly");
-
-        // SAFETY: the explicit semaphore wait above (via `wait_fence`) guarantees the
-        // async dispatch's GPU work, including its own fence signal, has completed.
-        unsafe {
-            target.destroy(&device);
-            device.destroy_command_pool(pool, None);
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
-    }
-
-    /// Drives `dispatch_into_image_async` across more dispatches than there are async
-    /// slots, confirming slot reuse (waiting on a slot's own fence from its previous
-    /// use, two dispatches back) is actually safe against a real device -- not just
-    /// "the first two calls work."
-    #[test]
-    fn dispatch_into_image_async_survives_many_slot_reuses() {
-        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
-            eprintln!("dispatch_into_image_async_survives_many_slot_reuses: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
-            eprintln!("dispatch_into_image_async_survives_many_slot_reuses: GpuCompose::new failed, skipping");
-            // SAFETY: nothing was created past the device/instance.
-            unsafe {
-                device.destroy_device(None);
-                instance.destroy_instance(None);
-            }
-            return;
-        };
-
-        let (width, height) = (8u32, 8u32);
-        let pixel_count = (width * height) as usize;
-        let original = vec![120u8; pixel_count * 4];
-        let model_answer = vec![90u8; pixel_count * 4];
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
-
-        // Real code always chains each dispatch's semaphore into that same frame's
-        // present call before the next dispatch could ever reuse (and re-signal) it --
-        // reproduced here by waiting on each semaphore immediately, every iteration,
-        // same real discipline `device.rs` follows, just without a real swapchain.
-        for i in 0..(ASYNC_SLOTS * 3 + 1) {
-            let target = make_target_image(&device, &mem_props, width, height);
-            transition_to_present_src(&device, queue, pool, target.image);
-            let sem = gpu.dispatch_into_image_async(&device, &instance, physical_device, queue, width, height, &original, &model_answer, 1.0, 1.0, 2.0, false, target.image);
-            let Some(sem) = sem else { panic!("dispatch_into_image_async returned None on iteration {i}") };
-            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-            let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
-            let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
-            unsafe {
-                device.queue_submit(queue, &[submit], wait_fence).unwrap();
-                device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
-                device.destroy_fence(wait_fence, None);
-                target.destroy(&device);
-            }
-        }
-
-        // SAFETY: every iteration above already waited out its own GPU work.
-        unsafe {
             device.destroy_command_pool(pool, None);
             gpu.destroy(&device);
             device.destroy_device(None);

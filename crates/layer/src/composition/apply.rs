@@ -92,7 +92,7 @@ pub fn apply_rgba8(
                 // `[r, g, b]` triples -- never has to know which order the bytes came
                 // in.
                 let (r, b) = if bgr_order { (2, 0) } else { (0, 2) };
-                for (orig_px, ans_px) in orig_chunk.chunks_exact(4).zip(ans_chunk.chunks_exact_mut(4)) {
+                for (orig_px, ans_px) in orig_chunk.as_chunks::<4>().0.iter().zip(ans_chunk.as_chunks_mut::<4>().0.iter_mut()) {
                     let new_pixel = compose_pixel(
                         [orig_px[r], orig_px[1], orig_px[b]],
                         [ans_px[r], ans_px[1], ans_px[b]],

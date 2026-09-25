@@ -33,7 +33,7 @@ mod surface_usage;
 mod entry_points;
 mod present_sync;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
@@ -47,19 +47,24 @@ use vulkan_layer::{
 
 use device::NeuralForgeDeviceInfo;
 
-/// The most recently created `VkInstance`, so `create_device_info` (which the
-/// `vulkan_layer` framework calls with no way to reach whatever `create_instance_info`
-/// returned -- see that method's own doc comment) can still get an `ash::Instance` to
-/// query physical-device memory properties from when it builds capture resources.
-/// Games overwhelmingly create exactly one `VkInstance`; a plain "last one wins" slot
-/// is the same simplification `device::PRIMARY` already makes for the analogous
-/// one-swapchain-at-a-time assumption.
+/// What the layer keeps about one `VkInstance`: an `ash::Instance` to query
+/// physical-device properties through when it builds capture resources, and the next
+/// layer's surface-capabilities query.
 #[derive(Clone)]
 struct InstanceContext {
     instance: Arc<ash::Instance>,
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
 }
-static CURRENT_INSTANCE: Mutex<Option<InstanceContext>> = Mutex::new(None);
+
+/// The owning instance of each physical device a device is being created on, so
+/// `create_device_info` (which the `vulkan_layer` framework calls with only the physical
+/// device, no way to reach the instance's own hooks) resolves it through the right
+/// instance. Recorded by the owning instance's `create_device` hook, which the framework
+/// calls first, and dropped with the instance (see `NeuralForgeInstanceHooks`'s `Drop`):
+/// a launcher that creates a probe instance after the real one, or destroys one, never
+/// has a device resolved through someone else's (or a dead) instance.
+static PHYSICAL_DEVICE_INSTANCES: LazyLock<Mutex<HashMap<vk::PhysicalDevice, InstanceContext>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 pub const LAYER_NAME: &str = "VK_LAYER_neuralforge_neural";
 
@@ -88,30 +93,74 @@ fn layer_object_path() -> Option<String> {
     }
 }
 
-/// True when a *different* copy of this layer is already loaded in the process.
+/// Set when this copy of the layer has decided to be the live one. Exported unmangled so
+/// another copy loaded into the same process can look it up with `dlsym` (see
+/// [`duplicate_copy`]).
+#[no_mangle]
+pub static NEURAL_FORGE_LAYER_LIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// True when a *different* copy of this layer is already live in the process.
 ///
 /// A development manifest pointing at the build tree and an installed one pointing at the
 /// install prefix are both honoured by the loader: two copies, two present hooks, two full
 /// round trips and one shared-memory file with two writers racing on one sequence number. Only
-/// the first copy stays live; the rest go inert with one warning line. The claim is the
-/// object's own path rather than a bare flag, so a second call into the *same* copy (legal: the
-/// loader may negotiate more than once) is told apart from a second copy.
+/// the first copy to decide stays live; the rest go inert with one warning line. Each copy
+/// finds the others as mappings of a same-named object at another path in `/proc/self/maps`
+/// and asks each, through its exported [`NEURAL_FORGE_LAYER_LIVE`], whether it already went
+/// live. (This used to be a process environment variable, but `setenv` inside a running,
+/// multi-threaded game can race a concurrent `getenv` on another thread.) The copies decide in
+/// hook-chain order, one after the other, so the first one reached wins.
 fn duplicate_copy() -> bool {
-    const CLAIM: &str = "NEURAL_FORGE_LAYER_OBJECT";
     let Some(own) = layer_object_path() else { return false };
-    match std::env::var(CLAIM) {
-        Ok(claimed) if !claimed.is_empty() => {
-            if claimed == own {
-                return false;
-            }
-            crate::log!("[layer] another copy is already loaded from {claimed}; this copy ({own}) stays inert. Remove one of the implicit-layer manifests.");
-            true
+    let own = std::fs::canonicalize(&own).map_or(own, |p| p.to_string_lossy().into_owned());
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    if let Some(live) = other_copies(&maps, &own).into_iter().find(|path| copy_is_live(path)) {
+        crate::log!("[layer] another copy is already loaded from {live}; this copy ({own}) stays inert. Remove one of the implicit-layer manifests.");
+        return true;
+    }
+    NEURAL_FORGE_LAYER_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
+    false
+}
+
+/// The paths of every mapped object in `maps` (the text of `/proc/self/maps`) with the same
+/// file name as `own` but another path.
+fn other_copies(maps: &str, own: &str) -> Vec<String> {
+    let name = std::path::Path::new(own).file_name();
+    let mut found: Vec<String> = Vec::new();
+    for line in maps.lines() {
+        // address perms offset dev inode path -- the path is everything after the fifth field.
+        let mut rest = line;
+        for _ in 0..5 {
+            rest = rest.trim_start();
+            rest = rest.find(char::is_whitespace).map_or("", |at| &rest[at..]);
         }
-        _ => {
-            std::env::set_var(CLAIM, &own);
-            false
+        let path = rest.trim();
+        if path.starts_with('/') && path != own && std::path::Path::new(path).file_name() == name && !found.iter().any(|p| p == path) {
+            found.push(path.to_string());
         }
     }
+    found
+}
+
+/// Whether the copy of this layer mapped from `path` has gone live. Only looks at an object
+/// that is already loaded (`RTLD_NOLOAD`): never loads anything.
+fn copy_is_live(path: &str) -> bool {
+    let Ok(c_path) = std::ffi::CString::new(path) else { return false };
+    // SAFETY: `RTLD_NOLOAD` only returns a handle to an object that is already loaded (adding
+    // a reference, released below) and never runs anyone's initializers.
+    let handle = unsafe { libc::dlopen(c_path.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD) };
+    if handle.is_null() {
+        return false;
+    }
+    // SAFETY: the symbol, when present, is that copy's own `NEURAL_FORGE_LAYER_LIVE`, an
+    // `AtomicBool` that lives as long as the object, which the handle keeps loaded.
+    let live = unsafe {
+        let symbol = libc::dlsym(handle, c"NEURAL_FORGE_LAYER_LIVE".as_ptr());
+        !symbol.is_null() && (*symbol.cast::<std::sync::atomic::AtomicBool>()).load(std::sync::atomic::Ordering::Relaxed)
+    };
+    // SAFETY: releases the reference `dlopen` added above.
+    unsafe { libc::dlclose(handle) };
+    live
 }
 
 /// Latched by [`note_vk`] the first time a layer-issued Vulkan call reports `VK_ERROR_DEVICE_LOST`.
@@ -212,7 +261,7 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
         let create_instance: vk::PFN_vkCreateInstance = match create_instance {
             // SAFETY: a non-null `vkGetInstanceProcAddr(NULL, "vkCreateInstance")` result
             // is guaranteed by the Vulkan spec to have this exact signature.
-            Some(fp) => unsafe { std::mem::transmute(fp) },
+            Some(fp) => unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateInstance>(fp) },
             None => return LayerResult::Handled(Err(vk::Result::ERROR_INITIALIZATION_FAILED)),
         };
         let allocator = allocator.map_or(std::ptr::null(), |allocator| allocator as *const _);
@@ -235,7 +284,7 @@ pub(crate) const EXTERNAL_MEMORY_HOST_EXTENSION: &CStr = c"VK_EXT_external_memor
 /// called right after with the *original*, un-injected `VkDeviceCreateInfo` regardless
 /// of what a hooked `create_device` actually passed to the real driver -- there is no
 /// other way to learn this) checks and removes its own device's entry here exactly
-/// once. Same pattern as `device::CLEANUP`/`CURRENT_INSTANCE`: a small, short-lived,
+/// once. Same pattern as `device::CLEANUP`/`PHYSICAL_DEVICE_INSTANCES`: a small, short-lived,
 /// mutex-guarded side table, not a source of truth kept around indefinitely.
 static EXTERNAL_MEMORY_HOST_DEVICES: Mutex<Option<HashSet<vk::Device>>> = Mutex::new(None);
 
@@ -259,8 +308,30 @@ pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
     EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().as_mut().is_some_and(|set| set.remove(&device))
 }
 
+/// Per-instance hooks, carrying that instance's own context. Dropped by the framework when
+/// the application destroys the instance.
 #[derive(Default)]
-struct NeuralForgeInstanceHooks;
+struct NeuralForgeInstanceHooks {
+    ctx: Option<InstanceContext>,
+}
+
+impl NeuralForgeInstanceHooks {
+    /// Records `physical_device` as belonging to this instance, for `create_device_info`.
+    fn remember(&self, physical_device: vk::PhysicalDevice) {
+        if let Some(ctx) = &self.ctx {
+            PHYSICAL_DEVICE_INSTANCES.lock().unwrap().insert(physical_device, ctx.clone());
+        }
+    }
+}
+
+impl Drop for NeuralForgeInstanceHooks {
+    fn drop(&mut self) {
+        if let Some(ctx) = &self.ctx {
+            let handle = ctx.instance.handle();
+            PHYSICAL_DEVICE_INSTANCES.lock().unwrap().retain(|_, owner| owner.instance.handle() != handle);
+        }
+    }
+}
 
 impl InstanceHooks for NeuralForgeInstanceHooks {
     /// Adds [`EXTERNAL_MEMORY_HOST_EXTENSION`] to the game's own `vkCreateDevice` call
@@ -281,7 +352,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         allocator: Option<&vk::AllocationCallbacks>,
         p_device: &mut std::mem::MaybeUninit<vk::Device>,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
-        let Some(instance) = CURRENT_INSTANCE.lock().unwrap().clone() else {
+        self.remember(physical_device);
+        let Some(instance) = self.ctx.clone() else {
             return LayerResult::Unhandled;
         };
         // A `VkDeviceCreateInfo` requesting zero extensions may legitimately leave
@@ -309,7 +381,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         } {
             // SAFETY: a non-null `vkGetInstanceProcAddr(instance, "vkCreateDevice")`
             // result is guaranteed by the Vulkan spec to have this exact signature.
-            Some(f) => unsafe { std::mem::transmute(f) },
+            Some(f) => unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkCreateDevice>(f) },
             None => return LayerResult::Unhandled,
         };
         let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
@@ -331,8 +403,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             return LayerResult::Handled(result.result());
         }
         // SAFETY: `physical_device` is the one this exact `vkCreateDevice` call is
-        // for; `instance.instance` is its owning instance (the only kind
-        // `CURRENT_INSTANCE` ever stores).
+        // for; `instance.instance` is its owning instance (these are this instance's
+        // own hooks).
         let supported = unsafe { instance.instance.enumerate_device_extension_properties(physical_device) }
             .is_ok_and(|extensions| {
                 extensions.iter().any(|extension| {
@@ -431,8 +503,7 @@ impl Layer for NeuralForgeLayer {
             next_get_instance_proc_addr(instance.handle(), c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR".as_ptr())
                 .map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(p))
         };
-        *CURRENT_INSTANCE.lock().unwrap() = Some(InstanceContext { instance, surface_caps });
-        Default::default()
+        NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance, surface_caps }) }
     }
 
     fn create_device_info(
@@ -443,12 +514,11 @@ impl Layer for NeuralForgeLayer {
         device: Arc<ash::Device>,
         next_get_device_proc_addr: vk::PFN_vkGetDeviceProcAddr,
     ) -> Self::DeviceInfoContainer {
-        // `create_instance_info` always runs before `create_device_info` for the
-        // instance a device is created against (the app must call `vkCreateInstance`
-        // before `vkCreateDevice`), so this is always `Some` in practice; `unwrap_or`
-        // only matters for a hypothetical device created against an instance from
-        // before this layer was loaded, which never happens for an implicit layer.
-        let instance = CURRENT_INSTANCE.lock().unwrap().clone();
+        // The owning instance's `create_device` hook recorded it just before this call, so
+        // this is always `Some` in practice; `None` only for a device created against an
+        // instance from before this layer was loaded, which never happens for an implicit
+        // layer, and then capture is simply skipped.
+        let instance = PHYSICAL_DEVICE_INSTANCES.lock().unwrap().get(&physical_device).cloned();
         NeuralForgeDeviceInfo::new(instance.as_ref().map(|ctx| ctx.instance.clone()), instance.and_then(|ctx| ctx.surface_caps), physical_device, device, next_get_device_proc_addr, create_info)
     }
 }
@@ -469,6 +539,72 @@ mod requests_extension_tests {
         assert!(!requests_extension(&without, EXTERNAL_MEMORY_HOST_EXTENSION));
         // Zero extensions with a null list, as `vkcube` passes it.
         assert!(!requests_extension(&vk::DeviceCreateInfo::default(), EXTERNAL_MEMORY_HOST_EXTENSION));
+    }
+}
+
+#[cfg(test)]
+mod instance_table_tests {
+    use super::*;
+    use ash::vk::Handle;
+
+    /// A device is resolved through the instance that owns its physical device, not whichever
+    /// instance was created last, and an instance's entries go when it is destroyed.
+    #[test]
+    fn devices_resolve_through_their_own_instance_and_forget_a_destroyed_one() {
+        let Some(entry) = (unsafe { ash::Entry::load() }).ok() else {
+            eprintln!("instance table test: no Vulkan loader, skipping");
+            return;
+        };
+        let create = || unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder(), None) }.ok().map(Arc::new);
+        let (Some(real), Some(probe)) = (create(), create()) else {
+            eprintln!("instance table test: no Vulkan ICD, skipping");
+            return;
+        };
+        let hooks = |instance: &Arc<ash::Instance>| NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None }) };
+        // Stand-in handles: the table is keyed by whatever the framework hands over.
+        let (real_gpu, probe_gpu) = (vk::PhysicalDevice::from_raw(0x5100), vk::PhysicalDevice::from_raw(0x5200));
+        let real_hooks = hooks(&real);
+        let probe_hooks = hooks(&probe);
+        real_hooks.remember(real_gpu);
+        probe_hooks.remember(probe_gpu);
+        let owner = |gpu: vk::PhysicalDevice| PHYSICAL_DEVICE_INSTANCES.lock().unwrap().get(&gpu).map(|c| c.instance.handle());
+        assert_eq!(owner(real_gpu), Some(real.handle()), "the real instance's device is not resolved through the later probe");
+        assert_eq!(owner(probe_gpu), Some(probe.handle()));
+        drop(probe_hooks);
+        assert_eq!(owner(probe_gpu), None, "a destroyed instance's devices are forgotten");
+        assert_eq!(owner(real_gpu), Some(real.handle()));
+        drop(real_hooks);
+        assert_eq!(owner(real_gpu), None);
+        unsafe {
+            probe.destroy_instance(None);
+            real.destroy_instance(None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod duplicate_copy_tests {
+    use super::*;
+
+    #[test]
+    fn other_copies_are_same_named_objects_at_other_paths() {
+        let own = "/opt/nf/lib/neural-forge/libneural_forge_layer.so";
+        let maps = "\
+7f00-7f01 r--p 00000000 08:01 11 /opt/nf/lib/neural-forge/libneural_forge_layer.so
+7f01-7f02 r-xp 00001000 08:01 11 /opt/nf/lib/neural-forge/libneural_forge_layer.so
+7f10-7f11 r--p 00000000 08:01 22 /home/a/dev tree/target/release/libneural_forge_layer.so
+7f11-7f12 r-xp 00001000 08:01 22 /home/a/dev tree/target/release/libneural_forge_layer.so
+7f20-7f21 r--p 00000000 08:01 33 /usr/lib/libvulkan.so.1
+7f30-7f31 rw-p 00000000 00:00 0
+7f40-7f41 rw-p 00000000 00:00 0 [heap]
+";
+        assert_eq!(other_copies(maps, own), vec!["/home/a/dev tree/target/release/libneural_forge_layer.so".to_string()]);
+        assert!(other_copies(maps, "/home/a/dev tree/target/release/libneural_forge_layer.so").contains(&own.to_string()));
+    }
+
+    #[test]
+    fn an_object_that_is_not_loaded_is_not_live() {
+        assert!(!copy_is_live("/nonexistent/libneural_forge_layer.so"));
     }
 }
 
