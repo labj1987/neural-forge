@@ -4,6 +4,10 @@
 //! already shared code; everything else here is config/data/state, which has no
 //! Steam-container wrinkle to work around.
 
+use std::io::Write;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::path::Path;
+
 pub(crate) fn home() -> String {
     std::env::var("HOME").unwrap_or_else(|_| "/".to_string())
 }
@@ -97,6 +101,34 @@ pub fn steam_install_dir() -> Option<String> {
     ]
     .into_iter()
     .find(|dir| std::path::Path::new(dir).is_dir())
+}
+
+/// Writes `content` to `path`, replacing any existing file by renaming a same-directory
+/// staged file over it -- never truncates the destination in place, so an
+/// already-running process that has the old inode mapped (a GUI, a game, a Wine
+/// helper) keeps reading the old content until it reopens the path, exactly like
+/// `install.py`'s own `os.replace` step. A crash part-way leaves the old file whole, never an
+/// empty one: `config.ini`, `profiles.ini` and `dxvk.conf` are written through this too.
+pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| std::io::Error::other(format!("{} has no parent directory", path.display())))?;
+    std::fs::create_dir_all(parent)?;
+    let mut attempt = 0u32;
+    let staged = loop {
+        let candidate = parent.join(format!(".neural-forge-{}-{attempt}.tmp", std::process::id()));
+        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&candidate) {
+            Ok(mut file) => {
+                file.write_all(content)?;
+                file.sync_all()?;
+                break candidate;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1000 => attempt += 1,
+            Err(e) => return Err(e),
+        }
+    };
+    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staged);
+    })?;
+    std::fs::rename(&staged, path)
 }
 
 #[cfg(test)]

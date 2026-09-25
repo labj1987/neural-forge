@@ -8,13 +8,12 @@
 //! read/write the exact same record on purpose, so either can pick up after the other.
 
 use std::collections::BTreeMap;
-use std::io::Write;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
 use crate::paths;
+use crate::paths::write_atomic;
 
 pub const APP_ID: &str = "io.github.labj1987.NeuralForge";
 pub const LAYER: &str = "VK_LAYER_neuralforge_neural";
@@ -102,33 +101,6 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Writes `content` to `path`, replacing any existing file by renaming a same-directory
-/// staged file over it -- never truncates the destination in place, so an
-/// already-running process that has the old inode mapped (a GUI, a game, a Wine
-/// helper) keeps reading the old content until it reopens the path, exactly like
-/// `install.py`'s own `os.replace` step.
-fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
-    let parent = path.parent().ok_or_else(|| std::io::Error::other(format!("{} has no parent directory", path.display())))?;
-    std::fs::create_dir_all(parent)?;
-    let mut attempt = 0u32;
-    let staged = loop {
-        let candidate = parent.join(format!(".neural-forge-{}-{attempt}.tmp", std::process::id()));
-        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&candidate) {
-            Ok(mut file) => {
-                file.write_all(content)?;
-                file.sync_all()?;
-                break candidate;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1000 => attempt += 1,
-            Err(e) => return Err(e),
-        }
-    };
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).inspect_err(|_| {
-        let _ = std::fs::remove_file(&staged);
-    })?;
-    std::fs::rename(&staged, path)
-}
-
 /// Installs `appdir` (an extracted AppImage's `AppDir`) into persistent user storage.
 /// Refuses (writing nothing at all) if any destination is a symlink, or already
 /// exists with content this installer's own record doesn't recognize as what it last
@@ -185,10 +157,10 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     // `install.py`: a failure partway through must leave nothing changed, not a
     // half-installed mix of old and new files.
     for path in files.keys() {
-        for ancestor in path.ancestors() {
-            if !ancestor.as_os_str().is_empty() && ancestor.is_symlink() {
-                return Err(InstallError::RefusedSymlink(path.clone()));
-            }
+        // The destination and the directory it lands in, not every ancestor: a symlinked
+        // $HOME or ~/.local/share is an ordinary setup, and refusing it refused every launch.
+        if path.is_symlink() || path.parent().is_some_and(Path::is_symlink) {
+            return Err(InstallError::RefusedSymlink(path.clone()));
         }
         if path.exists() {
             let current = digest_file(path)?;
@@ -582,6 +554,32 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&binary).unwrap(), "user changed");
         assert_eq!(preserved, vec![binary]);
         assert!(!record_path().exists());
+    }
+
+    #[test]
+    fn a_symlinked_data_home_is_fine_but_a_symlinked_destination_directory_is_not() {
+        let scratch = ScratchDataHome::new("symlinks");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        // $XDG_DATA_HOME itself behind a symlink (a symlinked $HOME, say): an ordinary setup.
+        let real = scratch.dir.join("real-data");
+        std::fs::create_dir_all(&real).unwrap();
+        let link = scratch.dir.join("linked-data");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        std::env::set_var("XDG_DATA_HOME", &link);
+        install(&appdir).expect("an ancestor symlink must not refuse the install");
+        assert!(real.join("neural-forge/bin/neural-forge").is_file());
+
+        // The directory a file lands in being a symlink is refused.
+        uninstall().unwrap();
+        let bin = PathBuf::from(paths::data_dir()).join("bin");
+        let _ = std::fs::remove_dir_all(&bin);
+        let elsewhere = scratch.dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &bin).unwrap();
+        let err = install(&appdir).expect_err("a symlinked destination directory must be refused");
+        assert!(matches!(err, InstallError::RefusedSymlink(_)), "unexpected error: {err}");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing may be written through the symlink");
     }
 
     #[test]
