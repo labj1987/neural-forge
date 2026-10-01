@@ -60,12 +60,11 @@ GTA V Enhanced built-in benchmark, pass 4 (the long free-roam pass), 2560x1440, 
 off, model every 2nd frame, motion vectors on. Runner: `gta-bench.sh` (unattended), real fps from
 GTA's own frame-time file.
 
-Alex's current GTA settings (`settings.xml` last changed 2026-09-29 20:07) have ray tracing on.
-With it, GTA holds itself to about 63 fps with NR off while the GPU sits at 45-47% at full
-boost clock and no GTA thread is saturated: the game is waiting on its own work, not on the GPU or
-one CPU core. Neural Forge's model then runs in GPU time the game leaves idle, which is why NR costs
-only about 7% there. Smooth Motion and Reflex are not the cause (both measured below). The 1.0.0
-baselines (92.8 off / 61.5 on) were taken before that settings change and are not comparable.
+**Correction (later the same day): these runs had GTA's script mods loaded.** One of them, the
+Enable All Interiors .NET script, holds GTA's main thread every frame and caps the game at about
+63 fps with the GPU 45% busy. That cap, not ray tracing and not Neural Forge, is why NR looked
+almost free in the first table below. Without the mods (see the last table), NR off is 93.6 and
+NR on 61.6, the same proportion as the 1.0.0 baselines.
 
 | Run | Real fps | GPU | Model evaluate | `[sync]` per model frame |
 |---|---|---|---|---|
@@ -75,19 +74,29 @@ baselines (92.8 off / 61.5 on) were taken before that settings change and are no
 | 1.0.0, NR on, model 50% | 59.5 | 66% | 3.6 ms | total 14.2-15.6 ms, copy path |
 | 1.0.1, NR on, model 100%, 4 runs | 58.1 / 58.5 / 58.1 / 58.4 | 84-85% | 10.1-10.3 ms | total 18.6-19.9 ms |
 
-Cause of the NR-off ceiling (temporary `settings.xml` edits, restored and hash-checked after each run):
+Cause of the NR-off ceiling, found by elimination (NR off, Smooth Motion off unless noted;
+temporary `settings.xml` edits restored and hash-checked after each run; mods disabled for a run with
+`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b` or by setting one file aside, all 36 mod files verified
+identical afterwards):
 
-| Run | Real fps | Displayed | GPU |
-|---|---|---|---|
-| NR off, Smooth Motion off | 63.3 | 63.6 | 47% |
-| NR off, Smooth Motion on | 62.4 | 124.8 | 52% |
-| NR on, Smooth Motion off | 58.1 | 58.6 | 84% |
-| NR on, Smooth Motion on | 56.5 | 113.8 | 89% |
-| NR off, Reflex off | 63.6 | 63.6 | 46% |
-| NR off, ray tracing off | 83.2 | 83.0 | 38% |
-| NR on, ray tracing off | 74.6 | 74.9 | 89% |
+| Run | Real fps | GPU |
+|---|---|---|
+| Mods loaded (Alex's setup) | 63.3 | 47% |
+| Mods loaded, Smooth Motion on | 62.4 real / 124.8 displayed | 52% |
+| Mods loaded: Reflex off / VSync on / native res / `descriptor_heap` / latency 3 / 4 images | 62.6-63.7 | 46-61% |
+| Mods loaded, ray tracing off | 83.2 | 38% |
+| **All mods off** | **93.6** | **67%** |
+| Native trainer off | 63.1 | 46% |
+| ScriptHookVDotNet off | 92.0 | 66% |
+| **Enable All Interiors script off** | **93.0** | **67%** |
+| iFruitAddon2 script off | 71.9 | 52% |
+| No mods, NR on | 61.6 | 89% |
+| No mods, render 1920x1080 | 93.2 | 52% |
+| No mods, render 3840x2160 | 83.0 | 95% |
 
-Ray tracing is the ceiling. With it off, Neural Forge costs about 10% (83.2 to 74.6) instead of 7%.
+Without the mods the game is CPU-limited at about 93 fps (1080p and 1440p give the same frame rate)
+and saturates the GPU at 4K. The GPU, driver, PCIe link, RAM (DDR4-3600, dual channel) and CPU
+(7-Zip 88 GIPS) all check out.
 
 **Model resolution.** The evaluate itself scales as OpenDLSS-NR predicts: 56% of the pixels take 64%
 of the time and 25% take 36%, so the saving shrinks as the raster gets smaller. In Neural Forge the
