@@ -13,6 +13,20 @@ first shipped them; their phase is kept as a subheading.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
+## 1.0.1 — 2026-10-01
+
+- **No stale picture after a pause.** The model keeps its own history: the last picture it
+  produced, blended into the next answer. That history used to survive switching the effect
+  off and on, the layer passing frames through (warm-up, loading screens), and failed
+  evaluates, so the first answers after a pause were blended with a scene that could be
+  minutes old. The helper now resets the model's history, and the motion-vector reference
+  frame, on the first evaluate after any of those, or after more than 500 ms without one.
+  The helper log says `resetting model history` when it does.
+- **Review against OpenDLSS-NR** (`docs/OPENDLSS_REVIEW.md`): what the model's own pipeline
+  does around the network, what Neural Forge controls of it, and GTA V measurements of model
+  resolution and the hand-off. A higher queue priority for the model was tried and dropped:
+  NVIDIA's Linux driver refuses it to unprivileged processes.
+
 ## 1.0.0 — 2026-09-25
 
 - **The game no longer stalls when capture setup fails.** If the layer cannot set up capture

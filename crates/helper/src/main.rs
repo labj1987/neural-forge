@@ -41,7 +41,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ash::vk;
-use neural_forge_helper::{frame, guard, ngx, optical_flow, shm};
+use neural_forge_helper::{frame, guard, history, ngx, optical_flow, shm};
 
 /// The helper's motion-vector state across frames: the GPU flow session (rebuilt when the
 /// model's frame size or the quality changes), a small luma thumbnail of the last frame for
@@ -77,7 +77,9 @@ impl MotionState {
 
     /// The flow session for this frame, (re)built as needed, or `None` when motion can't run.
     #[allow(clippy::too_many_arguments)]
-    fn session(&mut self, instance: &ash::Instance, device: &ash::Device, physical_device: vk::PhysicalDevice, flow_queue: Option<&optical_flow::FlowQueue>, width: u32, height: u32, quality: u32, scene_cut: bool) -> Option<&mut optical_flow::GpuFlow> {
+    /// `reset` drops the flow's reference frame (a scene cut, or a model history that went
+    /// stale), so the next estimate seeds instead of measuring motion against an old picture.
+    fn session(&mut self, instance: &ash::Instance, device: &ash::Device, physical_device: vk::PhysicalDevice, flow_queue: Option<&optical_flow::FlowQueue>, width: u32, height: u32, quality: u32, reset: bool) -> Option<&mut optical_flow::GpuFlow> {
         if self.blocked {
             return None;
         }
@@ -104,8 +106,7 @@ impl MotionState {
             }
         }
         let flow = self.flow.as_mut()?;
-        if scene_cut {
-            neural_forge_helper::log!("[mvec] scene cut detected, resetting motion history");
+        if reset {
             flow.reset();
         }
         Some(flow)
@@ -223,6 +224,8 @@ fn main() {
     let mut frame_resources: [Option<frame::FrameResources>; 2] = [None, None];
     // Slot 0 only: slot 1 always evaluates with empty motion (see `process_request`).
     let mut motion = MotionState::default();
+    // Per slot, like `frame_resources`: when each slot last reached the model.
+    let mut history_gaps: [history::HistoryGap; 2] = Default::default();
     // Resized (not reallocated fresh every frame) to whatever the current frame's
     // real byte count is -- never the full `MAX_FRAME` reservation, which is sized for
     // the protocol's absolute ceiling (7680x4320 float16), not a typical frame.
@@ -262,7 +265,7 @@ fn main() {
             process_request(
                 hdr, &shm, &device, &instance, physical_device, queue, &mut snippet,
                 &mut frame_resources[slot], flow_queue.as_ref(), &mut motion,
-                slot, seq_req, helper_delay, &mut frames,
+                &mut history_gaps[slot], slot, seq_req, helper_delay, &mut frames,
             );
         }
         hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
@@ -337,6 +340,7 @@ fn process_request(
     frame_resources: &mut Option<frame::FrameResources>,
     flow_queue: Option<&optical_flow::FlowQueue>,
     motion: &mut MotionState,
+    history_gap: &mut history::HistoryGap,
     slot: usize,
     seq_req: u32,
     helper_delay: Duration,
@@ -445,10 +449,22 @@ fn process_request(
             }
             let f = frame_resources.as_ref()?;
             let (Some(eval_fn), params) = (snippet.evaluate_feature_fn(), snippet.params()) else { return None };
-            // Only a scene cut invalidates the model's history. Resetting whenever motion
-            // was missing told the model "frame one" on every frame while motion was
-            // unavailable, so its temporal history was never used.
-            let reset_history = scene_cut;
+            // A scene cut, or a history that no longer belongs to this frame: the slot went
+            // without an evaluate (effect off, model not ready, failed open) or nothing was
+            // evaluated for a long pause. NGX would otherwise blend its first answers with the
+            // last picture it produced before the gap. Resetting whenever motion was missing
+            // is wrong, though: that told the model "frame one" on every frame while motion
+            // was unavailable, so its temporal history was never used.
+            let stale = history_gap.begin(std::time::Instant::now());
+            match stale {
+                Some(history::Stale::Skipped) => neural_forge_helper::log!("[helper] slot {slot}: resetting model history (requests went unevaluated since the last answer)"),
+                Some(history::Stale::Idle(gap)) => neural_forge_helper::log!("[helper] slot {slot}: resetting model history ({} ms since the last answer)", gap.as_millis()),
+                None => {}
+            }
+            if scene_cut {
+                neural_forge_helper::log!("[mvec] scene cut detected, resetting motion history");
+            }
+            let reset_history = scene_cut || stale.is_some();
             // Sharpness is per pass (the model reads it at evaluate); the header index of a pass
             // is its position in the chain, holes excluded only from the *built* handles, so the
             // pass numbers here are the first `live_passes` of the header's list.
@@ -462,13 +478,16 @@ fn process_request(
                     sharpness: hdr.resolve_pass(i).sharpness,
                 })
                 .collect();
-            let flow = if want_motion { motion.session(instance, device, physical_device, flow_queue, width, height, hdr.mvec_quality.load(Ordering::Relaxed), scene_cut) } else { None };
+            let flow = if want_motion { motion.session(instance, device, physical_device, flow_queue, width, height, hdr.mvec_quality.load(Ordering::Relaxed), reset_history) } else { None };
             f.evaluate(device, queue, eval_fn, &chain, params, proxy, flow, motion_scale, reset_history, answer)
         })()
     } else {
         None
     };
     let evaluated = timing.is_some();
+    if !evaluated {
+        history_gap.skipped();
+    }
     if let Some(timing) = timing.as_ref() {
         motion.finished(device, timing);
     }
