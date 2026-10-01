@@ -60,9 +60,12 @@ GTA V Enhanced built-in benchmark, pass 4 (the long free-roam pass), 2560x1440, 
 off, model every 2nd frame, motion vectors on. Runner: `gta-bench.sh` (unattended), real fps from
 GTA's own frame-time file.
 
-Alex's current GTA settings (`settings.xml` last changed 2026-09-29 20:07, ray tracing with every
-BVH option on) make the game CPU-limited with NR off: the GPU sits at 45%. The 1.0.0 baselines
-(92.8 off / 61.5 on) were taken before that change and are not comparable.
+Alex's current GTA settings (`settings.xml` last changed 2026-09-29 20:07) have ray tracing on.
+With it, GTA holds itself to about 63 fps with NR off while the GPU sits at 45-47% at full
+boost clock and no GTA thread is saturated: the game is waiting on its own work, not on the GPU or
+one CPU core. Neural Forge's model then runs in GPU time the game leaves idle, which is why NR costs
+only about 7% there. Smooth Motion and Reflex are not the cause (both measured below). The 1.0.0
+baselines (92.8 off / 61.5 on) were taken before that settings change and are not comparable.
 
 | Run | Real fps | GPU | Model evaluate | `[sync]` per model frame |
 |---|---|---|---|---|
@@ -71,6 +74,20 @@ BVH option on) make the game CPU-limited with NR off: the GPU sits at 45%. The 1
 | 1.0.0, NR on, model 75% | 54.8 | 74% | 6.3 ms | total 19.3-21.0 ms, copy path (`copy_out` 2.8 ms + `rest` 1.6 ms) |
 | 1.0.0, NR on, model 50% | 59.5 | 66% | 3.6 ms | total 14.2-15.6 ms, copy path |
 | 1.0.1, NR on, model 100%, 4 runs | 58.1 / 58.5 / 58.1 / 58.4 | 84-85% | 10.1-10.3 ms | total 18.6-19.9 ms |
+
+Cause of the NR-off ceiling (temporary `settings.xml` edits, restored and hash-checked after each run):
+
+| Run | Real fps | Displayed | GPU |
+|---|---|---|---|
+| NR off, Smooth Motion off | 63.3 | 63.6 | 47% |
+| NR off, Smooth Motion on | 62.4 | 124.8 | 52% |
+| NR on, Smooth Motion off | 58.1 | 58.6 | 84% |
+| NR on, Smooth Motion on | 56.5 | 113.8 | 89% |
+| NR off, Reflex off | 63.6 | 63.6 | 46% |
+| NR off, ray tracing off | 83.2 | 83.0 | 38% |
+| NR on, ray tracing off | 74.6 | 74.9 | 89% |
+
+Ray tracing is the ceiling. With it off, Neural Forge costs about 10% (83.2 to 74.6) instead of 7%.
 
 **Model resolution.** The evaluate itself scales as OpenDLSS-NR predicts: 56% of the pixels take 64%
 of the time and 25% take 36%, so the saving shrinks as the raster gets smaller. In Neural Forge the
