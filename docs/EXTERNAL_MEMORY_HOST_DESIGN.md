@@ -225,6 +225,17 @@ It splits the old `capture=` into `capture_gpu=` (submit to completion observed)
 `copy_out=` (0 on zero-copy frames). It reports the white meter as `meter=` instead of
 counting it in `wait_answer=`, and adds `helper=`, the helper's published
 upload + evaluate + readback, so `wait_answer - helper` is the handoff overhead.
+It ends with `gpu_capture=` and `gpu_compose=`: the latest GPU timestamp readings the layer
+published (`layer_capture_gpu_ms` / `layer_compose_gpu_ms` in `neural-forge-cli shmctl
+status`). Each capture slot and each async compose slot owns a two-query timestamp pool
+(`crates/layer/src/gpu_timer.rs`). The span starts at the `TRANSFER` stage right after the
+command buffer's opening `ALL_COMMANDS -> TRANSFER` barrier, so it excludes the wait for the
+game's own work, and ends at `BOTTOM_OF_PIPE`. For the compose it covers the zero-copy
+`gen_*` copies, the upscale blits, the dispatch and the copy into the swapchain image. A
+reading is taken only when the existing non-blocking capture poll, or the compose slot's
+existing reuse wait, finds that slot's fence signalled, so it lags by one capture or one
+compose and adds no wait. A queue family with `timestampValidBits` 0 is not timed and both
+values stay 0.
 
 Tests (lavapipe supports the extension, as does the Intel ANV driver on the dev machine):
 

@@ -889,7 +889,7 @@ impl ComposeSlot {
     /// `Some([(capture_target, gen_base), (imported_answer, gen_answer)])`, first copies the
     /// new zero-copy pair into `gen_*` (`frame_bytes` each).
     #[allow(clippy::too_many_arguments)]
-    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, answer_width: u32, answer_height: u32, frame_bytes: u64, update_cache: bool, small_proxy: bool, held: bool, bgr_order: bool, target_image: vk::Image, compose: ComposeParams, update_src: (vk::Buffer, u64, vk::Buffer, u64), fresh_copy: Option<[(vk::Buffer, vk::Buffer); 2]>) {
+    unsafe fn record_temporal_delta_into_image(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, answer_width: u32, answer_height: u32, frame_bytes: u64, update_cache: bool, small_proxy: bool, held: bool, bgr_order: bool, target_image: vk::Image, compose: ComposeParams, update_src: (vk::Buffer, u64, vk::Buffer, u64), fresh_copy: Option<[(vk::Buffer, vk::Buffer); 2]>, timer: Option<&crate::gpu_timer::GpuTimer>) {
         let s = self.sized.as_ref().expect("caller already ensured this");
         let cached_before = self.cached_generation != 0;
         let scaled_answer = answer_width != width || answer_height != height;
@@ -899,6 +899,13 @@ impl ComposeSlot {
             // earlier read of `gen_*` on this queue (the other slot's carried compose).
             let target_to_src = image_barrier(target_image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[target_to_src]);
+            // The timed span starts here, after the barrier that waits for the queue's earlier
+            // work (see `crate::gpu_timer`); the caller records the end. SAFETY: `self.cmd` is
+            // recording outside a render pass, and the caller waited this slot's fence, so the
+            // timer's previous submission is complete.
+            if let Some(timer) = timer {
+                timer.record_start(device, self.cmd);
+            }
             device.cmd_copy_image_to_buffer(self.cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.current_buffer, &[image_copy_region(width, height, 0)]);
             let current_ready = vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.current_buffer).offset(0).size(frame_bytes).build();
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[current_ready], &[]);
@@ -1074,6 +1081,11 @@ impl ComposeSlot {
 /// until its *previous* use (two dispatches ago) has genuinely finished.
 struct AsyncSlot {
     slot: ComposeSlot,
+    /// This slot's GPU timestamp pair (see [`crate::gpu_timer`]) around the temporal-delta
+    /// compose, `None` until the first async compose builds it (or for good when the queue
+    /// family cannot write timestamps). Read when the slot's fence is waited for reuse;
+    /// destroyed with the slot.
+    timer: Option<crate::gpu_timer::GpuTimer>,
 }
 
 /// The size-independent pipeline state (shader module, descriptor/pipeline layouts,
@@ -1091,6 +1103,13 @@ pub struct GpuCompose {
     next_async_slot: usize,
     present_semaphores: crate::present_sync::PresentSemaphores,
     zc: ZeroCopy,
+    /// The queue family the command pool (and so every slot) serves, for the timers.
+    queue_family: u32,
+    /// Whether the async slots' timers were built yet: lazily, by the first async compose,
+    /// which is the first call that has the instance and physical device they need.
+    timers_built: bool,
+    /// The latest compose GPU reading not yet taken by [`Self::take_compose_gpu_ms`].
+    compose_gpu_ms: Option<f32>,
 }
 
 // SAFETY: every field is either a plain Vulkan handle or (inside a slot's own
@@ -1251,7 +1270,7 @@ impl GpuCompose {
                 cleanup_partial(device);
                 return None;
             };
-            async_slots.push(AsyncSlot { slot });
+            async_slots.push(AsyncSlot { slot, timer: None });
         }
 
         Some(Self {
@@ -1265,6 +1284,9 @@ impl GpuCompose {
             next_async_slot: 0,
             present_semaphores: Default::default(),
             zc: ZeroCopy::default(),
+            queue_family,
+            timers_built: false,
+            compose_gpu_ms: None,
         })
     }
 
@@ -1491,11 +1513,20 @@ impl GpuCompose {
         let semaphore = self.present_semaphores.get(target_image, || unsafe {
             device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
         })?;
+        if !self.timers_built {
+            self.timers_built = true;
+            for s in &mut self.async_slots {
+                s.timer = crate::gpu_timer::GpuTimer::new(device, instance, physical_device, self.queue_family);
+            }
+        }
         let idx = self.next_async_slot; self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let slot = &mut self.async_slots[idx];
         let wait = unsafe { device.wait_for_fences(&[slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
         if crate::note_fence_wait(wait, "gpu::present_temporal_delta_async slot reuse").is_err() { return None; }
         if self.zc.answer_reader == Some(slot.slot.fence) { self.zc.answer_reader = None; }
+        // The reuse wait just above (which this path always had) is what makes the slot's last
+        // timestamps readable; no wait of its own.
+        if let Some(ms) = slot.timer.as_mut().and_then(|t| { t.read_if_pending(device); t.take_reading() }) { self.compose_gpu_ms = Some(ms); }
         if generation == 0 || answer_bytes > bytes { return None; }
         let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let (update_src, fresh_copy, small_proxy, held) = match inputs {
@@ -1535,10 +1566,20 @@ impl GpuCompose {
         if unsafe { device.reset_command_buffer(slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
         let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() { return None; }
-        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, small_proxy, held, bgr_order, target_image, compose, update_src, fresh_copy); }
+        // Timed span: from just after the opening `ALL_COMMANDS -> TRANSFER` barrier on the
+        // target image (so not the wait for the queue's earlier work) to the end of the buffer.
+        // That covers the copy of the target out, the zero-copy `gen_*` copies, the uploads and
+        // the upscale blits of a cache update, the compute dispatch, and the copy back into the
+        // target image -- everything this submission does. See `crate::gpu_timer`.
+        unsafe { slot.slot.record_temporal_delta_into_image(device, self.pipeline, self.pipeline_layout, width, height, answer_width, answer_height, bytes as u64, update, small_proxy, held, bgr_order, target_image, compose, update_src, fresh_copy, slot.timer.as_ref()); }
+        if let Some(timer) = &slot.timer {
+            // SAFETY: `slot.slot.cmd` is recording and `record_start` went into it above.
+            unsafe { timer.record_end(device, slot.slot.cmd) };
+        }
         if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
         if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }).is_err() { return None; }
+        if let Some(timer) = slot.timer.as_mut() { timer.mark_submitted(); }
         if update { slot.slot.cached_generation = generation; }
         if zero_copy.is_some() {
             self.zc.last_queue = Some(queue);
@@ -1709,6 +1750,11 @@ impl GpuCompose {
         if self.zc.answer_reader == Some(async_slot.slot.fence) {
             self.zc.answer_reader = None;
         }
+        // Same as the temporal-delta path: the reuse wait just above makes the slot's last
+        // timestamps (if that submission was a timed compose) readable.
+        if let Some(ms) = async_slot.timer.as_mut().and_then(|t| { t.read_if_pending(device); t.take_reading() }) {
+            self.compose_gpu_ms = Some(ms);
+        }
         let frame_bytes = (u64::from(width) * u64::from(height) * 4) as usize;
         if raw_answer.len() < frame_bytes || generation == 0 {
             return None;
@@ -1749,6 +1795,12 @@ impl GpuCompose {
         crate::note_fence_wait(wait, "gpu::wait_in_flight").is_ok()
     }
 
+    /// The latest async compose GPU time read back since the last call (see
+    /// [`crate::gpu_timer`]), for the caller to publish.
+    pub fn take_compose_gpu_ms(&mut self) -> Option<f32> {
+        self.compose_gpu_ms.take()
+    }
+
     pub fn retire_present_images(&mut self, images: &[vk::Image]) {
         self.present_semaphores.retire(images);
     }
@@ -1763,7 +1815,9 @@ impl GpuCompose {
             self.sync.destroy(device);
             for async_slot in &self.async_slots {
                 async_slot.slot.destroy(device);
-
+                if let Some(timer) = &async_slot.timer {
+                    timer.destroy(device);
+                }
             }
             if let Some(f) = &self.zc.frames {
                 f.capture_target.destroy(device);

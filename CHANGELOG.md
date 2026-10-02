@@ -11,6 +11,10 @@ first shipped them; their phase is kept as a subheading.
   N consecutive presented frames on whichever present path runs; and `scripts/agreement.py`,
   which scores how closely a test run's edit matches a reference run's. `capture` without
   `--frames` (`capture_request = 1`) is unchanged.
+- **GPU timestamps for the layer's own work.** Every capture slot and async compose slot
+  carries a timestamp pair, read back without waiting once the slot's fence is seen
+  signalled. The results go to `layer_capture_gpu_ms` / `layer_compose_gpu_ms`
+  (`shmctl status`) and to the end of the `[sync]` log line as `gpu_capture=` / `gpu_compose=`.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
   `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
   earlier needs proof that the presentation engine's wait on them has completed, which core

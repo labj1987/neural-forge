@@ -26,6 +26,7 @@ mod ownership;
 mod loader_data;
 mod dump;
 mod series;
+mod gpu_timer;
 mod logging;
 mod hotkey;
 mod shm;

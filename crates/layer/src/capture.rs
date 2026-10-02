@@ -794,7 +794,11 @@ fn poll_or_submit_capture(
             return CaptureStep::Failed;
         }
         let d = direct[slot].as_mut().expect("just ensured above");
-        if let Some((w, h, f, target, submitted)) = poll_direct_capture(d, device) {
+        let polled = poll_direct_capture(d, device);
+        if let Some(ms) = d.timer.as_mut().and_then(crate::gpu_timer::GpuTimer::take_reading) {
+            shm.publish_capture_gpu_ms(ms);
+        }
+        if let Some((w, h, f, target, submitted)) = polled {
             if usable(w, h, f, submitted) {
                 if target.is_some() && target == zc_target {
                     // The same submission wrote the frame into the capture target the compose
@@ -831,6 +835,9 @@ fn poll_or_submit_capture(
         let p = pipeline.as_mut().expect("just ensured above");
         let t_copy = std::time::Instant::now();
         let (full, model_dims) = poll_pipeline_capture(p, slot, device, original_scratch, model_scratch);
+        if let Some(ms) = p.slots[slot].timer.as_mut().and_then(crate::gpu_timer::GpuTimer::take_reading) {
+            shm.publish_capture_gpu_ms(ms);
+        }
         if full.is_some_and(|(w, h, f, submitted)| usable(w, h, f, submitted)) {
             if let Some((mw, mh)) = model_dims {
                 // Encode self-check, once per process: the untouched frame and the
@@ -1677,7 +1684,7 @@ pub unsafe fn run(
                 held_original: compose_held.then_some(raw_answer_base.as_slice()),
             }
         };
-        if let Some(sem) = gpu.present_temporal_delta_async(
+        let sem = gpu.present_temporal_delta_async(
             device,
             instance,
             physical_device,
@@ -1709,14 +1716,25 @@ pub unsafe fn run(
                 proxy_encoded,
                 reversible_mode: settings.reversible_mode,
             },
-        ) {
+        );
+        // Whatever the compose call read back from the slot it reused, published even when this
+        // compose itself was refused.
+        if let Some(ms) = gpu.take_compose_gpu_ms() {
+            shm.publish_compose_gpu_ms(ms);
+        }
+        if let Some(sem) = sem {
             if let Some(t) = SYNC_TIMING.with(|t| t.take()) {
                 static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
                 let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if n % 300 == 5 {
                     let total = pipeline_start.elapsed();
+                    // `gpu_capture`/`gpu_compose` are the latest published timestamp readings
+                    // (`crate::gpu_timer`), not means: each lags its own submission by a capture
+                    // or a compose, and is 0.00 until the first reading (or on a queue that
+                    // cannot time). `capture_gpu` is the CPU-observed submit-to-completion time.
+                    let (gpu_capture_ms, gpu_compose_ms) = shm.published_gpu_ms();
                     crate::log!(
-                        "[sync] {width}x{height}: total={total:.1?} capture_gpu={:.1?} copy_out={:.1?} meter={:.1?} wait_answer={:.1?} helper={:.1?} rest(readback+compose)={:.1?} zc={}",
+                        "[sync] {width}x{height}: total={total:.1?} capture_gpu={:.1?} copy_out={:.1?} meter={:.1?} wait_answer={:.1?} helper={:.1?} rest(readback+compose)={:.1?} zc={} gpu_capture={gpu_capture_ms:.2}ms gpu_compose={gpu_compose_ms:.2}ms",
                         t.capture_wait,
                         t.copy_out,
                         t.meter,
@@ -1765,6 +1783,10 @@ pub unsafe fn run(
 /// zero-copy compose's device-local capture target (see `composition::gpu::GpuCompose`'s
 /// `zero_copy_capture_target`), which the compose that follows reads as the answer's base
 /// instead of a CPU copy of the frame.
+///
+/// `timer`, when `Some`, brackets the work with the slot's GPU timestamp pair (see
+/// [`crate::gpu_timer`]): the start right after the opening layout barrier, the end after the
+/// closing one. The caller marks the timer submitted only once the submission succeeds.
 #[allow(clippy::too_many_arguments)]
 fn record_capture_commands(
     device: &ash::Device,
@@ -1781,6 +1803,7 @@ fn record_capture_commands(
         vk::DescriptorSet,
         crate::composition::encode_pass::EncodePush,
     )>,
+    timer: Option<&crate::gpu_timer::GpuTimer>,
 ) -> bool {
     // SAFETY: `cmd` was allocated from a pool created with `RESET_COMMAND_BUFFER`.
     if unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
@@ -1818,6 +1841,13 @@ fn record_capture_commands(
             &[],
             &[to_transfer_src],
         );
+    }
+    if let Some(timer) = timer {
+        // SAFETY: `cmd` is recording, outside any render pass, on the queue family the slot (and
+        // its timer) was built for; the slot's previous submission was seen complete before
+        // this re-record. Started here, after the barrier that waits for the queue's earlier
+        // work, so the span is the capture's own (see `crate::gpu_timer`).
+        unsafe { timer.record_start(device, cmd) };
     }
     let region = vk::BufferImageCopy::builder()
         .buffer_offset(0)
@@ -1975,6 +2005,10 @@ fn record_capture_commands(
             &[to_present],
         );
     }
+    if let Some(timer) = timer {
+        // SAFETY: as for `record_start` above, which was recorded into this same `cmd`.
+        unsafe { timer.record_end(device, cmd) };
+    }
     unsafe { device.end_command_buffer(cmd) }.is_ok()
 }
 
@@ -2021,6 +2055,10 @@ struct PipelineSlot {
     /// invariant whose violation caused the 2026-09-12 UB regression documented in
     /// this project's history (`docs/history/development-before-neuralforge.md`).
     pending: Option<PendingCapture>,
+    /// This slot's GPU timestamp pair (see [`crate::gpu_timer`]), `None` when the queue family
+    /// cannot write timestamps. Read by [`poll_pipeline_capture`] when it sees the fence
+    /// signalled; built and destroyed with `buf`.
+    timer: Option<crate::gpu_timer::GpuTimer>,
 }
 
 /// A submitted pipeline capture: `(width, height, proxy_format, model_dims, submitted_at)`.
@@ -2083,6 +2121,9 @@ fn ensure_pipeline(
             if let Some(model) = &slot.model {
                 model.destroy(device, p.encode.as_ref());
             }
+            if let Some(timer) = &slot.timer {
+                timer.destroy(device);
+            }
         }
     }
     // After every set allocated from it has been freed above.
@@ -2107,9 +2148,13 @@ fn build_pipeline(
         unsafe { a.destroy(device) };
         return false;
     };
+    let timer = || crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family);
     *existing = Some(CapturePipeline {
         queue_family,
-        slots: [PipelineSlot { buf: a, model: None, pending: None }, PipelineSlot { buf: b, model: None, pending: None }],
+        slots: [
+            PipelineSlot { buf: a, model: None, pending: None, timer: timer() },
+            PipelineSlot { buf: b, model: None, pending: None, timer: timer() },
+        ],
         // Fail-open: `None` just means no encode, and the composition is told.
         encode: crate::composition::encode_pass::EncodePass::new(device),
     });
@@ -2183,6 +2228,10 @@ fn poll_pipeline_capture(
                 _ => None,
             };
             slot.pending = None;
+            if let Some(timer) = slot.timer.as_mut() {
+                // The fence just confirmed signalled covers the timestamp writes too.
+                timer.read_if_pending(device);
+            }
             (Some((width, height, proxy_format, submitted)), model_result)
         }
         Ok(false) => (None, None), // still in flight -- leave `pending`, check again next call
@@ -2262,6 +2311,7 @@ fn submit_pipeline_capture(
         height,
         model_dims,
         encode_dispatch.map(|(set, pass)| (pass, set, encode_push)),
+        slot.timer.as_ref(),
     ) {
         return false;
     }
@@ -2283,6 +2333,9 @@ fn submit_pipeline_capture(
         return false;
     }
     slot.pending = Some((width, height, proxy_format, model_dims.map(|(_, _, w, h)| (w, h)), std::time::Instant::now()));
+    if let Some(timer) = slot.timer.as_mut() {
+        timer.mark_submitted();
+    }
     true
 }
 
@@ -2345,6 +2398,9 @@ pub unsafe fn destroy_pipeline(pipeline: Option<CapturePipeline>, device: &ash::
                 if let Some(model) = &slot.model {
                     model.destroy(device, p.encode.as_ref());
                 }
+                if let Some(timer) = &slot.timer {
+                    timer.destroy(device);
+                }
             }
         }
         // After every set allocated from it was freed by the loop above.
@@ -2387,6 +2443,8 @@ pub struct DirectCapture {
     /// Same meaning as `PipelineSlot::pending`, for this capture's own single slot, plus the
     /// zero-copy capture target the submission also copied the frame into, if any.
     pending: Option<(u32, u32, u32, Option<vk::Buffer>, std::time::Instant)>,
+    /// Same as `PipelineSlot::timer`, read by [`poll_direct_capture`].
+    timer: Option<crate::gpu_timer::GpuTimer>,
 }
 
 /// Builds (or rebuilds, on a capacity/queue-family change) the one slot
@@ -2433,13 +2491,19 @@ unsafe fn ensure_direct_capture(
         }
         let d = existing.take().expect("checked above");
         // SAFETY: the fence was just confirmed signaled above (or was never pending).
-        unsafe { d.buf.destroy(device) };
+        unsafe {
+            d.buf.destroy(device);
+            if let Some(timer) = &d.timer {
+                timer.destroy(device);
+            }
+        }
     }
     // SAFETY: forwarded from this function's own contract.
     let Some(buf) = (unsafe { build_imported_capture_buffer(device, instance, physical_device, queue_family, host_ptr, capacity) }) else {
         return false;
     };
-    *existing = Some(DirectCapture { buf, pending: None });
+    let timer = crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family);
+    *existing = Some(DirectCapture { buf, pending: None, timer });
     true
 }
 
@@ -2456,6 +2520,10 @@ fn poll_direct_capture(direct: &mut DirectCapture, device: &ash::Device) -> Opti
     match crate::note_vk(unsafe { device.get_fence_status(direct.buf.fence) }) {
         Ok(true) => {
             direct.pending = None;
+            if let Some(timer) = direct.timer.as_mut() {
+                // The fence just confirmed signalled covers the timestamp writes too.
+                timer.read_if_pending(device);
+            }
             Some(dims)
         }
         Ok(false) => None,
@@ -2485,7 +2553,7 @@ fn submit_direct_capture(
     }
     // `working_scale` is not wired into the dma-buf path -- see `poll_or_submit_capture`'s
     // own doc comment on why.
-    if !record_capture_commands(device, direct.buf.cmd, image, initial_layout, direct.buf.buffer, original_dst, width, height, None, None) {
+    if !record_capture_commands(device, direct.buf.cmd, image, initial_layout, direct.buf.buffer, original_dst, width, height, None, None, direct.timer.as_ref()) {
         return false;
     }
     // SAFETY: `direct.buf.fence` is `pending: None` here -- either never used yet
@@ -2501,6 +2569,9 @@ fn submit_direct_capture(
         return false;
     }
     direct.pending = Some((width, height, proxy_format, original_dst, std::time::Instant::now()));
+    if let Some(timer) = direct.timer.as_mut() {
+        timer.mark_submitted();
+    }
     true
 }
 
@@ -2513,7 +2584,12 @@ fn submit_direct_capture(
 pub unsafe fn destroy_direct_capture(direct: Option<DirectCapture>, device: &ash::Device) {
     if let Some(d) = direct {
         // SAFETY: forwarded from this function's own contract.
-        unsafe { d.buf.destroy(device) };
+        unsafe {
+            d.buf.destroy(device);
+            if let Some(timer) = &d.timer {
+                timer.destroy(device);
+            }
+        }
     }
 }
 
@@ -3907,6 +3983,160 @@ mod tests {
         assert!(held.iter().all(|p| p.composed && !p.cpu_pair_empty), "frame hold composes from the CPU copies");
     }
 
+    /// Runs synchronous presents (the default mode) against a fake helper that answers at once,
+    /// until `composes` of them have composed, and returns the GPU timings the layer published
+    /// afterwards: `(capture, compose)` milliseconds. `direct` drives the direct capture
+    /// (`VK_EXT_external_memory_host` enabled on `device`), otherwise the capture pipeline. Tears
+    /// down everything it built, but not the device.
+    #[allow(clippy::too_many_arguments)]
+    fn published_gpu_ms_after_presents(
+        instance: &ash::Instance, physical_device: vk::PhysicalDevice, device: &ash::Device, queue: vk::Queue, queue_family: u32,
+        direct_capture: bool, composes: usize, tag: &str,
+    ) -> (f32, f32) {
+        let path = scratch_path(tag);
+        let _cleanup = RemoveScratch(path.clone());
+        let mut shm = ShmClient::default();
+        assert!(shm.test_open_at(&path));
+        let hdr_ptr = shm.test_header_ptr();
+        let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        assert_eq!(shm.published_gpu_ms(), (0.0, 0.0), "nothing is published before the first reading");
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_clone = Arc::clone(&stop);
+        let helper = std::thread::spawn(move || {
+            // SAFETY: the mapping outlives this thread (joined before the function returns).
+            let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
+            let mut last_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+            while !stop_clone.load(AtomicOrdering::Relaxed) {
+                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
+                if req != 0 && req != last_seen {
+                    last_seen = req;
+                    hdr.answered_w.store(hdr.width.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    hdr.answered_h.store(hdr.height.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
+                    hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
+                }
+                std::thread::sleep(Duration::from_micros(500));
+            }
+        });
+
+        let (width, height) = (64u32, 64u32);
+        let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
+        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
+        let (image, image_memory) = make_present_src_image(device, &mem_props, queue, pool, width, height);
+        let game_frame = test_game_frame(width, height);
+
+        let mut resources: Option<CaptureResources> = None;
+        let mut pipeline: Option<CapturePipeline> = None;
+        let mut direct: [Option<DirectCapture>; 2] = [None, None];
+        let mut gpu_compose: Option<crate::composition::gpu::GpuCompose> = None;
+        let (mut original_scratch, mut model_scratch, mut answer_scratch) = (Vec::new(), Vec::new(), Vec::new());
+        let (mut raw_answer_base, mut raw_answer_generation) = (Vec::new(), 0u64);
+        let (mut last_answer, mut last_answer_dims) = (Vec::new(), (0u32, 0u32));
+        let mut inflight: [Inflight; 2] = Default::default();
+        let mut bootstrap_complete = false;
+        let mut external_memory_host = direct_capture;
+
+        let mut composed = 0;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while composed < composes && Instant::now() < deadline {
+            upload_present_src(device, &mem_props, queue, pool, image, width, height, &game_frame);
+            // SAFETY: `image` is this test's own, currently `PRESENT_SRC_KHR`; one thread.
+            let sem = unsafe {
+                run(
+                    device, instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
+                    width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, &mut external_memory_host,
+                    &mut gpu_compose, &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete,
+                    &mut answer_scratch, &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
+                )
+            };
+            let Some(sem) = sem else {
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            };
+            composed += 1;
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let stage = vk::PipelineStageFlags::ALL_COMMANDS;
+            unsafe {
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
+                device.destroy_fence(wait_fence, None);
+            }
+        }
+        assert_eq!(composed, composes, "{tag}: the presents ran out of time");
+        if direct_capture {
+            assert!(direct[0].is_some() && pipeline.is_none(), "{tag}: must run on direct capture");
+        } else {
+            assert!(pipeline.is_some() && direct.iter().all(Option::is_none), "{tag}: must run on the capture pipeline");
+        }
+        let published = shm.published_gpu_ms();
+
+        stop.store(true, AtomicOrdering::Relaxed);
+        helper.join().unwrap();
+        unsafe {
+            device.device_wait_idle().unwrap();
+            device.destroy_image(image, None);
+            device.free_memory(image_memory, None);
+            device.destroy_command_pool(pool, None);
+            destroy(resources, device);
+            destroy_pipeline(pipeline, device);
+            for slot in direct {
+                destroy_direct_capture(slot, device);
+            }
+            if let Some(gpu) = gpu_compose {
+                gpu.destroy(device);
+            }
+        }
+        published
+    }
+
+    /// The per-present GPU timestamps reach the header: after a few synchronous presents, on the
+    /// capture pipeline and (where the device has `VK_EXT_external_memory_host`) on direct
+    /// capture, both the capture and the compose timing are positive and finite. The compose
+    /// is read back only when its async slot is reused, so this takes more composes than slots.
+    #[test]
+    fn gpu_timestamps_are_published_for_capture_and_compose() {
+        let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
+            eprintln!("gpu_timestamps_are_published_for_capture_and_compose: no Vulkan loader/ICD, skipping");
+            return;
+        };
+        let valid_bits = unsafe { instance.get_physical_device_queue_family_properties(physical_device) }[queue_family as usize].timestamp_valid_bits;
+        if valid_bits == 0 {
+            eprintln!("gpu_timestamps_are_published_for_capture_and_compose: queue family {queue_family} reports timestampValidBits 0, so the layer cannot time it; skipping");
+            unsafe {
+                device.destroy_device(None);
+                instance.destroy_instance(None);
+            }
+            return;
+        }
+        let composes = 4;
+        let (capture_ms, compose_ms) = published_gpu_ms_after_presents(&instance, physical_device, &device, queue, queue_family, false, composes, "gpu-ms-pipeline");
+        unsafe {
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+        assert!(capture_ms.is_finite() && capture_ms > 0.0, "pipeline capture GPU ms: {capture_ms}");
+        assert!(compose_ms.is_finite() && compose_ms > 0.0, "compose GPU ms: {compose_ms}");
+        assert!(capture_ms < 5_000.0 && compose_ms < 5_000.0, "a 64x64 frame cannot take seconds: {capture_ms} / {compose_ms}");
+
+        let Some((_entry, instance, physical_device, device, queue, queue_family, supported)) = test_device_with_external_memory_host() else { return };
+        if supported {
+            let (capture_ms, compose_ms) = published_gpu_ms_after_presents(&instance, physical_device, &device, queue, queue_family, true, composes, "gpu-ms-direct");
+            assert!(capture_ms.is_finite() && capture_ms > 0.0, "direct capture GPU ms: {capture_ms}");
+            assert!(compose_ms.is_finite() && compose_ms > 0.0, "zero-copy compose GPU ms: {compose_ms}");
+        } else {
+            eprintln!("gpu_timestamps_are_published_for_capture_and_compose: no VK_EXT_external_memory_host, direct capture not timed here");
+        }
+        unsafe {
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
     /// The synchronous one-shot path (`run_sync`, used for a capture dump): captures, waits for
     /// the helper's answer, composes it into the image and leaves the image presentable.
     /// Stage 1 now hands the image back in PRESENT_SRC_KHR before stage 2 takes it again, so an
@@ -4575,6 +4805,9 @@ mod tests {
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last = [0u32; 2];
             while !stop_clone.load(AtomicOrdering::Relaxed) {
+                // A helper whose heartbeat stands still reads as dead, and `run` then returns
+                // before capturing: without this the benchmark timed mostly no-op presents.
+                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 for slot in 0..2 {
                     let req = hdr.seq_req_slot(slot).load(AtomicOrdering::Relaxed);
                     if req != 0 && req != last[slot] {
