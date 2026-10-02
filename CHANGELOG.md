@@ -85,6 +85,9 @@ diagnostics. In detail:
     it cannot build) the model was applied nowhere for as long as DLSS ran. Such failures now count
     toward the circuit breaker, and after 8 in a row the after-the-upscaler path takes over
     again until a hold reaches the helper.
+  - layer (`NEURAL_FORGE_PIPELINED=1` only): a pre-upscaler request still in flight after its
+    hold gave up on it could later be read by the pipelined after-the-upscaler path as its own
+    answer; the layer now forgets that path's slot-0 answer whenever a hold starts a request.
   - layer: the DLSS submit on which DLSS's inputs are (re)identified is no longer held. Their
     layouts were not known yet (barriers are only tracked once the images are watched), and the
     hold assumed `GENERAL`; the next submit is held with the layouts tracked.

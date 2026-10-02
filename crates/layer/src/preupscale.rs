@@ -1512,6 +1512,14 @@ impl HoldResult {
         Self { miss: Some(why), local_failure: true, ..Default::default() }
     }
 
+    /// Whether the post path must forget its own slot-0 answer (`capture::Inflight::forget_answer`)
+    /// after this hold: it started a slot-0 request, so the answer region holds, or will hold once
+    /// a late answer lands, this path's answer. Not only after a write-back: a request left in
+    /// flight over budget would otherwise be read by the pipelined post path as its own answer.
+    pub(crate) fn claims_slot0(&self) -> bool {
+        self.request.is_some()
+    }
+
     /// Sets [`Self::local_failure`] for a finished hold: in model mode, a miss with no request
     /// started and no answer missing (those are the helper's: `over_budget`, `echoed`).
     pub(crate) fn mark_local(&mut self, mode: Mode) {
@@ -3772,6 +3780,13 @@ mod tests {
         let mut late = HoldResult { miss: Some("the answer was over budget"), over_budget: true, request: Some(3), ..Default::default() };
         late.mark_local(Mode::Model);
         assert!(!late.local_failure);
+        // A request left in flight over budget claims slot 0's answer as much as a written-back one
+        // (the pipelined post path would otherwise read the late answer as its own); a hold that
+        // never asked does not.
+        assert!(late.claims_slot0() && !late.wrote_back);
+        assert!(HoldResult { wrote_back: true, evaluated: true, request: Some(4), ..Default::default() }.claims_slot0());
+        assert!(!HoldResult { wrote_back: true, ..Default::default() }.claims_slot0(), "identity");
+        assert!(!exposure.claims_slot0());
         let mut unstarted = HoldResult { miss: Some("the request could not be started"), over_budget: true, ..Default::default() };
         unstarted.mark_local(Mode::Model);
         assert!(!unstarted.local_failure, "the helper's side, counted as a late answer already");

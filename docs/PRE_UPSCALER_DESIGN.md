@@ -1168,6 +1168,10 @@ has a test that fails without its fix. None of it is run on the rig yet.
     reaching the helper (...); the post-upscaler compose runs again until a hold does`), so the post
     path takes over while DLSS runs. `preupscale_state` 3 ("paused") is only published while the
     device is engaged (the post path off); otherwise it is 1.
+- **A late pre-path request read as a post-path answer** (`NEURAL_FORGE_PIPELINED=1` only;
+  `device.rs`). `inflight[0].forget_answer()` ran only after a write-back, so a request a hold left
+  in flight (over budget) could later be read by the resumed pipelined post path as an 8-bit
+  answer of its own size. It now runs whenever a hold started a slot-0 request.
 - **A rebuild after a frame-key change opened the breaker** (`ngx::maintain_passes`,
   `rebuild::after_key_change`). Releasing the features for a new key (DLSS render resolution or
   quality, an SDR/HDR switch) set the next build a full spacing (250 ms) later, while `model_up`

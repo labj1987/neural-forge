@@ -1022,9 +1022,9 @@ impl NeuralForgeDeviceInfo {
             consumed
         });
         if let Some((mut hold, cpu)) = held {
-            if hold.wrote_back && mode == Mode::Model {
-                // Slot 0's answer region now holds the pre-upscaler answers: the synchronous present
-                // must not carry its own last answer onto a later frame.
+            if hold.claims_slot0() {
+                // Slot 0's answer region now holds (or, for a late answer, will hold) the
+                // pre-upscaler answer: neither present path may take it for its own.
                 inflight[0].forget_answer();
             }
             hold.mark_local(mode);
