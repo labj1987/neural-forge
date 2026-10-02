@@ -34,13 +34,13 @@ fn usage() {
 }
 
 /// Extra fields worth real `set`/`toggle` access beyond what `persisted_settings`
-/// covers. Just `capture_request` now -- `debug_view`/`apply_model`/`compare_mode`/
-/// `hold_frame` moved into `persisted_settings` itself on 2026-09-10 (so a GUI change
-/// to any of them now survives a reboot too), leaving this for the one field that
-/// genuinely isn't a persisted preference: a one-shot trigger, not a setting.
+/// covers: the one-shot `capture_request` trigger, and `scene_cut_mode`, an A/B knob
+/// deliberately kept out of `config.ini` so a later change of its default is not pinned
+/// by an old saved value.
 fn extra_field<'a>(header: &'a ShmHeader, name: &str) -> Option<(&'a std::sync::atomic::AtomicU32, bool)> {
     Some(match name {
         "capture_request" => (&header.capture_request, false),
+        "scene_cut_mode" => (&header.scene_cut_mode, false),
         _ => return None,
     })
 }
@@ -70,9 +70,12 @@ fn cmd_status(header: &ShmHeader) {
     let layer_frames = (u64::from(header.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.layer_frames_lo.load(Ordering::Relaxed));
     println!("layer_frames={layer_frames}");
     println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
+    println!("layer_capture_gpu_ms={}", f32::from_bits(header.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)));
+    println!("layer_compose_gpu_ms={}", f32::from_bits(header.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)));
     println!("layer_measured_white={}", f32::from_bits(header.layer_measured_white_bits.load(Ordering::Relaxed)));
     println!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed));
     println!("capture_request={}", header.capture_request.load(Ordering::Relaxed));
+    println!("scene_cut_mode={}", header.scene_cut_mode.load(Ordering::Relaxed));
     println!("# settings (neural_forge_protocol::ShmHeader::persisted_settings)");
     for (name, is_float, bits) in header.persisted_settings() {
         if is_float {

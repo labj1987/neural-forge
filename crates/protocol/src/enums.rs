@@ -153,3 +153,11 @@ pub mod mvec_quality {
     pub const BALANCED: u32 = 1;
     pub const QUALITY: u32 = 2;
 }
+
+/// How the helper decides a model frame starts a new scene (`ShmHeader::scene_cut_mode`).
+pub mod scene_cut_mode {
+    /// Mean luma difference against a fixed threshold.
+    pub const FIXED: u32 = 0;
+    /// The same mean against a running baseline of recent frames.
+    pub const RUNNING_BASELINE: u32 = 1;
+}

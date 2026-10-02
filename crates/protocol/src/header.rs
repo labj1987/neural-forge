@@ -318,6 +318,21 @@ pub struct ShmHeader {
     /// 2 skips the model on roughly the generated half and carries the last answer onto them
     /// (ghost guard applied), instead of making every generated frame wait for its own answer.
     pub model_interval: AtomicU32,
+
+    // --- v8 ------------------------------------------------------------------------------
+    /// GPU milliseconds of the layer's capture copy on the last capture whose timestamps were
+    /// read back (f32 bits). Measured with a timestamp pair in the capture slot's own command
+    /// buffer and read when that slot's fence is next found signalled, so it lags a capture
+    /// or two and never stalls. 0 until the first reading.
+    pub layer_capture_gpu_ms_bits: AtomicU32,
+    /// GPU milliseconds of the layer's compose dispatch, measured the same way per async
+    /// compose slot (f32 bits). 0 until the first reading.
+    pub layer_compose_gpu_ms_bits: AtomicU32,
+    /// How the helper decides a frame is a scene cut. 0: a fixed mean-luma threshold between
+    /// consecutive model frames. 1: a running baseline of that mean, so a steady pan that
+    /// changes every pixel a little does not read as a cut. See
+    /// [`crate::enums::scene_cut_mode`]. Not persisted: an A/B knob, not a preference.
+    pub scene_cut_mode: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -343,7 +358,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1988, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2000, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -359,6 +374,11 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1952, "layou
 const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1972, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1980, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1984, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(
+    std::mem::offset_of!(ShmHeader, layer_capture_gpu_ms_bits) == 1988,
+    "layout changed -- bump SHM_VERSION"
+);
+const _: () = assert!(std::mem::offset_of!(ShmHeader, scene_cut_mode) == 1996, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
@@ -423,6 +443,7 @@ impl ShmHeader {
         self.colour_trust_bits.store(2.0f32.to_bits(), Ordering::Relaxed);
         self.ratio_smooth_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.model_interval.store(1, Ordering::Relaxed);
+        self.scene_cut_mode.store(crate::enums::scene_cut_mode::FIXED, Ordering::Relaxed);
         self.scaling_downscaler.store(crate::enums::downscaler::LANCZOS3, Ordering::Relaxed);
 
         self.helper_state.store(crate::enums::helper_state::STOPPED, Ordering::Relaxed);
@@ -444,6 +465,8 @@ impl ShmHeader {
         self.layer_format.store(0, Ordering::Relaxed);
         self.layer_composition_up.store(0, Ordering::Relaxed);
         self.layer_ms_bits.store(0, Ordering::Relaxed);
+        self.layer_capture_gpu_ms_bits.store(0, Ordering::Relaxed);
+        self.layer_compose_gpu_ms_bits.store(0, Ordering::Relaxed);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
