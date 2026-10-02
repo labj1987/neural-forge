@@ -1236,17 +1236,19 @@ Deterministic and independent of kernel names: a launch-bearing command buffer i
 only if one of its launches **names the identified colour input**.
 
 - The layer keeps the value each `vkGetImageViewHandleNVX`/`vkGetImageViewHandle64NVX` returned (and
-  each `vkGetImageViewAddressNVX` address) for the colour-input candidates (registered RGBA16F
-  storage images).
+  each `vkGetImageViewAddressNVX` address) for every registered view (since the second review: it
+  was the colour-input candidates only).
 - At `vkCmdCuLaunchKernelNVX` it reads (never writes) the launch's parameter buffer when it is in
   CUDA's "extra" form, the one vkd3d-proton uses for DXVK-NVAPI's `LaunchCubinShader`
   (`pExtras = {BUFFER_POINTER, buf, BUFFER_SIZE, &size, END}`, walked to its END, at most 4 pairs, up
   to 4 KiB; `preupscale::launch_params`), and notes which candidates' handles appear among its 8-byte
   words (a CUDA surface object is a 64-bit kernel parameter, 8-byte aligned).
 - At the submit (`Tracker::scan`, `LaunchRefs::kind`): a buffer whose launches name the colour input
-  is **Colour** (held); a buffer whose launches were all readable and never name it is **Foreign**
-  (forwarded untouched: DLSS FG's, or any other NGX feature's); a buffer with an unreadable launch,
-  or any launch before the colour input is identified, is **Unknown** and held as before, so nothing
+  is **Colour** (held); a buffer whose launches were all readable, name registered views, and never
+  the colour input is **Foreign** (forwarded untouched: DLSS FG's, or any other NGX feature's); a
+  buffer with an unreadable launch, one whose parameters name no registered view at all (a handle
+  form the 8-byte scan misses must not turn SR's own buffer into a forwarded one), or any launch
+  before the colour input is identified, is **Unknown** and held as before, so nothing
   that held before stops holding. The first Colour buffer in the submit is the split point, also when
   a Foreign buffer comes first.
 - Logged once per kind (`a launch-bearing submit reads DLSS's colour input ...`, `... never name

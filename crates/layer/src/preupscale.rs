@@ -381,8 +381,9 @@ pub(crate) struct Tracker {
     /// through executed secondaries), with what their launches' parameters referenced.
     launch: HashMap<vk::CommandBuffer, LaunchRefs>,
     /// The values a view registration returned (`vkGetImageViewHandle*NVX` handles,
-    /// `vkGetImageViewAddressNVX` addresses), for the colour-input candidates only (registered
-    /// RGBA16F storage images): what a kernel parameter buffer that reads one of them carries.
+    /// `vkGetImageViewAddressNVX` addresses), for every registered view: what a kernel parameter
+    /// buffer that reads one of them carries. A launch counts as someone else's only when it names
+    /// a registered view and none of them is the colour input.
     keys: Vec<(u64, vk::ImageView, vk::Image)>,
     /// Launch-bearing submits whose buffers all had readable parameters none of which named the
     /// colour input (DLSS Frame Generation's, in GTA V), forwarded untouched.
@@ -440,7 +441,7 @@ impl Scan {
 pub(crate) struct LaunchRefs {
     /// A launch whose parameter buffer could not be read.
     pub opaque: bool,
-    /// Colour-input candidates whose registered handle (or address) is in a launch's parameters.
+    /// Registered images whose handle (or address) is in a launch's parameters.
     pub images: Vec<vk::Image>,
 }
 
@@ -449,11 +450,13 @@ pub(crate) struct LaunchRefs {
 pub(crate) enum LaunchKind {
     /// A launch reads the identified colour input: DLSS Super Resolution's buffer, the hold point.
     Colour,
-    /// Every launch's parameters were read and none names the colour input (DLSS Frame Generation's
-    /// buffers in GTA V): forwarded untouched.
+    /// Every launch's parameters were read, they name registered views, and none of them is the
+    /// colour input (DLSS Frame Generation's buffers in GTA V): forwarded untouched.
     Foreign,
-    /// Not decidable (a launch's parameters were not readable, or no colour input is identified
-    /// yet): held as before the distinction existed, so nothing that worked stops working.
+    /// Not decidable (a launch's parameters were not readable or name no registered view at all,
+    /// or no colour input is identified yet): held as before the distinction existed, so nothing
+    /// that worked stops working, and a handle form the scan misses cannot turn DLSS Super
+    /// Resolution's own buffer into a forwarded one.
     Unknown,
 }
 
@@ -461,7 +464,7 @@ impl LaunchRefs {
     pub(crate) fn kind(&self, colour: Option<vk::Image>) -> LaunchKind {
         match colour {
             Some(c) if self.images.contains(&c) => LaunchKind::Colour,
-            Some(_) if !self.opaque => LaunchKind::Foreign,
+            Some(_) if !self.opaque && !self.images.is_empty() => LaunchKind::Foreign,
             _ => LaunchKind::Unknown,
         }
     }
@@ -472,7 +475,7 @@ impl LaunchRefs {
 /// saw `params=0 extras=1` on every launch): `pExtras` is the END-terminated list
 /// `{BUFFER_POINTER (1), buffer, BUFFER_SIZE (2), &size, END (0)}`. vkd3d-proton passes
 /// `extraCount = 1`, CUDA's convention being the terminator, so the list is walked to its END (at
-/// most 4 pairs). The size is read as 32 bits (vkd3d-proton's is a 32-bit value; on little-endian
+/// most 4 pairs; a larger `extraCount` also bounds the walk). The size is read as 32 bits (vkd3d-proton's is a 32-bit value; on little-endian
 /// that is also the low half of a `size_t`). `None` for anything else: no extras, an unknown key,
 /// no buffer, or a size of 0 or over 4 KiB. The buffer is only read, never changed, and only during
 /// the application's call.
@@ -487,8 +490,12 @@ pub(crate) unsafe fn launch_params<'a>(extras: *const *const c_void, extra_count
     let (mut buffer, mut size) = (std::ptr::null::<u8>(), None);
     let mut i = 0;
     loop {
-        if i > 8 {
+        if i >= 8 {
             return None;
+        }
+        // An explicit count larger than CUDA's terminator convention ends the list there.
+        if extra_count > 1 && i >= extra_count {
+            break;
         }
         // SAFETY: the list is END-terminated (caller); every read is at or before the terminator
         // or the value that follows a key.
@@ -553,11 +560,7 @@ impl Tracker {
             if self.registered.insert(view, image) != Some(image) {
                 self.dirty = true;
             }
-            let candidate = self
-                .images
-                .get(&image)
-                .is_some_and(|d| d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::STORAGE));
-            if let Some(key) = key.filter(|&k| k != 0 && candidate) {
+            if let Some(key) = key.filter(|&k| k != 0) {
                 if !self.keys.iter().any(|k| k.0 == key) {
                     self.keys.push((key, view, image));
                 }
@@ -575,7 +578,7 @@ impl Tracker {
 
     /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`; `params` is the launch's kernel
     /// parameter buffer when it could be read ([`launch_params`]), `None` otherwise. Every 8-byte
-    /// word of it is compared with the colour-input candidates' registered handles and addresses.
+    /// word of it is compared with the registered views' handles and addresses.
     pub(crate) fn launch(&mut self, command_buffer: vk::CommandBuffer, params: Option<&[u8]>) {
         let refs = self.launch.entry(command_buffer).or_default();
         let Some(bytes) = params else {
@@ -3440,8 +3443,16 @@ mod tests {
         // A destroyed colour view drops its key: its handle no longer matches anything.
         t.forget_view(vk::ImageView::from_raw(0x101));
         assert!(t.keys.iter().all(|k| k.2 != vk::Image::from_raw(0x100)));
-        // Only RGBA16F storage images are keys: depth's handle never marks a buffer.
-        assert!(t.keys.iter().all(|k| k.2 != vk::Image::from_raw(0x400)));
+        // Every registered view is a key: a launch naming only depth is someone else's, but a
+        // launch whose readable parameters name no registered view at all stays undecided (held),
+        // so a handle form the scan misses cannot turn Super Resolution's own buffer into a
+        // forwarded one.
+        let (mut t, [_, _, _, depth, _]) = fg_tracker();
+        t.launch(cb(5), Some(&param_block(&[depth])));
+        assert_eq!(t.launch[&cb(5)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
+        t.launch(cb(6), Some(&param_block(&[0xdead_beef_0000])));
+        assert_eq!(t.launch[&cb(6)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
+        assert!(t.scan(&[vec![cb(6)]]).is_some(), "names nothing registered: held as before");
     }
 
     #[test]

@@ -1619,7 +1619,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn cmd_cu_launch_kernel_nvx(&self, command_buffer: vk::CommandBuffer, launch_info: &vk::CuLaunchInfoNVX) -> LayerResult<()> {
-        // Records counts and dimensions only; `pParams`/`pExtras` are never read.
+        // The probe records counts and dimensions only. The pre-upscaler tracker reads `pExtras`
+        // (CUDA's buffer form, `preupscale::launch_params`) to tell whose launch this is; `pParams` is
+        // never read.
         if crate::probe_ngx::enabled() {
             crate::probe_ngx::on_launch(command_buffer, launch_info);
         }
