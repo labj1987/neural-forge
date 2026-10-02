@@ -58,8 +58,11 @@ before touching that either. Do not lower model resolution or disable the helper
 without explicit user authorization.
 
 Do not reapply the reverted capture/composition fence changes. Validate actual GPU
-operations and establish matched upstream/NeuralForge measurements before performance
-changes. Keep the Rust implementation independent; review licenses before source reuse.
+operations and measure before and after every performance change. The matched comparator
+is the 1.0.1 baseline in docs/HARDWARE_VALIDATION.md ("2.0 baseline"), taken with
+`scripts/gta-bench.sh` and mods off; upstream was removed from the rig (see
+docs/FRAMEGEN_SPIKE.md, "What broke and why"). Keep the Rust implementation independent;
+review licenses before source reuse.
 
 Current target-machine evidence and unresolved Vulkan errors are in
 [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).

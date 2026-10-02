@@ -639,8 +639,13 @@ impl ShmClient {
         // the game's presents must never stall for ten. A slow first answer costs a
         // timeout that the retry logic below absorbs; the async path (`begin_async_request`)
         // keeps the longer warm-up allowance because it never blocks.
+        // Tests answer from a thread that an oversubscribed CI runner (lavapipe rendering
+        // other tests on every core) can starve for over a second, which turned a slow
+        // answer into a flaky failure; their budget only bounds how long a broken test hangs.
         let budget = if !helper_present {
             Duration::from_millis(20)
+        } else if cfg!(test) {
+            Duration::from_secs(30)
         } else {
             Duration::from_secs(1)
         };

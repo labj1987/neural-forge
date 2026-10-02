@@ -250,6 +250,33 @@ Needs `mingw-w64` and the GTK4/libadwaita dev packages; see `build-appimage.sh` 
 exact package list. `CLAUDE.md` covers toolchain gotchas in detail if you're
 cross-compiling the Windows helper on a machine with its own non-rustup Rust install.
 
+### Benchmarking
+
+Performance changes are measured with GTA V Enhanced's built-in benchmark, run
+unattended on the test machine by `scripts/gta-bench.sh` and summarised by
+`scripts/bench-report.py`. Both run on the test machine, or from the dev machine with
+`--host <host>`. Steam must be running there. Each configuration is run three times
+and reported as the mean of pass 4 (the long free-roam pass): real fps from GTA's own
+frame-time file, displayed fps from MangoHud below any frame generator, GPU
+utilisation from `nvidia-smi`, and the medians of the layer's `[sync]` lines.
+
+```bash
+M='WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'   # GTA's script mods off for every run
+scripts/gta-bench.sh --host lordnikon nroff-1 '' "$M"
+scripts/gta-bench.sh --host lordnikon --set model_interval=2 i2-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 "$M"
+scripts/bench-report.py --host lordnikon --mean i2-1 i2-2 i2-3
+```
+
+The model resolution (`working_scale`) is set per run, never left lowered: pass
+`--set working_scale=0.66`, which sets it with `neural-forge-cli shmctl set` before the
+launch and restores the previous value afterwards, printing what `shmctl status` reports
+both times. Set by hand, it is
+`neural-forge-cli shmctl set working_scale 0.66`, then `shmctl set working_scale 1` and a
+`shmctl status` check when the run ends. GTA renders at the desktop's size under Proton,
+so a 4K run needs the desktop switched to 3840x2160 at scale 1.0 first (temporarily, with
+`gdctl set`). A connected remote desktop session costs about 8 fps; the runner warns
+when one is open.
+
 ## Legal
 
 `nvngx_dlssnr.dll` checks which module is calling into it and refuses to run outside
