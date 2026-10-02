@@ -1,9 +1,9 @@
-# Running the model before the game's upscaler: design (needs Alex's go-ahead)
+# Running the model before the game's upscaler: design
 
-Status: **proposal, 2026-10-02. Nothing here is built.** It follows from the probe in
-`docs/PRE_UPSCALER_PROBE.md`. The 2.0 plan said a positive probe stops the program here until
-Alex decides; Phases 2 and 3 (working scale on the zero-copy path, the pipelined present) are
-paused until then.
+Status: **approved 2026-10-02; the layer side is built** (behind `NEURAL_FORGE_PREUPSCALE`, off
+by default, see "Implementation (layer)" at the end). It follows from the probe in
+`docs/PRE_UPSCALER_PROBE.md`. The helper side (RGBA16F input, `DLSSNR.Hdr=1`) is a separate
+change. Nothing here is measured on the rig yet (E1-E3 below).
 
 ## What the probe established (GTA V Enhanced, 2560x1440, DLSS SR on)
 
@@ -171,3 +171,112 @@ path unchanged, so nothing is lost for other games or for DLAA/native settings.
    cheaper working scale at 4K, the pipelined present).
 
 1.1.0 (measurement tools, timestamps, log rotation, the probe) ships either way.
+
+## Implementation (layer)
+
+Built 2026-10-02 in `crates/layer/src/preupscale.rs`, wired into `device.rs`, `lib.rs` and
+`entry_points.rs`. Not yet run on the rig: everything below about GTA is what the code expects
+from the probe, not a measurement.
+
+### Modes
+
+`NEURAL_FORGE_PREUPSCALE` (with `NEURAL_FORGE_ENABLE=1`):
+
+| Value | What happens at the DLSS submit |
+|---|---|
+| unset / `off` | Nothing. The hooked-command list, the resolved entry points and every hot path are as before; no waits are added anywhere. |
+| `dump` | Once (the first hold after the colour input is identified and the depth and motion-vector layouts are known from the game's barriers, normally a frame later; after 120 DLSS submits without them, colour only), and again for each `shmctl capture` (`capture_request=1`): capture colour, depth and motion vectors, forward the game's submit unchanged, and write `~/.local/share/neural-forge/captures/preupscale-<ms>/` with `colour.rgba16f` (padded size), `depth.r32f` (`depth.raw` for a non-float depth), `mvec.rg16f`, `meta.json` (width, height, padded size, formats, frame number) and `colour-preview.png` (`x/(1+x)` per channel, sRGB-encoded). Files are written off the submit thread. |
+| `identity` | Capture the colour input into slot 0's proxy region, then copy the same bytes back into it. The helper is not called. Measures the hold's own cost; the picture must be unchanged. |
+| `model` | Capture, hand the frame to the helper (`width` = padded width, `proxy_format` = RGBA16F), wait up to 30 ms (or until the helper stops being alive), copy the answer back into the colour input with the padding cropped. Every frame (`model_interval` is ignored). With `enabled` off (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported unavailable, nothing is held. |
+
+Any non-off mode turns on the NVX tracking (the probe's hooks, production-grade, without its
+logging): `vkCreateImage`/`vkCreateImageView` descriptions, views registered through
+`vkGetImageViewHandleNVX`/`vkGetImageViewHandle64NVX`/`vkGetImageViewAddressNVX`, command buffers
+that record `vkCmdCuLaunchKernelNVX` (also through executed secondaries, cleared at
+`vkBeginCommandBuffer`/`vkFreeCommandBuffers`), and the identified images' layouts from barriers,
+committed in submission order. `NEURAL_FORGE_PROBE_NGX` still controls the probe's own lines.
+
+### Identification
+
+At a launch-bearing submit, when the registered set or the swapchains changed: the colour input is
+the registered RGBA16F storage image (2D, single-sample) whose extent equals a registered depth
+image's, with a registered RG16F image of the same extent, and smaller than the largest swapchain
+(DLAA is refused that way). Several candidates: lowest handles. Logged once per change:
+`[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ...`
+or `[preupscale] no DLSS input among N registered views ...; waiting`.
+
+### The hold
+
+At `vkQueueSubmit`/`vkQueueSubmit2`, the first command buffer marked launch-bearing is the hold
+point (one hold per call, one at a time per device: the device's state lock is held throughout).
+The call is re-issued through the next layer as: the batches before the launch batch plus, if the
+launch buffer is not first in its batch, the buffers before it with the batch's wait semaphores
+(no fence); the layer's capture batch (carrying the launch batch's wait semaphores when the launch
+buffer was first, timeline values kept, stage masks widened to `ALL_COMMANDS`); the write-back
+batch; then the launch buffer onward with the batch's signal semaphores, the call's later batches,
+and the application's fence. Batches without a launch buffer are unchanged. `VkSubmitInfo` pNext
+chains other than `VkTimelineSemaphoreSubmitInfo`, and `VkSubmitInfo2` chains other than a latency
+present id, a performance-query pass or a frame-boundary marker, are not held (logged once).
+The module doc comment of `preupscale.rs` has the full dependency-chain argument.
+
+The capture copies the colour input (in `GENERAL`, no layout change) into slot 0's proxy region,
+imported as a buffer (`VK_EXT_external_memory_host`, zero-copy; a mapped buffer of the layer's own
+plus a CPU copy when the import is unavailable), at the padded size: an odd width gets its last
+column duplicated into the padding column, an odd height its last row (4K Balanced is 2227x1253).
+The capture fence is waited on (bounded, `note_fence_wait`); the write-back is not, its fence is
+checked at the next hold or before the post-upscaler path next runs. Capture and write-back carry
+GPU timestamps. A hold is skipped (frame forwarded untouched) when: the layer is not engaged yet
+(loading screens), the colour input's last committed barrier left it outside `GENERAL`, a slot-0
+request is still with the helper (the post path's, or a hold that ran over budget), the post
+path's zero-copy capture is still writing slot 0, or anything fails.
+
+In model mode, while a hold happened in the last 500 ms the post-upscaler compose is skipped for
+that device's presents (the game's frame is presented as DLSS made it), so the model is not
+applied twice. Without holds (DLSS off, DLAA, a game without DLSS, the toggle off) the post path
+runs exactly as before.
+
+### Running it on the rig
+
+Select DLSS at Quality or Balanced (not DLAA) with frame generation off, then:
+
+```bash
+scripts/gta-bench.sh --host lordnikon preupscale-dump VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=dump 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+```
+
+```bash
+scripts/gta-bench.sh --host lordnikon preupscale-identity VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+```
+
+```bash
+scripts/gta-bench.sh --host lordnikon preupscale-model VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=model 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+```
+
+Model mode needs a helper that accepts an RGBA16F proxy (`DLSSNR.Hdr=1`); with one that refuses
+it, every hold is a miss and the frame goes to DLSS untouched. For identity, the post-upscaler
+path still runs unless NR is off (`--set enabled=0`), so set that to measure the hold alone.
+
+What to look for in the launch log (`grep -F '[preupscale]'`):
+
+- `[preupscale] mode <mode> in pid N` and `[preupscale] device ...: vkGetImageViewHandleNVX present, ..., vkQueueSubmit2 present`.
+- The identification line (above).
+- `[preupscale] resources for WxH (padded PWxPH) built: zero-copy (SHM regions imported)`.
+- Model mode: `the model runs before the upscaler; the post-upscaler compose is off while frames are held`.
+- Every 300 holds: `[preupscale] mode=... extent=WxH (padded ...) holds=N hold_ms median=... capture_gpu_ms median=... writeback_gpu_ms median=... misses=... (total ...)`.
+- Misses, at most one line per 5 s: `[preupscale] frame went to DLSS untouched: <why> (...)`.
+- Dump mode: `[preupscale] dump of the DLSS input (WxH, frame N) written to <dir>: colour.rgba16f, depth.r32f, mvec.rg16f, colour-preview.png, meta.json`.
+
+`neural-forge-cli shmctl status` shows `preupscale_state` (0 off, 1 waiting for DLSS input,
+2 holding), `preupscale_extent`, `preupscale_hold_ms` (the last hold's CPU time) and
+`preupscale_misses` (shared-memory protocol 9).
+
+### Not verified without NVX hardware
+
+The tests run the split, the identification and the hold machinery itself (lavapipe and the local
+GPU, with validation and synchronization validation clean), but no device here has
+`VK_NVX_image_view_handle`/`VK_NVX_binary_import`, so the following is untested until the rig run:
+that GTA's registrations and launches arrive as the probe saw them through these hooks; the launch
+buffer's position in its batch; whether vkd3d-proton's launch-bearing `VkSubmitInfo2` carries a
+pNext structure outside the accepted list; how long the capture fence wait is in practice (it also
+drains everything queued before it); and whether vkd3d-proton's waits are ever wait-before-signal
+on a timeline the same thread signals later (the bounded 5 s wait would then stall once and fail
+open).

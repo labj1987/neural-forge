@@ -94,9 +94,15 @@ pub struct NeuralForgeDeviceInfo {
     next_get_device_queue: Option<vk::PFN_vkGetDeviceQueue>,
     next_get_device_queue2: Option<vk::PFN_vkGetDeviceQueue2>,
     next_create_image: Option<vk::PFN_vkCreateImage>,
-    /// The next layer's entry points the `NEURAL_FORGE_PROBE_NGX` probe forwards through;
-    /// `None` (never resolved) when the probe is off.
+    /// The next layer's entry points the `NEURAL_FORGE_PROBE_NGX` probe and the
+    /// `NEURAL_FORGE_PREUPSCALE` tracking forward through; `None` (never resolved) when both are off.
     probe_next: Option<ProbeNext>,
+    /// The pre-upscaler path's view/launch tracking (`crate::preupscale`); `None` when its mode is
+    /// off, which is the only check the always-hooked commands make.
+    preupscale: Option<Arc<crate::preupscale::Tracking>>,
+    /// The next layer's `vkQueueSubmit2` (or `vkQueueSubmit2KHR`), resolved only with a
+    /// pre-upscaler mode on: a held `vkQueueSubmit2` is re-issued through it.
+    next_queue_submit2: Option<vk::PFN_vkQueueSubmit2>,
     state: Arc<Mutex<State>>,
     tracker: Mutex<TapTracker>,
 }
@@ -223,6 +229,8 @@ struct State {
     engaged_swapchains: HashSet<vk::SwapchainKHR>,
     /// A running `capture_request = N` frame series (see `crate::series`).
     series: crate::series::Series,
+    /// The pre-upscaler path's resources and statistics (`crate::preupscale`); empty when off.
+    preupscale: crate::preupscale::Session,
 }
 
 impl State {
@@ -237,10 +245,11 @@ impl State {
     /// synchronized, which a swapchain hook cannot guarantee (a vkd3d-proton title may be
     /// submitting on another queue from a worker thread while it recreates the
     /// swapchain), and it stalls the whole GPU on every recreate.
-    fn drain_layer_work(&self, device: &ash::Device) -> bool {
+    fn drain_layer_work(&mut self, device: &ash::Device) -> bool {
         let captures = capture::wait_in_flight(self.capture_pipeline.as_ref(), &self.direct_capture, device);
         let composes = self.gpu_compose.as_ref().is_none_or(|gpu| gpu.wait_in_flight(device));
-        captures && composes
+        let holds = self.preupscale.drain(device);
+        captures && composes && holds
     }
 }
 
@@ -558,7 +567,7 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     let owned = CLEANUP.lock().unwrap().remove(&handle);
     if let Some((device, state)) = owned {
         let mut state = state.lock().unwrap();
-        if state.capture.is_some() || state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() {
+        if state.capture.is_some() || state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || state.preupscale.res.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     unsafe { capture::destroy(state.capture.take(), &device); }
@@ -572,6 +581,8 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                     // SAFETY: device is idle (or lost) and the application's swapchains are
                     // gone, so no present still waits on a relay semaphore.
                     unsafe { state.relay_semaphores.destroy(&device); }
+                    // SAFETY: the device is idle (or lost): no hold's submission is pending.
+                    unsafe { state.preupscale.destroy(&device); }
                 }
                 Err(error) => crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources", error),
             }
@@ -619,6 +630,27 @@ fn note_present_rate(composited: bool) {
         );
         crate::logging::flush();
         *rate = Some((now, 0, 0));
+    }
+}
+
+/// Whether the present hook last judged the game to be rendering steadily (`swapchain::Warmup`).
+/// Holds (`crate::preupscale`) only happen while it is: loading screens are where engaging froze.
+static PRESENTING_STEADILY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+fn presenting_steadily() -> bool {
+    PRESENTING_STEADILY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `len` elements at `ptr`, or an empty slice for a zero count or a null pointer.
+///
+/// # Safety
+/// A non-null `ptr` must be valid for `len` elements for the returned lifetime.
+unsafe fn preupscale_slice<'a, T>(ptr: *const T, len: u32) -> &'a [T] {
+    if len == 0 || ptr.is_null() {
+        &[]
+    } else {
+        // SAFETY: forwarded from this function's contract.
+        unsafe { std::slice::from_raw_parts(ptr, len as usize) }
     }
 }
 
@@ -695,10 +727,30 @@ impl NeuralForgeDeviceInfo {
         // on the framework's own path its extension list is already freed here.
         // SAFETY: as above.
         let create_image = unsafe { resolve::<vk::PFN_vkCreateImage>(next_get_device_proc_addr, handle, c"vkCreateImage") };
-        // SAFETY: as above. Resolved only with the probe on, so a default run makes exactly
-        // the queries it always made.
-        let probe_next = crate::probe_ngx::enabled().then(|| unsafe { ProbeNext::resolve(next_get_device_proc_addr, handle) });
-        if let Some(next) = &probe_next {
+        // SAFETY: as above. Resolved only with the probe or a pre-upscaler mode on, so a default
+        // run makes exactly the queries it always made.
+        let preupscale_on = crate::preupscale::active();
+        let probe_next = (crate::probe_ngx::enabled() || preupscale_on).then(|| unsafe { ProbeNext::resolve(next_get_device_proc_addr, handle) });
+        // SAFETY: as above; `vkQueueSubmit2` and its KHR alias share the PFN type.
+        let next_queue_submit2 = if preupscale_on {
+            unsafe {
+                resolve::<vk::PFN_vkQueueSubmit2>(next_get_device_proc_addr, handle, c"vkQueueSubmit2")
+                    .or_else(|| resolve::<vk::PFN_vkQueueSubmit2>(next_get_device_proc_addr, handle, c"vkQueueSubmit2KHR"))
+            }
+        } else {
+            None
+        };
+        let preupscale = preupscale_on.then(|| crate::preupscale::Tracking::new_for(handle));
+        if let (true, Some(next)) = (preupscale_on, &probe_next) {
+            crate::log!(
+                "[preupscale] device {:?}: vkGetImageViewHandleNVX {}, vkGetImageViewAddressNVX {}, vkQueueSubmit2 {}",
+                handle,
+                if next.get_image_view_handle_nvx.is_some() { "present" } else { "absent" },
+                if next.get_image_view_address_nvx.is_some() { "present" } else { "absent" },
+                if next_queue_submit2.is_some() { "present" } else { "absent" },
+            );
+        }
+        if let Some(next) = probe_next.as_ref().filter(|_| crate::probe_ngx::enabled()) {
             crate::log!(
                 "[probe-ngx] device {:?}: vkGetImageViewHandleNVX {}, vkGetImageViewAddressNVX {}, vkCreateCuFunctionNVX {}",
                 handle,
@@ -753,6 +805,8 @@ impl NeuralForgeDeviceInfo {
             next_get_device_queue2: get_queue2,
             next_create_image: create_image,
             probe_next,
+            preupscale,
+            next_queue_submit2,
             state,
             tracker: Mutex::new(TapTracker::default()),
         }
@@ -802,6 +856,143 @@ impl NeuralForgeDeviceInfo {
                 kind, src, src_layout, dst, dst_layout, region_count);
             crate::logging::flush();
         }
+    }
+
+    /// The pre-upscaler hold at a `vkQueueSubmit`/`vkQueueSubmit2` (`crate::preupscale`'s module
+    /// doc comment has the dependency chain). `cbs` are each batch's command buffers; `parse` turns
+    /// the application's batches into owned ones; `submit` issues batches on `queue` through the
+    /// next layer. `None` means "not held": the caller forwards the application's call untouched,
+    /// and nothing of the layer's was submitted. `Some(result)` means the call was submitted here
+    /// (split around the launch buffer, with the layer's work in between) and `result` is what the
+    /// application gets back.
+    fn preupscale_submit<B: crate::preupscale::SplitBatch>(
+        &self, tracking: &crate::preupscale::Tracking, queue: vk::Queue, cbs: &[Vec<vk::CommandBuffer>],
+        parse: impl FnOnce() -> Result<Vec<B>, &'static str>, fence: vk::Fence, submit: &dyn Fn(&[B], vk::Fence) -> vk::Result,
+    ) -> Option<vk::Result> {
+        use crate::preupscale::{Mode, Which};
+        let scan = tracking.scan(cbs)?;
+        let mode = crate::preupscale::mode();
+        if !crate::layer_enabled() || !self.nvidia || crate::device_lost() || !presenting_steadily() {
+            return None;
+        }
+        let instance = self.instance.as_ref()?;
+        let inputs = scan.inputs?;
+        let mut state = self.state.lock().unwrap();
+        let State { shm, preupscale: session, queue_families, external_memory_host, direct_capture, gpu_compose, inflight, .. } = &mut *state;
+        if scan.colour_layout.is_some_and(|l| l != vk::ImageLayout::GENERAL) {
+            session.say_once("the colour input was last transitioned out of GENERAL; not holding (frames go to DLSS untouched)");
+            return None;
+        }
+        let colour = inputs.colour.1;
+        let usage_ok = colour.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+            && (mode == Mode::Dump || colour.usage.contains(vk::ImageUsageFlags::TRANSFER_DST));
+        if !usage_ok {
+            session.say_once("the colour input lacks TRANSFER_SRC/TRANSFER_DST usage; not holding");
+            return None;
+        }
+        let Some(&queue_family) = queue_families.get(&queue) else {
+            session.say_once("the DLSS submit's queue was never seen through vkGetDeviceQueue*; not holding");
+            return None;
+        };
+        if !shm.open() {
+            return None;
+        }
+        let dump = match mode {
+            Mode::Off => return None,
+            Mode::Dump => {
+                if !session.dump_due(shm) || !session.dump_ready(scan.depth_layout.is_some() && scan.mvec_layout.is_some()) {
+                    return None;
+                }
+                true
+            }
+            // The live toggle (F11, the GUI, `shmctl set enabled 0`) means no hold at all, and a
+            // helper that is not running is never waited for.
+            Mode::Model => {
+                if !shm.model_wanted() || !shm.helper_alive() {
+                    return None;
+                }
+                false
+            }
+            Mode::Identity => false,
+        };
+        // Slot 0 must be free: no request (the post path's, or an earlier hold's that ran over
+        // budget) still with the helper, no zero-copy capture still writing its proxy region, and
+        // in model mode no compose still reading its answer region.
+        if shm.has_pending_request(0) && shm.poll_async_request(0) == Some(false) {
+            let result = crate::preupscale::HoldResult {
+                miss: Some("an earlier request is still with the helper"),
+                over_budget: mode == Mode::Model,
+                ..Default::default()
+            };
+            session.note(shm, &result, std::time::Duration::ZERO, (colour.width, colour.height));
+            return None;
+        }
+        if capture::direct_slot_busy(direct_capture, 0) {
+            return None;
+        }
+        if mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(&self.device)) {
+            return None;
+        }
+        let batches = match parse() {
+            Ok(batches) => batches,
+            Err(why) => {
+                session.say_once(why);
+                return None;
+            }
+        };
+        // SAFETY: the SHM mapping is never unmapped once open.
+        if !unsafe { session.ensure(&self.device, instance, self.physical_device, queue_family, colour.width, colour.height, shm, *external_memory_host) } {
+            return None;
+        }
+        let plan = crate::preupscale::plan(batches, scan.batch, scan.index);
+        let aux = |(image, desc): (vk::Image, crate::preupscale::ImageDesc), layout| crate::preupscale::Aux {
+            image,
+            format: desc.format,
+            layout,
+            readable: desc.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (desc.width, desc.height) == (colour.width, colour.height),
+        };
+        let target = crate::preupscale::Target {
+            colour: inputs.colour.0,
+            width: colour.width,
+            height: colour.height,
+            depth: Some(aux(inputs.depth, scan.depth_layout)),
+            mvec: Some(aux(inputs.mvec, scan.mvec_layout)),
+        };
+        let res = session.res.as_mut()?;
+        let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;
+        let result = crate::preupscale::submit_around(plan, fence, submit, |moved| {
+            let started = std::time::Instant::now();
+            let mut layer_submit = |which: Which, cmd: vk::CommandBuffer, own_fence: vk::Fence| {
+                let waits = if which == Which::Capture { moved.to_vec() } else { Vec::new() };
+                submit(std::slice::from_ref(&B::own(waits, cmd)), own_fence).result()
+            };
+            // SAFETY: `res` was built on this device for this extent; the colour input is live and
+            // in GENERAL; `layer_submit` submits on the application's queue, which it holds for the
+            // duration of its call.
+            let hold = unsafe {
+                crate::preupscale::run_hold(
+                    &self.device, instance, self.physical_device, res, shm, &target, mode, dump, scan.evaluation,
+                    crate::preupscale::ANSWER_BUDGET, &mut layer_submit,
+                )
+            };
+            let consumed = hold.waits_consumed;
+            held = Some((hold, started.elapsed()));
+            consumed
+        });
+        if let Some((mut hold, cpu)) = held {
+            if hold.wrote_back && mode == Mode::Model {
+                // Slot 0's answer region now holds the pre-upscaler answers: the synchronous present
+                // must not carry its own last answer onto a later frame.
+                inflight[0].forget_answer();
+            }
+            session.note(shm, &hold, cpu, (colour.width, colour.height));
+            if let Some(frame) = hold.dump.take() {
+                crate::preupscale::write_dump_async(frame);
+                session.dumped();
+                shm.take_capture_request();
+            }
+        }
+        Some(result)
     }
 }
 
@@ -945,6 +1136,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             state.pass_through,
             state.images.len()
         );
+        if let Some(t) = &self.preupscale {
+            t.lock().swapchain(swapchain, Some((state.width, state.height)));
+        }
         let mut layer_state = self.state.lock().unwrap();
         self.tracker.lock().unwrap().swapchain_images.extend(state.images.iter().copied());
         layer_state.swapchains.insert(swapchain, state);
@@ -1018,6 +1212,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 u32::try_from(buffers.len()).unwrap_or(u32::MAX),
             );
         }
+        if let Some(t) = self.preupscale.as_ref().filter(|t| t.watching()) {
+            t.barriers(command_buffer, images.iter().map(|b| (b.image, b.new_layout)));
+        }
         // No logging here: this fires for every barrier the game records, from every
         // recording thread.
         let mut tracker = self.tracker.lock().unwrap();
@@ -1057,6 +1254,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             );
         }
         let Some(images) = barrier2_images(info) else { return LayerResult::Unhandled };
+        if let Some(t) = self.preupscale.as_ref().filter(|t| t.watching()) {
+            t.barriers(command_buffer, images.iter().map(|b| (b.image, b.new_layout)));
+        }
         let mut tracker = self.tracker.lock().unwrap();
         for barrier in images {
             tracker.record_barrier(command_buffer, barrier.image, barrier.new_layout);
@@ -1068,6 +1268,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         &self, command_buffer: vk::CommandBuffer, begin_info: &vk::CommandBufferBeginInfo,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         crate::probe_ngx::on_begin_command_buffer(command_buffer, begin_info.flags);
+        if let Some(t) = &self.preupscale {
+            t.lock().begin(command_buffer);
+        }
         self.tracker.lock().unwrap().begin_recording(command_buffer);
         LayerResult::Unhandled
     }
@@ -1076,6 +1279,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         &self, _command_pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_free_command_buffers(command_buffers);
+        if let Some(t) = &self.preupscale {
+            t.lock().free(command_buffers);
+        }
         self.tracker.lock().unwrap().free(command_buffers);
         LayerResult::Unhandled
     }
@@ -1084,12 +1290,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         &self, command_buffer: vk::CommandBuffer, secondaries: &[vk::CommandBuffer],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_execute_commands(command_buffer, secondaries);
+        if let Some(t) = &self.preupscale {
+            t.lock().execute(command_buffer, secondaries);
+        }
         self.tracker.lock().unwrap().execute_secondary(command_buffer, secondaries);
         LayerResult::Unhandled
     }
 
     fn queue_submit(
-        &self, queue: vk::Queue, submits: &[vk::SubmitInfo], _fence: vk::Fence,
+        &self, queue: vk::Queue, submits: &[vk::SubmitInfo], fence: vk::Fence,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         if crate::probe_ngx::enabled() {
             crate::probe_ngx::on_submit(queue, submits.iter().flat_map(|submit| {
@@ -1106,11 +1315,28 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let buffers = unsafe { std::slice::from_raw_parts(submit.p_command_buffers, submit.command_buffer_count as usize) };
             tracker.commit_submit(buffers.iter().copied());
         }
+        drop(tracker);
+        if let Some(tracking) = &self.preupscale {
+            // SAFETY: as above.
+            let cbs: Vec<Vec<vk::CommandBuffer>> =
+                submits.iter().map(|s| unsafe { preupscale_slice(s.p_command_buffers, s.command_buffer_count) }.to_vec()).collect();
+            let device = &self.device;
+            let submit = |batches: &[crate::preupscale::Batch1], fence: vk::Fence| {
+                let built = crate::preupscale::build1(batches);
+                // SAFETY: `built` owns every array its infos point at and outlives the call; the
+                // queue is the application's, externally synchronized for its `vkQueueSubmit`.
+                unsafe { (device.fp_v1_0().queue_submit)(queue, built.infos.len() as u32, built.infos.as_ptr(), fence) }
+            };
+            // SAFETY: `submits` is the application's own, valid for this call.
+            if let Some(result) = self.preupscale_submit(tracking, queue, &cbs, || unsafe { crate::preupscale::parse1(submits) }, fence, &submit) {
+                return LayerResult::Handled(result.result());
+            }
+        }
         LayerResult::Unhandled
     }
 
     fn queue_submit2(
-        &self, queue: vk::Queue, submits: &[vk::SubmitInfo2], _fence: vk::Fence,
+        &self, queue: vk::Queue, submits: &[vk::SubmitInfo2], fence: vk::Fence,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         if crate::probe_ngx::enabled() {
             crate::probe_ngx::on_submit(queue, submits.iter().flat_map(|submit| {
@@ -1127,6 +1353,24 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let infos = unsafe { std::slice::from_raw_parts(submit.p_command_buffer_infos, submit.command_buffer_info_count as usize) };
             tracker.commit_submit(infos.iter().map(|info| info.command_buffer));
         }
+        drop(tracker);
+        if let (Some(tracking), Some(next)) = (&self.preupscale, self.next_queue_submit2) {
+            let cbs: Vec<Vec<vk::CommandBuffer>> = submits
+                .iter()
+                // SAFETY: as above.
+                .map(|s| unsafe { preupscale_slice(s.p_command_buffer_infos, s.command_buffer_info_count) }.iter().map(cb_of).collect())
+                .collect();
+            let submit = |batches: &[crate::preupscale::Batch2], fence: vk::Fence| {
+                let infos = crate::preupscale::build2(batches);
+                // SAFETY: `infos` points into `batches`, both alive for the call; `next` is the next
+                // layer's `vkQueueSubmit2`; the queue is externally synchronized by the caller.
+                unsafe { next(queue, infos.len() as u32, infos.as_ptr(), fence) }
+            };
+            // SAFETY: `submits` is the application's own, valid for this call.
+            if let Some(result) = self.preupscale_submit(tracking, queue, &cbs, || unsafe { crate::preupscale::parse2(submits) }, fence, &submit) {
+                return LayerResult::Handled(result.result());
+            }
+        }
         LayerResult::Unhandled
     }
 
@@ -1139,6 +1383,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             return LayerResult::Unhandled;
         };
         release_primary(self.device.handle(), swapchain);
+        if let Some(t) = &self.preupscale {
+            t.lock().swapchain(swapchain, None);
+        }
         {
             let mut state = self.state.lock().unwrap();
             // Drain before anything per-swapchain is freed: a capture or compose the layer
@@ -1197,11 +1444,17 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         }
         self.tracker.lock().unwrap().record_image(image, create_info);
         crate::probe_ngx::on_create_image(image, create_info);
+        if let Some(t) = &self.preupscale {
+            t.lock().record_image(image, create_info);
+        }
         LayerResult::Handled(Ok(image))
     }
 
     fn destroy_image(&self, image: vk::Image, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
         crate::probe_ngx::on_destroy_image(image);
+        if let Some(t) = &self.preupscale {
+            t.lock().forget_image(image);
+        }
         let mut tracker = self.tracker.lock().unwrap();
         tracker.image_info.remove(&image);
         // A source can be registered (recorded) before any submission has committed a
@@ -1229,12 +1482,22 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if result != vk::Result::SUCCESS {
             return LayerResult::Handled(Err(result));
         }
-        crate::probe_ngx::on_create_image_view(view, create_info);
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_create_image_view(view, create_info);
+        }
+        if let Some(t) = &self.preupscale {
+            t.lock().record_view(view, create_info.image);
+        }
         LayerResult::Handled(Ok(view))
     }
 
     fn destroy_image_view(&self, view: vk::ImageView, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
-        crate::probe_ngx::on_destroy_image_view(view);
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_destroy_image_view(view);
+        }
+        if let Some(t) = &self.preupscale {
+            t.lock().forget_view(view);
+        }
         LayerResult::Unhandled
     }
 
@@ -1242,7 +1505,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next) = self.probe_next.as_ref().and_then(|n| n.get_image_view_handle_nvx) else { return LayerResult::Unhandled };
         // SAFETY: the next layer's own `vkGetImageViewHandleNVX`, with the application's info.
         let handle = unsafe { next(self.device.handle(), info) };
-        crate::probe_ngx::on_view_handle("vkGetImageViewHandleNVX", info.image_view, format!("handle {handle:#x}"));
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_view_handle("vkGetImageViewHandleNVX", info.image_view, format!("handle {handle:#x}"));
+        }
+        if let Some(t) = &self.preupscale {
+            t.lock().register(info.image_view);
+        }
         LayerResult::Handled(handle)
     }
 
@@ -1260,7 +1528,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         } else {
             format!("{result:?}")
         };
-        crate::probe_ngx::on_view_handle("vkGetImageViewAddressNVX", view, described);
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_view_handle("vkGetImageViewAddressNVX", view, described);
+        }
+        if let Some(t) = self.preupscale.as_ref().filter(|_| result == vk::Result::SUCCESS) {
+            t.lock().register(view);
+        }
         LayerResult::Handled(result.result())
     }
 
@@ -1272,7 +1545,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: the next layer's own `vkCreateCuModuleNVX`, with the application's arguments.
         let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut module) };
-        crate::probe_ngx::on_create_cu_module(create_info.data_size, result);
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_create_cu_module(create_info.data_size, result);
+        }
         LayerResult::Handled(if result == vk::Result::SUCCESS { Ok(module) } else { Err(result) })
     }
 
@@ -1284,18 +1559,27 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
         // SAFETY: the next layer's own `vkCreateCuFunctionNVX`, with the application's arguments.
         let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut function) };
-        crate::probe_ngx::on_create_cu_function(function, create_info, result);
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_create_cu_function(function, create_info, result);
+        }
         LayerResult::Handled(if result == vk::Result::SUCCESS { Ok(function) } else { Err(result) })
     }
 
     fn destroy_cu_function_nvx(&self, function: vk::CuFunctionNVX, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
-        crate::probe_ngx::on_destroy_cu_function(function);
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_destroy_cu_function(function);
+        }
         LayerResult::Unhandled
     }
 
     fn cmd_cu_launch_kernel_nvx(&self, command_buffer: vk::CommandBuffer, launch_info: &vk::CuLaunchInfoNVX) -> LayerResult<()> {
         // Records counts and dimensions only; `pParams`/`pExtras` are never read.
-        crate::probe_ngx::on_launch(command_buffer, launch_info);
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_launch(command_buffer, launch_info);
+        }
+        if let Some(t) = &self.preupscale {
+            t.lock().launch(command_buffer);
+        }
         LayerResult::Unhandled
     }
 
@@ -1565,6 +1849,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 )
             };
             let mut state = self.state.lock().unwrap();
+            if let Some(t) = &self.preupscale {
+                let extent = t.extent();
+                let State { shm, preupscale, .. } = &mut *state;
+                preupscale.publish_status(shm, extent);
+            }
             for (&sc, &image_index) in swapchains.iter().zip(image_indices) {
                 if !state.swapchains.contains_key(&sc) {
                     continue;
@@ -1580,6 +1869,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 };
                 {
                     static ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    PRESENTING_STEADILY.store(engaged, std::sync::atomic::Ordering::Relaxed);
                     if ENGAGED.swap(engaged, std::sync::atomic::Ordering::Relaxed) != engaged {
                         crate::log!(
                             "[layer] {}",
@@ -1726,8 +2016,39 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
                 };
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, series, .. } = &mut *state;
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
+                if self.preupscale.is_some() {
+                    // Model mode applied the model to DLSS's input within the last 500 ms: the
+                    // post-upscaler compose must not apply it a second time. Logged on change.
+                    static SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                    let suppressed = preupscale.suppresses_post();
+                    if SUPPRESSED.swap(suppressed, std::sync::atomic::Ordering::Relaxed) != suppressed {
+                        crate::log!(
+                            "[preupscale] {}",
+                            if suppressed {
+                                "the model runs before the upscaler; the post-upscaler compose is off while frames are held"
+                            } else {
+                                "no hold in the last 500 ms; the post-upscaler compose runs as before"
+                            }
+                        );
+                        crate::logging::flush();
+                    }
+                    if suppressed {
+                        break;
+                    }
+                    // The post path is about to write slot 0's proxy region (from the CPU, or on
+                    // the GPU, possibly on another queue): a hold's write-back that still reads it
+                    // must be finished first. Normally long done; bounded either way.
+                    if preupscale.res.as_ref().is_some_and(crate::preupscale::Resources::pending) {
+                        let mut gpu = None;
+                        let drained = preupscale.res.as_mut().is_some_and(|r| r.wait_idle(&self.device, &mut gpu));
+                        preupscale.note_writeback_gpu(gpu);
+                        if !drained {
+                            break;
+                        }
+                    }
+                }
                 if shm.model_known_unavailable() {
                     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {

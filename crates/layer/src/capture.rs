@@ -570,6 +570,22 @@ pub struct Inflight {
     proxy_dims: Option<(u32, u32)>,
 }
 
+impl Inflight {
+    /// Forgets which frame slot 0's last answer belongs to, so the synchronous present never
+    /// carries it onto a later frame. The pre-upscaler path (`crate::preupscale`) calls this when
+    /// it uses slot 0 itself: the answer region then holds its answers, not this path's.
+    pub(crate) fn forget_answer(&mut self) {
+        self.dims = None;
+    }
+}
+
+/// Whether the zero-copy capture of wire slot `slot` still has a GPU write into that slot's
+/// proxy region in flight. The pre-upscaler path (`crate::preupscale`) writes the same region and
+/// must not start while this is so.
+pub(crate) fn direct_slot_busy(direct: &[Option<DirectCapture>; 2], slot: usize) -> bool {
+    direct[slot].as_ref().is_some_and(|d| d.pending.is_some())
+}
+
 /// `working_scale × (width, height)`, rounded to the nearest even number (several
 /// paths in this crate and the helper implicitly assume even dimensions are safe, not
 /// a hazard) and floored at 64px per axis -- upstream (DLSS5VKLayer) hit and fixed a

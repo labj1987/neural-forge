@@ -330,6 +330,21 @@ pub struct ShmHeader {
     /// GPU milliseconds of the layer's compose dispatch, measured the same way per async
     /// compose slot (f32 bits). 0 until the first reading.
     pub layer_compose_gpu_ms_bits: AtomicU32,
+
+    // --- v9 ------------------------------------------------------------------------------
+    /// The layer's pre-upscaler path (`NEURAL_FORGE_PREUPSCALE`, docs/PRE_UPSCALER_DESIGN.md):
+    /// 0 off (the default; nothing is held), 1 waiting for the game's DLSS input (the mode is on
+    /// but no launch-bearing submit was held in the last 500 ms: no DLSS, DLAA, input not
+    /// identified, or the toggle is off), 2 holding the DLSS submit.
+    pub preupscale_state: AtomicU32,
+    /// The identified DLSS colour input's extent (the render resolution), 0 before one is found.
+    pub preupscale_width: AtomicU32,
+    pub preupscale_height: AtomicU32,
+    /// CPU milliseconds the last hold blocked the game's submit (f32 bits).
+    pub preupscale_hold_ms_bits: AtomicU32,
+    /// Holds whose answer did not come back within the budget (or failed), so the frame went to
+    /// DLSS untouched. Counts up for the life of the layer's session.
+    pub preupscale_misses: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -355,7 +370,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1996, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2016, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -379,6 +394,8 @@ const _: () = assert!(
     std::mem::offset_of!(ShmHeader, layer_compose_gpu_ms_bits) == 1992,
     "layout changed -- bump SHM_VERSION"
 );
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1996, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 2012, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
@@ -466,6 +483,11 @@ impl ShmHeader {
         self.layer_ms_bits.store(0, Ordering::Relaxed);
         self.layer_capture_gpu_ms_bits.store(0, Ordering::Relaxed);
         self.layer_compose_gpu_ms_bits.store(0, Ordering::Relaxed);
+        self.preupscale_state.store(0, Ordering::Relaxed);
+        self.preupscale_width.store(0, Ordering::Relaxed);
+        self.preupscale_height.store(0, Ordering::Relaxed);
+        self.preupscale_hold_ms_bits.store(0, Ordering::Relaxed);
+        self.preupscale_misses.store(0, Ordering::Relaxed);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
