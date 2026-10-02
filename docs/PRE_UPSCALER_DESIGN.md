@@ -304,7 +304,8 @@ column duplicated into the padding column, an odd height its last row (4K Balanc
 The capture fence is waited on (bounded, `note_fence_wait`); the write-back is not, its fence is
 checked at the next hold or before the post-upscaler path next runs. Capture and write-back carry
 GPU timestamps. A hold is skipped (frame forwarded untouched) when: the layer is not engaged yet
-(loading screens), the colour input's last committed barrier left it outside `GENERAL`, a slot-0
+(loading screens), DLSS's inputs were (re)identified at this very submit (no layout is known yet;
+the next one is held), the colour input's last committed barrier left it outside `GENERAL`, a slot-0
 request is still with the helper (the post path's, or a hold that ran over budget), the post
 path's zero-copy capture is still writing slot 0, or anything fails.
 
@@ -1157,5 +1158,11 @@ has a test that fails without its fix. None of it is run on the rig yet.
 - **Double tone map of the encoded proxy** (`hdr_to_flow.comp`, `scene.rs`): see "Implementation
   (helper)" above; the flow input and the scene-cut thumbnail now quantise the layer's encode as
   it is.
+- **The first hold after an identification assumed `GENERAL`** (`preupscale::Scan::colour_in_general`).
+  Barriers are only recorded for watched images (the device hooks skip them until an input is
+  identified), and a new identification drops what was committed, so on the submit that
+  (re)identified DLSS's inputs every layout read "none seen" and the hold took the colour input
+  (and the exposure image) to be in `GENERAL` without having watched it. That submit now goes to
+  DLSS untouched; from the next one, "none seen" really means no barrier since it was watched.
 - **Helper Color image usage** (`images.rs`): `TRANSFER_SRC` added; the 8-bit flow path blits from
   it (a validation error since before 1.1.0).

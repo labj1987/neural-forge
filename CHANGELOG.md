@@ -78,6 +78,9 @@ diagnostics. In detail:
   - helper: after a change of DLSS render resolution or quality, or an SDR/HDR switch, the model
     is rebuilt at once instead of 250 ms later (unless it was built less than that ago). The
     wait echoed ~15 frames, which opened the layer's circuit breaker for 2 s on every such change.
+  - layer: the DLSS submit on which DLSS's inputs are (re)identified is no longer held. Their
+    layouts were not known yet (barriers are only tracked once the images are watched), and the
+    hold assumed `GENERAL`; the next submit is held with the layouts tracked.
 - **Pre-upscaler hold: hand-off latency cut** (`docs/PRE_UPSCALER_DESIGN.md`, "Hand-off
   latency"). GTA V Enhanced, DLSS Balanced, model every frame: **50.5 -> 66.1 fps** (three runs),
   above the 61.6 gate; the hold went from 14.7 to about 10.2 ms. The ~4.8 ms "hand-off" was the

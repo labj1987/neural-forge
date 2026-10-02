@@ -900,8 +900,12 @@ impl NeuralForgeDeviceInfo {
         if !presenting_steadily() {
             return None;
         }
-        if scan.colour_layout.is_some_and(|l| l != vk::ImageLayout::GENERAL) {
-            session.say_once("the colour input was last transitioned out of GENERAL; not holding (frames go to DLSS untouched)");
+        if !scan.colour_in_general() {
+            // Just (re)identified: no layout known yet, so this one goes untouched (the next is
+            // held). Otherwise the last committed barrier left it outside GENERAL.
+            if !scan.identified_now {
+                session.say_once("the colour input was last transitioned out of GENERAL; not holding (frames go to DLSS untouched)");
+            }
             return None;
         }
         let colour = inputs.colour.1;

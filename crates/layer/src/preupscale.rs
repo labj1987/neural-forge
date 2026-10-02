@@ -384,6 +384,9 @@ pub(crate) struct Tracker {
     committed: HashMap<vk::Image, vk::ImageLayout>,
     /// Launch-bearing submits seen.
     evaluations: u64,
+    /// The inputs changed in [`Self::refresh`] and no launch-bearing submit has been scanned since
+    /// ([`Scan::identified_now`]).
+    identified: bool,
 }
 
 /// Where a submit's first launch-bearing command buffer is.
@@ -403,6 +406,20 @@ pub(crate) struct Scan {
     /// The exposure input's committed layout.
     pub exposure_input_layout: Option<vk::ImageLayout>,
     pub evaluation: u64,
+    /// The inputs were (re)identified since the last launch-bearing submit: no layout is known yet
+    /// (barriers are only recorded on watched images, and a new identification drops what was
+    /// committed), so a `None` layout here does not mean "no barrier ever".
+    pub identified_now: bool,
+}
+
+impl Scan {
+    /// Whether the colour input can be taken to be in `GENERAL` at this submit: its last committed
+    /// barrier left it there, or no barrier on it was seen since it was watched. Never on the
+    /// submit that (re)identified the inputs ([`Self::identified_now`]): that one goes to DLSS
+    /// untouched, and the next is held with known layouts.
+    pub(crate) fn colour_in_general(&self) -> bool {
+        !self.identified_now && self.colour_layout.is_none_or(|l| l == vk::ImageLayout::GENERAL)
+    }
 }
 
 impl Tracker {
@@ -523,6 +540,7 @@ impl Tracker {
         if key(inputs) != key(self.inputs) {
             self.committed.clear();
             self.pending.clear();
+            self.identified = true;
         }
         self.inputs = inputs;
         let line = match inputs {
@@ -582,6 +600,7 @@ impl Tracker {
                         exposure_layouts: std::array::from_fn(|k| layout(self.inputs.and_then(|i| i.exposure[k]).map(|e| e.0))),
                         exposure_input_layout: layout(self.inputs.and_then(|i| i.exposure_input).map(|e| e.0)),
                         evaluation: self.evaluations,
+                        identified_now: self.identified,
                     });
                 }
                 self.commit(cb);
@@ -589,6 +608,7 @@ impl Tracker {
         }
         if found.is_some() {
             self.evaluations += 1;
+            self.identified = false;
         }
         found
     }
@@ -2997,6 +3017,7 @@ mod tests {
         assert_eq!((scan.batch, scan.index), (1, 1));
         assert_eq!(scan.colour_layout, Some(vk::ImageLayout::GENERAL), "the layout as of submission order just before the launch");
         assert!(!t.committed.contains_key(&vk::Image::from_raw(0x999)), "only the inputs are watched");
+        assert!(scan.identified_now && !scan.colour_in_general(), "the first launch-bearing submit since identification is not held");
         assert!(t.scan(&[vec![cb(7)]]).is_none());
         t.begin(cb(3));
         assert!(t.scan(&[vec![cb(3)]]).is_none(), "re-recorded: no longer launch-bearing");
@@ -3004,6 +3025,50 @@ mod tests {
         t.forget_image(vk::Image::from_raw(0x200));
         assert!(t.refresh().unwrap().starts_with("no DLSS input among 2 registered views"));
         assert!(t.inputs.is_none());
+    }
+
+    /// The submit that (re)identifies the inputs is not held: barriers recorded before the images
+    /// were watched were never seen (the device hooks only record them while watching), and a new
+    /// identification drops what was committed, so "no layout" there is not "GENERAL". The next
+    /// launch-bearing submit, with no barrier seen while watched, is.
+    #[test]
+    fn the_submit_that_identifies_the_inputs_is_not_held() {
+        let t = Tracking::default();
+        let info = |w, h, format| vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: w, height: h, depth: 1 },
+            format,
+            usage: vk::ImageUsageFlags::STORAGE,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        let register = |base: u64| {
+            let mut tr = t.lock();
+            for (raw, format) in [(base, vk::Format::R16G16B16A16_SFLOAT), (base + 0x100, vk::Format::D32_SFLOAT_S8_UINT), (base + 0x200, vk::Format::R16G16_SFLOAT)] {
+                tr.record_image(vk::Image::from_raw(raw), &info(1707, 960, format));
+                tr.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
+                tr.register(vk::ImageView::from_raw(raw + 1));
+            }
+            tr.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
+        };
+        register(0x1000);
+        t.launch(cb(1));
+        let first = t.scan(&[vec![cb(1)]]).expect("launch-bearing");
+        assert!(first.inputs.is_some() && first.identified_now && first.colour_layout.is_none());
+        assert!(!first.colour_in_general(), "identified on this submit: nothing known, not held");
+        let second = t.scan(&[vec![cb(1)]]).expect("launch-bearing");
+        assert!(!second.identified_now && second.colour_layout.is_none());
+        assert!(second.colour_in_general(), "watched for a submit and no barrier seen: GENERAL");
+        // A re-identification (DLSS's inputs re-created) starts over.
+        t.lock().forget_image(vk::Image::from_raw(0x1000));
+        register(0x5000);
+        let again = t.scan(&[vec![cb(1)]]).expect("launch-bearing");
+        assert_eq!(again.inputs.map(|i| i.colour.0), Some(vk::Image::from_raw(0x5000)));
+        assert!(again.identified_now && !again.colour_in_general());
+        assert!(t.scan(&[vec![cb(1)]]).expect("launch-bearing").colour_in_general());
+        // A barrier out of GENERAL still refuses the hold.
+        t.barriers(cb(2), [(vk::Image::from_raw(0x5000), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)].into_iter());
+        assert!(!t.scan(&[vec![cb(2), cb(1)]]).expect("launch-bearing").colour_in_general());
     }
 
     /// On a device with NVX but no DLSS nothing is ever armed, so the per-command-buffer and
