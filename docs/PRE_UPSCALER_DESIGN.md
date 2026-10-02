@@ -1139,3 +1139,23 @@ with `NVPRESENT_ENABLE_SMOOTH_MOTION=1`, two runs back to back.
 - settings.xml sha256 8de357621960...1a7a, byte-identical; the backup was removed.
 - `intensity` back to 1 after (a). Live settings `enabled=1`, `working_scale=1`, `model_interval=2`,
   `mvec_enabled=1`. The helper (this build, no fault injection) is running.
+
+## Fixes from the 2.0 review
+
+A code review of 2.0 (2026-10-02) found the following; each was confirmed in the code first and
+has a test that fails without its fix. None of it is run on the rig yet.
+
+- **A rebuild after a frame-key change opened the breaker** (`ngx::maintain_passes`,
+  `rebuild::after_key_change`). Releasing the features for a new key (DLSS render resolution or
+  quality, an SDR/HDR switch) set the next build a full spacing (250 ms) later, while `model_up`
+  stayed 1: ~15 echoes at 60 fps, more than `BREAKER_MISSES`, so the breaker opened for 2 s on
+  every such change (the echoed first hold of every rig run in "Robustness: failed feature builds"
+  was this). The rebuild is now due at once unless the previous build was less than the spacing
+  ago, so a key that keeps changing still builds at most once per spacing. `model_up` keeps its
+  meaning (0 only while the model cannot be built): publishing 0 during a normal rebuild would
+  open the breaker at once instead.
+- **Double tone map of the encoded proxy** (`hdr_to_flow.comp`, `scene.rs`): see "Implementation
+  (helper)" above; the flow input and the scene-cut thumbnail now quantise the layer's encode as
+  it is.
+- **Helper Color image usage** (`images.rs`): `TRANSFER_SRC` added; the 8-bit flow path blits from
+  it (a validation error since before 1.1.0).

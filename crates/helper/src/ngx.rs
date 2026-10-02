@@ -996,7 +996,8 @@ const MAX_BUILD_FAILURES: u32 = 3;
 /// that fails to *rebuild* is left a hole (skipped) and retried after the spacing.
 ///
 /// `key` is the frame's size and HDR mode (an RGBA16F proxy builds with `DLSSNR.Hdr=1`); a
-/// change of either rebuilds every pass.
+/// change of either rebuilds every pass, pass 0 at once unless the last build was within the
+/// spacing ([`crate::rebuild::after_key_change`]): every request until then is echoed.
 ///
 /// Returns the number of built passes afterwards.
 pub fn maintain_passes(
@@ -1037,7 +1038,9 @@ pub fn maintain_passes(
         let _ = unsafe { device.device_wait_idle() };
         release_all(s);
         s.ceiling = None;
-        s.build_after = Some(Instant::now() + spacing);
+        // Due at once unless the last build was within the spacing (`rebuild::after_key_change`):
+        // nothing answers until it is rebuilt.
+        s.build_after = crate::rebuild::after_key_change(s.build_after, Instant::now());
     }
 
     s.last_seen.resize(wanted.len(), NgxTuning::default());

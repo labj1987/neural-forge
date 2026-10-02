@@ -108,6 +108,19 @@ impl BuildRetry {
     }
 }
 
+/// When the features released for a new frame key (a DLSS render-resolution or quality change, an
+/// SDR/HDR switch) may be built again, given `build_after` (the previous build's time plus the
+/// rebuild spacing, which `maintain_passes` sets after every build): at once, unless that build
+/// was less than the spacing ago, so a key that keeps changing (a window being resized) still
+/// builds at most once per spacing. `None` means now.
+///
+/// Nothing answers until the rebuild: every request meanwhile is echoed. Waiting a full spacing
+/// after every change (250 ms) echoed ~15 frames at 60 fps while `model_up` said 1, more than the
+/// layer's circuit breaker allows in a row, so the breaker opened for 2 s on every such change.
+pub fn after_key_change(build_after: Option<Instant>, now: Instant) -> Option<Instant> {
+    build_after.filter(|t| *t > now)
+}
+
 /// `NEURAL_FORGE_FAIL_CREATE=N` or `N@K`: let `K` creations through (default 0), then fail the next
 /// `N` without calling NGX. A debug switch for the rig; unset (the default) does nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,6 +164,20 @@ impl FailInject {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A frame-key change long after the last build rebuilds at once (the layer's breaker would
+    /// otherwise count a spacing's worth of echoes); one right after a build still waits for the
+    /// spacing, so a key that keeps changing cannot rebuild every frame.
+    #[test]
+    fn a_key_change_rebuilds_at_once_unless_the_last_build_was_within_the_spacing() {
+        let spacing = Duration::from_millis(250);
+        let t0 = Instant::now();
+        let after_build = Some(t0 + spacing);
+        assert_eq!(after_key_change(after_build, t0 + Duration::from_secs(10)), None, "steady state: build now");
+        assert_eq!(after_key_change(None, t0), None, "never built or discarded: build now");
+        assert_eq!(after_key_change(after_build, t0 + Duration::from_millis(100)), Some(t0 + spacing), "just built: wait out the spacing");
+        assert_eq!(after_key_change(after_build, t0 + spacing), None);
+    }
 
     /// Drives the schedule like `maintain_passes` does, with a build that fails `fails` times and
     /// then succeeds, polling every 100 ms of simulated time. Returns the (time, step) of every

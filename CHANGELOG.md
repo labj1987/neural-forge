@@ -75,6 +75,9 @@ diagnostics. In detail:
     that was a second tone map: white came out at 188 of 255 and the scene-cut threshold was about
     a third less sensitive than on 8-bit frames. The value is now clamped to [0, 1] and quantised
     as it is, on the GPU (`hdr_to_flow.comp`) and the CPU (a half-to-byte table, as before).
+  - helper: after a change of DLSS render resolution or quality, or an SDR/HDR switch, the model
+    is rebuilt at once instead of 250 ms later (unless it was built less than that ago). The
+    wait echoed ~15 frames, which opened the layer's circuit breaker for 2 s on every such change.
 - **Pre-upscaler hold: hand-off latency cut** (`docs/PRE_UPSCALER_DESIGN.md`, "Hand-off
   latency"). GTA V Enhanced, DLSS Balanced, model every frame: **50.5 -> 66.1 fps** (three runs),
   above the 61.6 gate; the hold went from 14.7 to about 10.2 ms. The ~4.8 ms "hand-off" was the
