@@ -40,6 +40,14 @@ diagnostics. In detail:
   OpenDLSS-NR's documented proxy encode and shoulder, OptiScaler_DLSSNR's exposure-texture idea and
   OptiScaler's pre-SR mod (design only, no code).
 
+- **DLSS Frame Generation works with the model before the upscaler** (`docs/PRE_UPSCALER_DESIGN.md`,
+  "DLSS Frame Generation"). The layer held every submit that launched CUDA kernels, so with GTA's FG
+  on it also held FG's two submits per frame (on another queue) and ran the model three times per
+  real frame, twice on the wrong input: 22.4 real / 67 displayed fps. Now only the command buffer
+  whose kernel launches name DLSS's colour input (its registered handle, read from the launch's
+  parameter buffer) is held; FG's submits go through untouched, and anything undecidable is held as
+  before. GTA V Enhanced, DLSS Balanced, FG on (3 presented frames per real frame): **53.0 real /
+  159 displayed fps** against 28.7 / 86 for the after-the-upscaler path.
 - **A model that fails to build no longer stays broken or stalls the game**
   (`docs/PRE_UPSCALER_DESIGN.md`, "Robustness: failed feature builds"). At 4K with Smooth Motion
   and VRAM nearly full, one failed NGX feature build (`0xbad00002`) used to leave every later build

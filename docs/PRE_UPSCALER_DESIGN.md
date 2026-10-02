@@ -1192,3 +1192,135 @@ has a test that fails without its fix. None of it is run on the rig yet.
   DLSS untouched; from the next one, "none seen" really means no barrier since it was watched.
 - **Helper Color image usage** (`images.rs`): `TRANSFER_SRC` added; the 8-bit flow path blits from
   it (a validation error since before 1.1.0).
+
+## DLSS Frame Generation
+
+Question (Alex): does the pre-upscaler path help with frame generation? In theory yes: the model
+edits DLSS Super Resolution's render-resolution input, so DLSS Frame Generation builds its generated
+frames from frames that are already enhanced, and the model runs only on real frames (the "run the
+model before frame generation" fix that was shelved in September). The risk: the layer held *any*
+submit whose command buffer recorded a `vkCmdCuLaunchKernelNVX`, and DLSS FG also runs as CUDA
+kernels.
+
+Run 2026-10-02 18:34-19:50 on lordnikon: GTA V Enhanced, DLSS Balanced (1485x836), 2560x1440@288
+HDR bt2100 desktop, script mods off, `model_interval=2`, `working_scale=1`, `mvec_enabled=1`, no
+remote-desktop session, no Xid. GTA's FG setting is `FrameGenType` (0 off, 1 on; the September FG
+run had 1, not 2, with `dlssFrameGenMode` 2); it was set to 1 for these runs, `dlssFrameGenMode`
+left at 1, and settings.xml was put back byte-identical afterwards (sha256 8de35762...1a7a). With
+`dlssFrameGenMode` 1 the game presents **three frames per real frame** (MangoHud and GTA's on-screen
+counter count all of them; GTA's frame-time file counts real frames only, so "real" below is that
+file and "displayed" is MangoHud, last in the chain).
+
+### Before the fix: FG's submits were held too
+
+`fg-probe-1` (main c467c65, default mode, `NEURAL_FORGE_PROBE_NGX=1`):
+
+- DLSS FG creates its own kernels (`k_conv_fp16_nhwc`, `k_pooling`, `main_kernel`,
+  `custom_block0_convPre_kernel`, `k_initial_merge`, ...) and registers its own views (67 at once:
+  1280x720 R8, output-size images, and the render-size depth and motion vectors again). It launches
+  them in **two command buffers per real frame** (80 and 36 launches), submitted on **another queue**
+  than SR's (SR's 14 launches stay one buffer on the graphics queue), and the game presents on a
+  third queue. Probe stats: first kernel `hiluma_engine_input_*` in 4028 buffers, `main_kernel` in
+  8056, i.e. two FG buffers per SR buffer. All launches use vkd3d-proton's CUDA buffer form
+  (`params=0 extras=1`).
+- The identification stayed right (colour input 1485x836 RGBA16F, same image all run; depth and motion
+  vectors flipped to FG's registrations of the same extent, harmless for the model).
+- But **every** launch-bearing submit was held: `holds_per_s` 66-68 against 22.4 real fps, i.e. the
+  model ran three times per real frame, twice on the FG queue on the colour input SR had already
+  consumed (wrong input for the model's history, a write-back racing the next frame's rendering on
+  the graphics queue, and three times the cost). Result: **22.4 real / 67.1 displayed**, GPU 72%.
+
+### The fix: hold only the buffer that reads DLSS's colour input
+
+Deterministic and independent of kernel names: a launch-bearing command buffer is the hold point
+only if one of its launches **names the identified colour input**.
+
+- The layer keeps the value each `vkGetImageViewHandleNVX`/`vkGetImageViewHandle64NVX` returned (and
+  each `vkGetImageViewAddressNVX` address) for the colour-input candidates (registered RGBA16F
+  storage images).
+- At `vkCmdCuLaunchKernelNVX` it reads (never writes) the launch's parameter buffer when it is in
+  CUDA's "extra" form, the one vkd3d-proton uses for DXVK-NVAPI's `LaunchCubinShader`
+  (`pExtras = {BUFFER_POINTER, buf, BUFFER_SIZE, &size, END}`, walked to its END, at most 4 pairs, up
+  to 4 KiB; `preupscale::launch_params`), and notes which candidates' handles appear among its 8-byte
+  words (a CUDA surface object is a 64-bit kernel parameter, 8-byte aligned).
+- At the submit (`Tracker::scan`, `LaunchRefs::kind`): a buffer whose launches name the colour input
+  is **Colour** (held); a buffer whose launches were all readable and never name it is **Foreign**
+  (forwarded untouched: DLSS FG's, or any other NGX feature's); a buffer with an unreadable launch,
+  or any launch before the colour input is identified, is **Unknown** and held as before, so nothing
+  that held before stops holding. The first Colour buffer in the submit is the split point, also when
+  a Foreign buffer comes first.
+- Logged once per kind (`a launch-bearing submit reads DLSS's colour input ...`, `... never name
+  DLSS's colour input (DLSS Frame Generation's, ...) is forwarded untouched ...`, `... held
+  undecided ...`) and every 3000 forwarded submits a tally (`launch-bearing submits: N held reading
+  the colour input, N held undecided, N forwarded untouched ...`).
+- Tests: `only_the_buffer_whose_launches_name_the_colour_input_is_held` (a synthetic tracker with
+  GTA's FG registered set, an SR buffer and two FG buffers, across submits, FG first in the same
+  submit, SR through a secondary), `unreadable_parameters_or_no_colour_input_keep_the_old_rule`,
+  `launch_params_reads_cudas_extra_buffer_form_only`. `NEURAL_FORGE_PREUPSCALE=off` is untouched (no
+  tracking, so no hook reads anything; the hooked-command list is unchanged, `probe_command_tests`
+  pass).
+
+On the rig (this build, layer `0e3e0331f773`): `a launch-bearing submit reads DLSS's colour input` at
+the first DLSS frame, then `... forwarded untouched`, and the tally in `fg-model-2`: 7502 held reading
+the colour input, 3 held undecided (before identification), 15000 forwarded, exactly two FG submits
+per SR submit. `holds_per_s` equals real fps.
+
+### Results (pass 4, `scripts/bench-report.py`)
+
+| Run | Build | Real fps | Displayed | Holds/s | Hold ms | GPU % | Power |
+|---|---|---|---|---|---|---|---|
+| `fg-probe-1`: default mode, probe on | main c467c65 (holds FG too) | 22.4 | 67.1 | 66-68 | 8.0-8.2 | 72 | 154 W |
+| `fg-model-2`: default mode | fix | **52.9** | **158.9** | 52-54 | 9.6-10.1 | 96 | 195 W |
+| `fg-model-3`: default mode | fix | **53.0** | **159.2** | 52-54 | 9.6-10.2 | 96 | 196 W |
+| `fg-model-1`: default mode, **FG did not engage** | fix | 67.7 | 68.4 | 64-70 | 9.8-10.5 | 94 | 188 W |
+| `fg-post-1`: `NEURAL_FORGE_PREUPSCALE=off` | fix | 28.7 | 86.0 | - (composited/s 85.9) | - | 98 | 213 W |
+| `fg-post-2`: `NEURAL_FORGE_PREUPSCALE=off` | fix | 28.6 | 85.9 | - (composited/s 86.0) | - | 98 | 213 W |
+| `fg-nroff-1`, `-2`: no layer, **FG did not engage** | - | 92.5 / 92.5 | 93.2 / 93.8 | - | - | 67-68 | 148-149 W |
+| `fg-nroff-m2`: no layer, `dlssFrameGenMode` 2, **FG did not engage** | - | 92.5 | 93.7 | - | - | 68 | 149 W |
+
+Misses: 2 per run in every model run (the first hold's unusable exposure and the usual echo while the
+helper rebuilds, with the 4 s breaker at the first loading screen); none in pass 4. No over-budget
+answer, no failed feature build, no Xid.
+
+**FG engagement is not under our control.** In the same settings the game's FG generated frames in
+some launches and not in others: never without the layer (3 of 3), always with the post path (2 of
+2) and the unfixed build (1 of 1), 2 of 3 with the fix. When it does not engage the game still sets
+DLSS FG up (its kernels run at the start, `fg-model-1` logged the forwarded kind once) and then
+presents real frames only; when it does, it is three presented frames per real frame for the whole
+benchmark from pass 1 on. What decides it (a dynamic FG mode, start-up timing) is not known; it
+looks like it engages when the frame rate early in the run is low, which would explain the no-layer
+runs. Treat `fg-model-1` as a run without FG (it matches the FG-off 2.0 numbers, 65-68 fps).
+
+### Verdict
+
+**Yes, the pre-upscaler path helps with frame generation, once FG's submits are left alone (this
+fix).** With DLSS FG engaged, the model before the upscaler gives **53.0 real / 159 displayed fps**
+against **28.7 / 86** for the post path: +85% displayed, and the model runs once per real frame
+(53/s) instead of on every presented frame (86/s, generated frames included). FG itself costs real
+frames (68 -> 53 here, three-frame FG at 1485x836 + 2560x1440), but the displayed rate is 2.3x the
+FG-off pre-upscaler rate. Without the fix the default 2.0 build was the worst configuration of all
+with FG on (22.4 / 67.1): the model ran three times per real frame, twice on the wrong input.
+
+### Picture
+
+GTA's window was grabbed with GStreamer `ximagesrc` 200 s after the game started in `fg-model-3`
+(FG engaged), twice about a second apart (images in the dev machine's scratchpad `pu5/`, not in the
+repo; the `fg-model-1` grab is a frame without FG). Both show the benchmark's drive down Vinewood
+Boulevard in daylight behind a black Mammoth SUV: correct colours (blue sky, red awnings, grey road),
+readable signs and licence plate, no grey wash, no black or NaN blocks, 0.03% of pixels at 254-255.
+GTA's own counter reads 164-167 fps and MangoHud 164. On the "Vinewood Fashion Goods" sign at the
+top left there is a faint doubled contour along the frame and the lettering, the kind of edge
+ghosting interpolated frames show on high-contrast edges during camera motion; elsewhere (palms, car
+edges, road markings) nothing stands out. Whether that grab is a generated frame, and whether the
+model adds anything FG then smears, cannot be told from a single grab without a plain comparison;
+that is for Alex's eyes.
+
+### Restored
+
+- settings.xml back to `FrameGenType` 0, byte-identical (sha256 8de35762...1a7a); the backup made for
+  this test was removed. (The game rewrites its own `pc_settings.bin` and caches at every launch, as
+  in every earlier benchmark.)
+- Desktop 2560x1440@288.001, scale 1.0, bt2100 (unchanged).
+- This fix's build is deployed on the rig (`scripts/deploy-rig.sh` from the worktree; layer
+  `0e3e0331f773`), helper restarted and running (`helper_state=4`, `model_up=1`), live settings
+  `enabled=1`, `working_scale=1`, `model_interval=2`, `mvec_enabled=1`.
