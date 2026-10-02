@@ -19,13 +19,15 @@
 //! values are what the logs report anyway. Frames are counted between presents of any
 //! swapchain the layer sees.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::ffi::CStr;
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use ash::vk;
 use ash::vk::Handle;
 use vulkan_layer::LayerVulkanCommand as VulkanCommand;
+
+use crate::probe_seq::{hex, Attachment, ImageBarrier, Recording};
 
 /// The variable that turns the probe on. Read through `neural_forge_protocol::env`.
 pub(crate) const ENV: &str = "NEURAL_FORGE_PROBE_NGX";
@@ -37,6 +39,12 @@ const SUMMARY_EVERY: u64 = 60;
 const MAX_EVENT_LINES: u32 = 64;
 /// Caps on how many distinct entries one frame's summary lists.
 const MAX_LISTED: usize = 12;
+/// Registered views count as settled this many frames after the last new one.
+const STABLE_FRAMES: u64 = 30;
+/// Full command sequences: the first `SEQ_FIRST` launch-bearing buffers ended after the views
+/// settled, then one every `SEQ_EVERY` frames. The aggregate line follows `SEQ_EVERY` too.
+const SEQ_FIRST: u32 = 3;
+const SEQ_EVERY: u64 = 300;
 
 /// Whether the probe is on for this process: only when the layer itself is live
 /// (`NEURAL_FORGE_ENABLE`, not disabled, not a duplicate copy) and the variable is set.
@@ -65,6 +73,42 @@ pub(crate) const PROBE_COMMANDS: &[VulkanCommand] = &[
     VulkanCommand::CreateCuFunctionNvx,
     VulkanCommand::DestroyCuFunctionNvx,
     VulkanCommand::CmdCuLaunchKernelNvx,
+    // The command sequence of launch-bearing buffers (`probe_seq`). `vkCmdCopyImage`,
+    // `vkCmdBlitImage`, both pipeline barriers, `vkBeginCommandBuffer` and
+    // `vkCmdExecuteCommands` are already in the default set.
+    VulkanCommand::EndCommandBuffer,
+    VulkanCommand::CreateFramebuffer,
+    VulkanCommand::DestroyFramebuffer,
+    VulkanCommand::CmdDraw,
+    VulkanCommand::CmdDrawIndexed,
+    VulkanCommand::CmdDrawIndirect,
+    VulkanCommand::CmdDrawIndexedIndirect,
+    VulkanCommand::CmdDrawIndirectCount,
+    VulkanCommand::CmdDrawIndexedIndirectCount,
+    VulkanCommand::CmdDrawMultiExt,
+    VulkanCommand::CmdDrawMultiIndexedExt,
+    VulkanCommand::CmdDrawMeshTasksExt,
+    VulkanCommand::CmdDrawMeshTasksIndirectExt,
+    VulkanCommand::CmdDrawMeshTasksIndirectCountExt,
+    VulkanCommand::CmdDispatch,
+    VulkanCommand::CmdDispatchIndirect,
+    VulkanCommand::CmdDispatchBase,
+    VulkanCommand::CmdExecuteGeneratedCommandsNv,
+    VulkanCommand::CmdCopyImage2,
+    VulkanCommand::CmdBlitImage2,
+    VulkanCommand::CmdCopyBufferToImage,
+    VulkanCommand::CmdCopyBufferToImage2,
+    VulkanCommand::CmdClearColorImage,
+    VulkanCommand::CmdClearDepthStencilImage,
+    VulkanCommand::CmdClearAttachments,
+    VulkanCommand::CmdResolveImage,
+    VulkanCommand::CmdResolveImage2,
+    VulkanCommand::CmdBeginRenderPass,
+    VulkanCommand::CmdBeginRenderPass2,
+    VulkanCommand::CmdEndRenderPass,
+    VulkanCommand::CmdEndRenderPass2,
+    VulkanCommand::CmdBeginRendering,
+    VulkanCommand::CmdEndRendering,
 ];
 
 /// [`PROBE_COMMANDS`] when `probe` is on, nothing otherwise.
@@ -213,6 +257,69 @@ struct State {
     module_lines: u32,
     function_lines: u32,
     registration_lines: u32,
+    /// The image each live view was created on.
+    view_images: HashMap<vk::ImageView, vk::Image>,
+    /// Images of interest: those with a view registered through a handle/address query.
+    interest: BTreeMap<vk::Image, ViewDesc>,
+    /// The colour input among them (see [`identify_colour`]).
+    colour: Option<vk::Image>,
+    /// The frame of the last first-time view registration.
+    last_new_registration: Option<u64>,
+    framebuffers: HashMap<vk::Framebuffer, Vec<vk::ImageView>>,
+    /// What every command buffer recorded since its last begin.
+    recordings: HashMap<vk::CommandBuffer, Recording>,
+    next_epoch: u64,
+    /// The most recently recorded barrier on the colour input: buffer and description.
+    colour_last_barrier: Option<(vk::CommandBuffer, String)>,
+    seq_printed: u32,
+    last_seq_frame: Option<u64>,
+    /// Each launch-bearing buffer's epoch at its last submit.
+    submitted_epochs: HashMap<vk::CommandBuffer, u64>,
+    stats: SeqStats,
+}
+
+/// Counts over every launch-bearing command buffer ended after the views settled.
+#[derive(Default)]
+struct SeqStats {
+    buffers: u32,
+    classes: BTreeMap<&'static str, u32>,
+    first_kernels: BTreeMap<String, u32>,
+    flags: BTreeMap<String, u32>,
+    layouts: BTreeMap<String, u32>,
+    handles: HashSet<vk::CommandBuffer>,
+    first_submits: u32,
+    resubmitted_unchanged: u32,
+    rerecorded: u32,
+}
+
+/// The colour input among the images of interest: the RGBA16F storage image at the extent of
+/// a registered depth image (DLSS's inputs share the render extent, and the output and NGX's
+/// scratch images don't have a depth image beside them). Returns the lowest-handle candidate
+/// and how many there were.
+fn identify_colour(interest: &BTreeMap<vk::Image, ViewDesc>) -> (Option<vk::Image>, usize) {
+    const DEPTH: [vk::Format; 6] = [
+        vk::Format::D16_UNORM,
+        vk::Format::X8_D24_UNORM_PACK32,
+        vk::Format::D32_SFLOAT,
+        vk::Format::D16_UNORM_S8_UINT,
+        vk::Format::D24_UNORM_S8_UINT,
+        vk::Format::D32_SFLOAT_S8_UINT,
+    ];
+    let depth_extents: BTreeSet<(u32, u32)> = interest
+        .values()
+        .filter(|d| DEPTH.contains(&vk::Format::from_raw(d.format)))
+        .map(|d| (d.width, d.height))
+        .collect();
+    let candidates: Vec<vk::Image> = interest
+        .iter()
+        .filter(|(_, d)| {
+            d.format == vk::Format::R16G16B16A16_SFLOAT.as_raw()
+                && vk::ImageUsageFlags::from_raw(d.usage).contains(vk::ImageUsageFlags::STORAGE)
+                && depth_extents.contains(&(d.width, d.height))
+        })
+        .map(|(image, _)| *image)
+        .collect();
+    (candidates.first().copied(), candidates.len())
 }
 
 impl State {
@@ -236,10 +343,12 @@ impl State {
             usage: image.usage.as_raw(),
         });
         self.views.insert(view, desc);
+        self.view_images.insert(view, info.image);
     }
 
     fn forget_view(&mut self, view: vk::ImageView) {
         self.views.remove(&view);
+        self.view_images.remove(&view);
     }
 
     fn register(&mut self, kind: &str, view: vk::ImageView, result: String) -> Vec<String> {
@@ -247,11 +356,203 @@ impl State {
         self.frame.registrations += 1;
         self.frame.registered.insert(desc);
         let first = self.ever_registered.insert(view);
-        if first && self.registration_lines < MAX_EVENT_LINES {
-            self.registration_lines += 1;
-            return vec![format!("{kind} view={:#x} ({}) -> {result}", view.as_raw(), describe(desc))];
+        let mut lines = Vec::new();
+        if !first {
+            return lines;
         }
-        Vec::new()
+        if self.registration_lines < MAX_EVENT_LINES {
+            self.registration_lines += 1;
+            let image = self.view_images.get(&view).map_or_else(|| "?".to_string(), |i| hex(*i));
+            lines.push(format!("{kind} view={:#x} image={image} ({}) -> {result}", view.as_raw(), describe(desc)));
+        }
+        self.last_new_registration = Some(self.frames);
+        if let (Some(desc), Some(image)) = (desc, self.view_images.get(&view).copied()) {
+            self.interest.insert(image, desc);
+            let (colour, candidates) = identify_colour(&self.interest);
+            if colour != self.colour {
+                self.colour = colour;
+                if let Some(c) = colour {
+                    lines.push(format!(
+                        "colour input: image {} ({}){}, the registered RGBA16F storage image at the depth image's extent",
+                        hex(c),
+                        self.interest[&c],
+                        if candidates > 1 { format!(" (first of {candidates} candidates)") } else { String::new() }
+                    ));
+                }
+            }
+        }
+        lines
+    }
+
+    fn label(&self, image: vk::Image) -> String {
+        if Some(image) == self.colour {
+            format!("{}[COLOUR-IN]", hex(image))
+        } else if let Some(desc) = self.interest.get(&image) {
+            format!("{}[{}x{} {:?}]", hex(image), desc.width, desc.height, vk::Format::from_raw(desc.format))
+        } else {
+            hex(image)
+        }
+    }
+
+    fn interesting(&self, image: vk::Image) -> bool {
+        self.interest.contains_key(&image)
+    }
+
+    /// The views settled: some were registered and none new for [`STABLE_FRAMES`].
+    fn settled(&self) -> bool {
+        self.last_new_registration.is_some_and(|at| self.frames >= at + STABLE_FRAMES)
+    }
+
+    fn rec(&mut self, command_buffer: vk::CommandBuffer) -> &mut Recording {
+        self.recordings.entry(command_buffer).or_default()
+    }
+
+    fn cmd_draw(&mut self, command_buffer: vk::CommandBuffer) {
+        self.rec(command_buffer).draw();
+    }
+
+    fn cmd_dispatch(&mut self, command_buffer: vk::CommandBuffer) {
+        self.rec(command_buffer).dispatch();
+    }
+
+    fn cmd_generated(&mut self, command_buffer: vk::CommandBuffer) {
+        self.rec(command_buffer).generated();
+    }
+
+    fn cmd_clear_attachments(&mut self, command_buffer: vk::CommandBuffer) {
+        self.rec(command_buffer).clear_attachments();
+    }
+
+    fn cmd_transfer(
+        &mut self, command_buffer: vk::CommandBuffer, kind: &'static str,
+        src: Option<(vk::Image, vk::ImageLayout)>, dst: Option<(vk::Image, vk::ImageLayout)>,
+    ) {
+        let interesting = src.is_some_and(|(i, _)| self.interesting(i)) || dst.is_some_and(|(i, _)| self.interesting(i));
+        self.rec(command_buffer).transfer(kind, src, dst, interesting);
+    }
+
+    /// `views`: (view, layout, load op, depth) per attachment; views the probe never saw
+    /// created are left out.
+    fn cmd_begin_render(&mut self, command_buffer: vk::CommandBuffer, kind: &'static str, views: &[RenderView]) {
+        let attachments: Vec<Attachment> = views
+            .iter()
+            .filter_map(|&(view, layout, load, depth)| {
+                self.view_images.get(&view).map(|&image| Attachment { image, layout, load, depth })
+            })
+            .collect();
+        let interesting = attachments.iter().any(|a| self.interesting(a.image));
+        self.rec(command_buffer).begin_render(kind, attachments, interesting);
+    }
+
+    fn cmd_begin_render_pass(&mut self, command_buffer: vk::CommandBuffer, framebuffer: vk::Framebuffer, imageless: Option<Vec<vk::ImageView>>) {
+        let views = imageless.or_else(|| self.framebuffers.get(&framebuffer).cloned()).unwrap_or_default();
+        let views: Vec<RenderView> = views.into_iter().map(|v| (v, None, None, false)).collect();
+        self.cmd_begin_render(command_buffer, "renderpass", &views);
+    }
+
+    fn cmd_end_render(&mut self, command_buffer: vk::CommandBuffer) {
+        self.rec(command_buffer).end_render();
+    }
+
+    fn cmd_barriers(
+        &mut self, command_buffer: vk::CommandBuffer, images: impl Iterator<Item = ImageBarrier>,
+        memory: impl Iterator<Item = (u64, u64, u64, u64)>, buffers: u32,
+    ) {
+        for (src_stage, src_access, dst_stage, dst_access) in memory {
+            self.rec(command_buffer).memory_barrier(src_stage, src_access, dst_stage, dst_access);
+        }
+        self.rec(command_buffer).buffer_barriers(buffers);
+        for barrier in images {
+            if Some(barrier.image) == self.colour {
+                self.colour_last_barrier = Some((
+                    command_buffer,
+                    format!("{:?}->{:?} in cmdbuf {} (frame {})", barrier.old, barrier.new, hex(command_buffer), self.frames),
+                ));
+            }
+            let interesting = self.interesting(barrier.image);
+            self.rec(command_buffer).image_barrier(barrier, interesting);
+        }
+    }
+
+    fn framebuffer(&mut self, framebuffer: vk::Framebuffer, views: Vec<vk::ImageView>) {
+        self.framebuffers.insert(framebuffer, views);
+    }
+
+    /// At `vkEndCommandBuffer`: aggregate and maybe print a launch-bearing buffer's sequence.
+    fn end(&mut self, command_buffer: vk::CommandBuffer) -> Vec<String> {
+        let Some(rec) = self.recordings.get(&command_buffer) else { return Vec::new() };
+        let launches = rec.total_launches();
+        if launches == 0 || !self.settled() {
+            return Vec::new();
+        }
+        let analysis = rec.analyse(self.colour);
+        let flags = if rec.flags.is_empty() { "none".to_string() } else { format!("{:?}", rec.flags) };
+        let first_kernel = analysis.first_launch.as_ref().map_or_else(|| "?".to_string(), |(_, k)| k.clone());
+        let stats = &mut self.stats;
+        stats.buffers += 1;
+        *stats.classes.entry(analysis.class()).or_default() += 1;
+        *stats.first_kernels.entry(first_kernel.clone()).or_default() += 1;
+        *stats.flags.entry(flags.clone()).or_default() += 1;
+        *stats.layouts.entry(analysis.layout_text()).or_default() += 1;
+        let due = self.seq_printed < SEQ_FIRST || self.last_seq_frame.is_none_or(|at| self.frames >= at + SEQ_EVERY);
+        if !due {
+            return Vec::new();
+        }
+        self.seq_printed += 1;
+        self.last_seq_frame = Some(self.frames);
+        let rec = &self.recordings[&command_buffer];
+        let cb = hex(command_buffer);
+        let mut lines = vec![format!(
+            "seq cb={cb} frame {} epoch {} flags={flags} launches={launches} entries={}{}: begin",
+            self.frames,
+            rec.epoch,
+            rec.ops.len(),
+            if rec.overflowed { " (entry cap reached, later commands only counted)" } else { "" }
+        )];
+        lines.extend(rec.lines(&|image| self.label(image)).into_iter().map(|line| format!("seq cb={cb} {line}")));
+        let list = |items: &[String]| if items.is_empty() { "none".to_string() } else { items.join("; ") };
+        let colour = self.colour.map_or_else(|| "not identified".to_string(), |c| self.label(c));
+        let input_kernel = if first_kernel.contains("input") { "yes" } else { "no" };
+        let elsewhere = rec.colour_elsewhere_at_first_launch.clone().unwrap_or_else(|| "none seen".into());
+        lines.push(format!(
+            "seq cb={cb} end: first launch {} {first_kernel} (input kernel: {input_kernel}); before it {} draws, {} dispatches, \
+             {} renderings(other), {} transfers(other), {} mem-barriers with a write in src access",
+            analysis.first_launch.as_ref().map_or_else(|| "-".to_string(), |(i, _)| format!("[{i}]")),
+            analysis.draws_before,
+            analysis.dispatches_before,
+            analysis.renderings_before,
+            analysis.transfers_before,
+            analysis.write_memory_barriers_before,
+        ));
+        lines.push(format!(
+            "seq cb={cb} colour input {colour} before the first launch: explicit writes: {}; barriers with write src access: {}; \
+             transitions: {}; layout at first launch: {}; used as: {}; last barrier on it in another cmdbuf when the first launch was recorded: {elsewhere}",
+            list(&analysis.explicit_writes),
+            list(&analysis.barrier_writes),
+            list(&analysis.transitions),
+            analysis.layout_text(),
+            analysis.usage_layout.as_ref().map_or_else(|| "-".to_string(), |(l, at)| format!("{l:?} at {at}")),
+        ));
+        lines
+    }
+
+    fn stats_line(&self) -> String {
+        let s = &self.stats;
+        let map = |m: &BTreeMap<String, u32>| m.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", ");
+        let classes = s.classes.iter().map(|(k, v)| format!("{k}: {v}")).collect::<Vec<_>>().join(", ");
+        format!(
+            "cmdbuf stats after frame {}: launch-bearing buffers ended={} distinct handles={} colour-input-before-first-launch={{{classes}}} \
+             first kernel={{{}}} begin flags={{{}}} layout at first launch={{{}}} submits: first={} resubmitted-unchanged={} re-recorded={}",
+            self.frames,
+            s.buffers,
+            s.handles.len(),
+            map(&s.first_kernels),
+            map(&s.flags),
+            map(&s.layouts),
+            s.first_submits,
+            s.resubmitted_unchanged,
+            s.rerecorded
+        )
     }
 
     fn create_module(&mut self, data_size: usize, result: vk::Result) -> Vec<String> {
@@ -276,13 +577,22 @@ impl State {
 
     fn launch(&mut self, command_buffer: vk::CommandBuffer, info: &vk::CuLaunchInfoNVX) {
         *self.launch_cmdbufs.entry(command_buffer).or_default() += 1;
+        let function = self.functions.get(&info.function).cloned().unwrap_or_else(|| format!("fn{:#x}", info.function.as_raw()));
+        let elsewhere = match &self.colour_last_barrier {
+            Some((cb, _)) if *cb == command_buffer => None,
+            other => other.as_ref().map(|(_, text)| text.clone()),
+        };
+        let rec = self.rec(command_buffer);
+        if rec.launches == 0 {
+            rec.colour_elsewhere_at_first_launch = elsewhere;
+        }
+        rec.launch(function.clone());
         let frame = &mut self.frame;
         frame.launches += 1;
         if !frame.cmdbufs.contains(&command_buffer) {
             frame.cmdbufs.push(command_buffer);
         }
         if frame.shapes.len() < MAX_LISTED {
-            let function = self.functions.get(&info.function).cloned().unwrap_or_else(|| format!("fn{:#x}", info.function.as_raw()));
             frame.shapes.insert(LaunchShape {
                 function,
                 grid: (info.grid_dim_x, info.grid_dim_y, info.grid_dim_z),
@@ -294,13 +604,17 @@ impl State {
         }
     }
 
-    fn begin(&mut self, command_buffer: vk::CommandBuffer) {
+    fn begin(&mut self, command_buffer: vk::CommandBuffer, flags: vk::CommandBufferUsageFlags) {
         self.launch_cmdbufs.remove(&command_buffer);
+        self.next_epoch += 1;
+        self.recordings.insert(command_buffer, Recording::new(flags, self.next_epoch));
     }
 
     fn free(&mut self, command_buffers: &[vk::CommandBuffer]) {
         for cb in command_buffers {
             self.launch_cmdbufs.remove(cb);
+            self.recordings.remove(cb);
+            self.submitted_epochs.remove(cb);
         }
     }
 
@@ -309,6 +623,7 @@ impl State {
         if inherited > 0 {
             *self.launch_cmdbufs.entry(primary).or_default() += inherited;
         }
+        self.rec(primary).execute(u32::try_from(secondaries.len()).unwrap_or(u32::MAX), inherited);
     }
 
     fn submit(&mut self, queue: vk::Queue, command_buffers: impl Iterator<Item = vk::CommandBuffer>) -> Vec<String> {
@@ -317,9 +632,21 @@ impl State {
         if self.launch_cmdbufs.is_empty() {
             return Vec::new();
         }
-        let carried: u32 = command_buffers.filter_map(|cb| self.launch_cmdbufs.get(&cb)).sum();
+        let bearing: Vec<(vk::CommandBuffer, u32)> =
+            command_buffers.filter_map(|cb| self.launch_cmdbufs.get(&cb).map(|n| (cb, *n))).collect();
+        let carried: u32 = bearing.iter().map(|(_, n)| n).sum();
         if carried == 0 {
             return Vec::new();
+        }
+        for (cb, _) in &bearing {
+            let epoch = self.recordings.get(cb).map_or(0, |r| r.epoch);
+            let stats = &mut self.stats;
+            stats.handles.insert(*cb);
+            match self.submitted_epochs.insert(*cb, epoch) {
+                None => stats.first_submits += 1,
+                Some(previous) if previous == epoch => stats.resubmitted_unchanged += 1,
+                Some(_) => stats.rerecorded += 1,
+            }
         }
         self.frame.launch_submits.push((index, queue, carried));
         if self.first_launch_submit.is_none() && !self.first_launch_submit_done {
@@ -356,6 +683,9 @@ impl State {
                 self.any_launch_frame_logged = true;
             }
             lines.push(summary_line(n, &frame, queue, self.ever_registered.len()));
+        }
+        if n.is_multiple_of(SEQ_EVERY) && self.stats.buffers > 0 {
+            lines.push(self.stats_line());
         }
         lines
     }
@@ -437,9 +767,94 @@ pub(crate) fn on_launch(command_buffer: vk::CommandBuffer, info: &vk::CuLaunchIn
     state().launch(command_buffer, info);
 }
 
-pub(crate) fn on_begin_command_buffer(command_buffer: vk::CommandBuffer) {
+pub(crate) fn on_begin_command_buffer(command_buffer: vk::CommandBuffer, flags: vk::CommandBufferUsageFlags) {
     if enabled() {
-        state().begin(command_buffer);
+        state().begin(command_buffer, flags);
+    }
+}
+
+pub(crate) fn on_end_command_buffer(command_buffer: vk::CommandBuffer) {
+    if enabled() {
+        let lines = state().end(command_buffer);
+        emit(lines);
+    }
+}
+
+/// One render attachment as the hooks see it: view, layout (`None` for a render pass),
+/// load op (`None` for a render pass), and whether it is the depth/stencil attachment.
+pub(crate) type RenderView = (vk::ImageView, Option<vk::ImageLayout>, Option<vk::AttachmentLoadOp>, bool);
+
+pub(crate) fn on_cmd_draw(command_buffer: vk::CommandBuffer) {
+    if enabled() {
+        state().cmd_draw(command_buffer);
+    }
+}
+
+pub(crate) fn on_cmd_dispatch(command_buffer: vk::CommandBuffer) {
+    if enabled() {
+        state().cmd_dispatch(command_buffer);
+    }
+}
+
+pub(crate) fn on_cmd_generated(command_buffer: vk::CommandBuffer) {
+    if enabled() {
+        state().cmd_generated(command_buffer);
+    }
+}
+
+pub(crate) fn on_cmd_clear_attachments(command_buffer: vk::CommandBuffer) {
+    if enabled() {
+        state().cmd_clear_attachments(command_buffer);
+    }
+}
+
+pub(crate) fn on_cmd_transfer(
+    command_buffer: vk::CommandBuffer, kind: &'static str,
+    src: Option<(vk::Image, vk::ImageLayout)>, dst: Option<(vk::Image, vk::ImageLayout)>,
+) {
+    if enabled() {
+        state().cmd_transfer(command_buffer, kind, src, dst);
+    }
+}
+
+pub(crate) fn on_cmd_begin_rendering(command_buffer: vk::CommandBuffer, views: &[RenderView]) {
+    if enabled() {
+        state().cmd_begin_render(command_buffer, "rendering", views);
+    }
+}
+
+pub(crate) fn on_cmd_begin_render_pass(command_buffer: vk::CommandBuffer, framebuffer: vk::Framebuffer, imageless: Option<Vec<vk::ImageView>>) {
+    if enabled() {
+        state().cmd_begin_render_pass(command_buffer, framebuffer, imageless);
+    }
+}
+
+pub(crate) fn on_cmd_end_render(command_buffer: vk::CommandBuffer) {
+    if enabled() {
+        state().cmd_end_render(command_buffer);
+    }
+}
+
+/// Image barriers, memory barriers as `(src stage, src access, dst stage, dst access)`, and
+/// the number of buffer barriers, all widened to sync2's 64-bit masks.
+pub(crate) fn on_cmd_barriers(
+    command_buffer: vk::CommandBuffer, images: impl Iterator<Item = ImageBarrier>,
+    memory: impl Iterator<Item = (u64, u64, u64, u64)>, buffers: u32,
+) {
+    if enabled() {
+        state().cmd_barriers(command_buffer, images, memory, buffers);
+    }
+}
+
+pub(crate) fn on_create_framebuffer(framebuffer: vk::Framebuffer, views: Vec<vk::ImageView>) {
+    if enabled() {
+        state().framebuffer(framebuffer, views);
+    }
+}
+
+pub(crate) fn on_destroy_framebuffer(framebuffer: vk::Framebuffer) {
+    if enabled() {
+        state().framebuffers.remove(&framebuffer);
     }
 }
 
@@ -569,7 +984,7 @@ mod tests {
         assert!(summary.contains("dlss_sr_kernel grid=80x45x1 block=16x16x1 smem=0 params=5 extras=0"), "{summary}");
         assert!(summary.contains("fn0x88"), "an unknown function is named by handle: {summary}");
         // A re-begun buffer no longer carries launches.
-        s.begin(cb(0xa));
+        s.begin(cb(0xa), vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         s.free(&[cb(0xd)]);
         assert!(s.submit(queue(0x2), [cb(0xa), cb(0xd)].into_iter()).is_empty());
         assert!(s.frame.launch_submits.is_empty());
@@ -598,6 +1013,111 @@ mod tests {
             s.present(q);
         }
         assert_eq!(s.present(q).len(), 1, "every 60th frame is logged");
+    }
+
+    /// GTA's DLSS inputs: colour, depth, MV at 1707x960, output and scratch elsewhere.
+    fn register_dlss_inputs(s: &mut State) -> (vk::Image, vk::Image) {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+        let images = [
+            (0x100, 1707, 960, rgba, storage | vk::ImageUsageFlags::COLOR_ATTACHMENT),
+            (0x200, 1707, 960, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
+            (0x300, 1707, 960, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT),
+            (0x400, 2560, 1440, rgba, storage),
+            (0x500, 640, 384, rgba, storage),
+        ];
+        // Scratch and output first, so the colour input is not simply the first registered.
+        for (raw, w, h, format, usage) in images.iter().rev() {
+            let image = vk::Image::from_raw(*raw);
+            s.record_image(image, &image_info(*w, *h, *format, *usage));
+            let view = vk::ImageView::from_raw(raw + 1);
+            s.record_view(view, &view_info(image, *format, 0));
+            s.register("vkGetImageViewHandle64NVX", view, "handle 0x1".into());
+        }
+        (vk::Image::from_raw(0x100), vk::Image::from_raw(0x400))
+    }
+
+    #[test]
+    fn the_colour_input_is_the_rgba16f_storage_image_at_the_depth_extent() {
+        let mut s = State::default();
+        let image = vk::Image::from_raw(0x100);
+        s.record_image(image, &image_info(1707, 960, vk::Format::R16G16B16A16_SFLOAT, vk::ImageUsageFlags::STORAGE));
+        s.record_view(vk::ImageView::from_raw(0x101), &view_info(image, vk::Format::R16G16B16A16_SFLOAT, 0));
+        s.register("vkGetImageViewHandleNVX", vk::ImageView::from_raw(0x101), "0x1".into());
+        assert_eq!(s.colour, None, "without a depth image beside it there is no render extent");
+        let mut s = State::default();
+        let (colour, _) = register_dlss_inputs(&mut s);
+        assert_eq!(s.colour, Some(colour));
+        assert!(s.label(colour).ends_with("[COLOUR-IN]"));
+        assert!(s.label(vk::Image::from_raw(0x200)).contains("1707x960 D32_SFLOAT_S8_UINT"));
+        assert_eq!(s.label(vk::Image::from_raw(0x999)), "0x999");
+    }
+
+    #[test]
+    fn launch_bearing_sequences_are_printed_after_the_views_settle_and_then_sampled() {
+        let mut s = State::default();
+        let (colour, output) = register_dlss_inputs(&mut s);
+        s.create_function(vk::CuFunctionNVX::from_raw(0x77), "cuda_engine_input_kernel_rel_hdr".into(), vk::Result::SUCCESS);
+        s.create_function(vk::CuFunctionNVX::from_raw(0x78), "dltss_pwin_enc0_layer".into(), vk::Result::SUCCESS);
+        let q = queue(0x9);
+        let game = cb(0xa);
+        let record = |s: &mut State| {
+            s.begin(game, vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            s.cmd_draw(game);
+            s.cmd_dispatch(game);
+            s.cmd_barriers(
+                game,
+                [ImageBarrier {
+                    image: colour,
+                    old: vk::ImageLayout::GENERAL,
+                    new: vk::ImageLayout::GENERAL,
+                    src_stage: vk::PipelineStageFlags2::COMPUTE_SHADER.as_raw(),
+                    src_access: vk::AccessFlags2::SHADER_WRITE.as_raw(),
+                    dst_stage: vk::PipelineStageFlags2::ALL_COMMANDS.as_raw(),
+                    dst_access: vk::AccessFlags2::SHADER_READ.as_raw(),
+                }]
+                .into_iter(),
+                std::iter::empty(),
+                0,
+            );
+            s.launch(game, &launch_info(0x77, 4));
+            s.launch(game, &launch_info(0x78, 4));
+            s.cmd_transfer(game, "copy", Some((output, vk::ImageLayout::GENERAL)), Some((vk::Image::from_raw(0x777), vk::ImageLayout::GENERAL)));
+            s.end(game)
+        };
+        assert!(record(&mut s).is_empty(), "not before the views settle");
+        for _ in 0..STABLE_FRAMES {
+            s.present(q);
+        }
+        let lines = record(&mut s);
+        assert!(lines[0].starts_with("seq cb=0xa frame 30 epoch 2 flags=ONE_TIME_SUBMIT launches=2 entries=5"), "{lines:?}");
+        assert_eq!(lines[1], "seq cb=0xa [0] ... 1 draws, 1 dispatches");
+        assert!(lines[2].starts_with("seq cb=0xa [1] barrier 0x100[COLOUR-IN] GENERAL->GENERAL src COMPUTE_SHADER:SHADER_WRITE"), "{}", lines[2]);
+        assert_eq!(lines[3], "seq cb=0xa [2] LAUNCH #1 cuda_engine_input_kernel_rel_hdr");
+        assert!(lines[5].contains("copy src=0x400[2560x1440 R16G16B16A16_SFLOAT] (GENERAL) dst=0x777 (GENERAL)"), "{}", lines[5]);
+        assert!(lines[6].contains("first launch [2] cuda_engine_input_kernel_rel_hdr (input kernel: yes); before it 1 draws, 1 dispatches"), "{}", lines[6]);
+        assert!(lines[7].contains("explicit writes: none; barriers with write src access: [1] src access SHADER_WRITE; transitions: none; layout at first launch: GENERAL (barrier [1])"), "{}", lines[7]);
+        // Resubmission bookkeeping: submitted twice unchanged, then re-recorded.
+        s.submit(q, [game].into_iter());
+        s.submit(q, [game].into_iter());
+        // Two more full sequences, then quiet until SEQ_EVERY frames later.
+        assert!(!record(&mut s).is_empty());
+        s.submit(q, [game].into_iter());
+        assert!(!record(&mut s).is_empty());
+        assert!(record(&mut s).is_empty(), "the fourth is not printed");
+        while !s.frames.is_multiple_of(SEQ_EVERY) {
+            s.present(q);
+        }
+        let lines = s.present(q);
+        let stats = lines.last().unwrap();
+        assert!(stats.starts_with("cmdbuf stats after frame 301: launch-bearing buffers ended=4 distinct handles=1"), "{stats}");
+        assert!(stats.contains("colour-input-before-first-launch={barrier-write: 4}"), "{stats}");
+        assert!(stats.contains("submits: first=1 resubmitted-unchanged=1 re-recorded=1"), "{stats}");
+        assert!(record(&mut s).is_empty(), "the last print was at frame 30");
+        while s.frames < STABLE_FRAMES + SEQ_EVERY {
+            s.present(q);
+        }
+        assert!(!record(&mut s).is_empty(), "printed again once SEQ_EVERY frames passed");
     }
 
     #[test]
