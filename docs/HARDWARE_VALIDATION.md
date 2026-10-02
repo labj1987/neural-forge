@@ -713,3 +713,34 @@ confirmed it isn't visible in Tailscale from any path and will restart it by han
 Alex confirming it's back up first** -- the machine may be stuck at POST or otherwise
 requires physical presence; blind SSH/reboot attempts against a host in this state
 waste a session's time for no possible benefit.
+
+## 2026-10-02 -- false scene cuts: none found, nothing changed
+
+**Question:** `MotionState::prepare` (`crates/helper/src/main.rs`) calls
+`optical_flow::is_scene_cut` with a fixed mean-luma threshold of 40 between consecutive model
+frames. A cut resets NGX's history and the optical-flow reference, so a false cut costs a frame
+without temporal history. Another DLSS 5 layer measured a fixed threshold tripping about four
+times a second on steady pans, and at model interval 2 Neural Forge compares frames two presents
+apart, so it could be worse off here.
+
+**Setup:** LordNikon, Neural Forge 1.0.1, GTA V Enhanced built-in benchmark (all five passes,
+pass 4 = 117 s of continuous free roam), 2560x1440 at 288 Hz with the HDR desktop on (GTA's
+swapchain is still 8-bit, so NR composites normally), NR on, model every 2nd frame, model
+resolution 100%, motion vectors on, Alex's mods with the fixed Enable All Interiors.
+
+**Result:**
+
+| | Count |
+|---|---|
+| Model evaluations (helper frame counter) | 7121 |
+| Scene cuts logged (`[mvec] scene cut detected`) | 9 (0.13% of evaluations) |
+| Of those, at most in pass 4 | 3 (at most one per 39 s of continuous play) |
+| History resets from a pause (`resetting model history`, 1.0.1) | 1 (a 7.9 s loading gap) |
+
+The cut count is exact. The times are not: the helper buffers its log, so lines reach the file in
+bursts (six cuts within 90 ms, three within 20 ms, while model frames are about 36 ms apart). The
+first burst falls before pass 4, during the benchmark's scripted camera cuts and loading; the
+second is the only one that can be inside pass 4.
+
+**Decision:** far below one cut per ten seconds of continuous play, so the fixed threshold stays.
+No adaptive baseline was built. Real fps in this run: 55.2 (pass 4).
