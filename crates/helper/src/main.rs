@@ -88,7 +88,7 @@ impl MotionState {
     #[allow(clippy::too_many_arguments)]
     /// `reset` drops the flow's reference frame (a scene cut, or a model history that went
     /// stale), so the next estimate seeds instead of measuring motion against an old picture.
-    /// `hdr`: the frame is RGBA16F, so the session tone maps it before estimating (and a session
+    /// `hdr`: the frame is RGBA16F, so the session quantises it to 8 bits first (and a session
     /// built for the other class is replaced, like one for another size).
     fn session(&mut self, instance: &ash::Instance, device: &ash::Device, physical_device: vk::PhysicalDevice, flow_queue: Option<&optical_flow::FlowQueue>, width: u32, height: u32, quality: u32, hdr: bool, reset: bool) -> Option<&mut optical_flow::GpuFlow> {
         if self.blocked {
@@ -214,9 +214,9 @@ fn main() {
     hdr.control_seq.fetch_add(1, Ordering::Relaxed);
     hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
     neural_forge_helper::log!("[helper] shm attached");
-    // Builds the scene-cut thumbnail's tone-map table now (a few ms under Wine) rather than
+    // Builds the scene-cut thumbnail's half-to-byte table now (a few ms under Wine) rather than
     // inside the first RGBA16F request, which a layer is holding a game submit for.
-    let _ = neural_forge_helper::hdr::tonemap_u8_half(0);
+    let _ = neural_forge_helper::hdr::encoded_u8_half(0);
     neural_forge_helper::logging::flush();
 
     let Some((entry, instance, physical_device, device, queue, flow_queue, flow_status)) = create_vulkan_context(hdr.mvec_enabled()) else {
@@ -488,8 +488,9 @@ fn process_request(
     // Real motion vectors, estimated on the GPU inside `evaluate` -- see `optical_flow.rs`.
     // Slot 0 only (protocol v3 never duplicated the motion payload for slot 1). The GUI's
     // "Estimate motion vectors" toggle is the only switch.
-    // An RGBA16F frame is tone mapped to 8 bits for these two only (the flow on the GPU, the
-    // scene-cut thumbnail on the CPU); the model gets the raw half floats.
+    // An RGBA16F frame (the layer's encoded proxy, display-referred in [0, 1]) is quantised to
+    // 8 bits for these two only (the flow on the GPU, the scene-cut thumbnail on the CPU); the
+    // model gets the proxy's half floats as they are.
     let want_motion = class.filter(|_| slot == 0 && hdr.mvec_enabled());
     let t_setup = t_seen.elapsed();
     let scene_cut = motion.prepare(device, want_motion, proxy, width, height);

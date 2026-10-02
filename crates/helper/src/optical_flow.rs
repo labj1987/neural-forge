@@ -9,10 +9,10 @@
 //!
 //! Per frame, three submissions chained by semaphores, with no CPU copy of any frame:
 //! 1. main queue: blit the model's Color image (already uploaded) down by [`DOWNSCALE`]
-//!    into this frame's flow input. An RGBA16F (scene-linear HDR) Color image is first tone
-//!    mapped into an 8-bit copy by `hdr_to_flow.comp` (`x / (1 + x)`, then sRGB; the same
-//!    function as `hdr::tonemap_encode`), and that copy is blitted instead: a plain blit would
-//!    clamp everything above 1.0 and spend the 8 bits linearly;
+//!    into this frame's flow input. An RGBA16F Color image (the layer's encoded proxy,
+//!    display-referred in [0, 1]) is first quantised into an 8-bit copy by `hdr_to_flow.comp`
+//!    (clamped to [0, 1], no tone map; the same function as `hdr::encoded_unit`), and that copy
+//!    is blitted instead;
 //! 2. optical-flow queue: estimate flow between this input and the previous one, copy the
 //!    gridded result into a buffer;
 //! 3. main queue: `flow_to_mvec.comp` turns it into full-resolution R16G16_SFLOAT motion
@@ -103,12 +103,12 @@ pub struct GpuFlow {
     shader: vk::ShaderModule,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
-    /// The HDR tone-map pass (`hdr_to_flow.comp`); all null unless `hdr`.
+    /// The HDR-to-8-bit pass (`hdr_to_flow.comp`); all null unless `hdr`.
     tone: ToneMap,
     pub width: u32,
     pub height: u32,
     pub quality: u32,
-    /// Built for an RGBA16F Color image: [`Self::estimate`] tone maps it before the blit.
+    /// Built for an RGBA16F Color image: [`Self::estimate`] quantises it to 8 bits before the blit.
     pub hdr: bool,
     flow_width: u32,
     flow_height: u32,
@@ -125,7 +125,7 @@ pub struct GpuFlow {
 // Access is serialized by the helper's own single-threaded per-frame loop.
 unsafe impl Send for GpuFlow {}
 
-/// Resources of the HDR tone-map pass: a full-resolution `R8G8B8A8_UNORM` storage image and
+/// Resources of the HDR-to-8-bit pass: a full-resolution `R8G8B8A8_UNORM` storage image and
 /// the compute pipeline that fills it from the model's RGBA16F Color image.
 #[derive(Clone, Copy, Default)]
 struct ToneMap {
@@ -149,7 +149,7 @@ impl GpuFlow {
     /// `device`/`instance`/`pd` are the helper's own live Vulkan context; `main_family` is the
     /// family the model's images and main queue belong to, `flow_queue` the optical-flow one.
     /// `width`/`height` are the model's (full) frame size. `hdr`: the Color image this session
-    /// will be handed is RGBA16F scene-linear, so it is tone mapped before the flow sees it.
+    /// will be handed is RGBA16F (the layer's encoded proxy), so it is quantised to 8 bits first.
     #[allow(clippy::too_many_arguments)]
     pub fn new(instance: &ash::Instance, device: &ash::Device, pd: vk::PhysicalDevice, main_family: u32, flow_queue: &FlowQueue, width: u32, height: u32, quality: u32, hdr: bool) -> Result<Self, String> {
         let api = vk::NvOpticalFlowFn::load(|name| unsafe { std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr())) });
@@ -308,7 +308,7 @@ impl GpuFlow {
         Ok(())
     }
 
-    /// The HDR tone-map pass: its 8-bit output image and pipeline. Binding 0 (the Color view) is
+    /// The HDR-to-8-bit pass: its 8-bit output image and pipeline. Binding 0 (the Color view) is
     /// written per estimate, since the model's Color image can be rebuilt under a live session.
     unsafe fn build_tone_map(&mut self, device: &ash::Device, mem: &vk::PhysicalDeviceMemoryProperties) -> Result<(), String> {
         let format = vk::Format::R8G8B8A8_UNORM;
@@ -371,7 +371,7 @@ impl GpuFlow {
 
     /// Estimates motion into `mvec` (the model's MVec image, `width`x`height`, R16G16_SFLOAT)
     /// from `color` (the model's Color image, same size; `color_view` is its view, read by the
-    /// tone-map pass when the session is `hdr`). Both must be in
+    /// HDR-to-8-bit pass when the session is `hdr`). Both must be in
     /// `SHADER_READ_ONLY_OPTIMAL` and idle on `main_queue`, and are left that way. `scale` is
     /// the units scale from `neural_forge_protocol::motion::scales`. `Ok(false)` on the first
     /// frame after creation or `reset` (history seeded, `mvec` untouched), `Ok(true)` when
@@ -398,7 +398,7 @@ impl GpuFlow {
             }
             begin(device, self.cmd_pre)?;
             let source = if self.hdr {
-                // Scene-linear half floats -> tone-mapped 8-bit copy; the blit reads that copy.
+                // The encoded half floats -> an 8-bit copy; the blit reads that copy.
                 let tone = self.tone;
                 self.barrier(self.cmd_pre, tone.image.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
                 device.cmd_bind_pipeline(self.cmd_pre, vk::PipelineBindPoint::COMPUTE, tone.pipeline);

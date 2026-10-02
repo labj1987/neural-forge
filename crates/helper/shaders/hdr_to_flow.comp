@@ -1,9 +1,10 @@
 #version 450
 #extension GL_EXT_samplerless_texture_functions : require
-// Tone maps the model's scene-linear RGBA16F Color image into an 8-bit picture for optical
-// flow only (the model itself keeps the raw half floats). Per channel: NaN and negatives to 0,
-// Reinhard x / (1 + x), then the sRGB transfer function. Must stay the same function as
-// `crates/helper/src/hdr.rs`'s `tonemap_encode` (the CPU scene-cut thumbnail uses that one).
+// Quantises the model's RGBA16F Color image (the layer's encoded proxy, already display-referred
+// in [0, 1]) into an 8-bit picture for optical flow only (the model itself keeps the half floats).
+// Per channel: NaN to 0, then clamped to [0, 1]; no tone map and no transfer function (the layer's
+// encode did both). Must stay the same function as `crates/helper/src/hdr.rs`'s `encoded_unit`
+// (the CPU scene-cut thumbnail uses that one).
 // Output: a full-resolution R8G8B8A8_UNORM storage image the flow input is blitted from.
 layout(local_size_x = 16, local_size_y = 16) in;
 
@@ -15,14 +16,10 @@ layout(push_constant) uniform Params {
 } p;
 
 float encode(float x) {
-    if (isnan(x) || x <= 0.0) {
+    if (isnan(x)) {
         return 0.0;
     }
-    if (isinf(x)) {
-        return 1.0;
-    }
-    float c = x / (1.0 + x);
-    return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+    return clamp(x, 0.0, 1.0);
 }
 
 void main() {

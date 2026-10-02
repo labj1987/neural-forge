@@ -669,7 +669,7 @@ impl FrameResources {
         // B's fence covers it (the flow's last submission is on `queue` before B).
         let mut motion_time = None;
         let mut motion_failed = false;
-        // A session built for the other format class would blit floats as bytes or tone map
+        // A session built for the other format class would blit floats as bytes or convert
         // bytes; the caller keys sessions by class, so this only guards against a mismatch.
         let mut motion = motion.filter(|flow| flow.hdr == self.is_hdr());
         if let Some(flow) = motion.as_deref_mut() {

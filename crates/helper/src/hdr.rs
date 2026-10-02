@@ -1,11 +1,15 @@
-//! The scene-linear RGBA16F proxy (the pre-upscaler path, `docs/PRE_UPSCALER_DESIGN.md`
-//! section 3): what the helper needs to know about a frame's format class, and the small
-//! amount of CPU-side float handling it does on such a frame.
+//! The RGBA16F proxy (the pre-upscaler path, `docs/PRE_UPSCALER_DESIGN.md` section 3): what the
+//! helper needs to know about a frame's format class, and the small amount of CPU-side float
+//! handling it does on such a frame.
 //!
-//! The model itself always gets the raw half floats. Only two consumers want an 8-bit
-//! picture: optical flow (whose input format is `B8G8R8A8_UNORM`; the GPU twin of
-//! [`tonemap_encode`] lives in `shaders/hdr_to_flow.comp`) and the scene-cut thumbnail
-//! (`scene.rs`, CPU, which decodes halves with [`f16_to_f32`]).
+//! The layer sends DLSS's input already encoded for the model (`preupscale_encode.comp`: the
+//! game's exposure, a paper white, a per-channel shoulder, sRGB), a display-referred picture in
+//! [0, 1] stored as half floats. The model gets exactly those halves. Two consumers want an 8-bit
+//! picture of it: optical flow (whose input format is `B8G8R8A8_UNORM`; the GPU twin of
+//! [`encoded_unit`] lives in `shaders/hdr_to_flow.comp`) and the scene-cut thumbnail (`scene.rs`,
+//! CPU, which decodes halves with [`f16_to_f32`]). Both quantise the encoded value as it is, with
+//! no further tone map or transfer function, so an HDR frame's 8-bit picture is what an 8-bit
+//! proxy of the same picture would be.
 //!
 //! Pure bookkeeping and arithmetic with no Win32 or Vulkan calls, so it builds and tests
 //! natively.
@@ -19,7 +23,7 @@ use neural_forge_protocol::enums::proxy_format;
 pub enum FormatClass {
     /// `RGBA8`/`BGRA8`: the display-referred frame, told to the model as SDR.
     Sdr8,
-    /// `RGBA16F`: scene-linear HDR half floats, values may far exceed 1.0.
+    /// `RGBA16F`: half floats; from the layer, DLSS's HDR input encoded into [0, 1] for the model.
     Hdr16,
 }
 
@@ -122,42 +126,35 @@ pub fn f16_to_f32(bits: u16) -> f32 {
     f32::from_bits(out)
 }
 
-/// The 8-bit picture optical flow and the scene-cut thumbnail see for one scene-linear
-/// channel value: Reinhard `x / (1 + x)` (so any brightness lands in [0, 1) and highlights
-/// keep their texture), then the sRGB transfer function (so the 8 bits are spent where the
-/// eye and the flow's block matcher need them). NaN and negatives map to 0, +Inf to 1.
+/// The 8-bit picture optical flow and the scene-cut thumbnail see of one RGBA16F channel, in
+/// [0, 1]: the layer's encoded value clamped (NaN and negatives to 0, anything above 1, +Inf
+/// included, to 1). No tone map: the layer's encode already made the frame display-referred, and
+/// tone mapping it again (the old `x / (1 + x)` then sRGB) put white at 188/255 and squeezed the
+/// scene-cut threshold's range by about a third.
 ///
 /// `shaders/hdr_to_flow.comp`'s `encode` is the same function; keep them in step.
-pub fn tonemap_encode(x: f32) -> f32 {
-    if x.is_nan() || x <= 0.0 {
+pub fn encoded_unit(x: f32) -> f32 {
+    if x.is_nan() {
         return 0.0;
     }
-    if x.is_infinite() {
-        return 1.0;
-    }
-    let c = x / (1.0 + x);
-    if c <= 0.003_130_8 {
-        12.92 * c
-    } else {
-        1.055 * c.powf(1.0 / 2.4) - 0.055
-    }
+    x.clamp(0.0, 1.0)
 }
 
-/// [`tonemap_encode`] quantised to a byte, rounding to nearest.
-pub fn tonemap_u8(x: f32) -> u8 {
-    (tonemap_encode(x) * 255.0 + 0.5).clamp(0.0, 255.0) as u8
+/// [`encoded_unit`] quantised to a byte, rounding to nearest.
+pub fn encoded_u8(x: f32) -> u8 {
+    (encoded_unit(x) * 255.0 + 0.5) as u8
 }
 
-/// [`tonemap_u8`] of a half float given as its bits, through a table of all 65536 answers built
-/// on first use. The scene-cut thumbnail calls this ~60000 times per frame, and `powf` from the
-/// helper's Windows C runtime under Wine costs about 80 ns a call: 4.9 ms of every request,
-/// measured on the rig (docs/PRE_UPSCALER_DESIGN.md, "Hand-off latency"). Identical results.
-pub fn tonemap_u8_half(bits: u16) -> u8 {
+/// [`encoded_u8`] of a half float given as its bits, through a table of all 65536 answers built
+/// on first use. The scene-cut thumbnail calls this ~60000 times per frame; per-sample float work
+/// through the helper's Windows C runtime under Wine once cost 4.9 ms of every request, measured
+/// on the rig (docs/PRE_UPSCALER_DESIGN.md, "Hand-off latency"). Identical results.
+pub fn encoded_u8_half(bits: u16) -> u8 {
     static TABLE: std::sync::OnceLock<Box<[u8; 65536]>> = std::sync::OnceLock::new();
     TABLE.get_or_init(|| {
         let mut t = Box::new([0u8; 65536]);
         for (b, out) in t.iter_mut().enumerate() {
-            *out = tonemap_u8(f16_to_f32(b as u16));
+            *out = encoded_u8(f16_to_f32(b as u16));
         }
         t
     })[usize::from(bits)]
@@ -182,9 +179,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn the_tone_map_table_matches_the_function_for_every_half() {
+    fn the_table_matches_the_function_for_every_half() {
         for b in 0..=u16::MAX {
-            assert_eq!(tonemap_u8_half(b), tonemap_u8(f16_to_f32(b)), "half bits {b:#06x}");
+            assert_eq!(encoded_u8_half(b), encoded_u8(f16_to_f32(b)), "half bits {b:#06x}");
         }
         assert_eq!(rgb16_bits_at(&[0x00, 0x3c, 0x01, 0x00, 0xff, 0x7b, 0, 0], 0), [0x3c00, 0x0001, 0x7bff]);
     }
@@ -261,25 +258,24 @@ mod tests {
     }
 
     #[test]
-    fn tonemap_maps_open_range_into_unit_interval() {
-        assert_eq!(tonemap_encode(0.0), 0.0);
-        assert_eq!(tonemap_encode(-3.0), 0.0);
-        assert_eq!(tonemap_encode(f32::NAN), 0.0);
-        assert_eq!(tonemap_encode(f32::INFINITY), 1.0);
-        // x = 1 -> 0.5 linear -> sRGB 0.7354.
-        assert!((tonemap_encode(1.0) - 0.735_356_7).abs() < 1e-5);
-        // The linear toe of the sRGB curve.
-        assert!((tonemap_encode(0.001) - 12.92 * (0.001 / 1.001)).abs() < 1e-7);
-        let mut prev = 0.0;
-        for x in [0.0005f32, 0.01, 0.1, 0.5, 1.0, 4.0, 16.0, 100.0, 1000.0, 65504.0] {
-            let y = tonemap_encode(x);
-            assert!(y > prev && y < 1.0, "{x} -> {y}");
-            prev = y;
+    fn the_encoded_proxy_is_quantised_as_it_is() {
+        // The layer's encode is display-referred: 1.0 is white, 0.5 is mid-grey, no tone map.
+        assert_eq!(encoded_u8(1.0), 255);
+        assert_eq!(encoded_u8(0.5), 128);
+        assert_eq!(encoded_u8(0.0), 0);
+        for k in 0..=255u8 {
+            assert_eq!(encoded_u8(f32::from(k) / 255.0), k, "an 8-bit value survives the trip");
         }
-        assert_eq!(tonemap_u8(0.0), 0);
-        assert_eq!(tonemap_u8(1.0), 188);
-        assert_eq!(tonemap_u8(65504.0), 255);
-        assert_eq!(tonemap_u8(f32::NAN), 0);
+        // Out of range and non-finite values clamp.
+        assert_eq!(encoded_u8(-3.0), 0);
+        assert_eq!(encoded_u8(f32::NAN), 0);
+        assert_eq!(encoded_u8(1.5), 255);
+        assert_eq!(encoded_u8(65504.0), 255);
+        assert_eq!(encoded_u8(f32::INFINITY), 255);
+        assert_eq!(encoded_u8(f32::NEG_INFINITY), 0);
+        assert_eq!(encoded_u8_half(0x3c00), 255, "1.0");
+        assert_eq!(encoded_u8_half(0x3800), 128, "0.5");
+        assert_eq!(encoded_u8_half(0x7e00), 0, "NaN");
     }
 
     #[test]

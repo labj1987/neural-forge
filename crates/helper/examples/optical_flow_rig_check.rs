@@ -7,7 +7,7 @@
 //!
 //! Usage (under the helper's runner): optical_flow_rig_check.exe [frames] [width] [height] [--hdr]
 //! `--hdr` runs the pre-upscaler path instead: Color is R16G16B16A16_SFLOAT holding the same
-//! pattern as scene-linear values up to ~50.0, so the session's tone-map pass
+//! pattern in [0, 1] (as the layer's encoded proxy is), so the session's quantising pass
 //! (`hdr_to_flow.comp`) feeds the flow.
 //! Exit status: 0 = pass; nonzero = a failed check, or 3 when a single frame stalls >10 s.
 //! Every line also goes, flushed, to `optical_flow_rig_check.log` beside the executable:
@@ -61,13 +61,13 @@ fn f32_to_half(v: f32) -> u16 {
     ((exp as u16) << 10) | ((bits >> 13) & 0x3ff) as u16
 }
 
-/// [`noise_frame`]'s pattern as scene-linear RGBA16F: byte `v` becomes `(v/255)^2.2 * 50`, so
-/// most of the picture is far above 1.0, as in a game's HDR render target.
+/// [`noise_frame`]'s pattern as RGBA16F in [0, 1], as the layer's encoded proxy is: byte `v`
+/// becomes `v / 255`.
 fn noise_frame16(w: u32, h: u32, shift: u32, scratch: &mut Vec<u8>, out: &mut [u8]) {
     scratch.resize((w * h * 4) as usize, 0);
     noise_frame(w, h, shift, scratch);
     for (i, px) in scratch.as_chunks::<4>().0.iter().enumerate() {
-        let v = f32_to_half((f32::from(px[0]) / 255.0).powf(2.2) * 50.0).to_le_bytes();
+        let v = f32_to_half(f32::from(px[0]) / 255.0).to_le_bytes();
         out[i * 8..i * 8 + 8].copy_from_slice(&[v[0], v[1], v[0], v[1], v[0], v[1], 0x00, 0x3c]);
     }
 }

@@ -2,13 +2,13 @@
 //! the previous one. Carrying a flow field across a cut hands the model a field describing
 //! content no longer on screen, worse than handing it nothing.
 //!
-//! Works on both proxy classes: 8-bit frames are averaged as they are; RGBA16F frames are
-//! decoded from half floats and put through the same tone map optical flow sees
-//! ([`crate::hdr::tonemap_u8`]), so one threshold fits both.
+//! Works on both proxy classes: 8-bit frames are averaged as they are; RGBA16F frames (the
+//! layer's display-referred encode, in [0, 1]) are quantised to 8 bits the way optical flow sees
+//! them ([`crate::hdr::encoded_u8`]), so one threshold means the same on both.
 //!
 //! Pure arithmetic with no Win32 or Vulkan calls, so it builds and tests natively.
 
-use crate::hdr::{rgb16_bits_at, tonemap_u8_half, FormatClass};
+use crate::hdr::{encoded_u8_half, rgb16_bits_at, FormatClass};
 
 /// Every `STEP`th pixel on each axis goes into the thumbnail.
 const STEP: usize = 8;
@@ -33,7 +33,8 @@ pub fn luma_thumbnail(frame: &[u8], width: u32, height: u32) -> Vec<u8> {
 }
 
 /// [`luma_thumbnail`] for an RGBA16F frame (8 bytes per pixel, little-endian halves): each
-/// sampled channel is tone mapped to 8 bits first, then averaged the same way.
+/// sampled channel is quantised to 8 bits first ([`crate::hdr::encoded_u8`]: clamped to [0, 1],
+/// no tone map), then averaged the same way.
 pub fn luma_thumbnail_rgba16f(frame: &[u8], width: u32, height: u32) -> Vec<u8> {
     let (w, h) = (width as usize, height as usize);
     if frame.len() < w * h * 8 {
@@ -42,9 +43,9 @@ pub fn luma_thumbnail_rgba16f(frame: &[u8], width: u32, height: u32) -> Vec<u8> 
     let mut out = Vec::with_capacity(w.div_ceil(STEP) * h.div_ceil(STEP));
     for y in (0..h).step_by(STEP) {
         for x in (0..w).step_by(STEP) {
-            // Through the table, not `tonemap_u8` per sample: see `tonemap_u8_half`.
+            // Through the table, not `encoded_u8` per sample: see `encoded_u8_half`.
             let [r, g, b] = rgb16_bits_at(frame, (y * w + x) * 8);
-            out.push(((u32::from(tonemap_u8_half(r)) + u32::from(tonemap_u8_half(g)) + u32::from(tonemap_u8_half(b))) / 3) as u8);
+            out.push(((u32::from(encoded_u8_half(r)) + u32::from(encoded_u8_half(g)) + u32::from(encoded_u8_half(b))) / 3) as u8);
         }
     }
     out
@@ -113,9 +114,11 @@ mod tests {
     }
 
     #[test]
-    fn rgba16f_thumbnail_decodes_and_tone_maps() {
-        // 1.0 -> Reinhard 0.5 -> sRGB 0.7354 -> 188.
-        assert_eq!(luma_thumbnail_rgba16f(&frame16(16, 16, 0x3c00), 16, 16), vec![188; 4]);
+    fn rgba16f_thumbnail_decodes_and_quantises_without_a_tone_map() {
+        // The layer's encode is already display-referred: 1.0 is white (255), not Reinhard and
+        // sRGB again (188), and 0.5 is 128.
+        assert_eq!(luma_thumbnail_rgba16f(&frame16(16, 16, 0x3c00), 16, 16), vec![255; 4]);
+        assert_eq!(luma_thumbnail_rgba16f(&frame16(8, 8, 0x3800), 8, 8), vec![128]);
         // 0.0 -> 0; 65504 -> 255; NaN and -Inf -> 0, +Inf -> 255.
         assert_eq!(luma_thumbnail_rgba16f(&frame16(8, 8, 0x0000), 8, 8), vec![0]);
         assert_eq!(luma_thumbnail_rgba16f(&frame16(8, 8, 0x7bff), 8, 8), vec![255]);
@@ -130,11 +133,10 @@ mod tests {
 
     #[test]
     fn rgba16f_thumbnail_reads_per_pixel_channels() {
-        // Pixel (0,0) R=4.0 G=0 B=0; everything else black.
+        // Pixel (0,0) R=0.75 G=0 B=0; everything else black.
         let mut f = frame16(8, 8, 0x0000);
-        f[0..2].copy_from_slice(&0x4400u16.to_le_bytes());
-        let expected = (u32::from(crate::hdr::tonemap_u8(4.0)) / 3) as u8;
-        assert_eq!(luma_thumbnail_rgba16f(&f, 8, 8), vec![expected]);
+        f[0..2].copy_from_slice(&0x3a00u16.to_le_bytes());
+        assert_eq!(luma_thumbnail_rgba16f(&f, 8, 8), vec![(191 / 3) as u8]);
     }
 
     #[test]
@@ -143,9 +145,25 @@ mod tests {
         let dim = thumbnail(&frame16(32, 32, 0x3800), 32, 32, FormatClass::Hdr16);
         let slightly = thumbnail(&frame16(32, 32, 0x38cd), 32, 32, FormatClass::Hdr16);
         let dark = thumbnail(&frame16(32, 32, 0x2000), 32, 32, FormatClass::Hdr16);
-        let bright = thumbnail(&frame16(32, 32, 0x4900), 32, 32, FormatClass::Hdr16);
+        let bright = thumbnail(&frame16(32, 32, 0x3c00), 32, 32, FormatClass::Hdr16);
         assert!(!is_scene_cut(&dim, &slightly, 40));
         assert!(is_scene_cut(&dark, &bright, 40));
         assert_eq!(thumbnail(&frame(16, 16, 90), 16, 16, FormatClass::Sdr8), vec![90; 4]);
+        // The same picture as an 8-bit proxy and as the layer's encoded RGBA16F proxy gives the
+        // same thumbnail, so the threshold means the same on both: 20 -> 70 (50 levels) is a cut
+        // either way (the old tone map made it 21 levels on the HDR side, under the threshold).
+        let half = |v: u8| {
+            let x = f32::from(v) / 255.0;
+            // The nearest half of x (normal range): 10 mantissa bits.
+            let e = x.log2().floor() as i32;
+            let m = ((x / 2f32.powi(e) - 1.0) * 1024.0).round() as u16;
+            (((e + 15) as u16) << 10) + m
+        };
+        for v in [20u8, 70, 128, 200, 255] {
+            assert_eq!(thumbnail(&frame16(16, 16, half(v)), 16, 16, FormatClass::Hdr16), thumbnail(&frame(16, 16, v), 16, 16, FormatClass::Sdr8), "level {v}");
+        }
+        let a = thumbnail(&frame16(32, 32, half(20)), 32, 32, FormatClass::Hdr16);
+        let b = thumbnail(&frame16(32, 32, half(70)), 32, 32, FormatClass::Hdr16);
+        assert!(is_scene_cut(&a, &b, 40));
     }
 }

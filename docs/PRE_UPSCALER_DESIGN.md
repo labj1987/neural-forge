@@ -194,21 +194,27 @@ lands; with 8-bit proxies the helper behaves exactly as before.
   and a failed first build blocks retries per key, not per size.
 - **Motion vectors.** The flow input is built on the GPU (`GpuFlow::estimate` blits Color down
   into a `B8G8R8A8_UNORM` image). A session built for an HDR frame (`GpuFlow::new(.., hdr)`)
-  first runs `shaders/hdr_to_flow.comp` over Color (per channel: NaN and negatives to 0,
-  `x / (1 + x)`, sRGB encode) into a full-size `R8G8B8A8_UNORM` image, and the blit reads that.
+  first runs `shaders/hdr_to_flow.comp` over Color into a full-size `R8G8B8A8_UNORM` image, and
+  the blit reads that. (Built as a tone map, `x / (1 + x)` then sRGB, for the raw frame; since
+  the layer sends its encoded proxy, already display-referred in [0, 1], it only clamps: NaN to 0,
+  the value clamped to [0, 1], see the fixes from the 2.0 review below.)
   Sessions are keyed by size, quality and HDR-ness, so a format switch builds a new one (which
   also drops the flow's reference frame). `optical_flow_rig_check --hdr` exercises it on the rig.
 - **Scene cuts.** `scene::thumbnail` (moved out of `optical_flow.rs` so it is tested natively)
-  decodes an RGBA16F frame's halves (`hdr::f16_to_f32`) and applies the same tone map on the CPU
-  (`hdr::tonemap_u8`) before averaging; the 40-level threshold is unchanged. Thumbnails of
-  different classes are never compared.
+  decodes an RGBA16F frame's halves (`hdr::f16_to_f32`) and quantises them the same way on the
+  CPU (`hdr::encoded_u8`, through a table, `hdr::encoded_u8_half`) before averaging; the 40-level
+  threshold is unchanged and means the same on both classes. Thumbnails of different classes are
+  never compared.
 - **History.** Everything in `history.rs` applies unchanged; in addition each request's format
   class goes through `HistoryGap::note_format`, and the first evaluate after a class change
   resets the model's history (`Stale::FormatChanged`, logged `resetting model history (proxy
   format changed ...)`). The rebuilt feature and frame resources reset it as well.
-- The model input is always the raw scene-linear frame; the tone map only feeds the flow and
-  the thumbnail. The GPU tone map and the CPU one agree exactly (0 LSB difference) on all 65536
-  half bit patterns, checked on lavapipe during development.
+- The model gets the proxy's half floats exactly as the layer sent them: since E1b that is the
+  layer's encode (exposure, paper white, shoulder, sRGB), not the raw scene-linear frame. The 8-bit
+  conversion only feeds the flow and the thumbnail. The GPU pass and the CPU function agree on all
+  65536 half bit patterns within one step of float-to-UNORM rounding (3 of 196608 channels on
+  lavapipe), checked by a layer test that runs the helper's shader
+  (`preupscale::hdr::tests::the_helpers_flow_input_pass_quantises_the_encoded_proxy_without_a_tone_map`).
 
 ### Running the model on a dumped frame (experiment E1)
 
@@ -738,7 +744,7 @@ latency in them.
 
 ### What changed
 
-- **Thumbnail through a table** (`hdr::tonemap_u8_half`): the tone map of all 65536 half bit
+- **Thumbnail through a table** (`hdr::tonemap_u8_half`, now `hdr::encoded_u8_half`): the tone map of all 65536 half bit
   patterns, built once at helper start (2.4 ms under Wine), then one lookup per channel.
   Bit-identical to the function (a test checks every half); the scene-cut threshold and behaviour
   are unchanged. 4.9 ms -> 0.13 ms on the rig (0.06 ms in the Wine benchmark).

@@ -70,6 +70,11 @@ diagnostics. In detail:
   - helper: the model's input image (Color) now has `TRANSFER_SRC` usage; the 8-bit optical-flow
     path blits from it, a validation error since before 1.1.0 (the HDR path reads it through a
     shader and was not affected).
+  - helper: the optical flow's input and the scene-cut thumbnail of an RGBA16F frame no longer
+    tone map it (`x / (1 + x)`, then sRGB). The layer's proxy is already encoded into [0, 1], so
+    that was a second tone map: white came out at 188 of 255 and the scene-cut threshold was about
+    a third less sensitive than on 8-bit frames. The value is now clamped to [0, 1] and quantised
+    as it is, on the GPU (`hdr_to_flow.comp`) and the CPU (a half-to-byte table, as before).
 - **Pre-upscaler hold: hand-off latency cut** (`docs/PRE_UPSCALER_DESIGN.md`, "Hand-off
   latency"). GTA V Enhanced, DLSS Balanced, model every frame: **50.5 -> 66.1 fps** (three runs),
   above the 61.6 gate; the hold went from 14.7 to about 10.2 ms. The ~4.8 ms "hand-off" was the
@@ -96,9 +101,9 @@ diagnostics. In detail:
   `RGBA16F` is uploaded and answered as half floats with no conversion, and its NGX feature is
   created with `DLSSNR.Hdr=1, SDR=0` (8-bit frames keep `Hdr=0, SDR=1`). Switching a slot
   between 8-bit and RGBA16F rebuilds the feature like a size change and resets the model's
-  history. Optical flow and the scene-cut check see a tone-mapped 8-bit picture of an HDR
-  frame (`x / (1 + x)`, then sRGB); the model still gets the raw values. 8-bit frames behave
-  exactly as before.
+  history. Optical flow and the scene-cut check see an 8-bit picture of an HDR frame (the
+  proxy's values clamped to [0, 1]); the model gets the proxy's half floats as the layer sent
+  them (the layer's encode, see below). 8-bit frames behave exactly as before.
 - `trigger_helper_roundtrip` can send a raw RGBA16F frame from a file to a running helper
   (`--rgba16f FILE --width W --height H [--out FILE] [--repeat N]`) and prints per-channel
   statistics of input and answer; `optical_flow_rig_check --hdr` checks the flow's tone-map pass
