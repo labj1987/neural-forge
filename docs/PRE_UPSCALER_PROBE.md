@@ -45,10 +45,10 @@ next layer's pointer for it in `vkGetDeviceProcAddr`, again only with the probe 
 
 Before the run, select DLSS as GTA's upscaler at a preset that renders below the output
 resolution (Quality or Balanced, not DLAA), with frame generation off. Then run the
-unattended benchmark runner (`gta-bench.sh`, kept on the rig, not in this repo):
+unattended benchmark runner (`scripts/gta-bench.sh`):
 
 ```bash
-~/nf-spike/gta-bench.sh probe-ngx VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 NEURAL_FORGE_LOG=/tmp/neural-forge-probe-ngx.log
+scripts/gta-bench.sh --host lordnikon probe-ngx VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 NEURAL_FORGE_LOG=/tmp/neural-forge-probe-ngx.log
 ```
 
 `NEURAL_FORGE_LOG` puts the layer's lines in a file. Without it they go to the game's
