@@ -744,3 +744,53 @@ second is the only one that can be inside pass 4.
 
 **Decision:** far below one cut per ten seconds of continuous play, so the fixed threshold stays.
 No adaptive baseline was built. Real fps in this run: 55.2 (pass 4).
+
+## 2026-10-02 -- 2.0 baseline (1.0.1, mods off)
+
+The comparator for every 2.0 performance change. Neural Forge 1.0.1 as installed on LordNikon,
+RTX 5070, driver 615.71.09. Desktop 2560x1440 at 288.001 Hz, scale 1.0, HDR on (bt2100).
+GTA settings.xml: 2560x1440, RefreshRate 288, Windowed 0, VSync 0, FrameLimit 0, ReflexMode 2,
+FrameGenType 0. GTA's script mods off (`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), no remote
+desktop session, MangoHud as the last layer, `scripts/gta-bench.sh`. NR off = Neural Forge's
+layer not loaded. NR on = model every 2nd frame unless stated, working scale 1.0, motion vectors on.
+
+One run per configuration: the existing no-mods runs already gave every number the 2.0 gates
+use, so the planned three-run set was cut short. Both single runs land on the earlier
+references (93.6 / 67% and 61.6 / 89%, `docs/OPENDLSS_REVIEW.md`), which is the harness check.
+
+| Run (pass 4, ~116 s) | Real fps | Displayed | GPU | Power | Composited/s |
+|---|---|---|---|---|---|
+| NR off | 93.2 | 94.6 | 67% | 148 W | - |
+| NR on, model every frame | 41.9 | 41.9 | 88% | 201 W | 43.0 |
+| NR on, every 2nd frame | 61.6 | 62.0 | 89% | 195 W | 63.5 |
+| NR on, every 2nd frame, working scale 0.75 | 58.1 | 58.5 | 78% | 166 W | 60.3 |
+
+`[sync]` medians over pass 4 (ms per model frame) and the helper's own timings:
+
+| Config | total | capture_gpu | copy_out | wait_answer | helper | rest | zc | helper upload / eval / download | flow |
+|---|---|---|---|---|---|---|---|---|---|
+| every frame, 1.0 | 18.4 | 5.60 | 0 | 12.7 | 11.6 | 0.05 | true | 0.78 / 9.90 / 0.60 | 0.72 |
+| every 2nd, 1.0 | 19.0 | 5.95 | 0 | 12.75 | 11.55 | 0.06 | true | 0.86 / 10.21 / 0.68 | 0.74 |
+| every 2nd, 0.75 | 19.5 | 6.30 | 2.9 | 8.3 | 7.5 | 1.7 | false | 0.68 / 6.17 / 0.40 | 0.53 |
+
+- Working scale 0.75 leaves the zero-copy path: `copy_out` 2.9 ms plus `rest` 1.7 ms eat most
+  of the 4 ms the smaller model saves, so it is 3.5 fps slower than 1.0 at 11 points less GPU.
+  That is what Phase 2 removes.
+- `capture_gpu` (submit to observed completion, which includes waiting for the game's own frame)
+  is 5.6-6.3 ms in play against about 0.75 ms on the first `[sync]` line of each run.
+- `wait_answer - helper` is about 1.1 ms: the optical flow (0.7 ms, not part of the published
+  helper time) and the two poll loops.
+
+4K is not re-run. On record (Alex's notes, real 4K at desktop scale 1.0, mods on with Enable All
+Interiors patched, which matches mods off at 1440p): NR off 82.0 (GPU 93%; mods off 83.0 at 95%),
+NR on every 2nd frame 32.8 (GPU 95%), NR on + Smooth Motion 25.9 real / 52.3 displayed (GPU 97%).
+The older `r-nomods-nroff-4k` run on the rig read 93.0 at 68% GPU: it ran at the 1440p desktop and
+is not a 4K number.
+
+`capture_hot_path_cost_per_present` on LordNikon (release test binary at 9f2c084):
+
+```
+capture_hot_path_cost_per_present @ 2560x1440 (200 samples, 31 composited a fresh answer):
+  cpu (run() on present thread): mean=54.201µs p50=221ns p95=990ns max=5.50823ms
+  gpu (queue drain after run()): mean=62.796µs p50=36.68µs p95=89.218µs max=1.850415ms
+```
