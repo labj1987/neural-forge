@@ -142,6 +142,10 @@ pub struct ShmClient {
     /// array of two, not a single value -- each slot still only ever has one
     /// outstanding request at a time.
     pending: [Option<(u32, Instant)>; 2],
+    /// Per-slot: the request number of the last round trip started with
+    /// [`Self::begin_async_request`], kept after it resolves so [`Self::answer_evaluated`] can
+    /// compare it with the helper's `seq_eval`.
+    last_req: [u32; 2],
 }
 
 // SAFETY: `header` points at a `MAP_SHARED` mapping that stays valid for the process's
@@ -170,6 +174,7 @@ impl Default for ShmClient {
             map_refused: false,
             frames: 0,
             pending: [None, None],
+            last_req: [0, 0],
         }
     }
 }
@@ -799,7 +804,21 @@ impl ShmClient {
         std::sync::atomic::fence(Ordering::Release);
         hdr.seq_req_slot(slot).store(req, Ordering::Relaxed);
         self.pending[slot] = Some((req, Instant::now()));
+        self.last_req[slot] = req;
         true
+    }
+
+    /// Slot 0: whether the answer to the last request [`Self::begin_async_request`] started (and
+    /// [`Self::poll_async_request`] saw answered) is the model's, not an echo of the frame. The
+    /// helper writes `seq_eval` before `seq_resp`, and only for a request it ran the model on.
+    pub fn answer_evaluated(&self) -> bool {
+        self.header().is_some_and(|hdr| self.last_req[0] != 0 && hdr.seq_eval.load(Ordering::Relaxed) == self.last_req[0])
+    }
+
+    /// Whether the helper says the model is built (`model_up`). 0 before the first build too, not
+    /// only after a failure; `false` before the mapping is open.
+    pub fn model_up(&self) -> bool {
+        self.header().is_some_and(|hdr| hdr.model_up.load(Ordering::Relaxed) != 0)
     }
 
     /// Non-blocking: checks whether the request [`Self::begin_async_request`] started

@@ -446,13 +446,18 @@ fn process_request(
         0
     };
     let ready = live_passes > 0;
+    let recovered = snippet.take_recovered();
+    if let Some(streak) = recovered {
+        neural_forge_helper::log!("[helper] the model built again at {key} after {streak} failed attempt(s)");
+        neural_forge_helper::logging::flush();
+    }
     if let Some(note) = snippet.take_failure_note() {
         hdr.set_helper_reason(&note);
     } else if ready {
         static CLEARED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-        // Clears a stale failure reason once the model builds; a plain store per frame would churn
-        // the seqlock for nothing.
-        if !CLEARED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        // Clears a stale failure reason once the model builds (the first time, and after every
+        // recovery); a plain store per frame would churn the seqlock for nothing.
+        if !CLEARED.swap(true, std::sync::atomic::Ordering::Relaxed) || recovered.is_some() {
             hdr.set_helper_reason("");
         }
     }
@@ -462,7 +467,13 @@ fn process_request(
     }
     if ready {
         hdr.model_up.store(1, Ordering::Relaxed);
-    } else if model_requested && snippet.disabled {
+    } else if model_requested && (snippet.disabled || snippet.build_failing()) {
+        // No feature can be built right now: say so, so the layer stops holding frames for answers
+        // that can only be echoes (it probes again on its own schedule). Set back to 1 by the first
+        // successful build.
+        hdr.model_up.store(0, Ordering::Relaxed);
+    }
+    if !ready && model_requested && snippet.disabled {
         // `maintain_feature` only ever disables the snippet after a real, one-shot
         // `CreateFeature` attempt (see its own doc comment) -- worth surfacing in
         // status immediately rather than leaving `RUNNING` displayed forever after
@@ -556,6 +567,11 @@ fn process_request(
         answer.copy_from_slice(proxy);
     }
     hdr.seq_ok.store(seq_req, Ordering::Relaxed);
+    // Slot 0 only, and only for a real answer: the pre-upscaler hold tells a model answer from an
+    // echo of its own frame by this (`ShmHeader::seq_eval`), written before `seq_resp`.
+    if slot == 0 && evaluated {
+        hdr.seq_eval.store(seq_req, Ordering::Relaxed);
+    }
     // The raster this answer is for, echoed before `seq_resp` so the layer can refuse an answer
     // for a different size (another swapchain's request, or one from before a resize) instead of
     // reading the wrong number of bytes. Slot 0 only: slot 1 has no such field.

@@ -65,6 +65,7 @@ fn cmd_status(header: &ShmHeader) {
     println!("# live status");
     println!("helper_state={} ({})", header.helper_state.load(Ordering::Relaxed), helper_state_name(header.helper_state.load(Ordering::Relaxed)));
     println!("model_up={}", header.model_up.load(Ordering::Relaxed));
+    println!("helper_reason={}", header.helper_reason());
     let frames = (u64::from(header.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.helper_frames_lo.load(Ordering::Relaxed));
     println!("helper_frames={frames}");
     println!("helper_upload_ms={}", f32::from_bits(header.helper_upload_ms_bits.load(Ordering::Relaxed)));
@@ -77,7 +78,7 @@ fn cmd_status(header: &ShmHeader) {
     println!("layer_capture_gpu_ms={}", f32::from_bits(header.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)));
     println!("layer_compose_gpu_ms={}", f32::from_bits(header.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)));
     let preupscale = header.preupscale_state.load(Ordering::Relaxed);
-    println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", _ => "unknown" });
+    println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", 3 => "paused: no model answer, forwarding untouched", _ => "unknown" });
     println!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed));
     println!("preupscale_hold_ms={}", f32::from_bits(header.preupscale_hold_ms_bits.load(Ordering::Relaxed)));
     println!("preupscale_misses={}", header.preupscale_misses.load(Ordering::Relaxed));

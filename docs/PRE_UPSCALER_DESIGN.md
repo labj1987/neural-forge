@@ -355,7 +355,9 @@ the write-back inverts, on the GPU, in the layer's own two submissions (`preupsc
 In model mode, while a hold happened in the last 500 ms the post-upscaler compose is skipped for
 that device's presents (the game's frame is presented as DLSS made it), so the model is not
 applied twice. Without holds (DLSS off, DLAA, a game without DLSS, the toggle off) the post path
-runs exactly as before.
+runs exactly as before. (Since "Robustness: failed feature builds" below: once a hold on the
+device has asked the helper, the compose stays off until DLSS has not run for 30 s, loading
+screens included, and an open circuit breaker forwards DLSS submits untouched.)
 
 ### Running it on the rig
 
@@ -909,7 +911,7 @@ runs peak around 11.2 GB.
 - **The layer kept holding:** with no model, every hold still drained the queue, and most were
   counted as "the answer was over budget". The fps in those runs measures the hold without a
   model. The kernel logged nothing during `sm-1` and `sm-2`.
-- **Not fixed here.** Two possible fixes: have the helper reinitialise NGX after repeated
+- **Not fixed here** (fixed since: "Robustness: failed feature builds" below). Two possible fixes: have the helper reinitialise NGX after repeated
   `0xbad00002`, and report "model not buildable" through shared memory so the layer stops
   holding. A third option is to avoid the 3840x2160 rebuild at loading screens in model mode.
 - **Smaller oddities:**
@@ -962,3 +964,172 @@ runs peak around 11.2 GB.
 - Live settings: `enabled=1`, `working_scale=1`, `model_interval=2`, `mvec_enabled=1`.
 - The helper was restarted at ~16:46 and is running (`helper_state=4`, `model_up=1`). GTA is not
   running.
+
+## Robustness: failed feature builds
+
+Fixes the anomaly in "4K and HDR output" ("NGX feature creation fails and stays failed"): one
+`VULKAN_CreateFeature -> 0xbad00002` near full VRAM at 4K with Smooth Motion, after which every
+creation failed (433 times, across later game launches, until `neural-forge-cli restart`), while
+`shmctl status` said `model_up=1` and the layer kept holding every DLSS submit for the full 30 ms
+budget.
+
+### Cause
+
+The helper log of that session (`helper.log` on the rig) shows three things:
+
+- **No backoff, no escalation.** The failure was a *rebuild*: the 2228x1254 HDR feature released
+  for a 3840x2160 SDR one when the post path took over at a loading screen. `maintain_passes`
+  treated a failed pass 0 after an earlier success as "a later pass that will not build"
+  (`pass 0 would not build; holding the chain at 0`, a ceiling of 0, clamped back to one wanted
+  pass), so it retried on the rebuild spacing, every 250 ms, for ever: 433 identical attempts and
+  never a re-initialisation of NGX. The one-shot `create_failed` (a 30 s block per key) only covered
+  the very first build of a session.
+- **NGX stayed refusing.** The attempts continued after GTA exited (VRAM free again) and through two
+  more launches, at both sizes, all `0xbad00002`, while a fresh helper process (the restart) built
+  the feature at once. So what refused was the helper's NGX instance, not the VRAM, and nothing in
+  the helper ever shut NGX down and initialised it again.
+- **Nobody was told.** `model_up` was only ever set to 1 (when a feature built), never back to 0,
+  and the layer had no way to tell an echo from a model answer (`seq_ok` was written for every
+  answer and read by nothing). So each hold drained the game's queue and waited for an answer that
+  was the frame itself, often late because the helper was busy failing a creation.
+
+The rebuilds themselves came from the layer: with no hold for 500 ms (every loading screen) the
+post path took over and asked for a 3840x2160 SDR feature, and the next hold asked for 2228x1254
+HDR again. That is two creations per loading screen, each near full VRAM.
+
+### What changed
+
+1. **Helper: no permanent failure** (`crates/helper/src/rebuild.rs`, `ngx.rs`, `main.rs`).
+   - Pass 0 (the model itself), first build or rebuild, goes through a retry schedule,
+     `rebuild::BuildRetry`. After the 1st, 2nd and 3rd consecutive failure it waits 0.5, 1 and 2 s.
+     The 4th attempt first **re-initialises NGX**: `device_wait_idle`, release every feature,
+     `Shutdown1`, destroy and allocate again a DLL-owned parameter block, then `VULKAN_Init_Ext` with
+     the original arguments. After that it waits 30 s between attempts and re-initialises again on
+     every 4th.
+   - Never fatal: the old "pass 0 failed 3 times; giving up on the model" is gone. Never faster than
+     the schedule, and not reset by a size or mode change.
+   - `CreateFeature` failures carry their result code. A handle that came back with a failure, or
+     whose setup work did not run, is released.
+   - `model_up` is set to **0** while pass 0 cannot be built, and back to 1 by the next build.
+     `helper_reason` says why (`model would not build at 1486x836 (0xbad00002, 4 in a row); retrying
+     in 30s (NGX re-initialised); ...`) and is cleared on recovery (`[helper] the model built again
+     at ... after N failed attempt(s)`). `shmctl status` now prints `helper_reason`.
+   - `NEURAL_FORGE_FAIL_CREATE=N[@K]` (helper, debug, unset by default) lets K creations through and
+     fails the next N without calling NGX.
+   - Native unit tests, `rebuild::tests`: the schedule's timings, one re-initialisation then every
+     4th, at most ~44 attempts in 20 minutes (the 250 ms spacing made 4800), recovery reported once,
+     the injection's parsing.
+2. **Layer: circuit breaker** (`preupscale::Breaker`).
+   - Shared-memory protocol **11** appends `seq_eval` (offset 2020). The helper writes the slot-0
+     request number there, before `seq_resp`, only when the model ran on it, so a hold can tell a
+     model answer from an echo (`preupscale::await_answer` returns `Answer::{Model, Echo, Missed}`).
+     An echo is not written back (miss `the helper echoed the frame (no model answer)`) and counts
+     in `preupscale_misses`.
+   - In model mode the breaker opens when the helper reports `model_up=0`, or when 8 holds in a row
+     got no model answer (echo, late, none). DLSS submits are then forwarded untouched, with no
+     capture and no wait, for 2 s; then one probe hold goes through. A model answer closes it;
+     anything else opens it for another 2 s. It starts as a probe.
+   - Logged on opening, every 30 s while open (`breaker still open after Ns: ... (N probes without a
+     model answer, N DLSS submits forwarded untouched)`), and on closing.
+   - `preupscale_state` 3 means paused. The GUI says "paused: DLSS's WxH input goes to DLSS
+     untouched until the helper's model answers again"; `shmctl` says "paused: no model answer,
+     forwarding untouched".
+   - Tests, with a header-only fake helper: echoes open the breaker after exactly 8 holds; 240
+     submits over the cool-down are forwarded with zero waiting; a failed probe re-opens it; a model
+     answer closes it; a silent helper costs at most 8 budgets; `model_up=0` opens it at once and the
+     probe still goes out. The GPU hold test also checks that an echo is not written back.
+3. **Fewer rebuilds: a 30 s hand-back.**
+   - Once a model-mode hold on a device has asked the helper (whatever came back), the post-upscaler
+     compose stays off until no DLSS submit with identified inputs has been seen for **30 s**
+     (`preupscale::HAND_BACK`; it was 500 ms since the last hold). Meanwhile frames are presented as
+     DLSS made them. Loading screens get no model, and the helper's feature is no longer rebuilt at
+     the output size and back at each one.
+   - DLSS switched off for longer than that (DLAA, a game that stops using it) gives the post path
+     back as before, logged (`no DLSS submit in the last 30 s (...); the post-upscaler compose runs
+     as before`).
+   - The DLSS submit is noted before the "presenting steadily" check, so a loading screen that still
+     runs DLSS keeps the window open too.
+   - "Asked the helper" rather than "held successfully" on purpose: while the breaker is open, the
+     post path's output-size requests would otherwise rebuild the feature against the probes, and
+     no probe would ever find it built.
+   - Test: `post_off` across a 20 s loading screen, just under and just over 30 s, a device that
+     never engaged, and through `Session::note` (a hold skipped before its request does not engage).
+   - `NEURAL_FORGE_PREUPSCALE=off` is untouched: no tracking, so none of this is reachable
+     (`probe_command_tests` and the smoke test's `off` pass are unchanged).
+
+### Rig results
+
+Run 2026-10-02 17:40-18:24 on lordnikon.
+
+- This build was deployed with `scripts/deploy-rig.sh` (layer `eedf88b2c8f8`, helper
+  `43c398d24fd8`). The stale protocol-10 `shm.bin` and `.owner` were removed first; nothing had
+  them mapped. The committed build differs only in two log/reason strings (layer `74a4f101b7fc`,
+  helper `78d5658dcee9`, deployed afterwards and left running).
+- GTA V Enhanced, DLSS Balanced, script mods off, default mode (no `NEURAL_FORGE_PREUPSCALE`),
+  `model_interval=2`, `working_scale=1`, `mvec_enabled=1`. Frame generation off unless noted. No
+  remote-desktop session.
+- A status poller (`shmctl status` and `nvidia-smi` VRAM every 0.5 s) ran beside each benchmark
+  (`~/nf-spike/gta/<label>/poll.log`).
+- One launch (`rb-c1440-1`) hung in the Rockstar Launcher before the game started: no game process
+  after 10 minutes. It was killed by PID and rerun 5 minutes later.
+- Kernel log: no Xid and no NVRM line from 17:30 to the end.
+
+**(a) Fault injection, 1440p** (`rb-a1`). The helper was started with
+`NEURAL_FORGE_FAIL_CREATE=6@2`. At 17:43:18, one second into pass 4, `shmctl set intensity 1.01`
+retuned pass 0 to force a rebuild.
+
+- Helper: the rebuild failed 6 times, at 0, +0.5, +1.5, +3.5 s (after `Shutdown1 -> 0x1` and
+  `VULKAN_Init_Ext (re-initialisation) -> 0x1`), +33.5 and +63.5 s. It built at +93.5 s (`the model
+  built again at 1486x836 hdr=1 after 6 failed attempt(s)`). The re-initialisation worked on the
+  real NGX.
+- Status: `model_up=0` from 17:43:19.5 (1 s after the retune) to 17:44:55.5, with the reason
+  string. `preupscale_state=3` throughout. At 17:44:56 `model_up=1` and the reason was cleared.
+- Layer: one echoed hold, then `breaker open: the helper reports no model (model_up=0)`. 48 probes
+  got no model answer and 9460 DLSS submits were forwarded untouched; then `breaker closed ... after
+  98.7s open`. Misses for the whole run: 51 (the probes plus the start).
+- Frame rate (MangoHud; displayed = real here): **97.0 fps** while open (17:43:22-17:44:55), where
+  NR off is 93.0-93.2 over pass 4 (`pu-nroff-1`, `p0-1440-nroff-1`). **66 fps** once holding
+  resumed (17:44:55-17:45:13). Pass 4 as a whole: 91.5 real, 93.3 displayed, mostly breaker-open.
+  Nothing waited 30 ms while the model was down.
+- At the start of every run (here and in (b), (c)) the first hold was an echo: the helper was
+  rebuilding from the post path's output-size SDR feature, with its 250 ms spacing. The breaker
+  opened for 4.1 s at the first loading screen and closed on the second probe.
+
+**(b) 4K + Smooth Motion, the scenario that triggered it.** The desktop was set temporarily to
+3840x2160@144.000, scale 1.0, bt2100 with a non-persistent `gdctl set` (verified), and settings.xml
+ScreenWidth/Height/RefreshRate to 3840/2160/144. Layers `VK_LAYER_neuralforge_neural:VK_LAYER_NV_present`
+with `NVPRESENT_ENABLE_SMOOTH_MOTION=1`, two runs back to back.
+
+| Run | Real fps | Displayed | GPU % | Power | Hold ms | Misses (run) | Creations | VRAM peak |
+|---|---|---|---|---|---|---|---|---|
+| `rb-b4k-sm-1` | 32.6 | 65.0 | 97 | 192 W | 19.3-20.0 | 2 | 2 | 11.86 GB |
+| `rb-b4k-sm-2` | 35.3 | 70.7 | 96 | 203 W | 18.7-18.9 | 2 | 2 | 11.86 GB |
+| before: `a4k-model-sm-3` (fresh helper) | 33.3 | 66.6 | 97 | 195 W | 18.6 | 64 | 2 per loading screen | 11.7-11.9 GB |
+
+- No `0xbad00002`, no failed creation, never `model_up=0`. The breaker opened only at the start
+  (4.1 s).
+- The post path never took over at a loading screen. The helper built each size once per launch
+  (3840x2160 SDR for the post path at the game's start, before the first hold, at low VRAM; then
+  2228x1254 HDR) instead of twice per loading screen. The rebuild near full VRAM that started the
+  stuck state no longer happens.
+
+**(c) 1440p default mode, no variable** (desktop and settings.xml restored first):
+
+| Run | Real fps | Displayed | GPU % | Power | Hold ms | Misses (run) | VRAM peak |
+|---|---|---|---|---|---|---|---|
+| `rb-c1440-2` | 65.2 | 65.5 | 90 | 181 W | 9.9-10.5 | 2 | 9.4 GB |
+| `rb-c1440-3` | 64.7 | 65.5 | 90 | 181 W | 9.9-10.0 | 2 | 9.4 GB |
+| **mean of 2** | **65.0** | 65.5 | 90 | 181 W | | | |
+
+- Against 66.1 (65.1 / 68.1 / 65.2) in "Hand-off latency": within the ~3 fps run-to-run spread,
+  so the breaker and the hand-back cost nothing measurable in steady state.
+- Misses per run: 2, both at the start, against 85-89 before. Loading screens and scene changes
+  no longer hand back to the post path, so nothing is rebuilt there and no hold waits for an
+  answer that cannot come.
+
+### Restored
+
+- Desktop 2560x1440@288.001, scale 1.0, bt2100 (`gdctl show`, `gdctl show -p`).
+- settings.xml sha256 8de357621960...1a7a, byte-identical; the backup was removed.
+- `intensity` back to 1 after (a). Live settings `enabled=1`, `working_scale=1`, `model_interval=2`,
+  `mvec_enabled=1`. The helper (this build, no fault injection) is running.

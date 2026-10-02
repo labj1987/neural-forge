@@ -117,12 +117,21 @@ pub struct NgxSnippet {
     /// The header values seen on the previous call, per pass.
     last_seen: Vec<NgxTuning>,
     ever_built: bool,
-    /// The first feature failed to build at this size and HDR mode (and when). Not fatal: the
-    /// model is unavailable *at that key* and is retried when the key changes, or after
-    /// [`RETRY_FAILED_SIZE_AFTER`] -- the likely causes (not enough VRAM while the game is still
-    /// loading, a size too large for the model) pass. Failing once used to disable the model for
-    /// the rest of the session, so lowering the resolution scale afterwards did nothing.
-    create_failed: Option<(FeatureKey, Instant)>,
+    /// When pass 0 (the model itself) is built again after it failed: short backoff, one
+    /// re-initialisation of NGX, then a long backoff ([`crate::rebuild`]). Never fatal: the
+    /// likely causes (VRAM full while the game loads or at 4K with frame generation, a size too
+    /// large for the model) pass, and NGX itself can be left refusing every creation until it is
+    /// re-initialised. `failing()` is what `model_up` 0 reports.
+    retry: crate::rebuild::BuildRetry,
+    /// `NEURAL_FORGE_FAIL_CREATE`: creations to fail on purpose (debug; unset does nothing).
+    fail_inject: Option<crate::rebuild::FailInject>,
+    /// What `VULKAN_Init_Ext` was called with, for a re-initialisation.
+    instance: vk::Instance,
+    physical_device: vk::PhysicalDevice,
+    bin_dir: String,
+    /// The DLL's `AllocateParameters`, to replace a DLL-owned parameter block after a
+    /// re-initialisation.
+    alloc: Option<abi::FnVkAllocateParameters>,
     /// A human-readable account of the latest failure, for the header's reason string. Taken by
     /// the main loop.
     failure_note: Option<String>,
@@ -239,7 +248,12 @@ impl Default for NgxSnippet {
             build_after: None,
             last_seen: Vec::new(),
             ever_built: false,
-            create_failed: None,
+            retry: crate::rebuild::BuildRetry::default(),
+            fail_inject: None,
+            instance: vk::Instance::null(),
+            physical_device: vk::PhysicalDevice::null(),
+            bin_dir: String::new(),
+            alloc: None,
             failure_note: None,
         }
     }
@@ -264,11 +278,16 @@ unsafe fn resolve_export<F: Copy>(module: *mut c_void, name: &str) -> Option<F> 
 /// creates Feature 18. Every DLL call is wrapped in [`guarded`] — a fault anywhere in
 /// here latches `disabled` rather than taking the whole helper down with it.
 pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice, device: vk::Device) -> NgxSnippet {
-    let mut s = NgxSnippet { device, ..NgxSnippet::default() };
+    let mut s = NgxSnippet { device, instance, physical_device, ..NgxSnippet::default() };
+    s.fail_inject = neural_forge_protocol::env::var(crate::rebuild::FailInject::ENV).and_then(|v| crate::rebuild::FailInject::parse(&v));
+    if let Some(f) = s.fail_inject {
+        crate::log!("[ngx] {}: the next feature creations will fail on purpose ({} of them)", crate::rebuild::FailInject::ENV, f.remaining());
+    }
 
     let Some(bin_dir) = resolve_bin_dir() else {
         return s.fail_no_binaries("NEURAL_FORGE_BIN_DIR is not set".to_string());
     };
+    s.bin_dir = bin_dir.clone();
     let dll_file = format!("{bin_dir}\\nvngx_dlssnr.dll");
     if !std::path::Path::new(&dll_file).is_file() {
         return s.fail_no_binaries(format!("nvngx_dlssnr.dll not found in {bin_dir}"));
@@ -480,6 +499,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
         }
     };
     s.params = params;
+    s.alloc = alloc;
 
     params_self_test(params);
 
@@ -587,10 +607,20 @@ impl NgxSnippet {
         self.params
     }
 
-    /// Whether the model is unavailable at the current size because its first feature failed to
-    /// build (as opposed to `disabled`, which is fatal for the session).
-    pub fn create_failed(&self) -> bool {
-        self.create_failed.is_some()
+    /// Whether the model is unavailable because its first feature failed to build and is waiting
+    /// for its next attempt (as opposed to `disabled`, which is fatal for the session).
+    pub fn build_failing(&self) -> bool {
+        self.retry.failing()
+    }
+
+    /// Consecutive failed builds of the model's first feature.
+    pub fn failed_builds(&self) -> u32 {
+        self.retry.streak()
+    }
+
+    /// The length of the failure streak a successful build just ended, once.
+    pub fn take_recovered(&mut self) -> Option<u32> {
+        self.retry.take_recovered()
     }
 
     /// The latest failure note, once.
@@ -619,9 +649,21 @@ impl NgxSnippet {
     }
 }
 
-fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, key: FeatureKey, tuning: &NgxTuning) -> Option<abi::NgxHandle> {
-    let create_feature = s.create_feature?;
+/// Builds one feature. `Err` carries a short account of why not (an NGX result code, a Vulkan
+/// step that failed), for the header's reason string.
+fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, key: FeatureKey, tuning: &NgxTuning) -> Result<abi::NgxHandle, String> {
+    let create_feature = s.create_feature.ok_or("no CreateFeature export")?;
     let FeatureKey { width, height, hdr: hdr_input } = key;
+    if s.fail_inject.as_mut().is_some_and(crate::rebuild::FailInject::should_fail) {
+        crate::log!(
+            "[ngx] VULKAN_CreateFeature(18) not called: failing on purpose ({}, {} more) size={width}x{height} hdr={}",
+            crate::rebuild::FailInject::ENV,
+            s.fail_inject.map_or(0, |f| f.remaining()),
+            u8::from(hdr_input)
+        );
+        crate::logging::flush();
+        return Err("0xbad00002 (injected)".to_string());
+    }
     let flags_env = neural_forge_protocol::env::var(crate::hdr::HDR_FLAGS_ENV).filter(|v| !v.trim().is_empty());
     let (flags, unknown) = crate::hdr::create_flags(hdr_input, flags_env.as_deref());
     let hdr = flags.hdr;
@@ -696,7 +738,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     );
     crate::log!("[ngx] set DLSSNR parameters seh={:#x}", seh);
     if seh != 0 {
-        return None;
+        return Err(format!("setting the parameters faulted ({seh:#x})"));
     }
 
     // `NVSDK_NGX_VULKAN_CreateFeature`'s first parameter is a real, currently-
@@ -714,7 +756,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     // SAFETY: `device` is the live device this snippet was initialized against.
     let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else {
         crate::log!("[ngx] CreateFeature: failed to create the setup command pool");
-        return None;
+        return Err("no setup command pool".to_string());
     };
     let alloc_info =
         vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
@@ -725,7 +767,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
             crate::log!("[ngx] CreateFeature: failed to allocate the setup command buffer");
             // SAFETY: `pool` owns no other resources yet.
             unsafe { device.destroy_command_pool(pool, None) };
-            return None;
+            return Err("no setup command buffer".to_string());
         }
     };
     let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
@@ -734,14 +776,14 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         crate::log!("[ngx] CreateFeature: failed to begin the setup command buffer");
         // SAFETY: `pool` owns `cmd`; nothing else references either.
         unsafe { device.destroy_command_pool(pool, None) };
-        return None;
+        return Err("the setup command buffer would not begin".to_string());
     }
 
     // Last, so nothing above can overwrite it.
     if set_create_tuning(params, tuning) != 0 {
         // SAFETY: `cmd` was begun above and never submitted; `pool` owns it.
         unsafe { device.destroy_command_pool(pool, None) };
-        return None;
+        return Err("setting the tuning faulted".to_string());
     }
 
     let ((result, handle), seh) = guarded(
@@ -768,7 +810,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         // corrupted -- abandon it rather than risk submitting garbage GPU work.
         // SAFETY: `cmd` was never submitted; `pool` owns it and nothing else.
         unsafe { device.destroy_command_pool(pool, None) };
-        return None;
+        return Err(format!("CreateFeature faulted ({seh:#x})"));
     }
     // SAFETY: `cmd` was successfully recorded into above (the guarded call above
     // returned without faulting, regardless of `result`'s own success/failure code --
@@ -777,14 +819,18 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     if unsafe { device.end_command_buffer(cmd) }.is_err() {
         crate::log!("[ngx] CreateFeature: failed to end the setup command buffer");
         unsafe { device.destroy_command_pool(pool, None) };
-        return None;
+        // NGX may have created the feature before the buffer failed to end: release it rather than
+        // leak its memory (nothing of it was submitted).
+        release_handle(s, handle, 0);
+        return Err("the setup command buffer would not end".to_string());
     }
     let fence_info = vk::FenceCreateInfo::builder();
     // SAFETY: `fence_info` is valid.
     let Ok(fence) = (unsafe { device.create_fence(&fence_info, None) }) else {
         crate::log!("[ngx] CreateFeature: failed to create the setup fence");
         unsafe { device.destroy_command_pool(pool, None) };
-        return None;
+        release_handle(s, handle, 0);
+        return Err("no setup fence".to_string());
     };
     let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build();
     // SAFETY: `cmd` was just ended above; `queue` is the caller's own, live queue.
@@ -804,7 +850,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         // build fail like any other `CreateFeature` failure below.
         crate::log!("[ngx] CreateFeature: setup fence wait timed out after {FENCE_WAIT_TIMEOUT:?}; abandoning the setup command pool and fence rather than risk freeing in-flight work");
         crate::logging::flush();
-        return None;
+        return Err("the setup work did not finish".to_string());
     }
     // SAFETY: either the fence was just waited on successfully (work complete), or
     // submission itself failed (nothing in flight to wait for) -- both cases make
@@ -815,10 +861,13 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
     }
 
     crate::logging::flush();
-    if !abi::succeeded(result) || handle.is_null() {
-        return None;
+    if !abi::succeeded(result) || handle.is_null() || !waited {
+        // A handle that came back with a failure code, or whose setup work did not run, is not a
+        // usable feature; release it so nothing it holds stays allocated across the retries.
+        release_handle(s, handle, 0);
+        return Err(if abi::succeeded(result) { "the setup work was not submitted".to_string() } else { format!("{:#x}", result as u32) });
     }
-    Some(handle)
+    Ok(handle)
 }
 
 /// Releases one feature handle. Callers drain the device first (nothing may be in flight).
@@ -856,8 +905,77 @@ fn release_all(s: &mut NgxSnippet) {
     }
 }
 
-/// How long a failed first build at one size blocks retrying that same size.
-const RETRY_FAILED_SIZE_AFTER: Duration = Duration::from_secs(30);
+/// Shuts NGX down and initialises it again on the same device (`Shutdown1`, then
+/// `VULKAN_Init_Ext` with the arguments `load_and_init` used), after every feature is released.
+/// The rig showed NGX refusing every `CreateFeature` with `0xbad00002` after one failure at full
+/// VRAM, until the helper restarted, even once the VRAM was free again; a restart is exactly this
+/// (and a new process). A DLL-owned parameter block belongs to the instance being shut down, so it
+/// is destroyed and allocated again; the self-implemented one is ours and is kept. `false` when
+/// the initialisation failed (the next attempt then fails too, and the schedule re-initialises
+/// again later).
+fn reinit(s: &mut NgxSnippet, device: &ash::Device) -> bool {
+    crate::log!("[ngx] re-initialising NGX after {} failed builds in a row (Shutdown1, then VULKAN_Init_Ext)", s.retry.streak());
+    crate::logging::flush();
+    // SAFETY: nothing may be in flight when a feature is destroyed.
+    let _ = unsafe { device.device_wait_idle() };
+    release_all(s);
+    s.ceiling = None;
+    if let Some(shutdown1) = s.shutdown1 {
+        let ngx_device = s.device;
+        let (result, seh) = guarded(|| unsafe { shutdown1(ngx_device) }, abi::result::FAIL_SEH);
+        crate::log!("[ngx] Shutdown1 -> {:#x} seh={:#x}", result as u32, seh);
+        if seh != 0 {
+            return false;
+        }
+    }
+    if !s.self_params && !s.params.is_null() {
+        if let Some(destroy) = s.params_destroy {
+            let params = s.params;
+            let (result, seh) = guarded(|| unsafe { destroy(params) }, abi::result::FAIL_SEH);
+            crate::log!("[ngx] DestroyParameters -> {:#x} seh={:#x}", result as u32, seh);
+        }
+        s.params = std::ptr::null_mut();
+    }
+    let Some(init_ext) = s.init_ext else { return false };
+    let app_data_path = utf16(&s.bin_dir);
+    let (instance, physical_device, ngx_device) = (s.instance, s.physical_device, s.device);
+    let ((init_result,), seh) = guarded(
+        || {
+            // SAFETY: the same live handles and arguments `load_and_init` passed; `app_data_path`
+            // outlives the call.
+            let r = unsafe {
+                init_ext(abi::SIGNED_SNIPPET_APPLICATION_ID, app_data_path.as_ptr(), instance, physical_device, ngx_device, abi::VERSION_API_14, std::ptr::null())
+            };
+            (r,)
+        },
+        (abi::result::FAIL_SEH,),
+    );
+    crate::log!("[ngx] VULKAN_Init_Ext (re-initialisation) -> {:#x} seh={:#x}", init_result as u32, seh);
+    if s.params.is_null() {
+        let allocated = s.alloc.and_then(|alloc| {
+            let ((code, params), seh) = guarded(
+                || {
+                    let mut params: NgxParameter = std::ptr::null_mut();
+                    // SAFETY: `alloc` resolved from a live module; `&mut params` is a valid out-pointer.
+                    let r = unsafe { alloc(&mut params) };
+                    (r, params)
+                },
+                (abi::result::FAIL_SEH, std::ptr::null_mut()),
+            );
+            crate::log!("[ngx] AllocateParameters (re-initialisation) -> {:#x} seh={:#x}", code as u32, seh);
+            (abi::succeeded(code) && !params.is_null()).then_some(params)
+        });
+        s.params = match allocated {
+            Some(p) => p,
+            None => {
+                s.self_params = true;
+                selfparam::allocate()
+            }
+        };
+    }
+    crate::logging::flush();
+    abi::succeeded(init_result)
+}
 
 /// Gives up on a pass after this many consecutive failed builds.
 const MAX_BUILD_FAILURES: u32 = 3;
@@ -871,9 +989,11 @@ const MAX_BUILD_FAILURES: u32 = 3;
 /// spaced by `settle_ms`; a value that keeps changing keeps postponing the rebuild. With a spacing
 /// of 0 everything pending is built within this call.
 ///
-/// A failure to build the very first feature is one-shot (`disabled`). A later pass that will not
-/// build sets the ceiling instead: the chain runs at what fits. A pass that fails to *rebuild* is
-/// left a hole (skipped) and retried after the spacing.
+/// Pass 0 is the model itself: a failure to build it, first time or rebuild, goes to the retry
+/// schedule ([`crate::rebuild::BuildRetry`]: short backoff, one NGX re-initialisation, long
+/// backoff), never disables the model, and leaves `build_failing()` true until it builds. A later
+/// pass that will not build sets the ceiling instead: the chain runs at what fits. A later pass
+/// that fails to *rebuild* is left a hole (skipped) and retried after the spacing.
 ///
 /// `key` is the frame's size and HDR mode (an RGBA16F proxy builds with `DLSSNR.Hdr=1`); a
 /// change of either rebuilds every pass.
@@ -910,16 +1030,6 @@ pub fn maintain_passes(
         return 0;
     }
     let spacing = Duration::from_millis(u64::from(settle_ms));
-
-    if let Some((failed, when)) = s.create_failed {
-        if failed == key && when.elapsed() < RETRY_FAILED_SIZE_AFTER {
-            return 0; // still blocked at this size and mode; the frame just passes through
-        }
-        // A different size or mode, or long enough: try again from scratch.
-        s.create_failed = None;
-        s.ever_built = false;
-        s.build_after = None;
-    }
 
     if s.live_passes() > 0 && s.built != key {
         crate::log!("[helper] frame {} -> {key}; rebuilding {} pass(es)", s.built, s.live_passes());
@@ -975,6 +1085,17 @@ pub fn maintain_passes(
             break;
         }
 
+        // Pass 0 is built on the retry schedule once it has failed (the spacing alone retried a
+        // failing build every 250 ms for ever).
+        let mut reinit_failed = false;
+        if pass == 0 {
+            match s.retry.step(now) {
+                crate::rebuild::Step::Wait(_) => break,
+                crate::rebuild::Step::ReinitThenBuild => reinit_failed = !reinit(s, device),
+                crate::rebuild::Step::Build => {}
+            }
+        }
+
         if pass < s.passes.len() && !s.passes[pass].handle.is_null() {
             crate::log!("[helper] pass {pass} retuned; rebuilding it (spacing {settle_ms} ms)");
             crate::logging::flush();
@@ -987,7 +1108,10 @@ pub fn maintain_passes(
         let created = create_feature_at(s, device, queue, key, &wanted[pass]);
         s.build_after = Some(Instant::now() + spacing);
         match created {
-            Some(handle) => {
+            Ok(handle) => {
+                if pass == 0 {
+                    s.retry.succeeded();
+                }
                 s.ever_built = true;
                 s.built = key;
                 let slot = PassSlot { handle, built: wanted[pass], needs_reset: true, failures: 0 };
@@ -997,32 +1121,39 @@ pub fn maintain_passes(
                     s.passes.push(slot);
                 }
             }
-            None if first_build => {
-                // Not retried every frame (that would redo the whole command pool/fence setup
-                // per captured frame), and not fatal either: blocked at this size until it
-                // changes or the retry interval passes.
-                crate::log!("[helper] the model would not build at {key}; passing frames through, retrying when the size or mode changes or in {}s", RETRY_FAILED_SIZE_AFTER.as_secs());
+            Err(why) if pass == 0 => {
+                // Not fatal and not retried every frame: the schedule decides when the next attempt
+                // is, and whether NGX is re-initialised before it. Nothing answers meanwhile.
+                let wait = s.retry.failed(Instant::now());
+                let streak = s.retry.streak();
+                crate::log!(
+                    "[helper] the model would not build at {key} ({why}; {streak} failed in a row{}); passing frames through, next attempt in {:.1}s{}",
+                    if reinit_failed { ", NGX re-initialisation failed" } else { "" },
+                    wait.as_secs_f32(),
+                    if streak == crate::rebuild::BuildRetry::REINIT_AFTER { " after re-initialising NGX" } else { "" }
+                );
                 crate::logging::flush();
-                s.failure_note = Some(format!("model would not build at {width}x{height}; lower the resolution scale"));
-                s.create_failed = Some((key, Instant::now()));
-                return 0;
+                s.failure_note = Some(format!(
+                    "model would not build at {width}x{height} ({why}, {streak} in a row); retrying in {}s{}",
+                    wait.as_secs().max(1),
+                    if s.retry.reinits() > 0 { " (NGX re-initialised); lower the resolution scale or free VRAM" } else { "" }
+                ));
+                if pass < s.passes.len() {
+                    s.passes[pass].failures += 1;
+                }
+                return s.live_passes();
             }
-            None if pass >= s.passes.len() => {
+            Err(_) if pass >= s.passes.len() => {
                 // A later pass would not build: a ceiling, not a fault.
                 crate::log!("[helper] pass {pass} would not build; holding the chain at {}", s.passes.len());
                 crate::logging::flush();
                 s.ceiling = Some(s.passes.len());
             }
-            None => {
+            Err(_) => {
                 let slot = &mut s.passes[pass];
                 slot.failures += 1;
                 crate::log!("[helper] pass {pass} rebuild failed ({}); skipping it until it builds", slot.failures);
                 if slot.failures >= MAX_BUILD_FAILURES {
-                    if pass == 0 {
-                        crate::log!("[helper] pass 0 failed {} times; giving up on the model", slot.failures);
-                        s.disabled = true;
-                        return 0;
-                    }
                     // Not coming back: drop the tail from here and hold the chain short.
                     s.passes.truncate(pass);
                     s.ceiling = Some(pass);

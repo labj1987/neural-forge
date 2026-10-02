@@ -336,7 +336,9 @@ pub struct ShmHeader {
     /// 0 off (`NEURAL_FORGE_PREUPSCALE=off`, or no device with NVX: nothing is held, the model runs
     /// after the upscaler), 1 waiting for the game's DLSS input (the mode is on, as it is by default,
     /// but no launch-bearing submit was held in the last 500 ms: no DLSS, DLAA, input not
-    /// identified, or the toggle is off), 2 holding the DLSS submit.
+    /// identified, or the toggle is off), 2 holding the DLSS submit, 3 paused: DLSS input is there
+    /// but the helper has no model (it reports `model_up` 0, or the last holds all came back as
+    /// echoes or late), so submits are forwarded untouched until a probe hold gets a model answer.
     pub preupscale_state: AtomicU32,
     /// The identified DLSS colour input's extent (the render resolution), 0 before one is found.
     pub preupscale_width: AtomicU32,
@@ -353,6 +355,13 @@ pub struct ShmHeader {
     /// processes' clocks never have to agree). Written before `seq_resp`, so a layer that has
     /// seen the answer reads this request's value. 0 before the first answer.
     pub helper_busy_us: AtomicU32,
+
+    // --- v11 -----------------------------------------------------------------------------
+    /// The last slot-0 request the helper actually ran the model on (`seq_req`'s value), written
+    /// before `seq_resp`. A layer that sees `seq_resp` reach its request and this field equal to it
+    /// got a model answer; anything else is an echo of its own frame (no feature built, an
+    /// evaluate that failed, a refused frame). 0 before the first evaluated request.
+    pub seq_eval: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -378,7 +387,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2020, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2024, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -405,6 +414,7 @@ const _: () = assert!(
 const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1996, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 2012, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_busy_us) == 2016, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 2020, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
@@ -498,6 +508,7 @@ impl ShmHeader {
         self.preupscale_hold_ms_bits.store(0, Ordering::Relaxed);
         self.preupscale_misses.store(0, Ordering::Relaxed);
         self.helper_busy_us.store(0, Ordering::Relaxed);
+        self.seq_eval.store(0, Ordering::Relaxed);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 

@@ -40,6 +40,32 @@ diagnostics. In detail:
   OpenDLSS-NR's documented proxy encode and shoulder, OptiScaler_DLSSNR's exposure-texture idea and
   OptiScaler's pre-SR mod (design only, no code).
 
+- **A model that fails to build no longer stays broken or stalls the game**
+  (`docs/PRE_UPSCALER_DESIGN.md`, "Robustness: failed feature builds"). At 4K with Smooth Motion
+  and VRAM nearly full, one failed NGX feature build (`0xbad00002`) used to leave every later build
+  failing, retried every 250 ms until the helper was restarted, while status said the model was up
+  and the layer held every DLSS frame for the full 30 ms. Now:
+  - the helper retries the model on a schedule (0.5, 1, 2 s, then every 30 s), re-initialises NGX
+    (`Shutdown1` + `VULKAN_Init_Ext`) before the 4th attempt and on every 4th after, and never
+    gives up for the session. `model_up` is 0 while the model cannot be built and the helper's
+    reason says why; `shmctl status` prints that reason;
+  - the layer has a circuit breaker: when the helper reports no model, or 8 holds in a row get
+    no model answer, DLSS frames go through untouched with no wait, with one probe every 2 s; a
+    model answer resumes holding. An answer that is only an echo of the frame is no longer
+    written back. The status page's "Model placement" shows "paused" meanwhile
+    (`preupscale_state` 3);
+  - once the model has run before the upscaler on a device, the after-the-upscaler path no longer
+    takes over at loading screens: it waits until DLSS has not run for 30 s (was 500 ms), and
+    loading screens are presented untouched. The helper no longer rebuilds its feature at the
+    output size and back at every loading screen.
+  - Rig: a forced failure streak (`NEURAL_FORGE_FAIL_CREATE=6@2`, new, debug only) mid-benchmark
+    kept the game at 97 fps (NR off: 93) with `model_up=0` and recovered after 6 attempts, with a
+    real NGX re-initialisation on the way. 4K + Smooth Motion twice back to back: 32.6/65.0 and
+    35.3/70.7 fps real/displayed, 2 misses per run (was 64), no failed build. 1440p: 65.0 fps
+    (two runs; 66.1 before, within the spread), 2 misses per run instead of 85-89.
+  - Shared-memory protocol **11** appends `seq_eval` (which request the model actually answered).
+    An old protocol-10 `shm.bin` must be removed once (nothing holding it open) before the new
+    helper starts.
 - **Pre-upscaler hold: hand-off latency cut** (`docs/PRE_UPSCALER_DESIGN.md`, "Hand-off
   latency"). GTA V Enhanced, DLSS Balanced, model every frame: **50.5 -> 66.1 fps** (three runs),
   above the 61.6 gate; the hold went from 14.7 to about 10.2 ms. The ~4.8 ms "hand-off" was the

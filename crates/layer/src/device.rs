@@ -887,13 +887,19 @@ impl NeuralForgeDeviceInfo {
         use crate::preupscale::{Mode, Which};
         let scan = tracking.scan(cbs)?;
         let mode = crate::preupscale::mode();
-        if !crate::layer_enabled() || !self.nvidia || crate::device_lost() || !presenting_steadily() {
+        if !crate::layer_enabled() || !self.nvidia || crate::device_lost() {
             return None;
         }
         let instance = self.instance.as_ref()?;
         let inputs = scan.inputs?;
         let mut state = self.state.lock().unwrap();
         let State { shm, preupscale: session, queue_families, external_memory_host, direct_capture, gpu_compose, inflight, .. } = &mut *state;
+        // DLSS is running on this device (held or not): the post path stays off for
+        // `preupscale::HAND_BACK` after this once the device has held.
+        session.saw_dlss();
+        if !presenting_steadily() {
+            return None;
+        }
         if scan.colour_layout.is_some_and(|l| l != vk::ImageLayout::GENERAL) {
             session.say_once("the colour input was last transitioned out of GENERAL; not holding (frames go to DLSS untouched)");
             return None;
@@ -2046,8 +2052,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if self.preupscale.is_some() {
-                    // Model mode applied the model to DLSS's input within the last 500 ms: the
-                    // post-upscaler compose must not apply it a second time. Logged on change.
+                    // Model mode: once this device has held, the post-upscaler compose stays off
+                    // while DLSS ran within `preupscale::HAND_BACK` (30 s), loading screens included:
+                    // the model is not applied a second time, and the helper's feature is not rebuilt
+                    // at the output size and back at every loading screen. Logged on change.
                     static SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     let suppressed = preupscale.suppresses_post();
                     if SUPPRESSED.swap(suppressed, std::sync::atomic::Ordering::Relaxed) != suppressed {
@@ -2056,7 +2064,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             if suppressed {
                                 "the model runs before the upscaler; the post-upscaler compose is off while frames are held"
                             } else {
-                                "no hold in the last 500 ms; the post-upscaler compose runs as before"
+                                "no DLSS submit in the last 30 s (DLSS off, DLAA, or never held); the post-upscaler compose runs as before"
                             }
                         );
                         crate::logging::flush();

@@ -1640,6 +1640,7 @@ fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, mis
         _ if !layer_active => "no game running".to_string(),
         2 => format!("before the upscaler: holding DLSS's {width}x{height} input every frame{missed}"),
         1 => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
+        3 => format!("paused: DLSS's {width}x{height} input goes to DLSS untouched until the helper's model answers again{missed}"),
         _ => "after the upscaler".to_string(),
     }
 }
@@ -1691,6 +1692,7 @@ mod preupscale_label_tests {
         assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input every frame");
         assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input every frame, 1 frame missed");
         assert_eq!(preupscale_label(true, 1, 1485, 836, 85), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
+        assert_eq!(preupscale_label(true, 3, 1485, 836, 8), "paused: DLSS's 1485x836 input goes to DLSS untouched until the helper's model answers again, 8 frames missed");
     }
 }
 

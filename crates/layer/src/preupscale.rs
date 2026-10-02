@@ -87,8 +87,23 @@ pub(crate) mod hdr;
 /// The variable that selects the mode. Read through `neural_forge_protocol::env`.
 pub(crate) const ENV: &str = "NEURAL_FORGE_PREUPSCALE";
 
-/// How long after the last hold the post-upscaler compose stays off in model mode.
+/// How long after the last hold the device counts as holding (`preupscale_state` 2).
 pub(crate) const RECENT: Duration = Duration::from_millis(500);
+
+/// In model mode, on a device that has held, how long after the last DLSS submit seen the
+/// post-upscaler path stays off (frames are presented as DLSS made them). Covers loading screens,
+/// where DLSS does not run: handing back to the post path there rebuilt the helper's feature at the
+/// output size and back at every loading screen (twice per screen, at 4K near full VRAM; see
+/// "Robustness: failed feature builds" in docs/PRE_UPSCALER_DESIGN.md). Loading screens do not need
+/// the model. Longer than this without DLSS (switched off, DLAA) and the post path runs as before.
+pub(crate) const HAND_BACK: Duration = Duration::from_secs(30);
+
+/// Model-mode holds in a row without a model answer (an echo, late, or none) that open the
+/// [`Breaker`].
+pub(crate) const BREAKER_MISSES: u32 = 8;
+
+/// How long an open [`Breaker`] forwards DLSS submits untouched before one probe hold.
+pub(crate) const BREAKER_COOL_DOWN: Duration = Duration::from_secs(2);
 
 /// The longest a model-mode hold waits for the helper's answer.
 pub(crate) const ANSWER_BUDGET: Duration = Duration::from_millis(30);
@@ -1448,6 +1463,11 @@ pub(crate) struct HoldResult {
     pub miss: Option<&'static str>,
     /// The answer was late or missing (counted in `preupscale_misses`).
     pub over_budget: bool,
+    /// The helper answered in time with an echo of the frame, not the model's answer (no feature
+    /// built, a failed evaluate): nothing is written back. Counted in `preupscale_misses`.
+    pub echoed: bool,
+    /// Model mode: the helper's answer was the model's and was written back.
+    pub evaluated: bool,
     pub capture_gpu_ms: Option<f32>,
     /// The previous hold's write-back GPU time, read when its fence was found signalled here.
     pub writeback_gpu_ms: Option<f32>,
@@ -1884,46 +1904,19 @@ pub(crate) unsafe fn run_hold(
         Mode::Identity | Mode::Roundtrip => res.proxy.buffer,
         Mode::Model => {
             let (pw, ph) = padded(target.width, target.height);
-            shm.set_frame_info(0, pw, ph, neural_forge_protocol::enums::proxy_format::RGBA16F);
-            if !shm.begin_async_request(0) {
-                result.miss = Some("the request could not be started");
-                result.over_budget = true;
-                return result;
-            }
-            let start = Instant::now();
-            let mut spins = 0u32;
-            let answered = loop {
-                match shm.poll_async_request(0) {
-                    Some(true) => break true,
-                    None => break false,
-                    Some(false) => {}
+            match await_answer(shm, pw, ph, budget, &mut result.timing) {
+                Answer::Model => result.evaluated = true,
+                Answer::Echo => {
+                    // The frame itself came back: nothing to write, and the breaker counts it.
+                    result.miss = Some("the helper echoed the frame (no model answer)");
+                    result.echoed = true;
+                    return result;
                 }
-                if start.elapsed() >= budget {
-                    result.miss = Some("the answer was over budget");
-                    break false;
+                Answer::Missed(why) => {
+                    result.miss = Some(why);
+                    result.over_budget = true;
+                    return result;
                 }
-                if !shm.helper_alive() {
-                    result.miss = Some("the helper stopped answering");
-                    break false;
-                }
-                // Spin, not sleep: this is vkd3d-proton's submission thread, held anyway, and a
-                // sleep's wake-up is latency added to every frame (see "Hand-off latency" in
-                // docs/PRE_UPSCALER_DESIGN.md). Yielding keeps it polite to a busy core.
-                relax(&mut spins);
-            };
-            result.timing.round_trip = Some(start.elapsed());
-            if answered {
-                result.timing.helper_busy = shm.helper_busy();
-            }
-            if !answered {
-                result.miss.get_or_insert("the helper did not answer");
-                result.over_budget = true;
-                return result;
-            }
-            if shm.answered_dims() != Some((pw, ph)) {
-                result.miss = Some("the answer is for another size");
-                result.over_budget = true;
-                return result;
             }
             if res.answer.staged {
                 // SAFETY: both valid for `bytes`; the helper finished writing before `seq_resp`.
@@ -1956,6 +1949,187 @@ pub(crate) unsafe fn run_hold(
     result.wrote_back = true;
     result.timing.writeback = Some(t_writeback.elapsed());
     result
+}
+
+/// What came back for a model-mode hold's request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Answer {
+    /// The model's answer, for this size.
+    Model,
+    /// In time and for this size, but the helper echoed the frame (`seq_eval` not this request).
+    Echo,
+    /// No usable answer: over budget, the helper stopped, the request could not be started, or an
+    /// answer for another size.
+    Missed(&'static str),
+}
+
+/// Sends slot 0's proxy (already written, `pw`x`ph` RGBA16F) to the helper and waits for the
+/// answer, at most `budget` (or until the helper stops being alive), spinning. Fills `timing`'s
+/// round trip and helper time.
+pub(crate) fn await_answer(shm: &mut ShmClient, pw: u32, ph: u32, budget: Duration, timing: &mut HoldTiming) -> Answer {
+    shm.set_frame_info(0, pw, ph, neural_forge_protocol::enums::proxy_format::RGBA16F);
+    if !shm.begin_async_request(0) {
+        return Answer::Missed("the request could not be started");
+    }
+    let start = Instant::now();
+    let mut spins = 0u32;
+    let mut why = "the helper did not answer";
+    let answered = loop {
+        match shm.poll_async_request(0) {
+            Some(true) => break true,
+            None => break false,
+            Some(false) => {}
+        }
+        if start.elapsed() >= budget {
+            why = "the answer was over budget";
+            break false;
+        }
+        if !shm.helper_alive() {
+            why = "the helper stopped answering";
+            break false;
+        }
+        // Spin, not sleep: this is vkd3d-proton's submission thread, held anyway, and a
+        // sleep's wake-up is latency added to every frame (see "Hand-off latency" in
+        // docs/PRE_UPSCALER_DESIGN.md). Yielding keeps it polite to a busy core.
+        relax(&mut spins);
+    };
+    timing.round_trip = Some(start.elapsed());
+    if !answered {
+        return Answer::Missed(why);
+    }
+    timing.helper_busy = shm.helper_busy();
+    if shm.answered_dims() != Some((pw, ph)) {
+        return Answer::Missed("the answer is for another size");
+    }
+    if shm.answer_evaluated() { Answer::Model } else { Answer::Echo }
+}
+
+/// The pre-upscaler path's circuit breaker (model mode). Closed, every DLSS submit is held. When
+/// the helper reports no model (`model_up` 0) or [`BREAKER_MISSES`] holds in a row got no model
+/// answer, it opens: submits are forwarded untouched with no wait for [`BREAKER_COOL_DOWN`], then
+/// one probe hold is let through; a model answer closes it, anything else opens it again. Without
+/// it a helper that could not build its feature still cost every frame a drained queue and the
+/// full answer budget (the rig's stuck-feature run, docs/PRE_UPSCALER_DESIGN.md "Robustness: failed
+/// feature builds"). Starts as a probe: the first hold decides.
+#[derive(Debug)]
+pub(crate) struct Breaker {
+    state: BreakerState,
+    /// Holds in a row without a model answer.
+    misses: u32,
+    /// When it opened (the first time since it was last closed).
+    opened_at: Option<Instant>,
+    /// Submits forwarded untouched while open, and probes that failed, since it opened.
+    forwarded: u64,
+    failed_probes: u32,
+    last_log: Option<Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BreakerState {
+    Closed,
+    Open { until: Instant },
+    Probing,
+}
+
+impl Default for Breaker {
+    fn default() -> Self {
+        Self { state: BreakerState::Probing, misses: 0, opened_at: None, forwarded: 0, failed_probes: 0, last_log: None }
+    }
+}
+
+impl Breaker {
+    /// Whether this DLSS submit may be held, at `now`; `model_up` is the helper's flag. A `false`
+    /// is counted as a submit forwarded untouched.
+    pub(crate) fn allow(&mut self, now: Instant, model_up: bool) -> bool {
+        match self.state {
+            BreakerState::Closed if model_up => true,
+            BreakerState::Closed => {
+                self.open(now, "the helper reports no model (model_up=0)".to_string());
+                self.forwarded += 1;
+                false
+            }
+            BreakerState::Open { until } if now >= until => {
+                self.state = BreakerState::Probing;
+                true
+            }
+            BreakerState::Open { .. } => {
+                self.forwarded += 1;
+                false
+            }
+            BreakerState::Probing => true,
+        }
+    }
+
+    /// A held submit's outcome: `true` when the model's answer was written back, `false` for an
+    /// echo, a late answer or none.
+    pub(crate) fn record(&mut self, now: Instant, model_answer: bool) {
+        if model_answer {
+            self.misses = 0;
+            if self.state != BreakerState::Closed {
+                if let Some(t) = self.opened_at.take() {
+                    crate::log!(
+                        "[preupscale] breaker closed: the helper answered with the model again; holding resumes after {:.1}s open ({} DLSS submits forwarded untouched, {} probes without a model answer)",
+                        now.duration_since(t).as_secs_f32(),
+                        self.forwarded,
+                        self.failed_probes
+                    );
+                    crate::logging::flush();
+                }
+                self.state = BreakerState::Closed;
+                self.last_log = None;
+            }
+            return;
+        }
+        self.misses = self.misses.saturating_add(1);
+        match self.state {
+            BreakerState::Probing => {
+                let why = if self.opened_at.is_some() { "the probe hold got no model answer" } else { "the first hold got no model answer" };
+                self.open(now, why.to_string());
+            }
+            BreakerState::Closed if self.misses >= BREAKER_MISSES => {
+                self.open(now, format!("{} holds in a row got no model answer (echoed or late)", self.misses));
+            }
+            _ => {}
+        }
+    }
+
+    fn open(&mut self, now: Instant, why: String) {
+        self.state = BreakerState::Open { until: now + BREAKER_COOL_DOWN };
+        if self.opened_at.is_none() {
+            self.opened_at = Some(now);
+            self.forwarded = 0;
+            self.failed_probes = 0;
+            self.last_log = Some(now);
+            crate::log!(
+                "[preupscale] breaker open: {why}; DLSS submits go through untouched (no wait), one probe hold every {}s",
+                BREAKER_COOL_DOWN.as_secs()
+            );
+            crate::logging::flush();
+            return;
+        }
+        self.failed_probes += 1;
+        if self.last_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(30)) {
+            self.last_log = Some(now);
+            crate::log!(
+                "[preupscale] breaker still open after {:.0}s: {why} ({} probes without a model answer, {} DLSS submits forwarded untouched)",
+                self.opened_at.map_or(0.0, |t| now.duration_since(t).as_secs_f32()),
+                self.failed_probes,
+                self.forwarded
+            );
+            crate::logging::flush();
+        }
+    }
+
+    /// Whether it has opened and not closed since: holds are paused (or one is probing).
+    pub(crate) fn paused(&self) -> bool {
+        self.opened_at.is_some()
+    }
+
+    /// Whether the next submit would be held at `now` without changing anything (tests).
+    #[cfg(test)]
+    pub(crate) fn is_closed(&self) -> bool {
+        self.state == BreakerState::Closed
+    }
 }
 
 /// One step of a busy wait: a few CPU spin hints, then a yield to any other runnable thread on
@@ -2185,13 +2359,28 @@ pub(crate) struct Session {
     /// Launch-bearing submits a due dump waited for the depth and motion-vector layouts.
     dump_waits: u32,
     said: HashSet<&'static str>,
+    /// Model mode: whether to hold at all right now.
+    pub(crate) breaker: Breaker,
+    /// The last launch-bearing submit with DLSS's inputs identified (held or not).
+    last_dlss: Option<Instant>,
+    /// A model-mode hold on this device has asked the helper (whatever came back): the
+    /// pre-upscaler path works here, so the post path stays off while DLSS runs, also while the
+    /// breaker is open (otherwise the post path's output-size requests and the probes' render-size
+    /// ones would rebuild the helper's feature back and forth, and no probe would ever find it
+    /// built).
+    engaged: bool,
 }
 
 impl Session {
-    /// In model mode, whether the post-upscaler compose must stay off for this device's present:
-    /// a hold applied the model within [`RECENT`].
+    /// In model mode, whether the post-upscaler compose must stay off for this device's present
+    /// ([`post_off`]).
     pub(crate) fn suppresses_post(&self) -> bool {
-        mode() == Mode::Model && self.holding()
+        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, Instant::now())
+    }
+
+    /// A launch-bearing submit with DLSS's inputs identified reached the hold point.
+    pub(crate) fn saw_dlss(&mut self) {
+        self.last_dlss = Some(Instant::now());
     }
 
     /// Whether a hold happened within [`RECENT`].
@@ -2285,8 +2474,21 @@ impl Session {
     /// Books one hold's result; publishes the header fields and logs misses (sampled) and the
     /// periodic summary.
     pub(crate) fn note(&mut self, shm: &ShmClient, result: &HoldResult, cpu: Duration, extent: (u32, u32)) {
+        let now = Instant::now();
         if result.wrote_back || result.dump.is_some() {
-            self.last_hold = Some(Instant::now());
+            self.last_hold = Some(now);
+            self.last_dlss = Some(now);
+        }
+        if result.evaluated || result.echoed || result.over_budget {
+            self.engaged = true;
+        }
+        // The breaker only hears about holds that asked the helper: a model answer, or an echo, a
+        // late answer or none. A hold skipped before the request (the exposure value, a pending
+        // write-back) says nothing about the helper.
+        if result.evaluated {
+            self.breaker.record(now, true);
+        } else if result.over_budget || result.echoed {
+            self.breaker.record(now, false);
         }
         let holding = self.holding();
         let s = &mut self.stats;
@@ -2305,21 +2507,21 @@ impl Session {
             s.writeback_gpu_ms.push(g);
         }
         s.book(&result.timing);
-        if result.over_budget {
+        if result.over_budget || result.echoed {
             s.misses += 1;
             s.window_misses += 1;
         }
         if let Some(why) = result.miss {
             s.unlogged_misses += 1;
             if s.last_miss_log.is_none_or(|t| t.elapsed() >= Duration::from_secs(5)) {
-                crate::log!("[preupscale] frame went to DLSS untouched: {why} ({} such since the last line, {} answers over budget in total)", s.unlogged_misses, s.misses);
+                crate::log!("[preupscale] frame went to DLSS untouched: {why} ({} such since the last line, {} answers over budget or echoed in total)", s.unlogged_misses, s.misses);
                 crate::logging::flush();
                 s.last_miss_log = Some(Instant::now());
                 s.unlogged_misses = 0;
             }
         }
         shm.publish_preupscale_hold(s.last_hold_ms, s.misses);
-        shm.publish_preupscale_state(if holding { 2 } else { 1 }, extent.0, extent.1);
+        shm.publish_preupscale_state(if holding { 2 } else if self.breaker.paused() { 3 } else { 1 }, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
             // The window's rate: frames the model ran on before the upscaler (the post path's
@@ -2362,24 +2564,42 @@ impl Session {
         self.dumped = true;
     }
 
-    /// The header state for a present: holding when a hold happened within [`RECENT`].
+    /// The header state for a present: holding when a hold happened within [`RECENT`]; paused
+    /// while the breaker is open and DLSS is still running.
     pub(crate) fn publish_status(&self, shm: &ShmClient, extent: Option<(u32, u32)>) {
         let (w, h) = extent.unwrap_or((0, 0));
-        shm.publish_preupscale_state(if self.holding() { 2 } else { 1 }, w, h);
+        let dlss_running = self.last_dlss.is_some_and(|t| t.elapsed() < RECENT);
+        let state = if self.holding() {
+            2
+        } else if self.breaker.paused() && dlss_running {
+            3
+        } else {
+            1
+        };
+        shm.publish_preupscale_state(state, w, h);
     }
+}
+
+/// Whether the post-upscaler path stays off at `now` in model mode: a hold on the device has asked
+/// the helper (`engaged`) and DLSS ran within [`HAND_BACK`] (`last_dlss`).
+pub(crate) fn post_off(engaged: bool, last_dlss: Option<Instant>, now: Instant) -> bool {
+    engaged && last_dlss.is_some_and(|t| now.saturating_duration_since(t) < HAND_BACK)
 }
 
 /// Whether a launch-bearing submit is held in `mode`, given the live switches: `None` forwards it
 /// untouched; `Some(dump)` holds it, `dump` saying whether this hold writes a dump. In model mode the
 /// live toggle (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported
 /// unavailable mean no hold at all (the post path then sees the toggle too and presents the game's
-/// frame as it is), and a helper that is not running is never waited for. `layouts_known`: the
-/// depth and motion-vector layouts are known (a dump waits for them, [`Session::dump_ready`]).
+/// frame as it is), a helper that is not running is never waited for, and an open [`Breaker`]
+/// forwards the submit untouched. `layouts_known`: the depth and motion-vector layouts are known (a
+/// dump waits for them, [`Session::dump_ready`]).
 pub(crate) fn gate(mode: Mode, session: &mut Session, shm: &mut ShmClient, layouts_known: bool) -> Option<bool> {
     match mode {
         Mode::Off => None,
         Mode::Dump => (session.dump_due(shm) && session.dump_ready(layouts_known)).then_some(true),
-        Mode::Model => (shm.model_wanted() && shm.helper_alive()).then_some(false),
+        Mode::Model => {
+            (shm.model_wanted() && shm.helper_alive() && session.breaker.allow(Instant::now(), shm.model_up())).then_some(false)
+        }
         Mode::Identity | Mode::Roundtrip => Some(false),
     }
 }
@@ -3044,10 +3264,12 @@ mod tests {
 
     /// A stand-in helper on the header: keeps its heartbeat moving and, unless muted, answers each
     /// slot-0 request by transforming the proxy region into the answer region at the size the
-    /// layer published.
+    /// layer published (marking it evaluated in `seq_eval`), or, with `echo` set, by copying the
+    /// proxy back unchanged without marking it, as the real helper does with no feature built.
     struct FakeHelper {
         stop: Arc<AtomicBool>,
         mute: Arc<AtomicBool>,
+        echo: Arc<AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
     }
 
@@ -3058,7 +3280,8 @@ mod tests {
             let answer = shm.answer_region(0).unwrap().0 as usize;
             let stop = Arc::new(AtomicBool::new(false));
             let mute = Arc::new(AtomicBool::new(false));
-            let (s, m) = (stop.clone(), mute.clone());
+            let echo = Arc::new(AtomicBool::new(false));
+            let (s, m, e) = (stop.clone(), mute.clone(), echo.clone());
             let thread = std::thread::spawn(move || {
                 // SAFETY: the mapping outlives the thread (joined before the test ends).
                 let hdr = unsafe { &*(header as *const neural_forge_protocol::ShmHeader) };
@@ -3072,16 +3295,22 @@ mod tests {
                         let n = w as usize * h as usize * TEXEL as usize;
                         // SAFETY: both regions are `MAX_FRAME`-sized and mapped for the process.
                         let mut texels = unsafe { std::slice::from_raw_parts(proxy as *const u8, n) }.to_vec();
-                        transform(&mut texels);
+                        let echoing = e.load(Ordering::Relaxed);
+                        if !echoing {
+                            transform(&mut texels);
+                        }
                         unsafe { std::ptr::copy_nonoverlapping(texels.as_ptr(), answer as *mut u8, n) };
                         hdr.answered_w.store(w, Ordering::Relaxed);
                         hdr.answered_h.store(h, Ordering::Relaxed);
+                        if !echoing {
+                            hdr.seq_eval.store(req, Ordering::Relaxed);
+                        }
                         hdr.seq_resp.store(req, Ordering::Release);
                     }
                     std::thread::sleep(Duration::from_micros(100));
                 }
             });
-            Self { stop, mute, thread: Some(thread) }
+            Self { stop, mute, echo, thread: Some(thread) }
         }
     }
 
@@ -3151,6 +3380,218 @@ mod tests {
             assert!(Instant::now() < deadline, "the fake helper's heartbeat is never seen");
             std::thread::sleep(Duration::from_millis(1));
         }
+    }
+
+    // ---- The circuit breaker and the hand-back window. ----
+
+    /// What [`HeaderHelper`] does with each slot-0 request.
+    const SILENT: u32 = 0;
+    const ECHO: u32 = 1;
+    const MODEL: u32 = 2;
+
+    /// A header-only stand-in helper (no pixel regions): keeps its heartbeat moving and answers
+    /// each slot-0 request at once at the published size, as the model (`seq_eval`), as an echo,
+    /// or not at all.
+    struct HeaderHelper {
+        stop: Arc<AtomicBool>,
+        mode: Arc<std::sync::atomic::AtomicU32>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl HeaderHelper {
+        fn start(header: &neural_forge_protocol::ShmHeader, mode: u32) -> Self {
+            let ptr = std::ptr::from_ref(header) as usize;
+            let stop = Arc::new(AtomicBool::new(false));
+            let mode = Arc::new(std::sync::atomic::AtomicU32::new(mode));
+            let (s, m) = (stop.clone(), mode.clone());
+            let thread = std::thread::spawn(move || {
+                // SAFETY: the header outlives the thread (joined on drop, before the test ends).
+                let hdr = unsafe { &*(ptr as *const neural_forge_protocol::ShmHeader) };
+                hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+                while !s.load(Ordering::Relaxed) {
+                    hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
+                    let req = hdr.seq_req.load(Ordering::Acquire);
+                    let mode = m.load(Ordering::Relaxed);
+                    if mode != SILENT && req != 0 && hdr.seq_resp.load(Ordering::Relaxed) != req {
+                        hdr.answered_w.store(hdr.width.load(Ordering::Relaxed), Ordering::Relaxed);
+                        hdr.answered_h.store(hdr.height.load(Ordering::Relaxed), Ordering::Relaxed);
+                        if mode == MODEL {
+                            hdr.seq_eval.store(req, Ordering::Relaxed);
+                        }
+                        hdr.seq_resp.store(req, Ordering::Release);
+                    }
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            });
+            Self { stop, mode, thread: Some(thread) }
+        }
+
+        fn set(&self, mode: u32) {
+            self.mode.store(mode, Ordering::Relaxed);
+        }
+    }
+
+    impl Drop for HeaderHelper {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(t) = self.thread.take() {
+                let _ = t.join();
+            }
+        }
+    }
+
+    /// One model-mode DLSS submit as the device hook sees it, minus the GPU: the breaker decides
+    /// (at the simulated time `now`), and a held submit waits for the helper's answer within
+    /// `budget`. Returns the answer (`None`: forwarded untouched) and the time spent waiting.
+    fn submit_once(breaker: &mut Breaker, shm: &mut ShmClient, now: Instant, budget: Duration) -> (Option<Answer>, Duration) {
+        if !breaker.allow(now, shm.model_up()) {
+            return (None, Duration::ZERO);
+        }
+        let started = Instant::now();
+        let answer = await_answer(shm, 64, 64, budget, &mut HoldTiming::default());
+        let waited = started.elapsed();
+        breaker.record(now, answer == Answer::Model);
+        (Some(answer), waited)
+    }
+
+    /// The rig's stuck-feature case: the helper keeps answering in time, but only with echoes (no
+    /// feature built), and still says `model_up=1`. Within [`BREAKER_MISSES`] holds the breaker
+    /// opens; while it is open nothing is held and nothing waits; after the cool-down one probe goes
+    /// through (an echo again: open again); once the model answers, the probe closes it and every
+    /// submit is held again. With `model_up=0` it opens at once, and the probes still go out (so a
+    /// helper that has not built yet is asked to).
+    #[test]
+    fn the_breaker_opens_on_echoes_stops_waiting_and_closes_when_the_model_answers() {
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        header.model_up.store(1, Ordering::Relaxed);
+        let mut shm = ShmClient::test_over_header(&header);
+        let helper = HeaderHelper::start(&header, MODEL);
+        wait_for_helper(&mut shm);
+        let budget = ANSWER_BUDGET;
+        let mut breaker = Breaker::default();
+        let t0 = Instant::now();
+
+        // The first hold is a probe; a model answer closes the breaker.
+        assert_eq!(submit_once(&mut breaker, &mut shm, t0, budget).0, Some(Answer::Model));
+        assert!(breaker.is_closed() && !breaker.paused());
+
+        // Echoes: held (and waited for, briefly) until the breaker opens, within BREAKER_MISSES.
+        helper.set(ECHO);
+        let mut held = 0;
+        while let (Some(answer), _) = submit_once(&mut breaker, &mut shm, t0, budget) {
+            assert_eq!(answer, Answer::Echo);
+            held += 1;
+            assert!(held <= BREAKER_MISSES, "the breaker never opened");
+        }
+        assert_eq!(held, BREAKER_MISSES, "opens after exactly BREAKER_MISSES echoed holds");
+        assert!(breaker.paused());
+
+        // Open: a frame's worth of submits for the whole cool-down, none held, no wait at all.
+        let started = Instant::now();
+        for i in 0..240u32 {
+            let now = t0 + BREAKER_COOL_DOWN * i / 240;
+            let (answer, waited) = submit_once(&mut breaker, &mut shm, now, budget);
+            assert_eq!((answer, waited), (None, Duration::ZERO), "submit {i} at +{:?} was held", now - t0);
+        }
+        assert!(started.elapsed() < budget, "forwarding 240 submits took {:?}", started.elapsed());
+
+        // After the cool-down: one probe, an echo again, so it opens again for another cool-down.
+        let t1 = t0 + BREAKER_COOL_DOWN;
+        assert_eq!(submit_once(&mut breaker, &mut shm, t1, budget).0, Some(Answer::Echo));
+        assert_eq!(submit_once(&mut breaker, &mut shm, t1, budget).0, None, "a failed probe opens it again");
+        assert_eq!(submit_once(&mut breaker, &mut shm, t1 + BREAKER_COOL_DOWN / 2, budget).0, None);
+
+        // The helper recovers: the next probe gets the model's answer and holding resumes.
+        helper.set(MODEL);
+        let t2 = t1 + BREAKER_COOL_DOWN;
+        assert_eq!(submit_once(&mut breaker, &mut shm, t2, budget).0, Some(Answer::Model));
+        assert!(breaker.is_closed() && !breaker.paused());
+        for _ in 0..20 {
+            assert_eq!(submit_once(&mut breaker, &mut shm, t2, budget).0, Some(Answer::Model), "closed: every submit held");
+        }
+
+        // The helper says it has no model: open at once, without a single wait.
+        header.model_up.store(0, Ordering::Relaxed);
+        assert_eq!(submit_once(&mut breaker, &mut shm, t2, budget), (None, Duration::ZERO));
+        assert!(breaker.paused());
+        // The probe still goes out with model_up=0 (a helper that has not built yet builds on a
+        // request), and a model answer closes it.
+        header.model_up.store(1, Ordering::Relaxed);
+        assert_eq!(submit_once(&mut breaker, &mut shm, t2 + BREAKER_COOL_DOWN, budget).0, Some(Answer::Model));
+        assert!(breaker.is_closed());
+    }
+
+    /// A helper that has stopped answering in time (alive, but silent): each hold costs the whole
+    /// budget, so the breaker caps the damage at BREAKER_MISSES budgets and then waits no more.
+    #[test]
+    fn the_breaker_opens_on_late_answers_after_breaker_misses_budgets() {
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        header.model_up.store(1, Ordering::Relaxed);
+        let mut shm = ShmClient::test_over_header(&header);
+        let helper = HeaderHelper::start(&header, MODEL);
+        wait_for_helper(&mut shm);
+        let budget = Duration::from_millis(5);
+        let mut breaker = Breaker::default();
+        let t0 = Instant::now();
+        assert_eq!(submit_once(&mut breaker, &mut shm, t0, budget).0, Some(Answer::Model));
+        helper.set(SILENT);
+        let mut waited = Duration::ZERO;
+        let mut held = 0;
+        for _ in 0..100 {
+            let (answer, w) = submit_once(&mut breaker, &mut shm, t0, budget);
+            if let Some(answer) = answer {
+                assert!(matches!(answer, Answer::Missed(_)), "{answer:?}");
+                held += 1;
+            }
+            waited += w;
+        }
+        assert_eq!(held, BREAKER_MISSES);
+        assert!(waited < budget * (BREAKER_MISSES + 2), "waited {waited:?} over 100 submits");
+        drop(helper);
+    }
+
+    /// The post-upscaler hand-back: once a hold on a device has asked the helper, the post path
+    /// stays off until DLSS has not run for HAND_BACK, so a loading screen (no DLSS for a few to
+    /// ~20 s) never hands back, while DLSS switched off does after HAND_BACK. A device that never
+    /// got that far is never affected.
+    #[test]
+    fn the_post_path_takes_over_only_after_hand_back_without_dlss() {
+        let t0 = Instant::now();
+        let s = |secs: f32| t0 + Duration::from_secs_f32(secs);
+        // Never held: the post path runs, DLSS or not.
+        assert!(!post_off(false, Some(t0), t0));
+        assert!(!post_off(false, None, t0));
+        // Held, and DLSS was last seen at t0 (the game went to a loading screen).
+        assert!(post_off(true, Some(t0), s(0.6)), "0.6 s into a loading screen (the old 500 ms hand-back)");
+        assert!(post_off(true, Some(t0), s(20.0)), "a long loading screen");
+        assert!(post_off(true, Some(t0), s(HAND_BACK.as_secs_f32() - 0.01)));
+        assert!(!post_off(true, Some(t0), s(HAND_BACK.as_secs_f32() + 0.01)), "DLSS off for longer than HAND_BACK: the post path resumes");
+        assert!(!post_off(true, None, t0));
+        // A clock read before the last DLSS submit (another thread's) is not "long ago".
+        assert!(post_off(true, Some(s(1.0)), t0));
+
+        // Through a Session: holds and DLSS submits refresh the window; skipped holds count too.
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        let shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        session.saw_dlss();
+        assert!(!post_off(session.engaged, session.last_dlss, Instant::now()), "not before the first hold asked the helper");
+        let skipped = HoldResult { miss: Some("the exposure value is not usable (zero, negative or not finite)"), waits_consumed: true, ..Default::default() };
+        session.note(&shm, &skipped, Duration::from_millis(1), (64, 64));
+        assert!(!session.engaged, "a hold that never reached the helper does not engage the device");
+        let held = HoldResult { waits_consumed: true, wrote_back: true, evaluated: true, ..Default::default() };
+        session.note(&shm, &held, Duration::from_millis(10), (64, 64));
+        assert!(session.engaged && session.breaker.is_closed());
+        let last = session.last_dlss.expect("a hold is a DLSS submit");
+        assert!(post_off(session.engaged, session.last_dlss, last + Duration::from_secs(10)));
+        // An echoed first hold engages the device (the post path stays off, so its output-size
+        // requests cannot fight the probes over the helper's feature) and opens the breaker.
+        let mut fresh = Session::default();
+        let echoed = HoldResult { waits_consumed: true, echoed: true, ..Default::default() };
+        fresh.note(&shm, &echoed, Duration::from_millis(1), (64, 64));
+        assert!(fresh.engaged && fresh.breaker.paused(), "the first hold was an echo: engaged, paused");
+        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 1, "an echo is counted as a miss");
+        assert_eq!(header.preupscale_state.load(Ordering::Relaxed), 3, "and the state says paused");
     }
 
     // ---- The HDR encode: a CPU reference and the GPU checks against it. ----
@@ -3426,6 +3867,14 @@ mod tests {
             let after_model = gpu.read(image, w, h);
             assert_ne!(after_model, original, "the answer was applied");
             check_decode(&after_model, &original, &proxy, &answer, w, h, e, white);
+
+            // Echo: the helper answers in time but with the frame itself (no model built): nothing
+            // is written back, and the hold says so (the breaker counts it).
+            helper.echo.store(true, Ordering::Relaxed);
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 2, ANSWER_BUDGET, &mut submit) };
+            assert!(result.echoed && !result.evaluated && !result.wrote_back && !result.over_budget, "{result:?}");
+            assert_eq!(gpu.read(image, w, h), after_model, "an echo leaves the frame untouched");
+            helper.echo.store(false, Ordering::Relaxed);
 
             // Timeout: the helper is alive but silent; the image is left alone, promptly.
             helper.mute.store(true, Ordering::Relaxed);
