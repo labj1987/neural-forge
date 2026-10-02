@@ -25,7 +25,35 @@ impl EntryPoints {
     }
     pub unsafe extern "system" fn get_device_proc_addr(device: vk::Device, name: *const c_char) -> vk::PFN_vkVoidFunction {
         let original = unsafe { Framework::get_device_proc_addr(device, name) };
+        let original = unsafe { Self::intercept_probe(device, name, original, crate::probe_ngx::enabled()) };
         unsafe { Self::intercept(name, original) }
+    }
+    /// `vkGetImageViewHandle64NVX` is newer than the pinned ash and `vulkan-layer`, so the
+    /// framework hands out the next layer's pointer for it. With the `NEURAL_FORGE_PROBE_NGX`
+    /// probe on (and only then), wrap that pointer; a null result (extension absent) stays null.
+    unsafe fn intercept_probe(device: vk::Device, name: *const c_char, original: vk::PFN_vkVoidFunction, probe: bool) -> vk::PFN_vkVoidFunction {
+        let Some(next) = original.filter(|_| probe) else { return original };
+        if unsafe { CStr::from_ptr(name) } != crate::probe_ngx::HANDLE64_NAME {
+            return original;
+        }
+        // SAFETY: a non-null `vkGetDeviceProcAddr(device, "vkGetImageViewHandle64NVX")` has
+        // this signature.
+        crate::probe_ngx::remember_handle64(device, unsafe { std::mem::transmute::<unsafe extern "system" fn(), crate::probe_ngx::PfnGetImageViewHandle64Nvx>(next) });
+        Some(unsafe { std::mem::transmute::<crate::probe_ngx::PfnGetImageViewHandle64Nvx, unsafe extern "system" fn()>(Self::get_image_view_handle64_nvx) })
+    }
+    unsafe extern "system" fn get_image_view_handle64_nvx(device: vk::Device, info: *const vk::ImageViewHandleInfoNVX) -> u64 {
+        // Recorded when this wrapper was handed out for `device`; if it somehow was not, ask
+        // the framework again (it forwards unknown names to the next layer).
+        let next = crate::probe_ngx::handle64_next(device).or_else(|| {
+            let p = unsafe { Framework::get_device_proc_addr(device, crate::probe_ngx::HANDLE64_NAME.as_ptr()) }?;
+            Some(unsafe { std::mem::transmute::<unsafe extern "system" fn(), crate::probe_ngx::PfnGetImageViewHandle64Nvx>(p) })
+        });
+        let Some(next) = next else { return 0 };
+        let handle = unsafe { next(device, info) };
+        if let Some(info) = unsafe { info.as_ref() } {
+            crate::probe_ngx::on_view_handle("vkGetImageViewHandle64NVX", info.image_view, format!("handle {handle:#x}"));
+        }
+        handle
     }
     unsafe fn intercept(name: *const c_char, original: vk::PFN_vkVoidFunction) -> vk::PFN_vkVoidFunction {
         // Preserve null results (including invalid instance/device queries). Keep
@@ -45,6 +73,7 @@ impl EntryPoints {
         let original = unsafe { Framework::get_device_proc_addr(device, c"vkDestroyDevice".as_ptr()) };
         if let Some(original) = original {
             unsafe { crate::device::destroy_private_resources(device); }
+            if crate::probe_ngx::enabled() { crate::probe_ngx::forget_device(device); }
             let destroy: vk::PFN_vkDestroyDevice = unsafe { std::mem::transmute(original) };
             unsafe { destroy(device, allocator); }
         }
@@ -64,5 +93,43 @@ mod tests {
                 assert_ne!(EntryPoints::intercept(name.as_ptr(), Some(dummy)).unwrap() as usize, dummy as *const () as usize);
             }
         }
+    }
+    #[test]
+    fn the_handle64_probe_wraps_only_when_on_and_only_a_present_entry_point() {
+        use ash::vk::Handle;
+        let device = vk::Device::from_raw(0xd00d);
+        let name = crate::probe_ngx::HANDLE64_NAME.as_ptr();
+        let same = |p: vk::PFN_vkVoidFunction| p.map(|f| f as usize);
+        unsafe {
+            // Off: the next layer's pointer, untouched, and nothing recorded.
+            assert_eq!(same(EntryPoints::intercept_probe(device, name, Some(dummy), false)), same(Some(dummy)));
+            assert!(crate::probe_ngx::handle64_next(device).is_none());
+            // On, extension absent: still null.
+            assert!(EntryPoints::intercept_probe(device, name, None, true).is_none());
+            // On, unrelated names: untouched.
+            for other in [c"vkGetImageViewHandleNVX", c"vkCmdCuLaunchKernelNVX", c"vkQueueSubmit"] {
+                assert_eq!(same(EntryPoints::intercept_probe(device, other.as_ptr(), Some(dummy), true)), same(Some(dummy)));
+            }
+            // On, present: wrapped, and the next pointer remembered for forwarding.
+            let wrapped = EntryPoints::intercept_probe(device, name, Some(dummy), true);
+            assert_ne!(same(wrapped), same(Some(dummy)));
+            assert!(crate::probe_ngx::handle64_next(device).is_some());
+        }
+        crate::probe_ngx::forget_device(device);
+        assert!(crate::probe_ngx::handle64_next(device).is_none());
+    }
+
+    #[test]
+    fn the_handle64_wrapper_forwards_arguments_and_result_unchanged() {
+        use ash::vk::Handle;
+        unsafe extern "system" fn next(device: vk::Device, info: *const vk::ImageViewHandleInfoNVX) -> u64 {
+            device.as_raw() ^ unsafe { (*info).image_view.as_raw() }
+        }
+        let device = vk::Device::from_raw(0xbeef);
+        crate::probe_ngx::remember_handle64(device, next);
+        let info = vk::ImageViewHandleInfoNVX { image_view: vk::ImageView::from_raw(0x1234), ..Default::default() };
+        // The probe is off in the test process, so this is pure forwarding plus a no-op record.
+        assert_eq!(unsafe { EntryPoints::get_image_view_handle64_nvx(device, &info) }, 0xbeef ^ 0x1234);
+        crate::probe_ngx::forget_device(device);
     }
 }

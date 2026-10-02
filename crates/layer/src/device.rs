@@ -94,8 +94,38 @@ pub struct NeuralForgeDeviceInfo {
     next_get_device_queue: Option<vk::PFN_vkGetDeviceQueue>,
     next_get_device_queue2: Option<vk::PFN_vkGetDeviceQueue2>,
     next_create_image: Option<vk::PFN_vkCreateImage>,
+    /// The next layer's entry points the `NEURAL_FORGE_PROBE_NGX` probe forwards through;
+    /// `None` (never resolved) when the probe is off.
+    probe_next: Option<ProbeNext>,
     state: Arc<Mutex<State>>,
     tracker: Mutex<TapTracker>,
+}
+
+/// See `NeuralForgeDeviceInfo::probe_next`. Each is `None` when the device lacks the
+/// extension, and the matching hook then leaves the call to the framework.
+struct ProbeNext {
+    create_image_view: Option<vk::PFN_vkCreateImageView>,
+    get_image_view_handle_nvx: Option<vk::PFN_vkGetImageViewHandleNVX>,
+    get_image_view_address_nvx: Option<vk::PFN_vkGetImageViewAddressNVX>,
+    create_cu_module_nvx: Option<vk::PFN_vkCreateCuModuleNVX>,
+    create_cu_function_nvx: Option<vk::PFN_vkCreateCuFunctionNVX>,
+}
+
+impl ProbeNext {
+    /// # Safety
+    /// `get_proc` must be a valid `vkGetDeviceProcAddr` for `device`.
+    unsafe fn resolve(get_proc: vk::PFN_vkGetDeviceProcAddr, device: vk::Device) -> Self {
+        // SAFETY: each name matches the `PFN_vk*` type requested; forwarded contract.
+        unsafe {
+            Self {
+                create_image_view: resolve(get_proc, device, c"vkCreateImageView"),
+                get_image_view_handle_nvx: resolve(get_proc, device, c"vkGetImageViewHandleNVX"),
+                get_image_view_address_nvx: resolve(get_proc, device, c"vkGetImageViewAddressNVX"),
+                create_cu_module_nvx: resolve(get_proc, device, c"vkCreateCuModuleNVX"),
+                create_cu_function_nvx: resolve(get_proc, device, c"vkCreateCuFunctionNVX"),
+            }
+        }
+    }
 }
 
 #[derive(Default)]
@@ -477,6 +507,10 @@ fn prune_orphaned_tap_source(state: &mut TapTracker, source: vk::Image) {
 /// The image barriers of a `vkCmdPipelineBarrier2` call, or `None` when it has none
 /// (a zero count, or a null pointer, which is how buffer- and memory-only barriers
 /// arrive).
+fn cb_of(info: &vk::CommandBufferSubmitInfo) -> vk::CommandBuffer {
+    info.command_buffer
+}
+
 fn barrier2_images(info: &vk::DependencyInfo) -> Option<&[vk::ImageMemoryBarrier2]> {
     if info.image_memory_barrier_count == 0 || info.p_image_memory_barriers.is_null() {
         return None;
@@ -634,6 +668,18 @@ impl NeuralForgeDeviceInfo {
         // on the framework's own path its extension list is already freed here.
         // SAFETY: as above.
         let create_image = unsafe { resolve::<vk::PFN_vkCreateImage>(next_get_device_proc_addr, handle, c"vkCreateImage") };
+        // SAFETY: as above. Resolved only with the probe on, so a default run makes exactly
+        // the queries it always made.
+        let probe_next = crate::probe_ngx::enabled().then(|| unsafe { ProbeNext::resolve(next_get_device_proc_addr, handle) });
+        if let Some(next) = &probe_next {
+            crate::log!(
+                "[probe-ngx] device {:?}: vkGetImageViewHandleNVX {}, vkGetImageViewAddressNVX {}, vkCreateCuFunctionNVX {}",
+                handle,
+                if next.get_image_view_handle_nvx.is_some() { "present" } else { "absent" },
+                if next.get_image_view_address_nvx.is_some() { "present" } else { "absent" },
+                if next.create_cu_function_nvx.is_some() { "present" } else { "absent" },
+            );
+        }
         let external_memory_host = crate::take_external_memory_host_enabled(handle);
         crate::log!(
             "[layer] hooked device {:?} (swapchain support: {}, external_memory_host: {})",
@@ -679,6 +725,7 @@ impl NeuralForgeDeviceInfo {
             next_get_device_queue: get_queue,
             next_get_device_queue2: get_queue2,
             next_create_image: create_image,
+            probe_next,
             state,
             tracker: Mutex::new(TapTracker::default()),
         }
@@ -950,6 +997,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     fn begin_command_buffer(
         &self, command_buffer: vk::CommandBuffer, _begin_info: &vk::CommandBufferBeginInfo,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
+        crate::probe_ngx::on_begin_command_buffer(command_buffer);
         self.tracker.lock().unwrap().begin_recording(command_buffer);
         LayerResult::Unhandled
     }
@@ -957,6 +1005,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     fn free_command_buffers(
         &self, _command_pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer],
     ) -> LayerResult<()> {
+        crate::probe_ngx::on_free_command_buffers(command_buffers);
         self.tracker.lock().unwrap().free(command_buffers);
         LayerResult::Unhandled
     }
@@ -964,13 +1013,21 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     fn cmd_execute_commands(
         &self, command_buffer: vk::CommandBuffer, secondaries: &[vk::CommandBuffer],
     ) -> LayerResult<()> {
+        crate::probe_ngx::on_execute_commands(command_buffer, secondaries);
         self.tracker.lock().unwrap().execute_secondary(command_buffer, secondaries);
         LayerResult::Unhandled
     }
 
     fn queue_submit(
-        &self, _queue: vk::Queue, submits: &[vk::SubmitInfo], _fence: vk::Fence,
+        &self, queue: vk::Queue, submits: &[vk::SubmitInfo], _fence: vk::Fence,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_submit(queue, submits.iter().flat_map(|submit| {
+                if submit.command_buffer_count == 0 || submit.p_command_buffers.is_null() { return [].iter().copied(); }
+                // SAFETY: as below.
+                unsafe { std::slice::from_raw_parts(submit.p_command_buffers, submit.command_buffer_count as usize) }.iter().copied()
+            }));
+        }
         let mut tracker = self.tracker.lock().unwrap();
         for submit in submits {
             if submit.command_buffer_count == 0 || submit.p_command_buffers.is_null() { continue; }
@@ -983,8 +1040,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn queue_submit2(
-        &self, _queue: vk::Queue, submits: &[vk::SubmitInfo2], _fence: vk::Fence,
+        &self, queue: vk::Queue, submits: &[vk::SubmitInfo2], _fence: vk::Fence,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
+        if crate::probe_ngx::enabled() {
+            crate::probe_ngx::on_submit(queue, submits.iter().flat_map(|submit| {
+                if submit.command_buffer_info_count == 0 || submit.p_command_buffer_infos.is_null() { return [].iter().map(cb_of); }
+                // SAFETY: as below.
+                unsafe { std::slice::from_raw_parts(submit.p_command_buffer_infos, submit.command_buffer_info_count as usize) }.iter().map(cb_of)
+            }));
+        }
         let mut tracker = self.tracker.lock().unwrap();
         for submit in submits {
             if submit.command_buffer_info_count == 0 || submit.p_command_buffer_infos.is_null() { continue; }
@@ -1062,10 +1126,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             return LayerResult::Handled(Err(result));
         }
         self.tracker.lock().unwrap().record_image(image, create_info);
+        crate::probe_ngx::on_create_image(image, create_info);
         LayerResult::Handled(Ok(image))
     }
 
     fn destroy_image(&self, image: vk::Image, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
+        crate::probe_ngx::on_destroy_image(image);
         let mut tracker = self.tracker.lock().unwrap();
         tracker.image_info.remove(&image);
         // A source can be registered (recorded) before any submission has committed a
@@ -1077,11 +1143,98 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
+    // ---- `NEURAL_FORGE_PROBE_NGX` probe hooks (crate::probe_ngx). The framework only routes
+    // these here when the probe is on (see `NeuralForgeLayer::hooked_device_commands`); each
+    // forwards the application's call unchanged and returns the next layer's own result.
+
+    fn create_image_view(
+        &self, create_info: &vk::ImageViewCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<ash::prelude::VkResult<vk::ImageView>> {
+        let Some(next) = self.probe_next.as_ref().and_then(|n| n.create_image_view) else { return LayerResult::Unhandled };
+        let mut view = vk::ImageView::null();
+        let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: `next` is the next layer's own `vkCreateImageView`; the create info (with its
+        // pNext chain) and allocator are the application's, passed unchanged.
+        let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut view) };
+        if result != vk::Result::SUCCESS {
+            return LayerResult::Handled(Err(result));
+        }
+        crate::probe_ngx::on_create_image_view(view, create_info);
+        LayerResult::Handled(Ok(view))
+    }
+
+    fn destroy_image_view(&self, view: vk::ImageView, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
+        crate::probe_ngx::on_destroy_image_view(view);
+        LayerResult::Unhandled
+    }
+
+    fn get_image_view_handle_nvx(&self, info: &vk::ImageViewHandleInfoNVX) -> LayerResult<u32> {
+        let Some(next) = self.probe_next.as_ref().and_then(|n| n.get_image_view_handle_nvx) else { return LayerResult::Unhandled };
+        // SAFETY: the next layer's own `vkGetImageViewHandleNVX`, with the application's info.
+        let handle = unsafe { next(self.device.handle(), info) };
+        crate::probe_ngx::on_view_handle("vkGetImageViewHandleNVX", info.image_view, format!("handle {handle:#x}"));
+        LayerResult::Handled(handle)
+    }
+
+    fn get_image_view_address_nvx(
+        &self, view: vk::ImageView, properties: &mut std::mem::MaybeUninit<vk::ImageViewAddressPropertiesNVX>,
+    ) -> LayerResult<ash::prelude::VkResult<()>> {
+        let Some(next) = self.probe_next.as_ref().and_then(|n| n.get_image_view_address_nvx) else { return LayerResult::Unhandled };
+        // SAFETY: the next layer's own `vkGetImageViewAddressNVX`, writing into the
+        // application's own output struct (its sType/pNext untouched).
+        let result = unsafe { next(self.device.handle(), view, properties.as_mut_ptr()) };
+        let described = if result == vk::Result::SUCCESS {
+            // SAFETY: a successful call filled the struct.
+            let props = unsafe { properties.assume_init_ref() };
+            format!("address {:#x} size {}", props.device_address, props.size)
+        } else {
+            format!("{result:?}")
+        };
+        crate::probe_ngx::on_view_handle("vkGetImageViewAddressNVX", view, described);
+        LayerResult::Handled(result.result())
+    }
+
+    fn create_cu_module_nvx(
+        &self, create_info: &vk::CuModuleCreateInfoNVX, allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<ash::prelude::VkResult<vk::CuModuleNVX>> {
+        let Some(next) = self.probe_next.as_ref().and_then(|n| n.create_cu_module_nvx) else { return LayerResult::Unhandled };
+        let mut module = vk::CuModuleNVX::null();
+        let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the next layer's own `vkCreateCuModuleNVX`, with the application's arguments.
+        let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut module) };
+        crate::probe_ngx::on_create_cu_module(create_info.data_size, result);
+        LayerResult::Handled(if result == vk::Result::SUCCESS { Ok(module) } else { Err(result) })
+    }
+
+    fn create_cu_function_nvx(
+        &self, create_info: &vk::CuFunctionCreateInfoNVX, allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<ash::prelude::VkResult<vk::CuFunctionNVX>> {
+        let Some(next) = self.probe_next.as_ref().and_then(|n| n.create_cu_function_nvx) else { return LayerResult::Unhandled };
+        let mut function = vk::CuFunctionNVX::null();
+        let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the next layer's own `vkCreateCuFunctionNVX`, with the application's arguments.
+        let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut function) };
+        crate::probe_ngx::on_create_cu_function(function, create_info, result);
+        LayerResult::Handled(if result == vk::Result::SUCCESS { Ok(function) } else { Err(result) })
+    }
+
+    fn destroy_cu_function_nvx(&self, function: vk::CuFunctionNVX, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
+        crate::probe_ngx::on_destroy_cu_function(function);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_cu_launch_kernel_nvx(&self, command_buffer: vk::CommandBuffer, launch_info: &vk::CuLaunchInfoNVX) -> LayerResult<()> {
+        // Records counts and dimensions only; `pParams`/`pExtras` are never read.
+        crate::probe_ngx::on_launch(command_buffer, launch_info);
+        LayerResult::Unhandled
+    }
+
     fn queue_present_khr(
         &self,
         queue: vk::Queue,
         present_info: &vk::PresentInfoKHR,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
+        crate::probe_ngx::on_present(queue);
         let Some(next_present) = self.next_queue_present_khr else {
             return LayerResult::Unhandled;
         };
