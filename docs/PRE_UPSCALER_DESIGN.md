@@ -828,3 +828,137 @@ that:
 Left for the rig: Alex's on-screen judgement (daylight, night, F11), a three-run confirmation of the
 default with no variable set, a `shmctl capture --frames 2` while holding, and a game without DLSS
 (or DLAA) to see the device stay on the post path at its 1.1.0 frame rate.
+
+## 4K and HDR output
+
+Run 2026-10-02 15:59-17:10 on lordnikon, main at 346e280 (the build already on the rig;
+`shmctl status` showed `helper_busy_ms`, so no redeploy). GTA V Enhanced, DLSS Balanced, frame
+generation off, script mods off (`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), `model_interval=2`,
+`working_scale=1`, `mvec_enabled=1`. No remote-desktop session during any run. One benchmark
+iteration per run with `scripts/gta-bench.sh`; numbers are pass 4 from `scripts/bench-report.py`.
+Hold columns are the medians over the `[preupscale]` lines covering pass 4. Two runs exited early
+at Game Init (`a4k-model-1`, `b-hdr-model-1`, both at about 90 s), and both reruns after 5 minutes
+worked. No Xid at any point. The kernel log's only NVRM lines are 95 `NV_ERR_NO_MEMORY`, all at
+16:48:59 during `a4k-model-sm-3`.
+
+### A: 4K (3840x2160)
+
+The desktop was switched temporarily to 3840x2160@144.000, scale 1.0, bt2100 with `gdctl set`
+(non-persistent). GTA's settings.xml was set to 3840x2160 at 144 Hz. Both were restored
+afterwards (see the end of this section).
+
+| Run | Real fps | Displayed | GPU % | Power | Hold ms | Capture / write-back GPU ms | capture_wait / helper_busy ms | Misses |
+|---|---|---|---|---|---|---|---|---|
+| `a4k-nroff-1`: NR off (no layer) | 81.9 | 83.3 | 96 | 222 W | - | - | - | - |
+| `a4k-post-1`: today's post path, model every 2nd frame | **28.7** | 28.9 | 93 | 195 W | - | - | `[sync]` helper 25.6 | - |
+| `a4k-model-1` | 38.9 | 39.1 | 96 | 208 W | 17.2 (16.0-19.3) | 1.21 / 1.21 | 5.0-8.5 / 10.7-11.0 | 58 total, at scene changes |
+| `a4k-model-2` | 39.1 | 39.2 | 96 | 209 W | 17.3 (16.0-19.3) | 1.21 / 1.21 | 5.0-8.5 / 10.7-11.0 | 58 total, at scene changes |
+| **model, mean of 2** | **39.0** | 39.2 | 96 | 209 W | 17.3 | | | |
+| `a4k-model-sm-3`: model + Smooth Motion (fresh helper) | 33.3 | **66.6** | 97 | 195 W | 18.6 | 1.12 / 1.18 | 5.2-8.4 / 10.9-11.7 | 0 in pass 4 (64 total) |
+| `a4k-model-sm-1`: model + Smooth Motion | *invalid*: the model stopped partway (below) | 77.4 | 64 | 138 W | | | | 2713 |
+| `a4k-model-sm-2`: model + Smooth Motion | *invalid*: the model was never built | 109.3 | 85 | 179 W | 9.5 | | helper_busy 2.2 (no evaluate) | 3521 |
+| `a4k-model-3`: model, no SM (recovery check) | *invalid*: the model was never built | 60.8 | 81 | 176 W | 9.2 | | | 4270 |
+
+What the layer did at 4K:
+
+- Identification: `colour input: image ... (2228x1253 R16G16B16A16_SFLOAT ...)`, depth
+  D32_SFLOAT_S8_UINT, motion vectors R16G16_SFLOAT, exposure input R16_SFLOAT 1x1, swapchain
+  3840x2160 B8G8R8A8_UNORM. The resources line was `resources for 2228x1253 (padded 2228x1254)
+  built: zero-copy`. DLSS's Balanced input at 4K is **2228**x1253, not 2227x1253 as assumed in
+  "The hold", so only the height is padded.
+- The first hold was skipped with `exposure value is not usable`, as at 1440p. `the model runs
+  before the upscaler` alternated with `no hold in the last 500 ms` at each loading screen.
+- Phases: prep 0.05, capture_wait 5.0-8.5 ms (the drain, up from 3.6-4.4 ms at 1440p),
+  round_trip 10.7-11.0 ms with handoff 0.00. Helper stages at 2228x1254: thumb 0.23, the one wait
+  10.2, busy 10.9 ms. In the post path the helper's busy time at 3840x2160 was 25.0-25.9 ms.
+- Over-budget answers: 58 per model run, at loading screens and scene changes. Steady pass 4
+  had a few at most.
+
+### A verdict: at 4K the pre-upscaler path clearly wins
+
+Model every frame before DLSS ran at **39.0 fps** (38.9 / 39.1). The post path, which runs the
+model only every 2nd frame, ran at **28.7**: **+36%**, or 10.3 fps. The model's input is 2228x1254
+instead of 3840x2160, about a third of the pixels, so the helper's GPU time per call drops from
+~25 ms to ~10.9 ms. Frame time rises from 12.2 ms (NR off) to 25.6 ms. That is the helper's
+~10.9 ms plus the layer's ~2.4 ms of capture and write-back. GPU utilisation stays at 96%, so
+this is GPU work, not waiting. At 1440p the gain was 66.1 vs 61.9. At 4K it is much larger,
+because the post path's cost grows with the output size while the pre-upscaler path's cost grows
+with DLSS's render size. With Smooth Motion below the layer (fresh helper), real fps is 33.3 and
+displayed is **66.6**. For comparison, a 2026-10-02 measurement on an older build with mods on gave
+25.9 / 52.3 for NR on + SM; that was not re-measured on this build.
+
+**VRAM is the limit at 4K with Smooth Motion.** The GPU sat at 11.7-11.9 GB of 12.2 GB through
+the SM runs. In `a4k-model-sm-3`, 22 NGX feature creations at 3840x2160 failed together with the
+kernel's 95 `NV_ERR_NO_MEMORY` lines at 16:48:59, then recovered. Without Smooth Motion, model
+runs peak around 11.2 GB.
+
+### Anomaly: NGX feature creation fails and stays failed
+
+- **Trigger:** in model mode, the helper rebuilds its NGX feature at every loading screen.
+  While there are no holds, the post path runs at 3840x2160 SDR; once holds resume, it runs at
+  2228x1254 HDR (`frame 3840x2160 hdr=0 -> 2228x1254 hdr=1; rebuilding 1 pass(es)` and back).
+  Each rebuild near full VRAM can fail.
+- **What happened in `a4k-model-sm-1`:** a 3840x2160 recreation returned `VULKAN_CreateFeature(18)
+  -> 0xbad00002`. From then on, **every** creation failed: 433 times in that run, at both sizes,
+  with `pass 0 would not build; holding the chain at 0` and `evaluated=false` answers.
+- **The failure outlived the game:** it continued through two further GTA launches,
+  `a4k-model-sm-2` and `a4k-model-3`. The second of those ran without Smooth Motion, and its VRAM
+  peak was the same as the runs that worked. It cleared only with `neural-forge-cli restart`.
+- **Status didn't show it:** `shmctl status` kept saying `helper_state=4 (running)` and
+  `model_up=1` the whole time.
+- **The layer kept holding:** with no model, every hold still drained the queue, and most were
+  counted as "the answer was over budget". The fps in those runs measures the hold without a
+  model. The kernel logged nothing during `sm-1` and `sm-2`.
+- **Not fixed here.** Two possible fixes: have the helper reinitialise NGX after repeated
+  `0xbad00002`, and report "model not buildable" through shared memory so the layer stops
+  holding. A third option is to avoid the 3840x2160 rebuild at loading screens in model mode.
+- **Smaller oddities:**
+  - `sm-1`'s benchmark.txt pass-4 average (54.1) disagrees with its frame-time file (39.3 fps).
+  - Some helper `stages ms` lines labelled 2228x1254 carry ~25 ms medians. The label is the
+    current size, but the 300-request window includes post-path frames.
+
+### B: GTA's HDR output
+
+**GTA V Enhanced on PC has no HDR output to turn on.**
+
+- There is no HDR key in settings.xml or in either of its backups (`.bak-nf`, `.bak-restest`).
+- Rockstar shipped HDR for the Enhanced edition on PS5 and Xbox Series only. PC players use
+  Auto HDR, RTX HDR or the RenoDX mod.
+- The profile's binary `pc_settings.bin` was not touched.
+- The closest test was to let DXGI advertise HDR with `DXVK_HDR=1`, at 1440p on the default
+  desktop (bt2100). settings.xml was unchanged and still hashed 8de35762....
+
+| Run | Real fps | Displayed | GPU % | Power | Hold ms | capture_wait / helper_busy ms | Misses |
+|---|---|---|---|---|---|---|---|
+| `b-hdr-model-1`: `DXVK_HDR=1`, `PREUPSCALE=model` | 64.5 | 65.2 | 90 | 181 W | 9.6 (8.9-11.0) | 3.6-4.2 / 6.1 | 88 total, scene changes |
+| `b-hdr-post-1`: `DXVK_HDR=1`, `PREUPSCALE=off` | 61.9 | 62.3 | 90 | 197 W | - | `[sync]` helper 11.6 | - |
+
+- **Swapchain:** both runs used `2560x1440 fmt=B8G8R8A8_UNORM hdr=0 pass_through=false`, the
+  same as without `DXVK_HDR`. The game never asks for a 10-bit/PQ or fp16 swapchain.
+- **The post-upscaler path still composes:** because the swapchain is SDR, there is nothing to
+  pass through. How the post path handles a real HDR swapchain (it should pass through untouched,
+  per `swapchain::is_supported_format`) **is still unverified on the rig**. That needs a game
+  with HDR output, probably through Proton's Wayland driver.
+- **The pre-upscaler path is unaffected:** it identified 1485x836 RGBA16F and held as usual. It
+  works on the render-resolution scene input, and the output format does not matter to it.
+- **Fps:** 64.5 for the model path and 61.9 for the post path. These are within the spread of
+  `ho-after-1..3` (66.1) and `ho-post-1` (61.9).
+- **Picture:** GTA's Xwayland window was grabbed with GStreamer about 200 s after launch, twice,
+  1 s apart. The images are in the dev machine's scratchpad `pu4/`, not in the repo. They show
+  two correct-looking frames of the benchmark's jet flight along the highway through the hills:
+  - Clear blue sky with soft cloud streaks, natural greens and tans, crisp power pylons and
+    cables, and readable cars on the road.
+  - No colour cast, no wash-out, and no black or NaN blocks.
+  - Mean RGB 139/158/171 and 139/152/154.
+  - These are 8-bit SDR grabs with the MangoHud overlay, from model mode, with no plain
+    comparison frame. Like E3's grabs, they show that the pre-upscaler output is sane, not that
+    it is better.
+
+### Restored
+
+- The desktop is back to 2560x1440@288.001, scale 1.0, bt2100 (`gdctl show`, `gdctl show -p`).
+- settings.xml is byte-identical to the start (sha256 8de357621960...1a7a), and the backup made
+  for this test was removed.
+- Live settings: `enabled=1`, `working_scale=1`, `model_interval=2`, `mvec_enabled=1`.
+- The helper was restarted at ~16:46 and is running (`helper_state=4`, `model_up=1`). GTA is not
+  running.
