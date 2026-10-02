@@ -2,7 +2,7 @@
 
 Status: **approved by Alex 2026-10-02, HDR included. Layer and helper sides are built**, behind
 `NEURAL_FORGE_PREUPSCALE` (off by default); see the two "Implementation" sections at the end.
-E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame; E2-E3 not run (see "Rig results" at the end). E1b found the encode that works (the game's exposure, paper white 3, a per-channel shoulder, sRGB); the layer now applies it on the GPU before the model and inverts it on write-back (model mode, plus a `roundtrip` mode that checks the transform alone), not yet run on the rig. Phases 2 and 3 of the original 2.0 plan are paused.
+E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame (see "Rig results (E1-E3)"). E1b found the encode that works (the game's exposure, paper white 3, a per-channel shoulder, sRGB); the layer now applies it on the GPU before the model and inverts it on write-back (model mode, plus a `roundtrip` mode that checks the transform alone). E2-E3 run 2026-10-02 (see "Rig results (E2-E3)"): the hold alone is cheap, but the model every frame gives 50.5 fps at Balanced, **below the 61.6 gate**. Phases 2 and 3 of the original 2.0 plan are paused.
 
 ## What the probe established (GTA V Enhanced, 2560x1440, DLSS SR on)
 
@@ -473,8 +473,7 @@ input behaves better than `Hdr=1` (not tried).
 
 ### E2, E3
 
-Not run (E1 decides; see above). The layer's identification and dump path are proven on GTA; the
-hold, identity write-back and model mode are unmeasured.
+Not run at the time (E1 decides; see above); run after E1b, see "Rig results (E2-E3)" at the end.
 
 ## E1b: the HDR encode
 
@@ -594,3 +593,93 @@ lose distinction above v of about 1.8: pixels whose input was at the shoulder's 
 here: sky, sun) cannot come back. The write-back should keep the original scene value where the
 encoded input was >= 0.999. (3) The exposure image is read before
 DLSS runs and was in `GENERAL` (the first dump had not seen a barrier on it yet, the second had).
+
+## Rig results (E2-E3)
+
+Run 2026-10-02 13:12-14:25 on lordnikon (2560x1440@288 HDR bt2100, scale 1.0; GTA V Enhanced, DLSS
+Balanced 1485x836 unless noted, frame generation off, script mods off via
+`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), main at 840fc80 deployed with `scripts/deploy-rig.sh`,
+helper restarted (`helper_state=4`). No remote-desktop session during any run. One benchmark
+iteration per run with `scripts/gta-bench.sh`; numbers are pass 4 (117 s) from
+`scripts/bench-report.py`. Hold columns are the median over the `[preupscale] mode=...` lines that
+cover pass 4 (one line per 300 holds). Three runs exited early at Game Init (roundtrip, model 3,
+Quality; no preupscale activity yet, no Xid) and were rerun after 5 minutes. No Xid/NVRM line in the
+kernel log for the whole session.
+
+| Config | Real fps | Displayed | GPU % | Power | Hold ms | Capture / write-back GPU ms | Misses (over budget) |
+|---|---|---|---|---|---|---|---|
+| `pu-nroff-1`: NR off (no layer) | 93.0 | 94.2 | 67 | 148 W | - | - | - |
+| `pu-plain-cap`: layer loaded, `enabled=0`, no PREUPSCALE | 92.5 | 93.9 | 67 | 147 W | - | - | - |
+| `pu-identity-1`: identity, `enabled=0` | 91.5 | 92.4 | 77 | 146 W | 4.28 | 0.68 / 0.63 | 0 |
+| `pu-roundtrip-1`: roundtrip, `enabled=0` | 90.7 | 92.0 | 77 | 146 W | 4.21 | 0.69 / 0.65 | 0 (1 frame: exposure not usable, first hold) |
+| `pu-post-1`: today's post path (model every 2nd frame) | **61.4** | 61.8 | 90 | 195 W | - | - | - |
+| `pu-model-bal-1` | 50.5 | 50.8 | 69 | 151 W | 14.61 | 0.68 / 0.52 | 0 in pass 4 (60 total) |
+| `pu-model-bal-2` | 50.4 | 50.4 | 68 | 150 W | 14.73 | 0.67 / 0.52 | 0 in pass 4 (85 total) |
+| `pu-model-bal-3` | 50.6 | 50.7 | 68 | 150 W | 14.69 | 0.68 / 0.52 | 0 in pass 4 (93 total) |
+| **model, Balanced, mean of 3** | **50.5** | 50.6 | 68 | 150 W | 14.7 | 0.68 / 0.52 | |
+| `pu-model-q-1`: model, Quality (1707x960, padded 1708x960) | 43.5 | 43.6 | 66 | 150 W | 17.42 | 0.79 / 0.64 | ~14 around the pass 3/4 boundary (91 total) |
+
+(Model mode's `composited/s 62.9` in `bench-report.py` comes from the loading screens between
+passes, where no hold happens for 500 ms and the post path runs; it is not the pass-4 rate.)
+
+### What the layer did
+
+- Identification, every mode: `colour input: image ... (1485x836 R16G16B16A16_SFLOAT ...)`, depth
+  D32_SFLOAT_S8_UINT, motion vectors R16G16_SFLOAT, `1x1 (exposure) ... R16_SFLOAT`, `exposure input
+  0x...`, swapchain 2560x1440 (re-logged twice per run as NGX registers more 1x1 RGBA32F images);
+  `resources for 1485x836 (padded 1486x836) built: zero-copy (SHM regions imported)`;
+  `HDR encode: paper white 3` (also printed in identity mode, which does not encode).
+- Model mode: `the model runs before the upscaler; the post-upscaler compose is off while frames
+  are held`, alternating with `no hold in the last 500 ms` at each loading screen, as designed.
+- The first hold of each run in model and roundtrip modes is skipped with `the exposure value is not
+  usable` (the exposure image is still zero on the first DLSS frame); harmless.
+- Over-budget answers (30 ms): 60-93 per model run, all in passes 0-3 and around the start of pass 4
+  (scene changes), about 1% of ~7800 holds; **none in steady pass 4** at Balanced. No other errors.
+- Helper per model frame (helper.log `[frame] timing`): upload 0.7 + evaluate 4.4 + download 0.5 =
+  **5.7 ms** at 1486x836; 0.8 + 4.85 + 0.6 = 6.2 ms at 1708x960.
+
+### E2 verdict: the hold alone is cheap
+
+Identity costs 1.0 fps against the layer loaded and idle (92.5 -> 91.5; 1.5 against no layer at all),
+i.e. about 0.1-0.2 ms per frame, single runs, so within about twice the run-to-run noise. Capture
+and write-back are 0.65-0.7 ms of GPU each. The hold's CPU time (4.2 ms median) is mostly the
+capture-fence wait, which drains the game's work queued before it, so it overlaps the game's own
+GPU time rather than adding to it. Roundtrip (the HDR encode and decode, no model) is within noise
+of identity: 0.01-0.02 ms more GPU per hold and 0.8 fps (one run each). The roundtrip and identity
+pictures were not captured, so "picture unchanged" is not verified here; validation layers were
+not run on the rig.
+
+### E3 verdict: **gate fails**
+
+Model every frame at Balanced: **50.5 fps** (three runs, 50.4-50.6) against the gate of 61.6 and
+today's matched post path at **61.4** in the same session; Quality: 43.5. The frame time grows from
+10.75 ms (NR off) to 19.8 ms, +9.1 ms, against the design's ~6.5 ms estimate. The hold is 14.7 ms:
+~4.2 ms of it is the drain identity also has, ~5.7 ms is the helper's own GPU work, and the remaining
+~4.8 ms is hand-off latency (fence waits, the shared-memory round trip, waking the helper). While the
+submission thread is held, vkd3d-proton queues nothing new, so the GPU idles: GPU utilisation drops
+to 68% (today's path runs at 90%) and power to 150 W. The cost is serial latency, not GPU throughput.
+Even with zero hand-off the helper's 5.7 ms on top of ~10.9 ms would land near 60 fps, at the gate
+rather than clearly above it (arithmetic, not measured). Making this path win needs the hold to stop
+being synchronous (e.g. answer frame N-1's input while N renders, at the cost of a frame of latency
+on the enhanced input) or a much cheaper model call.
+
+### Picture (rough, unattended)
+
+`shmctl capture --frames 2` cannot capture in model mode: the series capture lives in the post
+path's present, which model mode skips while holding, so the request just stays pending (it had to be
+cleared with `shmctl set capture_request 0`). Instead GTA's Xwayland window was grabbed with
+GStreamer (`ximagesrc xid=<GTA window>`, 8-bit, MangoHud overlay included) 200 s after launch, in
+`pu-model-bal-3` and in `pu-plain-cap` (layer loaded, `enabled=0`), plus the layer's own series
+capture 5 s later in `pu-plain-cap` (original == composited, as expected with NR off). Images are in
+the dev machine's scratchpad `pu3/` (`model-xgrab-{1,2}.png`, `plain-xgrab-{1,2}.png`,
+`plain-layer-{0,1}-{original,composited}.png`), not in the repo; the rig copies were removed.
+
+- The model-mode frames look like correct GTA frames: downtown from the air in daylight, blue sky,
+  normal reds/greens on rooftops and billboards, crisp rooftop detail; no grey wash, no colour shift,
+  no black or NaN blocks, no blown highlights (0.06% of pixels at 254-255, plain 0.07%).
+- They are **not a like-for-like comparison** with plain: the scripted camera was at a different
+  shot at the same delay (load times differ; the plain grab caught the hillside flight, the plain
+  series 5 s later the downtown flight at a different angle). Mean levels are similar (model
+  155/171/188, plain 148-151/167-170/182-191). Whether the model visibly enhances the frame after
+  DLSS, and whether DLSS's temporal accumulation shimmers with it, is not decidable from these and is
+  for Alex at the screen.
