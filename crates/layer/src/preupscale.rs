@@ -1354,6 +1354,27 @@ pub(crate) struct HoldResult {
     pub dump: Option<DumpFrame>,
     /// Model and roundtrip modes: the exposure value the capture read.
     pub exposure: Option<f32>,
+    /// Where the hold's CPU time went (wall time on this thread).
+    pub timing: HoldTiming,
+}
+
+/// Wall-clock phases of one hold, for the periodic `[preupscale]` line. `None` for a phase the
+/// hold did not reach.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct HoldTiming {
+    /// From the start of the hold to the capture submit returning: the previous write-back's
+    /// fence check, recording, the submit itself.
+    pub prep: Option<Duration>,
+    /// The capture fence wait (it also drains the game's work queued before the capture).
+    pub capture_wait: Option<Duration>,
+    /// Model mode: `seq_req` bumped -> `seq_resp` seen.
+    pub round_trip: Option<Duration>,
+    /// Model mode: the helper's own wall time for this request (`helper_busy_us`), so
+    /// `round_trip - helper_busy` is the hand-off: the helper noticing the request plus this
+    /// thread noticing the answer.
+    pub helper_busy: Option<Duration>,
+    /// From the answer (or the capture, without a helper) to the write-back submit returning.
+    pub writeback: Option<Duration>,
 }
 
 /// One dump's bytes, written off the submit thread by [`DumpFrame::write`].
@@ -1621,6 +1642,7 @@ pub(crate) unsafe fn run_hold(
     submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> HoldResult {
     let mut result = HoldResult::default();
+    let t_hold = Instant::now();
     let mut writeback_gpu = None;
     if !res.wait_idle(device, &mut writeback_gpu) {
         result.miss = Some("the previous hold's work is still pending");
@@ -1686,8 +1708,11 @@ pub(crate) unsafe fn run_hold(
     if let Some(timer) = res.capture_timer.as_mut() {
         timer.mark_submitted();
     }
+    result.timing.prep = Some(t_hold.elapsed());
+    let t_capture = Instant::now();
     // SAFETY: the layer's own fence, just submitted.
     let wait = unsafe { device.wait_for_fences(&[res.capture_fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    result.timing.capture_wait = Some(t_capture.elapsed());
     if crate::note_fence_wait(wait, "preupscale::capture").is_err() {
         result.miss = Some("the capture did not finish");
         return result;
@@ -1765,6 +1790,7 @@ pub(crate) unsafe fn run_hold(
                 return result;
             }
             let start = Instant::now();
+            let mut spins = 0u32;
             let answered = loop {
                 match shm.poll_async_request(0) {
                     Some(true) => break true,
@@ -1779,8 +1805,15 @@ pub(crate) unsafe fn run_hold(
                     result.miss = Some("the helper stopped answering");
                     break false;
                 }
-                std::thread::sleep(Duration::from_micros(50));
+                // Spin, not sleep: this is vkd3d-proton's submission thread, held anyway, and a
+                // sleep's wake-up is latency added to every frame (see "Hand-off latency" in
+                // docs/PRE_UPSCALER_DESIGN.md). Yielding keeps it polite to a busy core.
+                relax(&mut spins);
             };
+            result.timing.round_trip = Some(start.elapsed());
+            if answered {
+                result.timing.helper_busy = shm.helper_busy();
+            }
             if !answered {
                 result.miss.get_or_insert("the helper did not answer");
                 result.over_budget = true;
@@ -1798,6 +1831,7 @@ pub(crate) unsafe fn run_hold(
             res.answer.buffer
         }
     };
+    let t_writeback = Instant::now();
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     // SAFETY: the write-back buffer is idle (`wait_idle` above); in the HDR modes the pass holds this
     // hold's capture and its colour view.
@@ -1819,8 +1853,24 @@ pub(crate) unsafe fn run_hold(
         timer.mark_submitted();
     }
     result.wrote_back = true;
+    result.timing.writeback = Some(t_writeback.elapsed());
     result
 }
+
+/// One step of a busy wait: a few CPU spin hints, then a yield to any other runnable thread on
+/// this core every [`YIELD_EVERY`] steps. Never sleeps (a sleep's wake-up granularity is what the
+/// busy wait is there to avoid), so the caller bounds the wait itself.
+pub(crate) fn relax(spins: &mut u32) {
+    *spins = spins.wrapping_add(1);
+    if (*spins).is_multiple_of(YIELD_EVERY) {
+        std::thread::yield_now();
+    } else {
+        std::hint::spin_loop();
+    }
+}
+
+/// [`relax`] yields on every this-many-th step.
+pub(crate) const YIELD_EVERY: u32 = 16;
 
 // ---- Dump files. ----
 
@@ -1951,11 +2001,59 @@ struct Stats {
     hold_ms: Vec<f32>,
     capture_gpu_ms: Vec<f32>,
     writeback_gpu_ms: Vec<f32>,
+    /// [`HoldTiming`]'s phases in milliseconds, per hold that reached them; `handoff` is
+    /// `round_trip - helper_busy` per answered hold.
+    prep_ms: Vec<f32>,
+    capture_wait_ms: Vec<f32>,
+    round_trip_ms: Vec<f32>,
+    helper_busy_ms: Vec<f32>,
+    handoff_ms: Vec<f32>,
+    writeback_cpu_ms: Vec<f32>,
     misses: u32,
     window_misses: u32,
     last_miss_log: Option<Instant>,
     unlogged_misses: u32,
     last_hold_ms: f32,
+}
+
+impl Stats {
+    fn book(&mut self, t: &HoldTiming) {
+        let ms = |d: Duration| d.as_secs_f32() * 1000.0;
+        let pairs = [
+            (&mut self.prep_ms, t.prep),
+            (&mut self.capture_wait_ms, t.capture_wait),
+            (&mut self.round_trip_ms, t.round_trip),
+            (&mut self.helper_busy_ms, t.helper_busy),
+            (&mut self.writeback_cpu_ms, t.writeback),
+        ];
+        for (v, d) in pairs {
+            if let Some(d) = d {
+                v.push(ms(d));
+            }
+        }
+        if let (Some(rt), Some(busy)) = (t.round_trip, t.helper_busy) {
+            self.handoff_ms.push(ms(rt.saturating_sub(busy)));
+        }
+    }
+
+    /// The phase medians, for the periodic line.
+    fn phases(&self) -> String {
+        format!(
+            "phases ms (median): prep={:.2} capture_wait={:.2} round_trip={:.2} helper_busy={:.2} handoff={:.2} writeback={:.2}",
+            median(&self.prep_ms),
+            median(&self.capture_wait_ms),
+            median(&self.round_trip_ms),
+            median(&self.helper_busy_ms),
+            median(&self.handoff_ms),
+            median(&self.writeback_cpu_ms)
+        )
+    }
+
+    fn clear_phases(&mut self) {
+        for v in [&mut self.prep_ms, &mut self.capture_wait_ms, &mut self.round_trip_ms, &mut self.helper_busy_ms, &mut self.handoff_ms, &mut self.writeback_cpu_ms] {
+            v.clear();
+        }
+    }
 }
 
 fn median(values: &[f32]) -> f32 {
@@ -2096,6 +2194,7 @@ impl Session {
         if let Some(g) = result.writeback_gpu_ms {
             s.writeback_gpu_ms.push(g);
         }
+        s.book(&result.timing);
         if result.over_budget {
             s.misses += 1;
             s.window_misses += 1;
@@ -2125,10 +2224,12 @@ impl Session {
                 s.window_misses,
                 s.misses
             );
+            crate::log!("[preupscale] {}", s.phases());
             crate::logging::flush();
             s.hold_ms.clear();
             s.capture_gpu_ms.clear();
             s.writeback_gpu_ms.clear();
+            s.clear_phases();
             s.window_misses = 0;
         }
     }
@@ -2177,6 +2278,21 @@ mod tests {
     }
     fn cb(raw: u64) -> vk::CommandBuffer {
         vk::CommandBuffer::from_raw(raw)
+    }
+
+    #[test]
+    fn relax_counts_its_steps_and_never_sleeps() {
+        let mut spins = 0;
+        let started = Instant::now();
+        for _ in 0..(YIELD_EVERY * 1000) {
+            relax(&mut spins);
+        }
+        assert_eq!(spins, YIELD_EVERY * 1000);
+        // 16000 steps with 1000 yields: microseconds each at most, never a sleep's granularity.
+        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
+        let mut near_wrap = u32::MAX;
+        relax(&mut near_wrap);
+        assert_eq!(near_wrap, 0, "the counter wraps instead of overflowing");
     }
 
     #[test]

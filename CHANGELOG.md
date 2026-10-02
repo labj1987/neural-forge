@@ -6,6 +6,27 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- **Pre-upscaler hold: hand-off latency cut** (`docs/PRE_UPSCALER_DESIGN.md`, "Hand-off
+  latency"). GTA V Enhanced, DLSS Balanced, model every frame: **50.5 -> 66.1 fps** (three runs),
+  above the 61.6 gate; the hold went from 14.7 to about 10.2 ms. The ~4.8 ms "hand-off" was the
+  helper's CPU scene-cut thumbnail of the RGBA16F frame: ~60000 `powf` calls through the Windows
+  C runtime under Wine, 4.9 ms per request. It now goes through a 64K-entry table built at
+  helper start (identical results, 0.13 ms). Also:
+  - the helper records a request as two command buffers (upload; every pass's
+    `EvaluateFeature` plus the download) with the optical flow's submissions between them on the
+    same queue, and waits once on both fences, instead of a submit and fence wait per stage
+    (the flow is no longer waited on separately: `GpuFlow::estimate(.., FlowSync::Chained)`).
+    `helper_upload_ms`/`helper_eval_ms` are now record+submit times and `helper_readback_ms` the
+    one wait;
+  - the helper's loop yields instead of sleeping for 50 ms after each request (it went back to
+    200 us sleeps once quiet), and the layer spins (with yields) on the answer instead of
+    sleeping 50 us between checks;
+  - instrumentation: a `[preupscale] phases ms (median)` line after each hold summary (prep,
+    capture wait, round trip, the helper's own time, hand-off, write-back) and a helper
+    `[frame] stages ms (median)` line every 300 requests. Shared-memory protocol **10** appends
+    `helper_busy_us` (the helper's wall time for its last slot-0 request; `shmctl status` shows
+    `helper_busy_ms`). An old protocol-9 `shm.bin` must be removed once (nothing holding it
+    open) before the new helper starts.
 - **Helper: RGBA16F (scene-linear HDR) frames**, the model's side of the pre-upscaler path
   (`docs/PRE_UPSCALER_DESIGN.md`, "Implementation (helper)"). A slot whose `proxy_format` is
   `RGBA16F` is uploaded and answered as half floats with no conversion, and its NGX feature is

@@ -509,6 +509,13 @@ impl ShmClient {
         if total.is_finite() && total > 0.0 { total } else { 0.0 }
     }
 
+    /// The helper's own wall time for its last slot-0 request (`helper_busy_us`), `None` before
+    /// the first one (or before the mapping is open).
+    pub fn helper_busy(&self) -> Option<Duration> {
+        let us = self.header()?.helper_busy_us.load(Ordering::Relaxed);
+        (us > 0).then(|| Duration::from_micros(u64::from(us)))
+    }
+
     /// Opens (or creates) the mapping if not already attached. Idempotent.
     pub fn open(&mut self) -> bool {
         if self.header().is_some() { return true; }

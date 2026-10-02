@@ -35,6 +35,11 @@ pub struct FrameTiming {
     pub motion: Option<std::time::Duration>,
     /// Motion estimation failed this frame; the caller should drop the flow session.
     pub motion_failed: bool,
+    /// CPU time inside `EvaluateFeature` itself (NGX recording its work), all passes.
+    pub ngx_record: std::time::Duration,
+    /// Time blocked in this instance's own fence waits (upload, evaluate, download; not the
+    /// flow's), i.e. the part of the stages above spent waiting for the GPU.
+    pub fence_waits: std::time::Duration,
 }
 
 /// The format of the multipass working images: 16-bit float, so a chain of passes does not lose
@@ -60,8 +65,13 @@ pub struct FrameResources {
     height: u32,
     queue_family: u32,
     pool: vk::CommandPool,
+    /// A: the upload. Signals `fence`.
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// B: every pass's `EvaluateFeature`, the steps between passes and the download. Signals
+    /// `fence_b`. A request waits once, on both (`evaluate`).
+    cmd_b: vk::CommandBuffer,
+    fence_b: vk::Fence,
 
     color_image: vk::Image,
     color_view: vk::ImageView,
@@ -87,7 +97,7 @@ pub struct FrameResources {
 
     /// `VK_EXT_external_memory_host` imports of the SHM proxy/answer regions
     /// (`docs/EXTERNAL_MEMORY_HOST_DESIGN.md`'s helper-side half) -- when present,
-    /// `run_transfer` copies Color directly from `imported_proxy`'s buffer and Output
+    /// the upload copies Color directly from `imported_proxy`'s buffer and Output
     /// directly into `imported_answer`'s, skipping the staging-buffer CPU copies
     /// `evaluate` would otherwise do for those two. `None` (the common fallback, e.g.
     /// the mapping didn't land aligned, or the device lacks the extension) just means
@@ -104,14 +114,19 @@ pub struct FrameResources {
     /// interior mutability to track from there.
     reset_done: std::cell::Cell<bool>,
 
-    /// Set once a bounded fence wait on `cmd`/`fence` (`run_evaluate`/`run_transfer`)
-    /// times out. `cmd`/`fence` are reused every call on this single instance (there is
+    /// Set once a bounded fence wait on `fence`/`fence_b` (`wait_both`)
+    /// times out. Both buffers and fences are reused every call on this single instance (there is
     /// no double-buffering here, unlike the layer's own async slots), so a timeout
     /// means the GPU work they guard might still be running -- every later call must
     /// refuse to touch either again (`evaluate` checks this first), and whoever would
     /// otherwise call `destroy` on this instance must leak it instead. See
     /// `matches`, `evaluate`, and `main.rs`'s two rebuild-on-resize call sites.
     stalled: std::cell::Cell<bool>,
+
+    /// Per-`evaluate` accumulators for [`FrameTiming::ngx_record`] and
+    /// [`FrameTiming::fence_waits`], reset at its start.
+    ngx_time: std::cell::Cell<std::time::Duration>,
+    wait_time: std::cell::Cell<std::time::Duration>,
 }
 
 // SAFETY: every field is a plain Vulkan handle or a `vkMapMemory` pointer into memory
@@ -441,13 +456,17 @@ impl FrameResources {
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.ok()?;
         partial.track(Undo::Pool(pool));
         let alloc_info =
-            vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+            vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(2);
         // SAFETY: `pool` was just created above.
-        let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.ok()?[0];
+        let cmds = unsafe { device.allocate_command_buffers(&alloc_info) }.ok()?;
+        let (cmd, cmd_b) = (cmds[0], cmds[1]);
         let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
         // SAFETY: `fence_info` is valid.
         let fence = unsafe { device.create_fence(&fence_info, None) }.ok()?;
         partial.track(Undo::Fence(fence));
+        // SAFETY: as above.
+        let fence_b = unsafe { device.create_fence(&fence_info, None) }.ok()?;
+        partial.track(Undo::Fence(fence_b));
 
         // Holds one frame in the proxy's format (4 bytes per pixel, 8 for RGBA16F): Color on
         // upload, Output on download, each only when that shared-memory region could not be
@@ -481,7 +500,7 @@ impl FrameResources {
         let staging_ptr = unsafe { device.map_memory(staging_memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.ok()?.cast::<u8>();
 
         // Try importing the live SHM proxy/answer regions as device memory
-        // (`VK_EXT_external_memory_host`) -- `run_transfer` uses these directly
+        // (`VK_EXT_external_memory_host`) -- the upload and download use these directly
         // instead of the staging buffer above when available. Checked against the
         // *actual* runtime pointer, not just assumed: `shm::open`'s own aligned-mapping
         // attempt can fall back to an unaligned view, and this device might lack the
@@ -526,6 +545,8 @@ impl FrameResources {
             pool,
             cmd,
             fence,
+            cmd_b,
+            fence_b,
             color_image,
             color_view,
             color_memory,
@@ -545,6 +566,8 @@ impl FrameResources {
             imported_answer,
             reset_done: std::cell::Cell::new(false),
             stalled: std::cell::Cell::new(false),
+            ngx_time: std::cell::Cell::new(std::time::Duration::ZERO),
+            wait_time: std::cell::Cell::new(std::time::Duration::ZERO),
             work: std::cell::OnceCell::new(),
             mem_props,
         })
@@ -604,40 +627,61 @@ impl FrameResources {
         }
         static EVALUATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let evaluate_no = EVALUATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.ngx_time.set(std::time::Duration::ZERO);
+        self.wait_time.set(std::time::Duration::ZERO);
         let pixel_count = (self.width as usize) * (self.height as usize);
         let frame_bytes = pixel_count * self.bytes_per_pixel;
         if chain.is_empty() || proxy.len() < frame_bytes || answer_out.len() < frame_bytes {
             return None;
         }
 
-        // Stage 1: upload proxy -> Color and clear MVec. The proxy copy is skipped when
-        // `imported_proxy` is set: `proxy` is already a view into the exact memory
-        // that buffer is imported from (`ShmMapping::frame_regions`/`proxy_and_answer_regions`
-        // share the same base), so `run_transfer` below reads directly from it instead.
+        // One request is two command buffers on `queue` and a single CPU wait (the hand-off
+        // latency work, docs/PRE_UPSCALER_DESIGN.md "Hand-off latency"): A uploads the proxy into
+        // Color and clears MVec and Depth; the optical flow's own submissions follow it (main
+        // queue, flow queue, main queue, chained by semaphores, not waited on); B records every
+        // pass's `EvaluateFeature`, the steps between passes and the download. Queue submission
+        // order plus each buffer's barriers order them on the GPU. Until 2026-10-02 every stage
+        // was its own submit and fence wait, three to five CPU round trips per request.
+        //
+        // The proxy copy is skipped when `imported_proxy` is set: `proxy` is already a view into
+        // the exact memory that buffer is imported from (`ShmMapping::frame_regions` /
+        // `proxy_and_answer_regions` share the same base), so the upload reads directly from it.
         if self.imported_proxy.is_none() {
             // SAFETY: `staging_ptr` is a live mapping of at least `frame_bytes`
             // bytes (this type's own construction sized it to exactly that).
             unsafe { std::ptr::copy_nonoverlapping(proxy.as_ptr(), self.staging_ptr, frame_bytes) };
         }
         let t_upload_start = std::time::Instant::now();
-        if !self.run_transfer(device, queue, TransferKind::Upload) {
+        // SAFETY: both fences are signalled (the previous call waited on them, or drained), so
+        // neither buffer is pending.
+        if !unsafe { self.begin(device, self.cmd) } {
+            return None;
+        }
+        // SAFETY: `self.cmd` is recording.
+        unsafe { self.record_transfer(device, self.cmd, TransferKind::Upload) };
+        // SAFETY: as above; nothing is pending, so a failed submit leaves nothing behind.
+        if !unsafe { self.submit(device, queue, Some(self.cmd), self.fence) } {
             return None;
         }
         let t_upload = t_upload_start.elapsed();
 
-        // Stage 1b: motion vectors, on the GPU from the Color image just uploaded.
+        // Stage 1b: motion vectors, on the GPU from the Color image A uploads. Not waited on:
+        // B's fence covers it (the flow's last submission is on `queue` before B).
         let mut motion_time = None;
         let mut motion_failed = false;
         // A session built for the other format class would blit floats as bytes or tone map
         // bytes; the caller keys sessions by class, so this only guards against a mismatch.
-        let motion = motion.filter(|flow| flow.hdr == self.is_hdr());
-        if let Some(flow) = motion {
+        let mut motion = motion.filter(|flow| flow.hdr == self.is_hdr());
+        if let Some(flow) = motion.as_deref_mut() {
             let t = std::time::Instant::now();
-            match flow.estimate(device, queue, self.color_image, self.color_view, self.mvec_image, motion_scale) {
+            match flow.estimate(device, queue, self.color_image, self.color_view, self.mvec_image, motion_scale, crate::optical_flow::FlowSync::Chained) {
                 Ok(_) => motion_time = Some(t.elapsed()),
-                // A timed-out estimate may still be using Color/MVec on the GPU: skip this
-                // frame's evaluation (fail open) rather than race it.
-                Err(vk::Result::TIMEOUT) => return None,
+                // The session is stalled from an earlier timeout: skip this frame's evaluation
+                // (fail open) rather than race whatever it may still be running.
+                Err(vk::Result::TIMEOUT) => {
+                    self.drain(device, queue, None);
+                    return None;
+                }
                 Err(e) => {
                     crate::log!("[mvec] estimate failed, dropping the flow session: {e:?}");
                     motion_failed = true;
@@ -645,8 +689,13 @@ impl FrameResources {
             }
         }
 
-        // Stage 2: the real NGX call, guarded the same way every other DLL call in
-        // this crate already is.
+        // Stage 2: B. Every NGX call is guarded the same way every other DLL call in this crate
+        // already is.
+        // SAFETY: B's fence is signalled (see above), so B is not pending.
+        if !unsafe { self.begin(device, self.cmd_b) } {
+            self.drain(device, queue, motion);
+            return None;
+        }
         let color_info = self.resource_info(self.color_view, self.color_image, self.color_format);
         let output_info = self.resource_info(self.output_view, self.output_image, self.color_format);
         let mvec_info = self.resource_info(self.mvec_view, self.mvec_image, MVEC_FORMAT);
@@ -662,7 +711,7 @@ impl FrameResources {
         let name = |n: &str| std::ffi::CString::new(n).unwrap();
         // The first evaluate on this set of resources tells every pass its history is gone.
         let first = !self.reset_done.replace(true);
-        let mut t_eval = std::time::Duration::ZERO;
+        let t_eval_start = std::time::Instant::now();
         // Chains of more than one pass go through the 16-bit working images: pass 0 reads Color and
         // writes work[0], the middle passes alternate, the last writes Output.
         let work = if chain.len() > 1 && !WORK16_REFUSED.load(std::sync::atomic::Ordering::Relaxed) {
@@ -687,121 +736,126 @@ impl FrameResources {
             None
         };
         if let Some(w) = work {
-            if !self.run_transfer(device, queue, TransferKind::WorkInit(w[0].0, w[1].0)) {
-                return None;
-            }
+            // SAFETY: B is recording.
+            unsafe { self.record_transfer(device, self.cmd_b, TransferKind::WorkInit(w[0].0, w[1].0)) };
         }
         let last = chain.len() - 1;
         for (k, pass) in chain.iter().enumerate() {
-        let (color_info, output_info) = match work {
-            Some(w) => (
-                if k == 0 { color_info } else { self.resource_info(w[(k - 1) % 2].1, w[(k - 1) % 2].0, WORK_FORMAT) },
-                if k == last { output_info } else { self.resource_info(w[k % 2].1, w[k % 2].0, WORK_FORMAT) },
-            ),
-            None => (color_info, output_info),
-        };
-        // SAFETY: `params` was allocated and validated by the caller (`ngx::load_and_init`).
-        let t_pass = unsafe {
-            let mut color = NgxResourceVk::from_image_view(color_info, false);
-            abi::ngx_set_ptr(params, name("DLSSNR.Color").as_ptr(), std::ptr::from_mut(&mut color).cast());
-            let mut output = NgxResourceVk::from_image_view(output_info, true);
-            abi::ngx_set_ptr(params, name("DLSSNR.Output").as_ptr(), std::ptr::from_mut(&mut output).cast());
-            abi::ngx_set_f32(params, name("DLSSNR.MVecScaleX").as_ptr(), motion_scale[0]);
-            abi::ngx_set_f32(params, name("DLSSNR.MVecScaleY").as_ptr(), motion_scale[1]);
-            // Only sharpness is written per evaluate: DoSharpening is enabled at create and this is
-            // the per-frame amount it applies. Style, intensity, the local strengths and auto mask
-            // are latched by the model at creation (`ngx::set_create_tuning`); writing them here
-            // does nothing to a running feature and poisons the block for the next create.
-            abi::ngx_set_f32(params, name("Sharpness").as_ptr(), pass.sharpness.clamp(0.0, 1.0));
-            let mut mvec = NgxResourceVk::from_image_view(mvec_info, false);
-            abi::ngx_set_ptr(params, name("DLSSNR.MVec").as_ptr(), std::ptr::from_mut(&mut mvec).cast());
-            let mut depth = NgxResourceVk::from_image_view(depth_info, false);
-            abi::ngx_set_ptr(params, name("DLSSNR.Depth").as_ptr(), std::ptr::from_mut(&mut depth).cast());
-            // Standard, non-reversed-Z convention (near=0, far=1) -- matches the
-            // constant 1.0 ("far") the depth image is cleared to in `run_transfer`.
-            abi::ngx_set_u32(params, name("DLSSNR.DepthInverted").as_ptr(), 0);
+            let (color_info, output_info) = match work {
+                Some(w) => (
+                    if k == 0 { color_info } else { self.resource_info(w[(k - 1) % 2].1, w[(k - 1) % 2].0, WORK_FORMAT) },
+                    if k == last { output_info } else { self.resource_info(w[k % 2].1, w[k % 2].0, WORK_FORMAT) },
+                ),
+                None => (color_info, output_info),
+            };
+            // SAFETY: `params` was allocated and validated by the caller (`ngx::load_and_init`).
+            let result = unsafe {
+                let mut color = NgxResourceVk::from_image_view(color_info, false);
+                abi::ngx_set_ptr(params, name("DLSSNR.Color").as_ptr(), std::ptr::from_mut(&mut color).cast());
+                let mut output = NgxResourceVk::from_image_view(output_info, true);
+                abi::ngx_set_ptr(params, name("DLSSNR.Output").as_ptr(), std::ptr::from_mut(&mut output).cast());
+                abi::ngx_set_f32(params, name("DLSSNR.MVecScaleX").as_ptr(), motion_scale[0]);
+                abi::ngx_set_f32(params, name("DLSSNR.MVecScaleY").as_ptr(), motion_scale[1]);
+                // Only sharpness is written per evaluate: DoSharpening is enabled at create and this is
+                // the per-frame amount it applies. Style, intensity, the local strengths and auto mask
+                // are latched by the model at creation (`ngx::set_create_tuning`); writing them here
+                // does nothing to a running feature and poisons the block for the next create.
+                abi::ngx_set_f32(params, name("Sharpness").as_ptr(), pass.sharpness.clamp(0.0, 1.0));
+                let mut mvec = NgxResourceVk::from_image_view(mvec_info, false);
+                abi::ngx_set_ptr(params, name("DLSSNR.MVec").as_ptr(), std::ptr::from_mut(&mut mvec).cast());
+                let mut depth = NgxResourceVk::from_image_view(depth_info, false);
+                abi::ngx_set_ptr(params, name("DLSSNR.Depth").as_ptr(), std::ptr::from_mut(&mut depth).cast());
+                // Standard, non-reversed-Z convention (near=0, far=1) -- matches the
+                // constant 1.0 ("far") the depth image is cleared to by the upload.
+                abi::ngx_set_u32(params, name("DLSSNR.DepthInverted").as_ptr(), 0);
 
-            // Every resource is the full frame at (0,0) -- no sub-rect windowing is
-            // used anywhere in this crate yet.
-            for resource in ["Color", "Output", "MVec", "Depth"] {
-                abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectBaseX")).as_ptr(), 0);
-                abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectBaseY")).as_ptr(), 0);
-                abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectWidth")).as_ptr(), self.width);
-                abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectHeight")).as_ptr(), self.height);
-            }
-            // `ngx::create_feature_at` sets `DLSSNR.Reset = 1` once, at creation, and
-            // this crate never touched it again before now -- every single evaluate
-            // call therefore told the model "no valid history, this is frame one" for
-            // the life of the feature, a real, plausible cause of a first real visual
-            // check (see CLAUDE.md) finding every frame produces the exact same
-            // (solid white) output regardless of input: a temporal model's real,
-            // history-dependent answer would only ever appear from the second frame
-            // set to `Reset = 0` onward, which never happened before this. `1` only on
-            // this feature's actual first `evaluate` call, `0` on every one after.
-            let reset = u32::from(first || reset_history || pass.reset);
-            abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), reset);
-
-            let t_eval_start = std::time::Instant::now();
-            // NGX Vulkan evaluation records its GPU work into a caller-owned, live
-            // command buffer, just as feature creation does. A null buffer can return
-            // success while recording no output work, which leaves Output untouched.
-            let result = self.run_evaluate(device, queue, || {
-                crate::guard::guarded(
-                    || evaluate_feature(self.cmd, pass.handle, params, std::ptr::null()),
-                    abi::result::FAIL_SEH,
-                )
-            });
-            // `color`/`output`/`mvec`/`depth` are locals of this block: once it ends, the block
-            // must not keep their addresses, or the next `CreateFeature` (a rebuild) reads
-            // dangling pointers out of it.
-            // (After a caught fault nothing may call into the DLLs again, this included.)
-            if crate::guard::faulted().is_none() {
-                for key in ["DLSSNR.Color", "DLSSNR.Output", "DLSSNR.MVec", "DLSSNR.Depth"] {
-                    abi::ngx_set_ptr(params, name(key).as_ptr(), std::ptr::null_mut());
+                // Every resource is the full frame at (0,0) -- no sub-rect windowing is
+                // used anywhere in this crate yet.
+                for resource in ["Color", "Output", "MVec", "Depth"] {
+                    abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectBaseX")).as_ptr(), 0);
+                    abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectBaseY")).as_ptr(), 0);
+                    abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectWidth")).as_ptr(), self.width);
+                    abi::ngx_set_u32(params, name(&format!("DLSSNR.{resource}SubrectHeight")).as_ptr(), self.height);
                 }
-            }
-            let result = result?;
-            let t_eval = t_eval_start.elapsed();
+                // `ngx::create_feature_at` sets `DLSSNR.Reset = 1` once, at creation; every
+                // evaluate after that states it: `1` only on this resource set's first evaluate,
+                // after a scene cut or a stale history, or for a just-rebuilt pass, `0` otherwise
+                // (a temporal model's history-dependent answer only appears from the second frame
+                // with `Reset = 0` on).
+                let reset = u32::from(first || reset_history || pass.reset);
+                abi::ngx_set_u32(params, name("DLSSNR.Reset").as_ptr(), reset);
+
+                // NGX Vulkan evaluation records its GPU work into a caller-owned, live
+                // command buffer, just as feature creation does. A null buffer can return
+                // success while recording no output work, which leaves Output untouched.
+                let t_ngx = std::time::Instant::now();
+                let result = crate::guard::guarded(
+                    || evaluate_feature(self.cmd_b, pass.handle, params, std::ptr::null()),
+                    abi::result::FAIL_SEH,
+                );
+                self.ngx_time.set(self.ngx_time.get() + t_ngx.elapsed());
+                // `color`/`output`/`mvec`/`depth` are locals of this block: once it ends, the block
+                // must not keep their addresses, or the next `CreateFeature` (a rebuild) reads
+                // dangling pointers out of it.
+                // (After a caught fault nothing may call into the DLLs again, this included.)
+                if crate::guard::faulted().is_none() {
+                    for key in ["DLSSNR.Color", "DLSSNR.Output", "DLSSNR.MVec", "DLSSNR.Depth"] {
+                        abi::ngx_set_ptr(params, name(key).as_ptr(), std::ptr::null_mut());
+                    }
+                }
+                result
+            };
             let failed = !abi::succeeded(result.0) || result.1 != 0;
             // Bounded: one line per evaluate, forever, is real time under Wine. Failures always log.
             if failed || crate::logging::sampled(evaluate_no) {
-                crate::log!("[ngx] EvaluateFeature pass {k} -> {:#x} seh={:#x} took={:?}", result.0 as u32, result.1, t_eval);
+                crate::log!("[ngx] EvaluateFeature pass {k} -> {:#x} seh={:#x} recorded in {:?}", result.0 as u32, result.1, self.ngx_time.get());
             }
             if failed {
                 if work.is_some() && !WORK16_REFUSED.swap(true, std::sync::atomic::Ordering::Relaxed) {
                     crate::log!("[frame] the model refused 16-bit working images; multipass goes through 8 bits from now on");
                     crate::logging::flush();
                 }
+                // B is abandoned unsubmitted (the next `begin` resets it); A and the flow drain.
+                // After a caught fault nothing may touch the device through NGX again, but the
+                // drain is plain Vulkan on the helper's own queue.
+                self.drain(device, queue, motion);
                 return None;
             }
-            t_eval
-        };
-        t_eval += t_pass;
-        // Between passes the answer becomes the next pass's input: a barrier on the 16-bit path
-        // (it already sits in the next pass's input image), a copy through Color on the 8-bit one.
-        let step = if work.is_some() { TransferKind::ComputeBarrier } else { TransferKind::Chain };
-        if k + 1 < chain.len() && !self.run_transfer(device, queue, step) {
+            // Between passes the answer becomes the next pass's input: a barrier on the 16-bit path
+            // (it already sits in the next pass's input image), a copy through Color on the 8-bit one.
+            if k + 1 < chain.len() {
+                let step = if work.is_some() { TransferKind::ComputeBarrier } else { TransferKind::Chain };
+                // SAFETY: B is recording.
+                unsafe { self.record_transfer(device, self.cmd_b, step) };
+            }
+        }
+        // Stage 3: download Output -> the answer region (or staging), in B too.
+        // SAFETY: B is recording.
+        unsafe { self.record_transfer(device, self.cmd_b, TransferKind::Download) };
+        // SAFETY: B was recorded above; A is pending but signals its own fence.
+        if !unsafe { self.submit(device, queue, Some(self.cmd_b), self.fence_b) } {
+            self.drain(device, queue, motion);
             return None;
         }
-        }
+        let t_eval = t_eval_start.elapsed();
 
-        // Stage 3: download Output -> answer_out.
+        // The one CPU wait: everything above, flow included, is done when both fences are.
         let t_download_start = std::time::Instant::now();
-        if !self.run_transfer(device, queue, TransferKind::Download) {
+        if !self.wait_both(device, motion) {
             return None;
         }
         let t_download = t_download_start.elapsed();
         if crate::logging::sampled(evaluate_no) {
             crate::log!(
-                "[frame] timing upload={:?} eval={:?} download={:?} total={:?}",
+                "[frame] timing upload={:?} eval={:?} download={:?} total={:?} (record+submit, record+submit, the one wait)",
                 t_upload,
                 t_eval,
                 t_download,
                 t_upload + t_eval + t_download
             );
         }
-        // Skipped when `imported_answer` is set: `run_transfer`'s download copy just
-        // wrote Output directly into the exact memory `answer_out` is a view of.
+        // Skipped when `imported_answer` is set: the download copy just wrote Output directly
+        // into the exact memory `answer_out` is a view of.
         if self.imported_answer.is_none() {
             // SAFETY: `staging_ptr` is a live mapping of at least `frame_bytes` bytes.
             unsafe { std::ptr::copy_nonoverlapping(self.staging_ptr, answer_out.as_mut_ptr(), frame_bytes) };
@@ -812,6 +866,8 @@ impl FrameResources {
             download: t_download,
             motion: motion_time,
             motion_failed,
+            ngx_record: self.ngx_time.get(),
+            fence_waits: self.wait_time.get(),
         })
     }
 
@@ -832,55 +888,74 @@ impl FrameResources {
         }
     }
 
-    /// Records NGX evaluation into the same queue used for the resource upload and
-    /// download, then waits for completion before Output is copied back to staging.
-    fn run_evaluate<F>(&self, device: &ash::Device, queue: vk::Queue, evaluate: F) -> Option<(abi::NgxResult, u32)>
-    where
-        F: FnOnce() -> (abi::NgxResult, u32),
-    {
-        if unsafe { device.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
-            return None;
+    /// Resets and begins `cmd` for one submission.
+    ///
+    /// # Safety
+    /// `cmd` is one of this instance's buffers and not pending.
+    unsafe fn begin(&self, device: &ash::Device, cmd: vk::CommandBuffer) -> bool {
+        // SAFETY: allocated from `self.pool` (created with `RESET_COMMAND_BUFFER`), not pending.
+        unsafe {
+            device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).is_ok()
+                && device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).is_ok()
         }
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        if unsafe { device.begin_command_buffer(self.cmd, &begin_info) }.is_err() {
-            return None;
-        }
-        let result = evaluate();
-        if result.1 != 0 || unsafe { device.end_command_buffer(self.cmd) }.is_err() {
-            return None;
-        }
-        if unsafe { device.reset_fences(&[self.fence]) }.is_err() {
-            return None;
-        }
-        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.cmd)).build();
-        if unsafe { device.queue_submit(queue, &[submit], self.fence) }.is_err() {
-            return None;
-        }
-        // Bounded, not `u64::MAX`: see `stalled`'s own doc comment for what a timeout
-        // here means and why it latches this instance rather than just failing once.
-        let wait = unsafe { device.wait_for_fences(&[self.fence], true, crate::ngx::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if matches!(wait, Err(vk::Result::TIMEOUT)) {
-            crate::log!("[frame] EvaluateFeature's own fence wait timed out after {:?}; this frame-resource instance is now permanently stalled", crate::ngx::FENCE_WAIT_TIMEOUT);
-            crate::logging::flush();
-            self.stalled.set(true);
-        }
-        if wait.is_err() {
-            return None;
-        }
-        Some(result)
     }
 
-    fn run_transfer(&self, device: &ash::Device, queue: vk::Queue, kind: TransferKind) -> bool {
-        // SAFETY: `self.cmd` was allocated from `self.pool`, created with
-        // `RESET_COMMAND_BUFFER`.
-        if unsafe { device.reset_command_buffer(self.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
-            return false;
+    /// Ends `cmd` (when given) and submits it to `queue` with `fence`, which is reset first. With
+    /// no buffer, an empty submission: `fence` then signals once everything earlier on `queue` is
+    /// done (a fence signal's first scope includes all earlier submissions on the queue).
+    ///
+    /// # Safety
+    /// `cmd` is recording; `fence` is this instance's and not in use by a pending submission.
+    unsafe fn submit(&self, device: &ash::Device, queue: vk::Queue, cmd: Option<vk::CommandBuffer>, fence: vk::Fence) -> bool {
+        let cmds: Vec<vk::CommandBuffer> = cmd.into_iter().collect();
+        // SAFETY: forwarded.
+        unsafe {
+            if cmd.is_some_and(|c| device.end_command_buffer(c).is_err()) || device.reset_fences(&[fence]).is_err() {
+                return false;
+            }
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&cmds).build()], fence).is_ok()
         }
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: `self.cmd` was just reset above.
-        if unsafe { device.begin_command_buffer(self.cmd, &begin_info) }.is_err() {
-            return false;
+    }
+
+    /// The one bounded CPU wait of a request: both buffers' fences. A timeout latches `stalled`
+    /// (and the flow session's, whose unwaited submissions it covered).
+    fn wait_both(&self, device: &ash::Device, motion: Option<&mut crate::optical_flow::GpuFlow>) -> bool {
+        let t_wait = std::time::Instant::now();
+        // SAFETY: both fences belong to this instance; bounded, not `u64::MAX` (see `stalled`).
+        let wait = unsafe { device.wait_for_fences(&[self.fence, self.fence_b], true, crate::ngx::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        self.wait_time.set(self.wait_time.get() + t_wait.elapsed());
+        if matches!(wait, Err(vk::Result::TIMEOUT)) {
+            crate::log!("[frame] the request's fence wait timed out after {:?}; this frame-resource instance is now permanently stalled", crate::ngx::FENCE_WAIT_TIMEOUT);
+            crate::logging::flush();
+            self.stalled.set(true);
+            if let Some(flow) = motion {
+                flow.mark_stalled();
+            }
         }
+        wait.is_ok()
+    }
+
+    /// After a failure part-way through a request: an empty submission on B's fence, then the
+    /// usual bounded wait, so nothing this request submitted (A, the flow) is still running when
+    /// the next request reuses the buffers.
+    fn drain(&self, device: &ash::Device, queue: vk::Queue, motion: Option<&mut crate::optical_flow::GpuFlow>) {
+        // SAFETY: B was not submitted (it is recording or idle), so its fence is not in use.
+        if unsafe { self.submit(device, queue, None, self.fence_b) } {
+            self.wait_both(device, motion);
+        } else {
+            // Could not even queue the fence: never touch this instance's buffers again.
+            self.stalled.set(true);
+            if let Some(flow) = motion {
+                flow.mark_stalled();
+            }
+        }
+    }
+
+    /// Records one stage into `cmd`.
+    ///
+    /// # Safety
+    /// `cmd` is recording.
+    unsafe fn record_transfer(&self, device: &ash::Device, cmd: vk::CommandBuffer, kind: TransferKind) {
         let region = |width: u32, height: u32| {
             vk::BufferImageCopy::builder()
                 .buffer_offset(0)
@@ -936,11 +1011,11 @@ impl FrameResources {
                     vk::AccessFlags::empty(),
                     vk::AccessFlags::TRANSFER_WRITE,
                 );
-                // SAFETY: `self.cmd` is recording; all three images were just created
+                // SAFETY: `cmd` is recording; all three images were just created
                 // (`UNDEFINED` matches their real, never-yet-transitioned layout).
                 unsafe {
                     device.cmd_pipeline_barrier(
-                        self.cmd,
+                        cmd,
                         vk::PipelineStageFlags::TOP_OF_PIPE,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::DependencyFlags::empty(),
@@ -954,7 +1029,7 @@ impl FrameResources {
                     // own `proxy -> staging_ptr` copy above requires.
                     let color_src = self.imported_proxy.map_or(self.staging_buffer, |(buffer, _)| buffer);
                     device.cmd_copy_buffer_to_image(
-                        self.cmd,
+                        cmd,
                         color_src,
                         self.color_image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
@@ -962,7 +1037,7 @@ impl FrameResources {
                     );
                     // No motion unless `evaluate`'s own motion stage writes some after this.
                     device.cmd_clear_color_image(
-                        self.cmd,
+                        cmd,
                         self.mvec_image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &vk::ClearColorValue { float32: [0.0; 4] },
@@ -973,7 +1048,7 @@ impl FrameResources {
                     // convention, matching `DLSSNR.DepthInverted = 0` below) rather
                     // than leaving it undefined.
                     device.cmd_clear_color_image(
-                        self.cmd,
+                        cmd,
                         self.depth_image,
                         vk::ImageLayout::TRANSFER_DST_OPTIMAL,
                         &vk::ClearColorValue { float32: [1.0, 1.0, 1.0, 1.0] },
@@ -1008,7 +1083,7 @@ impl FrameResources {
                         vk::AccessFlags::SHADER_WRITE,
                     );
                     device.cmd_pipeline_barrier(
-                        self.cmd,
+                        cmd,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::DependencyFlags::empty(),
@@ -1020,10 +1095,10 @@ impl FrameResources {
             }
             TransferKind::WorkInit(a, b) => {
                 let to_general = |image| img_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
-                // SAFETY: `self.cmd` is recording; both images belong to this resource set.
+                // SAFETY: `cmd` is recording; both images belong to this resource set.
                 unsafe {
                     device.cmd_pipeline_barrier(
-                        self.cmd,
+                        cmd,
                         vk::PipelineStageFlags::TOP_OF_PIPE,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::DependencyFlags::empty(),
@@ -1038,10 +1113,10 @@ impl FrameResources {
                     .src_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
                     .build();
-                // SAFETY: `self.cmd` is recording.
+                // SAFETY: `cmd` is recording.
                 unsafe {
                     device.cmd_pipeline_barrier(
-                        self.cmd,
+                        cmd,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::DependencyFlags::empty(),
@@ -1086,13 +1161,13 @@ impl FrameResources {
                     .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1).build())
                     .extent(vk::Extent3D { width: self.width, height: self.height, depth: 1 })
                     .build();
-                // SAFETY: `self.cmd` is recording; Color and Output are this frame's own images, in
+                // SAFETY: `cmd` is recording; Color and Output are this frame's own images, in
                 // the layouts the upload stage and the preceding evaluate left them in. Color and
                 // Output have the same format and extent, and Color has TRANSFER_DST, Output
                 // TRANSFER_SRC, usage.
                 unsafe {
                     device.cmd_pipeline_barrier(
-                        self.cmd,
+                        cmd,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::DependencyFlags::empty(),
@@ -1101,7 +1176,7 @@ impl FrameResources {
                         &[out_to_src, color_to_dst],
                     );
                     device.cmd_copy_image(
-                        self.cmd,
+                        cmd,
                         self.output_image,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         self.color_image,
@@ -1109,7 +1184,7 @@ impl FrameResources {
                         &[copy],
                     );
                     device.cmd_pipeline_barrier(
-                        self.cmd,
+                        cmd,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::DependencyFlags::empty(),
@@ -1127,13 +1202,13 @@ impl FrameResources {
                     vk::AccessFlags::SHADER_WRITE,
                     vk::AccessFlags::TRANSFER_READ,
                 );
-                // SAFETY: `self.cmd` is recording; `output_image` was left `GENERAL`
-                // by the upload stage's own final barrier, matching what
-                // `EvaluateFeature` (run on the CPU-side call in between, not this
-                // command buffer) was told to expect as the storage image's layout.
+                // SAFETY: `cmd` is recording; `output_image` was left `GENERAL`
+                // by the upload stage's own final barrier (in A, earlier on the queue), matching
+                // what `EvaluateFeature` (recorded earlier in this same buffer) was told to expect
+                // as the storage image's layout.
                 unsafe {
                     device.cmd_pipeline_barrier(
-                        self.cmd,
+                        cmd,
                         vk::PipelineStageFlags::ALL_COMMANDS,
                         vk::PipelineStageFlags::TRANSFER,
                         vk::DependencyFlags::empty(),
@@ -1147,7 +1222,7 @@ impl FrameResources {
                     // requires.
                     let answer_dst = self.imported_answer.map_or(self.staging_buffer, |(buffer, _)| buffer);
                     device.cmd_copy_image_to_buffer(
-                        self.cmd,
+                        cmd,
                         self.output_image,
                         vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
                         answer_dst,
@@ -1156,28 +1231,6 @@ impl FrameResources {
                 }
             }
         }
-        if unsafe { device.end_command_buffer(self.cmd) }.is_err() {
-            return false;
-        }
-        // SAFETY: `self.fence` starts signaled or was reset+waited-on by this same
-        // function's previous call.
-        if unsafe { device.reset_fences(&[self.fence]) }.is_err() {
-            return false;
-        }
-        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.cmd)).build();
-        // SAFETY: `self.cmd` was just recorded and ended above.
-        if unsafe { device.queue_submit(queue, &[submit], self.fence) }.is_err() {
-            return false;
-        }
-        // SAFETY: `self.fence` was just submitted against above. Bounded, not
-        // `u64::MAX`: see `stalled`'s own doc comment.
-        let wait = unsafe { device.wait_for_fences(&[self.fence], true, crate::ngx::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if matches!(wait, Err(vk::Result::TIMEOUT)) {
-            crate::log!("[frame] a transfer's own fence wait timed out after {:?}; this frame-resource instance is now permanently stalled", crate::ngx::FENCE_WAIT_TIMEOUT);
-            crate::logging::flush();
-            self.stalled.set(true);
-        }
-        wait.is_ok()
     }
 
     /// # Safety
@@ -1194,6 +1247,7 @@ impl FrameResources {
                 }
             }
             device.destroy_fence(self.fence, None);
+            device.destroy_fence(self.fence_b, None);
             device.destroy_buffer(self.staging_buffer, None);
             device.free_memory(self.staging_memory, None);
             if let Some((buffer, memory)) = self.imported_proxy {

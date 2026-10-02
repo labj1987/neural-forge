@@ -148,6 +148,28 @@ pub fn tonemap_u8(x: f32) -> u8 {
     (tonemap_encode(x) * 255.0 + 0.5).clamp(0.0, 255.0) as u8
 }
 
+/// [`tonemap_u8`] of a half float given as its bits, through a table of all 65536 answers built
+/// on first use. The scene-cut thumbnail calls this ~60000 times per frame, and `powf` from the
+/// helper's Windows C runtime under Wine costs about 80 ns a call: 4.9 ms of every request,
+/// measured on the rig (docs/PRE_UPSCALER_DESIGN.md, "Hand-off latency"). Identical results.
+pub fn tonemap_u8_half(bits: u16) -> u8 {
+    static TABLE: std::sync::OnceLock<Box<[u8; 65536]>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        let mut t = Box::new([0u8; 65536]);
+        for (b, out) in t.iter_mut().enumerate() {
+            *out = tonemap_u8(f16_to_f32(b as u16));
+        }
+        t
+    })[usize::from(bits)]
+}
+
+/// One RGBA16F pixel's three colour channels at byte offset `i` of `frame` (8 bytes per
+/// pixel, little-endian halves), as raw half bits. The caller checks `i + 6 <= frame.len()`.
+pub fn rgb16_bits_at(frame: &[u8], i: usize) -> [u16; 3] {
+    let half = |k: usize| u16::from_le_bytes([frame[i + 2 * k], frame[i + 2 * k + 1]]);
+    [half(0), half(1), half(2)]
+}
+
 /// One RGBA16F pixel's three colour channels at byte offset `i` of `frame` (8 bytes per
 /// pixel, little-endian halves), as `f32`. The caller checks `i + 6 <= frame.len()`.
 pub fn rgb16f_at(frame: &[u8], i: usize) -> [f32; 3] {
@@ -158,6 +180,14 @@ pub fn rgb16f_at(frame: &[u8], i: usize) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_tone_map_table_matches_the_function_for_every_half() {
+        for b in 0..=u16::MAX {
+            assert_eq!(tonemap_u8_half(b), tonemap_u8(f16_to_f32(b)), "half bits {b:#06x}");
+        }
+        assert_eq!(rgb16_bits_at(&[0x00, 0x3c, 0x01, 0x00, 0xff, 0x7b, 0, 0], 0), [0x3c00, 0x0001, 0x7bff]);
+    }
 
     #[test]
     fn format_classes() {

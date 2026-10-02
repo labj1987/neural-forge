@@ -2,7 +2,7 @@
 
 Status: **approved by Alex 2026-10-02, HDR included. Layer and helper sides are built**, behind
 `NEURAL_FORGE_PREUPSCALE` (off by default); see the two "Implementation" sections at the end.
-E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame (see "Rig results (E1-E3)"). E1b found the encode that works (the game's exposure, paper white 3, a per-channel shoulder, sRGB); the layer now applies it on the GPU before the model and inverts it on write-back (model mode, plus a `roundtrip` mode that checks the transform alone). E2-E3 run 2026-10-02 (see "Rig results (E2-E3)"): the hold alone is cheap, but the model every frame gives 50.5 fps at Balanced, **below the 61.6 gate**. Phases 2 and 3 of the original 2.0 plan are paused.
+E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame (see "Rig results (E1-E3)"). E1b found the encode that works (the game's exposure, paper white 3, a per-channel shoulder, sRGB); the layer now applies it on the GPU before the model and inverts it on write-back (model mode, plus a `roundtrip` mode that checks the transform alone). E2-E3 run 2026-10-02 (see "Rig results (E2-E3)"): the hold alone is cheap, but the model every frame gives 50.5 fps at Balanced, **below the 61.6 gate**. Phases 2 and 3 of the original 2.0 plan are paused. The ~4.8 ms of "hand-off latency" turned out to be the helper's CPU scene-cut thumbnail under Wine; with it fixed and the helper's submissions chained, model every frame gives **66.1 fps** (see "Hand-off latency"), **above the gate**.
 
 ## What the probe established (GTA V Enhanced, 2560x1440, DLSS SR on)
 
@@ -683,3 +683,111 @@ the dev machine's scratchpad `pu3/` (`model-xgrab-{1,2}.png`, `plain-xgrab-{1,2}
   155/171/188, plain 148-151/167-170/182-191). Whether the model visibly enhances the frame after
   DLSS, and whether DLSS's temporal accumulation shimmers with it, is not decidable from these and is
   for Alex at the screen.
+
+## Hand-off latency
+
+Run 2026-10-02 14:40-15:55 on lordnikon, same settings as E2-E3 (2560x1440@288 HDR bt2100, GTA V
+Enhanced DLSS Balanced 1485x836 padded 1486x836, frame generation off, script mods off, model
+every frame, `NEURAL_FORGE_PREUPSCALE=model`), `scripts/gta-bench.sh` pass 4 via
+`scripts/bench-report.py`. No remote-desktop session during any run; one early exit at Game Init
+(`ho-before-1`, rerun after 5 minutes).
+
+### Instrumentation (kept)
+
+- Layer, after each 300-hold summary: `[preupscale] phases ms (median): prep= capture_wait=
+  round_trip= helper_busy= handoff= writeback=`. `prep` is the hold's start to the capture submit
+  returning, `capture_wait` the capture fence wait (which drains the game's queued work),
+  `round_trip` `seq_req` bumped to `seq_resp` seen, `helper_busy` the helper's own wall time for
+  that request (published in the new header field `helper_busy_us`, shared-memory protocol 10;
+  an interval on the helper's clock, so Wine's clock never has to agree with the layer's),
+  `handoff` = `round_trip - helper_busy` per hold (the helper noticing the request plus the layer
+  noticing the answer), `writeback` the answer to the write-back submit returning.
+- Helper, every 300 evaluated slot-0 requests: `[frame] stages ms (median) WxH: n= idle= setup=
+  thumb= upload= flow= ngx_rec= eval= download= fence_waits= publish= busy=` (`idle` the loop's
+  last wait step before the request, `thumb` the CPU scene-cut thumbnail, `ngx_rec` the CPU inside
+  `EvaluateFeature`, `fence_waits` the helper's own fence waits within upload/eval/download).
+
+### Before (main at 7ddc3d2 plus the instrumentation, `ho-before-1`)
+
+50.5 fps, GPU 68%, hold 14.7-15.5 ms (medians per 300 holds over pass 4):
+
+| Layer phase | ms | | Helper stage | ms |
+|---|---|---|---|---|
+| prep | 0.04 | | idle (200 us sleep under Proton) | 0.28 |
+| capture_wait | 3.2-3.9 | | setup | 0.00 |
+| round_trip | 11.3-11.5 | | **thumb** | **4.7-5.0** |
+| helper_busy | 11.1-11.3 | | upload (submit + wait) | 0.65-0.75 |
+| handoff | 0.17-0.19 | | flow (three submits + wait) | 0.44-0.48 |
+| writeback | 0.04 | | ngx_rec | 0.19 |
+| | | | eval (record + submit + wait) | 4.3 |
+| | | | download (submit + wait) | 0.50 |
+| | | | of which fence waits | 5.2 |
+| | | | busy | 10.8-11.1 |
+
+The "unexplained ~4.8 ms" was not a hand-off at all: the shared-memory hand-off both ways is
+0.18 ms. It was the helper's **CPU scene-cut thumbnail** of the RGBA16F frame (every 8th pixel,
+three channels tone mapped with `x / (1 + x)` and the sRGB curve, about 58000 `powf` calls): 0.6 ms
+natively, but `powf` from the helper's Windows C runtime under Wine costs ~80 ns a call, and the
+same code measured 4.8-5.3 ms under Wine on the dev machine. The fence waits (5.2 ms) are the GPU
+work itself: upload, flow, evaluate and download add up to about that, so there was little wake-up
+latency in them.
+
+### What changed
+
+- **Thumbnail through a table** (`hdr::tonemap_u8_half`): the tone map of all 65536 half bit
+  patterns, built once at helper start (2.4 ms under Wine), then one lookup per channel.
+  Bit-identical to the function (a test checks every half); the scene-cut threshold and behaviour
+  are unchanged. 4.9 ms -> 0.13 ms on the rig (0.06 ms in the Wine benchmark).
+- **One wait per request in the helper** (`FrameResources::evaluate`): command buffer A (upload)
+  is submitted with its fence, the optical flow's three submissions follow on the same queues
+  without a fence (`GpuFlow::estimate(.., FlowSync::Chained)`; `FlowSync::Wait` keeps the old
+  behaviour for `optical_flow_rig_check`), command buffer B holds every pass's `EvaluateFeature`,
+  the multipass steps and the download, and the helper waits once on both fences (bounded, the
+  5 s `FENCE_WAIT_TIMEOUT`; a timeout latches the frame resources and the flow session as stalled,
+  as before). A failure part-way (an evaluate refused at record time, a failed submit) queues an
+  empty submission on B's fence and waits, so nothing is still running when the buffers are next
+  reused. On the rig this saved little by itself (the waits were already mostly GPU time); it
+  removes four CPU round trips per request and puts all the helper's GPU work back to back.
+- **Helper loop**: for 50 ms after a request it yields between checks of `seq_req` instead of
+  sleeping 200 us (`idle.rs`; back to sleeping once quiet, so an idle helper costs nothing).
+  `idle` went from 0.28 ms to 0.00 ms.
+- **Layer**: the answer wait spins (`spin_loop` hints, a yield every 16 checks) instead of
+  sleeping 50 us between checks; still bounded by the 30 ms budget and the helper's heartbeat.
+  `handoff` went from 0.18 ms to 0.00-0.01 ms.
+- Not changed: the capture fence wait (still `wait_for_fences` with `FENCE_WAIT_TIMEOUT` and
+  `note_fence_wait`; it is the drain of the game's own work, 3.6-4.4 ms, and shrinks only if the hold
+  stops being synchronous). Nothing of the reverted capture/compose fence changes was reapplied.
+
+### After (`ho-after-1..3`, this build)
+
+| Run | Real fps | Displayed | GPU % | Power | Hold ms | capture_wait | round_trip | helper_busy | handoff |
+|---|---|---|---|---|---|---|---|---|---|
+| `ho-before-1` | 50.5 | 50.7 | 68 | 150 W | 14.7-15.5 | 3.2-3.9 | 11.3-11.5 | 11.1-11.3 | 0.18 |
+| `ho-after-1` | 65.1 | 65.7 | 91 | 182 W | 9.9-10.5 | 3.7-4.4 | 6.0-6.1 | 5.9-6.1 | 0.00 |
+| `ho-after-2` | 68.1 | 68.3 | 93 | 187 W | 10.0-10.4 | 3.6-3.9 | 6.04 | 6.0 | 0.00-0.01 |
+| `ho-after-3` | 65.2 | 65.5 | 88 | 181 W | 10.5 | 4.4 | 6.04 | 6.0 | 0.00 |
+| **mean of 3** | **66.1** | 66.5 | 91 | 183 W | ~10.2 | | | | |
+| `ho-mvec0-1`: `--set mvec_enabled=0` | 67.0 | 67.7 | 92 | 185 W | 10.0 | 4.25 | 5.59 | 5.55 | 0.00 |
+| `ho-post-1`: no PREUPSCALE (today's post path, model every 2nd frame) | 61.9 | 62.3 | 91 | 197 W | - | - | - | - | - |
+
+Helper stages after: idle 0.00, thumb 0.12-0.15, upload (record + submit) 0.07, flow (submits)
+0.10, ngx_rec 0.24-0.34, eval (record + submit) 0.27-0.37, the one wait 5.22-5.24, busy 5.85-5.98.
+No over-budget answer in steady pass 4 (85-89 per run in total, at the loading screens and scene
+changes, as before); no fence timeout or evaluate failure in the helper log.
+
+**Optical flow** in this path costs about 0.45 ms of the hold (helper_busy 6.0 -> 5.55 ms with
+motion vectors off, thumbnail included) and 1 fps in one run (67.0 against 65.1-68.1), within the
+run-to-run spread. The default stays on: whether the vectors help the model's answer on DLSS's
+jittered input is a picture question, not a timing one.
+
+### Verdict
+
+**The gate passes**: model every frame at Balanced, **66.1 fps** (65.1 / 68.1 / 65.2) against the
+gate of 61.6 and today's post path (61.9 with this build, 61.4 before: no regression there). GPU utilisation is back
+to 88-93%, so what remains is GPU work (the helper's ~5.2 ms and the layer's 1.3 ms of capture and
+write-back on top of the game's ~10.9 ms), not waiting; the design's ~70 fps was arithmetic that
+assumed the model's GPU time simply adds to the game's. The hold is still synchronous (the capture
+wait drains the game's queued work, 3.6-4.4 ms), so going further means making it asynchronous.
+In the post path the helper's stages are the same shape (2560x1440 RGBA8: thumb 0.18 ms, one wait
+of 11.5 ms for the GPU work).
+Run-to-run spread is about 3 fps (65.1-68.1), so a 1-2 fps difference between single runs is noise.

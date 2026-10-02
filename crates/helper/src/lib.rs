@@ -14,6 +14,7 @@ pub mod frame;
 pub mod guard;
 pub mod hdr;
 pub mod history;
+pub mod idle;
 pub mod logging;
 #[cfg(windows)]
 pub mod ngx;
@@ -26,3 +27,4 @@ pub mod selfparam;
 pub mod shm;
 #[cfg(windows)]
 pub mod spoof;
+pub mod stages;

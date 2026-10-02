@@ -13,7 +13,7 @@
 //! Every line also goes, flushed, to `optical_flow_rig_check.log` beside the executable:
 //! Proton does not reliably pass a Windows program's stdout through.
 use ash::vk;
-use neural_forge_helper::optical_flow::{FlowQueue, GpuFlow};
+use neural_forge_helper::optical_flow::{FlowQueue, FlowSync, GpuFlow};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -254,9 +254,9 @@ fn main() {
         let mut fill = |shift: u32, mapped: &mut [u8]| if hdr { noise_frame16(w, h, shift, &mut scratch, mapped) } else { noise_frame(w, h, shift, mapped) };
         fill(0, mapped);
         upload();
-        assert!(!flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0]).expect("seed"), "first frame only seeds history");
+        assert!(!flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0], FlowSync::Wait).expect("seed"), "first frame only seeds history");
         upload();
-        assert!(flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0]).expect("stationary"));
+        assert!(flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0], FlowSync::Wait).expect("stationary"));
         readback();
         let (sx, sy) = median_motion(mapped, w, h);
         say!("stationary median=({sx:.2},{sy:.2}) expected (0,0)");
@@ -266,7 +266,7 @@ fn main() {
             fill(i * STEP, mapped);
             upload();
             let t = Instant::now();
-            assert!(flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0]).expect("estimate"));
+            assert!(flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0], FlowSync::Wait).expect("estimate"));
             total += t.elapsed();
             PROGRESS.store(u64::from(i), Ordering::Relaxed);
             if i % 50 == 0 || i == 1 {

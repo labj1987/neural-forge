@@ -162,6 +162,21 @@ fn store_ms(field: &std::sync::atomic::AtomicU32, duration: Duration) {
     );
 }
 
+/// The `[frame] stages` line's columns, one row per evaluated slot-0 request (milliseconds):
+/// the loop's last idle step before the request was seen (a yield while requests flow, a sleep
+/// once quiet, see `idle.rs`; a request waits on average about half of it), header reads and feature upkeep, the CPU scene-cut
+/// thumbnail, upload, optical flow, the CPU inside `EvaluateFeature`, evaluate (record + wait),
+/// download, the helper's own fence waits within those, the publish, and the whole request
+/// (seen to `seq_resp`).
+const STAGE_NAMES: [&str; 11] = ["idle", "setup", "thumb", "upload", "flow", "ngx_rec", "eval", "download", "fence_waits", "publish", "busy"];
+
+/// Per-request timing kept across the loop.
+struct HelperStages {
+    window: neural_forge_helper::stages::StageWindow<11>,
+    /// How long the loop's last idle step (yield or sleep) actually took.
+    last_sleep: Duration,
+}
+
 /// Exit status when the shared memory holds another protocol version's header.
 const EXIT_SHM_VERSION_SKEW: i32 = 3;
 
@@ -199,6 +214,9 @@ fn main() {
     hdr.control_seq.fetch_add(1, Ordering::Relaxed);
     hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
     neural_forge_helper::log!("[helper] shm attached");
+    // Builds the scene-cut thumbnail's tone-map table now (a few ms under Wine) rather than
+    // inside the first RGBA16F request, which a layer is holding a game submit for.
+    let _ = neural_forge_helper::hdr::tonemap_u8_half(0);
     neural_forge_helper::logging::flush();
 
     let Some((entry, instance, physical_device, device, queue, flow_queue, flow_status)) = create_vulkan_context(hdr.mvec_enabled()) else {
@@ -242,6 +260,9 @@ fn main() {
     // the protocol's absolute ceiling (7680x4320 float16), not a typical frame.
     let mut last_seq_req = [hdr.seq_req.load(Ordering::Acquire), hdr.seq_req_b.load(Ordering::Acquire)];
     let mut frames: u64 = 0;
+    let idle = neural_forge_helper::idle::IdlePolicy::default();
+    let mut last_request: Option<std::time::Instant> = None;
+    let mut stages = HelperStages { window: neural_forge_helper::stages::StageWindow::new(STAGE_NAMES, 300), last_sleep: Duration::ZERO };
 
     loop {
         if hdr.quit.load(Ordering::Relaxed) != 0 {
@@ -273,14 +294,20 @@ fn main() {
                 ngx::discard_features(&mut snippet, &device);
             }
             last_seq_req[slot] = seq_req;
+            last_request = Some(std::time::Instant::now());
             process_request(
                 hdr, &shm, &device, &instance, physical_device, queue, &mut snippet,
                 &mut frame_resources[slot], flow_queue.as_ref(), &mut motion,
-                &mut history_gaps[slot], slot, seq_req, helper_delay, &mut frames,
+                &mut history_gaps[slot], slot, seq_req, helper_delay, &mut frames, &mut stages,
             );
         }
         hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
-        std::thread::sleep(Duration::from_micros(200));
+        let slept = std::time::Instant::now();
+        match idle.next(last_request.map(|t| t.elapsed())) {
+            neural_forge_helper::idle::Idle::Yield => std::thread::yield_now(),
+            neural_forge_helper::idle::Idle::Sleep(d) => std::thread::sleep(d),
+        }
+        stages.last_sleep = slept.elapsed();
     }
 
     // The process is tearing down; nothing else can still be submitting work against
@@ -356,7 +383,9 @@ fn process_request(
     seq_req: u32,
     helper_delay: Duration,
     frames: &mut u64,
+    stages: &mut HelperStages,
 ) {
+    let t_seen = std::time::Instant::now();
     let width = hdr.width_slot(slot).load(Ordering::Relaxed);
     let height = hdr.height_slot(slot).load(Ordering::Relaxed);
     let proxy_format = hdr.proxy_format_slot(slot).load(Ordering::Relaxed);
@@ -451,7 +480,9 @@ fn process_request(
     // An RGBA16F frame is tone mapped to 8 bits for these two only (the flow on the GPU, the
     // scene-cut thumbnail on the CPU); the model gets the raw half floats.
     let want_motion = class.filter(|_| slot == 0 && hdr.mvec_enabled());
+    let t_setup = t_seen.elapsed();
     let scene_cut = motion.prepare(device, want_motion, proxy, width, height);
+    let t_prepared = t_seen.elapsed();
 
     let timing = if ready && class.is_some() {
         (|| {
@@ -504,6 +535,7 @@ fn process_request(
     } else {
         None
     };
+    let t_evaluated = t_seen.elapsed();
     let evaluated = timing.is_some();
     if !evaluated {
         history_gap.skipped();
@@ -511,7 +543,7 @@ fn process_request(
     if let Some(timing) = timing.as_ref() {
         motion.finished(device, timing);
     }
-    if let Some(timing) = timing {
+    if let Some(timing) = timing.as_ref() {
         store_ms(&hdr.helper_upload_ms_bits, timing.upload);
         store_ms(&hdr.helper_eval_ms_bits, timing.evaluate);
         store_ms(&hdr.helper_readback_ms_bits, timing.download);
@@ -534,7 +566,30 @@ fn process_request(
     if !helper_delay.is_zero() {
         std::thread::sleep(helper_delay);
     }
+    let busy = t_seen.elapsed();
+    if slot == 0 {
+        hdr.helper_busy_us.store(u32::try_from(busy.as_micros()).unwrap_or(u32::MAX), Ordering::Relaxed);
+    }
     hdr.seq_resp_slot(slot).store(seq_req, Ordering::Release);
+    if let (0, Some(t)) = (slot, timing.as_ref()) {
+        use neural_forge_helper::stages::ms;
+        let row = [
+            ms(stages.last_sleep),
+            ms(t_setup),
+            ms(t_prepared - t_setup),
+            ms(t.upload),
+            t.motion.map_or(0.0, ms),
+            ms(t.ngx_record),
+            ms(t.evaluate),
+            ms(t.download),
+            ms(t.fence_waits),
+            ms(busy.saturating_sub(t_evaluated)),
+            ms(busy),
+        ];
+        if let Some(line) = stages.window.push(row) {
+            neural_forge_helper::log!("[frame] stages ms (median) {}x{}: {line}", width, height);
+        }
+    }
     *frames += 1;
     neural_forge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, *frames);
     if neural_forge_helper::logging::sampled(*frames) || !evaluated {

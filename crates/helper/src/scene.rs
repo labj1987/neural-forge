@@ -8,7 +8,7 @@
 //!
 //! Pure arithmetic with no Win32 or Vulkan calls, so it builds and tests natively.
 
-use crate::hdr::{rgb16f_at, tonemap_u8, FormatClass};
+use crate::hdr::{rgb16_bits_at, tonemap_u8_half, FormatClass};
 
 /// Every `STEP`th pixel on each axis goes into the thumbnail.
 const STEP: usize = 8;
@@ -42,8 +42,9 @@ pub fn luma_thumbnail_rgba16f(frame: &[u8], width: u32, height: u32) -> Vec<u8> 
     let mut out = Vec::with_capacity(w.div_ceil(STEP) * h.div_ceil(STEP));
     for y in (0..h).step_by(STEP) {
         for x in (0..w).step_by(STEP) {
-            let [r, g, b] = rgb16f_at(frame, (y * w + x) * 8);
-            out.push(((u32::from(tonemap_u8(r)) + u32::from(tonemap_u8(g)) + u32::from(tonemap_u8(b))) / 3) as u8);
+            // Through the table, not `tonemap_u8` per sample: see `tonemap_u8_half`.
+            let [r, g, b] = rgb16_bits_at(frame, (y * w + x) * 8);
+            out.push(((u32::from(tonemap_u8_half(r)) + u32::from(tonemap_u8_half(g)) + u32::from(tonemap_u8_half(b))) / 3) as u8);
         }
     }
     out

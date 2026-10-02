@@ -345,6 +345,13 @@ pub struct ShmHeader {
     /// Holds whose answer did not come back within the budget (or failed), so the frame went to
     /// DLSS untouched. Counts up for the life of the layer's session.
     pub preupscale_misses: AtomicU32,
+
+    // --- v10 -----------------------------------------------------------------------------
+    /// Microseconds the helper spent on its last slot-0 request, from the loop seeing `seq_req`
+    /// move to just before it stored `seq_resp` (its own clock; an interval, so the two
+    /// processes' clocks never have to agree). Written before `seq_resp`, so a layer that has
+    /// seen the answer reads this request's value. 0 before the first answer.
+    pub helper_busy_us: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -370,7 +377,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2016, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2020, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -396,6 +403,7 @@ const _: () = assert!(
 );
 const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1996, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 2012, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_busy_us) == 2016, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
@@ -488,6 +496,7 @@ impl ShmHeader {
         self.preupscale_height.store(0, Ordering::Relaxed);
         self.preupscale_hold_ms_bits.store(0, Ordering::Relaxed);
         self.preupscale_misses.store(0, Ordering::Relaxed);
+        self.helper_busy_us.store(0, Ordering::Relaxed);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 

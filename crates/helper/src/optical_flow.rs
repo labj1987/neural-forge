@@ -37,6 +37,19 @@ pub struct FlowQueue {
     pub queue: vk::Queue,
 }
 
+/// Whether [`GpuFlow::estimate`] waits for its own work.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlowSync {
+    /// Its last submission signals the session's fence, waited on (bounded) before returning:
+    /// standalone use (`optical_flow_rig_check`).
+    Wait,
+    /// Nothing is waited on and no fence is signalled: the caller submits more work on the same
+    /// main queue after it and waits on that (a fence's signal covers every earlier submission
+    /// on its queue, and the flow queue's part is ordered before the last main-queue part by
+    /// its semaphore). The caller must call [`GpuFlow::mark_stalled`] if that wait times out.
+    Chained,
+}
+
 const SPV: &[u8] = include_bytes!("../shaders/flow_to_mvec.spv");
 const TONE_SPV: &[u8] = include_bytes!("../shaders/hdr_to_flow.spv");
 
@@ -350,15 +363,23 @@ impl GpuFlow {
         self.previous = false;
     }
 
+    /// The caller's wait covering a [`FlowSync::Chained`] estimate timed out: the GPU may still
+    /// own this session's resources, so it is never used again and `destroy` leaks it.
+    pub fn mark_stalled(&mut self) {
+        self.stalled = true;
+    }
+
     /// Estimates motion into `mvec` (the model's MVec image, `width`x`height`, R16G16_SFLOAT)
     /// from `color` (the model's Color image, same size; `color_view` is its view, read by the
     /// tone-map pass when the session is `hdr`). Both must be in
     /// `SHADER_READ_ONLY_OPTIMAL` and idle on `main_queue`, and are left that way. `scale` is
     /// the units scale from `neural_forge_protocol::motion::scales`. `Ok(false)` on the first
     /// frame after creation or `reset` (history seeded, `mvec` untouched), `Ok(true)` when
-    /// `mvec` now holds this frame's motion.
+    /// `mvec` now holds this frame's motion (with [`FlowSync::Chained`]: once the caller's later
+    /// work on `main_queue` has completed). With `Chained`, the previous estimate's work must be
+    /// complete before this call (the caller waited on it).
     #[allow(clippy::too_many_arguments)]
-    pub fn estimate(&mut self, device: &ash::Device, main_queue: vk::Queue, color: vk::Image, color_view: vk::ImageView, mvec: vk::Image, scale: [f32; 2]) -> Result<bool, vk::Result> {
+    pub fn estimate(&mut self, device: &ash::Device, main_queue: vk::Queue, color: vk::Image, color_view: vk::ImageView, mvec: vk::Image, scale: [f32; 2], sync: FlowSync) -> Result<bool, vk::Result> {
         if self.stalled {
             return Err(vk::Result::TIMEOUT);
         }
@@ -408,9 +429,13 @@ impl GpuFlow {
             let pre = [self.cmd_pre];
             if !self.previous {
                 // Seed frame: nothing to compare against yet.
-                device.reset_fences(&[self.fence])?;
-                device.queue_submit(main_queue, &[vk::SubmitInfo::builder().command_buffers(&pre).build()], self.fence)?;
-                self.wait(device)?;
+                if sync == FlowSync::Wait {
+                    device.reset_fences(&[self.fence])?;
+                    device.queue_submit(main_queue, &[vk::SubmitInfo::builder().command_buffers(&pre).build()], self.fence)?;
+                    self.wait(device)?;
+                } else {
+                    device.queue_submit(main_queue, &[vk::SubmitInfo::builder().command_buffers(&pre).build()], vk::Fence::null())?;
+                }
                 self.previous = true;
                 self.current = 1 - self.current;
                 return Ok(false);
@@ -418,7 +443,7 @@ impl GpuFlow {
             // From the first semaphore-signalling submit on, a failure leaves work (and a signalled
             // `sem_pre`) behind: drain both queues before reporting it, so nothing this session owns
             // is still in use when the caller drops it.
-            if let Err(e) = self.submit_pair(device, main_queue, input, mvec, scale) {
+            if let Err(e) = self.submit_pair(device, main_queue, input, mvec, scale, sync) {
                 if !self.stalled {
                     let drained = device.queue_wait_idle(main_queue).is_ok() && device.queue_wait_idle(self.flow_queue).is_ok();
                     if !drained {
@@ -437,7 +462,7 @@ impl GpuFlow {
 
     /// Steps 1b-3 of [`Self::estimate`]: everything from the first submit that signals `sem_pre`
     /// to the wait on the final fence.
-    unsafe fn submit_pair(&mut self, device: &ash::Device, main_queue: vk::Queue, input: ImageRes, mvec: vk::Image, scale: [f32; 2]) -> Result<(), vk::Result> {
+    unsafe fn submit_pair(&mut self, device: &ash::Device, main_queue: vk::Queue, input: ImageRes, mvec: vk::Image, scale: [f32; 2], sync: FlowSync) -> Result<(), vk::Result> {
         let pre = [self.cmd_pre];
         unsafe {
             let signal_pre = [self.sem_pre];
@@ -499,15 +524,18 @@ impl GpuFlow {
             device.end_command_buffer(self.cmd_post)?;
             let post = [self.cmd_post];
             let post_stage = [vk::PipelineStageFlags::COMPUTE_SHADER];
-            device.reset_fences(&[self.fence])?;
+            let fence = if sync == FlowSync::Wait { self.fence } else { vk::Fence::null() };
+            if sync == FlowSync::Wait {
+                device.reset_fences(&[self.fence])?;
+            }
             device.queue_submit(
                 main_queue,
                 &[vk::SubmitInfo::builder().wait_semaphores(&signal_flow).wait_dst_stage_mask(&post_stage).command_buffers(&post).build()],
-                self.fence,
+                fence,
             )?;
             // The post submission waits on the flow one, which waits on the pre one, so its
-            // fence covers all three.
-            self.wait(device)
+            // fence (or, chained, the caller's later one on the same queue) covers all three.
+            if sync == FlowSync::Wait { self.wait(device) } else { Ok(()) }
         }
     }
 

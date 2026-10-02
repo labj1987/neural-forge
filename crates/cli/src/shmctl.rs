@@ -70,6 +70,7 @@ fn cmd_status(header: &ShmHeader) {
     println!("helper_upload_ms={}", f32::from_bits(header.helper_upload_ms_bits.load(Ordering::Relaxed)));
     println!("helper_eval_ms={}", f32::from_bits(header.helper_eval_ms_bits.load(Ordering::Relaxed)));
     println!("helper_readback_ms={}", f32::from_bits(header.helper_readback_ms_bits.load(Ordering::Relaxed)));
+    println!("helper_busy_ms={}", f64::from(header.helper_busy_us.load(Ordering::Relaxed)) / 1000.0);
     let layer_frames = (u64::from(header.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.layer_frames_lo.load(Ordering::Relaxed));
     println!("layer_frames={layer_frames}");
     println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
