@@ -794,3 +794,22 @@ capture_hot_path_cost_per_present @ 2560x1440 (200 samples, 31 composited a fres
   cpu (run() on present thread): mean=54.201µs p50=221ns p95=990ns max=5.50823ms
   gpu (queue drain after run()): mean=62.796µs p50=36.68µs p95=89.218µs max=1.850415ms
 ```
+
+## 2026-10-02 -- 1.1.0 against the 2.0 baseline
+
+Same setup as the baseline above (1440p, mods off, model every 2nd frame, scale 1.0), one run:
+**61.6 real fps, 61.9 displayed, GPU 90%, 196 W** against 61.6 / 89% on 1.0.1, so the always-on
+GPU timestamps cost nothing measurable. `[sync]` medians: total 18.5 ms, capture_gpu 5.75,
+wait_answer 12.65, helper 11.5, zc=true. The new timestamps: **gpu_capture 0.79 ms,
+gpu_compose 1.85 ms** of the layer's own GPU work per capture and per compose.
+
+`capture_hot_path_cost_per_present` on LordNikon at 1.1.0. Its fake helper now keeps a heartbeat,
+so every present composites (229 fresh answers in 200 samples; at 1.0.1 only 31 did and the CPU
+mean of 54 µs measured mostly presents that returned early, so the two are not comparable). It
+runs the copy path (zc=false):
+
+```
+[sync] 2560x1440: total=5.5ms capture_gpu=1.3ms copy_out=2.0ms ... zc=false gpu_capture=1.08ms gpu_compose=1.56ms
+cpu (run() on present thread): mean=5.586228ms p50=5.497712ms p95=6.248682ms max=7.70366ms
+gpu (queue drain after run()): mean=1.713983ms p50=1.673638ms p95=1.849431ms max=1.883138ms
+```
