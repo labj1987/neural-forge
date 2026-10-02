@@ -4,7 +4,7 @@
 //! binary wrapper around this.
 //!
 //! The helper only runs on Windows (under Wine/Proton). The modules with no Win32 calls
-//! (`abi`, `hdr`, `history`, `logging`, `pe`, `rebuild`, `scene`, `selfparam`) also build natively, so their unit tests run without
+//! (`abi`, `hdr`, `history`, `images`, `logging`, `pe`, `rebuild`, `scene`, `selfparam`) also build natively, so their unit tests run without
 //! Wine: `cargo +stable test --target x86_64-unknown-linux-gnu -p neural-forge-helper --lib`.
 
 pub mod abi;
@@ -15,6 +15,7 @@ pub mod guard;
 pub mod hdr;
 pub mod history;
 pub mod idle;
+pub mod images;
 pub mod logging;
 #[cfg(windows)]
 pub mod ngx;

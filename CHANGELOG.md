@@ -66,6 +66,10 @@ diagnostics. In detail:
   - Shared-memory protocol **11** appends `seq_eval` (which request the model actually answered).
     An old protocol-10 `shm.bin` must be removed once (nothing holding it open) before the new
     helper starts.
+- **Fixes from the 2.0 review** (pre-upscaler path and helper):
+  - helper: the model's input image (Color) now has `TRANSFER_SRC` usage; the 8-bit optical-flow
+    path blits from it, a validation error since before 1.1.0 (the HDR path reads it through a
+    shader and was not affected).
 - **Pre-upscaler hold: hand-off latency cut** (`docs/PRE_UPSCALER_DESIGN.md`, "Hand-off
   latency"). GTA V Enhanced, DLSS Balanced, model every frame: **50.5 -> 66.1 fps** (three runs),
   above the 61.6 gate; the hold went from 14.7 to about 10.2 ms. The ~4.8 ms "hand-off" was the

@@ -423,7 +423,7 @@ impl FrameResources {
             width,
             height,
             color_format,
-            vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_DST,
+            crate::images::COLOR_USAGE,
         )?);
         let (output_image, output_view, output_memory) = partial.track_image(create_image(
             device,
@@ -431,7 +431,7 @@ impl FrameResources {
             width,
             height,
             color_format,
-            vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            crate::images::OUTPUT_USAGE,
         )?);
         let (mvec_image, mvec_view, mvec_memory) = partial.track_image(create_image(
             device,
