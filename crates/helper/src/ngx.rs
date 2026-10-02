@@ -621,12 +621,17 @@ impl NgxSnippet {
 
 fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, key: FeatureKey, tuning: &NgxTuning) -> Option<abi::NgxHandle> {
     let create_feature = s.create_feature?;
-    let FeatureKey { width, height, hdr } = key;
+    let FeatureKey { width, height, hdr: hdr_input } = key;
+    let flags_env = neural_forge_protocol::env::var(crate::hdr::HDR_FLAGS_ENV).filter(|v| !v.trim().is_empty());
+    let (flags, unknown) = crate::hdr::create_flags(hdr_input, flags_env.as_deref());
+    let hdr = flags.hdr;
     crate::log!(
-        "[ngx] feature {width}x{height} hdr={}: DLSSNR.Hdr={} DLSSNR.SDR={} AutoExposure=1",
+        "[ngx] feature {width}x{height} hdr={}: DLSSNR.Hdr={} DLSSNR.SDR={} AutoExposure={}{}",
+        u8::from(hdr_input),
         u8::from(hdr),
-        u8::from(hdr),
-        u8::from(!hdr)
+        u8::from(!hdr),
+        u8::from(flags.auto_exposure),
+        flags_env.as_deref().map_or_else(String::new, |v| format!(" ({}={v:?}{})", crate::hdr::HDR_FLAGS_ENV, if unknown.is_empty() { String::new() } else { format!(", ignored {unknown:?}") }))
     );
     let name = |n: &str| CString::new(n).unwrap();
     let params = s.params;
@@ -669,7 +674,7 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 // Style, Intensity, the local strengths and UseAutoMask are deliberately absent:
                 // they are the create-time tuning block, written by `set_create_tuning` right
                 // before `CreateFeature` below so nothing later in this function can overwrite them.
-                abi::ngx_set_u32(params, name("DLSSNR.AutoExposure").as_ptr(), 1);
+                abi::ngx_set_u32(params, name("DLSSNR.AutoExposure").as_ptr(), u32::from(flags.auto_exposure));
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_ExposureScale").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_PreExposure").as_ptr(), 1.0);
                 // What the Color input is: the 8-bit display-referred swapchain proxy (SDR), or
@@ -683,8 +688,8 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 abi::ngx_set_u32(params, name("Height").as_ptr(), height);
                 abi::ngx_set_u32(params, name("CreationNodeMask").as_ptr(), 1);
                 abi::ngx_set_u32(params, name("VisibilityNodeMask").as_ptr(), 1);
-                let flags = abi::feature_flags::DO_SHARPENING | abi::feature_flags::AUTO_EXPOSURE;
-                abi::ngx_set_u32(params, name("Feature_Flags").as_ptr(), flags);
+                let feature_flags = abi::feature_flags::DO_SHARPENING | if flags.auto_exposure { abi::feature_flags::AUTO_EXPOSURE } else { 0 };
+                abi::ngx_set_u32(params, name("Feature_Flags").as_ptr(), feature_flags);
             }
         },
         (),

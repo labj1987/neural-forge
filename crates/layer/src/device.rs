@@ -957,6 +957,16 @@ impl NeuralForgeDeviceInfo {
             height: colour.height,
             depth: Some(aux(inputs.depth, scan.depth_layout)),
             mvec: Some(aux(inputs.mvec, scan.mvec_layout)),
+            // The 1x1 candidates: read in their committed layout, or as GENERAL (assumed, flagged in
+            // exposure.json) when no barrier on a storage image was seen.
+            exposure: std::array::from_fn(|k| {
+                inputs.exposure[k].map(|(image, desc)| {
+                    let assumed = scan.exposure_layouts[k].is_none() && desc.usage.contains(vk::ImageUsageFlags::STORAGE);
+                    let layout = if assumed { Some(vk::ImageLayout::GENERAL) } else { scan.exposure_layouts[k] };
+                    let readable = desc.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (desc.width, desc.height) == (1, 1);
+                    (crate::preupscale::Aux { image, format: desc.format, layout, readable }, assumed)
+                })
+            }),
         };
         let res = session.res.as_mut()?;
         let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;

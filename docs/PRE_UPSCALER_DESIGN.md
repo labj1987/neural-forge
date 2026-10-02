@@ -247,7 +247,7 @@ from the probe, not a measurement.
 | Value | What happens at the DLSS submit |
 |---|---|
 | unset / `off` | Nothing. The hooked-command list, the resolved entry points and every hot path are as before; no waits are added anywhere. |
-| `dump` | Once (the first hold after the colour input is identified and the depth and motion-vector layouts are known from the game's barriers, normally a frame later; after 120 DLSS submits without them, colour only), and again for each `shmctl capture` (`capture_request=1`): capture colour, depth and motion vectors, forward the game's submit unchanged, and write `~/.local/share/neural-forge/captures/preupscale-<ms>/` with `colour.rgba16f` (padded size), `depth.r32f` (`depth.raw` for a non-float depth), `mvec.rg16f`, `meta.json` (width, height, padded size, formats, frame number) and `colour-preview.png` (`x/(1+x)` per channel, sRGB-encoded). Files are written off the submit thread. |
+| `dump` | Once (the first hold after the colour input is identified and the depth and motion-vector layouts are known from the game's barriers, normally a frame later; after 120 DLSS submits without them, colour only), and again for each `shmctl capture` (`capture_request=1`): capture colour, depth and motion vectors, forward the game's submit unchanged, and write `~/.local/share/neural-forge/captures/preupscale-<ms>/` with `colour.rgba16f` (padded size), `depth.r32f` (`depth.raw` for a non-float depth), `mvec.rg16f`, `meta.json` (width, height, padded size, formats, frame number), `colour-preview.png` (`x/(1+x)` per channel, sRGB-encoded) and `exposure.json` (every registered 1x1 float image, DLSS's exposure input among them: format, layout, raw bytes and values; a storage image with no barrier seen yet is read as `GENERAL`, flagged `layout_assumed`). Files are written off the submit thread. |
 | `identity` | Capture the colour input into slot 0's proxy region, then copy the same bytes back into it. The helper is not called. Measures the hold's own cost; the picture must be unchanged. |
 | `model` | Capture, hand the frame to the helper (`width` = padded width, `proxy_format` = RGBA16F), wait up to 30 ms (or until the helper stops being alive), copy the answer back into the colour input with the padding cropped. Every frame (`model_interval` is ignored). With `enabled` off (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported unavailable, nothing is held. |
 
@@ -404,3 +404,122 @@ input behaves better than `Hdr=1` (not tried).
 
 Not run (E1 decides; see above). The layer's identification and dump path are proven on GTA; the
 hold, identity write-back and model mode are unmeasured.
+
+## E1b: the HDR encode
+
+Run 2026-10-02 on lordnikon (same settings as E1: Balanced 1485x836, mods off). Question: which
+encode of the scene-linear DLSS input makes the model give a correct answer, and what is its
+inverse for the write-back.
+
+### What was added for it
+
+- **Layer, dump mode** also reads every registered 1x1 float image (DLSS's exposure input among
+  them) at the hold and writes `exposure.json` (format, layout, raw bytes, values). Everything
+  else in the dump is unchanged.
+- **Helper:** `NEURAL_FORGE_HDR_FLAGS` (debug, read at feature creation): `hdr` (default for an
+  RGBA16F proxy: `Hdr=1, SDR=0`), `sdr` (`Hdr=0, SDR=1` for an RGBA16F proxy), `autoexp0`
+  (`AutoExposure=0` and no `AUTO_EXPOSURE` feature flag). The `[ngx] feature` line logs the flags
+  and the variable. `neural-forge-cli restart` passes its environment to the helper, so
+  `NEURAL_FORGE_HDR_FLAGS=sdr neural-forge-cli restart` is enough; a plain restart undoes it.
+- **`trigger_helper_roundtrip --rgba8 FILE`**: sends a raw 8-bit frame as an RGBA8 proxy (the
+  8-bit reference).
+- **`scripts/hdr_encode.py`** (numpy + Pillow; run on the rig): `info`, `encode`, `judge`
+  (inverse, display PNGs of input and answer through the same display mapping, an x8 diff, and
+  the statistics below), `montage`.
+
+### The exposure value
+
+GTA registers one **1x1 R16_SFLOAT** image (in `GENERAL`) and several 1x1 R32G32B32A32_SFLOAT
+images (no `TRANSFER_SRC`, not readable; NGX's own). The R16F value is the game's exposure and
+it adapts per scene: **0.1282** at Grove Street (dump A, frame 3), **0.1581** on Vinewood
+Boulevard (dump B, frame 8397, taken with `shmctl capture` 219 s into the benchmark).
+
+The convention is **multiply**: `exposed = scene * e`. Scene luma p50 5.9 / 3.0 becomes exposed
+p50 0.75 / 0.47 (p99 2.5 / 3.3); dividing gives p50 46 / 19, which is nonsense.
+
+### Encodes tried
+
+All through the rig's real helper (`--repeat 64`, no game running), same frame, both dumps.
+`w` is the paper white in exposed units (OpenDLSS-NR's `paperWhite`): `v = scene * e / w`.
+"clamp" = pixels with any channel >= 0.999 in the model domain. "Edit" = mean |answer - input|
+in a common display (opendlss shoulder at w = 3, sRGB), in 8-bit levels; "hi-grad" = edit on the
+top 10% gradient pixels / edit elsewhere; "luma out/in" = scene-linear mean luma after the
+inverse / before. A / B per cell.
+
+| Encode | sent clamp % | answer clamp % | edit (8-bit) | hi-grad | signed edit B | luma out/in | identity round trip, px >1% off |
+|---|---|---|---|---|---|---|---|
+| E-a `opendlss`, w = 1 (exposure as is) | 39.9 / 31.4 | 1.8 / 1.1 | 17.9 / 15.5 | 0.67 / 0.64 | -0.070 / -0.053 | **0.79 / 0.77** | 38% |
+| **E-a `opendlss`, w = 3** | 0.08 / 0.88 | 0.03 / 0.01 | **9.1 / 8.5** | 1.13 / 1.00 | -0.010 / -0.008 | 1.00 / 0.96 | 0.08% |
+| E-b = E-a with `NEURAL_FORGE_HDR_FLAGS=sdr` | | | bit-identical answers to E-a | | | | |
+| E-a, w = 3, `autoexp0` | | | bit-identical (A) | | | | |
+| E-c `opendlss-linear`, w = 3 | 0.03 / 0.69 | 0.00 / 0.00 | 10.6 / 9.7 | 1.32 / 1.11 | +0.010 / +0.002 | 0.99 / 0.96 | 0.04% |
+| E-c `opendlss-linear`, w = 1 | 36.3 / 30.4 | 0.4 / 0.08 | 17.1 / 16.4 | 0.80 / 0.69 | -0.053 / -0.052 | 0.81 / 0.77 | 34% |
+| E-d `lumaknee` (encode.comp's SoftKnee), w = 3 | 0.70 / 14.6 | 0.02 / 0.01 | 9.0 / 8.3 | 1.13 / 1.00 | -0.009 / -0.005 | 1.00 / 0.99 | 0.64% |
+| E-e `reinhard` x/(1+x) after exposure, w = 1 | 0 / 0 | 0 / 0 | 12.8 / 11.9 | 0.94 / 0.78 | **-0.026 / -0.027** | 0.94 / 0.90 | 0% |
+| 8-bit reference: E-a w = 3 quantised, RGBA8 proxy | 0.11 / 1.0 | 0.04 / 0.03 | **9.1 / 8.4** | 1.16 / 1.00 | -0.010 / -0.008 | 1.00 / 0.96 | 26% (8-bit) |
+| 8-bit reference at w = 1 | 41 / 32 | 2.8 / 1.8 | 19.4 / 16.2 | 0.65 / 0.63 | -0.074 / -0.053 | 0.76 / 0.74 | 58% (8-bit) |
+
+Evaluate time 4.1-4.2 ms for every variant. No NaN/Inf; every answer is in [0, 0.9995].
+
+**The creation flags do nothing.** `Hdr=1`/`SDR=0` vs `Hdr=0`/`SDR=1`, and `AutoExposure` 1 vs 0,
+give **bit-identical** answers for the same input (checked pairwise on both dumps; the model is
+deterministic: two runs of the same input are bit-identical too). The few pairs that differed
+(1.3-2/255) were the runs where a feature rebuild echoed part of the 64 requests, so the model had
+fewer history frames. So the model always treats its input as a display-referred [0, 1] picture
+and clamps its output there, whatever it is told; the encode alone decides the result. (This
+also explains E1's raw-input grey wash.) The 16F proxy with E-a w = 3 and the RGBA8 proxy of the
+same picture differ by 1.1-1.2/255, i.e. quantisation plus history length.
+
+### Visual verdict (images in the dev machine's scratchpad `pu2/`, not in the repo)
+
+- **E-a w = 1** (the game's exposure straight into the OpenDLSS-NR shoulder): the encoded picture
+  is blown out (a third of the pixels sit on the shoulder's top), and the model "fixes" that by
+  pulling everything down: the answer is darker and greyer than the exposed picture, highlight
+  texture is invented on the clipped billboard skin, and the write-back would lose 20-23% of the
+  frame's mean luminance. Rejected; the exposure is right, the paper white is not.
+- **E-a w = 3**: the input looks like a normal, well-exposed GTA frame (blue sky, correct reds),
+  and the answer looks like the model's usual edit: a bit more local contrast and texture on
+  skin, foliage and edges, greens slightly toward olive, reds slightly deeper. No grey wash, no
+  hue shift, not washed out. Statistically indistinguishable from the 8-bit reference.
+- **E-b**: identical to E-a (see above).
+- **E-c (linear, w = 3)**: works, but the model sees a darker picture (sRGB-encoded midtones at
+  ~0.23 instead of ~0.51), and its edit is larger, more edge-weighted and brightens slightly
+  (+0.01 on every channel). Further from the 8-bit reference than E-a.
+- **E-d (luminance knee, w = 3)**: same result as E-a where they agree, but the knee's peak divide
+  pins 14.6% of dump B (the bright sky) at 1.0 in one channel and is not invertible there. At
+  w = 3 the per-channel shoulder barely engages (p99 exposed ~0.9-1.1), so its hue risk is not
+  visible; no reason to prefer the luminance knee.
+- **E-e (x/(1+x), linear)**: no clamping and an exact inverse, but the model sees a flat, pale,
+  dark-midtone picture: the answer is hazier, blue drops (-0.027), saturated reds turn toward
+  crimson, and the frame loses 6-10% of its mean luminance. Rejected.
+
+### Recommendation
+
+The model input (RGBA16F, alpha 1):
+
+```
+e     = the game's 1x1 R16_SFLOAT exposure image (read on the GPU each frame; it adapts)
+v     = max(scene, 0) * e / 3                                    (paper white 3, exposed units)
+y     = v                                                        if v <= 0.75
+        0.75 + 0.25 * (1 - exp(-5.770780 * (v - 0.75)))           otherwise   (per channel)
+input = sRGB_OETF(y)
+```
+
+The write-back (per channel):
+
+```
+y     = sRGB_EOTF(clamp(answer, 0, 1))
+y     = min(y, 1 - 1e-4)
+v     = y                                                        if y < 0.75
+        0.75 - ln(1 - (y - 0.75) / 0.25) / 5.770780              otherwise
+scene' = v * 3 / e
+```
+
+The flags stay `Hdr=1, SDR=0, AutoExposure=1` (they make no difference). Open points for the
+build: (1) the paper white 3 was picked so the exposed median lands at 0.16-0.25 and the clamp
+stays under 1%; 2.5-4 would do as well, it wants one look in the game. (2) The inverse tops out at
+v = 2.1 (y = 1 - 1e-4), i.e. scene = 6.3 / e (about 40-50 here), and half floats near 1.0 already
+lose distinction above v of about 1.8: pixels whose input was at the shoulder's top (0.06-0.9%
+here: sky, sun) cannot come back. The write-back should keep the original scene value where the
+encoded input was >= 0.999. (3) The exposure image is read before
+DLSS runs and was in `GENERAL` (the first dump had not seen a barrier on it yet, the second had).

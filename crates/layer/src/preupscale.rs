@@ -14,9 +14,9 @@
 //!    the model round trip and a write-back submit on the same queue ([`run_hold`]).
 //!
 //! Modes: `off` (the default: nothing here is reachable, no extra hooks, no waits), `dump`
-//! (capture colour, depth and motion vectors once and write them to disk), `identity` (capture
-//! and write the same bytes back: the hold's own cost, picture-neutral), `model` (the helper's
-//! answer replaces the colour input). Every failure forwards the game's submit untouched.
+//! (capture colour, depth, motion vectors and the 1x1 exposure images once and write them to
+//! disk), `identity` (capture and write the same bytes back: the hold's own cost,
+//! picture-neutral), `model` (the helper's answer replaces the colour input). Every failure forwards the game's submit untouched.
 //!
 //! # The dependency chain of a hold
 //!
@@ -212,6 +212,23 @@ fn depth_texel_bytes(format: vk::Format) -> u64 {
     }
 }
 
+/// Bytes per texel of a float colour format a 1x1 exposure image can have; `None` for any other.
+pub(crate) fn exposure_texel_bytes(format: vk::Format) -> Option<u64> {
+    match format {
+        vk::Format::R16_SFLOAT => Some(2),
+        vk::Format::R32_SFLOAT | vk::Format::R16G16_SFLOAT => Some(4),
+        vk::Format::R32G32_SFLOAT | vk::Format::R16G16B16A16_SFLOAT => Some(8),
+        vk::Format::R32G32B32A32_SFLOAT => Some(16),
+        _ => None,
+    }
+}
+
+/// At most this many registered 1x1 images are kept as exposure candidates (GTA registers two).
+pub(crate) const MAX_EXPOSURE: usize = 4;
+
+/// Bytes reserved per exposure image in the dump readback (the largest texel).
+const EXPOSURE_STRIDE: u64 = 16;
+
 /// The DLSS inputs among the registered images.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inputs {
@@ -220,6 +237,9 @@ pub(crate) struct Inputs {
     pub mvec: (vk::Image, ImageDesc),
     /// How many colour candidates there were (the lowest handle is taken).
     pub candidates: usize,
+    /// The registered 1x1 float images (DLSS's exposure input among them), lowest handles first.
+    /// Only dump mode reads them.
+    pub exposure: [Option<(vk::Image, ImageDesc)>; MAX_EXPOSURE],
 }
 
 /// The colour input: the registered RGBA16F storage image whose extent equals a registered depth
@@ -248,11 +268,18 @@ pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
         .collect();
     let colour = *candidates.first()?;
     let (w, h) = (colour.1.width, colour.1.height);
+    let mut exposure = [None; MAX_EXPOSURE];
+    for (slot, found) in exposure.iter_mut().zip(
+        registered.values().filter(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && exposure_texel_bytes(d.format).is_some()),
+    ) {
+        *slot = Some(*found);
+    }
     Some(Inputs {
         colour,
         depth: at(&|f| DEPTH_FORMATS.contains(&f), w, h)?,
         mvec: at(&|f| f == vk::Format::R16G16_SFLOAT, w, h)?,
         candidates: candidates.len(),
+        exposure,
     })
 }
 
@@ -292,6 +319,8 @@ pub(crate) struct Scan {
     /// The depth and motion-vector images' committed layouts at the same point.
     pub depth_layout: Option<vk::ImageLayout>,
     pub mvec_layout: Option<vk::ImageLayout>,
+    /// The exposure candidates' committed layouts, index for index with [`Inputs::exposure`].
+    pub exposure_layouts: [Option<vk::ImageLayout>; MAX_EXPOSURE],
     pub evaluation: u64,
 }
 
@@ -364,7 +393,9 @@ impl Tracker {
     }
 
     fn watched(&self, image: vk::Image) -> bool {
-        self.inputs.is_some_and(|i| i.colour.0 == image || i.depth.0 == image || i.mvec.0 == image)
+        self.inputs.is_some_and(|i| {
+            i.colour.0 == image || i.depth.0 == image || i.mvec.0 == image || i.exposure.iter().flatten().any(|e| e.0 == image)
+        })
     }
 
     pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, image: vk::Image, layout: vk::ImageLayout) {
@@ -398,14 +429,15 @@ impl Tracker {
             .filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d))))
             .collect();
         let inputs = identify(&registered, self.swapchain_extent());
-        if inputs.map(|i| (i.colour.0, i.depth.0, i.mvec.0)) != self.inputs.map(|i| (i.colour.0, i.depth.0, i.mvec.0)) {
+        let key = |i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0))));
+        if key(inputs) != key(self.inputs) {
             self.committed.clear();
             self.pending.clear();
         }
         self.inputs = inputs;
         let line = match inputs {
             Some(i) => format!(
-                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}; swapchain {:?}",
+                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}{}; swapchain {:?}",
                 hex(i.colour.0),
                 i.colour.1.width,
                 i.colour.1.height,
@@ -416,6 +448,12 @@ impl Tracker {
                 i.depth.1.format,
                 hex(i.mvec.0),
                 i.mvec.1.format,
+                if i.exposure.iter().any(Option::is_some) {
+                    let list: Vec<String> = i.exposure.iter().flatten().map(|(image, d)| format!("{} {:?}", hex(*image), d.format)).collect();
+                    format!(", 1x1 (exposure) {}", list.join(", "))
+                } else {
+                    String::new()
+                },
                 self.swapchain_extent()
             ),
             None => format!(
@@ -450,6 +488,7 @@ impl Tracker {
                         inputs: self.inputs,
                         depth_layout: layout(self.inputs.map(|i| i.depth.0)),
                         mvec_layout: layout(self.inputs.map(|i| i.mvec.0)),
+                        exposure_layouts: std::array::from_fn(|k| layout(self.inputs.and_then(|i| i.exposure[k]).map(|e| e.0))),
                         evaluation: self.evaluations,
                     });
                 }
@@ -1042,8 +1081,8 @@ pub(crate) struct Resources {
     /// Slot 0's answer region (model's write-back source).
     answer: HostBuffer,
     answer_region: *mut u8,
-    /// Dump-mode depth and motion-vector readbacks, built on first use.
-    dump: Option<(HostBuffer, HostBuffer)>,
+    /// Dump-mode depth, motion-vector and exposure readbacks, built on first use.
+    dump: Option<DumpBuffers>,
     capture_pending: bool,
     writeback_pending: bool,
 }
@@ -1194,15 +1233,24 @@ impl Resources {
             device.destroy_command_pool(self.pool, None);
             self.proxy.destroy(device);
             self.answer.destroy(device);
-            if let Some((depth, mvec)) = &self.dump {
-                depth.destroy(device);
-                mvec.destroy(device);
+            if let Some(dump) = &self.dump {
+                dump.depth.destroy(device);
+                dump.mvec.destroy(device);
+                dump.exposure.destroy(device);
             }
         }
     }
 }
 
-/// A depth or motion-vector image to read in dump mode.
+/// Dump mode's readbacks: depth and motion vectors (render extent, 4 bytes per texel), and the
+/// 1x1 exposure candidates at [`EXPOSURE_STRIDE`] bytes each.
+struct DumpBuffers {
+    depth: HostBuffer,
+    mvec: HostBuffer,
+    exposure: HostBuffer,
+}
+
+/// A depth, motion-vector or 1x1 exposure image to read in dump mode.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Aux {
     pub image: vk::Image,
@@ -1220,6 +1268,10 @@ pub(crate) struct Target {
     pub height: u32,
     pub depth: Option<Aux>,
     pub mvec: Option<Aux>,
+    /// The 1x1 exposure candidates, read in dump mode, each with whether its layout is assumed
+    /// (no barrier on it was seen: a storage image is then read as `GENERAL`, the layout
+    /// vkd3d-proton keeps those in).
+    pub exposure: [Option<(Aux, bool)>; MAX_EXPOSURE],
 }
 
 /// Which of the layer's two submissions [`run_hold`] asks the caller to make.
@@ -1257,6 +1309,20 @@ pub(crate) struct DumpFrame {
     pub depth: Option<(Vec<u8>, vk::Format)>,
     pub mvec: Option<Vec<u8>>,
     pub frame: u64,
+    /// The 1x1 exposure candidates, read or not.
+    pub exposure: Vec<ExposureValue>,
+}
+
+/// One 1x1 exposure candidate in a dump.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ExposureValue {
+    pub image: u64,
+    pub format: vk::Format,
+    /// The layout it was read in (`None`: not read), and whether that layout was assumed.
+    pub layout: Option<vk::ImageLayout>,
+    pub assumed: bool,
+    /// The texel (little-endian, the format's size), `None` when it was not read.
+    pub bytes: Option<Vec<u8>>,
 }
 
 fn aux_copy_layout(layout: Option<vk::ImageLayout>) -> Option<(vk::ImageLayout, bool)> {
@@ -1276,37 +1342,67 @@ fn aux_range(format: vk::Format) -> vk::ImageSubresourceRange {
     vk::ImageSubresourceRange { aspect_mask: aspect, base_mip_level: 0, level_count: vk::REMAINING_MIP_LEVELS, base_array_layer: 0, layer_count: vk::REMAINING_ARRAY_LAYERS }
 }
 
+/// What a dump reads besides colour.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DumpPart {
+    Depth,
+    Mvec,
+    /// The exposure candidate at this index of [`Target::exposure`].
+    Exposure(usize),
+}
+
+/// One image a dump copies into a readback buffer.
+#[derive(Clone, Copy, Debug)]
+struct DumpRead {
+    part: DumpPart,
+    aux: Aux,
+    buffer: vk::Buffer,
+    offset: u64,
+    extent: (u32, u32),
+    read: vk::ImageLayout,
+    transition: bool,
+}
+
+/// The dump's reads: the depth aspect and the motion vectors at the render extent, and each 1x1
+/// exposure candidate at its [`EXPOSURE_STRIDE`] slot, each readable one in a layout it can be
+/// copied from (see [`aux_copy_layout`]).
+fn dump_reads(target: &Target, bufs: &DumpBuffers) -> Vec<DumpRead> {
+    let full = (target.width, target.height);
+    let mut parts = vec![(DumpPart::Depth, target.depth, bufs.depth.buffer, 0, full), (DumpPart::Mvec, target.mvec, bufs.mvec.buffer, 0, full)];
+    for (k, e) in target.exposure.iter().enumerate() {
+        parts.push((DumpPart::Exposure(k), e.map(|(a, _)| a), bufs.exposure.buffer, k as u64 * EXPOSURE_STRIDE, (1, 1)));
+    }
+    parts
+        .into_iter()
+        .filter_map(|(part, aux, buffer, offset, extent)| {
+            let aux = aux.filter(|a| a.readable)?;
+            let (read, transition) = aux_copy_layout(aux.layout)?;
+            Some(DumpRead { part, aux, buffer, offset, extent, read, transition })
+        })
+        .collect()
+}
+
 /// Records the capture: colour (GENERAL) into the proxy buffer at the padded size; in dump mode
-/// also the depth aspect and the motion vectors, each in its committed layout (transitioned to
-/// TRANSFER_SRC_OPTIMAL and back when that layout cannot be copied from).
+/// also the depth aspect, the motion vectors and the 1x1 exposure candidates, each in its committed
+/// layout (transitioned to TRANSFER_SRC_OPTIMAL and back when that layout cannot be copied from).
 ///
 /// # Safety
 /// `res`'s capture command buffer must not be pending.
-unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target, dump: Option<(&HostBuffer, &HostBuffer)>) -> ash::prelude::VkResult<()> {
+unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>) -> ash::prelude::VkResult<()> {
     let cmd = res.capture_cmd;
     // SAFETY: the pool allows resetting buffers individually; the buffer is not pending.
     unsafe {
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
     }
-    let aux: Vec<(Aux, &HostBuffer, vk::ImageLayout, bool)> = match dump {
-        Some((depth_buf, mvec_buf)) => [(target.depth, depth_buf), (target.mvec, mvec_buf)]
-            .into_iter()
-            .filter_map(|(aux, buf)| {
-                let aux = aux.filter(|a| a.readable)?;
-                let (read_layout, transition) = aux_copy_layout(aux.layout)?;
-                Some((aux, buf, read_layout, transition))
-            })
-            .collect(),
-        None => Vec::new(),
-    };
+    let aux: Vec<DumpRead> = dump.map(|bufs| dump_reads(target, bufs)).unwrap_or_default();
     let to_read: Vec<vk::ImageMemoryBarrier> = aux
         .iter()
-        .filter(|(_, _, _, transition)| *transition)
-        .map(|(a, _, read, _)| {
+        .filter(|r| r.transition)
+        .map(|&DumpRead { aux: a, read, .. }| {
             vk::ImageMemoryBarrier::builder()
                 .old_layout(a.layout.unwrap_or_default())
-                .new_layout(*read)
+                .new_layout(read)
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
                 .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -1327,25 +1423,25 @@ unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target,
             timer.record_start(device, cmd);
         }
         device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, res.proxy.buffer, &capture_regions(target.width, target.height));
-        for (a, buf, read, _) in &aux {
-            let aspect = if DEPTH_FORMATS.contains(&a.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+        for r in &aux {
+            let aspect = if DEPTH_FORMATS.contains(&r.aux.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
             let region = vk::BufferImageCopy {
-                buffer_offset: 0,
+                buffer_offset: r.offset,
                 buffer_row_length: 0,
                 buffer_image_height: 0,
                 image_subresource: vk::ImageSubresourceLayers { aspect_mask: aspect, mip_level: 0, base_array_layer: 0, layer_count: 1 },
                 image_offset: vk::Offset3D::default(),
-                image_extent: vk::Extent3D { width: target.width, height: target.height, depth: 1 },
+                image_extent: vk::Extent3D { width: r.extent.0, height: r.extent.1, depth: 1 },
             };
-            device.cmd_copy_image_to_buffer(cmd, a.image, *read, buf.buffer, &[region]);
+            device.cmd_copy_image_to_buffer(cmd, r.aux.image, r.read, r.buffer, &[region]);
         }
     }
     let back: Vec<vk::ImageMemoryBarrier> = aux
         .iter()
-        .filter(|(_, _, _, transition)| *transition)
-        .map(|(a, _, read, _)| {
+        .filter(|r| r.transition)
+        .map(|&DumpRead { aux: a, read, .. }| {
             vk::ImageMemoryBarrier::builder()
-                .old_layout(*read)
+                .old_layout(read)
                 .new_layout(a.layout.unwrap_or_default())
                 .src_access_mask(vk::AccessFlags::empty())
                 .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
@@ -1442,17 +1538,18 @@ pub(crate) unsafe fn run_hold(
         let bytes = u64::from(target.width) * u64::from(target.height) * 4;
         let depth = own_host_buffer(device, instance, physical_device, bytes);
         let mvec = own_host_buffer(device, instance, physical_device, bytes);
-        match (depth, mvec) {
-            (Some(d), Some(m)) => res.dump = Some((d, m)),
-            (d, m) => {
+        let exposure = own_host_buffer(device, instance, physical_device, MAX_EXPOSURE as u64 * EXPOSURE_STRIDE);
+        match (depth, mvec, exposure) {
+            (Some(depth), Some(mvec), Some(exposure)) => res.dump = Some(DumpBuffers { depth, mvec, exposure }),
+            (d, m, e) => {
                 // SAFETY: never submitted.
                 unsafe {
-                    d.iter().chain(m.iter()).for_each(|b| b.destroy(device));
+                    d.iter().chain(m.iter()).chain(e.iter()).for_each(|b| b.destroy(device));
                 }
             }
         }
     }
-    let dump_bufs = if dump { res.dump.as_ref().map(|(d, m)| (d, m)) } else { None };
+    let dump_bufs = if dump { res.dump.as_ref() } else { None };
     // SAFETY: the capture buffer is idle (`wait_idle` above).
     if unsafe { record_capture(device, res, target, dump_bufs) }.is_err() {
         result.miss = Some("recording the capture failed");
@@ -1494,19 +1591,39 @@ pub(crate) unsafe fn run_hold(
         Mode::Dump => {
             if dump {
                 let n = target.width as usize * target.height as usize * 4;
-                // SAFETY: the capture finished; each buffer holds at least `n` (resp. `bytes`) bytes.
-                let read = |buf: &HostBuffer, len: usize| unsafe { std::slice::from_raw_parts(buf.ptr, len) }.to_vec();
-                let readable = |aux: Option<Aux>| aux.is_some_and(|a| a.readable && aux_copy_layout(a.layout).is_some());
+                // SAFETY: the capture finished; each buffer holds at least `at + len` bytes (`n`,
+                // `bytes`, `MAX_EXPOSURE * EXPOSURE_STRIDE`).
+                let read = |buf: &HostBuffer, at: usize, len: usize| unsafe { std::slice::from_raw_parts(buf.ptr.add(at), len) }.to_vec();
+                let reads = res.dump.as_ref().map(|bufs| dump_reads(target, bufs)).unwrap_or_default();
+                let was_read = |part: DumpPart| reads.iter().any(|r| r.part == part);
                 result.dump = Some(DumpFrame {
                     width: target.width,
                     height: target.height,
-                    colour: read(&res.proxy, bytes),
-                    depth: res.dump.as_ref().filter(|_| readable(target.depth)).map(|(d, _)| {
+                    colour: read(&res.proxy, 0, bytes),
+                    depth: res.dump.as_ref().filter(|_| was_read(DumpPart::Depth)).map(|b| {
                         let format = target.depth.map_or(vk::Format::UNDEFINED, |a| a.format);
-                        (read(d, target.width as usize * target.height as usize * depth_texel_bytes(format) as usize), format)
+                        (read(&b.depth, 0, target.width as usize * target.height as usize * depth_texel_bytes(format) as usize), format)
                     }),
-                    mvec: res.dump.as_ref().filter(|_| readable(target.mvec)).map(|(_, m)| read(m, n)),
+                    mvec: res.dump.as_ref().filter(|_| was_read(DumpPart::Mvec)).map(|b| read(&b.mvec, 0, n)),
                     frame,
+                    exposure: target
+                        .exposure
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(k, e)| e.map(|(a, assumed)| (k, a, assumed)))
+                        .map(|(k, a, assumed)| {
+                            let read_now = was_read(DumpPart::Exposure(k));
+                            ExposureValue {
+                                image: a.image.as_raw(),
+                                format: a.format,
+                                layout: if read_now { a.layout } else { None },
+                                assumed,
+                                bytes: res.dump.as_ref().filter(|_| read_now).map(|b| {
+                                    read(&b.exposure, k * EXPOSURE_STRIDE as usize, exposure_texel_bytes(a.format).unwrap_or(EXPOSURE_STRIDE) as usize)
+                                }),
+                            }
+                        })
+                        .collect(),
                 });
             }
             return result;
@@ -1613,7 +1730,8 @@ pub(crate) fn preview_rgba8(colour: &[u8], row_texels: u32, width: u32, height: 
 
 impl DumpFrame {
     /// Writes `colour.rgba16f` (padded), `depth.r32f` (or `depth.raw` for a non-float depth),
-    /// `mvec.rg16f`, `meta.json` and `colour-preview.png` under `dir`. Returns the files written.
+    /// `mvec.rg16f`, `meta.json`, `colour-preview.png` and, with any 1x1 candidates,
+    /// `exposure.json` under `dir`. Returns the files written.
     pub(crate) fn write(&self, dir: &std::path::Path) -> std::io::Result<Vec<String>> {
         std::fs::create_dir_all(dir)?;
         let (pw, ph) = padded(self.width, self.height);
@@ -1648,8 +1766,51 @@ impl DumpFrame {
         );
         std::fs::write(dir.join("meta.json"), meta)?;
         files.push("meta.json".to_string());
+        if !self.exposure.is_empty() {
+            std::fs::write(dir.join("exposure.json"), exposure_json(&self.exposure))?;
+            files.push("exposure.json".to_string());
+        }
         Ok(files)
     }
+}
+
+/// The channels of a 1x1 exposure texel as floats (halves or singles, little-endian).
+pub(crate) fn exposure_channels(format: vk::Format, bytes: &[u8]) -> Vec<f32> {
+    let half = matches!(format, vk::Format::R16_SFLOAT | vk::Format::R16G16_SFLOAT | vk::Format::R16G16B16A16_SFLOAT);
+    if half {
+        bytes.as_chunks::<2>().0.iter().map(|c| f16_to_f32(u16::from_le_bytes(*c))).collect()
+    } else {
+        bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes(*c)).collect()
+    }
+}
+
+/// `exposure.json`: every registered 1x1 float image at the hold (DLSS's exposure input among
+/// them), with its raw bytes (hex) and their values. Non-finite values are written as strings.
+fn exposure_json(values: &[ExposureValue]) -> String {
+    let number = |v: f32| if v.is_finite() { format!("{v:e}") } else { format!("\"{v}\"") };
+    let entries: Vec<String> = values
+        .iter()
+        .map(|e| {
+            let (raw, decoded) = match &e.bytes {
+                Some(b) => (
+                    format!("\"{}\"", b.iter().map(|x| format!("{x:02x}")).collect::<String>()),
+                    format!("[{}]", exposure_channels(e.format, b).into_iter().map(number).collect::<Vec<_>>().join(", ")),
+                ),
+                None => ("null".to_string(), "null".to_string()),
+            };
+            format!(
+                "    {{\"image\": \"{:#x}\", \"format\": \"{:?}\", \"layout\": {}, \"layout_assumed\": {}, \"raw_le_hex\": {raw}, \"values\": {decoded}}}",
+                e.image,
+                e.format,
+                e.layout.map_or_else(|| "null".to_string(), |l| format!("\"{l:?}\"")),
+                e.assumed
+            )
+        })
+        .collect();
+    format!(
+        "{{\n  \"note\": \"registered 1x1 float images at the DLSS submit, read before DLSS ran (the game's exposure input among them)\",\n  \"images\": [\n{}\n  ]\n}}\n",
+        entries.join(",\n")
+    )
 }
 
 // ---- Per-device session: resources, statistics, status. ----
@@ -2137,6 +2298,8 @@ mod tests {
             (0x200, desc(1707, 960, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
             (0x100, desc(1707, 960, rgba, storage | vk::ImageUsageFlags::COLOR_ATTACHMENT)),
             (0x600, desc(1, 1, vk::Format::R32G32B32A32_SFLOAT, storage)),
+            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
+            (0x620, desc(1, 1, vk::Format::R8G8B8A8_UNORM, storage)),
             (0x700, desc(5120, 2880, vk::Format::R16_SFLOAT, storage)),
         ]
         .into_iter()
@@ -2152,6 +2315,7 @@ mod tests {
         assert_eq!(found.depth.0, vk::Image::from_raw(0x200));
         assert_eq!(found.mvec.0, vk::Image::from_raw(0x300));
         assert_eq!(found.candidates, 1);
+        assert_eq!(found.exposure.map(|e| e.map(|e| e.0.as_raw())), [Some(0x600), Some(0x610), None, None], "the 1x1 float images, not the 5120x2880 R16F");
         assert_eq!(identify(&set, None), None, "no swapchain, no comparison, no hold");
         assert_eq!(identify(&set, Some((1707, 960))), None, "DLAA: the render extent is the output's");
         let mut no_mv = set.clone();
@@ -2252,12 +2416,38 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let (w, h) = (3u32, 1u32);
         let colour = vec![0u8; (4 * 2 * TEXEL) as usize];
-        let frame = DumpFrame { width: w, height: h, colour, depth: Some((vec![0u8; 12], vk::Format::D32_SFLOAT_S8_UINT)), mvec: Some(vec![0u8; 12]), frame: 42 };
+        let mut frame = DumpFrame {
+            width: w,
+            height: h,
+            colour,
+            depth: Some((vec![0u8; 12], vk::Format::D32_SFLOAT_S8_UINT)),
+            mvec: Some(vec![0u8; 12]),
+            frame: 42,
+            exposure: Vec::new(),
+        };
         let files = frame.write(&dir).unwrap();
-        assert_eq!(files, vec!["colour.rgba16f", "depth.r32f", "mvec.rg16f", "colour-preview.png", "meta.json"]);
+        assert_eq!(files, vec!["colour.rgba16f", "depth.r32f", "mvec.rg16f", "colour-preview.png", "meta.json"], "no exposure.json without candidates");
         let meta = std::fs::read_to_string(dir.join("meta.json")).unwrap();
         for needle in ["\"width\": 3", "\"height\": 1", "\"padded_width\": 4", "\"padded_height\": 2", "\"frame\": 42", "D32_SFLOAT_S8_UINT"] {
             assert!(meta.contains(needle), "{needle} in {meta}");
+        }
+        let rgba32: Vec<u8> = [0.5f32, 2.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        frame.exposure = vec![
+            ExposureValue { image: 0x600, format: vk::Format::R32G32B32A32_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), assumed: true, bytes: Some(rgba32) },
+            ExposureValue { image: 0x610, format: vk::Format::R16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), assumed: false, bytes: Some(vec![0x00, 0x3c]) },
+            ExposureValue { image: 0x620, format: vk::Format::R16_SFLOAT, layout: None, assumed: false, bytes: None },
+        ];
+        let files = frame.write(&dir).unwrap();
+        assert_eq!(files.last().map(String::as_str), Some("exposure.json"));
+        assert_eq!(std::fs::read_to_string(dir.join("meta.json")).unwrap(), meta, "meta.json does not change");
+        let json = std::fs::read_to_string(dir.join("exposure.json")).unwrap();
+        for needle in [
+            "\"image\": \"0x600\", \"format\": \"R32G32B32A32_SFLOAT\", \"layout\": \"GENERAL\", \"layout_assumed\": true, \"raw_le_hex\": \"0000003f00000040000000000000803f\"",
+            "\"values\": [5e-1, 2e0, 0e0, 1e0]",
+            "\"raw_le_hex\": \"003c\", \"values\": [1e0]",
+            "\"image\": \"0x620\", \"format\": \"R16_SFLOAT\", \"layout\": null, \"layout_assumed\": false, \"raw_le_hex\": null, \"values\": null",
+        ] {
+            assert!(json.contains(needle), "{needle} in {json}");
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2490,7 +2680,7 @@ mod tests {
             if cfg!(target_pointer_width = "64") {
                 assert_eq!(res.imported(), import, "imported exactly when the device can");
             }
-            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None };
+            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE] };
             let (device, queue) = (&gpu.device, gpu.queue);
             let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
                 device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
@@ -2550,8 +2740,9 @@ mod tests {
     }
 
     /// Dump mode on a real device: colour (padded), the depth aspect of a D32S8 image that sits in
-    /// DEPTH_STENCIL_ATTACHMENT_OPTIMAL (read through a transition and put back), and RG16F motion
-    /// vectors in GENERAL; no write-back.
+    /// DEPTH_STENCIL_ATTACHMENT_OPTIMAL (read through a transition and put back), RG16F motion
+    /// vectors in GENERAL, and two 1x1 exposure images (RGBA32F in GENERAL, R16F in
+    /// SHADER_READ_ONLY_OPTIMAL, read through a transition); no write-back.
     #[test]
     fn a_dump_hold_reads_colour_depth_and_motion_vectors_without_writing_back() {
         let Some(gpu) = Gpu::open(false) else {
@@ -2563,7 +2754,7 @@ mod tests {
         let (image, memory) = gpu.image(w, h);
         let original = pattern(w, h);
         gpu.upload(image, w, h, &original);
-        let make = |format: vk::Format, usage: vk::ImageUsageFlags| {
+        let make_sized = |format: vk::Format, usage: vk::ImageUsageFlags, (w, h): (u32, u32)| {
             let info = vk::ImageCreateInfo::builder()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
@@ -2582,6 +2773,9 @@ mod tests {
             unsafe { d.bind_image_memory(image, memory, 0) }.ok()?;
             Some((image, memory))
         };
+        let make = |format: vk::Format, usage: vk::ImageUsageFlags| make_sized(format, usage, (w, h));
+        let (exp32, exp32_mem) = make_sized(vk::Format::R32G32B32A32_SFLOAT, vk::ImageUsageFlags::STORAGE, (1, 1)).expect("1x1 RGBA32F image");
+        let (exp16, exp16_mem) = make_sized(vk::Format::R16_SFLOAT, vk::ImageUsageFlags::SAMPLED, (1, 1)).expect("1x1 R16F image");
         let depth_format = vk::Format::D32_SFLOAT_S8_UINT;
         let Some((depth, depth_mem)) = make(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT) else {
             eprintln!("preupscale dump test: no D32_SFLOAT_S8_UINT image here, skipping");
@@ -2607,15 +2801,17 @@ mod tests {
             d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[
                 to(depth, ds_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
                 to(mvec, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL),
+                to(exp32, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL),
+                to(exp16, colour_range, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
             ]);
+            d.cmd_clear_color_image(cmd, exp32, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [0.5, 2.0, 0.0, 1.0] }, &[colour_range]);
+            d.cmd_clear_color_image(cmd, exp16, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [3.0, 0.0, 0.0, 0.0] }, &[colour_range]);
             d.cmd_clear_depth_stencil_image(cmd, depth, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearDepthStencilValue { depth: 0.25, stencil: 7 }, &[ds_range]);
             d.cmd_clear_color_image(cmd, mvec, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [1.0, -2.0, 0.0, 0.0] }, &[colour_range]);
-            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(
-                depth,
-                ds_range,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-            )]);
+            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[
+                to(depth, ds_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL),
+                to(exp16, colour_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
+            ]);
         });
         let mut shm = scratch_shm("dump");
         let mut res = unsafe { Resources::build(d, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
@@ -2625,6 +2821,12 @@ mod tests {
             height: h,
             depth: Some(Aux { image: depth, format: depth_format, layout: Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL), readable: true }),
             mvec: Some(Aux { image: mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
+            exposure: [
+                Some((Aux { image: exp32, format: vk::Format::R32G32B32A32_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }, true)),
+                Some((Aux { image: exp16, format: vk::Format::R16_SFLOAT, layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), readable: true }, false)),
+                None,
+                Some((Aux { image: exp16, format: vk::Format::R16_SFLOAT, layout: None, readable: true }, false)),
+            ],
         };
         let queue = gpu.queue;
         let mut submits = Vec::new();
@@ -2645,21 +2847,25 @@ mod tests {
         assert!(depth_bytes.chunks_exact(4).all(|v| f32::from_le_bytes(v.try_into().unwrap()) == 0.25), "the depth aspect as float32");
         let mv = frame.mvec.expect("motion vectors read");
         assert!(mv.chunks_exact(4).all(|v| v == [0x00, 0x3c, 0x00, 0xc0]), "RG16F (1, -2)");
+        assert_eq!(frame.exposure.len(), 3, "one entry per candidate");
+        let rgba32: Vec<u8> = [0.5f32, 2.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
+        assert_eq!(frame.exposure[0], ExposureValue { image: exp32.as_raw(), format: vk::Format::R32G32B32A32_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), assumed: true, bytes: Some(rgba32) });
+        assert_eq!(frame.exposure[1].bytes.as_deref(), Some(&[0x00, 0x42][..]), "R16F 3.0, read through a transition");
+        assert_eq!(frame.exposure[1].layout, Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+        assert_eq!((frame.exposure[2].layout, frame.exposure[2].bytes.as_ref()), (None, None), "no layout known, not read");
         assert_eq!(gpu.read(image, w, h), original, "the colour input is untouched");
-        // The depth image is back in DEPTH_STENCIL_ATTACHMENT_OPTIMAL (validation checks this use).
+        // The depth and R16F images are back in their layouts (validation checks this use).
         gpu.one_shot(|cmd| unsafe {
-            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(
-                depth,
-                ds_range,
-                vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL,
-                vk::ImageLayout::GENERAL,
-            )]);
+            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[
+                to(depth, ds_range, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL),
+                to(exp16, colour_range, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::GENERAL),
+            ]);
         });
         let mut gpu_ms = None;
         assert!(res.wait_idle(d, &mut gpu_ms));
         unsafe {
             res.destroy(d);
-            for (i, m) in [(image, memory), (depth, depth_mem), (mvec, mvec_mem)] {
+            for (i, m) in [(image, memory), (depth, depth_mem), (mvec, mvec_mem), (exp32, exp32_mem), (exp16, exp16_mem)] {
                 d.destroy_image(i, None);
                 d.free_memory(m, None);
             }

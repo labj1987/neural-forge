@@ -65,6 +65,43 @@ impl std::fmt::Display for FeatureKey {
     }
 }
 
+/// Debug override for the HDR/SDR and exposure flags the feature is created with (the
+/// pre-upscaler encode experiments, `docs/PRE_UPSCALER_DESIGN.md` "E1b"). Read at every
+/// feature creation; comma- or space-separated tokens:
+///
+/// - `hdr`: an RGBA16F proxy is created with `DLSSNR.Hdr=1, SDR=0` (the default);
+/// - `sdr`: an RGBA16F proxy is created with `DLSSNR.Hdr=0, SDR=1` (an encoded, display-like
+///   frame in half floats);
+/// - `autoexp0`: `DLSSNR.AutoExposure=0` and no `AUTO_EXPOSURE` feature flag, for any proxy.
+///
+/// 8-bit proxies are always `Hdr=0, SDR=1`. Unset or empty: the defaults, exactly as before.
+pub const HDR_FLAGS_ENV: &str = "NEURAL_FORGE_HDR_FLAGS";
+
+/// What `create_feature_at` tells NGX about the colour input.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateFlags {
+    /// `DLSSNR.Hdr` (and `SDR` is its complement).
+    pub hdr: bool,
+    /// `DLSSNR.AutoExposure` and the `AUTO_EXPOSURE` feature flag.
+    pub auto_exposure: bool,
+}
+
+/// The creation flags for a proxy of class `hdr_input` under the override `env`
+/// ([`HDR_FLAGS_ENV`]'s value), and the tokens it did not recognise.
+pub fn create_flags(hdr_input: bool, env: Option<&str>) -> (CreateFlags, Vec<String>) {
+    let mut flags = CreateFlags { hdr: hdr_input, auto_exposure: true };
+    let mut unknown = Vec::new();
+    for token in env.unwrap_or("").split([',', ' ']).map(str::trim).filter(|t| !t.is_empty()) {
+        match token.to_ascii_lowercase().as_str() {
+            "hdr" => flags.hdr = hdr_input,
+            "sdr" => flags.hdr = false,
+            "autoexp0" => flags.auto_exposure = false,
+            _ => unknown.push(token.to_string()),
+        }
+    }
+    (flags, unknown)
+}
+
 /// IEEE 754 binary16 (little-endian `u16` bits) to `f32`, exact for every value including
 /// subnormals, infinities and NaN.
 pub fn f16_to_f32(bits: u16) -> f32 {
@@ -144,6 +181,20 @@ mod tests {
         assert_eq!(hdr, FeatureKey::new(1708, 960, true));
         assert_eq!(hdr.to_string(), "1708x960 hdr=1");
         assert_eq!(sdr.to_string(), "1708x960 hdr=0");
+    }
+
+    #[test]
+    fn create_flags_default_and_overrides() {
+        let on = |hdr, auto_exposure| CreateFlags { hdr, auto_exposure };
+        assert_eq!(create_flags(true, None), (on(true, true), vec![]), "16F default: Hdr=1");
+        assert_eq!(create_flags(false, None), (on(false, true), vec![]), "8-bit default: SDR=1");
+        assert_eq!(create_flags(true, Some("")), (on(true, true), vec![]));
+        assert_eq!(create_flags(true, Some("hdr")), (on(true, true), vec![]));
+        assert_eq!(create_flags(true, Some("sdr")), (on(false, true), vec![]));
+        assert_eq!(create_flags(true, Some("sdr,autoexp0")), (on(false, false), vec![]));
+        assert_eq!(create_flags(true, Some(" autoexp0 ")), (on(true, false), vec![]));
+        assert_eq!(create_flags(false, Some("hdr autoexp0")), (on(false, false), vec![]), "an 8-bit proxy is never Hdr=1");
+        assert_eq!(create_flags(true, Some("SDR,bogus")), (on(false, true), vec!["bogus".to_string()]));
     }
 
     #[test]

@@ -14,6 +14,7 @@
 //! ```text
 //! trigger_helper_roundtrip [W H [SLOT]]
 //! trigger_helper_roundtrip --rgba16f FILE --width W --height H [--slot N] [--out FILE] [--repeat N]
+//! trigger_helper_roundtrip --rgba8 FILE --width W --height H [--slot N] [--out FILE] [--repeat N]
 //! ```
 //!
 //! The first sends one synthetic RGBA8 frame (default 64x64, slot 0), as this tool always did.
@@ -29,6 +30,11 @@
 //! For the last answer it prints per-channel min/max/mean of input and answer (finite values),
 //! NaN and Inf counts, and the mean |answer - input| per channel, and writes the answer, in the
 //! input's format and size, to `--out`.
+//!
+//! `--rgba8 FILE` is the same for a raw 8-bit frame (W*H*4 bytes, R, G, B, A), sent as an RGBA8
+//! proxy (`DLSSNR.Hdr=0, SDR=1`, the path the post-upscaler frames take): the 8-bit reference for
+//! the HDR encode experiments (`docs/PRE_UPSCALER_DESIGN.md`, "E1b"). Its answer is written to
+//! `--out` the same way, and the statistics are per channel on the 0..255 bytes.
 //!
 //! Respects `$NEURAL_FORGE_SHM`/`$NEURAL_FORGE_UID`, same as every other tool in this
 //! workspace. Maps the *full* `shm_total_bytes()` region (unlike
@@ -56,13 +62,15 @@ struct Args {
     slot: usize,
     /// `--rgba16f FILE`: the raw half-float frame; `None` for the synthetic RGBA8 frame.
     rgba16f: Option<String>,
+    /// `--rgba8 FILE`: a raw 8-bit frame.
+    rgba8: Option<String>,
     out: Option<String>,
     repeat: u32,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: trigger_helper_roundtrip [W H [SLOT]]\n       trigger_helper_roundtrip --rgba16f FILE --width W --height H [--slot N] [--out FILE] [--repeat N]"
+        "usage: trigger_helper_roundtrip [W H [SLOT]]\n       trigger_helper_roundtrip --rgba16f FILE --width W --height H [--slot N] [--out FILE] [--repeat N]\n       trigger_helper_roundtrip --rgba8 FILE --width W --height H [--slot N] [--out FILE] [--repeat N]"
     );
     std::process::exit(2);
 }
@@ -72,14 +80,15 @@ fn parse_args() -> Args {
     if !raw.iter().any(|a| a.starts_with("--")) {
         // The original positional form.
         let num = |i: usize, default: u32| raw.get(i).map(|s| s.parse().unwrap_or_else(|_| usage())).unwrap_or(default);
-        return Args { width: num(0, 64), height: num(1, 64), slot: num(2, 0) as usize, rgba16f: None, out: None, repeat: 1 };
+        return Args { width: num(0, 64), height: num(1, 64), slot: num(2, 0) as usize, rgba16f: None, rgba8: None, out: None, repeat: 1 };
     }
-    let mut args = Args { width: 0, height: 0, slot: 0, rgba16f: None, out: None, repeat: 4 };
+    let mut args = Args { width: 0, height: 0, slot: 0, rgba16f: None, rgba8: None, out: None, repeat: 4 };
     let mut it = raw.into_iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
         match flag.as_str() {
             "--rgba16f" => args.rgba16f = Some(value()),
+            "--rgba8" => args.rgba8 = Some(value()),
             "--out" => args.out = Some(value()),
             "--width" => args.width = value().parse().unwrap_or_else(|_| usage()),
             "--height" => args.height = value().parse().unwrap_or_else(|_| usage()),
@@ -88,7 +97,7 @@ fn parse_args() -> Args {
             _ => usage(),
         }
     }
-    if args.width == 0 || args.height == 0 || args.slot > 1 {
+    if args.width == 0 || args.height == 0 || args.slot > 1 || (args.rgba16f.is_some() && args.rgba8.is_some()) {
         usage();
     }
     args
@@ -192,7 +201,8 @@ fn main() {
     let slot = args.slot;
 
     // The frame to send, at the (even) size the helper sees.
-    let (format, input, width, height) = match &args.rgba16f {
+    let file_arg = args.rgba16f.as_ref().map(|f| (f, 8usize, proxy_format::RGBA16F)).or(args.rgba8.as_ref().map(|f| (f, 4usize, proxy_format::RGBA8)));
+    let (format, input, width, height) = match file_arg {
         None => {
             // A real, checkable, non-zero pattern -- not just zero-filled, so a real
             // (as opposed to a silently-echoed-back) evaluation is at least plausible from
@@ -204,23 +214,23 @@ fn main() {
             }
             (proxy_format::RGBA8, frame, args.width, args.height)
         }
-        Some(file) => {
+        Some((file, bpp, format)) => {
             let raw = std::fs::read(file).unwrap_or_else(|e| panic!("failed to read {file}: {e}"));
-            let want = args.width as usize * args.height as usize * 8;
+            let want = args.width as usize * args.height as usize * bpp;
             if raw.len() != want {
                 eprintln!(
-                    "trigger_helper_roundtrip: {file} is {} bytes; {}x{} RGBA16F needs exactly {want}",
+                    "trigger_helper_roundtrip: {file} is {} bytes; {}x{} at {bpp} bytes per pixel needs exactly {want}",
                     raw.len(),
                     args.width,
                     args.height
                 );
                 std::process::exit(2);
             }
-            let (padded, pw, ph) = pad_even(&raw, args.width, args.height, 8);
+            let (padded, pw, ph) = pad_even(&raw, args.width, args.height, bpp);
             if (pw, ph) != (args.width, args.height) {
                 println!("trigger_helper_roundtrip: padded {}x{} to {pw}x{ph} (last column/row repeated)", args.width, args.height);
             }
-            (proxy_format::RGBA16F, padded, pw, ph)
+            (format, padded, pw, ph)
         }
     };
     let frame_bytes = input.len();
@@ -282,6 +292,37 @@ fn main() {
     }
     println!("trigger_helper_roundtrip: model_up={} helper_state={}", hdr.model_up.load(Ordering::Relaxed), hdr.helper_state.load(Ordering::Relaxed));
 
+    if format == proxy_format::RGBA8 && args.rgba8.is_some() {
+        let input = crop(&input, width, args.width, args.height, 4);
+        let answer = crop(answer, width, args.width, args.height, 4);
+        println!("trigger_helper_roundtrip: {}x{} RGBA8, last answer {}", args.width, args.height, if evaluated { "evaluated" } else { "ECHOED" });
+        for (label, frame) in [("input ", &input), ("answer", &answer)] {
+            let mut sum = [0u64; 4];
+            for px in frame.as_chunks::<4>().0 {
+                for k in 0..4 {
+                    sum[k] += u64::from(px[k]);
+                }
+            }
+            let n = (frame.len() / 4).max(1) as f64;
+            println!("  {label} mean R={:.2} G={:.2} B={:.2} A={:.2}", sum[0] as f64 / n, sum[1] as f64 / n, sum[2] as f64 / n, sum[3] as f64 / n);
+        }
+        let mut diff = [0u64; 4];
+        for (a, b) in input.as_chunks::<4>().0.iter().zip(answer.as_chunks::<4>().0) {
+            for k in 0..4 {
+                diff[k] += u64::from(a[k].abs_diff(b[k]));
+            }
+        }
+        let n = (input.len() / 4).max(1) as f64;
+        println!("  mean |answer - input| (0..255): R={:.3} G={:.3} B={:.3} A={:.3}", diff[0] as f64 / n, diff[1] as f64 / n, diff[2] as f64 / n, diff[3] as f64 / n);
+        if let Some(out) = &args.out {
+            std::fs::write(out, &answer).unwrap_or_else(|e| panic!("failed to write {out}: {e}"));
+            println!("trigger_helper_roundtrip: wrote {} bytes ({}x{} RGBA8) to {out}", answer.len(), args.width, args.height);
+        }
+        if !evaluated {
+            std::process::exit(1);
+        }
+        return;
+    }
     if format == proxy_format::RGBA8 {
         let all_zero = answer.iter().all(|&b| b == 0);
         println!(
