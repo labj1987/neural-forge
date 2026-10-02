@@ -26,6 +26,26 @@ pub(crate) fn append_log(log: &str, line: &str) {
     }
 }
 
+/// Size above which [`rotate_log`] moves the helper log aside at start (20 MB).
+pub const LOG_ROTATE_BYTES: u64 = 20 * 1024 * 1024;
+
+/// Renames `log` to `<log>.1` (replacing any previous `.1`) when it exists and is over
+/// `limit` bytes; returns whether it did. Called by `start()` before anything opens the log
+/// for the new helper, so both writers (the helper's own `NEURAL_FORGE_LOG` handle and the
+/// Wine process's redirected stdout/stderr in [`start_detached`]) begin on the fresh file. A
+/// rename keeps a `tail -F` reader working: it reopens the name when the new file appears.
+pub fn rotate_log(log: &str, limit: u64) -> std::io::Result<bool> {
+    match std::fs::metadata(log) {
+        Ok(meta) if meta.is_file() && meta.len() > limit => {
+            std::fs::rename(log, format!("{log}.1"))?;
+            Ok(true)
+        }
+        Ok(_) => Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Spawns `program` with `args`/`envs`, in a new session (`setsid`) so it becomes its
 /// own process group leader, redirecting stdout/stderr to `log_path` (append). Writes
 /// the child's PID to `pid_file`, whose directory must be private to this user (see
@@ -179,6 +199,39 @@ mod tests {
         isolate_helper_layers(&mut command, Some("VK_LAYER_NV_dlssnr:VK_LAYER_KHRONOS_validation:VK_LAYER_neuralforge_neural:VK_LAYER_NV_present"));
         let result = command.args(["-c", "test -z \"$VKLayer_DLSS5$DLSSNR_ENABLE$NEURAL_FORGE_ENABLE\" && test \"$VK_INSTANCE_LAYERS\" = VK_LAYER_KHRONOS_validation:VK_LAYER_NV_present"]).status().unwrap();
         assert!(result.success());
+    }
+
+    #[test]
+    fn rotate_log_moves_only_an_oversized_log_aside() {
+        let log = scratch_path("rotate.log");
+        let old = format!("{log}.1");
+        // Missing: nothing to do.
+        assert!(!rotate_log(&log, 10).unwrap());
+        // At the limit: kept.
+        std::fs::write(&log, [b'a'; 10]).unwrap();
+        assert!(!rotate_log(&log, 10).unwrap());
+        assert!(Path::new(&log).exists() && !Path::new(&old).exists());
+        // Over it, with a previous `.1` present: the current log replaces it.
+        std::fs::write(&old, b"previous").unwrap();
+        std::fs::write(&log, [b'b'; 11]).unwrap();
+        assert!(rotate_log(&log, 10).unwrap());
+        assert!(!Path::new(&log).exists());
+        assert_eq!(std::fs::read(&old).unwrap(), vec![b'b'; 11]);
+        // The next writer gets a fresh file.
+        append_log(&log, "fresh");
+        assert_eq!(std::fs::read_to_string(&log).unwrap(), "fresh\n");
+        let _ = std::fs::remove_dir_all(Path::new(&log).parent().unwrap());
+    }
+
+    #[test]
+    fn rotate_log_reports_a_failed_rename_and_leaves_the_log() {
+        // A non-empty directory where `.1` should go: the rename fails.
+        let log = scratch_path("rotatefail.log");
+        std::fs::create_dir_all(format!("{log}.1/keep")).unwrap();
+        std::fs::write(&log, [b'c'; 11]).unwrap();
+        assert!(rotate_log(&log, 10).is_err());
+        assert!(Path::new(&log).exists(), "a failed rotation leaves the log in place");
+        let _ = std::fs::remove_dir_all(Path::new(&log).parent().unwrap());
     }
 
     /// A path inside a private per-process scratch directory (the pid file's directory

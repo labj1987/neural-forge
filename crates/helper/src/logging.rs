@@ -3,6 +3,10 @@
 //! `neural_forge_layer::logging` — kept as a separate copy rather than a shared crate since
 //! it's this small and the two crates otherwise share nothing OS-specific here
 //! (`std::env`/`std::fs`/`std::io` are already portable).
+//!
+//! Rotation is not done here: the supervisor also writes this file (the Wine process's
+//! redirected stdout/stderr), so `neural_forge_supervisor::start()` rotates it before spawning
+//! the helper and both writers open the fresh file.
 
 use std::fmt::Arguments;
 use std::fs::{File, OpenOptions};
