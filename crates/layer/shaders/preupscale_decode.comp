@@ -1,0 +1,80 @@
+#version 450
+// The pre-upscaler path's write-back (docs/PRE_UPSCALER_DESIGN.md, "E1b: the HDR encode" and
+// "Implementation (layer)"): the inverse of preupscale_encode.comp, applied to the model's answer
+// and written over DLSS's colour input in place, padding cropped.
+//
+// Per channel: y = sRGB EOTF(clamp(answer, 0, 1)), clamped to <= 1 - 1e-4; at or above 0.75 the
+// shoulder's inverse v = 0.75 - ln(1 - (y - 0.75) / 0.25) / K, else v = y; scene' = v * paper_white
+// / e. Where the encoded input of that channel was >= 0.999 (a blown highlight: sky, sun; the
+// inverse cannot bring it back) and flags bit 0 is set, the original scene value is kept. Alpha is
+// always the original. With an unusable exposure value nothing is written.
+//
+// In place: every invocation reads its own pixel of the colour input before writing it, and no
+// other, so there is no hazard within the dispatch.
+//
+// The descriptor set layout, the push constants and the curve functions must stay identical to
+// preupscale_encode.comp's (see there) and to `preupscale::hdr::HdrPush`.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The game's colour input, in GENERAL: read (the original) and written (the result).
+layout(set = 0, binding = 0, rgba16f) uniform image2D u_colour;
+// The encoded picture the capture sent (padded extent).
+layout(set = 0, binding = 1, rgba16f) uniform readonly image2D u_encoded;
+layout(set = 0, binding = 2, std430) readonly buffer Exposure {
+  uint bits;
+} u_exposure;
+// The answer, copied in from the answer region (padded extent).
+layout(set = 0, binding = 3, rgba16f) uniform readonly image2D u_answer;
+
+layout(push_constant) uniform Params {
+  uvec2 size;        // the colour input's extent
+  uvec2 padded;      // the proxy's extent (even)
+  float paper_white; // exposed units that map to 1.0 before the shoulder
+  uint flags;        // bit 0: keep clamped highlights
+} p;
+
+const float KNEE = 0.75;
+const float K = 5.770780;
+const float CLAMPED = 0.999;
+const uint KEEP_CLAMPED = 1u;
+
+bool exposure_ok(float e) {
+  return e > 1e-6 && e < 65504.0;
+}
+
+float srgb_eotf(float s) {
+  s = clamp(s, 0.0, 1.0);
+  return s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4);
+}
+
+float shoulder_inverse(float y) {
+  y = min(y, 1.0 - 1e-4);
+  return y >= KNEE ? KNEE - log(1.0 - (y - KNEE) / 0.25) / K : y;
+}
+
+// model domain -> scene-linear.
+float decode(float answer, float inv_scale) {
+  return shoulder_inverse(srgb_eotf(answer)) * inv_scale;
+}
+
+void main() {
+  uvec2 xy = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(xy, p.size))) {
+    return;
+  }
+  float e = unpackHalf2x16(u_exposure.bits).x;
+  if (!exposure_ok(e)) {
+    return;
+  }
+  float inv_scale = p.paper_white / e;
+  ivec2 at = ivec2(xy);
+  vec4 original = imageLoad(u_colour, at);
+  vec3 encoded = imageLoad(u_encoded, at).rgb;
+  vec3 answer = imageLoad(u_answer, at).rgb;
+  bool keep = (p.flags & KEEP_CLAMPED) != 0u;
+  vec3 result;
+  for (int c = 0; c < 3; c++) {
+    result[c] = keep && encoded[c] >= CLAMPED ? original[c] : decode(answer[c], inv_scale);
+  }
+  imageStore(u_colour, at, vec4(result, original.a));
+}

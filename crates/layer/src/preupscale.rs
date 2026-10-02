@@ -16,7 +16,9 @@
 //! Modes: `off` (the default: nothing here is reachable, no extra hooks, no waits), `dump`
 //! (capture colour, depth, motion vectors and the 1x1 exposure images once and write them to
 //! disk), `identity` (capture and write the same bytes back: the hold's own cost,
-//! picture-neutral), `model` (the helper's answer replaces the colour input). Every failure forwards the game's submit untouched.
+//! picture-neutral), `model` (the colour input is encoded for the model, [`hdr`], and the helper's
+//! answer decoded back over it), `roundtrip` (the same encode and decode with the proxy itself as the
+//! answer, no helper: the transform's neutrality). Every failure forwards the game's submit untouched.
 //!
 //! # The dependency chain of a hold
 //!
@@ -46,6 +48,18 @@
 //! - `W` -> DLSS: `W` ends with `TRANSFER/TRANSFER_WRITE -> ALL_COMMANDS/MEMORY_READ|MEMORY_WRITE`.
 //!   `tail` (the launch buffer, whose kernels read the colour input) is later in submission order,
 //!   so it is in that barrier's second scope: the write-back is visible to DLSS.
+//! - The HDR modes (model, roundtrip; [`hdr`]) add compute work inside `C` and `W`, and the same
+//!   chain holds with the stages widened: `C` opens `ALL_COMMANDS/MEMORY_WRITE ->
+//!   TRANSFER|COMPUTE_SHADER` (the encode reads the colour input from a storage view), copies the
+//!   exposure texel, then `TRANSFER -> COMPUTE_SHADER` (exposure visible to the encode), the encode
+//!   dispatch into the layer's padded image, `COMPUTE_SHADER -> TRANSFER` and the copy into the
+//!   proxy region, closed as above. `W` opens `ALL_COMMANDS|HOST -> TRANSFER|COMPUTE_SHADER` (also
+//!   the write-after-read on the colour input after the encode's read), copies the answer into the
+//!   layer's answer image, `TRANSFER -> COMPUTE_SHADER`, then the decode dispatch, which reads and
+//!   writes the colour input in place (each invocation its own pixel only), and ends with
+//!   `COMPUTE_SHADER/SHADER_WRITE -> ALL_COMMANDS/MEMORY_READ|MEMORY_WRITE`. The encoded image (in
+//!   `C`) and the answer image (in `W`) go `UNDEFINED -> GENERAL` in the opening barrier (rewritten every hold;
+//!   the encoded image is read by `W` of the same hold, after `C`'s fence).
 //! - The game's own signals and fence: a semaphore signal's and a fence's first scope include
 //!   every command earlier in submission order, so the signals on `tail[0]` and the fence on the
 //!   last call still cover the prefix, `C` and `W` -- everything the game's batch covered before.
@@ -64,6 +78,8 @@ use ash::vk::Handle;
 use vulkan_layer::LayerVulkanCommand as VulkanCommand;
 
 use crate::shm::ShmClient;
+
+pub(crate) mod hdr;
 
 /// The variable that selects the mode. Read through `neural_forge_protocol::env`.
 pub(crate) const ENV: &str = "NEURAL_FORGE_PREUPSCALE";
@@ -86,6 +102,9 @@ pub(crate) enum Mode {
     Dump,
     Identity,
     Model,
+    /// The HDR encode and its inverse with the answer := the proxy itself (no helper call): checks
+    /// the transform's neutrality on the rig.
+    Roundtrip,
 }
 
 impl Mode {
@@ -96,6 +115,7 @@ impl Mode {
             Some("dump") => Ok(Mode::Dump),
             Some("identity") => Ok(Mode::Identity),
             Some("model") => Ok(Mode::Model),
+            Some("roundtrip") => Ok(Mode::Roundtrip),
             Some(other) => Err(other.to_string()),
         }
     }
@@ -106,7 +126,14 @@ impl Mode {
             Mode::Dump => "dump",
             Mode::Identity => "identity",
             Mode::Model => "model",
+            Mode::Roundtrip => "roundtrip",
         }
+    }
+
+    /// Whether the hold encodes the colour input for the model and decodes on write-back
+    /// ([`hdr`]). `identity` stays a raw copy-through (the hold's own cost).
+    pub(crate) fn hdr(self) -> bool {
+        matches!(self, Mode::Model | Mode::Roundtrip)
     }
 }
 
@@ -123,7 +150,7 @@ pub(crate) fn mode() -> Mode {
             Ok(_) => Mode::Off,
             Err(other) => {
                 if crate::layer_enabled() {
-                    crate::log!("[preupscale] {ENV}={other:?} is not one of off, dump, identity, model; staying off");
+                    crate::log!("[preupscale] {ENV}={other:?} is not one of off, dump, identity, model, roundtrip; staying off");
                 }
                 Mode::Off
             }
@@ -240,6 +267,9 @@ pub(crate) struct Inputs {
     /// The registered 1x1 float images (DLSS's exposure input among them), lowest handles first.
     /// Only dump mode reads them.
     pub exposure: [Option<(vk::Image, ImageDesc)>; MAX_EXPOSURE],
+    /// DLSS's exposure input, which the HDR encode multiplies in: the registered 1x1 R16_SFLOAT
+    /// image (lowest handle among several). NGX's own 1x1 RGBA32F images are not it.
+    pub exposure_input: Option<(vk::Image, ImageDesc)>,
 }
 
 /// The colour input: the registered RGBA16F storage image whose extent equals a registered depth
@@ -274,12 +304,14 @@ pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
     ) {
         *slot = Some(*found);
     }
+    let exposure_input = registered.values().find(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && d.format == vk::Format::R16_SFLOAT).copied();
     Some(Inputs {
         colour,
         depth: at(&|f| DEPTH_FORMATS.contains(&f), w, h)?,
         mvec: at(&|f| f == vk::Format::R16G16_SFLOAT, w, h)?,
         candidates: candidates.len(),
         exposure,
+        exposure_input,
     })
 }
 
@@ -321,6 +353,8 @@ pub(crate) struct Scan {
     pub mvec_layout: Option<vk::ImageLayout>,
     /// The exposure candidates' committed layouts, index for index with [`Inputs::exposure`].
     pub exposure_layouts: [Option<vk::ImageLayout>; MAX_EXPOSURE],
+    /// The exposure input's committed layout.
+    pub exposure_input_layout: Option<vk::ImageLayout>,
     pub evaluation: u64,
 }
 
@@ -394,7 +428,11 @@ impl Tracker {
 
     fn watched(&self, image: vk::Image) -> bool {
         self.inputs.is_some_and(|i| {
-            i.colour.0 == image || i.depth.0 == image || i.mvec.0 == image || i.exposure.iter().flatten().any(|e| e.0 == image)
+            i.colour.0 == image
+                || i.depth.0 == image
+                || i.mvec.0 == image
+                || i.exposure.iter().flatten().any(|e| e.0 == image)
+                || i.exposure_input.is_some_and(|e| e.0 == image)
         })
     }
 
@@ -429,7 +467,7 @@ impl Tracker {
             .filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d))))
             .collect();
         let inputs = identify(&registered, self.swapchain_extent());
-        let key = |i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0))));
+        let key = |i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
         if key(inputs) != key(self.inputs) {
             self.committed.clear();
             self.pending.clear();
@@ -437,7 +475,7 @@ impl Tracker {
         self.inputs = inputs;
         let line = match inputs {
             Some(i) => format!(
-                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}{}; swapchain {:?}",
+                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}{}, exposure input {}; swapchain {:?}",
                 hex(i.colour.0),
                 i.colour.1.width,
                 i.colour.1.height,
@@ -454,6 +492,7 @@ impl Tracker {
                 } else {
                     String::new()
                 },
+                i.exposure_input.map_or_else(|| "none (no registered 1x1 R16_SFLOAT)".to_string(), |(image, _)| hex(image)),
                 self.swapchain_extent()
             ),
             None => format!(
@@ -489,6 +528,7 @@ impl Tracker {
                         depth_layout: layout(self.inputs.map(|i| i.depth.0)),
                         mvec_layout: layout(self.inputs.map(|i| i.mvec.0)),
                         exposure_layouts: std::array::from_fn(|k| layout(self.inputs.and_then(|i| i.exposure[k]).map(|e| e.0))),
+                        exposure_input_layout: layout(self.inputs.and_then(|i| i.exposure_input).map(|e| e.0)),
                         evaluation: self.evaluations,
                     });
                 }
@@ -994,10 +1034,12 @@ impl HostBuffer {
 
 /// Allocates a mapped, host-visible, host-coherent `TRANSFER_SRC|TRANSFER_DST` buffer.
 fn own_host_buffer(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64) -> Option<HostBuffer> {
-    let info = vk::BufferCreateInfo::builder()
-        .size(bytes)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
-        .sharing_mode(vk::SharingMode::EXCLUSIVE);
+    own_host_buffer_with(device, instance, physical_device, bytes, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+}
+
+/// [`own_host_buffer`] with the given usage.
+fn own_host_buffer_with(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64, usage: vk::BufferUsageFlags) -> Option<HostBuffer> {
+    let info = vk::BufferCreateInfo::builder().size(bytes).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
     // SAFETY: `info` is valid.
     let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
     // SAFETY: `buffer` was just created.
@@ -1083,6 +1125,8 @@ pub(crate) struct Resources {
     answer_region: *mut u8,
     /// Dump-mode depth, motion-vector and exposure readbacks, built on first use.
     dump: Option<DumpBuffers>,
+    /// The HDR encode and decode (model and roundtrip modes), built on first use.
+    hdr: Option<hdr::HdrPass>,
     capture_pending: bool,
     writeback_pending: bool,
 }
@@ -1166,6 +1210,7 @@ impl Resources {
             answer,
             answer_region,
             dump: None,
+            hdr: None,
             capture_pending: false,
             writeback_pending: false,
         })
@@ -1238,6 +1283,9 @@ impl Resources {
                 dump.mvec.destroy(device);
                 dump.exposure.destroy(device);
             }
+            if let Some(hdr) = &self.hdr {
+                hdr.destroy(device);
+            }
         }
     }
 }
@@ -1272,6 +1320,12 @@ pub(crate) struct Target {
     /// (no barrier on it was seen: a storage image is then read as `GENERAL`, the layout
     /// vkd3d-proton keeps those in).
     pub exposure: [Option<(Aux, bool)>; MAX_EXPOSURE],
+    /// DLSS's exposure input (the registered 1x1 R16_SFLOAT image), read by the capture in model
+    /// and roundtrip modes for the HDR encode; `None` when there is none (those modes then fail
+    /// open). Its layout is the committed one, or `GENERAL` assumed for a storage image.
+    pub exposure_input: Option<Aux>,
+    /// The HDR encode's paper white ([`hdr::paper_white`]).
+    pub paper_white: f32,
 }
 
 /// Which of the layer's two submissions [`run_hold`] asks the caller to make.
@@ -1298,6 +1352,8 @@ pub(crate) struct HoldResult {
     pub writeback_gpu_ms: Option<f32>,
     /// Dump mode: the bytes to write, captured.
     pub dump: Option<DumpFrame>,
+    /// Model and roundtrip modes: the exposure value the capture read.
+    pub exposure: Option<f32>,
 }
 
 /// One dump's bytes, written off the submit thread by [`DumpFrame::write`].
@@ -1349,6 +1405,8 @@ enum DumpPart {
     Mvec,
     /// The exposure candidate at this index of [`Target::exposure`].
     Exposure(usize),
+    /// [`Target::exposure_input`], into the HDR pass's exposure buffer.
+    ExposureInput,
 }
 
 /// One image a dump copies into a readback buffer.
@@ -1363,14 +1421,22 @@ struct DumpRead {
     transition: bool,
 }
 
-/// The dump's reads: the depth aspect and the motion vectors at the render extent, and each 1x1
-/// exposure candidate at its [`EXPOSURE_STRIDE`] slot, each readable one in a layout it can be
-/// copied from (see [`aux_copy_layout`]).
-fn dump_reads(target: &Target, bufs: &DumpBuffers) -> Vec<DumpRead> {
+/// The capture's reads besides colour: for a dump, the depth aspect and the motion vectors at the
+/// render extent and each 1x1 exposure candidate at its [`EXPOSURE_STRIDE`] slot; for the HDR
+/// encode (`exposure_buffer`), the exposure input. Each readable one in a layout it can be copied
+/// from (see [`aux_copy_layout`]).
+fn capture_reads(target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: Option<vk::Buffer>) -> Vec<DumpRead> {
     let full = (target.width, target.height);
-    let mut parts = vec![(DumpPart::Depth, target.depth, bufs.depth.buffer, 0, full), (DumpPart::Mvec, target.mvec, bufs.mvec.buffer, 0, full)];
-    for (k, e) in target.exposure.iter().enumerate() {
-        parts.push((DumpPart::Exposure(k), e.map(|(a, _)| a), bufs.exposure.buffer, k as u64 * EXPOSURE_STRIDE, (1, 1)));
+    let mut parts = Vec::new();
+    if let Some(bufs) = bufs {
+        parts.push((DumpPart::Depth, target.depth, bufs.depth.buffer, 0, full));
+        parts.push((DumpPart::Mvec, target.mvec, bufs.mvec.buffer, 0, full));
+        for (k, e) in target.exposure.iter().enumerate() {
+            parts.push((DumpPart::Exposure(k), e.map(|(a, _)| a), bufs.exposure.buffer, k as u64 * EXPOSURE_STRIDE, (1, 1)));
+        }
+    }
+    if let Some(buffer) = exposure_buffer {
+        parts.push((DumpPart::ExposureInput, target.exposure_input, buffer, 0, (1, 1)));
     }
     parts
         .into_iter()
@@ -1382,21 +1448,24 @@ fn dump_reads(target: &Target, bufs: &DumpBuffers) -> Vec<DumpRead> {
         .collect()
 }
 
-/// Records the capture: colour (GENERAL) into the proxy buffer at the padded size; in dump mode
-/// also the depth aspect, the motion vectors and the 1x1 exposure candidates, each in its committed
+/// Records the capture into the proxy buffer at the padded size: the colour input (GENERAL) copied
+/// raw, or with `hdr`, the exposure input read into the HDR pass's buffer and the colour input
+/// encoded for the model ([`hdr::HdrPass::record_encode`]); in dump mode also the depth aspect, the
+/// motion vectors and the 1x1 exposure candidates. Each auxiliary image is read in its committed
 /// layout (transitioned to TRANSFER_SRC_OPTIMAL and back when that layout cannot be copied from).
 ///
 /// # Safety
-/// `res`'s capture command buffer must not be pending.
-unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>) -> ash::prelude::VkResult<()> {
+/// `res`'s capture command buffer must not be pending; with `hdr`, its colour view is bound to
+/// `target.colour`.
+unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>) -> ash::prelude::VkResult<()> {
     let cmd = res.capture_cmd;
     // SAFETY: the pool allows resetting buffers individually; the buffer is not pending.
     unsafe {
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
     }
-    let aux: Vec<DumpRead> = dump.map(|bufs| dump_reads(target, bufs)).unwrap_or_default();
-    let to_read: Vec<vk::ImageMemoryBarrier> = aux
+    let aux: Vec<DumpRead> = capture_reads(target, dump, hdr.map(hdr::HdrPass::exposure_buffer));
+    let mut to_read: Vec<vk::ImageMemoryBarrier> = aux
         .iter()
         .filter(|r| r.transition)
         .map(|&DumpRead { aux: a, read, .. }| {
@@ -1412,17 +1481,23 @@ unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target,
                 .build()
         })
         .collect();
-    let open = vk::MemoryBarrier::builder()
-        .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
-        .build();
+    // The encode's own image: its old contents are not needed (fully rewritten).
+    to_read.extend(hdr.map(hdr::HdrPass::encoded_to_general));
+    let (dst_stage, dst_access) = if hdr.is_some() {
+        (
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+        )
+    } else {
+        (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
+    };
+    let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(dst_access).build();
     // SAFETY: recording into the layer's own buffer; every handle is live.
     unsafe {
-        device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[open], &[], &to_read);
+        device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, dst_stage, vk::DependencyFlags::empty(), &[open], &[], &to_read);
         if let Some(timer) = &res.capture_timer {
             timer.record_start(device, cmd);
         }
-        device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, res.proxy.buffer, &capture_regions(target.width, target.height));
         for r in &aux {
             let aspect = if DEPTH_FORMATS.contains(&r.aux.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
             let region = vk::BufferImageCopy {
@@ -1434,6 +1509,10 @@ unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target,
                 image_extent: vk::Extent3D { width: r.extent.0, height: r.extent.1, depth: 1 },
             };
             device.cmd_copy_image_to_buffer(cmd, r.aux.image, r.read, r.buffer, &[region]);
+        }
+        match hdr {
+            Some(pass) => pass.record_encode(device, cmd, res.proxy.buffer, target.paper_white),
+            None => device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, res.proxy.buffer, &capture_regions(target.width, target.height)),
         }
     }
     let back: Vec<vk::ImageMemoryBarrier> = aux
@@ -1471,21 +1550,29 @@ unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target,
     }
 }
 
-/// Records the write-back: `source` (padded RGBA16F) into the colour input (GENERAL), cropping the
-/// padding, closed by a barrier that makes it visible to everything later on the queue.
+/// Records the write-back into the colour input (GENERAL), cropping the padding: `source` (padded
+/// RGBA16F) copied raw, or with `hdr`, copied into the HDR pass's answer image and decoded over the
+/// colour input in place ([`hdr::HdrPass::record_decode`]). Closed by a barrier that makes it
+/// visible to everything later on the queue.
 ///
 /// # Safety
-/// `res`'s write-back command buffer must not be pending.
-unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Target, source: vk::Buffer) -> ash::prelude::VkResult<()> {
+/// `res`'s write-back command buffer must not be pending; with `hdr`, the pass holds this hold's
+/// capture and its colour view is bound to `target.colour`.
+unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Target, source: vk::Buffer, hdr: Option<&hdr::HdrPass>) -> ash::prelude::VkResult<()> {
     let cmd = res.writeback_cmd;
-    let open = vk::MemoryBarrier::builder()
-        .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
-        .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
-        .build();
-    let close = vk::MemoryBarrier::builder()
-        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
-        .build();
+    let (dst_stage, dst_access, src_stage, src_access) = if hdr.is_some() {
+        (
+            vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
+            vk::PipelineStageFlags::COMPUTE_SHADER,
+            vk::AccessFlags::SHADER_WRITE,
+        )
+    } else {
+        (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
+    };
+    let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE).dst_access_mask(dst_access).build();
+    let close = vk::MemoryBarrier::builder().src_access_mask(src_access).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+    let answer_image: Vec<vk::ImageMemoryBarrier> = hdr.map(hdr::HdrPass::answer_to_general).into_iter().collect();
     // SAFETY: the layer's own buffer, not pending; every handle is live.
     unsafe {
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
@@ -1493,17 +1580,20 @@ unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Targe
         device.cmd_pipeline_barrier(
             cmd,
             vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST,
-            vk::PipelineStageFlags::TRANSFER,
+            dst_stage,
             vk::DependencyFlags::empty(),
             &[open],
             &[],
-            &[],
+            &answer_image,
         );
         if let Some(timer) = &res.writeback_timer {
             timer.record_start(device, cmd);
         }
-        device.cmd_copy_buffer_to_image(cmd, source, target.colour, vk::ImageLayout::GENERAL, &[writeback_region(target.width, target.height)]);
-        device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &[]);
+        match hdr {
+            Some(pass) => pass.record_decode(device, cmd, source, target.paper_white),
+            None => device.cmd_copy_buffer_to_image(cmd, source, target.colour, vk::ImageLayout::GENERAL, &[writeback_region(target.width, target.height)]),
+        }
+        device.cmd_pipeline_barrier(cmd, src_stage, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &[]);
         if let Some(timer) = &res.writeback_timer {
             timer.record_end(device, cmd);
         }
@@ -1513,7 +1603,10 @@ unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Targe
 
 /// One hold: capture the colour input into slot 0's proxy region, then per `mode` write the same
 /// bytes back (identity), hand them to the helper and write its answer back (model), or keep them
-/// for a dump. `submit` makes the layer's two submissions on the game's queue (the capture one with
+/// for a dump. In model and roundtrip modes the capture encodes the frame for the model and the
+/// write-back decodes the answer ([`hdr`]; roundtrip's answer is the encoded proxy itself); with no
+/// readable exposure image nothing is submitted, and with an unusable exposure value nothing is
+/// written back. `submit` makes the layer's two submissions on the game's queue (the capture one with
 /// the moved wait semaphores). Never blocks longer than the capture's bounded fence wait plus, in
 /// model mode, `budget`. The write-back is not waited on: its fence is checked at the next hold
 /// ([`Resources::wait_idle`]).
@@ -1549,9 +1642,33 @@ pub(crate) unsafe fn run_hold(
             }
         }
     }
+    if mode.hdr() {
+        // The encode needs the game's exposure value; without a readable exposure image nothing is
+        // captured and the frame goes to DLSS untouched.
+        if !target.exposure_input.is_some_and(|a| a.readable && aux_copy_layout(a.layout).is_some()) {
+            result.miss = Some("no readable exposure image (registered 1x1 R16_SFLOAT) for the HDR encode");
+            return result;
+        }
+        if res.hdr.is_none() {
+            // SAFETY: `device` is live.
+            res.hdr = unsafe { hdr::HdrPass::build(device, instance, physical_device, res.width, res.height) };
+        }
+        let Some(pass) = res.hdr.as_mut() else {
+            result.miss = Some("the HDR encode/decode pipelines could not be built");
+            return result;
+        };
+        pass.clear_exposure();
+        // SAFETY: nothing of the pass is pending (`wait_idle` above); the colour input is a live
+        // plain RGBA16F storage image (`identify`).
+        if !unsafe { pass.bind_colour(device, target.colour) } {
+            result.miss = Some("a storage view of the colour input could not be created");
+            return result;
+        }
+    }
+    let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     let dump_bufs = if dump { res.dump.as_ref() } else { None };
-    // SAFETY: the capture buffer is idle (`wait_idle` above).
-    if unsafe { record_capture(device, res, target, dump_bufs) }.is_err() {
+    // SAFETY: the capture buffer is idle (`wait_idle` above); the colour view was bound above.
+    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass) }.is_err() {
         result.miss = Some("recording the capture failed");
         return result;
     }
@@ -1586,6 +1703,15 @@ pub(crate) unsafe fn run_hold(
         // is larger); the capture's fence was waited on and its memory is host-coherent.
         unsafe { std::ptr::copy_nonoverlapping(res.proxy.ptr, res.proxy_region, bytes) };
     }
+    if let Some(pass) = res.hdr.as_ref().filter(|_| mode.hdr()) {
+        // The decode divides by it: a zero, negative or non-finite exposure means no write-back.
+        let e = pass.exposure_value();
+        result.exposure = Some(e);
+        if !hdr::exposure_ok(e) {
+            result.miss = Some("the exposure value is not usable (zero, negative or not finite)");
+            return result;
+        }
+    }
     let source = match mode {
         Mode::Off => return result,
         Mode::Dump => {
@@ -1594,7 +1720,7 @@ pub(crate) unsafe fn run_hold(
                 // SAFETY: the capture finished; each buffer holds at least `at + len` bytes (`n`,
                 // `bytes`, `MAX_EXPOSURE * EXPOSURE_STRIDE`).
                 let read = |buf: &HostBuffer, at: usize, len: usize| unsafe { std::slice::from_raw_parts(buf.ptr.add(at), len) }.to_vec();
-                let reads = res.dump.as_ref().map(|bufs| dump_reads(target, bufs)).unwrap_or_default();
+                let reads = res.dump.as_ref().map(|bufs| capture_reads(target, Some(bufs), None)).unwrap_or_default();
                 let was_read = |part: DumpPart| reads.iter().any(|r| r.part == part);
                 result.dump = Some(DumpFrame {
                     width: target.width,
@@ -1628,7 +1754,8 @@ pub(crate) unsafe fn run_hold(
             }
             return result;
         }
-        Mode::Identity => res.proxy.buffer,
+        // The encoded picture itself is the answer: the decode must give the frame back.
+        Mode::Identity | Mode::Roundtrip => res.proxy.buffer,
         Mode::Model => {
             let (pw, ph) = padded(target.width, target.height);
             shm.set_frame_info(0, pw, ph, neural_forge_protocol::enums::proxy_format::RGBA16F);
@@ -1671,8 +1798,10 @@ pub(crate) unsafe fn run_hold(
             res.answer.buffer
         }
     };
-    // SAFETY: the write-back buffer is idle (`wait_idle` above).
-    if unsafe { record_writeback(device, res, target, source) }.is_err() {
+    let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
+    // SAFETY: the write-back buffer is idle (`wait_idle` above); in the HDR modes the pass holds this
+    // hold's capture and its colour view.
+    if unsafe { record_writeback(device, res, target, source, hdr_pass) }.is_err() {
         result.miss = Some("recording the write-back failed");
         return result;
     }
@@ -2057,7 +2186,9 @@ mod tests {
         assert_eq!(Mode::parse(Some("dump")), Ok(Mode::Dump));
         assert_eq!(Mode::parse(Some("identity")), Ok(Mode::Identity));
         assert_eq!(Mode::parse(Some(" model ")), Ok(Mode::Model));
+        assert_eq!(Mode::parse(Some("roundtrip")), Ok(Mode::Roundtrip));
         assert!(Mode::parse(Some("on")).is_err());
+        assert!(Mode::Model.hdr() && Mode::Roundtrip.hdr() && !Mode::Identity.hdr() && !Mode::Dump.hdr(), "identity stays the raw copy-through");
         assert!(commands(false).is_empty());
         assert!(commands(true).contains(&VulkanCommand::CmdCuLaunchKernelNvx));
         // The test process does not set the variable: off, and nothing extra is hooked.
@@ -2316,6 +2447,11 @@ mod tests {
         assert_eq!(found.mvec.0, vk::Image::from_raw(0x300));
         assert_eq!(found.candidates, 1);
         assert_eq!(found.exposure.map(|e| e.map(|e| e.0.as_raw())), [Some(0x600), Some(0x610), None, None], "the 1x1 float images, not the 5120x2880 R16F");
+        assert_eq!(found.exposure_input.map(|e| e.0.as_raw()), Some(0x610), "the exposure input is the 1x1 R16F, not NGX's RGBA32F");
+        let mut no_exposure = set.clone();
+        no_exposure.remove(&0x610);
+        let found = identify(&no_exposure, Some((2560, 1440))).expect("still identified");
+        assert_eq!(found.exposure_input, None, "no 1x1 R16F: no exposure input (the HDR modes then fail open)");
         assert_eq!(identify(&set, None), None, "no swapchain, no comparison, no hold");
         assert_eq!(identify(&set, Some((1707, 960))), None, "DLAA: the render extent is the output's");
         let mut no_mv = set.clone();
@@ -2591,6 +2727,18 @@ mod tests {
         }
     }
 
+    /// Another fake "model", in the encoded domain: `0.9 * v + 0.05` per colour channel, clamped
+    /// to [0, 0.9995] as the real model's answers are; alpha 1.
+    fn affine(texels: &mut [u8]) {
+        for t in texels.chunks_exact_mut(TEXEL as usize) {
+            for c in 0..3 {
+                let v = f16_to_f32(u16::from_le_bytes([t[c * 2], t[c * 2 + 1]]));
+                t[c * 2..c * 2 + 2].copy_from_slice(&f32_to_f16((0.9 * v + 0.05).clamp(0.0, 0.9995)).to_le_bytes());
+            }
+            t[6..8].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
+        }
+    }
+
     /// A stand-in helper on the header: keeps its heartbeat moving and, unless muted, answers each
     /// slot-0 request by transforming the proxy region into the answer region at the size the
     /// layer published.
@@ -2601,7 +2749,7 @@ mod tests {
     }
 
     impl FakeHelper {
-        fn start(shm: &ShmClient) -> Self {
+        fn start(shm: &ShmClient, transform: fn(&mut [u8])) -> Self {
             let header = shm.test_header_ptr();
             let proxy = shm.proxy_region(0).unwrap().0 as usize;
             let answer = shm.answer_region(0).unwrap().0 as usize;
@@ -2621,7 +2769,7 @@ mod tests {
                         let n = w as usize * h as usize * TEXEL as usize;
                         // SAFETY: both regions are `MAX_FRAME`-sized and mapped for the process.
                         let mut texels = unsafe { std::slice::from_raw_parts(proxy as *const u8, n) }.to_vec();
-                        swap_rb(&mut texels);
+                        transform(&mut texels);
                         unsafe { std::ptr::copy_nonoverlapping(texels.as_ptr(), answer as *mut u8, n) };
                         hdr.answered_w.store(w, Ordering::Relaxed);
                         hdr.answered_h.store(h, Ordering::Relaxed);
@@ -2655,11 +2803,225 @@ mod tests {
         shm
     }
 
-    /// The hold on a 17x9 RGBA16F image in GENERAL (odd in both directions): identity leaves the image
-    /// bit-identical and pads the proxy with the edge; model writes the fake helper's transformed
-    /// answer back with the padding cropped; a helper that does not answer leaves the image
-    /// untouched and the hold returns within its budget. Once with the SHM regions imported
-    /// (zero-copy), once staged.
+    fn wait_for_helper(shm: &mut ShmClient) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !shm.helper_alive() {
+            assert!(Instant::now() < deadline, "the fake helper's heartbeat is never seen");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    // ---- The HDR encode: a CPU reference and the GPU checks against it. ----
+
+    /// Single to half precision, round to nearest even.
+    fn f32_to_f16(v: f32) -> u16 {
+        if v.is_nan() {
+            return 0x7e00;
+        }
+        let sign = if v.is_sign_negative() { 0x8000u16 } else { 0 };
+        let a = f64::from(v.abs());
+        if a >= 65520.0 {
+            return sign | 0x7c00;
+        }
+        if a < 2f64.powi(-14) {
+            // Subnormal (or zero) in units of 2^-24; 1024 rounds up into the smallest normal.
+            return sign | (a * 2f64.powi(24)).round_ties_even() as u16;
+        }
+        let mut e = a.log2().floor() as i32;
+        if 2f64.powi(e) > a {
+            e -= 1;
+        }
+        if 2f64.powi(e + 1) <= a {
+            e += 1;
+        }
+        let mut m = ((a / 2f64.powi(e) - 1.0) * 1024.0).round_ties_even() as u32;
+        if m == 1024 {
+            m = 0;
+            e += 1;
+        }
+        if e > 15 {
+            return sign | 0x7c00;
+        }
+        sign | (((e + 15) as u16) << 10) | m as u16
+    }
+
+    #[test]
+    fn half_conversion_round_trips_every_finite_half() {
+        for h in 0u16..=0xffff {
+            let v = f16_to_f32(h);
+            if v.is_finite() {
+                assert_eq!(f16_to_f32(f32_to_f16(v)).to_bits(), v.to_bits(), "{h:#06x} = {v}");
+            }
+        }
+        assert_eq!(f32_to_f16(0.1), 0x2e66);
+        assert_eq!(f32_to_f16(1e6), 0x7c00);
+    }
+
+    /// The CPU reference of `preupscale_encode.comp` / `preupscale_decode.comp`, in f64, from the
+    /// formulas in docs/PRE_UPSCALER_DESIGN.md, "E1b: the HDR encode" (the 8-bit path's edit).
+    mod hdr_ref {
+        const K: f64 = 5.770780;
+        const KNEE: f64 = 0.75;
+
+        fn srgb_oetf(c: f64) -> f64 {
+            let c = c.clamp(0.0, 1.0);
+            if c <= 0.0031308 { 12.92 * c } else { 1.055 * c.powf(1.0 / 2.4) - 0.055 }
+        }
+
+        fn srgb_eotf(s: f64) -> f64 {
+            let s = s.clamp(0.0, 1.0);
+            if s <= 0.04045 { s / 12.92 } else { ((s + 0.055) / 1.055).powf(2.4) }
+        }
+
+        /// scene-linear -> model domain: `max(scene, 0) * e / w`, the shoulder above 0.75, sRGB.
+        pub fn encode(scene: f32, e: f32, w: f32) -> f64 {
+            let x = if scene >= 0.0 { f64::from(scene) } else { 0.0 };
+            let v = x * f64::from(e) / f64::from(w);
+            srgb_oetf(if v <= KNEE { v } else { KNEE + 0.25 * (1.0 - (-K * (v - KNEE)).exp()) })
+        }
+
+        /// model domain -> scene-linear: sRGB EOTF, clamped below 1 - 1e-4, the shoulder's inverse.
+        pub fn decode(answer: f32, e: f32, w: f32) -> f64 {
+            let y = srgb_eotf(f64::from(answer)).min(1.0 - 1e-4);
+            let v = if y >= KNEE { KNEE - (1.0 - (y - KNEE) / 0.25).ln() / K } else { y };
+            v * f64::from(w) / f64::from(e)
+        }
+    }
+
+    /// A scene-linear RGBA16F test frame: a ramp from 0 to about 60 per channel at different rates
+    /// (with the game's exposure and paper white 3, encoded values from 0 through the shoulder to
+    /// its clamped top), a black texel, a sun texel (1000, 800, 30000) and a near-black one; alpha
+    /// 0.25..0.75.
+    fn hdr_pattern(width: u32, height: u32) -> Vec<u8> {
+        let n = (width * height) as usize;
+        let mut out = Vec::with_capacity(n * TEXEL as usize);
+        for i in 0..n {
+            let t = i as f64 / (n - 1) as f64;
+            let rgb = match i {
+                0 => [0.0, 0.0, 0.0],
+                1 => [1000.0, 800.0, 30000.0],
+                2 => [0.01, 0.02, 0.05],
+                _ => [60.0 * t * t, 45.0 * t, 48.0 * t.sqrt()],
+            };
+            for v in [rgb[0], rgb[1], rgb[2], 0.25 + 0.5 * t] {
+                out.extend_from_slice(&f32_to_f16(v as f32).to_le_bytes());
+            }
+        }
+        out
+    }
+
+    /// One half of a tightly packed RGBA16F buffer `row` texels wide.
+    fn half_at(buf: &[u8], row: u32, x: u32, y: u32, c: usize) -> u16 {
+        let at = ((y * row + x) as usize * TEXEL as usize) + c * 2;
+        u16::from_le_bytes([buf[at], buf[at + 1]])
+    }
+
+    fn proxy_bytes(shm: &ShmClient, pw: u32, ph: u32) -> Vec<u8> {
+        unsafe { std::slice::from_raw_parts(shm.proxy_region(0).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec()
+    }
+
+    fn answer_bytes(shm: &ShmClient, pw: u32, ph: u32) -> Vec<u8> {
+        unsafe { std::slice::from_raw_parts(shm.answer_region(0).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec()
+    }
+
+    /// Check (a): every texel of the padded proxy is the CPU encode of the colour input's texel
+    /// (the edge texel for the padding) within 1e-3, alpha exactly 1. Returns how many channels in
+    /// the real extent the encode clamped (>= 0.999).
+    fn check_encode(proxy: &[u8], original: &[u8], w: u32, h: u32, e: f32, white: f32) -> usize {
+        let (pw, ph) = padded(w, h);
+        let mut clamped = 0;
+        for y in 0..ph {
+            for x in 0..pw {
+                let (sx, sy) = (x.min(w - 1), y.min(h - 1));
+                for c in 0..3 {
+                    let scene = f16_to_f32(half_at(original, w, sx, sy, c));
+                    let want = hdr_ref::encode(scene, e, white);
+                    let got = f16_to_f32(half_at(proxy, pw, x, y, c));
+                    assert!((f64::from(got) - want).abs() <= 1e-3, "encode at {x},{y} channel {c}: scene {scene} -> {got}, the CPU reference says {want}");
+                    if got >= hdr::CLAMPED && x < w && y < h {
+                        clamped += 1;
+                    }
+                }
+                assert_eq!(half_at(proxy, pw, x, y, 3), 0x3c00, "alpha 1 at {x},{y}");
+            }
+        }
+        clamped
+    }
+
+    /// The write-back: per channel, the original where the encoded input (`proxy`) was >= 0.999,
+    /// else the CPU inverse of the answer (`answer`) within relative 2e-3; alpha the original's.
+    #[allow(clippy::too_many_arguments)]
+    fn check_decode(after: &[u8], original: &[u8], proxy: &[u8], answer: &[u8], w: u32, h: u32, e: f32, white: f32) {
+        let (pw, _) = padded(w, h);
+        for y in 0..h {
+            for x in 0..w {
+                for c in 0..3 {
+                    let got = half_at(after, w, x, y, c);
+                    let orig = half_at(original, w, x, y, c);
+                    let enc = f16_to_f32(half_at(proxy, pw, x, y, c));
+                    if enc >= hdr::CLAMPED {
+                        assert_eq!(got, orig, "a clamped highlight keeps its original value at {x},{y} channel {c} (encoded {enc})");
+                        continue;
+                    }
+                    let want = hdr_ref::decode(f16_to_f32(half_at(answer, pw, x, y, c)), e, white);
+                    let got = f64::from(f16_to_f32(got));
+                    assert!((got - want).abs() <= 2e-3 * want.abs() + 1e-5, "decode at {x},{y} channel {c}: {got}, the CPU reference says {want}");
+                }
+                assert_eq!(half_at(after, w, x, y, 3), half_at(original, w, x, y, 3), "alpha is kept at {x},{y}");
+            }
+        }
+    }
+
+    /// A 1x1 R16_SFLOAT image holding `value`, in GENERAL: DLSS's exposure input.
+    fn exposure_image(gpu: &Gpu, value: f32) -> (vk::Image, vk::DeviceMemory) {
+        let d = &gpu.device;
+        let info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R16_SFLOAT)
+            .extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let image = unsafe { d.create_image(&info, None) }.unwrap();
+        let reqs = unsafe { d.get_image_memory_requirements(image) };
+        let index = (0..32).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
+        let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
+        unsafe { d.bind_image_memory(image, memory, 0) }.unwrap();
+        let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+        gpu.one_shot(|cmd| unsafe {
+            Gpu::barrier(cmd, d, image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
+            d.cmd_clear_color_image(cmd, image, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [value, 0.0, 0.0, 0.0] }, &[range]);
+            Gpu::barrier(cmd, d, image, vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL);
+        });
+        (image, memory)
+    }
+
+    fn exposure_aux(image: vk::Image) -> Option<Aux> {
+        Some(Aux { image, format: vk::Format::R16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true })
+    }
+
+    /// Waits for the layer's own work, then frees `res` and the test's images.
+    fn finish(gpu: &Gpu, mut res: Resources, images: &[(vk::Image, vk::DeviceMemory)]) {
+        let mut gpu_ms = None;
+        assert!(res.wait_idle(&gpu.device, &mut gpu_ms));
+        unsafe {
+            res.destroy(&gpu.device);
+            for &(i, m) in images {
+                gpu.device.destroy_image(i, None);
+                gpu.device.free_memory(m, None);
+            }
+        }
+    }
+
+    /// The hold on a 17x9 RGBA16F image in GENERAL (odd in both directions): identity leaves the
+    /// image bit-identical and pads the proxy with the edge (the raw copy-through); model sends the
+    /// HDR-encoded frame and writes the fake helper's answer (red and blue swapped, in the encoded
+    /// domain) back through the inverse with the padding cropped and clamped highlights kept
+    /// (check (c)); a helper that does not answer leaves the image untouched and the hold returns
+    /// within its budget. Once with the SHM regions imported (zero-copy), once staged.
     #[test]
     fn a_hold_is_picture_neutral_in_identity_applies_the_answer_in_model_and_fails_open_on_timeout() {
         for import in [true, false] {
@@ -2670,17 +3032,19 @@ mod tests {
             let (w, h) = (17u32, 9u32);
             let (pw, ph) = padded(w, h);
             let (image, memory) = gpu.image(w, h);
-            let original = pattern(w, h);
+            let original = hdr_pattern(w, h);
             gpu.upload(image, w, h, &original);
             assert_eq!(gpu.read(image, w, h), original, "the test's own upload round-trips");
+            let (exposure, exposure_mem) = exposure_image(&gpu, 0.128);
 
             let mut shm = scratch_shm(if import { "import" } else { "staged" });
-            let helper = FakeHelper::start(&shm);
+            let helper = FakeHelper::start(&shm, swap_rb);
             let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
             if cfg!(target_pointer_width = "64") {
                 assert_eq!(res.imported(), import, "imported exactly when the device can");
             }
-            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE] };
+            let white = hdr::DEFAULT_PAPER_WHITE;
+            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white };
             let (device, queue) = (&gpu.device, gpu.queue);
             let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
                 device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
@@ -2691,7 +3055,7 @@ mod tests {
             assert!(result.waits_consumed && result.wrote_back, "{result:?}");
             assert_eq!(result.miss, None);
             assert_eq!(gpu.read(image, w, h), original, "identity is bit-identical");
-            let proxy = unsafe { std::slice::from_raw_parts(shm.proxy_region(0).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec();
+            let proxy = proxy_bytes(&shm, pw, ph);
             let texel = |buf: &[u8], x: u32, y: u32, row: u32| buf[((y * row + x) as usize * TEXEL as usize)..][..TEXEL as usize].to_vec();
             for y in 0..h {
                 for x in 0..w {
@@ -2703,19 +3067,23 @@ mod tests {
                 assert_eq!(texel(&proxy, x, ph - 1, pw), texel(&proxy, x, h - 1, pw), "padding row duplicates the edge, column {x}");
             }
 
-            // Model: the helper's answer comes back, padding cropped.
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while !shm.helper_alive() {
-                assert!(Instant::now() < deadline, "the fake helper's heartbeat is never seen");
-                std::thread::sleep(Duration::from_millis(1));
-            }
+            // Model: the frame goes out encoded, the helper's answer comes back decoded, padding
+            // cropped, clamped highlights kept.
+            wait_for_helper(&mut shm);
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 1, Duration::from_secs(10), &mut submit) };
             assert!(result.wrote_back, "{result:?}");
             assert_eq!(shm.answered_dims(), Some((pw, ph)), "the helper was asked for the padded size");
-            let mut expected = original.clone();
-            swap_rb(&mut expected);
+            let e = result.exposure.expect("the exposure value was read");
+            assert!((e - 0.128).abs() < 1e-3, "the exposure image's value: {e}");
+            let proxy = proxy_bytes(&shm, pw, ph);
+            let clamped = check_encode(&proxy, &original, w, h, e, white);
+            assert!(clamped > 0, "the pattern reaches the shoulder's top");
+            let mut answer = proxy.clone();
+            swap_rb(&mut answer);
+            assert_eq!(answer_bytes(&shm, pw, ph), answer, "the fake helper answered");
             let after_model = gpu.read(image, w, h);
-            assert_eq!(after_model, expected, "the model's answer replaces the colour input");
+            assert_ne!(after_model, original, "the answer was applied");
+            check_decode(&after_model, &original, &proxy, &answer, w, h, e, white);
 
             // Timeout: the helper is alive but silent; the image is left alone, promptly.
             helper.mute.store(true, Ordering::Relaxed);
@@ -2727,16 +3095,197 @@ mod tests {
             assert!(took < Duration::from_secs(1), "a late answer must not hold the submit beyond its budget (took {took:?})");
             assert_eq!(gpu.read(image, w, h), after_model, "a missed answer leaves the frame untouched");
 
-            eprintln!("preupscale hold test (import={import}): identity, model and timeout checked");
+            eprintln!("preupscale hold test (import={import}): identity, model (HDR encode/decode, {clamped} clamped channels kept) and timeout checked");
             drop(helper);
-            let mut gpu_ms = None;
-            assert!(res.wait_idle(&gpu.device, &mut gpu_ms));
-            unsafe {
-                res.destroy(&gpu.device);
-                gpu.device.destroy_image(image, None);
-                gpu.device.free_memory(memory, None);
-            }
+            finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
         }
+    }
+
+    /// Checks (a) and (b): roundtrip mode on a 17x9 scene-linear frame with the game's exposure.
+    /// The proxy is the CPU reference encode within 1e-3 (padding included, alpha 1); the
+    /// write-back gives the frame back: channels the encode clamped (>= 0.999) bit-exactly, every
+    /// other one within relative 1e-3 plus what the half floats themselves lose (one step of the
+    /// 16-bit proxy, carried through the inverse, plus one step of the 16-bit result). That bound
+    /// rather than a flat 2e-3: lavapipe's (and Intel's) float-to-half store truncates, which alone makes
+    /// midtones come back up to ~2.6e-3 off, and towards the shoulder's top the inverse steepens
+    /// so one proxy step is several percent (the maxima per band are printed). The write-back is
+    /// also checked against the CPU inverse of the proxy within 2e-3 (`check_decode`). No helper is
+    /// involved. A second hold on the result is again its own inverse. Imported and staged.
+    #[test]
+    fn roundtrip_encodes_like_the_cpu_reference_and_decodes_back_to_the_frame() {
+        for import in [true, false] {
+            let Some(gpu) = Gpu::open(import) else {
+                eprintln!("preupscale roundtrip test (import={import}): no suitable Vulkan device, skipping");
+                continue;
+            };
+            let (w, h) = (17u32, 9u32);
+            let (pw, ph) = padded(w, h);
+            let (image, memory) = gpu.image(w, h);
+            let original = hdr_pattern(w, h);
+            gpu.upload(image, w, h, &original);
+            let (exposure, exposure_mem) = exposure_image(&gpu, 0.128);
+            let mut shm = scratch_shm(if import { "rt-import" } else { "rt-staged" });
+            let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
+            let white = 2.5;
+            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white };
+            let (device, queue) = (&gpu.device, gpu.queue);
+            let mut submits = Vec::new();
+            let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+                submits.push(which);
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+            };
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut submit) };
+            assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{result:?}");
+            assert!(!shm.has_pending_request(0), "roundtrip never calls the helper");
+            let e = result.exposure.expect("exposure read");
+            let proxy = proxy_bytes(&shm, pw, ph);
+            let clamped = check_encode(&proxy, &original, w, h, e, white);
+            let after = gpu.read(image, w, h);
+            check_decode(&after, &original, &proxy, &proxy, w, h, e, white);
+            let (mut strict, mut steep, mut kept) = (0f64, 0f64, 0);
+            // How this device rounds into the 16-bit proxy (reported): to nearest, or towards zero.
+            let (mut nearest, mut channels) = (0, 0);
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let want = hdr_ref::encode(f16_to_f32(half_at(&original, w, x, y, c)), e, white) as f32;
+                        channels += 1;
+                        nearest += usize::from(half_at(&proxy, pw, x, y, c) == f32_to_f16(want));
+                    }
+                }
+            }
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let x0 = f64::from(f16_to_f32(half_at(&original, w, x, y, c)));
+                        let enc_bits = half_at(&proxy, pw, x, y, c);
+                        let enc = f16_to_f32(enc_bits);
+                        let got = f64::from(f16_to_f32(half_at(&after, w, x, y, c)));
+                        if enc >= hdr::CLAMPED {
+                            kept += 1;
+                            assert_eq!(got, x0);
+                            continue;
+                        }
+                        // One step of the 16-bit proxy, in scene units, plus one step of the 16-bit
+                        // result: what half floats alone can lose (either rounding mode).
+                        let proxy_step = (hdr_ref::decode(f16_to_f32(enc_bits + 1), e, white) - hdr_ref::decode(enc, e, white)).abs();
+                        let out_step = f64::from(f16_to_f32(f32_to_f16(x0 as f32) + 1)) - x0;
+                        let rel = (got - x0).abs() / x0.max(1e-6);
+                        assert!(
+                            (got - x0).abs() <= 1e-3 * x0 + proxy_step + out_step + 1e-6,
+                            "roundtrip at {x},{y} channel {c}: {x0} -> {got} (encoded {enc}, one proxy step = {proxy_step}, one result step = {out_step})"
+                        );
+                        if enc <= 0.9 {
+                            strict = strict.max(rel);
+                        } else {
+                            steep = steep.max(rel);
+                        }
+                    }
+                }
+            }
+            assert_eq!(kept, clamped);
+            assert!(kept > 0, "the pattern has clamped highlights");
+            // Stable: a second roundtrip on the written-back frame is again its own inverse.
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Roundtrip, false, 1, ANSWER_BUDGET, &mut submit) };
+            assert!(result.wrote_back, "{result:?}");
+            assert_eq!(submits, vec![Which::Capture, Which::WriteBack, Which::Capture, Which::WriteBack]);
+            let again = gpu.read(image, w, h);
+            let proxy2 = proxy_bytes(&shm, pw, ph);
+            check_decode(&again, &after, &proxy2, &proxy2, w, h, e, white);
+            eprintln!(
+                "preupscale roundtrip test (import={import}): e={e} white={white}; max relative error {strict:.2e} (encoded <= 0.9), {steep:.2e} (0.9 < encoded < 0.999); {kept} clamped channels kept exactly; {nearest}/{channels} proxy halves round-to-nearest of the CPU encode"
+            );
+            finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
+        }
+    }
+
+    /// Check (c) with a non-trivial answer: the fake helper maps every encoded channel through
+    /// `0.9 v + 0.05` (clamped to the model's [0, 0.9995]); the write-back is the CPU inverse of
+    /// that answer, the clamped highlights the original. Even size (no padding), staged.
+    #[test]
+    fn model_mode_writes_back_the_inverse_of_the_answer() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("preupscale model inverse test: no Vulkan device, skipping");
+            return;
+        };
+        let (w, h) = (16u32, 6u32);
+        let (image, memory) = gpu.image(w, h);
+        let original = hdr_pattern(w, h);
+        gpu.upload(image, w, h, &original);
+        let (exposure, exposure_mem) = exposure_image(&gpu, 0.1581);
+        let mut shm = scratch_shm("affine");
+        let helper = FakeHelper::start(&shm, affine);
+        wait_for_helper(&mut shm);
+        let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
+        let white = hdr::DEFAULT_PAPER_WHITE;
+        let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white };
+        let (device, queue) = (&gpu.device, gpu.queue);
+        let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+        };
+        let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 0, Duration::from_secs(10), &mut submit) };
+        assert!(result.wrote_back, "{result:?}");
+        let e = result.exposure.unwrap();
+        let proxy = proxy_bytes(&shm, w, h);
+        check_encode(&proxy, &original, w, h, e, white);
+        let mut answer = proxy.clone();
+        affine(&mut answer);
+        assert_eq!(answer_bytes(&shm, w, h), answer);
+        let after = gpu.read(image, w, h);
+        check_decode(&after, &original, &proxy, &answer, w, h, e, white);
+        // Not the identity: a midtone moved by the answer's change, through the inverse.
+        let mid = f16_to_f32(half_at(&original, w, 8, 2, 1));
+        let moved = f16_to_f32(half_at(&after, w, 8, 2, 1));
+        assert!((moved - mid).abs() > 0.01 * mid, "{mid} -> {moved}");
+        drop(helper);
+        finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
+    }
+
+    /// Check (d): no exposure image, an unreadable one, or one holding 0: model and roundtrip modes
+    /// leave the frame untouched and never call the helper. Without a readable image nothing is
+    /// submitted at all (the waits stay with the game's batch); with a zero value the capture runs
+    /// and the write-back is skipped.
+    #[test]
+    fn a_missing_or_zero_exposure_leaves_the_frame_untouched() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("preupscale exposure fail-open test: no Vulkan device, skipping");
+            return;
+        };
+        let (w, h) = (9u32, 5u32);
+        let (image, memory) = gpu.image(w, h);
+        let original = hdr_pattern(w, h);
+        gpu.upload(image, w, h, &original);
+        let (zero, zero_mem) = exposure_image(&gpu, 0.0);
+        let mut shm = scratch_shm("noexposure");
+        let helper = FakeHelper::start(&shm, swap_rb);
+        wait_for_helper(&mut shm);
+        let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
+        let (device, queue) = (&gpu.device, gpu.queue);
+        let mut submits = Vec::new();
+        let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+            submits.push(which);
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+        };
+        let base = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE };
+        let unreadable = Some(Aux { readable: false, ..exposure_aux(zero).unwrap() });
+        for (mode, exposure_input) in [(Mode::Model, None), (Mode::Roundtrip, None), (Mode::Model, unreadable)] {
+            let target = Target { exposure_input, ..base };
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, mode, false, 0, ANSWER_BUDGET, &mut submit) };
+            assert!(!result.waits_consumed && !result.wrote_back && !result.over_budget, "{mode:?}: {result:?}");
+            assert!(result.miss.is_some_and(|m| m.contains("exposure")), "{result:?}");
+        }
+        for mode in [Mode::Model, Mode::Roundtrip] {
+            let target = Target { exposure_input: exposure_aux(zero), ..base };
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, mode, false, 0, ANSWER_BUDGET, &mut submit) };
+            assert!(result.waits_consumed && !result.wrote_back && !result.over_budget, "{mode:?}: {result:?}");
+            assert_eq!(result.exposure, Some(0.0));
+            assert!(result.miss.is_some_and(|m| m.contains("exposure value")), "{result:?}");
+        }
+        assert_eq!(submits, vec![Which::Capture, Which::Capture], "nothing without an exposure image; captures only, no write-back, with a zero one");
+        assert!(!shm.has_pending_request(0), "the helper was never asked");
+        assert_eq!(gpu.read(image, w, h), original, "the frame is untouched");
+        drop(helper);
+        finish(&gpu, res, &[(image, memory), (zero, zero_mem)]);
     }
 
     /// Dump mode on a real device: colour (padded), the depth aspect of a D32S8 image that sits in
@@ -2827,6 +3376,8 @@ mod tests {
                 None,
                 Some((Aux { image: exp16, format: vk::Format::R16_SFLOAT, layout: None, readable: true }, false)),
             ],
+            exposure_input: None,
+            paper_white: hdr::DEFAULT_PAPER_WHITE,
         };
         let queue = gpu.queue;
         let mut submits = Vec::new();

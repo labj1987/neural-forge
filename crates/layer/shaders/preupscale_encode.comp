@@ -1,0 +1,70 @@
+#version 450
+// The pre-upscaler path's HDR encode (docs/PRE_UPSCALER_DESIGN.md, "E1b: the HDR encode" and
+// "Implementation (layer)"): turns DLSS's scene-linear, pre-exposure RGBA16F colour input into the
+// display-referred [0, 1] picture the model expects, at the padded size the helper is sent.
+//
+// Per channel: v = max(scene, 0) * e / paper_white (e: the game's 1x1 R16_SFLOAT exposure value,
+// multiplied in); above 0.75 the shoulder 0.75 + 0.25 * (1 - exp(-K * (v - 0.75))); then the sRGB
+// OETF. Alpha is 1. Padding: an invocation outside the real extent reads the nearest edge texel, so
+// the padding column/row duplicates the last column/row (as the raw copy's regions do).
+//
+// The descriptor set layout and the push constants are shared with preupscale_decode.comp and must
+// stay identical in both shaders and in `preupscale::hdr::HdrPush` (field for field, append only).
+// The curve functions are duplicated in preupscale_decode.comp (no include: scripts/check_shaders.py
+// hashes .comp files only) and must stay the same functions as the CPU reference in
+// `preupscale::tests::hdr_ref`.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The game's colour input, in GENERAL. Only read here.
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_colour;
+// The encoded picture, padded extent, GENERAL. Copied to the proxy region afterwards, and read by
+// the decode for the clamped-highlight rule.
+layout(set = 0, binding = 1, rgba16f) uniform writeonly image2D u_encoded;
+// The exposure texel (R16_SFLOAT, copied in by the capture's transfer), in the low 16 bits.
+layout(set = 0, binding = 2, std430) readonly buffer Exposure {
+  uint bits;
+} u_exposure;
+// binding 3 (the answer image) is the decode's only.
+
+layout(push_constant) uniform Params {
+  uvec2 size;        // the colour input's extent
+  uvec2 padded;      // the proxy's extent (even)
+  float paper_white; // exposed units that map to 1.0 before the shoulder
+  uint flags;        // bit 0: keep clamped highlights (decode only)
+} p;
+
+const float KNEE = 0.75;
+const float K = 5.770780;
+
+// A usable exposure value: finite and clearly positive. Otherwise the CPU skips the write-back and
+// the decode leaves every pixel alone.
+bool exposure_ok(float e) {
+  return e > 1e-6 && e < 65504.0;
+}
+
+float shoulder(float v) {
+  return v <= KNEE ? v : KNEE + 0.25 * (1.0 - exp(-K * (v - KNEE)));
+}
+
+float srgb_oetf(float c) {
+  c = clamp(c, 0.0, 1.0);
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+// scene-linear -> model domain. NaN and negatives are 0; +Inf ends on the shoulder's top (1.0).
+float encode(float scene, float scale) {
+  float x = scene >= 0.0 ? scene : 0.0;
+  return srgb_oetf(shoulder(x * scale));
+}
+
+void main() {
+  uvec2 xy = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(xy, p.padded))) {
+    return;
+  }
+  float e = unpackHalf2x16(u_exposure.bits).x;
+  float scale = exposure_ok(e) ? e / p.paper_white : 0.0;
+  ivec2 src = ivec2(min(xy, p.size - uvec2(1u)));
+  vec3 scene = imageLoad(u_colour, src).rgb;
+  imageStore(u_encoded, ivec2(xy), vec4(encode(scene.r, scale), encode(scene.g, scale), encode(scene.b, scale), 1.0));
+}

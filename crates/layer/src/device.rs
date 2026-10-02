@@ -884,10 +884,19 @@ impl NeuralForgeDeviceInfo {
             return None;
         }
         let colour = inputs.colour.1;
-        let usage_ok = colour.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
-            && (mode == Mode::Dump || colour.usage.contains(vk::ImageUsageFlags::TRANSFER_DST));
+        // Dump and identity copy the colour input with transfers; model and roundtrip read and write
+        // it from the HDR encode/decode shaders (STORAGE, which `identify` already requires).
+        let usage_ok = match mode {
+            Mode::Off | Mode::Dump => colour.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC),
+            Mode::Identity => colour.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST),
+            Mode::Model | Mode::Roundtrip => colour.usage.contains(vk::ImageUsageFlags::STORAGE),
+        };
         if !usage_ok {
-            session.say_once("the colour input lacks TRANSFER_SRC/TRANSFER_DST usage; not holding");
+            session.say_once("the colour input lacks the usage this mode needs (TRANSFER_SRC/TRANSFER_DST, or STORAGE); not holding");
+            return None;
+        }
+        if mode.hdr() && inputs.exposure_input.is_none() {
+            session.say_once("no exposure image (a registered 1x1 R16_SFLOAT) among DLSS's inputs; the HDR encode cannot run, frames go to DLSS untouched");
             return None;
         }
         let Some(&queue_family) = queue_families.get(&queue) else {
@@ -913,7 +922,7 @@ impl NeuralForgeDeviceInfo {
                 }
                 false
             }
-            Mode::Identity => false,
+            Mode::Identity | Mode::Roundtrip => false,
         };
         // Slot 0 must be free: no request (the post path's, or an earlier hold's that ran over
         // budget) still with the helper, no zero-copy capture still writing its proxy region, and
@@ -967,6 +976,14 @@ impl NeuralForgeDeviceInfo {
                     (crate::preupscale::Aux { image, format: desc.format, layout, readable }, assumed)
                 })
             }),
+            // DLSS's exposure input: its committed layout, or GENERAL for a storage image no barrier
+            // was seen on (the layout vkd3d-proton keeps those in; E1b found it there).
+            exposure_input: inputs.exposure_input.map(|(image, desc)| {
+                let layout = scan.exposure_input_layout.or(desc.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
+                let readable = desc.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (desc.width, desc.height) == (1, 1);
+                crate::preupscale::Aux { image, format: desc.format, layout, readable }
+            }),
+            paper_white: crate::preupscale::hdr::paper_white(),
         };
         let res = session.res.as_mut()?;
         let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;

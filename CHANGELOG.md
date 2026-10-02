@@ -25,6 +25,17 @@ first shipped them; their phase is kept as a subheading.
   (`dump`), writes the same bytes back (`identity`), or writes the helper's answer back
   (`model`, every frame, 30 ms budget; the post-upscaler compose is off while it holds). See
   `docs/PRE_UPSCALER_DESIGN.md`, "Implementation (layer)". Not yet run on the rig.
+- **Pre-upscaler path: the HDR encode** (E1b). In `model` mode the layer now encodes DLSS's
+  scene-linear colour input for the model on the GPU before sending it (the game's 1x1 R16F
+  exposure value multiplied in, divided by a paper white of 3, a per-channel shoulder above 0.75,
+  sRGB) and inverts that on the answer as it writes it back, keeping the original value where the
+  encoded input was clamped (>= 0.999: sky, sun) and the original alpha. Two compute shaders
+  (`preupscale_encode.comp`, `preupscale_decode.comp`) run inside the hold's own capture and
+  write-back submits. No exposure image, or a zero/non-finite exposure value, means the frame goes
+  to DLSS untouched. New mode `NEURAL_FORGE_PREUPSCALE=roundtrip`: encode and decode with the
+  encoded frame itself as the answer (no helper), to check on the rig that the transform alone
+  leaves the picture unchanged. `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE` overrides the paper white for
+  tuning. `identity` stays the raw copy-through. Not yet run on the rig.
 - `shmctl status` shows `preupscale_state`, `preupscale_extent`, `preupscale_hold_ms` and
   `preupscale_misses`. Shared-memory protocol 9: restart the helper and the game together after
   updating.

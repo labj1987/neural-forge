@@ -2,7 +2,7 @@
 
 Status: **approved by Alex 2026-10-02, HDR included. Layer and helper sides are built**, behind
 `NEURAL_FORGE_PREUPSCALE` (off by default); see the two "Implementation" sections at the end.
-E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame; E2-E3 not run (see "Rig results" at the end). Phases 2 and 3 of the original 2.0 plan are paused.
+E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame; E2-E3 not run (see "Rig results" at the end). E1b found the encode that works (the game's exposure, paper white 3, a per-channel shoulder, sRGB); the layer now applies it on the GPU before the model and inverts it on write-back (model mode, plus a `roundtrip` mode that checks the transform alone), not yet run on the rig. Phases 2 and 3 of the original 2.0 plan are paused.
 
 ## What the probe established (GTA V Enhanced, 2560x1440, DLSS SR on)
 
@@ -236,9 +236,11 @@ same order as the input's (scene-linear, not clamped to [0, 1] and not collapsed
 
 ## Implementation (layer)
 
-Built 2026-10-02 in `crates/layer/src/preupscale.rs`, wired into `device.rs`, `lib.rs` and
-`entry_points.rs`. Not yet run on the rig: everything below about GTA is what the code expects
-from the probe, not a measurement.
+Built 2026-10-02 in `crates/layer/src/preupscale.rs` (the HDR encode and decode in
+`crates/layer/src/preupscale/hdr.rs` and `crates/layer/shaders/preupscale_{encode,decode}.comp`, after
+E1b), wired into `device.rs`, `lib.rs` and `entry_points.rs`. The hold, identity, the HDR encode and
+roundtrip are not yet run on the rig: everything below about GTA is what the code expects from the
+probe and E1/E1b, not a measurement.
 
 ### Modes
 
@@ -248,8 +250,9 @@ from the probe, not a measurement.
 |---|---|
 | unset / `off` | Nothing. The hooked-command list, the resolved entry points and every hot path are as before; no waits are added anywhere. |
 | `dump` | Once (the first hold after the colour input is identified and the depth and motion-vector layouts are known from the game's barriers, normally a frame later; after 120 DLSS submits without them, colour only), and again for each `shmctl capture` (`capture_request=1`): capture colour, depth and motion vectors, forward the game's submit unchanged, and write `~/.local/share/neural-forge/captures/preupscale-<ms>/` with `colour.rgba16f` (padded size), `depth.r32f` (`depth.raw` for a non-float depth), `mvec.rg16f`, `meta.json` (width, height, padded size, formats, frame number), `colour-preview.png` (`x/(1+x)` per channel, sRGB-encoded) and `exposure.json` (every registered 1x1 float image, DLSS's exposure input among them: format, layout, raw bytes and values; a storage image with no barrier seen yet is read as `GENERAL`, flagged `layout_assumed`). Files are written off the submit thread. |
-| `identity` | Capture the colour input into slot 0's proxy region, then copy the same bytes back into it. The helper is not called. Measures the hold's own cost; the picture must be unchanged. |
-| `model` | Capture, hand the frame to the helper (`width` = padded width, `proxy_format` = RGBA16F), wait up to 30 ms (or until the helper stops being alive), copy the answer back into the colour input with the padding cropped. Every frame (`model_interval` is ignored). With `enabled` off (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported unavailable, nothing is held. |
+| `identity` | Capture the colour input into slot 0's proxy region, then copy the same bytes back into it (raw, no encode). The helper is not called. Measures the hold's own cost; the picture must be unchanged. |
+| `model` | Capture the colour input **HDR-encoded** (see "The HDR encode and decode" below), hand it to the helper (`width` = padded width, `proxy_format` = RGBA16F), wait up to 30 ms (or until the helper stops being alive), decode the answer back over the colour input with the padding cropped. Every frame (`model_interval` is ignored). With `enabled` off (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported unavailable, nothing is held. |
+| `roundtrip` | The same encode and decode, with the answer := the encoded proxy itself; the helper is not called. Checks the transform's neutrality on the rig: the picture must come back unchanged except for half-float rounding and the clamped highlights (which are kept as they were). Ignores the toggle, like `identity`. |
 
 Any non-off mode turns on the NVX tracking (the probe's hooks, production-grade, without its
 logging): `vkCreateImage`/`vkCreateImageView` descriptions, views registered through
@@ -263,9 +266,14 @@ committed in submission order. `NEURAL_FORGE_PROBE_NGX` still controls the probe
 At a launch-bearing submit, when the registered set or the swapchains changed: the colour input is
 the registered RGBA16F storage image (2D, single-sample) whose extent equals a registered depth
 image's, with a registered RG16F image of the same extent, and smaller than the largest swapchain
-(DLAA is refused that way). Several candidates: lowest handles. Logged once per change:
-`[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ...`
-or `[preupscale] no DLSS input among N registered views ...; waiting`.
+(DLAA is refused that way). Several candidates: lowest handles. DLSS's **exposure input** is the
+registered 1x1 `R16_SFLOAT` image (lowest handle if there are several; NGX's own 1x1 RGBA32F images,
+which are not transfer sources, are never it). Logged once per change:
+`[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ..., exposure input 0x...`
+(`exposure input none (no registered 1x1 R16_SFLOAT)` when missing) or
+`[preupscale] no DLSS input among N registered views ...; waiting`. Without an exposure input,
+model and roundtrip modes hold nothing (frames go to DLSS untouched), logged once: `no exposure
+image (a registered 1x1 R16_SFLOAT) among DLSS's inputs; ...`.
 
 ### The hold
 
@@ -292,6 +300,56 @@ GPU timestamps. A hold is skipped (frame forwarded untouched) when: the layer is
 request is still with the helper (the post path's, or a hold that ran over budget), the post
 path's zero-copy capture is still writing slot 0, or anything fails.
 
+### The HDR encode and decode (model, roundtrip)
+
+The model treats its input as a display-referred [0, 1] picture (E1b), so the capture encodes and
+the write-back inverts, on the GPU, in the layer's own two submissions (`preupscale/hdr.rs`,
+`shaders/preupscale_encode.comp`, `shaders/preupscale_decode.comp`), with E1b's formulas exactly:
+
+- **Capture** (one command buffer): `ALL_COMMANDS/MEMORY_WRITE -> TRANSFER|COMPUTE_SHADER` (the
+  layer's padded encoded image `UNDEFINED -> GENERAL` in the same barrier); copy the exposure texel
+  (in its committed layout, `GENERAL` assumed for a storage image no barrier was seen on,
+  transitioned and put back otherwise) into a 16-byte host-visible storage buffer;
+  `TRANSFER -> COMPUTE_SHADER`; the **encode** dispatch over the padded extent: reads the colour
+  input through a storage view (`GENERAL`, read only), `v = max(scene, 0) * e / W`, per channel
+  above 0.75 `0.75 + 0.25 (1 - exp(-5.770780 (v - 0.75)))`, sRGB OETF, alpha 1; the padding
+  column/row reads the edge texel (as the raw copy duplicates it); `COMPUTE_SHADER -> TRANSFER`;
+  copy the encoded image into slot 0's proxy region (imported, or the staged buffer); the usual
+  `TRANSFER -> HOST` close. After the capture fence the CPU reads the exposure value back: zero,
+  negative or not finite means no helper call and no write-back for that frame (`frame went to
+  DLSS untouched: the exposure value is not usable ...`).
+- **Write-back** (one command buffer): `ALL_COMMANDS|HOST -> TRANSFER|COMPUTE_SHADER` (the layer's
+  padded answer image `UNDEFINED -> GENERAL`); copy the answer region (model) or the proxy region
+  (roundtrip) into the answer image; `TRANSFER -> COMPUTE_SHADER`; the **decode** dispatch over the
+  real extent (the padding is cropped): `y = sRGB EOTF(answer)`, `y = min(y, 1 - 1e-4)`, at or above
+  0.75 `v = 0.75 - ln(1 - (y - 0.75) / 0.25) / 5.770780`, `scene' = v * W / e`; where the encoded
+  input of that channel (read from the encoded image the capture wrote) was >= 0.999 the original
+  scene value is kept; alpha is always the original. It reads and writes the colour input in place
+  (each invocation its own pixel only); then `COMPUTE_SHADER/SHADER_WRITE ->
+  ALL_COMMANDS/MEMORY_READ|MEMORY_WRITE` before DLSS. The decode also writes nothing when the
+  exposure value is unusable (belt and braces; the CPU already skipped the submit).
+- **Push constants** (`hdr::HdrPush`, both shaders' `Params`, 24 bytes, append only): `uvec2 size`
+  (the colour input's extent), `uvec2 padded`, `float paper_white`, `uint flags` (bit 0: keep
+  clamped highlights, always set).
+- **Paper white** `W`: `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE` (default **3.0**; a positive number up
+  to 1000, anything else logs and uses 3). Logged once: `[preupscale] HDR encode: paper white 3 ...`.
+- **Resources**: two padded RGBA16F device-local images (encoded, answer, ~10 MB each at 1486x836),
+  the exposure buffer, two compute pipelines over one descriptor set, built on the first HDR hold
+  for an extent and destroyed with the hold's other resources (after their fences). The storage
+  view of the game's colour input is re-created every hold, after the previous hold's work drained,
+  so a destroyed and re-created image with a reused handle is never reached through a stale view.
+  Any failure to build them is a logged miss (frame untouched).
+- **Timing**: `capture_gpu_ms` and `writeback_gpu_ms` span the whole command buffers, so in model and
+  roundtrip modes they include the encode and the decode; roundtrip's medians minus identity's give
+  the transform's own GPU cost.
+- **Precision** (tests, lavapipe and an Intel iGPU, both of which truncate on the float-to-half
+  store): roundtrip comes back within about 2.6e-3 relative where the encoded value is at most 0.9;
+  towards the shoulder's top the inverse is steep and one step of the 16-bit proxy is worth up to
+  ~4% of the scene value (encoded 0.99-0.999); channels at >= 0.999 come back bit-exact. Negative or
+  NaN scene values encode as 0 and come back as 0.
+
+`identity` is unchanged: a raw copy-through, the hold's own cost.
+
 In model mode, while a hold happened in the last 500 ms the post-upscaler compose is skipped for
 that device's presents (the game's frame is presented as DLSS made it), so the model is not
 applied twice. Without holds (DLSS off, DLAA, a game without DLSS, the toggle off) the post path
@@ -313,9 +371,17 @@ scripts/gta-bench.sh --host lordnikon preupscale-identity VK_LAYER_neuralforge_n
 scripts/gta-bench.sh --host lordnikon preupscale-model VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=model 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
+```bash
+scripts/gta-bench.sh --host lordnikon preupscale-roundtrip VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=roundtrip 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+```
+
+Add `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=2.5` (or 4) to any of the model/roundtrip runs to try
+another paper white.
+
 Model mode needs a helper that accepts an RGBA16F proxy (`DLSSNR.Hdr=1`); with one that refuses
-it, every hold is a miss and the frame goes to DLSS untouched. For identity, the post-upscaler
-path still runs unless NR is off (`--set enabled=0`), so set that to measure the hold alone.
+it, every hold is a miss and the frame goes to DLSS untouched. For identity and roundtrip, the
+post-upscaler path still runs unless NR is off (`--set enabled=0`), so set that to measure the hold
+alone.
 
 What to look for in the launch log (`grep -F '[preupscale]'`):
 
@@ -323,6 +389,8 @@ What to look for in the launch log (`grep -F '[preupscale]'`):
 - The identification line (above).
 - `[preupscale] resources for WxH (padded PWxPH) built: zero-copy (SHM regions imported)`.
 - Model mode: `the model runs before the upscaler; the post-upscaler compose is off while frames are held`.
+- Model and roundtrip: `[preupscale] HDR encode: paper white 3 (...)`, and the identification line
+  names an `exposure input`.
 - Every 300 holds: `[preupscale] mode=... extent=WxH (padded ...) holds=N hold_ms median=... capture_gpu_ms median=... writeback_gpu_ms median=... misses=... (total ...)`.
 - Misses, at most one line per 5 s: `[preupscale] frame went to DLSS untouched: <why> (...)`.
 - Dump mode: `[preupscale] dump of the DLSS input (WxH, frame N) written to <dir>: colour.rgba16f, depth.r32f, mvec.rg16f, colour-preview.png, meta.json`.
@@ -341,7 +409,10 @@ buffer's position in its batch; whether vkd3d-proton's launch-bearing `VkSubmitI
 pNext structure outside the accepted list; how long the capture fence wait is in practice (it also
 drains everything queued before it); and whether vkd3d-proton's waits are ever wait-before-signal
 on a timeline the same thread signals later (the bounded 5 s wait would then stall once and fail
-open).
+open). For the HDR encode: that GTA's 1x1 R16F exposure image carries `TRANSFER_SRC` at every hold
+(the E1b dump read it, so it did then), that a storage view of the colour input can be created
+(its usage includes `STORAGE`; the probe saw `SAMPLED | STORAGE | ...`), the encode/decode GPU time
+at 1486x836, and how NVIDIA rounds float-to-half stores (the tests' drivers truncate).
 
 ## Rig results (E1-E3)
 
