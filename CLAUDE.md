@@ -73,7 +73,9 @@ Since 2.0 the model runs **before** DLSS Super Resolution by default (`crates/la
 docs/PRE_UPSCALER_DESIGN.md): on a device with `VK_NVX_image_view_handle`, the layer identifies
 DLSS's registered colour input, holds the game's DLSS submit, sends the HDR-encoded render-resolution
 frame to the helper every frame and decodes the answer back before DLSS runs. Everything else (no
-NVX, no DLSS, DLAA, native) keeps the post-upscaler path. `NEURAL_FORGE_PREUPSCALE=off` is the A/B
+NVX, no DLSS, DLAA, native) keeps the post-upscaler path. Only the launch-bearing command buffer whose
+kernel parameters name the identified colour input is held, so DLSS Frame Generation's submits go
+through untouched (docs/PRE_UPSCALER_DESIGN.md, "DLSS Frame Generation"). `NEURAL_FORGE_PREUPSCALE=off` is the A/B
 and rollback switch; `dump`, `identity` and `roundtrip` are diagnostics. Rule: with
 `NEURAL_FORGE_PREUPSCALE=off` the post path must stay byte-identical to 1.1.0 (the hooked-command
 list is the default set, no NVX entry points resolved, nothing of `preupscale` reachable), and a

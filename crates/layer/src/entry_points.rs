@@ -56,7 +56,7 @@ impl EntryPoints {
                 crate::probe_ngx::on_view_handle("vkGetImageViewHandle64NVX", info.image_view, format!("handle {handle:#x}"));
             }
             if let Some(tracking) = crate::preupscale::tracking_for(device) {
-                tracking.lock().register(info.image_view);
+                tracking.lock().register(info.image_view, Some(handle));
             }
         }
         handle

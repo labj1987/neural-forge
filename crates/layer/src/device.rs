@@ -1542,7 +1542,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             crate::probe_ngx::on_view_handle("vkGetImageViewHandleNVX", info.image_view, format!("handle {handle:#x}"));
         }
         if let Some(t) = &self.preupscale {
-            t.lock().register(info.image_view);
+            t.lock().register(info.image_view, Some(u64::from(handle)));
         }
         LayerResult::Handled(handle)
     }
@@ -1565,7 +1565,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             crate::probe_ngx::on_view_handle("vkGetImageViewAddressNVX", view, described);
         }
         if let Some(t) = self.preupscale.as_ref().filter(|_| result == vk::Result::SUCCESS) {
-            t.lock().register(view);
+            // SAFETY: a successful call filled the struct.
+            let address = unsafe { properties.assume_init_ref() }.device_address;
+            t.lock().register(view, Some(address));
         }
         LayerResult::Handled(result.result())
     }
@@ -1611,7 +1613,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             crate::probe_ngx::on_launch(command_buffer, launch_info);
         }
         if let Some(t) = &self.preupscale {
-            t.launch(command_buffer);
+            // The parameter buffer is read (never written) to tell DLSS Super Resolution's launches,
+            // which name the colour input, from DLSS Frame Generation's (docs/PRE_UPSCALER_DESIGN.md,
+            // "DLSS Frame Generation").
+            // SAFETY: `p_extras` is the application's own launch-parameter list, valid for this call.
+            let params = unsafe { crate::preupscale::launch_params(launch_info.p_extras, launch_info.extra_count) };
+            t.launch(command_buffer, params);
         }
         LayerResult::Unhandled
     }

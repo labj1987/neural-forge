@@ -7,7 +7,9 @@
 //! colour input is final when the launch-bearing submit starts and sits in `GENERAL`. So this
 //! module:
 //!
-//! 1. tracks the registered views and marks launch-bearing command buffers ([`Tracking`]);
+//! 1. tracks the registered views and marks launch-bearing command buffers ([`Tracking`]), noting
+//!    whether their launches name the colour input ([`LaunchRefs`]: only those are held, so DLSS
+//!    Frame Generation's launch-bearing submits go through untouched);
 //! 2. identifies the colour input (and depth, motion vectors) from the registered set ([`identify`]);
 //! 3. at a `vkQueueSubmit`/`vkQueueSubmit2` carrying a launch-bearing buffer, splits the call
 //!    around that buffer ([`plan`]) and, between the two halves, runs its own capture submit,
@@ -376,8 +378,19 @@ pub(crate) struct Tracker {
     /// What the last identification log line said, so a change is logged once.
     announced: Option<String>,
     /// Command buffers with a `vkCmdCuLaunchKernelNVX` recorded since their last begin (directly or
-    /// through executed secondaries).
-    launch: HashSet<vk::CommandBuffer>,
+    /// through executed secondaries), with what their launches' parameters referenced.
+    launch: HashMap<vk::CommandBuffer, LaunchRefs>,
+    /// The values a view registration returned (`vkGetImageViewHandle*NVX` handles,
+    /// `vkGetImageViewAddressNVX` addresses), for the colour-input candidates only (registered
+    /// RGBA16F storage images): what a kernel parameter buffer that reads one of them carries.
+    keys: Vec<(u64, vk::ImageView, vk::Image)>,
+    /// Launch-bearing submits whose buffers all had readable parameters none of which named the
+    /// colour input (DLSS Frame Generation's, in GTA V), forwarded untouched.
+    pub(crate) foreign_submits: u64,
+    /// Held launch-bearing submits whose held buffer reads the colour input.
+    pub(crate) colour_submits: u64,
+    /// Which first-of-a-kind classification lines were logged.
+    said_kinds: u8,
     /// Layouts recorded into each command buffer for the watched images, awaiting submission.
     pending: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::ImageLayout)>>,
     /// The watched images' layouts as of the last submission (submission order, not recording order).
@@ -405,6 +418,89 @@ pub(crate) struct Scan {
     pub evaluation: u64,
 }
 
+/// What one command buffer's `vkCmdCuLaunchKernelNVX` launches referenced.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct LaunchRefs {
+    /// A launch whose parameter buffer could not be read.
+    pub opaque: bool,
+    /// Colour-input candidates whose registered handle (or address) is in a launch's parameters.
+    pub images: Vec<vk::Image>,
+}
+
+/// How a launch-bearing command buffer is treated at the submit.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LaunchKind {
+    /// A launch reads the identified colour input: DLSS Super Resolution's buffer, the hold point.
+    Colour,
+    /// Every launch's parameters were read and none names the colour input (DLSS Frame Generation's
+    /// buffers in GTA V): forwarded untouched.
+    Foreign,
+    /// Not decidable (a launch's parameters were not readable, or no colour input is identified
+    /// yet): held as before the distinction existed, so nothing that worked stops working.
+    Unknown,
+}
+
+impl LaunchRefs {
+    pub(crate) fn kind(&self, colour: Option<vk::Image>) -> LaunchKind {
+        match colour {
+            Some(c) if self.images.contains(&c) => LaunchKind::Colour,
+            Some(_) if !self.opaque => LaunchKind::Foreign,
+            _ => LaunchKind::Unknown,
+        }
+    }
+}
+
+/// The kernel parameter buffer of a `vkCmdCuLaunchKernelNVX` given in CUDA's "extra" form, the form
+/// vkd3d-proton uses for DXVK-NVAPI's `NvAPI_D3D12_LaunchCubinShader` (DLSS under Proton; the probe
+/// saw `params=0 extras=1` on every launch): `pExtras` is the END-terminated list
+/// `{BUFFER_POINTER (1), buffer, BUFFER_SIZE (2), &size, END (0)}`. vkd3d-proton passes
+/// `extraCount = 1`, CUDA's convention being the terminator, so the list is walked to its END (at
+/// most 4 pairs). The size is read as 32 bits (vkd3d-proton's is a 32-bit value; on little-endian
+/// that is also the low half of a `size_t`). `None` for anything else: no extras, an unknown key,
+/// no buffer, or a size of 0 or over 4 KiB. The buffer is only read, never changed, and only during
+/// the application's call.
+///
+/// # Safety
+/// `extras`, when non-null, must point at a CUDA launch-parameter list as described, valid for
+/// the call (the application's own `VkCuLaunchInfoNVX::pExtras`).
+pub(crate) unsafe fn launch_params<'a>(extras: *const *const c_void, extra_count: usize) -> Option<&'a [u8]> {
+    if extras.is_null() || extra_count == 0 {
+        return None;
+    }
+    let (mut buffer, mut size) = (std::ptr::null::<u8>(), None);
+    let mut i = 0;
+    loop {
+        if i > 8 {
+            return None;
+        }
+        // SAFETY: the list is END-terminated (caller); every read is at or before the terminator
+        // or the value that follows a key.
+        let key = unsafe { *extras.add(i) } as usize;
+        match key {
+            0 => break,
+            // SAFETY: as above.
+            1 => buffer = unsafe { *extras.add(i + 1) }.cast::<u8>(),
+            2 => {
+                // SAFETY: as above.
+                let p = unsafe { *extras.add(i + 1) }.cast::<u32>();
+                if p.is_null() {
+                    return None;
+                }
+                // SAFETY: BUFFER_SIZE's value points at the size.
+                size = Some(unsafe { p.read_unaligned() } as usize);
+            }
+            _ => return None,
+        }
+        i += 2;
+    }
+    let size = size?;
+    if buffer.is_null() || size == 0 || size > 4096 {
+        return None;
+    }
+    // SAFETY: BUFFER_POINTER points at `size` bytes of parameters, valid for the call.
+    Some(unsafe { std::slice::from_raw_parts(buffer, size) })
+}
+
 impl Tracker {
     pub(crate) fn record_image(&mut self, image: vk::Image, info: &vk::ImageCreateInfo) {
         self.images.insert(image, ImageDesc::from_info(info));
@@ -412,6 +508,7 @@ impl Tracker {
 
     pub(crate) fn forget_image(&mut self, image: vk::Image) {
         self.images.remove(&image);
+        self.keys.retain(|k| k.2 != image);
         let before = self.registered.len();
         self.registered.retain(|_, i| *i != image);
         if self.registered.len() != before {
@@ -426,15 +523,27 @@ impl Tracker {
 
     pub(crate) fn forget_view(&mut self, view: vk::ImageView) {
         self.views.remove(&view);
+        self.keys.retain(|k| k.1 != view);
         if self.registered.remove(&view).is_some() {
             self.dirty = true;
         }
     }
 
-    pub(crate) fn register(&mut self, view: vk::ImageView) {
+    /// A view registered through `vkGetImageViewHandle*NVX` / `vkGetImageViewAddressNVX`; `key` is
+    /// the handle or address it returned (what a kernel that reads the view is given).
+    pub(crate) fn register(&mut self, view: vk::ImageView, key: Option<u64>) {
         if let Some(&image) = self.views.get(&view) {
             if self.registered.insert(view, image) != Some(image) {
                 self.dirty = true;
+            }
+            let candidate = self
+                .images
+                .get(&image)
+                .is_some_and(|d| d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::STORAGE));
+            if let Some(key) = key.filter(|&k| k != 0 && candidate) {
+                if !self.keys.iter().any(|k| k.0 == key) {
+                    self.keys.push((key, view, image));
+                }
             }
         }
     }
@@ -447,8 +556,26 @@ impl Tracker {
         self.dirty = true;
     }
 
-    pub(crate) fn launch(&mut self, command_buffer: vk::CommandBuffer) {
-        self.launch.insert(command_buffer);
+    /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`; `params` is the launch's kernel
+    /// parameter buffer when it could be read ([`launch_params`]), `None` otherwise. Every 8-byte
+    /// word of it is compared with the colour-input candidates' registered handles and addresses.
+    pub(crate) fn launch(&mut self, command_buffer: vk::CommandBuffer, params: Option<&[u8]>) {
+        let refs = self.launch.entry(command_buffer).or_default();
+        let Some(bytes) = params else {
+            refs.opaque = true;
+            return;
+        };
+        for word in bytes.chunks_exact(8) {
+            let value = u64::from_le_bytes(word.try_into().unwrap_or_default());
+            if value == 0 {
+                continue;
+            }
+            for &(key, _, image) in &self.keys {
+                if key == value && !refs.images.contains(&image) {
+                    refs.images.push(image);
+                }
+            }
+        }
     }
 
     /// Whether any command buffer carries a launch or recorded layouts.
@@ -469,8 +596,17 @@ impl Tracker {
     }
 
     pub(crate) fn execute(&mut self, primary: vk::CommandBuffer, secondaries: &[vk::CommandBuffer]) {
-        if secondaries.iter().any(|cb| self.launch.contains(cb)) {
-            self.launch.insert(primary);
+        let carried: Vec<LaunchRefs> = secondaries.iter().filter_map(|cb| self.launch.get(cb)).cloned().collect();
+        if !carried.is_empty() {
+            let refs = self.launch.entry(primary).or_default();
+            for c in carried {
+                refs.opaque |= c.opaque;
+                for image in c.images {
+                    if !refs.images.contains(&image) {
+                        refs.images.push(image);
+                    }
+                }
+            }
         }
         let inherited: Vec<_> = secondaries.iter().filter_map(|cb| self.pending.get(cb)).flatten().copied().collect();
         if !inherited.is_empty() {
@@ -568,9 +704,17 @@ impl Tracker {
             return None;
         }
         let mut found: Option<Scan> = None;
+        let mut any_foreign = false;
+        let mut held_kind = None;
         for (bi, cbs) in batches.iter().enumerate() {
             for (ci, &cb) in cbs.iter().enumerate() {
-                if found.is_none() && self.launch.contains(&cb) {
+                let colour = self.inputs.map(|i| i.colour.0);
+                let kind = self.launch.get(&cb).map(|r| r.kind(colour));
+                if kind == Some(LaunchKind::Foreign) {
+                    any_foreign = true;
+                }
+                if found.is_none() && kind.is_some_and(|k| k != LaunchKind::Foreign) {
+                    held_kind = kind;
                     let layout = |image: Option<vk::Image>| image.and_then(|i| self.committed.get(&i).copied());
                     found = Some(Scan {
                         batch: bi,
@@ -589,8 +733,32 @@ impl Tracker {
         }
         if found.is_some() {
             self.evaluations += 1;
+            if held_kind == Some(LaunchKind::Colour) {
+                self.colour_submits += 1;
+            }
+        } else if any_foreign {
+            self.foreign_submits += 1;
         }
         found
+    }
+
+    /// A first-of-its-kind classification line, once per kind: a launch-bearing submit held because
+    /// a launch reads the colour input; one forwarded because its launches name other images only;
+    /// one held undecided (a launch's parameters could not be read, or no colour input yet: the rule
+    /// before the distinction). `undecided_before`: held-undecided submits before this scan.
+    fn classify_line(&mut self, scan: Option<&Scan>, undecided_before: u64) -> Option<String> {
+        let undecided = self.evaluations - self.colour_submits;
+        let (bit, line) = if scan.is_some() && self.colour_submits > 0 && self.said_kinds & 1 == 0 {
+            (1, "a launch-bearing submit reads DLSS's colour input (its registered handle is in a launch's parameters): DLSS Super Resolution's, the hold point")
+        } else if scan.is_none() && self.foreign_submits > 0 && self.said_kinds & 2 == 0 {
+            (2, "a launch-bearing submit whose CUDA launches never name DLSS's colour input (DLSS Frame Generation's, or another NGX feature's) is forwarded untouched; only the one that reads it is held")
+        } else if scan.is_some() && undecided > undecided_before && self.inputs.is_some() && self.said_kinds & 4 == 0 {
+            (4, "a launch-bearing submit is held undecided: a launch's parameters were not readable (not in CUDA's buffer form), so it cannot be told from DLSS Super Resolution's")
+        } else {
+            return None;
+        };
+        self.said_kinds |= bit;
+        Some(line.to_string())
     }
 }
 
@@ -640,10 +808,11 @@ impl Tracking {
         self.armed.store(t.armed(), Ordering::Relaxed);
     }
 
-    /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`.
-    pub(crate) fn launch(&self, command_buffer: vk::CommandBuffer) {
+    /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`, with its parameter buffer if
+    /// readable ([`launch_params`]).
+    pub(crate) fn launch(&self, command_buffer: vk::CommandBuffer, params: Option<&[u8]>) {
         let mut t = self.lock();
-        t.launch(command_buffer);
+        t.launch(command_buffer, params);
         self.rearm(&t);
     }
 
@@ -699,11 +868,23 @@ impl Tracking {
             let line = t.refresh();
             self.watching.store(t.inputs.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
+            let undecided_before = t.evaluations - t.colour_submits;
+            let foreign_before = t.foreign_submits;
             let scan = t.scan(batches);
+            let kind_line = t.classify_line(scan.as_ref(), undecided_before);
+            // Every 3000th forwarded one: the running counts.
+            let tally = (t.foreign_submits != foreign_before && t.foreign_submits.is_multiple_of(3000)).then(|| {
+                format!(
+                    "launch-bearing submits: {} held reading the colour input, {} held undecided, {} forwarded untouched (their launches never name the colour input)",
+                    t.colour_submits,
+                    t.evaluations - t.colour_submits,
+                    t.foreign_submits
+                )
+            });
             self.rearm(&t);
-            (scan, line)
+            (scan, [line, kind_line, tally])
         };
-        if let Some(line) = line {
+        for line in line.into_iter().flatten() {
             crate::log!("[preupscale] {line}");
             crate::logging::flush();
         }
@@ -2980,7 +3161,7 @@ mod tests {
         for (raw, w, h, format) in [(0x100, 1707, 960, vk::Format::R16G16B16A16_SFLOAT), (0x200, 1707, 960, vk::Format::D32_SFLOAT_S8_UINT), (0x300, 1707, 960, vk::Format::R16G16_SFLOAT)] {
             t.record_image(vk::Image::from_raw(raw), &info(w, h, format, storage));
             t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
-            t.register(vk::ImageView::from_raw(raw + 1));
+            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
         }
         t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
         let line = t.refresh().expect("the identification is logged");
@@ -2991,7 +3172,7 @@ mod tests {
         t.barrier(cb(1), colour, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
         t.barrier(cb(2), colour, vk::ImageLayout::GENERAL);
         t.barrier(cb(2), vk::Image::from_raw(0x999), vk::ImageLayout::GENERAL);
-        t.launch(cb(5));
+        t.launch(cb(5), None);
         t.execute(cb(3), &[cb(5)]);
         let scan = t.scan(&[vec![cb(1)], vec![cb(2), cb(3)]]).expect("launch-bearing");
         assert_eq!((scan.batch, scan.index), (1, 1));
@@ -3022,7 +3203,7 @@ mod tests {
         assert!(t.scan(&[vec![cb(1), cb(2)]]).is_none());
         assert_eq!(t.extent(), None);
         // DLSS records a launch: armed, and the submit carrying it is found.
-        t.launch(cb(7));
+        t.launch(cb(7), None);
         assert!(t.armed());
         assert!(t.scan(&[vec![cb(6), cb(7)]]).is_some_and(|s| (s.batch, s.index) == (0, 1)));
         // A secondary's launch carries over to its primary.
@@ -3032,6 +3213,136 @@ mod tests {
         t.free(&[cb(8)]);
         assert!(!t.armed(), "every launch buffer was reset or freed");
         assert!(t.scan(&[vec![cb(7), cb(8)]]).is_none());
+    }
+
+    /// A parameter buffer in vkd3d-proton's layout: some scalars, then the given 64-bit handles.
+    fn param_block(handles: &[u64]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&1485u32.to_le_bytes());
+        bytes.extend_from_slice(&836u32.to_le_bytes());
+        bytes.extend_from_slice(&0.5f32.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        for h in handles {
+            bytes.extend_from_slice(&h.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// GTA V's registered set with DLSS Frame Generation on: SR's colour input, depth and motion
+    /// vectors, the output, and FG's own images (an output-size RGBA16F storage image among them).
+    /// Returns the tracker and the handles: (colour, sr output, fg colour, depth, mvec).
+    fn fg_tracker() -> (Tracker, [u64; 5]) {
+        let mut t = Tracker::default();
+        let info = |w, h, format| vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: w, height: h, depth: 1 },
+            format,
+            usage: vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let set = [
+            (0x100, 1485, 836, rgba, 0x14_0000_195f_u64),
+            (0x200, 2560, 1440, rgba, 0x15_0000_43cd),
+            (0x300, 2560, 1440, rgba, 0x15_0000_5000),
+            (0x400, 1485, 836, vk::Format::D32_SFLOAT_S8_UINT, 0x14_0000_1962),
+            (0x500, 1485, 836, vk::Format::R16G16_SFLOAT, 0x14_0000_215e),
+        ];
+        for (raw, w, h, format, handle) in set {
+            t.record_image(vk::Image::from_raw(raw), &info(w, h, format));
+            t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
+            t.register(vk::ImageView::from_raw(raw + 1), Some(handle));
+        }
+        t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
+        assert!(t.refresh().unwrap().starts_with("colour input: image 0x100 (1485x836"));
+        (t, set.map(|s| s.4))
+    }
+
+    /// DLSS Frame Generation's launch-bearing buffers (they read depth, motion vectors and the
+    /// output-size frame, never the render-size colour input) are forwarded; only Super
+    /// Resolution's buffer, whose input kernel names the colour input, is the hold point, wherever
+    /// the two sit in a submit or across submits.
+    #[test]
+    fn only_the_buffer_whose_launches_name_the_colour_input_is_held() {
+        let (mut t, [colour, sr_out, fg_colour, depth, mvec]) = fg_tracker();
+        // SR: the input kernel reads colour, depth and motion vectors; later kernels only scratch.
+        t.launch(cb(1), Some(&param_block(&[colour, depth, mvec])));
+        t.launch(cb(1), Some(&param_block(&[sr_out])));
+        // FG: two buffers (GTA's 80- and 36-launch ones), depth, motion vectors and the output only.
+        t.launch(cb(2), Some(&param_block(&[fg_colour, depth, mvec])));
+        t.launch(cb(2), Some(&param_block(&[sr_out])));
+        t.launch(cb(3), Some(&param_block(&[fg_colour, sr_out])));
+        assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Colour);
+        assert_eq!(t.launch[&cb(2)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
+
+        // FG's submits on their own (another queue in GTA V): not held, counted.
+        assert!(t.scan(&[vec![cb(2)]]).is_none(), "frame generation's buffer is not the hold point");
+        assert!(t.scan(&[vec![cb(3)]]).is_none());
+        assert_eq!(t.foreign_submits, 2);
+        // An FG buffer first in the same submit: the split point is SR's buffer behind it.
+        let scan = t.scan(&[vec![cb(2)], vec![cb(7), cb(1)]]).expect("SR's buffer is held");
+        assert_eq!((scan.batch, scan.index), (1, 1));
+        assert_eq!((t.colour_submits, t.evaluations, t.foreign_submits), (1, 1, 2));
+        // SR's buffer through a secondary carries its references to the primary.
+        t.begin(cb(1));
+        t.launch(cb(11), Some(&param_block(&[colour])));
+        t.execute(cb(1), &[cb(11)]);
+        assert!(t.scan(&[vec![cb(3), cb(1)]]).is_some_and(|s| s.index == 1));
+        assert_eq!(t.colour_submits, 2);
+    }
+
+    /// Without readable parameters (another translation layer's launch form) or before the colour
+    /// input is identified, a launch-bearing buffer is held as it was before the distinction:
+    /// nothing that held before stops holding.
+    #[test]
+    fn unreadable_parameters_or_no_colour_input_keep_the_old_rule() {
+        let (mut t, [_, sr_out, ..]) = fg_tracker();
+        t.launch(cb(1), Some(&param_block(&[sr_out])));
+        t.launch(cb(1), None);
+        assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
+        assert!(t.scan(&[vec![cb(1)]]).is_some(), "an opaque launch could be SR's: held");
+        assert_eq!((t.colour_submits, t.foreign_submits), (0, 0));
+        let refs = LaunchRefs { opaque: false, images: vec![] };
+        assert_eq!(refs.kind(None), LaunchKind::Unknown, "no colour input identified yet");
+        // A destroyed colour view drops its key: its handle no longer matches anything.
+        t.forget_view(vk::ImageView::from_raw(0x101));
+        assert!(t.keys.iter().all(|k| k.2 != vk::Image::from_raw(0x100)));
+        // Only RGBA16F storage images are keys: depth's handle never marks a buffer.
+        assert!(t.keys.iter().all(|k| k.2 != vk::Image::from_raw(0x400)));
+    }
+
+    #[test]
+    fn launch_params_reads_cudas_extra_buffer_form_only() {
+        let block = param_block(&[0x14_0000_195f]);
+        let size = block.len() as u32;
+        let size64 = block.len() as u64;
+        let ptr = |v: usize| v as *const c_void;
+        // vkd3d-proton's list: extraCount 1, END-terminated; size as u32 and as size_t.
+        for size_ptr in [std::ptr::from_ref(&size).cast::<c_void>(), std::ptr::from_ref(&size64).cast::<c_void>()] {
+            let extras = [ptr(1), block.as_ptr().cast(), ptr(2), size_ptr, ptr(0)];
+            let got = unsafe { launch_params(extras.as_ptr(), 1) }.expect("readable");
+            assert_eq!(got, &block[..]);
+        }
+        // Size first, then buffer.
+        let extras = [ptr(2), std::ptr::from_ref(&size).cast(), ptr(1), block.as_ptr().cast(), ptr(0)];
+        assert_eq!(unsafe { launch_params(extras.as_ptr(), 5) }, Some(&block[..]));
+        // Refused: no extras, an unknown key, a missing size or buffer, zero or huge sizes.
+        assert_eq!(unsafe { launch_params(std::ptr::null(), 1) }, None);
+        assert_eq!(unsafe { launch_params(extras.as_ptr(), 0) }, None);
+        let unknown = [ptr(3), ptr(0), ptr(0)];
+        assert_eq!(unsafe { launch_params(unknown.as_ptr(), 1) }, None);
+        let no_size = [ptr(1), block.as_ptr().cast(), ptr(0)];
+        assert_eq!(unsafe { launch_params(no_size.as_ptr(), 1) }, None);
+        let zero = 0u32;
+        let zero_size = [ptr(1), block.as_ptr().cast(), ptr(2), std::ptr::from_ref(&zero).cast(), ptr(0)];
+        assert_eq!(unsafe { launch_params(zero_size.as_ptr(), 1) }, None);
+        let huge = 1u32 << 20;
+        let huge_size = [ptr(1), block.as_ptr().cast(), ptr(2), std::ptr::from_ref(&huge).cast(), ptr(0)];
+        assert_eq!(unsafe { launch_params(huge_size.as_ptr(), 1) }, None);
+        // No terminator within four pairs: refused, nothing past the ninth entry is read.
+        let endless = [ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast()];
+        assert_eq!(unsafe { launch_params(endless.as_ptr(), 1) }, None);
     }
 
     #[test]
