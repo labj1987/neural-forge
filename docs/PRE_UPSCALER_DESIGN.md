@@ -1,9 +1,8 @@
-# Running the model before the game's upscaler: design (needs Alex's go-ahead)
+# Running the model before the game's upscaler: design
 
-Status: **proposal, 2026-10-02. Nothing here is built.** It follows from the probe in
-`docs/PRE_UPSCALER_PROBE.md`. The 2.0 plan said a positive probe stops the program here until
-Alex decides; Phases 2 and 3 (working scale on the zero-copy path, the pipelined present) are
-paused until then.
+Status: **approved by Alex 2026-10-02, HDR included; being built.** It follows from the probe
+in `docs/PRE_UPSCALER_PROBE.md`. Phases 2 and 3 of the original 2.0 plan (working scale on the
+zero-copy path, the pipelined present) are paused.
 
 ## What the probe established (GTA V Enhanced, 2560x1440, DLSS SR on)
 
