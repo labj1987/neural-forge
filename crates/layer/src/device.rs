@@ -189,6 +189,8 @@ struct State {
     /// `destroy_swapchain_khr`); a pass-through or never-engaged swapchain is destroyed
     /// without the layer waiting on anything.
     engaged_swapchains: HashSet<vk::SwapchainKHR>,
+    /// A running `capture_request = N` frame series (see `crate::series`).
+    series: crate::series::Series,
 }
 
 impl State {
@@ -518,6 +520,9 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                 Err(error) => crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources", error),
             }
         }
+        // SAFETY: a series never leaves GPU work pending once a present returns (it waits on
+        // its own fences), so no idle wait is needed; this also finishes writing its files.
+        unsafe { state.series.destroy(&device); }
         state.swapchains.clear();
         let mut primary = PRIMARY.lock().unwrap();
         if primary.as_ref().is_some_and(|p| p.device == handle) { *primary = None; }
@@ -1096,6 +1101,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // layer-submitted relay batch (see below); the real present must then wait on
         // this instead of them.
         let mut relay_semaphore: Option<vk::Semaphore> = None;
+        // Set when a frame series' readback consumed `wait_semaphore` (see `crate::series`).
+        let mut series_composed = false;
         if crate::layer_enabled() && self.nvidia && !crate::device_lost()
             && present_info.swapchain_count > 0 && !present_info.p_swapchains.is_null() && !present_info.p_image_indices.is_null()
         {
@@ -1265,11 +1272,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let height = sw.height;
                 let proxy_format = swapchain::proxy_format_for(sw.format);
                 let bgr_order = swapchain::is_bgr_order(sw.format);
+                let readable = sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC);
                 let (capture_image, capture_layout) = match tap {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
                 };
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, .. } = &mut *state;
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, series, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
                 if shm.model_known_unavailable() {
                     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1326,6 +1334,25 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 }
                 if let Some(instance) = &self.instance {
                     engaged_swapchains.insert(sc);
+                    // `capture_request = N > 1`: a frame series (see `crate::series`), taken here,
+                    // before `capture::run` would read the field as a one-shot dump. 1 stays the
+                    // one-shot dump's. The mapping is opened first so a request made before this
+                    // process's first engaged present is not mistaken for a one-shot.
+                    shm.open();
+                    if let Some(frames) = shm.take_series_request() {
+                        if readable {
+                            series.start(frames, &crate::dump::captures_dir());
+                        } else {
+                            crate::log!("[series] request for {frames} frames dropped: this swapchain cannot be read back");
+                            crate::logging::flush();
+                        }
+                    }
+                    let observing = readable && series.running();
+                    if observing {
+                        // SAFETY: as for `capture::run` below; `readable` checked TRANSFER_SRC, and
+                        // the relay above (if any) is the only layer submission so far.
+                        unsafe { series.before(&self.device, instance, self.physical_device, queue, queue_family, image, width, height) };
+                    }
                     // SAFETY: `queue` is the same queue this present call was made on,
                     // externally synchronized for its duration by the same Vulkan rule
                     // that lets the caller call `vkQueuePresentKHR` on it at all right
@@ -1364,6 +1391,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             last_answer_dims,
                         );
                     }
+                    if observing {
+                        // SAFETY: same present, same queue, right after `before`. When the readback
+                        // waited on the composition's semaphore, the present must not wait on it too.
+                        if unsafe { series.after(&self.device, queue, image, width, height, bgr_order, wait_semaphore) } && wait_semaphore.is_some() {
+                            wait_semaphore = None;
+                            series_composed = true;
+                        }
+                    }
                     if capture::take_setup_failure() {
                         // Capture resources could not be built for this swapchain. It holds the
                         // primary claim but cannot drive the channel, which would keep every peer
@@ -1379,7 +1414,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             }
         }
 
-        note_present_rate(wait_semaphore.is_some());
+        note_present_rate(wait_semaphore.is_some() || series_composed);
 
         // SAFETY: `present_info` is valid for the duration of this call; `next_present`
         // was resolved from the next layer/driver's own proc-addr table.
