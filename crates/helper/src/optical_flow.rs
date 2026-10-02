@@ -466,6 +466,40 @@ impl GpuFlow {
     }
 }
 
+/// A coarse luma thumbnail of a BGRA8/RGBA8 frame (every 8th pixel on each axis), kept
+/// between frames for [`is_scene_cut`] instead of a copy of the whole frame.
+pub fn luma_thumbnail(frame: &[u8], width: u32, height: u32) -> Vec<u8> {
+    const STEP: usize = 8;
+    let (w, h) = (width as usize, height as usize);
+    if frame.len() < w * h * 4 {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(w.div_ceil(STEP) * h.div_ceil(STEP));
+    for y in (0..h).step_by(STEP) {
+        for x in (0..w).step_by(STEP) {
+            let i = (y * w + x) * 4;
+            // Unweighted average of the three channels: only needs to catch "the whole picture
+            // changed", and channel order does not matter for it.
+            out.push(((u32::from(frame[i]) + u32::from(frame[i + 1]) + u32::from(frame[i + 2])) / 3) as u8);
+        }
+    }
+    out
+}
+
+/// Whether two [`luma_thumbnail`]s look like different scenes -- a hard cut (level
+/// transition, cutscene, death/respawn) rather than motion within one scene. Carrying a flow
+/// field across a cut hands the model a field describing content no longer on screen, worse
+/// than handing it nothing. DLSS5VKLayer's helper runs the same kind of check
+/// (`DetectSceneCut`); this is an independent implementation of the generic technique (mean
+/// luma delta against a threshold).
+pub fn is_scene_cut(previous: &[u8], current: &[u8], threshold: u8) -> bool {
+    if previous.len() != current.len() || current.is_empty() {
+        return false;
+    }
+    let sum: u64 = previous.iter().zip(current).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum();
+    sum / current.len() as u64 >= u64::from(threshold)
+}
+
 /// `quality` is [`neural_forge_protocol::enums::mvec_quality`]'s raw value.
 fn level_for(quality: u32) -> vk::OpticalFlowPerformanceLevelNV {
     match quality {
@@ -533,9 +567,41 @@ fn region(width: u32, height: u32) -> vk::BufferImageCopy {
 mod tests {
     use super::*;
 
+    fn frame(width: u32, height: u32, value: u8) -> Vec<u8> {
+        vec![value; (width * height * 4) as usize]
+    }
+
     #[test]
     fn push_constants_match_the_shader_block() {
         // uvec2 full, uvec2 grid_dims, vec2 to_cell, vec2 factor, vec2 inv_scale (std430 push).
         assert_eq!(std::mem::size_of::<Push>(), 40);
+    }
+
+    #[test]
+    fn thumbnail_samples_every_eighth_pixel_per_axis() {
+        assert_eq!(luma_thumbnail(&frame(16, 16, 90), 16, 16), vec![90; 4]);
+        assert_eq!(luma_thumbnail(&frame(17, 9, 90), 17, 9).len(), 3 * 2);
+        assert!(luma_thumbnail(&[1, 2, 3], 16, 16).is_empty(), "a short frame must not panic");
+    }
+
+    #[test]
+    fn scene_cut_is_not_flagged_for_a_stable_or_slightly_changed_frame() {
+        let a = luma_thumbnail(&frame(32, 32, 100), 32, 32);
+        let b = luma_thumbnail(&frame(32, 32, 105), 32, 32);
+        assert!(!is_scene_cut(&a, &a, 40), "identical frames must never be a cut");
+        assert!(!is_scene_cut(&a, &b, 40), "a small uniform change must not be a cut");
+    }
+
+    #[test]
+    fn scene_cut_is_flagged_for_a_completely_different_frame() {
+        let a = luma_thumbnail(&frame(32, 32, 20), 32, 32);
+        let b = luma_thumbnail(&frame(32, 32, 220), 32, 32);
+        assert!(is_scene_cut(&a, &b, 40));
+    }
+
+    #[test]
+    fn scene_cut_never_panics_on_mismatched_or_empty_thumbnails() {
+        assert!(!is_scene_cut(&[], &[], 40));
+        assert!(!is_scene_cut(&[1, 2], &[1, 2, 3], 40));
     }
 }

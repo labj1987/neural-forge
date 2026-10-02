@@ -328,11 +328,6 @@ pub struct ShmHeader {
     /// GPU milliseconds of the layer's compose dispatch, measured the same way per async
     /// compose slot (f32 bits). 0 until the first reading.
     pub layer_compose_gpu_ms_bits: AtomicU32,
-    /// How the helper decides a frame is a scene cut. 0: a fixed mean-luma threshold between
-    /// consecutive model frames. 1: a running baseline of that mean, so a steady pan that
-    /// changes every pixel a little does not read as a cut. See
-    /// [`crate::enums::scene_cut_mode`]. Not persisted: an A/B knob, not a preference.
-    pub scene_cut_mode: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -358,7 +353,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2000, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1996, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
@@ -378,7 +373,10 @@ const _: () = assert!(
     std::mem::offset_of!(ShmHeader, layer_capture_gpu_ms_bits) == 1988,
     "layout changed -- bump SHM_VERSION"
 );
-const _: () = assert!(std::mem::offset_of!(ShmHeader, scene_cut_mode) == 1996, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(
+    std::mem::offset_of!(ShmHeader, layer_compose_gpu_ms_bits) == 1992,
+    "layout changed -- bump SHM_VERSION"
+);
 const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
@@ -443,7 +441,6 @@ impl ShmHeader {
         self.colour_trust_bits.store(2.0f32.to_bits(), Ordering::Relaxed);
         self.ratio_smooth_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.model_interval.store(1, Ordering::Relaxed);
-        self.scene_cut_mode.store(crate::enums::scene_cut_mode::FIXED, Ordering::Relaxed);
         self.scaling_downscaler.store(crate::enums::downscaler::LANCZOS3, Ordering::Relaxed);
 
         self.helper_state.store(crate::enums::helper_state::STOPPED, Ordering::Relaxed);

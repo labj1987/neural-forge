@@ -61,7 +61,7 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// The wire contract version (v2 added BGRA8 and a motion payload region; v3 adds a
 /// second independent request/response slot — see `docs/PROTOCOL_V3_DESIGN.md`; v7
 /// removes the motion payload region and `frame_mvec_valid` again, since motion is now
-/// estimated inside the helper; v8 appends the layer's GPU timestamps and `scene_cut_mode`).
+/// estimated inside the helper; v8 appends the layer's GPU timestamps).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
