@@ -32,6 +32,7 @@ mod swapchain;
 mod surface_usage;
 mod entry_points;
 mod present_sync;
+mod probe_ngx;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
@@ -490,6 +491,18 @@ impl Layer for NeuralForgeLayer {
         &self.0
     }
 
+    /// The framework's default (`DeviceInfo::hooked_commands`), plus the
+    /// `NEURAL_FORGE_PROBE_NGX` probe's commands only when the probe is on. With it off the
+    /// list is exactly the default, so the framework hands out the next layer's pointers for
+    /// every NVX entry point, as before.
+    fn hooked_device_commands(
+        &self,
+        _instance_info: &Self::InstanceInfo,
+        _device_info: Option<&Self::DeviceInfo>,
+    ) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
+        device_commands(probe_ngx::enabled())
+    }
+
     fn create_instance_info(
         &self,
         _create_info: &vk::InstanceCreateInfo,
@@ -524,6 +537,30 @@ impl Layer for NeuralForgeLayer {
 }
 
 declare_introspection_queries!(entry_points::EntryPoints);
+
+/// The device commands the framework routes to this layer's hooks.
+fn device_commands(probe: bool) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
+    use vulkan_layer::DeviceInfo;
+    Box::new(NeuralForgeDeviceInfo::hooked_commands().iter().chain(probe_ngx::probe_commands(probe)).cloned())
+}
+
+#[cfg(test)]
+mod probe_command_tests {
+    use super::*;
+    use vulkan_layer::DeviceInfo;
+
+    #[test]
+    fn probe_off_hooks_exactly_the_default_set() {
+        let off: Vec<_> = device_commands(false).collect();
+        assert_eq!(off, NeuralForgeDeviceInfo::hooked_commands().to_vec());
+        for command in probe_ngx::PROBE_COMMANDS {
+            assert!(!off.contains(command), "{command:?} must not be hooked with the probe off");
+        }
+        let on: Vec<_> = device_commands(true).collect();
+        assert_eq!(on.len(), off.len() + probe_ngx::PROBE_COMMANDS.len());
+        assert!(probe_ngx::PROBE_COMMANDS.iter().all(|command| on.contains(command)));
+    }
+}
 
 #[cfg(test)]
 mod requests_extension_tests {
