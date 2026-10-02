@@ -393,6 +393,29 @@ impl ShmClient {
         hdr.layer_compose_gpu_ms_bits.store(ms.to_bits(), Ordering::Relaxed);
     }
 
+    /// The pre-upscaler path's state and identified input extent (`ShmHeader::preupscale_*`).
+    pub fn publish_preupscale_state(&self, state: u32, width: u32, height: u32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.preupscale_state.store(state, Ordering::Relaxed);
+        hdr.preupscale_width.store(width, Ordering::Relaxed);
+        hdr.preupscale_height.store(height, Ordering::Relaxed);
+    }
+
+    /// The last hold's CPU milliseconds and the running count of answers over budget.
+    pub fn publish_preupscale_hold(&self, hold_ms: f32, misses: u32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.preupscale_hold_ms_bits.store(hold_ms.to_bits(), Ordering::Relaxed);
+        hdr.preupscale_misses.store(misses, Ordering::Relaxed);
+    }
+
+    /// Whether the model is wanted at all right now: the live `enabled` toggle (F11 / the GUI /
+    /// `shmctl set enabled`), `apply_model`, and not reported permanently unavailable. `false`
+    /// before the mapping is open.
+    pub fn model_wanted(&self) -> bool {
+        let Some(hdr) = self.header() else { return false };
+        hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0 && !self.model_known_unavailable()
+    }
+
     /// The published `(capture, compose)` GPU milliseconds, for the `[sync]` log line. Zeros
     /// before the first reading (or before the mapping is open).
     pub fn published_gpu_ms(&self) -> (f32, f32) {

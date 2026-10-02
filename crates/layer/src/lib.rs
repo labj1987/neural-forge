@@ -36,6 +36,7 @@ mod entry_points;
 mod present_sync;
 mod probe_ngx;
 mod probe_seq;
+mod preupscale;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
@@ -495,7 +496,8 @@ impl Layer for NeuralForgeLayer {
     }
 
     /// The framework's default (`DeviceInfo::hooked_commands`), plus the
-    /// `NEURAL_FORGE_PROBE_NGX` probe's commands only when the probe is on. With it off the
+    /// `NEURAL_FORGE_PROBE_NGX` probe's commands only when the probe is on, and the
+    /// `NEURAL_FORGE_PREUPSCALE` tracking commands only when a mode is selected. With both off the
     /// list is exactly the default, so the framework hands out the next layer's pointers for
     /// every NVX entry point, as before.
     fn hooked_device_commands(
@@ -503,7 +505,7 @@ impl Layer for NeuralForgeLayer {
         _instance_info: &Self::InstanceInfo,
         _device_info: Option<&Self::DeviceInfo>,
     ) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
-        device_commands(probe_ngx::enabled())
+        device_commands(probe_ngx::enabled(), preupscale::active())
     }
 
     fn create_instance_info(
@@ -541,10 +543,17 @@ impl Layer for NeuralForgeLayer {
 
 declare_introspection_queries!(entry_points::EntryPoints);
 
-/// The device commands the framework routes to this layer's hooks.
-fn device_commands(probe: bool) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
+/// The device commands the framework routes to this layer's hooks: the default set, then the
+/// probe's and the pre-upscaler path's when they are on, each command once.
+fn device_commands(probe: bool, preupscale: bool) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
     use vulkan_layer::DeviceInfo;
-    Box::new(NeuralForgeDeviceInfo::hooked_commands().iter().chain(probe_ngx::probe_commands(probe)).cloned())
+    let mut seen: Vec<LayerVulkanCommand> = Vec::new();
+    for command in NeuralForgeDeviceInfo::hooked_commands().iter().chain(probe_ngx::probe_commands(probe)).chain(preupscale::commands(preupscale)) {
+        if !seen.contains(command) {
+            seen.push(command.clone());
+        }
+    }
+    Box::new(seen.into_iter())
 }
 
 #[cfg(test)]
@@ -554,14 +563,24 @@ mod probe_command_tests {
 
     #[test]
     fn probe_off_hooks_exactly_the_default_set() {
-        let off: Vec<_> = device_commands(false).collect();
+        let off: Vec<_> = device_commands(false, false).collect();
         assert_eq!(off, NeuralForgeDeviceInfo::hooked_commands().to_vec());
         for command in probe_ngx::PROBE_COMMANDS {
             assert!(!off.contains(command), "{command:?} must not be hooked with the probe off");
         }
-        let on: Vec<_> = device_commands(true).collect();
+        let on: Vec<_> = device_commands(true, false).collect();
         assert_eq!(on.len(), off.len() + probe_ngx::PROBE_COMMANDS.len());
         assert!(probe_ngx::PROBE_COMMANDS.iter().all(|command| on.contains(command)));
+        for command in preupscale::COMMANDS {
+            assert!(!off.contains(command), "{command:?} must not be hooked with the pre-upscaler path off");
+        }
+        let pre: Vec<_> = device_commands(false, true).collect();
+        assert_eq!(pre.len(), off.len() + preupscale::COMMANDS.len());
+        assert!(preupscale::COMMANDS.iter().all(|command| pre.contains(command)));
+        // Both: the union, each command once.
+        let both: Vec<_> = device_commands(true, true).collect();
+        assert_eq!(both.len(), on.len(), "the pre-upscaler path's commands are a subset of the probe's");
+        assert!(preupscale::COMMANDS.iter().all(|command| both.contains(command)));
     }
 }
 

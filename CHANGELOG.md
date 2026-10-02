@@ -13,11 +13,21 @@ first shipped them; their phase is kept as a subheading.
   between 8-bit and RGBA16F rebuilds the feature like a size change and resets the model's
   history. Optical flow and the scene-cut check see a tone-mapped 8-bit picture of an HDR
   frame (`x / (1 + x)`, then sRGB); the model still gets the raw values. 8-bit frames behave
-  exactly as before. Nothing sends RGBA16F yet; the layer side comes separately.
+  exactly as before.
 - `trigger_helper_roundtrip` can send a raw RGBA16F frame from a file to a running helper
   (`--rgba16f FILE --width W --height H [--out FILE] [--repeat N]`) and prints per-channel
   statistics of input and answer; `optical_flow_rig_check --hdr` checks the flow's tone-map pass
   on the rig.
+- **Pre-upscaler path, layer side** (`NEURAL_FORGE_PREUPSCALE`, off by default; behaviour with it
+  unset is unchanged). At the game's DLSS submit the layer splits the submit around the DLSS
+  command buffer, captures DLSS's colour input (render resolution, RGBA16F, padded to even sizes)
+  into the shared-memory proxy region, and per mode dumps it with depth and motion vectors
+  (`dump`), writes the same bytes back (`identity`), or writes the helper's answer back
+  (`model`, every frame, 30 ms budget; the post-upscaler compose is off while it holds). See
+  `docs/PRE_UPSCALER_DESIGN.md`, "Implementation (layer)". Not yet run on the rig.
+- `shmctl status` shows `preupscale_state`, `preupscale_extent`, `preupscale_hold_ms` and
+  `preupscale_misses`. Shared-memory protocol 9: restart the helper and the game together after
+  updating.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
   `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
   earlier needs proof that the presentation engine's wait on them has completed, which core

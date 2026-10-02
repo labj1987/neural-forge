@@ -59,3 +59,28 @@ if ! grep -q '\[probe-ngx\] on in pid' "$NEURAL_FORGE_LOG" 2>/dev/null; then
     echo "FAIL: NEURAL_FORGE_PROBE_NGX=1 did not turn the probe on" >&2
     exit 1
 fi
+
+# Third pass with the pre-upscaler path in model mode (docs/PRE_UPSCALER_DESIGN.md, "Implementation
+# (layer)"): the local ICD has no VK_NVX_* extensions and no DLSS, so this proves the tracking hooks
+# install, nothing is held, and the probe's logging stays off.
+unset NEURAL_FORGE_PROBE_NGX
+export NEURAL_FORGE_PREUPSCALE=model
+export NEURAL_FORGE_LOG="$SCRATCH/layer-preupscale.log"
+echo
+echo "==> again with NEURAL_FORGE_PREUPSCALE=model"
+cargo run --example smoke -p neural-forge-layer
+echo
+echo "==> layer log ($NEURAL_FORGE_LOG):"
+cat "$NEURAL_FORGE_LOG" 2>/dev/null || echo "(no log written -- the layer never ran)"
+if ! grep -q '\[preupscale\] mode model in pid' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+    echo "FAIL: NEURAL_FORGE_PREUPSCALE=model did not turn the pre-upscaler path on" >&2
+    exit 1
+fi
+if grep -q '\[probe-ngx\]' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+    echo "FAIL: the NGX probe logged with only NEURAL_FORGE_PREUPSCALE set" >&2
+    exit 1
+fi
+if grep -q 'frame went to DLSS untouched\|resources for' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+    echo "FAIL: the pre-upscaler path held a submit on a device without DLSS" >&2
+    exit 1
+fi

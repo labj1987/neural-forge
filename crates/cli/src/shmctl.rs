@@ -75,6 +75,11 @@ fn cmd_status(header: &ShmHeader) {
     println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
     println!("layer_capture_gpu_ms={}", f32::from_bits(header.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)));
     println!("layer_compose_gpu_ms={}", f32::from_bits(header.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)));
+    let preupscale = header.preupscale_state.load(Ordering::Relaxed);
+    println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", _ => "unknown" });
+    println!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed));
+    println!("preupscale_hold_ms={}", f32::from_bits(header.preupscale_hold_ms_bits.load(Ordering::Relaxed)));
+    println!("preupscale_misses={}", header.preupscale_misses.load(Ordering::Relaxed));
     println!("layer_measured_white={}", f32::from_bits(header.layer_measured_white_bits.load(Ordering::Relaxed)));
     println!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed));
     println!("capture_request={}", header.capture_request.load(Ordering::Relaxed));
