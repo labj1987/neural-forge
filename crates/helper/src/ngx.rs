@@ -24,6 +24,7 @@ use ash::vk;
 
 use crate::abi::{self, NgxParameter};
 use crate::guard::guarded;
+pub use crate::hdr::FeatureKey;
 use crate::selfparam;
 use crate::spoof::{self, InstalledSpoof};
 
@@ -102,8 +103,9 @@ pub struct NgxSnippet {
     /// One NGX feature per pass, in chain order. A slot with a null handle is a hole: a pass
     /// that failed to rebuild and is skipped by the chain until it builds again.
     passes: Vec<PassSlot>,
-    /// The frame size every live feature was built for; a different incoming size rebuilds all.
-    built_size: (u32, u32),
+    /// The frame size and HDR mode every live feature was built for; a different incoming
+    /// key (a new size, or the proxy switching between 8-bit and RGBA16F) rebuilds all.
+    built: FeatureKey,
     /// The highest pass count the model would actually build at this size, once a later pass has
     /// failed to build. Not a fault: the chain simply runs at what fits.
     ceiling: Option<usize>,
@@ -115,12 +117,12 @@ pub struct NgxSnippet {
     /// The header values seen on the previous call, per pass.
     last_seen: Vec<NgxTuning>,
     ever_built: bool,
-    /// The first feature failed to build at this size (and when). Not fatal: the model is
-    /// unavailable *at that size* and is retried when the size changes, or after
+    /// The first feature failed to build at this size and HDR mode (and when). Not fatal: the
+    /// model is unavailable *at that key* and is retried when the key changes, or after
     /// [`RETRY_FAILED_SIZE_AFTER`] -- the likely causes (not enough VRAM while the game is still
     /// loading, a size too large for the model) pass. Failing once used to disable the model for
     /// the rest of the session, so lowering the resolution scale afterwards did nothing.
-    create_failed: Option<((u32, u32), Instant)>,
+    create_failed: Option<(FeatureKey, Instant)>,
     /// A human-readable account of the latest failure, for the header's reason string. Taken by
     /// the main loop.
     failure_note: Option<String>,
@@ -231,7 +233,7 @@ impl Default for NgxSnippet {
             disabled: false,
             no_binaries: false,
             passes: Vec::new(),
-            built_size: (0, 0),
+            built: FeatureKey::default(),
             ceiling: None,
             tuning_changed: None,
             build_after: None,
@@ -617,8 +619,15 @@ impl NgxSnippet {
     }
 }
 
-fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, width: u32, height: u32, tuning: &NgxTuning) -> Option<abi::NgxHandle> {
+fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue, key: FeatureKey, tuning: &NgxTuning) -> Option<abi::NgxHandle> {
     let create_feature = s.create_feature?;
+    let FeatureKey { width, height, hdr } = key;
+    crate::log!(
+        "[ngx] feature {width}x{height} hdr={}: DLSSNR.Hdr={} DLSSNR.SDR={} AutoExposure=1",
+        u8::from(hdr),
+        u8::from(hdr),
+        u8::from(!hdr)
+    );
     let name = |n: &str| CString::new(n).unwrap();
     let params = s.params;
     // Guarded like every other real call into the DLL below: `params`'s vtable is a
@@ -663,13 +672,13 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 abi::ngx_set_u32(params, name("DLSSNR.AutoExposure").as_ptr(), 1);
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_ExposureScale").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("NVSDK_NGX_Parameter_PreExposure").as_ptr(), 1.0);
-                // This helper always captures the swapchain as a plain 8-bit UNORM
-                // proxy today (see `neural_forge_layer::capture`) regardless of the
-                // swapchain's own HDR-ness -- SDR is the only honest hint to give
-                // until the real HDR float16 path (mentioned in the project's own
-                // README, not yet implemented) exists.
-                abi::ngx_set_u32(params, name("DLSSNR.Hdr").as_ptr(), 0);
-                abi::ngx_set_u32(params, name("DLSSNR.SDR").as_ptr(), 1);
+                // What the Color input is: the 8-bit display-referred swapchain proxy (SDR), or
+                // the game's scene-linear RGBA16F frame from before its upscaler
+                // (`docs/PRE_UPSCALER_DESIGN.md`), whose values run far above 1.0. The model
+                // latches this at creation, so the feature key carries it and a change of
+                // proxy class rebuilds the feature.
+                abi::ngx_set_u32(params, name("DLSSNR.Hdr").as_ptr(), u32::from(hdr));
+                abi::ngx_set_u32(params, name("DLSSNR.SDR").as_ptr(), u32::from(!hdr));
                 abi::ngx_set_u32(params, name("Width").as_ptr(), width);
                 abi::ngx_set_u32(params, name("Height").as_ptr(), height);
                 abi::ngx_set_u32(params, name("CreationNodeMask").as_ptr(), 1);
@@ -742,10 +751,11 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
         (abi::result::FAIL_SEH, std::ptr::null_mut()),
     );
     crate::log!(
-        "[ngx] VULKAN_CreateFeature(18) -> {:#x} seh={:#x} handle={:?} size={width}x{height}",
+        "[ngx] VULKAN_CreateFeature(18) -> {:#x} seh={:#x} handle={:?} size={width}x{height} hdr={}",
         result as u32,
         seh,
-        handle
+        handle,
+        u8::from(hdr)
     );
 
     if seh != 0 {
@@ -860,16 +870,19 @@ const MAX_BUILD_FAILURES: u32 = 3;
 /// build sets the ceiling instead: the chain runs at what fits. A pass that fails to *rebuild* is
 /// left a hole (skipped) and retried after the spacing.
 ///
+/// `key` is the frame's size and HDR mode (an RGBA16F proxy builds with `DLSSNR.Hdr=1`); a
+/// change of either rebuilds every pass.
+///
 /// Returns the number of built passes afterwards.
 pub fn maintain_passes(
     s: &mut NgxSnippet,
     device: &ash::Device,
     queue: vk::Queue,
-    width: u32,
-    height: u32,
+    key: FeatureKey,
     wanted: &[NgxTuning],
     settle_ms: u32,
 ) -> usize {
+    let FeatureKey { width, height, .. } = key;
     if s.disabled {
         return 0;
     }
@@ -893,21 +906,18 @@ pub fn maintain_passes(
     }
     let spacing = Duration::from_millis(u64::from(settle_ms));
 
-    if let Some((size, when)) = s.create_failed {
-        if size == (width, height) && when.elapsed() < RETRY_FAILED_SIZE_AFTER {
-            return 0; // still blocked at this size; the frame just passes through
+    if let Some((failed, when)) = s.create_failed {
+        if failed == key && when.elapsed() < RETRY_FAILED_SIZE_AFTER {
+            return 0; // still blocked at this size and mode; the frame just passes through
         }
-        // A different size, or long enough: try again from scratch.
+        // A different size or mode, or long enough: try again from scratch.
         s.create_failed = None;
         s.ever_built = false;
         s.build_after = None;
     }
 
-    if s.live_passes() > 0 && s.built_size != (width, height) {
-        crate::log!(
-            "[helper] frame size {}x{} -> {width}x{height}; rebuilding {} pass(es)",
-            s.built_size.0, s.built_size.1, s.live_passes()
-        );
+    if s.live_passes() > 0 && s.built != key {
+        crate::log!("[helper] frame {} -> {key}; rebuilding {} pass(es)", s.built, s.live_passes());
         // SAFETY: nothing may be in flight when a feature is destroyed.
         let _ = unsafe { device.device_wait_idle() };
         release_all(s);
@@ -969,12 +979,12 @@ pub fn maintain_passes(
             release_handle(s, old, pass);
         }
 
-        let created = create_feature_at(s, device, queue, width, height, &wanted[pass]);
+        let created = create_feature_at(s, device, queue, key, &wanted[pass]);
         s.build_after = Some(Instant::now() + spacing);
         match created {
             Some(handle) => {
                 s.ever_built = true;
-                s.built_size = (width, height);
+                s.built = key;
                 let slot = PassSlot { handle, built: wanted[pass], needs_reset: true, failures: 0 };
                 if pass < s.passes.len() {
                     s.passes[pass] = slot;
@@ -986,10 +996,10 @@ pub fn maintain_passes(
                 // Not retried every frame (that would redo the whole command pool/fence setup
                 // per captured frame), and not fatal either: blocked at this size until it
                 // changes or the retry interval passes.
-                crate::log!("[helper] the model would not build at {width}x{height}; passing frames through, retrying when the size changes or in {}s", RETRY_FAILED_SIZE_AFTER.as_secs());
+                crate::log!("[helper] the model would not build at {key}; passing frames through, retrying when the size or mode changes or in {}s", RETRY_FAILED_SIZE_AFTER.as_secs());
                 crate::logging::flush();
                 s.failure_note = Some(format!("model would not build at {width}x{height}; lower the resolution scale"));
-                s.create_failed = Some(((width, height), Instant::now()));
+                s.create_failed = Some((key, Instant::now()));
                 return 0;
             }
             None if pass >= s.passes.len() => {

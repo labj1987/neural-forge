@@ -51,7 +51,11 @@ pub struct FrameResources {
     /// runs (`None` inside if they could not be built).
     work: std::cell::OnceCell<Option<[WorkImage; 2]>>,
     mem_props: vk::PhysicalDeviceMemoryProperties,
+    /// Color's and Output's format: the proxy's own (`color_format`), so upload and download
+    /// are plain copies in either class.
     color_format: vk::Format,
+    /// The proxy's bytes per pixel: 4, or 8 for RGBA16F.
+    bytes_per_pixel: usize,
     width: u32,
     height: u32,
     queue_family: u32,
@@ -115,11 +119,15 @@ pub struct FrameResources {
 // in `main.rs` that owns this value.
 unsafe impl Send for FrameResources {}
 
+/// The model's Color/Output format for a proxy format. RGBA16F (the pre-upscaler path's
+/// scene-linear frame) is the working format itself, so its upload and download are plain
+/// copies, no conversion.
 fn color_format(proxy: u32) -> Option<vk::Format> {
     use neural_forge_protocol::enums::proxy_format;
     match proxy {
         proxy_format::RGBA8 => Some(vk::Format::R8G8B8A8_UNORM),
         proxy_format::BGRA8 => Some(vk::Format::B8G8R8A8_UNORM),
+        proxy_format::RGBA16F => Some(WORK_FORMAT),
         _ => None,
     }
 }
@@ -441,10 +449,12 @@ impl FrameResources {
         let fence = unsafe { device.create_fence(&fence_info, None) }.ok()?;
         partial.track(Undo::Fence(fence));
 
-        // Holds one 8-bit frame: Color on upload, Output on download, each only when that
-        // shared-memory region could not be imported. Motion never goes through it: it is
-        // estimated on the GPU (`optical_flow.rs`) or cleared there.
-        let staging_size = u64::from(width) * u64::from(height) * 4;
+        // Holds one frame in the proxy's format (4 bytes per pixel, 8 for RGBA16F): Color on
+        // upload, Output on download, each only when that shared-memory region could not be
+        // imported. Motion never goes through it: it is estimated on the GPU
+        // (`optical_flow.rs`) or cleared there.
+        let bytes_per_pixel = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format);
+        let staging_size = u64::from(width) * u64::from(height) * bytes_per_pixel as u64;
         let buf_info = vk::BufferCreateInfo::builder()
             .size(staging_size)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
@@ -509,6 +519,7 @@ impl FrameResources {
         partial.disarm();
         Some(Self {
             color_format,
+            bytes_per_pixel,
             width,
             height,
             queue_family,
@@ -550,6 +561,11 @@ impl FrameResources {
             && self.height == height
     }
 
+    /// Color holds the scene-linear RGBA16F proxy (the pre-upscaler path).
+    pub fn is_hdr(&self) -> bool {
+        self.color_format == WORK_FORMAT
+    }
+
     /// Whether a bounded fence wait on this instance's `cmd`/`fence` has already timed
     /// out -- see `stalled`'s own doc comment. Callers that would otherwise call
     /// `destroy` must check this first and leak instead.
@@ -589,7 +605,8 @@ impl FrameResources {
         static EVALUATES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let evaluate_no = EVALUATES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let pixel_count = (self.width as usize) * (self.height as usize);
-        if chain.is_empty() || proxy.len() < pixel_count * 4 || answer_out.len() < pixel_count * 4 {
+        let frame_bytes = pixel_count * self.bytes_per_pixel;
+        if chain.is_empty() || proxy.len() < frame_bytes || answer_out.len() < frame_bytes {
             return None;
         }
 
@@ -598,9 +615,9 @@ impl FrameResources {
         // that buffer is imported from (`ShmMapping::frame_regions`/`proxy_and_answer_regions`
         // share the same base), so `run_transfer` below reads directly from it instead.
         if self.imported_proxy.is_none() {
-            // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4`
+            // SAFETY: `staging_ptr` is a live mapping of at least `frame_bytes`
             // bytes (this type's own construction sized it to exactly that).
-            unsafe { std::ptr::copy_nonoverlapping(proxy.as_ptr(), self.staging_ptr, pixel_count * 4) };
+            unsafe { std::ptr::copy_nonoverlapping(proxy.as_ptr(), self.staging_ptr, frame_bytes) };
         }
         let t_upload_start = std::time::Instant::now();
         if !self.run_transfer(device, queue, TransferKind::Upload) {
@@ -611,9 +628,12 @@ impl FrameResources {
         // Stage 1b: motion vectors, on the GPU from the Color image just uploaded.
         let mut motion_time = None;
         let mut motion_failed = false;
+        // A session built for the other format class would blit floats as bytes or tone map
+        // bytes; the caller keys sessions by class, so this only guards against a mismatch.
+        let motion = motion.filter(|flow| flow.hdr == self.is_hdr());
         if let Some(flow) = motion {
             let t = std::time::Instant::now();
-            match flow.estimate(device, queue, self.color_image, self.mvec_image, motion_scale) {
+            match flow.estimate(device, queue, self.color_image, self.color_view, self.mvec_image, motion_scale) {
                 Ok(_) => motion_time = Some(t.elapsed()),
                 // A timed-out estimate may still be using Color/MVec on the GPU: skip this
                 // frame's evaluation (fail open) rather than race it.
@@ -783,8 +803,8 @@ impl FrameResources {
         // Skipped when `imported_answer` is set: `run_transfer`'s download copy just
         // wrote Output directly into the exact memory `answer_out` is a view of.
         if self.imported_answer.is_none() {
-            // SAFETY: `staging_ptr` is a live mapping of at least `pixel_count * 4` bytes.
-            unsafe { std::ptr::copy_nonoverlapping(self.staging_ptr, answer_out.as_mut_ptr(), pixel_count * 4) };
+            // SAFETY: `staging_ptr` is a live mapping of at least `frame_bytes` bytes.
+            unsafe { std::ptr::copy_nonoverlapping(self.staging_ptr, answer_out.as_mut_ptr(), frame_bytes) };
         }
         Some(FrameTiming {
             upload: t_upload,
@@ -1233,13 +1253,16 @@ enum TransferKind {
         let pd = unsafe {instance.enumerate_physical_devices()}.unwrap()[0];
         let q = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
         let device = unsafe {instance.create_device(pd,&vk::DeviceCreateInfo::builder().queue_create_infos(&q),None)}.unwrap();
-        for format in [proxy_format::RGBA8,proxy_format::BGRA8] {
+        for format in [proxy_format::RGBA8,proxy_format::BGRA8,proxy_format::RGBA16F] {
             // No real SHM mapping in this manual test -- null/zero-length regions,
             // which `try_import` inside `new` safely declines (falling back to the
             // staging path) rather than dereferencing.
             let f = FrameResources::new(&device,&instance,pd,0,512,512,format,(std::ptr::null_mut(),0),(std::ptr::null_mut(),0)).expect("real Color/Output/MVec resources");
             assert!(f.matches(0,512,512,format));
-            assert!(!f.matches(0,512,512,if format == proxy_format::RGBA8 {proxy_format::BGRA8} else {proxy_format::RGBA8}));
+            assert_eq!(f.is_hdr(), format == proxy_format::RGBA16F);
+            for other in [proxy_format::RGBA8,proxy_format::BGRA8,proxy_format::RGBA16F].into_iter().filter(|&o| o != format) {
+                assert!(!f.matches(0,512,512,other));
+            }
             assert!(!f.matches(0,256,512,format));
             unsafe {f.destroy(&device)};
         }
@@ -1248,7 +1271,8 @@ enum TransferKind {
     #[test] fn ngx_formats_match_raw_bytes() {
         assert_eq!(color_format(proxy_format::RGBA8),Some(vk::Format::R8G8B8A8_UNORM));
         assert_eq!(color_format(proxy_format::BGRA8),Some(vk::Format::B8G8R8A8_UNORM));
-        assert_eq!(color_format(proxy_format::RGBA16F),None);
+        assert_eq!(color_format(proxy_format::RGBA16F),Some(vk::Format::R16G16B16A16_SFLOAT));
+        assert_eq!(color_format(proxy_format::UNKNOWN),None);
         assert_eq!(color_format(999),None);
     }
 }

@@ -171,3 +171,66 @@ path unchanged, so nothing is lost for other games or for DLAA/native settings.
    cheaper working scale at 4K, the pipelined present).
 
 1.1.0 (measurement tools, timestamps, log rotation, the probe) ships either way.
+
+## Implementation (helper)
+
+Built 2026-10-02 (section 3, "The model's side"). Nothing sends RGBA16F until the layer's half
+lands; with 8-bit proxies the helper behaves exactly as before.
+
+### What changed
+
+- **Format.** `frame::color_format(RGBA16F)` is `R16G16B16A16_SFLOAT` (the multipass working
+  format), so Color and Output are created in the proxy's own format and the upload (staging
+  buffer or the imported shared-memory region) and the download into the answer region are
+  plain copies at 8 bytes per pixel. `FrameResources` sizes its staging buffer and imports by
+  `proxy_format::bytes_per_pixel`; for 8-bit proxies every size, copy and image is what it was.
+- **HDR signalled to NGX at creation.** `ngx::create_feature_at` writes `DLSSNR.Hdr=1`,
+  `DLSSNR.SDR=0` for an RGBA16F slot (`Hdr=0, SDR=1` for 8-bit), `AutoExposure=1` and
+  `Feature_Flags` unchanged, and logs `[ngx] feature WxH hdr=1: DLSSNR.Hdr=1 DLSSNR.SDR=0
+  AutoExposure=1` before `CreateFeature` (whose own line now ends in `hdr=1`). The features are
+  keyed by `hdr::FeatureKey { width, height, hdr }`: `maintain_passes` rebuilds every pass when
+  the key changes (`[helper] frame 1708x960 hdr=0 -> 1708x960 hdr=1; rebuilding N pass(es)`),
+  and a failed first build blocks retries per key, not per size.
+- **Motion vectors.** The flow input is built on the GPU (`GpuFlow::estimate` blits Color down
+  into a `B8G8R8A8_UNORM` image). A session built for an HDR frame (`GpuFlow::new(.., hdr)`)
+  first runs `shaders/hdr_to_flow.comp` over Color (per channel: NaN and negatives to 0,
+  `x / (1 + x)`, sRGB encode) into a full-size `R8G8B8A8_UNORM` image, and the blit reads that.
+  Sessions are keyed by size, quality and HDR-ness, so a format switch builds a new one (which
+  also drops the flow's reference frame). `optical_flow_rig_check --hdr` exercises it on the rig.
+- **Scene cuts.** `scene::thumbnail` (moved out of `optical_flow.rs` so it is tested natively)
+  decodes an RGBA16F frame's halves (`hdr::f16_to_f32`) and applies the same tone map on the CPU
+  (`hdr::tonemap_u8`) before averaging; the 40-level threshold is unchanged. Thumbnails of
+  different classes are never compared.
+- **History.** Everything in `history.rs` applies unchanged; in addition each request's format
+  class goes through `HistoryGap::note_format`, and the first evaluate after a class change
+  resets the model's history (`Stale::FormatChanged`, logged `resetting model history (proxy
+  format changed ...)`). The rebuilt feature and frame resources reset it as well.
+- The model input is always the raw scene-linear frame; the tone map only feeds the flow and
+  the thumbnail. The GPU tone map and the CPU one agree exactly (0 LSB difference) on all 65536
+  half bit patterns, checked on lavapipe during development.
+
+### Running the model on a dumped frame (experiment E1)
+
+`crates/protocol/examples/trigger_helper_roundtrip.rs` plays the layer against a running
+helper. With `--rgba16f` it sends a raw frame (W*H*8 bytes, little-endian halves R, G, B, A),
+as `RGBA16F` on slot 0, `--repeat` times (default 4: the first request after a size or format
+change can come back as an echo while the feature builds). Each round prints whether the answer
+was evaluated or echoed; for the last one it prints per-channel min/max/mean, NaN and Inf counts
+for input and answer, and the mean |answer - input| per channel, and writes the answer (same
+format and size) to `--out`. Odd sizes are padded by repeating the last column/row and cropped
+back. Exit status 1 when the last answer was an echo.
+
+The helper on the rig must be this build (`scripts/deploy-rig.sh`), started by the CLI with no
+game running (the layer would drive slot 0 too), with the effect on:
+
+```bash
+cargo +stable build --release -p neural-forge-protocol --example trigger_helper_roundtrip
+scp target/release/examples/trigger_helper_roundtrip lordnikon:/tmp/nf-roundtrip
+ssh lordnikon 'export NEURAL_FORGE_SHM=/tmp/neural-forge-1000/shm.bin NEURAL_FORGE_UID=1000; /tmp/nf-roundtrip --rgba16f /tmp/gta-color-1708x960.rgba16f --width 1708 --height 960 --out /tmp/gta-color-1708x960.answer.rgba16f --repeat 8'
+ssh lordnikon 'grep -E "\[ngx\] (feature|VULKAN_CreateFeature|EvaluateFeature)|resetting model history|\[frame\]" ~/.local/state/neural-forge/helper.log | tail -20'
+```
+
+What E1 reads from it: `[ngx] VULKAN_CreateFeature(18) -> 0x1 ... hdr=1` (NGX accepted the HDR
+feature), `evaluated` rather than `ECHO`, no NaN/Inf in the answer, the answer's range of the
+same order as the input's (scene-linear, not clamped to [0, 1] and not collapsed), and a mean
+|answer - input| that is clearly non-zero but small next to the channel means.

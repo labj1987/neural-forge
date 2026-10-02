@@ -5,7 +5,10 @@
 //! `FrameResources::evaluate` does, and reads MVec back to check the vectors. Proves the
 //! device comes up with the flow queue, the vectors are right, and nothing hangs.
 //!
-//! Usage (under the helper's runner): optical_flow_rig_check.exe [frames] [width] [height]
+//! Usage (under the helper's runner): optical_flow_rig_check.exe [frames] [width] [height] [--hdr]
+//! `--hdr` runs the pre-upscaler path instead: Color is R16G16B16A16_SFLOAT holding the same
+//! pattern as scene-linear values up to ~50.0, so the session's tone-map pass
+//! (`hdr_to_flow.comp`) feeds the flow.
 //! Exit status: 0 = pass; nonzero = a failed check, or 3 when a single frame stalls >10 s.
 //! Every line also goes, flushed, to `optical_flow_rig_check.log` beside the executable:
 //! Proton does not reliably pass a Windows program's stdout through.
@@ -41,6 +44,31 @@ fn noise_frame(w: u32, h: u32, shift: u32, out: &mut [u8]) {
             let i = ((y * w + x) * 4) as usize;
             out[i..i + 4].copy_from_slice(&[v, v, v, 255]);
         }
+    }
+}
+
+/// `f32` to binary16 bits for the non-negative values this test writes (rounds toward zero;
+/// tiny values flush to zero).
+fn f32_to_half(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    if v <= 0.0 || exp <= 0 {
+        return 0;
+    }
+    if exp >= 31 {
+        return 0x7bff;
+    }
+    ((exp as u16) << 10) | ((bits >> 13) & 0x3ff) as u16
+}
+
+/// [`noise_frame`]'s pattern as scene-linear RGBA16F: byte `v` becomes `(v/255)^2.2 * 50`, so
+/// most of the picture is far above 1.0, as in a game's HDR render target.
+fn noise_frame16(w: u32, h: u32, shift: u32, scratch: &mut Vec<u8>, out: &mut [u8]) {
+    scratch.resize((w * h * 4) as usize, 0);
+    noise_frame(w, h, shift, scratch);
+    for (i, px) in scratch.as_chunks::<4>().0.iter().enumerate() {
+        let v = f32_to_half((f32::from(px[0]) / 255.0).powf(2.2) * 50.0).to_le_bytes();
+        out[i * 8..i * 8 + 8].copy_from_slice(&[v[0], v[1], v[0], v[1], v[0], v[1], 0x00, 0x3c]);
     }
 }
 
@@ -112,6 +140,7 @@ fn region(w: u32, h: u32) -> vk::BufferImageCopy {
 
 fn main() {
     let args: Vec<u32> = std::env::args().skip(1).filter_map(|a| a.parse().ok()).collect();
+    let hdr = std::env::args().any(|a| a == "--hdr");
     let (frames, w, h) = (*args.first().unwrap_or(&500), *args.get(1).unwrap_or(&2560), *args.get(2).unwrap_or(&1440));
     if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
         if let Ok(f) = std::fs::File::create(dir.join("optical_flow_rig_check.log")) {
@@ -159,9 +188,20 @@ fn main() {
         let fq = FlowQueue { family, queue: device.get_device_queue(family, 0) };
 
         let mem = instance.get_physical_device_memory_properties(pd);
-        let color = image(&device, &mem, w, h, vk::Format::B8G8R8A8_UNORM);
+        let color_format = if hdr { vk::Format::R16G16B16A16_SFLOAT } else { vk::Format::B8G8R8A8_UNORM };
+        let color = image(&device, &mem, w, h, color_format);
+        let color_view = device
+            .create_image_view(
+                &vk::ImageViewCreateInfo::builder()
+                    .image(color)
+                    .view_type(vk::ImageViewType::TYPE_2D)
+                    .format(color_format)
+                    .subresource_range(vk::ImageSubresourceRange::builder().aspect_mask(vk::ImageAspectFlags::COLOR).level_count(1).layer_count(1).build()),
+                None,
+            )
+            .expect("color view");
         let mvec = image(&device, &mem, w, h, vk::Format::R16G16_SFLOAT);
-        let bytes = u64::from(w) * u64::from(h) * 4;
+        let bytes = u64::from(w) * u64::from(h) * if hdr { 8 } else { 4 };
         let staging = device
             .create_buffer(&vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST), None)
             .expect("staging");
@@ -208,23 +248,25 @@ fn main() {
             });
         };
 
-        let mut flow = GpuFlow::new(&instance, &device, pd, 0, &fq, w, h, 1).expect("GPU flow session");
-        say!("session: {w}x{h}");
-        noise_frame(w, h, 0, mapped);
+        let mut flow = GpuFlow::new(&instance, &device, pd, 0, &fq, w, h, 1, hdr).expect("GPU flow session");
+        say!("session: {w}x{h} hdr={}", u8::from(hdr));
+        let mut scratch = Vec::new();
+        let mut fill = |shift: u32, mapped: &mut [u8]| if hdr { noise_frame16(w, h, shift, &mut scratch, mapped) } else { noise_frame(w, h, shift, mapped) };
+        fill(0, mapped);
         upload();
-        assert!(!flow.estimate(&device, main_queue, color, mvec, [1.0, 1.0]).expect("seed"), "first frame only seeds history");
+        assert!(!flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0]).expect("seed"), "first frame only seeds history");
         upload();
-        assert!(flow.estimate(&device, main_queue, color, mvec, [1.0, 1.0]).expect("stationary"));
+        assert!(flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0]).expect("stationary"));
         readback();
         let (sx, sy) = median_motion(mapped, w, h);
         say!("stationary median=({sx:.2},{sy:.2}) expected (0,0)");
         let mut worst = 0f32;
         let mut total = Duration::ZERO;
         for i in 1..=frames {
-            noise_frame(w, h, i * STEP, mapped);
+            fill(i * STEP, mapped);
             upload();
             let t = Instant::now();
-            assert!(flow.estimate(&device, main_queue, color, mvec, [1.0, 1.0]).expect("estimate"));
+            assert!(flow.estimate(&device, main_queue, color, color_view, mvec, [1.0, 1.0]).expect("estimate"));
             total += t.elapsed();
             PROGRESS.store(u64::from(i), Ordering::Relaxed);
             if i % 50 == 0 || i == 1 {

@@ -6,6 +6,18 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- **Helper: RGBA16F (scene-linear HDR) frames**, the model's side of the pre-upscaler path
+  (`docs/PRE_UPSCALER_DESIGN.md`, "Implementation (helper)"). A slot whose `proxy_format` is
+  `RGBA16F` is uploaded and answered as half floats with no conversion, and its NGX feature is
+  created with `DLSSNR.Hdr=1, SDR=0` (8-bit frames keep `Hdr=0, SDR=1`). Switching a slot
+  between 8-bit and RGBA16F rebuilds the feature like a size change and resets the model's
+  history. Optical flow and the scene-cut check see a tone-mapped 8-bit picture of an HDR
+  frame (`x / (1 + x)`, then sRGB); the model still gets the raw values. 8-bit frames behave
+  exactly as before. Nothing sends RGBA16F yet; the layer side comes separately.
+- `trigger_helper_roundtrip` can send a raw RGBA16F frame from a file to a running helper
+  (`--rgba16f FILE --width W --height H [--out FILE] [--repeat N]`) and prints per-channel
+  statistics of input and answer; `optical_flow_rig_check --hdr` checks the flow's tone-map pass
+  on the rig.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
   `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
   earlier needs proof that the presentation engine's wait on them has completed, which core

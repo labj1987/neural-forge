@@ -9,7 +9,10 @@
 //!
 //! Per frame, three submissions chained by semaphores, with no CPU copy of any frame:
 //! 1. main queue: blit the model's Color image (already uploaded) down by [`DOWNSCALE`]
-//!    into this frame's flow input;
+//!    into this frame's flow input. An RGBA16F (scene-linear HDR) Color image is first tone
+//!    mapped into an 8-bit copy by `hdr_to_flow.comp` (`x / (1 + x)`, then sRGB; the same
+//!    function as `hdr::tonemap_encode`), and that copy is blitted instead: a plain blit would
+//!    clamp everything above 1.0 and spend the 8 bits linearly;
 //! 2. optical-flow queue: estimate flow between this input and the previous one, copy the
 //!    gridded result into a buffer;
 //! 3. main queue: `flow_to_mvec.comp` turns it into full-resolution R16G16_SFLOAT motion
@@ -35,6 +38,7 @@ pub struct FlowQueue {
 }
 
 const SPV: &[u8] = include_bytes!("../shaders/flow_to_mvec.spv");
+const TONE_SPV: &[u8] = include_bytes!("../shaders/hdr_to_flow.spv");
 
 /// Flow runs on the frame scaled down by this much per axis: a quarter of the pixels, which
 /// is where most of optical flow's cost goes. Vectors are scaled back up by the shader.
@@ -86,9 +90,13 @@ pub struct GpuFlow {
     shader: vk::ShaderModule,
     descriptor_pool: vk::DescriptorPool,
     descriptor_set: vk::DescriptorSet,
+    /// The HDR tone-map pass (`hdr_to_flow.comp`); all null unless `hdr`.
+    tone: ToneMap,
     pub width: u32,
     pub height: u32,
     pub quality: u32,
+    /// Built for an RGBA16F Color image: [`Self::estimate`] tone maps it before the blit.
+    pub hdr: bool,
     flow_width: u32,
     flow_height: u32,
     grid: u32,
@@ -104,12 +112,33 @@ pub struct GpuFlow {
 // Access is serialized by the helper's own single-threaded per-frame loop.
 unsafe impl Send for GpuFlow {}
 
+/// Resources of the HDR tone-map pass: a full-resolution `R8G8B8A8_UNORM` storage image and
+/// the compute pipeline that fills it from the model's RGBA16F Color image.
+#[derive(Clone, Copy, Default)]
+struct ToneMap {
+    image: ImageRes,
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    shader: vk::ShaderModule,
+    descriptor_pool: vk::DescriptorPool,
+    descriptor_set: vk::DescriptorSet,
+}
+
+/// `hdr_to_flow.comp`'s push-constant block.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TonePush {
+    size: [u32; 2],
+}
+
 impl GpuFlow {
     /// `device`/`instance`/`pd` are the helper's own live Vulkan context; `main_family` is the
     /// family the model's images and main queue belong to, `flow_queue` the optical-flow one.
-    /// `width`/`height` are the model's (full) frame size.
+    /// `width`/`height` are the model's (full) frame size. `hdr`: the Color image this session
+    /// will be handed is RGBA16F scene-linear, so it is tone mapped before the flow sees it.
     #[allow(clippy::too_many_arguments)]
-    pub fn new(instance: &ash::Instance, device: &ash::Device, pd: vk::PhysicalDevice, main_family: u32, flow_queue: &FlowQueue, width: u32, height: u32, quality: u32) -> Result<Self, String> {
+    pub fn new(instance: &ash::Instance, device: &ash::Device, pd: vk::PhysicalDevice, main_family: u32, flow_queue: &FlowQueue, width: u32, height: u32, quality: u32, hdr: bool) -> Result<Self, String> {
         let api = vk::NvOpticalFlowFn::load(|name| unsafe { std::mem::transmute(instance.get_device_proc_addr(device.handle(), name.as_ptr())) });
         let mut flow = Self {
             api,
@@ -134,9 +163,11 @@ impl GpuFlow {
             shader: vk::ShaderModule::null(),
             descriptor_pool: vk::DescriptorPool::null(),
             descriptor_set: vk::DescriptorSet::null(),
+            tone: ToneMap::default(),
             width,
             height,
             quality,
+            hdr,
             flow_width: 0,
             flow_height: 0,
             grid: 0,
@@ -258,6 +289,59 @@ impl GpuFlow {
             vk::WriteDescriptorSet::builder().dst_set(self.descriptor_set).dst_binding(i as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&infos[i]).build()
         });
         device.update_descriptor_sets(&writes, &[]);
+        if self.hdr {
+            self.build_tone_map(device, &mem)?;
+        }
+        Ok(())
+    }
+
+    /// The HDR tone-map pass: its 8-bit output image and pipeline. Binding 0 (the Color view) is
+    /// written per estimate, since the model's Color image can be rebuilt under a live session.
+    unsafe fn build_tone_map(&mut self, device: &ash::Device, mem: &vk::PhysicalDeviceMemoryProperties) -> Result<(), String> {
+        let format = vk::Format::R8G8B8A8_UNORM;
+        let image_info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(format)
+            .extent(vk::Extent3D { width: self.width, height: self.height, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let t = &mut self.tone;
+        t.image.image = device.create_image(&image_info, None).map_err(err("tone image"))?;
+        let req = device.get_image_memory_requirements(t.image.image);
+        t.image.memory = device
+            .allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(req.size).memory_type_index(memory_type(mem, req.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)?), None)
+            .map_err(err("tone image memory"))?;
+        device.bind_image_memory(t.image.image, t.image.memory, 0).map_err(err("bind tone image"))?;
+        t.image.view = device
+            .create_image_view(&vk::ImageViewCreateInfo::builder().image(t.image.image).view_type(vk::ImageViewType::TYPE_2D).format(format).subresource_range(subresource()), None)
+            .map_err(err("tone image view"))?;
+
+        let words = ash::util::read_spv(&mut std::io::Cursor::new(TONE_SPV)).map_err(|e| format!("tone shader: {e}"))?;
+        t.shader = device.create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&words), None).map_err(err("tone shader module"))?;
+        let bindings = [(0, vk::DescriptorType::SAMPLED_IMAGE), (1, vk::DescriptorType::STORAGE_IMAGE)].map(|(b, ty)| {
+            vk::DescriptorSetLayoutBinding::builder().binding(b).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build()
+        });
+        t.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).map_err(err("tone set layout"))?;
+        let ranges = [vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<TonePush>() as u32).build()];
+        let layouts = [t.set_layout];
+        t.pipeline_layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&layouts).push_constant_ranges(&ranges), None).map_err(err("tone pipeline layout"))?;
+        let entry = std::ffi::CString::new("main").expect("static name");
+        let stage = vk::PipelineShaderStageCreateInfo::builder().stage(vk::ShaderStageFlags::COMPUTE).module(t.shader).name(&entry);
+        let pipeline_info = [vk::ComputePipelineCreateInfo::builder().stage(*stage).layout(t.pipeline_layout).build()];
+        t.pipeline = device.create_compute_pipelines(vk::PipelineCache::null(), &pipeline_info, None).map_err(|(_, e)| format!("tone pipeline: {e:?}"))?[0];
+        let sizes = [
+            vk::DescriptorPoolSize::builder().ty(vk::DescriptorType::SAMPLED_IMAGE).descriptor_count(1).build(),
+            vk::DescriptorPoolSize::builder().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(1).build(),
+        ];
+        t.descriptor_pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None).map_err(err("tone descriptor pool"))?;
+        t.descriptor_set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(t.descriptor_pool).set_layouts(&layouts)).map_err(err("tone descriptor set"))?[0];
+        let info = [vk::DescriptorImageInfo::builder().image_view(t.image.view).image_layout(vk::ImageLayout::GENERAL).build()];
+        let write = vk::WriteDescriptorSet::builder().dst_set(t.descriptor_set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&info).build();
+        device.update_descriptor_sets(&[write], &[]);
         Ok(())
     }
 
@@ -267,12 +351,14 @@ impl GpuFlow {
     }
 
     /// Estimates motion into `mvec` (the model's MVec image, `width`x`height`, R16G16_SFLOAT)
-    /// from `color` (the model's Color image, same size). Both must be in
+    /// from `color` (the model's Color image, same size; `color_view` is its view, read by the
+    /// tone-map pass when the session is `hdr`). Both must be in
     /// `SHADER_READ_ONLY_OPTIMAL` and idle on `main_queue`, and are left that way. `scale` is
     /// the units scale from `neural_forge_protocol::motion::scales`. `Ok(false)` on the first
     /// frame after creation or `reset` (history seeded, `mvec` untouched), `Ok(true)` when
     /// `mvec` now holds this frame's motion.
-    pub fn estimate(&mut self, device: &ash::Device, main_queue: vk::Queue, color: vk::Image, mvec: vk::Image, scale: [f32; 2]) -> Result<bool, vk::Result> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn estimate(&mut self, device: &ash::Device, main_queue: vk::Queue, color: vk::Image, color_view: vk::ImageView, mvec: vk::Image, scale: [f32; 2]) -> Result<bool, vk::Result> {
         if self.stalled {
             return Err(vk::Result::TIMEOUT);
         }
@@ -282,8 +368,30 @@ impl GpuFlow {
         let input = self.inputs[self.current];
         unsafe {
             // 1. Main queue: scale the model's input down into this frame's flow input.
+            if self.hdr {
+                // The previous estimate waited for its fence, so the set is idle and may be
+                // rewritten; Color is in SHADER_READ_ONLY_OPTIMAL (this function's contract).
+                let info = [vk::DescriptorImageInfo::builder().image_view(color_view).image_layout(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL).build()];
+                let write = vk::WriteDescriptorSet::builder().dst_set(self.tone.descriptor_set).dst_binding(0).descriptor_type(vk::DescriptorType::SAMPLED_IMAGE).image_info(&info).build();
+                device.update_descriptor_sets(&[write], &[]);
+            }
             begin(device, self.cmd_pre)?;
-            self.barrier(self.cmd_pre, color, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+            let source = if self.hdr {
+                // Scene-linear half floats -> tone-mapped 8-bit copy; the blit reads that copy.
+                let tone = self.tone;
+                self.barrier(self.cmd_pre, tone.image.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL);
+                device.cmd_bind_pipeline(self.cmd_pre, vk::PipelineBindPoint::COMPUTE, tone.pipeline);
+                device.cmd_bind_descriptor_sets(self.cmd_pre, vk::PipelineBindPoint::COMPUTE, tone.pipeline_layout, 0, &[tone.descriptor_set], &[]);
+                let push = TonePush { size: [self.width, self.height] };
+                let bytes = std::slice::from_raw_parts((&push as *const TonePush).cast::<u8>(), std::mem::size_of::<TonePush>());
+                device.cmd_push_constants(self.cmd_pre, tone.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, bytes);
+                device.cmd_dispatch(self.cmd_pre, self.width.div_ceil(16), self.height.div_ceil(16), 1);
+                self.barrier(self.cmd_pre, tone.image.image, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                tone.image.image
+            } else {
+                self.barrier(self.cmd_pre, color, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+                color
+            };
             self.barrier(self.cmd_pre, input.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL);
             let blit = vk::ImageBlit::builder()
                 .src_subresource(layers())
@@ -291,9 +399,11 @@ impl GpuFlow {
                 .dst_subresource(layers())
                 .dst_offsets([vk::Offset3D::default(), offset(self.flow_width, self.flow_height)])
                 .build();
-            device.cmd_blit_image(self.cmd_pre, color, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, input.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
+            device.cmd_blit_image(self.cmd_pre, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, input.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
             self.barrier(self.cmd_pre, input.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL);
-            self.barrier(self.cmd_pre, color, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            if !self.hdr {
+                self.barrier(self.cmd_pre, color, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
+            }
             device.end_command_buffer(self.cmd_pre)?;
             let pre = [self.cmd_pre];
             if !self.previous {
@@ -462,42 +572,17 @@ impl GpuFlow {
                 device.destroy_buffer(res.buffer, None);
                 device.free_memory(res.memory, None);
             }
+            let t = self.tone;
+            device.destroy_pipeline(t.pipeline, None);
+            device.destroy_pipeline_layout(t.pipeline_layout, None);
+            device.destroy_descriptor_pool(t.descriptor_pool, None);
+            device.destroy_descriptor_set_layout(t.set_layout, None);
+            device.destroy_shader_module(t.shader, None);
+            device.destroy_image_view(t.image.view, None);
+            device.destroy_image(t.image.image, None);
+            device.free_memory(t.image.memory, None);
         }
     }
-}
-
-/// A coarse luma thumbnail of a BGRA8/RGBA8 frame (every 8th pixel on each axis), kept
-/// between frames for [`is_scene_cut`] instead of a copy of the whole frame.
-pub fn luma_thumbnail(frame: &[u8], width: u32, height: u32) -> Vec<u8> {
-    const STEP: usize = 8;
-    let (w, h) = (width as usize, height as usize);
-    if frame.len() < w * h * 4 {
-        return Vec::new();
-    }
-    let mut out = Vec::with_capacity(w.div_ceil(STEP) * h.div_ceil(STEP));
-    for y in (0..h).step_by(STEP) {
-        for x in (0..w).step_by(STEP) {
-            let i = (y * w + x) * 4;
-            // Unweighted average of the three channels: only needs to catch "the whole picture
-            // changed", and channel order does not matter for it.
-            out.push(((u32::from(frame[i]) + u32::from(frame[i + 1]) + u32::from(frame[i + 2])) / 3) as u8);
-        }
-    }
-    out
-}
-
-/// Whether two [`luma_thumbnail`]s look like different scenes -- a hard cut (level
-/// transition, cutscene, death/respawn) rather than motion within one scene. Carrying a flow
-/// field across a cut hands the model a field describing content no longer on screen, worse
-/// than handing it nothing. DLSS5VKLayer's helper runs the same kind of check
-/// (`DetectSceneCut`); this is an independent implementation of the generic technique (mean
-/// luma delta against a threshold).
-pub fn is_scene_cut(previous: &[u8], current: &[u8], threshold: u8) -> bool {
-    if previous.len() != current.len() || current.is_empty() {
-        return false;
-    }
-    let sum: u64 = previous.iter().zip(current).map(|(&a, &b)| u64::from(a.abs_diff(b))).sum();
-    sum / current.len() as u64 >= u64::from(threshold)
 }
 
 /// `quality` is [`neural_forge_protocol::enums::mvec_quality`]'s raw value.
@@ -567,41 +652,11 @@ fn region(width: u32, height: u32) -> vk::BufferImageCopy {
 mod tests {
     use super::*;
 
-    fn frame(width: u32, height: u32, value: u8) -> Vec<u8> {
-        vec![value; (width * height * 4) as usize]
-    }
-
     #[test]
     fn push_constants_match_the_shader_block() {
         // uvec2 full, uvec2 grid_dims, vec2 to_cell, vec2 factor, vec2 inv_scale (std430 push).
         assert_eq!(std::mem::size_of::<Push>(), 40);
-    }
-
-    #[test]
-    fn thumbnail_samples_every_eighth_pixel_per_axis() {
-        assert_eq!(luma_thumbnail(&frame(16, 16, 90), 16, 16), vec![90; 4]);
-        assert_eq!(luma_thumbnail(&frame(17, 9, 90), 17, 9).len(), 3 * 2);
-        assert!(luma_thumbnail(&[1, 2, 3], 16, 16).is_empty(), "a short frame must not panic");
-    }
-
-    #[test]
-    fn scene_cut_is_not_flagged_for_a_stable_or_slightly_changed_frame() {
-        let a = luma_thumbnail(&frame(32, 32, 100), 32, 32);
-        let b = luma_thumbnail(&frame(32, 32, 105), 32, 32);
-        assert!(!is_scene_cut(&a, &a, 40), "identical frames must never be a cut");
-        assert!(!is_scene_cut(&a, &b, 40), "a small uniform change must not be a cut");
-    }
-
-    #[test]
-    fn scene_cut_is_flagged_for_a_completely_different_frame() {
-        let a = luma_thumbnail(&frame(32, 32, 20), 32, 32);
-        let b = luma_thumbnail(&frame(32, 32, 220), 32, 32);
-        assert!(is_scene_cut(&a, &b, 40));
-    }
-
-    #[test]
-    fn scene_cut_never_panics_on_mismatched_or_empty_thumbnails() {
-        assert!(!is_scene_cut(&[], &[], 40));
-        assert!(!is_scene_cut(&[1, 2], &[1, 2, 3], 40));
+        // uvec2 size.
+        assert_eq!(std::mem::size_of::<TonePush>(), 8);
     }
 }

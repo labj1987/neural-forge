@@ -21,6 +21,10 @@ use std::time::{Duration, Instant};
 pub struct HistoryGap {
     last: Option<Instant>,
     broken: bool,
+    /// The proxy format class of the latest request on this slot, and whether it changed
+    /// since the last evaluate.
+    format: Option<crate::hdr::FormatClass>,
+    format_changed: bool,
 }
 
 /// Why a history reset was asked for, for the log line.
@@ -32,6 +36,9 @@ pub enum Stale {
     /// No evaluate for longer than [`HistoryGap::MAX_GAP`] (the layer stopped sending: pass
     /// through, warm-up, a long hitch).
     Idle(Duration),
+    /// The slot's proxy switched between 8-bit and RGBA16F: the model's history (and the flow's
+    /// reference frame) describe a picture in the other encoding.
+    FormatChanged,
 }
 
 impl HistoryGap {
@@ -45,12 +52,23 @@ impl HistoryGap {
         self.broken = true;
     }
 
+    /// Every request on this slot, with its proxy's format class (before deciding whether it
+    /// reaches the model). A change from the previous request's class makes the next
+    /// [`Self::begin`] report [`Stale::FormatChanged`].
+    pub fn note_format(&mut self, class: crate::hdr::FormatClass) {
+        if self.format.is_some_and(|f| f != class) {
+            self.format_changed = true;
+        }
+        self.format = Some(class);
+    }
+
     /// Called once per evaluate, just before it runs. Returns why the model's history must be
     /// reset for it, or `None` when the previous evaluate on this slot was the frame before.
     /// The first evaluate of a session returns `None`: a new feature already resets itself.
     pub fn begin(&mut self, now: Instant) -> Option<Stale> {
         let stale = match self.last {
             None => None,
+            Some(_) if self.format_changed => Some(Stale::FormatChanged),
             Some(_) if self.broken => Some(Stale::Skipped),
             Some(t) => {
                 let gap = now.saturating_duration_since(t);
@@ -58,6 +76,7 @@ impl HistoryGap {
             }
         };
         self.broken = false;
+        self.format_changed = false;
         self.last = Some(now);
         stale
     }
@@ -119,5 +138,33 @@ mod tests {
         let t0 = Instant::now();
         g.begin(t0);
         assert_eq!(g.begin(t0 + HistoryGap::MAX_GAP), None);
+    }
+
+    #[test]
+    fn format_change_resets_once() {
+        use crate::hdr::FormatClass::{Hdr16, Sdr8};
+        let mut g = HistoryGap::default();
+        let t0 = Instant::now();
+        g.note_format(Sdr8);
+        g.begin(t0);
+        g.note_format(Sdr8);
+        assert_eq!(g.begin(t0 + Duration::from_millis(16)), None, "same class keeps history");
+        g.note_format(Hdr16);
+        assert_eq!(g.begin(t0 + Duration::from_millis(32)), Some(Stale::FormatChanged));
+        g.note_format(Hdr16);
+        assert_eq!(g.begin(t0 + Duration::from_millis(48)), None);
+        // Back again, through a request that was not evaluated: still reported as the format.
+        g.note_format(Sdr8);
+        g.skipped();
+        assert_eq!(g.begin(t0 + Duration::from_millis(64)), Some(Stale::FormatChanged));
+    }
+
+    #[test]
+    fn format_seen_before_first_evaluate_is_not_stale() {
+        use crate::hdr::FormatClass::{Hdr16, Sdr8};
+        let mut g = HistoryGap::default();
+        g.note_format(Sdr8);
+        g.note_format(Hdr16);
+        assert_eq!(g.begin(Instant::now()), None, "a new feature resets on its own");
     }
 }

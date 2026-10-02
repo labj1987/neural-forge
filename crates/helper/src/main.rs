@@ -41,7 +41,8 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ash::vk;
-use neural_forge_helper::{frame, guard, history, ngx, optical_flow, shm};
+use neural_forge_helper::hdr::FormatClass;
+use neural_forge_helper::{frame, guard, history, ngx, optical_flow, scene, shm};
 
 /// The helper's motion-vector state across frames: the GPU flow session (rebuilt when the
 /// model's frame size or the quality changes), a small luma thumbnail of the last frame for
@@ -51,6 +52,9 @@ use neural_forge_helper::{frame, guard, history, ngx, optical_flow, shm};
 struct MotionState {
     flow: Option<optical_flow::GpuFlow>,
     thumb: Vec<u8>,
+    /// The format class `thumb` was taken from: thumbnails of different classes are not
+    /// compared (the switch itself resets history, see `history::Stale::FormatChanged`).
+    thumb_class: Option<FormatClass>,
     blocked: bool,
     frames: u64,
 }
@@ -59,18 +63,23 @@ impl MotionState {
     /// Per frame, before evaluating: drops everything when motion is off (an explicit off
     /// state, freeing the session), otherwise updates the thumbnail and returns whether this
     /// frame is a scene cut.
-    fn prepare(&mut self, device: &ash::Device, want: bool, proxy: &[u8], width: u32, height: u32) -> bool {
-        if !want {
+    fn prepare(&mut self, device: &ash::Device, want: Option<FormatClass>, proxy: &[u8], width: u32, height: u32) -> bool {
+        let Some(class) = want else {
             if let Some(f) = self.flow.take() {
                 // SAFETY: every `estimate` waits for its own work before returning.
                 unsafe { f.destroy(device) };
             }
             self.thumb.clear();
+            self.thumb_class = None;
             self.blocked = false;
             return false;
+        };
+        if self.thumb_class != Some(class) {
+            self.thumb.clear();
+            self.thumb_class = Some(class);
         }
-        let thumb = optical_flow::luma_thumbnail(proxy, width, height);
-        let cut = optical_flow::is_scene_cut(&self.thumb, &thumb, 40);
+        let thumb = scene::thumbnail(proxy, width, height, class);
+        let cut = scene::is_scene_cut(&self.thumb, &thumb, 40);
         self.thumb = thumb;
         cut
     }
@@ -79,7 +88,9 @@ impl MotionState {
     #[allow(clippy::too_many_arguments)]
     /// `reset` drops the flow's reference frame (a scene cut, or a model history that went
     /// stale), so the next estimate seeds instead of measuring motion against an old picture.
-    fn session(&mut self, instance: &ash::Instance, device: &ash::Device, physical_device: vk::PhysicalDevice, flow_queue: Option<&optical_flow::FlowQueue>, width: u32, height: u32, quality: u32, reset: bool) -> Option<&mut optical_flow::GpuFlow> {
+    /// `hdr`: the frame is RGBA16F, so the session tone maps it before estimating (and a session
+    /// built for the other class is replaced, like one for another size).
+    fn session(&mut self, instance: &ash::Instance, device: &ash::Device, physical_device: vk::PhysicalDevice, flow_queue: Option<&optical_flow::FlowQueue>, width: u32, height: u32, quality: u32, hdr: bool, reset: bool) -> Option<&mut optical_flow::GpuFlow> {
         if self.blocked {
             return None;
         }
@@ -90,16 +101,16 @@ impl MotionState {
             }
             return None;
         };
-        if !self.flow.as_ref().is_some_and(|f| (f.width, f.height, f.quality) == (width, height, quality)) {
+        if !self.flow.as_ref().is_some_and(|f| (f.width, f.height, f.quality, f.hdr) == (width, height, quality, hdr)) {
             if let Some(old) = self.flow.take() {
                 // SAFETY: every `estimate` waits for its own work before returning.
                 unsafe { old.destroy(device) };
             }
             // Family 0: the model's images and main queue (`FrameResources::new(.., 0, ..)`).
-            match optical_flow::GpuFlow::new(instance, device, physical_device, 0, flow_queue, width, height, quality) {
+            match optical_flow::GpuFlow::new(instance, device, physical_device, 0, flow_queue, width, height, quality, hdr) {
                 Ok(f) => self.flow = Some(f),
                 Err(e) => {
-                    neural_forge_helper::log!("[mvec] optical flow session unavailable at {width}x{height}: {e}");
+                    neural_forge_helper::log!("[mvec] optical flow session unavailable at {width}x{height} hdr={}: {e}", u8::from(hdr));
                     self.blocked = true;
                     return None;
                 }
@@ -362,6 +373,13 @@ fn process_request(
         neural_forge_helper::log!("[helper] slot {slot}: rejecting out-of-range frame {width}x{height} format={proxy_format}");
     }
     let n = if dims_ok { bytes } else { 0 };
+    // 8-bit (the post-upscaler swapchain proxy) or RGBA16F (the pre-upscaler scene-linear
+    // frame); `None` for a format the helper cannot evaluate, which only ever echoes.
+    let class = if dims_ok { FormatClass::of(proxy_format) } else { None };
+    if let Some(class) = class {
+        history_gap.note_format(class);
+    }
+    let key = ngx::FeatureKey::new(width, height, class.is_some_and(FormatClass::is_hdr));
     let motion_scale = neural_forge_protocol::motion::scales(hdr.mvec_scale_mode(), width, height);
     // Fixed addresses/capacity regardless of this frame's own width/height --
     // `FrameResources::new` decides for itself (per its own doc comment) whether
@@ -370,17 +388,16 @@ fn process_request(
 
     // Nothing below the model's floor reaches NGX (or a prewarm): such a frame just echoes.
     let big_enough = width >= ngx::MIN_FEATURE_DIM && height >= ngx::MIN_FEATURE_DIM;
-    let model_requested = dims_ok && big_enough && hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0;
+    let model_requested = class.is_some() && big_enough && hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0;
     // Reserve the frame-sized Vulkan images as soon as the layer sees the game's real
     // swapchain, but do not enter the proprietary NGX runtime while NR is switched
     // off.  GTA is still bringing up its own GPU work at that point; calling
     // CreateFeature there has been observed to hang.  The resource reservation itself
     // is safe, makes later activation possible even after GTA fills VRAM, and
     // performs no model work or write-back.
-    if dims_ok
+    if class.is_some()
         && big_enough
         && !model_requested
-        && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format)
         && !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format))
     {
         if let Some(old) = frame_resources.take() {
@@ -394,7 +411,7 @@ fn process_request(
     let wanted_tunings: Vec<ngx::NgxTuning> = (0..hdr.resolved_passes() as usize).map(|i| hdr.resolve_pass(i).into()).collect();
     let live_passes = if model_requested {
         ngx::maintain_passes(
-            snippet, device, queue, width, height, &wanted_tunings, hdr.rebuild_settle_ms.load(Ordering::Relaxed),
+            snippet, device, queue, key, &wanted_tunings, hdr.rebuild_settle_ms.load(Ordering::Relaxed),
         )
     } else {
         0
@@ -431,10 +448,12 @@ fn process_request(
     // Real motion vectors, estimated on the GPU inside `evaluate` -- see `optical_flow.rs`.
     // Slot 0 only (protocol v3 never duplicated the motion payload for slot 1). The GUI's
     // "Estimate motion vectors" toggle is the only switch.
-    let want_motion = slot == 0 && dims_ok && hdr.mvec_enabled() && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format);
+    // An RGBA16F frame is tone mapped to 8 bits for these two only (the flow on the GPU, the
+    // scene-cut thumbnail on the CPU); the model gets the raw half floats.
+    let want_motion = class.filter(|_| slot == 0 && hdr.mvec_enabled());
     let scene_cut = motion.prepare(device, want_motion, proxy, width, height);
 
-    let timing = if ready && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+    let timing = if ready && class.is_some() {
         (|| {
             if !frame_resources.as_ref().is_some_and(|f| f.matches(0, width, height, proxy_format)) {
                 // `matches` returns `false` for a stalled instance too, so this branch
@@ -459,6 +478,7 @@ fn process_request(
             match stale {
                 Some(history::Stale::Skipped) => neural_forge_helper::log!("[helper] slot {slot}: resetting model history (requests went unevaluated since the last answer)"),
                 Some(history::Stale::Idle(gap)) => neural_forge_helper::log!("[helper] slot {slot}: resetting model history ({} ms since the last answer)", gap.as_millis()),
+                Some(history::Stale::FormatChanged) => neural_forge_helper::log!("[helper] slot {slot}: resetting model history (proxy format changed to {proxy_format}, hdr={})", u8::from(key.hdr)),
                 None => {}
             }
             if scene_cut {
@@ -478,7 +498,7 @@ fn process_request(
                     sharpness: hdr.resolve_pass(i).sharpness,
                 })
                 .collect();
-            let flow = if want_motion { motion.session(instance, device, physical_device, flow_queue, width, height, hdr.mvec_quality.load(Ordering::Relaxed), reset_history) } else { None };
+            let flow = if want_motion.is_some() { motion.session(instance, device, physical_device, flow_queue, width, height, hdr.mvec_quality.load(Ordering::Relaxed), key.hdr, reset_history) } else { None };
             f.evaluate(device, queue, eval_fn, &chain, params, proxy, flow, motion_scale, reset_history, answer)
         })()
     } else {
