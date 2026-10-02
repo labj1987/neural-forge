@@ -370,6 +370,29 @@ impl ShmClient {
         hdr.layer_composition_up.store(u32::from(composition_up), Ordering::Relaxed);
     }
 
+    /// Publishes the GPU time of the last capture whose timestamps were read back (see
+    /// `crate::gpu_timer`). The latest reading, not an average: one store per completed capture.
+    pub fn publish_capture_gpu_ms(&self, ms: f32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.layer_capture_gpu_ms_bits.store(ms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// Publishes the GPU time of the last async compose whose timestamps were read back.
+    pub fn publish_compose_gpu_ms(&self, ms: f32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.layer_compose_gpu_ms_bits.store(ms.to_bits(), Ordering::Relaxed);
+    }
+
+    /// The published `(capture, compose)` GPU milliseconds, for the `[sync]` log line. Zeros
+    /// before the first reading (or before the mapping is open).
+    pub fn published_gpu_ms(&self) -> (f32, f32) {
+        let Some(hdr) = self.header() else { return (0.0, 0.0) };
+        (
+            f32::from_bits(hdr.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)),
+            f32::from_bits(hdr.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)),
+        )
+    }
+
     /// Writes `bytes` (truncated to `MAX_FRAME`, same discipline as the free-text
     /// fields in `ShmHeader`) into the given slot's proxy region -- the frame the
     /// layer is about to hand the model. Call before bumping that slot's `seq_req`
