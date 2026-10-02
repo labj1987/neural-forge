@@ -41,38 +41,38 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use ash::vk;
-use neural_forge_helper::{frame, guard, history, ngx, optical_flow, shm};
+use neural_forge_helper::{frame, guard, history, ngx, optical_flow, scene_cut, shm};
 
 /// The helper's motion-vector state across frames: the GPU flow session (rebuilt when the
-/// model's frame size or the quality changes), a small luma thumbnail of the last frame for
-/// scene-cut detection, and a latch that stops retrying after a failure until the toggle is
+/// model's frame size or the quality changes), the scene-cut detector (luma thumbnails of
+/// recent frames), and a latch that stops retrying after a failure until the toggle is
 /// switched off and on again.
 #[derive(Default)]
 struct MotionState {
     flow: Option<optical_flow::GpuFlow>,
-    thumb: Vec<u8>,
+    cuts: scene_cut::SceneCutDetector,
+    /// Scene cuts that reset the model's history this session, for the periodic frame line.
+    cut_count: u64,
     blocked: bool,
     frames: u64,
 }
 
 impl MotionState {
     /// Per frame, before evaluating: drops everything when motion is off (an explicit off
-    /// state, freeing the session), otherwise updates the thumbnail and returns whether this
-    /// frame is a scene cut.
-    fn prepare(&mut self, device: &ash::Device, want: bool, proxy: &[u8], width: u32, height: u32) -> bool {
+    /// state, freeing the session), otherwise updates the detector and returns whether this
+    /// frame is a scene cut under `cut_mode` (`ShmHeader::scene_cut_mode`, read per frame).
+    fn prepare(&mut self, device: &ash::Device, want: bool, proxy: &[u8], width: u32, height: u32, cut_mode: u32) -> bool {
         if !want {
             if let Some(f) = self.flow.take() {
                 // SAFETY: every `estimate` waits for its own work before returning.
                 unsafe { f.destroy(device) };
             }
-            self.thumb.clear();
+            self.cuts.clear();
             self.blocked = false;
             return false;
         }
-        let thumb = optical_flow::luma_thumbnail(proxy, width, height);
-        let cut = optical_flow::is_scene_cut(&self.thumb, &thumb, 40);
-        self.thumb = thumb;
-        cut
+        let thumb = scene_cut::luma_thumbnail(proxy, width, height);
+        self.cuts.observe(thumb, width, height, cut_mode)
     }
 
     /// The flow session for this frame, (re)built as needed, or `None` when motion can't run.
@@ -432,7 +432,7 @@ fn process_request(
     // Slot 0 only (protocol v3 never duplicated the motion payload for slot 1). The GUI's
     // "Estimate motion vectors" toggle is the only switch.
     let want_motion = slot == 0 && dims_ok && hdr.mvec_enabled() && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format);
-    let scene_cut = motion.prepare(device, want_motion, proxy, width, height);
+    let scene_cut = motion.prepare(device, want_motion, proxy, width, height, hdr.scene_cut_mode.load(Ordering::Relaxed));
 
     let timing = if ready && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         (|| {
@@ -462,6 +462,7 @@ fn process_request(
                 None => {}
             }
             if scene_cut {
+                motion.cut_count += 1;
                 neural_forge_helper::log!("[mvec] scene cut detected, resetting motion history");
             }
             let reset_history = scene_cut || stale.is_some();
@@ -519,8 +520,8 @@ fn process_request(
     neural_forge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, *frames);
     if neural_forge_helper::logging::sampled(*frames) || !evaluated {
         neural_forge_helper::log!(
-            "[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated} passes={live_passes}/{} ceiling={:?}",
-            wanted_tunings.len(), snippet.pass_ceiling()
+            "[helper] slot {slot} frame {frames}: {width}x{height} evaluated={evaluated} passes={live_passes}/{} ceiling={:?} scene_cuts={} cut_mode={}",
+            wanted_tunings.len(), snippet.pass_ceiling(), motion.cut_count, hdr.scene_cut_mode.load(Ordering::Relaxed)
         );
     }
 }

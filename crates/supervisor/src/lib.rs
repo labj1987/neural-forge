@@ -249,6 +249,14 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
     // exists, so paying for it unconditionally here costs nothing on the common path.
     let _ = std::fs::create_dir_all(paths::prefix_dir());
 
+    // Rotated here, before anything opens it for this helper: `start_detached` redirects the
+    // Wine process's stdout/stderr into this file and the helper appends to it through
+    // `NEURAL_FORGE_LOG`, so this is the one point both writers start after. A failed rename
+    // is noted in the log and otherwise ignored.
+    if let Err(e) = process::rotate_log(&cfg.log, process::LOG_ROTATE_BYTES) {
+        process::append_log(&cfg.log, &format!("[neural-forge] could not rotate {0} to {0}.1: {e}", cfg.log));
+    }
+
     // Without a `binaries=` line the helper would be told to look in `Z:` itself; fall back to
     // the default binaries directory the way `doctor` does.
     let binaries = if cfg.binaries.is_empty() { paths::binaries_dir() } else { cfg.binaries.clone() };
