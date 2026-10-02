@@ -67,6 +67,19 @@ review licenses before source reuse.
 Current target-machine evidence and unresolved Vulkan errors are in
 [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
 
+## Pre-upscaler path
+
+Since 2.0 the model runs **before** DLSS Super Resolution by default (`crates/layer/src/preupscale.rs`,
+docs/PRE_UPSCALER_DESIGN.md): on a device with `VK_NVX_image_view_handle`, the layer identifies
+DLSS's registered colour input, holds the game's DLSS submit, sends the HDR-encoded render-resolution
+frame to the helper every frame and decodes the answer back before DLSS runs. Everything else (no
+NVX, no DLSS, DLAA, native) keeps the post-upscaler path. `NEURAL_FORGE_PREUPSCALE=off` is the A/B
+and rollback switch; `dump`, `identity` and `roundtrip` are diagnostics. Rule: with
+`NEURAL_FORGE_PREUPSCALE=off` the post path must stay byte-identical to 1.1.0 (the hooked-command
+list is the default set, no NVX entry points resolved, nothing of `preupscale` reachable), and a
+device without NVX must not get the tracking under the default either; the tests in
+`lib.rs::probe_command_tests` and the smoke test's `off` pass guard this.
+
 ## Deliberately not done
 
 One item from the completion plan's Phase 6 was considered and intentionally left

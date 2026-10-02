@@ -1,7 +1,9 @@
 # Running the model before the game's upscaler: design
 
-Status: **approved by Alex 2026-10-02, HDR included. Layer and helper sides are built**, behind
-`NEURAL_FORGE_PREUPSCALE` (off by default); see the two "Implementation" sections at the end.
+Status: **the default since 2.0** (`model` mode with `NEURAL_FORGE_PREUPSCALE` unset, on devices with
+`VK_NVX_image_view_handle`; `NEURAL_FORGE_PREUPSCALE=off` restores the 1.1.0 post-upscaler path
+everywhere). Approved by Alex 2026-10-02, HDR included; see the two "Implementation" sections at the
+end, and "2.0: the default" at the very end.
 E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame (see "Rig results (E1-E3)"). E1b found the encode that works (the game's exposure, paper white 3, a per-channel shoulder, sRGB); the layer now applies it on the GPU before the model and inverts it on write-back (model mode, plus a `roundtrip` mode that checks the transform alone). E2-E3 run 2026-10-02 (see "Rig results (E2-E3)"): the hold alone is cheap, but the model every frame gives 50.5 fps at Balanced, **below the 61.6 gate**. Phases 2 and 3 of the original 2.0 plan are paused. The ~4.8 ms of "hand-off latency" turned out to be the helper's CPU scene-cut thumbnail under Wine; with it fixed and the helper's submissions chained, model every frame gives **66.1 fps** (see "Hand-off latency"), **above the gate**.
 
 ## What the probe established (GTA V Enhanced, 2560x1440, DLSS SR on)
@@ -248,10 +250,10 @@ probe and E1/E1b, not a measurement.
 
 | Value | What happens at the DLSS submit |
 |---|---|
-| unset / `off` | Nothing. The hooked-command list, the resolved entry points and every hot path are as before; no waits are added anywhere. |
+| `off` | Nothing. The hooked-command list, the resolved entry points and every hot path are as in 1.1.0; no waits are added anywhere. |
 | `dump` | Once (the first hold after the colour input is identified and the depth and motion-vector layouts are known from the game's barriers, normally a frame later; after 120 DLSS submits without them, colour only), and again for each `shmctl capture` (`capture_request=1`): capture colour, depth and motion vectors, forward the game's submit unchanged, and write `~/.local/share/neural-forge/captures/preupscale-<ms>/` with `colour.rgba16f` (padded size), `depth.r32f` (`depth.raw` for a non-float depth), `mvec.rg16f`, `meta.json` (width, height, padded size, formats, frame number), `colour-preview.png` (`x/(1+x)` per channel, sRGB-encoded) and `exposure.json` (every registered 1x1 float image, DLSS's exposure input among them: format, layout, raw bytes and values; a storage image with no barrier seen yet is read as `GENERAL`, flagged `layout_assumed`). Files are written off the submit thread. |
 | `identity` | Capture the colour input into slot 0's proxy region, then copy the same bytes back into it (raw, no encode). The helper is not called. Measures the hold's own cost; the picture must be unchanged. |
-| `model` | Capture the colour input **HDR-encoded** (see "The HDR encode and decode" below), hand it to the helper (`width` = padded width, `proxy_format` = RGBA16F), wait up to 30 ms (or until the helper stops being alive), decode the answer back over the colour input with the padding cropped. Every frame (`model_interval` is ignored). With `enabled` off (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported unavailable, nothing is held. |
+| `model` (also unset, the default since 2.0) | Capture the colour input **HDR-encoded** (see "The HDR encode and decode" below), hand it to the helper (`width` = padded width, `proxy_format` = RGBA16F), wait up to 30 ms (or until the helper stops being alive), decode the answer back over the colour input with the padding cropped. Every frame (`model_interval` is ignored). With `enabled` off (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported unavailable, nothing is held. |
 | `roundtrip` | The same encode and decode, with the answer := the encoded proxy itself; the helper is not called. Checks the transform's neutrality on the rig: the picture must come back unchanged except for half-float rounding and the clamped highlights (which are kept as they were). Ignores the toggle, like `identity`. |
 
 Any non-off mode turns on the NVX tracking (the probe's hooks, production-grade, without its
@@ -791,3 +793,38 @@ wait drains the game's queued work, 3.6-4.4 ms), so going further means making i
 In the post path the helper's stages are the same shape (2560x1440 RGBA8: thumb 0.18 ms, one wait
 of 11.5 ms for the GPU work).
 Run-to-run spread is about 3 fps (65.1-68.1), so a 1-2 fps difference between single runs is noise.
+
+## 2.0: the default
+
+`model` is what an unset `NEURAL_FORGE_PREUPSCALE` means (`preupscale::DEFAULT`). What changed with
+that:
+
+- **Per device.** The tracking (and the NVX hooks in the device's own hooked-command table) is only
+  set up on a device whose next layer hands out `vkGetImageViewHandleNVX`, i.e. one that enabled
+  `VK_NVX_image_view_handle` (logged `[preupscale] device ...: no VK_NVX_image_view_handle, ...; the
+  model runs after the upscaler` otherwise). Such a device runs exactly the post path.
+- **Cheap without DLSS.** On a device with NVX but no DLSS launches (a vkd3d-proton game without
+  DLSS) the begin/free/execute/submit hooks read one relaxed atomic (`Tracking::armed`) and take no
+  lock; the submit hook no longer copies the batch lists unless a launch-bearing buffer exists; the
+  present reads the identified extent from an atomic. Image and view creation still record into the
+  tracker (creation-time only). `capture_hot_path_cost_per_present` measures `capture::run`, which
+  this does not touch.
+- **`NEURAL_FORGE_PREUPSCALE=off`** keeps 1.1.0's hooked-command list (`probe_command_tests`), resolves
+  no NVX entry point and logs no `[preupscale]` line (the smoke test's `off` pass checks the log).
+- **The mode is read from the environment only** (`NEURAL_FORGE_ENABLE`, `NEURAL_FORGE_DISABLE`, the
+  variable), not through `layer_enabled()`: it is first asked at instance creation, and the
+  duplicate-copy decision must keep its 1.1.0 order. The hold checks `layer_enabled()` itself.
+- **Captures while holding.** `shmctl capture` and `capture --frames N` are taken by the present hook
+  while frames are held (they used to stay pending): the swapchain image is read back after the
+  application's present waits (relayed), and each pair's original and composited are both the
+  presented frame. The one-shot request becomes a series of one frame
+  (`captures/series-<ms>/000000-{original,composited}.png`).
+- **Logs.** The paper-white line only prints in model and roundtrip. Each 300-hold summary ends with
+  `holds_per_s=` (the window's rate), which `scripts/bench-report.py` reports as "held before
+  upscaler/s" instead of the post path's "composited/s" (which then only counts loading screens).
+- **GUI.** The Status page's "Model placement" line: before the upscaler (holding WxH, misses), waiting
+  for DLSS Super Resolution, or after the upscaler.
+
+Left for the rig: Alex's on-screen judgement (daylight, night, F11), a three-run confirmation of the
+default with no variable set, a `shmctl capture --frames 2` while holding, and a game without DLSS
+(or DLAA) to see the device stay on the post path at its 1.1.0 frame rate.

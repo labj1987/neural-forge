@@ -497,15 +497,17 @@ impl Layer for NeuralForgeLayer {
 
     /// The framework's default (`DeviceInfo::hooked_commands`), plus the
     /// `NEURAL_FORGE_PROBE_NGX` probe's commands only when the probe is on, and the
-    /// `NEURAL_FORGE_PREUPSCALE` tracking commands only when a mode is selected. With both off the
-    /// list is exactly the default, so the framework hands out the next layer's pointers for
-    /// every NVX entry point, as before.
+    /// `NEURAL_FORGE_PREUPSCALE` tracking commands only when a mode is selected and, for a
+    /// device's own table, only on a device that got the tracking (one with
+    /// `VK_NVX_image_view_handle`). With both off (`NEURAL_FORGE_PREUPSCALE=off`) the list is exactly
+    /// the default, so the framework hands out the next layer's pointers for every NVX entry point,
+    /// as in 1.1.0; a device without NVX gets the default list under the default mode too.
     fn hooked_device_commands(
         &self,
         _instance_info: &Self::InstanceInfo,
-        _device_info: Option<&Self::DeviceInfo>,
+        device_info: Option<&Self::DeviceInfo>,
     ) -> Box<dyn Iterator<Item = LayerVulkanCommand>> {
-        device_commands(probe_ngx::enabled(), preupscale::active())
+        device_commands(probe_ngx::enabled(), preupscale_hooks(preupscale::active(), device_info.map(NeuralForgeDeviceInfo::preupscale_tracked)))
     }
 
     fn create_instance_info(
@@ -542,6 +544,13 @@ impl Layer for NeuralForgeLayer {
 }
 
 declare_introspection_queries!(entry_points::EntryPoints);
+
+/// Whether the pre-upscaler path's commands are hooked: a mode is on and, for a device's own table
+/// (`tracked` is `Some`), that device got the tracking. The instance-level table (`None`) follows
+/// the mode alone; its hooks find no tracking on a device without it and forward the call.
+fn preupscale_hooks(mode_on: bool, tracked: Option<bool>) -> bool {
+    mode_on && tracked.unwrap_or(true)
+}
 
 /// The device commands the framework routes to this layer's hooks: the default set, then the
 /// probe's and the pre-upscaler path's when they are on, each command once.
@@ -581,6 +590,22 @@ mod probe_command_tests {
         let both: Vec<_> = device_commands(true, true).collect();
         assert_eq!(both.len(), on.len(), "the pre-upscaler path's commands are a subset of the probe's");
         assert!(preupscale::COMMANDS.iter().all(|command| both.contains(command)));
+    }
+
+    /// `NEURAL_FORGE_PREUPSCALE=off` hooks exactly 1.1.0's list everywhere; the default mode hooks
+    /// the tracking commands only on a device that got the tracking (one with NVX).
+    #[test]
+    fn the_pre_upscaler_commands_follow_the_mode_and_the_device() {
+        assert!(!preupscale_hooks(false, None));
+        assert!(!preupscale_hooks(false, Some(true)));
+        assert!(!preupscale_hooks(false, Some(false)));
+        assert!(preupscale_hooks(true, None), "instance level: the mode alone");
+        assert!(preupscale_hooks(true, Some(true)));
+        assert!(!preupscale_hooks(true, Some(false)), "a device without NVX keeps the default list");
+        assert_eq!(device_commands(false, preupscale_hooks(true, Some(false))).collect::<Vec<_>>(), NeuralForgeDeviceInfo::hooked_commands().to_vec());
+        assert!(preupscale::wanted_on_device(true, true));
+        assert!(!preupscale::wanted_on_device(true, false));
+        assert!(!preupscale::wanted_on_device(false, true));
     }
 }
 

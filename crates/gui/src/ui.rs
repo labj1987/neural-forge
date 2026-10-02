@@ -1363,8 +1363,13 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     helper_row.add_suffix(&start_stop_button);
     let layer_row = adw::ActionRow::new();
     layer_row.set_title("Layer");
+    // Where the model runs: before DLSS's upscaler (when the game uses DLSS Super Resolution) or
+    // after it (everything else). Read-only; there is no setting for it.
+    let preupscale_row = adw::ActionRow::new();
+    preupscale_row.set_title("Model placement");
     group.add(&helper_row);
     group.add(&layer_row);
+    group.add(&preupscale_row);
 
     let log_button = gtk4::Button::from_icon_name("text-x-generic-symbolic");
     log_button.set_tooltip_text(Some("Open the helper log"));
@@ -1409,6 +1414,13 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         } else {
             "no game attached yet"
         });
+        preupscale_row.set_subtitle(&preupscale_label(
+            layer_active,
+            hdr.preupscale_state.load(Ordering::Relaxed),
+            hdr.preupscale_width.load(Ordering::Relaxed),
+            hdr.preupscale_height.load(Ordering::Relaxed),
+            hdr.preupscale_misses.load(Ordering::Relaxed),
+        ));
         // Keyed off the actual OS-level pid-file check (what start/stop manage), not
         // the SHM helper_state above -- those can briefly disagree right after a
         // start/stop (e.g. STARTING vs. the process not existing yet) and the button
@@ -1619,6 +1631,19 @@ fn binaries_status_subtitle() -> String {
     }
 }
 
+/// The Status page's one line on the pre-upscaler path, from the header's `preupscale_*` fields
+/// (0 off, 1 waiting for DLSS's input, 2 holding). `layer_active`: the layer's heartbeat is fresh;
+/// otherwise the fields are a closed game's leftovers.
+fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, misses: u32) -> String {
+    let missed = if misses == 0 { String::new() } else { format!(", {misses} frame{} missed", if misses == 1 { "" } else { "s" }) };
+    match state {
+        _ if !layer_active => "no game running".to_string(),
+        2 => format!("before the upscaler: holding DLSS's {width}x{height} input every frame{missed}"),
+        1 => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
+        _ => "after the upscaler".to_string(),
+    }
+}
+
 fn helper_state_label(state: u32) -> &'static str {
     use neural_forge_protocol::enums::helper_state::*;
     match state {
@@ -1652,6 +1677,21 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
     let status = adw::StatusPage::builder().icon_name("dialog-error-symbolic").title(title).description(description).build();
     let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();
     window.present();
+}
+
+#[cfg(test)]
+mod preupscale_label_tests {
+    use super::preupscale_label;
+
+    #[test]
+    fn says_where_the_model_runs_in_one_line() {
+        assert_eq!(preupscale_label(false, 2, 1485, 836, 3), "no game running");
+        assert_eq!(preupscale_label(true, 0, 0, 0, 0), "after the upscaler");
+        assert_eq!(preupscale_label(true, 1, 0, 0, 0), "after the upscaler: waiting for DLSS Super Resolution");
+        assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input every frame");
+        assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input every frame, 1 frame missed");
+        assert_eq!(preupscale_label(true, 1, 1485, 836, 85), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
+    }
 }
 
 #[cfg(test)] mod hotkey_tests {

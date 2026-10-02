@@ -192,6 +192,15 @@ impl ShmClient {
         self.open_at(path)
     }
 
+    /// Test-only: a client over a header in ordinary memory, with no pixel regions and no file.
+    /// For tests of header-only logic (switches, requests, liveness): a real mapping costs ~130 MB
+    /// of address space, which the i686 test run cannot spare for every test (mappings are never
+    /// unmapped).
+    #[cfg(test)]
+    pub(crate) fn test_over_header(header: &neural_forge_protocol::ShmHeader) -> Self {
+        Self { header: std::ptr::from_ref(header).cast_mut(), ..Self::default() }
+    }
+
     fn header(&self) -> Option<&neural_forge_protocol::ShmHeader> {
         // SAFETY: non-null only after a successful `open()`, which mmaps
         // `neural_forge_protocol::shm_total_bytes()` at this address and never unmaps it for

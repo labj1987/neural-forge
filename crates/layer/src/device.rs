@@ -727,10 +727,15 @@ impl NeuralForgeDeviceInfo {
         // on the framework's own path its extension list is already freed here.
         // SAFETY: as above.
         let create_image = unsafe { resolve::<vk::PFN_vkCreateImage>(next_get_device_proc_addr, handle, c"vkCreateImage") };
-        // SAFETY: as above. Resolved only with the probe or a pre-upscaler mode on, so a default
-        // run makes exactly the queries it always made.
-        let preupscale_on = crate::preupscale::active();
-        let probe_next = (crate::probe_ngx::enabled() || preupscale_on).then(|| unsafe { ProbeNext::resolve(next_get_device_proc_addr, handle) });
+        // SAFETY: as above. Resolved only with the probe or a pre-upscaler mode on, so a run with
+        // `NEURAL_FORGE_PREUPSCALE=off` makes exactly the queries 1.1.0 made.
+        let preupscale_mode = crate::preupscale::active();
+        let probe_next = (crate::probe_ngx::enabled() || preupscale_mode).then(|| unsafe { ProbeNext::resolve(next_get_device_proc_addr, handle) });
+        // The pre-upscaler path only on a device where DLSS can reach Vulkan at all: one that has
+        // `VK_NVX_image_view_handle` enabled (the next layer hands out `vkGetImageViewHandleNVX`
+        // only then). Every other device keeps exactly the post-upscaler path, with nothing of
+        // this module's tracking on it (`hooked_device_commands` leaves its commands unhooked too).
+        let preupscale_on = crate::preupscale::wanted_on_device(preupscale_mode, probe_next.as_ref().is_some_and(|n| n.get_image_view_handle_nvx.is_some()));
         // SAFETY: as above; `vkQueueSubmit2` and its KHR alias share the PFN type.
         let next_queue_submit2 = if preupscale_on {
             unsafe {
@@ -741,14 +746,18 @@ impl NeuralForgeDeviceInfo {
             None
         };
         let preupscale = preupscale_on.then(|| crate::preupscale::Tracking::new_for(handle));
-        if let (true, Some(next)) = (preupscale_on, &probe_next) {
-            crate::log!(
-                "[preupscale] device {:?}: vkGetImageViewHandleNVX {}, vkGetImageViewAddressNVX {}, vkQueueSubmit2 {}",
-                handle,
-                if next.get_image_view_handle_nvx.is_some() { "present" } else { "absent" },
-                if next.get_image_view_address_nvx.is_some() { "present" } else { "absent" },
-                if next_queue_submit2.is_some() { "present" } else { "absent" },
-            );
+        if let (true, Some(next)) = (preupscale_mode, &probe_next) {
+            if preupscale_on {
+                crate::log!(
+                    "[preupscale] device {:?}: vkGetImageViewHandleNVX {}, vkGetImageViewAddressNVX {}, vkQueueSubmit2 {}",
+                    handle,
+                    if next.get_image_view_handle_nvx.is_some() { "present" } else { "absent" },
+                    if next.get_image_view_address_nvx.is_some() { "present" } else { "absent" },
+                    if next_queue_submit2.is_some() { "present" } else { "absent" },
+                );
+            } else {
+                crate::log!("[preupscale] device {handle:?}: no VK_NVX_image_view_handle, so no DLSS input to find; the model runs after the upscaler");
+            }
         }
         if let Some(next) = probe_next.as_ref().filter(|_| crate::probe_ngx::enabled()) {
             crate::log!(
@@ -810,6 +819,12 @@ impl NeuralForgeDeviceInfo {
             state,
             tracker: Mutex::new(TapTracker::default()),
         }
+    }
+
+    /// Whether this device got the pre-upscaler path's tracking (a mode is on and the device has
+    /// `VK_NVX_image_view_handle`).
+    pub(crate) fn preupscale_tracked(&self) -> bool {
+        self.preupscale.is_some()
     }
 
     /// The images backing `swapchain`, in the order the loader hands out indices for
@@ -906,24 +921,7 @@ impl NeuralForgeDeviceInfo {
         if !shm.open() {
             return None;
         }
-        let dump = match mode {
-            Mode::Off => return None,
-            Mode::Dump => {
-                if !session.dump_due(shm) || !session.dump_ready(scan.depth_layout.is_some() && scan.mvec_layout.is_some()) {
-                    return None;
-                }
-                true
-            }
-            // The live toggle (F11, the GUI, `shmctl set enabled 0`) means no hold at all, and a
-            // helper that is not running is never waited for.
-            Mode::Model => {
-                if !shm.model_wanted() || !shm.helper_alive() {
-                    return None;
-                }
-                false
-            }
-            Mode::Identity | Mode::Roundtrip => false,
-        };
+        let dump = crate::preupscale::gate(mode, session, shm, scan.depth_layout.is_some() && scan.mvec_layout.is_some())?;
         // Slot 0 must be free: no request (the post path's, or an earlier hold's that ran over
         // budget) still with the helper, no zero-copy capture still writing its proxy region, and
         // in model mode no compose still reading its answer region.
@@ -983,7 +981,8 @@ impl NeuralForgeDeviceInfo {
                 let readable = desc.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (desc.width, desc.height) == (1, 1);
                 crate::preupscale::Aux { image, format: desc.format, layout, readable }
             }),
-            paper_white: crate::preupscale::hdr::paper_white(),
+            // Only the modes that encode read (and so log) the paper white.
+            paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
         };
         let res = session.res.as_mut()?;
         let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;
@@ -1296,7 +1295,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         crate::probe_ngx::on_begin_command_buffer(command_buffer, begin_info.flags);
         if let Some(t) = &self.preupscale {
-            t.lock().begin(command_buffer);
+            t.begin(command_buffer);
         }
         self.tracker.lock().unwrap().begin_recording(command_buffer);
         LayerResult::Unhandled
@@ -1307,7 +1306,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     ) -> LayerResult<()> {
         crate::probe_ngx::on_free_command_buffers(command_buffers);
         if let Some(t) = &self.preupscale {
-            t.lock().free(command_buffers);
+            t.free(command_buffers);
         }
         self.tracker.lock().unwrap().free(command_buffers);
         LayerResult::Unhandled
@@ -1318,7 +1317,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     ) -> LayerResult<()> {
         crate::probe_ngx::on_execute_commands(command_buffer, secondaries);
         if let Some(t) = &self.preupscale {
-            t.lock().execute(command_buffer, secondaries);
+            t.execute(command_buffer, secondaries);
         }
         self.tracker.lock().unwrap().execute_secondary(command_buffer, secondaries);
         LayerResult::Unhandled
@@ -1343,7 +1342,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             tracker.commit_submit(buffers.iter().copied());
         }
         drop(tracker);
-        if let Some(tracking) = &self.preupscale {
+        if let Some(tracking) = self.preupscale.as_ref().filter(|t| t.armed()) {
             // SAFETY: as above.
             let cbs: Vec<Vec<vk::CommandBuffer>> =
                 submits.iter().map(|s| unsafe { preupscale_slice(s.p_command_buffers, s.command_buffer_count) }.to_vec()).collect();
@@ -1381,7 +1380,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             tracker.commit_submit(infos.iter().map(|info| info.command_buffer));
         }
         drop(tracker);
-        if let (Some(tracking), Some(next)) = (&self.preupscale, self.next_queue_submit2) {
+        if let (Some(tracking), Some(next)) = (self.preupscale.as_ref().filter(|t| t.armed()), self.next_queue_submit2) {
             let cbs: Vec<Vec<vk::CommandBuffer>> = submits
                 .iter()
                 // SAFETY: as above.
@@ -1494,7 +1493,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     // ---- `NEURAL_FORGE_PROBE_NGX` probe hooks (crate::probe_ngx). The framework only routes
-    // these here when the probe is on (see `NeuralForgeLayer::hooked_device_commands`); each
+    // these here when the probe is on, or (the view and NVX ones) on a device with the pre-upscaler
+    // path's tracking (see `NeuralForgeLayer::hooked_device_commands`); each
     // forwards the application's call unchanged and returns the next layer's own result.
 
     fn create_image_view(
@@ -1605,7 +1605,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             crate::probe_ngx::on_launch(command_buffer, launch_info);
         }
         if let Some(t) = &self.preupscale {
-            t.lock().launch(command_buffer);
+            t.launch(command_buffer);
         }
         LayerResult::Unhandled
     }
@@ -2062,6 +2062,42 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         crate::logging::flush();
                     }
                     if suppressed {
+                        // Captures are still served while frames are held (otherwise a `shmctl
+                        // capture` request would stay pending): the presented frame, which already
+                        // carries the model's edit made before DLSS, is read back as both halves of
+                        // each pair. The one-shot request is served as a series of one frame.
+                        if let Some(instance) = &self.instance {
+                            if let Some(frames) = crate::series::take_request(shm, true) {
+                                if readable {
+                                    series.start(frames, &crate::dump::captures_dir());
+                                    crate::log!("[series] frames are held before the upscaler: the model already ran on DLSS's input, so each pair's original and composited are both the presented frame");
+                                    crate::logging::flush();
+                                } else {
+                                    crate::log!("[series] request for {frames} frames dropped: this swapchain cannot be read back");
+                                    crate::logging::flush();
+                                }
+                            }
+                            if readable && series.running() {
+                                // The readback must come after the game's rendering, as on the post
+                                // path: relay the application's present waits first.
+                                // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count`.
+                                let app_waits: &[vk::Semaphore] = unsafe { preupscale_slice(present_info.p_wait_semaphores, present_info.wait_semaphore_count) };
+                                let ordered = app_waits.is_empty() || {
+                                    // SAFETY: as for the post path's relay below.
+                                    let relay = unsafe { relay_app_waits(&self.device, queue, relay_semaphores, image, app_waits) };
+                                    relay_semaphore = relay;
+                                    relay.is_some()
+                                };
+                                if ordered {
+                                    // SAFETY: as for the post path's series below; nothing of the
+                                    // layer's but the relay was submitted for this present.
+                                    unsafe {
+                                        series.before(&self.device, instance, self.physical_device, queue, queue_family, image, width, height);
+                                        series.after(&self.device, queue, image, width, height, bgr_order, None);
+                                    }
+                                }
+                            }
+                        }
                         break;
                     }
                     // The post path is about to write slot 0's proxy region (from the CPU, or on
@@ -2135,7 +2171,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // one-shot dump's, and each path only ever consumes its own values. Before
                     // `capture::run` has opened the mapping this finds nothing, and the series
                     // starts one present later.
-                    if let Some(frames) = shm.take_series_request() {
+                    if let Some(frames) = crate::series::take_request(shm, false) {
                         if readable {
                             series.start(frames, &crate::dump::captures_dir());
                         } else {

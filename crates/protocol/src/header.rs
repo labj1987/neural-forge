@@ -333,7 +333,8 @@ pub struct ShmHeader {
 
     // --- v9 ------------------------------------------------------------------------------
     /// The layer's pre-upscaler path (`NEURAL_FORGE_PREUPSCALE`, docs/PRE_UPSCALER_DESIGN.md):
-    /// 0 off (the default; nothing is held), 1 waiting for the game's DLSS input (the mode is on
+    /// 0 off (`NEURAL_FORGE_PREUPSCALE=off`, or no device with NVX: nothing is held, the model runs
+    /// after the upscaler), 1 waiting for the game's DLSS input (the mode is on, as it is by default,
     /// but no launch-bearing submit was held in the last 500 ms: no DLSS, DLAA, input not
     /// identified, or the toggle is off), 2 holding the DLSS submit.
     pub preupscale_state: AtomicU32,

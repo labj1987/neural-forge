@@ -44,6 +44,41 @@ if grep -q '\[probe-ngx\]' "$NEURAL_FORGE_LOG" 2>/dev/null; then
     echo "FAIL: the NGX probe logged without NEURAL_FORGE_PROBE_NGX" >&2
     exit 1
 fi
+# The default is the pre-upscaler path in model mode (docs/PRE_UPSCALER_DESIGN.md): the local ICD
+# has no VK_NVX_* extensions and no DLSS, so it must load cleanly, give the device no tracking, and
+# hold nothing.
+if ! grep -q '\[preupscale\] mode model (default) in pid' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+    echo "FAIL: with NEURAL_FORGE_PREUPSCALE unset the pre-upscaler path is not the default" >&2
+    exit 1
+fi
+if ! grep -q 'no VK_NVX_image_view_handle, so no DLSS input to find' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+    echo "FAIL: a device without NVX did not stay on the post-upscaler path" >&2
+    exit 1
+fi
+if grep -q 'frame went to DLSS untouched\|resources for\|HDR encode' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+    echo "FAIL: the default held a submit on a device without DLSS" >&2
+    exit 1
+fi
+
+# Pass with NEURAL_FORGE_PREUPSCALE=off: the A/B and rollback switch, 1.1.0's behaviour. Nothing of
+# the pre-upscaler path may run or log.
+export NEURAL_FORGE_PREUPSCALE=off
+export NEURAL_FORGE_LOG="$SCRATCH/layer-off.log"
+echo
+echo "==> again with NEURAL_FORGE_PREUPSCALE=off"
+cargo run --example smoke -p neural-forge-layer
+echo
+echo "==> layer log ($NEURAL_FORGE_LOG):"
+cat "$NEURAL_FORGE_LOG" 2>/dev/null || echo "(no log written -- the layer never ran)"
+if ! grep -q '\[layer\] hooked device' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+    echo "FAIL: the layer did not run with NEURAL_FORGE_PREUPSCALE=off" >&2
+    exit 1
+fi
+if grep -q '\[preupscale\]' "$NEURAL_FORGE_LOG" 2>/dev/null; then
+    echo "FAIL: the pre-upscaler path ran with NEURAL_FORGE_PREUPSCALE=off" >&2
+    exit 1
+fi
+unset NEURAL_FORGE_PREUPSCALE
 
 # Second pass with the diagnostic NGX probe on (docs/PRE_UPSCALER_PROBE.md): the local ICD has
 # no VK_NVX_* extensions, so this proves the probe's hooks install and stay harmless there.
@@ -60,9 +95,9 @@ if ! grep -q '\[probe-ngx\] on in pid' "$NEURAL_FORGE_LOG" 2>/dev/null; then
     exit 1
 fi
 
-# Third pass with the pre-upscaler path in model mode (docs/PRE_UPSCALER_DESIGN.md, "Implementation
-# (layer)"): the local ICD has no VK_NVX_* extensions and no DLSS, so this proves the tracking hooks
-# install, nothing is held, and the probe's logging stays off.
+# Third pass with the pre-upscaler path's model mode named explicitly (docs/PRE_UPSCALER_DESIGN.md,
+# "Implementation (layer)"): the local ICD has no VK_NVX_* extensions and no DLSS, so this proves
+# the mode is taken, nothing is held, and the probe's logging stays off.
 unset NEURAL_FORGE_PROBE_NGX
 export NEURAL_FORGE_PREUPSCALE=model
 export NEURAL_FORGE_LOG="$SCRATCH/layer-preupscale.log"

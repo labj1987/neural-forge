@@ -6,6 +6,40 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+**The model now runs before the game's upscaler when the game uses DLSS Super Resolution.** The
+layer recognises DLSS's input (the scene at render resolution, HDR, no HUD) on the game's Vulkan
+device, holds the game's DLSS submit, sends that frame to the model every frame (HDR-encoded with
+the game's own exposure) and writes the answer back before DLSS upscales it. Every other case (DLAA,
+native resolution, no DLSS, a device without NVIDIA's NVX extensions) keeps the after-the-upscaler
+path exactly as in 1.1.0. Measured on GTA V Enhanced on an RTX 5070 at DLSS Balanced, 2560x1440,
+script mods off: **66.1 fps** (three-run mean, model every frame) against 61.4-61.9 fps for the
+after-the-upscaler path (model every 2nd frame) and 93 fps with the effect off. Nothing to set: the
+launch option is unchanged. `NEURAL_FORGE_PREUPSCALE=off` switches back to the after-the-upscaler
+path everywhere (for comparisons, or to roll back); `dump`, `identity` and `roundtrip` stay as
+diagnostics. In detail:
+
+- **Default** (`NEURAL_FORGE_PREUPSCALE` unset = `model`). The tracking and the NVX hooks are set up
+  per device, only on a device with `VK_NVX_image_view_handle`; any other device gets 1.1.0's
+  hooked-command list. On a device with NVX but no DLSS, the per-command-buffer and per-submit hooks
+  are one atomic read (no lock, no copy of the submit's batch lists). With
+  `NEURAL_FORGE_PREUPSCALE=off` the hooked commands, resolved entry points and logs are 1.1.0's. F11
+  (and the GUI's or `shmctl`'s `enabled`) switches the model off and on in this path too. An unknown
+  value of the variable is logged and treated as `off`.
+- **Captures while frames are held.** `neural-forge-cli shmctl capture` and `capture --frames N` used
+  to stay pending while the model ran before the upscaler. They are now served from the present:
+  each pair's original and composited are both the presented frame (the model's edit is already in
+  it); the one-shot request is written as a series of one frame.
+- **Status page:** a "Model placement" line says where the model runs: before the upscaler (holding
+  DLSS's WxH input, with the missed-frame count), waiting for DLSS Super Resolution, or after the
+  upscaler. No new settings.
+- **Logs and reports:** the `[preupscale] HDR encode: paper white` line only prints in the modes that
+  encode (model, roundtrip); each 300-hold summary line ends with `holds_per_s=`, and
+  `scripts/bench-report.py` reports that as "held before upscaler/s" when present, since the
+  post path's "composited/s" then only counts loading screens (`--self-test` checks the parsing).
+- **Docs:** README explains the two paths, the measurement and the switch; ATTRIBUTION credits
+  OpenDLSS-NR's documented proxy encode and shoulder, OptiScaler_DLSSNR's exposure-texture idea and
+  OptiScaler's pre-SR mod (design only, no code).
+
 - **Pre-upscaler hold: hand-off latency cut** (`docs/PRE_UPSCALER_DESIGN.md`, "Hand-off
   latency"). GTA V Enhanced, DLSS Balanced, model every frame: **50.5 -> 66.1 fps** (three runs),
   above the 61.6 gate; the hold went from 14.7 to about 10.2 ms. The ~4.8 ms "hand-off" was the
@@ -39,13 +73,14 @@ first shipped them; their phase is kept as a subheading.
   (`--rgba16f FILE --width W --height H [--out FILE] [--repeat N]`) and prints per-channel
   statistics of input and answer; `optical_flow_rig_check --hdr` checks the flow's tone-map pass
   on the rig.
-- **Pre-upscaler path, layer side** (`NEURAL_FORGE_PREUPSCALE`, off by default; behaviour with it
-  unset is unchanged). At the game's DLSS submit the layer splits the submit around the DLSS
+- **Pre-upscaler path, layer side** (`NEURAL_FORGE_PREUPSCALE`; built off by default, the default
+  since the summary above). At the game's DLSS submit the layer splits the submit around the DLSS
   command buffer, captures DLSS's colour input (render resolution, RGBA16F, padded to even sizes)
   into the shared-memory proxy region, and per mode dumps it with depth and motion vectors
   (`dump`), writes the same bytes back (`identity`), or writes the helper's answer back
   (`model`, every frame, 30 ms budget; the post-upscaler compose is off while it holds). See
-  `docs/PRE_UPSCALER_DESIGN.md`, "Implementation (layer)". Not yet run on the rig.
+  `docs/PRE_UPSCALER_DESIGN.md`, "Implementation (layer)". Run on the rig since: see "Rig results
+  (E2-E3)" and "Hand-off latency" there.
 - **Pre-upscaler path: the HDR encode** (E1b). In `model` mode the layer now encodes DLSS's
   scene-linear colour input for the model on the GPU before sending it (the game's 1x1 R16F
   exposure value multiplied in, divided by a paper white of 3, a per-channel shoulder above 0.75,
@@ -56,7 +91,7 @@ first shipped them; their phase is kept as a subheading.
   to DLSS untouched. New mode `NEURAL_FORGE_PREUPSCALE=roundtrip`: encode and decode with the
   encoded frame itself as the answer (no helper), to check on the rig that the transform alone
   leaves the picture unchanged. `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE` overrides the paper white for
-  tuning. `identity` stays the raw copy-through. Not yet run on the rig.
+  tuning. `identity` stays the raw copy-through. Run on the rig since (E2-E3).
 - `shmctl status` shows `preupscale_state`, `preupscale_extent`, `preupscale_hold_ms` and
   `preupscale_misses`. Shared-memory protocol 9: restart the helper and the game together after
   updating.

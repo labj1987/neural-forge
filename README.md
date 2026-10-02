@@ -21,12 +21,33 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 ## What it does
 
-- A Vulkan implicit layer hooks presentation for native Linux and Proton games. Each
-  presented frame is captured, answered by the model and composited back onto that same
-  frame before it is shown (synchronous present), so an answer is never pasted onto a later
-  frame -- which is what used to ghost whenever the camera moved. The wait is bounded
-  (250 ms): a slow, missing or restarting helper means that frame is shown untouched.
-  `NEURAL_FORGE_PIPELINED=1` restores the older pipelined mode (higher frame rate, ghosts).
+The model runs in one of two places, picked automatically per game:
+
+- **Before the upscaler**, when the game uses DLSS Super Resolution (DLSS Quality,
+  Balanced, Performance...). The layer catches the moment the game hands its frame to DLSS
+  and gives the model DLSS's own input: the scene at render resolution, in HDR, without the
+  HUD, every frame. The model's answer is written back before DLSS upscales it, so DLSS
+  upscales the enhanced frame. Fewer pixels to work on, and the input the model is made
+  for.
+- **After the upscaler** for everything else (DLAA, native resolution, no DLSS, games
+  without DLSS): the finished frame is captured as it is presented, answered by the model
+  and composited back.
+
+Measured on GTA V Enhanced on an RTX 5070 at DLSS Balanced, 2560x1440, script mods off:
+**66.1 fps** before the upscaler (model every frame, three-run mean) against 61.4-61.9 fps
+after it (model every 2nd frame), and 93 fps with the effect off. Nothing has to be set for
+this; `NEURAL_FORGE_PREUPSCALE=off` in the launch options switches back to the
+after-the-upscaler path everywhere (the way to compare the two or roll back). How it works
+and every measurement: [docs/PRE_UPSCALER_DESIGN.md](docs/PRE_UPSCALER_DESIGN.md).
+
+- A Vulkan implicit layer hooks presentation for native Linux and Proton games. On the
+  after-the-upscaler path each presented frame is captured, answered by the model and
+  composited back onto that same frame before it is shown (synchronous present), so an
+  answer is never pasted onto a later frame -- which is what used to ghost whenever the
+  camera moved. The wait is bounded (250 ms): a slow, missing or restarting helper means
+  that frame is shown untouched. `NEURAL_FORGE_PIPELINED=1` restores the older pipelined
+  mode (higher frame rate, ghosts). Before the upscaler the wait is bounded at 30 ms, after
+  which that frame goes to DLSS untouched.
 - Start order does not matter: the helper can be started before or after the game, and
   stopped or restarted while it runs. The layer stays out of the way until the game has
   rendered steadily for 5 seconds, and steps back out on loading screens.
@@ -37,10 +58,11 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 - The Windows-side helper runs NVIDIA's `nvngx_dlssnr.dll` (Feature 18) under Wine or a
   Proton build. With "Estimate motion vectors" on, the helper also estimates motion
   between frames with `VK_NV_optical_flow` and passes it to the model.
-- SDR 8-bit swapchains only (B8G8R8A8 / R8G8B8A8, UNORM or sRGB); the validated GTA
-  baseline is SDR B8G8R8A8. HDR (PQ 10-bit) and float16 swapchains are recognised and logged
-  but present untouched for now — the half-float compose path is a tracked follow-up.
-- A composition pass blends the model's output back into the frame — tone/structure/
+- After the upscaler: SDR 8-bit swapchains only (B8G8R8A8 / R8G8B8A8, UNORM or sRGB); the
+  validated GTA baseline is SDR B8G8R8A8. HDR (PQ 10-bit) and float16 swapchains are
+  recognised and logged but present untouched for now — the half-float compose path is a
+  tracked follow-up.
+- After the upscaler, a composition pass blends the model's output back into the frame — tone/structure/
   skin/sharpness controls (applied when the model's feature is built; changing one rebuilds
   it), multiple model passes, and a reversible neutral-axis proxy mode. The model can work
   below the frame's resolution (faster, softer); supersampling above it is not available. The colour math in `composition/color.rs` is rederived
@@ -113,6 +135,16 @@ or from the GUI's binaries import flow. Files are copied into
 Add `NEURAL_FORGE_ENABLE=1` (and, for a specific target executable in a multi-process
 game, `NEURAL_FORGE_TARGET_EXE=<name>.exe`) to a game's Steam launch options to
 activate the layer; the GUI's Setup page builds the full string, Smooth Motion included.
+The launch option does not change for the before-the-upscaler path; GTA V Enhanced on the
+test machine runs with
+
+```text
+NEURAL_FORGE_ENABLE=1 NVPRESENT_ENABLE_SMOOTH_MOTION=1 VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present %command%
+```
+
+The Status page's "Model placement" line says which path a running game is on: before the
+upscaler (with DLSS's render resolution), waiting for DLSS Super Resolution, or after the
+upscaler.
 GUI and layer share live settings over the same shared-memory segment;
 `neural-forge-cli shmctl status/set/toggle/capture` covers the same controls from a
 terminal.
@@ -124,6 +156,10 @@ the window closes, so closing the settings mid-game doesn't turn the effect off.
 with the Status tab's Stop button or `neural-forge-cli stop`.
 
 ## Status
+
+Before the upscaler (the default with DLSS Super Resolution): 66.1 fps on GTA V Enhanced at
+DLSS Balanced 1440p (see [What it does](#what-it-does)). The numbers below are the
+after-the-upscaler path's.
 
 Validated on GTA V Enhanced (RTX 5070, driver `615.71.09`): the render tap correctly
 captures GTA's own render target while leaving Rockstar Launcher, Social Club, Wine
@@ -170,6 +206,9 @@ Set on a game (Steam launch options) unless noted.
 | `NEURAL_FORGE_ENABLE=1` | Turns the layer on for this game (the layer manifest's enable switch). |
 | `NEURAL_FORGE_DISABLE=1` | Forces it off, overriding `ENABLE`. |
 | `NEURAL_FORGE_TARGET_EXE=a.exe,b.exe` | Only these executables may use the layer (for games that start several processes). |
+| `NEURAL_FORGE_PREUPSCALE=off` | Never run the model before the upscaler: the after-the-upscaler path everywhere, as in 1.1.0 (for A/B comparisons and rollback). Unset (the default) means before the upscaler wherever DLSS Super Resolution's input is found. |
+| `NEURAL_FORGE_PREUPSCALE=dump\|identity\|roundtrip` | Diagnostics for the before-the-upscaler path: dump DLSS's input to `captures/`, hold without the model, or check the HDR encode alone (docs/PRE_UPSCALER_DESIGN.md). |
+| `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=3` | Before the upscaler: the HDR encode's paper white (default 3). For tuning only. |
 | `NEURAL_FORGE_PIPELINED=1` | Old pipelined present: higher frame rate, but answers land on later frames and ghost. |
 | `NEURAL_FORGE_TOGGLE_KEY=F10` | In-game toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
 | `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | Forces one keyboard backend (default: evdev, then XInput2). |
@@ -215,6 +254,9 @@ managed prefix, the logs and `/tmp/neural-forge-$UID`.
 - **No effect in game:** check the launch option has `NEURAL_FORGE_ENABLE=1`, the helper is
   running (Status tab), and give the game about 5 s of normal play: the layer stays out of the
   way on loading screens.
+- **Comparing the two paths:** add `NEURAL_FORGE_PREUPSCALE=off` to the launch options for the
+  after-the-upscaler path, remove it for the default. F11 switches the model off and on in
+  either.
 - **The helper shuts down or reports the model failed:** open the helper log. A model that will
   not build at the game's size is retried when the size changes; lowering Model resolution
   helps on cards short of video memory.
@@ -298,7 +340,9 @@ closed), `--save DIR` (write every frame as a PNG).
 `neural-forge-cli shmctl capture --frames N` (N > 1) captures the next N presented frames as
 `~/.local/share/neural-forge/captures/series-<ms>/<seq>-{original,composited}.png`, plus an
 `index.tsv`, on whichever present path is running. `capture` with no `--frames` is still the
-one-shot dump. pan can make the request itself, right before a given frame, so every run
+one-shot dump. While the model runs before the upscaler there is no separate original to
+show (the enhanced frame went through DLSS), so each pair's two images are both the
+presented frame, and the one-shot dump comes out as a series of one frame. pan can make the request itself, right before a given frame, so every run
 captures the same frames:
 
 ```bash

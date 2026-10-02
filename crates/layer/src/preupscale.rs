@@ -13,7 +13,10 @@
 //!    around that buffer ([`plan`]) and, between the two halves, runs its own capture submit,
 //!    the model round trip and a write-back submit on the same queue ([`run_hold`]).
 //!
-//! Modes: `off` (the default: nothing here is reachable, no extra hooks, no waits), `dump`
+//! Modes: `model` (the default with the variable unset; it only ever holds on a device that has the
+//! NVX extensions DLSS needs and a submit carrying DLSS's input, every other device and frame keeps
+//! the post-upscaler path), `off` (`NEURAL_FORGE_PREUPSCALE=off`: nothing here is reachable, no extra
+//! hooks, no waits; the hooked-command list is exactly 1.1.0's), `dump`
 //! (capture colour, depth, motion vectors and the 1x1 exposure images once and write them to
 //! disk), `identity` (capture and write the same bytes back: the hold's own cost,
 //! picture-neutral), `model` (the colour input is encoded for the model, [`hdr`], and the helper's
@@ -69,7 +72,7 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -108,10 +111,12 @@ pub(crate) enum Mode {
 }
 
 impl Mode {
-    /// `None` (unset) and `off` are off; anything unrecognised is an error (and off).
+    /// `None` (unset) and empty are the default, [`Mode::Model`]; `off` (or `0`) is off; anything
+    /// unrecognised is an error (and off).
     pub(crate) fn parse(value: Option<&str>) -> Result<Mode, String> {
         match value.map(str::trim) {
-            None | Some("") | Some("off") | Some("0") => Ok(Mode::Off),
+            None | Some("") => Ok(DEFAULT),
+            Some("off") | Some("0") => Ok(Mode::Off),
             Some("dump") => Ok(Mode::Dump),
             Some("identity") => Ok(Mode::Identity),
             Some("model") => Ok(Mode::Model),
@@ -137,26 +142,46 @@ impl Mode {
     }
 }
 
-/// The mode for this process: off unless the layer itself is live and the variable names a mode.
-/// Cached; it cannot change for the life of the process.
+/// The mode with `NEURAL_FORGE_PREUPSCALE` unset: the model runs before the upscaler wherever DLSS
+/// Super Resolution's input is identified (measured 66.1 fps against 61.4-61.9 for the post path,
+/// GTA V Enhanced at DLSS Balanced 1440p; docs/PRE_UPSCALER_DESIGN.md, "Hand-off latency").
+pub(crate) const DEFAULT: Mode = Mode::Model;
+
+/// The mode for `raw` (the variable's value) in a process where the layer is switched on
+/// (`switched_on`: `NEURAL_FORGE_ENABLE` set and `NEURAL_FORGE_DISABLE` not). Off when the layer is
+/// switched off or the value is not a mode.
+pub(crate) fn resolve(raw: Option<&str>, switched_on: bool) -> Result<Mode, String> {
+    match Mode::parse(raw) {
+        Ok(mode) if switched_on => Ok(mode),
+        Ok(_) => Ok(Mode::Off),
+        Err(other) => Err(other),
+    }
+}
+
+/// The mode for this process. Cached; it cannot change for the life of the process.
+///
+/// Only the environment is read here, never `crate::layer_enabled()`: this is first asked while the
+/// instance is created (for the hooked-command list), and evaluating the duplicate-copy check there
+/// would let an inner copy of the layer decide before the outer one, which it never did before.
+/// The hold itself checks `layer_enabled()` (`NeuralForgeDeviceInfo::preupscale_submit`).
 pub(crate) fn mode() -> Mode {
     static MODE: LazyLock<Mode> = LazyLock::new(|| {
-        // The variable first: with it unset, `layer_enabled` is not evaluated any earlier than
-        // it always was.
         let raw = neural_forge_protocol::env::var(ENV);
-        let mode = match Mode::parse(raw.as_deref()) {
-            Ok(Mode::Off) => Mode::Off,
-            Ok(mode) if crate::layer_enabled() => mode,
-            Ok(_) => Mode::Off,
+        let switched_on = crate::env_flag("NEURAL_FORGE_ENABLE") && !crate::env_flag("NEURAL_FORGE_DISABLE");
+        let mode = match resolve(raw.as_deref(), switched_on) {
+            Ok(mode) => mode,
             Err(other) => {
-                if crate::layer_enabled() {
-                    crate::log!("[preupscale] {ENV}={other:?} is not one of off, dump, identity, model, roundtrip; staying off");
-                }
+                crate::log!("[preupscale] {ENV}={other:?} is not one of off, model, dump, identity, roundtrip; staying off");
                 Mode::Off
             }
         };
         if mode != Mode::Off {
-            crate::log!("[preupscale] mode {} in pid {}: NVX view-registration and launch tracking hooks installed", mode.name(), std::process::id());
+            crate::log!(
+                "[preupscale] mode {}{} in pid {}: NVX view-registration and launch tracking on devices that have VK_NVX_image_view_handle",
+                mode.name(),
+                if raw.as_deref().is_none_or(|v| v.trim().is_empty()) { " (default)" } else { "" },
+                std::process::id()
+            );
             crate::logging::flush();
         }
         mode
@@ -167,6 +192,13 @@ pub(crate) fn mode() -> Mode {
 /// Whether any non-off mode is selected.
 pub(crate) fn active() -> bool {
     mode() != Mode::Off
+}
+
+/// Whether a device gets the tracking (and so can ever hold): a mode is on and the device has
+/// `VK_NVX_image_view_handle` (`nvx`), through which DLSS registers its inputs. A device without it
+/// stays exactly on the post-upscaler path.
+pub(crate) fn wanted_on_device(mode_on: bool, nvx: bool) -> bool {
+    mode_on && nvx
 }
 
 /// The device commands this module adds to the framework's hooked set when a mode is on. The
@@ -404,6 +436,11 @@ impl Tracker {
         self.launch.insert(command_buffer);
     }
 
+    /// Whether any command buffer carries a launch or recorded layouts.
+    fn armed(&self) -> bool {
+        !self.launch.is_empty() || !self.pending.is_empty()
+    }
+
     pub(crate) fn begin(&mut self, command_buffer: vk::CommandBuffer) {
         self.launch.remove(&command_buffer);
         self.pending.remove(&command_buffer);
@@ -512,7 +549,7 @@ impl Tracker {
     /// buffers, in order) and commits every buffer's recorded layouts in submission order, reading
     /// the watched images' layouts just before the launch buffer.
     pub(crate) fn scan(&mut self, batches: &[Vec<vk::CommandBuffer>]) -> Option<Scan> {
-        if self.launch.is_empty() && self.pending.is_empty() {
+        if !self.armed() {
             return None;
         }
         let mut found: Option<Scan> = None;
@@ -542,11 +579,18 @@ impl Tracker {
     }
 }
 
-/// A device's [`Tracker`] plus a lock-free "anything to watch" flag for the barrier hooks.
+/// A device's [`Tracker`] plus lock-free flags, so that on a device with NVX but no DLSS (a
+/// vkd3d-proton game without DLSS) the per-command-buffer and per-submit hooks cost one relaxed
+/// load: `watching` (an input is identified, so barriers on it are worth recording), `armed` (some
+/// command buffer carries a launch or recorded layouts, so begin/free/execute/submit have something
+/// to do) and the identified extent for the present hook.
 #[derive(Default)]
 pub(crate) struct Tracking {
     tracker: Mutex<Tracker>,
     watching: AtomicBool,
+    armed: AtomicBool,
+    /// The identified colour input's extent, `width << 32 | height`; 0 when none.
+    extent: AtomicU64,
 }
 
 static TRACKING: LazyLock<Mutex<HashMap<vk::Device, Arc<Tracking>>>> = LazyLock::new(Default::default);
@@ -569,24 +613,80 @@ impl Tracking {
         self.watching.load(Ordering::Relaxed)
     }
 
+    /// Whether any command buffer carries a launch or recorded layouts. Stored under the lock
+    /// after every change; read without it. A command buffer's own recording happens-before its
+    /// reset, free or submit (the application synchronizes those), so a `false` read for a buffer
+    /// that was marked is impossible.
+    pub(crate) fn armed(&self) -> bool {
+        self.armed.load(Ordering::Relaxed)
+    }
+
+    fn rearm(&self, t: &Tracker) {
+        self.armed.store(t.armed(), Ordering::Relaxed);
+    }
+
+    /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`.
+    pub(crate) fn launch(&self, command_buffer: vk::CommandBuffer) {
+        let mut t = self.lock();
+        t.launch(command_buffer);
+        self.rearm(&t);
+    }
+
+    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording. Nothing to do (no lock)
+    /// while nothing is armed.
+    pub(crate) fn begin(&self, command_buffer: vk::CommandBuffer) {
+        if self.armed() {
+            let mut t = self.lock();
+            t.begin(command_buffer);
+            self.rearm(&t);
+        }
+    }
+
+    /// `vkFreeCommandBuffers`, as [`Self::begin`].
+    pub(crate) fn free(&self, command_buffers: &[vk::CommandBuffer]) {
+        if self.armed() {
+            let mut t = self.lock();
+            t.free(command_buffers);
+            self.rearm(&t);
+        }
+    }
+
+    /// `vkCmdExecuteCommands`: a secondary's launch or layouts carry over to the primary. Nothing
+    /// to carry while nothing is armed.
+    pub(crate) fn execute(&self, primary: vk::CommandBuffer, secondaries: &[vk::CommandBuffer]) {
+        if self.armed() {
+            let mut t = self.lock();
+            t.execute(primary, secondaries);
+            self.rearm(&t);
+        }
+    }
+
     /// Records image barriers' new layouts for the watched images.
     pub(crate) fn barriers(&self, command_buffer: vk::CommandBuffer, images: impl Iterator<Item = (vk::Image, vk::ImageLayout)>) {
         let mut t = self.lock();
         for (image, layout) in images {
             t.barrier(command_buffer, image, layout);
         }
+        self.rearm(&t);
     }
 
-    /// See [`Tracker::scan`]; re-derives the inputs first and logs a change.
+    /// See [`Tracker::scan`]; re-derives the inputs first and logs a change. `None` without taking
+    /// the lock while nothing is armed.
     pub(crate) fn scan(&self, batches: &[Vec<vk::CommandBuffer>]) -> Option<Scan> {
+        if !self.armed() {
+            return None;
+        }
         let (scan, line) = {
             let mut t = self.lock();
-            if t.launch.is_empty() && t.pending.is_empty() {
+            if !t.armed() {
                 return None;
             }
             let line = t.refresh();
             self.watching.store(t.inputs.is_some(), Ordering::Relaxed);
-            (t.scan(batches), line)
+            self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
+            let scan = t.scan(batches);
+            self.rearm(&t);
+            (scan, line)
         };
         if let Some(line) = line {
             crate::log!("[preupscale] {line}");
@@ -595,9 +695,10 @@ impl Tracking {
         scan
     }
 
-    /// The identified colour input's extent, if any.
+    /// The identified colour input's extent, if any (as of the last launch-bearing submit; no lock).
     pub(crate) fn extent(&self) -> Option<(u32, u32)> {
-        self.lock().inputs.map(|i| (i.colour.1.width, i.colour.1.height))
+        let packed = self.extent.load(Ordering::Relaxed);
+        (packed != 0).then_some(((packed >> 32) as u32, packed as u32))
     }
 }
 
@@ -2014,6 +2115,14 @@ struct Stats {
     last_miss_log: Option<Instant>,
     unlogged_misses: u32,
     last_hold_ms: f32,
+    /// When the current summary window started: the previous summary, or the first hold.
+    window_start: Option<Instant>,
+}
+
+/// Holds per second over a summary window of `holds` holds that took `elapsed`.
+fn per_second(holds: u64, elapsed: Duration) -> f32 {
+    let secs = elapsed.as_secs_f32();
+    if secs > 0.0 { holds as f32 / secs } else { 0.0 }
 }
 
 impl Stats {
@@ -2185,6 +2294,7 @@ impl Session {
         let held = result.waits_consumed;
         if held {
             s.holds += 1;
+            s.window_start.get_or_insert_with(Instant::now);
             s.last_hold_ms = cpu.as_secs_f32() * 1000.0;
             s.hold_ms.push(s.last_hold_ms);
         }
@@ -2212,8 +2322,13 @@ impl Session {
         shm.publish_preupscale_state(if holding { 2 } else { 1 }, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
+            // The window's rate: frames the model ran on before the upscaler (the post path's
+            // "composited" count does not include them). Loading screens inside a window lower it.
+            let now = Instant::now();
+            let rate = per_second(SUMMARY_EVERY, s.window_start.map_or(Duration::ZERO, |t| now.duration_since(t)));
+            s.window_start = Some(now);
             crate::log!(
-                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2} misses={} (total {})",
+                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2} misses={} (total {}) holds_per_s={:.1}",
                 mode().name(),
                 extent.0,
                 extent.1,
@@ -2222,7 +2337,8 @@ impl Session {
                 median(&s.capture_gpu_ms),
                 median(&s.writeback_gpu_ms),
                 s.window_misses,
-                s.misses
+                s.misses,
+                rate
             );
             crate::log!("[preupscale] {}", s.phases());
             crate::logging::flush();
@@ -2250,6 +2366,21 @@ impl Session {
     pub(crate) fn publish_status(&self, shm: &ShmClient, extent: Option<(u32, u32)>) {
         let (w, h) = extent.unwrap_or((0, 0));
         shm.publish_preupscale_state(if self.holding() { 2 } else { 1 }, w, h);
+    }
+}
+
+/// Whether a launch-bearing submit is held in `mode`, given the live switches: `None` forwards it
+/// untouched; `Some(dump)` holds it, `dump` saying whether this hold writes a dump. In model mode the
+/// live toggle (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported
+/// unavailable mean no hold at all (the post path then sees the toggle too and presents the game's
+/// frame as it is), and a helper that is not running is never waited for. `layouts_known`: the
+/// depth and motion-vector layouts are known (a dump waits for them, [`Session::dump_ready`]).
+pub(crate) fn gate(mode: Mode, session: &mut Session, shm: &mut ShmClient, layouts_known: bool) -> Option<bool> {
+    match mode {
+        Mode::Off => None,
+        Mode::Dump => (session.dump_due(shm) && session.dump_ready(layouts_known)).then_some(true),
+        Mode::Model => (shm.model_wanted() && shm.helper_alive()).then_some(false),
+        Mode::Identity | Mode::Roundtrip => Some(false),
     }
 }
 
@@ -2281,6 +2412,12 @@ mod tests {
     }
 
     #[test]
+    fn the_summary_rate_is_holds_over_the_window() {
+        assert_eq!(per_second(300, Duration::from_secs(5)), 60.0);
+        assert_eq!(per_second(300, Duration::ZERO), 0.0);
+    }
+
+    #[test]
     fn relax_counts_its_steps_and_never_sleeps() {
         let mut spins = 0;
         let started = Instant::now();
@@ -2297,8 +2434,10 @@ mod tests {
 
     #[test]
     fn modes_parse_and_unknown_values_are_refused() {
-        assert_eq!(Mode::parse(None), Ok(Mode::Off));
+        assert_eq!(Mode::parse(None), Ok(Mode::Model), "unset is the default: the model before the upscaler");
+        assert_eq!(Mode::parse(Some("")), Ok(Mode::Model));
         assert_eq!(Mode::parse(Some("off")), Ok(Mode::Off));
+        assert_eq!(Mode::parse(Some(" 0 ")), Ok(Mode::Off));
         assert_eq!(Mode::parse(Some("dump")), Ok(Mode::Dump));
         assert_eq!(Mode::parse(Some("identity")), Ok(Mode::Identity));
         assert_eq!(Mode::parse(Some(" model ")), Ok(Mode::Model));
@@ -2307,8 +2446,28 @@ mod tests {
         assert!(Mode::Model.hdr() && Mode::Roundtrip.hdr() && !Mode::Identity.hdr() && !Mode::Dump.hdr(), "identity stays the raw copy-through");
         assert!(commands(false).is_empty());
         assert!(commands(true).contains(&VulkanCommand::CmdCuLaunchKernelNvx));
-        // The test process does not set the variable: off, and nothing extra is hooked.
+        // The test process does not set NEURAL_FORGE_ENABLE: off, and nothing extra is hooked.
         assert_eq!(mode(), Mode::Off);
+    }
+
+    #[test]
+    fn the_default_resolves_to_model_only_with_the_layer_switched_on_and_off_is_the_way_back() {
+        assert_eq!(DEFAULT, Mode::Model);
+        // Unset or empty, layer on: the model before the upscaler.
+        assert_eq!(resolve(None, true), Ok(Mode::Model));
+        assert_eq!(resolve(Some("  "), true), Ok(Mode::Model));
+        // The A/B and rollback switch.
+        assert_eq!(resolve(Some("off"), true), Ok(Mode::Off));
+        // The diagnostics stay selectable.
+        for (value, mode) in [("dump", Mode::Dump), ("identity", Mode::Identity), ("roundtrip", Mode::Roundtrip), ("model", Mode::Model)] {
+            assert_eq!(resolve(Some(value), true), Ok(mode));
+        }
+        // The layer switched off (or disabled): nothing, whatever the variable says.
+        for value in [None, Some("model"), Some("dump"), Some("off")] {
+            assert_eq!(resolve(value, false), Ok(Mode::Off), "{value:?}");
+        }
+        // A typo is refused (the caller logs it and stays off), not taken as the default.
+        assert_eq!(resolve(Some("modle"), true), Err("modle".to_string()));
     }
 
     fn batch1(waits: &[(u64, Option<u64>)], cbs: &[u64], signals: &[(u64, Option<u64>)]) -> Batch1 {
@@ -2627,6 +2786,34 @@ mod tests {
         assert!(t.inputs.is_none());
     }
 
+    /// On a device with NVX but no DLSS nothing is ever armed, so the per-command-buffer and
+    /// per-submit hooks stay a relaxed load; a launch arms it until its buffer is re-recorded.
+    #[test]
+    fn tracking_stays_disarmed_without_launches_and_disarms_after_the_launch_buffer_is_reset() {
+        let t = Tracking::default();
+        assert!(!t.armed());
+        // A game without DLSS: buffers come and go, submits carry no launch.
+        for k in 0..100 {
+            t.begin(cb(k));
+            t.execute(cb(k), &[cb(k + 1000)]);
+        }
+        t.free(&[cb(1), cb(2)]);
+        assert!(!t.armed());
+        assert!(t.scan(&[vec![cb(1), cb(2)]]).is_none());
+        assert_eq!(t.extent(), None);
+        // DLSS records a launch: armed, and the submit carrying it is found.
+        t.launch(cb(7));
+        assert!(t.armed());
+        assert!(t.scan(&[vec![cb(6), cb(7)]]).is_some_and(|s| (s.batch, s.index) == (0, 1)));
+        // A secondary's launch carries over to its primary.
+        t.execute(cb(8), &[cb(7)]);
+        t.begin(cb(7));
+        assert!(t.armed(), "the primary still carries the launch");
+        t.free(&[cb(8)]);
+        assert!(!t.armed(), "every launch buffer was reset or freed");
+        assert!(t.scan(&[vec![cb(7), cb(8)]]).is_none());
+    }
+
     #[test]
     fn capture_regions_pad_odd_sizes_with_the_edge() {
         assert_eq!(padded(1707, 960), (1708, 960));
@@ -2917,6 +3104,45 @@ mod tests {
         let mut shm = ShmClient::default();
         assert!(shm.test_open_at(&path.display().to_string()));
         shm
+    }
+
+    /// The live toggle switches the model off in the pre-upscaler path: with `enabled` off (what F11
+    /// flips), `apply_model` off, or the helper gone, model mode holds nothing, and toggling back on
+    /// holds again. The diagnostics ignore the toggle; off never holds.
+    #[test]
+    fn the_live_toggle_switches_model_mode_holds_off_and_on() {
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        let mut shm = ShmClient::test_over_header(&header);
+        let (enabled, apply_model) = (&header.enabled, &header.apply_model);
+        // A running helper: its heartbeat moves before every check (the first sample only primes).
+        header.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+        let _ = shm.helper_alive();
+        let beat = || {
+            header.heartbeat.fetch_add(1, Ordering::Relaxed);
+        };
+        let mut session = Session::default();
+        enabled.store(1, Ordering::Relaxed);
+        apply_model.store(1, Ordering::Relaxed);
+        beat();
+        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), Some(false), "on: held, no dump");
+        // F11 (the hotkey poller flips exactly this field).
+        enabled.store(0, Ordering::Relaxed);
+        beat();
+        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), None, "toggled off: nothing held");
+        assert_eq!(gate(Mode::Identity, &mut session, &mut shm, true), Some(false), "identity ignores the toggle");
+        assert_eq!(gate(Mode::Roundtrip, &mut session, &mut shm, true), Some(false), "roundtrip ignores the toggle");
+        assert_eq!(gate(Mode::Off, &mut session, &mut shm, true), None);
+        enabled.store(1, Ordering::Relaxed);
+        beat();
+        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), Some(false), "toggled back on: held again");
+        apply_model.store(0, Ordering::Relaxed);
+        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), None, "apply_model off: nothing held");
+        apply_model.store(1, Ordering::Relaxed);
+        // The helper stops: its heartbeat freezes, and after the liveness window nothing is held.
+        std::thread::sleep(Duration::from_millis(600));
+        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), None, "no helper: never waited for");
+        beat();
+        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), Some(false), "the helper is back: held again");
     }
 
     fn wait_for_helper(shm: &mut ShmClient) {

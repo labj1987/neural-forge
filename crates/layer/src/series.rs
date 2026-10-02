@@ -73,6 +73,14 @@ pub struct Series {
 // state's `Mutex`, like every other Vulkan resource in that state.
 unsafe impl Send for Series {}
 
+/// The capture request this present takes, as a series length. Normally only a series
+/// (`capture_request` above 1): the one-shot (1) belongs to `capture::run`. While frames are `held`
+/// before the upscaler (`crate::preupscale`) the post path does not run, so the present takes the
+/// one-shot as well, as a series of one frame; otherwise the request would stay pending.
+pub fn take_request(shm: &crate::shm::ShmClient, held: bool) -> Option<u32> {
+    shm.take_series_request().or_else(|| (held && shm.take_capture_request()).then_some(1))
+}
+
 impl Series {
     /// Starts a series of `frames` presents, written under `base/series-<ms>/`.
     pub fn start(&mut self, frames: u32, base: &Path) {
@@ -480,10 +488,38 @@ mod tests {
         }
     }
 
+    /// The one-shot stays `capture::run`'s on the post path, and is taken (as one frame) while
+    /// frames are held before the upscaler; a series is taken either way, once.
+    #[test]
+    fn requests_are_taken_by_the_post_path_and_while_held() {
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        let shm = crate::shm::ShmClient::test_over_header(&header);
+        let field = &header.capture_request;
+        use std::sync::atomic::Ordering::Relaxed;
+        assert_eq!(take_request(&shm, false), None);
+        assert_eq!(take_request(&shm, true), None);
+        field.store(1, Relaxed);
+        assert_eq!(take_request(&shm, false), None, "the one-shot is left for capture::run");
+        assert_eq!(field.load(Relaxed), 1);
+        assert_eq!(take_request(&shm, true), Some(1), "held: the one-shot is served as one frame");
+        assert_eq!(field.load(Relaxed), 0);
+        assert_eq!(take_request(&shm, true), None, "served once");
+        field.store(30, Relaxed);
+        assert_eq!(take_request(&shm, true), Some(30));
+        field.store(2, Relaxed);
+        assert_eq!(take_request(&shm, false), Some(2));
+        assert_eq!(field.load(Relaxed), 0);
+    }
+
     /// A series of three presents where something (standing in for the composition) rewrites
     /// the image between `before` and `after`: each pair must hold the frame as it was before
     /// and after that write, the files must be named by sequence, and the series must end by
     /// itself after the requested count, with an index row per frame.
+    ///
+    /// Then, on the same device (a second Vulkan device per test does not fit the i686 test run's
+    /// address space): while frames are held before the upscaler the present composes nothing, so a
+    /// one-shot request taken there reads the presented frame twice, both halves of its pair are the
+    /// final picture, and the request is served (no longer left pending).
     #[test]
     fn series_reads_back_each_present_before_and_after_the_composition() {
         let Some((_entry, instance, physical_device, device, queue, family)) = crate::composition::gpu::test_device() else {
@@ -493,6 +529,8 @@ mod tests {
         let (width, height) = (16u32, 8u32);
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(format!("target/test-scratch/series-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
+        let held_base = base.with_file_name(format!("series-held-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&held_base);
         unsafe {
             let info = vk::ImageCreateInfo::builder()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -527,6 +565,24 @@ mod tests {
                 assert_eq!(was_running, frame < 3, "the series must end after exactly 3 presents");
             }
             assert!(!series.running());
+
+            // Held before the upscaler: the one-shot is taken by the present, as one frame.
+            let header = Box::new(neural_forge_protocol::ShmHeader::default());
+            let shm = crate::shm::ShmClient::test_over_header(&header);
+            header.capture_request.store(1, std::sync::atomic::Ordering::Relaxed);
+            for frame in 0..2u32 {
+                if let Some(frames) = take_request(&shm, true) {
+                    series.start(frames, &held_base);
+                }
+                // The game's frame, the model's edit already in it.
+                clear(&device, queue, pool, image, layout, [0.25 + frame as f32 / 4.0, 0.5, 0.0, 1.0]);
+                let was_running = series.running();
+                series.before(&device, &instance, physical_device, queue, family, image, width, height);
+                series.after(&device, queue, image, width, height, true, None);
+                assert_eq!(was_running, frame == 0, "a one-shot is one frame");
+            }
+            assert_eq!(header.capture_request.load(std::sync::atomic::Ordering::Relaxed), 0, "the request was served");
+            assert!(!series.running());
             series.destroy(&device);
             device.queue_wait_idle(queue).unwrap();
             device.destroy_command_pool(pool, None);
@@ -557,5 +613,21 @@ mod tests {
         let index = std::fs::read_to_string(dir.join("index.tsv")).unwrap();
         assert_eq!(index.lines().count(), 4, "header plus one row per frame:\n{index}");
         let _ = std::fs::remove_dir_all(&base);
+
+        let dir = std::fs::read_dir(&held_base).unwrap().next().unwrap().unwrap().path();
+        let (original, composited) = pair_names(0);
+        let (o, c) = (decode_at(&dir, &original), decode_at(&dir, &composited));
+        assert_eq!(o, c, "held: both halves are the presented frame");
+        // The first held frame (0.25, 0.5, 0, 1), within a level of the driver's rounding.
+        assert!(o[0].abs_diff(64) <= 1 && o[1].abs_diff(128) <= 1 && o[2] == 0 && o[3] == 255, "{:?}", &o[..4]);
+        assert!(!dir.join(pair_names(1).0).exists());
+        let _ = std::fs::remove_dir_all(&held_base);
+    }
+
+    fn decode_at(dir: &std::path::Path, name: &str) -> Vec<u8> {
+        let mut reader = png::Decoder::new(std::fs::File::open(dir.join(name)).unwrap()).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size()];
+        reader.next_frame(&mut buf).unwrap();
+        buf
     }
 }

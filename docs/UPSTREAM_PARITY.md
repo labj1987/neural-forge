@@ -80,7 +80,8 @@ presents untouched. See `RENDER_TAP_DESIGN.md`.
   work goes into generated frames). 0.1.83's "Model every Nth frame" (2 with
   frame generation) carries the answer to the frames between, measured +29% presented frames on the
   rig. The full fix is to enhance before frame generation (the game's render target, not the
-  swapchain).
+  swapchain). The 2.0 pre-upscaler path (below) runs before DLSS Super Resolution; with DLSS Frame
+  Generation also on it is not measured yet.
 - **Why compositing during GTA V's loading screens stalls the game** is still unknown; the layer
   avoids it by waiting for 5 s of steady rendering (`swapchain::Warmup`). v0.1.85-0.1.87 found and
   fixed one concrete way this *class* of stall could happen: every `wait_for_fences` the layer or
@@ -96,5 +97,8 @@ presents untouched. See `RENDER_TAP_DESIGN.md`.
   abandoned -- not attempted, deliberately, pending that decision. (`optical_flow.rs` no longer
   has one: its per-frame wait is a fence with `FENCE_WAIT_TIMEOUT`, and a stalled session is
   leaked rather than waited on.)
-- **Running the model before the game's own upscaler** (on the internal render resolution)
-  rather than on the upscaled output: a later performance idea.
+- **Running the model before the game's own upscaler:** done in 2.0 and the default where DLSS
+  Super Resolution's input is found (`docs/PRE_UPSCALER_DESIGN.md`; `NEURAL_FORGE_PREUPSCALE=off`
+  switches back). Not done yet there: an asynchronous hold (the capture still waits for the
+  game's queued work, 3.6-4.4 ms), the game's own depth and motion vectors for the model (it
+  still uses optical flow), and a probe of any game other than GTA V Enhanced.

@@ -2,11 +2,15 @@
 """Summarise gta-bench.sh runs.
 
 usage: bench-report.py [--host HOST] [--mean] <label>...
+       bench-report.py --self-test
 
 Per run: the real fps of each benchmark pass (GTA's own Benchmark file), pass 4 in detail
 (real fps from its frame-time file; displayed fps from MangoHud's per-frame log, counted
 over pass 4's wall-clock window, which is right below a frame generator because MangoHud
-is the last layer; the layer's composited rate; GPU utilisation and power from nvidia-smi
+is the last layer; the layer's composited rate, or, when the model ran before the upscaler
+(the pre-upscaler path's [preupscale] summary lines are in the log), the rate of frames it
+held and enhanced there instead, since those frames are not "composited" and the
+composited figure then only counts loading screens; GPU utilisation and power from nvidia-smi
 over the same window), and the median of every field of the layer's [sync] lines (one per
 300 composed frames, first line dropped as warm-up). --mean adds the mean of the pass-4
 numbers over all labels given, which is how three runs of one configuration are reported.
@@ -56,6 +60,24 @@ def sync_medians(log):
     return f"{len(rows)} lines: " + " ".join(out)
 
 
+def held_per_second(log):
+    """Median `holds_per_s` of the pre-upscaler path's summary lines (one per 300 holds), or None
+    when the log has none (the post-upscaler path ran, or a build before the rate was logged)."""
+    rates = sorted(
+        float(x) for x in re.findall(r"\[preupscale\] mode=\S+ .* holds_per_s=([\d.]+)", log) if float(x) > 0
+    )
+    return rates[len(rates) // 2] if rates else None
+
+
+def rate_text(composited, held):
+    """The layer's own rate for the report line. When frames were held before the upscaler the
+    composited figure is not the effect's rate, so it is labelled as what it is."""
+    fmt = lambda v: "NA" if v is None else f"{v:.1f}"
+    if held is None:
+        return f"composited/s {fmt(composited)}"
+    return f"held before upscaler/s {fmt(held)} (composited/s {fmt(composited)}: frames not held, e.g. loading screens)"
+
+
 def report(label, base):
     d = os.path.join(base, label)
     if not os.path.exists(f"{d}/benchmark.txt"):
@@ -99,11 +121,12 @@ def report(label, base):
     log = open(f"{d}/launch.log", errors="replace").read()
     comp = sorted(float(x) for x in re.findall(r"\[present\] [\d.]+ fps \(([\d.]+)/s composited", log) if float(x) > 0)
     nf = comp[len(comp) // 2] if comp else None
+    held = held_per_second(log)
     settings = open(f"{d}/settings").read().split() if os.path.exists(f"{d}/settings") else []
     fmt = lambda v, f: "NA" if v is None else f.format(v)
     print(
         f"{label}: passes {' / '.join(f'{a:.1f}' for a in avgs)} | pass4 ({dur:.0f}s) real {real4:.1f}, "
-        f"displayed {fmt(disp, '{:.1f}')}, composited/s {fmt(nf, '{:.1f}')}, "
+        f"displayed {fmt(disp, '{:.1f}')}, {rate_text(nf, held)}, "
         f"GPU {fmt(gpu, '{:.0f}%')} {fmt(power, '{:.0f}W')}"
         + (f" | {' '.join(s for s in settings if '=' in s)}" if settings else "")
     )
@@ -134,5 +157,26 @@ def main(argv):
         )
 
 
+def _self_test():
+    log = (
+        "[neural-forge-layer] [present] 66.0 fps (0.0/s composited by the effect) over 5.0s\n"
+        "[neural-forge-layer] [present] 30.0 fps (29.0/s composited by the effect) over 5.0s\n"
+        "[neural-forge-layer] [preupscale] mode=model extent=1485x836 (padded 1486x836) holds=300 hold_ms median=10.20 "
+        "capture_gpu_ms median=0.68 writeback_gpu_ms median=0.52 misses=0 (total 3) holds_per_s=65.8\n"
+        "[neural-forge-layer] [preupscale] mode=model extent=1485x836 (padded 1486x836) holds=600 hold_ms median=10.10 "
+        "capture_gpu_ms median=0.68 writeback_gpu_ms median=0.52 misses=0 (total 3) holds_per_s=66.2\n"
+        "[neural-forge-layer] [preupscale] mode=model extent=1485x836 (padded 1486x836) holds=900 hold_ms median=10.10 "
+        "capture_gpu_ms median=0.68 writeback_gpu_ms median=0.52 misses=0 (total 3) holds_per_s=40.0\n"
+    )
+    assert held_per_second(log) == 65.8, held_per_second(log)
+    assert held_per_second("[present] 61.0 fps (61.0/s composited by the effect) over 5.0s") is None
+    assert rate_text(61.0, None) == "composited/s 61.0"
+    assert rate_text(29.0, 65.8).startswith("held before upscaler/s 65.8 (composited/s 29.0")
+    print("bench-report self-test ok")
+
+
 if __name__ == "__main__":
-    main(sys.argv[1:])
+    if sys.argv[1:] == ["--self-test"]:
+        _self_test()
+    else:
+        main(sys.argv[1:])
