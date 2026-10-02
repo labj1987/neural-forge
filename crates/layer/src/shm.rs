@@ -223,6 +223,14 @@ impl ShmClient {
         hdr.capture_request.swap(0, Ordering::Relaxed) != 0
     }
 
+    /// Consumes a pending *series* request: a `capture_request` above 1 asks for that many
+    /// consecutive presented frames (see `crate::series`). A value of 1 is the one-shot dump
+    /// and is left untouched for [`Self::take_capture_request`], exactly as before.
+    pub fn take_series_request(&self) -> Option<u32> {
+        let hdr = self.header()?;
+        series_request_from(&hdr.capture_request)
+    }
+
     /// Non-consuming version of [`Self::take_capture_request`] -- lets a caller decide
     /// *how* to produce this frame's composited bytes (a fast, GPU-only path with no
     /// CPU-visible result, vs. a path that leaves the result somewhere
@@ -831,6 +839,46 @@ impl ShmClient {
 /// another local user left in our way."
 fn ensure_private_parent_dir(path: &str) -> bool {
     neural_forge_protocol::private_dir::ensure_private_parent_dir(path)
+}
+
+/// [`ShmClient::take_series_request`]'s decision on the raw field: a value above 1 is taken
+/// (reset to 0 in the same atomic step, so a request is served once); 0 and 1 are left alone.
+fn series_request_from(field: &std::sync::atomic::AtomicU32) -> Option<u32> {
+    let mut current = field.load(Ordering::Relaxed);
+    loop {
+        if current <= 1 {
+            return None;
+        }
+        match field.compare_exchange_weak(current, 0, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return Some(current),
+            Err(now) => current = now,
+        }
+    }
+}
+
+#[cfg(test)]
+mod series_request_tests {
+    use super::series_request_from;
+    use std::sync::atomic::{AtomicU32, Ordering};
+
+    /// `capture_request = 1` must stay the one-shot dump's, untouched; 0 is no request.
+    #[test]
+    fn one_and_zero_are_left_for_the_one_shot_dump() {
+        let field = AtomicU32::new(1);
+        assert_eq!(series_request_from(&field), None);
+        assert_eq!(field.load(Ordering::Relaxed), 1);
+        let field = AtomicU32::new(0);
+        assert_eq!(series_request_from(&field), None);
+        assert_eq!(field.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn above_one_is_taken_once() {
+        let field = AtomicU32::new(120);
+        assert_eq!(series_request_from(&field), Some(120));
+        assert_eq!(field.load(Ordering::Relaxed), 0);
+        assert_eq!(series_request_from(&field), None);
+    }
 }
 
 #[cfg(test)]

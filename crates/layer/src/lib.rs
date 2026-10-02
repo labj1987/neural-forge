@@ -25,6 +25,7 @@ mod device;
 mod ownership;
 mod loader_data;
 mod dump;
+mod series;
 mod logging;
 mod hotkey;
 mod shm;

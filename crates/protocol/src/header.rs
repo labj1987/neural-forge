@@ -178,6 +178,8 @@ pub struct ShmHeader {
     pub compare_swap: AtomicU32,
     pub colour_mode: AtomicU32,
     /// Writes one set of matched before/after frames per session when the layer next presents.
+    /// A value N above 1 instead captures the next N presented frames as a numbered series
+    /// (the layer's `series` module); 1 is the one-shot dump, unchanged.
     pub capture_request: AtomicU32,
     /// A Linux key code the layer watches to toggle the pass, or 0 for none.
     pub toggle_key: AtomicU32,

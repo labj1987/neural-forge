@@ -6,6 +6,11 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Testing: `crates/layer/examples/pan.rs`, a deterministic panning Vulkan app with its frame
+  number stamped in the corner; `shmctl capture --frames N` (layer `series.rs`), which captures
+  N consecutive presented frames on whichever present path runs; and `scripts/agreement.py`,
+  which scores how closely a test run's edit matches a reference run's. `capture` without
+  `--frames` (`capture_request = 1`) is unchanged.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
   `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
   earlier needs proof that the presentation engine's wait on them has completed, which core

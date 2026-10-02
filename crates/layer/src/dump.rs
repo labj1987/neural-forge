@@ -8,7 +8,7 @@
 use std::io::BufWriter;
 use std::path::PathBuf;
 
-fn captures_dir() -> PathBuf {
+pub(crate) fn captures_dir() -> PathBuf {
     let base = std::env::var("XDG_DATA_HOME").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
         format!("{}/.local/share", std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
     });
@@ -27,8 +27,8 @@ pub fn write_pair(original: &[u8], composited: &[u8], width: u32, height: u32, b
         return;
     }
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let ok_original = write_png(&dir.join(format!("{stamp}-original.png")), original, width, height, bgr_order);
-    let ok_composited = write_png(&dir.join(format!("{stamp}-composited.png")), composited, width, height, bgr_order);
+    let ok_original = write_png(&dir.join(format!("{stamp}-original.png")), original, width, height, bgr_order, false);
+    let ok_composited = write_png(&dir.join(format!("{stamp}-composited.png")), composited, width, height, bgr_order, false);
     crate::log!(
         "[dump] capture_request: wrote {stamp}-{{original,composited}}.png under {} (original={} composited={})",
         dir.display(),
@@ -37,7 +37,9 @@ pub fn write_pair(original: &[u8], composited: &[u8], width: u32, height: u32, b
     );
 }
 
-fn write_png(path: &std::path::Path, rgba: &[u8], width: u32, height: u32, bgr_order: bool) -> bool {
+/// `fast` picks the PNG encoder's fastest compression (a `crate::series` capture writes a
+/// pair per presented frame and must keep up); the one-shot dump keeps the default.
+pub(crate) fn write_png(path: &std::path::Path, rgba: &[u8], width: u32, height: u32, bgr_order: bool, fast: bool) -> bool {
     let Ok(file) = std::fs::File::create(path) else { return false };
     let mut encoder = png::Encoder::new(BufWriter::new(file), width, height);
     // Forced fully opaque, on purpose: this is `RGBA8` straight off a real present
@@ -63,6 +65,9 @@ fn write_png(path: &std::path::Path, rgba: &[u8], width: u32, height: u32, bgr_o
     }
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    if fast {
+        encoder.set_compression(png::Compression::Fast);
+    }
     let Ok(mut writer) = encoder.write_header() else { return false };
     writer.write_image_data(&opaque).is_ok()
 }

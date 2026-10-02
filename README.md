@@ -277,6 +277,51 @@ so a 4K run needs the desktop switched to 3840x2160 at scale 1.0 first (temporar
 `gdctl set`). A connected remote desktop session costs about 8 fps; the runner warns
 when one is open.
 
+### Measuring where the edit lands (pan + agreement)
+
+`vkcube`'s background never moves, so it cannot show an edit landing on the wrong frame.
+`crates/layer/examples/pan.rs` is a small Vulkan app (X11/XWayland) that presents a detailed
+procedural picture moving `--px-per-frame` right and half that down every frame, bilinear
+sampled. Frame N is the same picture in every run, and its number is stamped into the top-left
+corner. The layer engages on it like on a game (helper running, `NEURAL_FORGE_ENABLE=1`).
+
+```bash
+cargo build --release -p neural-forge-layer --example pan
+# 2 and 6 px/frame with grain; fps goes to stderr every second.
+NEURAL_FORGE_ENABLE=1 ./target/release/examples/pan --width 2560 --height 1440 --px-per-frame 2 --grain 0.3 --frames 1500
+NEURAL_FORGE_ENABLE=1 ./target/release/examples/pan --width 2560 --height 1440 --px-per-frame 6 --grain 0.3 --frames 1500
+```
+
+Other flags: `--contrast C`, `--present-mode fifo|immediate|mailbox`, `--frames 0` (run until
+closed), `--save DIR` (write every frame as a PNG).
+
+`neural-forge-cli shmctl capture --frames N` (N > 1) captures the next N presented frames as
+`~/.local/share/neural-forge/captures/series-<ms>/<seq>-{original,composited}.png`, plus an
+`index.tsv`, on whichever present path is running. `capture` with no `--frames` is still the
+one-shot dump. pan can make the request itself, right before a given frame, so every run
+captures the same frames:
+
+```bash
+# Reference (synchronous present), then the path under test, same flags otherwise.
+NEURAL_FORGE_ENABLE=1 ./target/release/examples/pan --width 2560 --height 1440 --px-per-frame 6 --grain 0.3 --frames 1100 --capture-at 900 --capture-frames 120
+NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PIPELINED=1 ./target/release/examples/pan --width 2560 --height 1440 --px-per-frame 6 --grain 0.3 --frames 1100 --capture-at 900 --capture-frames 120
+```
+
+`scripts/agreement.py` (needs Pillow) matches the two runs' frames by their stamped number and
+reports the correlation of the two edit fields (`composited - original`; 1.0 = same edit in the
+same place) and the test run's edit strength on the original's sharpest 10% of pixels as a
+percentage of the reference's:
+
+```bash
+python3 scripts/agreement.py REF_SERIES_DIR TEST_SERIES_DIR
+python3 scripts/agreement.py --runs ref1:test1 ref2:test2 ref3:test3
+python3 scripts/agreement.py --self-test
+```
+
+Two synchronous runs may not score exactly 1.0 if the model's answer to the same frame varies
+between runs. Compare one synchronous run against another first: that score is the ceiling for
+any other path.
+
 ## Legal
 
 `nvngx_dlssnr.dll` checks which module is calling into it and refuses to run outside

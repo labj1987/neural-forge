@@ -26,6 +26,9 @@ fn usage() {
          \x20 toggle <name>       flip a 0/1-valued setting\n\
          \x20 capture [view]      dump the next frame's original+composited PNGs\n\
          \x20                     (see neural_forge_layer::dump); optional debug_view 0-3\n\
+         \x20 capture --frames N  dump the next N presented frames (N > 1) as a series of\n\
+         \x20                     original+composited pairs, whichever present path runs\n\
+         \x20                     (see neural_forge_layer::series)\n\
          \x20 reset               reset every setting to its default; preserves the\n\
          \x20                     live helper/layer session (see ShmHeader::reset_persisted_settings)\n\n\
          Opens config.ini's shm= channel, else $NEURAL_FORGE_SHM, else the default under\n\
@@ -155,7 +158,26 @@ fn cmd_toggle(header: &ShmHeader, name: &str) -> bool {
     true
 }
 
-fn cmd_capture(header: &ShmHeader, view: Option<&str>) -> bool {
+fn cmd_capture(header: &ShmHeader, args: &[String]) -> bool {
+    let mut view = None;
+    let mut frames = 1u32;
+    let mut it = args.iter();
+    while let Some(arg) = it.next() {
+        if arg == "--frames" {
+            match it.next().and_then(|v| v.parse::<u32>().ok()).filter(|&n| n >= 1) {
+                Some(n) => frames = n,
+                None => {
+                    eprintln!("shmctl capture: --frames takes a count of at least 1");
+                    return false;
+                }
+            }
+        } else if view.is_none() {
+            view = Some(arg.as_str());
+        } else {
+            eprintln!("shmctl capture: unexpected argument {arg:?}");
+            return false;
+        }
+    }
     if let Some(view) = view {
         let Ok(mode) = view.parse::<u32>() else {
             eprintln!("shmctl capture: debug_view must be 0-3, got {view:?}");
@@ -163,8 +185,12 @@ fn cmd_capture(header: &ShmHeader, view: Option<&str>) -> bool {
         };
         header.debug_view.store(mode, Ordering::Relaxed);
     }
-    header.capture_request.store(1, Ordering::Relaxed);
-    println!("capture_request set -- check $XDG_DATA_HOME/neural-forge/captures on the layer's next present");
+    header.capture_request.store(frames, Ordering::Relaxed);
+    if frames == 1 {
+        println!("capture_request set -- check $XDG_DATA_HOME/neural-forge/captures on the layer's next present");
+    } else {
+        println!("capture_request={frames} -- the next {frames} presents go to a new $XDG_DATA_HOME/neural-forge/captures/series-<ms>/");
+    }
     true
 }
 
@@ -198,7 +224,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
                 false
             }
         },
-        Some("capture") => cmd_capture(header, args.get(1).map(String::as_str)),
+        Some("capture") => cmd_capture(header, &args[1..]),
         Some("reset") => {
             header.reset_persisted_settings();
             println!("settings reset to defaults; helper/layer session preserved");
@@ -275,6 +301,17 @@ mod tests {
         let header = ShmHeader::default();
         assert!(store(&header, "capture_request", 1));
         assert_eq!(header.capture_request.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn cmd_capture_sets_one_by_default_and_n_with_frames() {
+        let header = ShmHeader::default();
+        assert!(cmd_capture(&header, &[]));
+        assert_eq!(header.capture_request.load(Ordering::Relaxed), 1);
+        assert!(cmd_capture(&header, &["--frames".to_string(), "150".to_string()]));
+        assert_eq!(header.capture_request.load(Ordering::Relaxed), 150);
+        assert!(!cmd_capture(&header, &["--frames".to_string(), "0".to_string()]));
+        assert!(!cmd_capture(&header, &["--frames".to_string()]));
     }
 
     #[test]
