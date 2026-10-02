@@ -109,6 +109,7 @@ struct ProbeNext {
     get_image_view_address_nvx: Option<vk::PFN_vkGetImageViewAddressNVX>,
     create_cu_module_nvx: Option<vk::PFN_vkCreateCuModuleNVX>,
     create_cu_function_nvx: Option<vk::PFN_vkCreateCuFunctionNVX>,
+    create_framebuffer: Option<vk::PFN_vkCreateFramebuffer>,
 }
 
 impl ProbeNext {
@@ -123,6 +124,7 @@ impl ProbeNext {
                 get_image_view_address_nvx: resolve(get_proc, device, c"vkGetImageViewAddressNVX"),
                 create_cu_module_nvx: resolve(get_proc, device, c"vkCreateCuModuleNVX"),
                 create_cu_function_nvx: resolve(get_proc, device, c"vkCreateCuFunctionNVX"),
+                create_framebuffer: resolve(get_proc, device, c"vkCreateFramebuffer"),
             }
         }
     }
@@ -520,6 +522,26 @@ fn barrier2_images(info: &vk::DependencyInfo) -> Option<&[vk::ImageMemoryBarrier
     // SAFETY: a non-null `pImageMemoryBarriers` is an array of `imageMemoryBarrierCount`
     // valid structures for the duration of the application's call.
     Some(unsafe { std::slice::from_raw_parts(info.p_image_memory_barriers, info.image_memory_barrier_count as usize) })
+}
+
+/// The views of an imageless framebuffer's render pass instance
+/// (`VkRenderPassAttachmentBeginInfo` in `begin`'s pNext chain), if there is one.
+///
+/// # Safety
+/// `begin`'s pNext chain must be valid, as it is for the application's own call.
+unsafe fn imageless_attachments(begin: &vk::RenderPassBeginInfo) -> Option<Vec<vk::ImageView>> {
+    let mut next = begin.p_next.cast::<vk::BaseInStructure>();
+    while let Some(s) = unsafe { next.as_ref() } {
+        if s.s_type == vk::StructureType::RENDER_PASS_ATTACHMENT_BEGIN_INFO {
+            let info = unsafe { &*next.cast::<vk::RenderPassAttachmentBeginInfo>() };
+            if info.attachment_count == 0 || info.p_attachments.is_null() {
+                return Some(Vec::new());
+            }
+            return Some(unsafe { std::slice::from_raw_parts(info.p_attachments, info.attachment_count as usize) }.to_vec());
+        }
+        next = s.p_next;
+    }
+    None
 }
 
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
@@ -958,6 +980,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         &self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
         dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageCopy],
     ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "copy", Some((src, src_layout)), Some((dst, dst_layout)));
         self.observe_swapchain_write("copy", command_buffer, src, src_layout, dst, dst_layout, regions.len(), TapWrite::from_copy(regions));
         LayerResult::Unhandled
     }
@@ -966,16 +989,35 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         &self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout,
         dst: vk::Image, dst_layout: vk::ImageLayout, regions: &[vk::ImageBlit], _filter: vk::Filter,
     ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "blit", Some((src, src_layout)), Some((dst, dst_layout)));
         self.observe_swapchain_write("blit", command_buffer, src, src_layout, dst, dst_layout, regions.len(), TapWrite::from_blit(regions));
         LayerResult::Unhandled
     }
 
     fn cmd_pipeline_barrier(
-        &self, command_buffer: vk::CommandBuffer, _src_stage: vk::PipelineStageFlags,
-        _dst_stage: vk::PipelineStageFlags, _dependency: vk::DependencyFlags,
-        _memory: &[vk::MemoryBarrier], _buffers: &[vk::BufferMemoryBarrier],
+        &self, command_buffer: vk::CommandBuffer, src_stage: vk::PipelineStageFlags,
+        dst_stage: vk::PipelineStageFlags, _dependency: vk::DependencyFlags,
+        memory: &[vk::MemoryBarrier], buffers: &[vk::BufferMemoryBarrier],
         images: &[vk::ImageMemoryBarrier],
     ) -> LayerResult<()> {
+        if crate::probe_ngx::enabled() {
+            // Sync1 stage and access bits are the low bits of their sync2 counterparts.
+            let (src_stage, dst_stage) = (u64::from(src_stage.as_raw()), u64::from(dst_stage.as_raw()));
+            crate::probe_ngx::on_cmd_barriers(
+                command_buffer,
+                images.iter().map(|b| crate::probe_seq::ImageBarrier {
+                    image: b.image,
+                    old: b.old_layout,
+                    new: b.new_layout,
+                    src_stage,
+                    src_access: u64::from(b.src_access_mask.as_raw()),
+                    dst_stage,
+                    dst_access: u64::from(b.dst_access_mask.as_raw()),
+                }),
+                memory.iter().map(|m| (src_stage, u64::from(m.src_access_mask.as_raw()), dst_stage, u64::from(m.dst_access_mask.as_raw()))),
+                u32::try_from(buffers.len()).unwrap_or(u32::MAX),
+            );
+        }
         // No logging here: this fires for every barrier the game records, from every
         // recording thread.
         let mut tracker = self.tracker.lock().unwrap();
@@ -991,6 +1033,29 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // A buffer-only or memory-only barrier legally passes a zero count with a null
         // pointer, and `slice::from_raw_parts` must never see a null pointer even for an
         // empty slice (with debug assertions that is an immediate abort).
+        if crate::probe_ngx::enabled() {
+            let memory: &[vk::MemoryBarrier2] = if info.memory_barrier_count == 0 || info.p_memory_barriers.is_null() {
+                &[]
+            } else {
+                // SAFETY: a non-null `pMemoryBarriers` holds `memoryBarrierCount` valid
+                // structures for the duration of the application's call.
+                unsafe { std::slice::from_raw_parts(info.p_memory_barriers, info.memory_barrier_count as usize) }
+            };
+            crate::probe_ngx::on_cmd_barriers(
+                command_buffer,
+                barrier2_images(info).unwrap_or(&[]).iter().map(|b| crate::probe_seq::ImageBarrier {
+                    image: b.image,
+                    old: b.old_layout,
+                    new: b.new_layout,
+                    src_stage: b.src_stage_mask.as_raw(),
+                    src_access: b.src_access_mask.as_raw(),
+                    dst_stage: b.dst_stage_mask.as_raw(),
+                    dst_access: b.dst_access_mask.as_raw(),
+                }),
+                memory.iter().map(|m| (m.src_stage_mask.as_raw(), m.src_access_mask.as_raw(), m.dst_stage_mask.as_raw(), m.dst_access_mask.as_raw())),
+                if info.p_buffer_memory_barriers.is_null() { 0 } else { info.buffer_memory_barrier_count },
+            );
+        }
         let Some(images) = barrier2_images(info) else { return LayerResult::Unhandled };
         let mut tracker = self.tracker.lock().unwrap();
         for barrier in images {
@@ -1000,9 +1065,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn begin_command_buffer(
-        &self, command_buffer: vk::CommandBuffer, _begin_info: &vk::CommandBufferBeginInfo,
+        &self, command_buffer: vk::CommandBuffer, begin_info: &vk::CommandBufferBeginInfo,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
-        crate::probe_ngx::on_begin_command_buffer(command_buffer);
+        crate::probe_ngx::on_begin_command_buffer(command_buffer, begin_info.flags);
         self.tracker.lock().unwrap().begin_recording(command_buffer);
         LayerResult::Unhandled
     }
@@ -1231,6 +1296,237 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     fn cmd_cu_launch_kernel_nvx(&self, command_buffer: vk::CommandBuffer, launch_info: &vk::CuLaunchInfoNVX) -> LayerResult<()> {
         // Records counts and dimensions only; `pParams`/`pExtras` are never read.
         crate::probe_ngx::on_launch(command_buffer, launch_info);
+        LayerResult::Unhandled
+    }
+
+    // The probe's command-sequence hooks (`crate::probe_seq`): each notes the command for
+    // the command buffer's recorded sequence and leaves the call to the framework.
+
+    fn end_command_buffer(&self, command_buffer: vk::CommandBuffer) -> LayerResult<ash::prelude::VkResult<()>> {
+        crate::probe_ngx::on_end_command_buffer(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn create_framebuffer(
+        &self, create_info: &vk::FramebufferCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<ash::prelude::VkResult<vk::Framebuffer>> {
+        let Some(next) = self.probe_next.as_ref().and_then(|n| n.create_framebuffer) else { return LayerResult::Unhandled };
+        let mut framebuffer = vk::Framebuffer::null();
+        let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the next layer's own `vkCreateFramebuffer`, with the application's arguments.
+        let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut framebuffer) };
+        if result != vk::Result::SUCCESS {
+            return LayerResult::Handled(Err(result));
+        }
+        let imageless = create_info.flags.contains(vk::FramebufferCreateFlags::IMAGELESS);
+        let views = if imageless || create_info.attachment_count == 0 || create_info.p_attachments.is_null() {
+            Vec::new()
+        } else {
+            // SAFETY: a non-imageless framebuffer's `pAttachments` holds `attachmentCount` views.
+            unsafe { std::slice::from_raw_parts(create_info.p_attachments, create_info.attachment_count as usize) }.to_vec()
+        };
+        crate::probe_ngx::on_create_framebuffer(framebuffer, views);
+        LayerResult::Handled(Ok(framebuffer))
+    }
+
+    fn destroy_framebuffer(&self, framebuffer: vk::Framebuffer, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
+        crate::probe_ngx::on_destroy_framebuffer(framebuffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw(&self, command_buffer: vk::CommandBuffer, _: u32, _: u32, _: u32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_indexed(&self, command_buffer: vk::CommandBuffer, _: u32, _: u32, _: u32, _: i32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_indirect(&self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_indexed_indirect(&self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_indirect_count(
+        &self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32,
+    ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_indexed_indirect_count(
+        &self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32,
+    ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_multi_ext(&self, command_buffer: vk::CommandBuffer, _: &[vk::MultiDrawInfoEXT], _: u32, _: u32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_multi_indexed_ext(
+        &self, command_buffer: vk::CommandBuffer, _: &[vk::MultiDrawIndexedInfoEXT], _: u32, _: u32, _: u32, _: Option<&i32>,
+    ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_mesh_tasks_ext(&self, command_buffer: vk::CommandBuffer, _: u32, _: u32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_mesh_tasks_indirect_ext(&self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_draw_mesh_tasks_indirect_count_ext(
+        &self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize, _: vk::Buffer, _: vk::DeviceSize, _: u32, _: u32,
+    ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_draw(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_dispatch(&self, command_buffer: vk::CommandBuffer, _: u32, _: u32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_dispatch(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_dispatch_indirect(&self, command_buffer: vk::CommandBuffer, _: vk::Buffer, _: vk::DeviceSize) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_dispatch(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_dispatch_base(&self, command_buffer: vk::CommandBuffer, _: u32, _: u32, _: u32, _: u32, _: u32, _: u32) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_dispatch(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_execute_generated_commands_nv(&self, command_buffer: vk::CommandBuffer, _: bool, _: &vk::GeneratedCommandsInfoNV) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_generated(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_copy_image2(&self, command_buffer: vk::CommandBuffer, info: &vk::CopyImageInfo2) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "copy2", Some((info.src_image, info.src_image_layout)), Some((info.dst_image, info.dst_image_layout)));
+        LayerResult::Unhandled
+    }
+
+    fn cmd_blit_image2(&self, command_buffer: vk::CommandBuffer, info: &vk::BlitImageInfo2) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "blit2", Some((info.src_image, info.src_image_layout)), Some((info.dst_image, info.dst_image_layout)));
+        LayerResult::Unhandled
+    }
+
+    fn cmd_copy_buffer_to_image(
+        &self, command_buffer: vk::CommandBuffer, _: vk::Buffer, dst: vk::Image, dst_layout: vk::ImageLayout, _: &[vk::BufferImageCopy],
+    ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "copy-buffer-to-image", None, Some((dst, dst_layout)));
+        LayerResult::Unhandled
+    }
+
+    fn cmd_copy_buffer_to_image2(&self, command_buffer: vk::CommandBuffer, info: &vk::CopyBufferToImageInfo2) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "copy-buffer-to-image2", None, Some((info.dst_image, info.dst_image_layout)));
+        LayerResult::Unhandled
+    }
+
+    fn cmd_clear_color_image(
+        &self, command_buffer: vk::CommandBuffer, image: vk::Image, layout: vk::ImageLayout, _: &vk::ClearColorValue, _: &[vk::ImageSubresourceRange],
+    ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "clear-color", None, Some((image, layout)));
+        LayerResult::Unhandled
+    }
+
+    fn cmd_clear_depth_stencil_image(
+        &self, command_buffer: vk::CommandBuffer, image: vk::Image, layout: vk::ImageLayout, _: &vk::ClearDepthStencilValue, _: &[vk::ImageSubresourceRange],
+    ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "clear-depth", None, Some((image, layout)));
+        LayerResult::Unhandled
+    }
+
+    fn cmd_clear_attachments(&self, command_buffer: vk::CommandBuffer, _: &[vk::ClearAttachment], _: &[vk::ClearRect]) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_clear_attachments(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_resolve_image(
+        &self, command_buffer: vk::CommandBuffer, src: vk::Image, src_layout: vk::ImageLayout, dst: vk::Image, dst_layout: vk::ImageLayout, _: &[vk::ImageResolve],
+    ) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "resolve", Some((src, src_layout)), Some((dst, dst_layout)));
+        LayerResult::Unhandled
+    }
+
+    fn cmd_resolve_image2(&self, command_buffer: vk::CommandBuffer, info: &vk::ResolveImageInfo2) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_transfer(command_buffer, "resolve2", Some((info.src_image, info.src_image_layout)), Some((info.dst_image, info.dst_image_layout)));
+        LayerResult::Unhandled
+    }
+
+    fn cmd_begin_render_pass(&self, command_buffer: vk::CommandBuffer, begin: &vk::RenderPassBeginInfo, _: vk::SubpassContents) -> LayerResult<()> {
+        if crate::probe_ngx::enabled() {
+            // SAFETY: the application's begin info and its pNext chain, valid for this call.
+            let imageless = unsafe { imageless_attachments(begin) };
+            crate::probe_ngx::on_cmd_begin_render_pass(command_buffer, begin.framebuffer, imageless);
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_begin_render_pass2(&self, command_buffer: vk::CommandBuffer, begin: &vk::RenderPassBeginInfo, _: &vk::SubpassBeginInfo) -> LayerResult<()> {
+        if crate::probe_ngx::enabled() {
+            // SAFETY: as above.
+            let imageless = unsafe { imageless_attachments(begin) };
+            crate::probe_ngx::on_cmd_begin_render_pass(command_buffer, begin.framebuffer, imageless);
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_end_render_pass(&self, command_buffer: vk::CommandBuffer) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_end_render(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_end_render_pass2(&self, command_buffer: vk::CommandBuffer, _: &vk::SubpassEndInfo) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_end_render(command_buffer);
+        LayerResult::Unhandled
+    }
+
+    fn cmd_begin_rendering(&self, command_buffer: vk::CommandBuffer, info: &vk::RenderingInfo) -> LayerResult<()> {
+        if crate::probe_ngx::enabled() {
+            let mut views: Vec<crate::probe_ngx::RenderView> = Vec::new();
+            let mut push = |att: &vk::RenderingAttachmentInfo, depth: bool| {
+                if att.image_view != vk::ImageView::null() {
+                    views.push((att.image_view, Some(att.image_layout), Some(att.load_op), depth));
+                }
+                if att.resolve_image_view != vk::ImageView::null() {
+                    views.push((att.resolve_image_view, Some(att.resolve_image_layout), None, depth));
+                }
+            };
+            if info.color_attachment_count > 0 && !info.p_color_attachments.is_null() {
+                // SAFETY: `pColorAttachments` holds `colorAttachmentCount` valid structures
+                // for the duration of the application's call.
+                for att in unsafe { std::slice::from_raw_parts(info.p_color_attachments, info.color_attachment_count as usize) } {
+                    push(att, false);
+                }
+            }
+            // SAFETY: optional pointers to valid structures for the duration of the call.
+            for att in unsafe { [info.p_depth_attachment.as_ref(), info.p_stencil_attachment.as_ref()] }.into_iter().flatten() {
+                push(att, true);
+            }
+            crate::probe_ngx::on_cmd_begin_rendering(command_buffer, &views);
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_end_rendering(&self, command_buffer: vk::CommandBuffer) -> LayerResult<()> {
+        crate::probe_ngx::on_cmd_end_render(command_buffer);
         LayerResult::Unhandled
     }
 

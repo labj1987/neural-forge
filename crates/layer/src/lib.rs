@@ -35,6 +35,7 @@ mod surface_usage;
 mod entry_points;
 mod present_sync;
 mod probe_ngx;
+mod probe_seq;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;

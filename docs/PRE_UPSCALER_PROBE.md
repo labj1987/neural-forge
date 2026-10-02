@@ -1,6 +1,7 @@
 # Pre-upscaler probe (`NEURAL_FORGE_PROBE_NGX`)
 
-**Status: hooks built, rig run done 2026-10-02.** Diagnostic only, nothing user-facing.
+**Status: hooks built, two rig runs done 2026-10-02** (the second, inside the launch command
+buffer, is at the end). Diagnostic only, nothing user-facing.
 
 ## Question
 
@@ -208,3 +209,159 @@ e. **Stability.** The benchmark completed on the first try, with no crash, no de
    stall. At about 60 fps (16.7 ms frames) and model_interval=2, that is roughly 4-5 ms
    added per frame on average, close to today's swapchain-path cost. The gain would be
    applying the model before DLSS, not speed. This is an estimate, not a measurement.
+
+## Second run: inside the launch command buffer
+
+The first run left one question open: could the layer run the model on the colour input
+*before* the DLSS kernels read it and write the answer back in place? Two mechanisms:
+
+- **(A) submit level.** At the `vkQueueSubmit` that carries the launches, submit the layer's
+  own capture first, wait for the model, write the answer back, then forward the game's
+  submit. Valid only if nothing inside the launch-bearing command buffer writes the colour
+  input before the first DLSS launch.
+- **(B) record level.** At the first `vkCmdCuLaunchKernelNVX` recorded into a buffer, inject
+  commands before forwarding it (copy out, event to the host, host-set event wait, copy
+  back). Needs the image's layout at that point.
+
+### What the probe adds
+
+Still only under `NEURAL_FORGE_PROBE_NGX=1`. With it unset the hooked-command list is the
+default one, and the always-hooked commands (`vkCmdCopyImage`, `vkCmdBlitImage`, both
+pipeline barriers, `vkBeginCommandBuffer`, `vkCmdExecuteCommands`) test the cached flag
+before touching probe state.
+
+- **Command sequence per command buffer** (`crates/layer/src/probe_seq.rs`), from
+  `vkBeginCommandBuffer` to `vkEndCommandBuffer`. Commands that touch an *image of
+  interest* are kept one per line. An image of interest is an image with a view registered
+  through `vkGetImageViewHandle*NVX`/`AddressNVX`, mapped view -> image at `vkCreateImageView`.
+  So are every launch (kernel name from the `CUfunction` map) and every `vkCmdExecuteCommands`
+  whose secondaries carry launches. Everything between two kept lines folds into one
+  `... N draws, N dispatches, ...` line. That line also gives the union of stages and
+  accesses of the global memory barriers it holds. Kept entries are capped at 4096 per buffer;
+  past that the probe only counts.
+- **Hooked for the sequence.** `vkEndCommandBuffer`, `vkCmdDraw`, `DrawIndexed`,
+  `DrawIndirect`, `DrawIndexedIndirect`, `DrawIndirectCount`, `DrawIndexedIndirectCount`,
+  `DrawMultiEXT`, `DrawMultiIndexedEXT`, `DrawMeshTasks{,Indirect,IndirectCount}EXT`,
+  `vkCmdDispatch`, `DispatchIndirect`, `DispatchBase`, `vkCmdExecuteGeneratedCommandsNV`,
+  `vkCmdCopyImage2`, `BlitImage2`, `CopyBufferToImage{,2}`, `ClearColorImage`,
+  `ClearDepthStencilImage`, `ClearAttachments`, `ResolveImage{,2}`, `BeginRenderPass{,2}`,
+  `EndRenderPass{,2}`, `BeginRendering`, `EndRendering`, and
+  `vkCreateFramebuffer`/`vkDestroyFramebuffer` for render pass attachments (imageless
+  framebuffers through `VkRenderPassAttachmentBeginInfo`). The framework maps the KHR
+  aliases to the same hooks.
+- **Not hookable with the pinned `vulkan-layer`/ash 0.37.3.** `vkCmdExecuteGeneratedCommandsEXT`
+  (newer than ash 0.37.3). Also not counted: `vkCmdSetEvent*`/`vkCmdWaitEvents*`,
+  `vkCmdDrawIndirectByteCountEXT`, the NV mesh draws, and buffer-only commands.
+- **What can't be seen.** A dispatch's or draw's storage-image writes go through
+  descriptors, which the probe doesn't track. Such a write shows only as an image barrier on
+  that image, or a global memory barrier, with a write in its source access.
+- **Colour input**, chosen deterministically: the registered RGBA16F view with STORAGE usage
+  at the extent of a registered depth view. Logged once as `colour input: image 0x...`.
+- **Rate limit.** Views count as settled 30 frames after the last new registration. After
+  that, the full sequence is printed for the first 3 launch-bearing buffers ended, then one
+  every 300 frames. Each print ends with a verdict line (first launch, its kernel, and
+  whether that is an input kernel; draws, dispatches and write barriers before it) and a
+  colour line (explicit writes, barriers with write source access, transitions, layout from
+  a barrier in this buffer, and the last barrier recorded on it in another buffer).
+- **Every 300 frames, a `cmdbuf stats` line** over *all* launch-bearing buffers ended after
+  settling: class counts (`explicit-write`, `barrier-write`, `transition-only`,
+  `untouched`), first kernels, begin flags, layouts at the first launch, and re-record
+  behaviour. At each launch-bearing submit, the buffer's begin epoch is compared with the
+  epoch at its previous submit: equal means resubmitted unchanged, different means
+  re-recorded.
+
+### Run
+
+Setup as in the first run: lordnikon, worktree build of this commit's code (version label
+1.0.1), desktop 2560x1440@288.001 scale 1 HDR bt2100, NR on (helper_state=4, enabled=1,
+working_scale=1, model_interval=2), mods off. `dlssQuality` went 1 -> 2 (Quality;
+`ResScalingType` 4 and `FrameGenType` 0 verified) and was restored afterwards (sha256
+`8de35762...b1a7a` matched). The first attempt exited at Game Init after 95 s, before DLSS
+was created (no views registered). The rerun five minutes later completed:
+
+```bash
+scripts/gta-bench.sh --host lordnikon probe-ngx-2 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+```
+
+Passes 60.2 / 60.1 / 61.6 / 65.1 / 63.5 fps, the same as the first probe run (61.0-65.3), so
+the extra hooks cost nothing visible. `[sync]` total about 20-21 ms. There were no
+validation messages and no Xid. The launch submit was again 5 submits before the present
+(`submits=21 launch_submits=[#15:14]` most often, #14-#21 overall), on the present queue.
+
+The rest of this section is from `grep -F '[probe-ngx]' ~/nf-spike/gta/probe-ngx-2/launch.log`:
+35 full sequences were printed (frames 3477-15789), and the stats line covers 9006
+launch-bearing buffers. Long stage and access masks are shortened with `...` below.
+
+```
+[probe-ngx] colour input: image 0x769cacc548a0 (1707x960 R16G16B16A16_SFLOAT TRANSFER_SRC | TRANSFER_DST | SAMPLED | STORAGE | COLOR_ATTACHMENT), the registered RGBA16F storage image at the depth image's extent
+[probe-ngx] seq cb=0x7699fac2a470 frame 3477 epoch 25329 flags=none launches=14 entries=47: begin
+[probe-ngx] seq cb=0x7699fac2a470 [0] ... 1 dispatches
+[probe-ngx] seq cb=0x7699fac2a470 [1] LAUNCH #1 hiluma_engine_input_depthinv_mvlo_hdr_v2_rel
+[probe-ngx] seq cb=0x7699fac2a470 [2] ... 1 mem-barriers(src FRAGMENT_SHADER | COMPUTE_SHADER | ...:SHADER_READ | SHADER_WRITE | ... -> dst ...)
+[probe-ngx] seq cb=0x7699fac2a470 [3] LAUNCH #2 dltss_pwin_enc0_layer
+  ... enc1-4 and dec5-0, each launch followed by 1-2 such global memory barriers ...
+[probe-ngx] seq cb=0x7699fac2a470 [25] LAUNCH #13 hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel
+[probe-ngx] seq cb=0x7699fac2a470 [26] barrier 0x7698940385d0[1x1 R16_SFLOAT] GENERAL->GENERAL ...
+[probe-ngx] seq cb=0x7699fac2a470 [27] LAUNCH #14 cuda_copy_exposure_kernel
+  [28]-[34]: GENERAL->GENERAL barriers on the 1x1 exposure, 5120x2880 R16F and 2560x1440 RGBA16F images
+[probe-ngx] seq cb=0x7699fac2a470 [35] rendering [0x76995de1d400[2560x1440 R16G16B16A16_SFLOAT] GENERAL load=LOAD] draws=1 clear-attachments=0
+  [36]-[46]: the game's own work after DLSS: 1707x960 depth barriers, a depth load=CLEAR rendering, more 2560x1440 rendering
+[probe-ngx] seq cb=0x7699fac2a470 end: first launch [1] hiluma_engine_input_depthinv_mvlo_hdr_v2_rel (input kernel: yes); before it 0 draws, 1 dispatches, 0 renderings(other), 0 transfers(other), 0 mem-barriers with a write in src access
+[probe-ngx] seq cb=0x7699fac2a470 colour input 0x769cacc548a0[COLOUR-IN] before the first launch: explicit writes: none; barriers with write src access: none; transitions: none; layout at first launch: unknown, no barrier in this cmdbuf; used as: -; last barrier on it in another cmdbuf when the first launch was recorded: GENERAL->GENERAL in cmdbuf 0x7699f949a2c0 (frame 3477)
+[probe-ngx] cmdbuf stats after frame 15601: launch-bearing buffers ended=9006 distinct handles=1400 colour-input-before-first-launch={untouched: 9006} first kernel={hiluma_engine_input_depthinv_mvlo_hdr_v2_rel: 9006} begin flags={none: 9006} layout at first launch={unknown, no barrier in this cmdbuf: 9006} submits: first=1400 resubmitted-unchanged=0 re-recorded=7638
+```
+
+All 35 printed sequences have identical verdict and colour lines (`uniq -c` gives 35 each),
+and all of them open with `[0] ... 1 dispatches` and then `[1] LAUNCH #1`.
+
+### Answers
+
+1. **Is the colour input written inside the launch-bearing buffer before the first launch?
+   No.** In every printed buffer, the only command before the first launch is one dispatch,
+   and nothing touching the colour input is recorded: no copy, clear or resolve into it,
+   no rendering with it attached, no barrier on it, and no global memory barrier with a write
+   in its source access. The stats line says `untouched` for all 9006 launch-bearing
+   buffers. The one dispatch's target can't be seen, because its writes would go through
+   descriptors. But there is no barrier between it and the first launch, so if the launch
+   read something that dispatch wrote, it would be an unsynchronised read-after-write. The
+   dispatch can't be producing the colour input DLSS reads. vkd3d-proton places a barrier
+   after every launch, but none before the first one. The last barrier recorded on the
+   colour input is in a *different* command buffer (`GENERAL->GENERAL in cmdbuf
+   0x7699f949a2c0`, same frame), so the input is finished in earlier command buffers. This
+   much is inferred from barriers: a write through descriptors is never seen directly.
+2. **Layout at the first launch: GENERAL.** There's no barrier on it in the launch buffer
+   (`unknown, no barrier in this cmdbuf` for all 9006). The last barrier recorded on it
+   (in the earlier buffer) is `GENERAL->GENERAL`. Every barrier seen on the DLSS images in
+   these buffers is GENERAL->GENERAL. vkd3d-proton keeps these storage-capable images in
+   GENERAL.
+3. **First kernel: `hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`**, an input kernel (it
+   takes colour, depth and MV), in all 9006 buffers. After it come `dltss_pwin_enc0..4`,
+   `dec5..0`, `hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel` and
+   `cuda_copy_exposure_kernel`. The buffer then goes on with the game's post-DLSS work:
+   renderings into a 2560x1440 RGBA16F image, depth barriers, and a depth clear.
+4. **Begin flags and re-recording.** Begin flags are `none` (neither ONE_TIME_SUBMIT nor
+   SIMULTANEOUS_USE) on all 9006. Every buffer is re-recorded before it is submitted again:
+   `resubmitted-unchanged=0`, `re-recorded=7638`, `first=1400` across 1400 distinct handles.
+   vkd3d-proton cycles a pool of command buffers and records each one fresh from a D3D12
+   command list.
+5. **Mechanism A is valid; B isn't needed.** The colour input is final before the
+   launch-bearing command buffer starts. That buffer opens with one dispatch that DLSS can't
+   depend on, then the input kernel. The layer can hold the launch-bearing submit at
+   `vkQueueSubmit`, put its own capture -> model -> write-back submit(s) first on the same
+   queue, then forward the game's submit unchanged. The image is in GENERAL throughout, so
+   the layer's copy out and copy back can use GENERAL without changing the game's layout
+   state. Its first command needs a full memory dependency on the earlier submits (the
+   game's last write is in an earlier buffer). The write-back must be made visible to the
+   game's submit: same-queue submission order plus a closing barrier in the layer's own
+   buffer, or a semaphore.
+
+   **Caveat.** The probe records which *submit* carries the launch buffer, not where that
+   buffer sits inside its `VkSubmitInfo` command buffer array. If the buffer that writes
+   the colour input (`0x7699f949a2c0` above, recorded in the same frame) is an earlier
+   element of the same submit, A has to split that one submit at the launch buffer: forward
+   the buffers before it, then the layer's work, then the rest. In Vulkan the wait
+   semaphores go on the first part and the signal semaphores and fence on the last. That is
+   still submit-level work with nothing recorded into the game's buffers. B (injecting at
+   record time) would only be needed if a write showed up inside the launch buffer, and
+   none did. B would also have to cope with a fresh recording every frame across a pool of
+   about 1400 handles, which A avoids.
