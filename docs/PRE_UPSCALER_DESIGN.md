@@ -2,7 +2,7 @@
 
 Status: **approved by Alex 2026-10-02, HDR included. Layer and helper sides are built**, behind
 `NEURAL_FORGE_PREUPSCALE` (off by default); see the two "Implementation" sections at the end.
-Nothing is measured on the rig yet (E1-E3 below). Phases 2 and 3 of the original 2.0 plan are paused.
+E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame; E2-E3 not run (see "Rig results" at the end). Phases 2 and 3 of the original 2.0 plan are paused.
 
 ## What the probe established (GTA V Enhanced, 2560x1440, DLSS SR on)
 
@@ -342,3 +342,65 @@ pNext structure outside the accepted list; how long the capture fence wait is in
 drains everything queued before it); and whether vkd3d-proton's waits are ever wait-before-signal
 on a timeline the same thread signals later (the bounded 5 s wait would then stall once and fail
 open).
+
+## Rig results (E1-E3)
+
+Run 2026-10-02 on lordnikon (RTX, 2560x1440@288 HDR bt2100, GTA V Enhanced DLSS Balanced, frame
+generation off, script mods off), main at 2aa02bf deployed with `scripts/deploy-rig.sh`
+(protocol 9; the old v8 `shm.bin` had to be removed, nothing had it open). **E1 failed on the raw
+scene-linear input, so E2 and E3 were not run**, as the plan says.
+
+### E1: HDR input to the model
+
+Dump run (`pu-dump-1`, `NEURAL_FORGE_PREUPSCALE=dump`, post path on as usual): the layer side
+worked first time.
+
+- `[preupscale] device ...: vkGetImageViewHandleNVX present, vkGetImageViewAddressNVX present,
+  vkQueueSubmit2 present` on GTA's devices (absent on the launcher's).
+- `[preupscale] colour input: image 0x791e6ea941c0 (1485x836 R16G16B16A16_SFLOAT TRANSFER_SRC |
+  TRANSFER_DST | SAMPLED | STORAGE | COLOR_ATTACHMENT), depth ... D32_SFLOAT_S8_UINT, motion
+  vectors ... R16G16_SFLOAT; swapchain Some((2560, 1440))` (logged twice: the depth image was
+  re-registered once). Balanced is **1485x836**, padded to 1486x836.
+- `resources for 1485x836 (padded 1486x836) built: zero-copy (SHM regions imported)`, then the
+  dump (`frame 1`, about 40 s after launch, the benchmark's first scene: Grove Street towards
+  downtown, daylight). The benchmark completed normally (61.2 fps pass 4, the post path at model
+  every 2nd frame).
+
+The dumped colour: luma p50 6.1, p90 13.0, p99 19.8, max 95 (scene-linear, pre-exposure; the
+game's exposure value is not dumped). Alpha is not 1 (0..3, mean 0.72).
+
+Round trip (`trigger_helper_roundtrip --rgba16f`, no game running): NGX **accepts** the HDR
+feature: `[ngx] feature 1486x836 hdr=1: DLSSNR.Hdr=1 DLSSNR.SDR=0 AutoExposure=1`,
+`VULKAN_CreateFeature(18) -> 0x1 ... size=1486x836 hdr=1`, and evaluates (first evaluates ~30 ms,
+then **4.1 ms** steady at 1486x836). Note: with `--repeat 8` every answer was an echo, because the
+size/format change rebuilds the feature after `rebuild_settle_ms` (250 ms) and 8 requests take
+~90 ms; `--repeat 32+` is needed.
+
+| Input sent | Answer range | Answer mean R/G/B | mean abs diff (display domain, x/(1+x)) | Verdict |
+|---|---|---|---|---|
+| raw scene-linear (as designed) | 0 .. 1.0 (clamped) | 0.27 / 0.26 / 0.26 vs input 6.0 / 6.5 / 8.2 | 0.53-0.55 | **garbage**: grey wash, detail smeared |
+| scaled by 1/p99 luma (1/19.8) | 0 .. 0.9995 | 0.29 / 0.33 / 0.43 vs 0.30 / 0.33 / 0.41 | 0.044-0.048 | plausible, but 5.4% of pixels clip at 1.0 (highlights lost) |
+| tone-mapped x/(1+x) per channel (0..1) | 0 .. 0.9995 | 0.74 / 0.76 / 0.75 vs 0.74 / 0.75 / 0.75 | 0.026-0.037 | plausible enhancement, no clipping |
+
+No NaN/Inf in any answer. The answer's alpha is always 1.0. With `Hdr=1` the model's output is
+clamped to [0, 1] in every case: it does not produce scene-linear values above 1, so the design's
+"answer replaces the colour input directly" cannot work on the raw frame. The diffs of the two
+working variants are structured (foliage, building edges, window detail, a mild local-contrast
+change), not noise or a global shift.
+
+Images (tone-mapped x/(1+x), sRGB; diff = |answer - input| x 8 in the tone-mapped domain) were made
+on the dev machine and are not in the repo.
+
+**Verdict: E1 fails as designed** (NGX takes `Hdr=1` but returns a clamped, broken picture for
+scene-linear input). A tone-mapped input (x/(1+x) before the model, y/(1-y) on write-back, or the
+same with an exposure scale) does give a plausible answer, so the design should be re-cut around
+tone-mapping the input first (the plan's own fallback), with the inverse applied on write-back. Open
+questions for the re-cut: whether to tone-map with the game's 1x1 exposure value, whether the
+inverse (y/(1-y)) amplifies the model's changes in highlights too much (the blue channel's
+scene-linear mean moved by -1.2 in the sky), and whether `Hdr=0, SDR=1` on the tone-mapped
+input behaves better than `Hdr=1` (not tried).
+
+### E2, E3
+
+Not run (E1 decides; see above). The layer's identification and dump path are proven on GTA; the
+hold, identity write-back and model mode are unmeasured.
