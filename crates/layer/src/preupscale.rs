@@ -1488,6 +1488,13 @@ pub(crate) struct HoldResult {
     pub echoed: bool,
     /// Model mode: the helper's answer was the model's and was written back.
     pub evaluated: bool,
+    /// Model mode: the slot-0 request (`seq_req`) this hold started, so it reached the helper
+    /// (whatever came back). Only such a hold engages the device ([`Session::note`]).
+    pub request: Option<u32>,
+    /// Model mode: the hold failed on the layer's side before any request reached the helper
+    /// (an unusable exposure value, a submit it cannot parse, resources it cannot build, ...).
+    /// Counted toward the breaker like a missing answer ([`Self::mark_local`]).
+    pub local_failure: bool,
     pub capture_gpu_ms: Option<f32>,
     /// The previous hold's write-back GPU time, read when its fence was found signalled here.
     pub writeback_gpu_ms: Option<f32>,
@@ -1497,6 +1504,19 @@ pub(crate) struct HoldResult {
     pub exposure: Option<f32>,
     /// Where the hold's CPU time went (wall time on this thread).
     pub timing: HoldTiming,
+}
+
+impl HoldResult {
+    /// A model-mode hold that failed on the layer's side before reaching the helper, for `why`.
+    pub(crate) fn local(why: &'static str) -> Self {
+        Self { miss: Some(why), local_failure: true, ..Default::default() }
+    }
+
+    /// Sets [`Self::local_failure`] for a finished hold: in model mode, a miss with no request
+    /// started and no answer missing (those are the helper's: `over_budget`, `echoed`).
+    pub(crate) fn mark_local(&mut self, mode: Mode) {
+        self.local_failure = mode == Mode::Model && self.miss.is_some() && self.request.is_none() && !self.over_budget && !self.echoed;
+    }
 }
 
 /// Wall-clock phases of one hold, for the periodic `[preupscale]` line. `None` for a phase the
@@ -1924,7 +1944,11 @@ pub(crate) unsafe fn run_hold(
         Mode::Identity | Mode::Roundtrip => res.proxy.buffer,
         Mode::Model => {
             let (pw, ph) = padded(target.width, target.height);
-            match await_answer(shm, pw, ph, budget, &mut result.timing) {
+            let before = shm.last_request(0);
+            let answer = await_answer(shm, pw, ph, budget, &mut result.timing);
+            // A request was started (`seq_req` bumped): it reached the helper.
+            result.request = Some(shm.last_request(0)).filter(|&r| r != before);
+            match answer {
                 Answer::Model => result.evaluated = true,
                 Answer::Echo => {
                     // The frame itself came back: nothing to write, and the breaker counts it.
@@ -2081,7 +2105,7 @@ impl Breaker {
     }
 
     /// A held submit's outcome: `true` when the model's answer was written back, `false` for an
-    /// echo, a late answer or none.
+    /// echo, a late answer or none, or a hold that failed before asking ([`HoldResult::local_failure`]).
     pub(crate) fn record(&mut self, now: Instant, model_answer: bool) {
         if model_answer {
             self.misses = 0;
@@ -2107,7 +2131,7 @@ impl Breaker {
                 self.open(now, why.to_string());
             }
             BreakerState::Closed if self.misses >= BREAKER_MISSES => {
-                self.open(now, format!("{} holds in a row got no model answer (echoed or late)", self.misses));
+                self.open(now, format!("{} holds in a row got no model answer (echoed, late, or failed before reaching the helper)", self.misses));
             }
             _ => {}
         }
@@ -2387,8 +2411,16 @@ pub(crate) struct Session {
     /// pre-upscaler path works here, so the post path stays off while DLSS runs, also while the
     /// breaker is open (otherwise the post path's output-size requests and the probes' render-size
     /// ones would rebuild the helper's feature back and forth, and no probe would ever find it
-    /// built).
+    /// built). Set only by a hold whose own request reached the helper ([`HoldResult::request`]),
+    /// never by a slot 0 the post path left busy; cleared after [`BREAKER_MISSES`] holds in a row
+    /// failed on the layer's side (the pre path cannot work here right now, so the post path
+    /// takes over again).
     engaged: bool,
+    /// The last slot-0 request a hold started, so a request still with the helper can be told to
+    /// be this path's (an answer over budget) or the post path's.
+    own_request: Option<u32>,
+    /// Holds in a row that failed on the layer's side ([`HoldResult::local_failure`]).
+    local_misses: u32,
 }
 
 impl Session {
@@ -2499,16 +2531,31 @@ impl Session {
             self.last_hold = Some(now);
             self.last_dlss = Some(now);
         }
-        if result.evaluated || result.echoed || result.over_budget {
+        if result.request.is_some() {
             self.engaged = true;
+            self.own_request = result.request;
+            self.local_misses = 0;
         }
-        // The breaker only hears about holds that asked the helper: a model answer, or an echo, a
-        // late answer or none. A hold skipped before the request (the exposure value, a pending
-        // write-back) says nothing about the helper.
+        // The breaker hears about holds that asked the helper (a model answer, or an echo, a late
+        // answer or none) and about model-mode holds that failed on the layer's side before asking
+        // (an unusable exposure value, a refused submit, no resources): those repeat every frame
+        // in a game where they happen at all, each costing a capture or nothing for no model.
+        // Contention for slot 0 is not reported here at all.
         if result.evaluated {
             self.breaker.record(now, true);
         } else if result.over_budget || result.echoed {
             self.breaker.record(now, false);
+        } else if result.local_failure {
+            self.breaker.record(now, false);
+            self.local_misses = self.local_misses.saturating_add(1);
+            if self.local_misses == BREAKER_MISSES && self.engaged {
+                self.engaged = false;
+                crate::log!(
+                    "[preupscale] {BREAKER_MISSES} holds in a row failed before reaching the helper ({}); the post-upscaler compose runs again until a hold does",
+                    result.miss.unwrap_or("?")
+                );
+                crate::logging::flush();
+            }
         }
         let holding = self.holding();
         let s = &mut self.stats;
@@ -2541,7 +2588,7 @@ impl Session {
             }
         }
         shm.publish_preupscale_hold(s.last_hold_ms, s.misses);
-        shm.publish_preupscale_state(if holding { 2 } else if self.breaker.paused() { 3 } else { 1 }, extent.0, extent.1);
+        shm.publish_preupscale_state(if holding { 2 } else if self.breaker.paused() && self.engaged { 3 } else { 1 }, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
             // The window's rate: frames the model ran on before the upscaler (the post path's
@@ -2572,6 +2619,18 @@ impl Session {
         }
     }
 
+    /// A DLSS submit found slot 0 with a request still in flight, so it is not held. When that
+    /// request is this path's own (a hold's answer that ran over budget), it is booked as another
+    /// late answer; when it is the post path's (it often has one pending before the device first
+    /// holds), nothing is booked: no request of this path reached the helper, so neither the
+    /// device's engagement nor the breaker may hear of it.
+    pub(crate) fn note_busy_slot(&mut self, shm: &ShmClient, mode: Mode, extent: (u32, u32)) {
+        if mode == Mode::Model && self.own_request.is_some() && shm.pending_request(0) == self.own_request {
+            let result = HoldResult { miss: Some("an earlier request is still with the helper"), over_budget: true, ..Default::default() };
+            self.note(shm, &result, Duration::ZERO, extent);
+        }
+    }
+
     /// Books a write-back GPU reading taken at a later drain.
     pub(crate) fn note_writeback_gpu(&mut self, ms: Option<f32>) {
         if let Some(ms) = ms {
@@ -2585,13 +2644,13 @@ impl Session {
     }
 
     /// The header state for a present: holding when a hold happened within [`RECENT`]; paused
-    /// while the breaker is open and DLSS is still running.
+    /// while the breaker is open, DLSS is still running and the device is engaged (the post path is off).
     pub(crate) fn publish_status(&self, shm: &ShmClient, extent: Option<(u32, u32)>) {
         let (w, h) = extent.unwrap_or((0, 0));
         let dlss_running = self.last_dlss.is_some_and(|t| t.elapsed() < RECENT);
         let state = if self.holding() {
             2
-        } else if self.breaker.paused() && dlss_running {
+        } else if self.breaker.paused() && dlss_running && self.engaged {
             3
         } else {
             1
@@ -3644,7 +3703,7 @@ mod tests {
         let skipped = HoldResult { miss: Some("the exposure value is not usable (zero, negative or not finite)"), waits_consumed: true, ..Default::default() };
         session.note(&shm, &skipped, Duration::from_millis(1), (64, 64));
         assert!(!session.engaged, "a hold that never reached the helper does not engage the device");
-        let held = HoldResult { waits_consumed: true, wrote_back: true, evaluated: true, ..Default::default() };
+        let held = HoldResult { waits_consumed: true, wrote_back: true, evaluated: true, request: Some(1), ..Default::default() };
         session.note(&shm, &held, Duration::from_millis(10), (64, 64));
         assert!(session.engaged && session.breaker.is_closed());
         let last = session.last_dlss.expect("a hold is a DLSS submit");
@@ -3652,11 +3711,99 @@ mod tests {
         // An echoed first hold engages the device (the post path stays off, so its output-size
         // requests cannot fight the probes over the helper's feature) and opens the breaker.
         let mut fresh = Session::default();
-        let echoed = HoldResult { waits_consumed: true, echoed: true, ..Default::default() };
+        let echoed = HoldResult { waits_consumed: true, echoed: true, request: Some(1), ..Default::default() };
         fresh.note(&shm, &echoed, Duration::from_millis(1), (64, 64));
         assert!(fresh.engaged && fresh.breaker.paused(), "the first hold was an echo: engaged, paused");
         assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 1, "an echo is counted as a miss");
         assert_eq!(header.preupscale_state.load(Ordering::Relaxed), 3, "and the state says paused");
+    }
+
+    /// Before the device first holds, the post path often has a slot-0 request in flight. A DLSS
+    /// submit that finds it is not held, and must neither engage the device (which would switch
+    /// the post path off with no pre-path request ever made) nor feed the breaker. A request of
+    /// this path's own still in flight (an answer over budget) is booked as a late answer.
+    #[test]
+    fn a_slot_the_post_path_left_busy_does_not_engage_the_device() {
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        let mut shm = ShmClient::test_over_header(&header);
+        let mut session = Session::default();
+        session.saw_dlss();
+        // The post path's request, unanswered (no helper here).
+        assert!(shm.begin_async_request(0));
+        for _ in 0..(2 * BREAKER_MISSES) {
+            session.note_busy_slot(&shm, Mode::Model, (64, 64));
+        }
+        assert!(!session.engaged, "no request of the pre path reached the helper");
+        assert!(!post_off(session.engaged, session.last_dlss, Instant::now()), "the post path keeps running");
+        assert!(!session.breaker.paused(), "the breaker heard nothing");
+        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 0);
+
+        // A hold of this path's own that ran over budget: its request is still in flight.
+        let mut shm = ShmClient::test_over_header(&header);
+        assert!(shm.begin_async_request(0));
+        let late = HoldResult { waits_consumed: true, over_budget: true, request: shm.pending_request(0), miss: Some("the answer was over budget"), ..Default::default() };
+        session.note(&shm, &late, Duration::from_millis(30), (64, 64));
+        assert!(session.engaged, "a request that reached the helper engages the device");
+        session.note_busy_slot(&shm, Mode::Model, (64, 64));
+        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 2, "the late answer and the busy slot it left");
+        // Identity and the other diagnostics never book it.
+        session.note_busy_slot(&shm, Mode::Identity, (64, 64));
+        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 2);
+    }
+
+    /// Holds that fail on the layer's side before asking the helper (an exposure value of 0 every
+    /// frame, a submit whose pNext chain is refused, resources that cannot be built) count toward
+    /// the breaker, so they stop costing a capture and a fence drain per frame; and after
+    /// BREAKER_MISSES of them in a row an engaged device hands back to the post path (which would
+    /// otherwise stay off for as long as DLSS runs while the model is never applied).
+    #[test]
+    fn holds_failing_before_the_helper_open_the_breaker_and_hand_back_to_the_post_path() {
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        let shm = ShmClient::test_over_header(&header);
+        let extent = (64, 64);
+
+        // Classification: only model-mode misses with no request and no missing answer are local.
+        let mut exposure = HoldResult { waits_consumed: true, miss: Some("the exposure value is not usable (zero, negative or not finite)"), ..Default::default() };
+        exposure.mark_local(Mode::Model);
+        assert!(exposure.local_failure);
+        let mut roundtrip = HoldResult { miss: Some("x"), ..Default::default() };
+        roundtrip.mark_local(Mode::Roundtrip);
+        assert!(!roundtrip.local_failure);
+        let mut late = HoldResult { miss: Some("the answer was over budget"), over_budget: true, request: Some(3), ..Default::default() };
+        late.mark_local(Mode::Model);
+        assert!(!late.local_failure);
+        let mut unstarted = HoldResult { miss: Some("the request could not be started"), over_budget: true, ..Default::default() };
+        unstarted.mark_local(Mode::Model);
+        assert!(!unstarted.local_failure, "the helper's side, counted as a late answer already");
+
+        // A device that has run the model before the upscaler, then fails every hold locally.
+        let mut session = Session::default();
+        session.saw_dlss();
+        let good = HoldResult { waits_consumed: true, wrote_back: true, evaluated: true, request: Some(1), ..Default::default() };
+        session.note(&shm, &good, Duration::from_millis(10), extent);
+        assert!(session.engaged && session.breaker.is_closed());
+        for k in 1..BREAKER_MISSES {
+            session.note(&shm, &exposure, Duration::from_millis(5), extent);
+            session.saw_dlss();
+            assert!(session.breaker.is_closed() && session.engaged, "only {k} in a row");
+        }
+        // A request that reaches the helper resets the streak.
+        session.note(&shm, &good, Duration::from_millis(10), extent);
+        for _ in 0..BREAKER_MISSES {
+            session.note(&shm, &exposure, Duration::from_millis(5), extent);
+            session.saw_dlss();
+        }
+        assert!(session.breaker.paused(), "BREAKER_MISSES local failures in a row open the breaker");
+        assert!(!session.engaged && !post_off(session.engaged, session.last_dlss, Instant::now()), "and the post path takes over although DLSS still runs");
+        assert_ne!(header.preupscale_state.load(Ordering::Relaxed), 3, "not 'paused before the upscaler': the post path runs");
+
+        // A device that never asked the helper: a local failure neither engages it nor stalls.
+        let mut fresh = Session::default();
+        fresh.saw_dlss();
+        let parse = HoldResult::local("a VkSubmitInfo pNext chain the hold does not handle");
+        fresh.note(&shm, &parse, Duration::ZERO, extent);
+        assert!(!fresh.engaged && fresh.breaker.paused(), "the first hold failed: probe again later, post path on");
+        assert!(!post_off(fresh.engaged, fresh.last_dlss, Instant::now()));
     }
 
     // ---- The HDR encode: a CPU reference and the GPU checks against it. ----
@@ -3902,6 +4049,7 @@ mod tests {
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Identity, false, 0, ANSWER_BUDGET, &mut submit) };
             assert!(result.waits_consumed && result.wrote_back, "{result:?}");
             assert_eq!(result.miss, None);
+            assert_eq!(result.request, None, "identity never asks the helper");
             assert_eq!(gpu.read(image, w, h), original, "identity is bit-identical");
             let proxy = proxy_bytes(&shm, pw, ph);
             let texel = |buf: &[u8], x: u32, y: u32, row: u32| buf[((y * row + x) as usize * TEXEL as usize)..][..TEXEL as usize].to_vec();
@@ -3920,6 +4068,7 @@ mod tests {
             wait_for_helper(&mut shm);
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 1, Duration::from_secs(10), &mut submit) };
             assert!(result.wrote_back, "{result:?}");
+            assert_eq!(result.request, Some(shm.last_request(0)), "the request that reached the helper");
             assert_eq!(shm.answered_dims(), Some((pw, ph)), "the helper was asked for the padded size");
             let e = result.exposure.expect("the exposure value was read");
             assert!((e - 0.128).abs() < 1e-3, "the exposure image's value: {e}");
@@ -3947,6 +4096,7 @@ mod tests {
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 2, ANSWER_BUDGET, &mut submit) };
             let took = started.elapsed();
             assert!(!result.wrote_back && result.over_budget, "{result:?}");
+            assert!(result.request.is_some() && shm.pending_request(0) == result.request, "its own request is still in flight");
             assert!(result.waits_consumed, "the capture itself went out (the waits are consumed either way)");
             assert!(took < Duration::from_secs(1), "a late answer must not hold the submit beyond its budget (took {took:?})");
             assert_eq!(gpu.read(image, w, h), after_model, "a missed answer leaves the frame untouched");

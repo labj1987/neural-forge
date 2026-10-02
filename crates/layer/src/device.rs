@@ -936,12 +936,9 @@ impl NeuralForgeDeviceInfo {
         // budget) still with the helper, no zero-copy capture still writing its proxy region, and
         // in model mode no compose still reading its answer region.
         if shm.has_pending_request(0) && shm.poll_async_request(0) == Some(false) {
-            let result = crate::preupscale::HoldResult {
-                miss: Some("an earlier request is still with the helper"),
-                over_budget: mode == Mode::Model,
-                ..Default::default()
-            };
-            session.note(shm, &result, std::time::Duration::ZERO, (colour.width, colour.height));
+            // Booked as a late answer only when the request is this path's own; the post path's
+            // says nothing about this path (and must not engage the device).
+            session.note_busy_slot(shm, mode, (colour.width, colour.height));
             return None;
         }
         if capture::direct_slot_busy(direct_capture, 0) {
@@ -950,15 +947,24 @@ impl NeuralForgeDeviceInfo {
         if mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(&self.device)) {
             return None;
         }
+        // Failures from here on repeat every frame in a game where they happen at all: in model
+        // mode they count toward the breaker (`HoldResult::local_failure`).
+        let extent = (colour.width, colour.height);
         let batches = match parse() {
             Ok(batches) => batches,
             Err(why) => {
                 session.say_once(why);
+                if mode == Mode::Model {
+                    session.note(shm, &crate::preupscale::HoldResult::local(why), std::time::Duration::ZERO, extent);
+                }
                 return None;
             }
         };
         // SAFETY: the SHM mapping is never unmapped once open.
         if !unsafe { session.ensure(&self.device, instance, self.physical_device, queue_family, colour.width, colour.height, shm, *external_memory_host) } {
+            if mode == Mode::Model {
+                session.note(shm, &crate::preupscale::HoldResult::local("the hold's resources could not be built"), std::time::Duration::ZERO, extent);
+            }
             return None;
         }
         let plan = crate::preupscale::plan(batches, scan.batch, scan.index);
@@ -1021,7 +1027,8 @@ impl NeuralForgeDeviceInfo {
                 // must not carry its own last answer onto a later frame.
                 inflight[0].forget_answer();
             }
-            session.note(shm, &hold, cpu, (colour.width, colour.height));
+            hold.mark_local(mode);
+            session.note(shm, &hold, cpu, extent);
             if let Some(frame) = hold.dump.take() {
                 crate::preupscale::write_dump_async(frame);
                 session.dumped();

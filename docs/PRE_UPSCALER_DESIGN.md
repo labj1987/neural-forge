@@ -306,8 +306,9 @@ checked at the next hold or before the post-upscaler path next runs. Capture and
 GPU timestamps. A hold is skipped (frame forwarded untouched) when: the layer is not engaged yet
 (loading screens), DLSS's inputs were (re)identified at this very submit (no layout is known yet;
 the next one is held), the colour input's last committed barrier left it outside `GENERAL`, a slot-0
-request is still with the helper (the post path's, or a hold that ran over budget), the post
-path's zero-copy capture is still writing slot 0, or anything fails.
+request is still with the helper (the post path's, or a hold that ran over budget; only the latter
+is booked, as a late answer), the post path's zero-copy capture is still writing slot 0, or
+anything fails.
 
 ### The HDR encode and decode (model, roundtrip)
 
@@ -1033,7 +1034,8 @@ HDR again. That is two creations per loading screen, each near full VRAM.
      An echo is not written back (miss `the helper echoed the frame (no model answer)`) and counts
      in `preupscale_misses`.
    - In model mode the breaker opens when the helper reports `model_up=0`, or when 8 holds in a row
-     got no model answer (echo, late, none). DLSS submits are then forwarded untouched, with no
+     got no model answer (echo, late, none, or, since the review fixes below, a hold that failed on
+     the layer's side before asking). DLSS submits are then forwarded untouched, with no
      capture and no wait, for 2 s; then one probe hold goes through. A model answer closes it;
      anything else opens it for another 2 s. It starts as a probe.
    - Logged on opening, every 30 s while open (`breaker still open after Ns: ... (N probes without a
@@ -1046,7 +1048,8 @@ HDR again. That is two creations per loading screen, each near full VRAM.
      answer closes it; a silent helper costs at most 8 budgets; `model_up=0` opens it at once and the
      probe still goes out. The GPU hold test also checks that an echo is not written back.
 3. **Fewer rebuilds: a 30 s hand-back.**
-   - Once a model-mode hold on a device has asked the helper (whatever came back), the post-upscaler
+   - Once a model-mode hold on a device has asked the helper (whatever came back; its own request,
+     see the review fixes below), the post-upscaler
      compose stays off until no DLSS submit with identified inputs has been seen for **30 s**
      (`preupscale::HAND_BACK`; it was 500 ms since the last hold). Meanwhile frames are presented as
      DLSS made them. Loading screens get no model, and the helper's feature is no longer rebuilt at
@@ -1146,6 +1149,25 @@ with `NVPRESENT_ENABLE_SMOOTH_MOTION=1`, two runs back to back.
 A code review of 2.0 (2026-10-02) found the following; each was confirmed in the code first and
 has a test that fails without its fix. None of it is run on the rig yet.
 
+- **The device engaged on the post path's request** (`preupscale::Session::note`,
+  `Session::note_busy_slot`, `HoldResult::{request, local_failure}`). Before the device first held,
+  the post path often had a slot-0 request in flight; the first DLSS submit found it, booked "an
+  earlier request is still with the helper" as an answer over budget, and that engaged the device
+  and fed the breaker without any request of the pre path. From then on the post path stayed off
+  while DLSS ran, so in a game where every hold then failed before asking the helper (exposure 0,
+  an unreadable exposure image, a refused pNext chain, resources that would not build) the model
+  was never applied anywhere, the status said "before the upscaler", and the exposure-0 case paid
+  a capture and a fence drain per frame for nothing, unseen by the breaker. Now:
+  - a hold engages the device only when its own request reached the helper (`seq_req` bumped,
+    kept as `HoldResult::request`); a busy slot is booked as a late answer only when the request
+    in flight is that one (`ShmClient::pending_request`), and otherwise ignored;
+  - a model-mode hold that fails on the layer's side before asking (`HoldResult::local_failure`:
+    run_hold's early misses, a refused submit, `ensure` failing) counts toward the breaker like a
+    missing answer, so after 8 in a row such submits go untouched with one probe every 2 s; and
+    after 8 in a row an engaged device is disengaged (logged `8 holds in a row failed before
+    reaching the helper (...); the post-upscaler compose runs again until a hold does`), so the post
+    path takes over while DLSS runs. `preupscale_state` 3 ("paused") is only published while the
+    device is engaged (the post path off); otherwise it is 1.
 - **A rebuild after a frame-key change opened the breaker** (`ngx::maintain_passes`,
   `rebuild::after_key_change`). Releasing the features for a new key (DLSS render resolution or
   quality, an SDR/HDR switch) set the next build a full spacing (250 ms) later, while `model_up`

@@ -769,6 +769,16 @@ impl ShmClient {
         self.pending[slot].is_some()
     }
 
+    /// The request number (`seq_req`) of the round trip in flight on this slot, if any.
+    pub fn pending_request(&self, slot: usize) -> Option<u32> {
+        self.pending[slot].map(|(req, _)| req)
+    }
+
+    /// The request number the last [`Self::begin_async_request`] on this slot started (0: none).
+    pub fn last_request(&self, slot: usize) -> u32 {
+        self.last_req[slot]
+    }
+
     /// Starts a round trip on the given slot without waiting for it: bumps that
     /// slot's `seq_req` and records when, exactly like the first half of
     /// [`Self::round_trip_after_open`] (which only ever uses slot 0), but returns

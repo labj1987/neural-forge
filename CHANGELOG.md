@@ -78,6 +78,13 @@ diagnostics. In detail:
   - helper: after a change of DLSS render resolution or quality, or an SDR/HDR switch, the model
     is rebuilt at once instead of 250 ms later (unless it was built less than that ago). The
     wait echoed ~15 frames, which opened the layer's circuit breaker for 2 s on every such change.
+  - layer: the pre-upscaler path no longer switches the after-the-upscaler path off on a request
+    it did not make. Before the first hold, the after-the-upscaler path's own request still in
+    flight was counted as a late answer of the pre path, which engaged it; in a game where every
+    hold then failed before reaching the helper (exposure 0, a submit it cannot split, resources
+    it cannot build) the model was applied nowhere for as long as DLSS ran. Such failures now count
+    toward the circuit breaker, and after 8 in a row the after-the-upscaler path takes over
+    again until a hold reaches the helper.
   - layer: the DLSS submit on which DLSS's inputs are (re)identified is no longer held. Their
     layouts were not known yet (barriers are only tracked once the images are watched), and the
     hold assumed `GENERAL`; the next submit is held with the layouts tracked.
