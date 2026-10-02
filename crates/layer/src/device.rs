@@ -506,13 +506,13 @@ fn prune_orphaned_tap_source(state: &mut TapTracker, source: vk::Image) {
     }
 }
 
-/// The image barriers of a `vkCmdPipelineBarrier2` call, or `None` when it has none
-/// (a zero count, or a null pointer, which is how buffer- and memory-only barriers
-/// arrive).
 fn cb_of(info: &vk::CommandBufferSubmitInfo) -> vk::CommandBuffer {
     info.command_buffer
 }
 
+/// The image barriers of a `vkCmdPipelineBarrier2` call, or `None` when it has none
+/// (a zero count, or a null pointer, which is how buffer- and memory-only barriers
+/// arrive).
 fn barrier2_images(info: &vk::DependencyInfo) -> Option<&[vk::ImageMemoryBarrier2]> {
     if info.image_memory_barrier_count == 0 || info.p_image_memory_barriers.is_null() {
         return None;
@@ -1487,11 +1487,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 }
                 if let Some(instance) = &self.instance {
                     engaged_swapchains.insert(sc);
-                    // `capture_request = N > 1`: a frame series (see `crate::series`), taken here,
-                    // before `capture::run` would read the field as a one-shot dump. 1 stays the
-                    // one-shot dump's. The mapping is opened first so a request made before this
-                    // process's first engaged present is not mistaken for a one-shot.
-                    shm.open();
+                    // `capture_request = N > 1`: a frame series (see `crate::series`). 1 stays the
+                    // one-shot dump's, and each path only ever consumes its own values. Before
+                    // `capture::run` has opened the mapping this finds nothing, and the series
+                    // starts one present later.
                     if let Some(frames) = shm.take_series_request() {
                         if readable {
                             series.start(frames, &crate::dump::captures_dir());

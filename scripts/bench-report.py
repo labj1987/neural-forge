@@ -63,7 +63,11 @@ def report(label, base):
         return None
     b = open(f"{d}/benchmark.txt").read().splitlines()
     avgs = [float(line.split(",")[3]) for line in b[1:6]]
-    p4 = glob.glob(f"{d}/Pass4-*.txt")[0]
+    p4s = glob.glob(f"{d}/Pass4-*.txt")
+    if not p4s:
+        print(f"{label}: no Pass4 frame-time file")
+        return None
+    p4 = p4s[0]
     ts = re.search(r"Pass4-(.+)\.txt", p4).group(1)
     end = dt.datetime.strptime(ts, "%y-%m-%d-%H-%M-%S")
     ft = [float(line.split()[1]) for line in open(p4).read().splitlines()[1:] if line.strip()]

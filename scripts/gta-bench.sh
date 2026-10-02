@@ -56,12 +56,6 @@ status_of() { shmctl status | sed -n "s/^$1=//p"; }
 out=${NF_BENCH_DIR:-$HOME/nf-spike/gta}/$label; rm -rf "$out"; mkdir -p "$out"
 
 restore=()
-for kv in "${sets[@]}"; do
-    k=${kv%%=*}
-    restore+=("$k=$(status_of "$k")")
-    shmctl set "$k" "${kv#*=}" >/dev/null || { echo "shmctl set $kv failed" >&2; exit 1; }
-    echo "set $k=$(status_of "$k")" | tee -a "$out/settings"
-done
 put_back() {
     for kv in "${restore[@]}"; do
         k=${kv%%=*}
@@ -69,7 +63,14 @@ put_back() {
         echo "restored $k=$(status_of "$k")"
     done
 }
+# Installed before the first set, so a failed later --set still puts back the earlier ones.
 trap put_back EXIT
+for kv in "${sets[@]}"; do
+    k=${kv%%=*}
+    restore+=("$k=$(status_of "$k")")
+    shmctl set "$k" "${kv#*=}" >/dev/null || { echo "shmctl set $kv failed" >&2; exit 1; }
+    echo "set $k=$(status_of "$k")" | tee -a "$out/settings"
+done
 if [ -n "$(ss -tn state established '( sport = :3390 )' 2>/dev/null | tail -n +2)" ]; then
     echo "warning: a remote desktop session is connected (port 3390); it costs about 8 fps" | tee -a "$out/settings"
 fi

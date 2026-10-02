@@ -6,21 +6,40 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
-- Testing: `crates/layer/examples/pan.rs`, a deterministic panning Vulkan app with its frame
-  number stamped in the corner; `shmctl capture --frames N` (layer `series.rs`), which captures
-  N consecutive presented frames on whichever present path runs; and `scripts/agreement.py`,
-  which scores how closely a test run's edit matches a reference run's. `capture` without
-  `--frames` (`capture_request = 1`) is unchanged.
-- **GPU timestamps for the layer's own work.** Every capture slot and async compose slot
-  carries a timestamp pair, read back without waiting once the slot's fence is seen
-  signalled. The results go to `layer_capture_gpu_ms` / `layer_compose_gpu_ms`
-  (`shmctl status`) and to the end of the `[sync]` log line as `gpu_capture=` / `gpu_compose=`.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
   `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
   earlier needs proof that the presentation engine's wait on them has completed, which core
   Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
+
+## 1.1.0 — 2026-10-02
+
+Measurement groundwork for 2.0. The picture and frame rate at the default settings are unchanged.
+
+- **GPU timestamps for the layer's own work.** Every capture slot and async compose slot
+  carries a timestamp pair, read back without waiting once the slot's fence is seen
+  signalled. The results are in `shmctl status` (`layer_capture_gpu_ms`,
+  `layer_compose_gpu_ms`) and at the end of the `[sync]` log line (`gpu_capture=`,
+  `gpu_compose=`). Shared-memory protocol 8: restart the helper and the game together after
+  updating.
+- **`helper.log` no longer grows without limit.** Starting the helper moves a log over 20 MB to
+  `helper.log.1`.
+- **Benchmark runner in the repo.** `scripts/gta-bench.sh` runs GTA V Enhanced's built-in
+  benchmark unattended, and `scripts/bench-report.py` summarises it (real and displayed fps,
+  GPU load, `[sync]` medians, three-run means). `--set working_scale=0.66` lowers the model
+  resolution for one run and restores it afterwards. See README, "Benchmarking".
+- **Tools to measure where the edit lands.** `crates/layer/examples/pan.rs`, a deterministic
+  panning Vulkan app with its frame number stamped in the corner; `shmctl capture --frames N`,
+  which captures N consecutive presented frames on whichever present path runs; and
+  `scripts/agreement.py`, which scores how closely a test run's edit matches a reference
+  run's. `shmctl capture` without `--frames` is unchanged.
+- **Pre-upscaler probe** (`NEURAL_FORGE_PROBE_NGX=1`, diagnostic only, off by default): logs
+  the game's DLSS work as it reaches Vulkan (`docs/PRE_UPSCALER_PROBE.md`). In GTA V Enhanced
+  it found DLSS's input image and the submit that runs it.
+- 2.0 baseline recorded in `docs/HARDWARE_VALIDATION.md` (1.0.1, mods off: 93.2 fps without the
+  effect, 61.6 with it at model interval 2).
+- Fixed a test that failed when CI's 32-bit runner starved its fake helper for over a second.
 
 ## 1.0.1 — 2026-10-01
 

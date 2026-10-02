@@ -229,13 +229,34 @@ impl Series {
 
     /// Ends the series: waits for every queued pair to be written, then says where they are.
     fn finish(&mut self) {
+        self.finish_within(None);
+    }
+
+    /// [`Self::finish`], but gives the writers at most `limit`: past it they are left to finish
+    /// on their own threads (the process may exit first, losing the pairs still queued).
+    fn finish_within(&mut self, limit: Option<std::time::Duration>) {
         let Some(mut active) = self.active.take() else { return };
         if let Some(mut index) = active.index.take() {
             let _ = index.flush();
         }
         drop(active.sender.take());
-        let failures: u32 = active.writers.drain(..).map(|w| w.join().unwrap_or(1)).sum();
-        crate::log!("[series] wrote {} frame pairs into {} ({} failed)", active.seq, active.dir.display(), failures);
+        let deadline = limit.map(|l| std::time::Instant::now() + l);
+        while let Some(deadline) = deadline {
+            if active.writers.iter().all(|w| w.is_finished()) || std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let (done, running): (Vec<_>, Vec<_>) = active.writers.drain(..).partition(|w| deadline.is_none() || w.is_finished());
+        let failures: u32 = done.into_iter().map(|w| w.join().unwrap_or(1)).sum();
+        if running.is_empty() {
+            crate::log!("[series] wrote {} frame pairs into {} ({} failed)", active.seq, active.dir.display(), failures);
+        } else {
+            crate::log!(
+                "[series] {} writers still busy at teardown: {} frame pairs captured into {}, the last ones may be missing",
+                running.len(), active.seq, active.dir.display()
+            );
+        }
         crate::logging::flush();
     }
 
@@ -243,7 +264,9 @@ impl Series {
     /// Nothing submitted through this series may still be pending (it never is after
     /// [`Self::after`] returns).
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        self.finish();
+        // Device teardown holds the layer's state lock: a game quitting mid-series must not
+        // wait out a long PNG backlog.
+        self.finish_within(Some(std::time::Duration::from_secs(2)));
         unsafe { destroy_resources(self.resources.take(), device) };
     }
 }

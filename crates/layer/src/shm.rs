@@ -220,7 +220,9 @@ impl ShmClient {
     /// already served.
     pub fn take_capture_request(&self) -> bool {
         let Some(hdr) = self.header() else { return false };
-        hdr.capture_request.swap(0, Ordering::Relaxed) != 0
+        // Only the one-shot value: a series request (above 1) belongs to `take_series_request`,
+        // so neither path can swallow the other's even when they run in either order.
+        hdr.capture_request.compare_exchange(1, 0, Ordering::Relaxed, Ordering::Relaxed).is_ok()
     }
 
     /// Consumes a pending *series* request: a `capture_request` above 1 asks for that many
@@ -238,7 +240,7 @@ impl ShmClient {
     /// without losing/duplicating the actual one-shot request in the process.
     pub fn capture_request_pending(&self) -> bool {
         let Some(hdr) = self.header() else { return false };
-        hdr.capture_request.load(Ordering::Relaxed) != 0
+        hdr.capture_request.load(Ordering::Relaxed) == 1
     }
 
     /// The settings `composition::apply::apply_rgba8` needs, read fresh every frame
