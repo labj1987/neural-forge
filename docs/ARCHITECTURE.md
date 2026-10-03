@@ -150,7 +150,7 @@ flowchart TD
     mode -- "no (default: model)" --> nvx{"Device has<br/>VK_NVX_image_view_handle?"}
     nvx -- no --> post
     nvx -- yes --> dlss{"DLSS SR input identified<br/>and a submit reads it?"}
-    dlss -- "no (no DLSS, DLAA, native)" --> post
+    dlss -- "no (no DLSS, native)" --> post
     dlss -- yes --> pre["Before the upscaler:<br/>hold the DLSS submit"]
     pre --> handback{"No DLSS submit<br/>for 30 s?"}
     handback -- yes --> post
@@ -205,10 +205,21 @@ read.
 
 ### 4.3 Identification
 
-At a launch-bearing submit, when the registered set or the swapchains changed
-(`preupscale::identify`):
+At a launch-bearing submit (`Tracker::observe`, then `Tracker::refresh`), two rules, the first
+winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameters (DLAA)"):
 
-- **Colour input:** the registered `RGBA16F` storage image (2D, single sample) whose extent equals
+- **By the input kernel's parameters** (`Rule::Params`). A command buffer's first launch that names a
+  registered depth image and a 2-channel float image is read as DLSS SR's input kernel. If it names
+  exactly one depth image and exactly one `RGBA16F`/`R11G11B10` storage image at the depth's extent,
+  that image is the colour input, with that depth and those motion vectors. It need not be smaller
+  than the output, so DLAA is found. The extent condition keeps DLSS Frame Generation out, because
+  FG's launch names its output-size frame beside the render-size depth. An output-size candidate
+  (DLAA, or FG at native resolution) counts only if its buffer also names the 1x1 `R16_SFLOAT`
+  exposure image, which SR takes and FG does not. The decision waits for 16 launch-bearing submits
+  without new evidence, so both SR's and FG's buffers have been seen. Ambiguity (two candidates in
+  one launch, or different colour inputs from different buffers that the exposure does not settle)
+  is logged once, and the size rule decides. Only an `RGBA16F` colour input is held.
+- **By size** (`Rule::Size`, `preupscale::identify`), the fallback: the registered `RGBA16F` storage image (2D, single sample) whose extent equals
   a registered depth image's (any depth format: `D32_SFLOAT`, `D32_SFLOAT_S8_UINT`,
   `D24_UNORM_S8_UINT`, ...) and a registered motion-vector image's (`RG16F`, else `RG32F`), and is
   smaller than the output. The output is the device's largest swapchain; on a device with no
@@ -217,8 +228,14 @@ At a launch-bearing submit, when the registered set or the swapchains changed
   what rules out DLAA. Several candidates: the lowest handle is the colour input; the others are
   only logged, and a forwarded buffer that names one of them is counted (PRE_UPSCALER_DESIGN.md,
   "Several colour candidates (2.0.1)").
-- **Exposure input:** the registered 1x1 `R16_SFLOAT` image.
+- The identification line ends with `identified by the input kernel's parameters (...)` or
+  `identified by size`. When both rules pick the same images (GTA V, Crimson Desert), the switch
+  from size to parameters is no re-identification: nothing is skipped and the hold target stays.
+- **Exposure input:** the 1x1 `R16_SFLOAT` image the input kernel's buffer names, else the
+  registered one.
 - Without an exposure input, nothing is held.
+- With DLAA the model works on the full output-size frame every frame (as costly as the 1.x path on
+  every frame). The hold, encode and decode do not depend on the size.
 - When nothing qualifies, the line says why: the output used, the first failed condition for every
   `RGBA16F` storage extent, and the registered views grouped by extent, format and usage (at most
   1500 bytes, for the first 16 changes of the set per device).

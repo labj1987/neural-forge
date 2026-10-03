@@ -6,6 +6,21 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Pre-upscaler identification (layer): DLSS's colour input is now what DLSS Super Resolution's own
+  input kernel names in its CUDA parameters. That is the first launch of a buffer naming one depth
+  image, motion vectors and exactly one RGBA16F/R11G11B10 storage image at the depth's extent. The
+  colour input no longer has to be smaller than the output, so DLAA is found (Resident Evil
+  Requiem waited forever with `UpscalingQuality_DLSS=MaxQuality`). DLSS Frame Generation cannot
+  win, for two reasons. Its launch names the output-size frame beside the render-size depth. And an
+  output-size candidate counts only when its buffer also names the 1x1 R16_SFLOAT exposure, which FG
+  does not take. The decision waits for 16 launch-bearing submits without new evidence.
+  Ambiguous launches or buffers are logged once and leave the decision to the size rule, which stays
+  as the fallback. The identification line ends with `identified by the input kernel's parameters`
+  or `identified by size`. GTA V and Crimson Desert keep the same images and hold target with no
+  re-identification; their line appears a second time with the new rule. An R11G11B10 input is
+  identified but not held. With DLAA the model runs on the full output-size frame every frame. See
+  docs/PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameters (DLAA)".
+
 - Pre-upscaler identification (layer): on a device that knows no swapchain, DLSS's colour input is
   now compared with the largest registered RGBA16F/R11G11B10 storage image. Before, such a device
   gave up, which is why Cyberpunk 2077 logged `no DLSS input among 11 registered views (swapchain

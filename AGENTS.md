@@ -74,8 +74,11 @@ Current target-machine evidence and unresolved Vulkan errors are in
 Since 2.0 the model runs **before** DLSS Super Resolution by default (`crates/layer/src/preupscale.rs`,
 docs/PRE_UPSCALER_DESIGN.md): on a device with `VK_NVX_image_view_handle`, the layer identifies
 DLSS's registered colour input, holds the game's DLSS submit, sends the HDR-encoded render-resolution
-frame to the helper every frame and decodes the answer back before DLSS runs. Everything else (no
-NVX, no DLSS, DLAA, native) keeps the post-upscaler path. Only the launch-bearing command buffer whose
+frame to the helper every frame and decodes the answer back before DLSS runs. The colour input is
+what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's
+output-size input), with the older size rule as the fallback (docs/PRE_UPSCALER_DESIGN.md,
+"Identification by the input kernel's parameters (DLAA)"). Everything else (no NVX, no DLSS, native)
+keeps the post-upscaler path. Only the launch-bearing command buffer whose
 kernel parameters name the identified colour input is held, so DLSS Frame Generation's submits go
 through untouched (docs/PRE_UPSCALER_DESIGN.md, "DLSS Frame Generation"). `NEURAL_FORGE_PREUPSCALE=off` is the A/B
 and rollback switch; `dump`, `identity` and `roundtrip` are diagnostics. Rule: with

@@ -10,7 +10,9 @@
 //! 1. tracks the registered views and marks launch-bearing command buffers ([`Tracking`]), noting
 //!    whether their launches name the colour input ([`LaunchRefs`]: only those are held, so DLSS
 //!    Frame Generation's launch-bearing submits go through untouched);
-//! 2. identifies the colour input (and depth, motion vectors) from the registered set ([`identify`]);
+//! 2. identifies the colour input (and depth, motion vectors) from what DLSS Super Resolution's
+//!    input kernel names in its parameters ([`input_launch`], [`Tracker::observe`]; also finds
+//!    DLAA's output-size input), with the registered set's shapes as the fallback ([`identify`]);
 //! 3. at a `vkQueueSubmit`/`vkQueueSubmit2` carrying a launch-bearing buffer, splits the call
 //!    around that buffer ([`plan`]) and, between the two halves, runs its own capture submit,
 //!    the model round trip and a write-back submit on the same queue ([`run_hold`]).
@@ -333,8 +335,26 @@ pub(crate) struct Inputs {
     /// Only dump mode reads them.
     pub exposure: [Option<(vk::Image, ImageDesc)>; MAX_EXPOSURE],
     /// DLSS's exposure input, which the HDR encode multiplies in: the registered 1x1 R16_SFLOAT
-    /// image (lowest handle among several). NGX's own 1x1 RGBA32F images are not it.
+    /// image the input kernel's command buffer names ([`Rule::Params`]), else the registered one
+    /// (lowest handle among several). NGX's own 1x1 RGBA32F images are not it.
     pub exposure_input: Option<(vk::Image, ImageDesc)>,
+    /// The exposure input is the one DLSS's own command buffer names (not just the registered one).
+    pub exposure_named: bool,
+    /// Which rule found the colour input.
+    pub rule: Rule,
+}
+
+/// How the colour input was found.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Rule {
+    /// A launch of DLSS's own command buffer names it together with exactly one depth image and
+    /// motion vectors ([`InputLaunch`], [`Tracker::observe`]): what DLSS Super Resolution's input
+    /// kernel reads. Works with DLAA (input extent == output extent).
+    Params,
+    /// The registered set alone ([`identify`]): the RGBA16F storage image beside depth and motion
+    /// vectors that is smaller than the output. The fallback (unreadable parameters, other launch
+    /// forms, before the parameters have settled).
+    Size,
 }
 
 
@@ -379,7 +399,9 @@ fn at(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, formats: &[vk::Format]
 /// same extent. DLSS's inputs share the render extent; its output and NGX's scratch images have no
 /// depth image beside them, and DLAA (render extent == output) is refused by the size test.
 /// Deterministic: among several candidates, the lowest handles win (Crimson Desert registers two
-/// or three; the others are kept in [`Inputs::others`] for the log).
+/// or three; the others are kept in [`Inputs::others`] for the log). This is the size rule
+/// ([`Rule::Size`]), the fallback: what DLSS's own input kernel names ([`Tracker::observe`],
+/// [`Rule::Params`]) wins once it has settled.
 pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapchain: Option<(u32, u32)>) -> Option<Inputs> {
     let (output, output_from_swapchain) = match swapchain {
         Some(e) => (e, true),
@@ -401,13 +423,6 @@ pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
     for (slot, other) in others.iter_mut().zip(&candidates[1..]) {
         *slot = Some(*other);
     }
-    let mut exposure = [None; MAX_EXPOSURE];
-    for (slot, found) in exposure.iter_mut().zip(
-        registered.values().filter(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && exposure_texel_bytes(d.format).is_some()),
-    ) {
-        *slot = Some(*found);
-    }
-    let exposure_input = registered.values().find(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && d.format == vk::Format::R16_SFLOAT).copied();
     Some(Inputs {
         colour,
         depth: at(registered, &DEPTH_FORMATS, w, h)?,
@@ -416,8 +431,144 @@ pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
         others,
         output,
         output_from_swapchain,
-        exposure,
-        exposure_input,
+        exposure: exposure_images(registered),
+        exposure_input: registered_exposure_input(registered),
+        exposure_named: false,
+        rule: Rule::Size,
+    })
+}
+
+/// The registered 1x1 float images (DLSS's exposure input among them), lowest handles first.
+fn exposure_images(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>) -> [Option<(vk::Image, ImageDesc)>; MAX_EXPOSURE] {
+    let mut exposure = [None; MAX_EXPOSURE];
+    for (slot, found) in exposure.iter_mut().zip(
+        registered.values().filter(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && exposure_texel_bytes(d.format).is_some()),
+    ) {
+        *slot = Some(*found);
+    }
+    exposure
+}
+
+/// Whether `d` is DLSS's exposure input's kind: a 2D single-sample 1x1 `R16_SFLOAT` image.
+fn exposure_like(d: &ImageDesc) -> bool {
+    d.plain && (d.width, d.height) == (1, 1) && d.format == vk::Format::R16_SFLOAT
+}
+
+/// The registered 1x1 R16_SFLOAT image (lowest handle): the exposure input when DLSS's buffer
+/// names none.
+fn registered_exposure_input(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>) -> Option<(vk::Image, ImageDesc)> {
+    registered.values().find(|(_, d)| exposure_like(d)).copied()
+}
+
+/// What DLSS Super Resolution's input kernel reads, as one launch's parameters name it: the colour
+/// input, depth and motion vectors. Found by [`input_launch`], kept per command buffer
+/// ([`LaunchRefs::input`]) and decided on in [`Tracker::observe`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum InputLaunch {
+    /// Exactly one depth image, motion vectors, and exactly one colour candidate at the depth's
+    /// extent.
+    Inputs { colour: vk::Image, depth: vk::Image, mvec: vk::Image },
+    /// Exactly one depth image and motion vectors, but several colour candidates at its extent: not
+    /// used, logged once.
+    Ambiguous { depth: vk::Image, colours: Vec<(vk::Image, ImageDesc)> },
+    /// Depth and motion vectors, but several depth images, or no colour candidate at the depth's
+    /// extent (DLSS Frame Generation's launches in GTA V: the output-size frame beside the
+    /// render-size depth).
+    Unusable,
+}
+
+/// Whether `d` can be DLSS's colour input as its input kernel's parameters name it: a 2D
+/// single-sample RGBA16F or R11G11B10 storage image (only RGBA16F is held, see `device.rs`).
+fn colour_candidate(d: &ImageDesc) -> bool {
+    d.plain && OUTPUT_FORMATS.contains(&d.format) && d.usage.contains(vk::ImageUsageFlags::STORAGE)
+}
+
+/// Reads one launch's named registered images (`named`; `images` has their descriptions) the way
+/// DLSS Super Resolution's input kernel names its inputs. `None` when the launch names no depth
+/// image or no 2-channel float image (it is not an input launch). Otherwise exactly one depth image
+/// ([`DEPTH_FORMATS`]) and exactly one colour candidate ([`colour_candidate`]) **at the depth's
+/// extent** give [`InputLaunch::Inputs`]: DLSS's colour input and depth share the render extent
+/// (with DLAA both are the output's), while DLSS Frame Generation reads the output-size frame
+/// beside the render-size depth. The colour input need not be smaller than the output. The motion
+/// vectors: at the depth's extent first, RG16F before RG32F, lowest handle.
+pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image]) -> Option<InputLaunch> {
+    let of = |keep: fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
+        let mut list: Vec<(vk::Image, ImageDesc)> = named.iter().filter_map(|i| images.get(i).filter(|d| keep(d)).map(|d| (*i, *d))).collect();
+        list.sort_by_key(|(i, _)| i.as_raw());
+        list
+    };
+    let depths = of(|d| d.plain && DEPTH_FORMATS.contains(&d.format));
+    let mvecs = of(|d| d.plain && MVEC_FORMATS.contains(&d.format));
+    if depths.is_empty() || mvecs.is_empty() {
+        return None;
+    }
+    let [(depth, dd)] = depths[..] else {
+        return Some(InputLaunch::Unusable);
+    };
+    let extent = (dd.width, dd.height);
+    let colours: Vec<(vk::Image, ImageDesc)> = of(colour_candidate).into_iter().filter(|(_, d)| (d.width, d.height) == extent).collect();
+    let mvec = mvecs
+        .iter()
+        .min_by_key(|(i, d)| ((d.width, d.height) != extent, MVEC_FORMATS.iter().position(|f| *f == d.format), i.as_raw()))
+        .map(|(i, _)| *i)?;
+    Some(match colours[..] {
+        [] => InputLaunch::Unusable,
+        [(colour, _)] => InputLaunch::Inputs { colour, depth, mvec },
+        _ => InputLaunch::Ambiguous { depth, colours },
+    })
+}
+
+/// One command buffer's evidence: its input launch's colour input, depth and motion vectors, and
+/// the 1x1 R16_SFLOAT image (DLSS's exposure input) the buffer names, if any.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Named {
+    pub colour: vk::Image,
+    pub depth: vk::Image,
+    pub mvec: vk::Image,
+    pub exposure: Option<vk::Image>,
+}
+
+/// Launch-bearing submits without new evidence before [`Tracker::observe`] decides. With DLSS Frame
+/// Generation each real frame has one Super Resolution buffer and two (GTA V's 3x) to about five
+/// (Crimson Desert's 6x) FG submits, so this spans a few real frames: both kinds are seen before
+/// anything is chosen.
+pub(crate) const SETTLE_SUBMITS: u32 = 16;
+
+/// At most this many different colour inputs are kept as evidence.
+const MAX_NAMED: usize = 4;
+
+/// The inputs as DLSS's own input kernel names them ([`Rule::Params`]); `None` when one of the
+/// images is no longer registered. `size` is what the size rule found; its other candidates are
+/// listed beside the colour input (and a forwarded buffer naming one is counted, as before).
+fn by_params(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, n: Named, swapchain: Option<(u32, u32)>, size: Option<&Inputs>) -> Option<Inputs> {
+    let get = |i: vk::Image| registered.get(&i.as_raw()).copied();
+    let colour = get(n.colour)?;
+    let rest: Vec<(vk::Image, ImageDesc)> = size
+        .into_iter()
+        .flat_map(|s| std::iter::once(s.colour).chain(s.others.iter().flatten().copied()))
+        .filter(|o| o.0 != n.colour)
+        .collect();
+    let mut others = [None; MAX_OTHERS];
+    for (slot, other) in others.iter_mut().zip(&rest) {
+        *slot = Some(*other);
+    }
+    let (output, output_from_swapchain) = match swapchain {
+        Some(e) => (e, true),
+        None => (output_candidate(registered).unwrap_or((colour.1.width, colour.1.height)), false),
+    };
+    let named_exposure = n.exposure.and_then(get);
+    Some(Inputs {
+        colour,
+        depth: get(n.depth)?,
+        mvec: get(n.mvec)?,
+        candidates: 1 + rest.len(),
+        others,
+        output,
+        output_from_swapchain,
+        exposure: exposure_images(registered),
+        exposure_input: named_exposure.or_else(|| registered_exposure_input(registered)),
+        exposure_named: named_exposure.is_some(),
+        rule: Rule::Params,
     })
 }
 
@@ -548,6 +699,16 @@ pub(crate) struct Tracker {
     /// The inputs changed in [`Self::refresh`] and no launch-bearing submit has been scanned since
     /// ([`Scan::identified_now`]).
     identified: bool,
+    /// What submitted launch-bearing buffers' input launches named ([`InputLaunch::Inputs`]), one
+    /// entry per colour input, at most [`MAX_NAMED`].
+    named: Vec<Named>,
+    /// Launch-bearing submits since [`Self::named`] last changed.
+    named_quiet: u32,
+    /// The evidence chosen once it settled ([`SETTLE_SUBMITS`]); [`Self::refresh`] prefers it to
+    /// the size rule.
+    named_pick: Option<Named>,
+    /// Which of [`Self::observe`]'s once-only lines were logged.
+    said_named: u8,
 }
 
 /// Where a submit's first launch-bearing command buffer is.
@@ -590,6 +751,10 @@ pub(crate) struct LaunchRefs {
     pub opaque: bool,
     /// Registered images whose handle (or address) is in a launch's parameters.
     pub images: Vec<vk::Image>,
+    /// The first launch (in recording order) that names a depth image and a 2-channel float image,
+    /// read as DLSS Super Resolution's input kernel ([`input_launch`]): the first launch of SR's
+    /// buffer.
+    pub input: Option<InputLaunch>,
 }
 
 /// How a launch-bearing command buffer is treated at the submit.
@@ -686,6 +851,21 @@ impl Tracker {
             self.dirty = true;
         }
         self.committed.remove(&image);
+        // Evidence naming a destroyed image is dropped; the rest settles again before it decides.
+        let before = self.named.len();
+        self.named.retain(|n| ![n.colour, n.depth, n.mvec].contains(&image));
+        for n in &mut self.named {
+            if n.exposure == Some(image) {
+                n.exposure = None;
+            }
+        }
+        if self.named.len() != before {
+            self.named_quiet = 0;
+        }
+        if self.named_pick.is_some_and(|n| [n.colour, n.depth, n.mvec].contains(&image) || n.exposure == Some(image)) {
+            self.named_pick = None;
+            self.dirty = true;
+        }
     }
 
     pub(crate) fn record_view(&mut self, view: vk::ImageView, image: vk::Image) {
@@ -725,22 +905,32 @@ impl Tracker {
 
     /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`; `params` is the launch's kernel
     /// parameter buffer when it could be read ([`launch_params`]), `None` otherwise. Every 8-byte
-    /// word of it is compared with the registered views' handles and addresses.
+    /// word of it is compared with the registered views' handles and addresses. The buffer's first
+    /// launch naming depth and motion vectors is kept as its input launch ([`input_launch`]).
     pub(crate) fn launch(&mut self, command_buffer: vk::CommandBuffer, params: Option<&[u8]>) {
-        let refs = self.launch.entry(command_buffer).or_default();
         let Some(bytes) = params else {
-            refs.opaque = true;
+            self.launch.entry(command_buffer).or_default().opaque = true;
             return;
         };
+        let mut named: Vec<vk::Image> = Vec::new();
         for word in bytes.chunks_exact(8) {
             let value = u64::from_le_bytes(word.try_into().unwrap_or_default());
             if value == 0 {
                 continue;
             }
             for &(key, _, image) in &self.keys {
-                if key == value && !refs.images.contains(&image) {
-                    refs.images.push(image);
+                if key == value && !named.contains(&image) {
+                    named.push(image);
                 }
+            }
+        }
+        let refs = self.launch.entry(command_buffer).or_default();
+        if refs.input.is_none() {
+            refs.input = input_launch(&self.images, &named);
+        }
+        for image in named {
+            if !refs.images.contains(&image) {
+                refs.images.push(image);
             }
         }
     }
@@ -768,6 +958,9 @@ impl Tracker {
             let refs = self.launch.entry(primary).or_default();
             for c in carried {
                 refs.opaque |= c.opaque;
+                if refs.input.is_none() {
+                    refs.input = c.input;
+                }
                 for image in c.images {
                     if !refs.images.contains(&image) {
                         refs.images.push(image);
@@ -816,13 +1009,11 @@ impl Tracker {
         if !std::mem::take(&mut self.dirty) {
             return None;
         }
-        let registered: BTreeMap<u64, (vk::Image, ImageDesc)> = self
-            .registered
-            .values()
-            .filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d))))
-            .collect();
-        let inputs = identify(&registered, self.swapchain_extent());
-        let key = |i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
+        let registered = self.registered_set();
+        // What DLSS's own input kernel names, once settled; the size rule otherwise.
+        let size = identify(&registered, self.swapchain_extent());
+        let inputs = self.named_pick.and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())).or(size);
+        let key =|i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
         if key(inputs) != key(self.inputs) {
             self.committed.clear();
             self.pending.clear();
@@ -831,7 +1022,7 @@ impl Tracker {
         self.inputs = inputs;
         let line = match inputs {
             Some(i) => format!(
-                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}{}, exposure input {}; swapchain {:?}{}",
+                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}{}, exposure input {}{}; swapchain {:?}{}; {}",
                 hex(i.colour.0),
                 i.colour.1.width,
                 i.colour.1.height,
@@ -839,7 +1030,10 @@ impl Tracker {
                 i.colour.1.usage,
                 if i.candidates > 1 {
                     let others: Vec<String> = i.others.iter().flatten().map(|(image, d)| format!("{} {}x{}", hex(*image), d.width, d.height)).collect();
-                    format!(" (first of {} candidates; others {})", i.candidates, others.join(", "))
+                    match i.rule {
+                        Rule::Size => format!(" (first of {} candidates; others {})", i.candidates, others.join(", ")),
+                        Rule::Params => format!(" (the size rule's other candidates: {})", others.join(", ")),
+                    }
                 } else {
                     String::new()
                 },
@@ -854,11 +1048,16 @@ impl Tracker {
                     String::new()
                 },
                 i.exposure_input.map_or_else(|| "none (no registered 1x1 R16_SFLOAT)".to_string(), |(image, _)| hex(image)),
+                if i.exposure_named { " (named by the same command buffer)" } else { "" },
                 self.swapchain_extent(),
-                if i.output_from_swapchain {
+                if i.output_from_swapchain || i.rule == Rule::Params {
                     String::new()
                 } else {
                     format!(", compared with the largest registered RGBA16F/R11G11B10 storage image ({}x{})", i.output.0, i.output.1)
+                },
+                match i.rule {
+                    Rule::Params => "identified by the input kernel's parameters (one launch names it with the depth and motion vectors)",
+                    Rule::Size => "identified by size",
                 }
             ),
             None => format!(
@@ -880,6 +1079,124 @@ impl Tracker {
         }
         self.announced = Some(line.clone());
         Some(line)
+    }
+
+    /// Gathers what the submit's launch-bearing buffers' input launches name ([`LaunchRefs::input`])
+    /// and, once that evidence has not changed for [`SETTLE_SUBMITS`] launch-bearing submits,
+    /// decides ([`Self::pick_named`]); a changed decision marks the inputs for [`Self::refresh`].
+    /// Called before it at every launch-bearing submit. Returns once-only log lines.
+    pub(crate) fn observe(&mut self, batches: &[Vec<vk::CommandBuffer>]) -> Vec<String> {
+        let mut lines = Vec::new();
+        let mut any = false;
+        let mut changed = false;
+        for cb in batches.iter().flatten() {
+            let Some(refs) = self.launch.get(cb) else { continue };
+            any = true;
+            match &refs.input {
+                Some(InputLaunch::Inputs { colour, depth, mvec }) => {
+                    let (colour, depth, mvec) = (*colour, *depth, *mvec);
+                    let exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
+                    if let Some(n) = self.named.iter_mut().find(|n| n.colour == colour) {
+                        if n.exposure.is_none() && exposure.is_some() {
+                            n.exposure = exposure;
+                            changed = true;
+                        }
+                    } else if self.named.len() < MAX_NAMED {
+                        self.named.push(Named { colour, depth, mvec, exposure });
+                        changed = true;
+                    }
+                }
+                Some(InputLaunch::Ambiguous { depth, colours }) if self.said_named & 1 == 0 => {
+                    self.said_named |= 1;
+                    let list: Vec<String> = colours.iter().map(|(i, d)| format!("{} {}x{} {:?}", hex(*i), d.width, d.height, d.format)).collect();
+                    lines.push(format!(
+                        "a CUDA launch names depth {} with several colour candidates at its extent ({}): not used to identify DLSS's colour input",
+                        hex(*depth),
+                        list.join(", ")
+                    ));
+                }
+                _ => {}
+            }
+        }
+        if !any {
+            return lines;
+        }
+        self.named_quiet = if changed { 0 } else { self.named_quiet.saturating_add(1) };
+        // Decided when the evidence has just settled, and again when the registered set or the
+        // swapchains change after that (the output the colour input is compared with may move).
+        if self.named_quiet == SETTLE_SUBMITS || (self.named_quiet > SETTLE_SUBMITS && self.dirty) {
+            let pick = self.pick_named(&mut lines);
+            if pick != self.named_pick {
+                self.named_pick = pick;
+                self.dirty = true;
+            }
+        }
+        lines
+    }
+
+    /// The registered images with their descriptions, keyed by raw handle (what [`identify`] reads).
+    fn registered_set(&self) -> BTreeMap<u64, (vk::Image, ImageDesc)> {
+        self.registered.values().filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d)))).collect()
+    }
+
+    /// The evidence to identify by. An entry whose colour input is smaller than the output (the
+    /// swapchain; without one the largest registered RGBA16F/R11G11B10 storage image) counts as it
+    /// is: DLSS Frame Generation's launches never name a render-size frame beside the render-size
+    /// depth. An entry whose colour input is the output's size (DLAA, or frame generation at native
+    /// resolution, whose launch names the output-size frame beside output-size depth and motion
+    /// vectors) counts only if its buffer also names a 1x1 R16_SFLOAT image: DLSS Super
+    /// Resolution's exposure input, which frame generation does not take (and without which the
+    /// model path holds nothing anyway). Among several counted entries, the only one whose buffer
+    /// names the exposure; otherwise none, logged once, and the size rule decides.
+    fn pick_named(&mut self, lines: &mut Vec<String>) -> Option<Named> {
+        let describe = |t: &Self, list: &[Named]| -> String {
+            let list: Vec<String> = list
+                .iter()
+                .map(|n| {
+                    let size = t.images.get(&n.colour).map_or_else(String::new, |d| format!(" {}x{}", d.width, d.height));
+                    format!("{}{size}{}", hex(n.colour), n.exposure.map_or_else(String::new, |e| format!(" with exposure {}", hex(e))))
+                })
+                .collect();
+            list.join(", ")
+        };
+        let output = self.swapchain_extent().or_else(|| output_candidate(&self.registered_set()));
+        let (counted, output_size): (Vec<Named>, Vec<Named>) = self.named.iter().partition(|n| {
+            n.exposure.is_some() || self.images.get(&n.colour).zip(output).is_some_and(|(d, o)| smaller(d.width, d.height, o))
+        });
+        if !output_size.is_empty() && self.said_named & 8 == 0 {
+            self.said_named |= 8;
+            lines.push(format!(
+                "a CUDA launch names an output-size colour image with depth and motion vectors ({}), but its command buffer names no 1x1 R16_SFLOAT exposure: not DLSS Super Resolution's input (DLSS Frame Generation's frame, or SR without an exposure input); not used",
+                describe(self, &output_size)
+            ));
+        }
+        match counted[..] {
+            [] => None,
+            [one] => Some(one),
+            _ => {
+                let with: Vec<Named> = counted.iter().filter(|n| n.exposure.is_some()).copied().collect();
+                if let [one] = with[..] {
+                    if self.said_named & 2 == 0 {
+                        self.said_named |= 2;
+                        lines.push(format!(
+                            "input launches in different command buffers name different colour inputs ({}): {} chosen, the one whose buffer names the 1x1 R16_SFLOAT exposure",
+                            describe(self, &counted),
+                            hex(one.colour)
+                        ));
+                    }
+                    Some(one)
+                } else {
+                    if self.said_named & 4 == 0 {
+                        self.said_named |= 4;
+                        lines.push(format!(
+                            "input launches in different command buffers name different colour inputs ({}): none chosen by the input kernel's parameters, the size rule decides",
+                            describe(self, &counted)
+                        ));
+                    }
+                    None
+                }
+            }
+        }
     }
 
     /// Finds the first launch-bearing command buffer in a submit (`batches`: each batch's command
@@ -1075,6 +1392,7 @@ impl Tracking {
                 return None;
             }
             let device = self.device;
+            let observed = t.observe(batches);
             let line = t.refresh().map(|l| format!("{l} [device {device:#x}]"));
             self.watching.store(t.inputs.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
@@ -1097,9 +1415,9 @@ impl Tracking {
                 )
             });
             self.rearm(&t);
-            (scan, [line, kind_line, tally])
+            (scan, observed.into_iter().map(Some).chain([line, kind_line, tally]))
         };
-        for line in line.into_iter().flatten() {
+        for line in line.flatten() {
             crate::log!("[preupscale] {line}");
             crate::logging::flush();
         }
@@ -3491,7 +3809,7 @@ mod tests {
         let line = t.refresh().expect("identified");
         assert!(line.starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT"), "{line}");
         assert!(!line.contains("candidates") && !line.contains("compared with"), "one candidate, the swapchain: {line}");
-        assert!(line.ends_with("exposure input 0x610; swapchain Some((2560, 1440))"), "{line}");
+        assert!(line.ends_with("exposure input 0x610; swapchain Some((2560, 1440)); identified by size"), "{line}");
         t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
         t.launch(cb(2), Some(&param_block(&[0x1400, 0x1200])));
         let scan = t.scan(&[vec![cb(2), cb(1)]]).expect("SR's buffer is held");
@@ -3563,7 +3881,7 @@ mod tests {
         let line = t.refresh().expect("identified");
         assert!(line.starts_with("colour input: image 0x100 (1708x960 R16G16B16A16_SFLOAT"), "{line}");
         assert!(line.contains("depth 0x200 D32_SFLOAT, motion vectors 0x300 R32G32_SFLOAT"), "{line}");
-        assert!(line.ends_with("swapchain None, compared with the largest registered RGBA16F/R11G11B10 storage image (2560x1440)"), "{line}");
+        assert!(line.ends_with("swapchain None, compared with the largest registered RGBA16F/R11G11B10 storage image (2560x1440); identified by size"), "{line}");
         assert_eq!(t.inputs.map(|i| (i.output, i.output_from_swapchain, i.exposure_input.map(|e| e.0.as_raw()))), Some(((2560, 1440), false, Some(0x400))));
         // An RGBA16F output does as well; a swapchain, once known, is what counts.
         let mut rgba_out = inputs.to_vec();
@@ -3849,7 +4167,7 @@ mod tests {
         assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
         assert!(t.scan(&[vec![cb(1)]]).is_some(), "an opaque launch could be SR's: held");
         assert_eq!((t.colour_submits, t.foreign_submits), (0, 0));
-        let refs = LaunchRefs { opaque: false, images: vec![] };
+        let refs = LaunchRefs { opaque: false, images: vec![], input: None };
         assert_eq!(refs.kind(None), LaunchKind::Unknown, "no colour input identified yet");
         // A destroyed colour view drops its key: its handle no longer matches anything.
         t.forget_view(vk::ImageView::from_raw(0x101));
@@ -3897,6 +4215,311 @@ mod tests {
         // No terminator within four pairs: refused, nothing past the ninth entry is read.
         let endless = [ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast()];
         assert_eq!(unsafe { launch_params(endless.as_ptr(), 1) }, None);
+    }
+
+    // ---- Identification by the input kernel's parameters (`Tracker::observe`). ----
+
+    fn img(raw: u64) -> vk::Image {
+        vk::Image::from_raw(raw)
+    }
+
+    /// The kernel handle [`tracker_with`] registers for image `raw`.
+    fn h(raw: u64) -> u64 {
+        raw + 0x1000
+    }
+
+    fn set_of(list: &[(u64, ImageDesc)]) -> BTreeMap<u64, (vk::Image, ImageDesc)> {
+        list.iter().map(|&(raw, d)| (raw, (img(raw), d))).collect()
+    }
+
+    /// One launch-bearing submit as [`Tracking::scan`] runs it: observe, refresh, scan, classify.
+    /// Returns the scan and the lines it would log.
+    fn submit(t: &mut Tracker, batches: &[Vec<vk::CommandBuffer>]) -> (Option<Scan>, Vec<String>) {
+        let mut lines = t.observe(batches);
+        lines.extend(t.refresh());
+        let undecided = t.evaluations - t.colour_submits;
+        let scan = t.scan(batches);
+        lines.extend(t.classify_line(scan.as_ref(), undecided));
+        (scan, lines)
+    }
+
+    fn identification_lines(lines: &[String]) -> Vec<&String> {
+        lines.iter().filter(|l| l.starts_with("colour input:") || l.starts_with("no DLSS input")).collect()
+    }
+
+    /// (a) GTA V with DLSS Frame Generation: SR's buffer (input kernel naming colour, depth and
+    /// motion vectors, then the network, the output kernel and the exposure copy) and FG's two
+    /// buffers (fg_tracker's shape: FG's output-size frame beside the render-size depth and motion
+    /// vectors, then the output). Identified by size at the first submit exactly as before, then by
+    /// the input kernel's parameters with the very same images (no re-identification, so no skipped
+    /// hold); SR's buffer is held every frame and FG's are forwarded, every frame.
+    #[test]
+    fn gtas_sr_and_fg_buffers_keep_their_inputs_and_hold_target_by_the_input_kernel() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let mut set = gta_registered();
+        set.insert(0x420, (img(0x420), desc(2560, 1440, rgba, storage)));
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x500), h(0x700)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x610)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x420), h(0x200), h(0x300)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x400)])));
+        t.launch(cb(3), Some(&param_block(&[h(0x420), h(0x400)])));
+        assert_eq!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
+        assert_eq!(t.launch[&cb(2)].input, Some(InputLaunch::Unusable), "FG's frame is not at the depth's extent: no evidence");
+        assert_eq!(t.launch[&cb(3)].input, None, "no depth: not an input launch");
+        let mut lines = Vec::new();
+        for frame in 0..40 {
+            let (sr, l) = submit(&mut t, &[vec![cb(1)]]);
+            lines.extend(l);
+            let sr = sr.expect("SR's buffer is the hold point");
+            assert_eq!((sr.batch, sr.index, sr.identified_now), (0, 0, frame == 0), "frame {frame}: identified once, at the first submit");
+            let i = sr.inputs.unwrap();
+            assert_eq!(
+                (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.candidates, i.exposure_input.map(|e| e.0.as_raw())),
+                (0x100, 0x200, 0x300, 1, Some(0x610)),
+                "frame {frame}"
+            );
+            for fg in [cb(2), cb(3)] {
+                let (s, l) = submit(&mut t, &[vec![fg]]);
+                lines.extend(l);
+                assert!(s.is_none(), "frame {frame}: frame generation's buffers are forwarded");
+            }
+        }
+        assert_eq!((t.colour_submits, t.foreign_submits, t.evaluations), (40, 80, 40));
+        assert_eq!(t.named, vec![Named { colour: img(0x100), depth: img(0x200), mvec: img(0x300), exposure: Some(img(0x610)) }]);
+        let ids = identification_lines(&lines);
+        assert_eq!(ids.len(), 2, "{lines:#?}");
+        assert!(ids[0].starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT") && ids[0].ends_with("exposure input 0x610; swapchain Some((2560, 1440)); identified by size"), "{}", ids[0]);
+        assert!(ids[1].starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT") && !ids[1].contains("candidates"), "{}", ids[1]);
+        assert!(ids[1].ends_with("exposure input 0x610 (named by the same command buffer); swapchain Some((2560, 1440)); identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
+        assert!(lines.iter().all(|l| !l.contains("output-size colour image") && !l.contains("different colour inputs") && !l.contains("several colour candidates")), "{lines:#?}");
+
+        // fg_tracker's own data: FG's first launch is not evidence, its buffers stay forwarded.
+        let (mut t, [colour, sr_out, fg_colour, depth, mvec]) = fg_tracker();
+        t.launch(cb(1), Some(&param_block(&[colour, depth, mvec])));
+        t.launch(cb(1), Some(&param_block(&[sr_out])));
+        t.launch(cb(2), Some(&param_block(&[fg_colour, depth, mvec])));
+        t.launch(cb(2), Some(&param_block(&[sr_out])));
+        t.launch(cb(3), Some(&param_block(&[fg_colour, sr_out])));
+        assert_eq!(t.launch[&cb(2)].input, Some(InputLaunch::Unusable));
+        for _ in 0..30 {
+            assert!(submit(&mut t, &[vec![cb(1)]]).0.is_some_and(|s| s.inputs.unwrap().colour.0 == img(0x100)));
+            assert!(submit(&mut t, &[vec![cb(2)]]).0.is_none());
+            assert!(submit(&mut t, &[vec![cb(3)]]).0.is_none());
+        }
+        assert_eq!((t.named.len(), t.inputs.map(|i| i.rule)), (1, Some(Rule::Params)));
+        assert_eq!((t.colour_submits, t.foreign_submits), (30, 60));
+    }
+
+    /// The DLAA set (Resident Evil Requiem: `UpscalingQuality_DLSS=MaxQuality`, FG on): DLSS's colour
+    /// input, depth and motion vectors are all the swapchain's 2560x1440, beside a separate output
+    /// image and FG's own output-size frame.
+    fn dlaa_set() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        set_of(&[
+            (0x100, desc(2560, 1440, rgba, storage)),
+            (0x200, desc(2560, 1440, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
+            (0x300, desc(2560, 1440, vk::Format::R16G16_SFLOAT, storage)),
+            (0x400, desc(2560, 1440, rgba, storage)),
+            (0x500, desc(2560, 1440, rgba, storage)),
+            (0x600, desc(1, 1, vk::Format::R32G32B32A32_SFLOAT, storage)),
+            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
+            (0x700, desc(1280, 720, vk::Format::R8_UNORM, storage)),
+        ])
+    }
+
+    /// (b) DLAA with frame generation: the size rule refuses DLAA by design ("no DLSS input ...;
+    /// waiting", as on the rig), and the input kernel's parameters identify it once settled. FG's
+    /// launch names its output-size frame with the same depth and motion vectors, but its buffer
+    /// names no exposure image, so it does not count (logged once). Held from the submit after
+    /// identification on, FG forwarded; the hold is size-agnostic (no padding at 2560x1440).
+    #[test]
+    fn dlaa_is_identified_by_the_input_kernels_parameters_and_held() {
+        let mut t = tracker_with(&dlaa_set(), Some((2560, 1440)));
+        assert_eq!(identify(&dlaa_set(), Some((2560, 1440))), None, "the size rule refuses DLAA");
+        // SR: input kernel, network, output kernel (names input and output: only the first launch counts), exposure copy.
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x700)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x610)])));
+        // FG: its frame with depth and motion vectors, then the output.
+        t.launch(cb(2), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x400)])));
+        t.launch(cb(3), Some(&param_block(&[h(0x500), h(0x400), h(0x700)])));
+        assert_eq!(t.launch[&cb(2)].input, Some(InputLaunch::Inputs { colour: img(0x500), depth: img(0x200), mvec: img(0x300) }), "FG's launch has SR's shape under DLAA");
+        let mut lines = Vec::new();
+        let mut first_held = None;
+        for frame in 0..40 {
+            let (sr, l) = submit(&mut t, &[vec![cb(1)]]);
+            lines.extend(l);
+            let sr = sr.expect("launch-bearing");
+            match sr.inputs {
+                None => assert!(first_held.is_none(), "frame {frame}: never un-identified"),
+                Some(i) => {
+                    assert_eq!((i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.rule, i.exposure_input.map(|e| e.0.as_raw())), (0x100, 0x200, 0x300, Rule::Params, Some(0x610)));
+                    if sr.identified_now {
+                        assert!(first_held.is_none());
+                    } else {
+                        assert!(sr.colour_in_general());
+                        first_held.get_or_insert(frame);
+                    }
+                }
+            }
+            for fg in [cb(2), cb(3)] {
+                let (s, l) = submit(&mut t, &[vec![fg]]);
+                lines.extend(l);
+                assert!(s.and_then(|s| s.inputs).is_none(), "frame {frame}: frame generation's buffer is never held with inputs");
+            }
+        }
+        // 16 quiet submits after the first: frame 5's second FG submit decides, frame 6 is the
+        // identifying (unheld) SR submit, frame 7 the first hold.
+        assert_eq!(first_held, Some(7));
+        assert_eq!(t.colour_submits, 40 - 6, "SR submits reading the colour input from the identifying one on");
+        let ids = identification_lines(&lines);
+        assert_eq!(ids.len(), 2, "{lines:#?}");
+        assert!(ids[0].starts_with("no DLSS input among 8 registered views (swapchain Some((2560, 1440))); waiting. output: swapchain 2560x1440"), "{}", ids[0]);
+        assert!(ids[0].contains("2560x1440 not smaller than the output"), "{}", ids[0]);
+        assert!(ids[1].starts_with("colour input: image 0x100 (2560x1440 R16G16B16A16_SFLOAT"), "{}", ids[1]);
+        assert!(ids[1].ends_with("exposure input 0x610 (named by the same command buffer); swapchain Some((2560, 1440)); identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
+        let fg_line: Vec<&String> = lines.iter().filter(|l| l.contains("output-size colour image")).collect();
+        assert_eq!(fg_line.len(), 1, "{lines:#?}");
+        assert!(fg_line[0].contains("(0x500 2560x1440)"), "{}", fg_line[0]);
+        // The hold's sizes: no padding at 2560x1440 (or at 4K DLAA), and 4K RGBA16F fits a region.
+        assert_eq!((padded(2560, 1440), padded(3840, 2160)), ((2560, 1440), (3840, 2160)));
+        assert!(3840 * 2160 * TEXEL as usize <= neural_forge_protocol::MAX_FRAME);
+    }
+
+    /// (c) Frame generation alone never identifies: GTA V's FG buffers (fg_tracker's data, their
+    /// frame is not at the depth's extent), and FG at native resolution (frame, depth and motion
+    /// vectors all output-size, which has SR's shape) without SR, whose buffers name no exposure.
+    #[test]
+    fn frame_generation_buffers_alone_never_identify() {
+        let (mut t, [_, sr_out, fg_colour, depth, mvec]) = fg_tracker();
+        t.launch(cb(2), Some(&param_block(&[fg_colour, depth, mvec])));
+        t.launch(cb(2), Some(&param_block(&[sr_out])));
+        t.launch(cb(3), Some(&param_block(&[fg_colour, sr_out])));
+        for _ in 0..100 {
+            assert!(submit(&mut t, &[vec![cb(2)]]).0.is_none());
+            assert!(submit(&mut t, &[vec![cb(3)]]).0.is_none());
+        }
+        assert!(t.named.is_empty() && t.named_pick.is_none());
+        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), Some((0x100, Rule::Size)), "the size rule's identification stays");
+        // Native resolution: no SR buffer at all.
+        let mut set = dlaa_set();
+        set.remove(&0x100);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        t.launch(cb(2), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x400)])));
+        let mut lines = Vec::new();
+        for _ in 0..100 {
+            let (s, l) = submit(&mut t, &[vec![cb(2)]]);
+            lines.extend(l);
+            assert!(s.and_then(|s| s.inputs).is_none(), "FG's frame is never the colour input");
+        }
+        assert!(t.inputs.is_none() && t.named_pick.is_none());
+        assert_eq!(t.named.len(), 1, "seen, but not counted");
+        assert_eq!(lines.iter().filter(|l| l.contains("names no 1x1 R16_SFLOAT exposure")).count(), 1, "{lines:#?}");
+    }
+
+    /// (d) Ambiguity falls back to the size rule and is logged once: one launch naming two colour
+    /// candidates at the depth's extent, and two buffers naming different colour inputs with
+    /// neither (or both) naming the exposure.
+    #[test]
+    fn ambiguous_parameters_fall_back_to_the_size_rule_and_log_once() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let mut set = gta_registered();
+        set.insert(0x110, (img(0x110), desc(1707, 960, rgba, vk::ImageUsageFlags::STORAGE)));
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x110), h(0x200), h(0x300)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x610)])));
+        assert!(matches!(&t.launch[&cb(1)].input, Some(InputLaunch::Ambiguous { colours, .. }) if colours.len() == 2));
+        let mut lines = Vec::new();
+        for _ in 0..40 {
+            let (s, l) = submit(&mut t, &[vec![cb(1)]]);
+            lines.extend(l);
+            assert!(s.is_some_and(|s| s.inputs.is_some_and(|i| i.colour.0 == img(0x100) && i.rule == Rule::Size)));
+        }
+        assert!(t.named.is_empty());
+        let said: Vec<&String> = lines.iter().filter(|l| l.contains("several colour candidates")).collect();
+        assert_eq!(said.len(), 1, "{lines:#?}");
+        assert!(said[0].contains("depth 0x200 with several colour candidates at its extent (0x100 1707x960 R16G16B16A16_SFLOAT, 0x110 1707x960 R16G16B16A16_SFLOAT)"), "{}", said[0]);
+        assert_eq!(identification_lines(&lines).len(), 1, "identified by size once, never changed");
+
+        // Two buffers, two colour inputs, no exposure named by either.
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x110), h(0x200), h(0x300)])));
+        let mut lines = Vec::new();
+        for _ in 0..40 {
+            for b in [cb(1), cb(2)] {
+                let (_, l) = submit(&mut t, &[vec![b]]);
+                lines.extend(l);
+            }
+        }
+        assert_eq!(t.named.len(), 2);
+        assert_eq!((t.named_pick, t.inputs.map(|i| (i.colour.0.as_raw(), i.rule))), (None, Some((0x100, Rule::Size))));
+        let said: Vec<&String> = lines.iter().filter(|l| l.contains("different colour inputs")).collect();
+        assert_eq!(said.len(), 1, "{lines:#?}");
+        assert!(said[0].contains("(0x100 1707x960, 0x110 1707x960): none chosen"), "{}", said[0]);
+        // With exactly one of them naming the exposure, that one is chosen.
+        t.launch(cb(1), Some(&param_block(&[h(0x610)])));
+        for _ in 0..20 {
+            for b in [cb(1), cb(2)] {
+                submit(&mut t, &[vec![b]]);
+            }
+        }
+        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), Some((0x100, Rule::Params)));
+    }
+
+    /// (e) Crimson Desert's set (two render-size candidates, the lowest handle the one DLSS's buffer
+    /// names; multi frame generation with ~5 FG submits per frame): the same colour input and hold
+    /// target, by size first and by the input kernel's parameters once settled, without a
+    /// re-identification; the size rule's other candidate stays listed and counted as before.
+    #[test]
+    fn crimson_like_set_keeps_its_identification_and_hold_target() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
+        let set = set_of(&[
+            (0x100, desc(1516, 852, rgba, storage)),
+            (0x110, desc(1516, 852, rgba, storage)),
+            (0x200, desc(1516, 852, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
+            (0x300, desc(1516, 852, vk::Format::R16G16_SFLOAT, storage)),
+            (0x400, desc(2560, 1440, rgba, storage)),
+            (0x500, desc(2560, 1440, rgba, storage)),
+            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
+        ]);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x400), h(0x610)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x400)])));
+        let mut lines = Vec::new();
+        for frame in 0..20 {
+            let (s, l) = submit(&mut t, &[vec![cb(1)]]);
+            lines.extend(l);
+            let s = s.expect("held");
+            assert_eq!(s.identified_now, frame == 0);
+            assert_eq!(s.inputs.map(|i| (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw())), Some((0x100, 0x200, 0x300)));
+            for _ in 0..5 {
+                let (s, l) = submit(&mut t, &[vec![cb(2)]]);
+                lines.extend(l);
+                assert!(s.is_none());
+            }
+        }
+        assert_eq!((t.colour_submits, t.foreign_submits, t.other_candidate_buffers), (20, 100, 0));
+        let ids = identification_lines(&lines);
+        assert_eq!(ids.len(), 2, "{lines:#?}");
+        assert!(ids[0].contains("(first of 2 candidates; others 0x110 1516x852)") && ids[0].ends_with("identified by size"), "{}", ids[0]);
+        assert!(ids[1].starts_with("colour input: image 0x100 (1516x852") && ids[1].contains("(the size rule's other candidates: 0x110 1516x852)"), "{}", ids[1]);
+        assert!(ids[1].ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{}", ids[1]);
+        // A buffer naming only the other candidate is still forwarded and counted.
+        t.launch(cb(5), Some(&param_block(&[h(0x110), h(0x400)])));
+        assert!(submit(&mut t, &[vec![cb(5)]]).0.is_none());
+        assert_eq!(t.other_candidate_buffers, 1);
     }
 
     #[test]

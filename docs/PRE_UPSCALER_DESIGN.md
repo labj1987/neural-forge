@@ -276,7 +276,14 @@ committed in submission order. `NEURAL_FORGE_PROBE_NGX` still controls the probe
 
 ### Identification
 
-At a launch-bearing submit, when the registered set or the swapchains changed: the colour input is
+Since the change in "Identification by the input kernel's parameters (DLAA)" (end of this
+document), the colour input is first what DLSS Super Resolution's own input kernel names in its
+parameters, together with depth and motion vectors. That rule also finds DLAA's output-size input.
+The size rule below is the fallback, used before the parameters have settled, when they are
+unreadable or ambiguous, and when no launch has the input kernel's shape. The identification line
+ends with `; identified by the input kernel's parameters (...)` or `; identified by size`.
+
+The size rule: at a launch-bearing submit, when the registered set or the swapchains changed, the colour input is
 the registered RGBA16F storage image (2D, single-sample) whose extent equals a registered depth
 image's, with a registered RG16F (since 2.0.1 also RG32F) image of the same extent, and smaller than
 the largest swapchain (DLAA is refused that way; since 2.0.1, on a device with no swapchain, smaller
@@ -369,7 +376,8 @@ the write-back inverts, on the GPU, in the layer's own two submissions (`preupsc
 
 In model mode, while a hold happened in the last 500 ms the post-upscaler compose is skipped for
 that device's presents (the game's frame is presented as DLSS made it), so the model is not
-applied twice. Without holds (DLSS off, DLAA, a game without DLSS, the toggle off) the post path
+applied twice. Without holds (DLSS off, a game without DLSS, the toggle off; DLAA too until the
+input-kernel identification at the end of this document) the post path
 runs exactly as before. (Since "Robustness: failed feature builds" below: once a hold on the
 device has asked the helper, the compose stays off until DLSS has not run for 30 s, loading
 screens included, and an open circuit breaker forwards DLSS submits untouched.)
@@ -1415,3 +1423,164 @@ What to look for on the next rig run:
   no post-path `[sync]` lines while holding.
 - **Crimson Desert:** holds/s as before (≈ real fps), and whether the
   `names another colour candidate` line or tally count ever appears.
+
+## Identification by the input kernel's parameters (DLAA)
+
+Two reports from the rig, with the 0abcd28 build:
+
+- **Resident Evil Requiem** (RE Engine, vkd3d-proton, 2560x1440, HDR10, `UpscalingAlgorithm=DLSS`,
+  `UpscalingQuality_DLSS=MaxQuality`, i.e. DLAA, DLSS FG 3x) logged `no DLSS input among 13-15
+  registered views (swapchain Some((2560, 1440))); waiting` for the whole session. DLAA's input has
+  the swapchain's size, and the size rule refuses anything that is not smaller than the output, on
+  purpose. The swapchain is `A2B10G10R10` HDR, so the post path skipped it too: the model ran
+  nowhere.
+- **Cyberpunk 2077** (DLSS Auto at 1440p, RT, HDR10 PQ, scRGB or SDR) logged `no DLSS input among
+  11-16 registered views (swapchain Some((2560, 1440)))`. The cause is not known yet. The 0abcd28
+  diagnostic line will name the failed condition on the next run.
+
+The size rule guesses from shapes: an RGBA16F storage image beside depth and motion vectors of the
+same extent, smaller than the output. DLSS's own kernels say directly what they read. The layer
+already reads every launch's parameter buffer to tell SR's buffers from FG's ("DLSS Frame
+Generation"). The probe showed that SR's buffer always starts with the input kernel
+(`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel` in GTA V), whose name says it takes the colour
+input, depth and motion vectors.
+
+### The rule
+
+- **Input launch.** At `vkCmdCuLaunchKernelNVX` the layer notes which registered images each
+  launch's parameters name (as before). The first launch of a command buffer that names a registered
+  depth image (any `D16`/`D24`/`D32` variant) and a registered 2-channel float image
+  (`R16G16_SFLOAT`/`R32G32_SFLOAT`) is that buffer's **input launch** (`LaunchRefs::input`,
+  `preupscale::input_launch`). Later launches of the buffer are not read for this. SR's output
+  kernel names the input and the output together, which under DLAA have the same size.
+- **Shape.** The input launch must name exactly one depth image, and exactly one colour candidate (a
+  2D single-sample `RGBA16F` or `B10G11R11_UFLOAT` storage image) **at the depth's extent**. The
+  colour candidate need not be smaller than the output; that is what makes DLAA work. The extent
+  condition follows from DLSS's API (colour input and depth are both at render resolution). It also
+  keeps GTA V's FG out: FG's first launch names its output-size frame beside the render-size depth
+  and motion vectors (fg_tracker's data). Motion vectors: at the depth's extent first, RG16F before
+  RG32F, lowest handle. If the launch names two or more colour candidates at the depth's extent, it
+  is not used, and this is logged once: `a CUDA launch names depth 0x... with several colour
+  candidates at its extent (...): not used to identify DLSS's colour input`.
+- **Evidence per buffer.** At each launch-bearing submit (`Tracker::observe`, before the
+  identification is refreshed), every submitted buffer with a usable input launch contributes its
+  colour input, depth and motion vectors. The layer also records the 1x1 `R16_SFLOAT` image the same
+  buffer names, if any. GTA's SR buffer ends with `cuda_copy_exposure_kernel` on DLSS's 1x1
+  exposure input. The evidence is kept per colour image (at most 4) and dropped when one of its
+  images is destroyed.
+- **Settling.** A decision is taken only after 16 launch-bearing submits without new evidence
+  (`SETTLE_SUBMITS`), and again when the registered set or the swapchains change after that. With
+  FG there are 2 (GTA 3x) to about 5 (Crimson Desert 6x) FG submits per real frame. So a few real
+  frames, with both kinds of buffers, are seen before anything is chosen, and an FG buffer that
+  happens to come first cannot be chosen on its own.
+- **Decision** (`Tracker::pick_named`). An entry whose colour input is smaller than the output
+  (swapchain, else the largest registered RGBA16F/R11G11B10 storage image) counts as it is. An
+  entry whose colour input is the output's size counts only if its buffer also names the 1x1
+  `R16_SFLOAT` exposure image. That case covers DLAA, and also FG at native resolution, whose first
+  launch has exactly SR's shape there (output-size frame, depth and motion vectors). DLSS FG takes no
+  exposure input, and without one the model path holds nothing anyway, because the HDR encode needs
+  it. An output-size entry without exposure is logged once and not used: `a CUDA launch names an
+  output-size colour image with depth and motion vectors (0x... 2560x1440), but its command buffer
+  names no 1x1 R16_SFLOAT exposure: ... not used`. If one entry counts, it is chosen. If several
+  count, the only one whose buffer names the exposure is chosen. If that leaves no single entry,
+  none is chosen, and this is logged once: `... name different colour inputs (...): none chosen by
+  the input kernel's parameters, the size rule decides`.
+- **Precedence.** `Tracker::refresh` uses the chosen evidence (`Rule::Params`) when its images are
+  still registered, and the size rule (`Rule::Size`, `identify`, unchanged) otherwise. The
+  identification key is the images only. So in a game where both rules pick the same images (GTA V,
+  Crimson Desert) the identification stays, with no re-identification and no skipped hold. Only the
+  log line is repeated, with the new rule at its end.
+- **Exposure input.** The 1x1 `R16_SFLOAT` image the input kernel's buffer names, else the registered
+  one as before. The line says `exposure input 0x... (named by the same command buffer)` in the first
+  case.
+- **Format.** An `R11G11B10` colour input can be identified, so the log says what DLSS reads. But
+  every hold mode reads and writes 8-byte RGBA16F texels, so `device.rs` refuses it, logged once:
+  `the colour input DLSS reads is not R16G16B16A16_SFLOAT ...; not holding`. The post path stays on
+  for that device, because only a hold that reached the helper turns it off.
+- **Classification** (which buffer is held, "DLSS Frame Generation") is unchanged. It compares
+  against whichever colour input was identified.
+
+The identification line now ends with the rule:
+
+```
+[preupscale] colour input: image 0x... (2560x1440 R16G16B16A16_SFLOAT ...), depth 0x... D32_SFLOAT, motion vectors 0x... R16G16_SFLOAT, 1x1 (exposure) ..., exposure input 0x... (named by the same command buffer); swapchain Some((2560, 1440)); identified by the input kernel's parameters (one launch names it with the depth and motion vectors) [device 0x...]
+[preupscale] colour input: image 0x100 (1707x960 ...) ...; swapchain Some((2560, 1440)); identified by size [device 0x...]
+```
+
+When the size rule identified first and the parameters then agree, both lines appear, size first.
+With the parameters rule, other size-rule candidates are listed as `(the size rule's other
+candidates: 0x... WxH)` instead of `(first of N candidates; ...)`.
+
+### Cost with DLAA
+
+With DLAA the model runs on the full output-size input every frame: 2560x1440 at 1440p and
+3840x2160 at 4K. At 1440p that is about 3 times the Balanced input (1485x836). Per frame it costs as
+much as the 1.x path running the model on every frame. That is accepted: the alternative was no
+model at all (Resident Evil Requiem with HDR output). The hold, encode, decode and the shared-memory
+transfer are size-agnostic. 2560x1440 and 3840x2160 need no padding. A 3840x2160 RGBA16F frame
+(66 MB) fits the 64-bit layer's region (`MAX_FRAME`, 7680x4320 at 8 bytes). The post path's
+4K-equivalent model cap (`capture.rs`, `DEFAULT_MAX_MODEL_PIXELS`) does not apply to this path, and
+DLAA at 4K is exactly that size anyway. A 32-bit process maps 3840x2160x4 bytes per region, so a 4K
+DLAA input there cannot build its resources and is forwarded untouched (logged once). A 1440p input
+fits.
+
+### Tests
+
+Synthetic trackers, each submit run through `observe`, `refresh`, `scan` and the classification
+lines, as `Tracking::scan` runs them (`preupscale::tests`):
+
+- `gtas_sr_and_fg_buffers_keep_their_inputs_and_hold_target_by_the_input_kernel`: GTA V's set plus
+  FG's output-size frame, 40 frames. Each frame has SR's buffer (input kernel, network, an output
+  kernel naming input and output, exposure copy) and FG's two buffers. The first submit identifies by
+  size (the line as before, plus `; identified by size`). Then the parameters identify the same
+  images. SR's buffer is the hold point at every submit, with `identified_now` only on the first.
+  Both FG buffers are forwarded every frame (40 held, 80 forwarded), and FG's input launch is
+  `Unusable`. fg_tracker's own data gives the same result.
+- `dlaa_is_identified_by_the_input_kernels_parameters_and_held`: a DLAA set (input, depth and motion
+  vectors at 2560x1440, a separate output image, FG's output-size frame, swapchain 2560x1440). The
+  size rule refuses it (`no DLSS input ...; waiting ... 2560x1440 not smaller than the output`). FG's
+  launch has SR's shape, but its buffer names no exposure: logged once, not used. The parameters
+  identify SR's input, with the exposure named by the same buffer. The identifying SR submit is not
+  held; every later one is, and no FG submit is.
+- `frame_generation_buffers_alone_never_identify`: fg_tracker's FG buffers alone leave the size
+  rule's identification as it was. FG at native resolution with no SR buffer is seen but never
+  counted, so nothing is identified.
+- `ambiguous_parameters_fall_back_to_the_size_rule_and_log_once`: a launch naming two render-size
+  colour candidates gives no evidence, the size rule decides, and the launch is logged once. Two
+  buffers naming different colour inputs, neither naming the exposure: none chosen, the size rule
+  decides, logged once. Once exactly one buffer names the exposure, its colour input is chosen.
+- `crimson_like_set_keeps_its_identification_and_hold_target`: two render-size candidates and multi
+  frame generation (5 FG submits per frame). The colour input and hold target stay the same
+  throughout, by size and then by parameters, with no re-identification. The other candidate is still
+  listed and counted.
+
+Revert checks, each run with one change reverted:
+
+| Reverted | Fails |
+|---|---|
+| the depth-extent condition in `input_launch` | GTA (FG's launch becomes evidence), FG-only (native FG) |
+| the precedence (`refresh` uses the size rule only) | GTA, DLAA, ambiguous, Crimson |
+| the exposure condition for output-size entries | DLAA (FG's frame competes), FG-only (native FG identifies) |
+| `Ambiguous` taking the first colour | ambiguous |
+| several counted entries taking the first | ambiguous |
+| the size rule's other candidates keeping the chosen one | GTA, Crimson |
+
+### What to look for on the rig
+
+- **Resident Evil Requiem (DLAA, FG 3x):** a few frames after DLSS starts, `[preupscale] colour
+  input: image ... (2560x1440 R16G16B16A16_SFLOAT ...) ... identified by the input kernel's parameters
+  ...`. Then `a launch-bearing submit reads DLSS's colour input`, holds at the real fps, and FG's
+  submits forwarded (tally). Each possible failure has its own line:
+  - `... names an output-size colour image ... names no 1x1 R16_SFLOAT exposure`, with nothing
+    identified: RE's SR buffer names no exposure image, so the HDR encode has none either.
+  - `... several colour candidates ...`.
+  - `... different colour inputs ...`.
+  - The RGBA16F refusal: an R11G11B10 input.
+
+  If none of those lines appears and it still waits, no launch names depth and motion vectors
+  together (another parameter form), and only the short `no DLSS input` line repeats.
+- **Cyberpunk 2077:** either the parameters line, or the 0abcd28 diagnostic line, which says which
+  size condition failed.
+- **GTA V, Crimson Desert:** the identification line twice (by size, then by the input kernel's
+  parameters, same image), holds/s and fps as before, and no `different colour inputs` or
+  `output-size colour image` line.

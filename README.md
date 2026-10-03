@@ -25,11 +25,11 @@ The screenshots show 2.0.0 with default settings and no game running.
 The model runs in one of two places. The layer picks the place for each game by itself:
 
 - **Before the upscaler**, when the game uses DLSS Super Resolution (DLSS Quality, Balanced,
-  Performance). The layer recognises the frame the game hands to DLSS: the scene at render
+  Performance, and DLAA). The layer recognises the frame the game hands to DLSS: the scene at render
   resolution, in HDR (16-bit float), without the HUD. It holds that DLSS submission, sends the
   frame to the model every frame, and writes the answer back before DLSS upscales it. DLSS then
   upscales the enhanced frame. The model works on fewer pixels and gets the input it was made for.
-- **After the upscaler**, for everything else: DLAA, native resolution, games without DLSS, and
+- **After the upscaler**, for everything else: native resolution, games without DLSS, and
   devices without NVIDIA's `VK_NVX_image_view_handle`. This is the 1.x path: the finished 8-bit
   frame is captured at present, answered by the model and composited back onto the same frame
   before it is shown.
@@ -243,8 +243,10 @@ is harmless.
   running (Status tab), and give the game 5 s of normal play. The Status tab's Model placement
   line says which path is active.
 - **"Waiting for DLSS Super Resolution" never changes.** The game is not using DLSS Super
-  Resolution (DLAA and native resolution count as "not"), or it does not reach Vulkan through
-  NVIDIA's NVX extensions. The model then runs after the upscaler.
+  Resolution (native resolution counts as "not"), or it does not reach Vulkan through NVIDIA's NVX
+  extensions. The model then runs after the upscaler. With DLAA, recognising the frame takes a few
+  frames after DLSS starts, and the model then works on the full output-size frame, so it costs more
+  than with DLSS Quality or Balanced.
 - **"Paused".** The helper has no model right now (a failed build, often VRAM). Frames go to
   DLSS untouched until it rebuilds; the helper log says why.
 - **Something looks wrong.** Add `NEURAL_FORGE_PREUPSCALE=off` to the launch options to compare

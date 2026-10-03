@@ -909,6 +909,12 @@ impl NeuralForgeDeviceInfo {
             return None;
         }
         let colour = inputs.colour.1;
+        // The input kernel's parameters may name an R11G11B10 colour input; every mode here reads
+        // and writes 8-byte RGBA16F texels.
+        if colour.format != vk::Format::R16G16B16A16_SFLOAT {
+            session.say_once("the colour input DLSS reads is not R16G16B16A16_SFLOAT (only RGBA16F is handled); not holding, frames go to DLSS untouched");
+            return None;
+        }
         // Dump and identity copy the colour input with transfers; model and roundtrip read and write
         // it from the HDR encode/decode shaders (STORAGE, which `identify` already requires).
         let usage_ok = match mode {
