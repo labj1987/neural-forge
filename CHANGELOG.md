@@ -6,6 +6,18 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
+  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
+  earlier needs proof that the presentation engine's wait on them has completed, which core
+  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
+- Deferred (layer): the unit-test target still carries clippy lints (mostly
+  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
+
+## 2.0.1 — 2026-10-03
+
+Fixes from Alex's first day of play on 2.0. Measured on the test machine: Crimson Desert (4K, HDR,
+DLSS frame generation) and GTA V Enhanced (4K) hold every DLSS frame on the before-the-upscaler path.
+
 - **Pre-upscaler: the colour input follows what DLSS's input kernel reads.** Crimson Desert
   registers three 1516x852 RGBA16F candidates; the size rule took the lowest handle while SR's
   buffers read another, so almost nothing was held (`1 held ...; 6871 forwarded buffers named
@@ -72,13 +84,6 @@ first shipped them; their phase is kept as a subheading.
   device other than the swapchain's cannot get the model twice. Other colour candidates are listed,
   and a forwarded buffer naming one is counted, but nothing new is held. GTA V's identification and
   hold are unchanged. See docs/PRE_UPSCALER_DESIGN.md, "Several colour candidates (2.0.1)".
-
-- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
-  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
-  earlier needs proof that the presentation engine's wait on them has completed, which core
-  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
-- Deferred (layer): the unit-test target still carries clippy lints (mostly
-  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
 ## 2.0.0 — 2026-10-02
 
