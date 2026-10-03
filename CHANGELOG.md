@@ -6,6 +6,12 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- **Kernel names no longer decide anything.** The Ray Reconstruction guard that required
+  `hiluma_engine_input*`/`cuda_engine_input_kernel*` launches switched Crimson Desert off: its
+  newer DLSS Super Resolution launches `custom_block*`/`k_initial_merge` kernels instead. Names
+  are kept for log lines only (`GATE_BY_KERNEL_NAME = false`) until a reliable Ray Reconstruction
+  signature exists.
+- Fixed a flaky supervisor test that raced the helper's reaper thread (it failed twice on CI).
 - Pre-upscaler (layer): DLSS Ray Reconstruction is never held. Resident Evil Requiem with ray
   tracing runs RR, not Super Resolution, and at Balanced the size rule had identified RR's noisy
   1486x836 B10G11R11 input. `vkCreateCuFunctionNVX` is now hooked in every non-off mode, and once

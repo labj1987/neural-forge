@@ -234,6 +234,10 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     VulkanCommand::DestroyCuFunctionNvx,
 ];
 
+/// Whether kernel names gate identification and holds. Off: names differ between DLSS versions
+/// (see [`Tracker::record_function`]).
+const GATE_BY_KERNEL_NAME: bool = false;
+
 /// What a CUDA kernel is, by the name `vkCreateCuFunctionNVX` gave it. An identification
 /// precondition only (docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction"): the colour input is
 /// found by the registered handles a launch names, as before; the name says whether that launch is
@@ -1003,7 +1007,12 @@ impl Tracker {
     /// `vkCreateCuFunctionNVX` returned `function` for the kernel `name`.
     pub(crate) fn record_function(&mut self, function: vk::CuFunctionNVX, name: &str) {
         self.functions.insert(function, (Kernel::of(name), name.to_string()));
-        self.names_known = true;
+        // Kernel names only feed the logs, never the decision: Crimson Desert's DLSS Super
+        // Resolution (a newer DLSS than GTA V's) launches `custom_block*`/`k_initial_merge`
+        // kernels and no `hiluma_engine_input*`, so gating on names switched a working game off
+        // (2026-10-03). `names_known` stays false until a reliable Ray Reconstruction signature
+        // exists.
+        self.names_known = GATE_BY_KERNEL_NAME;
     }
 
     pub(crate) fn forget_function(&mut self, function: vk::CuFunctionNVX) {
@@ -5062,7 +5071,20 @@ mod tests {
     /// the size rule would take (RR's noisy input). With kernel names known, neither rule identifies
     /// anything, no buffer is held, and "DLSS Ray Reconstruction detected" is logged once. Without
     /// the names (the same launches), SR's shape would have been taken: the names are what keep RR out.
+    /// Kernel names never gate identification or holds: a newer DLSS's Super Resolution
+    /// (Crimson Desert) launches `custom_block*` kernels and no `hiluma_engine_input*`, and the
+    /// name gate switched it off. Recording a name must leave the decision to the image rules.
     #[test]
+    fn kernel_names_do_not_gate_identification() {
+        let mut t = Tracker::default();
+        t.record_function(vk::CuFunctionNVX::from_raw(0x1), "custom_block0_conv0_c8_kernel");
+        t.record_function(vk::CuFunctionNVX::from_raw(0x2), "k_initial_merge");
+        assert!(!t.names_known, "names must not switch the gates on");
+        assert!(t.sr_running(), "with names off, every buffer stays eligible as before");
+    }
+
+    #[test]
+    #[ignore = "kernel-name gating is off (GATE_BY_KERNEL_NAME): Crimson Desert's DLSS Super Resolution launches custom_block* kernels; see Tracker::record_function"]
     fn ray_reconstruction_is_never_identified_or_held() {
         let mut set = re_set();
         set.remove(&0x100);
@@ -5127,6 +5149,7 @@ mod tests {
     /// submit, then by the parameters, SR held every frame, FG forwarded), and no Ray Reconstruction
     /// line. The same for the DLAA SR set (with an exposure image) and for RE-like DLAA without one.
     #[test]
+    #[ignore = "kernel-name gating is off (GATE_BY_KERNEL_NAME): Crimson Desert's DLSS Super Resolution launches custom_block* kernels; see Tracker::record_function"]
     fn with_kernel_names_sr_games_keep_their_identification_and_hold_target() {
         let names = ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "dltss_pwin_enc0_layer", "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel", "cuda_copy_exposure_kernel", "main_kernel", "custom_block0_convPre_kernel", "k_initial_merge"];
         // GTA V.
