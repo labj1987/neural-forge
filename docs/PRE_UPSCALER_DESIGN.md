@@ -1,10 +1,8 @@
 # Running the model before the game's upscaler: design
 
-Status: **the default since 2.0** (`model` mode with `NEURAL_FORGE_PREUPSCALE` unset, on devices with
-`VK_NVX_image_view_handle`; `NEURAL_FORGE_PREUPSCALE=off` restores the 1.1.0 post-upscaler path
-everywhere). Approved by Alex 2026-10-02, HDR included; see the two "Implementation" sections at the
-end, and "2.0: the default" at the very end.
-E1 run on the rig 2026-10-02: NGX accepts `Hdr=1` but returns a clamped, broken answer for the raw scene-linear frame (see "Rig results (E1-E3)"). E1b found the encode that works (the game's exposure, paper white 3, a per-channel shoulder, sRGB); the layer now applies it on the GPU before the model and inverts it on write-back (model mode, plus a `roundtrip` mode that checks the transform alone). E2-E3 run 2026-10-02 (see "Rig results (E2-E3)"): the hold alone is cheap, but the model every frame gives 50.5 fps at Balanced, **below the 61.6 gate**. Phases 2 and 3 of the original 2.0 plan are paused. The ~4.8 ms of "hand-off latency" turned out to be the helper's CPU scene-cut thumbnail under Wine; with it fixed and the helper's submissions chained, model every frame gives **66.1 fps** (see "Hand-off latency"), **above the gate**.
+Status: **shipped as the default in 2.0.0 (2026-10-02)**, HDR input included, approved by Alex. Phases 2 and 3 of the
+original 2.0 plan (working scale on the zero-copy path, the pipelined present) are not built: this
+path replaced them for DLSS games.
 
 ## What the probe established (GTA V Enhanced, 2560x1440, DLSS SR on)
 

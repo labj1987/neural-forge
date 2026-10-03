@@ -6,12 +6,40 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
+  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
+  earlier needs proof that the presentation engine's wait on them has completed, which core
+  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
+- Deferred (layer): the unit-test target still carries clippy lints (mostly
+  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
+
+## 2.0.0 — 2026-10-02
+
+**The model now runs before the game's upscaler.** When a game uses DLSS Super Resolution, Neural
+Forge enhances DLSS's own input (the game's HDR picture at render resolution, no HUD) every frame,
+before DLSS upscales it; everything else keeps the 1.x path. Measured on GTA V Enhanced, RTX 5070,
+DLSS Balanced, script mods off:
+
+| | 1.x path | 2.0 |
+|---|---|---|
+| 2560x1440 | 61.4-62.2 fps | 64.6 fps (three-run mean), model every frame |
+| 3840x2160 | 28.7 fps | 39.0 fps |
+| 2560x1440, DLSS Frame Generation 3x | 28.7 real / 86 shown | 53.0 real / 159 shown |
+| 2560x1440, DLSS Frame Generation 4x (an hour of play, mods on) | - | ~50 real / ~198 shown, 0 misses in steady play |
+
+The game's own frame generation now works with the effect: generated frames are built from enhanced
+frames, and the model runs once per real frame. The launch option is just
+`NEURAL_FORGE_ENABLE=1 %command%`; `NEURAL_FORGE_PREUPSCALE=off` restores the 1.x path. Shared-memory
+protocol 11: the helper and the game must be restarted together after updating (an older
+`/tmp/neural-forge-$UID/shm.bin` that nothing holds open can be deleted).
+
 - **Frame generation: the game's own.** The Setup page no longer has a Smooth Motion switch, and its
   launch option is just `NEURAL_FORGE_ENABLE=1 %command%` (plus the target executable when set). With
   the model before DLSS, the game's DLSS Frame Generation builds its frames from enhanced ones and
   the model runs on real frames only (GTA V Enhanced: 53 real / 159 shown vs 28.7 / 86); NVIDIA
   recommends the in-game generator, and every game on the test machine has one. The saved
   `launch_smooth_motion` key is no longer read.
+
 **The model now runs before the game's upscaler when the game uses DLSS Super Resolution.** The
 layer recognises DLSS's input (the scene at render resolution, HDR, no HUD) on the game's Vulkan
 device, holds the game's DLSS submit, sends that frame to the model every frame (HDR-encoded with
@@ -160,12 +188,6 @@ diagnostics. In detail:
 - `shmctl status` shows `preupscale_state`, `preupscale_extent`, `preupscale_hold_ms` and
   `preupscale_misses`. Shared-memory protocol 9: restart the helper and the game together after
   updating.
-- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
-  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
-  earlier needs proof that the presentation engine's wait on them has completed, which core
-  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
-- Deferred (layer): the unit-test target still carries clippy lints (mostly
-  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
 ## 1.1.0 — 2026-10-02
 

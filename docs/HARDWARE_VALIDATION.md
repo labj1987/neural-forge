@@ -813,3 +813,30 @@ runs the copy path (zc=false):
 cpu (run() on present thread): mean=5.586228ms p50=5.497712ms p95=6.248682ms max=7.70366ms
 gpu (queue drain after run()): mean=1.713983ms p50=1.673638ms p95=1.849431ms max=1.883138ms
 ```
+
+## 2026-10-02 -- 2.0.0
+
+The model runs before DLSS Super Resolution by default (`docs/PRE_UPSCALER_DESIGN.md` has every
+experiment). GTA V Enhanced, LordNikon, RTX 5070, driver 615.71.09, 2560x1440 at 288 Hz, HDR desktop,
+DLSS Balanced (render 1485x836), `scripts/gta-bench.sh`, script mods off, pass 4:
+
+| Build / config | Real fps | Shown fps | GPU |
+|---|---|---|---|
+| 1.0.1 baseline, model every 2nd frame (above) | 61.6 | 62.0 | 89% |
+| 2.0 candidate e801204, default (model before the upscaler, every frame), 3 runs | 64.6 / 64.2 / 65.0, mean **64.6** | 65.3 / 64.4 / 65.6 | 89-92% |
+| same build, `NEURAL_FORGE_PREUPSCALE=off` | 62.2 | 62.6 | 90% |
+| 4K, 2.0 default vs 1.x path | 39.0 vs 28.7 | | 96% vs 93% |
+| DLSS Frame Generation 3x, 2.0 default vs 1.x path | 53.0 vs 28.7 | 159 vs 86 | 96% vs 98% |
+
+**Real play, 2.0 (137f24e, same code as 2.0.0), Alex at the screen, about an hour, mods on, DLSS
+Frame Generation 4x.** A 60 s sample: ~50 real frames per second, every one held and run through the
+model (48-50 holds/s), 195-199 fps shown, hold 9.7 ms median (capture wait 3.6, helper 5.9, hand-off
+0.00), 0 misses in the sample and 28 over 29 minutes (loading screens and start-up), DLSS FG's
+launch submits forwarded untouched (228,000 vs 88,655 held), GPU 96% (never below 94%), 9.5 of 12.2
+GB VRAM, 205 W, 68 C, no Xid. Alex: "everything is working beautifully ... nothing I can complain
+about", mods working.
+
+**GTA's start-up crash.** Every early exit today is an access violation at
+`GTA5_Enhanced.exe+0x12c6eb` during "Game Init" (32 dumps on this machine, 11 of them on 2026-10-01
+with 1.0.1; other Game Init crashes go back to January, before Neural Forge). It is the game's own;
+relaunching works.
