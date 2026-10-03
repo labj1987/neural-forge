@@ -270,8 +270,13 @@ mod tests {
             assert!(Instant::now() < deadline, "pid {pid} still reported running after it exited");
             std::thread::sleep(Duration::from_millis(50));
         }
-        // Reaped, not merely hidden from `running_pid`.
-        assert!(signal::kill(Pid::from_raw(pid), None).is_err(), "exited child was left as a zombie");
+        // Reaped, not merely hidden from `running_pid` (which already treats a zombie as gone):
+        // the reaping happens on another thread, so give it the same deadline instead of
+        // checking the instant the zombie appears, which failed on loaded CI runners.
+        while signal::kill(Pid::from_raw(pid), None).is_ok() {
+            assert!(Instant::now() < deadline, "exited child was left as a zombie");
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = std::fs::remove_file(&pid_file);
         let _ = std::fs::remove_dir_all(Path::new(&log).parent().unwrap());
     }
