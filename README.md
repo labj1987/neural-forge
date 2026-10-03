@@ -144,8 +144,7 @@ NEURAL_FORGE_ENABLE=1 %command%
 and the game's own DLSS Frame Generation on in its settings. With the model before the
 upscaler, frame generation builds its frames from enhanced frames and the model only runs on
 real ones (GTA V Enhanced, DLSS Balanced, 1440p: 53 real / 159 displayed fps against 28.7 / 86
-on the after-the-upscaler path). For games without their own frame generation, Smooth Motion
-is still available (below).
+on the after-the-upscaler path).
 
 The Status page's "Model placement" line says which path a running game is on: before the
 upscaler (with DLSS's render resolution), waiting for DLSS Super Resolution, or after the
@@ -268,18 +267,9 @@ managed prefix, the logs and `/tmp/neural-forge-$UID`.
 - **Steam overlay crashes or misbehaves:** the overlay has its own small swapchain, which the
   layer leaves alone; if a game still conflicts, set `NEURAL_FORGE_TARGET_EXE` to the game's
   executable.
-- **Smooth Motion (`VK_LAYER_NV_present`, RTX 40 series or newer)**, for games without their own
-  frame generation (with DLSS, prefer the game's): turn on the Smooth Motion switch under Setup -> Steam launch option and copy the result. It adds
-  `NVPRESENT_ENABLE_SMOOTH_MOTION=1` and
-  `VK_INSTANCE_LAYERS=VK_LAYER_neuralforge_neural:VK_LAYER_NV_present:VK_LAYER_VALVE_steam_overlay_64`.
-  The Vulkan loader does not order implicit layers, and without that line Smooth Motion and the
-  Steam overlay were both measured landing above this layer. The order matters in two ways:
-  - Generated frames carry the effect, and the model only runs on real frames. In GTA V
-    Enhanced's benchmark this showed 116.4 fps against 60.9 without Smooth Motion.
-  - The Steam overlay's fps counter shows the displayed rate. Counters above the generator,
-    including the game's own, only count real frames.
-
-  See `docs/FRAMEGEN_SPIKE.md`.
+- **Frame generation:** use the game's own DLSS Frame Generation. The app no longer sets up
+  NVIDIA Smooth Motion; for a game without frame generation it can still be added by hand, with
+  the layer order from `docs/FRAMEGEN_SPIKE.md`.
 - **Steam Linux Runtime / pressure-vessel:** the game must see `/tmp/neural-forge-$UID`. If it
   does not, add `PRESSURE_VESSEL_FILESYSTEMS_RW=/tmp/neural-forge-$UID` to the launch options.
 - **32-bit games:** a separate 32-bit layer ships (`VK_LAYER_neuralforge_neural_32`, same

@@ -106,10 +106,10 @@ mod tests {
         let mut cfg = Config::default();
         cfg.settings.insert("set_enabled".into(), "0".into());
         cfg.settings.insert("set_stale".into(), "1".into());
-        cfg.settings.insert("launch_smooth_motion".into(), "1".into());
+        cfg.settings.insert("launch_extra".into(), "1".into());
         cfg.replace_tuning(BTreeMap::from([("set_enabled".to_string(), "1".to_string())]));
         assert_eq!(cfg.settings.get("set_enabled").map(String::as_str), Some("1"));
         assert!(!cfg.settings.contains_key("set_stale"));
-        assert_eq!(cfg.settings.get("launch_smooth_motion").map(String::as_str), Some("1"));
+        assert_eq!(cfg.settings.get("launch_extra").map(String::as_str), Some("1"));
     }
 }

@@ -6,6 +6,12 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- **Frame generation: the game's own.** The Setup page no longer has a Smooth Motion switch, and its
+  launch option is just `NEURAL_FORGE_ENABLE=1 %command%` (plus the target executable when set). With
+  the model before DLSS, the game's DLSS Frame Generation builds its frames from enhanced ones and
+  the model runs on real frames only (GTA V Enhanced: 53 real / 159 shown vs 28.7 / 86); NVIDIA
+  recommends the in-game generator, and every game on the test machine has one. The saved
+  `launch_smooth_motion` key is no longer read.
 **The model now runs before the game's upscaler when the game uses DLSS Super Resolution.** The
 layer recognises DLSS's input (the scene at render resolution, HDR, no HUD) on the game's Vulkan
 device, holds the game's DLSS submit, sends that frame to the model every frame (HDR-encoded with
