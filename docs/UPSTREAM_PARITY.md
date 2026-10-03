@@ -1,5 +1,11 @@
 # Upstream parity
 
+> **Note (2026-10-02, 2.0.0):** the "Frame generation" item below is resolved. With the model
+> before DLSS Super Resolution (the 2.0 default), DLSS Frame Generation was measured on the rig at
+> 53.0 real / 159 shown fps against 28.7 / 86 on the 1.x path
+> ([PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md), "DLSS Frame Generation"). The other "Not done
+> yet" items still stand.
+
 Compared against DLSS5VKLayer (bmitch87) **0.3.1-1**, commit `117c953`, shared-memory header
 **v20** (2026-09-15). Earlier notes in `docs/history/` refer to 0.2.6-x; they are kept as written.
 Every ported function is listed in [ATTRIBUTION.md](../ATTRIBUTION.md).

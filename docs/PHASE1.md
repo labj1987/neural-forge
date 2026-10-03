@@ -1,5 +1,13 @@
 # NeuralForge Phase 1
 
+> **Note (2026-10-02):** the namespace, installation and target-ownership sections are current.
+> The "Preserved baseline and benchmark gate" section is historical: upstream DLSS5VKLayer has been
+> removed from the test machine (FRAMEGEN_SPIKE.md, "What broke and why"), the matched comparator
+> is the 1.0.1 "2.0 baseline" in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md), and benchmarks
+> run unattended with `scripts/gta-bench.sh` ([RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md)).
+> The old roughly 9 fps result was resolved in 0.1.64 (the PCIe BAR readback,
+> [LESSONS.md](LESSONS.md)).
+
 NeuralForge is the Rust application in `labj1987/neural-forge`. The GitHub repository
 has been renamed from `labj1987/dlssnr`. Historical handoffs are evidence, not deployment instructions.
 No installed upstream package or game setting is changed by this work.

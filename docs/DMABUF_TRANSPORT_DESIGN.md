@@ -1,5 +1,10 @@
 # Phase 4: DMA-BUF transport -- investigation and current status
 
+> **Note (2026-10-02):** the measurement this document waited for exists. The model's evaluate
+> dominates (about 10 ms at 1440p, 25 ms at 4K) and the zero-copy host-memory path leaves the
+> layer's own capture and compose at about 0.8 and 1.9 ms of GPU time (HARDWARE_VALIDATION.md,
+> "1.1.0 against the 2.0 baseline"). Nothing here was revisited.
+
 **Status: blocked on a real architectural constraint, not a missing implementation.**
 This document exists so a future session doesn't re-derive (or worse, re-discover the
 hard way) what this one already found. Read this before writing any DMA-BUF code.

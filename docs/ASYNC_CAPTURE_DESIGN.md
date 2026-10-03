@@ -1,5 +1,11 @@
 # Asynchronous host capture design
 
+> **Note (2026-10-02):** this design was the default present until 0.1.78. Since then the
+> default after the upscaler is the synchronous present (each frame waits, at most 250 ms, for its
+> own answer), because the pipelined present applied answers to later frames and ghosted. The
+> pipelined behaviour is still available with `NEURAL_FORGE_PIPELINED=1`. See
+> [ARCHITECTURE.md](ARCHITECTURE.md), section 5.
+
 The current GTA render tap is correct but waits for its capture fence inside the
 present hook before copying staging bytes to shared memory. The repeated live result
 of about 7.7 layer frames per second identifies that wait as the next bottleneck.

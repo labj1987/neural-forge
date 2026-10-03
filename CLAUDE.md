@@ -6,6 +6,8 @@ Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation co
 benchmark plan. The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
 
+All documentation is indexed in [docs/README.md](docs/README.md); start with docs/ARCHITECTURE.md and docs/LESSONS.md.
+
 ## Naming convention
 
 - Display name (anything a person reads: window titles, About, docs prose): **Neural Forge**.
@@ -88,7 +90,10 @@ One item from the completion plan's Phase 6 was considered and intentionally lef
 as-is; don't re-raise it without new information:
 
 - **Hotkey capture does not filter non-keyboard evdev devices** (Phase 6 item 6, as
-  literally worded). Investigated 2026-09-15: neither the layer's in-game hotkey
+  literally worded). Note (2026-10-02): since 0.1.78 the layer's hotkey does read evdev
+  (`hotkey.rs`, ported from upstream), and it only opens devices that report keys A-Z, so
+  the item is covered; the 2026-09-15 reasoning below described the older X11 code.
+  Investigated 2026-09-15: neither the layer's in-game hotkey
   polling (`crates/layer/src/hotkey.rs`, X11 `XQueryKeymap`) nor the GUI's
   hotkey-capture row (`crates/gui/src/ui.rs`'s `hotkey_row`, GDK key-press events) does
   raw `/dev/input/eventN` enumeration at all -- both are already inherently

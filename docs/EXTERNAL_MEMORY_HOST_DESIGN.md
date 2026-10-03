@@ -1,5 +1,11 @@
 # Zero-copy host transport: device-extension injection
 
+> **Note (2026-10-02):** the "not yet validated" items about GTA are done. Since 0.1.96 the layer
+> also recognises the extension when the game (vkd3d-proton) enables it itself, and GTA V's
+> `[sync]` lines show `zc=true` (HARDWARE_VALIDATION.md, "2.0 baseline"); the copies this removed
+> were about 4.6 ms of a 24 ms frame (CHANGELOG 0.1.96). The 2.0 pre-upscaler hold uses the same
+> imported regions.
+
 Phase 3's first goal (`ASYNC_CAPTURE_DESIGN.md`'s natural successor) is importing the
 SHM proxy/answer regions directly as Vulkan device memory (`VK_EXT_external_memory_host`),
 so a capture's `vkCmdCopyImageToBuffer` writes straight into shared memory instead of a

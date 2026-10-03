@@ -1,6 +1,6 @@
 > Historical record: pre-NeuralForge names and deployment instructions below are
 > archival, not current instructions. Do not remove or modify upstream installations.
-> See ../../PHASE1.md for current paths, safety constraints and the benchmark plan.
+> See ../PHASE1.md for current paths, safety constraints and the benchmark plan.
 
 # NeuralForge pre-rename handoff — 2026-09-12, FPS/freeze regression unresolved
 

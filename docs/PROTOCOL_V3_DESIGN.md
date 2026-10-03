@@ -1,5 +1,11 @@
 # Protocol v3: a second independent request/response slot
 
+> **Note (2026-10-02):** the helper no longer waits on a fence per stage. Since 2.0 it records
+> each request as two command buffers (upload; every pass's evaluate plus the download), with the
+> optical flow's submissions between them, and waits once
+> ([PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md), "Hand-off latency"). Evaluation is still one
+> request at a time. The protocol is at version 11 ([ARCHITECTURE.md](ARCHITECTURE.md), section 2).
+
 Phase 3's remaining goal after `EXTERNAL_MEMORY_HOST_DESIGN.md`'s zero-copy host
 import: the wire protocol has only ever supported one outstanding request at a time
 (a single `seq_req`/`seq_resp` pair). Even with `CapturePipeline`'s two GPU capture

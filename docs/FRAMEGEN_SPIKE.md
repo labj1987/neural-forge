@@ -1,5 +1,14 @@
 # Frame generation spike: Smooth Motion vs lsfg-vk (2026-09-25)
 
+> **Note (2026-10-02, 2.0.0):** the recommendation below (Smooth Motion below Neural Forge) is
+> superseded. Since 2.0 the model runs before DLSS Super Resolution, and the game's own DLSS Frame
+> Generation builds its frames from enhanced frames: 53.0 real / 159 shown fps in GTA V Enhanced
+> at 1440p, against 28.7 / 86 on the 1.x path. The Setup tab's Smooth Motion switch was removed and
+> the launch option is just `NEURAL_FORGE_ENABLE=1 %command%`. The layer-order findings still hold
+> for anyone adding a presentation-level generator by hand. See
+> [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md), "DLSS Frame Generation", and
+> [LESSONS.md](LESSONS.md).
+
 Question: can a presentation-level frame generator sit *below* Neural Forge so that
 generated frames carry NR and the model only runs on real frames, and what does it cost?
 

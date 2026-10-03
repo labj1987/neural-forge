@@ -1,6 +1,6 @@
 > Historical record: pre-NeuralForge names and deployment instructions below are
 > archival, not current instructions. Do not remove or modify upstream installations.
-> See ../../PHASE1.md for current paths, safety constraints and the benchmark plan.
+> See ../PHASE1.md for current paths, safety constraints and the benchmark plan.
 
 # 2026-09-12 (later still): v0.1.33/v0.1.34's Vulkan sync changes reverted -- made
 # things worse, not better; handed off. Read this section before touching
@@ -982,7 +982,7 @@ image still looks like *something*, not obviously broken, at a casual glance) an
 exactly why this test was worth writing before trusting the port at all.
 
 **Verified correct on real hardware after the fix**: a real `capture_request` dump
-(same tool as [the section above](#first-confirmed-correct-visual-output-plus-three-real-bugs-found-and-fixed-along-the-way-plus-one-important-false-alarm-2026-09-10-lordnikon))
+(same tool as [the section above](#first-confirmed-correct-visual-output-plus-three-real-bugs-found-and-fixed-along))
 shows the same real, substantial, structured composition effect the CPU path already
 proved (mean per-channel diff ~17/255 from the original, across the whole frame) — the
 GPU path produces the same real answer, not just "doesn't crash."
@@ -1012,7 +1012,7 @@ than breaking a build that has no way to run them.
 **`GpuCompose::dispatch_into_image` (new)**, tried first in `capture.rs`'s write-back
 whenever nothing on the CPU needs to see the composited bytes afterward (i.e. no
 `capture_request` dump is pending -- checked via a new non-consuming
-`ShmClient::capture_request_pending`, since [`take_capture_request`](#first-confirmed-correct-visual-output-plus-three-real-bugs-found-and-fixed-along-the-way-plus-one-important-false-alarm-2026-09-10-lordnikon)
+`ShmClient::capture_request_pending`, since [`take_capture_request`](#first-confirmed-correct-visual-output-plus-three-real-bugs-found-and-fixed-along)
 would wrongly consume a real request just to decide routing). Instead of downloading
 the compute shader's answer to a CPU slice and having `capture.rs` upload it again in
 a separate stage-2 submission, this writes the result straight into the real swapchain

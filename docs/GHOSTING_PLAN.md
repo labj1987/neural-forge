@@ -1,5 +1,12 @@
 # Ghosting: what upstream does differently, and the plan to fix it
 
+> **Note (2026-10-02):** this plan is finished history. Step 2 (the synchronous present) shipped
+> as the default in 0.1.78 and removed the ghosting; step 4 (motion vectors in the helper) shipped
+> in 0.1.93-0.1.98 and is on by default. The proposed `working_scale` default of 0.75 was not
+> adopted: below 100% the layer leaves the zero-copy path, which made 0.75 slower than 1.0 (58.1
+> against 61.6 fps, HARDWARE_VALIDATION.md, "2.0 baseline"). The step 5 deploy gap was fixed in
+> 0.1.94 (the AppImage installs its layer on every launch). Summary: [LESSONS.md](LESSONS.md).
+
 Status: **step 1 done and measured live on real hardware** (2026-09-17, second
 session, Alex live). Step 4 remains a larger, deferred feature (§1b unchanged). See
 §1c for the real, measured result.

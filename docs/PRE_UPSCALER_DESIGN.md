@@ -1,5 +1,12 @@
 # Running the model before the game's upscaler: design
 
+> **Note (2026-10-02, after 2.0.0):** the sections below are kept in the order they were written.
+> Statements like "not yet run on the rig", "Not verified without NVX hardware" and "Left for the
+> rig" were answered by the later sections in this file and by the 2.0.0 entry in
+> [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md), which includes an hour of Alex's real play at
+> DLSS Frame Generation 4x. The 4K runs here used Smooth Motion, which the app no longer sets up.
+> The overview of this path is in [ARCHITECTURE.md](ARCHITECTURE.md), section 4.
+
 Status: **shipped as the default in 2.0.0 (2026-10-02)**, HDR input included, approved by Alex. Phases 2 and 3 of the
 original 2.0 plan (working scale on the zero-copy path, the pipelined present) are not built: this
 path replaced them for DLSS games.

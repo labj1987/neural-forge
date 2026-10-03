@@ -1,5 +1,11 @@
 # Review against OpenDLSS-NR (2026-10-01)
 
+> **Note (2026-10-02):** two rows below are out of date. GPU timestamps now exist (1.1.0,
+> `layer_capture_gpu_ms`/`layer_compose_gpu_ms`). And an HDR path was built: since 2.0 the model
+> runs before DLSS on the game's HDR input, with the game's exposure value and a paper white of 3
+> in an encode that follows this review's proxy shoulder ([PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md),
+> "E1b"). The helper's separate per-stage fence waits became one wait per request in 2.0.
+
 Neural Forge compared with [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (MIT,
 commit `9d08f41`, docs `frame.md`, `execution.md`, `numerics.md`, `network.md`), an open
 reimplementation of the DLSS 5 neural-rendering network and the pipeline around it. Read for

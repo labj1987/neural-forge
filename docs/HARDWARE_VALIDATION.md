@@ -1,5 +1,11 @@
 # NeuralForge target-machine validation — 2026-09-14
 
+> **Note (2026-10-02):** entries are dated and kept as written; later entries correct earlier ones.
+> One forward-looking line no longer holds: "2.0 baseline" says the copy path below 100% model
+> resolution is "what Phase 2 removes". Phases 2 and 3 of the 2.0 plan were not built; running the
+> model before the upscaler replaced them for DLSS games ([PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md)).
+> A summary of the whole record is in [LESSONS.md](LESSONS.md).
+
 Target: `alex@lordnikon`, RTX 5070, NVIDIA 615.71.09. Upstream package 0.3.0-1
 remains installed. At inspection time GTA and the upstream helper were not running.
 The saved upstream config retains passes=1, model_resolution=1, motion_enabled=0,
