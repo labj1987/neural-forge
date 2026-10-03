@@ -6,6 +6,30 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Pre-upscaler (layer): DLSS Ray Reconstruction is never held. Resident Evil Requiem with ray
+  tracing runs RR, not Super Resolution, and at Balanced the size rule had identified RR's noisy
+  1486x836 B10G11R11 input. `vkCreateCuFunctionNVX` is now hooked in every non-off mode, and once
+  kernel names are known nothing is identified (by either rule) unless SR's input kernel
+  (`hiluma_engine_input*`, `cuda_engine_input_kernel*`) launched within the last 64 launch-bearing
+  submits; only that kernel's launch is parameter evidence, and a buffer that launches it is the only
+  possible hold point. Logged once: `DLSS Ray Reconstruction detected (... launched, no DLSS Super
+  Resolution input kernel)`; the post path runs instead. Without kernel names the rules are as
+  before. See docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction".
+
+- Pre-upscaler (layer): auto-exposure for games that give DLSS no exposure texture. When the inputs
+  have no readable 1x1 R16_SFLOAT image, the capture measures the exposure from the colour input on
+  the GPU (`preupscale_exposure.comp`: a log2-luma histogram over a quarter of the pixels, NaN/Inf
+  and black skipped, 1% trimmed at each end, `e = 0.6 / 2^mean`, 5% per frame adaptation in log
+  space, reset on a new identification) and writes it into the same buffer the game's texel goes
+  to, so the encode and decode of a frame use the same value. The key 0.6 is calibrated on GTA V's
+  own exposure (within -21% / +27% on both E1b dumps). A DLAA input whose buffer names no exposure
+  is now identified when it has SR's whole shape (its output kernel names it with the output, no
+  other buffer reads it, a single such entry). Logged once per identification: `exposure: the
+  game's 1x1 R16F` or `exposure: measured from the frame (auto)`; the 300-hold summary adds
+  `exposure median=... (auto|game)`. About 0.43 ms on an Intel Iris Xe at 1440p, estimated
+  0.04-0.05 ms on an RTX 5070. See docs/PRE_UPSCALER_DESIGN.md, "Auto-exposure when the game gives
+  DLSS none (RE Requiem)".
+
 - Pre-upscaler identification (layer): DLSS's colour input is now what DLSS Super Resolution's own
   input kernel names in its CUDA parameters. That is the first launch of a buffer naming one depth
   image, motion vectors and exactly one RGBA16F/R11G11B10 storage image at the depth's extent. The

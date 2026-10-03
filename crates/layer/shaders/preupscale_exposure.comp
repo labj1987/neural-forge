@@ -1,0 +1,163 @@
+#version 450
+// The pre-upscaler path's auto-exposure (docs/PRE_UPSCALER_DESIGN.md, "Auto-exposure when the game
+// gives DLSS none (RE Requiem)"): when DLSS's inputs have no readable 1x1 exposure image, the
+// exposure value the HDR encode multiplies in is measured from the colour input itself, in the
+// capture's command buffer, before the encode.
+//
+// Two passes of this one shader (push constant `pass`):
+//
+// 0, histogram (one workgroup per 64x64 pixels): every pixel with even x and even y is a sample.
+//    A sample with a NaN or infinite channel is skipped; otherwise L = Rec.709 luma of
+//    max(rgb, 0); L below 2^-24 (black) is skipped; t = (log2 L - LOG2_LO) * BINS / (LOG2_HI -
+//    LOG2_LO), clamped into [0, BINS); bin = floor(t), and floor((t - bin) * 256) is added to the
+//    bin's fraction sum (so the mean within a bin is exact to 1/256 bin, not the bin centre).
+//    Counted in shared memory, then added into the histogram buffer (cleared by the capture).
+// 1, resolve (one workgroup): the lowest and highest 1% of the samples (TRIM) are dropped, the
+//    rest gives the mean log2 luma; target log2 e = log2(key) - mean. Temporal adaptation in log
+//    space: log2 e += rate * (target - log2 e), or log2 e = target when the state is not valid
+//    (first frame, or reset by the CPU on a new identification). Clamped to [-16, 15]. e is
+//    written as a half into the exposure buffer the encode and the decode read (low 16 bits), the
+//    same slot the game's 1x1 R16_SFLOAT texel is copied into otherwise. No samples (a black frame)
+//    keeps the previous e, or 1 when there is none.
+//
+// The CPU reference is `preupscale::hdr::auto_exposure_reference`; constants must match.
+layout(local_size_x = 16, local_size_y = 16) in;
+
+const uint BINS = 256u;
+const float LOG2_LO = -24.0;
+const float LOG2_HI = 16.0;
+const float TRIM = 0.01;
+const float MIN_LOG2_E = -16.0;
+const float MAX_LOG2_E = 15.0;
+
+// The game's colour input, in GENERAL. Only read.
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_colour;
+// Per bin: sample count, then the sum of the 8-bit position within the bin.
+layout(set = 0, binding = 1, std430) buffer Histogram {
+  uint count[BINS];
+  uint frac[BINS];
+} u_hist;
+// The adaptation state (host-visible: the CPU resets `valid` and reads the rest for the log).
+layout(set = 0, binding = 2, std430) buffer State {
+  float log2_e;        // the adapted exposure, log2
+  uint valid;          // log2_e holds a previous frame's value
+  float target_log2_e; // this frame's measured target
+  float mean_log2;     // this frame's trimmed mean log2 luma
+  uint samples;        // samples that went into the histogram
+  uint pad0;
+  uint pad1;
+  uint pad2;
+} u_state;
+// The exposure the encode and decode read: a half in the low 16 bits.
+layout(set = 0, binding = 3, std430) buffer Exposure {
+  uint bits;
+} u_exposure;
+
+layout(push_constant) uniform Params {
+  uvec2 size;  // the colour input's extent
+  float key;   // the exposed luma the log-average maps to
+  float rate;  // per-frame adaptation towards the target, in log2 space
+  uint pass;   // 0 histogram, 1 resolve
+} p;
+
+shared uint s_count[BINS];
+shared uint s_frac[BINS];
+
+void add_sample(ivec2 at) {
+  vec3 rgb = imageLoad(u_colour, at).rgb;
+  if (any(isnan(rgb)) || any(isinf(rgb))) {
+    return;
+  }
+  rgb = max(rgb, vec3(0.0));
+  float luma = dot(rgb, vec3(0.2126, 0.7152, 0.0722));
+  if (!(luma >= exp2(LOG2_LO))) {
+    return;
+  }
+  float t = (log2(luma) - LOG2_LO) * (float(BINS) / (LOG2_HI - LOG2_LO));
+  t = clamp(t, 0.0, float(BINS) - 1e-3);
+  uint bin = min(uint(t), BINS - 1u);
+  uint q = min(uint((t - float(bin)) * 256.0), 255u);
+  atomicAdd(s_count[bin], 1u);
+  atomicAdd(s_frac[bin], q);
+}
+
+void histogram() {
+  uint lid = gl_LocalInvocationIndex;
+  s_count[lid] = 0u;
+  s_frac[lid] = 0u;
+  barrier();
+  uvec2 base = gl_WorkGroupID.xy * 64u + gl_LocalInvocationID.xy * 2u;
+  for (uint dy = 0u; dy < 2u; dy++) {
+    for (uint dx = 0u; dx < 2u; dx++) {
+      uvec2 xy = base + uvec2(dx, dy) * 32u;
+      if (all(lessThan(xy, p.size))) {
+        add_sample(ivec2(xy));
+      }
+    }
+  }
+  barrier();
+  if (s_count[lid] != 0u) {
+    atomicAdd(u_hist.count[lid], s_count[lid]);
+    atomicAdd(u_hist.frac[lid], s_frac[lid]);
+  }
+}
+
+void resolve() {
+  uint lid = gl_LocalInvocationIndex;
+  s_count[lid] = u_hist.count[lid];
+  s_frac[lid] = u_hist.frac[lid];
+  barrier();
+  if (lid != 0u) {
+    return;
+  }
+  uint total = 0u;
+  for (uint i = 0u; i < BINS; i++) {
+    total += s_count[i];
+  }
+  bool valid = u_state.valid != 0u;
+  float log2_e;
+  if (total == 0u) {
+    log2_e = valid ? u_state.log2_e : 0.0;
+    u_state.target_log2_e = log2_e;
+    u_state.mean_log2 = 0.0;
+  } else {
+    float n = float(total);
+    float lo = TRIM * n;
+    float hi = n - TRIM * n;
+    float cum = 0.0;
+    float weight = 0.0;
+    float sum = 0.0;
+    for (uint i = 0u; i < BINS; i++) {
+      float c = float(s_count[i]);
+      if (c == 0.0) {
+        continue;
+      }
+      float a = max(cum, lo);
+      float b = min(cum + c, hi);
+      if (b > a) {
+        float pos = float(i) + (float(s_frac[i]) / c + 0.5) / 256.0;
+        weight += b - a;
+        sum += (b - a) * pos;
+      }
+      cum += c;
+    }
+    float mean_log2 = LOG2_LO + (sum / weight) * ((LOG2_HI - LOG2_LO) / float(BINS));
+    float target = log2(p.key) - mean_log2;
+    log2_e = valid ? u_state.log2_e + p.rate * (target - u_state.log2_e) : target;
+    u_state.target_log2_e = target;
+    u_state.mean_log2 = mean_log2;
+  }
+  log2_e = clamp(log2_e, MIN_LOG2_E, MAX_LOG2_E);
+  u_state.log2_e = log2_e;
+  u_state.valid = 1u;
+  u_state.samples = total;
+  u_exposure.bits = packHalf2x16(vec2(exp2(log2_e), 0.0));
+}
+
+void main() {
+  if (p.pass == 0u) {
+    histogram();
+  } else {
+    resolve();
+  }
+}

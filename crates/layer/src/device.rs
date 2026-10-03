@@ -926,10 +926,6 @@ impl NeuralForgeDeviceInfo {
             session.say_once("the colour input lacks the usage this mode needs (TRANSFER_SRC/TRANSFER_DST, or STORAGE); not holding");
             return None;
         }
-        if mode.hdr() && inputs.exposure_input.is_none() {
-            session.say_once("no exposure image (a registered 1x1 R16_SFLOAT) among DLSS's inputs; the HDR encode cannot run, frames go to DLSS untouched");
-            return None;
-        }
         let Some(&queue_family) = queue_families.get(&queue) else {
             session.say_once("the DLSS submit's queue was never seen through vkGetDeviceQueue*; not holding");
             return None;
@@ -1006,6 +1002,7 @@ impl NeuralForgeDeviceInfo {
             }),
             // Only the modes that encode read (and so log) the paper white.
             paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
+            identification: scan.identification,
         };
         let res = session.res.as_mut()?;
         let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;
@@ -1035,6 +1032,7 @@ impl NeuralForgeDeviceInfo {
                 inflight[0].forget_answer();
             }
             hold.mark_local(mode);
+            session.note_exposure_source(scan.identification, &inputs, &hold);
             session.note(shm, &hold, cpu, extent);
             if let Some(frame) = hold.dump.take() {
                 crate::preupscale::write_dump_async(frame);
@@ -1617,12 +1615,23 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if crate::probe_ngx::enabled() {
             crate::probe_ngx::on_create_cu_function(function, create_info, result);
         }
+        if let Some(t) = self.preupscale.as_ref().filter(|_| result == vk::Result::SUCCESS && !create_info.p_name.is_null()) {
+            // Only DLSS Super Resolution's input kernel identifies its colour input
+            // (`preupscale::Kernel`, docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction").
+            // SAFETY: `pName` is a NUL-terminated string per `VkCuFunctionCreateInfoNVX`'s own
+            // contract, valid for the duration of the application's call.
+            let name = unsafe { std::ffi::CStr::from_ptr(create_info.p_name) }.to_string_lossy();
+            t.record_function(function, &name);
+        }
         LayerResult::Handled(if result == vk::Result::SUCCESS { Ok(function) } else { Err(result) })
     }
 
     fn destroy_cu_function_nvx(&self, function: vk::CuFunctionNVX, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
         if crate::probe_ngx::enabled() {
             crate::probe_ngx::on_destroy_cu_function(function);
+        }
+        if let Some(t) = &self.preupscale {
+            t.forget_function(function);
         }
         LayerResult::Unhandled
     }
@@ -1640,7 +1649,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // "DLSS Frame Generation").
             // SAFETY: `p_extras` is the application's own launch-parameter list, valid for this call.
             let params = unsafe { crate::preupscale::launch_params(launch_info.p_extras, launch_info.extra_count) };
-            t.launch(command_buffer, params);
+            t.launch(command_buffer, launch_info.function, params);
         }
         LayerResult::Unhandled
     }

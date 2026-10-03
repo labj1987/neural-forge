@@ -11,6 +11,12 @@
 //! set (the colour input's view, the padded encoded and answer images, the exposure buffer), built
 //! on first use in a mode that needs it. Every failure is fail-open: the caller forwards the frame
 //! untouched.
+//!
+//! When the game gives DLSS no readable exposure image (Resident Evil Requiem), the exposure value
+//! is measured from the colour input on the GPU instead ([`AutoExposure`],
+//! `shaders/preupscale_exposure.comp`): a histogram of log2 luma, the trimmed log-average, `e = key /
+//! 2^mean`, adapted over frames. It is written into the same exposure buffer the game's texel is
+//! copied into, so the encode and the decode of a hold read the very same value.
 
 use ash::vk;
 
@@ -18,6 +24,130 @@ use super::HostBuffer;
 
 const ENCODE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_encode.spv");
 const DECODE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_decode.spv");
+const EXPOSURE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_exposure.spv");
+
+/// The auto-exposure's key: the exposed luma (before the paper white) the frame's trimmed
+/// log-average luma is mapped to, `e = AUTO_KEY / 2^mean_log2`. Calibrated on GTA V's own exposure
+/// (docs/PRE_UPSCALER_DESIGN.md, "Auto-exposure when the game gives DLSS none"): the game put the
+/// scene's median luma at 0.756 (Grove Street) and 0.474 (Vinewood) exposed; for log-normal luma
+/// the log-average is the median, and the geometric middle sqrt(0.756 * 0.474) = 0.599 keeps both
+/// within -21% / +27% of the game's own e.
+pub(crate) const AUTO_KEY: f32 = 0.6;
+
+/// The auto-exposure's adaptation per frame, in log2 space: 5% of the way to the target, so a
+/// change settles in about 20 real frames (0.3 s at 60 fps) and no single frame makes it flicker.
+pub(crate) const AUTO_RATE: f32 = 0.05;
+
+/// The auto-exposure histogram: bins over log2 luma in [`AUTO_LOG2_LO`], [`AUTO_LOG2_HI`].
+/// These are the shader's own constants, restated for the CPU reference (which alone uses them
+/// besides the bin count).
+pub(crate) const AUTO_BINS: usize = 256;
+#[cfg(test)]
+pub(crate) const AUTO_LOG2_LO: f32 = -24.0;
+#[cfg(test)]
+pub(crate) const AUTO_LOG2_HI: f32 = 16.0;
+/// The share of samples dropped at each end before the log-average (sun, speculars, near-black).
+#[cfg(test)]
+pub(crate) const AUTO_TRIM: f32 = 0.01;
+/// The adapted log2 e is kept in this range (a normal half, and [`exposure_ok`]).
+#[cfg(test)]
+pub(crate) const AUTO_MIN_LOG2_E: f32 = -16.0;
+#[cfg(test)]
+pub(crate) const AUTO_MAX_LOG2_E: f32 = 15.0;
+
+/// Bytes of the auto-exposure histogram (a count and a fraction sum per bin).
+const HISTOGRAM_BYTES: u64 = 2 * AUTO_BINS as u64 * 4;
+/// Bytes of the auto-exposure state ([`AutoState`], the shader's `State`).
+const STATE_BYTES: u64 = 32;
+/// The histogram pass's pixels per workgroup in each direction (16x16 invocations, 2x2 samples
+/// each, every other pixel).
+const AUTO_TILE: u32 = 64;
+
+/// The push constants of `preupscale_exposure.comp` (its `Params` block, field for field).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ExposurePush {
+    /// The colour input's extent (`uvec2 size`).
+    pub width: u32,
+    pub height: u32,
+    /// `float key`: [`AUTO_KEY`].
+    pub key: f32,
+    /// `float rate`: [`AUTO_RATE`].
+    pub rate: f32,
+    /// `uint pass`: 0 the histogram, 1 the resolve.
+    pub pass: u32,
+}
+
+/// What the auto-exposure resolve left in its state buffer (read after the capture's fence).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct AutoState {
+    /// The adapted exposure, log2 (the encode's `e` is its `exp2` rounded to a half).
+    pub log2_e: f32,
+    pub valid: bool,
+    /// This frame's target, log2.
+    pub target_log2_e: f32,
+    /// This frame's trimmed mean log2 luma.
+    pub mean_log2: f32,
+    /// The samples that went into the histogram (finite, not black).
+    pub samples: u32,
+}
+
+/// The CPU reference of `preupscale_exposure.comp` on a tightly packed RGBA16F frame (`texels`,
+/// `width` x `height`), in the shader's f32 arithmetic: the samples (even x and y), the histogram,
+/// the trimmed log-average, the target and the adaptation from `previous` (the state's log2 e when
+/// it is valid). Returns the state the resolve writes.
+#[cfg(test)]
+pub(crate) fn auto_exposure_reference(texels: &[u8], width: u32, height: u32, previous: Option<f32>) -> AutoState {
+    let mut count = [0u32; AUTO_BINS];
+    let mut frac = [0u32; AUTO_BINS];
+    let half = |x: u32, y: u32, c: usize| {
+        let at = (y as usize * width as usize + x as usize) * 8 + c * 2;
+        super::f16_to_f32(u16::from_le_bytes([texels[at], texels[at + 1]]))
+    };
+    for y in (0..height).step_by(2) {
+        for x in (0..width).step_by(2) {
+            let rgb = [half(x, y, 0), half(x, y, 1), half(x, y, 2)];
+            if rgb.iter().any(|v| !v.is_finite()) {
+                continue;
+            }
+            let [r, g, b] = rgb.map(|v| v.max(0.0));
+            let luma = 0.2126 * r + 0.7152 * g + 0.0722 * b;
+            if luma < AUTO_LOG2_LO.exp2() {
+                continue;
+            }
+            let t = ((luma.log2() - AUTO_LOG2_LO) * (AUTO_BINS as f32 / (AUTO_LOG2_HI - AUTO_LOG2_LO))).clamp(0.0, AUTO_BINS as f32 - 1e-3);
+            let bin = (t as usize).min(AUTO_BINS - 1);
+            count[bin] += 1;
+            frac[bin] += (((t - bin as f32) * 256.0) as u32).min(255);
+        }
+    }
+    let total: u32 = count.iter().sum();
+    let (log2_e, target, mean) = if total == 0 {
+        let l = previous.unwrap_or(0.0);
+        (l, l, 0.0)
+    } else {
+        let n = total as f32;
+        let (lo, hi) = (AUTO_TRIM * n, n - AUTO_TRIM * n);
+        let (mut cum, mut weight, mut sum) = (0f32, 0f32, 0f32);
+        for (i, (&c, &f)) in count.iter().zip(&frac).enumerate() {
+            if c == 0 {
+                continue;
+            }
+            let c = c as f32;
+            let (a, b) = (cum.max(lo), (cum + c).min(hi));
+            if b > a {
+                let pos = i as f32 + (f as f32 / c + 0.5) / 256.0;
+                weight += b - a;
+                sum += (b - a) * pos;
+            }
+            cum += c;
+        }
+        let mean = AUTO_LOG2_LO + (sum / weight) * ((AUTO_LOG2_HI - AUTO_LOG2_LO) / AUTO_BINS as f32);
+        let target = AUTO_KEY.log2() - mean;
+        (previous.map_or(target, |p| p + AUTO_RATE * (target - p)), target, mean)
+    };
+    AutoState { log2_e: log2_e.clamp(AUTO_MIN_LOG2_E, AUTO_MAX_LOG2_E), valid: true, target_log2_e: target, mean_log2: mean, samples: total }
+}
 
 /// The variable that overrides the paper white (exposed units mapped to 1.0 before the shoulder).
 pub(crate) const PAPER_WHITE_ENV: &str = "NEURAL_FORGE_PREUPSCALE_PAPER_WHITE";
@@ -161,6 +291,201 @@ impl OwnImage {
     }
 }
 
+/// A device-local storage buffer of the layer's own (the auto-exposure histogram: it takes
+/// atomics from every workgroup, which must not cross the bus to host memory).
+struct DeviceBuffer {
+    buffer: vk::Buffer,
+    memory: vk::DeviceMemory,
+}
+
+impl DeviceBuffer {
+    /// # Safety
+    /// `device` is live.
+    unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64) -> Option<Self> {
+        let info = vk::BufferCreateInfo::builder()
+            .size(bytes)
+            .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE);
+        // SAFETY: valid create info.
+        let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
+        // SAFETY: just created.
+        let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
+        // SAFETY: plain property query.
+        let props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let pick = |want: vk::MemoryPropertyFlags| {
+            (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
+        };
+        let memory = pick(vk::MemoryPropertyFlags::DEVICE_LOCAL).or_else(|| pick(vk::MemoryPropertyFlags::empty())).and_then(|index| {
+            let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index);
+            // SAFETY: valid allocation info.
+            unsafe { device.allocate_memory(&alloc, None) }.ok()
+        });
+        let Some(memory) = memory else {
+            // SAFETY: nothing bound or submitted.
+            unsafe { device.destroy_buffer(buffer, None) };
+            return None;
+        };
+        // SAFETY: sized for each other by construction.
+        if unsafe { device.bind_buffer_memory(buffer, memory, 0) }.is_err() {
+            // SAFETY: nothing submitted uses either.
+            unsafe {
+                device.destroy_buffer(buffer, None);
+                device.free_memory(memory, None);
+            }
+            return None;
+        }
+        Some(Self { buffer, memory })
+    }
+
+    /// # Safety
+    /// Nothing submitted may still use it.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded.
+        unsafe {
+            device.destroy_buffer(self.buffer, None);
+            device.free_memory(self.memory, None);
+        }
+    }
+}
+
+/// The auto-exposure pass (`preupscale_exposure.comp`): its pipeline and descriptor set (the colour
+/// input's view, the histogram, the adaptation state, the pass's exposure buffer), built on the first
+/// hold that has no readable exposure image.
+struct AutoExposure {
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+    histogram: DeviceBuffer,
+    /// [`AutoState`]'s bytes; host-visible so the CPU resets it and reads it for the log.
+    state: HostBuffer,
+    /// The identification ([`super::Target::identification`]) the state adapted for.
+    identification: Option<u64>,
+}
+
+impl AutoExposure {
+    /// # Safety
+    /// `device` is live; `exposure` is the pass's exposure buffer.
+    unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, exposure: vk::Buffer) -> Option<Self> {
+        let binding = |n: u32, ty: vk::DescriptorType| {
+            vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build()
+        };
+        let bindings = [
+            binding(0, vk::DescriptorType::STORAGE_IMAGE),
+            binding(1, vk::DescriptorType::STORAGE_BUFFER),
+            binding(2, vk::DescriptorType::STORAGE_BUFFER),
+            binding(3, vk::DescriptorType::STORAGE_BUFFER),
+        ];
+        let mut set_layout = vk::DescriptorSetLayout::null();
+        let mut pipeline_layout = vk::PipelineLayout::null();
+        let mut pipeline = vk::Pipeline::null();
+        let mut pool = vk::DescriptorPool::null();
+        let mut histogram = None;
+        let mut state = None;
+        // SAFETY: valid create infos; every handle made here is destroyed below on failure.
+        let built = unsafe {
+            (|| -> Option<vk::DescriptorSet> {
+                set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
+                let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<ExposurePush>() as u32).build();
+                pipeline_layout = device
+                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None)
+                    .ok()?;
+                pipeline = compute_pipeline(device, pipeline_layout, EXPOSURE_SPV)?;
+                let sizes = [
+                    vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 1 },
+                    vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 3 },
+                ];
+                pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None).ok()?;
+                let set = device
+                    .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(std::slice::from_ref(&set_layout)))
+                    .ok()?
+                    .first()
+                    .copied()?;
+                histogram = Some(DeviceBuffer::new(device, instance, physical_device, HISTOGRAM_BYTES)?);
+                state = Some(super::own_host_buffer_with(device, instance, physical_device, STATE_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER)?);
+                Some(set)
+            })()
+        };
+        let (Some(set), Some(histogram), Some(state)) = (built, histogram.take(), state.take()) else {
+            // SAFETY: nothing here was submitted; null handles are ignored.
+            unsafe {
+                if let Some(h) = histogram {
+                    h.destroy(device);
+                }
+                if let Some(s) = state {
+                    s.destroy(device);
+                }
+                device.destroy_descriptor_pool(pool, None);
+                device.destroy_pipeline(pipeline, None);
+                device.destroy_pipeline_layout(pipeline_layout, None);
+                device.destroy_descriptor_set_layout(set_layout, None);
+            }
+            return None;
+        };
+        // SAFETY: the mapping covers STATE_BYTES; all zero is "not valid".
+        unsafe { std::ptr::write_bytes(state.ptr, 0, STATE_BYTES as usize) };
+        let info = |buffer: vk::Buffer, range: u64| [vk::DescriptorBufferInfo { buffer, offset: 0, range }];
+        let (h, s, e) = (info(histogram.buffer, HISTOGRAM_BYTES), info(state.buffer, STATE_BYTES), info(exposure, EXPOSURE_BYTES));
+        let write = |n: u32, b: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(b).build();
+        // SAFETY: the set is not in use; every buffer is live.
+        unsafe { device.update_descriptor_sets(&[write(1, &h), write(2, &s), write(3, &e)], &[]) };
+        Some(Self { set_layout, pipeline_layout, pipeline, pool, set, histogram, state, identification: None })
+    }
+
+    /// The state the last resolve wrote (call after the capture's fence).
+    fn state(&self) -> AutoState {
+        // SAFETY: the mapping covers STATE_BYTES and is host-coherent; the capture's fence was
+        // waited on and its closing barrier made the shader's writes available to the host.
+        let raw = unsafe { std::ptr::read_volatile(self.state.ptr.cast::<[u32; 5]>()) };
+        AutoState {
+            log2_e: f32::from_bits(raw[0]),
+            valid: raw[1] != 0,
+            target_log2_e: f32::from_bits(raw[2]),
+            mean_log2: f32::from_bits(raw[3]),
+            samples: raw[4],
+        }
+    }
+
+    /// # Safety
+    /// `cmd` is recording; binding 0 holds a live view of the colour input.
+    unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, width: u32, height: u32) {
+        let filled = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
+        let counted = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
+        let push = |pass: u32| ExposurePush { width, height, key: AUTO_KEY, rate: AUTO_RATE, pass };
+        let bytes = |p: &ExposurePush| {
+            // SAFETY: `ExposurePush` is `repr(C)`, plain data; read as bytes for its own size.
+            unsafe { std::slice::from_raw_parts(std::ptr::from_ref(p).cast::<u8>(), std::mem::size_of::<ExposurePush>()) }.to_vec()
+        };
+        // SAFETY: forwarded; every handle is the pass's own and live.
+        unsafe {
+            device.cmd_fill_buffer(cmd, self.histogram.buffer, 0, HISTOGRAM_BYTES, 0);
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[filled], &[], &[]);
+            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline);
+            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, std::slice::from_ref(&self.set), &[]);
+            device.cmd_push_constants(cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes(&push(0)));
+            device.cmd_dispatch(cmd, width.div_ceil(AUTO_TILE), height.div_ceil(AUTO_TILE), 1);
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[counted], &[], &[]);
+            device.cmd_push_constants(cmd, self.pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, &bytes(&push(1)));
+            device.cmd_dispatch(cmd, 1, 1, 1);
+        }
+    }
+
+    /// # Safety
+    /// Nothing submitted may still use it.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded; destroying the pool frees the set.
+        unsafe {
+            self.histogram.destroy(device);
+            self.state.destroy(device);
+            device.destroy_descriptor_pool(self.pool, None);
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.pipeline_layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
+}
+
 /// A plain 2D RGBA16F view of `image`'s first mip and layer.
 ///
 /// # Safety
@@ -197,6 +522,8 @@ pub(crate) struct HdrPass {
     /// (after the previous hold's work drained), so a destroyed and re-created image with a reused
     /// handle is never reached through a stale view.
     colour_view: Option<vk::ImageView>,
+    /// The auto-exposure, built on the first hold without a readable exposure image.
+    auto: Option<AutoExposure>,
 }
 
 // SAFETY: plain handles and the layer's own mapped allocation, only used behind the device's
@@ -279,6 +606,7 @@ impl HdrPass {
             answer,
             exposure,
             colour_view: None,
+            auto: None,
         };
         Some(pass)
     }
@@ -303,6 +631,51 @@ impl HdrPass {
         unsafe { std::ptr::write_bytes(self.exposure.ptr, 0, EXPOSURE_BYTES as usize) };
     }
 
+    /// Builds the auto-exposure pass if it is not built yet (binding the current colour view, if
+    /// any). `false` when it cannot be built.
+    ///
+    /// # Safety
+    /// `device` is live; nothing submitted may still use the pass (the hold's `wait_idle` passed).
+    pub(crate) unsafe fn ensure_auto(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+        if self.auto.is_none() {
+            // SAFETY: forwarded.
+            self.auto = unsafe { AutoExposure::build(device, instance, physical_device, self.exposure.buffer) };
+            if let (Some(auto), Some(view)) = (&self.auto, self.colour_view) {
+                // SAFETY: the new set is not in use; the view is live.
+                unsafe { bind_view(device, auto.set, view) };
+            }
+        }
+        self.auto.is_some()
+    }
+
+    /// Starts the auto-exposure's adaptation afresh when `identification` differs from the one it
+    /// adapted for (a new colour input: the first frame takes its target directly).
+    pub(crate) fn auto_for(&mut self, identification: u64) {
+        if let Some(auto) = self.auto.as_mut().filter(|a| a.identification != Some(identification)) {
+            // SAFETY: the mapping covers STATE_BYTES; nothing pending uses it (after `wait_idle`).
+            unsafe { std::ptr::write_bytes(auto.state.ptr, 0, STATE_BYTES as usize) };
+            auto.identification = Some(identification);
+        }
+    }
+
+    /// What the last auto-exposure resolve wrote (call after the capture's fence).
+    pub(crate) fn auto_state(&self) -> Option<AutoState> {
+        self.auto.as_ref().map(AutoExposure::state)
+    }
+
+    /// Records the auto-exposure (histogram, then resolve into the exposure buffer) for the colour
+    /// input; [`Self::record_encode`]'s opening barrier makes its write visible to the encode.
+    /// Returns `false` (nothing recorded) when the pass is not built.
+    ///
+    /// # Safety
+    /// `cmd` is recording; [`Self::bind_colour`] was called for this hold.
+    pub(crate) unsafe fn record_auto_exposure(&self, device: &ash::Device, cmd: vk::CommandBuffer) -> bool {
+        let Some(auto) = &self.auto else { return false };
+        // SAFETY: forwarded.
+        unsafe { auto.record(device, cmd, self.width, self.height) };
+        true
+    }
+
     /// Points binding 0 at a fresh view of `colour`, destroying the previous one.
     ///
     /// # Safety
@@ -318,10 +691,13 @@ impl HdrPass {
             return false;
         };
         self.colour_view = Some(view);
-        let info = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }];
-        let write = vk::WriteDescriptorSet::builder().dst_set(self.set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&info).build();
-        // SAFETY: the set is not in use (contract).
-        unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
+        // SAFETY: the sets are not in use (contract).
+        unsafe {
+            bind_view(device, self.set, view);
+            if let Some(auto) = &self.auto {
+                bind_view(device, auto.set, view);
+            }
+        }
         true
     }
 
@@ -340,7 +716,8 @@ impl HdrPass {
         to_general(self.answer.image, vk::AccessFlags::TRANSFER_WRITE)
     }
 
-    /// Records, after the capture's exposure copy: the exposure write made visible to the shader,
+    /// Records, after the capture's exposure copy (or the auto-exposure's resolve): the exposure
+    /// write made visible to the shader,
     /// the encode dispatch over the padded extent, and the copy of the encoded image into `proxy`
     /// (tightly packed at the padded size). The caller's closing barrier covers the transfer.
     ///
@@ -348,7 +725,10 @@ impl HdrPass {
     /// `cmd` is recording, the encoded image is in `GENERAL` (the caller's opening barrier),
     /// [`Self::bind_colour`] was called for this hold, and `proxy` holds the padded frame.
     pub(crate) unsafe fn record_encode(&self, device: &ash::Device, cmd: vk::CommandBuffer, proxy: vk::Buffer, paper_white: f32) {
-        let exposure_in = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ).build();
+        let exposure_in = vk::MemoryBarrier::builder()
+            .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+            .dst_access_mask(vk::AccessFlags::SHADER_READ)
+            .build();
         let encoded_out = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).build();
         let region = vk::BufferImageCopy {
             buffer_offset: 0,
@@ -360,7 +740,15 @@ impl HdrPass {
         };
         // SAFETY: forwarded; every handle is live.
         unsafe {
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[exposure_in], &[], &[]);
+            device.cmd_pipeline_barrier(
+                cmd,
+                vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::PipelineStageFlags::COMPUTE_SHADER,
+                vk::DependencyFlags::empty(),
+                &[exposure_in],
+                &[],
+                &[],
+            );
             self.dispatch(device, cmd, self.encode, paper_white, self.padded_width, self.padded_height);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[encoded_out], &[], &[]);
             device.cmd_copy_image_to_buffer(cmd, self.encoded.image, vk::ImageLayout::GENERAL, proxy, &[region]);
@@ -417,6 +805,9 @@ impl HdrPass {
             if let Some(view) = self.colour_view {
                 device.destroy_image_view(view, None);
             }
+            if let Some(auto) = &self.auto {
+                auto.destroy(device);
+            }
             self.encoded.destroy(device);
             self.answer.destroy(device);
             self.exposure.destroy(device);
@@ -427,6 +818,17 @@ impl HdrPass {
             device.destroy_descriptor_set_layout(self.set_layout, None);
         }
     }
+}
+
+/// Points `set`'s binding 0 (a storage image in `GENERAL`) at `view`.
+///
+/// # Safety
+/// `set` is not in use; `view` is live.
+unsafe fn bind_view(device: &ash::Device, set: vk::DescriptorSet, view: vk::ImageView) {
+    let info = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }];
+    let write = vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&info).build();
+    // SAFETY: forwarded.
+    unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
 }
 
 fn to_general(image: vk::Image, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier {
@@ -525,7 +927,12 @@ mod tests {
         assert_eq!(std::mem::offset_of!(HdrPush, padded_width), 8);
         assert_eq!(std::mem::offset_of!(HdrPush, paper_white), 16);
         assert_eq!(std::mem::offset_of!(HdrPush, flags), 20);
-        for spv in [ENCODE_SPV, DECODE_SPV] {
+        // preupscale_exposure.comp: uvec2 size, float key, float rate, uint pass: 20 bytes.
+        assert_eq!(std::mem::size_of::<ExposurePush>(), 20);
+        assert_eq!(std::mem::offset_of!(ExposurePush, key), 8);
+        assert_eq!(std::mem::offset_of!(ExposurePush, rate), 12);
+        assert_eq!(std::mem::offset_of!(ExposurePush, pass), 16);
+        for spv in [ENCODE_SPV, DECODE_SPV, EXPOSURE_SPV] {
             assert!(spv.len() > 20 && spv.len().is_multiple_of(4), "embedded SPIR-V");
         }
     }

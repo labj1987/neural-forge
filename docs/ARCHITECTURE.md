@@ -169,7 +169,7 @@ DLSS does not run, are presented untouched instead of switching paths (see
 ## 4. Before the upscaler (2.0)
 
 `crates/layer/src/preupscale.rs`, `crates/layer/src/preupscale/hdr.rs`,
-`crates/layer/shaders/preupscale_{encode,decode}.comp`. The full design record, with every
+`crates/layer/shaders/preupscale_{encode,decode,exposure}.comp`. The full design record, with every
 experiment, is [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md).
 
 ### 4.1 What DLSS looks like from a Vulkan layer
@@ -193,10 +193,12 @@ CUDA kernels: `vkCmdCuLaunchKernelNVX`, on image views registered with
 - `vkCreateImage` / `vkCreateImageView`: the layer records extent, format and usage.
 - The NVX registration calls: the layer records every registered view and the handle or address
   it got back.
+- `vkCreateCuFunctionNVX` / `vkDestroyCuFunctionNVX`: the layer records each kernel's name and
+  what it is (`preupscale::Kernel`: DLSS SR's input kernel, Ray Reconstruction's network, other).
 - `vkCmdCuLaunchKernelNVX`: marks the command buffer as launch-bearing (also through
-  `vkCmdExecuteCommands`). When the launch's parameters use CUDA's "extra" buffer form (what
-  vkd3d-proton uses), the layer reads that parameter buffer (never writes it; at most 4 KiB) and
-  notes which registered handles appear among its 8-byte words.
+  `vkCmdExecuteCommands`), with which kernels it launches. When the launch's parameters use CUDA's
+  "extra" buffer form (what vkd3d-proton uses), the layer reads that parameter buffer (never writes
+  it; at most 4 KiB) and notes which registered handles appear among its 8-byte words.
 - Image barriers on the watched images, committed in submission order, so the layer knows their
   layout at a submit.
 
@@ -206,7 +208,17 @@ read.
 ### 4.3 Identification
 
 At a launch-bearing submit (`Tracker::observe`, then `Tracker::refresh`), two rules, the first
-winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameters (DLAA)"):
+winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameters (DLAA)"), behind
+one precondition:
+
+- **DLSS Super Resolution must be running** (PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction").
+  Once any kernel name is known, nothing is identified unless SR's input kernel
+  (`hiluma_engine_input*`, `cuda_engine_input_kernel*`) launched within the last 64 launch-bearing
+  submits; only a launch of that kernel is parameter evidence; and a buffer that launches no SR
+  input kernel is never the hold point. This keeps DLSS Ray Reconstruction (Resident Evil Requiem
+  with ray tracing: its input is the noisy ray-traced frame) and frame generation alone out of
+  both rules. It is logged once: `DLSS Ray Reconstruction detected (... launched, no DLSS Super
+  Resolution input kernel)`. Without kernel names the rules work as before.
 
 - **By the input kernel's parameters** (`Rule::Params`). A command buffer's first launch that names a
   registered depth image and a 2-channel float image is read as DLSS SR's input kernel. If it names
@@ -214,8 +226,11 @@ winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameter
   that image is the colour input, with that depth and those motion vectors. It need not be smaller
   than the output, so DLAA is found. The extent condition keeps DLSS Frame Generation out, because
   FG's launch names its output-size frame beside the render-size depth. An output-size candidate
-  (DLAA, or FG at native resolution) counts only if its buffer also names the 1x1 `R16_SFLOAT`
-  exposure image, which SR takes and FG does not. The decision waits for 16 launch-bearing submits
+  (DLAA, or FG at native resolution) counts if its buffer also names the 1x1 `R16_SFLOAT`
+  exposure image, which SR takes and FG does not; without one (a game that gives DLSS no exposure)
+  only with SR's own shape: a later launch of the same buffer names it with another output-size
+  image (SR's output kernel), no other launch-bearing buffer names it, and it is the only such
+  entry. The decision waits for 16 launch-bearing submits
   without new evidence, so both SR's and FG's buffers have been seen. Ambiguity (two candidates in
   one launch, or different colour inputs from different buffers that the exposure does not settle)
   is logged once, and the size rule decides. Only an `RGBA16F` colour input is held.
@@ -232,8 +247,8 @@ winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameter
   `identified by size`. When both rules pick the same images (GTA V, Crimson Desert), the switch
   from size to parameters is no re-identification: nothing is skipped and the hold target stays.
 - **Exposure input:** the 1x1 `R16_SFLOAT` image the input kernel's buffer names, else the
-  registered one.
-- Without an exposure input, nothing is held.
+  registered one (not for an output-size input whose buffer names none).
+- Without a readable exposure input the exposure is measured from the frame (4.6).
 - With DLAA the model works on the full output-size frame every frame (as costly as the 1.x path on
   every frame). The hold, encode and decode do not depend on the size.
 - When nothing qualifies, the line says why: the output used, the first failed condition for every
@@ -254,8 +269,8 @@ another queue. Each launch-bearing buffer is classified (`LaunchRefs::kind`):
 | Kind | Rule | Action |
 |---|---|---|
 | Colour | a launch's parameters name the identified colour input | held (the split point) |
-| Foreign | every launch readable, naming registered views, never the colour input | forwarded untouched (DLSS FG's, other NGX features') |
-| Unknown | an unreadable launch, parameters naming no registered view, or a launch before identification | held, as before the fix |
+| Foreign | every launch readable, naming registered views, never the colour input; or, once kernel names are known, no launch of SR's input kernel | forwarded untouched (DLSS FG's, Ray Reconstruction's, other NGX features') |
+| Unknown | an unreadable launch, parameters naming no registered view, or a launch before identification | held, as before the fix (only with inputs identified) |
 
 Before this rule, the layer held FG's submits too and ran the model three times per real frame,
 twice on the wrong input: 22.4 real / 67.1 shown fps. After it: 53.0 / 159
@@ -291,7 +306,9 @@ sequenceDiagram
    application's fence. Nothing is injected into a game command buffer. The module comment of
    `preupscale.rs` has the full dependency-chain argument.
 2. **Capture and encode** (`C`, one command buffer): a full memory barrier on earlier work; copy
-   the exposure texel into a small host-visible buffer; the encode compute shader reads the
+   the exposure texel into a small host-visible buffer (or, with no readable exposure image,
+   measure it from the colour input into the same buffer: the auto-exposure, 4.6); the encode
+   compute shader reads the
    colour input through a storage view and writes the layer's padded `RGBA16F` image; copy that
    into slot 0's proxy region, which is imported as Vulkan memory (`VK_EXT_external_memory_host`,
    zero copy). An odd width or height is padded by repeating the last column or row.
@@ -318,7 +335,8 @@ the layer encodes DLSS's scene-linear input before sending it, and inverts that 
 (`preupscale/hdr.rs`):
 
 ```
-e     = the game's 1x1 R16_SFLOAT exposure value (read on the GPU every frame)
+e     = the game's 1x1 R16_SFLOAT exposure value (read on the GPU every frame),
+        else measured from the frame (auto-exposure, below)
 v     = max(scene, 0) * e / W                     W = paper white, default 3
 y     = v                                          v <= 0.75
         0.75 + 0.25 * (1 - exp(-5.770780 * (v - 0.75)))   above, per channel
@@ -336,6 +354,19 @@ The shoulder and sRGB step follow OpenDLSS-NR's documented proxy; the exposure m
 paper white of 3 and the inverse are this project's, chosen by measurement (PRE_UPSCALER_DESIGN.md,
 "E1b"). Precision on lavapipe: the round trip is within about 2.6e-3 relative where the encoded
 value is at most 0.9.
+
+**Auto-exposure** (`shaders/preupscale_exposure.comp`, `hdr::AutoExposure`; PRE_UPSCALER_DESIGN.md,
+"Auto-exposure when the game gives DLSS none (RE Requiem)"). When DLSS's inputs have no readable
+1x1 exposure image, the capture measures `e` from the colour input before the encode: a 256-bin
+histogram of log2 Rec.709 luma over every other pixel in each direction (NaN/Inf skipped, black
+skipped), the trimmed (1% each end) mean log2 luma, `target = log2(0.6) - mean`, and 5% per frame
+towards the target in log2 space, kept in a small host-visible state buffer (reset when the
+identification changes). The result is written as a half into the same exposure buffer the game's
+texel would be copied into, so the encode and the decode of a hold use the very same `e`. The key
+0.6 is calibrated on GTA V's own exposure (within -21% / +27% of it on both E1b dumps). The source
+is logged once per identification: `[preupscale] exposure: the game's 1x1 R16F` or `[preupscale]
+exposure: measured from the frame (auto)`, and the 300-hold summary ends with `exposure median=...
+(auto|game)`.
 
 ### 4.7 The circuit breaker and the hand-back
 

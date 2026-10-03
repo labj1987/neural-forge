@@ -229,7 +229,46 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     VulkanCommand::GetImageViewHandleNvx,
     VulkanCommand::GetImageViewAddressNvx,
     VulkanCommand::CmdCuLaunchKernelNvx,
+    // The kernels' names ([`Kernel`]): only DLSS Super Resolution's input kernel identifies.
+    VulkanCommand::CreateCuFunctionNvx,
+    VulkanCommand::DestroyCuFunctionNvx,
 ];
+
+/// What a CUDA kernel is, by the name `vkCreateCuFunctionNVX` gave it. An identification
+/// precondition only (docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction"): the colour input is
+/// found by the registered handles a launch names, as before; the name says whether that launch is
+/// DLSS Super Resolution's input kernel at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kernel {
+    /// DLSS Super Resolution's input kernel (`hiluma_engine_input_*` in GTA V,
+    /// `cuda_engine_input_kernel_*` among NGX's modules): it reads the colour input, depth and
+    /// motion vectors.
+    SrInput,
+    /// The network kernels of DLSS Ray Reconstruction (`custom_block*`, `k_central_block`,
+    /// `k_initial_merge`, `custom_upsample*`; Resident Evil Requiem with ray tracing). Frame
+    /// Generation shares some of these names (`custom_block0_convPre_kernel`, `k_initial_merge` in
+    /// GTA V), so they only mean Ray Reconstruction while no SR input kernel launches.
+    RayReconstruction,
+    /// Anything else (SR's network and output kernels, FG's, NGX's helpers).
+    Other,
+}
+
+impl Kernel {
+    pub(crate) fn of(name: &str) -> Self {
+        if name.starts_with("hiluma_engine_input") || name.starts_with("cuda_engine_input_kernel") {
+            Self::SrInput
+        } else if ["custom_block", "k_central_block", "k_initial_merge", "custom_upsample"].iter().any(|p| name.starts_with(p)) {
+            Self::RayReconstruction
+        } else {
+            Self::Other
+        }
+    }
+}
+
+/// Launch-bearing submits within which an SR input kernel must have launched for the inputs to be
+/// identified, once kernel names are known ([`Tracker::sr_running`]). With frame generation at 6x
+/// there are about 6 per real frame, so this is about 10 real frames.
+pub(crate) const SR_RECENT: u64 = 64;
 
 /// [`COMMANDS`] when `on`, nothing otherwise.
 pub(crate) fn commands(on: bool) -> &'static [VulkanCommand] {
@@ -526,6 +565,28 @@ pub(crate) struct Named {
     pub depth: vk::Image,
     pub mvec: vk::Image,
     pub exposure: Option<vk::Image>,
+    /// A later launch of a buffer whose input launch names this colour input names it again
+    /// together with another colour candidate of its extent ([`LaunchRefs::output_pair`]): DLSS
+    /// Super Resolution's output kernel, which reads the input and writes the output.
+    pub output_pair: bool,
+    /// A submitted launch-bearing buffer whose input launch does not name this colour input still
+    /// names it: something besides an input kernel reads it (DLSS Frame Generation's other buffer
+    /// reads FG's frame; nothing but SR's own buffer reads SR's input).
+    pub foreign: bool,
+}
+
+impl Named {
+    /// The evidence of an input launch naming `colour`, `depth` and `mvec`, nothing else known yet.
+    pub(crate) fn new(colour: vk::Image, depth: vk::Image, mvec: vk::Image, exposure: Option<vk::Image>) -> Self {
+        Self { colour, depth, mvec, exposure, output_pair: false, foreign: false }
+    }
+
+    /// Whether this output-size entry without an exposure image may still be DLSS Super
+    /// Resolution's input (DLAA in a game that gives DLSS no exposure, Resident Evil Requiem): its
+    /// buffer's output kernel names it with the output, and no other buffer names it.
+    pub(crate) fn sr_without_exposure(&self) -> bool {
+        self.output_pair && !self.foreign
+    }
 }
 
 /// Launch-bearing submits without new evidence before [`Tracker::observe`] decides. With DLSS Frame
@@ -557,6 +618,9 @@ fn by_params(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, n: Named, swapc
         None => (output_candidate(registered).unwrap_or((colour.1.width, colour.1.height)), false),
     };
     let named_exposure = n.exposure.and_then(get);
+    // An output-size colour input whose buffer names no exposure (DLAA in a game that gives DLSS
+    // none): a registered 1x1 R16F elsewhere is not DLSS's; the exposure is measured from the frame.
+    let measured = named_exposure.is_none() && !smaller(colour.1.width, colour.1.height, output);
     Some(Inputs {
         colour,
         depth: get(n.depth)?,
@@ -566,7 +630,7 @@ fn by_params(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, n: Named, swapc
         output,
         output_from_swapchain,
         exposure: exposure_images(registered),
-        exposure_input: named_exposure.or_else(|| registered_exposure_input(registered)),
+        exposure_input: if measured { None } else { named_exposure.or_else(|| registered_exposure_input(registered)) },
         exposure_named: named_exposure.is_some(),
         rule: Rule::Params,
     })
@@ -709,6 +773,25 @@ pub(crate) struct Tracker {
     named_pick: Option<Named>,
     /// Which of [`Self::observe`]'s once-only lines were logged.
     said_named: u8,
+    /// Counts identifications: bumped whenever [`Self::refresh`] changes the inputs
+    /// ([`Scan::identification`]).
+    generation: u64,
+    /// The CUDA kernels created on the device (`vkCreateCuFunctionNVX`), with what they are.
+    functions: HashMap<vk::CuFunctionNVX, (Kernel, String)>,
+    /// A kernel name was ever seen: from then on only DLSS Super Resolution's input kernel
+    /// identifies ([`Self::sr_running`]). Without names (no `vkCreateCuFunctionNVX` seen) the rules
+    /// work as before.
+    names_known: bool,
+    /// Launch-bearing submits seen by [`Self::observe`].
+    launch_submits: u64,
+    /// The last of those carrying an SR input kernel launch, and one carrying a Ray
+    /// Reconstruction-family launch.
+    last_sr: Option<u64>,
+    last_rr: Option<u64>,
+    /// The Ray Reconstruction-family kernels seen launching (at most 4 names, for the log).
+    rr_names: Vec<String>,
+    /// [`Self::sr_running`] as of the last [`Self::observe`] (a change re-runs the identification).
+    sr_gate: bool,
 }
 
 /// Where a submit's first launch-bearing command buffer is.
@@ -732,6 +815,9 @@ pub(crate) struct Scan {
     /// (barriers are only recorded on watched images, and a new identification drops what was
     /// committed), so a `None` layout here does not mean "no barrier ever".
     pub identified_now: bool,
+    /// Which identification the inputs are ([`Tracker`]'s count of changes): a hold's auto-exposure
+    /// starts its adaptation afresh when it changes ([`Target::identification`]).
+    pub identification: u64,
 }
 
 impl Scan {
@@ -755,6 +841,17 @@ pub(crate) struct LaunchRefs {
     /// read as DLSS Super Resolution's input kernel ([`input_launch`]): the first launch of SR's
     /// buffer.
     pub input: Option<InputLaunch>,
+    /// A launch after the input launch names its colour input again together with another colour
+    /// candidate of the same extent (DLSS Super Resolution's output kernel: input and output).
+    pub output_pair: bool,
+    /// Whether the input launch's kernel is DLSS Super Resolution's input kernel ([`Kernel`]);
+    /// `None` when its name is not known.
+    pub input_sr: Option<bool>,
+    /// A launch of an SR input kernel, anywhere in the buffer.
+    pub sr_input: bool,
+    /// The Ray Reconstruction-family kernels launched in the buffer ([`Kernel::RayReconstruction`]),
+    /// at most 4 distinct.
+    pub rr: Vec<vk::CuFunctionNVX>,
 }
 
 /// How a launch-bearing command buffer is treated at the submit.
@@ -903,11 +1000,45 @@ impl Tracker {
         self.dirty = true;
     }
 
-    /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`; `params` is the launch's kernel
-    /// parameter buffer when it could be read ([`launch_params`]), `None` otherwise. Every 8-byte
-    /// word of it is compared with the registered views' handles and addresses. The buffer's first
-    /// launch naming depth and motion vectors is kept as its input launch ([`input_launch`]).
+    /// `vkCreateCuFunctionNVX` returned `function` for the kernel `name`.
+    pub(crate) fn record_function(&mut self, function: vk::CuFunctionNVX, name: &str) {
+        self.functions.insert(function, (Kernel::of(name), name.to_string()));
+        self.names_known = true;
+    }
+
+    pub(crate) fn forget_function(&mut self, function: vk::CuFunctionNVX) {
+        self.functions.remove(&function);
+    }
+
+    /// Whether DLSS Super Resolution runs, as far as the identification is concerned: no kernel
+    /// name was ever seen (the rules work as before), or an SR input kernel launched within the
+    /// last [`SR_RECENT`] launch-bearing submits. Otherwise (DLSS Ray Reconstruction, or frame
+    /// generation alone) nothing is identified, so nothing is held: the model must not run on Ray
+    /// Reconstruction's noisy input.
+    fn sr_running(&self) -> bool {
+        !self.names_known || self.last_sr.is_some_and(|s| self.launch_submits.saturating_sub(s) < SR_RECENT)
+    }
+
+    /// [`Self::launch_kernel`] without the kernel (its name unknown).
+    #[cfg(test)]
     pub(crate) fn launch(&mut self, command_buffer: vk::CommandBuffer, params: Option<&[u8]>) {
+        self.launch_kernel(command_buffer, vk::CuFunctionNVX::null(), params);
+    }
+
+    /// `vkCmdCuLaunchKernelNVX` of `function` recorded into `command_buffer`; `params` is the
+    /// launch's kernel parameter buffer when it could be read ([`launch_params`]), `None`
+    /// otherwise. Every 8-byte word of it is compared with the registered views' handles and
+    /// addresses. The buffer's first launch naming depth and motion vectors is kept as its input
+    /// launch ([`input_launch`]), with whether its kernel is SR's input kernel ([`Kernel`]).
+    pub(crate) fn launch_kernel(&mut self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) {
+        let kernel = self.functions.get(&function).map(|(k, _)| *k);
+        {
+            let refs = self.launch.entry(command_buffer).or_default();
+            refs.sr_input |= kernel == Some(Kernel::SrInput);
+            if kernel == Some(Kernel::RayReconstruction) && refs.rr.len() < 4 && !refs.rr.contains(&function) {
+                refs.rr.push(function);
+            }
+        }
         let Some(bytes) = params else {
             self.launch.entry(command_buffer).or_default().opaque = true;
             return;
@@ -925,8 +1056,19 @@ impl Tracker {
             }
         }
         let refs = self.launch.entry(command_buffer).or_default();
-        if refs.input.is_none() {
+        if let Some(InputLaunch::Inputs { colour, .. }) = refs.input {
+            // A later launch naming the colour input with another candidate of its extent.
+            let extent = self.images.get(&colour).map(|d| (d.width, d.height));
+            if !refs.output_pair && named.contains(&colour) {
+                refs.output_pair = named
+                    .iter()
+                    .any(|i| *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && Some((d.width, d.height)) == extent));
+            }
+        } else if refs.input.is_none() {
             refs.input = input_launch(&self.images, &named);
+            if refs.input.is_some() {
+                refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
+            }
         }
         for image in named {
             if !refs.images.contains(&image) {
@@ -959,7 +1101,17 @@ impl Tracker {
             for c in carried {
                 refs.opaque |= c.opaque;
                 if refs.input.is_none() {
-                    refs.input = c.input;
+                    refs.input = c.input.clone();
+                    refs.input_sr = c.input_sr;
+                }
+                refs.sr_input |= c.sr_input;
+                for f in c.rr {
+                    if refs.rr.len() < 4 && !refs.rr.contains(&f) {
+                        refs.rr.push(f);
+                    }
+                }
+                if c.input.is_some() && c.input == refs.input {
+                    refs.output_pair |= c.output_pair;
                 }
                 for image in c.images {
                     if !refs.images.contains(&image) {
@@ -1010,14 +1162,17 @@ impl Tracker {
             return None;
         }
         let registered = self.registered_set();
-        // What DLSS's own input kernel names, once settled; the size rule otherwise.
-        let size = identify(&registered, self.swapchain_extent());
-        let inputs = self.named_pick.and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())).or(size);
+        // What DLSS's own input kernel names, once settled; the size rule otherwise. Neither while
+        // kernel names say DLSS Super Resolution is not running ([`Self::sr_running`]).
+        let gate = self.sr_running();
+        let size = identify(&registered, self.swapchain_extent()).filter(|_| gate);
+        let inputs = self.named_pick.filter(|_| gate).and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())).or(size);
         let key =|i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
         if key(inputs) != key(self.inputs) {
             self.committed.clear();
             self.pending.clear();
             self.identified = true;
+            self.generation += 1;
         }
         self.inputs = inputs;
         let line = match inputs {
@@ -1047,7 +1202,7 @@ impl Tracker {
                 } else {
                     String::new()
                 },
-                i.exposure_input.map_or_else(|| "none (no registered 1x1 R16_SFLOAT)".to_string(), |(image, _)| hex(image)),
+                i.exposure_input.map_or_else(|| "none (no registered 1x1 R16_SFLOAT; measured from the frame)".to_string(), |(image, _)| hex(image)),
                 if i.exposure_named { " (named by the same command buffer)" } else { "" },
                 self.swapchain_extent(),
                 if i.output_from_swapchain || i.rule == Rule::Params {
@@ -1060,6 +1215,10 @@ impl Tracker {
                     Rule::Size => "identified by size",
                 }
             ),
+            None if !gate => format!(
+                "no DLSS input: no DLSS Super Resolution input kernel (hiluma_engine_input*, cuda_engine_input_kernel*) launched in the last {SR_RECENT} launch-bearing submits{}; waiting",
+                if self.rr_names.is_empty() { String::new() } else { format!(" (DLSS Ray Reconstruction's kernels launch: {})", self.rr_names.join(", ")) }
+            ),
             None => format!(
                 "no DLSS input among {} registered views (swapchain {:?}); waiting",
                 registered.len(),
@@ -1069,7 +1228,7 @@ impl Tracker {
         // A failed identification says why, with the registered set ([`diagnose`]), once per change
         // of it, for the first [`MAX_DIAGNOSES`] changes; after those only the short line, once per
         // change of the short line (the rule before the diagnosis existed).
-        let detailed = inputs.is_none() && !registered.is_empty() && self.diagnoses < MAX_DIAGNOSES;
+        let detailed = gate && inputs.is_none() && !registered.is_empty() && self.diagnoses < MAX_DIAGNOSES;
         let line = if detailed { format!("{line}. {}", diagnose(&registered, self.swapchain_extent())) } else { line };
         if self.announced.as_deref() == Some(line.as_str()) {
             return None;
@@ -1093,6 +1252,9 @@ impl Tracker {
             let Some(refs) = self.launch.get(cb) else { continue };
             any = true;
             match &refs.input {
+                // With kernel names known, only SR's input kernel is evidence (not Ray
+                // Reconstruction's or Frame Generation's first launch, which can have its shape).
+                Some(InputLaunch::Inputs { .. }) if self.names_known && refs.input_sr != Some(true) => {}
                 Some(InputLaunch::Inputs { colour, depth, mvec }) => {
                     let (colour, depth, mvec) = (*colour, *depth, *mvec);
                     let exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
@@ -1101,8 +1263,12 @@ impl Tracker {
                             n.exposure = exposure;
                             changed = true;
                         }
+                        if !n.output_pair && refs.output_pair {
+                            n.output_pair = true;
+                            changed = true;
+                        }
                     } else if self.named.len() < MAX_NAMED {
-                        self.named.push(Named { colour, depth, mvec, exposure });
+                        self.named.push(Named { output_pair: refs.output_pair, ..Named::new(colour, depth, mvec, exposure) });
                         changed = true;
                     }
                 }
@@ -1118,8 +1284,54 @@ impl Tracker {
                 _ => {}
             }
         }
+        // A buffer whose input launch is not an entry's own but which names that entry's colour
+        // input: something besides an input kernel reads it.
+        for cb in batches.iter().flatten() {
+            let Some(refs) = self.launch.get(cb) else { continue };
+            let own = match &refs.input {
+                Some(InputLaunch::Inputs { colour, .. }) => Some(*colour),
+                _ => None,
+            };
+            for n in &mut self.named {
+                if !n.foreign && own != Some(n.colour) && refs.images.contains(&n.colour) {
+                    n.foreign = true;
+                    changed = true;
+                }
+            }
+        }
         if !any {
             return lines;
+        }
+        // Whether DLSS Super Resolution runs (by its input kernel's name) or Ray Reconstruction.
+        self.launch_submits += 1;
+        let now = self.launch_submits;
+        for cb in batches.iter().flatten() {
+            let Some(refs) = self.launch.get(cb) else { continue };
+            if refs.sr_input {
+                self.last_sr = Some(now);
+            }
+            if !refs.rr.is_empty() {
+                self.last_rr = Some(now);
+            }
+            for f in &refs.rr {
+                if let Some((_, name)) = self.functions.get(f) {
+                    if self.rr_names.len() < 4 && !self.rr_names.contains(name) {
+                        self.rr_names.push(name.clone());
+                    }
+                }
+            }
+        }
+        let gate = self.sr_running();
+        if gate != self.sr_gate {
+            self.sr_gate = gate;
+            self.dirty = true;
+        }
+        if !gate && self.last_rr == Some(now) && self.said_named & 64 == 0 {
+            self.said_named |= 64;
+            lines.push(format!(
+                "DLSS Ray Reconstruction detected ({} launched, no DLSS Super Resolution input kernel); the model can't run before it (its input is the noisy ray-traced frame): nothing is identified or held, the model runs after the upscaler",
+                self.rr_names.join(", ")
+            ));
         }
         self.named_quiet = if changed { 0 } else { self.named_quiet.saturating_add(1) };
         // Decided when the evidence has just settled, and again when the registered set or the
@@ -1144,10 +1356,14 @@ impl Tracker {
     /// is: DLSS Frame Generation's launches never name a render-size frame beside the render-size
     /// depth. An entry whose colour input is the output's size (DLAA, or frame generation at native
     /// resolution, whose launch names the output-size frame beside output-size depth and motion
-    /// vectors) counts only if its buffer also names a 1x1 R16_SFLOAT image: DLSS Super
-    /// Resolution's exposure input, which frame generation does not take (and without which the
-    /// model path holds nothing anyway). Among several counted entries, the only one whose buffer
-    /// names the exposure; otherwise none, logged once, and the size rule decides.
+    /// vectors) counts if its buffer also names a 1x1 R16_SFLOAT image: DLSS Super Resolution's
+    /// exposure input, which frame generation does not take. Without one (a game that gives DLSS no
+    /// exposure: Resident Evil Requiem at DLAA) it counts only with SR's own shape
+    /// ([`Named::sr_without_exposure`]): a later launch of its buffer names it with the output (SR's
+    /// output kernel), and no other launch-bearing buffer names it (FG's frame is read by FG's other
+    /// buffer too) — and only when exactly one such entry exists. Among several counted entries,
+    /// the only one whose buffer names the exposure; otherwise none, logged once, and the size rule
+    /// decides.
     fn pick_named(&mut self, lines: &mut Vec<String>) -> Option<Named> {
         let describe = |t: &Self, list: &[Named]| -> String {
             let list: Vec<String> = list
@@ -1160,14 +1376,51 @@ impl Tracker {
             list.join(", ")
         };
         let output = self.swapchain_extent().or_else(|| output_candidate(&self.registered_set()));
-        let (counted, output_size): (Vec<Named>, Vec<Named>) = self.named.iter().partition(|n| {
+        let (mut counted, output_size): (Vec<Named>, Vec<Named>) = self.named.iter().partition(|n| {
             n.exposure.is_some() || self.images.get(&n.colour).zip(output).is_some_and(|(d, o)| smaller(d.width, d.height, o))
         });
-        if !output_size.is_empty() && self.said_named & 8 == 0 {
-            self.said_named |= 8;
+        // Output-size entries without an exposure image: SR's shape (DLAA, no exposure given to
+        // DLSS), counted when it is the only one; the rest (FG's frame) not used.
+        let (sr_like, refused): (Vec<Named>, Vec<Named>) = output_size.iter().partition(|n| n.sr_without_exposure());
+        if let [one] = sr_like[..] {
+            counted.push(one);
+            if self.said_named & 16 == 0 {
+                self.said_named |= 16;
+                lines.push(format!(
+                    "a CUDA launch names an output-size colour image with depth and motion vectors and its command buffer names no 1x1 R16_SFLOAT exposure ({}): taken as DLSS Super Resolution's input at DLAA, because a later launch of the same buffer names it with the output (SR's output kernel) and no other launch-bearing buffer names it; the exposure is measured from the frame",
+                    describe(self, &sr_like)
+                ));
+            }
+        } else if sr_like.len() > 1 && self.said_named & 32 == 0 {
+            self.said_named |= 32;
             lines.push(format!(
-                "a CUDA launch names an output-size colour image with depth and motion vectors ({}), but its command buffer names no 1x1 R16_SFLOAT exposure: not DLSS Super Resolution's input (DLSS Frame Generation's frame, or SR without an exposure input); not used",
-                describe(self, &output_size)
+                "several output-size colour images have SR's shape without a 1x1 R16_SFLOAT exposure ({}): none used",
+                describe(self, &sr_like)
+            ));
+        }
+        let refused: Vec<Named> = if sr_like.len() > 1 { output_size.clone() } else { refused };
+        if !refused.is_empty() && self.said_named & 8 == 0 {
+            self.said_named |= 8;
+            let why: Vec<String> = refused
+                .iter()
+                .map(|n| {
+                    let mut reasons = Vec::new();
+                    if !n.output_pair {
+                        reasons.push("no later launch of its buffer names it with another output-size colour image");
+                    }
+                    if n.foreign {
+                        reasons.push("another launch-bearing buffer names it too");
+                    }
+                    if reasons.is_empty() {
+                        reasons.push("another output-size image has the same shape");
+                    }
+                    format!("{}: {}", hex(n.colour), reasons.join(", "))
+                })
+                .collect();
+            lines.push(format!(
+                "a CUDA launch names an output-size colour image with depth and motion vectors ({}), but its command buffer names no 1x1 R16_SFLOAT exposure: not DLSS Super Resolution's input (DLSS Frame Generation's frame, or SR without an exposure input); not used ({})",
+                describe(self, &refused),
+                why.join("; ")
             ));
         }
         match counted[..] {
@@ -1212,7 +1465,9 @@ impl Tracker {
         for (bi, cbs) in batches.iter().enumerate() {
             for (ci, &cb) in cbs.iter().enumerate() {
                 let colour = self.inputs.map(|i| i.colour.0);
-                let kind = self.launch.get(&cb).map(|r| r.kind(colour));
+                // With kernel names known, a buffer that launches no SR input kernel is never DLSS
+                // Super Resolution's (Ray Reconstruction's, Frame Generation's): forwarded.
+                let kind = self.launch.get(&cb).map(|r| if self.names_known && !r.sr_input { LaunchKind::Foreign } else { r.kind(colour) });
                 if kind == Some(LaunchKind::Foreign) {
                     any_foreign = true;
                     // Counted only: whether a forwarded buffer reads another colour candidate.
@@ -1239,6 +1494,7 @@ impl Tracker {
                         exposure_input_layout: layout(self.inputs.and_then(|i| i.exposure_input).map(|e| e.0)),
                         evaluation: self.evaluations,
                         identified_now: self.identified,
+                        identification: self.generation,
                     });
                 }
                 self.commit(cb);
@@ -1336,10 +1592,19 @@ impl Tracking {
 
     /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`, with its parameter buffer if
     /// readable ([`launch_params`]).
-    pub(crate) fn launch(&self, command_buffer: vk::CommandBuffer, params: Option<&[u8]>) {
+    pub(crate) fn launch(&self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) {
         let mut t = self.lock();
-        t.launch(command_buffer, params);
+        t.launch_kernel(command_buffer, function, params);
         self.rearm(&t);
+    }
+
+    /// `vkCreateCuFunctionNVX` created `function` for the kernel `name`.
+    pub(crate) fn record_function(&self, function: vk::CuFunctionNVX, name: &str) {
+        self.lock().record_function(function, name);
+    }
+
+    pub(crate) fn forget_function(&self, function: vk::CuFunctionNVX) {
+        self.lock().forget_function(function);
     }
 
     /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording. Nothing to do (no lock)
@@ -2151,11 +2416,44 @@ pub(crate) struct Target {
     /// vkd3d-proton keeps those in).
     pub exposure: [Option<(Aux, bool)>; MAX_EXPOSURE],
     /// DLSS's exposure input (the registered 1x1 R16_SFLOAT image), read by the capture in model
-    /// and roundtrip modes for the HDR encode; `None` when there is none (those modes then fail
-    /// open). Its layout is the committed one, or `GENERAL` assumed for a storage image.
+    /// and roundtrip modes for the HDR encode; `None` when there is none (the exposure is then
+    /// measured from the frame, [`ExposureSource::Auto`]). Its layout is the committed one, or
+    /// `GENERAL` assumed for a storage image.
     pub exposure_input: Option<Aux>,
     /// The HDR encode's paper white ([`hdr::paper_white`]).
     pub paper_white: f32,
+    /// Which identification of DLSS's inputs this hold works on ([`Scan::identification`]): the
+    /// auto-exposure starts its adaptation afresh when it changes.
+    pub identification: u64,
+}
+
+/// Where the HDR encode's exposure value comes from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ExposureSource {
+    /// DLSS's exposure input, the game's 1x1 R16_SFLOAT image, copied in by the capture.
+    Game,
+    /// Measured from the colour input on the GPU (`preupscale_exposure.comp`): the game gives DLSS
+    /// no exposure image, or it cannot be read.
+    Auto,
+}
+
+impl ExposureSource {
+    /// The source for `target`: the game's image when it can be copied from, else the frame.
+    pub(crate) fn of(target: &Target) -> Self {
+        if target.exposure_input.is_some_and(|a| a.readable && aux_copy_layout(a.layout).is_some()) {
+            Self::Game
+        } else {
+            Self::Auto
+        }
+    }
+
+    /// The log line's words for it.
+    pub(crate) fn describe(self) -> &'static str {
+        match self {
+            Self::Game => "the game's 1x1 R16F",
+            Self::Auto => "measured from the frame (auto)",
+        }
+    }
 }
 
 /// Which of the layer's two submissions [`run_hold`] asks the caller to make.
@@ -2194,8 +2492,13 @@ pub(crate) struct HoldResult {
     pub writeback_gpu_ms: Option<f32>,
     /// Dump mode: the bytes to write, captured.
     pub dump: Option<DumpFrame>,
-    /// Model and roundtrip modes: the exposure value the capture read.
+    /// Model and roundtrip modes: the exposure value the capture read (the half the encode and
+    /// the decode both use).
     pub exposure: Option<f32>,
+    /// Model and roundtrip modes: where it came from.
+    pub exposure_source: Option<ExposureSource>,
+    /// With [`ExposureSource::Auto`]: what the auto-exposure measured.
+    pub auto_exposure: Option<hdr::AutoState>,
     /// Where the hold's CPU time went (wall time on this thread).
     pub timing: HoldTiming,
 }
@@ -2333,22 +2636,25 @@ fn capture_reads(target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: O
 }
 
 /// Records the capture into the proxy buffer at the padded size: the colour input (GENERAL) copied
-/// raw, or with `hdr`, the exposure input read into the HDR pass's buffer and the colour input
-/// encoded for the model ([`hdr::HdrPass::record_encode`]); in dump mode also the depth aspect, the
+/// raw, or with `hdr`, the exposure input read into the HDR pass's buffer (or, with no readable one,
+/// [`ExposureSource::Auto`], measured from the colour input into the same buffer,
+/// [`hdr::HdrPass::record_auto_exposure`]) and the colour input encoded for the model
+/// ([`hdr::HdrPass::record_encode`]); in dump mode also the depth aspect, the
 /// motion vectors and the 1x1 exposure candidates. Each auxiliary image is read in its committed
 /// layout (transitioned to TRANSFER_SRC_OPTIMAL and back when that layout cannot be copied from).
 ///
 /// # Safety
 /// `res`'s capture command buffer must not be pending; with `hdr`, its colour view is bound to
-/// `target.colour`.
+/// `target.colour` and, for [`ExposureSource::Auto`], its auto-exposure is built.
 unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>) -> ash::prelude::VkResult<()> {
+    let auto = hdr.is_some() && ExposureSource::of(target) == ExposureSource::Auto;
     let cmd = res.capture_cmd;
     // SAFETY: the pool allows resetting buffers individually; the buffer is not pending.
     unsafe {
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
     }
-    let aux: Vec<DumpRead> = capture_reads(target, dump, hdr.map(hdr::HdrPass::exposure_buffer));
+    let aux: Vec<DumpRead> = capture_reads(target, dump, hdr.filter(|_| !auto).map(hdr::HdrPass::exposure_buffer));
     let mut to_read: Vec<vk::ImageMemoryBarrier> = aux
         .iter()
         .filter(|r| r.transition)
@@ -2395,7 +2701,14 @@ unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target,
             device.cmd_copy_image_to_buffer(cmd, r.aux.image, r.read, r.buffer, &[region]);
         }
         match hdr {
-            Some(pass) => pass.record_encode(device, cmd, res.proxy.buffer, target.paper_white),
+            Some(pass) => {
+                if auto {
+                    // Unbuilt (the caller builds it first), the exposure buffer would keep the 0 it
+                    // was cleared to, and nothing would be written back.
+                    pass.record_auto_exposure(device, cmd);
+                }
+                pass.record_encode(device, cmd, res.proxy.buffer, target.paper_white);
+            }
             None => device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, res.proxy.buffer, &capture_regions(target.width, target.height)),
         }
     }
@@ -2415,12 +2728,19 @@ unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target,
                 .build()
         })
         .collect();
-    let close = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ).build();
+    // The auto-exposure's resolve wrote its state and the exposure value from a shader: those are
+    // read by the host too.
+    let (close_stage, close_access) = if auto {
+        (vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
+    } else {
+        (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
+    };
+    let close = vk::MemoryBarrier::builder().src_access_mask(close_access).dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ).build();
     // SAFETY: as above.
     unsafe {
         device.cmd_pipeline_barrier(
             cmd,
-            vk::PipelineStageFlags::TRANSFER,
+            close_stage,
             vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS,
             vk::DependencyFlags::empty(),
             &[close],
@@ -2489,8 +2809,9 @@ unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Targe
 /// bytes back (identity), hand them to the helper and write its answer back (model), or keep them
 /// for a dump. In model and roundtrip modes the capture encodes the frame for the model and the
 /// write-back decodes the answer ([`hdr`]; roundtrip's answer is the encoded proxy itself); with no
-/// readable exposure image nothing is submitted, and with an unusable exposure value nothing is
-/// written back. `submit` makes the layer's two submissions on the game's queue (the capture one with
+/// readable exposure image the exposure is measured from the frame ([`ExposureSource::Auto`]), and
+/// with an unusable exposure value nothing is written back. Both the encode and the decode read the
+/// exposure from the same buffer, so they use the same value. `submit` makes the layer's two submissions on the game's queue (the capture one with
 /// the moved wait semaphores). Never blocks longer than the capture's bounded fence wait plus, in
 /// model mode, `budget`. The write-back is not waited on: its fence is checked at the next hold
 /// ([`Resources::wait_idle`]).
@@ -2528,12 +2849,10 @@ pub(crate) unsafe fn run_hold(
         }
     }
     if mode.hdr() {
-        // The encode needs the game's exposure value; without a readable exposure image nothing is
-        // captured and the frame goes to DLSS untouched.
-        if !target.exposure_input.is_some_and(|a| a.readable && aux_copy_layout(a.layout).is_some()) {
-            result.miss = Some("no readable exposure image (registered 1x1 R16_SFLOAT) for the HDR encode");
-            return result;
-        }
+        // The encode needs an exposure value: the game's, or without a readable exposure image one
+        // measured from the frame.
+        let source = ExposureSource::of(target);
+        result.exposure_source = Some(source);
         if res.hdr.is_none() {
             // SAFETY: `device` is live.
             res.hdr = unsafe { hdr::HdrPass::build(device, instance, physical_device, res.width, res.height) };
@@ -2542,6 +2861,14 @@ pub(crate) unsafe fn run_hold(
             result.miss = Some("the HDR encode/decode pipelines could not be built");
             return result;
         };
+        if source == ExposureSource::Auto {
+            // SAFETY: `device` is live; nothing of the pass is pending (`wait_idle` above).
+            if !unsafe { pass.ensure_auto(device, instance, physical_device) } {
+                result.miss = Some("the auto-exposure pipeline could not be built (no exposure image to read)");
+                return result;
+            }
+            pass.auto_for(target.identification);
+        }
         pass.clear_exposure();
         // SAFETY: nothing of the pass is pending (`wait_idle` above); the colour input is a live
         // plain RGBA16F storage image (`identify`).
@@ -2595,6 +2922,9 @@ pub(crate) unsafe fn run_hold(
         // The decode divides by it: a zero, negative or non-finite exposure means no write-back.
         let e = pass.exposure_value();
         result.exposure = Some(e);
+        if result.exposure_source == Some(ExposureSource::Auto) {
+            result.auto_exposure = pass.auto_state();
+        }
         if !hdr::exposure_ok(e) {
             result.miss = Some("the exposure value is not usable (zero, negative or not finite)");
             return result;
@@ -3037,6 +3367,9 @@ struct Stats {
     last_hold_ms: f32,
     /// When the current summary window started: the previous summary, or the first hold.
     window_start: Option<Instant>,
+    /// The HDR modes' exposure values in the window, and where the last one came from.
+    exposure: Vec<f32>,
+    exposure_source: Option<ExposureSource>,
 }
 
 /// Holds per second over a summary window of `holds` holds that took `elapsed`.
@@ -3123,6 +3456,8 @@ pub(crate) struct Session {
     own_request: Option<u32>,
     /// Holds in a row that failed on the layer's side ([`HoldResult::local_failure`]).
     local_misses: u32,
+    /// The identification and exposure source last logged ([`Self::note_exposure_source`]).
+    exposure_said: Option<(u64, ExposureSource)>,
 }
 
 impl Session {
@@ -3234,6 +3569,31 @@ impl Session {
         }
     }
 
+    /// Logs, once per identification of DLSS's inputs (and again if it changes), where the HDR
+    /// encode's exposure comes from: the game's 1x1 R16F, or measured from the frame.
+    pub(crate) fn note_exposure_source(&mut self, identification: u64, inputs: &Inputs, result: &HoldResult) {
+        let Some(source) = result.exposure_source else { return };
+        if self.exposure_said == Some((identification, source)) {
+            return;
+        }
+        self.exposure_said = Some((identification, source));
+        let detail = match source {
+            ExposureSource::Game => format!(" (image {})", inputs.exposure_input.map_or_else(|| "?".to_string(), |(i, _)| hex(i))),
+            ExposureSource::Auto => format!(
+                " for colour input {}: trimmed log-average luma, key {}, {}% per frame towards the target{}",
+                hex(inputs.colour.0),
+                hdr::AUTO_KEY,
+                hdr::AUTO_RATE * 100.0,
+                match (result.auto_exposure, result.exposure) {
+                    (Some(a), Some(e)) => format!("; first frame: mean log2 luma {:.2} over {} samples, e {e:.4}", a.mean_log2, a.samples),
+                    _ => String::new(),
+                }
+            ),
+        };
+        crate::log!("[preupscale] exposure: {}{detail}", source.describe());
+        crate::logging::flush();
+    }
+
     /// Books one hold's result; publishes the header fields and logs misses (sampled) and the
     /// periodic summary.
     pub(crate) fn note(&mut self, shm: &ShmClient, result: &HoldResult, cpu: Duration, extent: (u32, u32)) {
@@ -3286,6 +3646,10 @@ impl Session {
             s.writeback_gpu_ms.push(g);
         }
         s.book(&result.timing);
+        if let Some(e) = result.exposure.filter(|&e| hdr::exposure_ok(e)) {
+            s.exposure.push(e);
+            s.exposure_source = result.exposure_source;
+        }
         if result.over_budget || result.echoed {
             s.misses += 1;
             s.window_misses += 1;
@@ -3309,7 +3673,7 @@ impl Session {
             let rate = per_second(SUMMARY_EVERY, s.window_start.map_or(Duration::ZERO, |t| now.duration_since(t)));
             s.window_start = Some(now);
             crate::log!(
-                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2} misses={} (total {}) holds_per_s={:.1}",
+                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2} misses={} (total {}) holds_per_s={:.1}{}",
                 mode().name(),
                 extent.0,
                 extent.1,
@@ -3319,11 +3683,20 @@ impl Session {
                 median(&s.writeback_gpu_ms),
                 s.window_misses,
                 s.misses,
-                rate
+                rate,
+                match s.exposure_source.filter(|_| !s.exposure.is_empty()) {
+                    Some(source) => format!(
+                        " exposure median={:.4} ({})",
+                        median(&s.exposure),
+                        if source == ExposureSource::Auto { "auto" } else { "game" }
+                    ),
+                    None => String::new(),
+                }
             );
             crate::log!("[preupscale] {}", s.phases());
             crate::logging::flush();
             s.hold_ms.clear();
+            s.exposure.clear();
             s.capture_gpu_ms.clear();
             s.writeback_gpu_ms.clear();
             s.clear_phases();
@@ -4032,7 +4405,7 @@ mod tests {
             tr.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
         };
         register(0x1000);
-        t.launch(cb(1), None);
+        t.launch(cb(1), vk::CuFunctionNVX::null(), None);
         let first = t.scan(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(first.inputs.is_some() && first.identified_now && first.colour_layout.is_none());
         assert!(!first.colour_in_general(), "identified on this submit: nothing known, not held");
@@ -4067,7 +4440,7 @@ mod tests {
         assert!(t.scan(&[vec![cb(1), cb(2)]]).is_none());
         assert_eq!(t.extent(), None);
         // DLSS records a launch: armed, and the submit carrying it is found.
-        t.launch(cb(7), None);
+        t.launch(cb(7), vk::CuFunctionNVX::null(), None);
         assert!(t.armed());
         assert!(t.scan(&[vec![cb(6), cb(7)]]).is_some_and(|s| (s.batch, s.index) == (0, 1)));
         // A secondary's launch carries over to its primary.
@@ -4167,7 +4540,7 @@ mod tests {
         assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
         assert!(t.scan(&[vec![cb(1)]]).is_some(), "an opaque launch could be SR's: held");
         assert_eq!((t.colour_submits, t.foreign_submits), (0, 0));
-        let refs = LaunchRefs { opaque: false, images: vec![], input: None };
+        let refs = LaunchRefs::default();
         assert_eq!(refs.kind(None), LaunchKind::Unknown, "no colour input identified yet");
         // A destroyed colour view drops its key: its handle no longer matches anything.
         t.forget_view(vk::ImageView::from_raw(0x101));
@@ -4289,7 +4662,7 @@ mod tests {
             }
         }
         assert_eq!((t.colour_submits, t.foreign_submits, t.evaluations), (40, 80, 40));
-        assert_eq!(t.named, vec![Named { colour: img(0x100), depth: img(0x200), mvec: img(0x300), exposure: Some(img(0x610)) }]);
+        assert_eq!(t.named, vec![Named::new(img(0x100), img(0x200), img(0x300), Some(img(0x610)))], "the output kernel names the larger output: no same-extent output pair (that is DLAA's)");
         let ids = identification_lines(&lines);
         assert_eq!(ids.len(), 2, "{lines:#?}");
         assert!(ids[0].starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT") && ids[0].ends_with("exposure input 0x610; swapchain Some((2560, 1440)); identified by size"), "{}", ids[0]);
@@ -4520,6 +4893,290 @@ mod tests {
         t.launch(cb(5), Some(&param_block(&[h(0x110), h(0x400)])));
         assert!(submit(&mut t, &[vec![cb(5)]]).0.is_none());
         assert_eq!(t.other_candidate_buffers, 1);
+    }
+
+    /// Resident Evil Requiem's registered set at DLAA (from the rig's log): four 2560x1440 RGBA16F
+    /// storage images (0x100 DLSS's colour input, 0x110 its output, 0x120 and 0x130 others), depth
+    /// and motion vectors at 2560x1440, eight 2560x1440 A2B10G10R10 storage images (the HDR10
+    /// frames FG works on), R8/RGBA8 sRGB images, FG's 1280x720 images, and **no 1x1 exposure
+    /// image**.
+    fn re_set() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut list = vec![
+            (0x100, desc(2560, 1440, rgba, storage)),
+            (0x110, desc(2560, 1440, rgba, storage)),
+            (0x120, desc(2560, 1440, rgba, storage)),
+            (0x130, desc(2560, 1440, rgba, storage)),
+            (0x200, desc(2560, 1440, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
+            (0x300, desc(2560, 1440, vk::Format::R16G16_SFLOAT, storage)),
+            (0x500, desc(2560, 1440, vk::Format::R8_UNORM, storage)),
+            (0x510, desc(2560, 1440, vk::Format::R8G8B8A8_SRGB, vk::ImageUsageFlags::SAMPLED)),
+        ];
+        for k in 0..8 {
+            list.push((0x400 + k * 0x10, desc(2560, 1440, vk::Format::A2B10G10R10_UNORM_PACK32, storage)));
+        }
+        for k in 0..4 {
+            list.push((0x600 + k * 0x10, desc(1280, 720, if k % 2 == 0 { vk::Format::R8_UNORM } else { rgba }, storage)));
+        }
+        set_of(&list)
+    }
+
+    /// Records one frame's launches of an RE-like DLAA game without kernel names: SR (input kernel
+    /// with colour, depth and motion vectors; network on FG-size scratch; output kernel naming input
+    /// and output) in cb(1), and FG's two buffers: cb(2) naming its A2B10G10R10 frame with depth,
+    /// motion vectors and its 1280x720 images, cb(3) its frames and images.
+    fn re_launches(t: &mut Tracker) {
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x610), h(0x620)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x110), h(0x200), h(0x300)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x400), h(0x200), h(0x300), h(0x600), h(0x610)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x410), h(0x620)])));
+        t.launch(cb(3), Some(&param_block(&[h(0x400), h(0x410), h(0x630)])));
+    }
+
+    /// Runs `frames` frames of SR's cb(1) then FG's cb(2) and cb(3) (FG 3x). Returns the frame of
+    /// the first held SR submit and the lines logged; FG is never held with inputs.
+    fn run_frames(t: &mut Tracker, frames: usize) -> (Option<usize>, Vec<String>) {
+        let mut lines = Vec::new();
+        let mut first_held = None;
+        for frame in 0..frames {
+            let (sr, l) = submit(t, &[vec![cb(1)]]);
+            lines.extend(l);
+            if sr.is_some_and(|s| s.inputs.is_some() && !s.identified_now) {
+                first_held.get_or_insert(frame);
+            }
+            for fg in [cb(2), cb(3)] {
+                let (s, l) = submit(t, &[vec![fg]]);
+                lines.extend(l);
+                assert!(s.and_then(|s| s.inputs).is_none(), "frame {frame}: frame generation's buffer is never held with inputs");
+            }
+        }
+        (first_held, lines)
+    }
+
+    /// (f) Resident Evil Requiem-like DLAA without an exposure image: SR's buffer names no 1x1, so
+    /// the output-size entry counts only by SR's shape: its output kernel names the input with the
+    /// output, and no other buffer names it. Identified by the input kernel's parameters with no
+    /// exposure input (measured from the frame), held from frame 7; FG's buffers (A2B10G10R10
+    /// frames, 1280x720 images) are never evidence and never held. With FG naming an RGBA16F
+    /// output-size image with depth and motion vectors too (a HUD-less colour), that entry is refused
+    /// (its other buffer names it as well) and SR's is still chosen.
+    #[test]
+    fn re_like_dlaa_without_exposure_is_identified_by_srs_shape_and_fg_is_not() {
+        let set = re_set();
+        assert!(set.values().all(|(_, d)| !exposure_like(d)), "no 1x1 exposure image");
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        re_launches(&mut t);
+        assert_eq!(t.launch[&cb(2)].input, Some(InputLaunch::Unusable), "FG's frame is A2B10G10R10: not a colour candidate");
+        assert!(t.launch[&cb(1)].output_pair && !t.launch[&cb(2)].output_pair);
+        let (first_held, lines) = run_frames(&mut t, 40);
+        assert_eq!(first_held, Some(7));
+        let i = t.inputs.expect("identified");
+        assert_eq!((i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw(), i.rule, i.exposure_input), (0x100, 0x200, 0x300, Rule::Params, None));
+        assert_eq!(t.named, vec![Named { output_pair: true, ..Named::new(img(0x100), img(0x200), img(0x300), None) }]);
+        let ids = identification_lines(&lines);
+        assert!(ids.last().unwrap().contains("exposure input none (no registered 1x1 R16_SFLOAT; measured from the frame)"), "{}", ids.last().unwrap());
+        assert!(ids.last().unwrap().ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"));
+        assert_eq!(lines.iter().filter(|l| l.contains("taken as DLSS Super Resolution's input at DLAA")).count(), 1, "{lines:#?}");
+        assert!(lines.iter().all(|l| !l.contains("not used")), "{lines:#?}");
+
+        // FG names an RGBA16F output-size image with depth and motion vectors (SR's input shape),
+        // and its other buffer names it too: refused, SR still chosen.
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        re_launches(&mut t);
+        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x130)])));
+        t.begin(cb(2));
+        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x200), h(0x300), h(0x600)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x130)])));
+        t.launch(cb(3), Some(&param_block(&[h(0x120), h(0x400)])));
+        assert!(matches!(t.launch[&cb(2)].input, Some(InputLaunch::Inputs { colour, .. }) if colour == img(0x120)));
+        assert!(t.launch[&cb(2)].output_pair, "FG's buffer has SR's whole shape here");
+        let (first_held, lines) = run_frames(&mut t, 40);
+        assert_eq!(first_held, Some(7));
+        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), Some((0x100, Rule::Params)));
+        let fg = t.named.iter().find(|n| n.colour == img(0x120)).expect("FG's entry is seen");
+        assert!(fg.foreign && !fg.sr_without_exposure());
+        let refused: Vec<&String> = lines.iter().filter(|l| l.contains("not used")).collect();
+        assert_eq!(refused.len(), 1, "{lines:#?}");
+        assert!(refused[0].contains("0x120: another launch-bearing buffer names it too"), "{}", refused[0]);
+    }
+
+    /// (g) Frame generation alone at native resolution, with SR's whole shape (its launch names an
+    /// output-size RGBA16F frame with depth and motion vectors, a later launch that frame with
+    /// another output-size image), never identifies: its other buffer names the frame too.
+    #[test]
+    fn frame_generation_with_srs_shape_but_a_second_reader_never_identifies() {
+        let mut set = re_set();
+        set.remove(&0x100);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x200), h(0x300)])));
+        t.launch(cb(2), Some(&param_block(&[h(0x120), h(0x130)])));
+        t.launch(cb(3), Some(&param_block(&[h(0x120), h(0x400)])));
+        let mut lines = Vec::new();
+        for _ in 0..60 {
+            for b in [cb(2), cb(3)] {
+                let (s, l) = submit(&mut t, &[vec![b]]);
+                lines.extend(l);
+                assert!(s.and_then(|s| s.inputs).is_none());
+            }
+        }
+        assert!(t.inputs.is_none() && t.named_pick.is_none());
+        assert_eq!(t.named.iter().map(|n| (n.output_pair, n.foreign)).collect::<Vec<_>>(), vec![(true, true)]);
+        assert_eq!(lines.iter().filter(|l| l.contains("another launch-bearing buffer names it too")).count(), 1, "{lines:#?}");
+    }
+
+    /// Kernel names as `vkCreateCuFunctionNVX` gives them: GTA V's SR input kernel, NGX's input
+    /// kernel family, Ray Reconstruction's network (some names shared with Frame Generation), and
+    /// everything else.
+    #[test]
+    fn kernels_are_told_apart_by_name() {
+        for sr in ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "cuda_engine_input_kernel_rel_hdr_colvar_mvlo"] {
+            assert_eq!(Kernel::of(sr), Kernel::SrInput, "{sr}");
+        }
+        for rr in ["custom_block0_conv0_kernel", "custom_block1_hf_kernel", "custom_upsample_hf_kernel", "k_initial_merge", "k_central_block"] {
+            assert_eq!(Kernel::of(rr), Kernel::RayReconstruction, "{rr}");
+        }
+        for other in ["main_kernel", "k_conv_fp16_nhwc", "k_pooling", "dltss_pwin_enc0_layer", "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel", "cuda_copy_exposure_kernel"] {
+            assert_eq!(Kernel::of(other), Kernel::Other, "{other}");
+        }
+    }
+
+    /// Creates the kernels of `names` on `t` (handles 0x9000 + index) and returns their handles.
+    fn kernels(t: &mut Tracker, names: &[&str]) -> Vec<vk::CuFunctionNVX> {
+        names
+            .iter()
+            .enumerate()
+            .map(|(k, name)| {
+                let f = vk::CuFunctionNVX::from_raw(0x9000 + k as u64);
+                t.record_function(f, name);
+                f
+            })
+            .collect()
+    }
+
+    /// (h) DLSS Ray Reconstruction (Resident Evil Requiem with ray tracing, at DLAA and at Balanced):
+    /// SR's kernels are created but never launched; RR's network launches, its first launch naming
+    /// an RGBA16F output-size image with depth and motion vectors and a later one that image with
+    /// another (SR's whole shape), and at Balanced the registered set also has a render-size group
+    /// the size rule would take (RR's noisy input). With kernel names known, neither rule identifies
+    /// anything, no buffer is held, and "DLSS Ray Reconstruction detected" is logged once. Without
+    /// the names (the same launches), SR's shape would have been taken: the names are what keep RR out.
+    #[test]
+    fn ray_reconstruction_is_never_identified_or_held() {
+        let mut set = re_set();
+        set.remove(&0x100);
+        // Balanced: RR's render-size inputs, which the size rule alone would identify.
+        let b10 = vk::Format::B10G11R11_UFLOAT_PACK32;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
+        set.insert(0x700, (img(0x700), desc(1486, 836, vk::Format::R16G16B16A16_SFLOAT, storage)));
+        set.insert(0x710, (img(0x710), desc(1486, 836, b10, storage)));
+        set.insert(0x720, (img(0x720), desc(1486, 836, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)));
+        set.insert(0x730, (img(0x730), desc(1486, 836, vk::Format::R16G16_SFLOAT, storage)));
+        assert!(identify(&set, Some((2560, 1440))).is_some(), "the size rule alone takes RR's render-size input");
+        let record = |t: &mut Tracker, f: &[vk::CuFunctionNVX]| {
+            t.launch_kernel(cb(1), f[2], Some(&param_block(&[h(0x120), h(0x200), h(0x300), h(0x500)])));
+            t.launch_kernel(cb(1), f[3], Some(&param_block(&[h(0x600), h(0x610)])));
+            t.launch_kernel(cb(1), f[4], Some(&param_block(&[h(0x120), h(0x130)])));
+            t.launch_kernel(cb(2), f[5], Some(&param_block(&[h(0x400), h(0x200), h(0x300), h(0x620)])));
+            t.launch_kernel(cb(2), f[6], Some(&param_block(&[h(0x410), h(0x630)])));
+        };
+        let names = [
+            "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel",
+            "cuda_engine_input_kernel_rel_hdr_colvar_mvlo",
+            "custom_block0_conv0_kernel",
+            "k_central_block",
+            "custom_upsample_hf_kernel",
+            "main_kernel",
+            "k_conv_fp16_nhwc",
+        ];
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let f = kernels(&mut t, &names);
+        record(&mut t, &f);
+        assert_eq!(t.launch[&cb(1)].input_sr, Some(false), "RR's first launch is not SR's input kernel");
+        let mut lines = Vec::new();
+        for _ in 0..60 {
+            for b in [cb(1), cb(2)] {
+                let (s, l) = submit(&mut t, &[vec![b]]);
+                lines.extend(l);
+                assert!(s.is_none(), "with kernel names, a buffer launching no SR input kernel is never the hold point");
+            }
+        }
+        assert!(t.inputs.is_none() && t.named.is_empty() && t.named_pick.is_none(), "{:?}", t.named);
+        let rr: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS Ray Reconstruction detected")).collect();
+        assert_eq!(rr.len(), 1, "{lines:#?}");
+        assert!(rr[0].contains("custom_block0_conv0_kernel, k_central_block, custom_upsample_hf_kernel launched"), "{}", rr[0]);
+        let ids = identification_lines(&lines);
+        assert!(ids.iter().all(|l| l.starts_with("no DLSS input")), "{ids:#?}");
+        assert!(ids.last().unwrap().contains("no DLSS Super Resolution input kernel"), "{}", ids.last().unwrap());
+
+        // The same launches without kernel names: SR's shape would be taken (what the names prevent).
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        record(&mut t, &[vk::CuFunctionNVX::null(); 7]);
+        for _ in 0..60 {
+            for b in [cb(1), cb(2)] {
+                submit(&mut t, &[vec![b]]);
+            }
+        }
+        assert!(t.inputs.is_some(), "without names the shape rules alone identify");
+    }
+
+    /// (i) GTA V with kernel names known (SR's input kernel `hiluma_engine_input_*` launching in its
+    /// buffer, FG launching `main_kernel`, `custom_block0_convPre_kernel` and `k_initial_merge`, names
+    /// it shares with Ray Reconstruction): exactly as without names (identified by size at the first
+    /// submit, then by the parameters, SR held every frame, FG forwarded), and no Ray Reconstruction
+    /// line. The same for the DLAA SR set (with an exposure image) and for RE-like DLAA without one.
+    #[test]
+    fn with_kernel_names_sr_games_keep_their_identification_and_hold_target() {
+        let names = ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "dltss_pwin_enc0_layer", "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel", "cuda_copy_exposure_kernel", "main_kernel", "custom_block0_convPre_kernel", "k_initial_merge"];
+        // GTA V.
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let mut set = gta_registered();
+        set.insert(0x420, (img(0x420), desc(2560, 1440, rgba, storage)));
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let f = kernels(&mut t, &names);
+        t.launch_kernel(cb(1), f[0], Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
+        t.launch_kernel(cb(1), f[1], Some(&param_block(&[h(0x500), h(0x700)])));
+        t.launch_kernel(cb(1), f[2], Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
+        t.launch_kernel(cb(1), f[3], Some(&param_block(&[h(0x610)])));
+        t.launch_kernel(cb(2), f[5], Some(&param_block(&[h(0x420), h(0x200), h(0x300)])));
+        t.launch_kernel(cb(2), f[4], Some(&param_block(&[h(0x400)])));
+        t.launch_kernel(cb(3), f[6], Some(&param_block(&[h(0x420), h(0x400)])));
+        let mut lines = Vec::new();
+        for frame in 0..40 {
+            let (sr, l) = submit(&mut t, &[vec![cb(1)]]);
+            lines.extend(l);
+            let sr = sr.expect("SR's buffer is the hold point");
+            assert_eq!(sr.identified_now, frame == 0, "frame {frame}");
+            assert_eq!(sr.inputs.map(|i| (i.colour.0.as_raw(), i.exposure_input.map(|e| e.0.as_raw()))), Some((0x100, Some(0x610))));
+            for fg in [cb(2), cb(3)] {
+                let (s, l) = submit(&mut t, &[vec![fg]]);
+                lines.extend(l);
+                assert!(s.is_none(), "frame {frame}: FG forwarded");
+            }
+        }
+        assert_eq!((t.colour_submits, t.foreign_submits), (40, 80));
+        assert_eq!(t.inputs.map(|i| i.rule), Some(Rule::Params));
+        assert!(lines.iter().all(|l| !l.contains("Ray Reconstruction") && !l.contains("not used")), "{lines:#?}");
+
+        // RE-like DLAA without exposure, SR running: identified as without names.
+        let mut t = tracker_with(&re_set(), Some((2560, 1440)));
+        let f = kernels(&mut t, &names);
+        t.launch_kernel(cb(1), f[0], Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
+        t.launch_kernel(cb(1), f[1], Some(&param_block(&[h(0x610), h(0x620)])));
+        t.launch_kernel(cb(1), f[2], Some(&param_block(&[h(0x100), h(0x110), h(0x200), h(0x300)])));
+        // FG with SR's whole shape and no second reader: only the names keep it out (it would make
+        // two SR-like entries, and none would be chosen).
+        t.launch_kernel(cb(2), f[5], Some(&param_block(&[h(0x120), h(0x200), h(0x300)])));
+        t.launch_kernel(cb(2), f[4], Some(&param_block(&[h(0x120), h(0x130)])));
+        t.launch_kernel(cb(3), f[6], Some(&param_block(&[h(0x400), h(0x410)])));
+        assert_eq!(t.launch[&cb(2)].input_sr, Some(false));
+        let (first_held, lines) = run_frames(&mut t, 40);
+        assert_eq!(first_held, Some(7));
+        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule, i.exposure_input)), Some((0x100, Rule::Params, None)));
+        assert_eq!(t.named.len(), 1, "FG's launch is not evidence with names known: {:?}", t.named);
+        assert!(lines.iter().all(|l| !l.contains("Ray Reconstruction") && !l.contains("none used")), "{lines:#?}");
     }
 
     #[test]
@@ -5410,7 +6067,7 @@ mod tests {
                 assert_eq!(res.imported(), import, "imported exactly when the device can");
             }
             let white = hdr::DEFAULT_PAPER_WHITE;
-            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white };
+            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
             let (device, queue) = (&gpu.device, gpu.queue);
             let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
                 device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
@@ -5504,7 +6161,7 @@ mod tests {
             let mut shm = scratch_shm(if import { "rt-import" } else { "rt-staged" });
             let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
             let white = 2.5;
-            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white };
+            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
             let (device, queue) = (&gpu.device, gpu.queue);
             let mut submits = Vec::new();
             let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
@@ -5595,7 +6252,7 @@ mod tests {
         wait_for_helper(&mut shm);
         let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
         let white = hdr::DEFAULT_PAPER_WHITE;
-        let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white };
+        let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
         let (device, queue) = (&gpu.device, gpu.queue);
         let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
@@ -5618,12 +6275,12 @@ mod tests {
         finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
     }
 
-    /// Check (d): no exposure image, an unreadable one, or one holding 0: model and roundtrip modes
-    /// leave the frame untouched and never call the helper. Without a readable image nothing is
-    /// submitted at all (the waits stay with the game's batch); with a zero value the capture runs
-    /// and the write-back is skipped.
+    /// Check (d): a readable exposure image holding 0: model and roundtrip modes leave the frame
+    /// untouched and never call the helper (the capture runs, the write-back is skipped). No
+    /// exposure image, or an unreadable one, is no longer a reason to leave the frame alone: the
+    /// exposure is measured from the frame ([`ExposureSource::Auto`]), and those holds write back.
     #[test]
-    fn a_missing_or_zero_exposure_leaves_the_frame_untouched() {
+    fn a_zero_exposure_leaves_the_frame_untouched_and_a_missing_one_is_measured() {
         let Some(gpu) = Gpu::open(false) else {
             eprintln!("preupscale exposure fail-open test: no Vulkan device, skipping");
             return;
@@ -5643,26 +6300,311 @@ mod tests {
             submits.push(which);
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
         };
-        let base = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE };
-        let unreadable = Some(Aux { readable: false, ..exposure_aux(zero).unwrap() });
-        for (mode, exposure_input) in [(Mode::Model, None), (Mode::Roundtrip, None), (Mode::Model, unreadable)] {
-            let target = Target { exposure_input, ..base };
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, mode, false, 0, ANSWER_BUDGET, &mut submit) };
-            assert!(!result.waits_consumed && !result.wrote_back && !result.over_budget, "{mode:?}: {result:?}");
-            assert!(result.miss.is_some_and(|m| m.contains("exposure")), "{result:?}");
-        }
+        let base = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification: 1 };
         for mode in [Mode::Model, Mode::Roundtrip] {
             let target = Target { exposure_input: exposure_aux(zero), ..base };
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, mode, false, 0, ANSWER_BUDGET, &mut submit) };
             assert!(result.waits_consumed && !result.wrote_back && !result.over_budget, "{mode:?}: {result:?}");
-            assert_eq!(result.exposure, Some(0.0));
+            assert_eq!((result.exposure, result.exposure_source), (Some(0.0), Some(ExposureSource::Game)));
             assert!(result.miss.is_some_and(|m| m.contains("exposure value")), "{result:?}");
         }
-        assert_eq!(submits, vec![Which::Capture, Which::Capture], "nothing without an exposure image; captures only, no write-back, with a zero one");
+        assert_eq!(submits, vec![Which::Capture, Which::Capture], "captures only, no write-back, with a zero one");
         assert!(!shm.has_pending_request(0), "the helper was never asked");
         assert_eq!(gpu.read(image, w, h), original, "the frame is untouched");
+        let unreadable = Some(Aux { readable: false, ..exposure_aux(zero).unwrap() });
+        let unknown_layout = Some(Aux { layout: None, ..exposure_aux(zero).unwrap() });
+        let mut plain = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+        };
+        for exposure_input in [None, unreadable, unknown_layout] {
+            let target = Target { exposure_input, ..base };
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut plain) };
+            assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{exposure_input:?}: {result:?}");
+            assert_eq!(result.exposure_source, Some(ExposureSource::Auto), "{exposure_input:?}");
+            assert!(result.exposure.is_some_and(hdr::exposure_ok), "{result:?}");
+        }
         drop(helper);
         finish(&gpu, res, &[(image, memory), (zero, zero_mem)]);
+    }
+
+    // ---- Auto-exposure: the CPU reference on synthetic frames, and the GPU pass against it. ----
+
+    /// A tightly packed RGBA16F frame from a per-texel colour.
+    fn frame(width: u32, height: u32, mut colour: impl FnMut(u32, u32) -> [f32; 3]) -> Vec<u8> {
+        let mut out = Vec::with_capacity((width * height) as usize * TEXEL as usize);
+        for y in 0..height {
+            for x in 0..width {
+                for v in colour(x, y).into_iter().chain([1.0]) {
+                    out.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+                }
+            }
+        }
+        out
+    }
+
+    /// Luma of a half-rounded grey `v` (what the frame holds).
+    fn grey(v: f32) -> [f32; 3] {
+        [v, v, v]
+    }
+
+    /// The exact trimmed log2-average luma of `texels` over the same samples as the shader (even x
+    /// and y, finite, not black): sorted, the lowest and highest [`hdr::AUTO_TRIM`] dropped
+    /// (fractionally at the cut), averaged in f64. What the histogram approximates.
+    fn exact_trimmed_mean_log2(texels: &[u8], width: u32, height: u32) -> f64 {
+        let mut logs = Vec::new();
+        for y in (0..height).step_by(2) {
+            for x in (0..width).step_by(2) {
+                let rgb: Vec<f64> = (0..3).map(|c| f64::from(f16_to_f32(half_at(texels, width, x, y, c)))).collect();
+                if rgb.iter().any(|v| !v.is_finite()) {
+                    continue;
+                }
+                let l = 0.2126 * rgb[0].max(0.0) + 0.7152 * rgb[1].max(0.0) + 0.0722 * rgb[2].max(0.0);
+                if l >= 2f64.powi(-24) {
+                    logs.push(l.log2());
+                }
+            }
+        }
+        logs.sort_by(f64::total_cmp);
+        let n = logs.len() as f64;
+        let (lo, hi) = (f64::from(hdr::AUTO_TRIM) * n, n - f64::from(hdr::AUTO_TRIM) * n);
+        let (mut w, mut sum) = (0.0, 0.0);
+        for (i, l) in logs.iter().enumerate() {
+            let (a, b) = ((i as f64).max(lo), (i as f64 + 1.0).min(hi));
+            if b > a {
+                w += b - a;
+                sum += (b - a) * l;
+            }
+        }
+        sum / w
+    }
+
+    /// A deterministic log-normal luma frame (grey) with the given median and log spread `sigma`
+    /// (natural log): Box-Muller over a fixed LCG.
+    fn log_normal(width: u32, height: u32, median: f64, sigma: f64) -> Vec<u8> {
+        let mut state = 0x2545_f491_4f6c_dd1d_u64;
+        let mut uniform = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+        };
+        frame(width, height, |_, _| {
+            let z = (-2.0 * uniform().ln()).sqrt() * (2.0 * std::f64::consts::PI * uniform()).cos();
+            grey((median * (sigma * z).exp()) as f32)
+        })
+    }
+
+    /// The reference's histogram and trimmed log-average against the exact sort-based trimmed mean,
+    /// and its exposure against the formula, on synthetic HDR frames: uniform (e = key / L), a
+    /// gradient, bright sky over dark ground (the geometric mean of the two), the same with NaN,
+    /// infinite and negative texels (ignored / clamped), with a 0.5% sun (trimmed away), and black
+    /// (no samples: e stays, or 1). Adaptation: 5% per frame in log2 towards the target.
+    #[test]
+    fn the_auto_exposure_reference_finds_the_trimmed_log_average() {
+        let key = f64::from(hdr::AUTO_KEY);
+        let check = |name: &str, texels: &[u8], w: u32, h: u32, want_mean: Option<f64>| {
+            let got = hdr::auto_exposure_reference(texels, w, h, None);
+            let exact = exact_trimmed_mean_log2(texels, w, h);
+            assert!((f64::from(got.mean_log2) - exact).abs() < 0.01, "{name}: histogram mean log2 {} vs exact {exact}", got.mean_log2);
+            if let Some(want) = want_mean {
+                assert!((exact - want).abs() < 0.02, "{name}: exact trimmed mean log2 {exact}, expected {want}");
+            }
+            assert!((f64::from(got.target_log2_e) - (key.log2() - f64::from(got.mean_log2))).abs() < 1e-5, "{name}: target = log2(key) - mean");
+            assert_eq!(got.log2_e, got.target_log2_e, "{name}: the first frame takes the target");
+            got
+        };
+        let (w, h) = (96u32, 64u32);
+        // Uniform: e = key / L exactly (to the histogram's 1/256-bin resolution).
+        for l in [0.01f32, 1.0, 5.9, 3000.0] {
+            let got = check("uniform", &frame(w, h, |_, _| grey(l)), w, h, Some(f64::from(f16_to_f32(f32_to_f16(l))).log2()));
+            let e = got.log2_e.exp2();
+            assert!((f64::from(e) - key / f64::from(l)).abs() <= 0.005 * key / f64::from(l), "uniform {l}: e {e}, want {}", key / f64::from(l));
+        }
+        // A horizontal gradient 0.5..50 and a log gradient (exact mean known).
+        check("gradient", &frame(w, h, |x, _| grey(0.5 + 49.5 * x as f32 / (w - 1) as f32)), w, h, None);
+        check("log gradient", &frame(w, h, |x, _| grey(2f32.powf(-3.0 + 8.0 * x as f32 / (w - 1) as f32))), w, h, None);
+        // Bright sky over dark ground, half and half: the log-average is the geometric mean.
+        let sky = |_: u32, y: u32| if y < h / 2 { [40.0, 50.0, 70.0] } else { [0.4, 0.5, 0.3] };
+        let sky_luma = 0.2126f64 * 40.0 + 0.7152 * 50.0 + 0.0722 * 70.0;
+        let ground_luma = 0.2126f64 * 0.4 + 0.7152 * 0.5 + 0.0722 * 0.3;
+        let geo = (sky_luma.log2() + ground_luma.log2()) / 2.0;
+        let sky_ground = frame(w, h, sky);
+        let base = check("sky and ground", &sky_ground, w, h, Some(geo));
+        // NaN, +Inf, -Inf and negative texels: the first three are skipped, negatives are clamped
+        // to 0 (and a black sample is skipped). One bad texel per 16x8 block, on sampled positions.
+        let dirty = frame(w, h, |x, y| match (x % 16, y % 8) {
+            (0, 0) => [f32::NAN, 1.0, 1.0],
+            (2, 0) => [1.0, f32::INFINITY, 1.0],
+            (4, 0) => [f32::NEG_INFINITY, 1.0, 1.0],
+            (6, 0) => [-5.0, -5.0, -5.0],
+            _ => sky(x, y),
+        });
+        let got = check("with NaN/Inf/negative", &dirty, w, h, Some(geo));
+        assert!(got.samples < base.samples, "the bad texels were not counted");
+        assert!((got.mean_log2 - base.mean_log2).abs() < 0.02, "{} vs {}", got.mean_log2, base.mean_log2);
+        // A 0.5% sun at 30000 (fewer than the trimmed 1%): trimmed away.
+        let sunny = frame(w, h, |x, y| if y == 0 && x < 30 && x % 2 == 0 { grey(30000.0) } else { sky(x, y) });
+        let got = check("with a sun", &sunny, w, h, None);
+        assert!((got.mean_log2 - base.mean_log2).abs() < 0.03, "the sun moved the mean: {} vs {}", got.mean_log2, base.mean_log2);
+        // Black: nothing to measure, e keeps the previous value (or 1 with none).
+        let black = frame(w, h, |_, _| grey(0.0));
+        assert_eq!(hdr::auto_exposure_reference(&black, w, h, None).log2_e, 0.0);
+        assert_eq!(hdr::auto_exposure_reference(&black, w, h, Some(-2.5)).log2_e, -2.5);
+        // Adaptation: 5% of the way in log2, frame after frame.
+        let first = hdr::auto_exposure_reference(&sky_ground, w, h, None);
+        let next = hdr::auto_exposure_reference(&sky_ground, w, h, Some(first.target_log2_e + 2.0));
+        assert!((next.log2_e - (first.target_log2_e + 2.0 * 0.95)).abs() < 1e-5, "{next:?}");
+    }
+
+    /// The key against GTA V's own exposure (docs/PRE_UPSCALER_DESIGN.md, "E1b: the HDR encode"):
+    /// dump A (Grove Street) scene luma p50 5.9 and p99 19.5 with the game's e 0.1282; dump B
+    /// (Vinewood) p50 3.0 and p99 20.9 with e 0.1581. Log-normal frames with those medians and
+    /// spreads (sigma = ln(p99 / p50) / 2.326) give an auto e within 30% of the game's.
+    #[test]
+    fn the_auto_exposure_key_matches_gtas_own_exposure_within_30_percent() {
+        let (w, h) = (512u32, 288u32);
+        for (name, median, p99, game_e) in [("A", 5.9f64, 19.5f64, 0.1282f64), ("B", 3.0, 20.9, 0.1581)] {
+            let sigma = (p99 / median).ln() / 2.326;
+            let texels = log_normal(w, h, median, sigma);
+            let got = hdr::auto_exposure_reference(&texels, w, h, None);
+            let e = f64::from(got.log2_e.exp2());
+            let ratio = e / game_e;
+            eprintln!("GTA dump {name}: median {median}, sigma {sigma:.3}: auto e {e:.4}, the game's {game_e}: ratio {ratio:.3}");
+            assert!((0.7..=1.3).contains(&ratio), "dump {name}: auto e {e} vs the game's {game_e}");
+        }
+    }
+
+    /// Runs one auto-exposure hold (roundtrip mode, no exposure image) on `texels` and returns it.
+    fn auto_hold(gpu: &Gpu, res: &mut Resources, shm: &mut ShmClient, image: vk::Image, w: u32, h: u32, identification: u64) -> HoldResult {
+        let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification };
+        let (device, queue) = (&gpu.device, gpu.queue);
+        let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+        };
+        let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, res, shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut submit) };
+        assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{result:?}");
+        assert_eq!(result.exposure_source, Some(ExposureSource::Auto));
+        result
+    }
+
+    /// The GPU auto-exposure (`preupscale_exposure.comp`, through a real hold) against the CPU
+    /// reference: on a frame larger than one workgroup tile and not a multiple of it (200x130), for
+    /// uniform, sky-and-ground (with NaN, Inf and negative texels) and log-normal frames, the
+    /// sample count is exact, the mean log2 luma within 0.01, the exposure the half of the
+    /// reference's. Then, on one identification, the next frame (4x brighter) moves 5% of the way
+    /// (the persistent state), and a new identification takes the target at once.
+    #[test]
+    fn the_gpu_auto_exposure_matches_the_cpu_reference_adapts_and_resets() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("preupscale auto-exposure test: no Vulkan device, skipping");
+            return;
+        };
+        let (w, h) = (200u32, 130u32);
+        let (image, memory) = gpu.image(w, h);
+        let mut shm = scratch_shm("auto");
+        let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
+        let sky = |x: u32, y: u32| match (x % 16, y % 8) {
+            (0, 0) => [f32::NAN, 1.0, 1.0],
+            (2, 0) => [1.0, f32::INFINITY, 1.0],
+            (4, 0) => [-5.0, -5.0, -5.0],
+            _ if y < h / 3 => [40.0, 50.0, 70.0],
+            _ => [0.4, 0.5, 0.3],
+        };
+        let frames = [("uniform", frame(w, h, |_, _| grey(5.9))), ("sky and ground", frame(w, h, sky)), ("log-normal", log_normal(w, h, 3.0, 0.83))];
+        let mut identification = 10;
+        for (name, texels) in &frames {
+            gpu.upload(image, w, h, texels);
+            // A new identification each: the first frame takes the target.
+            identification += 1;
+            let result = auto_hold(&gpu, &mut res, &mut shm, image, w, h, identification);
+            let got = result.auto_exposure.expect("the state was read");
+            let want = hdr::auto_exposure_reference(texels, w, h, None);
+            assert_eq!(got.samples, want.samples, "{name}: samples");
+            assert!(got.valid, "{name}");
+            assert!((got.mean_log2 - want.mean_log2).abs() < 0.01, "{name}: GPU mean log2 {} vs CPU {}", got.mean_log2, want.mean_log2);
+            assert!((got.log2_e - want.log2_e).abs() < 0.01, "{name}: GPU log2 e {} vs CPU {}", got.log2_e, want.log2_e);
+            let e = result.exposure.unwrap();
+            assert_eq!(e, f16_to_f32(f32_to_f16(got.log2_e.exp2())), "{name}: the exposure buffer holds the state's e as a half");
+            eprintln!("auto-exposure {name}: {} samples, mean log2 luma {:.4} (CPU {:.4}), e {e:.5}", got.samples, got.mean_log2, want.mean_log2);
+        }
+        // Adaptation on the same identification: 4x brighter moves 5% of 2 EV.
+        let (_, last) = &frames[2];
+        let before = auto_hold(&gpu, &mut res, &mut shm, image, w, h, identification).auto_exposure.unwrap();
+        let brighter = frame(w, h, |x, y| {
+            let at = ((y * w + x) as usize) * TEXEL as usize;
+            let v = f16_to_f32(u16::from_le_bytes([last[at], last[at + 1]]));
+            grey(v * 4.0)
+        });
+        gpu.upload(image, w, h, &brighter);
+        let after = auto_hold(&gpu, &mut res, &mut shm, image, w, h, identification).auto_exposure.unwrap();
+        let want = hdr::auto_exposure_reference(&brighter, w, h, Some(before.log2_e));
+        assert!((after.log2_e - want.log2_e).abs() < 0.01, "adapted: GPU {} vs CPU {}", after.log2_e, want.log2_e);
+        assert!((before.log2_e - after.log2_e - 0.05 * 2.0).abs() < 0.02, "5% of 2 EV: {} -> {}", before.log2_e, after.log2_e);
+        // A new identification starts over: the target at once.
+        let reset = auto_hold(&gpu, &mut res, &mut shm, image, w, h, identification + 1).auto_exposure.unwrap();
+        assert!((reset.log2_e - reset.target_log2_e).abs() < 1e-6 && (reset.log2_e - after.log2_e).abs() > 1.5, "{reset:?} after {after:?}");
+        finish(&gpu, res, &[(image, memory)]);
+    }
+
+    /// Roundtrip with the auto-exposure is the identity the game-exposure roundtrip is: the encode
+    /// is the CPU reference with the measured e (the half in the exposure buffer), and the decode,
+    /// reading the same buffer, gives the frame back (clamped highlights exactly). Twice, with the
+    /// frame changing between holds so e changes (the adaptation), so a decode using any other
+    /// frame's e would show.
+    #[test]
+    fn roundtrip_with_auto_exposure_stays_an_identity() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("preupscale auto roundtrip test: no Vulkan device, skipping");
+            return;
+        };
+        let (w, h) = (17u32, 9u32);
+        let (pw, ph) = padded(w, h);
+        let (image, memory) = gpu.image(w, h);
+        let mut shm = scratch_shm("auto-rt");
+        let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
+        let white = hdr::DEFAULT_PAPER_WHITE;
+        let mut last_e = None;
+        for scale in [1.0f32, 8.0] {
+            let original: Vec<u8> = {
+                let base = hdr_pattern(w, h);
+                base.chunks_exact(2).enumerate().flat_map(|(i, b)| {
+                    let v = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                    let v = if i % 4 == 3 { v } else { v * scale };
+                    f32_to_f16(v).to_le_bytes()
+                }).collect()
+            };
+            gpu.upload(image, w, h, &original);
+            let result = auto_hold(&gpu, &mut res, &mut shm, image, w, h, 1);
+            let e = result.exposure.unwrap();
+            assert_ne!(Some(e), last_e, "the exposure changed with the frame");
+            last_e = Some(e);
+            let proxy = proxy_bytes(&shm, pw, ph);
+            let clamped = check_encode(&proxy, &original, w, h, e, white);
+            let after = gpu.read(image, w, h);
+            check_decode(&after, &original, &proxy, &proxy, w, h, e, white);
+            // Back to the frame: within what the half floats lose (as the game-exposure roundtrip).
+            let mut kept = 0;
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let x0 = f64::from(f16_to_f32(half_at(&original, w, x, y, c)));
+                        let enc_bits = half_at(&proxy, pw, x, y, c);
+                        let enc = f16_to_f32(enc_bits);
+                        let got = f64::from(f16_to_f32(half_at(&after, w, x, y, c)));
+                        if enc >= hdr::CLAMPED {
+                            kept += 1;
+                            assert_eq!(got, x0);
+                            continue;
+                        }
+                        let proxy_step = (hdr_ref::decode(f16_to_f32(enc_bits + 1), e, white) - hdr_ref::decode(enc, e, white)).abs();
+                        let out_step = f64::from(f16_to_f32(f32_to_f16(x0 as f32) + 1)) - x0;
+                        assert!((got - x0).abs() <= 1e-3 * x0 + proxy_step + out_step + 1e-6, "auto roundtrip at {x},{y} channel {c}: {x0} -> {got} (e {e})");
+                    }
+                    assert_eq!(half_at(&after, w, x, y, 3), half_at(&original, w, x, y, 3));
+                }
+            }
+            assert_eq!(kept, clamped);
+            eprintln!("auto roundtrip x{scale}: e={e}, {kept} clamped channels kept");
+        }
+        finish(&gpu, res, &[(image, memory)]);
     }
 
     /// Dump mode on a real device: colour (padded), the depth aspect of a D32S8 image that sits in
@@ -5755,6 +6697,7 @@ mod tests {
             ],
             exposure_input: None,
             paper_white: hdr::DEFAULT_PAPER_WHITE,
+            identification: 1,
         };
         let queue = gpu.queue;
         let mut submits = Vec::new();

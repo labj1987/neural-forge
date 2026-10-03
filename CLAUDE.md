@@ -77,7 +77,10 @@ DLSS's registered colour input, holds the game's DLSS submit, sends the HDR-enco
 frame to the helper every frame and decodes the answer back before DLSS runs. The colour input is
 what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's
 output-size input), with the older size rule as the fallback (docs/PRE_UPSCALER_DESIGN.md,
-"Identification by the input kernel's parameters (DLAA)"). Everything else (no NVX, no DLSS, native)
+"Identification by the input kernel's parameters (DLAA)"). Once kernel names are known
+(`vkCreateCuFunctionNVX`), nothing is identified unless DLSS SR's input kernel launches, so DLSS Ray
+Reconstruction is never held ("DLSS Ray Reconstruction"); without a readable exposure image the
+exposure is measured from the frame ("Auto-exposure when the game gives DLSS none"). Everything else (no NVX, no DLSS, native)
 keeps the post-upscaler path. Only the launch-bearing command buffer whose
 kernel parameters name the identified colour input is held, so DLSS Frame Generation's submits go
 through untouched (docs/PRE_UPSCALER_DESIGN.md, "DLSS Frame Generation"). `NEURAL_FORGE_PREUPSCALE=off` is the A/B

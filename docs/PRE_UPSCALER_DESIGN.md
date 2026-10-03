@@ -292,10 +292,12 @@ than the largest registered RGBA16F/R11G11B10 storage image, see "Several colour
 registered 1x1 `R16_SFLOAT` image (lowest handle if there are several; NGX's own 1x1 RGBA32F images,
 which are not transfer sources, are never it). Logged once per change:
 `[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ..., exposure input 0x...`
-(`exposure input none (no registered 1x1 R16_SFLOAT)` when missing) or
+(`exposure input none (no registered 1x1 R16_SFLOAT; measured from the frame)` when missing) or
 `[preupscale] no DLSS input among N registered views ...; waiting`. Without an exposure input,
-model and roundtrip modes hold nothing (frames go to DLSS untouched), logged once: `no exposure
-image (a registered 1x1 R16_SFLOAT) among DLSS's inputs; ...`.
+model and roundtrip modes held nothing until the auto-exposure ("Auto-exposure when the game gives
+DLSS none (RE Requiem)", end of this document); since then the exposure is measured from the
+frame. Since "DLSS Ray Reconstruction" (end of this document) neither rule identifies anything
+while kernel names show that DLSS Super Resolution's input kernel does not launch.
 
 ### The hold
 
@@ -1478,8 +1480,9 @@ input, depth and motion vectors.
   entry whose colour input is the output's size counts only if its buffer also names the 1x1
   `R16_SFLOAT` exposure image. That case covers DLAA, and also FG at native resolution, whose first
   launch has exactly SR's shape there (output-size frame, depth and motion vectors). DLSS FG takes no
-  exposure input, and without one the model path holds nothing anyway, because the HDR encode needs
-  it. An output-size entry without exposure is logged once and not used: `a CUDA launch names an
+  exposure input. (Since the auto-exposure, an output-size entry without exposure can also count, by
+  SR's own shape: see "Auto-exposure when the game gives DLSS none (RE Requiem)".) An output-size
+  entry without exposure is otherwise logged once and not used: `a CUDA launch names an
   output-size colour image with depth and motion vectors (0x... 2560x1440), but its command buffer
   names no 1x1 R16_SFLOAT exposure: ... not used`. If one entry counts, it is chosen. If several
   count, the only one whose buffer names the exposure is chosen. If that leaves no single entry,
@@ -1584,3 +1587,275 @@ Revert checks, each run with one change reverted:
 - **GTA V, Crimson Desert:** the identification line twice (by size, then by the input kernel's
   parameters, same image), holds/s and fps as before, and no `different colour inputs` or
   `output-size colour image` line.
+
+## DLSS Ray Reconstruction (RE Requiem with ray tracing)
+
+Two probe runs on the rig (coordinator, Alex playing; `NEURAL_FORGE_PROBE_NGX=1`), Resident Evil
+Requiem with `RayTracingSetting=High`, HDR10, FG 3x/4x:
+
+- At DLAA (`MaxQuality`) and at Balanced, the kernels **created** include DLSS Super Resolution's
+  set (`hiluma_engine_input_*`, `cuda_engine_input_*`, `dltss_*`), but the only kernels
+  **launched** (probe sequence lines over ~100 command buffers) are `main_kernel`,
+  `k_conv_fp16_nhwc`, `k_pooling`, `k_upscale`, `k_element_wise` (frame generation's kind) and
+  `custom_block0/1_conv*_kernel`, `custom_block*_hf_kernel`, `custom_upsample_hf_kernel`,
+  `k_initial_merge`, `k_central_block`: **DLSS Ray Reconstruction**, the denoiser and upscaler in
+  one, whose colour input is the noisy ray-traced frame with guide buffers. SR never runs.
+- At Balanced the size rule identified `colour input: image ... (1486x836 B10G11R11_UFLOAT_PACK32
+  ...)`, RR's noisy input. It was not held only because the hold refuses a colour input that is
+  not RGBA16F (01716fc).
+
+Running the model before Ray Reconstruction would feed it a noisy, un-denoised frame, and write
+its answer into RR's input: wrong whatever the format. So the identification needs a positive sign
+that DLSS Super Resolution runs. The handle rules cannot give one: RR's (and FG's) first launch can
+have SR's shape (a colour image with depth and motion vectors at one extent).
+
+### The rule: SR's input kernel by name
+
+An identification precondition, nothing more: the colour input is still found by the registered
+handles a launch names (the parameters rule) or by the registered set (the size rule).
+
+- **Names.** With any mode but `off`, `vkCreateCuFunctionNVX` and `vkDestroyCuFunctionNVX` are now
+  hooked too (`preupscale::COMMANDS`; with `off` the hooked list is unchanged, and the probe's own
+  hooks are as before). Each kernel is classified by its name (`preupscale::Kernel`):
+  `hiluma_engine_input*` / `cuda_engine_input_kernel*` is **SR's input kernel**; `custom_block*`,
+  `k_central_block`, `k_initial_merge`, `custom_upsample*` is **Ray Reconstruction's network**
+  (frame generation shares some of these names: GTA V's FG launches `custom_block0_convPre_kernel`
+  and `k_initial_merge`); anything else is other. `vkCmdCuLaunchKernelNVX` notes per command buffer
+  which kernels it launched (`LaunchRefs::sr_input`, `rr`), and whether the input launch's kernel is
+  SR's (`LaunchRefs::input_sr`).
+- **Gates**, once any kernel name is known on the device (`Tracker::names_known`):
+  1. Nothing is identified, by either rule, unless an SR input kernel launched within the last
+     `SR_RECENT` = 64 launch-bearing submits (`Tracker::sr_running`; about 10 real frames at FG
+     6x). A change re-runs the identification, so switching RR off (or on) in a game's settings
+     takes effect within that window.
+  2. Only an input launch whose kernel is SR's input kernel is parameter evidence (RR's and FG's
+     SR-shaped launches are not).
+  3. A launch-bearing buffer that launches no SR input kernel is never the hold point: it is
+     forwarded like FG's (`Foreign`).
+- **Without names** (no `vkCreateCuFunctionNVX` seen on the device) the rules work exactly as
+  before.
+- **Logs.** Once, when RR's family launches in a submit while SR's input kernel does not:
+  `[preupscale] DLSS Ray Reconstruction detected (custom_block0_conv0_kernel, k_central_block, ...
+  launched, no DLSS Super Resolution input kernel); the model can't run before it (its input is the
+  noisy ray-traced frame): nothing is identified or held, the model runs after the upscaler`. The
+  identification line is then `no DLSS input: no DLSS Super Resolution input kernel
+  (hiluma_engine_input*, cuda_engine_input_kernel*) launched in the last 64 launch-bearing submits
+  (DLSS Ray Reconstruction's kernels launch: ...); waiting [device 0x...]`. With nothing held, the
+  post path runs as before (model on the final frame).
+- **The cost of a name rule.** A future DLSS whose SR input kernel has another name would identify
+  nothing; the `no DLSS Super Resolution input kernel` line says so, and the name list in
+  `Kernel::of` is the one place to extend. Frame generation alone (no SR, no RR) gets the same
+  refusal; its line may say "Ray Reconstruction detected" because the two share kernel names.
+
+Not done: holding a `B10G11R11_UFLOAT_PACK32` colour input. RE's was RR's input, and no SR game is
+known to use that format; the hold still refuses it (`device.rs`).
+
+Tests (`preupscale::tests`):
+
+- `kernels_are_told_apart_by_name`: GTA V's and NGX's SR input kernel names, RR's names, and SR's
+  other kernels, FG's and NGX's helpers as other.
+- `ray_reconstruction_is_never_identified_or_held`: RE's registered set without SR's input, plus a
+  render-size group (RGBA16F and B10G11R11 at 1486x836 with depth and motion vectors) the size rule
+  alone identifies; SR's kernels created, RR's launched, RR's first launch with SR's whole shape.
+  Nothing identified, no buffer held, the RR line once, the identification line names the missing
+  SR kernel. The same launches without names would be identified (the names are what keep RR out).
+- `with_kernel_names_sr_games_keep_their_identification_and_hold_target`: GTA V with names (FG
+  launching `main_kernel`, `custom_block0_convPre_kernel`, `k_initial_merge`): identified at the
+  first submit, held every frame, FG forwarded, no RR line. RE-like DLAA without exposure with SR
+  running and FG's launch having SR's whole shape with no second reader: SR identified (FG's launch
+  is no evidence with names).
+- GTA V, Crimson Desert and the DLAA tests without names pass unchanged.
+
+## Auto-exposure when the game gives DLSS none (RE Requiem)
+
+Resident Evil Requiem registers no 1x1 `R16_SFLOAT` image on its DLSS device (2560x1440 RGBA16F
+storage x4, `D32_SFLOAT_S8_UINT`, `R16G16_SFLOAT` storage, `A2B10G10R10` storage x8, `R8_UNORM`,
+`R8G8B8A8_SRGB`, many 1280x720 FG images): it passes DLSS no exposure texture (NGX then exposes
+internally). The HDR encode needs an exposure value ("E1b: the HDR encode"), and the DLAA
+identification rule needed SR's buffer to name the exposure image, so such a game was never held.
+(RE itself turned out to run Ray Reconstruction with ray tracing on, see above; the fallback is for
+any SR or DLAA game without an exposure texture, including RE with ray tracing off if SR runs
+there.)
+
+### The measurement
+
+When the identified inputs have no exposure image, or it cannot be read (no `TRANSFER_SRC`, or a
+layout it cannot be copied from: `preupscale::ExposureSource::of`), the capture measures `e` from
+the colour input on the GPU, before the encode (`shaders/preupscale_exposure.comp`,
+`hdr::AutoExposure`):
+
+1. **Histogram** (one 16x16 workgroup per 64x64 pixels): every pixel with even x and even y is a
+   sample (a quarter of the frame). A sample with a NaN or infinite channel is skipped; `L` =
+   Rec.709 luma of `max(rgb, 0)`; `L < 2^-24` (black) is skipped. `t = (log2 L + 24) * 256 / 40`
+   (256 bins over log2 luma -24..16, 0.156 EV each), clamped; the bin's count and the 8-bit
+   position within the bin are added (shared-memory atomics, then one global add per non-empty bin
+   into a 2 KiB device-local buffer, cleared by `vkCmdFillBuffer` first).
+2. **Resolve** (one workgroup): the lowest and highest 1% of the samples are dropped (fractionally
+   at the cut); the rest give the mean log2 luma, each bin at its exact mean position (to 1/256 of
+   a bin). `target = log2(0.6) - mean`.
+3. **Adaptation** in log2 space, in a 32-byte host-visible state buffer that persists across
+   holds: `log2 e += 0.05 * (target - log2 e)` per hold (5% of the way: a change settles in about
+   20 real frames, 0.3 s at 60 fps, and one frame cannot make it flicker); the first hold, and the
+   first after the identification changes (`Scan::identification`, `Target::identification`, the
+   CPU zeroes the state), takes the target directly. A frame without samples (black) keeps the
+   previous `e` (1 with none). Clamped to `2^-16 .. 2^15`.
+4. `e = exp2(log2 e)` is written **as a half into the low 16 bits of the HDR pass's exposure
+   buffer**: the very slot the game's 1x1 `R16_SFLOAT` texel is copied into otherwise. The encode
+   reads it there (its opening barrier now waits on shader as well as transfer writes), the CPU
+   reads it after the capture fence (zero, negative or not finite: no write-back, as before), and
+   the write-back's decode reads the same buffer. Nothing writes it between the capture and the
+   write-back (the next capture comes after the write-back's fence), so **the decode uses exactly
+   the `e` the encode used for that frame**, half-rounded identically.
+
+`e` then goes through E1b's encode and inverse unchanged: `v = max(scene, 0) * e / 3`, the
+shoulder above 0.75, sRGB; the inverse on the way back.
+
+### The key: calibrated on GTA V's own exposure
+
+The auto `e` is `key / G`, `G` the trimmed geometric mean of the scene luma. E1b's two GTA dumps
+give the game's own choice:
+
+| Dump | game's `e` | scene luma p50 | exposed p50 = p50 * e | scene p99 (exposed p99 / e) |
+|---|---|---|---|---|
+| A, Grove Street | 0.1282 | 5.9 | 0.756 | 2.5 / 0.1282 = 19.5 |
+| B, Vinewood | 0.1581 | 3.0 | 0.474 | 3.3 / 0.1581 = 20.9 |
+
+For log-normally distributed luma (the usual model of a scene's luminance) the geometric mean is
+the median, and a symmetric trim does not move it, so `G = p50` and `e_auto / e_game = key /
+(exposed p50)`. The game's exposed medians differ (0.756 and 0.474: GTA's own exposure does not
+hold the median fixed), so no key matches both; the one that keeps both ratios closest to 1 in log
+terms is their geometric middle, `sqrt(0.756 * 0.474) = 0.599`: **key 0.6**, giving `e_auto /
+e_game` = 0.6 / 0.756 = **0.79** (A, 21% darker) and 0.6 / 0.474 = **1.27** (B, 27% brighter), within
+the ±30% asked for. After the paper white, the median lands at 0.6 / 3 = 0.2 (sRGB about 0.48), the
+middle of E1b's 0.16-0.25. On synthetic log-normal frames with each dump's median and spread
+(`sigma = ln(p99 / p50) / 2.326`: 0.514 and 0.835) the CPU reference gives 0.803 and 1.29
+(`the_auto_exposure_key_matches_gtas_own_exposure_within_30_percent`). Real frames are not
+log-normal: a heavy dark tail beyond the 1% trim (shadows, letterboxing) pulls `G` below the median
+and makes the picture brighter than GTA's choice would; a large bright sky the other way. The dumps
+themselves are not on this machine, so this was not checked on GTA's pixels.
+
+### Identification of DLAA without an exposure image
+
+The DLAA rule ("Identification by the input kernel's parameters") counted an output-size entry only
+if its buffer named the 1x1 exposure, because frame generation at native resolution has SR's input
+shape and takes no exposure. Without that evidence, an output-size entry with no exposure now counts
+only with SR's whole shape (`Named::sr_without_exposure`), and only when it is the single such
+entry:
+
+- **Output pair**: a later launch of the same buffer names the colour input together with another
+  colour candidate of its extent (`LaunchRefs::output_pair`): SR's output kernel reads the input and
+  writes the output, and under DLAA both are output-size. (At render size the output is larger, so
+  GTA's entry has no output pair; it does not need one.)
+- **No second reader**: no submitted launch-bearing buffer whose input launch is not this entry's
+  names the colour input (`Named::foreign`). Nothing but SR's own buffer reads SR's input (FG's
+  buffers never name it: that is what the "DLSS Frame Generation" classification relies on), while
+  FG's frame is read by both FG buffers in the tests' FG data, modelled on GTA V's (not confirmed
+  for every game).
+- **Single**: with two or more such entries none is used (logged once).
+- With kernel names known (on the rig the probe saw every kernel's name), the input launch must also be SR's
+  input kernel ("DLSS Ray Reconstruction" above), which keeps FG's and RR's launches out whatever
+  their shape. Shape and readers are what remain when names are unavailable.
+- Such an entry's `exposure_input` is `None` even if some other 1x1 R16F is registered (one SR's
+  buffer does not name is not DLSS's): the exposure is measured.
+
+Logged once when taken: `a CUDA launch names an output-size colour image with depth and motion
+vectors and its command buffer names no 1x1 R16_SFLOAT exposure (0x... 2560x1440): taken as DLSS
+Super Resolution's input at DLAA, because a later launch of the same buffer names it with the
+output (SR's output kernel) and no other launch-bearing buffer names it; the exposure is measured
+from the frame`. A refused entry's line now ends with why: `(0x...: no later launch of its buffer
+names it with another output-size colour image)` or `(0x...: another launch-bearing buffer names it
+too)`.
+
+FG safety, case by case: GTA's FG (render-size SR) never has an output-size entry beside render-size
+depth; RE-like FG on `A2B10G10R10` frames has no colour candidate at all; FG naming an RGBA16F
+output-size image with depth and motion vectors is refused because its other buffer names it too;
+FG at native resolution alone with SR's whole shape and no second reader would pass the shape test,
+and is refused by the kernel names (its input launch is not SR's input kernel, and no SR input
+kernel launches at all).
+
+### Logs
+
+- Once per identification (and when the source changes): `[preupscale] exposure: the game's 1x1
+  R16F (image 0x...)` or `[preupscale] exposure: measured from the frame (auto) for colour input
+  0x...: trimmed log-average luma, key 0.6, 5% per frame towards the target; first frame: mean log2
+  luma X over N samples, e Y`.
+- The 300-hold summary ends with ` exposure median=0.1234 (auto|game)`.
+- The identification line says `exposure input none (no registered 1x1 R16_SFLOAT; measured from
+  the frame)`.
+- The old `no exposure image ... frames go to DLSS untouched` refusal is gone.
+
+### Cost
+
+Measured here only for correctness on lavapipe; timing on this machine's Intel Iris Xe (TGL GT2,
+~68 GB/s shared memory) at 2560x1440 RGBA16F, roundtrip mode, capture GPU time median over 20 holds:
+5.0-5.1 ms with the game's exposure, 5.4-5.5 ms with the auto-exposure, i.e. **about 0.43 ms** for
+the fill, the histogram and the resolve. The histogram reads a quarter of the texels (every other
+row: about 15 MB of cache lines at 1440p) and does about 920 workgroups of shared-memory atomics plus
+at most 2 global atomics per non-empty bin per workgroup; the resolve is one workgroup, 256 bins
+from shared memory. On an RTX 5070 (672 GB/s, ~10x the iGPU's bandwidth and far more atomics
+throughput) that scales to **about 0.04-0.05 ms**, inside the 0.2 ms budget; at 4K DLAA about
+2.25x that. Not measured on NVIDIA.
+
+### Tests
+
+- `the_auto_exposure_reference_finds_the_trimmed_log_average` (CPU): the reference histogram's
+  mean against an exact sort-based trimmed mean within 0.01 log2 on uniform (`e = key / L` within
+  0.5%), linear and log gradients, bright sky over dark ground (the geometric mean of the two), the
+  same with NaN/+Inf/-Inf/negative texels (skipped / clamped), a 0.5% sun at 30000 (trimmed away),
+  black (no samples: `e` kept, or 1), and the 5% adaptation step.
+- `the_auto_exposure_key_matches_gtas_own_exposure_within_30_percent` (CPU): the calibration above.
+- `the_gpu_auto_exposure_matches_the_cpu_reference_adapts_and_resets` (lavapipe, through `run_hold`
+  at 200x130, not a multiple of the 64-pixel tile): uniform, sky and ground with NaN/Inf/negative
+  texels, log-normal: sample count exact, mean log2 and log2 e within 0.01 of the CPU reference,
+  the exposure buffer holds the state's `e` as a half; a 4x brighter next frame on the same
+  identification moves 5% of 2 EV (the persistent state); a new identification takes the target at
+  once.
+- `roundtrip_with_auto_exposure_stays_an_identity` (lavapipe): the encode is the CPU reference with
+  the measured `e`, the decode the CPU inverse of the proxy, and the frame comes back within what
+  half floats lose, clamped highlights exactly, on two different frames with different `e`.
+- `a_zero_exposure_leaves_the_frame_untouched_and_a_missing_one_is_measured`: a readable 1x1 holding
+  0 still means no write-back; a missing, unreadable or layout-unknown one holds with
+  `ExposureSource::Auto` and writes back.
+- `re_like_dlaa_without_exposure_is_identified_by_srs_shape_and_fg_is_not`: RE's registered set
+  (no 1x1), SR's buffer (input kernel, network, output kernel naming input and output) and FG's two
+  buffers (A2B10G10R10 frames, 1280x720 images): identified by the parameters with no exposure input,
+  held from frame 7, FG never held; with FG also naming an RGBA16F output-size image with depth and
+  motion vectors (and its other buffer naming it), that entry is refused and SR still chosen.
+- `frame_generation_with_srs_shape_but_a_second_reader_never_identifies`, and the existing
+  `frame_generation_buffers_alone_never_identify` (FG at native resolution without an output pair).
+
+Revert checks (each change reverted alone, the named tests fail; all tests pass with the change):
+
+| Reverted | Fails |
+|---|---|
+| the name gate in `refresh` (both rules) | `ray_reconstruction_is_never_identified_or_held` |
+| the SR-kernel evidence gate in `observe` | `with_kernel_names_sr_games_keep_their_identification_and_hold_target` |
+| the per-buffer SR-kernel gate in `scan` | `ray_reconstruction_is_never_identified_or_held` |
+| the second-reader condition (`!foreign`) | `frame_generation_with_srs_shape_but_a_second_reader_never_identifies`, `re_like_dlaa_without_exposure_...` |
+| the output-pair condition | `frame_generation_buffers_alone_never_identify` |
+| the auto source (always the game's) | `a_zero_exposure_..._a_missing_one_is_measured`, `roundtrip_with_auto_exposure_stays_an_identity`, `the_gpu_auto_exposure_...` |
+| the reset on a new identification | `the_gpu_auto_exposure_...` |
+| the adaptation (always the target) | `the_gpu_auto_exposure_...` |
+| the NaN/Inf filter in the shader | `the_gpu_auto_exposure_...` |
+| the 1% trim in the shader | `the_gpu_auto_exposure_...` |
+| the resolve writing `e` into the exposure buffer | `roundtrip_with_auto_exposure_stays_an_identity`, `the_gpu_auto_exposure_...` |
+
+### What to look for on the rig
+
+- **RE Requiem with ray tracing (DLAA or Balanced):** `[preupscale] DLSS Ray Reconstruction
+  detected (...)` once, then `no DLSS input: no DLSS Super Resolution input kernel ...; waiting`;
+  no `colour input:` line, no holds (`preupscale_state` 1), the post path running as before. The
+  Balanced B10G11R11 identification must be gone.
+- **RE Requiem with ray tracing off** (if SR runs there): `a CUDA launch names an output-size colour
+  image ... taken as DLSS Super Resolution's input at DLAA` (DLAA) or a `colour input:` line by
+  size/parameters (SR), then `[preupscale] exposure: measured from the frame (auto) ...`, holds at
+  the real fps, FG forwarded, and summaries ending ` exposure median=... (auto)`. Look at the
+  picture for brightness pumping (it should adapt over ~0.3 s, not flicker) and for a too-dark or
+  too-bright model input (`NEURAL_FORGE_PREUPSCALE=roundtrip` must still look unchanged). If SR
+  input is B10G11R11 there, the hold refuses it (logged).
+- **GTA V, Crimson Desert:** unchanged: identification at the first DLSS frame, `[preupscale]
+  exposure: the game's 1x1 R16F (image 0x...)` once, summaries ending ` exposure median=0.13..0.16
+  (game)`, no RR line, holds/s as before.
+- **Cyberpunk 2077 with RR on** should get the RR line, if its RR kernels have the names above
+  (not checked); with RR off and no exposure image it may now hold with the auto-exposure where it
+  ran the post path before.
