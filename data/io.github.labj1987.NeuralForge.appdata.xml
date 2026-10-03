@@ -28,6 +28,10 @@
       <caption>Setup tab: NGX binaries status, compatibility tool picker, Steam install and launch-option generator</caption>
       <image>https://raw.githubusercontent.com/labj1987/neural-forge/main/screenshots/setup.png</image>
     </screenshot>
+    <screenshot>
+      <caption>Status tab: helper, model and timings, and where the model runs (before or after the game's upscaler)</caption>
+      <image>https://raw.githubusercontent.com/labj1987/neural-forge/main/screenshots/status.png</image>
+    </screenshot>
   </screenshots>
   <releases>
     <release version="2.0.0" date="2026-10-02"/>
