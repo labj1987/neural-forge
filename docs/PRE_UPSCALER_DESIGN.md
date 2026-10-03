@@ -278,8 +278,10 @@ committed in submission order. `NEURAL_FORGE_PROBE_NGX` still controls the probe
 
 At a launch-bearing submit, when the registered set or the swapchains changed: the colour input is
 the registered RGBA16F storage image (2D, single-sample) whose extent equals a registered depth
-image's, with a registered RG16F image of the same extent, and smaller than the largest swapchain
-(DLAA is refused that way). Several candidates: lowest handles. DLSS's **exposure input** is the
+image's, with a registered RG16F (since 2.0.1 also RG32F) image of the same extent, and smaller than
+the largest swapchain (DLAA is refused that way; since 2.0.1, on a device with no swapchain, smaller
+than the largest registered RGBA16F/R11G11B10 storage image, see "Several colour candidates
+(2.0.1)"). Several candidates: lowest handles. DLSS's **exposure input** is the
 registered 1x1 `R16_SFLOAT` image (lowest handle if there are several; NGX's own 1x1 RGBA32F images,
 which are not transfer sources, are never it). Logged once per change:
 `[preupscale] colour input: image 0x... (1707x960 R16G16B16A16_SFLOAT ...), depth ..., motion vectors ..., exposure input 0x...`
@@ -1331,3 +1333,85 @@ that is for Alex's eyes.
 - This fix's build is deployed on the rig (`scripts/deploy-rig.sh` from the worktree; layer
   `0e3e0331f773`), helper restarted and running (`helper_state=4`, `model_up=1`), live settings
   `enabled=1`, `working_scale=1`, `model_interval=2`, `mvec_enabled=1`.
+
+## Several colour candidates (2.0.1)
+
+Two reports from the rig, Alex playing (no unattended run):
+
+- **Crimson Desert Enhanced** (vkd3d-proton, DLSS Balanced 1440p) identified its colour input as
+  "first of 2 candidates", later re-identified "first of 3" with another colour and depth image. It
+  first logged `no DLSS input among N registered views (swapchain None)` a few times: DLSS registered
+  its views before the swapchain existed. With FG off, holds/s matched the presented fps (32-40 vs
+  30-40). With FG on (~210 shown, ~34 held/s) that fits DLSS multi frame generation at 6x, with ~5
+  forwarded FG submits per hold. So every real frame was held, and nothing showed DLSS's input
+  alternating between the candidates.
+- **Cyberpunk 2077** (DLSS Auto, RT, FG off) never identified: `no DLSS input among 11 registered
+  views (swapchain None); waiting`, so it ran the post-upscaler path. Until now the rule needed a
+  swapchain on the device to compare against, so with none known it gave up before looking at the
+  registered set. The post path presented at 2560x1440, so a swapchain existed in the process. The
+  likely cause is that DLSS registered its views on a different `VkDevice` from the one that created
+  the swapchain. This is not confirmed: the log had no device handle on that line (it does now).
+
+What changed:
+
+- **No swapchain on the device:** the colour input is compared with the largest registered 2D
+  `RGBA16F` or `B10G11R11_UFLOAT` storage image (DLSS's output or NGX's output-size scratch) instead
+  of not being looked for. The rest of the rule is unchanged, including that the colour input must
+  be smaller than that image. DLAA with no swapchain has no larger image, so it is still refused.
+  Once a swapchain is known, it is what counts again. The identification line then ends with
+  `, compared with the largest registered RGBA16F/R11G11B10 storage image (WxH)`.
+- **Motion vectors** may be `R32G32_SFLOAT` as well as `R16G16_SFLOAT` (RG16F wins at an extent that
+  has both). Dumps do not read RG32F vectors, because the dump buffer and file are RG16F. Every depth
+  format was already accepted (`D32_SFLOAT`, `D32_SFLOAT_S8_UINT`, `D24_UNORM_S8_UINT`, ...).
+- **A failed identification says why.** The line is `no DLSS input among N registered views
+  (swapchain ...); waiting.`, followed by three things: the output it compared with; for each extent
+  that has an RGBA16F storage image, the first condition that failed (`not smaller than the output`,
+  `no depth image at this extent`, `no R16G16/R32G32_SFLOAT motion vectors at this extent`); and the
+  registered views grouped by extent, format and usage, largest first, with counts. An example from
+  the tests:
+  `output: no swapchain known, largest RGBA16F/R11G11B10 storage image 2560x1440; RGBA16F storage
+  extents: 1708x960 no R16G16/R32G32_SFLOAT motion vectors at this extent; registered: 2560x1440
+  B10G11R11_UFLOAT_PACK32 storage+sampled x1, 1708x960 R16G16B16A16_SFLOAT storage+sampled x1, ...`.
+  The line is logged once per change of the registered set, is at most 1500 bytes, and is logged for
+  at most 16 changes per device. After that only the short line is logged, as before.
+  `NEURAL_FORGE_PROBE_NGX`'s detailed logging is unchanged.
+- **Other candidates are logged, not held.** The identification line lists them: `(first of N
+  candidates; others 0x... WxH, ...)`. A forwarded buffer whose launches name one of them, and not
+  the colour input, is counted. It is logged once (`a forwarded launch-bearing buffer names another
+  colour candidate (0x...) and not the colour input 0x...: not held`) and appears in the
+  every-3000-forwarded tally (`; N forwarded buffers named another colour candidate`). Holding such a
+  buffer was considered and rejected for now. Crimson Desert's data does not need it. It could also
+  turn an FG buffer that reads some other render-size RGBA16F image into a hold, the FG regression
+  this path already had once ("DLSS Frame Generation"). The counter will show whether any game needs
+  it.
+- **Device handles in the log.** The identification lines (success and failure) end with
+  `[device 0x...]`, and a device with the tracking logs `[preupscale] device 0x...: swapchain WxH
+  tracked for the DLSS input's size test` for each swapchain it creates. Together with the existing
+  `[preupscale] device ...: vkGetImageViewHandleNVX ...` / `no VK_NVX_image_view_handle` lines, this
+  shows whether DLSS and the swapchain are on the same device.
+- **Post path off process-wide.** If DLSS runs on a device without the swapchain, the hold happens
+  on that device. The present (and the post-upscaler compose) happens on the other one, whose
+  session never saw DLSS. That would have applied the model twice and rebuilt the helper's feature
+  between the two sizes every frame. While a device holds, its post-path deadline (`post_off`, 30 s
+  after the last DLSS submit) is now shared through `preupscale::post_off_by_any_device`, and every
+  device's present honours it. With `NEURAL_FORGE_PREUPSCALE=off` it is never set. For a single
+  device (GTA) it equals that device's own rule (`the_shared_post_off_deadline_matches_the_holding_devices_own`).
+
+GTA V is unchanged. Its set (`gta_registered`) with its swapchain gives the same colour input
+(0x100), depth, motion vectors and exposure input, and the same identification line, scan split
+point and classification (`gtas_set_keeps_its_identification_and_hold_target`).
+
+Not addressed here: Crimson Desert's `capture_wait` median is 15-18 ms (GTA 3.6 ms).
+
+What to look for on the next rig run:
+
+- **Cyberpunk:** either `[preupscale] colour input: image ... compared with the largest registered
+  RGBA16F/R11G11B10 storage image (2560x1440) [device 0x...]` followed by holds, or the new `no DLSS
+  input ... . output: ...; RGBA16F storage extents: ...; registered: ... [device 0x...]` line. That
+  line names the condition that failed, for example a colour input without STORAGE, which shows up
+  as `R16G16B16A16_SFLOAT sampled+colour`. Compare the device handle with the `swapchain ... tracked`
+  line. If holds run on a device without the swapchain, the
+  `the post-upscaler compose is off while frames are held` line must appear too, and there must be
+  no post-path `[sync]` lines while holding.
+- **Crimson Desert:** holds/s as before (≈ real fps), and whether the
+  `names another colour candidate` line or tally count ever appears.

@@ -305,14 +305,30 @@ pub(crate) const MAX_EXPOSURE: usize = 4;
 /// Bytes reserved per exposure image in the dump readback (the largest texel).
 const EXPOSURE_STRIDE: u64 = 16;
 
+/// At most this many further colour candidates are kept beside the first (for the log and the
+/// "names another candidate" count, [`Tracker::other_candidate_buffers`]).
+pub(crate) const MAX_OTHERS: usize = 3;
+
 /// The DLSS inputs among the registered images.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Inputs {
+    /// The colour input: the candidate with the lowest handle. Only a launch-bearing buffer whose
+    /// launches name it is held as reading it ([`LaunchRefs::kind`]).
     pub colour: (vk::Image, ImageDesc),
+    /// The depth and motion-vector images at the colour input's extent.
     pub depth: (vk::Image, ImageDesc),
     pub mvec: (vk::Image, ImageDesc),
-    /// How many colour candidates there were (the lowest handle is taken).
+    /// How many colour candidates there were.
     pub candidates: usize,
+    /// The further candidates' colour images, lowest handles first. Not held: a buffer whose
+    /// launches name one of them and not [`Self::colour`] stays forwarded, and is only counted
+    /// ([`Tracker::other_candidate_buffers`]), so a game that alternated DLSS's colour input between
+    /// images would show in the log.
+    pub others: [Option<(vk::Image, ImageDesc)>; MAX_OTHERS],
+    /// What the candidates were judged smaller than: the swapchain's extent, or (no swapchain known
+    /// on the device) the largest registered output-like image ([`output_candidate`]).
+    pub output: (u32, u32),
+    pub output_from_swapchain: bool,
     /// The registered 1x1 float images (DLSS's exposure input among them), lowest handles first.
     /// Only dump mode reads them.
     pub exposure: [Option<(vk::Image, ImageDesc)>; MAX_EXPOSURE],
@@ -321,32 +337,70 @@ pub(crate) struct Inputs {
     pub exposure_input: Option<(vk::Image, ImageDesc)>,
 }
 
-/// The colour input: the registered RGBA16F storage image whose extent equals a registered depth
-/// image's and is smaller than the swapchain, with a registered RG16F (motion vector) image at the
+
+/// DLSS's motion-vector formats: RG16F (GTA V) or RG32F. RG16F first where both are at an extent.
+const MVEC_FORMATS: [vk::Format; 2] = [vk::Format::R16G16_SFLOAT, vk::Format::R32G32_SFLOAT];
+
+/// The formats of an image DLSS Super Resolution writes (its output, NGX's output-size scratch).
+const OUTPUT_FORMATS: [vk::Format; 2] = [vk::Format::R16G16B16A16_SFLOAT, vk::Format::B10G11R11_UFLOAT_PACK32];
+
+/// The largest registered output-like image (a 2D RGBA16F or R11G11B10 storage image): what the
+/// colour input is compared against when no swapchain is known on the device (Cyberpunk 2077 under
+/// vkd3d-proton logged "swapchain None").
+fn output_candidate(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>) -> Option<(u32, u32)> {
+    registered
+        .values()
+        .filter(|(_, d)| d.plain && OUTPUT_FORMATS.contains(&d.format) && d.usage.contains(vk::ImageUsageFlags::STORAGE))
+        .map(|(_, d)| (d.width, d.height))
+        .max_by_key(|&(w, h)| u64::from(w) * u64::from(h))
+}
+
+/// Whether `d` has the shape of DLSS's colour input: a 2D single-sample RGBA16F storage image.
+fn colour_like(d: &ImageDesc) -> bool {
+    d.plain && d.format == vk::Format::R16G16B16A16_SFLOAT && d.usage.contains(vk::ImageUsageFlags::STORAGE)
+}
+
+/// Whether an image of extent `(w, h)` is smaller than `output` (fits inside it, fewer texels).
+fn smaller(w: u32, h: u32, (ow, oh): (u32, u32)) -> bool {
+    w <= ow && h <= oh && u64::from(w) * u64::from(h) < u64::from(ow) * u64::from(oh)
+}
+
+/// The registered image at `(w, h)` with the first format of `formats` present there (lowest
+/// handle).
+fn at(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, formats: &[vk::Format], w: u32, h: u32) -> Option<(vk::Image, ImageDesc)> {
+    formats
+        .iter()
+        .find_map(|&f| registered.values().find(|(_, d)| d.plain && d.format == f && (d.width, d.height) == (w, h)).copied())
+}
+
+/// The colour candidates: every registered RGBA16F storage image smaller than the output (the
+/// swapchain, or without one the largest registered output-like image, [`output_candidate`]) with a
+/// registered depth image ([`DEPTH_FORMATS`]) and motion-vector image ([`MVEC_FORMATS`]) at the
 /// same extent. DLSS's inputs share the render extent; its output and NGX's scratch images have no
-/// depth image beside them, and DLAA (render extent == output) is refused by the swapchain test.
-/// Deterministic: among several candidates, the lowest handles win.
+/// depth image beside them, and DLAA (render extent == output) is refused by the size test.
+/// Deterministic: among several candidates, the lowest handles win (Crimson Desert registers two
+/// or three; the others are kept in [`Inputs::others`] for the log).
 pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapchain: Option<(u32, u32)>) -> Option<Inputs> {
-    let (sw, sh) = swapchain?;
-    let at = |format_ok: &dyn Fn(vk::Format) -> bool, w: u32, h: u32| {
-        registered.values().find(|(_, d)| d.plain && format_ok(d.format) && (d.width, d.height) == (w, h)).copied()
+    let (output, output_from_swapchain) = match swapchain {
+        Some(e) => (e, true),
+        None => (output_candidate(registered)?, false),
     };
     let candidates: Vec<(vk::Image, ImageDesc)> = registered
         .values()
         .filter(|(_, d)| {
-            d.plain
-                && d.format == vk::Format::R16G16B16A16_SFLOAT
-                && d.usage.contains(vk::ImageUsageFlags::STORAGE)
-                && d.width <= sw
-                && d.height <= sh
-                && u64::from(d.width) * u64::from(d.height) < u64::from(sw) * u64::from(sh)
-                && at(&|f| DEPTH_FORMATS.contains(&f), d.width, d.height).is_some()
-                && at(&|f| f == vk::Format::R16G16_SFLOAT, d.width, d.height).is_some()
+            colour_like(d)
+                && smaller(d.width, d.height, output)
+                && at(registered, &DEPTH_FORMATS, d.width, d.height).is_some()
+                && at(registered, &MVEC_FORMATS, d.width, d.height).is_some()
         })
         .copied()
         .collect();
     let colour = *candidates.first()?;
     let (w, h) = (colour.1.width, colour.1.height);
+    let mut others = [None; MAX_OTHERS];
+    for (slot, other) in others.iter_mut().zip(&candidates[1..]) {
+        *slot = Some(*other);
+    }
     let mut exposure = [None; MAX_EXPOSURE];
     for (slot, found) in exposure.iter_mut().zip(
         registered.values().filter(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && exposure_texel_bytes(d.format).is_some()),
@@ -356,12 +410,97 @@ pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
     let exposure_input = registered.values().find(|(_, d)| d.plain && (d.width, d.height) == (1, 1) && d.format == vk::Format::R16_SFLOAT).copied();
     Some(Inputs {
         colour,
-        depth: at(&|f| DEPTH_FORMATS.contains(&f), w, h)?,
-        mvec: at(&|f| f == vk::Format::R16G16_SFLOAT, w, h)?,
+        depth: at(registered, &DEPTH_FORMATS, w, h)?,
+        mvec: at(registered, &MVEC_FORMATS, w, h)?,
         candidates: candidates.len(),
+        others,
+        output,
+        output_from_swapchain,
         exposure,
         exposure_input,
     })
+}
+
+/// Short names for the usage bits that matter here, for [`diagnose`].
+fn usage_short(usage: vk::ImageUsageFlags) -> String {
+    let names = [
+        (vk::ImageUsageFlags::STORAGE, "storage"),
+        (vk::ImageUsageFlags::SAMPLED, "sampled"),
+        (vk::ImageUsageFlags::COLOR_ATTACHMENT, "colour"),
+        (vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, "depth"),
+        (vk::ImageUsageFlags::TRANSFER_SRC, "src"),
+        (vk::ImageUsageFlags::TRANSFER_DST, "dst"),
+    ];
+    let list: Vec<&str> = names.iter().filter(|(bit, _)| usage.contains(*bit)).map(|(_, n)| *n).collect();
+    if list.is_empty() { "-".to_string() } else { list.join("+") }
+}
+
+/// The longest [`diagnose`] text.
+pub(crate) const DIAGNOSE_MAX: usize = 1500;
+
+/// At most this many failed identifications per device are logged with [`diagnose`].
+const MAX_DIAGNOSES: u32 = 16;
+
+/// Why [`identify`] found nothing, compactly: what the output was taken to be, for every extent
+/// with an RGBA16F storage image the first condition it failed, and the registered views grouped by
+/// extent, format and usage (largest first, with counts). At most [`DIAGNOSE_MAX`] bytes.
+pub(crate) fn diagnose(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapchain: Option<(u32, u32)>) -> String {
+    let output = swapchain.or_else(|| output_candidate(registered));
+    type Key = (std::cmp::Reverse<u64>, u32, u32, i32, u32, bool);
+    let mut kinds: BTreeMap<Key, usize> = BTreeMap::new();
+    for (_, d) in registered.values() {
+        let key = (std::cmp::Reverse(u64::from(d.width) * u64::from(d.height)), d.width, d.height, d.format.as_raw(), d.usage.as_raw(), d.plain);
+        *kinds.entry(key).or_default() += 1;
+    }
+    let mut extents: Vec<(u32, u32)> = registered.values().filter(|(_, d)| colour_like(d)).map(|(_, d)| (d.width, d.height)).collect();
+    extents.sort_by_key(|&(w, h)| (std::cmp::Reverse(u64::from(w) * u64::from(h)), w, h));
+    extents.dedup();
+    const MAX_REASONS: usize = 8;
+    let mut reasons: Vec<String> = extents
+        .iter()
+        .take(MAX_REASONS)
+        .map(|&(w, h)| {
+            let why = if output.is_none_or(|o| !smaller(w, h, o)) {
+                "not smaller than the output"
+            } else if at(registered, &DEPTH_FORMATS, w, h).is_none() {
+                "no depth image at this extent"
+            } else if at(registered, &MVEC_FORMATS, w, h).is_none() {
+                "no R16G16/R32G32_SFLOAT motion vectors at this extent"
+            } else {
+                "qualifies"
+            };
+            format!("{w}x{h} {why}")
+        })
+        .collect();
+    if extents.len() > MAX_REASONS {
+        reasons.push(format!("... (+{} more)", extents.len() - MAX_REASONS));
+    }
+    let output_text = match (swapchain, output) {
+        (Some(s), _) => format!("output: swapchain {}x{}", s.0, s.1),
+        (None, Some(o)) => format!("output: no swapchain known, largest RGBA16F/R11G11B10 storage image {}x{}", o.0, o.1),
+        (None, None) => "output: no swapchain known and no RGBA16F/R11G11B10 storage image to compare with".to_string(),
+    };
+    let mut line = format!(
+        "{output_text}; RGBA16F storage extents: {}; registered: ",
+        if reasons.is_empty() { "none".to_string() } else { reasons.join(", ") }
+    );
+    let total = kinds.len();
+    for (k, (&(_, w, h, format, usage, plain), n)) in kinds.iter().enumerate() {
+        let item = format!(
+            "{}{w}x{h} {:?} {}{} x{n}",
+            if k > 0 { ", " } else { "" },
+            vk::Format::from_raw(format),
+            usage_short(vk::ImageUsageFlags::from_raw(usage)),
+            if plain { "" } else { " (not 2D single-sample)" }
+        );
+        let more = format!("{}... (+{} more)", if k > 0 { ", " } else { "" }, total - k);
+        if line.len() + item.len() + more.len() > DIAGNOSE_MAX {
+            line.push_str(&more);
+            break;
+        }
+        line.push_str(&item);
+    }
+    line
 }
 
 /// Per-device tracking state. Every hook that feeds it only does map operations under the lock.
@@ -390,8 +529,16 @@ pub(crate) struct Tracker {
     pub(crate) foreign_submits: u64,
     /// Held launch-bearing submits whose held buffer reads the colour input.
     pub(crate) colour_submits: u64,
+    /// Forwarded (foreign) launch-bearing buffers whose launches name another colour candidate
+    /// ([`Inputs::others`]) and not the colour input, and the first such candidate seen: evidence
+    /// for a game that alternates DLSS's colour input between images (none is held for it).
+    pub(crate) other_candidate_buffers: u64,
+    other_named: Option<vk::Image>,
     /// Which first-of-a-kind classification lines were logged.
     said_kinds: u8,
+    /// Failed identifications logged with the registered set ([`diagnose`]); at most
+    /// [`MAX_DIAGNOSES`], later ones get the short line only.
+    diagnoses: u32,
     /// Layouts recorded into each command buffer for the watched images, awaiting submission.
     pending: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::ImageLayout)>>,
     /// The watched images' layouts as of the last submission (submission order, not recording order).
@@ -684,13 +831,18 @@ impl Tracker {
         self.inputs = inputs;
         let line = match inputs {
             Some(i) => format!(
-                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}{}, exposure input {}; swapchain {:?}",
+                "colour input: image {} ({}x{} {:?} {:?}){}, depth {} {:?}, motion vectors {} {:?}{}, exposure input {}; swapchain {:?}{}",
                 hex(i.colour.0),
                 i.colour.1.width,
                 i.colour.1.height,
                 i.colour.1.format,
                 i.colour.1.usage,
-                if i.candidates > 1 { format!(" (first of {} candidates)", i.candidates) } else { String::new() },
+                if i.candidates > 1 {
+                    let others: Vec<String> = i.others.iter().flatten().map(|(image, d)| format!("{} {}x{}", hex(*image), d.width, d.height)).collect();
+                    format!(" (first of {} candidates; others {})", i.candidates, others.join(", "))
+                } else {
+                    String::new()
+                },
                 hex(i.depth.0),
                 i.depth.1.format,
                 hex(i.mvec.0),
@@ -702,7 +854,12 @@ impl Tracker {
                     String::new()
                 },
                 i.exposure_input.map_or_else(|| "none (no registered 1x1 R16_SFLOAT)".to_string(), |(image, _)| hex(image)),
-                self.swapchain_extent()
+                self.swapchain_extent(),
+                if i.output_from_swapchain {
+                    String::new()
+                } else {
+                    format!(", compared with the largest registered RGBA16F/R11G11B10 storage image ({}x{})", i.output.0, i.output.1)
+                }
             ),
             None => format!(
                 "no DLSS input among {} registered views (swapchain {:?}); waiting",
@@ -710,8 +867,16 @@ impl Tracker {
                 self.swapchain_extent()
             ),
         };
+        // A failed identification says why, with the registered set ([`diagnose`]), once per change
+        // of it, for the first [`MAX_DIAGNOSES`] changes; after those only the short line, once per
+        // change of the short line (the rule before the diagnosis existed).
+        let detailed = inputs.is_none() && !registered.is_empty() && self.diagnoses < MAX_DIAGNOSES;
+        let line = if detailed { format!("{line}. {}", diagnose(&registered, self.swapchain_extent())) } else { line };
         if self.announced.as_deref() == Some(line.as_str()) {
             return None;
+        }
+        if detailed {
+            self.diagnoses += 1;
         }
         self.announced = Some(line.clone());
         Some(line)
@@ -733,6 +898,15 @@ impl Tracker {
                 let kind = self.launch.get(&cb).map(|r| r.kind(colour));
                 if kind == Some(LaunchKind::Foreign) {
                     any_foreign = true;
+                    // Counted only: whether a forwarded buffer reads another colour candidate.
+                    let other = self.inputs.and_then(|i| {
+                        let refs = self.launch.get(&cb)?;
+                        i.others.iter().flatten().map(|o| o.0).find(|o| refs.images.contains(o))
+                    });
+                    if let Some(other) = other {
+                        self.other_candidate_buffers += 1;
+                        self.other_named.get_or_insert(other);
+                    }
                 }
                 if found.is_none() && kind.is_some_and(|k| k != LaunchKind::Foreign) {
                     held_kind = kind;
@@ -772,16 +946,25 @@ impl Tracker {
     fn classify_line(&mut self, scan: Option<&Scan>, undecided_before: u64) -> Option<String> {
         let undecided = self.evaluations - self.colour_submits;
         let (bit, line) = if scan.is_some() && self.colour_submits > 0 && self.said_kinds & 1 == 0 {
-            (1, "a launch-bearing submit reads DLSS's colour input (its registered handle is in a launch's parameters): DLSS Super Resolution's, the hold point")
+            (1, "a launch-bearing submit reads DLSS's colour input (its registered handle is in a launch's parameters): DLSS Super Resolution's, the hold point".to_string())
         } else if scan.is_none() && self.foreign_submits > 0 && self.said_kinds & 2 == 0 {
-            (2, "a launch-bearing submit whose CUDA launches never name DLSS's colour input (DLSS Frame Generation's, or another NGX feature's) is forwarded untouched; only the one that reads it is held")
+            (2, "a launch-bearing submit whose CUDA launches never name DLSS's colour input (DLSS Frame Generation's, or another NGX feature's) is forwarded untouched; only the one that reads it is held".to_string())
         } else if scan.is_some() && undecided > undecided_before && self.inputs.is_some() && self.said_kinds & 4 == 0 {
-            (4, "a launch-bearing submit is held undecided: a launch's parameters were not readable (not in CUDA's buffer form), so it cannot be told from DLSS Super Resolution's")
+            (4, "a launch-bearing submit is held undecided: a launch's parameters were not readable (not in CUDA's buffer form), so it cannot be told from DLSS Super Resolution's".to_string())
+        } else if self.other_candidate_buffers > 0 && self.said_kinds & 8 == 0 {
+            (
+                8,
+                format!(
+                    "a forwarded launch-bearing buffer names another colour candidate ({}) and not the colour input {}: not held (counted in the tally)",
+                    self.other_named.map_or_else(String::new, hex),
+                    self.inputs.map_or_else(String::new, |i| hex(i.colour.0))
+                ),
+            )
         } else {
             return None;
         };
         self.said_kinds |= bit;
-        Some(line.to_string())
+        Some(line)
     }
 }
 
@@ -797,6 +980,9 @@ pub(crate) struct Tracking {
     armed: AtomicBool,
     /// The identified colour input's extent, `width << 32 | height`; 0 when none.
     extent: AtomicU64,
+    /// The device's handle, named on the identification lines (DLSS and the swapchain may be on
+    /// different devices).
+    device: u64,
 }
 
 static TRACKING: LazyLock<Mutex<HashMap<vk::Device, Arc<Tracking>>>> = LazyLock::new(Default::default);
@@ -805,7 +991,7 @@ impl Tracking {
     /// A new tracker for `device`, also reachable through [`tracking_for`] (the
     /// `vkGetImageViewHandle64NVX` wrapper has only the device handle).
     pub(crate) fn new_for(device: vk::Device) -> Arc<Self> {
-        let tracking = Arc::new(Self::default());
+        let tracking = Arc::new(Self { device: device.as_raw(), ..Self::default() });
         lock(&TRACKING).insert(device, tracking.clone());
         tracking
     }
@@ -888,7 +1074,8 @@ impl Tracking {
             if !t.armed() {
                 return None;
             }
-            let line = t.refresh();
+            let device = self.device;
+            let line = t.refresh().map(|l| format!("{l} [device {device:#x}]"));
             self.watching.store(t.inputs.is_some(), Ordering::Relaxed);
             self.extent.store(t.inputs.map_or(0, |i| u64::from(i.colour.1.width) << 32 | u64::from(i.colour.1.height)), Ordering::Relaxed);
             let undecided_before = t.evaluations - t.colour_submits;
@@ -898,10 +1085,15 @@ impl Tracking {
             // Every 3000th forwarded one: the running counts.
             let tally = (t.foreign_submits != foreign_before && t.foreign_submits.is_multiple_of(3000)).then(|| {
                 format!(
-                    "launch-bearing submits: {} held reading the colour input, {} held undecided, {} forwarded untouched (their launches never name the colour input)",
+                    "launch-bearing submits: {} held reading the colour input, {} held undecided, {} forwarded untouched (their launches never name the colour input){}",
                     t.colour_submits,
                     t.evaluations - t.colour_submits,
-                    t.foreign_submits
+                    t.foreign_submits,
+                    if t.other_candidate_buffers > 0 {
+                        format!("; {} forwarded buffers named another colour candidate", t.other_candidate_buffers)
+                    } else {
+                        String::new()
+                    }
                 )
             });
             self.rearm(&t);
@@ -2625,6 +2817,15 @@ impl Session {
     /// A launch-bearing submit with DLSS's inputs identified reached the hold point.
     pub(crate) fn saw_dlss(&mut self) {
         self.last_dlss = Some(Instant::now());
+        self.share_post_off();
+    }
+
+    /// Publishes, process-wide, until when this device keeps the post path off
+    /// ([`post_off_by_any_device`]): a game whose DLSS runs on a device other than the one it
+    /// presents on (no swapchain on the DLSS device, identified against an output-like image) must
+    /// not get the model twice, before DLSS on one device and after it on the other.
+    fn share_post_off(&self) {
+        *lock(&POST_OFF_UNTIL) = post_off_until(mode() == Mode::Model, self.engaged, self.last_dlss);
     }
 
     /// Whether a hold happened within [`RECENT`].
@@ -2749,6 +2950,7 @@ impl Session {
                 crate::logging::flush();
             }
         }
+        self.share_post_off();
         let holding = self.holding();
         let s = &mut self.stats;
         // A hold is one that submitted its capture; a skipped one only counts as a miss.
@@ -2855,6 +3057,24 @@ impl Session {
 /// the helper (`engaged`) and DLSS ran within [`HAND_BACK`] (`last_dlss`).
 pub(crate) fn post_off(engaged: bool, last_dlss: Option<Instant>, now: Instant) -> bool {
     engaged && last_dlss.is_some_and(|t| now.saturating_duration_since(t) < HAND_BACK)
+}
+
+/// Until when the device that holds DLSS's input keeps the post path off ([`post_off`] as of its
+/// last DLSS submit or hold), shared by every device of the process; `None` when it does not.
+static POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// [`POST_OFF_UNTIL`]'s value for a device in model mode (`model`): [`post_off`] at any `now` is
+/// `now` before it.
+fn post_off_until(model: bool, engaged: bool, last_dlss: Option<Instant>) -> Option<Instant> {
+    last_dlss.filter(|_| model && engaged).map(|t| t + HAND_BACK)
+}
+
+/// Whether some device of the process keeps the post path off at `now` (its [`Session`]
+/// suppresses it, [`Session::suppresses_post`]). On the device that holds this is the same as its
+/// own [`Session::suppresses_post`]; it matters when DLSS runs on another device than the swapchain
+/// (only ever set in model mode).
+pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
+    lock(&POST_OFF_UNTIL).is_some_and(|until| now < until)
 }
 
 /// Whether a launch-bearing submit is held in `mode`, given the live switches: `None` forwards it
@@ -3218,7 +3438,10 @@ mod tests {
         no_exposure.remove(&0x610);
         let found = identify(&no_exposure, Some((2560, 1440))).expect("still identified");
         assert_eq!(found.exposure_input, None, "no 1x1 R16F: no exposure input (the HDR modes then fail open)");
-        assert_eq!(identify(&set, None), None, "no swapchain, no comparison, no hold");
+        assert!(found.output_from_swapchain && found.output == (2560, 1440) && found.others == [None; MAX_OTHERS]);
+        let fallback = identify(&set, None).expect("no swapchain: compared with the largest RGBA16F storage image");
+        assert_eq!((fallback.colour.0, fallback.depth.0, fallback.mvec.0), (found.colour.0, found.depth.0, found.mvec.0));
+        assert_eq!((fallback.output, fallback.output_from_swapchain), ((2560, 1440), false));
         assert_eq!(identify(&set, Some((1707, 960))), None, "DLAA: the render extent is the output's");
         let mut no_mv = set.clone();
         no_mv.remove(&0x300);
@@ -3234,6 +3457,194 @@ mod tests {
         two.insert(0x52, (vk::Image::from_raw(0x52), desc(1490, 838, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT)));
         let found = identify(&two, Some((2560, 1440))).unwrap();
         assert_eq!((found.colour.0, found.depth.0, found.mvec.0, found.candidates), (vk::Image::from_raw(0x50), vk::Image::from_raw(0x51), vk::Image::from_raw(0x52), 2));
+    }
+
+    /// A tracker with `set` registered (view `raw + 1`, kernel handle `raw + 0x1000`) and, when
+    /// given, one swapchain.
+    fn tracker_with(set: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapchain: Option<(u32, u32)>) -> Tracker {
+        let mut t = Tracker::default();
+        for (&raw, &(image, d)) in set {
+            let info = vk::ImageCreateInfo {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D { width: d.width, height: d.height, depth: 1 },
+                format: d.format,
+                usage: d.usage,
+                samples: vk::SampleCountFlags::TYPE_1,
+                ..Default::default()
+            };
+            t.record_image(image, &info);
+            t.record_view(vk::ImageView::from_raw(raw + 1), image);
+            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
+        }
+        if let Some(e) = swapchain {
+            t.swapchain(vk::SwapchainKHR::from_raw(9), Some(e));
+        }
+        t
+    }
+
+    /// (a) GTA V's registered set with its swapchain: the same inputs, line, scan target and
+    /// classification as before the relaxed rule (colour 0x100, depth 0x200, motion vectors 0x300,
+    /// one candidate, exposure input 0x610).
+    #[test]
+    fn gtas_set_keeps_its_identification_and_hold_target() {
+        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
+        let line = t.refresh().expect("identified");
+        assert!(line.starts_with("colour input: image 0x100 (1707x960 R16G16B16A16_SFLOAT"), "{line}");
+        assert!(!line.contains("candidates") && !line.contains("compared with"), "one candidate, the swapchain: {line}");
+        assert!(line.ends_with("exposure input 0x610; swapchain Some((2560, 1440))"), "{line}");
+        t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        t.launch(cb(2), Some(&param_block(&[0x1400, 0x1200])));
+        let scan = t.scan(&[vec![cb(2), cb(1)]]).expect("SR's buffer is held");
+        assert_eq!((scan.batch, scan.index), (0, 1));
+        let inputs = scan.inputs.unwrap();
+        assert_eq!(
+            (inputs.colour.0.as_raw(), inputs.depth.0.as_raw(), inputs.mvec.0.as_raw(), inputs.candidates, inputs.exposure_input.map(|e| e.0.as_raw())),
+            (0x100, 0x200, 0x300, 1, Some(0x610))
+        );
+        assert_eq!((t.colour_submits, t.foreign_submits, t.other_candidate_buffers), (1, 0, 0));
+    }
+
+    /// (b) Two render-size colour candidates (Crimson Desert registers two or three): the lowest
+    /// handle is the colour input and only a buffer naming it is held, as before. A buffer naming
+    /// only the other one stays forwarded, and is counted and logged once, so a game that alternated
+    /// DLSS's input between them would show.
+    #[test]
+    fn a_buffer_naming_another_candidate_is_forwarded_and_counted() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
+        let set: BTreeMap<u64, (vk::Image, ImageDesc)> = [
+            (0x100, desc(1516, 852, rgba, storage)),
+            (0x110, desc(1516, 852, rgba, storage)),
+            (0x200, desc(1516, 852, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
+            (0x300, desc(1516, 852, vk::Format::R16G16_SFLOAT, storage)),
+            (0x400, desc(2560, 1440, rgba, storage)),
+        ]
+        .into_iter()
+        .map(|(raw, d)| (raw, (vk::Image::from_raw(raw), d)))
+        .collect();
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let line = t.refresh().unwrap();
+        assert!(line.starts_with("colour input: image 0x100 (1516x852") && line.contains("(first of 2 candidates; others 0x110 1516x852)"), "{line}");
+        // The other candidate's buffer: forwarded, counted.
+        t.launch(cb(1), Some(&param_block(&[0x1110, 0x1200, 0x1300])));
+        assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
+        assert!(t.scan(&[vec![cb(1)]]).is_none(), "naming another candidate only: not held");
+        assert_eq!((t.foreign_submits, t.other_candidate_buffers), (1, 1));
+        let first = t.classify_line(None, 0).expect("the forwarded kind");
+        assert!(first.starts_with("a launch-bearing submit whose CUDA launches never name"), "{first}");
+        let other = t.classify_line(None, 0).expect("then the other candidate, once");
+        assert!(other.contains("names another colour candidate (0x110) and not the colour input 0x100"), "{other}");
+        assert!(t.classify_line(None, 0).is_none());
+        // The colour input's buffer is held exactly as before; a buffer naming both is too.
+        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
+        assert!(t.scan(&[vec![cb(2)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
+        t.launch(cb(3), Some(&param_block(&[0x1110, 0x1100])));
+        assert!(t.scan(&[vec![cb(3)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
+        assert_eq!((t.colour_submits, t.other_candidate_buffers), (2, 1));
+    }
+
+    /// (c) A Cyberpunk-2077-like set: no swapchain known on the device, depth D32_SFLOAT without
+    /// stencil, motion vectors RG32F, DLSS's output an R11G11B10 storage image. Identified against
+    /// the output-like image; without any larger one (DLAA) not.
+    #[test]
+    fn without_a_swapchain_the_largest_output_like_image_is_the_comparison() {
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED;
+        let mk = |list: &[(u64, ImageDesc)]| -> BTreeMap<u64, (vk::Image, ImageDesc)> { list.iter().map(|&(raw, d)| (raw, (vk::Image::from_raw(raw), d))).collect() };
+        let inputs = [
+            (0x100, desc(1708, 960, vk::Format::R16G16B16A16_SFLOAT, storage)),
+            (0x200, desc(1708, 960, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)),
+            (0x300, desc(1708, 960, vk::Format::R32G32_SFLOAT, storage)),
+            (0x400, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
+            (0x500, desc(1708, 960, vk::Format::R8_UNORM, storage)),
+        ];
+        let mut set = inputs.to_vec();
+        set.push((0x600, desc(2560, 1440, vk::Format::B10G11R11_UFLOAT_PACK32, storage)));
+        let mut t = tracker_with(&mk(&set), None);
+        let line = t.refresh().expect("identified");
+        assert!(line.starts_with("colour input: image 0x100 (1708x960 R16G16B16A16_SFLOAT"), "{line}");
+        assert!(line.contains("depth 0x200 D32_SFLOAT, motion vectors 0x300 R32G32_SFLOAT"), "{line}");
+        assert!(line.ends_with("swapchain None, compared with the largest registered RGBA16F/R11G11B10 storage image (2560x1440)"), "{line}");
+        assert_eq!(t.inputs.map(|i| (i.output, i.output_from_swapchain, i.exposure_input.map(|e| e.0.as_raw()))), Some(((2560, 1440), false, Some(0x400))));
+        // An RGBA16F output does as well; a swapchain, once known, is what counts.
+        let mut rgba_out = inputs.to_vec();
+        rgba_out.push((0x600, desc(2560, 1440, vk::Format::R16G16B16A16_SFLOAT, storage)));
+        assert!(identify(&mk(&rgba_out), None).is_some_and(|i| i.colour.0.as_raw() == 0x100 && i.candidates == 1));
+        assert_eq!(identify(&mk(&rgba_out), Some((1708, 960))), None, "DLAA with a swapchain");
+        // DLAA without a swapchain: nothing larger than the colour input, nothing identified.
+        assert_eq!(identify(&mk(&inputs), None), None);
+        // A larger image of another format (NGX's R16F scratch) is not an output.
+        let mut scratch = inputs.to_vec();
+        scratch.push((0x700, desc(5120, 2880, vk::Format::R16_SFLOAT, storage)));
+        assert_eq!(identify(&mk(&scratch), None), None);
+    }
+
+    /// (d) Nothing qualifies: not identified, and the line says why, with the registered views
+    /// grouped (extent, format, usage, count), once per change of the set, capped in length and
+    /// in number.
+    #[test]
+    fn a_failed_identification_logs_the_registered_set_once_per_change() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE;
+        // A colour input without STORAGE, a storage one without motion vectors beside it, depth.
+        let set: BTreeMap<u64, (vk::Image, ImageDesc)> = [
+            (0x100, desc(1708, 960, rgba, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT)),
+            (0x110, desc(1708, 960, rgba, storage)),
+            (0x200, desc(1708, 960, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
+            (0x300, desc(1708, 960, vk::Format::R16G16_UNORM, storage)),
+            (0x400, desc(2560, 1440, rgba, storage)),
+            (0x410, desc(2560, 1440, rgba, storage)),
+        ]
+        .into_iter()
+        .map(|(raw, d)| (raw, (vk::Image::from_raw(raw), d)))
+        .collect();
+        assert_eq!(identify(&set, None), None);
+        let mut t = tracker_with(&set, None);
+        let line = t.refresh().expect("the failure is logged");
+        assert!(line.starts_with("no DLSS input among 6 registered views (swapchain None); waiting. output: no swapchain known, largest RGBA16F/R11G11B10 storage image 2560x1440"), "{line}");
+        assert!(line.contains("RGBA16F storage extents: 2560x1440 not smaller than the output, 1708x960 no R16G16/R32G32_SFLOAT motion vectors at this extent"), "{line}");
+        assert!(line.contains("registered: 2560x1440 R16G16B16A16_SFLOAT storage x2, "), "{line}");
+        assert!(line.contains("1708x960 R16G16B16A16_SFLOAT sampled+colour x1") && line.contains("1708x960 D32_SFLOAT depth x1"), "{line}");
+        assert!(t.refresh().is_none(), "nothing changed");
+        // A change of the set (same count) is logged again.
+        t.forget_image(vk::Image::from_raw(0x300));
+        t.record_image(vk::Image::from_raw(0x310), &vk::ImageCreateInfo { image_type: vk::ImageType::TYPE_2D, extent: vk::Extent3D { width: 1708, height: 960, depth: 1 }, format: vk::Format::R16G16_SNORM, usage: storage, samples: vk::SampleCountFlags::TYPE_1, ..Default::default() });
+        t.record_view(vk::ImageView::from_raw(0x311), vk::Image::from_raw(0x310));
+        t.register(vk::ImageView::from_raw(0x311), None);
+        let again = t.refresh().expect("a changed set is logged again");
+        assert!(again.contains("R16G16_SNORM") && !again.contains("R16G16_UNORM"), "{again}");
+        // Long sets are cut at the cap.
+        let many: BTreeMap<u64, (vk::Image, ImageDesc)> = (0..400u64).map(|k| (0x1000 + k, (vk::Image::from_raw(0x1000 + k), desc(100 + k as u32, 50, rgba, storage)))).collect();
+        let long = diagnose(&many, None);
+        assert!(long.len() <= DIAGNOSE_MAX && long.ends_with(" more)"), "{} bytes: ...{}", long.len(), &long[long.len().saturating_sub(40)..]);
+        // After MAX_DIAGNOSES detailed lines, only the short one (once per change of it).
+        let mut t = tracker_with(&set, None);
+        for k in 0..MAX_DIAGNOSES {
+            t.dirty = true;
+            t.announced = None;
+            assert!(t.refresh().unwrap().contains("registered: "), "detailed {k}");
+        }
+        t.dirty = true;
+        assert_eq!(t.refresh().as_deref(), Some("no DLSS input among 6 registered views (swapchain None); waiting"));
+        t.dirty = true;
+        assert!(t.refresh().is_none());
+    }
+
+    /// The process-wide post-path switch (for DLSS on another device than the swapchain, the case
+    /// the output-like-image identification opens) agrees with the holding device's own at every
+    /// moment, and is never set outside model mode.
+    #[test]
+    fn the_shared_post_off_deadline_matches_the_holding_devices_own() {
+        let t0 = Instant::now();
+        for engaged in [false, true] {
+            for last in [None, Some(t0)] {
+                let until = post_off_until(true, engaged, last);
+                for ms in [0, 1, 29_999, 30_000, 30_001, 60_000] {
+                    let now = t0 + Duration::from_millis(ms);
+                    assert_eq!(until.is_some_and(|u| now < u), post_off(engaged, last, now), "engaged {engaged}, last {last:?}, +{ms} ms");
+                }
+                assert_eq!(post_off_until(false, engaged, last), None, "only model mode turns the post path off");
+            }
+        }
     }
 
     #[test]

@@ -209,10 +209,22 @@ At a launch-bearing submit, when the registered set or the swapchains changed
 (`preupscale::identify`):
 
 - **Colour input:** the registered `RGBA16F` storage image (2D, single sample) whose extent equals
-  a registered depth image's and a registered `RG16F` image's, and is smaller than the largest
-  swapchain. "Smaller" is what rules out DLAA.
+  a registered depth image's (any depth format: `D32_SFLOAT`, `D32_SFLOAT_S8_UINT`,
+  `D24_UNORM_S8_UINT`, ...) and a registered motion-vector image's (`RG16F`, else `RG32F`), and is
+  smaller than the output. The output is the device's largest swapchain; on a device with no
+  swapchain (DLSS on another device than the one that presents, or views registered before the
+  swapchain exists) it is the largest registered `RGBA16F`/`R11G11B10` storage image. "Smaller" is
+  what rules out DLAA. Several candidates: the lowest handle is the colour input; the others are
+  only logged, and a forwarded buffer that names one of them is counted (PRE_UPSCALER_DESIGN.md,
+  "Several colour candidates (2.0.1)").
 - **Exposure input:** the registered 1x1 `R16_SFLOAT` image.
 - Without an exposure input, nothing is held.
+- When nothing qualifies, the line says why: the output used, the first failed condition for every
+  `RGBA16F` storage extent, and the registered views grouped by extent, format and usage (at most
+  1500 bytes, for the first 16 changes of the set per device).
+- While any device of the process holds, the post-upscaler compose stays off on every device
+  (`preupscale::post_off_by_any_device`), so a game whose DLSS runs on a device without the
+  swapchain does not get the model twice.
 
 The submit on which the inputs are (re)identified is not held: their layouts are not known yet.
 The next one is.

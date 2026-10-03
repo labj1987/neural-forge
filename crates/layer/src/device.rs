@@ -979,7 +979,8 @@ impl NeuralForgeDeviceInfo {
             width: colour.width,
             height: colour.height,
             depth: Some(aux(inputs.depth, scan.depth_layout)),
-            mvec: Some(aux(inputs.mvec, scan.mvec_layout)),
+            // The dump's buffer and file are RG16F (4 bytes a texel): RG32F motion vectors are not read.
+            mvec: Some(aux(inputs.mvec, scan.mvec_layout)).map(|a| crate::preupscale::Aux { readable: a.readable && a.format == vk::Format::R16G16_SFLOAT, ..a }),
             // The 1x1 candidates: read in their committed layout, or as GENERAL (assumed, flagged in
             // exposure.json) when no barrier on a storage image was seen.
             exposure: std::array::from_fn(|k| {
@@ -1181,6 +1182,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         );
         if let Some(t) = &self.preupscale {
             t.lock().swapchain(swapchain, Some((state.width, state.height)));
+            // Which device presents: DLSS's views may be registered on another one.
+            crate::log!("[preupscale] device {:?}: swapchain {}x{} tracked for the DLSS input's size test", self.device.handle(), state.width, state.height);
         }
         let mut layer_state = self.state.lock().unwrap();
         self.tracker.lock().unwrap().swapchain_images.extend(state.images.iter().copied());
@@ -2071,13 +2074,17 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 };
                 let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
                 shm.poll_toggle_hotkey(hotkey);
-                if self.preupscale.is_some() {
-                    // Model mode: once this device has held, the post-upscaler compose stays off
-                    // while DLSS ran within `preupscale::HAND_BACK` (30 s), loading screens included:
-                    // the model is not applied a second time, and the helper's feature is not rebuilt
-                    // at the output size and back at every loading screen. Logged on change.
+                // Another device's hold counts too (DLSS on a device without the swapchain); never
+                // set with `NEURAL_FORGE_PREUPSCALE=off`, where no device holds.
+                let held_elsewhere = crate::preupscale::active() && crate::preupscale::post_off_by_any_device(std::time::Instant::now());
+                if self.preupscale.is_some() || held_elsewhere {
+                    // Model mode: once this device (or another of the process) has held, the
+                    // post-upscaler compose stays off while DLSS ran within `preupscale::HAND_BACK`
+                    // (30 s), loading screens included: the model is not applied a second time, and
+                    // the helper's feature is not rebuilt at the output size and back at every
+                    // loading screen. Logged on change.
                     static SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    let suppressed = preupscale.suppresses_post();
+                    let suppressed = preupscale.suppresses_post() || held_elsewhere;
                     if SUPPRESSED.swap(suppressed, std::sync::atomic::Ordering::Relaxed) != suppressed {
                         crate::log!(
                             "[preupscale] {}",

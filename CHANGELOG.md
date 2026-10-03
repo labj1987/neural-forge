@@ -6,6 +6,16 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Pre-upscaler identification (layer): on a device that knows no swapchain, DLSS's colour input is
+  now compared with the largest registered RGBA16F/R11G11B10 storage image. Before, such a device
+  gave up, which is why Cyberpunk 2077 logged `no DLSS input among 11 registered views (swapchain
+  None)`. Motion vectors may also be RG32F. A failed identification now logs why, with the
+  registered views grouped by extent, format and usage (capped). Identification lines name their
+  device. While any device holds, the post-upscaler compose stays off on every device, so DLSS on a
+  device other than the swapchain's cannot get the model twice. Other colour candidates are listed,
+  and a forwarded buffer naming one is counted, but nothing new is held. GTA V's identification and
+  hold are unchanged. See docs/PRE_UPSCALER_DESIGN.md, "Several colour candidates (2.0.1)".
+
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
   `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
   earlier needs proof that the presentation engine's wait on them has completed, which core
