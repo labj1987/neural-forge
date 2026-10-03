@@ -3822,10 +3822,14 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
+        // Read before the thread starts, so a late-scheduled thread can't take the first
+        // request as already seen.
+        // SAFETY: the mapping outlives this read.
+        let first_seen = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.seq_req.load(AtomicOrdering::Relaxed);
         let helper = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the sequence returns).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
-            let mut last_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+            let mut last_seen = first_seen;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
                 hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
@@ -4020,10 +4024,14 @@ mod tests {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
+        // Read before the thread starts, so a late-scheduled thread can't take the first
+        // request as already seen.
+        // SAFETY: the mapping outlives this read.
+        let first_seen = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.seq_req.load(AtomicOrdering::Relaxed);
         let helper = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the function returns).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
-            let mut last_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+            let mut last_seen = first_seen;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
                 hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
@@ -4176,10 +4184,14 @@ mod tests {
         let answer_region = shm.answer_region(0).unwrap().0 as usize;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
+        // Read before the thread starts: a thread scheduled after `run_sync` has already bumped
+        // `seq_req` would otherwise take that request as already seen and never answer it (the
+        // test's intermittent CI failure, which looked like starvation).
+        let first_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
         let helper = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
-            let mut last_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
+            let mut last_seen = first_seen;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
                 hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
