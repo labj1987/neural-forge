@@ -156,6 +156,28 @@ pub struct ShmClient {
 // concurrent access from two threads at once.
 unsafe impl Send for ShmClient {}
 
+/// Test builds on 32-bit only: unmap on drop. The shipped layer keeps its mapping for the
+/// process's life on purpose, but the 32-bit test binary opens a fresh ~130 MB set of mappings
+/// in test after test and ran out of address space on CI (`open_at` failing).
+#[cfg(all(test, target_pointer_width = "32"))]
+impl Drop for ShmClient {
+    fn drop(&mut self) {
+        // Only a client that mapped the file itself (it keeps the fd) owns the mapping;
+        // `test_over_header` borrows a header in ordinary memory.
+        if self.header.is_null() || self.fd.is_none() {
+            return;
+        }
+        // SAFETY: on 32-bit `open_at` maps the header (`HEADER_BYTES`) and each region
+        // (`REGION_CAP`) separately; nothing derived from them outlives the client in the tests.
+        unsafe {
+            libc::munmap(self.header.cast(), neural_forge_protocol::HEADER_BYTES);
+            for r in self.regions.iter().filter(|p| !p.is_null()) {
+                libc::munmap(r.cast(), REGION_CAP);
+            }
+        }
+    }
+}
+
 impl Default for ShmClient {
     fn default() -> Self {
         Self {
@@ -203,7 +225,9 @@ impl ShmClient {
     /// unmapped).
     #[cfg(test)]
     pub(crate) fn test_over_header(header: &neural_forge_protocol::ShmHeader) -> Self {
-        Self { header: std::ptr::from_ref(header).cast_mut(), ..Self::default() }
+        let mut client = Self::default();
+        client.header = std::ptr::from_ref(header).cast_mut();
+        client
     }
 
     fn header(&self) -> Option<&neural_forge_protocol::ShmHeader> {
