@@ -75,7 +75,10 @@ jobs:
 
       - name: 32-bit layer tests
         run: |
-          cargo test --target i686-unknown-linux-gnu -p neural-forge-layer 2>&1 | tee test-i686.log
+          # Two test threads: each GPU test maps four shared-memory regions and a Vulkan device,
+          # and run on every core at once they exhausted the 32-bit address space (a test's
+          # open_at failed on the runner while the same suite passed locally).
+          cargo test --target i686-unknown-linux-gnu -p neural-forge-layer -- --test-threads=2 2>&1 | tee test-i686.log
           ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-i686.log || true)"
           echo "GPU tests that ran (i686): $ran" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$ran" -gt 0
