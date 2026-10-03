@@ -846,3 +846,85 @@ about", mods working.
 `GTA5_Enhanced.exe+0x12c6eb` during "Game Init" (32 dumps on this machine, 11 of them on 2026-10-01
 with 1.0.1; other Game Init crashes go back to January, before Neural Forge). It is the game's own;
 relaunching works.
+
+## 2026-10-02 -- upstream 0.3.1-2 vs Neural Forge 2.0.0
+
+DLSS5VKLayer 0.3.1-2 (release 2026-09-26, commit `9f43793`), installed on LordNikon from the
+release tarball with `./install.sh --user` (no root): `~/.local/lib/dlssnr`, `~/.local/bin/dlssnr-*`,
+implicit manifests `~/.local/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.{x86_64,i686}.json`
+(`enable_environment` `VKLayer_DLSS5=1`), a `dlssnr.desktop` launcher (not autostart). NGX DLLs
+copied (not moved) from Neural Forge's binaries folder. The installer also writes
+`~/.config/environment.d/dlssnr.conf` with `VK_INSTANCE_LAYERS=VK_LAYER_NV_dlssnr:VK_LAYER_NV_present`;
+it was trashed right after the install, before any reload or login, so the session never saw it.
+Checked inert: no `VK_*` in `systemctl --user show-environment`, nothing in autostart or systemd user
+units, Steam launch options unchanged, and `VK_LOADER_DEBUG=layer vulkaninfo --summary` lists the
+layer but never loads `libVkLayer_NV_dlssnr.so` unless `VKLayer_DLSS5=1` is set.
+
+Upstream ran at its defaults: model every frame, after the upscaler, at 2560x1440, motion vectors on.
+Only one model helper ran at a time.
+
+**GTA V Enhanced: upstream still cannot run it.** `scripts/gta-bench.sh`, layers
+`VK_LAYER_NV_dlssnr`, `VKLayer_DLSS5=1`, mods off, Alex's settings (DLSS Balanced, FrameGenType 1):
+
+- Helper running from the start: 3 of 3 launches crashed at Game Init, about 95 s in, with the known
+  access violation at `GTA5_Enhanced.exe+0x12c6eb`. A fourth with `DLSSNR_IDLE_REPAINT=0` did the
+  same. The layer loads into the Rockstar Launcher as well as the game. The helper rebuilt its NGX
+  feature on every frame, alternating between the launcher (`neural ready 1022x598`) and the game
+  (`neural ready 2560x1440`). Each game frame was answered with `[shm] helper could not use frame N`
+  (the answer was made for the other size), and each frame's present waited for a rebuild of about
+  150 ms.
+- Helper started 130 s after launch, once Game Init was over: the game ran, but at **2.7 fps
+  displayed** (GPU 11%), against 377 fps on the loading screen just before. The helper logged 2,699
+  rebuilds of the feature, alternating between the two sizes. It is the 0.3.0/0.3.1 failure, still
+  there.
+- Layer loaded with its helper stopped (the layer passes frames through): the benchmark completed,
+  92.9 real / 94.3 shown, GPU 67%. That matches NR off, so the layer alone neither crashes the game
+  nor costs anything. Two launches before this one stopped in the Rockstar Launcher ("Failed to
+  connect to the Rockstar Games Library Service", then error 7002.1 "Launch validation had fatal
+  error"). An NR-off launch straight after worked, as did the next layer-only launch. Cause unknown.
+- For comparison, Neural Forge hit the same Game Init crash once in 4 launches, and NR off 0 in 2.
+
+Neural Forge 2.0 and NR off in the same GTA settings (pass 4). DLSS Frame Generation did not always
+engage. When it did, it gave 2x (`dlssFrameGenMode` 0), not 4x:
+
+| Run | Real fps | Shown fps | GPU | FG engaged |
+|---|---|---|---|---|
+| Neural Forge 2.0 #1 | 68.2 | 68.7 | 94% | no |
+| Neural Forge 2.0 #2 | 68.0 | 68.5 | 94% | no |
+| Neural Forge 2.0 #3 | 56.9 | 114.2 | 96% | 2x |
+| NR off #1 | 92.3 | 92.8 | 67% | no |
+| NR off #2 | 89.1 | 180.3 | 87% | 2x |
+| Upstream 0.3.1-2, helper from start (x4) | crashed at Game Init | | | |
+| Upstream 0.3.1-2, helper started after Game Init | ~2.7 shown | | 11% | |
+
+Neural Forge held 68.5 frames/s before the upscaler with FG off, and 57.1/s with FG on. The FG-off
+pair was skipped because upstream has no GTA number to pair it with.
+
+**Cyberpunk 2077: matched comparison.** It runs unattended under Proton:
+`Cyberpunk2077.exe --launcher-skip -skipStartScreen -benchmark`, through the same SLR_4 entry point
+as GTA with Proton-GE Latest. The game skips the menu, runs the 64 s benchmark scene and exits.
+Results go to `Documents/CD Projekt Red/Cyberpunk 2077/benchmarkResults/<time>/summary.json`.
+The runner and summariser are on the rig as `~/nf-spike/cp/cp-bench.sh` and `cp-report.py`.
+Settings were Alex's, unchanged: 2560x1440 fullscreen, DLSS Auto, ray tracing on (reflections, sun
+shadows, lighting Ultra), FG off, Reflex on.
+
+In Cyberpunk, Neural Forge's pre-upscaler path finds no DLSS input
+(`[preupscale] no DLSS input among 11 registered views`). It falls back to the after-upscaler path
+at 2560x1440, the same place upstream works, so this is a like-for-like comparison.
+
+| Config (benchmark scene, 64 s) | Real = shown fps | GPU | Power |
+|---|---|---|---|
+| Upstream 0.3.1-2 (model every frame), 3 runs | 38.0 / 37.9 / 37.9, mean **37.9** | 89-90% | 218 W |
+| Neural Forge 2.0, model every frame (`model_interval=1`), 2 runs | 38.2 / 38.4, mean **38.3** | 95% | 219 W |
+| Neural Forge 2.0, Alex's setting (`model_interval=2`), 3 runs | 51.9 / 51.8 / 52.1, mean **51.9** | 95-96% | 214 W |
+| NR off, 2 runs | 93.0 / 85.3, mean 89.2 | 95% | 206-210 W |
+
+At the same work per frame the two are equal (Neural Forge +0.4 fps). Neural Forge's default of
+running the model every 2nd frame is 37% faster. Neural Forge's `[sync]` in Cyberpunk: helper 11.4 ms,
+capture_gpu 11-24 ms (waiting for the game's frame), zc=true.
+
+Left on the rig: upstream installed but inert, with its helper stopped and nothing global set.
+The release tarball is kept in `~/Downloads`, and its `uninstall.sh --user` removes the install.
+Neural Forge's helper is running with its settings as found (enabled=1, working_scale=1,
+model_interval=2, mvec_enabled=1). GTA settings.xml is byte-identical (sha256 `6c687fff...addc`).
+The desktop is untouched at 2560x1440@288, scale 1.0.

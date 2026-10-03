@@ -7,7 +7,10 @@
 > yet" items still stand.
 
 Compared against DLSS5VKLayer (bmitch87) **0.3.1-1**, commit `117c953`, shared-memory header
-**v20** (2026-09-15). Earlier notes in `docs/history/` refer to 0.2.6-x; they are kept as written.
+**v20** (2026-09-15). Measured head-to-head against **0.3.1-2** (commit `9f43793`, 2026-09-26) on 2026-10-02: it still
+cannot run GTA V Enhanced (the Rockstar Launcher's frames make its helper rebuild every frame), and in
+Cyberpunk 2077 it matches Neural Forge 2.0 at the same work per frame (37.9 vs 38.3 fps). See
+[HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md), "upstream 0.3.1-2 vs Neural Forge 2.0.0". Earlier notes in `docs/history/` refer to 0.2.6-x; they are kept as written.
 Every ported function is listed in [ATTRIBUTION.md](../ATTRIBUTION.md).
 
 The two shared-memory protocols are **not wire-compatible and are not meant to be**. Neural
