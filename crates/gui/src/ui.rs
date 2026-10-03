@@ -1088,8 +1088,14 @@ fn launch_option(target_exe: &str, smooth_motion: bool) -> String {
     parts.join(" ")
 }
 
+/// Off unless switched on: since 2.0 the game's own DLSS Frame Generation is the recommended
+/// route (the model runs before it, on real frames only), and Smooth Motion is for games without it.
 fn smooth_motion_saved() -> bool {
-    neural_forge_supervisor::Config::load().settings.get(SMOOTH_MOTION_KEY).is_none_or(|v| v != "0")
+    smooth_motion_from(neural_forge_supervisor::Config::load().settings.get(SMOOTH_MOTION_KEY).map(String::as_str))
+}
+
+fn smooth_motion_from(saved: Option<&str>) -> bool {
+    saved == Some("1")
 }
 
 fn save_smooth_motion(on: bool) {
@@ -1112,8 +1118,8 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     let smooth_row = adw::SwitchRow::new();
     smooth_row.set_title("Smooth Motion");
     smooth_row.set_subtitle(
-        "NVIDIA frame generation after the effect (RTX 40 series or newer): about twice the frames on screen, \
-         while the model only runs on the game's own frames. The Steam overlay's fps counter shows the displayed rate.",
+        "For games without their own frame generation: NVIDIA's driver-level frame generation after the effect \
+         (RTX 40 series or newer). With DLSS, use the game's own frame generation instead.",
     );
     smooth_row.set_active(smooth_motion_saved());
     group.add(&smooth_row);
@@ -1736,6 +1742,13 @@ mod launch_option_tests {
     #[test]
     fn whitespace_only_target_exe_is_treated_as_empty() {
         assert_eq!(launch_option("   ", false), "NEURAL_FORGE_ENABLE=1 %command%");
+    }
+
+    #[test]
+    fn smooth_motion_is_off_unless_switched_on() {
+        assert!(!smooth_motion_from(None));
+        assert!(!smooth_motion_from(Some("0")));
+        assert!(smooth_motion_from(Some("1")));
     }
 
     #[test]
