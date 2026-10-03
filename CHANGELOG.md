@@ -6,6 +6,18 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- **Pre-upscaler: the colour input follows what DLSS's input kernel reads.** Crimson Desert
+  registers three 1516x852 RGBA16F candidates; the size rule took the lowest handle while SR's
+  buffers read another, so almost nothing was held (`1 held ...; 6871 forwarded buffers named
+  another colour candidate`), and whether it worked depended on handle order per launch. Now the
+  first identification takes the candidate SR's input launch names when that evidence is there;
+  later, the same other candidate named by 8 consecutive input launches switches the colour input
+  (`colour input switched to 0x... (DLSS's input kernel reads it; the size rule had picked 0x...)`,
+  one submit not held, as on any re-identification); and every SR buffer whose input launch names
+  another size-rule candidate with the same depth and motion vectors is held with that candidate
+  (a game alternating its input per frame is held every frame; logged once as `DLSS's input kernel
+  alternates between colour candidates ...`). Single-candidate games (GTA V) and DLAA are
+  unaffected. See docs/PRE_UPSCALER_DESIGN.md, "Several colour candidates".
 - **Kernel names no longer decide anything.** The Ray Reconstruction guard that required
   `hiluma_engine_input*`/`cuda_engine_input_kernel*` launches switched Crimson Desert off: its
   newer DLSS Super Resolution launches `custom_block*`/`k_initial_merge` kernels instead. Names

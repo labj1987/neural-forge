@@ -1426,6 +1426,74 @@ What to look for on the next rig run:
 - **Crimson Desert:** holds/s as before (≈ real fps), and whether the
   `names another colour candidate` line or tally count ever appears.
 
+### Addendum: the input kernel decides among the candidates
+
+It did appear. A later Crimson Desert Enhanced session logged `colour input: image 0x...cabd0
+(1516x852 RGBA16F ...) (first of 3 candidates; others 0x...0ef00 1516x852, 0x...17c20 1516x852)
+... identified by size`, then `launch-bearing submits: 1 held reading the colour input, 0 held
+undecided, 18000 forwarded untouched ...; 6871 forwarded buffers named another colour candidate`.
+The lowest handle was not what SR read, so nearly nothing was held. In the morning's session the
+lowest handle happened to be the right one. The settled parameter evidence ("Identification by the
+input kernel's parameters") never took over. The log does not say why; the likely cause is that it
+chooses none when two entries both name the exposure, and an entry is only dropped when one of its
+images is destroyed, so one input launch naming another candidate (an earlier phase, or a game that
+alternates) blocks it for good. Either way it decided only once settled and on set changes.
+
+What changed (`Tracker::switch_by_evidence`, `Tracker::retarget`):
+
+- **First identification.** If the submit that first identifies has an input launch naming one of
+  the size rule's other candidates, that candidate is the colour input (`Rule::Params`), not the
+  lowest handle.
+- **Switch.** When `SWITCH_AFTER` = 8 consecutive input launches name the same other size-rule
+  candidate (an input launch naming the colour input resets the count; launches with no input
+  launch, such as FG's, do not count), the colour input switches to it, logged once per switch:
+  `colour input switched to 0x... (DLSS's input kernel reads it; the size rule had picked 0x...)`.
+  It is an ordinary re-identification: layouts dropped, that one submit not held, the
+  identification line repeated with `identified by the input kernel's parameters`. The switch is
+  kept (it takes precedence over the settled pick) while its image is one of the size rule's
+  candidates and registered.
+- **Per-buffer target.** A buffer that would be forwarded, whose input launch names another of the
+  size rule's candidates together with the colour input's own depth and motion vectors, is held
+  with that candidate as the target (`Scan::inputs` carries it; the hold binds a view of whatever
+  image it is given every hold). The other candidates' barriers are tracked like the colour
+  input's, so their layouts are known. So a game that alternates its input between two images frame
+  by frame is held every frame, each with its own image, and the colour input never switches.
+  Logged once: `a launch-bearing buffer's input launch names another colour candidate (0x...) with
+  the colour input's depth and motion vectors: held with that candidate (DLSS's input kernel reads
+  it this frame)`, and, if the target changes more than 4 times in 60 held submits, `DLSS's input
+  kernel alternates between colour candidates 0x... and 0x... (...): each submit is held with the
+  candidate its input launch names`. The tally counts them:
+  `N held reading the colour input (M of them another candidate their input launch names)`.
+- **Scope.** Only among the size rule's candidates (render-size RGBA16F storage images smaller than
+  the output, with depth and motion vectors at their extent). GTA V (one candidate) and DLAA (no
+  size-rule candidate) never switch or retarget. A buffer naming another candidate without an input
+  launch (no depth and motion vectors beside it) is still forwarded and counted. Kernel names do not
+  gate it (`GATE_BY_KERNEL_NAME = false`); if the gate is turned back on, only SR input kernel
+  launches count.
+
+Tests: `the_input_kernel_overrides_the_size_rules_pick_among_several_candidates` (three 1516x852
+candidates, size rule on 0x100, one stale input launch naming a third so the settled pick chooses
+none, then SR naming the middle or the highest handle with 5 FG submits per frame: every SR submit
+held with the named image, retargeted until the switch at the 8th, the switch line once, one
+re-identification), `the_first_identification_prefers_the_input_kernels_candidate`,
+`alternating_colour_inputs_are_each_held_with_their_own_image` (pairs outside and including the
+identified colour input: 60 of 60 held with their own image, no switch, the alternation line once),
+`a_buffer_naming_another_candidate_is_forwarded_and_counted` (now also: an input launch naming the
+other candidate is held with it, with its tracked layout). GTA V's and the DLAA, RE and FG tests
+are unchanged.
+
+Revert checks (each reverted alone; all tests pass with the change):
+
+| Reverted | Fails |
+|---|---|
+| the switch after 8 consecutive launches | `the_input_kernel_overrides_...` |
+| the first identification's preference | `the_first_identification_prefers_...` |
+| `switched` taking precedence in `refresh` | `the_input_kernel_overrides_...`, `the_first_identification_prefers_...` |
+| the per-buffer target | `alternating_colour_inputs_...`, `the_input_kernel_overrides_...`, `a_buffer_naming_another_candidate_...` |
+| the count reset by a launch naming the colour input | `alternating_colour_inputs_...`, `ambiguous_parameters_fall_back_...` |
+| tracking the other candidates' barriers | `a_buffer_naming_another_candidate_...` |
+| the alternation line | `alternating_colour_inputs_...` |
+
 ## Identification by the input kernel's parameters (DLAA)
 
 Two reports from the rig, with the 0abcd28 build:

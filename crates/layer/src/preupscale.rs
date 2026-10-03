@@ -365,10 +365,10 @@ pub(crate) struct Inputs {
     pub mvec: (vk::Image, ImageDesc),
     /// How many colour candidates there were.
     pub candidates: usize,
-    /// The further candidates' colour images, lowest handles first. Not held: a buffer whose
-    /// launches name one of them and not [`Self::colour`] stays forwarded, and is only counted
-    /// ([`Tracker::other_candidate_buffers`]), so a game that alternated DLSS's colour input between
-    /// images would show in the log.
+    /// The further candidates' colour images, lowest handles first. A buffer whose input launch
+    /// names one of them with the colour input's depth and motion vectors is held with it as the
+    /// target ([`Tracker::retarget`]); one that names it otherwise stays forwarded, and is only
+    /// counted ([`Tracker::other_candidate_buffers`]).
     pub others: [Option<(vk::Image, ImageDesc)>; MAX_OTHERS],
     /// What the candidates were judged smaller than: the swapchain's extent, or (no swapchain known
     /// on the device) the largest registered output-like image ([`output_candidate`]).
@@ -796,7 +796,33 @@ pub(crate) struct Tracker {
     rr_names: Vec<String>,
     /// [`Self::sr_running`] as of the last [`Self::observe`] (a change re-runs the identification).
     sr_gate: bool,
+    /// The size rule's choice among several candidates overridden by what DLSS's input kernel
+    /// names ([`Self::observe`]: the same other candidate in [`SWITCH_AFTER`] consecutive input
+    /// launches, or at once when nothing is identified yet). [`Self::refresh`] prefers it while its
+    /// colour image is still one of the size rule's candidates.
+    switched: Option<Named>,
+    /// Consecutive input launches naming the same size-rule candidate other than the colour input.
+    streak: Option<(Named, u32)>,
+    /// Held launch-bearing submits whose buffer's input launch names another size-rule candidate
+    /// (with the colour input's depth and motion vectors): held with that candidate as the target
+    /// ([`Self::scan`]). Counted in [`Self::colour_submits`] too.
+    pub(crate) retargeted_submits: u64,
+    retarget_named: Option<vk::Image>,
+    /// The last held submit's target colour image, and the evaluations at which it changed (the
+    /// last [`ALTERNATION_WINDOW`]); more than [`ALTERNATION_FLIPS`] there is alternation, logged once.
+    last_target: Option<vk::Image>,
+    flips: std::collections::VecDeque<u64>,
+    alternation: Option<(vk::Image, vk::Image)>,
 }
+
+/// Consecutive input launches naming the same other size-rule candidate before the colour input
+/// is switched to it ([`Tracker::observe`]).
+pub(crate) const SWITCH_AFTER: u32 = 8;
+
+/// Alternation of the hold target between colour candidates is logged when it changes more than
+/// [`ALTERNATION_FLIPS`] times within [`ALTERNATION_WINDOW`] held submits.
+const ALTERNATION_WINDOW: u64 = 60;
+const ALTERNATION_FLIPS: usize = 4;
 
 /// Where a submit's first launch-bearing command buffer is.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -966,6 +992,13 @@ impl Tracker {
         if self.named_pick.is_some_and(|n| [n.colour, n.depth, n.mvec].contains(&image) || n.exposure == Some(image)) {
             self.named_pick = None;
             self.dirty = true;
+        }
+        if self.switched.is_some_and(|n| [n.colour, n.depth, n.mvec].contains(&image) || n.exposure == Some(image)) {
+            self.switched = None;
+            self.dirty = true;
+        }
+        if self.streak.is_some_and(|(n, _)| [n.colour, n.depth, n.mvec].contains(&image) || n.exposure == Some(image)) {
+            self.streak = None;
         }
     }
 
@@ -1138,6 +1171,7 @@ impl Tracker {
     fn watched(&self, image: vk::Image) -> bool {
         self.inputs.is_some_and(|i| {
             i.colour.0 == image
+                || i.others.iter().flatten().any(|o| o.0 == image)
                 || i.depth.0 == image
                 || i.mvec.0 == image
                 || i.exposure.iter().flatten().any(|e| e.0 == image)
@@ -1175,7 +1209,17 @@ impl Tracker {
         // kernel names say DLSS Super Resolution is not running ([`Self::sr_running`]).
         let gate = self.sr_running();
         let size = identify(&registered, self.swapchain_extent()).filter(|_| gate);
-        let inputs = self.named_pick.filter(|_| gate).and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())).or(size);
+        // The input kernel's choice among the size rule's candidates ([`Self::switched`]) only while
+        // its colour image still is one of them.
+        let is_candidate = |c: vk::Image| size.as_ref().is_some_and(|s| s.colour.0 == c || s.others.iter().flatten().any(|o| o.0 == c));
+        if self.switched.is_some_and(|n| !is_candidate(n.colour)) {
+            self.switched = None;
+        }
+        let inputs = self
+            .switched
+            .and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref()))
+            .or_else(|| self.named_pick.filter(|_| gate).and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())))
+            .or(size);
         let key =|i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
         if key(inputs) != key(self.inputs) {
             self.committed.clear();
@@ -1257,6 +1301,8 @@ impl Tracker {
         let mut lines = Vec::new();
         let mut any = false;
         let mut changed = false;
+        // This submit's input launches, in submission order, for the switch below.
+        let mut evidence: Vec<Named> = Vec::new();
         for cb in batches.iter().flatten() {
             let Some(refs) = self.launch.get(cb) else { continue };
             any = true;
@@ -1267,6 +1313,7 @@ impl Tracker {
                 Some(InputLaunch::Inputs { colour, depth, mvec }) => {
                     let (colour, depth, mvec) = (*colour, *depth, *mvec);
                     let exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
+                    evidence.push(Named::new(colour, depth, mvec, exposure));
                     if let Some(n) = self.named.iter_mut().find(|n| n.colour == colour) {
                         if n.exposure.is_none() && exposure.is_some() {
                             n.exposure = exposure;
@@ -1342,6 +1389,7 @@ impl Tracker {
                 self.rr_names.join(", ")
             ));
         }
+        self.switch_by_evidence(&evidence, &mut lines);
         self.named_quiet = if changed { 0 } else { self.named_quiet.saturating_add(1) };
         // Decided when the evidence has just settled, and again when the registered set or the
         // swapchains change after that (the output the colour input is compared with may move).
@@ -1353,6 +1401,59 @@ impl Tracker {
             }
         }
         lines
+    }
+
+    /// Overrides the size rule's choice among several colour candidates with the one DLSS's input
+    /// kernel names (`evidence`: this submit's input launches). With nothing identified yet, at
+    /// once; otherwise when the same other candidate is named by [`SWITCH_AFTER`] consecutive input
+    /// launches (one naming the colour input resets the count, so a game alternating between two
+    /// candidates never switches: [`Self::scan`] holds each submit with the one its buffer names).
+    /// Only the size rule's candidates (render-size, smaller than the output, with depth and motion
+    /// vectors at their extent) are switched between: a single candidate (GTA V) and DLAA (none)
+    /// are never affected.
+    fn switch_by_evidence(&mut self, evidence: &[Named], lines: &mut Vec<String>) {
+        if evidence.is_empty() || !self.sr_running() {
+            return;
+        }
+        let Some(current) = self.inputs else {
+            // The first identification: what the input kernel names among the size rule's
+            // candidates, rather than the lowest handle.
+            let Some(size) = identify(&self.registered_set(), self.swapchain_extent()) else { return };
+            if let Some(n) = evidence.iter().find(|n| size.others.iter().flatten().any(|o| o.0 == n.colour)) {
+                self.switched = Some(*n);
+                self.dirty = true;
+            }
+            return;
+        };
+        for n in evidence {
+            if n.colour == current.colour.0 {
+                self.streak = None;
+                continue;
+            }
+            if !current.others.iter().flatten().any(|o| o.0 == n.colour) {
+                continue;
+            }
+            let count = match self.streak {
+                Some((s, k)) if s.colour == n.colour => k + 1,
+                _ => 1,
+            };
+            self.streak = Some((*n, count));
+            if count >= SWITCH_AFTER {
+                self.streak = None;
+                self.switched = Some(*n);
+                self.dirty = true;
+                lines.push(format!(
+                    "colour input switched to {} (DLSS's input kernel reads it; the {} had picked {})",
+                    hex(n.colour),
+                    match current.rule {
+                        Rule::Size => "size rule",
+                        Rule::Params => "input kernel's earlier parameters",
+                    },
+                    hex(current.colour.0)
+                ));
+                return;
+            }
+        }
     }
 
     /// The registered images with their descriptions, keyed by raw handle (what [`identify`] reads).
@@ -1471,12 +1572,18 @@ impl Tracker {
         let mut found: Option<Scan> = None;
         let mut any_foreign = false;
         let mut held_kind = None;
+        let mut held_target: Option<(vk::Image, bool)> = None;
         for (bi, cbs) in batches.iter().enumerate() {
             for (ci, &cb) in cbs.iter().enumerate() {
                 let colour = self.inputs.map(|i| i.colour.0);
                 // With kernel names known, a buffer that launches no SR input kernel is never DLSS
                 // Super Resolution's (Ray Reconstruction's, Frame Generation's): forwarded.
                 let kind = self.launch.get(&cb).map(|r| if self.names_known && !r.sr_input { LaunchKind::Foreign } else { r.kind(colour) });
+                // A buffer whose input launch names another of the size rule's candidates with the
+                // colour input's depth and motion vectors: DLSS reads that candidate this frame
+                // (a game alternating its input between images). Held with it as the target.
+                let retarget = (kind == Some(LaunchKind::Foreign)).then(|| self.retarget(cb)).flatten();
+                let kind = if retarget.is_some() { Some(LaunchKind::Colour) } else { kind };
                 if kind == Some(LaunchKind::Foreign) {
                     any_foreign = true;
                     // Counted only: whether a forwarded buffer reads another colour candidate.
@@ -1491,12 +1598,14 @@ impl Tracker {
                 }
                 if found.is_none() && kind.is_some_and(|k| k != LaunchKind::Foreign) {
                     held_kind = kind;
+                    held_target = retarget.or(self.inputs.map(|i| i.colour)).map(|c| (c.0, retarget.is_some()));
                     let layout = |image: Option<vk::Image>| image.and_then(|i| self.committed.get(&i).copied());
+                    let inputs = self.inputs.map(|i| Inputs { colour: retarget.unwrap_or(i.colour), ..i });
                     found = Some(Scan {
                         batch: bi,
                         index: ci,
-                        colour_layout: layout(self.inputs.map(|i| i.colour.0)),
-                        inputs: self.inputs,
+                        colour_layout: layout(inputs.map(|i| i.colour.0)),
+                        inputs,
                         depth_layout: layout(self.inputs.map(|i| i.depth.0)),
                         mvec_layout: layout(self.inputs.map(|i| i.mvec.0)),
                         exposure_layouts: std::array::from_fn(|k| layout(self.inputs.and_then(|i| i.exposure[k]).map(|e| e.0))),
@@ -1515,10 +1624,48 @@ impl Tracker {
             if held_kind == Some(LaunchKind::Colour) {
                 self.colour_submits += 1;
             }
+            if let Some((target, retargeted)) = held_target.filter(|_| held_kind == Some(LaunchKind::Colour)) {
+                self.retargeted_submits += u64::from(retargeted);
+                if retargeted {
+                    self.retarget_named.get_or_insert(target);
+                }
+                self.note_target(target);
+            }
         } else if any_foreign {
             self.foreign_submits += 1;
         }
         found
+    }
+
+    /// The size rule's other candidate `cb`'s input launch names, with the colour input's depth and
+    /// motion vectors (so their layouts are watched), if any. With kernel names known, only an SR
+    /// input kernel's launch.
+    fn retarget(&self, cb: vk::CommandBuffer) -> Option<(vk::Image, ImageDesc)> {
+        let i = self.inputs?;
+        let refs = self.launch.get(&cb)?;
+        if self.names_known && refs.input_sr != Some(true) {
+            return None;
+        }
+        let Some(InputLaunch::Inputs { colour, depth, mvec }) = refs.input else { return None };
+        if colour == i.colour.0 || depth != i.depth.0 || mvec != i.mvec.0 {
+            return None;
+        }
+        i.others.iter().flatten().find(|o| o.0 == colour).copied()
+    }
+
+    /// Books a held submit's target colour image; logs (once) when it alternates.
+    fn note_target(&mut self, target: vk::Image) {
+        let now = self.evaluations;
+        if let Some(last) = self.last_target.filter(|&l| l != target) {
+            self.flips.push_back(now);
+            while self.flips.front().is_some_and(|&f| now.saturating_sub(f) >= ALTERNATION_WINDOW) {
+                self.flips.pop_front();
+            }
+            if self.flips.len() > ALTERNATION_FLIPS && self.alternation.is_none() {
+                self.alternation = Some((last, target));
+            }
+        }
+        self.last_target = Some(target);
     }
 
     /// A first-of-its-kind classification line, once per kind: a launch-bearing submit held because
@@ -1533,6 +1680,23 @@ impl Tracker {
             (2, "a launch-bearing submit whose CUDA launches never name DLSS's colour input (DLSS Frame Generation's, or another NGX feature's) is forwarded untouched; only the one that reads it is held".to_string())
         } else if scan.is_some() && undecided > undecided_before && self.inputs.is_some() && self.said_kinds & 4 == 0 {
             (4, "a launch-bearing submit is held undecided: a launch's parameters were not readable (not in CUDA's buffer form), so it cannot be told from DLSS Super Resolution's".to_string())
+        } else if scan.is_some() && self.retargeted_submits > 0 && self.said_kinds & 16 == 0 {
+            (
+                16,
+                format!(
+                    "a launch-bearing buffer's input launch names another colour candidate ({}) with the colour input's depth and motion vectors: held with that candidate (DLSS's input kernel reads it this frame)",
+                    self.retarget_named.map_or_else(String::new, hex)
+                ),
+            )
+        } else if let Some((a, b)) = self.alternation.filter(|_| self.said_kinds & 32 == 0) {
+            (
+                32,
+                format!(
+                    "DLSS's input kernel alternates between colour candidates {} and {} (more than {ALTERNATION_FLIPS} changes in {ALTERNATION_WINDOW} held submits): each submit is held with the candidate its input launch names",
+                    hex(a),
+                    hex(b)
+                ),
+            )
         } else if self.other_candidate_buffers > 0 && self.said_kinds & 8 == 0 {
             (
                 8,
@@ -1677,8 +1841,9 @@ impl Tracking {
             // Every 3000th forwarded one: the running counts.
             let tally = (t.foreign_submits != foreign_before && t.foreign_submits.is_multiple_of(3000)).then(|| {
                 format!(
-                    "launch-bearing submits: {} held reading the colour input, {} held undecided, {} forwarded untouched (their launches never name the colour input){}",
+                    "launch-bearing submits: {} held reading the colour input{}, {} held undecided, {} forwarded untouched (their launches never name the colour input){}",
                     t.colour_submits,
+                    if t.retargeted_submits > 0 { format!(" ({} of them another candidate their input launch names)", t.retargeted_submits) } else { String::new() },
                     t.evaluations - t.colour_submits,
                     t.foreign_submits,
                     if t.other_candidate_buffers > 0 {
@@ -4205,9 +4370,10 @@ mod tests {
     }
 
     /// (b) Two render-size colour candidates (Crimson Desert registers two or three): the lowest
-    /// handle is the colour input and only a buffer naming it is held, as before. A buffer naming
-    /// only the other one stays forwarded, and is counted and logged once, so a game that alternated
-    /// DLSS's input between them would show.
+    /// handle is the colour input and a buffer naming it is held, as before. A buffer whose launches
+    /// name only the other one, but not as an input launch (no depth and motion vectors beside it),
+    /// stays forwarded, and is counted and logged once. One whose input launch names the other
+    /// candidate with the colour input's depth and motion vectors is held with that candidate.
     #[test]
     fn a_buffer_naming_another_candidate_is_forwarded_and_counted() {
         let rgba = vk::Format::R16G16B16A16_SFLOAT;
@@ -4225,8 +4391,8 @@ mod tests {
         let mut t = tracker_with(&set, Some((2560, 1440)));
         let line = t.refresh().unwrap();
         assert!(line.starts_with("colour input: image 0x100 (1516x852") && line.contains("(first of 2 candidates; others 0x110 1516x852)"), "{line}");
-        // The other candidate's buffer: forwarded, counted.
-        t.launch(cb(1), Some(&param_block(&[0x1110, 0x1200, 0x1300])));
+        // The other candidate named without depth and motion vectors: forwarded, counted.
+        t.launch(cb(1), Some(&param_block(&[0x1110, 0x1400])));
         assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
         assert!(t.scan(&[vec![cb(1)]]).is_none(), "naming another candidate only: not held");
         assert_eq!((t.foreign_submits, t.other_candidate_buffers), (1, 1));
@@ -4241,6 +4407,20 @@ mod tests {
         t.launch(cb(3), Some(&param_block(&[0x1110, 0x1100])));
         assert!(t.scan(&[vec![cb(3)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
         assert_eq!((t.colour_submits, t.other_candidate_buffers), (2, 1));
+        // An input launch naming the other candidate with the same depth and motion vectors: held
+        // with it as the target, not counted as forwarded.
+        // Its layout is tracked like the colour input's (a barrier in an earlier buffer of the
+        // submit).
+        t.launch(cb(4), Some(&param_block(&[0x1110, 0x1200, 0x1300])));
+        t.barrier(cb(5), vk::Image::from_raw(0x110), vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
+        let s = t.scan(&[vec![cb(5), cb(4)]]).expect("held with the candidate its input launch names");
+        assert_eq!(s.inputs.map(|i| (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw())), Some((0x110, 0x200, 0x300)));
+        assert_eq!((s.index, s.colour_layout), (1, Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)));
+        assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (3, 1, 1));
+        let undecided = t.evaluations - t.colour_submits;
+        assert!(t.classify_line(Some(&s), undecided).is_some_and(|l| l.starts_with("a launch-bearing submit reads DLSS's colour input")));
+        let held = t.classify_line(Some(&s), undecided).expect("the retarget, once");
+        assert!(held.starts_with("a launch-bearing buffer's input launch names another colour candidate (0x110)"), "{held}");
     }
 
     /// (c) A Cyberpunk-2077-like set: no swapchain known on the device, depth D32_SFLOAT without
@@ -4902,6 +5082,140 @@ mod tests {
         t.launch(cb(5), Some(&param_block(&[h(0x110), h(0x400)])));
         assert!(submit(&mut t, &[vec![cb(5)]]).0.is_none());
         assert_eq!(t.other_candidate_buffers, 1);
+    }
+
+    /// Crimson Desert's set as the rig logged it with this bug: three 1516x852 RGBA16F storage
+    /// candidates (0x100, 0x110, 0x120), depth and motion vectors at that extent, the output and
+    /// FG's output-size frame, DLSS's 1x1 exposure.
+    fn crimson3_set() -> BTreeMap<u64, (vk::Image, ImageDesc)> {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
+        set_of(&[
+            (0x100, desc(1516, 852, rgba, storage)),
+            (0x110, desc(1516, 852, rgba, storage)),
+            (0x120, desc(1516, 852, rgba, storage)),
+            (0x200, desc(1516, 852, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)),
+            (0x300, desc(1516, 852, vk::Format::R16G16_SFLOAT, storage)),
+            (0x400, desc(2560, 1440, rgba, storage)),
+            (0x500, desc(2560, 1440, rgba, storage)),
+            (0x610, desc(1, 1, vk::Format::R16_SFLOAT, storage)),
+        ])
+    }
+
+    /// Records SR's buffer `sr` reading `colour` (input kernel with depth and motion vectors, then
+    /// the output kernel and the exposure copy) and FG's buffer `cb(90)` (its output-size frame
+    /// beside depth and motion vectors, then the output).
+    fn crimson_frame(t: &mut Tracker, sr: vk::CommandBuffer, colour: u64) {
+        t.begin(sr);
+        t.launch(sr, Some(&param_block(&[h(colour), h(0x200), h(0x300)])));
+        t.launch(sr, Some(&param_block(&[h(0x400), h(0x610)])));
+        t.begin(cb(90));
+        t.launch(cb(90), Some(&param_block(&[h(0x500), h(0x200), h(0x300)])));
+        t.launch(cb(90), Some(&param_block(&[h(0x400)])));
+    }
+
+    /// The rig's bug: the size rule took the lowest handle (0x100) while DLSS Super Resolution's
+    /// input kernel reads another candidate, so almost nothing was held. Here an early input launch
+    /// named a third candidate once (a stale entry: the settled evidence names two colour inputs
+    /// and the parameters rule chooses none, as it must have on the rig), then SR reads `named`
+    /// every frame, with ~5 FG submits per frame. Every SR submit is held with `named` (by the
+    /// per-buffer target until the switch, then as the colour input), the switch is logged once,
+    /// and only the switching submit is the "just identified" one. For both the middle and the
+    /// highest handle.
+    #[test]
+    fn the_input_kernel_overrides_the_size_rules_pick_among_several_candidates() {
+        for (named, stale) in [(0x110, 0x120), (0x120, 0x110)] {
+            let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
+            let line = t.refresh().expect("identified by size");
+            assert!(line.starts_with("colour input: image 0x100 (1516x852") && line.contains("(first of 3 candidates; others 0x110 1516x852, 0x120 1516x852)"), "{line}");
+            assert!(t.inputs.unwrap().others.iter().flatten().any(|o| o.0 == img(named)));
+            // The stale input launch (one frame, a loading screen), then the steady state.
+            crimson_frame(&mut t, cb(1), stale);
+            submit(&mut t, &[vec![cb(1)]]);
+            let mut lines = Vec::new();
+            let mut identified_at = Vec::new();
+            for frame in 0..40 {
+                crimson_frame(&mut t, cb(1), named);
+                let (s, l) = submit(&mut t, &[vec![cb(1)]]);
+                lines.extend(l);
+                let s = s.expect("SR's buffer is the hold point");
+                assert_eq!(s.inputs.map(|i| (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw())), Some((named, 0x200, 0x300)), "frame {frame}");
+                if s.identified_now {
+                    identified_at.push(frame);
+                }
+                for _ in 0..5 {
+                    let (s, l) = submit(&mut t, &[vec![cb(90)]]);
+                    lines.extend(l);
+                    assert!(s.is_none(), "frame generation's buffers are forwarded");
+                }
+            }
+            let switch = format!("colour input switched to {} (DLSS's input kernel reads it; the size rule had picked 0x100)", hex(img(named)));
+            assert_eq!(lines.iter().filter(|l| **l == switch).count(), 1, "{lines:#?}");
+            assert!(lines.iter().any(|l| l.contains("different colour inputs") && l.contains("none chosen")), "the settled evidence alone chooses nothing here: {lines:#?}");
+            assert_eq!(identified_at, vec![SWITCH_AFTER as usize - 1], "re-identified once, at the switch (that one submit goes to DLSS untouched)");
+            let i = t.inputs.unwrap();
+            assert_eq!((i.colour.0.as_raw(), i.rule, i.exposure_input.map(|e| e.0.as_raw()), i.exposure_named), (named, Rule::Params, Some(0x610), true));
+            let ids = identification_lines(&lines);
+            assert!(ids.last().unwrap().starts_with(&format!("colour input: image {} (1516x852", hex(img(named)))), "{ids:#?}");
+            assert!(ids.last().unwrap().ends_with("identified by the input kernel's parameters (one launch names it with the depth and motion vectors)"), "{ids:#?}");
+            assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (41, 1 + SWITCH_AFTER as u64 - 1, 0));
+            assert!(t.alternation.is_none());
+        }
+    }
+
+    /// With SR's buffer in the first launch-bearing submit (its evidence available when the first
+    /// identification happens), the colour input is what the input kernel names at once: no
+    /// lowest-handle identification first, no switch.
+    #[test]
+    fn the_first_identification_prefers_the_input_kernels_candidate() {
+        let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
+        let mut lines = Vec::new();
+        for frame in 0..20 {
+            crimson_frame(&mut t, cb(1), 0x110);
+            let (s, l) = submit(&mut t, &[vec![cb(1)]]);
+            lines.extend(l);
+            let s = s.expect("held");
+            assert_eq!((s.inputs.unwrap().colour.0.as_raw(), s.identified_now), (0x110, frame == 0), "frame {frame}");
+            for _ in 0..5 {
+                lines.extend(submit(&mut t, &[vec![cb(90)]]).1);
+            }
+        }
+        let ids = identification_lines(&lines);
+        assert_eq!(ids.len(), 1, "{ids:#?}");
+        assert!(ids[0].starts_with("colour input: image 0x110 (1516x852") && ids[0].contains("(the size rule's other candidates: 0x100 1516x852, 0x120 1516x852)"), "{}", ids[0]);
+        assert!(lines.iter().all(|l| !l.contains("switched")), "{lines:#?}");
+        assert_eq!((t.colour_submits, t.retargeted_submits), (20, 0));
+    }
+
+    /// A game that alternates DLSS's colour input between two candidates frame by frame: every SR
+    /// submit is held with the candidate its own input launch names, the colour input never
+    /// switches (each launch naming it resets the count), and the alternation is logged once. Both
+    /// with the identified colour input outside the pair and inside it.
+    #[test]
+    fn alternating_colour_inputs_are_each_held_with_their_own_image() {
+        for pair in [[0x110, 0x120], [0x100, 0x110]] {
+            let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
+            assert!(t.refresh().unwrap().starts_with("colour input: image 0x100"));
+            let mut lines = Vec::new();
+            for frame in 0..60 {
+                let colour = pair[frame % 2];
+                crimson_frame(&mut t, cb(1), colour);
+                let (s, l) = submit(&mut t, &[vec![cb(1)]]);
+                lines.extend(l);
+                let s = s.expect("every SR submit is held");
+                assert_eq!(s.inputs.map(|i| i.colour.0.as_raw()), Some(colour), "frame {frame}: held with the image its input launch names");
+                assert_eq!(s.identified_now, frame == 0, "frame {frame}: never re-identified after the first");
+                for _ in 0..5 {
+                    lines.extend(submit(&mut t, &[vec![cb(90)]]).1);
+                }
+            }
+            assert_eq!(t.inputs.unwrap().colour.0.as_raw(), 0x100, "{pair:x?}: no switch");
+            assert!(lines.iter().all(|l| !l.contains("switched")), "{lines:#?}");
+            let alternates: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS's input kernel alternates between colour candidates")).collect();
+            assert_eq!(alternates.len(), 1, "{lines:#?}");
+            let expected_retargets = if pair[0] == 0x100 { 30 } else { 60 };
+            assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (60, expected_retargets, 0), "{pair:x?}");
+        }
     }
 
     /// Resident Evil Requiem's registered set at DLAA (from the rig's log): four 2560x1440 RGBA16F
