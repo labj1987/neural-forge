@@ -86,8 +86,9 @@ presents untouched. See `RENDER_TAP_DESIGN.md`.
   work goes into generated frames). 0.1.83's "Model every Nth frame" (2 with
   frame generation) carries the answer to the frames between, measured +29% presented frames on the
   rig. The full fix is to enhance before frame generation (the game's render target, not the
-  swapchain). The 2.0 pre-upscaler path (below) runs before DLSS Super Resolution; with DLSS Frame
-  Generation also on it is not measured yet.
+  swapchain). Done in 2.0: the pre-upscaler path (below) runs before DLSS Super Resolution and
+  Frame Generation, and was measured at 53.0 real / 159 shown fps with DLSS FG 3x (see the note
+  at the top).
 - **Why compositing during GTA V's loading screens stalls the game** is still unknown; the layer
   avoids it by waiting for 5 s of steady rendering (`swapchain::Warmup`). v0.1.85-0.1.87 found and
   fixed one concrete way this *class* of stall could happen: every `wait_for_fences` the layer or
