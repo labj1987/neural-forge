@@ -1628,6 +1628,12 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
             "Couldn't open the shared-memory mapping",
             "Check the helper's log; neural-forge-cli doctor may also help.".to_string(),
         ),
+        OpenError::Foreign => (
+            "The shared-memory path names another file",
+            "The configured channel path (shm= in config.ini, or NEURAL_FORGE_SHM) points at an existing file that is not a \
+             Neural Forge mapping. It was left untouched. Point the setting at another path, or remove it to use the default."
+                .to_string(),
+        ),
     };
     let status = adw::StatusPage::builder().icon_name("dialog-error-symbolic").title(title).description(description).build();
     let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();

@@ -83,12 +83,24 @@ pub fn ensure_private_parent_dir(path: &str) -> bool {
     open_dir_checked(dir).is_some()
 }
 
-/// Like [`ensure_private_parent_dir`], but first takes a directory this uid already owns
-/// back to mode 0700 (through a descriptor, so a symlink is never followed). An earlier
-/// build created the runtime directory with the umask's mode, and the layer refuses such a
-/// directory for good; a directory someone else owns is left alone and refused.
+/// Whether `dir` is one of this project's own runtime directories by name
+/// (`.../neural-forge-<uid>`): the only kind [`heal_private_parent_dir`] may change the mode of.
+fn runtime_dir_by_name(dir: &str) -> bool {
+    dir.trim_end_matches('/').rsplit('/').next().is_some_and(|name| name.starts_with("neural-forge-"))
+}
+
+/// Like [`ensure_private_parent_dir`], but first takes this project's runtime directory, when
+/// this uid already owns it, back to mode 0700 (through a descriptor, so a symlink is never
+/// followed). An earlier build created the runtime directory with the umask's mode, and the
+/// layer refuses such a directory for good; a directory someone else owns is left alone and
+/// refused.
+///
+/// Only a directory named `neural-forge-<something>` is healed. A custom channel path can name
+/// any directory of the user's, and tightening that one would change the permissions of a
+/// directory this project does not own: it is checked as it is, and refused unless already
+/// private.
 pub fn heal_private_parent_dir(path: &str) -> bool {
-    if let Some((dir, _)) = split(path) {
+    if let Some((dir, _)) = split(path).filter(|(dir, _)| runtime_dir_by_name(dir)) {
         mkdir_all(dir);
         if let Ok(c_dir) = CString::new(dir) {
             // SAFETY: `c_dir` is a valid NUL-terminated C string for the call's duration.
@@ -196,6 +208,23 @@ mod tests {
         assert!(ensure_private_parent_dir(&format!("{dir}/rt/shm.bin")));
         assert_eq!(std::fs::metadata(format!("{dir}/rt")).unwrap().permissions().mode() & 0o777, 0o700);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A directory that is not one of this project's runtime directories keeps its mode: it is
+    /// refused as it stands, not tightened.
+    #[test]
+    fn heal_leaves_a_directory_outside_the_namespace_alone() {
+        let dir = format!("{}/someones-documents", scratch_dir());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!heal_private_parent_dir(&format!("{dir}/shm.bin")));
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
+        // Already private: accepted, and still untouched.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(heal_private_parent_dir(&format!("{dir}/shm.bin")));
+        assert!(runtime_dir_by_name("/tmp/neural-forge-1000") && runtime_dir_by_name("/tmp/neural-forge-1000/"));
+        assert!(!runtime_dir_by_name("/tmp/neural-forge-1000/custom") && !runtime_dir_by_name("/home/a/Documents"));
+        std::fs::remove_dir_all(std::path::Path::new(&dir).parent().unwrap()).ok();
     }
 
     #[test]

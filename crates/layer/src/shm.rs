@@ -15,7 +15,7 @@
 //! live in the same `mmap` this type already owns rather than a second one.
 
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -605,6 +605,21 @@ impl ShmClient {
         // owned anywhere else yet.
         let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
+        // Sizing the file and writing a header over its start is only for a file that is new or
+        // already a mapping; a path naming anything else is left exactly as it is.
+        match neural_forge_protocol::mapping::channel_file(fd.as_fd()) {
+            Some(neural_forge_protocol::mapping::ChannelFile::Foreign) => {
+                crate::log!("[shm] refusing {path}: it is an existing file that is not a Neural Forge mapping (left untouched)");
+                self.map_refused = true;
+                return false;
+            }
+            Some(_) => {}
+            None => {
+                crate::log!("[shm] cannot examine {path}");
+                return false;
+            }
+        }
+
         let total = neural_forge_protocol::shm_total_bytes();
         // SAFETY: `stat` is a plain out-parameter; zero-initializing it is always valid
         // and `fstat` either fully populates it or returns an error we check.
@@ -673,9 +688,9 @@ impl ShmClient {
         // (enforced at compile time in `neural_forge_protocol`).
         let hdr = unsafe { &*header };
         if hdr.magic.load(Ordering::Relaxed) != SHM_MAGIC || !hdr.is_valid() {
-            // A magic mismatch is some other mapping entirely (or garbage); a version
-            // mismatch is a stale build of ours. Both get the same answer: reinitialize
-            // rather than half-read a layout we don't agree on.
+            // No magic is a new file (a foreign one was refused above); a version mismatch is
+            // a stale build of ours. Both get the same answer: (re)initialize rather than
+            // half-read a layout we don't agree on.
             hdr.init_defaults();
         }
         self.last_heartbeat = hdr.heartbeat.load(Ordering::Relaxed);
@@ -1037,6 +1052,23 @@ mod tests {
         assert!(header_of(&client).is_valid());
         // Idempotent: a second open on the same client is a no-op, not a re-create.
         assert!(client.open_at(&path));
+    }
+
+    /// A custom channel path naming an unrelated file: not truncated, not written, and not
+    /// retried on every present.
+    #[test]
+    fn an_unrelated_existing_file_is_not_truncated_or_initialised() {
+        let path = scratch_path();
+        let dir = std::path::Path::new(&path).parent().unwrap().to_path_buf();
+        assert!(ensure_private_parent_dir(&path));
+        let content = b"something of the user's, not a mapping".to_vec();
+        std::fs::write(&path, &content).unwrap();
+        let mut client = ShmClient::default();
+        assert!(!client.open_at(&path));
+        assert!(client.header().is_none() && client.map_refused);
+        assert!(!client.open_at(&path));
+        assert_eq!(std::fs::read(&path).unwrap(), content, "contents and length unchanged");
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]

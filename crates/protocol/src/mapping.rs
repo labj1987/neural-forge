@@ -9,7 +9,7 @@
 //! enough set of Win32 APIs that sharing this module across the OS boundary would
 //! cost more in `cfg` noise than it would save in shared logic.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::Ordering;
 
 use crate::{shm_default_path, shm_total_bytes, ShmHeader, HEADER_BYTES, SHM_MAGIC, SHM_VERSION};
@@ -47,6 +47,9 @@ pub enum OpenError {
     /// The path is outside this project's namespace, its directory is not private to
     /// this user, or an open/size/map call failed.
     Unavailable,
+    /// The file exists and holds something else ([`ChannelFile::Foreign`]). Nothing was
+    /// written and its length is unchanged: a channel path pointed at an unrelated file.
+    Foreign,
     /// The file is one of ours (the magic matches) but laid out by another build. Nothing
     /// was written: another process in the chain is out of date, and reinitializing the
     /// header would pull it out from under that process.
@@ -57,6 +60,7 @@ impl std::fmt::Display for OpenError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             OpenError::Unavailable => write!(f, "the shared memory file could not be opened"),
+            OpenError::Foreign => write!(f, "the shared memory path names a file that is not a Neural Forge mapping; it was left untouched (point shm= / NEURAL_FORGE_SHM at another path, or remove the file)"),
             OpenError::WrongVersion { found } => write!(
                 f,
                 "shared memory is version {found}, this build speaks {SHM_VERSION} -- restart the helper and the game on the same Neural Forge version"
@@ -66,6 +70,57 @@ impl std::fmt::Display for OpenError {
 }
 
 impl std::error::Error for OpenError {}
+
+/// What an opened channel file holds, decided from its length and header bytes before anything
+/// is written to it or its length changed ([`channel_file`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChannelFile {
+    /// Empty: just created by this open, or by a peer that has not sized it yet.
+    New,
+    /// It starts with [`SHM_MAGIC`]: a Neural Forge mapping (of this build's layout or another's).
+    Ours,
+    /// Exactly a mapping's length with an all-zero header: a peer has sized it and not yet
+    /// written the header.
+    Blank,
+    /// Anything else. Not ours to resize or initialise.
+    Foreign,
+}
+
+/// Classifies the open file `fd` without changing it. `None` when it cannot be examined.
+///
+/// Opening a channel sizes the file to [`shm_total_bytes`] and writes a header over its start,
+/// so the path must not be allowed to name an unrelated file: only [`ChannelFile::New`],
+/// [`ChannelFile::Ours`] and [`ChannelFile::Blank`] may be sized or initialised.
+pub fn channel_file(fd: BorrowedFd<'_>) -> Option<ChannelFile> {
+    // SAFETY: `st` is a plain out-parameter; zero-initializing it is always valid.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is an open descriptor for the call's duration.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 {
+        return None;
+    }
+    let size = usize::try_from(st.st_size).ok()?;
+    if size == 0 {
+        return Some(ChannelFile::New);
+    }
+    let mut head = vec![0u8; size.min(HEADER_BYTES)];
+    let mut read = 0;
+    while read < head.len() {
+        // SAFETY: the destination is `head.len() - read` writable bytes; `pread` moves no
+        // file offset.
+        let n = unsafe { libc::pread(fd.as_raw_fd(), head[read..].as_mut_ptr().cast(), head.len() - read, read as libc::off_t) };
+        if n <= 0 {
+            return None;
+        }
+        read += n as usize;
+    }
+    if head.len() >= 4 && head[..4] == SHM_MAGIC.to_ne_bytes() {
+        Some(ChannelFile::Ours)
+    } else if size == shm_total_bytes() && head.iter().all(|&b| b == 0) {
+        Some(ChannelFile::Blank)
+    } else {
+        Some(ChannelFile::Foreign)
+    }
+}
 
 /// Opens the mapping at `$NEURAL_FORGE_SHM` (or the default runtime path), creating it if
 /// necessary. A caller that has a `config.ini` resolves the path once through the
@@ -78,20 +133,29 @@ pub fn open() -> Result<Mapping, OpenError> {
 
 /// Opens (or creates) the mapping at `path`.
 ///
-/// The parent directory must be private to this user (see [`crate::private_dir`]). A
-/// directory this user already owns with a looser mode is first tightened to 0700: an
-/// earlier build created it with the umask's mode, and the layer refuses such a
-/// directory for the rest of its life. The file itself is opened relative to the checked
+/// The parent directory must be private to this user (see [`crate::private_dir`]). This
+/// project's own runtime directory, when this user already owns it with a looser mode, is first
+/// tightened to 0700: an earlier build created it with the umask's mode, and the layer refuses
+/// such a directory for the rest of its life. Any other directory is used only if it is private
+/// already, and never has its mode changed. The file itself is opened relative to the checked
 /// directory and must be a regular file this user owns.
 ///
-/// A header with the wrong magic (a new, zero-filled file, or something that is not ours)
-/// is initialized with defaults. A header with our magic and another version is left
-/// untouched and reported as [`OpenError::WrongVersion`].
+/// A new file (empty, or sized by a peer and still all zero) is sized and initialized with
+/// defaults. A header with our magic and another version is left untouched and reported as
+/// [`OpenError::WrongVersion`]. A file holding anything else is not a mapping: it is neither
+/// resized nor written, and reported as [`OpenError::Foreign`].
 pub fn open_path(path: &str) -> Result<Mapping, OpenError> {
     if !crate::isolated_path(path) || !crate::private_dir::heal_private_parent_dir(path) {
         return Err(OpenError::Unavailable);
     }
     let fd = crate::private_dir::open_private_file(path, libc::O_RDWR | libc::O_CREAT, 0o600).ok_or(OpenError::Unavailable)?;
+
+    // Before the file is sized or written: is it one of ours, or new?
+    match channel_file(fd.as_fd()) {
+        Some(ChannelFile::New | ChannelFile::Ours | ChannelFile::Blank) => {}
+        Some(ChannelFile::Foreign) => return Err(OpenError::Foreign),
+        None => return Err(OpenError::Unavailable),
+    }
 
     let total = shm_total_bytes();
     // SAFETY: `st` is a plain out-parameter; zero-initializing it is always valid.
@@ -189,20 +253,62 @@ mod tests {
         cleanup(&path);
     }
 
+    /// A channel path that names an existing, unrelated file: opening it would size the file to
+    /// the mapping's length and write a header over its start. It is refused, with its contents
+    /// and length as they were, and its directory's permissions as they were.
     #[test]
-    fn a_file_with_foreign_magic_is_initialized() {
+    fn an_unrelated_existing_file_is_refused_and_left_untouched() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |dir: &std::path::Path| std::fs::metadata(dir).unwrap().permissions().mode() & 0o777;
+        for content in [vec![0xAB; 64], b"notes\n".to_vec(), vec![0u8; 4096], vec![7u8; HEADER_BYTES + 1]] {
+            let path = scratch_path();
+            let dir = std::path::Path::new(&path).parent().unwrap().to_path_buf();
+            assert!(crate::private_dir::ensure_private_parent_dir(&path));
+            std::fs::write(&path, &content).unwrap();
+            assert_eq!(open_path(&path).err(), Some(OpenError::Foreign));
+            assert_eq!(std::fs::read(&path).unwrap(), content, "contents and length unchanged");
+            assert_eq!(mode(&dir), 0o700);
+            // The same file in a directory other users can read: refused for the directory, and
+            // the directory's mode is not this project's to change.
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert_eq!(open_path(&path).err(), Some(OpenError::Unavailable));
+            assert_eq!(mode(&dir), 0o755, "the parent directory's permissions are unchanged");
+            assert_eq!(std::fs::read(&path).unwrap(), content);
+            cleanup(&path);
+        }
+    }
+
+    /// What may be sized and initialised: an empty file, one of ours, and a file a peer has
+    /// just sized to the mapping's length and not written yet.
+    #[test]
+    fn new_blank_and_our_own_files_are_told_from_foreign_ones() {
+        use std::os::fd::AsFd;
         let path = scratch_path();
         assert!(crate::private_dir::ensure_private_parent_dir(&path));
-        std::fs::write(&path, vec![0xAB; 64]).unwrap();
-        let mapping = open_path(&path).expect("a foreign file is reinitialized");
+        let kind = |path: &str| channel_file(std::fs::File::open(path).unwrap().as_fd());
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(kind(&path), Some(ChannelFile::New));
+        // Sized by a peer, header not yet written: sparse and all zero.
+        std::fs::File::options().write(true).open(&path).unwrap().set_len(shm_total_bytes() as u64).unwrap();
+        assert_eq!(kind(&path), Some(ChannelFile::Blank));
+        let mapping = open_path(&path).expect("a blank file of the mapping's length is initialised");
         assert!(mapping.freshly_created && mapping.header().is_valid());
+        assert_eq!(kind(&path), Some(ChannelFile::Ours));
+        // A zero-filled file of any other length is someone's data, not a mapping in the making.
+        std::fs::File::options().write(true).open(&path).unwrap().set_len(0).unwrap();
+        std::fs::File::options().write(true).open(&path).unwrap().set_len(1 << 20).unwrap();
+        assert_eq!(kind(&path), Some(ChannelFile::Foreign));
+        assert_eq!(open_path(&path).err(), Some(OpenError::Foreign));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), 1 << 20);
         cleanup(&path);
     }
 
     #[test]
     fn a_directory_shared_with_other_users_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let path = scratch_path();
+        // A runtime directory by name (`neural-forge-<uid>`), as the default path's is.
+        let scratch = scratch_path();
+        let path = format!("{}/neural-forge-heal/shm.bin", scratch.trim_end_matches("/shm.bin"));
         let dir = std::path::Path::new(&path).parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
         // Our own directory with a loose mode is tightened, not refused.
@@ -214,6 +320,6 @@ mod tests {
         std::os::unix::fs::symlink(&dir, &link).unwrap();
         assert_eq!(open_path(&format!("{link}/shm.bin")).err(), Some(OpenError::Unavailable));
         std::fs::remove_file(&link).ok();
-        cleanup(&path);
+        cleanup(&scratch);
     }
 }

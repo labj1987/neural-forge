@@ -130,10 +130,10 @@ fn skew(found: u32) -> OpenError {
 
 /// Opens (creating if necessary) the mapping and maps it.
 ///
-/// A new or foreign file is sized and initialised. A file already holding this protocol's
-/// magic is only ever grown, never shrunk, and its header is initialised only when the magic
-/// is wrong: with the magic right and the version different, this returns
-/// [`OpenError::VersionSkew`] having changed nothing.
+/// A new (or still blank) file is sized and initialised. A file already holding this protocol's
+/// magic is only ever grown, never shrunk: with the magic right and the version different, this
+/// returns [`OpenError::VersionSkew`] having changed nothing. A file that starts with anything
+/// else is not ours: it is neither resized nor written, and this returns [`OpenError::Io`].
 pub fn open() -> Result<ShmMapping, OpenError> {
     let posix_path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM").filter(|s| !s.is_empty()).unwrap_or_else(shm_default_path);
     if !neural_forge_protocol::isolated_path(&posix_path) {
@@ -174,6 +174,16 @@ pub fn open() -> Result<ShmMapping, OpenError> {
             // SAFETY: `file` is ours and nothing else references it.
             unsafe { CloseHandle(file) };
             return Err(skew(version));
+        }
+        // Something that is neither this protocol's mapping nor a blank file a peer has just
+        // sized: not ours to resize or write a header over (a custom `NEURAL_FORGE_SHM` naming an
+        // unrelated file). Left exactly as it is.
+        if magic != SHM_MAGIC && (magic, version) != (0, 0) {
+            crate::log!("[helper] {posix_path} is not a Neural Forge mapping (it starts with other data); leaving it untouched");
+            crate::logging::flush();
+            // SAFETY: `file` is ours and nothing else references it.
+            unsafe { CloseHandle(file) };
+            return Err(OpenError::Io);
         }
     }
 
