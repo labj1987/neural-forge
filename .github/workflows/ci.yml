@@ -20,7 +20,9 @@ jobs:
       # lavapipe install fails CI instead of passing it with nothing run.
       NEURAL_FORGE_REQUIRE_VULKAN: "1"
     steps:
-      - uses: actions/checkout@v7
+      # Actions are pinned to full commit SHAs (a tag can be moved); Dependabot proposes the
+      # updates (.github/dependabot.yml). The trailing comment is the release the SHA is.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Same package list build-appimage.sh installs on a from-scratch image --
       # libgtk-4-dev/libadwaita-1-dev for the gui crate (glib-sys and friends need the
