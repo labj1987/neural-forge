@@ -140,7 +140,7 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
   `shmctl status` both times. Any live setting works the same way (`--set model_interval=2`).
 - **Early exit at "Game Init".** GTA sometimes crashes at `GTA5_Enhanced.exe+0x12c6eb` during
   start-up, with or without Neural Forge. The runner says "launch exited early" and writes no
-  `benchmark.txt`. Wait five minutes and run it again.
+  `benchmark.txt`. Run it again straight away.
 - **Frame generation does not always engage.** With DLSS Frame Generation on, check shown fps:
   some launches present only real frames. GTA's setting is `FrameGenType` in `settings.xml`
   (0 off, 1 on).

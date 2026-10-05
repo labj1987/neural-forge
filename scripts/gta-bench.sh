@@ -26,7 +26,7 @@
 # Rig paths can be overridden with NF_BENCH_STEAM_LIBRARY (the library holding GTA),
 # NF_BENCH_STEAM_ROOT (the Steam client), NF_BENCH_PROTON and NF_BENCH_DIR.
 # GTA sometimes exits early at Game Init, with or without Neural Forge; the script says
-# "launch exited early" and leaves no benchmark.txt. Wait five minutes and run it again.
+# "launch exited early" and leaves no benchmark.txt. Run it again straight away.
 set -u
 
 if [ "${1:-}" = "--host" ]; then

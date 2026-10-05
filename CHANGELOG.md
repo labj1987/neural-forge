@@ -18,7 +18,9 @@ first shipped them; their phase is kept as a subheading.
 ## 2.0.2 — 2026-10-05
 
 Remediation of two static code reviews (Vulkan submit handling; shared-memory protocol and CI).
-Built and tested on lavapipe and in CI only: this release is the one to test on the GTA V machine.
+Measured on the test machine (GTA V Enhanced, 1440p, DLSS Balanced, 3 runs each): every DLSS frame
+is still held, no submit is refused, and frame rates match 2.0.1 within noise (NR off 92.0, NR on
+64.9, post path 62.4, layer loaded but idle 91.7). See docs/HARDWARE_VALIDATION.md, "2.0.2".
 
 - **Pre-upscaler: a DLSS submit is only split when that is provably safe.** Forwarded untouched,
   with one log line per reason: a barrier on a DLSS input (also `GENERAL -> GENERAL`, also a

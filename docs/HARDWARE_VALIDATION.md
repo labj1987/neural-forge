@@ -928,3 +928,37 @@ The release tarball is kept in `~/Downloads`, and its `uninstall.sh --user` remo
 Neural Forge's helper is running with its settings as found (enabled=1, working_scale=1,
 model_interval=2, mvec_enabled=1). GTA settings.xml is byte-identical (sha256 `6c687fff...addc`).
 The desktop is untouched at 2560x1440@288, scale 1.0.
+
+## 2026-10-05 -- 2.0.2
+
+2.0.2 (0720dfd, deployed with `scripts/deploy-rig.sh`) against 2.0.1's code (d79c82a, the build
+installed on 2026-10-03; 2.0.1 only bumped the version after it), same day. LordNikon, RTX 5070,
+driver 615.71.09, 2560x1440 at 288 Hz, HDR desktop, DLSS Balanced (render 1485x836), GTA settings.xml
+as Alex has it except `FrameGenType` 0 for the runs (restored afterwards, sha256 identical),
+`scripts/gta-bench.sh`, script mods off, no remote-desktop session, pass 4. Settings as found:
+enabled=1, passes=1, working_scale=1, mvec_enabled=1.
+
+| Config | 2.0.1 (1 run) | 2.0.2 (3 runs) | 2.0.2 mean | GPU |
+|---|---|---|---|---|
+| NR off (layer not loaded) | 92.4 | 92.1 / 92.2 / 91.7 | **92.0** | 67% |
+| NR on, default (model before the upscaler) | 65.2 | 65.1 / 65.1 / 64.5 | **64.9** | 89% |
+| Post-upscaler path (`NEURAL_FORGE_PREUPSCALE=off`) | 62.2 (2.0.0) | 62.1 / 63.0 / 62.1 | **62.4** | 90% |
+| Layer loaded, doing nothing (`enabled=0`, `PREUPSCALE=off`) | - | 91.6 / 91.5 / 92.0 | **91.7** | 66% |
+
+All within run-to-run noise. The layer issuing `vkQueueSubmit`/`vkQueueSubmit2` itself costs
+nothing measurable: loaded and idle it gives 91.7 against 92.0 without it.
+
+From every NR-on `launch.log` (2.0.2 runs 1-3, 2.0.1 run 1):
+
+- Holds every DLSS frame: 65.5 / 65.7 / 66.5 held before the upscaler per second in pass 4 against
+  65.1 / 65.1 / 64.5 real fps (2.0.1: 66.0 against 65.2). Hold 10.3-10.5 ms median (2.0.1:
+  9.8-10.3), capture_gpu 0.62-0.63 ms, writeback 0.61-0.62 ms.
+- No `not holding` line in any run, NR on or not: none of the new refusal reasons fires on GTA V.
+- `[shm] attached /tmp/neural-forge-1000/shm.bin` once per run, no `[shm] refusing`.
+- No `fence wait timed out`, no Vulkan error or validation line.
+- One `frame went to DLSS untouched: the answer was over budget` and one `breaker open` / `breaker
+  closed` at the first hold of each run (the model's first build); 2.0.1 logs the same lines at
+  the same point.
+- `capture_wait` session max: 13.42 / 6.16 / 14.08 ms (largest **14.08 ms**, against the 5000 ms
+  bound). Benchmark runs only: loading screens are covered, alt-tab and resolution changes are
+  not, so the bound is not changed yet.
