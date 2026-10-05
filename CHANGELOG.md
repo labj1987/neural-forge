@@ -15,6 +15,24 @@ first shipped them; their phase is kept as a subheading.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
+## 2.0.5 — 2026-10-05
+
+- **Pre-upscaler: Cyberpunk 2077 with DLSS Frame Generation is held for the whole session.** With
+  frame generation on, Streamline copies DLSS's inputs inside DLSS's command buffer right before its
+  launches, the depth into an `R32_SFLOAT` image, and no depth-format image is registered at all:
+  DLSS's input was never identified and the model only ran after the upscaler (75 fps shown). A
+  single-channel 32-bit image at the render extent now counts as DLSS's depth when an input launch
+  names no depth-format image. And when DLSS's input kernel names several same-size colour images
+  (Cyberpunk names two), the first in parameter order is the colour input: dumped, the first is the
+  rendered frame and the second a near-uniform dark buffer. Before, such a launch was not used, and
+  with frame generation off the size rule's pick held for about 11 s until the game switched images.
+  Benchmark, frame generation 3x: every real frame held (about 39/s, 0 misses after the model's first
+  build), 116 fps shown on average (107 minimum), no Xid.
+- `dump` runs through the hold inside DLSS's buffer too (colour and exposure only).
+- Tests: the breaker test checks that only the misses that open it wait, each about one budget,
+  instead of a total over 100 submits that a CI runner's jitter pushed past its margin (2.0.4's first
+  release build).
+
 ## 2.0.4 — 2026-10-05
 
 - **Pre-upscaler: the hold runs inside DLSS's own command buffer where the split is refused.**

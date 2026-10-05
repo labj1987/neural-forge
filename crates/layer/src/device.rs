@@ -649,9 +649,10 @@ fn inline_hold(
     if !shm.open() {
         return;
     }
-    if crate::preupscale::gate(mode, session, shm, false).is_none() {
+    // A dump here has the colour input only (no depth or motion-vector layouts to wait for).
+    let Some(dump) = crate::preupscale::gate(mode, session, shm, true) else {
         return;
-    }
+    };
     let extent = (job.point.desc.width, job.point.desc.height);
     if shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
         session.note_busy_slot(shm, mode, extent);
@@ -694,7 +695,7 @@ fn inline_hold(
     // SAFETY: `res` was built on this device for this extent and the side queue's family; the
     // staging image is live, in GENERAL, and holds this frame's colour input (`captured` was set).
     let mut hold = unsafe {
-        crate::preupscale::run_hold(device, instance, physical_device, res, shm, &target, mode, false, 0, crate::preupscale::ANSWER_BUDGET, &mut submit)
+        crate::preupscale::run_hold(device, instance, physical_device, res, shm, &target, mode, dump, 0, crate::preupscale::ANSWER_BUDGET, &mut submit)
     };
     if hold.wrote_back {
         let mut writeback_gpu = None;
@@ -711,6 +712,11 @@ fn inline_hold(
     }
     hold.mark_local(mode);
     session.note(shm, &hold, started.elapsed(), extent);
+    if let Some(frame) = hold.dump.take() {
+        crate::preupscale::write_dump_async(frame);
+        session.dumped();
+        shm.take_capture_request();
+    }
 }
 
 /// Submits a wait-only batch on `queue` that waits on the application's present wait

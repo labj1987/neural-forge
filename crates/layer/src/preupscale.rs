@@ -185,10 +185,10 @@ impl Mode {
     }
 
     /// Whether the mode holds inside DLSS's command buffer where the split is refused
-    /// ([`inline`]): every mode that writes back. `dump` reads depth and motion vectors too, which
-    /// the staging copy does not carry, so it keeps to the split.
+    /// ([`inline`]): every mode but `off`. A `dump` taken there has the colour input (and the
+    /// exposure) only: the staging copy does not carry depth and motion vectors.
     pub(crate) fn holds_inline(self) -> bool {
-        matches!(self, Mode::Model | Mode::Roundtrip | Mode::Identity)
+        matches!(self, Mode::Model | Mode::Roundtrip | Mode::Identity | Mode::Dump)
     }
 }
 
@@ -347,6 +347,13 @@ impl ImageDesc {
         }
     }
 }
+
+/// Depth as a single-channel 32-bit colour image: what DLSS reads when Streamline hands it a copy of
+/// the depth. Cyberpunk 2077 with DLSS Frame Generation copies its depth into an `R32_SFLOAT` image in
+/// DLSS's buffer right before the launches (NGX probe `cp/cp-fgprobe-1`, 2026-10-05), and no
+/// depth-format image is registered at all then. Only taken when an input launch names no image of
+/// [`DEPTH_FORMATS`].
+const DEPTH_AS_COLOUR: [vk::Format; 2] = [vk::Format::R32_SFLOAT, vk::Format::R32_UINT];
 
 const DEPTH_FORMATS: [vk::Format; 6] = [
     vk::Format::D16_UNORM,
@@ -565,7 +572,8 @@ fn colour_candidate(d: &ImageDesc) -> bool {
 /// Reads one launch's named registered images (`named`; `images` has their descriptions) the way
 /// DLSS Super Resolution's input kernel names its inputs. `None` when the launch names no depth
 /// image or no 2-channel float image (it is not an input launch). Otherwise exactly one depth image
-/// ([`DEPTH_FORMATS`]) and exactly one colour candidate ([`colour_candidate`]) **at the depth's
+/// ([`DEPTH_FORMATS`], or without one a single-channel 32-bit image, [`DEPTH_AS_COLOUR`]) and exactly
+/// one colour candidate ([`colour_candidate`]) **at the depth's
 /// extent** give [`InputLaunch::Inputs`]: DLSS's colour input and depth share the render extent
 /// (with DLAA both are the output's), while DLSS Frame Generation reads the output-size frame
 /// beside the render-size depth. The colour input need not be smaller than the output. The motion
@@ -576,8 +584,14 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
         list.sort_by_key(|(i, _)| i.as_raw());
         list
     };
-    let depths = of(|d| d.plain && DEPTH_FORMATS.contains(&d.format));
     let mvecs = of(|d| d.plain && MVEC_FORMATS.contains(&d.format));
+    let mut depths = of(|d| d.plain && DEPTH_FORMATS.contains(&d.format));
+    if depths.is_empty() && !mvecs.is_empty() {
+        // Depth handed over as a colour image (Streamline's copy): one at a motion-vector or colour
+        // candidate's extent.
+        let extents: Vec<(u32, u32)> = mvecs.iter().map(|(_, d)| (d.width, d.height)).chain(of(colour_candidate).iter().map(|(_, d)| (d.width, d.height))).collect();
+        depths = of(|d| d.plain && DEPTH_AS_COLOUR.contains(&d.format)).into_iter().filter(|(_, d)| extents.contains(&(d.width, d.height))).collect();
+    }
     if depths.is_empty() || mvecs.is_empty() {
         return None;
     }
@@ -597,7 +611,10 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
     Some(match colours[..] {
         [] => InputLaunch::Unusable,
         [(colour, _)] => InputLaunch::Inputs { colour, depth, mvec },
-        _ => match pick().and_then(|k| colours.get(k)) {
+        // Several: the first in parameter order is DLSS's colour input (Cyberpunk 2077: dumped, the
+        // first is the rendered frame, the second a near-uniform dark buffer, 2026-10-05).
+        // `NEURAL_FORGE_PREUPSCALE_PICK` takes another one, for diagnostics.
+        _ => match colours.get(pick().unwrap_or(0)) {
             Some(&(colour, _)) => InputLaunch::Inputs { colour, depth, mvec },
             None => InputLaunch::Ambiguous { depth, colours },
         },
@@ -605,8 +622,9 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
 }
 
 /// `NEURAL_FORGE_PREUPSCALE_PICK=N` (diagnostics only): when an input launch names several colour
-/// candidates at the depth's extent, take the Nth in parameter order (from 0) as the colour input.
-/// With `NEURAL_FORGE_PREUPSCALE=dump` it shows which candidate is the game's frame.
+/// candidates at the depth's extent, take the Nth in parameter order (from 0) instead of the first.
+/// With `NEURAL_FORGE_PREUPSCALE=dump` it shows which candidate is the game's frame; an N past the
+/// candidates leaves the launch ambiguous (not used, logged once).
 fn pick() -> Option<usize> {
     static PICK: LazyLock<Option<usize>> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PREUPSCALE_PICK").ok().and_then(|v| v.parse().ok()));
     *PICK
@@ -5255,6 +5273,32 @@ mod tests {
         assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("held undecided").hazard, Some(Hazard::MemoryBarrier));
     }
 
+    /// Cyberpunk 2077 with DLSS Frame Generation: Streamline copies the colour input and the depth
+    /// into fresh images in DLSS's buffer, the depth as `R32_SFLOAT`, and DLSS's input kernel names
+    /// those. Such a launch is DLSS's input launch, with the R32 image as its depth; a launch that
+    /// also names a real depth image keeps that one.
+    #[test]
+    fn a_depth_handed_over_as_an_r32_colour_image_is_dlss_depth() {
+        let desc = |format| ImageDesc { width: 1485, height: 835, format, usage: vk::ImageUsageFlags::STORAGE, plain: true };
+        let (colour, r32, mvec, d32) = (vk::Image::from_raw(0x10), vk::Image::from_raw(0x20), vk::Image::from_raw(0x30), vk::Image::from_raw(0x40));
+        let images: HashMap<vk::Image, ImageDesc> = [
+            (colour, desc(vk::Format::R16G16B16A16_SFLOAT)),
+            (r32, desc(vk::Format::R32_SFLOAT)),
+            (mvec, desc(vk::Format::R16G16_SFLOAT)),
+            (d32, desc(vk::Format::D32_SFLOAT)),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(input_launch(&images, &[colour, r32, mvec]), Some(InputLaunch::Inputs { colour, depth: r32, mvec }));
+        assert_eq!(input_launch(&images, &[colour, r32, d32, mvec]), Some(InputLaunch::Inputs { colour, depth: d32, mvec }));
+        // An R32 image at another extent is not taken as the depth.
+        let mut other = images.clone();
+        other.insert(r32, ImageDesc { width: 640, height: 360, ..desc(vk::Format::R32_SFLOAT) });
+        assert_eq!(input_launch(&other, &[colour, r32, mvec]), None);
+        // No motion vectors: not an input launch.
+        assert_eq!(input_launch(&images, &[colour, r32]), None);
+    }
+
     /// The hold goes inside DLSS's buffer exactly where the split is refused: Crimson Desert's and
     /// Cyberpunk 2077's buffers render the frame (draws, dispatches, write barriers) before DLSS's
     /// first colour launch. Not for GTA V's pattern (the split takes it), not for a colour input the
@@ -5822,29 +5866,19 @@ mod tests {
         assert_eq!(lines.iter().filter(|l| l.contains("names no 1x1 R16_SFLOAT exposure")).count(), 1, "{lines:#?}");
     }
 
-    /// (d) Ambiguity falls back to the size rule and is logged once: one launch naming two colour
-    /// candidates at the depth's extent, and two buffers naming different colour inputs with
-    /// neither (or both) naming the exposure.
+    /// (d) One launch naming two colour candidates at the depth's extent: the first in parameter
+    /// order is the colour input (Cyberpunk 2077's case), also when its handle is the higher one.
+    /// Ambiguity between buffers falls back to the size rule and is logged once: two buffers naming
+    /// different colour inputs with neither (or both) naming the exposure.
     #[test]
     fn ambiguous_parameters_fall_back_to_the_size_rule_and_log_once() {
         let rgba = vk::Format::R16G16B16A16_SFLOAT;
         let mut set = gta_registered();
         set.insert(0x110, (img(0x110), desc(1707, 960, rgba, vk::ImageUsageFlags::STORAGE)));
         let mut t = tracker_with(&set, Some((2560, 1440)));
-        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x110), h(0x200), h(0x300)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x110), h(0x100), h(0x200), h(0x300)])));
         t.launch(cb(1), Some(&param_block(&[h(0x610)])));
-        assert!(matches!(&t.launch[&cb(1)].input, Some(InputLaunch::Ambiguous { colours, .. }) if colours.len() == 2));
-        let mut lines = Vec::new();
-        for _ in 0..40 {
-            let (s, l) = submit(&mut t, &[vec![cb(1)]]);
-            lines.extend(l);
-            assert!(s.is_some_and(|s| s.inputs.is_some_and(|i| i.colour.0 == img(0x100) && i.rule == Rule::Size)));
-        }
-        assert!(t.named.is_empty());
-        let said: Vec<&String> = lines.iter().filter(|l| l.contains("several colour candidates")).collect();
-        assert_eq!(said.len(), 1, "{lines:#?}");
-        assert!(said[0].contains("depth 0x200 with several colour candidates at its extent, in parameter order (0x100 1707x960 R16G16B16A16_SFLOAT, 0x110 1707x960 R16G16B16A16_SFLOAT)"), "{}", said[0]);
-        assert_eq!(identification_lines(&lines).len(), 1, "identified by size once, never changed");
+        assert!(matches!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour, .. }) if colour == img(0x110)), "the first in parameter order");
 
         // Two buffers, two colour inputs, no exposure named by either.
         let mut t = tracker_with(&set, Some((2560, 1440)));
@@ -6852,18 +6886,24 @@ mod tests {
         let t0 = Instant::now();
         assert_eq!(submit_once(&mut breaker, &mut shm, t0, budget).0, Some(Answer::Model));
         helper.set(SILENT);
-        let mut waited = Duration::ZERO;
+        // Only the misses that open the breaker are held, each waiting about one budget; every
+        // submit after that goes through without a wait. (Not a total over all 100: a shared CI
+        // runner's scheduling jitter on the eight bounded waits alone pushed that past its margin.)
         let mut held = 0;
+        let mut longest = Duration::ZERO;
         for _ in 0..100 {
             let (answer, w) = submit_once(&mut breaker, &mut shm, t0, budget);
-            if let Some(answer) = answer {
-                assert!(matches!(answer, Answer::Missed(_)), "{answer:?}");
-                held += 1;
+            match answer {
+                Some(answer) => {
+                    assert!(matches!(answer, Answer::Missed(_)), "{answer:?}");
+                    held += 1;
+                    longest = longest.max(w);
+                }
+                None => assert_eq!(w, Duration::ZERO, "a submit forwarded by the open breaker waited"),
             }
-            waited += w;
         }
         assert_eq!(held, BREAKER_MISSES);
-        assert!(waited < budget * (BREAKER_MISSES + 2), "waited {waited:?} over 100 submits");
+        assert!(longest < budget * 4, "a held miss waited {longest:?} against a {budget:?} budget");
         drop(helper);
     }
 

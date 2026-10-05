@@ -1083,3 +1083,19 @@ rendering being applied ... no real flickering ... with frame gen it's playable"
   colour candidates at its extent`); its buffers were then classed as not reading the colour input and
   forwarded, and 30 s later the post-upscaler compose took over again (46-55/s), as on 2.0.3. Not yet
   held for a whole session: the switch between the two candidates is the next fix.
+
+## 2026-10-05 -- 2.0.5: Cyberpunk 2077 with frame generation
+
+Frame generation turned on in Cyberpunk's settings (DLSS FG 3x; it had been off, which is not how
+Alex plays). With it on, the NGX probe (`cp/cp-fgprobe-1`) shows Streamline copying DLSS's inputs in
+DLSS's buffer before the launches: the colour into a fresh 1485x835 RGBA16F image and the depth into a
+1485x835 `R32_SFLOAT` image; no depth-format image is registered. DLSS's input kernel names that R32
+image and two 1485x835 RGBA16F images. `dump` through the hold inside the buffer with
+`NEURAL_FORGE_PREUPSCALE_PICK=0` and `=1`: the first in parameter order is the rendered frame (a bar,
+pool table), the second a near-uniform dark blue buffer.
+
+2.0.5 (R32 depth accepted, first colour candidate in parameter order), benchmark `v204-cpfg-3`,
+frame generation 3x, SDR: held inside DLSS's buffer for the whole run, 2,400 holds (about 39/s),
+0 misses after the model's first build, 116.3 fps shown on average (107 minimum per Cyberpunk's own
+summary: 118.0 average, 106.7 minimum), post-upscaler compose off (0.8/s), no fence timeout, no Xid.
+2.0.4 in the same settings: never identified, 75 fps shown, the model after the upscaler.
