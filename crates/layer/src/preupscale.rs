@@ -73,6 +73,14 @@
 //!
 //! No command is recorded into a game command buffer and no layout is changed on the colour input
 //! (`GENERAL` throughout).
+//!
+//! # When the call is not split
+//!
+//! The chain above assumes the colour input is final, visible and owned by the queue's family when
+//! the launch buffer starts. The layer only holds when what it saw recorded is consistent with
+//! that; anything else forwards the application's call untouched ([`Hazard`], [`parse2`],
+//! docs/PRE_UPSCALER_DESIGN.md, "When a submit is not split"). Tracked state advances only from
+//! command buffers of submissions the next layer accepted ([`Tracker::commit_submitted`]).
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::c_void;
@@ -112,6 +120,20 @@ pub(crate) const BREAKER_COOL_DOWN: Duration = Duration::from_secs(2);
 
 /// The longest a model-mode hold waits for the helper's answer.
 pub(crate) const ANSWER_BUDGET: Duration = Duration::from_millis(30);
+
+/// The fence waits of this path, by class. Both are the layer-wide bound today
+/// ([`crate::FENCE_WAIT_TIMEOUT`], 5 s, there against a driver that stalls without losing the
+/// device); they are named apart so that the one on the game's submit thread can be given its own
+/// bound without touching the recovery wait. Not shortened without measurements from the target
+/// machine: the summary line's `capture_wait max` (per window and for the session) is what to read
+/// across loading screens, resolution changes, alt-tab and shutdown before choosing a value.
+/// (Device teardown waits with `vkDeviceWaitIdle`, which has no bound.)
+///
+/// The capture fence wait inside a hold: the game's DLSS submit is blocked for its duration.
+pub(crate) const FRAME_CAPTURE_WAIT: Duration = crate::FENCE_WAIT_TIMEOUT;
+/// Draining the path's own in-flight work before its resources are rebuilt or destroyed
+/// ([`Resources::wait_idle`]): off the steady frame path, and a timeout keeps the resources alive.
+pub(crate) const CLEANUP_WAIT: Duration = crate::FENCE_WAIT_TIMEOUT;
 
 /// A `[preupscale]` summary line every this many holds.
 const SUMMARY_EVERY: u64 = 300;
@@ -2829,7 +2851,7 @@ impl Resources {
             return true;
         }
         // SAFETY: the layer's own fences, each submitted (only `pending` after a successful submit).
-        let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+        let wait = unsafe { device.wait_for_fences(&fences, true, CLEANUP_WAIT.as_nanos() as u64) };
         if crate::note_fence_wait(wait, "preupscale::wait_idle").is_err() {
             return false;
         }
@@ -3388,7 +3410,7 @@ pub(crate) unsafe fn run_hold(
     result.timing.prep = Some(t_hold.elapsed());
     let t_capture = Instant::now();
     // SAFETY: the layer's own fence, just submitted.
-    let wait = unsafe { device.wait_for_fences(&[res.capture_fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    let wait = unsafe { device.wait_for_fences(&[res.capture_fence], true, FRAME_CAPTURE_WAIT.as_nanos() as u64) };
     result.timing.capture_wait = Some(t_capture.elapsed());
     if crate::note_fence_wait(wait, "preupscale::capture").is_err() {
         result.miss = Some("the capture did not finish");
@@ -3843,6 +3865,9 @@ struct Stats {
     /// `round_trip - helper_busy` per answered hold.
     prep_ms: Vec<f32>,
     capture_wait_ms: Vec<f32>,
+    /// The longest capture fence wait since the path started (the window's is the maximum of
+    /// `capture_wait_ms`): the worst case [`FRAME_CAPTURE_WAIT`] has to leave room for.
+    capture_wait_session_max_ms: f32,
     round_trip_ms: Vec<f32>,
     helper_busy_ms: Vec<f32>,
     handoff_ms: Vec<f32>,
@@ -3883,18 +3908,24 @@ impl Stats {
         if let (Some(rt), Some(busy)) = (t.round_trip, t.helper_busy) {
             self.handoff_ms.push(ms(rt.saturating_sub(busy)));
         }
+        if let Some(wait) = t.capture_wait {
+            self.capture_wait_session_max_ms = self.capture_wait_session_max_ms.max(ms(wait));
+        }
     }
 
     /// The phase medians, for the periodic line.
     fn phases(&self) -> String {
         format!(
-            "phases ms (median): prep={:.2} capture_wait={:.2} round_trip={:.2} helper_busy={:.2} handoff={:.2} writeback={:.2}",
+            "phases ms (median): prep={:.2} capture_wait={:.2} round_trip={:.2} helper_busy={:.2} handoff={:.2} writeback={:.2}; capture_wait max={:.2} (session max {:.2}, bound {} ms)",
             median(&self.prep_ms),
             median(&self.capture_wait_ms),
             median(&self.round_trip_ms),
             median(&self.helper_busy_ms),
             median(&self.handoff_ms),
-            median(&self.writeback_cpu_ms)
+            median(&self.writeback_cpu_ms),
+            self.capture_wait_ms.iter().copied().fold(0.0, f32::max),
+            self.capture_wait_session_max_ms,
+            FRAME_CAPTURE_WAIT.as_millis()
         )
     }
 
@@ -4298,6 +4329,23 @@ mod tests {
     }
     fn cb(raw: u64) -> vk::CommandBuffer {
         vk::CommandBuffer::from_raw(raw)
+    }
+
+    /// The summary line carries the capture fence wait's worst case, for the window and for the
+    /// session: the measurement the frame-path bound ([`FRAME_CAPTURE_WAIT`]) is to be chosen from.
+    #[test]
+    fn the_phase_line_reports_the_worst_capture_wait_of_the_window_and_the_session() {
+        let mut s = Stats::default();
+        for ms in [2, 40, 3] {
+            s.book(&HoldTiming { capture_wait: Some(Duration::from_millis(ms)), ..Default::default() });
+        }
+        assert!(s.phases().ends_with("capture_wait max=40.00 (session max 40.00, bound 5000 ms)"), "{}", s.phases());
+        assert!(s.phases().contains(" capture_wait=3.00 "), "the median is still there: {}", s.phases());
+        s.clear_phases();
+        s.book(&HoldTiming { capture_wait: Some(Duration::from_millis(5)), ..Default::default() });
+        assert!(s.phases().ends_with("capture_wait max=5.00 (session max 40.00, bound 5000 ms)"), "{}", s.phases());
+        // The classes are the layer-wide bound until the target machine's numbers say otherwise.
+        assert_eq!((FRAME_CAPTURE_WAIT, CLEANUP_WAIT), (crate::FENCE_WAIT_TIMEOUT, crate::FENCE_WAIT_TIMEOUT));
     }
 
     #[test]

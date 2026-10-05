@@ -6,6 +6,34 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+Remediation of two static code reviews (Vulkan submit handling; shared-memory protocol and CI).
+None of it has run on the GTA V machine yet.
+
+- **Pre-upscaler: a DLSS submit is only split when that is provably safe.** Forwarded untouched,
+  with one log line per reason: a barrier on a DLSS input (also `GENERAL -> GENERAL`, also a
+  queue-family transfer), a global memory barrier with a write in its source access, or
+  `vkCmdWaitEvents*` inside the launch buffer before the launch that reads the colour input; a
+  colour input last transferred to another queue family; a protected submit; a `VkSubmitInfo2`
+  with `VkFrameBoundaryEXT`; dynamic rendering suspended in the buffer before the launch buffer and
+  resumed in it. GTA V's pattern (nothing before the first launch) is held as before. See
+  docs/PRE_UPSCALER_DESIGN.md, "When a submit is not split".
+- **Tracked layouts advance only after an accepted submit.** The scan commits nothing; the
+  layer issues `vkQueueSubmit`/`vkQueueSubmit2` to the next layer itself and commits the command
+  buffers of what was accepted (head and tail separately for a split call). The render tap's
+  source layouts follow the same rule.
+- **Shared memory: a channel path naming an unrelated file is refused untouched.** It used to be
+  sized to the mapping's length and have a header written over its start. Only this project's
+  runtime directory is ever chmod'ed to 0700; any other directory must already be private.
+- **Shared memory: request numbers survive the `u32` wrap** (`next_request`, 0 skipped, answered
+  when `seq_resp == request`), and the two wire slots are a type (`Slot`), so a third cannot be
+  named.
+- **CI: actions pinned to commit SHAs** (the release workflow can write to the repository), with
+  Dependabot proposing the updates.
+- **Pre-upscaler: the hold's fence waits are named by class** (`FRAME_CAPTURE_WAIT`,
+  `CLEANUP_WAIT`), both still 5 s, and the phase line reports the worst capture wait of the window
+  and the session.
+- Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
+  `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
   `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
   earlier needs proof that the presentation engine's wait on them has completed, which core

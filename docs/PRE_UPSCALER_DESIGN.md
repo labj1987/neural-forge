@@ -321,10 +321,51 @@ The capture fence is waited on (bounded, `note_fence_wait`); the write-back is n
 checked at the next hold or before the post-upscaler path next runs. Capture and write-back carry
 GPU timestamps. A hold is skipped (frame forwarded untouched) when: the layer is not engaged yet
 (loading screens), DLSS's inputs were (re)identified at this very submit (no layout is known yet;
-the next one is held), the colour input's last committed barrier left it outside `GENERAL`, a slot-0
+the next one is held), the colour input's last committed barrier left it outside `GENERAL`, the split
+cannot be shown to be safe (see "When a submit is not split" below), a slot-0
 request is still with the helper (the post path's, or a hold that ran over budget; only the latter
 is booked, as a late answer), the post path's zero-copy capture is still writing slot 0, or
 anything fails.
+
+### When a submit is not split
+
+The rule for the whole path: if the layer cannot show that running in front of the launch buffer is
+safe, the application's `vkQueueSubmit*` goes to the next layer exactly as it was. A layout of
+`GENERAL` is not enough for that: a layout says nothing about memory visibility, execution
+dependencies or queue-family ownership. GTA V Enhanced under vkd3d-proton records nothing on DLSS's
+inputs in the launch buffer before the first launch (docs/PRE_UPSCALER_PROBE.md), which is the
+pattern that is held; that is what was observed in that game, not something Vulkan promises.
+
+Not split, each with its own once-per-session log line:
+
+- **Synchronization inside the launch buffer, before the launch that reads the colour input**
+  (`preupscale::Hazard`): an image barrier on an image the hold reads (colour, depth, motion
+  vectors, exposure), whether it changes the layout, keeps it (`GENERAL -> GENERAL`) or transfers
+  queue-family ownership; a global memory barrier with a write in its source access; or
+  `vkCmdWaitEvents*`. The capture would run ahead of the very operation that makes the input
+  visible to the launch. Barriers after the launch (vkd3d-proton records them after every launch)
+  do not count, and the order is kept across `vkCmdExecuteCommands`. Barriers are tracked whole
+  for this (`preupscale::ImageSync`: layouts, stages, accesses, queue families).
+- **The colour input belongs to another queue family**: the last ownership transfer of it the
+  application submitted named a family other than that of the queue the DLSS submit is on.
+- **A protected submit** (`VK_SUBMIT_PROTECTED_BIT`, or `VkProtectedSubmitInfo`): the layer's own
+  batches and command pool are unprotected.
+- **`VkFrameBoundaryEXT`** on a `VkSubmitInfo2`: split, the frame-end marker would be on both
+  halves, with the layer's submits in between.
+- **Dynamic rendering suspended across the split point**: the launch buffer resumes
+  (`VK_RENDERING_RESUMING_BIT`) a render pass instance suspended in the buffer before it.
+
+Not detected (the layer does not see them): a write to an input through a descriptor in the launch
+buffer before the launch with no barrier after it, and render pass attachments.
+
+Tracked state is transactional. `Tracker::scan` reads the layouts in front of the launch buffer
+from the committed state plus the barriers of the buffers ahead of it in the same call, and commits
+nothing. State advances in `commit_submitted`, which is only ever given command buffers of a
+submission the next layer accepted: for a split call the head's once it was submitted and the tail's
+once it was (`submit_around`), so a refused head leaves the state as it was and a refused tail adds
+only the head. For that the layer issues every `vkQueueSubmit`/`vkQueueSubmit2` to the next layer
+itself (the framework's own forwarding gives a hook no result), and the render tap's source layouts
+(`TapTracker`) follow the same rule.
 
 ### The HDR encode and decode (model, roundtrip)
 
