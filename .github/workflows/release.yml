@@ -81,6 +81,10 @@ jobs:
           test -s "$appimage.zsync"
           ls -l "$appimage" "$appimage.zsync"
 
+      # The release page carries this version's changes in full, from CHANGELOG.md: no link to it.
+      - name: Release notes from the changelog
+        run: python3 scripts/release_notes.py "${GITHUB_REF_NAME}" > release-notes.md && cat release-notes.md
+
       - name: Create Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
@@ -88,4 +92,4 @@ jobs:
             neural-forge-*-x86_64.AppImage
             neural-forge-*-x86_64.AppImage.zsync
           fail_on_unmatched_files: true
-          generate_release_notes: true
+          body_path: release-notes.md

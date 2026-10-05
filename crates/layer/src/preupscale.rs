@@ -96,6 +96,7 @@ use crate::shm::ShmClient;
 use neural_forge_protocol::Slot;
 
 pub(crate) mod hdr;
+pub(crate) mod inline;
 
 /// The variable that selects the mode. Read through `neural_forge_protocol::env`.
 pub(crate) const ENV: &str = "NEURAL_FORGE_PREUPSCALE";
@@ -181,6 +182,13 @@ impl Mode {
     /// ([`hdr`]). `identity` stays a raw copy-through (the hold's own cost).
     pub(crate) fn hdr(self) -> bool {
         matches!(self, Mode::Model | Mode::Roundtrip)
+    }
+
+    /// Whether the mode holds inside DLSS's command buffer where the split is refused
+    /// ([`inline`]): every mode that writes back. `dump` reads depth and motion vectors too, which
+    /// the staging copy does not carry, so it keeps to the split.
+    pub(crate) fn holds_inline(self) -> bool {
+        matches!(self, Mode::Model | Mode::Roundtrip | Mode::Identity)
     }
 }
 
@@ -577,7 +585,11 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
         return Some(InputLaunch::Unusable);
     };
     let extent = (dd.width, dd.height);
-    let colours: Vec<(vk::Image, ImageDesc)> = of(colour_candidate).into_iter().filter(|(_, d)| (d.width, d.height) == extent).collect();
+    // In the order the launch's parameters name them (not by handle).
+    let colours: Vec<(vk::Image, ImageDesc)> = named
+        .iter()
+        .filter_map(|i| images.get(i).filter(|d| colour_candidate(d) && (d.width, d.height) == extent).map(|d| (*i, *d)))
+        .collect();
     let mvec = mvecs
         .iter()
         .min_by_key(|(i, d)| ((d.width, d.height) != extent, MVEC_FORMATS.iter().position(|f| *f == d.format), i.as_raw()))
@@ -585,8 +597,19 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
     Some(match colours[..] {
         [] => InputLaunch::Unusable,
         [(colour, _)] => InputLaunch::Inputs { colour, depth, mvec },
-        _ => InputLaunch::Ambiguous { depth, colours },
+        _ => match pick().and_then(|k| colours.get(k)) {
+            Some(&(colour, _)) => InputLaunch::Inputs { colour, depth, mvec },
+            None => InputLaunch::Ambiguous { depth, colours },
+        },
     })
+}
+
+/// `NEURAL_FORGE_PREUPSCALE_PICK=N` (diagnostics only): when an input launch names several colour
+/// candidates at the depth's extent, take the Nth in parameter order (from 0) as the colour input.
+/// With `NEURAL_FORGE_PREUPSCALE=dump` it shows which candidate is the game's frame.
+fn pick() -> Option<usize> {
+    static PICK: LazyLock<Option<usize>> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PREUPSCALE_PICK").ok().and_then(|v| v.parse().ok()));
+    *PICK
 }
 
 /// One command buffer's evidence: its input launch's colour input, depth and motion vectors, and
@@ -926,6 +949,9 @@ pub(crate) struct Tracker {
     /// The first global synchronization recorded into each command buffer while an input was
     /// watched ([`Hazard::MemoryBarrier`], [`Hazard::EventWait`]).
     global_sync: HashMap<vk::CommandBuffer, Hazard>,
+    /// The launch just recorded was the first of its command buffer to name a colour candidate:
+    /// the buffer and that image ([`Self::inline_point`] decides on a hold inside the buffer there).
+    inline_at: Option<(vk::CommandBuffer, vk::Image)>,
     /// Command buffers with a suspending or resuming dynamic render pass instance.
     rendering: HashMap<vk::CommandBuffer, Rendering>,
     /// Launch-bearing submits seen.
@@ -1068,6 +1094,18 @@ pub(crate) struct LaunchRefs {
 pub(crate) struct Before {
     pub barriers: usize,
     pub global: Option<Hazard>,
+}
+
+/// Where a hold runs inside DLSS's own command buffer ([`Tracker::inline_point`],
+/// [`inline`]): the colour input the buffer's first colour launch names, DLSS's exposure input as
+/// the encode reads it, which identification they belong to, and what refused the split.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct InlinePoint {
+    pub colour: vk::Image,
+    pub desc: ImageDesc,
+    pub exposure_input: Option<Aux>,
+    pub identification: u64,
+    pub hazard: Hazard,
 }
 
 /// How a launch-bearing command buffer is treated at the submit.
@@ -1304,12 +1342,68 @@ impl Tracker {
                 refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
             }
         }
+        let candidate = |i: &vk::Image| self.inputs.is_some_and(|n| n.colour.0 == *i || n.others.iter().flatten().any(|o| o.0 == *i));
+        let had_colour = refs.images.iter().any(candidate);
+        let first_colour = if had_colour { None } else { named.iter().copied().find(candidate) };
         for image in named {
             if !refs.images.contains(&image) {
                 refs.images.push(image);
                 refs.before_named.push((image, before));
             }
         }
+        self.inline_at = first_colour.map(|c| (command_buffer, c));
+    }
+
+    /// Whether a hold should run inside `cb`, right before the launch just recorded, which is the
+    /// first of the buffer to name `colour` (a colour candidate): the inputs are identified (not on
+    /// the submit that identified them), the split in front of the buffer would be refused
+    /// ([`Self::launch_hazard`], other than a suspended render pass), the colour input is an
+    /// RGBA16F image the layer can copy (`TRANSFER_SRC | TRANSFER_DST`) at the identified extent,
+    /// in `GENERAL` by the buffer's own barriers or the committed state, and no render pass
+    /// instance is suspended at that point. A buffer the split can take (GTA V's) gets nothing.
+    pub(crate) fn inline_point(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Option<InlinePoint> {
+        let inputs = self.inputs?;
+        if self.identified {
+            return None;
+        }
+        let desc = *self.images.get(&colour)?;
+        let copyable = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        if desc.format != vk::Format::R16G16B16A16_SFLOAT
+            || !desc.plain
+            || !desc.usage.contains(copyable)
+            || (desc.width, desc.height) != (inputs.colour.1.width, inputs.colour.1.height)
+        {
+            return None;
+        }
+        if self.rendering.get(&cb).is_some_and(|r| r.last_suspending || r.open_resume) {
+            return None;
+        }
+        let at = Inputs { colour: (colour, desc), ..inputs };
+        let hazard = self.launch_hazard(cb, Some(&at)).0?;
+        let layout = self
+            .pending
+            .get(&cb)
+            .and_then(|p| p.iter().rev().find(|s| s.image == colour).map(|s| s.new_layout))
+            .or_else(|| self.committed.get(&colour).copied())
+            .unwrap_or(vk::ImageLayout::GENERAL);
+        if layout != vk::ImageLayout::GENERAL {
+            return None;
+        }
+        let exposure_input = inputs.exposure_input.map(|(image, d)| {
+            let layout = self
+                .pending
+                .get(&cb)
+                .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
+                .or_else(|| self.committed.get(&image).copied())
+                .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
+            Aux { image, format: d.format, layout, readable: d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == (1, 1) }
+        });
+        Some(InlinePoint { colour, desc, exposure_input, identification: self.generation, hazard })
+    }
+
+    /// Takes the mark [`Self::launch_kernel`] left for the launch just recorded.
+    pub(crate) fn take_inline_at(&mut self) -> Option<(vk::CommandBuffer, vk::Image)> {
+        self.inline_at.take()
     }
 
     /// Whether any command buffer carries a launch, recorded barriers or other synchronization.
@@ -1615,7 +1709,7 @@ impl Tracker {
                     self.said_named |= 1;
                     let list: Vec<String> = colours.iter().map(|(i, d)| format!("{} {}x{} {:?}", hex(*i), d.width, d.height, d.format)).collect();
                     lines.push(format!(
-                        "a CUDA launch names depth {} with several colour candidates at its extent ({}): not used to identify DLSS's colour input",
+                        "a CUDA launch names depth {} with several colour candidates at its extent, in parameter order ({}): not used to identify DLSS's colour input",
                         hex(*depth),
                         list.join(", ")
                     ));
@@ -2062,10 +2156,15 @@ impl Tracking {
 
     /// `vkCmdCuLaunchKernelNVX` recorded into `command_buffer`, with its parameter buffer if
     /// readable ([`launch_params`]).
-    pub(crate) fn launch(&self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) {
+    /// A launch recorded into `command_buffer`. Returns where a hold should run inside the buffer,
+    /// right before this launch, when it is the buffer's first to name a colour candidate and the
+    /// split in front of the buffer would be refused ([`Tracker::inline_point`]).
+    pub(crate) fn launch(&self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) -> Option<InlinePoint> {
         let mut t = self.lock();
         t.launch_kernel(command_buffer, function, params);
         self.rearm(&t);
+        let (cb, colour) = t.take_inline_at()?;
+        t.inline_point(cb, colour)
     }
 
     /// `vkCreateCuFunctionNVX` created `function` for the kernel `name`.
@@ -4070,7 +4169,8 @@ impl Session {
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
         width: u32, height: u32, shm: &ShmClient, import: bool,
     ) -> bool {
-        if self.res.as_ref().is_some_and(|r| r.matches(queue_family, width, height)) {
+        // A staged set serves either way; an imported one only where imports are wanted.
+        if self.res.as_ref().is_some_and(|r| r.matches(queue_family, width, height) && (import || !r.imported())) {
             return true;
         }
         if let Some(mut old) = self.res.take() {
@@ -5060,13 +5160,17 @@ mod tests {
     /// 0x300; registration keys `image + 0x1000`) and one launch-bearing submit behind it, so the
     /// next is not the identifying one.
     fn held_tracker() -> (Tracker, Vec<u8>) {
+        held_tracker_with(vk::ImageUsageFlags::STORAGE)
+    }
+
+    fn held_tracker_with(usage: vk::ImageUsageFlags) -> (Tracker, Vec<u8>) {
         let mut t = Tracker::default();
         for (raw, format) in [(0x100, vk::Format::R16G16B16A16_SFLOAT), (0x200, vk::Format::D32_SFLOAT_S8_UINT), (0x300, vk::Format::R16G16_SFLOAT)] {
             let info = vk::ImageCreateInfo {
                 image_type: vk::ImageType::TYPE_2D,
                 extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
                 format,
-                usage: vk::ImageUsageFlags::STORAGE,
+                usage,
                 samples: vk::SampleCountFlags::TYPE_1,
                 ..Default::default()
             };
@@ -5149,6 +5253,54 @@ mod tests {
         t.global(cb(2), Hazard::MemoryBarrier);
         t.launch(cb(2), None);
         assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("held undecided").hazard, Some(Hazard::MemoryBarrier));
+    }
+
+    /// The hold goes inside DLSS's buffer exactly where the split is refused: Crimson Desert's and
+    /// Cyberpunk 2077's buffers render the frame (draws, dispatches, write barriers) before DLSS's
+    /// first colour launch. Not for GTA V's pattern (the split takes it), not for a colour input the
+    /// layer cannot copy or that is not in GENERAL there, and only at the buffer's first colour
+    /// launch.
+    #[test]
+    fn the_hold_goes_inside_the_buffer_only_where_the_split_is_refused() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        // The frame rendered in the buffer: a write barrier before the colour launch.
+        let (mut t, params) = held_tracker_with(copyable);
+        t.global(cb(2), Hazard::MemoryBarrier);
+        t.launch(cb(2), Some(&params));
+        assert_eq!(t.take_inline_at(), Some((cb(2), colour())));
+        let point = t.inline_point(cb(2), colour()).expect("held inside the buffer");
+        assert_eq!((point.colour, point.hazard), (colour(), Hazard::MemoryBarrier));
+        assert_eq!((point.desc.width, point.desc.height), (1707, 960));
+        // A later launch of the same buffer naming it again: no second point.
+        t.launch(cb(2), Some(&params));
+        assert_eq!(t.take_inline_at(), None);
+        // GTA V's pattern: nothing before the launch, the split holds it.
+        let (mut t, params) = held_tracker_with(copyable);
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert!(t.inline_point(b, c).is_none());
+        // Barriers on depth only (GTA V with frame generation): the split holds it too.
+        let (mut t, params) = held_tracker_with(copyable);
+        t.barrier(cb(2), general_to_general(vk::Image::from_raw(0x200)));
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert!(t.inline_point(b, c).is_none());
+        // Not copyable (STORAGE only): nothing.
+        let (mut t, params) = held_tracker();
+        t.global(cb(2), Hazard::MemoryBarrier);
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert!(t.inline_point(b, c).is_none());
+        // Left outside GENERAL by the buffer's own barrier: nothing.
+        let (mut t, params) = held_tracker_with(copyable);
+        t.barrier(cb(2), ImageSync { old_layout: GENERAL, ..ImageSync::to(colour(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) });
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert!(t.inline_point(b, c).is_none());
+        // A launch naming no colour candidate leaves no mark.
+        let (mut t, _) = held_tracker_with(copyable);
+        t.launch(cb(3), Some(&param_block(&[0x1200])));
+        assert_eq!(t.take_inline_at(), None);
     }
 
     /// Depth and motion vectors are read only by a dump: a barrier on them before the launch stops
@@ -5691,7 +5843,7 @@ mod tests {
         assert!(t.named.is_empty());
         let said: Vec<&String> = lines.iter().filter(|l| l.contains("several colour candidates")).collect();
         assert_eq!(said.len(), 1, "{lines:#?}");
-        assert!(said[0].contains("depth 0x200 with several colour candidates at its extent (0x100 1707x960 R16G16B16A16_SFLOAT, 0x110 1707x960 R16G16B16A16_SFLOAT)"), "{}", said[0]);
+        assert!(said[0].contains("depth 0x200 with several colour candidates at its extent, in parameter order (0x100 1707x960 R16G16B16A16_SFLOAT, 0x110 1707x960 R16G16B16A16_SFLOAT)"), "{}", said[0]);
         assert_eq!(identification_lines(&lines).len(), 1, "identified by size once, never changed");
 
         // Two buffers, two colour inputs, no exposure named by either.
@@ -7251,6 +7403,103 @@ mod tests {
             );
             finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
         }
+    }
+
+    /// The hold inside DLSS's command buffer, end to end on one device with two queues: the
+    /// application's buffer is parked at the recorded hold on queue 0 while the worker runs
+    /// `run_hold` (roundtrip: encode, then decode of the encoded proxy) on the staging image on
+    /// queue 1, then releases it; the buffer's copy back puts the result into the colour input
+    /// before the buffer goes on. The frame must come back as roundtrip gives it (within the
+    /// half-float steps the roundtrip test allows, loosely here), and the application's buffer must
+    /// not finish before the release. Skips without a second queue (lavapipe).
+    #[test]
+    fn a_hold_inside_the_buffer_runs_on_the_side_queue_and_writes_back_through_the_staging_image() {
+        let Some((entry, instance, physical, device, q0, q1, family, import)) = crate::composition::gpu::test_device_two_queues() else {
+            eprintln!("inline hold test: no device with two queues in family 0, skipping");
+            return;
+        };
+        let info = vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool = unsafe { device.create_command_pool(&info, None) }.unwrap();
+        let gpu = Gpu { instance, physical, device, queue: q0, family, pool, _entry: entry };
+        let (w, h) = (64u32, 36u32);
+        let (image, memory) = gpu.image(w, h);
+        let original = hdr_pattern(w, h);
+        gpu.upload(image, w, h, &original);
+        let (exposure, exposure_mem) = exposure_image(&gpu, 0.128);
+        let shm = scratch_shm(if import { "inline-import" } else { "inline-staged" });
+        let res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
+        let shared = Arc::new(Mutex::new((res, shm, None::<HoldResult>)));
+        let (dev, inst, phys, side) = (gpu.device.clone(), gpu.instance.clone(), gpu.physical, q1);
+        let held = shared.clone();
+        let hold: inline::HoldFn = Box::new(move |job, queue| {
+            assert_eq!(queue, side);
+            let mut g = held.lock().unwrap();
+            let (res, shm, out) = &mut *g;
+            let target = Target {
+                colour: job.image,
+                width: w,
+                height: h,
+                depth: None,
+                mvec: None,
+                exposure: [None; MAX_EXPOSURE],
+                exposure_input: job.exposure,
+                paper_white: 2.5,
+                identification: 1,
+            };
+            let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
+                dev.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+            };
+            let result = unsafe { run_hold(&dev, &inst, phys, res, shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut submit) };
+            let mut ms = None;
+            assert!(res.wait_idle(&dev, &mut ms), "the write-back finished");
+            *out = Some(result);
+        });
+        let device = Arc::new(gpu.device.clone());
+        let inline = inline::Inline::start(device, &gpu.instance, gpu.physical, q1, family, family, hold).expect("worker");
+        let d = &gpu.device;
+        unsafe {
+            let cb = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(gpu.pool).command_buffer_count(1)).unwrap()[0];
+            let begin = vk::CommandBufferBeginInfo::default();
+            d.begin_command_buffer(cb, &begin).unwrap();
+            inline.begin(cb, begin.flags);
+            let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE;
+            let point = InlinePoint {
+                colour: image,
+                desc: ImageDesc { width: w, height: h, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true },
+                exposure_input: exposure_aux(exposure),
+                identification: 1,
+                hazard: Hazard::MemoryBarrier,
+            };
+            assert!(inline.record(cb, point));
+            d.end_command_buffer(cb).unwrap();
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            let jobs = inline.jobs_for([cb], Some(family));
+            d.queue_submit(q0, &[vk::SubmitInfo::builder().command_buffers(&[cb]).build()], fence).unwrap();
+            inline.dispatch(jobs);
+            d.wait_for_fences(&[fence], true, 10_000_000_000).expect("the application's buffer finished");
+            let result = shared.lock().unwrap().2.take().expect("the worker ran the hold");
+            assert!(result.wrote_back && result.miss.is_none(), "{result:?}");
+            let after = gpu.read(image, w, h);
+            let (mut worst, mut compared) = (0f64, 0);
+            for y in 0..h {
+                for x in 0..w {
+                    for c in 0..3 {
+                        let x0 = f64::from(f16_to_f32(half_at(&original, w, x, y, c)));
+                        let got = f64::from(f16_to_f32(half_at(&after, w, x, y, c)));
+                        if x0 > 1e-3 && x0 < 5.0 {
+                            worst = worst.max((got - x0).abs() / x0);
+                            compared += 1;
+                        }
+                    }
+                }
+            }
+            eprintln!("inline hold test (import={import}): {compared} channels, worst relative error {worst:.2e}");
+            assert!(compared > 0 && worst < 0.05, "the frame did not come back through the staging image (worst {worst})");
+            d.destroy_fence(fence, None);
+            inline::destroy(d.handle());
+        }
+        let (res, _shm, _) = Arc::try_unwrap(shared).ok().expect("worker joined").into_inner().unwrap();
+        finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
     }
 
     /// Check (c) with a non-trivial answer: the fake helper maps every encoded channel through

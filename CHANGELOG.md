@@ -15,6 +15,29 @@ first shipped them; their phase is kept as a subheading.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
+## 2.0.4 — 2026-10-05
+
+- **Pre-upscaler: the hold runs inside DLSS's own command buffer where the split is refused.**
+  Crimson Desert and Cyberpunk 2077 render the frame in the same command buffer as DLSS (draws,
+  dispatches and write barriers before DLSS's first launch), so 2.0.2's rule rightly refused to run
+  the model in front of that buffer, and the model never ran before the upscaler there. Now, right
+  before the buffer's first launch that reads the colour input, the layer records a copy of the
+  colour input (and DLSS's 1x1 exposure input) into its own images, an event, a wait on a second
+  event set by the host, and the copy back. A worker thread runs the ordinary hold (encode, helper,
+  decode) on the staging image on a queue of the layer's own, added to the device in a compute-only
+  family (the game's graphics family faulted: Xid 69), with staged buffers, then always releases
+  the GPU; a late, failed or skipped hold leaves the staging image as copied, so the copy back
+  changes nothing. Only copies, barriers and event commands go into the game's buffer. GTA V's
+  buffers, which the split takes, are unchanged. `NEURAL_FORGE_INLINE=off` turns it off
+  (`NEURAL_FORGE_INLINE=release` records it but never runs the hold, for diagnostics). Crimson
+  Desert, played: every real frame held, 148-164 fps shown with dynamic frame generation, no Xid.
+  Cyberpunk 2077 is held this way for its first seconds only: its DLSS input then switches between two
+  same-size colour images and the layer loses it (the post-upscaler compose takes over, as before).
+  See docs/PRE_UPSCALER_DESIGN.md, "The hold inside DLSS's command buffer".
+- Releases carry their changes on the release page (this changelog's section), not a link.
+- Diagnostics: when DLSS's input kernel names several colour candidates, they are logged in
+  parameter order, and `NEURAL_FORGE_PREUPSCALE_PICK=N` takes the Nth (for `dump`).
+
 ## 2.0.3 — 2026-10-05
 
 - **Pre-upscaler: GTA V with DLSS Frame Generation is held again.** 2.0.2 refused every DLSS submit

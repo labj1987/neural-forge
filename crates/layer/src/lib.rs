@@ -313,6 +313,77 @@ pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
     EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().as_mut().is_some_and(|set| set.remove(&device))
 }
 
+/// Devices created with the layer's own extra queue (the hold inside DLSS's command buffer,
+/// `preupscale::inline`): its family and index, and the game's graphics family. Taken once by
+/// `NeuralForgeDeviceInfo::new`, like [`EXTERNAL_MEMORY_HOST_DEVICES`].
+static SIDE_QUEUES: Mutex<Option<HashMap<vk::Device, SideQueue>>> = Mutex::new(None);
+
+/// Where the layer's own queue is.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SideQueue {
+    pub family: u32,
+    pub index: u32,
+    /// The first family the application requests with graphics and compute: where DLSS runs.
+    pub app_family: u32,
+}
+
+/// Checks and clears the side queue [`NeuralForgeInstanceHooks::create_device`] added to `device`.
+pub(crate) fn take_side_queue(device: vk::Device) -> Option<SideQueue> {
+    SIDE_QUEUES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
+}
+
+/// The application's queue requests with one queue more for the layer, in a compute family without
+/// graphics (NVIDIA's family 2): queues of the game's own graphics family share its GPU context,
+/// and the layer's compute work there while the game's queue waits at the hold inside DLSS's buffer
+/// faulted the channel (Xid 69, Crimson Desert, 2026-10-05). The application's request for that
+/// family is extended by one when it has a queue to spare and is a plain one (no flags); without
+/// one, a request for one queue is added. `priorities` backs the extended `pQueuePriorities`.
+struct SideQueueRequest {
+    infos: Vec<vk::DeviceQueueCreateInfo>,
+    _priorities: Vec<f32>,
+    queue: SideQueue,
+}
+
+fn side_queue_request(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &vk::DeviceCreateInfo) -> Option<SideQueueRequest> {
+    if create_info.queue_create_info_count == 0 || create_info.p_queue_create_infos.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures.
+    let infos = unsafe { std::slice::from_raw_parts(create_info.p_queue_create_infos, create_info.queue_create_info_count as usize) };
+    // SAFETY: `physical_device` belongs to `instance`.
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    let app_family = infos
+        .iter()
+        .find(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?
+        .queue_family_index;
+    let family = families
+        .iter()
+        .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && f.queue_count > 0)? as u32;
+    let mut extended = infos.to_vec();
+    let mut priorities: Vec<f32>;
+    let index;
+    match infos.iter().position(|q| q.queue_family_index == family) {
+        Some(at) => {
+            let q = infos[at];
+            if !q.flags.is_empty() || q.queue_count >= families[family as usize].queue_count || q.p_queue_priorities.is_null() {
+                return None;
+            }
+            // SAFETY: `pQueuePriorities` holds `queueCount` floats.
+            priorities = unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec();
+            priorities.push(1.0);
+            extended[at].queue_count = q.queue_count + 1;
+            extended[at].p_queue_priorities = priorities.as_ptr();
+            index = q.queue_count;
+        }
+        None => {
+            priorities = vec![1.0];
+            extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
+            index = 0;
+        }
+    }
+    Some(SideQueueRequest { infos: extended, _priorities: priorities, queue: SideQueue { family, index, app_family } })
+}
+
 /// Per-instance hooks, carrying that instance's own context. Dropped by the framework when
 /// the application destroys the instance.
 #[derive(Default)]
@@ -390,6 +461,33 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             None => return LayerResult::Unhandled,
         };
         let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // The hold inside DLSS's command buffer needs a queue of the layer's own beside the game's
+        // (`preupscale::inline`): one more in the game's graphics family, on an NVIDIA device with
+        // the pre-upscaler path on. A request with it that the driver refuses is made again without.
+        // SAFETY: `physical_device` belongs to this instance.
+        let nvidia = unsafe { instance.instance.get_physical_device_properties(physical_device) }.vendor_id == 0x10DE;
+        let side = (nvidia && preupscale::active() && preupscale::inline::enabled())
+            .then(|| side_queue_request(&instance.instance, physical_device, create_info))
+            .flatten();
+        let create = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| -> vk::Result {
+            if let Some(sq) = &side {
+                let mut with = *info;
+                with.queue_create_info_count = sq.infos.len() as u32;
+                with.p_queue_create_infos = sq.infos.as_ptr();
+                // SAFETY: `with` is the request with `sq`'s queue infos, which outlive the call;
+                // `p_device` is the framework's out-parameter.
+                let result = unsafe { next_create_device(physical_device, &with, allocator_ptr, p_device.as_mut_ptr()) };
+                if result == vk::Result::SUCCESS {
+                    // SAFETY: written by the successful call.
+                    let device = unsafe { p_device.assume_init() };
+                    SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.queue);
+                    return result;
+                }
+                log!("[preupscale] adding a queue for the hold inside DLSS's command buffer was refused ({result:?}); creating the device without it");
+            }
+            // SAFETY: the request as given; `p_device` as above.
+            unsafe { next_create_device(physical_device, info, allocator_ptr, p_device.as_mut_ptr()) }
+        };
         // The application already enables it (vkd3d-proton does): nothing to add, but the
         // device is created here, unmodified, so it can be recorded like one this hook
         // extended. `NeuralForgeDeviceInfo::new` must not look at the request's extension
@@ -397,9 +495,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         // freed by the time it is called, and reading it crashed the Rockstar launcher's GPU
         // process (0.1.96).
         if requests_extension(create_info, EXTERNAL_MEMORY_HOST_EXTENSION) {
-            // SAFETY: `create_info` is the application's own request, unmodified;
-            // `p_device` is the framework's out-parameter, valid for this call.
-            let result = unsafe { next_create_device(physical_device, create_info, allocator_ptr, p_device.as_mut_ptr()) };
+            // `create_info` is the application's own request (with the side queue, if any).
+            let result = create(create_info, p_device);
             if result.result().is_ok() {
                 // SAFETY: `p_device` was just written by the successful call above.
                 let device = unsafe { p_device.assume_init() };
@@ -420,7 +517,10 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 })
             });
         if !supported {
-            return LayerResult::Unhandled;
+            if side.is_none() {
+                return LayerResult::Unhandled;
+            }
+            return LayerResult::Handled(create(create_info, p_device).result());
         }
 
         let mut names: Vec<*const std::ffi::c_char> = requested.to_vec();
@@ -432,7 +532,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         // SAFETY: `extended` borrows `names`, which outlives this call; `p_device` is
         // the framework's own out-parameter, valid for this call; `physical_device`
         // was validated above via a successful query against it.
-        let result = unsafe { next_create_device(physical_device, &extended, allocator_ptr, p_device.as_mut_ptr()) };
+        let result = create(&extended, p_device);
         if result.result().is_ok() {
             // SAFETY: `p_device` was just written by the successful call above.
             let device = unsafe { p_device.assume_init() };
@@ -447,9 +547,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
             crate::log!("[layer] adding {EXTERNAL_MEMORY_HOST_EXTENSION:?} was refused ({result:?}); creating the device as requested, without zero-copy capture");
         }
-        // SAFETY: same reasoning as the call above, with `create_info` (the original,
-        // borrowed, unmodified request) this time.
-        let result = unsafe { next_create_device(physical_device, create_info, allocator_ptr, p_device.as_mut_ptr()) };
+        // Same as the call above, with `create_info` (the original request) this time.
+        let result = create(create_info, p_device);
         LayerResult::Handled(result.result())
     }
 }

@@ -1882,6 +1882,37 @@ fn open_test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, 
     Some((entry, instance, physical_device, device, queue, queue_family))
 }
 
+/// [`test_device`] with two queues in family 0 (the second one the layer's side queue, as for the
+/// hold inside DLSS's command buffer) and `VK_EXT_external_memory_host` when the device has it.
+/// `None` without a Vulkan device or when family 0 has a single queue (lavapipe); the tests that
+/// need it skip then.
+#[cfg(test)]
+pub(crate) fn test_device_two_queues() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, vk::Queue, u32, bool)> {
+    // SAFETY: same reasoning as `test_device`.
+    let entry = unsafe { ash::Entry::load() }.ok()?;
+    let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
+    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder().application_info(&app_info), None) }.ok()?;
+    let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    if families.first()?.queue_count < 2 {
+        return None;
+    }
+    let import = neural_forge_protocol::env::var("NEURAL_FORGE_TEST_IMPORT").as_deref() != Some("0")
+        && unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == crate::EXTERNAL_MEMORY_HOST_EXTENSION));
+    let names = [crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()];
+    let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0, 1.0]).build()];
+    let mut info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+    if import {
+        info = info.enabled_extension_names(&names);
+    }
+    let device = unsafe { instance.create_device(physical_device, &info, None) }.ok()?;
+    let (q0, q1) = unsafe { (device.get_device_queue(0, 0), device.get_device_queue(0, 1)) };
+    use std::io::Write;
+    let _ = std::io::stderr().write_all(b"[neural-forge-gpu-test] device acquired\n");
+    Some((entry, instance, physical_device, device, q0, q1, 0, import))
+}
+
 /// [`test_device`] with `VK_EXT_external_memory_host` enabled -- `None` when there is no
 /// Vulkan device, or it does not advertise the extension (the zero-copy tests skip then).
 #[cfg(test)]

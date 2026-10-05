@@ -58,6 +58,16 @@ unsafe fn initialize(device: vk::Device, object: *mut c_void) -> VkResult<()> {
     }
 }
 
+/// Sets the loader's dispatch data on a queue the layer got from the next layer's
+/// `vkGetDeviceQueue` (its own side queue): queues the application gets are set by the loader's
+/// trampoline, this one never passes through it.
+///
+/// # Safety
+/// `queue` is a live queue of `device`, obtained below the loader trampoline.
+pub unsafe fn initialize_queue(device: vk::Device, queue: vk::Queue) -> VkResult<()> {
+    unsafe { initialize(device, queue.as_raw() as *mut c_void) }
+}
+
 /// # Safety
 /// The device and allocation parameters satisfy vkAllocateCommandBuffers.
 pub unsafe fn allocate_commands(device: &ash::Device, info: &vk::CommandBufferAllocateInfo) -> VkResult<Vec<vk::CommandBuffer>> {

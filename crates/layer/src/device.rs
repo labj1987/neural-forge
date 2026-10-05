@@ -101,6 +101,9 @@ pub struct NeuralForgeDeviceInfo {
     /// The pre-upscaler path's view/launch tracking (`crate::preupscale`); `None` when its mode is
     /// off, which is the only check the always-hooked commands make.
     preupscale: Option<Arc<crate::preupscale::Tracking>>,
+    /// The hold inside DLSS's own command buffer (`crate::preupscale::inline`): `None` without the
+    /// pre-upscaler tracking, with `NEURAL_FORGE_INLINE=off`, or when the device got no side queue.
+    inline: Option<Arc<crate::preupscale::inline::Inline>>,
     /// The next layer's `vkQueueSubmit2` (or `vkQueueSubmit2KHR`). The layer issues the
     /// application's `vkQueueSubmit2` through it itself, so that it sees the result before any
     /// tracked state advances (and a held one is re-issued through it in parts).
@@ -578,6 +581,9 @@ static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> =
 /// # Safety
 /// The caller must meet vkDestroyDevice's external synchronization requirements.
 pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
+    // First: its worker uses the device state freed below, and the GPU may be waiting on it.
+    // SAFETY: forwarded.
+    unsafe { crate::preupscale::inline::destroy(handle) };
     let owned = CLEANUP.lock().unwrap().remove(&handle);
     if let Some((device, state)) = owned {
         let mut state = state.lock().unwrap();
@@ -610,6 +616,101 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
         crate::log!("[layer] private device teardown complete {:?}", handle);
         crate::logging::flush();
     }
+}
+
+/// The hold of one execution of a buffer carrying the hold inside DLSS's command buffer, on the
+/// inline worker (`crate::preupscale::inline`), once the GPU has copied the colour input into the
+/// job's staging image and waits for `release`: the same gates as the split hold, then
+/// `preupscale::run_hold` on the staging image, submitted on the layer's side `queue`, and the
+/// write-back waited on so that the staging image holds the answer when the worker releases the
+/// GPU. The device's state is only ever try-locked, for at most `INLINE_LOCK_WAIT`: a present
+/// holding it may itself be waiting on the GPU, which is waiting on this hold.
+fn inline_hold(
+    device: &Arc<ash::Device>, instance: &Arc<ash::Instance>, physical_device: vk::PhysicalDevice, state: &Arc<Mutex<State>>,
+    job: &crate::preupscale::inline::Job, queue: vk::Queue,
+) {
+    use crate::preupscale::{Mode, Which};
+    const INLINE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
+    let mode = crate::preupscale::mode();
+    if !mode.holds_inline() || !crate::layer_enabled() || crate::device_lost() || !presenting_steadily() {
+        return;
+    }
+    let started = std::time::Instant::now();
+    let mut state = loop {
+        match state.try_lock() {
+            Ok(guard) => break guard,
+            Err(std::sync::TryLockError::Poisoned(_)) => return,
+            Err(std::sync::TryLockError::WouldBlock) if started.elapsed() < INLINE_LOCK_WAIT => std::thread::sleep(std::time::Duration::from_micros(100)),
+            Err(std::sync::TryLockError::WouldBlock) => return,
+        }
+    };
+    let State { shm, preupscale: session, external_memory_host, direct_capture, gpu_compose, inflight, .. } = &mut *state;
+    session.saw_dlss();
+    if !shm.open() {
+        return;
+    }
+    if crate::preupscale::gate(mode, session, shm, false).is_none() {
+        return;
+    }
+    let extent = (job.point.desc.width, job.point.desc.height);
+    if shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
+        session.note_busy_slot(shm, mode, extent);
+        return;
+    }
+    if capture::direct_slot_busy(direct_capture, Slot::Primary) {
+        return;
+    }
+    if mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(device)) {
+        return;
+    }
+    // Staged, never imported: work on imported host memory from the layer's queue waited on the
+    // game's queue, which is parked at the hold (2026-10-05, Crimson Desert: no capture finished
+    // within 5 s, then Xid 69).
+    let _ = external_memory_host;
+    // SAFETY: the SHM mapping is never unmapped once open.
+    if !unsafe { session.ensure(device, instance, physical_device, job.side_family, extent.0, extent.1, shm, false) } {
+        if mode == Mode::Model {
+            session.note(shm, &crate::preupscale::HoldResult::local("the hold's resources could not be built"), started.elapsed(), extent);
+        }
+        return;
+    }
+    let target = crate::preupscale::Target {
+        colour: job.image,
+        width: extent.0,
+        height: extent.1,
+        depth: None,
+        mvec: None,
+        exposure: [None; crate::preupscale::MAX_EXPOSURE],
+        exposure_input: job.exposure,
+        paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
+        identification: job.point.identification,
+    };
+    let Some(res) = session.res.as_mut() else { return };
+    let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| {
+        let info = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build();
+        // SAFETY: the side queue is used by this worker thread only.
+        unsafe { device.queue_submit(queue, &[info], fence) }
+    };
+    // SAFETY: `res` was built on this device for this extent and the side queue's family; the
+    // staging image is live, in GENERAL, and holds this frame's colour input (`captured` was set).
+    let mut hold = unsafe {
+        crate::preupscale::run_hold(device, instance, physical_device, res, shm, &target, mode, false, 0, crate::preupscale::ANSWER_BUDGET, &mut submit)
+    };
+    if hold.wrote_back {
+        let mut writeback_gpu = None;
+        if res.wait_idle(device, &mut writeback_gpu) {
+            hold.writeback_gpu_ms = writeback_gpu.or(hold.writeback_gpu_ms);
+        } else {
+            // The GPU copies the staging image back as it is; the write-back may not have reached it.
+            hold.wrote_back = false;
+            hold.miss = Some("the write-back inside DLSS's buffer did not finish in time");
+        }
+    }
+    if hold.claims_slot0() {
+        inflight[0].forget_answer();
+    }
+    hold.mark_local(mode);
+    session.note(shm, &hold, started.elapsed(), extent);
 }
 
 /// Submits a wait-only batch on `queue` that waits on the application's present wait
@@ -794,6 +895,8 @@ impl NeuralForgeDeviceInfo {
         crate::logging::flush();
         let state = Arc::new(Mutex::new(State { external_memory_host, ..State::default() }));
         CLEANUP.lock().unwrap().insert(handle, (device.clone(), state.clone()));
+        // SAFETY: create_info is the loader chain for this newly created device.
+        let loader_data = unsafe { crate::loader_data::register(handle, create_info) };
         let nvidia = match &instance {
             // SAFETY: `physical_device` is the handle this device was just created from.
             Some(instance) => {
@@ -808,9 +911,27 @@ impl NeuralForgeDeviceInfo {
             // Cannot ask, so do not gate: same fail-open stance as everywhere else.
             None => true,
         };
+        let side = crate::take_side_queue(handle);
+        let inline = match (&preupscale, side, get_queue, &instance) {
+            (Some(_), Some(crate::SideQueue { family, index, app_family }), Some(get_queue), Some(instance)) if nvidia => {
+                let mut queue = vk::Queue::null();
+                // SAFETY: the next layer's `vkGetDeviceQueue` for the queue this layer added to the
+                // device's creation (`crate::take_side_queue`).
+                unsafe { get_queue(handle, family, index, &mut queue) };
+                // SAFETY: a live queue of this device from below the loader.
+                if queue == vk::Queue::null() || unsafe { crate::loader_data::initialize_queue(handle, queue) }.is_err() {
+                    crate::log!("[preupscale] the side queue for the hold inside DLSS's command buffer could not be set up; not holding there");
+                    None
+                } else {
+                    let (dev, inst, pd, st) = (device.clone(), instance.clone(), physical_device, state.clone());
+                    let hold: crate::preupscale::inline::HoldFn = Box::new(move |job, queue| inline_hold(&dev, &inst, pd, &st, job, queue));
+                    crate::preupscale::inline::Inline::start(device.clone(), instance, physical_device, queue, family, app_family, hold)
+                }
+            }
+            _ => None,
+        };
         Self {
-            // SAFETY: create_info is the loader chain for this newly created device.
-            _loader_data: unsafe { crate::loader_data::register(handle, create_info) },
+            _loader_data: loader_data,
             device,
             instance,
             surface_caps,
@@ -825,6 +946,7 @@ impl NeuralForgeDeviceInfo {
             next_create_image: create_image,
             probe_next,
             preupscale,
+            inline,
             next_queue_submit2,
             state,
             tracker: Mutex::new(TapTracker::default()),
@@ -896,6 +1018,21 @@ impl NeuralForgeDeviceInfo {
         self.tracker.lock().unwrap().commit_submit(command_buffers.into_iter());
     }
 
+    /// The jobs of the hold inside DLSS's buffer (`crate::preupscale::inline`) for a submission on
+    /// `queue` of `cbs`, taken before the submission is made.
+    fn inline_jobs(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
+        let Some(inline) = &self.inline else { return Vec::new() };
+        let family = self.state.lock().unwrap().queue_families.get(&queue).copied();
+        inline.jobs_for(cbs, family)
+    }
+
+    /// Hands `jobs` to the worker once the submission was accepted; a refused one runs nothing.
+    fn inline_dispatch(&self, result: vk::Result, jobs: Vec<crate::preupscale::inline::Job>) {
+        if let (Some(inline), vk::Result::SUCCESS) = (&self.inline, result) {
+            inline.dispatch(jobs);
+        }
+    }
+
     /// The pre-upscaler hold at a `vkQueueSubmit`/`vkQueueSubmit2` (`crate::preupscale`'s module
     /// doc comment has the dependency chain). `cbs` are each batch's command buffers; `parse` turns
     /// the application's batches into owned ones; `submit` issues batches on `queue` through the
@@ -910,6 +1047,10 @@ impl NeuralForgeDeviceInfo {
     ) -> Option<(vk::Result, Vec<vk::CommandBuffer>)> {
         use crate::preupscale::{Mode, Which};
         let scan = tracking.scan(cbs)?;
+        // DLSS's buffer carries the hold inside it (`crate::preupscale::inline`): nothing to split.
+        if self.inline.as_ref().is_some_and(|i| cbs.get(scan.batch).and_then(|b| b.get(scan.index)).is_some_and(|cb| i.owns(*cb))) {
+            return None;
+        }
         let mode = crate::preupscale::mode();
         if !crate::layer_enabled() || !self.nvidia || crate::device_lost() {
             return None;
@@ -1359,6 +1500,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if let Some(t) = &self.preupscale {
             t.begin(command_buffer);
         }
+        if let Some(i) = &self.inline {
+            i.begin(command_buffer, begin_info.flags);
+        }
         self.tracker.lock().unwrap().begin_recording(command_buffer);
         LayerResult::Unhandled
     }
@@ -1369,6 +1513,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         crate::probe_ngx::on_free_command_buffers(command_buffers);
         if let Some(t) = &self.preupscale {
             t.free(command_buffers);
+        }
+        if let Some(i) = &self.inline {
+            i.free(command_buffers);
         }
         self.tracker.lock().unwrap().free(command_buffers);
         LayerResult::Unhandled
@@ -1398,6 +1545,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // SAFETY: `p_command_buffers` is valid for `command_buffer_count` elements for the
         // duration of the application's own `vkQueueSubmit` call.
         let buffers = || submits.iter().flat_map(|s| unsafe { preupscale_slice(s.p_command_buffers, s.command_buffer_count) }.iter().copied());
+        let jobs = self.inline_jobs(queue, buffers());
         let device = &self.device;
         if let Some(tracking) = self.preupscale.as_ref().filter(|t| t.armed()) {
             // SAFETY: as above.
@@ -1413,6 +1561,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let held = self.preupscale_submit(tracking, queue, &cbs, || unsafe { crate::preupscale::parse1(submits) }, fence, &submit);
             if let Some((result, accepted)) = held {
                 self.commit_submitted(accepted);
+                self.inline_dispatch(result, jobs);
                 return LayerResult::Handled(result.result());
             }
         }
@@ -1423,6 +1572,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if result == vk::Result::SUCCESS {
             self.commit_submitted(buffers());
         }
+        self.inline_dispatch(result, jobs);
         LayerResult::Handled(result.result())
     }
 
@@ -1439,7 +1589,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // SAFETY: `p_command_buffer_infos` is valid for `command_buffer_info_count` elements for
         // the duration of the application's own `vkQueueSubmit2` call.
         let buffers = || submits.iter().flat_map(|s| unsafe { preupscale_slice(s.p_command_buffer_infos, s.command_buffer_info_count) }.iter().map(cb_of));
+        let jobs = self.inline_jobs(queue, buffers());
         let Some(next) = self.next_queue_submit2 else {
+            // The framework forwards without a result. A buffer that does not run never sets
+            // `captured`; the worker then gives up after the bounded capture wait.
+            self.inline_dispatch(vk::Result::SUCCESS, jobs);
             // Not resolvable below this layer (the application could not be calling it): the
             // framework forwards, and the result stays unseen.
             self.commit_submitted(buffers());
@@ -1461,6 +1615,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let held = self.preupscale_submit(tracking, queue, &cbs, || unsafe { crate::preupscale::parse2(submits) }, fence, &submit);
             if let Some((result, accepted)) = held {
                 self.commit_submitted(accepted);
+                self.inline_dispatch(result, jobs);
                 return LayerResult::Handled(result.result());
             }
         }
@@ -1470,6 +1625,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if result == vk::Result::SUCCESS {
             self.commit_submitted(buffers());
         }
+        self.inline_dispatch(result, jobs);
         LayerResult::Handled(result.result())
     }
 
@@ -1698,7 +1854,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // "DLSS Frame Generation").
             // SAFETY: `p_extras` is the application's own launch-parameter list, valid for this call.
             let params = unsafe { crate::preupscale::launch_params(launch_info.p_extras, launch_info.extra_count) };
-            t.launch(command_buffer, launch_info.function, params);
+            if let Some(point) = t.launch(command_buffer, launch_info.function, params) {
+                // DLSS's buffer renders its own input before this launch: the hold goes here, inside
+                // it (`crate::preupscale::inline`), when the mode holds at all.
+                if let Some(inline) = self.inline.as_ref().filter(|_| crate::preupscale::mode().holds_inline()) {
+                    inline.record(command_buffer, point);
+                }
+            }
         }
         LayerResult::Unhandled
     }

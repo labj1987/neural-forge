@@ -144,17 +144,15 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
 - **Test as it is played: frame generation on.** Release checks run with GTA's `settings.xml` as
   Alex has it (`FrameGenType` 1, `dlssFrameGenMode` 0/1/2 = 2x/3x/4x). Frame-generation-off runs
   are comparisons only; 2.0.2 passed them and failed with frame generation on.
-- **Frame generation does not engage in every launch, and only engaged runs count.** GTA decides
-  at each loading screen whether to run DLSS Frame Generation. In benchmark launches it often does
-  not, or stops at the pass 2 -> 3 load, with or without Neural Forge (2026-10-05: about half of
-  the launches; not window focus, VRAM, Reflex or Neural Forge, see HARDWARE_VALIDATION.md).
-  Report frame-generation runs with `--fg`: a run under 1.5x displayed / real is named
-  `frame generation did not engage`, left out of `--mean`, and the exit status is 1. Run it again
-  straight away until three runs engaged:
-
-  ```bash
-  scripts/bench-report.py --host lordnikon --fg --mean fg-nron-1 fg-nron-2 fg-nron-3
-  ```
+- **Automated runs check that the model is applied; frame generation is checked in real play.** One
+  run per game per change, with GTA's settings as Alex has them: every DLSS frame held
+  (`holds_per_s` equal to the real frame rate), model answers written back (0 misses, no echoes), no
+  `not holding` refusal, no `fence wait timed out`, no Xid. GTA decides at each loading screen whether
+  to run DLSS Frame Generation and in benchmark launches it often does not, with or without Neural
+  Forge (2026-10-05: about half of the launches; not window focus, VRAM, Reflex or Neural Forge, see
+  HARDWARE_VALIDATION.md), so a run is never repeated for it. `bench-report.py` gives each run's
+  multiplier, and `--fg` names a run where it did not engage and leaves it out of `--mean`. Whether
+  frame generation works and how the game feels is Alex's check, playing.
 
 **4K runs.** GTA renders at the desktop's size under Proton, so switch the host's desktop to
 3840x2160 at scale 1.0 first, temporarily, with GNOME's `gdctl set` (not persistent), and set
@@ -294,6 +292,23 @@ ssh lordnikon 'NEURAL_FORGE_FAIL_CREATE=6@2 neural-forge-cli restart'
   `neural-forge-cli shmctl set intensity 1.01` (and set it back to 1 afterwards).
 - `NEURAL_FORGE_HDR_FLAGS=hdr|sdr|autoexp0`: NGX creation flags for RGBA16F frames.
 - `NEURAL_FORGE_HELPER_DELAY_MS=N`: delay every answer.
+
+### The hold inside DLSS's command buffer (2.0.4)
+
+Where DLSS's buffer renders its own input (Crimson Desert, Cyberpunk 2077) the hold runs inside the
+buffer, with its work on a queue the layer adds in a compute-only family (PRE_UPSCALER_DESIGN.md,
+"The hold inside DLSS's command buffer"). Its lines: `hold inside DLSS's command buffer available:
+side queue in family N, DLSS's in M` per device, then `holding inside DLSS's command buffer ...` once;
+the 300-hold summaries are the ordinary ones. `NEURAL_FORGE_INLINE=off` turns it off;
+`NEURAL_FORGE_INLINE=release` records it but releases every hold at once without running it (to tell
+a fault in the recorded commands from one in the side queue's work).
+
+`crates/layer/examples/queue_wait_probe.rs` measures, natively, whether each candidate queue finishes
+work while queue (0, 0) waits on a host-set event. The two-queue GPU test
+(`a_hold_inside_the_buffer_runs_on_the_side_queue_and_writes_back_through_the_staging_image`) skips on
+a device with one queue (lavapipe); on the test machine run the release test binary with
+`NEURAL_FORGE_TEST_IMPORT=0` (with host-memory imports in that process, later device allocations
+fail there).
 
 ## 6. Reading the logs
 

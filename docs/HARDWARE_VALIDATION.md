@@ -1037,3 +1037,49 @@ never reaches it), so no generated frame is made. Either it never starts, or it 
 The cause inside GTA is not known. `scripts/bench-report.py --fg` now names a run where frame
 generation did not engage and leaves it out, so a frame-generation number is always an engaged one.
 With logging on, 2 of 3 engaged: 49.5 / 49.6 real, 198.5 / 198.6 shown, every frame held.
+
+## 2026-10-05 -- 2.0.4: the hold inside DLSS's command buffer
+
+**Crimson Desert renders its frame in DLSS's command buffer** (NGX probe `cd/probe-2`, 2.0.3): before
+DLSS's first launch (`cuda_dldn_engine_luma_convert_kernel`) the buffer records 7 draws, 27 dispatches,
+18 renderings and 23 barriers with a write in their source access. 2.0.2's rule refuses to split it
+(`global memory barrier with a write in its source access before its launch`), so on 2.0.2/2.0.3 the
+model never ran before the upscaler in Crimson Desert. Cyberpunk 2077's buffer has 2 dispatches and 6
+write barriers before its first launch and is refused the same way.
+
+**Getting the side queue right.** The hold's work on the layer's own queue while DLSS's buffer waits:
+
+| Side queue | Result in Crimson Desert |
+|---|---|
+| Family 0 (the game's graphics family), zero-copy SHM import | no capture finished within 5 s; Xid 69 (class error, compute class `cec0`, offset `1b0c`) |
+| Family 0, staged buffers | the same, plus 2x Xid 32 |
+| Hold recorded, released at once, no work on the side queue (`NEURAL_FORGE_INLINE=release`) | no Xid: the recorded copies, events and wait are fine |
+| Family 2 (compute only), staged, exposure copied in the buffer | **every frame held, 0 misses, no Xid, no fence timeout** |
+
+A native probe (`examples/queue_wait_probe.rs`, RTX 5070) shows a second queue of family 0 and a
+family-2 queue both finish work in 0.1-0.2 ms while queue (0,0) waits on a host event; the fault
+needs the game's buffer (CUDA launches in flight) on the parked queue. The two-queue GPU test
+(`a_hold_inside_the_buffer_runs_on_the_side_queue_and_writes_back_through_the_staging_image`) passes on
+the RTX 5070 with staged buffers (worst relative error 2.71e-3). With host-memory imports in that
+test process, a later 32 KB device-local allocation fails with `ERROR_OUT_OF_DEVICE_MEMORY` (also the
+existing roundtrip test on that machine); the test can run staged with `NEURAL_FORGE_TEST_IMPORT=0`.
+
+**Real play, Alex at the screen** (Steam launch, `NEURAL_FORGE_ENABLE=1 %command%`, 2560x1440, DLSS
+Balanced 1516x852, frame generation with dynamic multi frame generation, Reflex on, SDR): holding,
+24.7-31.3 frames held per second (every real frame), **148-164 fps shown**, hold 8.8-9.0 ms median
+(capture wait 0.83-0.90, helper 5.6), 0 misses, no Xid. Ray Reconstruction switched on in game changed
+nothing in the layer's view (same 1516x852 input held, 24.7/s, 148 shown); whether the game's Ray
+Reconstruction then runs is not measured. Alex: "for the first time I'm actually noticing the neural
+rendering being applied ... no real flickering ... with frame gen it's playable".
+
+**GTA V and Cyberpunk 2077 on 2.0.4** (one run each, settings as found):
+
+- GTA V Enhanced (frame generation on in its settings; it did not engage in pass 4 of this benchmark
+  launch, as often): the split hold as before, 68.8 held/s against 68.1 real, 0 misses after the
+  model's first build, no `not holding`, no hold inside the buffer, no fence timeout, no Xid.
+- Cyberpunk 2077 (SDR, frame generation off as Alex has it, ray tracing on): held inside DLSS's buffer,
+  54.1 held/s, hold 10.7 ms, 0 misses after the first build, no Xid. After about 11 s DLSS's launches
+  named another of its two 1485x835 RGBA16F candidates (`a CUDA launch names depth ... with several
+  colour candidates at its extent`); its buffers were then classed as not reading the colour input and
+  forwarded, and 30 s later the post-upscaler compose took over again (46-55/s), as on 2.0.3. Not yet
+  held for a whole session: the switch between the two candidates is the next fix.

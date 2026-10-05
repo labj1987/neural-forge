@@ -339,6 +339,7 @@ pattern that is held; that is what was observed in that game, not something Vulk
 Not split, each with its own once-per-session log line:
 
 - **Synchronization inside the launch buffer, before the launch that reads the colour input**
+  (since 2.0.4 such a buffer is held inside instead, "The hold inside DLSS's command buffer")
   (`preupscale::Hazard`): an image barrier on an image the hold reads, whether it changes the
   layout, keeps it (`GENERAL -> GENERAL`) or transfers queue-family ownership; a global memory
   barrier with a write in its source access; or `vkCmdWaitEvents*`. The capture would run ahead of
@@ -371,6 +372,68 @@ once it was (`submit_around`), so a refused head leaves the state as it was and 
 only the head. For that the layer issues every `vkQueueSubmit`/`vkQueueSubmit2` to the next layer
 itself (the framework's own forwarding gives a hook no result), and the render tap's source layouts
 (`TapTracker`) follow the same rule.
+
+### The hold inside DLSS's command buffer (2.0.4)
+
+**Why.** The split above runs the model in front of DLSS's launch buffer, which is only correct when
+the buffer does nothing to the colour input before DLSS reads it. The NGX probe on 2026-10-05:
+
+- GTA V Enhanced: the input launch is the buffer's first command, or follows only depth and
+  motion-vector copies for frame generation. The split takes it.
+- Crimson Desert: before DLSS's first launch (`cuda_dldn_engine_luma_convert_kernel`) the same
+  buffer records 7 draws, 27 dispatches, 18 renderings and 23 barriers with a write in their source
+  access: the frame is rendered in DLSS's buffer. A hold in front of it would read the colour input
+  before this frame is drawn into it, and its write-back would be drawn over. 2.0.2's rule refuses
+  it (`global memory barrier with a write in its source access before its launch`).
+- Cyberpunk 2077: 2 dispatches and 6 write barriers before the first launch; refused the same way.
+
+**How.** At record time, in `vkCmdCuLaunchKernelNVX`, when the launch is the buffer's first to name a
+colour candidate and the split would be refused there (`Tracker::inline_point`), the layer records
+into the application's buffer, right before that launch:
+
+1. a barrier (everything written so far, to transfer; the staging image `UNDEFINED -> GENERAL`),
+2. a copy of the colour input (`GENERAL`) into a layer-owned staging image of its size,
+3. a barrier publishing the copy, then `vkCmdSetEvent(captured)`,
+4. `vkCmdWaitEvents(release)` from the host stage, with a memory barrier from host and memory writes,
+5. the copy of the staging image back over the colour input, a barrier to everything after,
+6. `vkCmdResetEvent` of both events.
+
+Only copies, barriers and event commands: nothing binds pipelines, descriptors or push constants,
+so the application's (vkd3d-proton's) cached command-buffer state stays valid. The colour input must
+be RGBA16F with `TRANSFER_SRC | TRANSFER_DST`, in `GENERAL` there, and no render pass instance may
+be suspended at that point; otherwise nothing is recorded. A buffer recorded with
+`SIMULTANEOUS_USE` gets nothing (one execution at a time per staging slot).
+
+At the submit, each accepted submission's buffers that carry a hold become jobs for the device's
+worker thread, in order. The worker waits (bounded by `FRAME_CAPTURE_WAIT`) for `captured`, then runs
+the ordinary hold, `run_hold`, with the staging image as the colour input, on the layer's own queue,
+waits for the write-back, and sets `release`. It always sets `release`: a hold that did not run,
+missed its budget or failed leaves the staging image as the buffer copied it, so the copy back
+changes nothing and DLSS gets the frame untouched. The device state is only try-locked (20 ms): a
+present that holds it may itself be waiting on the GPU, which is waiting on the hold.
+
+**The layer's queue.** `vkCreateDevice` gets one more queue in a compute family without graphics
+(NVIDIA's family 2): the application's request for that family is extended by one when it has a queue
+to spare and is a plain one, or a one-queue request is added. A creation with it that the driver
+refuses is repeated without (then nothing is held inside buffers). The queue gets the loader's
+dispatch data (`loader_data::initialize_queue`). Not the game's graphics family: there, the hold's
+compute work while DLSS's buffer waited faulted the game's channel (Xid 69, class `cec0`, offset
+`1b0c`, Crimson Desert, 2026-10-05; with the hold recorded but released at once there was none, and a
+native probe with a plain parked buffer showed no fault, so it takes the game's buffer in flight).
+The staging image and a 1x1 copy of DLSS's exposure input (made in the buffer beside the colour copy,
+when the exposure input is readable in `GENERAL` or `TRANSFER_SRC_OPTIMAL`) are created with
+`CONCURRENT` sharing across the game's graphics family and the layer's; the layer's queue never
+touches the game's images. The hold's buffers are staged, never imported from the shared memory (with
+imports, no capture finished in Crimson Desert). A buffer submitted on a queue of another family than
+the game's graphics family is only released.
+
+**Slots.** Up to 8 staging images with their event pairs, one per buffer recorded with a hold and not
+yet re-recorded (`vkBeginCommandBuffer` and `vkFreeCommandBuffers` free them; a slot unsubmitted for
+10 s is taken back). Teardown stops the worker first (jobs left are released at once), joins it,
+waits the device idle and frees the slots, before the device's other resources.
+
+`NEURAL_FORGE_INLINE=off` turns it off (no queue is added either). `dump` keeps to the split: the
+staging copy carries the colour input only.
 
 ### The HDR encode and decode (model, roundtrip)
 
