@@ -339,11 +339,16 @@ pattern that is held; that is what was observed in that game, not something Vulk
 Not split, each with its own once-per-session log line:
 
 - **Synchronization inside the launch buffer, before the launch that reads the colour input**
-  (`preupscale::Hazard`): an image barrier on an image the hold reads (colour, depth, motion
-  vectors, exposure), whether it changes the layout, keeps it (`GENERAL -> GENERAL`) or transfers
-  queue-family ownership; a global memory barrier with a write in its source access; or
-  `vkCmdWaitEvents*`. The capture would run ahead of the very operation that makes the input
-  visible to the launch. Barriers after the launch (vkd3d-proton records them after every launch)
+  (`preupscale::Hazard`): an image barrier on an image the hold reads, whether it changes the
+  layout, keeps it (`GENERAL -> GENERAL`) or transfers queue-family ownership; a global memory
+  barrier with a write in its source access; or `vkCmdWaitEvents*`. The capture would run ahead of
+  the very operation that makes the input visible to the launch. Every hold reads and writes the
+  colour input and reads the exposure input; only a `dump` also reads depth, the motion vectors
+  and the 1x1 exposure candidates, so a barrier on one of those stops a dump and never a hold
+  (`Scan::dump_hazard`, 2.0.3). With DLSS Frame Generation on in its settings, GTA V Enhanced
+  copies depth and motion vectors for frame generation inside SR's launch buffer, between
+  `GENERAL -> GENERAL` barriers, right before the input launch; DLSS's depth and motion vectors
+  are those copies. 2.0.2 refused that buffer every frame. Barriers after the launch (vkd3d-proton records them after every launch)
   do not count, and the order is kept across `vkCmdExecuteCommands`. Barriers are tracked whole
   for this (`preupscale::ImageSync`: layouts, stages, accesses, queue families).
 - **The colour input belongs to another queue family**: the last ownership transfer of it the

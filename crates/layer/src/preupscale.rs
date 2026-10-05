@@ -1016,6 +1016,9 @@ pub(crate) struct Scan {
     pub identification: u64,
     /// Why the submit must not be split in front of its launch buffer, if anything recorded says so.
     pub hazard: Option<Hazard>,
+    /// Why a dump (which also reads depth, the motion vectors and the 1x1 exposure candidates)
+    /// must not be taken in front of the launch buffer: a barrier on one of those images only.
+    pub dump_hazard: Option<Hazard>,
     /// The queue family that owns the colour input, when a submitted ownership transfer said so.
     pub colour_owner: Option<u32>,
 }
@@ -1440,27 +1443,36 @@ impl Tracker {
     /// Why a hold must not run in front of launch buffer `cb` reading `inputs`, from what was
     /// recorded into it before the launch that first names the colour input (before its first
     /// launch when none names it): a barrier on an image the hold reads, or global synchronization.
-    fn launch_hazard(&self, cb: vk::CommandBuffer, inputs: Option<&Inputs>) -> Option<Hazard> {
+    ///
+    /// Returns `(hazard, dump_hazard)`. Every hold reads and writes the colour input and reads the
+    /// exposure input; only a dump also reads depth, the motion vectors and every 1x1 exposure
+    /// candidate, so a barrier on one of those alone stops only a dump. With DLSS Frame Generation
+    /// on, GTA V Enhanced copies depth and motion vectors for it inside the launch buffer, between
+    /// `GENERAL -> GENERAL` barriers, right before SR's input launch (docs/PRE_UPSCALER_DESIGN.md,
+    /// "When a submit is not split").
+    fn launch_hazard(&self, cb: vk::CommandBuffer, inputs: Option<&Inputs>) -> (Option<Hazard>, Option<Hazard>) {
         if self.rendering.get(&cb).is_some_and(|r| r.open_resume) {
-            return Some(Hazard::SuspendedRendering);
+            return (Some(Hazard::SuspendedRendering), None);
         }
-        let refs = self.launch.get(&cb)?;
+        let Some(refs) = self.launch.get(&cb) else { return (None, None) };
         let colour = inputs.map(|i| i.colour.0);
-        let before = colour.and_then(|c| refs.before_named.iter().find(|(i, _)| *i == c)).map(|(_, b)| *b).or(refs.before_first)?;
-        if before.global.is_some() {
-            return before.global;
-        }
-        let read = |image: vk::Image| {
-            inputs.is_none_or(|i| {
-                i.colour.0 == image
-                    || i.depth.0 == image
-                    || i.mvec.0 == image
-                    || i.exposure.iter().flatten().any(|e| e.0 == image)
-                    || i.exposure_input.is_some_and(|e| e.0 == image)
-            })
+        let Some(before) = colour.and_then(|c| refs.before_named.iter().find(|(i, _)| *i == c)).map(|(_, b)| *b).or(refs.before_first) else {
+            return (None, None);
         };
-        let recorded = self.pending.get(&cb)?;
-        recorded.iter().take(before.barriers).find(|s| read(s.image)).map(ImageSync::hazard)
+        if before.global.is_some() {
+            return (before.global, None);
+        }
+        // Unknown inputs: every watched image counts as read by every hold.
+        let held = |image: vk::Image| inputs.is_none_or(|i| i.colour.0 == image || i.exposure_input.is_some_and(|e| e.0 == image));
+        let dumped = |image: vk::Image| {
+            inputs.is_some_and(|i| i.depth.0 == image || i.mvec.0 == image || i.exposure.iter().flatten().any(|e| e.0 == image))
+        };
+        let Some(recorded) = self.pending.get(&cb) else { return (None, None) };
+        let before = &recorded[..before.barriers.min(recorded.len())];
+        (
+            before.iter().find(|s| held(s.image)).map(ImageSync::hazard),
+            before.iter().find(|s| dumped(s.image)).map(ImageSync::hazard),
+        )
     }
 
     /// The largest swapchain's extent.
@@ -1877,6 +1889,7 @@ impl Tracker {
                     let layout = |image: Option<vk::Image>| image.and_then(|i| proposed.get(&i).map(|p| p.0).or(self.committed.get(&i).copied()));
                     let inputs = self.inputs.map(|i| Inputs { colour: retarget.unwrap_or(i.colour), ..i });
                     let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
+                    let (hazard, dump_hazard) = self.launch_hazard(cb, inputs.as_ref());
                     found = Some(Scan {
                         batch: bi,
                         index: ci,
@@ -1889,7 +1902,8 @@ impl Tracker {
                         evaluation: self.evaluations,
                         identified_now: self.identified,
                         identification: self.generation,
-                        hazard: self.launch_hazard(cb, inputs.as_ref()),
+                        hazard,
+                        dump_hazard,
                         colour_owner,
                     });
                 }
@@ -5102,11 +5116,10 @@ mod tests {
     #[test]
     fn synchronization_before_the_launch_in_its_buffer_forbids_the_hold() {
         let transfer = ImageSync { src_queue_family: 0, dst_queue_family: 1, ..general_to_general(colour()) };
-        let cases: [(&str, &dyn Fn(&mut Tracker), Hazard); 6] = [
+        let cases: [(&str, &dyn Fn(&mut Tracker), Hazard); 5] = [
             ("GENERAL -> GENERAL on the colour input", &|t| t.barrier(cb(2), general_to_general(colour())), Hazard::SameLayoutBarrier),
             ("a queue-family ownership transfer", &|t| t.barrier(cb(2), transfer), Hazard::QueueFamilyTransfer),
             ("a layout transition", &|t| t.barrier(cb(2), ImageSync { old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, ..ImageSync::to(colour(), GENERAL) }), Hazard::LayoutTransition),
-            ("a barrier on depth, which the capture reads too", &|t| t.barrier(cb(2), general_to_general(vk::Image::from_raw(0x200))), Hazard::SameLayoutBarrier),
             ("a global memory barrier", &|t| t.global(cb(2), Hazard::MemoryBarrier), Hazard::MemoryBarrier),
             ("an event wait", &|t| t.global(cb(2), Hazard::EventWait), Hazard::EventWait),
         ];
@@ -5136,6 +5149,42 @@ mod tests {
         t.global(cb(2), Hazard::MemoryBarrier);
         t.launch(cb(2), None);
         assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("held undecided").hazard, Some(Hazard::MemoryBarrier));
+    }
+
+    /// Depth and motion vectors are read only by a dump: a barrier on them before the launch stops
+    /// a dump, never a hold. This is GTA V Enhanced's launch buffer with DLSS Frame Generation on
+    /// (probe `v201-fg-probe-1`): a dispatch, then depth and motion vectors copied for frame
+    /// generation between `GENERAL -> GENERAL` barriers (read -> transfer read, transfer write ->
+    /// shader read), then SR's input launch. Nothing touches the colour or exposure input.
+    #[test]
+    fn barriers_on_depth_and_motion_vectors_stop_only_a_dump() {
+        let (mut t, params) = held_tracker();
+        let (depth, mvec) = (vk::Image::from_raw(0x200), vk::Image::from_raw(0x300));
+        let sync = |image, src_access: vk::AccessFlags, dst_access: vk::AccessFlags| ImageSync {
+            src_access: u64::from(src_access.as_raw()),
+            dst_access: u64::from(dst_access.as_raw()),
+            ..general_to_general(image)
+        };
+        t.barrier(cb(2), sync(mvec, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ));
+        t.barrier(cb(2), sync(mvec, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ));
+        t.barrier(cb(2), sync(depth, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ));
+        t.launch(cb(2), Some(&params));
+        let scan = t.submit_ok(&[vec![cb(1), cb(2)]]).expect("launch-bearing");
+        assert_eq!((scan.hazard, scan.dump_hazard), (None, Some(Hazard::SameLayoutBarrier)));
+        assert!(scan.colour_in_general());
+        // A barrier on the colour input as well: no hold either.
+        t.begin(cb(2));
+        t.barrier(cb(2), sync(depth, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ));
+        t.barrier(cb(2), general_to_general(colour()));
+        t.launch(cb(2), Some(&params));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!((scan.hazard, scan.dump_hazard), (Some(Hazard::SameLayoutBarrier), Some(Hazard::SameLayoutBarrier)));
+        // A transition of depth: a dump's hazard only, named as a transition.
+        t.begin(cb(2));
+        t.barrier(cb(2), ImageSync { old_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, ..ImageSync::to(depth, GENERAL) });
+        t.launch(cb(2), Some(&params));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!((scan.hazard, scan.dump_hazard), (None, Some(Hazard::LayoutTransition)));
     }
 
     /// The order holds across `vkCmdExecuteCommands`: a barrier the primary recorded before

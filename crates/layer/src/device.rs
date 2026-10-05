@@ -934,7 +934,7 @@ impl NeuralForgeDeviceInfo {
         }
         // Synchronization the application recorded for DLSS's inputs inside the launch buffer, or a
         // render pass suspended across the split point: the layer does not run ahead of either.
-        if let Some(hazard) = scan.hazard {
+        if let Some(hazard) = scan.hazard.or(scan.dump_hazard.filter(|_| mode == Mode::Dump)) {
             session.say_once(hazard.why());
             return None;
         }

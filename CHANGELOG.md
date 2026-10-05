@@ -15,12 +15,25 @@ first shipped them; their phase is kept as a subheading.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
+## 2.0.3 — 2026-10-05
+
+- **Pre-upscaler: GTA V with DLSS Frame Generation is held again.** 2.0.2 refused every DLSS submit
+  in GTA V Enhanced once frame generation was on in its settings (`the DLSS launch buffer has a
+  same-layout barrier on a DLSS input before its launch; not holding`): GTA copies depth and motion
+  vectors for frame generation inside SR's launch buffer, between `GENERAL -> GENERAL` barriers,
+  before the input launch. The model then ran after the upscaler on every shown frame, generated
+  ones too: 22.7 real fps and 90.5 shown at 4x on the test machine. A barrier inside the launch
+  buffer now forbids a hold only when it is on an image the hold reads (the colour input, the
+  exposure input); depth, motion vectors and the 1x1 exposure candidates are read only by a
+  `dump`, so a barrier on them stops only a dump. Every other refusal is unchanged.
+
 ## 2.0.2 — 2026-10-05
 
 Remediation of two static code reviews (Vulkan submit handling; shared-memory protocol and CI).
-Measured on the test machine (GTA V Enhanced, 1440p, DLSS Balanced, 3 runs each): every DLSS frame
-is still held, no submit is refused, and frame rates match 2.0.1 within noise (NR off 92.0, NR on
-64.9, post path 62.4, layer loaded but idle 91.7). See docs/HARDWARE_VALIDATION.md, "2.0.2".
+Measured on the test machine (GTA V Enhanced, 1440p): with DLSS Frame Generation off, every DLSS
+frame is held and frame rates match 2.0.1 (NR off 92.0, NR on 64.9, post path 62.4, layer loaded but
+idle 91.7). With frame generation on, as it is played, no frame is held (fixed in 2.0.3). See
+docs/HARDWARE_VALIDATION.md, "2.0.2".
 
 - **Pre-upscaler: a DLSS submit is only split when that is provably safe.** Forwarded untouched,
   with one log line per reason: a barrier on a DLSS input (also `GENERAL -> GENERAL`, also a

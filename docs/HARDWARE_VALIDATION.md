@@ -931,6 +931,12 @@ The desktop is untouched at 2560x1440@288, scale 1.0.
 
 ## 2026-10-05 -- 2.0.2
 
+**Correction: 2.0.2 fails with DLSS Frame Generation on, which is how GTA is played.** The runs
+below had `FrameGenType` 0. With Alex's settings as they are (`FrameGenType` 1, `dlssFrameGenMode`
+2), 3 runs: **22.7 real fps, 90.5 shown** (frame generation 4x), no frame held. Every run logs
+`the DLSS launch buffer has a same-layout barrier on a DLSS input before its launch; not holding`,
+and the model ran after the upscaler on every shown frame (91 composited/s). Fixed in 2.0.3 (below).
+
 2.0.2 (0720dfd, deployed with `scripts/deploy-rig.sh`) against 2.0.1's code (d79c82a, the build
 installed on 2026-10-03; 2.0.1 only bumped the version after it), same day. LordNikon, RTX 5070,
 driver 615.71.09, 2560x1440 at 288 Hz, HDR desktop, DLSS Balanced (render 1485x836), GTA settings.xml
@@ -962,3 +968,37 @@ From every NR-on `launch.log` (2.0.2 runs 1-3, 2.0.1 run 1):
 - `capture_wait` session max: 13.42 / 6.16 / 14.08 ms (largest **14.08 ms**, against the 5000 ms
   bound). Benchmark runs only: loading screens are covered, alt-tab and resolution changes are
   not, so the bound is not changed yet.
+
+## 2026-10-05 -- 2.0.3
+
+**Why 2.0.2 refused GTA with frame generation on** (probe `v201-fg-probe-1`, NGX probe on 2.0.1,
+`FrameGenType` 1): SR's launch buffer starts with a dispatch, then copies depth and motion vectors
+for frame generation, each between `GENERAL -> GENERAL` barriers (`SHADER_READ -> TRANSFER_READ`
+and back on the game's motion vectors, `TRANSFER_WRITE -> SHADER_READ` on the copies), then SR's
+input launch. DLSS's depth and motion vectors are those copies. Nothing in the buffer touches the
+colour or exposure input. A hold reads only those two (depth and motion vectors only in `dump`
+mode), so 2.0.3 refuses a hold only for synchronization on them; a barrier on depth or motion
+vectors stops only a dump.
+
+2.0.3, Alex's settings as found (`FrameGenType` 1, `dlssFrameGenMode` 2), mods off, pass 4, 3 runs:
+
+| Run | Real fps | Shown fps | Held/s | GPU |
+|---|---|---|---|---|
+| 2.0.3 #1 | 68.2 | 68.6 | 68.8 | 94% |
+| 2.0.3 #2 | 68.1 | 68.3 | 68.7 | 94% |
+| 2.0.3 #3 | 68.3 | 68.6 | 68.9 | 94% |
+| 2.0.2 (3 runs, mean) | 22.7 | 90.5 | 0 | 97% |
+| 2.0.1 (2 runs) | 68.2 / 67.7 | 68.5 / 68.0 | 67.8 / 68.4 | 94% |
+| NR off, no layer | 91.3 | 92.5 | - | 66% |
+
+- Every DLSS frame held; no `not holding` line; `[shm] attached` once, no `[shm] refusing`; no
+  fence timeout, no Vulkan error. One over-budget miss and one breaker open/close at the first
+  hold, as on 2.0.1 and 2.0.2. `capture_wait` session max 8.09 / 6.84 / 6.63 ms.
+- **Frame generation was not shown in these benchmark launches**, with or without Neural Forge:
+  the layer's own `[present]` count equals the real frame rate (about 60/s), so no generated frame
+  was presented. NR off with no layer loaded showed none either, at `dlssFrameGenMode` 2 and at 0
+  (91.8 real, 92.8 shown; 2.0.3 at mode 0: 67.8 real, 68.5 shown, every frame held). The only
+  launches today that showed generated frames were 2.0.2's three (4x at 22.7 real). GTA's frame
+  generation did not engage reliably in benchmark launches on 2026-10-02 either. Holds with
+  generated frames shown are on record for the same hold on 2.0 (real play at 4x, about 50 real /
+  195 shown; benchmark at 2x, 56.9 real / 114.2 shown), not yet for 2.0.3.
