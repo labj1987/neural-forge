@@ -1001,4 +1001,19 @@ vectors stops only a dump.
   launches today that showed generated frames were 2.0.2's three (4x at 22.7 real). GTA's frame
   generation did not engage reliably in benchmark launches on 2026-10-02 either. Holds with
   generated frames shown are on record for the same hold on 2.0 (real play at 4x, about 50 real /
-  195 shown; benchmark at 2x, 56.9 real / 114.2 shown), not yet for 2.0.3.
+  195 shown; benchmark at 2x, 56.9 real / 114.2 shown).
+
+**After a restart of LordNikon, frame generation engaged with 2.0.3.** Same settings as found, mods
+off, no remote-desktop session, 4 launches:
+
+| Run | Real fps | Shown fps | Held/s | GPU | Frame generation |
+|---|---|---|---|---|---|
+| 2.0.3 #1 | 68.2 | 68.7 | 68.9 | 94% | not shown |
+| 2.0.3 #2 | 68.3 | 68.8 | 68.8 | 94% | not shown |
+| 2.0.3 #3 | **49.5** | **198.1** | **49.5** | 96% | **4x** |
+| NR off, no layer | 93.6 | 94.9 | - | 68% | not shown |
+
+Run 3 holds every real frame with frame generation at 4x, matching 2.0's hour of real play (about
+50 real / 195 shown). No `not holding`, no `[shm] refusing`, no fence timeout, no Vulkan error;
+`capture_wait` session max 6.33 / 6.49 / 6.39 ms. Frame generation's submits went through untouched
+(21,000 forwarded against 7,003 held).
