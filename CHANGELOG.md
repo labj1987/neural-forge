@@ -6,8 +6,19 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
+  `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
+- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
+  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
+  earlier needs proof that the presentation engine's wait on them has completed, which core
+  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
+- Deferred (layer): the unit-test target still carries clippy lints (mostly
+  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
+
+## 2.0.2 — 2026-10-05
+
 Remediation of two static code reviews (Vulkan submit handling; shared-memory protocol and CI).
-None of it has run on the GTA V machine yet.
+Built and tested on lavapipe and in CI only: this release is the one to test on the GTA V machine.
 
 - **Pre-upscaler: a DLSS submit is only split when that is provably safe.** Forwarded untouched,
   with one log line per reason: a barrier on a DLSS input (also `GENERAL -> GENERAL`, also a
@@ -32,14 +43,6 @@ None of it has run on the GTA V machine yet.
 - **Pre-upscaler: the hold's fence waits are named by class** (`FRAME_CAPTURE_WAIT`,
   `CLEANUP_WAIT`), both still 5 s, and the phase line reports the worst capture wait of the window
   and the session.
-- Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
-  `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
-- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
-  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
-  earlier needs proof that the presentation engine's wait on them has completed, which core
-  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
-- Deferred (layer): the unit-test target still carries clippy lints (mostly
-  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
 ## 2.0.1 — 2026-10-03
 
