@@ -53,13 +53,13 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use neural_forge_protocol::enums::proxy_format;
-use neural_forge_protocol::{answer_offset_slot, proxy_offset_slot, shm_default_path, shm_total_bytes, ShmHeader};
+use neural_forge_protocol::{answer_offset_slot, next_request, proxy_offset_slot, shm_default_path, shm_total_bytes, ShmHeader, Slot};
 
 /// What to send, from the command line.
 struct Args {
     width: u32,
     height: u32,
-    slot: usize,
+    slot: Slot,
     /// `--rgba16f FILE`: the raw half-float frame; `None` for the synthetic RGBA8 frame.
     rgba16f: Option<String>,
     /// `--rgba8 FILE`: a raw 8-bit frame.
@@ -80,9 +80,9 @@ fn parse_args() -> Args {
     if !raw.iter().any(|a| a.starts_with("--")) {
         // The original positional form.
         let num = |i: usize, default: u32| raw.get(i).map(|s| s.parse().unwrap_or_else(|_| usage())).unwrap_or(default);
-        return Args { width: num(0, 64), height: num(1, 64), slot: num(2, 0) as usize, rgba16f: None, rgba8: None, out: None, repeat: 1 };
+        return Args { width: num(0, 64), height: num(1, 64), slot: Slot::new(num(2, 0) as usize).unwrap_or_else(|| usage()), rgba16f: None, rgba8: None, out: None, repeat: 1 };
     }
-    let mut args = Args { width: 0, height: 0, slot: 0, rgba16f: None, rgba8: None, out: None, repeat: 4 };
+    let mut args = Args { width: 0, height: 0, slot: Slot::Primary, rgba16f: None, rgba8: None, out: None, repeat: 4 };
     let mut it = raw.into_iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -92,12 +92,12 @@ fn parse_args() -> Args {
             "--out" => args.out = Some(value()),
             "--width" => args.width = value().parse().unwrap_or_else(|_| usage()),
             "--height" => args.height = value().parse().unwrap_or_else(|_| usage()),
-            "--slot" => args.slot = value().parse().unwrap_or_else(|_| usage()),
+            "--slot" => args.slot = value().parse().ok().and_then(Slot::new).unwrap_or_else(|| usage()),
             "--repeat" => args.repeat = value().parse::<u32>().unwrap_or_else(|_| usage()).max(1),
             _ => usage(),
         }
     }
-    if args.width == 0 || args.height == 0 || args.slot > 1 || (args.rgba16f.is_some() && args.rgba8.is_some()) {
+    if args.width == 0 || args.height == 0 || (args.rgba16f.is_some() && args.rgba8.is_some()) {
         usage();
     }
     args
@@ -264,7 +264,7 @@ fn main() {
     let answer = unsafe { std::slice::from_raw_parts(base.add(answer_offset_slot(slot)), frame_bytes) };
     let mut evaluated = false;
     for round in 1..=args.repeat {
-        let seq = hdr.seq_req_slot(slot).load(Ordering::Relaxed).wrapping_add(1).max(1);
+        let seq = next_request(hdr.seq_req_slot(slot).load(Ordering::Relaxed));
         println!("trigger_helper_roundtrip: slot {slot}: {width}x{height} format={format}, requesting seq={seq} ({round}/{})", args.repeat);
         let sent = Instant::now();
         hdr.seq_req_slot(slot).store(seq, Ordering::Release);

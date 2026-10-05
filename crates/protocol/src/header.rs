@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::enums::{mvec_quality, mvec_scale_mode};
-use crate::{DEFAULT_MAX_PASSES, HEADER_BYTES, MAX_PASSES, NAME_BYTES, REASON_BYTES, SHM_MAGIC, SHM_VERSION};
+use crate::{Slot, DEFAULT_MAX_PASSES, HEADER_BYTES, MAX_PASSES, NAME_BYTES, REASON_BYTES, SHM_MAGIC, SHM_VERSION};
 
 /// One pass's overrides. Every field is present; `override_mask` says which of them
 /// mean anything — see [`crate::enums::pass_override`].
@@ -594,31 +594,38 @@ impl ShmHeader {
     }
 
     /// v3's two request/response slots (`docs/PROTOCOL_V3_DESIGN.md`) share every field
-    /// name and type; these are the one place that picks slot 0's or slot 1's field
-    /// by an actual `usize` index, so the layer and the helper -- both of which poll
-    /// both slots -- never have to hand-write their own `if slot == 0 { .. } else { .. }`
-    /// per field. `slot` is always 0 or 1 in this workspace; anything else is treated
-    /// as 1 rather than panicking (`debug_assert!` catches a real bug in a debug
-    /// build without turning a wrong index into a production abort).
-    pub fn seq_req_slot(&self, slot: usize) -> &AtomicU32 {
-        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
-        if slot == 0 { &self.seq_req } else { &self.seq_req_b }
+    /// name and type; these are the one place that picks slot 0's or slot 1's field, so the
+    /// layer and the helper -- both of which poll both slots -- never hand-write their own
+    /// choice per field. A [`Slot`] is one of exactly two, so there is no third case.
+    pub fn seq_req_slot(&self, slot: Slot) -> &AtomicU32 {
+        match slot {
+            Slot::Primary => &self.seq_req,
+            Slot::Secondary => &self.seq_req_b,
+        }
     }
-    pub fn seq_resp_slot(&self, slot: usize) -> &AtomicU32 {
-        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
-        if slot == 0 { &self.seq_resp } else { &self.seq_resp_b }
+    pub fn seq_resp_slot(&self, slot: Slot) -> &AtomicU32 {
+        match slot {
+            Slot::Primary => &self.seq_resp,
+            Slot::Secondary => &self.seq_resp_b,
+        }
     }
-    pub fn width_slot(&self, slot: usize) -> &AtomicU32 {
-        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
-        if slot == 0 { &self.width } else { &self.width_b }
+    pub fn width_slot(&self, slot: Slot) -> &AtomicU32 {
+        match slot {
+            Slot::Primary => &self.width,
+            Slot::Secondary => &self.width_b,
+        }
     }
-    pub fn height_slot(&self, slot: usize) -> &AtomicU32 {
-        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
-        if slot == 0 { &self.height } else { &self.height_b }
+    pub fn height_slot(&self, slot: Slot) -> &AtomicU32 {
+        match slot {
+            Slot::Primary => &self.height,
+            Slot::Secondary => &self.height_b,
+        }
     }
-    pub fn proxy_format_slot(&self, slot: usize) -> &AtomicU32 {
-        debug_assert!(slot < 2, "protocol v3 has exactly two slots");
-        if slot == 0 { &self.proxy_format } else { &self.proxy_format_b }
+    pub fn proxy_format_slot(&self, slot: Slot) -> &AtomicU32 {
+        match slot {
+            Slot::Primary => &self.proxy_format,
+            Slot::Secondary => &self.proxy_format_b,
+        }
     }
 
     /// Every setting a user can change from the GUI, as `("name", current bits)`
@@ -971,23 +978,23 @@ mod tests {
     #[test]
     fn slot_accessors_pick_the_matching_field() {
         let h = ShmHeader::default();
-        h.seq_req_slot(0).store(11, Ordering::Relaxed);
-        h.seq_req_slot(1).store(22, Ordering::Relaxed);
+        h.seq_req_slot(Slot::Primary).store(11, Ordering::Relaxed);
+        h.seq_req_slot(Slot::Secondary).store(22, Ordering::Relaxed);
         assert_eq!(h.seq_req.load(Ordering::Relaxed), 11);
         assert_eq!(h.seq_req_b.load(Ordering::Relaxed), 22);
-        assert_eq!(h.seq_req_slot(0).load(Ordering::Relaxed), 11);
-        assert_eq!(h.seq_req_slot(1).load(Ordering::Relaxed), 22);
+        assert_eq!(h.seq_req_slot(Slot::Primary).load(Ordering::Relaxed), 11);
+        assert_eq!(h.seq_req_slot(Slot::Secondary).load(Ordering::Relaxed), 22);
 
-        h.width_slot(0).store(2560, Ordering::Relaxed);
-        h.height_slot(0).store(1440, Ordering::Relaxed);
-        h.width_slot(1).store(1920, Ordering::Relaxed);
-        h.height_slot(1).store(1080, Ordering::Relaxed);
+        h.width_slot(Slot::Primary).store(2560, Ordering::Relaxed);
+        h.height_slot(Slot::Primary).store(1440, Ordering::Relaxed);
+        h.width_slot(Slot::Secondary).store(1920, Ordering::Relaxed);
+        h.height_slot(Slot::Secondary).store(1080, Ordering::Relaxed);
         assert_eq!(h.width.load(Ordering::Relaxed), 2560);
         assert_eq!(h.height.load(Ordering::Relaxed), 1440);
         assert_eq!(h.width_b.load(Ordering::Relaxed), 1920);
         assert_eq!(h.height_b.load(Ordering::Relaxed), 1080);
 
-        h.proxy_format_slot(1).store(crate::enums::proxy_format::BGRA8, Ordering::Relaxed);
+        h.proxy_format_slot(Slot::Secondary).store(crate::enums::proxy_format::BGRA8, Ordering::Relaxed);
         assert_eq!(h.proxy_format_b.load(Ordering::Relaxed), crate::enums::proxy_format::BGRA8);
         assert_eq!(h.proxy_format.load(Ordering::Relaxed), 0, "slot 0 must be untouched by a slot-1 write");
     }

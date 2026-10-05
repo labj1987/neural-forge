@@ -43,6 +43,7 @@ use std::time::Duration;
 use ash::vk;
 use neural_forge_helper::hdr::FormatClass;
 use neural_forge_helper::{frame, guard, history, ngx, optical_flow, scene, shm};
+use neural_forge_protocol::Slot;
 
 /// The helper's motion-vector state across frames: the GPU flow session (rebuilt when the
 /// model's frame size or the quality changes), a small luma thumbnail of the last frame for
@@ -278,27 +279,27 @@ fn main() {
                 hdr.set_helper_reason(note);
             }
         }
-        for slot in 0..2 {
+        for slot in Slot::ALL {
             let seq_req = hdr.seq_req_slot(slot).load(Ordering::Acquire);
-            if seq_req == last_seq_req[slot] {
+            if seq_req == last_seq_req[slot.index()] {
                 continue;
             }
             // A value behind the last one seen means the header was reinitialised under us
             // (wrapping distance, so a genuine u32 wrap is not mistaken for it). Whatever the
             // feature was built against is stale: drop it and let the next frame rebuild.
-            if seq_req.wrapping_sub(last_seq_req[slot]) > u32::MAX / 2 {
+            if seq_req.wrapping_sub(last_seq_req[slot.index()]) > u32::MAX / 2 {
                 neural_forge_helper::log!(
                     "[helper] slot {slot}: seq_req went backwards ({} -> {seq_req}); header reinitialised, resetting the feature",
-                    last_seq_req[slot]
+                    last_seq_req[slot.index()]
                 );
                 ngx::discard_features(&mut snippet, &device);
             }
-            last_seq_req[slot] = seq_req;
+            last_seq_req[slot.index()] = seq_req;
             last_request = Some(std::time::Instant::now());
             process_request(
                 hdr, &shm, &device, &instance, physical_device, queue, &mut snippet,
-                &mut frame_resources[slot], flow_queue.as_ref(), &mut motion,
-                &mut history_gaps[slot], slot, seq_req, helper_delay, &mut frames, &mut stages,
+                &mut frame_resources[slot.index()], flow_queue.as_ref(), &mut motion,
+                &mut history_gaps[slot.index()], slot, seq_req, helper_delay, &mut frames, &mut stages,
             );
         }
         hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
@@ -379,7 +380,7 @@ fn process_request(
     flow_queue: Option<&optical_flow::FlowQueue>,
     motion: &mut MotionState,
     history_gap: &mut history::HistoryGap,
-    slot: usize,
+    slot: Slot,
     seq_req: u32,
     helper_delay: Duration,
     frames: &mut u64,
@@ -491,7 +492,7 @@ fn process_request(
     // An RGBA16F frame (the layer's encoded proxy, display-referred in [0, 1]) is quantised to
     // 8 bits for these two only (the flow on the GPU, the scene-cut thumbnail on the CPU); the
     // model gets the proxy's half floats as they are.
-    let want_motion = class.filter(|_| slot == 0 && hdr.mvec_enabled());
+    let want_motion = class.filter(|_| slot == Slot::Primary && hdr.mvec_enabled());
     let t_setup = t_seen.elapsed();
     let scene_cut = motion.prepare(device, want_motion, proxy, width, height);
     let t_prepared = t_seen.elapsed();
@@ -570,13 +571,13 @@ fn process_request(
     hdr.seq_ok.store(seq_req, Ordering::Relaxed);
     // Slot 0 only, and only for a real answer: the pre-upscaler hold tells a model answer from an
     // echo of its own frame by this (`ShmHeader::seq_eval`), written before `seq_resp`.
-    if slot == 0 && evaluated {
+    if slot == Slot::Primary && evaluated {
         hdr.seq_eval.store(seq_req, Ordering::Relaxed);
     }
     // The raster this answer is for, echoed before `seq_resp` so the layer can refuse an answer
     // for a different size (another swapchain's request, or one from before a resize) instead of
     // reading the wrong number of bytes. Slot 0 only: slot 1 has no such field.
-    if slot == 0 {
+    if slot == Slot::Primary {
         hdr.answered_w.store(if dims_ok { width } else { 0 }, Ordering::Relaxed);
         hdr.answered_h.store(if dims_ok { height } else { 0 }, Ordering::Relaxed);
     }
@@ -584,11 +585,11 @@ fn process_request(
         std::thread::sleep(helper_delay);
     }
     let busy = t_seen.elapsed();
-    if slot == 0 {
+    if slot == Slot::Primary {
         hdr.helper_busy_us.store(u32::try_from(busy.as_micros()).unwrap_or(u32::MAX), Ordering::Relaxed);
     }
     hdr.seq_resp_slot(slot).store(seq_req, Ordering::Release);
-    if let (0, Some(t)) = (slot, timing.as_ref()) {
+    if let (Slot::Primary, Some(t)) = (slot, timing.as_ref()) {
         use neural_forge_helper::stages::ms;
         let row = [
             ms(stages.last_sleep),

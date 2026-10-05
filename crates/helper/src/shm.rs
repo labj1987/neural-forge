@@ -10,8 +10,8 @@
 use std::ffi::c_void;
 
 use neural_forge_protocol::{
-    answer_offset, answer_offset_slot, proxy_offset, proxy_offset_slot, shm_default_path, shm_total_bytes, MAX_FRAME, SHM_MAGIC,
-    SHM_VERSION,
+    answer_offset, answer_offset_slot, proxy_offset, proxy_offset_slot, shm_default_path, shm_total_bytes, Slot, MAX_FRAME,
+    SHM_MAGIC, SHM_VERSION,
 };
 
 #[link(name = "kernel32")]
@@ -290,7 +290,7 @@ impl ShmMapping {
     /// legitimate reason anything outside this module needs these addresses at all;
     /// every other caller already goes through
     /// [`Self::read_proxy`]/[`Self::write_answer`]/[`Self::frame_regions`].
-    pub fn proxy_and_answer_regions(&self, slot: usize) -> ((*mut u8, usize), (*mut u8, usize)) {
+    pub fn proxy_and_answer_regions(&self, slot: Slot) -> ((*mut u8, usize), (*mut u8, usize)) {
         let base = self.pixel_base();
         // SAFETY: both stay within the `shm_total_bytes()` mapping `open` established,
         // same reasoning as `frame_regions`' own pointer arithmetic.
@@ -310,7 +310,7 @@ impl ShmMapping {
     // Shared memory: the mutable view is into the mapping, not into `self`, and the caller's
     // ownership of the slot's request (the contract above) is what makes it exclusive.
     #[allow(clippy::mut_from_ref)]
-    pub unsafe fn frame_regions(&self, slot: usize, bytes: usize) -> (&[u8], &mut [u8]) {
+    pub unsafe fn frame_regions(&self, slot: Slot, bytes: usize) -> (&[u8], &mut [u8]) {
         let n = bytes.min(MAX_FRAME);
         let base = self.pixel_base();
         unsafe {

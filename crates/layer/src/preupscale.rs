@@ -85,6 +85,7 @@ use ash::vk::Handle;
 use vulkan_layer::LayerVulkanCommand as VulkanCommand;
 
 use crate::shm::ShmClient;
+use neural_forge_protocol::Slot;
 
 pub(crate) mod hdr;
 
@@ -2726,8 +2727,8 @@ impl Resources {
     ) -> Option<Self> {
         let (pw, ph) = padded(width, height);
         let bytes = u64::from(pw) * u64::from(ph) * TEXEL;
-        let (proxy_region, proxy_capacity) = shm.proxy_region(0)?;
-        let (answer_region, answer_capacity) = shm.answer_region(0)?;
+        let (proxy_region, proxy_capacity) = shm.proxy_region(Slot::Primary)?;
+        let (answer_region, answer_capacity) = shm.answer_region(Slot::Primary)?;
         if bytes > proxy_capacity as u64 || bytes > answer_capacity as u64 {
             return None;
         }
@@ -3462,10 +3463,10 @@ pub(crate) unsafe fn run_hold(
         Mode::Identity | Mode::Roundtrip => res.proxy.buffer,
         Mode::Model => {
             let (pw, ph) = padded(target.width, target.height);
-            let before = shm.last_request(0);
+            let before = shm.last_request(Slot::Primary);
             let answer = await_answer(shm, pw, ph, budget, &mut result.timing);
             // A request was started (`seq_req` bumped): it reached the helper.
-            result.request = Some(shm.last_request(0)).filter(|&r| r != before);
+            result.request = Some(shm.last_request(Slot::Primary)).filter(|&r| r != before);
             match answer {
                 Answer::Model => result.evaluated = true,
                 Answer::Echo => {
@@ -3529,15 +3530,15 @@ pub(crate) enum Answer {
 /// answer, at most `budget` (or until the helper stops being alive), spinning. Fills `timing`'s
 /// round trip and helper time.
 pub(crate) fn await_answer(shm: &mut ShmClient, pw: u32, ph: u32, budget: Duration, timing: &mut HoldTiming) -> Answer {
-    shm.set_frame_info(0, pw, ph, neural_forge_protocol::enums::proxy_format::RGBA16F);
-    if !shm.begin_async_request(0) {
+    shm.set_frame_info(Slot::Primary, pw, ph, neural_forge_protocol::enums::proxy_format::RGBA16F);
+    if !shm.begin_async_request(Slot::Primary) {
         return Answer::Missed("the request could not be started");
     }
     let start = Instant::now();
     let mut spins = 0u32;
     let mut why = "the helper did not answer";
     let answered = loop {
-        match shm.poll_async_request(0) {
+        match shm.poll_async_request(Slot::Primary) {
             Some(true) => break true,
             None => break false,
             Some(false) => {}
@@ -4196,7 +4197,7 @@ impl Session {
     /// holds), nothing is booked: no request of this path reached the helper, so neither the
     /// device's engagement nor the breaker may hear of it.
     pub(crate) fn note_busy_slot(&mut self, shm: &ShmClient, mode: Mode, extent: (u32, u32)) {
-        if mode == Mode::Model && self.own_request.is_some() && shm.pending_request(0) == self.own_request {
+        if mode == Mode::Model && self.own_request.is_some() && shm.pending_request(Slot::Primary) == self.own_request {
             let result = HoldResult { miss: Some("an earlier request is still with the helper"), over_budget: true, ..Default::default() };
             self.note(shm, &result, Duration::ZERO, extent);
         }
@@ -6343,8 +6344,8 @@ mod tests {
     impl FakeHelper {
         fn start(shm: &ShmClient, transform: fn(&mut [u8])) -> Self {
             let header = shm.test_header_ptr();
-            let proxy = shm.proxy_region(0).unwrap().0 as usize;
-            let answer = shm.answer_region(0).unwrap().0 as usize;
+            let proxy = shm.proxy_region(Slot::Primary).unwrap().0 as usize;
+            let answer = shm.answer_region(Slot::Primary).unwrap().0 as usize;
             let stop = Arc::new(AtomicBool::new(false));
             let mute = Arc::new(AtomicBool::new(false));
             let echo = Arc::new(AtomicBool::new(false));
@@ -6672,7 +6673,7 @@ mod tests {
         let mut session = Session::default();
         session.saw_dlss();
         // The post path's request, unanswered (no helper here).
-        assert!(shm.begin_async_request(0));
+        assert!(shm.begin_async_request(Slot::Primary));
         for _ in 0..(2 * BREAKER_MISSES) {
             session.note_busy_slot(&shm, Mode::Model, (64, 64));
         }
@@ -6683,8 +6684,8 @@ mod tests {
 
         // A hold of this path's own that ran over budget: its request is still in flight.
         let mut shm = ShmClient::test_over_header(&header);
-        assert!(shm.begin_async_request(0));
-        let late = HoldResult { waits_consumed: true, over_budget: true, request: shm.pending_request(0), miss: Some("the answer was over budget"), ..Default::default() };
+        assert!(shm.begin_async_request(Slot::Primary));
+        let late = HoldResult { waits_consumed: true, over_budget: true, request: shm.pending_request(Slot::Primary), miss: Some("the answer was over budget"), ..Default::default() };
         session.note(&shm, &late, Duration::from_millis(30), (64, 64));
         assert!(session.engaged, "a request that reached the helper engages the device");
         session.note_busy_slot(&shm, Mode::Model, (64, 64));
@@ -6862,11 +6863,11 @@ mod tests {
     }
 
     fn proxy_bytes(shm: &ShmClient, pw: u32, ph: u32) -> Vec<u8> {
-        unsafe { std::slice::from_raw_parts(shm.proxy_region(0).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec()
+        unsafe { std::slice::from_raw_parts(shm.proxy_region(Slot::Primary).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec()
     }
 
     fn answer_bytes(shm: &ShmClient, pw: u32, ph: u32) -> Vec<u8> {
-        unsafe { std::slice::from_raw_parts(shm.answer_region(0).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec()
+        unsafe { std::slice::from_raw_parts(shm.answer_region(Slot::Primary).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec()
     }
 
     /// Check (a): every texel of the padded proxy is the CPU encode of the colour input's texel
@@ -7018,7 +7019,7 @@ mod tests {
             wait_for_helper(&mut shm);
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 1, Duration::from_secs(10), &mut submit) };
             assert!(result.wrote_back, "{result:?}");
-            assert_eq!(result.request, Some(shm.last_request(0)), "the request that reached the helper");
+            assert_eq!(result.request, Some(shm.last_request(Slot::Primary)), "the request that reached the helper");
             assert_eq!(shm.answered_dims(), Some((pw, ph)), "the helper was asked for the padded size");
             let e = result.exposure.expect("the exposure value was read");
             assert!((e - 0.128).abs() < 1e-3, "the exposure image's value: {e}");
@@ -7046,7 +7047,7 @@ mod tests {
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 2, ANSWER_BUDGET, &mut submit) };
             let took = started.elapsed();
             assert!(!result.wrote_back && result.over_budget, "{result:?}");
-            assert!(result.request.is_some() && shm.pending_request(0) == result.request, "its own request is still in flight");
+            assert!(result.request.is_some() && shm.pending_request(Slot::Primary) == result.request, "its own request is still in flight");
             assert!(result.waits_consumed, "the capture itself went out (the waits are consumed either way)");
             assert!(took < Duration::from_secs(1), "a late answer must not hold the submit beyond its budget (took {took:?})");
             assert_eq!(gpu.read(image, w, h), after_model, "a missed answer leaves the frame untouched");
@@ -7092,7 +7093,7 @@ mod tests {
             };
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut submit) };
             assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{result:?}");
-            assert!(!shm.has_pending_request(0), "roundtrip never calls the helper");
+            assert!(!shm.has_pending_request(Slot::Primary), "roundtrip never calls the helper");
             let e = result.exposure.expect("exposure read");
             let proxy = proxy_bytes(&shm, pw, ph);
             let clamped = check_encode(&proxy, &original, w, h, e, white);
@@ -7231,7 +7232,7 @@ mod tests {
             assert!(result.miss.is_some_and(|m| m.contains("exposure value")), "{result:?}");
         }
         assert_eq!(submits, vec![Which::Capture, Which::Capture], "captures only, no write-back, with a zero one");
-        assert!(!shm.has_pending_request(0), "the helper was never asked");
+        assert!(!shm.has_pending_request(Slot::Primary), "the helper was never asked");
         assert_eq!(gpu.read(image, w, h), original, "the frame is untouched");
         let unreadable = Some(Aux { readable: false, ..exposure_aux(zero).unwrap() });
         let unknown_layout = Some(Aux { layout: None, ..exposure_aux(zero).unwrap() });

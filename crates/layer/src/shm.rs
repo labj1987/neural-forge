@@ -19,7 +19,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use neural_forge_protocol::{enums::helper_state, shm_default_path, MAX_FRAME, SHM_MAGIC};
+use neural_forge_protocol::{enums::helper_state, shm_default_path, Slot, MAX_FRAME, SHM_MAGIC};
 
 /// The subset of `ShmHeader`'s composition fields `composition::apply::apply_rgba8`
 /// needs, decoded once per frame from the raw atomics. See that field's own doc
@@ -96,18 +96,24 @@ enum Region {
 
 impl Region {
     const ALL: [Region; 4] = [Region::Proxy0, Region::Answer0, Region::Proxy1, Region::Answer1];
-    fn proxy(slot: usize) -> Self {
-        if slot == 0 { Region::Proxy0 } else { Region::Proxy1 }
+    fn proxy(slot: Slot) -> Self {
+        match slot {
+            Slot::Primary => Region::Proxy0,
+            Slot::Secondary => Region::Proxy1,
+        }
     }
-    fn answer(slot: usize) -> Self {
-        if slot == 0 { Region::Answer0 } else { Region::Answer1 }
+    fn answer(slot: Slot) -> Self {
+        match slot {
+            Slot::Primary => Region::Answer0,
+            Slot::Secondary => Region::Answer1,
+        }
     }
     fn offset(self) -> usize {
         match self {
-            Region::Proxy0 => neural_forge_protocol::proxy_offset_slot(0),
-            Region::Answer0 => neural_forge_protocol::answer_offset_slot(0),
-            Region::Proxy1 => neural_forge_protocol::proxy_offset_slot(1),
-            Region::Answer1 => neural_forge_protocol::answer_offset_slot(1),
+            Region::Proxy0 => neural_forge_protocol::proxy_offset_slot(Slot::Primary),
+            Region::Answer0 => neural_forge_protocol::answer_offset_slot(Slot::Primary),
+            Region::Proxy1 => neural_forge_protocol::proxy_offset_slot(Slot::Secondary),
+            Region::Answer1 => neural_forge_protocol::answer_offset_slot(Slot::Secondary),
         }
     }
 }
@@ -141,11 +147,11 @@ pub struct ShmClient {
     /// two fully independent request/response slots instead of one, so this is an
     /// array of two, not a single value -- each slot still only ever has one
     /// outstanding request at a time.
-    pending: [Option<(u32, Instant)>; 2],
+    pending: [Option<(u32, Instant)>; Slot::COUNT],
     /// Per-slot: the request number of the last round trip started with
     /// [`Self::begin_async_request`], kept after it resolves so [`Self::answer_evaluated`] can
     /// compare it with the helper's `seq_eval`.
-    last_req: [u32; 2],
+    last_req: [u32; Slot::COUNT],
 }
 
 // SAFETY: `header` points at a `MAP_SHARED` mapping that stays valid for the process's
@@ -367,7 +373,7 @@ impl ShmClient {
     /// `layer_attached`/`layer_heartbeat`/`layer_width`/`layer_height`/`layer_format`/
     /// `layer_frames` are status telemetry, not part of the handshake -- deliberately
     /// not per-slot; they just reflect whichever slot most recently captured.
-    pub fn set_frame_info(&mut self, slot: usize, width: u32, height: u32, proxy_format: u32) {
+    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32) {
         self.frames += 1;
         let frames = self.frames;
         let Some(hdr) = self.header() else { return };
@@ -473,7 +479,7 @@ impl ShmClient {
     ///
     /// # Safety
     /// Must only be called after a successful [`Self::open`]/[`Self::try_round_trip`].
-    pub fn write_proxy(&self, slot: usize, bytes: &[u8]) {
+    pub fn write_proxy(&self, slot: Slot, bytes: &[u8]) {
         let Some((dst, cap)) = self.region(Region::proxy(slot)) else { return };
         let n = bytes.len().min(cap);
         // SAFETY: `base` is the start of this process's own mapping of the full
@@ -497,7 +503,7 @@ impl ShmClient {
     /// which is why this never blocks or checks sequence numbers itself; the caller
     /// already knows from the round trip's own return value whether there is a real
     /// answer to read.
-    pub fn read_answer(&self, slot: usize, out: &mut [u8]) -> usize {
+    pub fn read_answer(&self, slot: Slot, out: &mut [u8]) -> usize {
         let Some((src, cap)) = self.region(Region::answer(slot)) else { return 0 };
         let n = out.len().min(cap);
         // SAFETY: same reasoning as `write_proxy`, mirrored for the answer region.
@@ -523,7 +529,7 @@ impl ShmClient {
     /// import: the *only* legitimate reason anything outside this module needs this
     /// address at all, since every other caller goes through [`Self::write_proxy`]
     /// instead.
-    pub fn proxy_region(&self, slot: usize) -> Option<(*mut u8, usize)> {
+    pub fn proxy_region(&self, slot: Slot) -> Option<(*mut u8, usize)> {
         // SAFETY: `pixel_base` plus `proxy_offset_slot(slot)` stays within the
         // `shm_total_bytes()` mapping `open_at` established, same reasoning as
         // `write_proxy`'s own pointer arithmetic.
@@ -534,7 +540,7 @@ impl ShmClient {
     /// [`Self::proxy_region`]. For `composition::gpu::GpuCompose`'s zero-copy compose, which
     /// imports it as device memory so the GPU reads the helper's answer where it landed instead
     /// of [`Self::read_answer`] copying it out first.
-    pub fn answer_region(&self, slot: usize) -> Option<(*mut u8, usize)> {
+    pub fn answer_region(&self, slot: Slot) -> Option<(*mut u8, usize)> {
         self.region(Region::answer(slot))
     }
 
@@ -730,7 +736,7 @@ impl ShmClient {
             return false;
         }
 
-        let req = hdr.seq_req.load(Ordering::Relaxed) + 1;
+        let req = neural_forge_protocol::next_request(hdr.seq_req.load(Ordering::Relaxed));
         std::sync::atomic::fence(Ordering::Release);
         hdr.seq_req.store(req, Ordering::Relaxed);
 
@@ -753,7 +759,9 @@ impl ShmClient {
 
         let start = Instant::now();
         loop {
-            if hdr.seq_resp.load(Ordering::Relaxed) >= req {
+            // Equality, not "at least": the counter wraps, and after the wrap an old answer is a
+            // larger number than the new request (`neural_forge_protocol::next_request`).
+            if hdr.seq_resp.load(Ordering::Relaxed) == req {
                 std::sync::atomic::fence(Ordering::Acquire);
                 self.timeouts = 0;
                 self.ever_answered = true;
@@ -789,18 +797,18 @@ impl ShmClient {
     /// outstanding request at a time (its own `seq_req`/`seq_resp` pair, not a
     /// queue); protocol v3 (`docs/PROTOCOL_V3_DESIGN.md`) is what makes there be two
     /// slots to ask this about instead of one.
-    pub fn has_pending_request(&self, slot: usize) -> bool {
-        self.pending[slot].is_some()
+    pub fn has_pending_request(&self, slot: Slot) -> bool {
+        self.pending[slot.index()].is_some()
     }
 
     /// The request number (`seq_req`) of the round trip in flight on this slot, if any.
-    pub fn pending_request(&self, slot: usize) -> Option<u32> {
-        self.pending[slot].map(|(req, _)| req)
+    pub fn pending_request(&self, slot: Slot) -> Option<u32> {
+        self.pending[slot.index()].map(|(req, _)| req)
     }
 
     /// The request number the last [`Self::begin_async_request`] on this slot started (0: none).
-    pub fn last_request(&self, slot: usize) -> u32 {
-        self.last_req[slot]
+    pub fn last_request(&self, slot: Slot) -> u32 {
+        self.last_req[slot.index()]
     }
 
     /// Starts a round trip on the given slot without waiting for it: bumps that
@@ -818,7 +826,7 @@ impl ShmClient {
     /// `seq_req` gets overwritten before `poll_async_request` ever sees a matching
     /// `seq_resp`) -- the two slots are otherwise completely independent, so a
     /// pending request on the *other* slot never blocks this call.
-    pub fn begin_async_request(&mut self, slot: usize) -> bool {
+    pub fn begin_async_request(&mut self, slot: Slot) -> bool {
         if !self.open() {
             self.dead = true;
             return false;
@@ -834,11 +842,11 @@ impl ShmClient {
             return false;
         }
 
-        let req = hdr.seq_req_slot(slot).load(Ordering::Relaxed) + 1;
+        let req = neural_forge_protocol::next_request(hdr.seq_req_slot(slot).load(Ordering::Relaxed));
         std::sync::atomic::fence(Ordering::Release);
         hdr.seq_req_slot(slot).store(req, Ordering::Relaxed);
-        self.pending[slot] = Some((req, Instant::now()));
-        self.last_req[slot] = req;
+        self.pending[slot.index()] = Some((req, Instant::now()));
+        self.last_req[slot.index()] = req;
         true
     }
 
@@ -846,7 +854,7 @@ impl ShmClient {
     /// [`Self::poll_async_request`] saw answered) is the model's, not an echo of the frame. The
     /// helper writes `seq_eval` before `seq_resp`, and only for a request it ran the model on.
     pub fn answer_evaluated(&self) -> bool {
-        self.header().is_some_and(|hdr| self.last_req[0] != 0 && hdr.seq_eval.load(Ordering::Relaxed) == self.last_req[0])
+        self.header().is_some_and(|hdr| self.last_req[Slot::Primary.index()] != 0 && hdr.seq_eval.load(Ordering::Relaxed) == self.last_req[Slot::Primary.index()])
     }
 
     /// Whether the helper says the model is built (`model_up`). 0 before the first build too, not
@@ -866,21 +874,22 @@ impl ShmClient {
     /// on this slot's cycle and start fresh rather than keep polling a request that
     /// will never resolve. Returns `Some(false)` (never blocks, never panics) if
     /// called with nothing pending on this slot.
-    pub fn poll_async_request(&mut self, slot: usize) -> Option<bool> {
-        let Some((req, sent_at)) = self.pending[slot] else { return Some(false) };
+    pub fn poll_async_request(&mut self, slot: Slot) -> Option<bool> {
+        let Some((req, sent_at)) = self.pending[slot.index()] else { return Some(false) };
         let Some(hdr) = self.header() else {
-            self.pending[slot] = None;
+            self.pending[slot.index()] = None;
             return None;
         };
-        if hdr.seq_resp_slot(slot).load(Ordering::Relaxed) >= req {
+        // Equality: see `round_trip_after_open`.
+        if hdr.seq_resp_slot(slot).load(Ordering::Relaxed) == req {
             std::sync::atomic::fence(Ordering::Acquire);
-            self.pending[slot] = None;
+            self.pending[slot.index()] = None;
             self.timeouts = 0;
             self.ever_answered = true;
             return Some(true);
         }
         if hdr.quit.load(Ordering::Relaxed) != 0 {
-            self.pending[slot] = None;
+            self.pending[slot.index()] = None;
             self.dead = true;
             return None;
         }
@@ -896,7 +905,7 @@ impl ShmClient {
         if sent_at.elapsed() < budget {
             return Some(false);
         }
-        self.pending[slot] = None;
+        self.pending[slot.index()] = None;
         self.timeouts += 1;
         if self.timeouts >= 4 {
             self.dead = true;
@@ -1111,19 +1120,19 @@ mod tests {
             }
         });
 
-        assert!(client.begin_async_request(0), "should start a request against an already-open mapping");
-        assert!(client.has_pending_request(0));
+        assert!(client.begin_async_request(Slot::Primary), "should start a request against an already-open mapping");
+        assert!(client.has_pending_request(Slot::Primary));
         // Real non-blocking behavior: a call arriving before the echo thread has had a
         // chance to run must not hang waiting -- it either sees `Some(false)` (not
         // answered yet) or, if the thread was fast enough, `Some(true)` -- either way
         // this call itself returns immediately.
-        let mut resolved = client.poll_async_request(0) == Some(true);
+        let mut resolved = client.poll_async_request(Slot::Primary) == Some(true);
         let deadline = Instant::now() + Duration::from_secs(2);
         while !resolved {
             assert!(Instant::now() < deadline, "poll_async_request never resolved true");
-            resolved = client.poll_async_request(0) == Some(true);
+            resolved = client.poll_async_request(Slot::Primary) == Some(true);
         }
-        assert!(!client.has_pending_request(0), "a resolved request must clear pending state");
+        assert!(!client.has_pending_request(Slot::Primary), "a resolved request must clear pending state");
         assert!(client.ever_answered);
         assert!(!client.dead);
 
@@ -1143,33 +1152,33 @@ mod tests {
         assert!(client.open_at(&path));
         header_of(&client).helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
 
-        assert!(client.begin_async_request(0));
-        assert!(client.begin_async_request(1));
-        assert!(client.has_pending_request(0));
-        assert!(client.has_pending_request(1));
+        assert!(client.begin_async_request(Slot::Primary));
+        assert!(client.begin_async_request(Slot::Secondary));
+        assert!(client.has_pending_request(Slot::Primary));
+        assert!(client.has_pending_request(Slot::Secondary));
 
         // Nothing has answered either slot yet.
-        assert_eq!(client.poll_async_request(0), Some(false));
-        assert_eq!(client.poll_async_request(1), Some(false));
+        assert_eq!(client.poll_async_request(Slot::Primary), Some(false));
+        assert_eq!(client.poll_async_request(Slot::Secondary), Some(false));
 
         // Answer slot 0 only.
         let req0 = header_of(&client).seq_req.load(Ordering::Relaxed);
         header_of(&client).seq_resp.store(req0, Ordering::Relaxed);
 
-        assert_eq!(client.poll_async_request(0), Some(true), "slot 0 should resolve once its own seq_resp catches up");
-        assert!(!client.has_pending_request(0));
+        assert_eq!(client.poll_async_request(Slot::Primary), Some(true), "slot 0 should resolve once its own seq_resp catches up");
+        assert!(!client.has_pending_request(Slot::Primary));
 
         // Slot 1 must still be genuinely pending -- answering slot 0 must not have
         // touched slot 1's own seq_req_b/seq_resp_b handshake at all.
-        assert!(client.has_pending_request(1), "slot 1 must still be pending after only slot 0 was answered");
-        assert_eq!(client.poll_async_request(1), Some(false));
+        assert!(client.has_pending_request(Slot::Secondary), "slot 1 must still be pending after only slot 0 was answered");
+        assert_eq!(client.poll_async_request(Slot::Secondary), Some(false));
         assert_eq!(header_of(&client).seq_resp_b.load(Ordering::Relaxed), 0, "nothing answered slot 1's own seq_resp_b");
 
         // Now answer slot 1 too.
         let req1 = header_of(&client).seq_req_b.load(Ordering::Relaxed);
         header_of(&client).seq_resp_b.store(req1, Ordering::Relaxed);
-        assert_eq!(client.poll_async_request(1), Some(true));
-        assert!(!client.has_pending_request(1));
+        assert_eq!(client.poll_async_request(Slot::Secondary), Some(true));
+        assert!(!client.has_pending_request(Slot::Secondary));
     }
 
     #[test]
@@ -1179,17 +1188,111 @@ mod tests {
         assert!(client.open_at(&path));
         // helper_state defaults to STOPPED -- short "nobody's listening" budget (20ms),
         // so this test still runs fast despite exercising a real timeout.
-        assert!(client.begin_async_request(0));
-        assert!(client.has_pending_request(0));
+        assert!(client.begin_async_request(Slot::Primary));
+        assert!(client.has_pending_request(Slot::Primary));
 
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut result = client.poll_async_request(0);
+        let mut result = client.poll_async_request(Slot::Primary);
         while result == Some(false) {
             assert!(Instant::now() < deadline, "poll_async_request never gave up");
-            result = client.poll_async_request(0);
+            result = client.poll_async_request(Slot::Primary);
         }
         assert_eq!(result, None, "an unanswered request past budget must resolve to None, not Some(true)");
-        assert!(!client.has_pending_request(0), "a timed-out request must clear pending state too");
+        assert!(!client.has_pending_request(Slot::Primary), "a timed-out request must clear pending state too");
+    }
+
+    /// Echoes each slot's `seq_req` into its `seq_resp`, as the helper does, until dropped.
+    struct Echo {
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl Echo {
+        fn start(header: &ShmHeader) -> Self {
+            let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (flag, ptr) = (std::sync::Arc::clone(&stop), std::ptr::from_ref(header) as usize);
+            let thread = std::thread::spawn(move || {
+                // SAFETY: the header outlives the thread (joined in `drop`, before the test's
+                // header goes away).
+                let hdr = unsafe { &*(ptr as *const ShmHeader) };
+                while !flag.load(Ordering::Relaxed) {
+                    for slot in Slot::ALL {
+                        let req = hdr.seq_req_slot(slot).load(Ordering::Relaxed);
+                        if hdr.seq_resp_slot(slot).load(Ordering::Relaxed) != req {
+                            hdr.seq_resp_slot(slot).store(req, Ordering::Relaxed);
+                        }
+                    }
+                    std::thread::sleep(Duration::from_micros(100));
+                }
+            });
+            Self { stop, thread: Some(thread) }
+        }
+    }
+
+    impl Drop for Echo {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(thread) = self.thread.take() {
+                thread.join().ok();
+            }
+        }
+    }
+
+    /// The request numbers issued across the `u32` wrap, and the answers they are paired with.
+    const ACROSS_THE_WRAP: [u32; 4] = [u32::MAX - 1, u32::MAX, 1, 2];
+
+    #[test]
+    fn synchronous_requests_stay_paired_with_their_answers_across_the_wrap() {
+        let header = Box::new(ShmHeader::default());
+        header.init_defaults();
+        header.helper_state.store(helper_state::RUNNING, Ordering::Relaxed);
+        header.seq_req.store(u32::MAX - 2, Ordering::Relaxed);
+        header.seq_resp.store(u32::MAX - 2, Ordering::Relaxed);
+        let mut client = ShmClient::test_over_header(&header);
+        {
+            let _echo = Echo::start(&header);
+            for expected in ACROSS_THE_WRAP {
+                assert!(client.round_trip_after_open(), "request {expected:#x} was answered");
+                assert_eq!(header.seq_req.load(Ordering::Relaxed), expected, "0 is never issued");
+                assert_eq!(header.seq_resp.load(Ordering::Relaxed), expected);
+            }
+        }
+        // The answer to the last request before the wrap is still in `seq_resp` when the first
+        // one after it goes out, and nothing answers: 0xffffffff must not pass for request 1.
+        header.helper_state.store(helper_state::STOPPED, Ordering::Relaxed);
+        header.seq_req.store(u32::MAX, Ordering::Relaxed);
+        header.seq_resp.store(u32::MAX, Ordering::Relaxed);
+        assert!(!client.round_trip_after_open(), "an old, larger answer is not this request's");
+        assert_eq!(header.seq_req.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn asynchronous_requests_stay_paired_with_their_answers_across_the_wrap() {
+        for slot in Slot::ALL {
+            let header = Box::new(ShmHeader::default());
+            header.init_defaults();
+            header.helper_state.store(helper_state::RUNNING, Ordering::Relaxed);
+            header.seq_req_slot(slot).store(u32::MAX - 2, Ordering::Relaxed);
+            header.seq_resp_slot(slot).store(u32::MAX - 2, Ordering::Relaxed);
+            let mut client = ShmClient::test_over_header(&header);
+            for expected in ACROSS_THE_WRAP {
+                assert!(client.begin_async_request(slot));
+                assert_eq!(client.pending_request(slot), Some(expected), "slot {slot}");
+                assert_eq!(client.last_request(slot), expected);
+                // Not answered yet: the previous answer (larger than the request, once the
+                // counter has wrapped) does not resolve it.
+                assert_eq!(client.poll_async_request(slot), Some(false), "slot {slot}, request {expected:#x}");
+                header.seq_resp_slot(slot).store(expected, Ordering::Relaxed);
+                assert_eq!(client.poll_async_request(slot), Some(true), "slot {slot}, request {expected:#x}");
+                assert!(!client.has_pending_request(slot));
+            }
+            // Slot 0's model answers are told from echoes by `seq_eval == request`: still true
+            // for a request numbered after the wrap, since 0 was skipped.
+            if slot == Slot::Primary {
+                header.seq_eval.store(2, Ordering::Relaxed);
+                assert!(client.answer_evaluated());
+            }
+        }
     }
 
     #[test]

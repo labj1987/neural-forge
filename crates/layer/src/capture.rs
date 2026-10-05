@@ -20,6 +20,7 @@
 use ash::vk;
 
 use crate::shm::ShmClient;
+use neural_forge_protocol::Slot;
 
 pub struct CaptureResources {
     queue_family: u32,
@@ -106,7 +107,7 @@ impl CaptureBuffer {
 ///
 /// Never touches [`CaptureBuffer`]'s own full-resolution buffer/copy at all: the
 /// full-resolution bytes this slot always still produces are what `run` swaps into
-/// `inflight[slot].original`, the compositor's motion-mask reference, which must stay
+/// `inflight[slot.index()].original`, the compositor's motion-mask reference, which must stay
 /// full-resolution (see `run`'s own doc comment on `raw_answer_base`).
 struct ModelScratch {
     image: vk::Image,
@@ -582,8 +583,8 @@ impl Inflight {
 /// Whether the zero-copy capture of wire slot `slot` still has a GPU write into that slot's
 /// proxy region in flight. The pre-upscaler path (`crate::preupscale`) writes the same region and
 /// must not start while this is so.
-pub(crate) fn direct_slot_busy(direct: &[Option<DirectCapture>; 2], slot: usize) -> bool {
-    direct[slot].as_ref().is_some_and(|d| d.pending.is_some())
+pub(crate) fn direct_slot_busy(direct: &[Option<DirectCapture>; 2], slot: Slot) -> bool {
+    direct[slot.index()].as_ref().is_some_and(|d| d.pending.is_some())
 }
 
 /// `working_scale × (width, height)`, rounded to the nearest even number (several
@@ -719,7 +720,7 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 /// (alignment checks fail it back to `CapturePipeline` on every device tested so far,
 /// see `docs/HARDWARE_VALIDATION.md`), so it is not worth the same surgery until it is.
 /// `original_scratch` is always the full-resolution capture regardless of `model` --
-/// callers still swap it into `inflight[slot].original` unchanged; `model_scratch`
+/// callers still swap it into `inflight[slot.index()].original` unchanged; `model_scratch`
 /// receives the scaled bytes only when `model` was requested and actually available
 /// this poll (a rebuild-in-progress or first-ever call can still miss a poll, in which
 /// case this falls back to sending the full-resolution proxy that frame, same
@@ -754,7 +755,7 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 /// copy out of the proxy region is skipped. Every other completion copies as before.
 #[allow(clippy::too_many_arguments)]
 fn poll_or_submit_capture(
-    slot: usize,
+    slot: Slot,
     use_direct: bool,
     external_memory_host: &mut bool,
     pipeline: &mut Option<CapturePipeline>,
@@ -798,7 +799,7 @@ fn poll_or_submit_capture(
             .map_or(capacity as u64, |alignment| frame_bytes.div_ceil(alignment) * alignment)
             .min(capacity as u64);
         if !unsafe {
-            ensure_direct_capture(&mut direct[slot], device, instance, physical_device, queue_family, host_ptr, import_bytes)
+            ensure_direct_capture(&mut direct[slot.index()], device, instance, physical_device, queue_family, host_ptr, import_bytes)
         } {
             note_setup_failure();
             *external_memory_host = false;
@@ -809,7 +810,7 @@ fn poll_or_submit_capture(
             }
             return CaptureStep::Failed;
         }
-        let d = direct[slot].as_mut().expect("just ensured above");
+        let d = direct[slot.index()].as_mut().expect("just ensured above");
         let polled = poll_direct_capture(d, device);
         if let Some(ms) = d.timer.as_mut().and_then(crate::gpu_timer::GpuTimer::take_reading) {
             shm.publish_capture_gpu_ms(ms);
@@ -851,7 +852,7 @@ fn poll_or_submit_capture(
         let p = pipeline.as_mut().expect("just ensured above");
         let t_copy = std::time::Instant::now();
         let (full, model_dims) = poll_pipeline_capture(p, slot, device, original_scratch, model_scratch);
-        if let Some(ms) = p.slots[slot].timer.as_mut().and_then(crate::gpu_timer::GpuTimer::take_reading) {
+        if let Some(ms) = p.slots[slot.index()].timer.as_mut().and_then(crate::gpu_timer::GpuTimer::take_reading) {
             shm.publish_capture_gpu_ms(ms);
         }
         if full.is_some_and(|(w, h, f, submitted)| usable(w, h, f, submitted)) {
@@ -909,7 +910,7 @@ fn poll_or_submit_capture(
             model,
             encode_push,
         );
-        if submitted || p.slots[slot].pending.is_some() {
+        if submitted || p.slots[slot.index()].pending.is_some() {
             CaptureStep::Pending
         } else {
             CaptureStep::Failed
@@ -1156,7 +1157,7 @@ pub unsafe fn run(
     // device, never per-slot (see `direct_capture`'s own doc comment in `device.rs`),
     // so a single combined decision is what `run` actually needs here.
     let use_direct = *external_memory_host
-        && (0..2).all(|slot| {
+        && Slot::ALL.into_iter().all(|slot| {
             shm.proxy_region(slot).is_some_and(|(ptr, capacity)| {
                 min_imported_host_pointer_alignment(instance, physical_device).is_some_and(|alignment| {
                     let alignment = alignment as usize;
@@ -1244,7 +1245,7 @@ pub unsafe fn run(
         // The one-shot bootstrap only ever needs one wire slot -- deliberately always
         // slot 0, exactly like `run_sync`'s own single-slot debug path, so it never
         // depends on protocol v3's second slot existing at all.
-        const SLOT: usize = 0;
+        const SLOT: Slot = Slot::Primary;
         if *bootstrap_complete {
             return None;
         }
@@ -1274,8 +1275,8 @@ pub unsafe fn run(
             shm, original_scratch, model_scratch, None, None,
         ) {
             if answer_region_free(gpu_compose, device) && shm.begin_async_request(SLOT) {
-                inflight[SLOT].dims = Some((width, height, proxy_format));
-                inflight[SLOT].proxy_dims = None;
+                inflight[SLOT.index()].dims = Some((width, height, proxy_format));
+                inflight[SLOT.index()].proxy_dims = None;
             }
         }
         return None;
@@ -1305,7 +1306,7 @@ pub unsafe fn run(
     // region: the same live alignment check as the proxy regions above, with the import sized to
     // the frame rounded up to that alignment (not the whole region: fewer pinned pages).
     let answer_import = if use_direct {
-        shm.answer_region(0).and_then(|(ptr, capacity)| {
+        shm.answer_region(Slot::Primary).and_then(|(ptr, capacity)| {
             let alignment = min_imported_host_pointer_alignment(instance, physical_device)?;
             let bytes = frame_bytes.div_ceil(alignment) * alignment;
             ((ptr as u64).is_multiple_of(alignment) && bytes <= capacity as u64).then_some((ptr, bytes))
@@ -1335,14 +1336,14 @@ pub unsafe fn run(
     // the answer region and the frame in the capture target, and neither was copied to the CPU.
     let mut zc_fresh = false;
     if pipelined_present() {
-        for slot in 0..2 {
+        for slot in Slot::ALL {
             // Poll whatever was sent on some earlier frame *before* touching anything
-            // else -- `inflight[slot]`'s current contents correspond to it, and must be
+            // else -- `inflight[slot.index()]`'s current contents correspond to it, and must be
             // read (below) before a new capture this same frame (if one happens) is
             // allowed to replace them.
             let mut have_answer = false;
             // Captured *before* the submit branch below can overwrite
-            // `inflight[slot].proxy_dims` with a brand-new request's own dims -- reading
+            // `inflight[slot.index()].proxy_dims` with a brand-new request's own dims -- reading
             // it again after that point would describe the wrong request. `(width,
             // height)` is a safe placeholder while `have_answer` is `false`; nothing below
             // reads `answer_dims` unless `have_answer` is `true`, at which point it was
@@ -1350,22 +1351,22 @@ pub unsafe fn run(
             let mut answer_dims = (width, height);
             if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(true) {
                 // The answer comes back at whatever resolution *this outstanding
-                // request* was actually sent at (`inflight[slot].proxy_dims`), not
+                // request* was actually sent at (`inflight[slot.index()].proxy_dims`), not
                 // necessarily this frame's own `(width, height)` -- see
                 // `Inflight::proxy_dims`'s own doc comment. Falls back to the
                 // swapchain's own `frame_bytes` when `proxy_dims` is `None`, the only
                 // possibility before `working_scale` existed.
-                answer_dims = inflight[slot].proxy_dims.unwrap_or((width, height));
+                answer_dims = inflight[slot.index()].proxy_dims.unwrap_or((width, height));
                 let (aw, ah) = answer_dims;
                 let answer_bytes = (u64::from(aw) * u64::from(ah) * bytes_per_pixel) as usize;
                 answer_scratch.resize(answer_bytes, 0);
                 shm.read_answer(slot, answer_scratch);
                 // Preserve the exact game frame supplied to the model before the next
-                // request replaces `inflight[slot].original`; the temporal GPU path
+                // request replaces `inflight[slot.index()].original`; the temporal GPU path
                 // uses it to carry only the model's enhancement delta onto current
                 // frames.
                 raw_answer_base.clear();
-                raw_answer_base.extend_from_slice(&inflight[slot].original);
+                raw_answer_base.extend_from_slice(&inflight[slot.index()].original);
                 have_answer = true;
             }
 
@@ -1396,19 +1397,19 @@ pub unsafe fn run(
                 ) {
                     let (sent_w, sent_h) = captured.sent;
                     if answer_region_free(gpu_compose, device) && shm.begin_async_request(slot) {
-                        std::mem::swap(&mut inflight[slot].original, original_scratch);
-                        inflight[slot].dims = Some((width, height, proxy_format));
+                        std::mem::swap(&mut inflight[slot.index()].original, original_scratch);
+                        inflight[slot.index()].dims = Some((width, height, proxy_format));
                         // The proxy's *actual* sent dims, straight from
                         // `poll_or_submit_capture`'s own return -- not re-derived from
                         // `model_request` here, which would be wrong whenever that
                         // function fell back to full-resolution (a scratch build/resize
                         // failure, or `use_direct`) despite scaling being requested.
-                        inflight[slot].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
+                        inflight[slot.index()].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
                     }
                 }
             }
 
-            if have_answer && inflight[slot].dims == Some((width, height, proxy_format)) && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+            if have_answer && inflight[slot.index()].dims == Some((width, height, proxy_format)) && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
                 // Retain the model's raw answer for continuous re-presentation below --
                 // deliberately *not* run through `composition::gpu`/`composition::apply`'s
                 // tone-map compositor. That compositor's `UpgradeToneMap` targets `original`'s
@@ -1461,19 +1462,19 @@ pub unsafe fn run(
         // presented untouched, and the late request is never waited on again, so a slow,
         // warming-up, restarted or missing helper can delay a frame by at most the budget and
         // can never hang the game.
-        const SLOT: usize = 0;
+        const SLOT: Slot = Slot::Primary;
         // Model interval: on the presents between model runs, carry the last answer onto this
         // frame instead of capturing and waiting (the pipelined mode's way, for one frame at a
         // time). With frame generation this spares the generated frames the model's wait.
-        let present_no = inflight[SLOT].presents;
-        inflight[SLOT].presents = present_no.wrapping_add(1);
+        let present_no = inflight[SLOT.index()].presents;
+        inflight[SLOT.index()].presents = present_no.wrapping_add(1);
         // An answer to carry is either the CPU pair or, after a zero-copy present, the GPU's.
         let answer_held = !last_answer.is_empty() || gpu_compose.as_ref().is_some_and(|gpu| gpu.holds_generation(*raw_answer_generation));
         let carry = settings.model_interval > 1
             && !present_no.is_multiple_of(u64::from(settings.model_interval))
             && !settings.hold_frame
             && answer_held
-            && inflight[SLOT].dims == Some((width, height, proxy_format));
+            && inflight[SLOT.index()].dims == Some((width, height, proxy_format));
         if carry {
             carried_answer = true;
         }
@@ -1487,7 +1488,7 @@ pub unsafe fn run(
             let deadline = std::time::Instant::now() + SYNC_BUDGET;
             // Left over from a frame that ran out of time (or from pipelined mode): its answer
             // belongs to an old frame. Discard it when it lands; never block on it.
-            for slot in 0..2 {
+            for slot in Slot::ALL {
                 if shm.has_pending_request(slot) && shm.poll_async_request(slot) == Some(false) && slot == SLOT {
                     shm.publish_frame_timing(pipeline_start.elapsed(), false);
                     return None;
@@ -1512,7 +1513,7 @@ pub unsafe fn run(
                 }
                 if let Some(gpu) = gpu_compose.as_mut() {
                     if gpu.ensure_answer_import(device, instance, physical_device, answer_ptr, import_bytes) {
-                        let capture_idle = direct[SLOT].as_ref().is_none_or(|d| d.pending.is_none());
+                        let capture_idle = direct[SLOT.index()].as_ref().is_none_or(|d| d.pending.is_none());
                         zc_target = gpu.zero_copy_capture_target(device, instance, physical_device, queue, frame_bytes, capture_idle);
                     }
                 }
@@ -1599,8 +1600,8 @@ pub unsafe fn run(
                 shm.publish_frame_timing(pipeline_start.elapsed(), false);
                 return None;
             }
-            inflight[SLOT].dims = Some((width, height, proxy_format));
-            inflight[SLOT].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
+            inflight[SLOT.index()].dims = Some((width, height, proxy_format));
+            inflight[SLOT.index()].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
             let helper_ms = loop {
                 match shm.poll_async_request(SLOT) {
                     Some(true) => {
@@ -2193,18 +2194,18 @@ fn build_pipeline(
 /// `pipeline.slots[0]` to wire slot 0's captures and `pipeline.slots[1]` to wire slot
 /// 1's, one-to-one, rather than handing either wire slot whichever GPU buffer happens
 /// to be free. That mapping is sound precisely because a caller only ever submits a
-/// new capture into `pipeline.slots[slot]` when wire slot `slot` itself has no
+/// new capture into `pipeline.slots[slot.index()]` when wire slot `slot` itself has no
 /// request outstanding (see `run`'s own orchestration) -- by the time that's true,
 /// any earlier capture headed for this same wire slot has already been polled out
 /// and sent, so this GPU slot is free too, not just "some" slot in a shared pool.
 fn poll_pipeline_capture(
     pipeline: &mut CapturePipeline,
-    slot: usize,
+    slot: Slot,
     device: &ash::Device,
     out: &mut Vec<u8>,
     out_model: &mut Vec<u8>,
 ) -> (Option<CompletedCapture>, Option<(u32, u32)>) {
-    let slot = &mut pipeline.slots[slot];
+    let slot = &mut pipeline.slots[slot.index()];
     let Some((width, height, proxy_format, model_dims, submitted)) = slot.pending else { return (None, None) };
     // SAFETY: `slot.buf.fence` belongs to this slot; a status query never touches
     // command-buffer/buffer/memory state, so it's sound to call regardless of
@@ -2272,7 +2273,7 @@ fn poll_pipeline_capture(
 #[allow(clippy::too_many_arguments)]
 fn submit_pipeline_capture(
     pipeline: &mut CapturePipeline,
-    slot: usize,
+    slot: Slot,
     device: &ash::Device,
     instance: &ash::Instance,
     physical_device: vk::PhysicalDevice,
@@ -2289,7 +2290,7 @@ fn submit_pipeline_capture(
     // they are disjoint fields of the same struct.
     let CapturePipeline { slots, encode, .. } = pipeline;
     let encode = encode.as_ref();
-    let slot = &mut slots[slot];
+    let slot = &mut slots[slot.index()];
     if slot.pending.is_some() {
         return false;
     }
@@ -2392,11 +2393,11 @@ pub(crate) fn test_capture_once(
     }
     let p = pipeline.as_mut()?;
     let push = crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: 0, reversible_mode: 0 };
-    let submitted = submit_pipeline_capture(p, 0, device, instance, physical_device, queue, image, layout, width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None, push);
+    let submitted = submit_pipeline_capture(p, Slot::Primary, device, instance, physical_device, queue, image, layout, width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None, push);
     // SAFETY: `queue` is the test's own; waiting for it idle completes the capture.
     unsafe { device.queue_wait_idle(queue) }.ok()?;
     let (mut out, mut model) = (Vec::new(), Vec::new());
-    let (full, _) = poll_pipeline_capture(p, 0, device, &mut out, &mut model);
+    let (full, _) = poll_pipeline_capture(p, Slot::Primary, device, &mut out, &mut model);
     // SAFETY: the queue is idle, so nothing references the pipeline any more.
     unsafe { destroy_pipeline(pipeline, device) };
     (submitted && full.is_some()).then_some(out)
@@ -3021,7 +3022,7 @@ unsafe fn run_sync(
     // `captured` (a shared view of `r.ptr`) lives only inside this block, so it is
     // provably dead before the `&mut` view of the same memory is created for
     // `answer_dst` further down -- the two never coexist.
-    const SLOT: usize = 0;
+    const SLOT: Slot = Slot::Primary;
     let t_snapshot_start = std::time::Instant::now();
     let (t_snapshot, t_write_proxy) = {
         // SAFETY: `r.ptr` is a live mapping of at least `frame_bytes` bytes (see above).
@@ -3817,8 +3818,8 @@ mod tests {
         // The measured white point would depend on the meter's process-wide phase.
         hdr.white_point_source.store(neural_forge_protocol::enums::white_point_source::MANUAL, AtomicOrdering::Relaxed);
         hdr.hold_frame.store(u32::from(hold), AtomicOrdering::Relaxed);
-        let proxy_region = shm.proxy_region(0).unwrap().0 as usize;
-        let answer_region = shm.answer_region(0).unwrap().0 as usize;
+        let proxy_region = shm.proxy_region(Slot::Primary).unwrap().0 as usize;
+        let answer_region = shm.answer_region(Slot::Primary).unwrap().0 as usize;
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
@@ -4180,8 +4181,8 @@ mod tests {
         hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
         let (width, height) = (16u32, 16u32);
         let frame_bytes = (width * height * 4) as usize;
-        let proxy_region = shm.proxy_region(0).unwrap().0 as usize;
-        let answer_region = shm.answer_region(0).unwrap().0 as usize;
+        let proxy_region = shm.proxy_region(Slot::Primary).unwrap().0 as usize;
+        let answer_region = shm.answer_region(Slot::Primary).unwrap().0 as usize;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
         // Read before the thread starts: a thread scheduled after `run_sync` has already bumped
@@ -4272,7 +4273,7 @@ mod tests {
         let (mut original, mut model) = (Vec::new(), Vec::new());
         let mut step = |w: u32, h: u32, after: Option<Instant>| {
             let step = poll_or_submit_capture(
-                0, false, &mut false, &mut pipeline, &mut direct, &device, &instance, physical_device, queue, queue_family,
+                Slot::Primary, false, &mut false, &mut pipeline, &mut direct, &device, &instance, physical_device, queue, queue_family,
                 image, vk::ImageLayout::PRESENT_SRC_KHR, w, h, proxy_format, frame_bytes, None,
                 crate::composition::encode_pass::EncodePush { white_point: 1.0, bgr_order: 0, reversible_mode: 0 },
                 &mut shm, &mut original, &mut model, None, after,
@@ -4695,10 +4696,10 @@ mod tests {
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = [0u32; 2];
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                for slot in 0..2 {
+                for slot in Slot::ALL {
                     let req = hdr.seq_req_slot(slot).load(AtomicOrdering::Relaxed);
-                    if req != 0 && req != last_seen[slot] {
-                        last_seen[slot] = req;
+                    if req != 0 && req != last_seen[slot.index()] {
+                        last_seen[slot.index()] = req;
                         let (w, h) = (hdr.width_slot(slot).load(AtomicOrdering::Relaxed), hdr.height_slot(slot).load(AtomicOrdering::Relaxed));
                         if (w, h) != (expected_model_w, expected_model_h) {
                             wrong_clone.store(true, AtomicOrdering::Relaxed);
@@ -4836,10 +4837,10 @@ mod tests {
                 // A helper whose heartbeat stands still reads as dead, and `run` then returns
                 // before capturing: without this the benchmark timed mostly no-op presents.
                 hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
-                for slot in 0..2 {
+                for slot in Slot::ALL {
                     let req = hdr.seq_req_slot(slot).load(AtomicOrdering::Relaxed);
-                    if req != 0 && req != last[slot] {
-                        last[slot] = req;
+                    if req != 0 && req != last[slot.index()] {
+                        last[slot.index()] = req;
                         hdr.seq_resp_slot(slot).store(req, AtomicOrdering::Relaxed);
                     }
                 }

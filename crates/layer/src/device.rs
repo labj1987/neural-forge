@@ -12,6 +12,7 @@ use vulkan_layer::{DeviceHooks, DeviceInfo, LayerResult, LayerVulkanCommand as V
 
 use crate::capture;
 use crate::shm::ShmClient;
+use neural_forge_protocol::Slot;
 use crate::swapchain::{self, SwapchainState};
 
 /// The one swapchain (across every device in this process) allowed to drive the
@@ -972,13 +973,13 @@ impl NeuralForgeDeviceInfo {
         // Slot 0 must be free: no request (the post path's, or an earlier hold's that ran over
         // budget) still with the helper, no zero-copy capture still writing its proxy region, and
         // in model mode no compose still reading its answer region.
-        if shm.has_pending_request(0) && shm.poll_async_request(0) == Some(false) {
+        if shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
             // Booked as a late answer only when the request is this path's own; the post path's
             // says nothing about this path (and must not engage the device).
             session.note_busy_slot(shm, mode, (colour.width, colour.height));
             return None;
         }
-        if capture::direct_slot_busy(direct_capture, 0) {
+        if capture::direct_slot_busy(direct_capture, Slot::Primary) {
             return None;
         }
         if mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(&self.device)) {
