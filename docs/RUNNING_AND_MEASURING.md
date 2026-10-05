@@ -141,9 +141,20 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
 - **Early exit at "Game Init".** GTA sometimes crashes at `GTA5_Enhanced.exe+0x12c6eb` during
   start-up, with or without Neural Forge. The runner says "launch exited early" and writes no
   `benchmark.txt`. Run it again straight away.
-- **Frame generation does not always engage.** With DLSS Frame Generation on, check shown fps:
-  some launches present only real frames. GTA's setting is `FrameGenType` in `settings.xml`
-  (0 off, 1 on).
+- **Test as it is played: frame generation on.** Release checks run with GTA's `settings.xml` as
+  Alex has it (`FrameGenType` 1, `dlssFrameGenMode` 0/1/2 = 2x/3x/4x). Frame-generation-off runs
+  are comparisons only; 2.0.2 passed them and failed with frame generation on.
+- **Frame generation does not engage in every launch, and only engaged runs count.** GTA decides
+  at each loading screen whether to run DLSS Frame Generation. In benchmark launches it often does
+  not, or stops at the pass 2 -> 3 load, with or without Neural Forge (2026-10-05: about half of
+  the launches; not window focus, VRAM, Reflex or Neural Forge, see HARDWARE_VALIDATION.md).
+  Report frame-generation runs with `--fg`: a run under 1.5x displayed / real is named
+  `frame generation did not engage`, left out of `--mean`, and the exit status is 1. Run it again
+  straight away until three runs engaged:
+
+  ```bash
+  scripts/bench-report.py --host lordnikon --fg --mean fg-nron-1 fg-nron-2 fg-nron-3
+  ```
 
 **4K runs.** GTA renders at the desktop's size under Proton, so switch the host's desktop to
 3840x2160 at scale 1.0 first, temporarily, with GNOME's `gdctl set` (not persistent), and set

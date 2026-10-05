@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarise gta-bench.sh runs.
 
-usage: bench-report.py [--host HOST] [--mean] <label>...
+usage: bench-report.py [--host HOST] [--mean] [--fg] <label>...
        bench-report.py --self-test
 
 Per run: the real fps of each benchmark pass (GTA's own Benchmark file), pass 4 in detail
@@ -15,6 +15,12 @@ over the same window), and the median of every field of the layer's [sync] lines
 300 composed frames, first line dropped as warm-up). --mean adds the mean of the pass-4
 numbers over all labels given, which is how three runs of one configuration are reported.
 
+Each run also gets its pass-4 frame-generation multiplier (displayed / real). GTA decides at each
+loading screen whether to run DLSS Frame Generation, and in benchmark launches it often does not,
+with or without Neural Forge (docs/RUNNING_AND_MEASURING.md). --fg is for runs with frame
+generation on in GTA's settings: a run under FG_ENGAGED is reported as "frame generation did not
+engage", is left out of --mean, and the exit status is 1, so the run is repeated.
+
 Reads $NF_BENCH_DIR (default ~/nf-spike/gta) on the machine it runs on; --host runs it on
 the rig over ssh.
 """
@@ -25,6 +31,10 @@ import re
 import statistics
 import subprocess
 import sys
+
+# Displayed / real at or above this means frame generation presented generated frames (2x is
+# the lowest multiplier GTA offers).
+FG_ENGAGED = 1.5
 
 UNITS = {"ns": 1e-6, "µs": 1e-3, "us": 1e-3, "ms": 1.0, "s": 1000.0}
 
@@ -124,14 +134,15 @@ def report(label, base):
     held = held_per_second(log)
     settings = open(f"{d}/settings").read().split() if os.path.exists(f"{d}/settings") else []
     fmt = lambda v, f: "NA" if v is None else f.format(v)
+    fg = disp / real4 if disp else None
     print(
         f"{label}: passes {' / '.join(f'{a:.1f}' for a in avgs)} | pass4 ({dur:.0f}s) real {real4:.1f}, "
-        f"displayed {fmt(disp, '{:.1f}')}, {rate_text(nf, held)}, "
+        f"displayed {fmt(disp, '{:.1f}')} (frame generation {fmt(fg, '{:.1f}x')}), {rate_text(nf, held)}, "
         f"GPU {fmt(gpu, '{:.0f}%')} {fmt(power, '{:.0f}W')}"
         + (f" | {' '.join(s for s in settings if '=' in s)}" if settings else "")
     )
     print(f"    [sync] {sync_medians(log)}")
-    return real4, disp, gpu
+    return real4, disp, gpu, fg
 
 
 def main(argv):
@@ -139,12 +150,17 @@ def main(argv):
         with open(__file__, "rb") as f:
             sys.exit(subprocess.run(["ssh", argv[1], "python3", "-", *argv[2:]], stdin=f).returncode)
     mean = "--mean" in argv
-    labels = [a for a in argv if a != "--mean"]
+    want_fg = "--fg" in argv
+    labels = [a for a in argv if a not in ("--mean", "--fg")]
     if not labels:
         print(__doc__, file=sys.stderr)
         sys.exit(2)
     base = os.path.expanduser(os.environ.get("NF_BENCH_DIR", "~/nf-spike/gta"))
-    results = [r for r in (report(label, base) for label in labels) if r]
+    results = [(label, r) for label, r in ((label, report(label, base)) for label in labels) if r]
+    missed = [label for label, r in results if want_fg and not engaged(r[3])]
+    for label in missed:
+        print(f"{label}: frame generation did not engage (displayed / real under {FG_ENGAGED}x); run it again")
+    results = [r for label, r in results if label not in missed]
     if mean and results:
         avg = lambda xs: sum(xs) / len(xs) if xs else None
         real = avg([r[0] for r in results])
@@ -155,6 +171,13 @@ def main(argv):
             + (f", displayed {disp:.1f}" if disp else "")
             + (f", GPU {gpu:.0f}%" if gpu else "")
         )
+    if missed:
+        sys.exit(1)
+
+
+def engaged(fg):
+    """Whether a run's displayed / real ratio shows frame generation presenting frames."""
+    return fg is not None and fg >= FG_ENGAGED
 
 
 def _self_test():
@@ -171,6 +194,7 @@ def _self_test():
     assert held_per_second(log) == 65.8, held_per_second(log)
     assert held_per_second("[present] 61.0 fps (61.0/s composited by the effect) over 5.0s") is None
     assert rate_text(61.0, None) == "composited/s 61.0"
+    assert engaged(3.99) and engaged(1.97) and not engaged(1.01) and not engaged(None)
     assert rate_text(29.0, 65.8).startswith("held before upscaler/s 65.8 (composited/s 29.0")
     print("bench-report self-test ok")
 

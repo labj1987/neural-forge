@@ -1017,3 +1017,23 @@ Run 3 holds every real frame with frame generation at 4x, matching 2.0's hour of
 50 real / 195 shown). No `not holding`, no `[shm] refusing`, no fence timeout, no Vulkan error;
 `capture_wait` session max 6.33 / 6.49 / 6.39 ms. Frame generation's submits went through untouched
 (21,000 forwarded against 7,003 held).
+
+## 2026-10-05 -- why GTA's frame generation engages in some benchmark launches only
+
+Twelve launches with frame generation on in the settings (4x), 2.0.3 and NR off. GTA decides at a
+loading screen whether to run DLSS Frame Generation at all: in launches where it does not show,
+frame generation's CUDA submits stop (the layer's `launch-bearing submits` count stays at 3000, or
+never reaches it), so no generated frame is made. Either it never starts, or it runs through passes
+1-2 and stops at the pass 2 -> 3 load. Measured and ruled out:
+
+- Neural Forge: NR off, no layer loaded, shows the same.
+- Window focus: GTA held focus for a whole run that lost frame generation (`xprop` every 2 s).
+- VRAM: peak 10.0 of 12.2 GB in two runs that lost it.
+- Dynamic multi frame generation: not configured (no DRS override; `dlssFrameGenMode` 2 is a fixed
+  4x).
+- Reflex: `DXVK_NVAPI_LOG_LEVEL=info` shows the same `SetSleepMode` sequence (disabled on each
+  loading screen, `Enabled/2000us` after) in engaged and non-engaged runs.
+
+The cause inside GTA is not known. `scripts/bench-report.py --fg` now names a run where frame
+generation did not engage and leaves it out, so a frame-generation number is always an engaged one.
+With logging on, 2 of 3 engaged: 49.5 / 49.6 real, 198.5 / 198.6 shown, every frame held.
