@@ -35,7 +35,17 @@ fn main() {
     println!("smoke: using physical device: {name:?}");
 
     let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
-    let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+    // `vkQueueSubmit2` needs synchronization2, where the device has it (lavapipe does).
+    let mut supported = vk::PhysicalDeviceVulkan13Features::default();
+    let mut features2 = vk::PhysicalDeviceFeatures2::builder().push_next(&mut supported);
+    // SAFETY: `physical_device` is live; the chain is a valid Vulkan 1.3 feature query.
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features2) };
+    let submit2 = props.api_version >= vk::API_VERSION_1_3 && supported.synchronization2 == vk::TRUE;
+    let mut enabled = vk::PhysicalDeviceVulkan13Features::builder().synchronization2(submit2);
+    let mut device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+    if submit2 {
+        device_create_info = device_create_info.push_next(&mut enabled);
+    }
     // SAFETY: `device_create_info` is valid; queue family 0 exists on every physical
     // device (the Vulkan spec guarantees at least one queue family).
     let device =
@@ -76,6 +86,38 @@ fn main() {
         let queue = device.get_device_queue(0, 0);
         device.queue_submit(queue, &[vk::SubmitInfo::default()], vk::Fence::null()).expect("empty vkQueueSubmit failed");
         device.queue_wait_idle(queue).expect("vkQueueWaitIdle failed");
+        // A recorded command buffer through both submit entry points, each with a fence: the
+        // layer issues the application's submits to the next layer itself (to see their result
+        // before its tracking advances), so the fence must signal and the result come back.
+        let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(0), None).expect("vkCreateCommandPool failed");
+        let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).expect("vkAllocateCommandBuffers failed")[0];
+        let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).expect("vkCreateFence failed");
+        let record = || {
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).expect("vkBeginCommandBuffer failed");
+            let barrier = vk::ImageMemoryBarrier::builder()
+                .image(image)
+                .old_layout(vk::ImageLayout::UNDEFINED)
+                .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+                .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, level_count: 1, layer_count: 1, ..Default::default() });
+            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier.build()]);
+            device.end_command_buffer(cmd).expect("vkEndCommandBuffer failed");
+        };
+        record();
+        device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).expect("vkQueueSubmit failed");
+        device.wait_for_fences(&[fence], true, 5_000_000_000).expect("the vkQueueSubmit fence never signalled");
+        if submit2 {
+            device.reset_fences(&[fence]).expect("vkResetFences failed");
+            record();
+            let infos = [vk::CommandBufferSubmitInfo::builder().command_buffer(cmd).build()];
+            device.queue_submit2(queue, &[vk::SubmitInfo2::builder().command_buffer_infos(&infos).build()], fence).expect("vkQueueSubmit2 failed");
+            device.wait_for_fences(&[fence], true, 5_000_000_000).expect("the vkQueueSubmit2 fence never signalled");
+        }
+        println!("smoke: vkQueueSubmit{} with a fence OK", if submit2 { " and vkQueueSubmit2" } else { "" });
+        device.destroy_fence(fence, None);
+        device.destroy_command_pool(pool, None);
         device.destroy_image_view(view, None);
         device.destroy_image(image, None);
         device.free_memory(memory, None);

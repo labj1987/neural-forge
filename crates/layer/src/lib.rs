@@ -588,8 +588,10 @@ mod probe_command_tests {
         assert!(preupscale::COMMANDS.iter().all(|command| pre.contains(command)));
         // Both: the union, each command once.
         let both: Vec<_> = device_commands(true, true).collect();
-        assert_eq!(both.len(), on.len(), "the pre-upscaler path's commands are a subset of the probe's");
+        let only_pre = preupscale::COMMANDS.iter().filter(|command| !probe_ngx::PROBE_COMMANDS.contains(command)).count();
+        assert_eq!(both.len(), on.len() + only_pre);
         assert!(preupscale::COMMANDS.iter().all(|command| both.contains(command)));
+        assert_eq!(both.iter().filter(|c| **c == LayerVulkanCommand::CmdBeginRendering).count(), 1, "each command once");
     }
 
     /// `NEURAL_FORGE_PREUPSCALE=off` hooks exactly 1.1.0's list everywhere; the default mode hooks

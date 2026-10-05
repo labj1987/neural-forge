@@ -232,6 +232,11 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     // The kernels' names ([`Kernel`]): only DLSS Super Resolution's input kernel identifies.
     VulkanCommand::CreateCuFunctionNvx,
     VulkanCommand::DestroyCuFunctionNvx,
+    // Synchronization a split must not come before or between ([`Hazard`]): event waits, and
+    // dynamic rendering suspended in one command buffer and resumed in the next.
+    VulkanCommand::CmdWaitEvents,
+    VulkanCommand::CmdWaitEvents2,
+    VulkanCommand::CmdBeginRendering,
 ];
 
 /// Whether kernel names gate identification and holds. Off: names differ between DLSS versions
@@ -722,6 +727,133 @@ pub(crate) fn diagnose(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
     line
 }
 
+/// One image barrier on a watched image, as the application recorded it (stages and accesses as
+/// their sync2 values; the sync1 bits are the same low bits).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ImageSync {
+    pub image: vk::Image,
+    pub old_layout: vk::ImageLayout,
+    pub new_layout: vk::ImageLayout,
+    pub src_stage: u64,
+    pub dst_stage: u64,
+    pub src_access: u64,
+    pub dst_access: u64,
+    pub src_queue_family: u32,
+    pub dst_queue_family: u32,
+}
+
+impl ImageSync {
+    pub(crate) fn from_barrier(b: &vk::ImageMemoryBarrier, src_stage: vk::PipelineStageFlags, dst_stage: vk::PipelineStageFlags) -> Self {
+        Self {
+            image: b.image,
+            old_layout: b.old_layout,
+            new_layout: b.new_layout,
+            src_stage: u64::from(src_stage.as_raw()),
+            dst_stage: u64::from(dst_stage.as_raw()),
+            src_access: u64::from(b.src_access_mask.as_raw()),
+            dst_access: u64::from(b.dst_access_mask.as_raw()),
+            src_queue_family: b.src_queue_family_index,
+            dst_queue_family: b.dst_queue_family_index,
+        }
+    }
+
+    pub(crate) fn from_barrier2(b: &vk::ImageMemoryBarrier2) -> Self {
+        Self {
+            image: b.image,
+            old_layout: b.old_layout,
+            new_layout: b.new_layout,
+            src_stage: b.src_stage_mask.as_raw(),
+            dst_stage: b.dst_stage_mask.as_raw(),
+            src_access: b.src_access_mask.as_raw(),
+            dst_access: b.dst_access_mask.as_raw(),
+            src_queue_family: b.src_queue_family_index,
+            dst_queue_family: b.dst_queue_family_index,
+        }
+    }
+
+    /// A barrier that leaves `image` in `layout`, with no ownership transfer.
+    #[cfg(test)]
+    pub(crate) fn to(image: vk::Image, layout: vk::ImageLayout) -> Self {
+        Self {
+            image,
+            old_layout: vk::ImageLayout::UNDEFINED,
+            new_layout: layout,
+            src_stage: 0,
+            dst_stage: 0,
+            src_access: 0,
+            dst_access: 0,
+            src_queue_family: vk::QUEUE_FAMILY_IGNORED,
+            dst_queue_family: vk::QUEUE_FAMILY_IGNORED,
+        }
+    }
+
+    /// A queue-family ownership transfer (its release or its acquire: both name the same pair).
+    pub(crate) fn transfers_ownership(&self) -> bool {
+        self.src_queue_family != self.dst_queue_family
+    }
+
+    /// Why a hold must not run before this barrier.
+    fn hazard(&self) -> Hazard {
+        if self.transfers_ownership() {
+            Hazard::QueueFamilyTransfer
+        } else if self.old_layout == self.new_layout {
+            Hazard::SameLayoutBarrier
+        } else {
+            Hazard::LayoutTransition
+        }
+    }
+}
+
+/// Why a launch-bearing submit cannot be split in front of its launch buffer: the hold would read
+/// (and write) DLSS's inputs before synchronization the application recorded for them, or between
+/// two command buffers that must stay adjacent. Such a submit is forwarded untouched.
+///
+/// The layer only reasons about what it saw recorded. In GTA V Enhanced under vkd3d-proton nothing
+/// of this is in the launch buffer before its first launch (docs/PRE_UPSCALER_PROBE.md: the last
+/// barrier on the colour input is in an earlier buffer), which is the pattern that is held; that is
+/// an observation about that game, not something Vulkan promises.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Hazard {
+    /// A queue-family ownership transfer of an input, in the launch buffer before the launch.
+    QueueFamilyTransfer,
+    /// A barrier on an input that keeps its layout (`GENERAL -> GENERAL`): memory visibility or an
+    /// execution dependency the launch relies on.
+    SameLayoutBarrier,
+    /// A layout transition of an input in the launch buffer before the launch.
+    LayoutTransition,
+    /// A global memory barrier with a write in its source access before the launch: it can be what
+    /// makes the producer's writes of an input visible.
+    MemoryBarrier,
+    /// `vkCmdWaitEvents*` before the launch.
+    EventWait,
+    /// The launch buffer resumes dynamic rendering suspended in the buffer before it
+    /// (`VK_RENDERING_RESUMING_BIT`): nothing may be submitted between the two.
+    SuspendedRendering,
+}
+
+impl Hazard {
+    pub(crate) fn why(self) -> &'static str {
+        match self {
+            Self::QueueFamilyTransfer => "the DLSS launch buffer transfers queue-family ownership of a DLSS input before its launch; not holding (the layer cannot run ahead of that transfer), frames go to DLSS untouched",
+            Self::SameLayoutBarrier => "the DLSS launch buffer has a same-layout barrier on a DLSS input before its launch; not holding (the layer cannot run ahead of that synchronization), frames go to DLSS untouched",
+            Self::LayoutTransition => "the DLSS launch buffer transitions a DLSS input's layout before its launch; not holding, frames go to DLSS untouched",
+            Self::MemoryBarrier => "the DLSS launch buffer has a global memory barrier with a write in its source access before its launch; not holding (it may be what makes the input visible), frames go to DLSS untouched",
+            Self::EventWait => "the DLSS launch buffer waits on an event before its launch; not holding, frames go to DLSS untouched",
+            Self::SuspendedRendering => "the DLSS launch buffer resumes dynamic rendering suspended in the buffer before it; not holding (nothing may be submitted between the two), frames go to DLSS untouched",
+        }
+    }
+}
+
+/// A command buffer's dynamic-rendering suspend/resume state ([`Tracker::rendering`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Rendering {
+    /// A `VK_RENDERING_RESUMING_BIT` render pass instance whose suspended half is not in this
+    /// buffer: it resumes one from the buffer before it in submission order.
+    open_resume: bool,
+    /// The last flagged render pass instance recorded has `VK_RENDERING_SUSPENDING_BIT`.
+    last_suspending: bool,
+}
+
 /// Per-device tracking state. Every hook that feeds it only does map operations under the lock.
 #[derive(Default)]
 pub(crate) struct Tracker {
@@ -758,10 +890,21 @@ pub(crate) struct Tracker {
     /// Failed identifications logged with the registered set ([`diagnose`]); at most
     /// [`MAX_DIAGNOSES`], later ones get the short line only.
     diagnoses: u32,
-    /// Layouts recorded into each command buffer for the watched images, awaiting submission.
-    pending: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::ImageLayout)>>,
-    /// The watched images' layouts as of the last submission (submission order, not recording order).
+    /// Barriers recorded into each command buffer for the watched images, in recording order,
+    /// awaiting submission.
+    pending: HashMap<vk::CommandBuffer, Vec<ImageSync>>,
+    /// The watched images' layouts as of the last successful submission (submission order, not
+    /// recording order): only [`Self::commit_submitted`] writes it, for command buffers the next
+    /// layer accepted.
     committed: HashMap<vk::Image, vk::ImageLayout>,
+    /// The queue family the last successfully submitted ownership transfer of a watched image
+    /// named as its destination.
+    owners: HashMap<vk::Image, u32>,
+    /// The first global synchronization recorded into each command buffer while an input was
+    /// watched ([`Hazard::MemoryBarrier`], [`Hazard::EventWait`]).
+    global_sync: HashMap<vk::CommandBuffer, Hazard>,
+    /// Command buffers with a suspending or resuming dynamic render pass instance.
+    rendering: HashMap<vk::CommandBuffer, Rendering>,
     /// Launch-bearing submits seen.
     evaluations: u64,
     /// The inputs changed in [`Self::refresh`] and no launch-bearing submit has been scanned since
@@ -848,6 +991,10 @@ pub(crate) struct Scan {
     /// Which identification the inputs are ([`Tracker`]'s count of changes): a hold's auto-exposure
     /// starts its adaptation afresh when it changes ([`Target::identification`]).
     pub identification: u64,
+    /// Why the submit must not be split in front of its launch buffer, if anything recorded says so.
+    pub hazard: Option<Hazard>,
+    /// The queue family that owns the colour input, when a submitted ownership transfer said so.
+    pub colour_owner: Option<u32>,
 }
 
 impl Scan {
@@ -882,6 +1029,19 @@ pub(crate) struct LaunchRefs {
     /// The Ray Reconstruction-family kernels launched in the buffer ([`Kernel::RayReconstruction`]),
     /// at most 4 distinct.
     pub rr: Vec<vk::CuFunctionNVX>,
+    /// What the buffer held when its first launch was recorded.
+    pub before_first: Option<Before>,
+    /// The same for the first launch naming each image of [`Self::images`].
+    pub before_named: Vec<(vk::Image, Before)>,
+}
+
+/// What a command buffer held at the point a launch was recorded into it: how many of its
+/// barriers on watched images come before the launch ([`Tracker`]'s `pending` list is in recording
+/// order), and the global synchronization recorded by then.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Before {
+    pub barriers: usize,
+    pub global: Option<Hazard>,
 }
 
 /// How a launch-bearing command buffer is treated at the submit.
@@ -978,6 +1138,7 @@ impl Tracker {
             self.dirty = true;
         }
         self.committed.remove(&image);
+        self.owners.remove(&image);
         // Evidence naming a destroyed image is dropped; the rest settles again before it decides.
         let before = self.named.len();
         self.named.retain(|n| ![n.colour, n.depth, n.mvec].contains(&image));
@@ -1074,8 +1235,13 @@ impl Tracker {
     /// launch ([`input_launch`]), with whether its kernel is SR's input kernel ([`Kernel`]).
     pub(crate) fn launch_kernel(&mut self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) {
         let kernel = self.functions.get(&function).map(|(k, _)| *k);
+        let before = Before {
+            barriers: self.pending.get(&command_buffer).map_or(0, Vec::len),
+            global: self.global_sync.get(&command_buffer).copied(),
+        };
         {
             let refs = self.launch.entry(command_buffer).or_default();
+            refs.before_first.get_or_insert(before);
             refs.sr_input |= kernel == Some(Kernel::SrInput);
             if kernel == Some(Kernel::RayReconstruction) && refs.rr.len() < 4 && !refs.rr.contains(&function) {
                 refs.rr.push(function);
@@ -1115,33 +1281,61 @@ impl Tracker {
         for image in named {
             if !refs.images.contains(&image) {
                 refs.images.push(image);
+                refs.before_named.push((image, before));
             }
         }
     }
 
-    /// Whether any command buffer carries a launch or recorded layouts.
+    /// Whether any command buffer carries a launch, recorded barriers or other synchronization.
     fn armed(&self) -> bool {
-        !self.launch.is_empty() || !self.pending.is_empty()
+        !self.launch.is_empty() || !self.pending.is_empty() || !self.global_sync.is_empty() || !self.rendering.is_empty()
     }
 
     pub(crate) fn begin(&mut self, command_buffer: vk::CommandBuffer) {
-        self.launch.remove(&command_buffer);
-        self.pending.remove(&command_buffer);
+        self.free(&[command_buffer]);
     }
 
     pub(crate) fn free(&mut self, command_buffers: &[vk::CommandBuffer]) {
         for cb in command_buffers {
             self.launch.remove(cb);
             self.pending.remove(cb);
+            self.global_sync.remove(cb);
+            self.rendering.remove(cb);
         }
     }
 
+    /// Global synchronization recorded into `command_buffer` (a memory barrier with a write in its
+    /// source access, an event wait); the first one is kept.
+    pub(crate) fn global(&mut self, command_buffer: vk::CommandBuffer, hazard: Hazard) {
+        self.global_sync.entry(command_buffer).or_insert(hazard);
+    }
+
+    /// `vkCmdBeginRendering` with `VK_RENDERING_SUSPENDING_BIT` or `VK_RENDERING_RESUMING_BIT`. A
+    /// suspended render pass instance is resumed by the next one, so a resuming one that does not
+    /// follow a suspending one in its own buffer resumes the previous buffer's.
+    pub(crate) fn begin_rendering(&mut self, command_buffer: vk::CommandBuffer, flags: vk::RenderingFlags) {
+        let r = self.rendering.entry(command_buffer).or_default();
+        if flags.contains(vk::RenderingFlags::RESUMING) && !r.last_suspending {
+            r.open_resume = true;
+        }
+        r.last_suspending = flags.contains(vk::RenderingFlags::SUSPENDING);
+    }
+
+    /// `vkCmdExecuteCommands`: each secondary's recording continues the primary's, in order.
     pub(crate) fn execute(&mut self, primary: vk::CommandBuffer, secondaries: &[vk::CommandBuffer]) {
-        let carried: Vec<LaunchRefs> = secondaries.iter().filter_map(|cb| self.launch.get(cb)).cloned().collect();
-        if !carried.is_empty() {
-            let refs = self.launch.entry(primary).or_default();
-            for c in carried {
+        for secondary in secondaries {
+            // Where the secondary's recording starts in the primary's.
+            let base = Before {
+                barriers: self.pending.get(&primary).map_or(0, Vec::len),
+                global: self.global_sync.get(&primary).copied(),
+            };
+            let shift = |b: Before| Before { barriers: base.barriers + b.barriers, global: base.global.or(b.global) };
+            if let Some(c) = self.launch.get(secondary).cloned() {
+                let refs = self.launch.entry(primary).or_default();
                 refs.opaque |= c.opaque;
+                if refs.before_first.is_none() {
+                    refs.before_first = c.before_first.map(shift);
+                }
                 if refs.input.is_none() {
                     refs.input = c.input.clone();
                     refs.input_sr = c.input_sr;
@@ -1158,13 +1352,24 @@ impl Tracker {
                 for image in c.images {
                     if !refs.images.contains(&image) {
                         refs.images.push(image);
+                        let before = c.before_named.iter().find(|(i, _)| *i == image).map(|(_, b)| *b).or(c.before_first).unwrap_or_default();
+                        refs.before_named.push((image, shift(before)));
                     }
                 }
             }
-        }
-        let inherited: Vec<_> = secondaries.iter().filter_map(|cb| self.pending.get(cb)).flatten().copied().collect();
-        if !inherited.is_empty() {
-            self.pending.entry(primary).or_default().extend(inherited);
+            if let Some(inherited) = self.pending.get(secondary).filter(|p| !p.is_empty()).cloned() {
+                self.pending.entry(primary).or_default().extend(inherited);
+            }
+            if let Some(hazard) = self.global_sync.get(secondary).copied() {
+                self.global(primary, hazard);
+            }
+            if let Some(c) = self.rendering.get(secondary).copied() {
+                let r = self.rendering.entry(primary).or_default();
+                if c.open_resume && !r.last_suspending {
+                    r.open_resume = true;
+                }
+                r.last_suspending = c.last_suspending;
+            }
         }
     }
 
@@ -1179,18 +1384,60 @@ impl Tracker {
         })
     }
 
-    pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, image: vk::Image, layout: vk::ImageLayout) {
-        if self.watched(image) {
-            self.pending.entry(command_buffer).or_default().push((image, layout));
+    pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, sync: ImageSync) {
+        if self.watched(sync.image) {
+            self.pending.entry(command_buffer).or_default().push(sync);
         }
     }
 
-    fn commit(&mut self, command_buffer: vk::CommandBuffer) {
-        if let Some(recorded) = self.pending.get(&command_buffer) {
-            for &(image, layout) in recorded {
-                self.committed.insert(image, layout);
+    /// The command buffers of a submission the next layer accepted (`VK_SUCCESS`), in submission
+    /// order: only now do their recorded barriers become the watched images' state. A failed
+    /// submission executed nothing, so it is never passed here; of a split call, each part is
+    /// passed once it was accepted ([`submit_around`]).
+    pub(crate) fn commit_submitted(&mut self, command_buffers: impl IntoIterator<Item = vk::CommandBuffer>) {
+        for cb in command_buffers {
+            let Some(recorded) = self.pending.get(&cb) else { continue };
+            for sync in recorded {
+                self.committed.insert(sync.image, sync.new_layout);
+                if sync.transfers_ownership() {
+                    self.owners.insert(sync.image, sync.dst_queue_family);
+                }
             }
         }
+    }
+
+    /// [`Self::scan`] followed by the commit of a submission the next layer accepted whole.
+    #[cfg(test)]
+    pub(crate) fn submit_ok(&mut self, batches: &[Vec<vk::CommandBuffer>]) -> Option<Scan> {
+        let scan = self.scan(batches);
+        self.commit_submitted(batches.iter().flatten().copied());
+        scan
+    }
+
+    /// Why a hold must not run in front of launch buffer `cb` reading `inputs`, from what was
+    /// recorded into it before the launch that first names the colour input (before its first
+    /// launch when none names it): a barrier on an image the hold reads, or global synchronization.
+    fn launch_hazard(&self, cb: vk::CommandBuffer, inputs: Option<&Inputs>) -> Option<Hazard> {
+        if self.rendering.get(&cb).is_some_and(|r| r.open_resume) {
+            return Some(Hazard::SuspendedRendering);
+        }
+        let refs = self.launch.get(&cb)?;
+        let colour = inputs.map(|i| i.colour.0);
+        let before = colour.and_then(|c| refs.before_named.iter().find(|(i, _)| *i == c)).map(|(_, b)| *b).or(refs.before_first)?;
+        if before.global.is_some() {
+            return before.global;
+        }
+        let read = |image: vk::Image| {
+            inputs.is_none_or(|i| {
+                i.colour.0 == image
+                    || i.depth.0 == image
+                    || i.mvec.0 == image
+                    || i.exposure.iter().flatten().any(|e| e.0 == image)
+                    || i.exposure_input.is_some_and(|e| e.0 == image)
+            })
+        };
+        let recorded = self.pending.get(&cb)?;
+        recorded.iter().take(before.barriers).find(|s| read(s.image)).map(ImageSync::hazard)
     }
 
     /// The largest swapchain's extent.
@@ -1223,6 +1470,7 @@ impl Tracker {
         let key =|i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
         if key(inputs) != key(self.inputs) {
             self.committed.clear();
+            self.owners.clear();
             self.pending.clear();
             self.identified = true;
             self.generation += 1;
@@ -1563,12 +1811,16 @@ impl Tracker {
     }
 
     /// Finds the first launch-bearing command buffer in a submit (`batches`: each batch's command
-    /// buffers, in order) and commits every buffer's recorded layouts in submission order, reading
-    /// the watched images' layouts just before the launch buffer.
+    /// buffers, in order) and reads the watched images' layouts just before it: the committed ones
+    /// with the barriers of the buffers ahead of it in this submit applied on top, in submission
+    /// order. Nothing is committed here: the submit has not happened yet, and may fail
+    /// ([`Self::commit_submitted`]).
     pub(crate) fn scan(&mut self, batches: &[Vec<vk::CommandBuffer>]) -> Option<Scan> {
         if !self.armed() {
             return None;
         }
+        // What this submit's buffers so far would leave behind.
+        let mut proposed: HashMap<vk::Image, (vk::ImageLayout, Option<u32>)> = HashMap::new();
         let mut found: Option<Scan> = None;
         let mut any_foreign = false;
         let mut held_kind = None;
@@ -1599,8 +1851,9 @@ impl Tracker {
                 if found.is_none() && kind.is_some_and(|k| k != LaunchKind::Foreign) {
                     held_kind = kind;
                     held_target = retarget.or(self.inputs.map(|i| i.colour)).map(|c| (c.0, retarget.is_some()));
-                    let layout = |image: Option<vk::Image>| image.and_then(|i| self.committed.get(&i).copied());
+                    let layout = |image: Option<vk::Image>| image.and_then(|i| proposed.get(&i).map(|p| p.0).or(self.committed.get(&i).copied()));
                     let inputs = self.inputs.map(|i| Inputs { colour: retarget.unwrap_or(i.colour), ..i });
+                    let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
                     found = Some(Scan {
                         batch: bi,
                         index: ci,
@@ -1613,9 +1866,16 @@ impl Tracker {
                         evaluation: self.evaluations,
                         identified_now: self.identified,
                         identification: self.generation,
+                        hazard: self.launch_hazard(cb, inputs.as_ref()),
+                        colour_owner,
                     });
                 }
-                self.commit(cb);
+                if found.is_none() {
+                    for sync in self.pending.get(&cb).into_iter().flatten() {
+                        let owner = sync.transfers_ownership().then_some(sync.dst_queue_family).or(proposed.get(&sync.image).and_then(|p| p.1));
+                        proposed.insert(sync.image, (sync.new_layout, owner));
+                    }
+                }
             }
         }
         if found.is_some() {
@@ -1809,13 +2069,33 @@ impl Tracking {
         }
     }
 
-    /// Records image barriers' new layouts for the watched images.
-    pub(crate) fn barriers(&self, command_buffer: vk::CommandBuffer, images: impl Iterator<Item = (vk::Image, vk::ImageLayout)>) {
+    /// Records the image barriers on watched images, and `global` synchronization recorded with
+    /// them (a memory barrier with a write in its source access, an event wait).
+    pub(crate) fn barriers(&self, command_buffer: vk::CommandBuffer, images: impl Iterator<Item = ImageSync>, global: Option<Hazard>) {
         let mut t = self.lock();
-        for (image, layout) in images {
-            t.barrier(command_buffer, image, layout);
+        for sync in images {
+            t.barrier(command_buffer, sync);
+        }
+        if let Some(hazard) = global {
+            t.global(command_buffer, hazard);
         }
         self.rearm(&t);
+    }
+
+    /// `vkCmdBeginRendering` with a suspending or resuming flag ([`Tracker::begin_rendering`]).
+    pub(crate) fn begin_rendering(&self, command_buffer: vk::CommandBuffer, flags: vk::RenderingFlags) {
+        if flags.intersects(vk::RenderingFlags::SUSPENDING | vk::RenderingFlags::RESUMING) {
+            let mut t = self.lock();
+            t.begin_rendering(command_buffer, flags);
+            self.rearm(&t);
+        }
+    }
+
+    /// See [`Tracker::commit_submitted`]. No lock while nothing is armed.
+    pub(crate) fn commit_submitted(&self, command_buffers: impl IntoIterator<Item = vk::CommandBuffer>) {
+        if self.armed() {
+            self.lock().commit_submitted(command_buffers);
+        }
     }
 
     /// See [`Tracker::scan`]; re-derives the inputs first and logs a change. `None` without taking
@@ -1860,6 +2140,14 @@ impl Tracking {
             crate::log!("[preupscale] {line}");
             crate::logging::flush();
         }
+        scan
+    }
+
+    /// [`Self::scan`] followed by the commit of a submission the next layer accepted whole.
+    #[cfg(test)]
+    pub(crate) fn submit_ok(&self, batches: &[Vec<vk::CommandBuffer>]) -> Option<Scan> {
+        let scan = self.scan(batches);
+        self.commit_submitted(batches.iter().flatten().copied());
         scan
     }
 
@@ -1913,13 +2201,6 @@ pub(crate) struct Batch2 {
     pub signals: Vec<vk::SemaphoreSubmitInfo>,
 }
 
-#[cfg(test)]
-impl Batch2 {
-    fn command_buffers(&self) -> Vec<vk::CommandBuffer> {
-        self.cbs.iter().map(|c| c.command_buffer).collect()
-    }
-}
-
 /// What [`plan`] needs from a batch type.
 pub(crate) trait SplitBatch: Sized {
     type Wait: Clone;
@@ -1931,6 +2212,8 @@ pub(crate) trait SplitBatch: Sized {
     /// The layer's own batch: `waits` (moved from the game's launch batch, stages widened to
     /// `ALL_COMMANDS`) and one command buffer.
     fn own(waits: Vec<Self::Wait>, command_buffer: vk::CommandBuffer) -> Self;
+    /// The batch's command buffers, in order.
+    fn command_buffers(&self) -> Vec<vk::CommandBuffer>;
 }
 
 impl SplitBatch for Batch1 {
@@ -1949,6 +2232,9 @@ impl SplitBatch for Batch1 {
     fn own(waits: Vec<Wait1>, command_buffer: vk::CommandBuffer) -> Self {
         let waits = waits.into_iter().map(|w| Wait1 { stage: vk::PipelineStageFlags::ALL_COMMANDS, ..w }).collect();
         Batch1 { waits, cbs: vec![command_buffer], signals: Vec::new() }
+    }
+    fn command_buffers(&self) -> Vec<vk::CommandBuffer> {
+        self.cbs.clone()
     }
 }
 
@@ -1969,6 +2255,9 @@ impl SplitBatch for Batch2 {
         let waits = waits.into_iter().map(|w| vk::SemaphoreSubmitInfo { stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS, ..w }).collect();
         let cb = vk::CommandBufferSubmitInfo { command_buffer, ..Default::default() };
         Batch2 { flags: vk::SubmitFlags::empty(), p_next: std::ptr::null(), waits, cbs: vec![cb], signals: Vec::new() }
+    }
+    fn command_buffers(&self) -> Vec<vk::CommandBuffer> {
+        self.cbs.iter().map(|c| c.command_buffer).collect()
     }
 }
 
@@ -2020,19 +2309,31 @@ pub(crate) fn plan<B: SplitBatch>(mut batches: Vec<B>, batch: usize, index: usiz
 /// whether its capture batch consumed them), then `tail` with the application's `fence` -- the
 /// fence always goes on the last submission. Moved waits that were not consumed go back onto the
 /// launch batch. A failed `head` submission is returned at once (nothing else was submitted).
+///
+/// `accepted` is called with the application's command buffers of each part the next layer
+/// accepted (`VK_SUCCESS`), in submission order: `head`'s once it was submitted, `tail`'s once it
+/// was. Tracked state advances from those only ([`Tracker::commit_submitted`]): after a failed
+/// `head` nothing is reported, after a failed `tail` only `head`'s buffers are.
 pub(crate) fn submit_around<B: SplitBatch>(
     mut plan: Plan<B>, fence: vk::Fence, submit: &dyn Fn(&[B], vk::Fence) -> vk::Result, hold: impl FnOnce(&[B::Wait]) -> bool,
+    accepted: &mut dyn FnMut(Vec<vk::CommandBuffer>),
 ) -> vk::Result {
+    let buffers = |part: &[B]| part.iter().flat_map(B::command_buffers).collect::<Vec<_>>();
     if !plan.head.is_empty() {
         let result = submit(&plan.head, vk::Fence::null());
         if result != vk::Result::SUCCESS {
             return result;
         }
+        accepted(buffers(&plan.head));
     }
     if !hold(&plan.capture_waits) {
         plan.restore_waits();
     }
-    submit(&plan.tail, fence)
+    let result = submit(&plan.tail, fence);
+    if result == vk::Result::SUCCESS {
+        accepted(buffers(&plan.tail));
+    }
+    result
 }
 
 /// # Safety
@@ -2113,22 +2414,33 @@ pub(crate) unsafe fn parse1(submits: &[vk::SubmitInfo]) -> Result<Vec<Batch1>, &
 /// `VK_STRUCTURE_TYPE_LATENCY_SUBMISSION_PRESENT_ID_NV` (`VK_NV_low_latency2`, newer than the pinned
 /// ash): a present id tag, safe on every part of a split batch.
 const LATENCY_SUBMISSION_PRESENT_ID_NV: vk::StructureType = vk::StructureType::from_raw(1_000_505_005);
-/// `VK_STRUCTURE_TYPE_FRAME_BOUNDARY_EXT` (`VK_EXT_frame_boundary`): a debug-tool frame marker.
+/// `VK_STRUCTURE_TYPE_FRAME_BOUNDARY_EXT` (`VK_EXT_frame_boundary`): marks the submit that ends a
+/// frame (`VK_FRAME_BOUNDARY_FRAME_END_BIT_EXT`). Not something to repeat on both halves of a split
+/// batch, and the layer's own submissions would land on the wrong side of it: refused.
 const FRAME_BOUNDARY_EXT: vk::StructureType = vk::StructureType::from_raw(1_000_375_001);
 
 /// The application's `VkSubmitInfo2`s as owned batches. The pNext chain is kept as is on every part
 /// of a split batch, so only structures that mean the same thing repeated are accepted (a latency
-/// present id, a performance-query pass index, a frame boundary marker); anything else is refused.
+/// present id, a performance-query pass index); anything else is refused, `VkFrameBoundaryEXT`
+/// among them. A call with a protected batch (`VK_SUBMIT_PROTECTED_BIT`) is refused as well: the
+/// layer's own batches and command pool are unprotected, and protected content is not its to read.
+/// The caller forwards a refused call untouched.
 ///
 /// # Safety
 /// `submits` must be the application's own, valid for the duration of its call.
 pub(crate) unsafe fn parse2(submits: &[vk::SubmitInfo2]) -> Result<Vec<Batch2>, &'static str> {
     let mut out = Vec::with_capacity(submits.len());
     for s in submits {
+        if s.flags.contains(vk::SubmitFlags::PROTECTED) {
+            return Err("a protected VkSubmitInfo2 (VK_SUBMIT_PROTECTED_BIT): protected submits are never held");
+        }
         let mut next = s.p_next.cast::<vk::BaseInStructure>();
         // SAFETY: a valid pNext chain of the application's own structure.
         while let Some(base) = unsafe { next.as_ref() } {
-            if !matches!(base.s_type, LATENCY_SUBMISSION_PRESENT_ID_NV | FRAME_BOUNDARY_EXT | vk::StructureType::PERFORMANCE_QUERY_SUBMIT_INFO_KHR) {
+            if base.s_type == FRAME_BOUNDARY_EXT {
+                return Err("a VkSubmitInfo2 with VkFrameBoundaryEXT: a frame boundary is never split or pushed behind the layer's own submits");
+            }
+            if !matches!(base.s_type, LATENCY_SUBMISSION_PRESENT_ID_NV | vk::StructureType::PERFORMANCE_QUERY_SUBMIT_INFO_KHR) {
                 return Err("a VkSubmitInfo2 pNext structure that cannot be repeated on a split batch");
             }
             next = base.p_next;
@@ -4172,12 +4484,14 @@ mod tests {
         let own_fence = vk::Fence::from_raw(0xe);
         let batches = vec![batch1(&[(1, None)], &[10], &[(2, None)]), batch1(&[(3, Some(5))], &[20], &[(4, Some(6))]), batch1(&[], &[30], &[(8, None)])];
         let p = plan(batches.clone(), 1, 0);
+        let mut accepted: Vec<Vec<vk::CommandBuffer>> = Vec::new();
         let result = submit_around(p, game_fence, &submit, |waits| {
             let _ = submit(&[Batch1::own(waits.to_vec(), cb(100))], own_fence);
             let _ = submit(&[Batch1::own(Vec::new(), cb(101))], own_fence);
             true
-        });
+        }, &mut |part| accepted.push(part));
         assert_eq!(result, vk::Result::SUCCESS);
+        assert_eq!(accepted, vec![vec![cb(10)], vec![cb(20), cb(30)]], "the application's buffers of each accepted part, never the layer's own");
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 4);
         assert_eq!(calls[0], (vec![batches[0].clone()], vk::Fence::null()), "head: the earlier batch, no fence");
@@ -4197,16 +4511,17 @@ mod tests {
             calls.borrow_mut().push((batches.to_vec(), fence));
             vk::Result::SUCCESS
         };
-        assert_eq!(submit_around(plan(batches[1..].to_vec(), 0, 0), game_fence, &submit, |_| false), vk::Result::SUCCESS);
+        assert_eq!(submit_around(plan(batches[1..].to_vec(), 0, 0), game_fence, &submit, |_| false, &mut |_| {}), vk::Result::SUCCESS);
         let calls = calls.into_inner();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0], (batches[1..].to_vec(), game_fence), "forwarded as it was");
 
         // A failing head is returned at once.
         let failing = |_: &[Batch1], _: vk::Fence| vk::Result::ERROR_DEVICE_LOST;
-        let mut held = false;
-        assert_eq!(submit_around(plan(batches.clone(), 1, 0), game_fence, &failing, |_| { held = true; true }), vk::Result::ERROR_DEVICE_LOST);
+        let (mut held, mut reported) = (false, false);
+        assert_eq!(submit_around(plan(batches.clone(), 1, 0), game_fence, &failing, |_| { held = true; true }, &mut |_| reported = true), vk::Result::ERROR_DEVICE_LOST);
         assert!(!held);
+        assert!(!reported, "a refused head reports nothing as accepted");
     }
 
     fn sem2(raw: u64, value: u64) -> vk::SemaphoreSubmitInfo {
@@ -4224,7 +4539,7 @@ mod tests {
         let signals = [sem2(3, 43)];
         let info = vk::SubmitInfo2 {
             p_next: std::ptr::from_ref(&latency).cast(),
-            flags: vk::SubmitFlags::PROTECTED,
+            flags: vk::SubmitFlags::empty(),
             wait_semaphore_info_count: 2,
             p_wait_semaphore_infos: waits.as_ptr(),
             command_buffer_info_count: 3,
@@ -4243,7 +4558,7 @@ mod tests {
         assert_eq!(prefix.waits.iter().map(|w| (w.semaphore, w.value)).collect::<Vec<_>>(), vec![(sem(1), 41), (sem(2), 42)]);
         assert_eq!(prefix.command_buffers(), vec![cb(10)]);
         assert!(prefix.signals.is_empty());
-        assert_eq!((prefix.flags, prefix.p_next), (vk::SubmitFlags::PROTECTED, info.p_next), "both parts keep the flags and the repeatable chain");
+        assert_eq!((prefix.flags, prefix.p_next), (vk::SubmitFlags::empty(), info.p_next), "both parts keep the flags and the repeatable chain");
         let suffix = &p.tail[0];
         assert_eq!(suffix.command_buffers(), vec![cb(11), cb(12)]);
         assert_eq!(suffix.signals[0].value, 43);
@@ -4359,7 +4674,7 @@ mod tests {
         assert!(line.ends_with("exposure input 0x610; swapchain Some((2560, 1440)); identified by size"), "{line}");
         t.launch(cb(1), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
         t.launch(cb(2), Some(&param_block(&[0x1400, 0x1200])));
-        let scan = t.scan(&[vec![cb(2), cb(1)]]).expect("SR's buffer is held");
+        let scan = t.submit_ok(&[vec![cb(2), cb(1)]]).expect("SR's buffer is held");
         assert_eq!((scan.batch, scan.index), (0, 1));
         let inputs = scan.inputs.unwrap();
         assert_eq!(
@@ -4394,7 +4709,7 @@ mod tests {
         // The other candidate named without depth and motion vectors: forwarded, counted.
         t.launch(cb(1), Some(&param_block(&[0x1110, 0x1400])));
         assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
-        assert!(t.scan(&[vec![cb(1)]]).is_none(), "naming another candidate only: not held");
+        assert!(t.submit_ok(&[vec![cb(1)]]).is_none(), "naming another candidate only: not held");
         assert_eq!((t.foreign_submits, t.other_candidate_buffers), (1, 1));
         let first = t.classify_line(None, 0).expect("the forwarded kind");
         assert!(first.starts_with("a launch-bearing submit whose CUDA launches never name"), "{first}");
@@ -4403,17 +4718,17 @@ mod tests {
         assert!(t.classify_line(None, 0).is_none());
         // The colour input's buffer is held exactly as before; a buffer naming both is too.
         t.launch(cb(2), Some(&param_block(&[0x1100, 0x1200, 0x1300])));
-        assert!(t.scan(&[vec![cb(2)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
+        assert!(t.submit_ok(&[vec![cb(2)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
         t.launch(cb(3), Some(&param_block(&[0x1110, 0x1100])));
-        assert!(t.scan(&[vec![cb(3)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
+        assert!(t.submit_ok(&[vec![cb(3)]]).is_some_and(|s| s.inputs.unwrap().colour.0 == vk::Image::from_raw(0x100)));
         assert_eq!((t.colour_submits, t.other_candidate_buffers), (2, 1));
         // An input launch naming the other candidate with the same depth and motion vectors: held
         // with it as the target, not counted as forwarded.
         // Its layout is tracked like the colour input's (a barrier in an earlier buffer of the
         // submit).
         t.launch(cb(4), Some(&param_block(&[0x1110, 0x1200, 0x1300])));
-        t.barrier(cb(5), vk::Image::from_raw(0x110), vk::ImageLayout::TRANSFER_SRC_OPTIMAL);
-        let s = t.scan(&[vec![cb(5), cb(4)]]).expect("held with the candidate its input launch names");
+        t.barrier(cb(5), ImageSync::to(vk::Image::from_raw(0x110), vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
+        let s = t.submit_ok(&[vec![cb(5), cb(4)]]).expect("held with the candidate its input launch names");
         assert_eq!(s.inputs.map(|i| (i.colour.0.as_raw(), i.depth.0.as_raw(), i.mvec.0.as_raw())), Some((0x110, 0x200, 0x300)));
         assert_eq!((s.index, s.colour_layout), (1, Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)));
         assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (3, 1, 1));
@@ -4550,19 +4865,19 @@ mod tests {
         assert!(t.refresh().is_none(), "nothing changed, nothing logged");
         let colour = vk::Image::from_raw(0x100);
         // Recorded in one order, submitted in the other; a launch in a secondary.
-        t.barrier(cb(1), colour, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL);
-        t.barrier(cb(2), colour, vk::ImageLayout::GENERAL);
-        t.barrier(cb(2), vk::Image::from_raw(0x999), vk::ImageLayout::GENERAL);
+        t.barrier(cb(1), ImageSync::to(colour, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+        t.barrier(cb(2), ImageSync::to(colour, vk::ImageLayout::GENERAL));
+        t.barrier(cb(2), ImageSync::to(vk::Image::from_raw(0x999), vk::ImageLayout::GENERAL));
         t.launch(cb(5), None);
         t.execute(cb(3), &[cb(5)]);
-        let scan = t.scan(&[vec![cb(1)], vec![cb(2), cb(3)]]).expect("launch-bearing");
+        let scan = t.submit_ok(&[vec![cb(1)], vec![cb(2), cb(3)]]).expect("launch-bearing");
         assert_eq!((scan.batch, scan.index), (1, 1));
         assert_eq!(scan.colour_layout, Some(vk::ImageLayout::GENERAL), "the layout as of submission order just before the launch");
         assert!(!t.committed.contains_key(&vk::Image::from_raw(0x999)), "only the inputs are watched");
         assert!(scan.identified_now && !scan.colour_in_general(), "the first launch-bearing submit since identification is not held");
-        assert!(t.scan(&[vec![cb(7)]]).is_none());
+        assert!(t.submit_ok(&[vec![cb(7)]]).is_none());
         t.begin(cb(3));
-        assert!(t.scan(&[vec![cb(3)]]).is_none(), "re-recorded: no longer launch-bearing");
+        assert!(t.submit_ok(&[vec![cb(3)]]).is_none(), "re-recorded: no longer launch-bearing");
         // A destroyed input image changes the set.
         t.forget_image(vk::Image::from_raw(0x200));
         assert!(t.refresh().unwrap().starts_with("no DLSS input among 2 registered views"));
@@ -4595,22 +4910,22 @@ mod tests {
         };
         register(0x1000);
         t.launch(cb(1), vk::CuFunctionNVX::null(), None);
-        let first = t.scan(&[vec![cb(1)]]).expect("launch-bearing");
+        let first = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(first.inputs.is_some() && first.identified_now && first.colour_layout.is_none());
         assert!(!first.colour_in_general(), "identified on this submit: nothing known, not held");
-        let second = t.scan(&[vec![cb(1)]]).expect("launch-bearing");
+        let second = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(!second.identified_now && second.colour_layout.is_none());
         assert!(second.colour_in_general(), "watched for a submit and no barrier seen: GENERAL");
         // A re-identification (DLSS's inputs re-created) starts over.
         t.lock().forget_image(vk::Image::from_raw(0x1000));
         register(0x5000);
-        let again = t.scan(&[vec![cb(1)]]).expect("launch-bearing");
+        let again = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert_eq!(again.inputs.map(|i| i.colour.0), Some(vk::Image::from_raw(0x5000)));
         assert!(again.identified_now && !again.colour_in_general());
-        assert!(t.scan(&[vec![cb(1)]]).expect("launch-bearing").colour_in_general());
+        assert!(t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing").colour_in_general());
         // A barrier out of GENERAL still refuses the hold.
-        t.barriers(cb(2), [(vk::Image::from_raw(0x5000), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)].into_iter());
-        assert!(!t.scan(&[vec![cb(2), cb(1)]]).expect("launch-bearing").colour_in_general());
+        t.barriers(cb(2), [ImageSync::to(vk::Image::from_raw(0x5000), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)].into_iter(), None);
+        assert!(!t.submit_ok(&[vec![cb(2), cb(1)]]).expect("launch-bearing").colour_in_general());
     }
 
     /// On a device with NVX but no DLSS nothing is ever armed, so the per-command-buffer and
@@ -4626,19 +4941,289 @@ mod tests {
         }
         t.free(&[cb(1), cb(2)]);
         assert!(!t.armed());
-        assert!(t.scan(&[vec![cb(1), cb(2)]]).is_none());
+        assert!(t.submit_ok(&[vec![cb(1), cb(2)]]).is_none());
         assert_eq!(t.extent(), None);
         // DLSS records a launch: armed, and the submit carrying it is found.
         t.launch(cb(7), vk::CuFunctionNVX::null(), None);
         assert!(t.armed());
-        assert!(t.scan(&[vec![cb(6), cb(7)]]).is_some_and(|s| (s.batch, s.index) == (0, 1)));
+        assert!(t.submit_ok(&[vec![cb(6), cb(7)]]).is_some_and(|s| (s.batch, s.index) == (0, 1)));
         // A secondary's launch carries over to its primary.
         t.execute(cb(8), &[cb(7)]);
         t.begin(cb(7));
         assert!(t.armed(), "the primary still carries the launch");
         t.free(&[cb(8)]);
         assert!(!t.armed(), "every launch buffer was reset or freed");
-        assert!(t.scan(&[vec![cb(7), cb(8)]]).is_none());
+        assert!(t.submit_ok(&[vec![cb(7), cb(8)]]).is_none());
+    }
+
+    /// A protected `vkQueueSubmit2` is never parsed into a plan, wherever its protected batch is:
+    /// the caller forwards the application's call as it was, with none of the layer's own batches.
+    #[test]
+    fn a_protected_submit_is_refused_and_forwarded_untouched() {
+        let cbs = [cb2(10), cb2(11)];
+        let plain = vk::SubmitInfo2 { command_buffer_info_count: 2, p_command_buffer_infos: cbs.as_ptr(), ..Default::default() };
+        let protected = vk::SubmitInfo2 { flags: vk::SubmitFlags::PROTECTED, ..plain };
+        assert!(unsafe { parse2(&[plain]) }.is_ok());
+        for call in [vec![protected], vec![plain, protected], vec![protected, plain]] {
+            let why = unsafe { parse2(&call) }.expect_err("no batches to split: the call is forwarded");
+            assert!(why.contains("protected"), "{why}");
+        }
+        // `vkQueueSubmit`: a protected batch carries `VkProtectedSubmitInfo`, refused with every
+        // chain but the timeline one.
+        let chain = vk::ProtectedSubmitInfo { protected_submit: vk::TRUE, ..Default::default() };
+        let raw = [cb(10)];
+        let info = vk::SubmitInfo { p_next: std::ptr::from_ref(&chain).cast(), command_buffer_count: 1, p_command_buffers: raw.as_ptr(), ..Default::default() };
+        assert!(unsafe { parse1(&[info]) }.is_err());
+    }
+
+    /// A call carrying `VkFrameBoundaryEXT` is forwarded untouched: split, the marker would be on
+    /// both halves, with the layer's own submits between them.
+    #[test]
+    fn a_frame_boundary_submit_is_refused_and_forwarded_untouched() {
+        let boundary = vk::BaseInStructure { s_type: FRAME_BOUNDARY_EXT, p_next: std::ptr::null() };
+        let latency = vk::BaseInStructure { s_type: LATENCY_SUBMISSION_PRESENT_ID_NV, p_next: std::ptr::from_ref(&boundary) };
+        let cbs = [cb2(10), cb2(11)];
+        let plain = vk::SubmitInfo2 { command_buffer_info_count: 2, p_command_buffer_infos: cbs.as_ptr(), ..Default::default() };
+        for chain in [std::ptr::from_ref(&boundary), std::ptr::from_ref(&latency)] {
+            let marked = vk::SubmitInfo2 { p_next: chain.cast(), ..plain };
+            for call in [vec![marked], vec![plain, marked]] {
+                let why = unsafe { parse2(&call) }.expect_err("forwarded untouched");
+                assert!(why.contains("VkFrameBoundaryEXT"), "{why}");
+            }
+        }
+    }
+
+    /// A tracker with GTA's three inputs identified (colour 0x100, depth 0x200, motion vectors
+    /// 0x300; registration keys `image + 0x1000`) and one launch-bearing submit behind it, so the
+    /// next is not the identifying one.
+    fn held_tracker() -> (Tracker, Vec<u8>) {
+        let mut t = Tracker::default();
+        for (raw, format) in [(0x100, vk::Format::R16G16B16A16_SFLOAT), (0x200, vk::Format::D32_SFLOAT_S8_UINT), (0x300, vk::Format::R16G16_SFLOAT)] {
+            let info = vk::ImageCreateInfo {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
+                format,
+                usage: vk::ImageUsageFlags::STORAGE,
+                samples: vk::SampleCountFlags::TYPE_1,
+                ..Default::default()
+            };
+            t.record_image(vk::Image::from_raw(raw), &info);
+            t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
+            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
+        }
+        t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
+        t.refresh().expect("identified");
+        let params = param_block(&[0x1100, 0x1200, 0x1300]);
+        t.launch(cb(900), Some(&params));
+        assert!(t.submit_ok(&[vec![cb(900)]]).is_some_and(|s| s.identified_now));
+        t.free(&[cb(900)]);
+        (t, params)
+    }
+
+    fn colour() -> vk::Image {
+        vk::Image::from_raw(0x100)
+    }
+    const GENERAL: vk::ImageLayout = vk::ImageLayout::GENERAL;
+
+    fn general_to_general(image: vk::Image) -> ImageSync {
+        ImageSync { old_layout: GENERAL, ..ImageSync::to(image, GENERAL) }
+    }
+
+    /// GTA V's pattern is still held: the last barrier on the colour input is in an earlier buffer,
+    /// the launch buffer has none before its first launch, and vkd3d-proton's barriers after the
+    /// launches (same-layout ones on the inputs, global ones) do not count.
+    #[test]
+    fn a_launch_buffer_with_no_synchronization_before_its_launch_is_held() {
+        let (mut t, params) = held_tracker();
+        t.barrier(cb(1), general_to_general(colour()));
+        t.launch(cb(2), Some(&params));
+        t.global(cb(2), Hazard::MemoryBarrier);
+        t.barrier(cb(2), general_to_general(colour()));
+        t.barrier(cb(2), general_to_general(vk::Image::from_raw(0x200)));
+        let scan = t.submit_ok(&[vec![cb(1), cb(2)]]).expect("launch-bearing");
+        assert_eq!((scan.index, scan.hazard, scan.colour_owner), (1, None, None));
+        assert!(scan.colour_in_general());
+        // Resubmitted unchanged: the same.
+        assert_eq!(t.submit_ok(&[vec![cb(1), cb(2)]]).and_then(|s| s.hazard), None);
+    }
+
+    /// Synchronization on a DLSS input inside the launch buffer, before the launch, is something
+    /// the hold would run ahead of: each kind makes the submit one to forward untouched, also when
+    /// the layout stays `GENERAL`.
+    #[test]
+    fn synchronization_before_the_launch_in_its_buffer_forbids_the_hold() {
+        let transfer = ImageSync { src_queue_family: 0, dst_queue_family: 1, ..general_to_general(colour()) };
+        let cases: [(&str, &dyn Fn(&mut Tracker), Hazard); 6] = [
+            ("GENERAL -> GENERAL on the colour input", &|t| t.barrier(cb(2), general_to_general(colour())), Hazard::SameLayoutBarrier),
+            ("a queue-family ownership transfer", &|t| t.barrier(cb(2), transfer), Hazard::QueueFamilyTransfer),
+            ("a layout transition", &|t| t.barrier(cb(2), ImageSync { old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, ..ImageSync::to(colour(), GENERAL) }), Hazard::LayoutTransition),
+            ("a barrier on depth, which the capture reads too", &|t| t.barrier(cb(2), general_to_general(vk::Image::from_raw(0x200))), Hazard::SameLayoutBarrier),
+            ("a global memory barrier", &|t| t.global(cb(2), Hazard::MemoryBarrier), Hazard::MemoryBarrier),
+            ("an event wait", &|t| t.global(cb(2), Hazard::EventWait), Hazard::EventWait),
+        ];
+        for (what, record, hazard) in cases {
+            let (mut t, params) = held_tracker();
+            record(&mut t);
+            t.launch(cb(2), Some(&params));
+            let scan = t.submit_ok(&[vec![cb(1), cb(2)]]).expect("launch-bearing");
+            assert_eq!(scan.hazard, Some(hazard), "{what}");
+            assert!(!hazard.why().is_empty());
+            // The layout alone would have allowed it.
+            assert!(scan.colour_in_general(), "{what}");
+            // Re-recorded without it: held again.
+            t.begin(cb(2));
+            t.launch(cb(2), Some(&params));
+            assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, None, "{what}");
+        }
+        // A launch that names other images first, then the barrier, then the launch naming the
+        // colour input: what counts is what precedes the launch that reads it.
+        let (mut t, params) = held_tracker();
+        t.launch(cb(2), Some(&param_block(&[0x1200])));
+        t.barrier(cb(2), general_to_general(colour()));
+        t.launch(cb(2), Some(&params));
+        assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, Some(Hazard::SameLayoutBarrier));
+        // An opaque launch (parameters unreadable): everything before the buffer's first launch.
+        let (mut t, _) = held_tracker();
+        t.global(cb(2), Hazard::MemoryBarrier);
+        t.launch(cb(2), None);
+        assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("held undecided").hazard, Some(Hazard::MemoryBarrier));
+    }
+
+    /// The order holds across `vkCmdExecuteCommands`: a barrier the primary recorded before
+    /// executing the secondary that launches is before the launch; one after it is not.
+    #[test]
+    fn synchronization_before_an_executed_secondarys_launch_counts() {
+        let (mut t, params) = held_tracker();
+        t.launch(cb(5), Some(&params));
+        t.barrier(cb(2), general_to_general(colour()));
+        t.execute(cb(2), &[cb(5)]);
+        assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, Some(Hazard::SameLayoutBarrier));
+        t.begin(cb(2));
+        t.execute(cb(2), &[cb(5)]);
+        t.barrier(cb(2), general_to_general(colour()));
+        assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, None);
+        // The barrier in one secondary, the launch in the next.
+        t.begin(cb(2));
+        t.global(cb(6), Hazard::EventWait);
+        t.execute(cb(2), &[cb(6), cb(5)]);
+        assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, Some(Hazard::EventWait));
+        t.begin(cb(2));
+        t.execute(cb(2), &[cb(5), cb(6)]);
+        assert_eq!(t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing").hazard, None);
+    }
+
+    /// A submitted ownership transfer of the colour input is remembered as its owner, for the
+    /// caller to compare with the family of the queue the hold would run on.
+    #[test]
+    fn the_colour_inputs_owning_queue_family_follows_submitted_transfers() {
+        let (mut t, params) = held_tracker();
+        t.launch(cb(2), Some(&params));
+        t.barrier(cb(1), ImageSync { src_queue_family: 0, dst_queue_family: 3, ..general_to_general(colour()) });
+        // In the same submit, ahead of the launch buffer: known to the scan before it is committed.
+        let scan = t.scan(&[vec![cb(1)], vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!((scan.colour_owner, scan.hazard), (Some(3), None));
+        assert!(t.owners.is_empty(), "nothing is committed by a scan");
+        t.commit_submitted([cb(1), cb(2)]);
+        assert_eq!(t.scan(&[vec![cb(2)]]).and_then(|s| s.colour_owner), Some(3));
+        t.forget_image(colour());
+        assert!(t.owners.is_empty());
+    }
+
+    /// Dynamic rendering suspended in the buffer before the launch buffer and resumed in it: the
+    /// split would put the layer's submits between the two.
+    #[test]
+    fn a_split_between_suspended_and_resumed_rendering_is_refused() {
+        let (suspending, resuming) = (vk::RenderingFlags::SUSPENDING, vk::RenderingFlags::RESUMING);
+        let (mut t, params) = held_tracker();
+        t.begin_rendering(cb(1), suspending);
+        t.begin_rendering(cb(2), resuming);
+        t.launch(cb(2), Some(&params));
+        let scan = t.submit_ok(&[vec![cb(1), cb(2)]]).expect("launch-bearing");
+        assert_eq!((scan.index, scan.hazard), (1, Some(Hazard::SuspendedRendering)));
+        // Suspended and resumed inside the launch buffer: nothing crosses the split.
+        t.begin(cb(2));
+        t.begin_rendering(cb(2), suspending);
+        t.begin_rendering(cb(2), resuming);
+        t.launch(cb(2), Some(&params));
+        assert_eq!(t.submit_ok(&[vec![cb(1), cb(2)]]).expect("launch-bearing").hazard, None);
+        // The launch buffer suspends and the next resumes: both are in the tail, together.
+        t.begin(cb(2));
+        t.launch(cb(2), Some(&params));
+        t.begin_rendering(cb(2), suspending);
+        t.begin_rendering(cb(3), resuming);
+        assert_eq!(t.submit_ok(&[vec![cb(2), cb(3)]]).expect("launch-bearing").hazard, None);
+        // Through secondaries: the resuming instance is in an executed secondary.
+        t.begin(cb(2));
+        t.begin_rendering(cb(7), resuming);
+        t.execute(cb(2), &[cb(7)]);
+        t.launch(cb(2), Some(&params));
+        assert_eq!(t.submit_ok(&[vec![cb(1), cb(2)]]).expect("launch-bearing").hazard, Some(Hazard::SuspendedRendering));
+        // The wrapper takes the lock for flagged instances only, and stays armed for them.
+        let tracking = Tracking::default();
+        tracking.begin_rendering(cb(1), vk::RenderingFlags::empty());
+        assert!(!tracking.armed());
+        tracking.begin_rendering(cb(1), suspending);
+        assert!(tracking.armed());
+        tracking.begin(cb(1));
+        assert!(!tracking.armed());
+    }
+
+    /// Tracked layouts advance only from command buffers the next layer accepted: a scan commits
+    /// nothing, a refused head leaves everything as it was, and after a refused tail only the
+    /// head's buffers count.
+    #[test]
+    fn failed_submissions_do_not_advance_the_tracked_layouts() {
+        let read_only = vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL;
+        let transfer = vk::ImageLayout::TRANSFER_SRC_OPTIMAL;
+        let fixture = || {
+            let (mut t, params) = held_tracker();
+            // Head: cb 1 leaves the colour input in GENERAL. Tail: the launch buffer, then cb 3,
+            // which moves it out of GENERAL after DLSS.
+            t.barrier(cb(1), ImageSync::to(colour(), GENERAL));
+            t.launch(cb(2), Some(&params));
+            t.barrier(cb(2), ImageSync::to(colour(), read_only));
+            t.barrier(cb(3), ImageSync::to(colour(), transfer));
+            t
+        };
+        let batches = vec![batch1(&[], &[1, 2, 3], &[])];
+        let cbs = vec![vec![cb(1), cb(2), cb(3)]];
+        // What the hold reads comes from the buffers ahead of the launch buffer, uncommitted.
+        let mut t = fixture();
+        let scan = t.scan(&cbs).expect("launch-bearing");
+        assert_eq!((scan.index, scan.colour_layout), (1, Some(GENERAL)));
+        assert!(t.committed.is_empty(), "a scan commits nothing");
+        // Submits `plan`'s parts, failing the call numbered `fail`; returns the result.
+        let run = |t: &mut Tracker, fail: usize| {
+            let scan = t.scan(&cbs).expect("launch-bearing");
+            let calls = std::cell::Cell::new(0);
+            let submit = |_: &[Batch1], _: vk::Fence| {
+                calls.set(calls.get() + 1);
+                if calls.get() == fail { vk::Result::ERROR_OUT_OF_DEVICE_MEMORY } else { vk::Result::SUCCESS }
+            };
+            let mut accepted = Vec::new();
+            let result = submit_around(plan(batches.clone(), scan.batch, scan.index), vk::Fence::null(), &submit, |_| false, &mut |part| accepted.extend(part));
+            t.commit_submitted(accepted);
+            result
+        };
+        // The head is refused: nothing executed, nothing tracked.
+        let mut t = fixture();
+        assert_eq!(run(&mut t, 1), vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert!(t.committed.is_empty());
+        // The head is accepted, the tail refused: the head's barrier only.
+        let mut t = fixture();
+        assert_eq!(run(&mut t, 2), vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert_eq!(t.committed.get(&colour()), Some(&GENERAL), "the launch buffer and what follows never ran");
+        // Both accepted: the last buffer's layout.
+        let mut t = fixture();
+        assert_eq!(run(&mut t, 0), vk::Result::SUCCESS);
+        assert_eq!(t.committed.get(&colour()), Some(&transfer));
+        // An unsplit call that fails is never committed by its caller: the state stays put, and
+        // the next scan still reads the last accepted layout.
+        let mut t = fixture();
+        assert!(t.scan(&cbs).is_some());
+        assert!(t.committed.is_empty());
+        t.commit_submitted([cb(1)]);
+        assert_eq!(t.scan(&[vec![cb(2)]]).and_then(|s| s.colour_layout), Some(GENERAL));
     }
 
     /// A parameter buffer in vkd3d-proton's layout: some scalars, then the given 64-bit handles.
@@ -4703,18 +5288,18 @@ mod tests {
         assert_eq!(t.launch[&cb(2)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
 
         // FG's submits on their own (another queue in GTA V): not held, counted.
-        assert!(t.scan(&[vec![cb(2)]]).is_none(), "frame generation's buffer is not the hold point");
-        assert!(t.scan(&[vec![cb(3)]]).is_none());
+        assert!(t.submit_ok(&[vec![cb(2)]]).is_none(), "frame generation's buffer is not the hold point");
+        assert!(t.submit_ok(&[vec![cb(3)]]).is_none());
         assert_eq!(t.foreign_submits, 2);
         // An FG buffer first in the same submit: the split point is SR's buffer behind it.
-        let scan = t.scan(&[vec![cb(2)], vec![cb(7), cb(1)]]).expect("SR's buffer is held");
+        let scan = t.submit_ok(&[vec![cb(2)], vec![cb(7), cb(1)]]).expect("SR's buffer is held");
         assert_eq!((scan.batch, scan.index), (1, 1));
         assert_eq!((t.colour_submits, t.evaluations, t.foreign_submits), (1, 1, 2));
         // SR's buffer through a secondary carries its references to the primary.
         t.begin(cb(1));
         t.launch(cb(11), Some(&param_block(&[colour])));
         t.execute(cb(1), &[cb(11)]);
-        assert!(t.scan(&[vec![cb(3), cb(1)]]).is_some_and(|s| s.index == 1));
+        assert!(t.submit_ok(&[vec![cb(3), cb(1)]]).is_some_and(|s| s.index == 1));
         assert_eq!(t.colour_submits, 2);
     }
 
@@ -4727,7 +5312,7 @@ mod tests {
         t.launch(cb(1), Some(&param_block(&[sr_out])));
         t.launch(cb(1), None);
         assert_eq!(t.launch[&cb(1)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
-        assert!(t.scan(&[vec![cb(1)]]).is_some(), "an opaque launch could be SR's: held");
+        assert!(t.submit_ok(&[vec![cb(1)]]).is_some(), "an opaque launch could be SR's: held");
         assert_eq!((t.colour_submits, t.foreign_submits), (0, 0));
         let refs = LaunchRefs::default();
         assert_eq!(refs.kind(None), LaunchKind::Unknown, "no colour input identified yet");
@@ -4743,7 +5328,7 @@ mod tests {
         assert_eq!(t.launch[&cb(5)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Foreign);
         t.launch(cb(6), Some(&param_block(&[0xdead_beef_0000])));
         assert_eq!(t.launch[&cb(6)].kind(Some(vk::Image::from_raw(0x100))), LaunchKind::Unknown);
-        assert!(t.scan(&[vec![cb(6)]]).is_some(), "names nothing registered: held as before");
+        assert!(t.submit_ok(&[vec![cb(6)]]).is_some(), "names nothing registered: held as before");
     }
 
     #[test]
@@ -4800,7 +5385,7 @@ mod tests {
         let mut lines = t.observe(batches);
         lines.extend(t.refresh());
         let undecided = t.evaluations - t.colour_submits;
-        let scan = t.scan(batches);
+        let scan = t.submit_ok(batches);
         lines.extend(t.classify_line(scan.as_ref(), undecided));
         (scan, lines)
     }
