@@ -1258,3 +1258,13 @@ no fps limit. The fullscreen resolution list under Proton stops at 2560x1080 (no
 windowed 2560x1440 stopped at a 255x114 dialog on start that synthetic input could not answer.
 Restored the original `user.cfg`. Not yet measured in play: the intro video runs for minutes on
 every launch and does not take controller input.
+
+## 2026-10-06 -- God of War (2018, DX11), branch build
+
+The first DX11 game (DXVK): held before the upscaler with no change. Settings found: borderless
+2560x1440, DLSS Quality (render 1708x960), V-Sync off, FPS limit off, Ultra. Menu: 38 holds/s.
+In play (`gw-1`, Continue): 49.5 holds/s = its frame rate (no frame generation in this game),
+0 misses, the game's exposure input, nothing composited after the upscaler, no fence timeout, no Xid.
+
+Witcher 3 and Metro Exodus EE were removed from the machine and from the README's tested games
+(neither ran far enough to test in play); their entries above stay as the record.
