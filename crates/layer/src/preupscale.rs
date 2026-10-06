@@ -116,6 +116,11 @@ pub(crate) const HAND_BACK: Duration = Duration::from_secs(30);
 /// [`Breaker`].
 pub(crate) const BREAKER_MISSES: u32 = 8;
 
+/// The largest value of the game's exposure image the HDR encode trusts. Measured exposures:
+/// GTA V 0.15-0.34, Crimson Desert 0.02-0.06, Cyberpunk 2077 2.7-3.3; Wukong's DLSS-internal 1x1
+/// read up to 59,456 ([`Session::check_exposure`]).
+pub(crate) const EXPOSURE_TRUST_MAX: f32 = 1000.0;
+
 /// How long an open [`Breaker`] forwards DLSS submits untouched before one probe hold.
 pub(crate) const BREAKER_COOL_DOWN: Duration = Duration::from_secs(2);
 
@@ -450,6 +455,16 @@ const MVEC_FORMATS: [vk::Format; 2] = [vk::Format::R16G16_SFLOAT, vk::Format::R3
 /// The formats of an image DLSS Super Resolution writes (its output, NGX's output-size scratch).
 const OUTPUT_FORMATS: [vk::Format; 2] = [vk::Format::R16G16B16A16_SFLOAT, vk::Format::B10G11R11_UFLOAT_PACK32];
 
+/// The colour input's layouts the hold inside DLSS's buffer moves from and back to (any other, or an
+/// unknown one, gets no hold there).
+const INLINE_LAYOUTS: [vk::ImageLayout; 5] = [
+    vk::ImageLayout::GENERAL,
+    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+];
+
 /// The largest registered output-like image (a 2D RGBA16F or R11G11B10 storage image): what the
 /// colour input is compared against when no swapchain is known on the device (Cyberpunk 2077 under
 /// vkd3d-proton logged "swapchain None").
@@ -564,9 +579,16 @@ pub(crate) enum InputLaunch {
 }
 
 /// Whether `d` can be DLSS's colour input as its input kernel's parameters name it: a 2D
-/// single-sample RGBA16F or R11G11B10 storage image (only RGBA16F is held, see `device.rs`).
+/// single-sample RGBA16F storage image, or an R11G11B10 one that is a storage or a sampled image
+/// (Unreal Engine 5 hands DLSS a sampled `B10G11R11_UFLOAT` colour input: Black Myth: Wukong's
+/// benchmark, 2026-10-05). The split holds RGBA16F only; the hold inside DLSS's buffer converts.
 fn colour_candidate(d: &ImageDesc) -> bool {
-    d.plain && OUTPUT_FORMATS.contains(&d.format) && d.usage.contains(vk::ImageUsageFlags::STORAGE)
+    d.plain
+        && match d.format {
+            vk::Format::R16G16B16A16_SFLOAT => d.usage.contains(vk::ImageUsageFlags::STORAGE),
+            vk::Format::B10G11R11_UFLOAT_PACK32 => d.usage.intersects(vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED),
+            _ => false,
+        }
 }
 
 /// Reads one launch's named registered images (`named`; `images` has their descriptions) the way
@@ -893,6 +915,10 @@ pub(crate) enum Hazard {
     /// The launch buffer resumes dynamic rendering suspended in the buffer before it
     /// (`VK_RENDERING_RESUMING_BIT`): nothing may be submitted between the two.
     SuspendedRendering,
+    /// Not a synchronization hazard: the colour input is not an RGBA16F image in `GENERAL`, which the
+    /// split needs (it reads and writes it as a storage image); only the hold inside the buffer,
+    /// which converts, takes it ([`inline`]).
+    NotSplittable,
 }
 
 impl Hazard {
@@ -904,6 +930,7 @@ impl Hazard {
             Self::MemoryBarrier => "the DLSS launch buffer has a global memory barrier with a write in its source access before its launch; not holding (it may be what makes the input visible), frames go to DLSS untouched",
             Self::EventWait => "the DLSS launch buffer waits on an event before its launch; not holding, frames go to DLSS untouched",
             Self::SuspendedRendering => "the DLSS launch buffer resumes dynamic rendering suspended in the buffer before it; not holding (nothing may be submitted between the two), frames go to DLSS untouched",
+            Self::NotSplittable => "the colour input is not an RGBA16F image in GENERAL; only the hold inside DLSS's buffer takes it",
         }
     }
 }
@@ -1121,6 +1148,8 @@ pub(crate) struct Before {
 pub(crate) struct InlinePoint {
     pub colour: vk::Image,
     pub desc: ImageDesc,
+    /// The colour input's layout at the hold (restored after it).
+    pub layout: vk::ImageLayout,
     pub exposure_input: Option<Aux>,
     pub identification: u64,
     pub hazard: Hazard,
@@ -1339,9 +1368,16 @@ impl Tracker {
             if value == 0 {
                 continue;
             }
-            for &(key, _, image) in &self.keys {
-                if key == value && !named.contains(&image) {
-                    named.push(image);
+            // The whole word, then its two 32-bit halves in memory order: Unreal Engine 5's DLSS
+            // (Black Myth: Wukong's benchmark) packs two 32-bit view handles per word
+            // (`0x3201c23_01401c00`), where GTA V's and Crimson Desert's give each its own.
+            let halves = [value & 0xffff_ffff, value >> 32];
+            let packed = value >> 32 != 0 && halves.iter().all(|&h| h != 0);
+            for candidate in std::iter::once(value).chain(halves.into_iter().filter(|_| packed)) {
+                for &(key, _, image) in &self.keys {
+                    if key == candidate && !named.contains(&image) {
+                        named.push(image);
+                    }
                 }
             }
         }
@@ -1359,6 +1395,40 @@ impl Tracker {
             if refs.input.is_some() {
                 refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
             }
+            // DLSS Super Resolution's input kernel by name, but not read as an input launch: say once
+            // what it named, so a new engine's input form shows in the log.
+            let read_as = refs.input.clone();
+            if kernel == Some(Kernel::SrInput) && !matches!(read_as, Some(InputLaunch::Inputs { .. })) && self.said_named & 4 == 0 {
+                self.said_named |= 4;
+                let list: Vec<String> = named
+                    .iter()
+                    .map(|i| match self.images.get(i) {
+                        Some(d) => format!("{}x{} {:?} {}", d.width, d.height, d.format, usage_short(d.usage)),
+                        None => "unregistered".into(),
+                    })
+                    .collect();
+                let words: Vec<String> = bytes
+                    .chunks_exact(8)
+                    .map(|w| u64::from_le_bytes(w.try_into().unwrap_or_default()))
+                    .filter(|&v| v != 0)
+                    .take(64)
+                    .map(|v| format!("{v:#x}"))
+                    .collect();
+                let mut keys: Vec<u64> = self.keys.iter().map(|k| k.0).collect();
+                keys.sort_unstable();
+                keys.dedup();
+                crate::log!(
+                    "[preupscale] DLSS's input kernel names {} registered image(s) ({}) and {} parameter word(s); read as {:?}; non-zero words [{}]; {} registered key(s), e.g. [{}]",
+                    named.len(),
+                    list.join(", "),
+                    bytes.len() / 8,
+                    read_as,
+                    words.join(" "),
+                    keys.len(),
+                    keys.iter().rev().take(24).map(|k| format!("{k:#x}")).collect::<Vec<_>>().join(" ")
+                );
+                crate::logging::flush();
+            }
         }
         let candidate = |i: &vk::Image| self.inputs.is_some_and(|n| n.colour.0 == *i || n.others.iter().flatten().any(|o| o.0 == *i));
         let had_colour = refs.images.iter().any(candidate);
@@ -1374,11 +1444,14 @@ impl Tracker {
 
     /// Whether a hold should run inside `cb`, right before the launch just recorded, which is the
     /// first of the buffer to name `colour` (a colour candidate): the inputs are identified (not on
-    /// the submit that identified them), the split in front of the buffer would be refused
-    /// ([`Self::launch_hazard`], other than a suspended render pass), the colour input is an
-    /// RGBA16F image the layer can copy (`TRANSFER_SRC | TRANSFER_DST`) at the identified extent,
-    /// in `GENERAL` by the buffer's own barriers or the committed state, and no render pass
-    /// instance is suspended at that point. A buffer the split can take (GTA V's) gets nothing.
+    /// the submit that identified them), the colour input is an RGBA16F or R11G11B10 image the layer
+    /// can transfer (`TRANSFER_SRC | TRANSFER_DST`) at the identified extent, its layout at that
+    /// point is known (the buffer's own barriers, else the committed state; an RGBA16F storage image
+    /// no barrier was seen on is taken as `GENERAL`, as the split does), no render pass instance is
+    /// suspended there, and the split in front of the buffer cannot take it: the split would be
+    /// refused ([`Self::launch_hazard`]), or the colour input is not an RGBA16F image in `GENERAL`
+    /// (the split reads and writes it as a storage image). A buffer the split can take (GTA V's)
+    /// gets nothing.
     pub(crate) fn inline_point(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Option<InlinePoint> {
         let inputs = self.inputs?;
         if self.identified {
@@ -1386,7 +1459,7 @@ impl Tracker {
         }
         let desc = *self.images.get(&colour)?;
         let copyable = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        if desc.format != vk::Format::R16G16B16A16_SFLOAT
+        if !OUTPUT_FORMATS.contains(&desc.format)
             || !desc.plain
             || !desc.usage.contains(copyable)
             || (desc.width, desc.height) != (inputs.colour.1.width, inputs.colour.1.height)
@@ -1396,17 +1469,22 @@ impl Tracker {
         if self.rendering.get(&cb).is_some_and(|r| r.last_suspending || r.open_resume) {
             return None;
         }
-        let at = Inputs { colour: (colour, desc), ..inputs };
-        let hazard = self.launch_hazard(cb, Some(&at)).0?;
+        let rgba16f = desc.format == vk::Format::R16G16B16A16_SFLOAT;
         let layout = self
             .pending
             .get(&cb)
             .and_then(|p| p.iter().rev().find(|s| s.image == colour).map(|s| s.new_layout))
             .or_else(|| self.committed.get(&colour).copied())
-            .unwrap_or(vk::ImageLayout::GENERAL);
-        if layout != vk::ImageLayout::GENERAL {
+            .or((rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE)).then_some(vk::ImageLayout::GENERAL))?;
+        if !INLINE_LAYOUTS.contains(&layout) {
             return None;
         }
+        let at = Inputs { colour: (colour, desc), ..inputs };
+        let hazard = match self.launch_hazard(cb, Some(&at)).0 {
+            Some(h) => h,
+            None if rgba16f && layout == vk::ImageLayout::GENERAL => return None,
+            None => Hazard::NotSplittable,
+        };
         let exposure_input = inputs.exposure_input.map(|(image, d)| {
             let layout = self
                 .pending
@@ -1416,7 +1494,7 @@ impl Tracker {
                 .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
             Aux { image, format: d.format, layout, readable: d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == (1, 1) }
         });
-        Some(InlinePoint { colour, desc, exposure_input, identification: self.generation, hazard })
+        Some(InlinePoint { colour, desc, layout, exposure_input, identification: self.generation, hazard })
     }
 
     /// Takes the mark [`Self::launch_kernel`] left for the launch just recorded.
@@ -4107,6 +4185,9 @@ pub(crate) struct Session {
     local_misses: u32,
     /// The identification and exposure source last logged ([`Self::note_exposure_source`]).
     exposure_said: Option<(u64, ExposureSource)>,
+    /// The identification whose game exposure read implausibly high ([`Self::check_exposure`]): its
+    /// holds measure the exposure from the frame instead.
+    exposure_untrusted: Option<u64>,
 }
 
 impl Session {
@@ -4221,6 +4302,30 @@ impl Session {
 
     /// Logs, once per identification of DLSS's inputs (and again if it changes), where the HDR
     /// encode's exposure comes from: the game's 1x1 R16F, or measured from the frame.
+    /// Whether the game's exposure image may be used for `identification` (not after it read
+    /// implausibly high, [`Self::check_exposure`]).
+    pub(crate) fn game_exposure_trusted(&self, identification: u64) -> bool {
+        self.exposure_untrusted != Some(identification)
+    }
+
+    /// After a hold that read the game's exposure: a value over [`EXPOSURE_TRUST_MAX`] is not an
+    /// exposure (Black Myth: Wukong's benchmark uses DLSS's own auto-exposure; the 1x1 R16F its DLSS
+    /// buffer names read 0.22 in some scenes and up to 59,456 in others, 2026-10-05). From then on
+    /// that identification's holds measure the exposure from the frame. Logged once.
+    pub(crate) fn check_exposure(&mut self, identification: u64, result: &HoldResult) {
+        if result.exposure_source == Some(ExposureSource::Game)
+            && result.exposure.is_some_and(|e| e > EXPOSURE_TRUST_MAX)
+            && self.exposure_untrusted != Some(identification)
+        {
+            self.exposure_untrusted = Some(identification);
+            crate::log!(
+                "[preupscale] the game's exposure image read {:.1} (over {EXPOSURE_TRUST_MAX}): not an exposure; measuring it from the frame for this identification",
+                result.exposure.unwrap_or_default()
+            );
+            crate::logging::flush();
+        }
+    }
+
     pub(crate) fn note_exposure_source(&mut self, identification: u64, inputs: &Inputs, result: &HoldResult) {
         let Some(source) = result.exposure_source else { return };
         if self.exposure_said == Some((identification, source)) {
@@ -5335,9 +5440,15 @@ mod tests {
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
         assert!(t.inline_point(b, c).is_none());
-        // Left outside GENERAL by the buffer's own barrier: nothing.
+        // Left in SHADER_READ_ONLY_OPTIMAL by the buffer's own barrier: held inside, moved to the
+        // transfer layouts and back to that one; in a layout outside those the hold handles: nothing.
         let (mut t, params) = held_tracker_with(copyable);
         t.barrier(cb(2), ImageSync { old_layout: GENERAL, ..ImageSync::to(colour(), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) });
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert_eq!(t.inline_point(b, c).map(|p| p.layout), Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL));
+        let (mut t, params) = held_tracker_with(copyable);
+        t.barrier(cb(2), ImageSync { old_layout: GENERAL, ..ImageSync::to(colour(), vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL) });
         t.launch(cb(2), Some(&params));
         let (b, c) = t.take_inline_at().expect("first colour launch");
         assert!(t.inline_point(b, c).is_none());
@@ -5345,6 +5456,93 @@ mod tests {
         let (mut t, _) = held_tracker_with(copyable);
         t.launch(cb(3), Some(&param_block(&[0x1200])));
         assert_eq!(t.take_inline_at(), None);
+    }
+
+    /// An implausible game exposure (Wukong's DLSS-internal 1x1 read 59,456) stops that
+    /// identification from using the game's exposure image; plausible ones (GTA V's 0.22, Cyberpunk's
+    /// 3.3) never do, and a measured exposure is not judged.
+    #[test]
+    fn an_implausible_game_exposure_switches_that_identification_to_the_measured_one() {
+        let mut session = Session::default();
+        let result = |source, e| HoldResult { exposure_source: Some(source), exposure: Some(e), ..HoldResult::default() };
+        session.check_exposure(7, &result(ExposureSource::Game, 0.2195));
+        session.check_exposure(7, &result(ExposureSource::Game, 3.32));
+        session.check_exposure(7, &result(ExposureSource::Auto, 59456.0));
+        assert!(session.game_exposure_trusted(7));
+        session.check_exposure(7, &result(ExposureSource::Game, 59456.0));
+        assert!(!session.game_exposure_trusted(7));
+        assert!(session.game_exposure_trusted(8), "a new identification starts trusted");
+    }
+
+    /// Unreal Engine 5's DLSS packs two 32-bit view handles into one 8-byte parameter word (Black
+    /// Myth: Wukong's benchmark, 2026-10-05: `0x3201c2301401c00` holds `0x3201c23` and `0x1401c00`):
+    /// both are read, in memory order (low half first). A word holding one handle is read as before.
+    #[test]
+    fn two_32_bit_handles_packed_in_one_parameter_word_are_both_read() {
+        let (mut t, _) = held_tracker();
+        // held_tracker's keys: 0x1100 (colour), 0x1200 (depth), 0x1300 (motion vectors).
+        let packed = |lo: u64, hi: u64| lo | hi << 32;
+        t.launch(cb(5), Some(&param_block(&[packed(0x1200, 0x1100), 0x1300])));
+        let refs = &t.launch[&cb(5)];
+        assert_eq!(refs.images, vec![vk::Image::from_raw(0x200), vk::Image::from_raw(0x100), vk::Image::from_raw(0x300)]);
+        assert!(matches!(refs.input, Some(InputLaunch::Inputs { colour, .. }) if colour == vk::Image::from_raw(0x100)));
+        // A word that is one 64-bit value is not split: a key equal to its low half is not named.
+        let (mut t, _) = held_tracker();
+        t.launch(cb(6), Some(&param_block(&[0x1100])));
+        assert_eq!(t.launch[&cb(6)].images, vec![vk::Image::from_raw(0x100)]);
+    }
+
+    /// Unreal Engine 5 (Black Myth: Wukong's benchmark): DLSS's colour input is a sampled, not storage,
+    /// `B10G11R11_UFLOAT` image. Its input kernel's parameters name it as the colour input; an
+    /// RGBA16F image that is only sampled still is not a candidate. The split cannot hold an
+    /// R11G11B10 input, so the hold goes inside the buffer even with nothing before the launch,
+    /// in the layout the buffer's barrier left it in.
+    #[test]
+    fn a_sampled_r11g11b10_colour_input_is_identified_and_held_inside_the_buffer() {
+        let r11 = |usage| ImageDesc { width: 1488, height: 836, format: vk::Format::B10G11R11_UFLOAT_PACK32, usage, plain: true };
+        let rgba = |usage| ImageDesc { width: 1488, height: 836, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true };
+        assert!(colour_candidate(&r11(vk::ImageUsageFlags::SAMPLED)));
+        assert!(colour_candidate(&r11(vk::ImageUsageFlags::STORAGE)));
+        assert!(!colour_candidate(&r11(vk::ImageUsageFlags::COLOR_ATTACHMENT)));
+        assert!(!colour_candidate(&rgba(vk::ImageUsageFlags::SAMPLED)));
+        assert!(colour_candidate(&rgba(vk::ImageUsageFlags::STORAGE)));
+
+        let mut t = Tracker::default();
+        let usage = vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        for (raw, format, usage) in [
+            (0x100, vk::Format::B10G11R11_UFLOAT_PACK32, usage),
+            (0x200, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT),
+            (0x300, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::STORAGE),
+        ] {
+            let info = vk::ImageCreateInfo {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D { width: 1488, height: 836, depth: 1 },
+                format,
+                usage,
+                samples: vk::SampleCountFlags::TYPE_1,
+                ..Default::default()
+            };
+            t.record_image(vk::Image::from_raw(raw), &info);
+            t.record_view(vk::ImageView::from_raw(raw + 1), vk::Image::from_raw(raw));
+            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
+        }
+        t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
+        let params = param_block(&[0x1100, 0x1200, 0x1300]);
+        // Settle the identification by the input kernel's parameters.
+        for _ in 0..(SETTLE_SUBMITS + 4) {
+            t.launch(cb(900), Some(&params));
+            let _ = submit(&mut t, &[vec![cb(900)]]);
+            t.free(&[cb(900)]);
+        }
+        let inputs = t.inputs.expect("identified");
+        assert_eq!((inputs.colour.0, inputs.colour.1.format), (vk::Image::from_raw(0x100), vk::Format::B10G11R11_UFLOAT_PACK32));
+        t.barrier(cb(2), ImageSync { old_layout: vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL, ..ImageSync::to(vk::Image::from_raw(0x100), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL) });
+        let _ = submit(&mut t, &[vec![cb(2)]]);
+        t.begin(cb(2));
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        let point = t.inline_point(b, c).expect("held inside the buffer");
+        assert_eq!((point.layout, point.hazard), (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, Hazard::NotSplittable));
     }
 
     /// Depth and motion vectors are read only by a dump: a barrier on them before the launch stops
@@ -7506,6 +7704,7 @@ mod tests {
             let point = InlinePoint {
                 colour: image,
                 desc: ImageDesc { width: w, height: h, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true },
+                layout: vk::ImageLayout::GENERAL,
                 exposure_input: exposure_aux(exposure),
                 identification: 1,
                 hazard: Hazard::MemoryBarrier,

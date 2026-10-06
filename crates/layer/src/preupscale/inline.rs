@@ -100,6 +100,9 @@ pub(crate) struct Inline {
     /// The game's graphics family (where DLSS's buffers are submitted) and the layer's queue's.
     app_family: u32,
     side_family: u32,
+    /// Whether `B10G11R11_UFLOAT_PACK32` (optimal tiling) can be blitted from and to: the conversion
+    /// to and from the RGBA16F staging image for an R11G11B10 colour input.
+    blit_r11g11b10: bool,
     slots: Mutex<Slots>,
     jobs: Mutex<Option<mpsc::Sender<Job>>>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -118,6 +121,13 @@ impl Inline {
     ) -> Option<Arc<Self>> {
         // SAFETY: `physical_device` is the device's own.
         let memory = unsafe { instance.get_physical_device_memory_properties(physical_device) };
+        let blit = vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
+        // SAFETY: as above.
+        let blit_r11g11b10 = unsafe { instance.get_physical_device_format_properties(physical_device, vk::Format::B10G11R11_UFLOAT_PACK32) }
+            .optimal_tiling_features
+            .contains(blit)
+            // SAFETY: as above.
+            && unsafe { instance.get_physical_device_format_properties(physical_device, vk::Format::R16G16B16A16_SFLOAT) }.optimal_tiling_features.contains(blit);
         let (tx, rx) = mpsc::channel::<Job>();
         let stopping = Arc::new(AtomicBool::new(false));
         let inline = Arc::new(Self {
@@ -125,6 +135,7 @@ impl Inline {
             memory,
             app_family,
             side_family: family,
+            blit_r11g11b10,
             slots: Mutex::new(Slots::default()),
             jobs: Mutex::new(Some(tx)),
             worker: Mutex::new(None),
@@ -198,6 +209,11 @@ impl Inline {
             return false;
         }
         let extent = (point.desc.width, point.desc.height);
+        let convert = point.desc.format != vk::Format::R16G16B16A16_SFLOAT;
+        if convert && !self.blit_r11g11b10 {
+            self.say_once(format!("the colour input is {:?} and the device cannot blit it to RGBA16F; not holding", point.desc.format));
+            return false;
+        }
         let now = Instant::now();
         let free = s.slots.iter().position(|sl| sl.owner.is_none()).or_else(|| s.slots.iter().position(|sl| now.duration_since(sl.used) > STALE));
         let index = match free {
@@ -238,7 +254,16 @@ impl Inline {
         // SAFETY: recording into the application's buffer, which it is recording on this thread
         // right now (the hook is inside its `vkCmdCuLaunchKernelNVX`); every handle is live.
         unsafe {
-            record_hold(&self.device, cb, point.colour, slot.image, extent, exposure.map(|(image, layout)| (image, layout, slot.exposure)), slot.captured, slot.release)
+            record_hold(
+                &self.device,
+                cb,
+                (point.colour, point.layout, convert),
+                slot.image,
+                extent,
+                exposure.map(|(image, layout)| (image, layout, slot.exposure)),
+                slot.captured,
+                slot.release,
+            )
         };
         slot.point = Some(InlinePoint {
             exposure_input: exposure.map(|_| Aux { image: slot.exposure, format: vk::Format::R16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
@@ -249,7 +274,10 @@ impl Inline {
         s.by_cb.insert(cb, index);
         drop(s);
         self.say_once(format!(
-            "holding inside DLSS's command buffer, right before its first launch that reads the colour input (the split in front of it is refused: {:?})",
+            "holding inside DLSS's command buffer, right before its first launch that reads the colour input ({:?} in {:?}{}; why not the split: {:?})",
+            point.desc.format,
+            point.layout,
+            if convert { ", blitted to and from RGBA16F" } else { "" },
             point.hazard
         ));
         true
@@ -460,13 +488,18 @@ fn wait_set(device: &ash::Device, event: vk::Event, deadline: Duration, stopping
     }
 }
 
-/// The commands recorded into the application's buffer before its first colour launch.
+/// The commands recorded into the application's buffer before its first colour launch. `colour` is
+/// the colour input, its layout there, and whether it is converted (blitted) rather than copied (an
+/// R11G11B10 colour input; the staging image is always RGBA16F). A colour input outside `GENERAL`
+/// is moved to the transfer layout and back.
 ///
 /// # Safety
-/// `cb` is being recorded on this thread; `colour` is in `GENERAL` at this point of the buffer and
-/// has `TRANSFER_SRC | TRANSFER_DST`; `staging` is the slot's image of the colour input's extent.
+/// `cb` is being recorded on this thread; the colour input is in that layout at this point of the
+/// buffer and has `TRANSFER_SRC | TRANSFER_DST` (and the blit format features when converted);
+/// `staging` is the slot's RGBA16F image of the colour input's extent.
+#[allow(clippy::too_many_arguments)]
 unsafe fn record_hold(
-    d: &ash::Device, cb: vk::CommandBuffer, colour: vk::Image, staging: vk::Image, extent: (u32, u32),
+    d: &ash::Device, cb: vk::CommandBuffer, (colour, layout, convert): (vk::Image, vk::ImageLayout, bool), staging: vk::Image, extent: (u32, u32),
     exposure: Option<(vk::Image, vk::ImageLayout, vk::Image)>, captured: vk::Event, release: vk::Event,
 ) {
     let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
@@ -478,22 +511,37 @@ unsafe fn record_hold(
         dst_offset: vk::Offset3D::default(),
         extent: vk::Extent3D { width: extent.0, height: extent.1, depth: 1 },
     };
+    let far = vk::Offset3D { x: extent.0 as i32, y: extent.1 as i32, z: 1 };
+    let blit = vk::ImageBlit { src_subresource: layers, src_offsets: [vk::Offset3D::default(), far], dst_subresource: layers, dst_offsets: [vk::Offset3D::default(), far] };
+    let image_barrier = |image, old, new, src: vk::AccessFlags, dst: vk::AccessFlags| {
+        vk::ImageMemoryBarrier::builder()
+            .old_layout(old)
+            .new_layout(new)
+            .src_access_mask(src)
+            .dst_access_mask(dst)
+            .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+            .image(image)
+            .subresource_range(range)
+            .build()
+    };
+    // In GENERAL the transfers use it as it is; otherwise it moves to the transfer layout and back.
+    let general = layout == vk::ImageLayout::GENERAL;
+    let (read_layout, write_layout) = if general {
+        (vk::ImageLayout::GENERAL, vk::ImageLayout::GENERAL)
+    } else {
+        (vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL)
+    };
     // Everything the buffer wrote before this point (the frame, rendered in this same buffer) is
     // visible to the copy; the staging image's old contents are not needed.
     let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).build();
-    let staging_general = vk::ImageMemoryBarrier::builder()
-        .old_layout(vk::ImageLayout::UNDEFINED)
-        .new_layout(vk::ImageLayout::GENERAL)
-        .src_access_mask(vk::AccessFlags::empty())
-        .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-        .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-        .image(staging)
-        .subresource_range(range)
-        .build();
+    let mut to_read = vec![image_barrier(staging, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)];
     // DLSS's 1x1 exposure input, copied beside the colour input into the slot's own (`exposure`:
     // source, its layout, the slot's image).
-    let exposure_general = exposure.map(|(_, _, own)| vk::ImageMemoryBarrier { image: own, ..staging_general });
+    to_read.extend(exposure.map(|(_, _, own)| image_barrier(own, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)));
+    if !general {
+        to_read.push(image_barrier(colour, layout, read_layout, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ));
+    }
     let exposure_region = vk::ImageCopy { extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..region };
     // The copy made available before the host sees `captured` and the side queue reads it.
     let published = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
@@ -503,22 +551,35 @@ unsafe fn record_hold(
         .src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE)
         .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
         .build();
-    // The copy back visible to DLSS's launch and everything after it.
+    let to_write: Vec<vk::ImageMemoryBarrier> =
+        (!general).then(|| image_barrier(colour, read_layout, write_layout, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)).into_iter().collect();
+    // The copy back visible to DLSS's launch and everything after it, in the colour input's layout.
     let close = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+    let back: Vec<vk::ImageMemoryBarrier> = (!general)
+        .then(|| image_barrier(colour, write_layout, layout, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE))
+        .into_iter()
+        .collect();
     // SAFETY: the contract; every command is legal outside a render pass instance, where a CUDA
     // launch is.
     unsafe {
-        let to_general: Vec<vk::ImageMemoryBarrier> = std::iter::once(staging_general).chain(exposure_general).collect();
-        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[open], &[], &to_general);
-        d.cmd_copy_image(cb, colour, vk::ImageLayout::GENERAL, staging, vk::ImageLayout::GENERAL, &[region]);
-        if let Some((source, layout, own)) = exposure {
-            d.cmd_copy_image(cb, source, layout, own, vk::ImageLayout::GENERAL, &[exposure_region]);
+        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[open], &[], &to_read);
+        if convert {
+            d.cmd_blit_image(cb, colour, read_layout, staging, vk::ImageLayout::GENERAL, &[blit], vk::Filter::NEAREST);
+        } else {
+            d.cmd_copy_image(cb, colour, read_layout, staging, vk::ImageLayout::GENERAL, &[region]);
+        }
+        if let Some((source, source_layout, own)) = exposure {
+            d.cmd_copy_image(cb, source, source_layout, own, vk::ImageLayout::GENERAL, &[exposure_region]);
         }
         d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[published], &[], &[]);
         d.cmd_set_event(cb, captured, vk::PipelineStageFlags::TRANSFER);
-        d.cmd_wait_events(cb, &[release], vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::TRANSFER, &[acquire], &[], &[]);
-        d.cmd_copy_image(cb, staging, vk::ImageLayout::GENERAL, colour, vk::ImageLayout::GENERAL, &[region]);
-        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &[]);
+        d.cmd_wait_events(cb, &[release], vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::TRANSFER, &[acquire], &[], &to_write);
+        if convert {
+            d.cmd_blit_image(cb, staging, vk::ImageLayout::GENERAL, colour, write_layout, &[blit], vk::Filter::NEAREST);
+        } else {
+            d.cmd_copy_image(cb, staging, vk::ImageLayout::GENERAL, colour, write_layout, &[region]);
+        }
+        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &back);
         // Reset for the next execution once everything before has run (the wait included).
         d.cmd_reset_event(cb, captured, vk::PipelineStageFlags::ALL_COMMANDS);
         d.cmd_reset_event(cb, release, vk::PipelineStageFlags::ALL_COMMANDS);
@@ -644,6 +705,7 @@ mod tests {
             let point = InlinePoint {
                 colour,
                 desc: ImageDesc { width: w, height: h, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true },
+                layout: vk::ImageLayout::GENERAL,
                 exposure_input: None,
                 identification: 0,
                 hazard: Hazard::MemoryBarrier,
@@ -692,6 +754,125 @@ mod tests {
             device.destroy_fence(fence, None);
             device.destroy_command_pool(pool, None);
             device.destroy_buffer(readback, None);
+            device.free_memory(bmemory, None);
+            device.destroy_image(colour, None);
+            device.free_memory(memory, None);
+        }
+    }
+}
+
+#[cfg(test)]
+mod convert_tests {
+    use super::*;
+    use crate::preupscale::{Hazard, ImageDesc};
+
+    /// The hold's conversion path on a real device: an R11G11B10 colour input in
+    /// `SHADER_READ_ONLY_OPTIMAL` (Unreal Engine 5's) is blitted to the RGBA16F staging image and back,
+    /// with the layout moved to the transfer layouts and restored. A hold that writes nothing must
+    /// leave the frame byte for byte as the same buffer recorded without the hold leaves it.
+    #[test]
+    fn an_r11g11b10_input_round_trips_through_the_staging_image_unchanged() {
+        let Some((_entry, instance, physical_device, device, queue, family)) = crate::composition::gpu::test_device() else { return };
+        let format = vk::Format::B10G11R11_UFLOAT_PACK32;
+        let blit = vk::FormatFeatureFlags::BLIT_SRC | vk::FormatFeatureFlags::BLIT_DST;
+        // SAFETY: test-only queries and setup on a live device; everything is destroyed at the end.
+        unsafe {
+            if !instance.get_physical_device_format_properties(physical_device, format).optimal_tiling_features.contains(blit) {
+                eprintln!("no R11G11B10 blit on this device, skipping");
+                return;
+            }
+            let device = Arc::new(device);
+            let (w, h) = (48u32, 32u32);
+            let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
+            let props = instance.get_physical_device_memory_properties(physical_device);
+            let info = vk::ImageCreateInfo::builder()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(usage)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let colour = device.create_image(&info, None).unwrap();
+            let reqs = device.get_image_memory_requirements(colour);
+            let index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
+            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None).unwrap();
+            device.bind_image_memory(colour, memory, 0).unwrap();
+            let bytes = u64::from(w * h * 4);
+            let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
+            let buffer = device.create_buffer(&vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_DST), None).unwrap();
+            let breqs = device.get_buffer_memory_requirements(buffer);
+            let bindex = (0..props.memory_type_count)
+                .find(|&i| breqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(host))
+                .unwrap();
+            let bmemory = device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(breqs.size).memory_type_index(bindex), None).unwrap();
+            device.bind_buffer_memory(buffer, bmemory, 0).unwrap();
+            let ptr = device.map_memory(bmemory, 0, bytes, vk::MemoryMapFlags::empty()).unwrap().cast::<u8>();
+
+            let hold: HoldFn = Box::new(|_job, _queue| {});
+            let inline = Inline::start(device.clone(), &instance, physical_device, vk::Queue::null(), family, family, hold).expect("worker");
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let barrier = |old, new| {
+                vk::ImageMemoryBarrier::builder()
+                    .old_layout(old)
+                    .new_layout(new)
+                    .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                    .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(colour)
+                    .subresource_range(range)
+                    .build()
+            };
+            let run = |with_hold: bool| -> Vec<u8> {
+                let cb = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+                let begin = vk::CommandBufferBeginInfo::default();
+                device.begin_command_buffer(cb, &begin).unwrap();
+                inline.begin(cb, begin.flags);
+                let all = vk::PipelineStageFlags::ALL_COMMANDS;
+                device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[barrier(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL)]);
+                let clear = vk::ClearColorValue { float32: [1.75, 0.3125, 6.5, 1.0] };
+                device.cmd_clear_color_image(cb, colour, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &clear, &[range]);
+                device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[barrier(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]);
+                if with_hold {
+                    let point = InlinePoint {
+                        colour,
+                        desc: ImageDesc { width: w, height: h, format, usage, plain: true },
+                        layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+                        exposure_input: None,
+                        identification: 0,
+                        hazard: Hazard::NotSplittable,
+                    };
+                    assert!(inline.record(cb, point));
+                }
+                device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[barrier(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)]);
+                let region = vk::BufferImageCopy {
+                    image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                    image_extent: vk::Extent3D { width: w, height: h, depth: 1 },
+                    ..Default::default()
+                };
+                device.cmd_copy_image_to_buffer(cb, colour, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[region]);
+                device.end_command_buffer(cb).unwrap();
+                let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+                let jobs = inline.jobs_for([cb], Some(family));
+                assert_eq!(jobs.len(), usize::from(with_hold));
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cb]).build()], fence).unwrap();
+                inline.dispatch(jobs);
+                device.wait_for_fences(&[fence], true, 10_000_000_000).unwrap();
+                device.destroy_fence(fence, None);
+                std::slice::from_raw_parts(ptr, bytes as usize).to_vec()
+            };
+            let reference = run(false);
+            let held = run(true);
+            assert!(reference.iter().any(|&b| b != 0), "the clear wrote something");
+            assert_eq!(held, reference, "an R11G11B10 frame changed across a hold that wrote nothing");
+            destroy(device.handle());
+            device.unmap_memory(bmemory);
+            device.destroy_command_pool(pool, None);
+            device.destroy_buffer(buffer, None);
             device.free_memory(bmemory, None);
             device.destroy_image(colour, None);
             device.free_memory(memory, None);

@@ -1099,3 +1099,38 @@ frame generation 3x, SDR: held inside DLSS's buffer for the whole run, 2,400 hol
 0 misses after the model's first build, 116.3 fps shown on average (107 minimum per Cyberpunk's own
 summary: 118.0 average, 106.7 minimum), post-upscaler compose off (0.8/s), no fence timeout, no Xid.
 2.0.4 in the same settings: never identified, 75 fps shown, the model after the upscaler.
+
+## 2026-10-05 -- 2.0.6: Unreal Engine 5 (Black Myth: Wukong benchmark tool)
+
+Steam launch, `NEURAL_FORGE_ENABLE=1 %command%`, Proton-GE Latest, the tool's own settings (DLSS,
+super resolution 60, full ray tracing Medium, Very High), driven by a virtual Xbox controller
+(`~/nf-spike/pad/nf-pad.py` on LordNikon: the tool ignores a synthetic mouse).
+
+- Why nothing was held before: DLSS's input kernel (`cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi`)
+  packs two 32-bit view handles per 8-byte parameter word (`0x3201c2301401c00`), so the layer
+  matched only the one handle alone in its word (the output). Its colour input is a sampled
+  1488x836 `B10G11R11_UFLOAT` image in `SHADER_READ_ONLY_OPTIMAL` in some scenes, an RGBA16F storage
+  image in others; depth D32_SFLOAT_S8_UINT; the frame is rendered in DLSS's buffer before the
+  launch.
+- 2.0.6: held inside DLSS's buffer through the whole benchmark (over 7,800 holds per run, 19-90/s by
+  scene), hold 8.4 ms, 0 misses after the model's first build, no Xid. The 1x1 DLSS's buffer names
+  read 0.22 to 59,456 (DLSS's auto-exposure); over 1,000 the hold measures the exposure from the
+  frame. Frames with the model on look natural against frames with it off (same scenes, different
+  moments: the run with it off moves faster). The tool's counter: 36-42 fps with the model, 49-72
+  without.
+- Frame generation: the tool refuses it under Proton (hardware-accelerated GPU scheduling), with
+  Proton Experimental and Proton-GE, `WINE_DISABLE_HARDWARE_SCHEDULING=0` and
+  `WINE_ENABLE_HARDWARE_SCHEDULING=1` alike. Not Neural Forge's.
+
+Regression on the final 2.0.6 build, one run each, with the settings as found (frame generation on
+wherever the game has it):
+
+- GTA V Enhanced (benchmark, `v206-gta-1`): split hold 69.0 held/s against 68.0 real fps, 0 misses,
+  nothing inside DLSS's buffer (not needed), no fence timeout, no Xid.
+- Cyberpunk 2077 (benchmark, FG 3x, `v206-cp-1`): held inside DLSS's buffer, about 2,700 holds at
+  38.4/s, 116.5 fps shown on average (106.6 minimum), 0 misses, no Xid.
+- Black Myth: Wukong benchmark tool: over 7,800 holds, 0 misses, no Xid.
+- Crimson Desert (`v206-cd-2`, Ray Reconstruction on since 17:18 that day): the title screen held
+  (5,700 holds, 44/s, 0 misses); in game (Nas River) DLSS runs as Ray Reconstruction, so by design
+  nothing is held and the model runs after the upscaler (75.6 fps composited, all presents), no
+  fence timeout, no Xid.

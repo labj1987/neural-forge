@@ -682,7 +682,7 @@ fn inline_hold(
         depth: None,
         mvec: None,
         exposure: [None; crate::preupscale::MAX_EXPOSURE],
-        exposure_input: job.exposure,
+        exposure_input: job.exposure.filter(|_| session.game_exposure_trusted(job.point.identification)),
         paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
         identification: job.point.identification,
     };
@@ -711,6 +711,7 @@ fn inline_hold(
         inflight[0].forget_answer();
     }
     hold.mark_local(mode);
+    session.check_exposure(job.point.identification, &hold);
     session.note(shm, &hold, started.elapsed(), extent);
     if let Some(frame) = hold.dump.take() {
         crate::preupscale::write_dump_async(frame);
@@ -1178,7 +1179,7 @@ impl NeuralForgeDeviceInfo {
             }),
             // DLSS's exposure input: its committed layout, or GENERAL for a storage image no barrier
             // was seen on (the layout vkd3d-proton keeps those in; E1b found it there).
-            exposure_input: inputs.exposure_input.map(|(image, desc)| {
+            exposure_input: inputs.exposure_input.filter(|_| session.game_exposure_trusted(scan.identification)).map(|(image, desc)| {
                 let layout = scan.exposure_input_layout.or(desc.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
                 let readable = desc.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (desc.width, desc.height) == (1, 1);
                 crate::preupscale::Aux { image, format: desc.format, layout, readable }
@@ -1216,6 +1217,7 @@ impl NeuralForgeDeviceInfo {
                 inflight[0].forget_answer();
             }
             hold.mark_local(mode);
+            session.check_exposure(scan.identification, &hold);
             session.note_exposure_source(scan.identification, &inputs, &hold);
             session.note(shm, &hold, cpu, extent);
             if let Some(frame) = hold.dump.take() {

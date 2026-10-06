@@ -432,8 +432,17 @@ yet re-recorded (`vkBeginCommandBuffer` and `vkFreeCommandBuffers` free them; a 
 10 s is taken back). Teardown stops the worker first (jobs left are released at once), joins it,
 waits the device idle and frees the slots, before the device's other resources.
 
-`NEURAL_FORGE_INLINE=off` turns it off (no queue is added either). `dump` keeps to the split: the
-staging copy carries the colour input only.
+**Other formats and layouts (2.0.6).** The colour input may be RGBA16F or `B10G11R11_UFLOAT` (Unreal
+Engine 5 hands DLSS a sampled R11G11B10 image), in `GENERAL`, `SHADER_READ_ONLY_OPTIMAL`,
+`COLOR_ATTACHMENT_OPTIMAL` or a transfer layout, known from the buffer's barriers or the committed
+state. Outside `GENERAL` it is moved to `TRANSFER_SRC_OPTIMAL` for the capture, to
+`TRANSFER_DST_OPTIMAL` for the copy back and back to its layout; an R11G11B10 input is blitted
+(`NEAREST`, same extent) to the RGBA16F staging image and back, when the device can blit both
+formats. Such inputs are held here even with nothing in the buffer before the launch
+(`Hazard::NotSplittable`): the split reads and writes the colour input as an RGBA16F storage image.
+
+`NEURAL_FORGE_INLINE=off` turns it off (no queue is added either). A `dump` taken here has the colour
+input and the exposure only.
 
 ### The HDR encode and decode (model, roundtrip)
 

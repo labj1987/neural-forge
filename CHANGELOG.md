@@ -15,6 +15,32 @@ first shipped them; their phase is kept as a subheading.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
+## 2.0.6 — 2026-10-05
+
+Unreal Engine 5 (Black Myth: Wukong's benchmark tool) is held before the upscaler.
+
+- **DLSS's input is found when its kernel packs two 32-bit view handles into one parameter word.**
+  Unreal Engine 5's DLSS does (`0x3201c2301401c00` is the handles `0x3201c23` and `0x1401c00`);
+  GTA V's, Crimson Desert's and Cyberpunk 2077's give each handle its own 8-byte word. Each word is
+  now also read as its two halves, in memory order. Before, Wukong's input kernel named only the
+  output, and nothing was ever identified.
+- **A sampled `B10G11R11_UFLOAT` colour input is held,** inside DLSS's buffer: blitted to the
+  RGBA16F staging image and back, with its layout (`SHADER_READ_ONLY_OPTIMAL` there) moved to the
+  transfer layouts and restored. The hold inside the buffer also takes an RGBA16F input outside
+  `GENERAL` now. RGBA16F colour inputs still must be storage images to be candidates.
+- **An implausible game exposure is not used.** Wukong uses DLSS's own auto-exposure; the 1x1 its
+  DLSS buffer names read 0.22 in some scenes and up to 59,456 in others. A value over 1,000 makes that
+  identification's holds measure the exposure from the frame instead (GTA V reads 0.15-0.34, Crimson
+  Desert 0.02-0.06, Cyberpunk 2077 2.7-3.3).
+- When DLSS's input kernel names images the layer cannot read as an input launch, what it names is
+  logged once (formats, extents, parameter words, registered keys).
+- Benchmark (frame generation off: the tool refuses it under Proton, see below): every frame held
+  (19-90/s by scene), hold 8.4 ms, 0 misses after the model's first build, no Xid. Frames look
+  natural with the model on (no blown or crushed exposure, no colour shift).
+- Not Neural Forge: the benchmark tool will not turn on DLSS Frame Generation under Proton ("enable
+  Hardware-Accelerated GPU scheduling"), with Proton Experimental or Proton-GE, with
+  `WINE_DISABLE_HARDWARE_SCHEDULING=0` or `WINE_ENABLE_HARDWARE_SCHEDULING=1`.
+
 ## 2.0.5 — 2026-10-05
 
 - **Pre-upscaler: Cyberpunk 2077 with DLSS Frame Generation is held for the whole session.** With
