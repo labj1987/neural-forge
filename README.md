@@ -88,6 +88,39 @@ At 4K the gain is larger because the 1.x path's cost grows with the output size,
 path's cost grows with DLSS's render size. The full record of every run is in
 [docs/PRE_UPSCALER_DESIGN.md](docs/PRE_UPSCALER_DESIGN.md).
 
+## Tested games
+
+Each game was run on the test machine (RTX 5070, 2560x1440, Proton) with its own settings as found:
+DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. "Before the upscaler"
+means the model ran on DLSS's input every real frame; "after" means the 1.x path on the finished
+frame. Numbers are from one run each; the full record is in
+[docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
+
+| Game | Engine, API | DLSS used | 2.0.7 (released) | Next release (in development) |
+|---|---|---|---|---|
+| GTA V Enhanced (built-in benchmark) | RAGE, DX12 | Super Resolution, Frame Generation 4x | Before the upscaler: 49.7 real / 198.9 fps shown | Same |
+| Cyberpunk 2077 (built-in benchmark) | REDengine 4, DX12 | Super Resolution, Frame Generation 3x | Before the upscaler: 116 fps shown on average (106 minimum) | Same |
+| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | Before the upscaler: 139-146 fps shown | Same |
+| Black Myth: Wukong Benchmark Tool | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler without frame generation; **with frame generation on, no effect at all** | Before the upscaler with frame generation: 69 fps average, 29 minimum (the tool's results) |
+| GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | After the upscaler (60 fps, capped) | Before the upscaler: 79 fps uncapped |
+| Resident Evil Requiem | RE Engine, DX12 | Super Resolution with ray tracing, Frame Generation 4x | Not measured | Before the upscaler: 159.7 fps shown |
+| Red Dead Redemption 2 | RAGE, Vulkan / DX12 | Super Resolution | Not running (see below) | Not running |
+
+Setup notes for these games:
+
+- **Black Myth: Wukong** refuses DLSS Frame Generation under Proton ("hardware-accelerated GPU
+  scheduling"). Fix: in its Proton prefix, add the DWORD `HwSchMode` = `2` under
+  `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` (for example with
+  `protontricks <appid> regedit`). The game then believes hardware scheduling is on.
+- **GTA San Andreas - The Definitive Edition** resets its Frame Rate setting to 60 at every launch,
+  whatever its settings files say (a game bug). Set it to Unlocked in Options > Graphics each time.
+- **Red Dead Redemption 2** exits at startup with its Vulkan renderer on current NVIDIA drivers,
+  with or without Neural Forge (a known Proton issue). Switching it to DX12 in
+  `Documents/Rockstar Games/Red Dead Redemption 2/Settings/system.xml` (`kSettingAPI_DX12`) is the
+  usual fix; not yet tested here.
+- **Crimson Desert** compiles shaders on its first launch after a Neural Forge update; the effect
+  starts once it is in the world.
+
 ## Requirements
 
 - x86_64 Linux, an NVIDIA GPU and driver, and the Vulkan loader. On non-NVIDIA GPUs the layer
@@ -208,8 +241,8 @@ Settings are live: the GUI and the running layer share them through shared memor
   `GTA5_Enhanced.exe+0x12c6eb`, in the game itself, and not Neural Forge's: the test machine has
   32 crash dumps at that address, 11 of them with 1.0.1 and others from before Neural Forge
   existed. Relaunching works ([docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md), "2.0.0").
-- **Only GTA V Enhanced has been probed and measured** for the model before the upscaler. Other
-  DLSS games should look the same to the layer, but each needs a probe run before that is claimed.
+- **Each DLSS game needs a test run before it is claimed:** engines hand DLSS its inputs in
+  different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
 - **The game's DLSS Frame Generation does not always switch on.** In the benchmark runs the game
   generated frames in some launches and not in others with the same settings, with or without
   Neural Forge. The fps counter shows which happened.
