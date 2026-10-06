@@ -106,6 +106,7 @@ frame. Numbers are from one run each; the full record is in
 | Resident Evil Requiem | RE Engine, DX12 | Super Resolution with ray tracing, Frame Generation 4x | Not measured | Before the upscaler: 159.7 fps shown |
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Not measured | Before the upscaler: 83.9 fps in play (High preset, DLSS Balanced) |
 | Red Dead Redemption 2 | RAGE, Vulkan / DX12 | Super Resolution | Not running (see below) | Not running |
+| The Witcher 3: Wild Hunt (next-gen) | REDengine 3, DX12 | Super Resolution, Frame Generation | Not running (see below) | Not running |
 
 Setup notes for these games:
 
@@ -122,6 +123,11 @@ Setup notes for these games:
 - **Shadow Warrior 3** greys out its NVIDIA DLSS option while FidelityFX CAS is on (Settings >
   Video): set CAS to Off and DLSS becomes selectable. Its first launch also benchmarks the machine and
   picks the Low preset under Proton; set Overall Quality yourself.
+- **The Witcher 3 (next-gen, DX12)** opens its window under Proton here but never starts rendering
+  (no swapchain after 12 minutes, the CPU busy), with Proton Experimental and with Proton-GE, and
+  with Proton Experimental also without Neural Forge. A known DX12 problem on some Proton setups;
+  its DX11 mode works for others but has no DLSS. Launch option used: `--launcher-skip` (skips
+  REDlauncher; Steam also asks to accept its EULA on the first launch).
 - **Crimson Desert** compiles shaders on its first launch after a Neural Forge update; the effect
   starts once it is in the world.
 
