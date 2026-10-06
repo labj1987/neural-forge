@@ -1249,6 +1249,10 @@ impl DeviceInfo for NeuralForgeDeviceInfo {
             VulkanCommand::DestroyImage,
             VulkanCommand::BeginCommandBuffer,
             VulkanCommand::FreeCommandBuffers,
+            VulkanCommand::AllocateCommandBuffers,
+            VulkanCommand::ResetCommandBuffer,
+            VulkanCommand::ResetCommandPool,
+            VulkanCommand::DestroyCommandPool,
             VulkanCommand::CmdExecuteCommands,
             VulkanCommand::QueueSubmit,
             VulkanCommand::QueueSubmit2,
@@ -1526,6 +1530,47 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             i.free(command_buffers);
         }
         self.tracker.lock().unwrap().free(command_buffers);
+        LayerResult::Unhandled
+    }
+
+    /// Allocated here (through the next layer) only to learn the buffers' pool, for the hold inside
+    /// DLSS's buffer ([`crate::preupscale::inline::Inline::reset_pool`]); without it, untouched.
+    fn allocate_command_buffers(
+        &self, allocate_info: &vk::CommandBufferAllocateInfo,
+    ) -> LayerResult<ash::prelude::VkResult<Vec<vk::CommandBuffer>>> {
+        let Some(i) = &self.inline else { return LayerResult::Unhandled };
+        // SAFETY: the application's own allocate info, forwarded unchanged to the next layer.
+        let result = unsafe { self.device.allocate_command_buffers(allocate_info) };
+        if let Ok(cbs) = &result {
+            i.allocated(allocate_info.command_pool, cbs);
+        }
+        LayerResult::Handled(result)
+    }
+
+    fn reset_command_buffer(
+        &self, command_buffer: vk::CommandBuffer, _flags: vk::CommandBufferResetFlags,
+    ) -> LayerResult<ash::prelude::VkResult<()>> {
+        if let Some(i) = &self.inline {
+            i.reset(command_buffer);
+        }
+        LayerResult::Unhandled
+    }
+
+    fn reset_command_pool(
+        &self, command_pool: vk::CommandPool, _flags: vk::CommandPoolResetFlags,
+    ) -> LayerResult<ash::prelude::VkResult<()>> {
+        if let Some(i) = &self.inline {
+            i.reset_pool(command_pool, false);
+        }
+        LayerResult::Unhandled
+    }
+
+    fn destroy_command_pool(
+        &self, command_pool: vk::CommandPool, _allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<()> {
+        if let Some(i) = &self.inline {
+            i.reset_pool(command_pool, true);
+        }
         LayerResult::Unhandled
     }
 

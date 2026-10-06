@@ -724,7 +724,9 @@ fn by_params(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, n: Named, swapc
     let measured = named_exposure.is_none() && !smaller(colour.1.width, colour.1.height, output);
     Some(Inputs {
         colour,
-        depth: get(n.depth)?,
+        // Its own depth image, or (destroyed since: a game rotating its depth images) the registered
+        // depth image at the colour input's extent.
+        depth: get(n.depth).or_else(|| at(registered, &DEPTH_FORMATS, colour.1.width, colour.1.height))?,
         mvec: get(n.mvec)?,
         candidates: size.map_or(1, |s| s.candidates.max(1 + rest.len())),
         others,
@@ -1051,6 +1053,29 @@ pub(crate) struct Tracker {
     /// three [`Inputs::others`] keeps (2.0.6 regression run, 2026-10-05: never switched to, nothing
     /// held in play).
     pub(crate) candidates: Vec<(vk::Image, ImageDesc)>,
+    /// Registered images whose last registered view was destroyed. They stay registered (in
+    /// [`Self::registered_set`]) until the image itself is destroyed: Black Myth: Wukong's
+    /// benchmark with DLSS Frame Generation on destroys and re-creates the views it hands DLSS every
+    /// frame (about 65 a second, the images never), and dropping the image with its view flipped the
+    /// identification every frame, so nothing was ever held (2026-10-05).
+    kept: HashSet<vk::Image>,
+    /// For the running tally line: registered images whose last view was destroyed (kept), and
+    /// registered images destroyed.
+    pub(crate) unregistered_by_view: u64,
+    pub(crate) unregistered_by_image: u64,
+    /// Changes of the depth image alone, and gaps without one, taken without re-identifying
+    /// ([`Self::refresh`]).
+    pub(crate) depth_changes: u64,
+    /// The motion vectors DLSS's input launches named most recently: what the size rule's pick takes
+    /// as its motion vectors when they are registered at its extent ([`Self::refresh`]). The size
+    /// rule alone takes the lowest-handle RG16F image there, which in Black Myth: Wukong's benchmark
+    /// with frame generation on is not the one DLSS reads (its colour and depth images are new every
+    /// frame, its motion vectors are not), and a buffer was only followed to its own colour image
+    /// with the identified motion vectors.
+    input_mvec: Option<vk::Image>,
+    /// The launch-bearing submit at which the current gap without a depth image began: the inputs
+    /// are kept for at most [`SR_RECENT`] launch-bearing submits from it.
+    depth_gap: Option<u64>,
     /// Consecutive input launches naming the same size-rule candidate other than the colour input.
     streak: Option<(Named, u32)>,
     /// Held launch-bearing submits whose buffer's input launch names another size-rule candidate
@@ -1258,14 +1283,18 @@ impl Tracker {
         self.keys.retain(|k| k.2 != image);
         let before = self.registered.len();
         self.registered.retain(|_, i| *i != image);
-        if self.registered.len() != before {
+        if self.kept.remove(&image) || self.registered.len() != before {
             self.dirty = true;
+            self.unregistered_by_image += 1;
         }
         self.committed.remove(&image);
         self.owners.remove(&image);
-        // Evidence naming a destroyed image is dropped; the rest settles again before it decides.
+        // Evidence naming a destroyed image is dropped; the rest settles again before it decides. Not
+        // for its depth image: a game rotating its depth images (Black Myth: Wukong with frame
+        // generation on, a new one every frame) would drop the evidence every frame; the depth is
+        // taken from the registered set instead ([`by_params`]).
         let before = self.named.len();
-        self.named.retain(|n| ![n.colour, n.depth, n.mvec].contains(&image));
+        self.named.retain(|n| ![n.colour, n.mvec].contains(&image));
         for n in &mut self.named {
             if n.exposure == Some(image) {
                 n.exposure = None;
@@ -1274,15 +1303,18 @@ impl Tracker {
         if self.named.len() != before {
             self.named_quiet = 0;
         }
-        if self.named_pick.is_some_and(|n| [n.colour, n.depth, n.mvec].contains(&image) || n.exposure == Some(image)) {
+        if self.named_pick.is_some_and(|n| [n.colour, n.mvec].contains(&image) || n.exposure == Some(image)) {
             self.named_pick = None;
             self.dirty = true;
         }
-        if self.switched.is_some_and(|n| [n.colour, n.depth, n.mvec].contains(&image) || n.exposure == Some(image)) {
+        if self.switched.is_some_and(|n| [n.colour, n.mvec].contains(&image) || n.exposure == Some(image)) {
             self.switched = None;
             self.dirty = true;
         }
-        if self.streak.is_some_and(|(n, _)| [n.colour, n.depth, n.mvec].contains(&image) || n.exposure == Some(image)) {
+        if self.input_mvec == Some(image) {
+            self.input_mvec = None;
+        }
+        if self.streak.is_some_and(|(n, _)| [n.colour, n.mvec].contains(&image) || n.exposure == Some(image)) {
             self.streak = None;
         }
     }
@@ -1294,8 +1326,12 @@ impl Tracker {
     pub(crate) fn forget_view(&mut self, view: vk::ImageView) {
         self.views.remove(&view);
         self.keys.retain(|k| k.1 != view);
-        if self.registered.remove(&view).is_some() {
-            self.dirty = true;
+        // The image stays registered ([`Self::kept`]): nothing changes for the identification.
+        if let Some(image) = self.registered.remove(&view) {
+            if !self.registered.values().any(|i| *i == image) {
+                self.kept.insert(image);
+                self.unregistered_by_view += 1;
+            }
         }
     }
 
@@ -1303,7 +1339,14 @@ impl Tracker {
     /// the handle or address it returned (what a kernel that reads the view is given).
     pub(crate) fn register(&mut self, view: vk::ImageView, key: Option<u64>) {
         if let Some(&image) = self.views.get(&view) {
-            if self.registered.insert(view, image) != Some(image) {
+            let known = self.kept.remove(&image) || self.registered.values().any(|i| *i == image);
+            if let Some(old) = self.registered.insert(view, image).filter(|&old| old != image) {
+                // A view handle reused for another image: the old image keeps its registration.
+                if !self.registered.values().any(|i| *i == old) {
+                    self.kept.insert(old);
+                }
+            }
+            if !known {
                 self.dirty = true;
             }
             if let Some(key) = key.filter(|&k| k != 0) {
@@ -1395,6 +1438,8 @@ impl Tracker {
             }
         }
         let refs = self.launch.entry(command_buffer).or_default();
+        // Whether this launch is the buffer's first one read as an input launch.
+        let mut fresh_input = false;
         if let Some(InputLaunch::Inputs { colour, .. }) = refs.input {
             // A later launch naming the colour input with another candidate of its extent.
             let extent = self.images.get(&colour).map(|d| (d.width, d.height));
@@ -1404,6 +1449,7 @@ impl Tracker {
                     .any(|i| *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && Some((d.width, d.height)) == extent));
             }
         } else if refs.input.is_none() {
+            fresh_input = true;
             refs.input = input_launch(&self.images, &named);
             if refs.input.is_some() {
                 refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
@@ -1445,7 +1491,35 @@ impl Tracker {
         }
         let candidate = |i: &vk::Image| self.inputs.is_some_and(|n| n.colour.0 == *i || n.others.iter().flatten().any(|o| o.0 == *i));
         let had_colour = refs.images.iter().any(candidate);
-        let first_colour = if had_colour { None } else { named.iter().copied().find(candidate) };
+        // The hold inside the buffer goes only before an input launch naming that colour image with
+        // depth and motion vectors (DLSS Super Resolution's input kernel): with DLSS Frame
+        // Generation on, Black Myth: Wukong's frame-generation buffers name the colour candidates
+        // too, and a hold recorded into each of them took every staging slot within a frame
+        // (2026-10-05).
+        let input_colour = match refs.input {
+            Some(InputLaunch::Inputs { colour, .. }) => Some(colour),
+            _ => None,
+        };
+        // Or this input launch's own colour image, with the identified motion vectors, when it is
+        // not a known candidate: Wukong's benchmark scene with frame generation on hands DLSS a new
+        // colour (and depth) image every frame, registered after the last identification.
+        let own_colour = match refs.input {
+            // Smaller than the output only: at DLAA, frame generation's launch has SR's shape at the
+            // output size.
+            Some(InputLaunch::Inputs { colour, mvec, .. })
+                if fresh_input
+                    && self.inputs.is_some_and(|n| n.mvec.0 == mvec)
+                    && self.images.get(&colour).zip(self.inputs).is_some_and(|(d, n)| smaller(d.width, d.height, n.output)) =>
+            {
+                Some(colour)
+            }
+            _ => None,
+        };
+        let first_colour = if had_colour {
+            None
+        } else {
+            named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c)).or(own_colour)
+        };
         for image in named {
             if !refs.images.contains(&image) {
                 refs.images.push(image);
@@ -1707,14 +1781,59 @@ impl Tracker {
             .switched
             .and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref()))
             .or_else(|| self.named_pick.filter(|_| gate).and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())))
-            .or(size);
-        let key =|i: Option<Inputs>| i.map(|i| (i.colour.0, i.depth.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
+            .or(size.map(|mut s| {
+                // The size rule's pick with the motion vectors DLSS's input launches name, when those
+                // are registered at its extent.
+                if let Some(m) = self.input_mvec.and_then(|m| registered.get(&m.as_raw())) {
+                    if MVEC_FORMATS.contains(&m.1.format) && (m.1.width, m.1.height) == (s.colour.1.width, s.colour.1.height) {
+                        s.mvec = *m;
+                    }
+                }
+                s
+            }));
+        // The depth image is not part of what was identified: the model reads the colour input and
+        // the exposure only, and the depth's layout only gates a dump ([`Scan::dump_hazard`]). Black
+        // Myth: Wukong's benchmark with DLSS Frame Generation on hands DLSS a new depth image every
+        // frame (16 in rotation, the colour input, motion vectors and exposure fixed): re-identifying
+        // on it skipped every hold (the identifying submit is never held). A depth change alone is
+        // taken silently.
+        // Between one depth image's destruction and the next one's registration there is no depth
+        // image at the render extent, and neither rule identifies anything. While the colour input
+        // and motion vectors are still registered and DLSS Super Resolution runs, the inputs are
+        // kept: the gap is not a new identification either. The destroyed depth has no layout any
+        // more, so a dump cannot read it, and a hold never reads depth.
+        let depth_gap = |old: &Inputs| {
+            let alive = |image: vk::Image| registered.contains_key(&image.as_raw());
+            gate && alive(old.colour.0)
+                && alive(old.mvec.0)
+                && at(&registered, &DEPTH_FORMATS, old.colour.1.width, old.colour.1.height).is_none()
+        };
+        let gap_open = self.depth_gap.is_none_or(|since| self.launch_submits.saturating_sub(since) < SR_RECENT);
+        if inputs.is_none() && gap_open && self.inputs.is_some_and(|old| depth_gap(&old)) {
+            if self.depth_gap.is_none() {
+                self.depth_gap = Some(self.launch_submits);
+                self.depth_changes += 1;
+            }
+            // Looked at again at the next launch-bearing submit, until the gap closes or expires.
+            self.dirty = true;
+            return None;
+        }
+        if inputs.is_some() {
+            self.depth_gap = None;
+        }
+        let key = |i: Option<Inputs>| i.map(|i| (i.colour.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
         if key(inputs) != key(self.inputs) {
             self.committed.clear();
             self.owners.clear();
             self.pending.clear();
             self.identified = true;
             self.generation += 1;
+        } else if let (Some(new), Some(old)) = (inputs, self.inputs) {
+            if new.depth.0 != old.depth.0 {
+                self.inputs = inputs;
+                self.depth_changes += 1;
+                return None;
+            }
         }
         self.inputs = inputs;
         let line = match inputs {
@@ -1807,6 +1926,10 @@ impl Tracker {
                     let (colour, depth, mvec) = (*colour, *depth, *mvec);
                     let exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
                     evidence.push(Named::new(colour, depth, mvec, exposure));
+                    if self.input_mvec != Some(mvec) {
+                        self.input_mvec = Some(mvec);
+                        self.dirty = true;
+                    }
                     if let Some(n) = self.named.iter_mut().find(|n| n.colour == colour) {
                         if n.exposure.is_none() && exposure.is_some() {
                             n.exposure = exposure;
@@ -1958,7 +2081,11 @@ impl Tracker {
 
     /// The registered images with their descriptions, keyed by raw handle (what [`identify`] reads).
     fn registered_set(&self) -> BTreeMap<u64, (vk::Image, ImageDesc)> {
-        self.registered.values().filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d)))).collect()
+        self.registered
+            .values()
+            .chain(&self.kept)
+            .filter_map(|&image| self.images.get(&image).map(|d| (image.as_raw(), (image, *d))))
+            .collect()
     }
 
     /// The evidence to identify by. An entry whose colour input is smaller than the output (the
@@ -2098,6 +2225,21 @@ impl Tracker {
                     if let Some(other) = other {
                         self.other_candidate_buffers += 1;
                         self.other_named.get_or_insert(other);
+                        // The first few: what their input launch names against the identified inputs.
+                        if self.other_candidate_buffers % 2000 == 1 {
+                            let i = self.inputs;
+                            let input = self.launch.get(&cb).and_then(|r| r.input.clone());
+                            let d = |img: vk::Image| self.images.get(&img).map_or("unknown".into(), |d| format!("{}x{} {:?}", d.width, d.height, d.format));
+                            crate::log!(
+                                "[preupscale] forwarded buffer naming candidate {} ({}): input launch {:?}; identified colour {:?} depth {:?} mvec {:?}",
+                                hex(other),
+                                d(other),
+                                input,
+                                i.map(|i| i.colour.0),
+                                i.map(|i| i.depth.0),
+                                i.map(|i| i.mvec.0)
+                            );
+                        }
                     }
                 }
                 if found.is_none() && kind.is_some_and(|k| k != LaunchKind::Foreign) {
@@ -2160,11 +2302,20 @@ impl Tracker {
         if self.names_known && refs.input_sr != Some(true) {
             return None;
         }
-        let Some(InputLaunch::Inputs { colour, depth, mvec }) = refs.input else { return None };
-        if colour == i.colour.0 || depth != i.depth.0 || mvec != i.mvec.0 {
+        let Some(InputLaunch::Inputs { colour, mvec, .. }) = refs.input else { return None };
+        // Any depth: a game may hand DLSS a new depth image every frame (Black Myth: Wukong with
+        // frame generation on); the motion vectors must be the identified ones.
+        if colour == i.colour.0 || mvec != i.mvec.0 {
             return None;
         }
-        self.candidates.iter().find(|c| c.0 == colour).copied()
+        // A candidate of the size rule, or (a new image every frame, registered after the last
+        // identification) a colour candidate at the colour input's extent.
+        self.candidates.iter().find(|c| c.0 == colour).copied().or_else(|| {
+            self.images
+                .get(&colour)
+                .filter(|d| colour_candidate(d) && (d.width, d.height) == (i.colour.1.width, i.colour.1.height) && smaller(d.width, d.height, i.output))
+                .map(|d| (colour, *d))
+        })
     }
 
     /// Books a held submit's target colour image; logs (once) when it alternates.
@@ -2380,7 +2531,7 @@ impl Tracking {
             // Every 3000th forwarded one: the running counts.
             let tally = (t.foreign_submits != foreign_before && t.foreign_submits.is_multiple_of(3000)).then(|| {
                 format!(
-                    "launch-bearing submits: {} held reading the colour input{}, {} held undecided, {} forwarded untouched (their launches never name the colour input){}",
+                    "launch-bearing submits: {} held reading the colour input{}, {} held undecided, {} forwarded untouched (their launches never name the colour input){}; registered images: {} kept after their last view was destroyed, {} destroyed; {} depth-only changes",
                     t.colour_submits,
                     if t.retargeted_submits > 0 { format!(" ({} of them another candidate their input launch names)", t.retargeted_submits) } else { String::new() },
                     t.evaluations - t.colour_submits,
@@ -2389,7 +2540,10 @@ impl Tracking {
                         format!("; {} forwarded buffers named another colour candidate", t.other_candidate_buffers)
                     } else {
                         String::new()
-                    }
+                    },
+                    t.unregistered_by_view,
+                    t.unregistered_by_image,
+                    t.depth_changes
                 )
             });
             self.rearm(&t);
@@ -5191,8 +5345,13 @@ mod tests {
         assert!(t.submit_ok(&[vec![cb(7)]]).is_none());
         t.begin(cb(3));
         assert!(t.submit_ok(&[vec![cb(3)]]).is_none(), "re-recorded: no longer launch-bearing");
-        // A destroyed input image changes the set.
+        // A destroyed input image changes the set: a destroyed depth image only after SR_RECENT
+        // launch-bearing submits without a new one (a game rotating its depth images has a moment
+        // without one, which is no new identification).
         t.forget_image(vk::Image::from_raw(0x200));
+        assert_eq!(t.refresh(), None);
+        assert!(t.inputs.is_some());
+        t.launch_submits += SR_RECENT;
         assert!(t.refresh().unwrap().starts_with("no DLSS input among 2 registered views"));
         assert!(t.inputs.is_none());
     }
@@ -5449,6 +5608,14 @@ mod tests {
         assert_eq!((point.desc.width, point.desc.height), (1707, 960));
         // A later launch of the same buffer naming it again: no second point.
         t.launch(cb(2), Some(&params));
+        assert_eq!(t.take_inline_at(), None);
+        // A buffer whose launch names the colour input without depth and motion vectors (DLSS Frame
+        // Generation's, Black Myth: Wukong with frame generation on): not an input launch, no hold
+        // inside it. Its later input launch is not the first to name the colour input either.
+        t.global(cb(3), Hazard::MemoryBarrier);
+        t.launch(cb(3), Some(&param_block(&[0x1100])));
+        assert_eq!(t.take_inline_at(), None);
+        t.launch(cb(3), Some(&params));
         assert_eq!(t.take_inline_at(), None);
         // GTA V's pattern: nothing before the launch, the split holds it.
         let (mut t, params) = held_tracker_with(copyable);
@@ -6255,6 +6422,98 @@ mod tests {
             assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (41, 1 + SWITCH_AFTER as u64 - 1, 0));
             assert!(t.alternation.is_none());
         }
+    }
+
+    /// Black Myth: Wukong's benchmark with DLSS Frame Generation on destroys and re-creates the views
+    /// it hands DLSS every frame; the images live on. The identification must not change with the
+    /// views (it changed every frame, and the submit that identifies is never held): an image stays
+    /// registered after its last view is destroyed, until the image itself is.
+    #[test]
+    fn views_recreated_every_frame_keep_the_identification() {
+        let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
+        assert!(t.refresh().is_some_and(|l| l.starts_with("colour input: image 0x100 ")));
+        for frame in 0..10u64 {
+            // The colour input's only view goes, and a new one is created and registered.
+            let old = vk::ImageView::from_raw(if frame == 0 { 0x101 } else { 0x9000 + frame - 1 });
+            t.forget_view(old);
+            assert_eq!(t.refresh(), None, "frame {frame}: a destroyed view changes nothing");
+            assert_eq!(t.inputs.map(|i| i.colour.0), Some(img(0x100)));
+            let new = vk::ImageView::from_raw(0x9000 + frame);
+            t.record_view(new, img(0x100));
+            t.register(new, Some(0x5000 + frame));
+            assert_eq!(t.refresh(), None, "frame {frame}: re-registering a kept image changes nothing");
+        }
+        assert_eq!(t.unregistered_by_view, 10);
+        // The image itself destroyed: the next candidate.
+        t.forget_image(img(0x100));
+        assert!(t.refresh().is_some_and(|l| l.starts_with("colour input: image 0x110 ")));
+        assert_eq!(t.unregistered_by_image, 1);
+    }
+
+    /// Wukong's benchmark with frame generation on hands DLSS a new depth image every frame (the
+    /// colour input, motion vectors and exposure stay). A depth change alone is taken without
+    /// re-identifying: no log line, and the next submit is not the "just identified" one.
+    #[test]
+    fn a_new_depth_image_every_frame_is_not_a_new_identification() {
+        let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
+        assert!(t.refresh().is_some());
+        let generation = t.generation;
+        for frame in 0..16u64 {
+            let (old, new) = (if frame == 0 { 0x200 } else { 0x7000 + frame - 1 }, 0x7000 + frame);
+            t.forget_image(img(old));
+            // The gap before the next depth image is registered: nothing changes.
+            assert_eq!(t.refresh(), None, "frame {frame}: no depth image for a moment");
+            assert_eq!(t.inputs.map(|i| i.colour.0), Some(img(0x100)));
+            let info = vk::ImageCreateInfo {
+                image_type: vk::ImageType::TYPE_2D,
+                extent: vk::Extent3D { width: 1516, height: 852, depth: 1 },
+                format: vk::Format::D32_SFLOAT_S8_UINT,
+                usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+                samples: vk::SampleCountFlags::TYPE_1,
+                ..Default::default()
+            };
+            t.record_image(img(new), &info);
+            t.record_view(vk::ImageView::from_raw(new + 1), img(new));
+            t.register(vk::ImageView::from_raw(new + 1), Some(new + 0x1000));
+            assert_eq!(t.refresh(), None, "frame {frame}");
+            let i = t.inputs.unwrap();
+            assert_eq!((i.colour.0, i.depth.0), (img(0x100), img(new)), "frame {frame}");
+        }
+        assert_eq!((t.generation, t.depth_changes), (generation, 32));
+        // The colour input destroyed is still a new identification.
+        t.forget_image(img(0x100));
+        assert!(t.refresh().is_some_and(|l| l.starts_with("colour input: image 0x110 ")));
+        assert_eq!(t.generation, generation + 1);
+    }
+
+    /// The input kernel's choice survives the depth image's rotation: the switch to the candidate
+    /// DLSS reads is kept when the depth it was seen with is destroyed and another one registered.
+    #[test]
+    fn the_switch_to_the_input_kernels_candidate_survives_a_new_depth_image() {
+        let mut t = tracker_with(&crimson3_set(), Some((2560, 1440)));
+        assert!(t.refresh().is_some());
+        crimson_frame(&mut t, cb(1), 0x120);
+        submit(&mut t, &[vec![cb(1)]]);
+        for _ in 0..40 {
+            crimson_frame(&mut t, cb(1), 0x110);
+            submit(&mut t, &[vec![cb(1)]]);
+        }
+        assert_eq!(t.inputs.map(|i| i.colour.0), Some(img(0x110)));
+        t.forget_image(img(0x200));
+        let info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: 1516, height: 852, depth: 1 },
+            format: vk::Format::D32_SFLOAT_S8_UINT,
+            usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        t.record_image(img(0x7000), &info);
+        t.record_view(vk::ImageView::from_raw(0x7001), img(0x7000));
+        t.register(vk::ImageView::from_raw(0x7001), Some(0x8000));
+        assert_eq!(t.refresh(), None, "a new depth image is no new identification");
+        let i = t.inputs.unwrap();
+        assert_eq!((i.colour.0, i.depth.0), (img(0x110), img(0x7000)));
     }
 
     /// Crimson Desert loaded into the world from the title screen (2.0.6 regression run): ten
