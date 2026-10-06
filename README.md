@@ -105,6 +105,7 @@ frame. Numbers are from one run each; the full record is in
 | GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | After the upscaler (60 fps, capped) | Before the upscaler: 79 fps uncapped |
 | Resident Evil Requiem | RE Engine, DX12 | Super Resolution with ray tracing, Frame Generation 4x | Not measured | Before the upscaler: 159.7 fps shown |
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Not measured | Before the upscaler: 83.9 fps in play (High preset, DLSS Balanced) |
+| Metro Exodus Enhanced Edition | 4A Engine, DX12, ray-traced lighting | Super Resolution | Not measured | Before the upscaler at its menu (81 fps, 1920x1200, DLSS Quality); a run in play still to do (see below) |
 | Red Dead Redemption 2 | RAGE, Vulkan / DX12 | Super Resolution | Not running (see below) | Not running |
 | The Witcher 3: Wild Hunt (next-gen) | REDengine 3, DX12 | Super Resolution, Frame Generation | Not running (see below) | Not running |
 
@@ -128,6 +129,11 @@ Setup notes for these games:
   with Proton Experimental also without Neural Forge. A known DX12 problem on some Proton setups;
   its DX11 mode works for others but has no DLSS. Launch option used: `--launcher-skip` (skips
   REDlauncher; Steam also asks to accept its EULA on the first launch).
+- **Metro Exodus Enhanced Edition** offers no 2560x1440 in its fullscreen resolution list under
+  Proton here (up to 2560x1080) and falls back to 1280x720 if `user.cfg` asks for it; windowed
+  2560x1440 stops at a dialog on start. Its default (1920x1200 fullscreen, DLSS Quality) works. It
+  compiles shaders for about 10 minutes after the intro on its first start, and asks to accept its
+  EULA on the first launch.
 - **Crimson Desert** compiles shaders on its first launch after a Neural Forge update; the effect
   starts once it is in the world.
 

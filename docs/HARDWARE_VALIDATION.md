@@ -1247,3 +1247,14 @@ from `bin/x64_dx12` starts, opens a 2560x1440 window ("The Witcher 3", `xwininfo
 240-290% CPU and 3.8 GB, and never creates a swapchain (12 minutes). Direct launches: the same with
 Proton Experimental (11.0-100, the prefix's) without Neural Forge's layer (no MangoHud frame log at
 all), and with Proton-GE Latest. Not a Neural Forge problem; not pursued further.
+
+## 2026-10-06 -- Metro Exodus Enhanced Edition (4A Engine, DX12), branch build
+
+First launch (Proton Experimental, after the EULA): about 10 minutes of shader compilation after the
+intro video, then the 3D main menu held before the upscaler: DLSS input 1280x800 (output 1920x1200,
+`r_dlss_rx 0` = Quality), 81 fps, 0 misses. Settings found: fullscreen 1920x1200, Ultra, V-Sync off,
+no fps limit. The fullscreen resolution list under Proton stops at 2560x1080 (no 2560x1440);
+`r_res 2560x1440` in `user.cfg` was reset to 1280x720 by the game (and DLSS did not run there);
+windowed 2560x1440 stopped at a 255x114 dialog on start that synthetic input could not answer.
+Restored the original `user.cfg`. Not yet measured in play: the intro video runs for minutes on
+every launch and does not take controller input.
