@@ -1226,3 +1226,16 @@ Red Dead Redemption 2: not run. Its Vulkan renderer exits at startup on this dri
 the layer (known Proton issue); switched to DX12 (`system.xml.nf-bak` keeps the original), after
 which the Rockstar Games Launcher did not start the game unattended (a dialog the unattended run
 cannot see is the likely cause; not confirmed).
+## 2026-10-06 -- Shadow Warrior 3: Definitive Edition (Unreal Engine 4), branch build
+
+First launch (Proton Experimental): the game's own GPU benchmark failed under Proton and chose the
+Low preset; NVIDIA DLSS was greyed out in Settings > Video until FidelityFX CAS was set to Off
+(`PROTON_ENABLE_NVAPI=1` alone did not change it; not needed once CAS is off). Set: DLSS Balanced,
+CAS Off, Frame Rate Limit No, V-Sync Off, Overall Quality High.
+
+- In play (opening level): 83.9 holds/s = its frame rate, 0 misses, the game's exposure input
+  (3.03); its menus pass a value over 1000 there, measured from the frame instead. Nothing composited
+  after the upscaler. The opening cutscene runs without DLSS ("no DLSS submit"): the model runs after
+  the upscaler there, as designed.
+- Steam launch with only `NEURAL_FORGE_ENABLE=1 %command%`: held (97.4/s, main menu), 0 misses.
+- No fence timeout, no Xid.
