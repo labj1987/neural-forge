@@ -15,6 +15,24 @@ first shipped them; their phase is kept as a subheading.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
+## 2.0.7 — 2026-10-05
+
+Crimson Desert is held before the upscaler in play again (2.0.6 held it on the title screen only).
+
+- **The input kernel is followed to any colour candidate, not only the first four.** When two of
+  DLSS's buffers name different colour images, the layer takes the lowest handle and switches to
+  the one DLSS's input kernel keeps reading. The switch, and the per-buffer retarget, only looked at
+  the three candidates kept beside the lowest handle for the log. Crimson Desert registers up to ten
+  at its render extent once it has loaded into the world from the title screen, and in play its
+  input kernel read one of the later ones: it was never switched to, nothing was held, and the
+  model ran after the upscaler. The tracker now keeps every candidate (`Tracker::candidates`); the
+  identification line still lists three and counts the rest. Where the hold goes inside DLSS's
+  buffer still depends on the identified input and the three kept beside it only: widened to every
+  candidate it moved Wukong's hold to an earlier launch reading another image (caught in the
+  regression run, not shipped).
+- README: in-game screenshots with the effect on and off (GTA V, GTA V at 4K, Resident Evil
+  Requiem).
+
 ## 2.0.6 — 2026-10-05
 
 Unreal Engine 5 (Black Myth: Wukong's benchmark tool) is held before the upscaler.

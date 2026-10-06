@@ -1130,7 +1130,29 @@ wherever the game has it):
 - Cyberpunk 2077 (benchmark, FG 3x, `v206-cp-1`): held inside DLSS's buffer, about 2,700 holds at
   38.4/s, 116.5 fps shown on average (106.6 minimum), 0 misses, no Xid.
 - Black Myth: Wukong benchmark tool: over 7,800 holds, 0 misses, no Xid.
-- Crimson Desert (`v206-cd-2`, Ray Reconstruction on since 17:18 that day): the title screen held
-  (5,700 holds, 44/s, 0 misses); in game (Nas River) DLSS runs as Ray Reconstruction, so by design
-  nothing is held and the model runs after the upscaler (75.6 fps composited, all presents), no
-  fence timeout, no Xid.
+- Crimson Desert (`v206-cd-2`): the title screen held (5,700 holds, 44/s, 0 misses); in game (Nas
+  River) nothing was held and the model ran after the upscaler (75.6 fps composited, all presents),
+  no fence timeout, no Xid. First put down to Ray Reconstruction (on since 17:18 that day): wrong.
+  Alex's play with 2.0.5 and Ray Reconstruction on held every real frame (3,154 buffers held reading
+  the colour input, 7 naming another candidate). In 2.0.6's run two buffers named different colour
+  images, the size rule took the lowest handle, and in play DLSS's input kernel read a candidate
+  past the three kept beside it (ten registered), so the switch to it never happened. Fixed in
+  2.0.7.
+
+## 2026-10-05 -- 2.0.7: Crimson Desert held in play again
+
+One run per game on the final build, settings as found (frame generation on wherever the game has
+it; Crimson Desert with Ray Reconstruction on):
+
+- Crimson Desert (`v207-cd-3`, in game at Nas River, checked on the captured frame): the colour
+  input switched once to the candidate DLSS's input kernel reads, 7,800 holds at 23/s, 141 fps
+  shown, nothing composited after the upscaler, 0 misses, no fence timeout, no Xid. (`v207-cd-1`
+  ended on the shader-compile screen: not counted.)
+- GTA V Enhanced (`v207-gta-2`): 68.8 held/s against 68.0 real, 0 misses, no fence timeout.
+- Cyberpunk 2077 (`v207-cp-2`, FG 3x): 115.3 fps shown on average (106.1 minimum), held inside
+  DLSS's buffer at 38/s, 0 misses, no fence timeout.
+- Black Myth: Wukong benchmark tool: an intermediate build that also widened where the hold goes
+  inside DLSS's buffer to every candidate stopped holding 45 s into the benchmark (`v207-wk`); the
+  final build (`v207-wk-2`) and the released 2.0.6 layer swapped in for an A/B (`v206-wk-ab`) both
+  reached 6,600 holds at the same point, with the same uneven stretches during the benchmark.
+- No Xid in any run.

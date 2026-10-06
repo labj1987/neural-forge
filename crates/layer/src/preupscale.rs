@@ -398,8 +398,8 @@ pub(crate) const MAX_EXPOSURE: usize = 4;
 /// Bytes reserved per exposure image in the dump readback (the largest texel).
 const EXPOSURE_STRIDE: u64 = 16;
 
-/// At most this many further colour candidates are kept beside the first (for the log and the
-/// "names another candidate" count, [`Tracker::other_candidate_buffers`]).
+/// At most this many further colour candidates are kept beside the first in [`Inputs::others`], for
+/// the identification line. Every candidate is in [`Tracker::candidates`].
 pub(crate) const MAX_OTHERS: usize = 3;
 
 /// The DLSS inputs among the registered images.
@@ -508,16 +508,7 @@ pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
         Some(e) => (e, true),
         None => (output_candidate(registered)?, false),
     };
-    let candidates: Vec<(vk::Image, ImageDesc)> = registered
-        .values()
-        .filter(|(_, d)| {
-            colour_like(d)
-                && smaller(d.width, d.height, output)
-                && at(registered, &DEPTH_FORMATS, d.width, d.height).is_some()
-                && at(registered, &MVEC_FORMATS, d.width, d.height).is_some()
-        })
-        .copied()
-        .collect();
+    let candidates = size_candidates(registered, output);
     let colour = *candidates.first()?;
     let (w, h) = (colour.1.width, colour.1.height);
     let mut others = [None; MAX_OTHERS];
@@ -537,6 +528,21 @@ pub(crate) fn identify(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, swapc
         exposure_named: false,
         rule: Rule::Size,
     })
+}
+
+/// The size rule's colour candidates ([`identify`]), lowest handles first: every one, where
+/// [`Inputs::others`] keeps three for the log.
+fn size_candidates(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, output: (u32, u32)) -> Vec<(vk::Image, ImageDesc)> {
+    registered
+        .values()
+        .filter(|(_, d)| {
+            colour_like(d)
+                && smaller(d.width, d.height, output)
+                && at(registered, &DEPTH_FORMATS, d.width, d.height).is_some()
+                && at(registered, &MVEC_FORMATS, d.width, d.height).is_some()
+        })
+        .copied()
+        .collect()
 }
 
 /// The registered 1x1 float images (DLSS's exposure input among them), lowest handles first.
@@ -720,7 +726,7 @@ fn by_params(registered: &BTreeMap<u64, (vk::Image, ImageDesc)>, n: Named, swapc
         colour,
         depth: get(n.depth)?,
         mvec: get(n.mvec)?,
-        candidates: 1 + rest.len(),
+        candidates: size.map_or(1, |s| s.candidates.max(1 + rest.len())),
         others,
         output,
         output_from_swapchain,
@@ -1038,6 +1044,13 @@ pub(crate) struct Tracker {
     /// launches, or at once when nothing is identified yet). [`Self::refresh`] prefers it while its
     /// colour image is still one of the size rule's candidates.
     switched: Option<Named>,
+    /// Every colour candidate of the size rule at the last [`Self::refresh`], lowest handles first
+    /// ([`size_candidates`]): what the input kernel may be followed to ([`Self::switch_by_evidence`],
+    /// [`Self::retarget`]). Crimson Desert registers up to ten at its render extent once it has
+    /// loaded into the world from the title screen, and in play its input kernel reads one past the
+    /// three [`Inputs::others`] keeps (2.0.6 regression run, 2026-10-05: never switched to, nothing
+    /// held in play).
+    pub(crate) candidates: Vec<(vk::Image, ImageDesc)>,
     /// Consecutive input launches naming the same size-rule candidate other than the colour input.
     streak: Option<(Named, u32)>,
     /// Held launch-bearing submits whose buffer's input launch names another size-rule candidate
@@ -1681,10 +1694,13 @@ impl Tracker {
         // kernel names say DLSS Super Resolution is not running ([`Self::sr_running`]).
         let gate = self.sr_running();
         let size = identify(&registered, self.swapchain_extent()).filter(|_| gate);
+        self.candidates = match (&size, self.swapchain_extent().or_else(|| output_candidate(&registered))) {
+            (Some(_), Some(output)) => size_candidates(&registered, output),
+            _ => Vec::new(),
+        };
         // The input kernel's choice among the size rule's candidates ([`Self::switched`]) only while
         // its colour image still is one of them.
-        let is_candidate = |c: vk::Image| size.as_ref().is_some_and(|s| s.colour.0 == c || s.others.iter().flatten().any(|o| o.0 == c));
-        if self.switched.is_some_and(|n| !is_candidate(n.colour)) {
+        if self.switched.is_some_and(|n| !self.is_candidate(n.colour)) {
             self.switched = None;
         }
         let inputs = self
@@ -1710,7 +1726,11 @@ impl Tracker {
                 i.colour.1.format,
                 i.colour.1.usage,
                 if i.candidates > 1 {
-                    let others: Vec<String> = i.others.iter().flatten().map(|(image, d)| format!("{} {}x{}", hex(*image), d.width, d.height)).collect();
+                    let mut others: Vec<String> = i.others.iter().flatten().map(|(image, d)| format!("{} {}x{}", hex(*image), d.width, d.height)).collect();
+                    let listed = 1 + others.len();
+                    if i.candidates > listed {
+                        others.push(format!("{} more", i.candidates - listed));
+                    }
                     match i.rule {
                         Rule::Size => format!(" (first of {} candidates; others {})", i.candidates, others.join(", ")),
                         Rule::Params => format!(" (the size rule's other candidates: {})", others.join(", ")),
@@ -1891,8 +1911,10 @@ impl Tracker {
         let Some(current) = self.inputs else {
             // The first identification: what the input kernel names among the size rule's
             // candidates, rather than the lowest handle.
-            let Some(size) = identify(&self.registered_set(), self.swapchain_extent()) else { return };
-            if let Some(n) = evidence.iter().find(|n| size.others.iter().flatten().any(|o| o.0 == n.colour)) {
+            let registered = self.registered_set();
+            let Some(size) = identify(&registered, self.swapchain_extent()) else { return };
+            let all = size_candidates(&registered, size.output);
+            if let Some(n) = evidence.iter().find(|n| n.colour != size.colour.0 && all.iter().any(|c| c.0 == n.colour)) {
                 self.switched = Some(*n);
                 self.dirty = true;
             }
@@ -1903,7 +1925,7 @@ impl Tracker {
                 self.streak = None;
                 continue;
             }
-            if !current.others.iter().flatten().any(|o| o.0 == n.colour) {
+            if !self.is_candidate(n.colour) {
                 continue;
             }
             let count = match self.streak {
@@ -1927,6 +1949,11 @@ impl Tracker {
                 return;
             }
         }
+    }
+
+    /// Whether `image` is one of the size rule's colour candidates ([`Self::candidates`]).
+    fn is_candidate(&self, image: vk::Image) -> bool {
+        self.candidates.iter().any(|c| c.0 == image)
     }
 
     /// The registered images with their descriptions, keyed by raw handle (what [`identify`] reads).
@@ -2066,7 +2093,7 @@ impl Tracker {
                     // Counted only: whether a forwarded buffer reads another colour candidate.
                     let other = self.inputs.and_then(|i| {
                         let refs = self.launch.get(&cb)?;
-                        i.others.iter().flatten().map(|o| o.0).find(|o| refs.images.contains(o))
+                        self.candidates.iter().map(|c| c.0).filter(|&c| c != i.colour.0).find(|c| refs.images.contains(c))
                     });
                     if let Some(other) = other {
                         self.other_candidate_buffers += 1;
@@ -2137,7 +2164,7 @@ impl Tracker {
         if colour == i.colour.0 || depth != i.depth.0 || mvec != i.mvec.0 {
             return None;
         }
-        i.others.iter().flatten().find(|o| o.0 == colour).copied()
+        self.candidates.iter().find(|c| c.0 == colour).copied()
     }
 
     /// Books a held submit's target colour image; logs (once) when it alternates.
@@ -6228,6 +6255,45 @@ mod tests {
             assert_eq!((t.colour_submits, t.retargeted_submits, t.other_candidate_buffers), (41, 1 + SWITCH_AFTER as u64 - 1, 0));
             assert!(t.alternation.is_none());
         }
+    }
+
+    /// Crimson Desert loaded into the world from the title screen (2.0.6 regression run): ten
+    /// 1516x852 candidates, and in play DLSS's input kernel reads the eighth. With only the first
+    /// three kept beside the lowest handle it was never switched to and nothing was held; every
+    /// candidate is kept now, so each SR submit is held with it and the switch happens once. The
+    /// identification line still lists three others.
+    #[test]
+    fn the_input_kernel_is_followed_to_any_of_many_candidates() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC;
+        let mut set = crimson3_set();
+        for k in 3..10u64 {
+            let handle = 0x100 + 0x10 * k;
+            set.insert(handle, (img(handle), desc(1516, 852, rgba, storage)));
+        }
+        let (named, stale) = (0x170, 0x110);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let line = t.refresh().expect("identified by size");
+        assert!(line.contains("(first of 10 candidates; others 0x110 1516x852, 0x120 1516x852, 0x130 1516x852, 6 more)"), "{line}");
+        crimson_frame(&mut t, cb(1), stale);
+        submit(&mut t, &[vec![cb(1)]]);
+        let mut lines = Vec::new();
+        for frame in 0..40 {
+            crimson_frame(&mut t, cb(1), named);
+            let (s, l) = submit(&mut t, &[vec![cb(1)]]);
+            lines.extend(l);
+            let s = s.expect("SR's buffer is the hold point");
+            assert_eq!(s.inputs.map(|i| i.colour.0.as_raw()), Some(named), "frame {frame}");
+            for _ in 0..5 {
+                let (s, l) = submit(&mut t, &[vec![cb(90)]]);
+                lines.extend(l);
+                assert!(s.is_none(), "frame generation's buffers are forwarded");
+            }
+        }
+        let switch = format!("colour input switched to {} (DLSS's input kernel reads it; the size rule had picked 0x100)", hex(img(named)));
+        assert_eq!(lines.iter().filter(|l| **l == switch).count(), 1, "{lines:#?}");
+        assert_eq!(t.inputs.unwrap().colour.0.as_raw(), named);
+        assert_eq!(t.other_candidate_buffers, 0);
     }
 
     /// With SR's buffer in the first launch-bearing submit (its evidence available when the first
