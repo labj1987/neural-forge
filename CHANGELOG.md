@@ -15,6 +15,32 @@ first shipped them; their phase is kept as a subheading.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
+## 2.0.8 — 2026-10-06
+
+Every DLSS game tested is held before the upscaler: Black Myth: Wukong with DLSS Frame Generation,
+GTA San Andreas - The Definitive Edition, Resident Evil Requiem, Shadow Warrior 3, God of War (the
+first DX11 game) and Marvel's Spider-Man Remastered join GTA V, Cyberpunk 2077 and Crimson Desert.
+The README's "Tested games" has the results and each game's setup notes.
+
+- **Frame generation that re-creates DLSS's views and images every frame (Wukong).** An image stays
+  registered after its last view is destroyed, until the image itself is; a new depth image, or a
+  short gap without one, is no new identification; a buffer whose DLSS input-kernel launch names a
+  new colour image at the render extent is held with that image (upscaling only, never at DLAA).
+  Before, the identification changed every frame and nothing was held, with the post-upscaler
+  compose also off: no effect at all with frame generation on.
+- **No hold inside frame generation's buffers.** The hold inside DLSS's buffer never goes before a
+  launch of DLSS Frame Generation's kernels (`main_kernel`, by name); in Wukong they took every
+  staging slot within a frame. Staging slots are also freed on `vkResetCommandPool`,
+  `vkDestroyCommandPool` and `vkResetCommandBuffer`, not only at the buffer's next begin.
+- **A sampled RGBA16F colour input** is taken when DLSS's input launch names no storage one (Unreal
+  Engine 4's DLSS plugin, GTA San Andreas DE), and **layouts come from `vkCmdBeginRendering`'s
+  attachments** too: its colour input is never transitioned by a barrier once identified, so the
+  hold inside DLSS's buffer had no layout for it.
+- **Quieter log:** an unchanged identification (only the candidates beside it changed) is not logged
+  again (it was 97% of Wukong's log with frame generation on); a one-time line says when the hold
+  inside DLSS's buffer finds no layout; the running tally counts kept and destroyed registrations.
+- `scripts/game-reg.sh`: one unattended run of a Steam game with controller steps.
+
 ## 2.0.7 — 2026-10-05
 
 Crimson Desert is held before the upscaler in play again (2.0.6 held it on the title screen only).

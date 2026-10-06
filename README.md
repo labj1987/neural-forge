@@ -96,7 +96,7 @@ means the model ran on DLSS's input every real frame; "after" means the 1.x path
 frame. Numbers are from one run each; the full record is in
 [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
 
-| Game | Engine, API | DLSS used | 2.0.7 (released) | Next release (in development) |
+| Game | Engine, API | DLSS used | 2.0.7 | 2.0.8 |
 |---|---|---|---|---|
 | GTA V Enhanced (built-in benchmark) | RAGE, DX12 | Super Resolution, Frame Generation 4x | Before the upscaler: 49.7 real / 198.9 fps shown | Same |
 | Cyberpunk 2077 (built-in benchmark) | REDengine 4, DX12 | Super Resolution, Frame Generation 3x | Before the upscaler: 116 fps shown on average (106 minimum) | Same |
