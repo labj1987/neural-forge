@@ -1156,3 +1156,33 @@ it; Crimson Desert with Ray Reconstruction on):
   final build (`v207-wk-2`) and the released 2.0.6 layer swapped in for an A/B (`v206-wk-ab`) both
   reached 6,600 holds at the same point, with the same uneven stretches during the benchmark.
 - No Xid in any run.
+
+## 2026-10-06 -- branch `wukong-fg-wip`: Black Myth: Wukong with DLSS Frame Generation
+
+Frame generation in the benchmark tool unlocked under Proton with `HwSchMode`=2 (DWORD) under
+`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` in its prefix (ProtonDB). With it on, the
+tool destroys and re-creates the views it hands DLSS every frame (about 65 a second), and in the
+benchmark scene hands DLSS a new colour and depth image every frame; its frame-generation buffers
+(`main_kernel`) name the colour candidates too. 2.0.7 held nothing there (identification changed
+every frame, the in-buffer staging slots were all taken by frame generation's buffers) and the
+post-upscaler compose stayed off: no effect at all.
+
+The branch: an image stays registered until it is destroyed (not with its last view); a new depth
+image, or a short gap without one, is not a new identification; staging slots are freed on
+`vkResetCommandPool`/`vkDestroyCommandPool`/`vkResetCommandBuffer`; the in-buffer hold never goes
+before a frame-generation kernel's launch (by name); a buffer whose DLSS input-kernel launch names a
+new colour image at the render extent is held with it; an unchanged identification is not logged
+again (it was 97% of the log).
+
+One run each on the final branch build, settings as found:
+
+- Wukong benchmark tool, FG on, full run: the tool's results 69 fps average, 80 maximum, 29 minimum,
+  62 low 5th; 12,000 holds at 48/s, 0 misses (FG on without the effect applied: 98 / 117 / 20 / 84).
+  Log 214 lines per run (was 8,104).
+- GTA V Enhanced (`wip-gta-2`, `wip-gta-4`): 68.4 and 68.7 held/s against 68.0 real, 0 misses
+  (`wip-gta-3`'s passes 2-3 at 51 fps did not repeat).
+- Cyberpunk 2077 (`wip-cp-3`, `wip-cp-4`, FG 3x): 115.7 and 117.0 fps shown on average, 38.7 held/s,
+  0 misses.
+- Crimson Desert (`wip-cd-2`, `wip-cd-3`, Nas River, Ray Reconstruction on): 146 and 141 fps shown,
+  24 held/s, nothing composited after the upscaler, 0 misses.
+- No fence timeout, no Xid in any run.

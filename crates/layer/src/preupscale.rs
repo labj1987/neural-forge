@@ -310,6 +310,16 @@ impl Kernel {
     }
 }
 
+/// Whether a kernel is DLSS Frame Generation's by its name: `main_kernel` (Black Myth: Wukong's
+/// frame-generation buffers, Resident Evil Requiem's) and the network kernels launched beside it
+/// there (`k_conv_fp16_nhwc`, `k_pooling`, `k_upscale`, `k_element_wise`). Everything else reading
+/// the colour input first may be the hold point, as before: DLSS Super Resolution's own kernels
+/// (Cyberpunk 2077's `cuda_luma_convert_kernel`) and Crimson Desert's (`rr2_*` with Ray
+/// Reconstruction on).
+pub(crate) fn fg_kernel_name(name: &str) -> bool {
+    name == "main_kernel" || ["k_conv_fp16_nhwc", "k_pooling", "k_upscale", "k_element_wise"].iter().any(|p| name.starts_with(p))
+}
+
 /// Launch-bearing submits within which an SR input kernel must have launched for the inputs to be
 /// identified, once kernel names are known ([`Tracker::sr_running`]). With frame generation at 6x
 /// there are about 6 per real frame, so this is about 10 real frames.
@@ -1066,13 +1076,8 @@ pub(crate) struct Tracker {
     /// Changes of the depth image alone, and gaps without one, taken without re-identifying
     /// ([`Self::refresh`]).
     pub(crate) depth_changes: u64,
-    /// The motion vectors DLSS's input launches named most recently: what the size rule's pick takes
-    /// as its motion vectors when they are registered at its extent ([`Self::refresh`]). The size
-    /// rule alone takes the lowest-handle RG16F image there, which in Black Myth: Wukong's benchmark
-    /// with frame generation on is not the one DLSS reads (its colour and depth images are new every
-    /// frame, its motion vectors are not), and a buffer was only followed to its own colour image
-    /// with the identified motion vectors.
-    input_mvec: Option<vk::Image>,
+    /// Diagnostics: the kernels seen making a buffer's first launch naming a colour candidate.
+    said_first_kernels: Vec<String>,
     /// The launch-bearing submit at which the current gap without a depth image began: the inputs
     /// are kept for at most [`SR_RECENT`] launch-bearing submits from it.
     depth_gap: Option<u64>,
@@ -1311,9 +1316,6 @@ impl Tracker {
             self.switched = None;
             self.dirty = true;
         }
-        if self.input_mvec == Some(image) {
-            self.input_mvec = None;
-        }
         if self.streak.is_some_and(|(n, _)| [n.colour, n.mvec].contains(&image) || n.exposure == Some(image)) {
             self.streak = None;
         }
@@ -1508,17 +1510,36 @@ impl Tracker {
             // output size.
             Some(InputLaunch::Inputs { colour, mvec, .. })
                 if fresh_input
-                    && self.inputs.is_some_and(|n| n.mvec.0 == mvec)
+                    && (refs.input_sr == Some(true) || self.inputs.is_some_and(|n| n.mvec.0 == mvec))
                     && self.images.get(&colour).zip(self.inputs).is_some_and(|(d, n)| smaller(d.width, d.height, n.output)) =>
             {
                 Some(colour)
             }
             _ => None,
         };
+        // Diagnostics: the kernel of each buffer's first launch naming a colour candidate.
+        if !had_colour && named.iter().any(candidate) && self.said_first_kernels.len() < 8 {
+            let name = self.functions.get(&function).map_or("unnamed".to_string(), |(_, n)| n.clone());
+            let kind = match &refs.input {
+                Some(InputLaunch::Inputs { .. }) => "inputs",
+                Some(InputLaunch::Unusable) => "unusable",
+                Some(InputLaunch::Ambiguous { .. }) => "ambiguous",
+                None => "none",
+            };
+            let key = format!("{name} ({kind}, input launch of this buffer: {})", input_colour.is_some());
+            if !self.said_first_kernels.contains(&key) {
+                crate::log!("[preupscale] first launch naming a colour candidate: kernel {key}");
+                self.said_first_kernels.push(key);
+            }
+        }
+        // The hold goes at the buffer's first launch naming a colour candidate unless that launch is
+        // DLSS Frame Generation's by its kernel's name (`main_kernel` in Wukong's frame-generation
+        // buffers, which took every staging slot) and not an input launch naming that image.
+        let sr_kernel = !self.functions.get(&function).is_some_and(|(_, n)| fg_kernel_name(n));
         let first_colour = if had_colour {
             None
         } else {
-            named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c)).or(own_colour)
+            named.iter().copied().find(candidate).filter(|c| input_colour == Some(*c) || sr_kernel).or(own_colour)
         };
         for image in named {
             if !refs.images.contains(&image) {
@@ -1781,16 +1802,7 @@ impl Tracker {
             .switched
             .and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref()))
             .or_else(|| self.named_pick.filter(|_| gate).and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())))
-            .or(size.map(|mut s| {
-                // The size rule's pick with the motion vectors DLSS's input launches name, when those
-                // are registered at its extent.
-                if let Some(m) = self.input_mvec.and_then(|m| registered.get(&m.as_raw())) {
-                    if MVEC_FORMATS.contains(&m.1.format) && (m.1.width, m.1.height) == (s.colour.1.width, s.colour.1.height) {
-                        s.mvec = *m;
-                    }
-                }
-                s
-            }));
+            .or(size);
         // The depth image is not part of what was identified: the model reads the colour input and
         // the exposure only, and the depth's layout only gates a dump ([`Scan::dump_hazard`]). Black
         // Myth: Wukong's benchmark with DLSS Frame Generation on hands DLSS a new depth image every
@@ -1822,6 +1834,10 @@ impl Tracker {
             self.depth_gap = None;
         }
         let key = |i: Option<Inputs>| i.map(|i| (i.colour.0, i.mvec.0, i.exposure.map(|e| e.map(|e| e.0)), i.exposure_input.map(|e| e.0)));
+        // The same inputs by the same rule: only the candidates beside them changed (a game creating
+        // and destroying render-size images every frame, Black Myth: Wukong with frame generation on:
+        // 97% of its log was this line). Taken silently, after the depth-only change below.
+        let unchanged = inputs.is_some() && key(inputs) == key(self.inputs) && inputs.map(|i| i.rule) == self.inputs.map(|i| i.rule);
         if key(inputs) != key(self.inputs) {
             self.committed.clear();
             self.owners.clear();
@@ -1834,6 +1850,10 @@ impl Tracker {
                 self.depth_changes += 1;
                 return None;
             }
+        }
+        if unchanged && self.announced.is_some() {
+            self.inputs = inputs;
+            return None;
         }
         self.inputs = inputs;
         let line = match inputs {
@@ -1926,10 +1946,6 @@ impl Tracker {
                     let (colour, depth, mvec) = (*colour, *depth, *mvec);
                     let exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
                     evidence.push(Named::new(colour, depth, mvec, exposure));
-                    if self.input_mvec != Some(mvec) {
-                        self.input_mvec = Some(mvec);
-                        self.dirty = true;
-                    }
                     if let Some(n) = self.named.iter_mut().find(|n| n.colour == colour) {
                         if n.exposure.is_none() && exposure.is_some() {
                             n.exposure = exposure;
@@ -2225,21 +2241,6 @@ impl Tracker {
                     if let Some(other) = other {
                         self.other_candidate_buffers += 1;
                         self.other_named.get_or_insert(other);
-                        // The first few: what their input launch names against the identified inputs.
-                        if self.other_candidate_buffers % 2000 == 1 {
-                            let i = self.inputs;
-                            let input = self.launch.get(&cb).and_then(|r| r.input.clone());
-                            let d = |img: vk::Image| self.images.get(&img).map_or("unknown".into(), |d| format!("{}x{} {:?}", d.width, d.height, d.format));
-                            crate::log!(
-                                "[preupscale] forwarded buffer naming candidate {} ({}): input launch {:?}; identified colour {:?} depth {:?} mvec {:?}",
-                                hex(other),
-                                d(other),
-                                input,
-                                i.map(|i| i.colour.0),
-                                i.map(|i| i.depth.0),
-                                i.map(|i| i.mvec.0)
-                            );
-                        }
                     }
                 }
                 if found.is_none() && kind.is_some_and(|k| k != LaunchKind::Foreign) {
@@ -2304,8 +2305,10 @@ impl Tracker {
         }
         let Some(InputLaunch::Inputs { colour, mvec, .. }) = refs.input else { return None };
         // Any depth: a game may hand DLSS a new depth image every frame (Black Myth: Wukong with
-        // frame generation on); the motion vectors must be the identified ones.
-        if colour == i.colour.0 || mvec != i.mvec.0 {
+        // frame generation on). The motion vectors must be the identified ones, unless the launch is
+        // DLSS Super Resolution's input kernel by name: Wukong's benchmark scene names other motion
+        // vectors than the ones identified in its intro, whose colour image lives on.
+        if colour == i.colour.0 || (refs.input_sr != Some(true) && mvec != i.mvec.0) {
             return None;
         }
         // A candidate of the size rule, or (a new image every frame, registered after the last
@@ -5612,11 +5615,19 @@ mod tests {
         // A buffer whose launch names the colour input without depth and motion vectors (DLSS Frame
         // Generation's, Black Myth: Wukong with frame generation on): not an input launch, no hold
         // inside it. Its later input launch is not the first to name the colour input either.
+        let (fg, luma) = (vk::CuFunctionNVX::from_raw(0xf1), vk::CuFunctionNVX::from_raw(0xf2));
+        t.record_function(fg, "main_kernel");
+        t.record_function(luma, "cuda_luma_convert_kernel");
         t.global(cb(3), Hazard::MemoryBarrier);
-        t.launch(cb(3), Some(&param_block(&[0x1100])));
+        t.launch_kernel(cb(3), fg, Some(&param_block(&[0x1100])));
         assert_eq!(t.take_inline_at(), None);
         t.launch(cb(3), Some(&params));
         assert_eq!(t.take_inline_at(), None);
+        // DLSS Super Resolution's own kernel reading the colour input before its input kernel
+        // (Cyberpunk 2077's `cuda_luma_convert_kernel`): the hold goes there.
+        t.global(cb(4), Hazard::MemoryBarrier);
+        t.launch_kernel(cb(4), luma, Some(&param_block(&[0x1100])));
+        assert_eq!(t.take_inline_at(), Some((cb(4), colour())));
         // GTA V's pattern: nothing before the launch, the split holds it.
         let (mut t, params) = held_tracker_with(copyable);
         t.launch(cb(2), Some(&params));
