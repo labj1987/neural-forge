@@ -1186,3 +1186,13 @@ One run each on the final branch build, settings as found:
 - Crimson Desert (`wip-cd-2`, `wip-cd-3`, Nas River, Ray Reconstruction on): 146 and 141 fps shown,
   24 held/s, nothing composited after the upscaler, 0 misses.
 - No fence timeout, no Xid in any run.
+
+GTA San Andreas - The Definitive Edition (Unreal Engine 4's DLSS plugin, Super Resolution only, no
+frame generation), checked on the branch: the effect is applied after the upscaler (60 fps,
+every frame composited). DLSS's input kernel (`cuda_engine_input_kernel`, after
+`cuda_luma_convert_kernel`) names a 1488x836 RGBA16F colour input that is sampled, not storage,
+with a D32S8 depth at that extent and motion vectors at the output size. Taking a sampled RGBA16F
+as the colour input (when no storage one is named) identified it, but nothing was held: the split
+is refused (a write barrier before the launch) and the in-buffer hold has no layout for the colour
+input (none of its transitions were seen as barriers; likely render-pass layout transitions). Not
+kept on the branch: holding it needs render-pass layout tracking first.
