@@ -1170,3 +1170,11 @@ CAS Off, Frame Rate Limit No, V-Sync Off, Overall Quality High.
   the upscaler there, as designed.
 - Steam launch with only `NEURAL_FORGE_ENABLE=1 %command%`: held (97.4/s, main menu), 0 misses.
 - No fence timeout, no Xid.
+
+## 2026-10-06 -- The Witcher 3: Wild Hunt (next-gen, DX12): not rendering under Proton here
+
+Steam launch `NEURAL_FORGE_ENABLE=1 %command% --launcher-skip` (after the EULA dialog): `witcher3.exe`
+from `bin/x64_dx12` starts, opens a 2560x1440 window ("The Witcher 3", `xwininfo`), stays at
+240-290% CPU and 3.8 GB, and never creates a swapchain (12 minutes). Direct launches: the same with
+Proton Experimental (11.0-100, the prefix's) without Neural Forge's layer (no MangoHud frame log at
+all), and with Proton-GE Latest. Not a Neural Forge problem; not pursued further.
