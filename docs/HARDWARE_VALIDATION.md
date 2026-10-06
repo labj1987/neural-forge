@@ -1196,3 +1196,33 @@ as the colour input (when no storage one is named) identified it, but nothing wa
 is refused (a write barrier before the launch) and the in-buffer hold has no layout for the colour
 input (none of its transitions were seen as barriers; likely render-pass layout transitions). Not
 kept on the branch: holding it needs render-pass layout tracking first.
+
+## 2026-10-06 -- branch: every installed DLSS game held before the upscaler
+
+GTA San Andreas DE is held now: its colour input is a sampled RGBA16F image (taken when a launch
+names no storage colour candidate), and its layout comes from `vkCmdBeginRendering`'s attachments
+(no barrier ever transitions it once identified: "0 barriers on it seen since identification").
+Resident Evil Requiem (ray tracing High, FG 4x) is held through DLSS Super Resolution's input kernel
+(`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`) with its B10G11R11 colour input.
+
+The game's frame-rate cap: San Andreas DE resets it to 60 at every launch whatever its
+GameUserSettings.ini say (both copies at `FrameRatePC=0`, also read-only, also with `FrameRate=0`:
+the menu still shows 60). `scripts/game-reg.sh` sets Frame Rate to Unlocked in the menu on every run.
+
+One run each on the final branch build (settings as found, frame generation on where the game has
+it, no frame-rate cap):
+
+- GTA San Andreas DE (`br-sa-3`, unlocked): 79 holds/s = its frame rate, 0 misses (capped at 60:
+  60 holds/s).
+- Resident Evil Requiem (`br-re-1`): 159.7 fps shown, 40.8 holds/s, 0 misses.
+- GTA V Enhanced (`br-gta-2`, FG engaged at 4x): 49.7 real / 198.9 shown, 49.6 held/s, 0 misses.
+- Cyberpunk 2077 (`br-cp-1`, FG 3x): 116.9 fps shown on average (106.2 minimum), 38.2 held/s.
+- Crimson Desert (`br-cd-2`, Nas River): 139 fps shown, 23.5 held/s (`br-cd-1` ended on the
+  shader-compile screen a new layer build brings: not counted).
+- Black Myth: Wukong benchmark (`br-wk-1`, FG on): 34.7 held/s, 0 misses.
+- No fence timeout, no Xid in any run.
+
+Red Dead Redemption 2: not run. Its Vulkan renderer exits at startup on this driver with or without
+the layer (known Proton issue); switched to DX12 (`system.xml.nf-bak` keeps the original), after
+which the Rockstar Games Launcher did not start the game unattended (a dialog the unattended run
+cannot see is the likely cause; not confirmed).
