@@ -106,6 +106,7 @@ frame. Numbers are from one run each; the full record is in
 | Resident Evil Requiem | RE Engine, DX12 | Super Resolution with ray tracing, Frame Generation 4x | Not measured | Before the upscaler: 159.7 fps shown |
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Not measured | Before the upscaler: 83.9 fps in play (High preset, DLSS Balanced) |
 | God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | Not measured | Before the upscaler: 49.5 fps in play (DLSS Quality, Ultra) |
+| Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Not measured | Before the upscaler: 49 real / about 98 fps shown in play (DLSS Quality, frame generation on) |
 
 Setup notes for these games:
 
@@ -118,6 +119,9 @@ Setup notes for these games:
 - **Shadow Warrior 3** greys out its NVIDIA DLSS option while FidelityFX CAS is on (Settings >
   Video): set CAS to Off and DLSS becomes selectable. Its first launch also benchmarks the machine and
   picks the Low preset under Proton; set Overall Quality yourself.
+- **Marvel's Spider-Man Remastered** starts with DLAA-like dynamic resolution (target 60 fps), V-Sync
+  on and frame generation off: set Upscale Quality to a fixed mode, Frame Generation to DLSS Frame
+  Generation and V-Sync off (Settings > Display and Graphics).
 - **Crimson Desert** compiles shaders on its first launch after a Neural Forge update; the effect
   starts once it is in the world.
 

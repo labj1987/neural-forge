@@ -1199,3 +1199,12 @@ In play (`gw-1`, Continue): 49.5 holds/s = its frame rate (no frame generation i
 
 Witcher 3 and Metro Exodus EE were removed from the machine and from the README's tested games
 (neither ran far enough to test in play); their entries above stay as the record.
+
+## 2026-10-06 -- Marvel's Spider-Man Remastered (DX12), branch build
+
+First launch defaults: V-Sync on, frame generation off, dynamic resolution targeting 60 fps (DLSS
+input 2560x1440 then, held at 37/s, 25 ms holds). Set (by Alex): V-Sync off, Reflex on, DLSS Frame
+Generation, DLSS Super Resolution Quality. In play (F.E.A.S.T. centre, Continue): DLSS input
+1712x960, 49.0 holds/s, 98.0 presents/s (frame generation 2x), 0 misses in the window, nothing
+composited after the upscaler; the game's 1x1 exposure reads over 1000, so it is measured from the
+frame. No fence timeout, no Xid.
