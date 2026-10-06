@@ -2142,6 +2142,23 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     fn cmd_begin_rendering(&self, command_buffer: vk::CommandBuffer, info: &vk::RenderingInfo) -> LayerResult<()> {
         if let Some(t) = &self.preupscale {
             t.begin_rendering(command_buffer, info.flags);
+            let mut views: Vec<(vk::ImageView, vk::ImageLayout)> = Vec::new();
+            if info.color_attachment_count > 0 && !info.p_color_attachments.is_null() {
+                // SAFETY: `pColorAttachments` holds `colorAttachmentCount` valid structures for the
+                // duration of the application's call.
+                for att in unsafe { std::slice::from_raw_parts(info.p_color_attachments, info.color_attachment_count as usize) } {
+                    if att.image_view != vk::ImageView::null() {
+                        views.push((att.image_view, att.image_layout));
+                    }
+                }
+            }
+            // SAFETY: optional pointers to valid structures for the duration of the call.
+            for att in unsafe { [info.p_depth_attachment.as_ref(), info.p_stencil_attachment.as_ref()] }.into_iter().flatten() {
+                if att.image_view != vk::ImageView::null() {
+                    views.push((att.image_view, att.image_layout));
+                }
+            }
+            t.attachments(command_buffer, &views);
         }
         if crate::probe_ngx::enabled() {
             let mut views: Vec<crate::probe_ngx::RenderView> = Vec::new();

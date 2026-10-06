@@ -607,6 +607,14 @@ fn colour_candidate(d: &ImageDesc) -> bool {
         }
 }
 
+/// A sampled, copyable 2D single-sample RGBA16F image: DLSS's colour input in a launch naming no
+/// [`colour_candidate`] at the depth's extent ([`input_launch`]); held inside DLSS's buffer only.
+fn sampled_colour(d: &ImageDesc) -> bool {
+    d.plain
+        && d.format == vk::Format::R16G16B16A16_SFLOAT
+        && d.usage.contains(vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+}
+
 /// Reads one launch's named registered images (`named`; `images` has their descriptions) the way
 /// DLSS Super Resolution's input kernel names its inputs. `None` when the launch names no depth
 /// image or no 2-channel float image (it is not an input launch). Otherwise exactly one depth image
@@ -638,10 +646,16 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
     };
     let extent = (dd.width, dd.height);
     // In the order the launch's parameters name them (not by handle).
-    let colours: Vec<(vk::Image, ImageDesc)> = named
-        .iter()
-        .filter_map(|i| images.get(i).filter(|d| colour_candidate(d) && (d.width, d.height) == extent).map(|d| (*i, *d)))
-        .collect();
+    let at_extent = |keep: fn(&ImageDesc) -> bool| -> Vec<(vk::Image, ImageDesc)> {
+        named.iter().filter_map(|i| images.get(i).filter(|d| keep(d) && (d.width, d.height) == extent).map(|d| (*i, *d))).collect()
+    };
+    // Without one, a sampled RGBA16F image the layer can copy: GTA San Andreas - The Definitive
+    // Edition (Unreal Engine 4's DLSS plugin) hands DLSS a sampled colour input (2026-10-06). Only as
+    // a fallback, so the games whose launches name several RGBA16F images keep their pick.
+    let mut colours = at_extent(colour_candidate);
+    if colours.is_empty() {
+        colours = at_extent(sampled_colour);
+    }
     let mvec = mvecs
         .iter()
         .min_by_key(|(i, d)| ((d.width, d.height) != extent, MVEC_FORMATS.iter().position(|f| *f == d.format), i.as_raw()))
@@ -1076,6 +1090,14 @@ pub(crate) struct Tracker {
     /// Changes of the depth image alone, and gaps without one, taken without re-identifying
     /// ([`Self::refresh`]).
     pub(crate) depth_changes: u64,
+    /// Watched images attached in `vkCmdBeginRendering`, per command buffer, with their layout
+    /// ([`Self::attachments`]).
+    attached: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::ImageLayout)>>,
+    /// Diagnostics: barriers seen on the identified colour input, the last one's new layout, and
+    /// whether the in-buffer hold's "layout unknown" line was logged.
+    colour_barriers: u64,
+    last_colour_layout: Option<vk::ImageLayout>,
+    said_layout_miss: bool,
     /// Diagnostics: the kernels seen making a buffer's first launch naming a colour candidate.
     said_first_kernels: Vec<String>,
     /// The launch-bearing submit at which the current gap without a depth image began: the inputs
@@ -1582,6 +1604,7 @@ impl Tracker {
             .pending
             .get(&cb)
             .and_then(|p| p.iter().rev().find(|s| s.image == colour).map(|s| s.new_layout))
+            .or_else(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == colour).map(|(_, l)| *l)))
             .or_else(|| self.committed.get(&colour).copied())
             .or((rgba16f && desc.usage.contains(vk::ImageUsageFlags::STORAGE)).then_some(vk::ImageLayout::GENERAL))?;
         if !INLINE_LAYOUTS.contains(&layout) {
@@ -1612,7 +1635,7 @@ impl Tracker {
 
     /// Whether any command buffer carries a launch, recorded barriers or other synchronization.
     fn armed(&self) -> bool {
-        !self.launch.is_empty() || !self.pending.is_empty() || !self.global_sync.is_empty() || !self.rendering.is_empty()
+        !self.launch.is_empty() || !self.pending.is_empty() || !self.global_sync.is_empty() || !self.rendering.is_empty() || !self.attached.is_empty()
     }
 
     pub(crate) fn begin(&mut self, command_buffer: vk::CommandBuffer) {
@@ -1625,6 +1648,22 @@ impl Tracker {
             self.pending.remove(cb);
             self.global_sync.remove(cb);
             self.rendering.remove(cb);
+            self.attached.remove(cb);
+        }
+    }
+
+    /// `vkCmdBeginRendering`'s attachments (`views` with their layouts) recorded into
+    /// `command_buffer`: a watched image attached there is in that layout (Vulkan requires it), so
+    /// its layout is known from there on in the buffer without a barrier. GTA San Andreas - The
+    /// Definitive Edition never transitions DLSS's colour input with a barrier once identified
+    /// (2026-10-06), so the hold inside DLSS's buffer had no layout for it. Kept apart from the
+    /// barriers: it is no synchronization, and the hazard rules count barriers.
+    pub(crate) fn attachments(&mut self, command_buffer: vk::CommandBuffer, views: &[(vk::ImageView, vk::ImageLayout)]) {
+        for &(view, layout) in views {
+            let Some(&image) = self.views.get(&view) else { continue };
+            if self.watched(image) {
+                self.attached.entry(command_buffer).or_default().push((image, layout));
+            }
         }
     }
 
@@ -1709,6 +1748,10 @@ impl Tracker {
     }
 
     pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, sync: ImageSync) {
+        if self.inputs.is_some_and(|i| i.colour.0 == sync.image) {
+            self.colour_barriers += 1;
+            self.last_colour_layout = Some(sync.new_layout);
+        }
         if self.watched(sync.image) {
             self.pending.entry(command_buffer).or_default().push(sync);
         }
@@ -1720,6 +1763,12 @@ impl Tracker {
     /// passed once it was accepted ([`submit_around`]).
     pub(crate) fn commit_submitted(&mut self, command_buffers: impl IntoIterator<Item = vk::CommandBuffer>) {
         for cb in command_buffers {
+            // Attachment layouts first, then the buffer's barriers (which follow its rendering).
+            if let Some(attached) = self.attached.get(&cb) {
+                for &(image, layout) in attached {
+                    self.committed.insert(image, layout);
+                }
+            }
             let Some(recorded) = self.pending.get(&cb) else { continue };
             for sync in recorded {
                 self.committed.insert(sync.image, sync.new_layout);
@@ -2441,7 +2490,21 @@ impl Tracking {
         t.launch_kernel(command_buffer, function, params);
         self.rearm(&t);
         let (cb, colour) = t.take_inline_at()?;
-        t.inline_point(cb, colour)
+        let point = t.inline_point(cb, colour);
+        if point.is_none() && !t.said_layout_miss && t.images.get(&colour).is_some() {
+            let own = t.pending.get(&cb).is_some_and(|p| p.iter().any(|s| s.image == colour)) || t.attached.get(&cb).is_some_and(|a| a.iter().any(|(i, _)| *i == colour));
+            if !own && !t.committed.contains_key(&colour) {
+                t.said_layout_miss = true;
+                crate::log!(
+                    "[preupscale] no hold inside DLSS's buffer: the colour input {}'s layout is unknown there ({} barriers on it seen since identification, last to {:?})",
+                    hex(colour),
+                    t.colour_barriers,
+                    t.last_colour_layout
+                );
+                crate::logging::flush();
+            }
+        }
+        point
     }
 
     /// `vkCreateCuFunctionNVX` created `function` for the kernel `name`.
@@ -2492,6 +2555,16 @@ impl Tracking {
         if let Some(hazard) = global {
             t.global(command_buffer, hazard);
         }
+        self.rearm(&t);
+    }
+
+    /// `vkCmdBeginRendering`'s attachments ([`Tracker::attachments`]), while inputs are watched.
+    pub(crate) fn attachments(&self, command_buffer: vk::CommandBuffer, views: &[(vk::ImageView, vk::ImageLayout)]) {
+        if !self.watching.load(Ordering::Relaxed) || views.is_empty() {
+            return;
+        }
+        let mut t = self.lock();
+        t.attachments(command_buffer, views);
         self.rearm(&t);
     }
 
