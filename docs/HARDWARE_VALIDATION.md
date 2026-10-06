@@ -1157,6 +1157,75 @@ it; Crimson Desert with Ray Reconstruction on):
   reached 6,600 holds at the same point, with the same uneven stretches during the benchmark.
 - No Xid in any run.
 
+## 2026-10-06 -- branch `wukong-fg-wip`: Black Myth: Wukong with DLSS Frame Generation
+
+Frame generation in the benchmark tool unlocked under Proton with `HwSchMode`=2 (DWORD) under
+`HKLM\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` in its prefix (ProtonDB). With it on, the
+tool destroys and re-creates the views it hands DLSS every frame (about 65 a second), and in the
+benchmark scene hands DLSS a new colour and depth image every frame; its frame-generation buffers
+(`main_kernel`) name the colour candidates too. 2.0.7 held nothing there (identification changed
+every frame, the in-buffer staging slots were all taken by frame generation's buffers) and the
+post-upscaler compose stayed off: no effect at all.
+
+The branch: an image stays registered until it is destroyed (not with its last view); a new depth
+image, or a short gap without one, is not a new identification; staging slots are freed on
+`vkResetCommandPool`/`vkDestroyCommandPool`/`vkResetCommandBuffer`; the in-buffer hold never goes
+before a frame-generation kernel's launch (by name); a buffer whose DLSS input-kernel launch names a
+new colour image at the render extent is held with it; an unchanged identification is not logged
+again (it was 97% of the log).
+
+One run each on the final branch build, settings as found:
+
+- Wukong benchmark tool, FG on, full run: the tool's results 69 fps average, 80 maximum, 29 minimum,
+  62 low 5th; 12,000 holds at 48/s, 0 misses (FG on without the effect applied: 98 / 117 / 20 / 84).
+  Log 214 lines per run (was 8,104).
+- GTA V Enhanced (`wip-gta-2`, `wip-gta-4`): 68.4 and 68.7 held/s against 68.0 real, 0 misses
+  (`wip-gta-3`'s passes 2-3 at 51 fps did not repeat).
+- Cyberpunk 2077 (`wip-cp-3`, `wip-cp-4`, FG 3x): 115.7 and 117.0 fps shown on average, 38.7 held/s,
+  0 misses.
+- Crimson Desert (`wip-cd-2`, `wip-cd-3`, Nas River, Ray Reconstruction on): 146 and 141 fps shown,
+  24 held/s, nothing composited after the upscaler, 0 misses.
+- No fence timeout, no Xid in any run.
+
+GTA San Andreas - The Definitive Edition (Unreal Engine 4's DLSS plugin, Super Resolution only, no
+frame generation), checked on the branch: the effect is applied after the upscaler (60 fps,
+every frame composited). DLSS's input kernel (`cuda_engine_input_kernel`, after
+`cuda_luma_convert_kernel`) names a 1488x836 RGBA16F colour input that is sampled, not storage,
+with a D32S8 depth at that extent and motion vectors at the output size. Taking a sampled RGBA16F
+as the colour input (when no storage one is named) identified it, but nothing was held: the split
+is refused (a write barrier before the launch) and the in-buffer hold has no layout for the colour
+input (none of its transitions were seen as barriers; likely render-pass layout transitions). Not
+kept on the branch: holding it needs render-pass layout tracking first.
+
+## 2026-10-06 -- branch: every installed DLSS game held before the upscaler
+
+GTA San Andreas DE is held now: its colour input is a sampled RGBA16F image (taken when a launch
+names no storage colour candidate), and its layout comes from `vkCmdBeginRendering`'s attachments
+(no barrier ever transitions it once identified: "0 barriers on it seen since identification").
+Resident Evil Requiem (ray tracing High, FG 4x) is held through DLSS Super Resolution's input kernel
+(`hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`) with its B10G11R11 colour input.
+
+The game's frame-rate cap: San Andreas DE resets it to 60 at every launch whatever its
+GameUserSettings.ini say (both copies at `FrameRatePC=0`, also read-only, also with `FrameRate=0`:
+the menu still shows 60). `scripts/game-reg.sh` sets Frame Rate to Unlocked in the menu on every run.
+
+One run each on the final branch build (settings as found, frame generation on where the game has
+it, no frame-rate cap):
+
+- GTA San Andreas DE (`br-sa-3`, unlocked): 79 holds/s = its frame rate, 0 misses (capped at 60:
+  60 holds/s).
+- Resident Evil Requiem (`br-re-1`): 159.7 fps shown, 40.8 holds/s, 0 misses.
+- GTA V Enhanced (`br-gta-2`, FG engaged at 4x): 49.7 real / 198.9 shown, 49.6 held/s, 0 misses.
+- Cyberpunk 2077 (`br-cp-1`, FG 3x): 116.9 fps shown on average (106.2 minimum), 38.2 held/s.
+- Crimson Desert (`br-cd-2`, Nas River): 139 fps shown, 23.5 held/s (`br-cd-1` ended on the
+  shader-compile screen a new layer build brings: not counted).
+- Black Myth: Wukong benchmark (`br-wk-1`, FG on): 34.7 held/s, 0 misses.
+- No fence timeout, no Xid in any run.
+
+Red Dead Redemption 2: not run. Its Vulkan renderer exits at startup on this driver with or without
+the layer (known Proton issue); switched to DX12 (`system.xml.nf-bak` keeps the original), after
+which the Rockstar Games Launcher did not start the game unattended (a dialog the unattended run
+cannot see is the likely cause; not confirmed).
 ## 2026-10-06 -- Shadow Warrior 3: Definitive Edition (Unreal Engine 4), branch build
 
 First launch (Proton Experimental): the game's own GPU benchmark failed under Proton and chose the

@@ -66,6 +66,10 @@ struct Slot {
     owner: Option<vk::CommandBuffer>,
     point: Option<InlinePoint>,
     used: Instant,
+    /// Since the owner recorded the hold: when, and how many times it was submitted (the one-time
+    /// line when every slot is taken says what the owners are doing).
+    recorded: Option<Instant>,
+    submits: u32,
 }
 
 /// One execution of a buffer carrying a hold: what the worker needs.
@@ -88,6 +92,13 @@ struct Slots {
     slots: Vec<Slot>,
     by_cb: HashMap<vk::CommandBuffer, usize>,
     simultaneous: HashSet<vk::CommandBuffer>,
+    /// The pool each of the device's command buffers was allocated from: resetting or destroying a
+    /// pool ends every one of its buffers' pending state, so their slots are free again.
+    /// vkd3d-proton resets a DX12 command allocator's pool and records into other buffers in the
+    /// meantime, so a slot freed only at the same buffer's next `vkBeginCommandBuffer` stayed taken
+    /// until [`STALE`]: all eight were in use within a few frames (Black Myth: Wukong's benchmark,
+    /// 2026-10-05), and a buffer was held about once a second.
+    pool_of: HashMap<vk::CommandBuffer, vk::CommandPool>,
 }
 
 /// What runs the hold for a job on the worker thread (`device.rs`): the device's state and the
@@ -188,6 +199,37 @@ impl Inline {
         for cb in cbs {
             release(&mut s, *cb);
             s.simultaneous.remove(cb);
+            s.pool_of.remove(cb);
+        }
+    }
+
+    /// `vkAllocateCommandBuffers` returned `cbs` from `pool`.
+    pub(crate) fn allocated(&self, pool: vk::CommandPool, cbs: &[vk::CommandBuffer]) {
+        let mut s = self.slots.lock().unwrap();
+        for cb in cbs {
+            s.pool_of.insert(*cb, pool);
+        }
+    }
+
+    /// `vkResetCommandBuffer`: the buffer is not pending (Vulkan requires it), so its slot is free.
+    pub(crate) fn reset(&self, cb: vk::CommandBuffer) {
+        release(&mut self.slots.lock().unwrap(), cb);
+    }
+
+    /// `vkResetCommandPool` (`destroyed`: `vkDestroyCommandPool`): none of the pool's buffers is
+    /// pending (Vulkan requires it), so their slots are free.
+    pub(crate) fn reset_pool(&self, pool: vk::CommandPool, destroyed: bool) {
+        let mut s = self.slots.lock().unwrap();
+        let owners: Vec<vk::CommandBuffer> = s.by_cb.keys().copied().filter(|cb| s.pool_of.get(cb) == Some(&pool)).collect();
+        for cb in owners {
+            release(&mut s, cb);
+        }
+        if destroyed {
+            let gone: Vec<vk::CommandBuffer> = s.pool_of.iter().filter(|(_, p)| **p == pool).map(|(cb, _)| *cb).collect();
+            for cb in gone {
+                s.pool_of.remove(&cb);
+                s.simultaneous.remove(&cb);
+            }
         }
     }
 
@@ -228,7 +270,28 @@ impl Inline {
                 s.slots.len() - 1
             }
             None => {
-                self.say_once(format!("all {MAX_SLOTS} staging slots of the hold inside DLSS's buffer are in use; that buffer is not held"));
+                let owners: Vec<String> = s
+                    .slots
+                    .iter()
+                    .map(|sl| {
+                        format!(
+                            "{:?} recorded {:.1}s ago, submitted {}x, pool {}",
+                            sl.owner,
+                            sl.recorded.map_or(f32::NAN, |r| now.duration_since(r).as_secs_f32()),
+                            sl.submits,
+                            sl.owner.and_then(|c| s.pool_of.get(&c)).map_or("unknown".to_string(), |p| format!("{p:?}"))
+                        )
+                    })
+                    .collect();
+                // Once (the details change every time).
+                if self.said.lock().unwrap().insert("all staging slots in use".into()) {
+                    crate::log!(
+                        "[preupscale] all {MAX_SLOTS} staging slots of the hold inside DLSS's buffer are in use; that buffer is not held (owners: {}; {} buffers with a known pool)",
+                        owners.join("; "),
+                        s.pool_of.len()
+                    );
+                    crate::logging::flush();
+                }
                 return false;
             }
         };
@@ -271,6 +334,8 @@ impl Inline {
         });
         slot.owner = Some(cb);
         slot.used = now;
+        slot.recorded = Some(now);
+        slot.submits = 0;
         s.by_cb.insert(cb, index);
         drop(s);
         self.say_once(format!(
@@ -293,6 +358,7 @@ impl Inline {
             let Some(&i) = s.by_cb.get(&cb) else { continue };
             let slot = &mut s.slots[i];
             slot.used = now;
+            slot.submits += 1;
             if let Some(point) = slot.point {
                 // A queue the layer never saw (`vkGetDeviceQueue*`) counts as another family: the
                 // worker then only releases.
@@ -355,6 +421,8 @@ impl Inline {
                 owner: None,
                 point: None,
                 used: Instant::now(),
+                recorded: None,
+                submits: 0,
             };
             self.resize_slot(&mut slot, extent);
             match self.image(vk::Format::R16_SFLOAT, (1, 1)) {
