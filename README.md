@@ -104,6 +104,7 @@ frame. Numbers are from one run each; the full record is in
 | Black Myth: Wukong Benchmark Tool | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler without frame generation; **with frame generation on, no effect at all** | Before the upscaler with frame generation: 69 fps average, 29 minimum (the tool's results) |
 | GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | After the upscaler (60 fps, capped) | Before the upscaler: 79 fps uncapped |
 | Resident Evil Requiem | RE Engine, DX12 | Super Resolution with ray tracing, Frame Generation 4x | Not measured | Before the upscaler: 159.7 fps shown |
+| Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Not measured | Before the upscaler: 83.9 fps in play (High preset, DLSS Balanced) |
 | Red Dead Redemption 2 | RAGE, Vulkan / DX12 | Super Resolution | Not running (see below) | Not running |
 
 Setup notes for these games:
@@ -118,6 +119,9 @@ Setup notes for these games:
   with or without Neural Forge (a known Proton issue). Switching it to DX12 in
   `Documents/Rockstar Games/Red Dead Redemption 2/Settings/system.xml` (`kSettingAPI_DX12`) is the
   usual fix; not yet tested here.
+- **Shadow Warrior 3** greys out its NVIDIA DLSS option while FidelityFX CAS is on (Settings >
+  Video): set CAS to Off and DLSS becomes selectable. Its first launch also benchmarks the machine and
+  picks the Low preset under Proton; set Overall Quality yourself.
 - **Crimson Desert** compiles shaders on its first launch after a Neural Forge update; the effect
   starts once it is in the world.
 
