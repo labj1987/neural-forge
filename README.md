@@ -20,6 +20,30 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 The screenshots show 2.0.0 with default settings and no game running.
 
+### In games
+
+The same moment with the effect on (left) and off (right), toggled in game. Screenshots from an
+RTX 5070 at 2560x1440 (the 4K pair at 3840x2160). The fps counter in the top-left corner is
+MangoHud, counting frame-generated frames.
+
+**GTA V Enhanced** (2.0.6, DLSS Balanced, DLSS Frame Generation 4x; the model before the upscaler):
+188 fps shown with the effect, 255 without.
+
+![GTA V Enhanced, a Los Santos street, Neural Forge on and off](screenshots/gta-v-street.jpg)
+
+**GTA V Enhanced at 4K** (2.0, 2026-10-03, DLSS Balanced, DLSS Frame Generation on): 116 fps shown
+with the effect, 190 without.
+
+![GTA V Enhanced at 4K, Neural Forge on and off](screenshots/gta-v-4k.jpg)
+
+**Resident Evil Requiem** (2.0, 2026-10-03, ray tracing on, so DLSS runs as Ray Reconstruction and
+the model runs after the upscaler; DLSS Frame Generation on): 89 and 203 fps shown with the effect,
+195 and 304 without. Each pair is a few seconds apart, so people and signs have moved.
+
+![Resident Evil Requiem, a rainy street, Neural Forge on and off](screenshots/re-requiem-street.jpg)
+
+![Resident Evil Requiem, a bus stop, Neural Forge on and off](screenshots/re-requiem-bus-stop.jpg)
+
 ## What 2.0 does
 
 The model runs in one of two places. The layer picks the place for each game by itself:
