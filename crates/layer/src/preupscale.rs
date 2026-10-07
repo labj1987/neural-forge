@@ -4518,6 +4518,25 @@ pub(crate) struct Session {
     /// The identification whose game exposure read implausibly high ([`Self::check_exposure`]): its
     /// holds measure the exposure from the frame instead.
     exposure_untrusted: Option<u64>,
+    /// Consecutive frames still to dump after the one just taken ([`dump_frames`]).
+    burst: u32,
+}
+
+/// `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore`: dump even when DLSS's launch buffer synchronizes
+/// the depth or motion vectors before its launch ([`Scan::dump_hazard`]). Diagnostic only: those
+/// images may then be read before the game finished them, which consecutive dumps show.
+pub(crate) fn dump_ignores_hazard() -> bool {
+    static IGNORE: LazyLock<bool> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD").is_ok_and(|v| v == "ignore"));
+    *IGNORE
+}
+
+/// `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES`: how many consecutive DLSS frames each dump takes (default
+/// 1). Two or more give frame pairs for checking the motion vectors' convention.
+pub(crate) fn dump_frames() -> u32 {
+    static FRAMES: LazyLock<u32> = LazyLock::new(|| {
+        std::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(1)
+    });
+    *FRAMES
 }
 
 impl Session {
@@ -4549,7 +4568,7 @@ impl Session {
     /// Whether a dump is due: the first hold after the input is identified, then whenever a
     /// one-shot `capture_request` is pending (the caller consumes it once the dump is taken).
     pub(crate) fn dump_due(&self, shm: &ShmClient) -> bool {
-        !self.dumped || shm.capture_request_pending()
+        !self.dumped || self.burst > 0 || shm.capture_request_pending()
     }
 
     /// Whether a due dump should be taken now: once the depth and motion-vector images' layouts are
@@ -4810,6 +4829,7 @@ impl Session {
 
     /// Marks the dump as done (a pending one-shot request is consumed by the caller).
     pub(crate) fn dumped(&mut self) {
+        self.burst = if self.burst > 0 { self.burst - 1 } else { dump_frames() - 1 };
         self.dumped = true;
     }
 
