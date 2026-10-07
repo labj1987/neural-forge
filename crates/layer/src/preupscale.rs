@@ -128,8 +128,8 @@ pub(crate) unsafe fn run_native(
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
     {
-        // The Model tab's settings for the first pass (NATIVE_BACKEND.md, "2.2").
-        let conditioning = shm.pass_tuning(0).map_or_else(native::Conditioning::default, native::Conditioning::from);
+        // The Model tab's settings; per-pass overrides are the helper's (NATIVE_BACKEND.md, "2.2").
+        let conditioning = shm.global_tuning().map_or_else(native::Conditioning::default, native::Conditioning::from);
         // SAFETY: forwarded.
         return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, conditioning, submit) };
     }
@@ -4581,6 +4581,8 @@ pub(crate) struct Session {
     pub(crate) res: Option<Resources>,
     stats: Stats,
     last_hold: Option<Instant>,
+    /// The last hold ran the native backend (for `native_running`).
+    last_hold_native: bool,
     dumped: bool,
     /// Launch-bearing submits a due dump waited for the depth and motion-vector layouts.
     dump_waits: u32,
@@ -4840,6 +4842,7 @@ impl Session {
         let now = Instant::now();
         if result.wrote_back || result.dump.is_some() {
             self.last_hold = Some(now);
+            self.last_hold_native = result.native;
             self.last_dlss = Some(now);
         }
         if result.request.is_some() || (result.native && result.evaluated) {
@@ -4907,7 +4910,7 @@ impl Session {
             }
         }
         shm.publish_preupscale_hold(s.last_hold_ms, s.misses);
-        shm.publish_preupscale_state(if holding { 2 } else if self.breaker.paused() && self.engaged { 3 } else { 1 }, extent.0, extent.1);
+        shm.publish_preupscale_state(if holding { 2 } else if self.breaker.paused() && self.engaged { 3 } else { 1 }, self.last_hold_native, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
             // The window's rate: frames the model ran on before the upscaler (the post path's
@@ -5039,7 +5042,7 @@ impl Session {
         } else {
             1
         };
-        shm.publish_preupscale_state(state, w, h);
+        shm.publish_preupscale_state(state, self.last_hold_native, w, h);
     }
 }
 

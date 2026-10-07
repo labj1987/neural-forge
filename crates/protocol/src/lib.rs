@@ -67,11 +67,12 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// removes the motion payload region and `frame_mvec_valid` again, since motion is now
 /// estimated inside the helper; v8 appends the layer's GPU timestamps; v9 the pre-upscaler path's status; v10 the helper's
 /// per-request wall time, for the hold's hand-off breakdown; v11 `seq_eval`, which tells a model
-/// answer from an echo; v12 drops `preset` and `sharpness`, which the 310.8 model never reads).
+/// answer from an echo; v12 drops `preset` and `sharpness`, which the 310.8 model never reads; v13
+/// `native_running`, so the GUI can hide the helper-only settings while the native backend runs).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 12;
+pub const SHM_VERSION: u32 = 13;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;

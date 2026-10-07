@@ -413,10 +413,10 @@ impl ShmClient {
         (!self.header.is_null() && self.regions.iter().all(|r| !r.is_null())).then_some(ShmView { header: self.header, regions: self.regions })
     }
 
-    /// Pass `pass`'s settings, its overrides merged over the global ones (the Model tab's).
+    /// The Model tab's settings without per-pass overrides (the native backend's).
     #[cfg(target_arch = "x86_64")]
-    pub fn pass_tuning(&self, pass: usize) -> Option<neural_forge_protocol::PassTuning> {
-        self.header().map(|hdr| hdr.resolve_pass(pass))
+    pub fn global_tuning(&self) -> Option<neural_forge_protocol::PassTuning> {
+        self.header().map(|hdr| hdr.global_tuning())
     }
 
     /// The layer's status line for the GUI (the native backend's state, or why it is not running).
@@ -492,9 +492,10 @@ impl ShmClient {
     }
 
     /// The pre-upscaler path's state and identified input extent (`ShmHeader::preupscale_*`).
-    pub fn publish_preupscale_state(&self, state: u32, width: u32, height: u32) {
+    pub fn publish_preupscale_state(&self, state: u32, native: bool, width: u32, height: u32) {
         let Some(hdr) = self.header() else { return };
         hdr.preupscale_state.store(state, Ordering::Relaxed);
+        hdr.native_running.store(u32::from(state == 2 && native), Ordering::Relaxed);
         hdr.preupscale_width.store(width, Ordering::Relaxed);
         hdr.preupscale_height.store(height, Ordering::Relaxed);
     }

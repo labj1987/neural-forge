@@ -89,6 +89,8 @@ are only ever appended; offsets are pinned by compile-time asserts. Groups:
 - **Handshake, slot 0:** `seq_req`, `seq_resp`, `width`, `height`, `proxy_format`, `seq_ok`,
   `answered_w`/`answered_h` (the size the helper answered, so an answer for another swapchain or
   an old size is refused), `seq_eval` (v11).
+- **Native backend (v13):** `native_running`, 1 while the layer runs the model itself before the
+  upscaler; the GUI shows the helper-only settings (passes, motion) only when it is 0 and a game is running.
 - **Handshake, slot 1 (v3):** `seq_req_b`, `seq_resp_b`, `width_b`, `height_b`, `proxy_format_b`.
 - **Liveness:** `heartbeat` (helper), `layer_heartbeat`, `quit`.
 - **Change counters:** `control_seq` (any setting changed), `tuning_seq` (a setting the model
@@ -139,6 +141,8 @@ re-initialising it; the GUI and CLI say which versions disagree.
 | 9 | Pre-upscaler status fields | 2.0.0 |
 | 10 | `helper_busy_us` | 2.0.0 |
 | 11 | `seq_eval` (model answer vs echo) | 2.0.0 |
+| 12 | `preset` and `sharpness` removed (the 310.8 model never reads them) | unreleased |
+| 13 | `native_running` (the layer runs the model itself) | unreleased |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11.

@@ -228,7 +228,7 @@ fn process(
         && height >= MIN_DIM
         && hdr.neural_enabled()
         && hdr.apply_model.load(Ordering::Relaxed) != 0;
-    let conditioning = Conditioning::from(hdr.resolve_pass(0));
+    let conditioning = Conditioning::from(hdr.global_tuning());
     let evaluated = wanted
         && loader.claim_post()
         && loader.ready(width, height).is_some_and(|built| {

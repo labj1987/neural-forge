@@ -265,7 +265,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_group.add(&switch_row("Auto mask", "Automatic skin/detail masking", auto_mask, set_auto_mask));
 
     let (passes, set_passes) = bind_u32(&shm, Some("passes"), |h| &h.passes);
-    model_group.add(&spin_row("Passes", "How many times the model runs over one frame", passes as f32, 1.0, 30.0, 1.0, move |v| set_passes(v as u32)));
+    let passes_row = spin_row("Passes", "How many times the model runs over one frame", passes as f32, 1.0, 30.0, 1.0, move |v| set_passes(v as u32));
+    model_group.add(&passes_row);
 
     let pass_row = adw::ActionRow::new();
     pass_row.set_title("Per-pass settings");
@@ -439,7 +440,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     ));
 
     let (unlock_passes, set_unlock_passes) = bind_bool(&shm, Some("unlock_passes"), |h| &h.unlock_passes);
-    comp_group.add(&switch_row("Unlock pass limit", "Allow more passes than the normal ceiling", unlock_passes, set_unlock_passes));
+    let unlock_row = switch_row("Unlock pass limit", "Allow more passes than the normal ceiling", unlock_passes, set_unlock_passes);
+    comp_group.add(&unlock_row);
 
     let (apply_model, set_apply_model) = bind_bool(&shm, Some("apply_model"), |h| &h.apply_model);
     comp_group.add(&switch_row("Apply model edit", "Off presents the clean frame — capture/transport/round-trip still run, for an honest A/B", apply_model, set_apply_model));
@@ -511,7 +513,42 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     let motion_page = adw::PreferencesPage::new();
     motion_page.add(&motion_group);
-    view_stack.add_titled_with_icon(&motion_page, Some("motion"), "Motion", "camera-video-symbolic");
+    let motion_tab = view_stack.add_titled_with_icon(&motion_page, Some("motion"), "Motion", "camera-video-symbolic");
+
+    // Passes, per-pass settings and motion only reach the helper. The native backend (the
+    // default before the upscaler) runs the model once per frame on DLSS's own motion vectors,
+    // so they are shown only while a game is running on the helper.
+    {
+        let shm = std::sync::Arc::clone(&shm);
+        let view_stack = view_stack.clone();
+        let beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
+        let update = move || {
+            let helper_in_use = {
+                let hdr = shm.header();
+                let now = hdr.layer_heartbeat.load(Ordering::Relaxed);
+                let (seen, at) = beat.get();
+                let active = if now != seen {
+                    beat.set((now, std::time::Instant::now()));
+                    seen != 0
+                } else {
+                    at.elapsed() < std::time::Duration::from_secs(2)
+                };
+                active && hdr.native_running.load(Ordering::Relaxed) == 0
+            };
+            for row in [passes_row.upcast_ref::<gtk4::Widget>(), pass_row.upcast_ref(), unlock_row.upcast_ref()] {
+                row.set_visible(helper_in_use);
+            }
+            motion_tab.set_visible(helper_in_use);
+            if !helper_in_use && view_stack.visible_child_name().as_deref() == Some("motion") {
+                view_stack.set_visible_child_name("model");
+            }
+        };
+        update();
+        glib::timeout_add_seconds_local(1, move || {
+            update();
+            glib::ControlFlow::Continue
+        });
+    }
 
     let composition_page = adw::PreferencesPage::new();
     composition_page.add(&comp_group);

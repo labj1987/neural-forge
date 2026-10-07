@@ -349,6 +349,12 @@ pub struct ShmHeader {
     /// got a model answer; anything else is an echo of its own frame (no feature built, an
     /// evaluate that failed, a refused frame). 0 before the first evaluated request.
     pub seq_eval: AtomicU32,
+
+    // --- v13 -----------------------------------------------------------------------------
+    /// 1 while the layer runs the model itself (the native backend) before the upscaler, 0
+    /// otherwise. Passes, per-pass settings and the motion controls only reach the helper, so
+    /// the GUI shows them only while a game runs on it.
+    pub native_running: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -374,7 +380,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1776, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1780, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 80,
@@ -402,6 +408,7 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1748,
 const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 1764, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_busy_us) == 1768, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 1772, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, native_running) == 1776, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 28, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
@@ -494,6 +501,7 @@ impl ShmHeader {
         self.preupscale_misses.store(0, Ordering::Relaxed);
         self.helper_busy_us.store(0, Ordering::Relaxed);
         self.seq_eval.store(0, Ordering::Relaxed);
+        self.native_running.store(0, Ordering::Relaxed);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
@@ -760,17 +768,23 @@ impl ShmHeader {
         }
     }
 
-    /// The global settings with one pass's overrides applied. A field the pass does not
-    /// name follows the global value, which is what keeps a sparse override sparse.
-    pub fn resolve_pass(&self, pass: usize) -> PassTuning {
-        let mut t = PassTuning {
+    /// The Model tab's settings, without any pass's overrides: what the native backend, which
+    /// runs the model once per frame, uses.
+    pub fn global_tuning(&self) -> PassTuning {
+        PassTuning {
             intensity: f32::from_bits(self.intensity_bits.load(Ordering::Relaxed)),
             local_tone: f32::from_bits(self.local_tone_bits.load(Ordering::Relaxed)),
             local_structure: f32::from_bits(self.local_structure_bits.load(Ordering::Relaxed)),
             skin_structure: f32::from_bits(self.skin_structure_bits.load(Ordering::Relaxed)),
             style: self.style.load(Ordering::Relaxed),
             auto_mask: self.auto_mask.load(Ordering::Relaxed),
-        };
+        }
+    }
+
+    /// The global settings with one pass's overrides applied. A field the pass does not
+    /// name follows the global value, which is what keeps a sparse override sparse.
+    pub fn resolve_pass(&self, pass: usize) -> PassTuning {
+        let mut t = self.global_tuning();
 
         let Some(p) = self.pass.get(pass) else { return t };
         let mask = p.override_mask.load(Ordering::Relaxed);
@@ -1131,6 +1145,19 @@ mod tests {
         let t = h.resolve_pass(3);
         assert_eq!(t.intensity, 0.4);
         assert_eq!(t.style, 0);
+    }
+
+    #[test]
+    fn global_tuning_ignores_pass_overrides() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        h.intensity_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        let p = &h.pass[0];
+        p.intensity_bits.store(0.4f32.to_bits(), Ordering::Relaxed);
+        p.override_mask.store(pass_override::INTENSITY, Ordering::Relaxed);
+        // The native backend runs the model once with the Model tab's values.
+        assert_eq!(h.resolve_pass(0).intensity, 0.4);
+        assert_eq!(h.global_tuning().intensity, 1.0);
     }
 
     #[test]
