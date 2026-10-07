@@ -229,14 +229,16 @@ fn process(
         && hdr.neural_enabled()
         && hdr.apply_model.load(Ordering::Relaxed) != 0;
     let conditioning = Conditioning::from(hdr.global_tuning());
-    let evaluated = wanted
-        && loader.claim_post()
-        && loader.ready(width, height).is_some_and(|built| {
+    // The claim is released whatever happens after it: a claim held while the network is not
+    // built at this size would keep the pre-upscaler path off it for good.
+    let evaluated = wanted && loader.claim_post() && {
+        let ok = loader.ready(width, height).is_some_and(|built| {
             // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
-            let ok = unsafe { evaluate(device, instance, physical, import, loader, view, gpu, slot, &built, width, height, format == proxy_format::BGRA8, conditioning) };
-            loader.release_post();
-            ok
+            unsafe { evaluate(device, instance, physical, import, loader, view, gpu, slot, &built, width, height, format == proxy_format::BGRA8, conditioning) }
         });
+        loader.release_post();
+        ok
+    };
     let (proxy, answer) = view.regions(slot);
     if !evaluated && bytes > 0 {
         // Fail open, as the helper does: the frame itself comes back.

@@ -489,9 +489,16 @@ impl ShmClient {
         hdr.preupscale_misses.store(misses, Ordering::Relaxed);
     }
 
-    /// Whether the model is wanted at all right now: the live `enabled` toggle (F11 / the GUI /
-    /// `shmctl set enabled`), `apply_model`, and not reported permanently unavailable. `false`
-    /// before the mapping is open.
+    /// Whether the model is switched on: the live `enabled` toggle (F11 / the GUI / `shmctl set
+    /// enabled`) and `apply_model`. What the native backend checks: it has no helper to report the
+    /// model unavailable. `false` before the mapping is open.
+    pub fn model_enabled(&self) -> bool {
+        let Some(hdr) = self.header() else { return false };
+        hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0
+    }
+
+    /// Whether the model is wanted at all right now: [`Self::model_enabled`], and not reported
+    /// permanently unavailable. `false` before the mapping is open.
     pub fn model_wanted(&self) -> bool {
         let Some(hdr) = self.header() else { return false };
         hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0 && !self.model_known_unavailable()

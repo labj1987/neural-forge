@@ -690,6 +690,10 @@ fn inline_hold(
     }
     // The native backend runs the network itself, on this side queue: no helper, no slot 0.
     let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
+    if native && !shm.model_enabled() {
+        inline_tally("skipped (the model is switched off)");
+        return;
+    }
     // A dump here has the colour input only (no depth or motion-vector layouts to wait for).
     let dump = if native {
         false
@@ -1196,6 +1200,11 @@ impl NeuralForgeDeviceInfo {
         }
         // The native backend runs the network itself: no helper to ask, no slot 0 to share.
         let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
+        // The native backend has no helper to gate on, but follows the toggle (F11, the GUI) as the helper's
+        // hold does: off, the submit goes to DLSS untouched.
+        if native && !shm.model_enabled() {
+            return None;
+        }
         let dump = if native { false } else { crate::preupscale::gate(mode, session, shm, scan.depth_layout.is_some() && scan.mvec_layout.is_some())? };
         // Slot 0 must be free: no request (the post path's, or an earlier hold's that ran over
         // budget) still with the helper, no zero-copy capture still writing its proxy region, and
