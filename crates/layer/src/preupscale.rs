@@ -3618,6 +3618,9 @@ pub(crate) struct HoldResult {
     pub timing: HoldTiming,
     /// The native backend ran this hold (no helper request; `evaluated` means the network ran).
     pub native: bool,
+    /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
+    /// network, composite), read when its fence was found signalled here.
+    pub network_gpu_ms: Option<f32>,
 }
 
 impl HoldResult {
@@ -4476,6 +4479,7 @@ struct Stats {
     hold_ms: Vec<f32>,
     capture_gpu_ms: Vec<f32>,
     writeback_gpu_ms: Vec<f32>,
+    network_gpu_ms: Vec<f32>,
     /// [`HoldTiming`]'s phases in milliseconds, per hold that reached them; `handoff` is
     /// `round_trip - helper_busy` per answered hold.
     prep_ms: Vec<f32>,
@@ -4849,6 +4853,9 @@ impl Session {
         if let Some(g) = result.writeback_gpu_ms {
             s.writeback_gpu_ms.push(g);
         }
+        if let Some(g) = result.network_gpu_ms {
+            s.network_gpu_ms.push(g);
+        }
         s.book(&result.timing);
         if let Some(e) = result.exposure.filter(|&e| hdr::exposure_ok(e)) {
             s.exposure.push(e);
@@ -4877,7 +4884,7 @@ impl Session {
             let rate = per_second(SUMMARY_EVERY, s.window_start.map_or(Duration::ZERO, |t| now.duration_since(t)));
             s.window_start = Some(now);
             crate::log!(
-                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2} misses={} (total {}) holds_per_s={:.1}{}",
+                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2}{} misses={} (total {}) holds_per_s={:.1}{}",
                 mode().name(),
                 extent.0,
                 extent.1,
@@ -4885,6 +4892,7 @@ impl Session {
                 median(&s.hold_ms),
                 median(&s.capture_gpu_ms),
                 median(&s.writeback_gpu_ms),
+                if s.network_gpu_ms.is_empty() { String::new() } else { format!(" network_gpu_ms median={:.2}", median(&s.network_gpu_ms)) },
                 s.window_misses,
                 s.misses,
                 rate,
@@ -4903,6 +4911,7 @@ impl Session {
             s.exposure.clear();
             s.capture_gpu_ms.clear();
             s.writeback_gpu_ms.clear();
+            s.network_gpu_ms.clear();
             s.clear_phases();
             s.window_misses = 0;
         }

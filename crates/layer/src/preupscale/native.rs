@@ -415,6 +415,10 @@ pub(crate) struct NativePass {
     command_pool: vk::CommandPool,
     /// `N[parity]`, then the one-time initialisation (history layouts, state cleared).
     commands: [vk::CommandBuffer; 3],
+    /// GPU timestamps around `N[parity]` (`None` where timestamps are not supported).
+    timers: [Option<crate::gpu_timer::GpuTimer>; 2],
+    /// The parity of the last frame submitted, whose timer is read at the next hold.
+    last_parity: Option<usize>,
     /// The [`Built::generation`] `commands` were recorded for, and whether the initialisation ran.
     recorded: Option<u64>,
     initialised: bool,
@@ -511,6 +515,11 @@ impl NativePass {
                 params,
                 command_pool,
                 commands: [cmds[0], cmds[1], cmds[2]],
+                timers: [
+                    crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
+                    crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
+                ],
+                last_parity: None,
                 recorded: None,
                 initialised: false,
                 frames: 0,
@@ -591,6 +600,9 @@ impl NativePass {
         unsafe {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE))?;
+            if let Some(timer) = &self.timers[p] {
+                timer.record_start(device, cmd);
+            }
             // `C`'s encode and motion-vector copy, and the previous frame's history write, before
             // anything here reads them.
             device.cmd_pipeline_barrier(
@@ -639,8 +651,18 @@ impl NativePass {
                 &[],
                 &[],
             );
+            if let Some(timer) = &self.timers[p] {
+                timer.record_end(device, cmd);
+            }
             device.end_command_buffer(cmd)
         }
+    }
+
+    /// The previous frame's network GPU time, once its work has completed (the caller waited for it).
+    pub(crate) fn take_gpu_ms(&mut self, device: &ash::Device) -> Option<f32> {
+        let timer = self.timers[self.last_parity.take()?].as_mut()?;
+        timer.read_if_pending(device);
+        timer.take_reading()
     }
 
     /// # Safety
@@ -700,6 +722,10 @@ impl NativePass {
         // ago) completed: the hold waits for the previous hold's work before it records anything.
         unsafe { std::ptr::copy_nonoverlapping(std::ptr::from_ref(&params).cast::<u8>(), self.params[p].ptr, PARAMS_BYTES as usize) };
         self.frames += 1;
+        self.last_parity = Some(p);
+        if let Some(timer) = self.timers[p].as_mut() {
+            timer.mark_submitted();
+        }
         let mut out = Vec::with_capacity(2);
         if !std::mem::replace(&mut self.initialised, true) {
             out.push(self.commands[2]);
@@ -713,6 +739,9 @@ impl NativePass {
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded; freeing the pools frees their sets and buffers.
         unsafe {
+            for t in self.timers.iter().flatten() {
+                t.destroy(device);
+            }
             device.destroy_command_pool(self.command_pool, None);
             for h in &self.history {
                 h.destroy(device);
@@ -791,6 +820,7 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     }
     result.writeback_gpu_ms = writeback_gpu;
+    result.network_gpu_ms = res.native.as_mut().and_then(|n| n.take_gpu_ms(device));
     // Every frame that ran the graph has completed: the chain watchdog's count is final for them.
     let fake = fake_chain_timeout(res.native.as_ref().map_or(0, |n| n.frames));
     if let Some((waits, at)) = loader.chain_timeouts().filter(|(n, _)| *n > 0).or(fake) {

@@ -10,7 +10,7 @@ log" so the next one starts from it.
 
 ## Phase 0: go or no-go (2026-10-07)
 
-**Verdict: go, with two cautions.** All three gates hold on the test machine:
+**Verdict: go, with two cautions.** (Alex: go, 2026-10-07.) All three gates hold on the test machine:
 
 | Gate | Needed | Measured |
 |---|---|---|
@@ -253,7 +253,162 @@ NVIDIA's weights are never committed, uploaded or packaged. The model directory 
 data directory, the DLL stays where `import-binaries` put it, and the scratch clone, fixtures and
 captures stay on the test machine.
 
-## For Alex to decide before Phase 1
+## Phase 1: the network inside the layer (2026-10-07)
+
+**Status: working in GTA V before the upscaler.** Every DLSS frame goes through the network on the
+game's own device; the helper is not running. Failure paths tested. Open items at the end of this
+section.
+
+### 1.1 Vendoring and the build
+
+- `third_party/opendlss-nr/`: upstream `src/` (minus `main.cpp` and `verify.cpp`), `shaders/`,
+  `scripts/ptx/`, `LICENSE`, `NOTICE`, at `9d08f41`. `UPSTREAM.md` lists every local change, each also
+  a patch in `patches/`: 0001 and 0002 the two GCC fixes, 0003 the asset loader (kernels come from
+  memory, not a directory), 0004 the adoption inside a layer (next layer's proc addresses, bounded
+  waits, no `vkDeviceWaitIdle` on an adopted device, a dispatchable-init hook, `CONCURRENT` buffers
+  over two queue families). ATTRIBUTION.md has the row.
+- `crates/native` (`neural-forge-native`): `build.rs` compiles the 13 GLSL kernels with the pinned
+  glslang and runs the 78 PTX generator invocations of upstream's `build_shaders.ps1` at build time,
+  embeds both (`.incbin`), and compiles the vendored C++ with the glue (`cpp/nf_native.cpp`) into the
+  rlib. Nothing prebuilt is committed. `scripts/fetch-native-tools.sh` fetches glslang 16.6.0,
+  Vulkan-Headers v1.4.363 and volk vulkan-sdk-1.4.357.0 (SHA-256 pinned) into `tools/native/`
+  (ignored); CI runs it. A clean native build takes 3.5 s.
+- libstdc++ is linked statically and nothing of the C++ is exported: the layer's `NEEDED` list is
+  unchanged (`libgcc_s`, `libm`, `libc`, `ld-linux`), its dynamic symbols too. volk is compiled as C++
+  in its own namespace (`VOLK_NAMESPACE`): as C its `vkGetInstanceProcAddr` and friends clashed with
+  the layer's exported entry points. The layer grew from 2.0 MB to 8.9 MB (5.5 MB of it PTX). It now
+  needs glibc 2.38 (GCC 15's libstdc++ and the vendored objects use `__isoc23_strtol`).
+- The 32-bit layer does not link the native crate (`[target.'cfg(target_arch = "x86_64")']`); see 2.4.
+- `crates/native/tests/rig.rs` (runs with `NEURAL_FORGE_NATIVE_RIG=<dlss5vk dump>`): a device made
+  with the layer's additions, the network loaded on a compute-only family's queue and executed from
+  a graphics queue, the head compared with dlss5vk's for GTA frame d1: **bit-exact**, three runs
+  identical, no chain timeouts, 5.51 ms back to back (dlss5vk: 5.50 ms). The recorded secondary costs
+  nothing against recording the graph straight into the primary (5.51 vs 5.60 ms).
+
+### 1.2 Device setup
+
+`NeuralForgeInstanceHooks::create_device` (`crates/layer/src/lib.rs`), on an NVIDIA device with the
+pre-upscaler path on and `NEURAL_FORGE_BACKEND` native: `nf_native_device_extend` checks every
+requirement and merges the network's features into the application's own chain. A flag whose Vulkan
+1.1/1.2/1.3 aggregate structure the application chains is set there (and put back after the call);
+otherwise the feature's own structure is prepended to a copy, and the extension added. Extensions
+added: `VK_NV_cuda_kernel_launch`, `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`,
+`VK_EXT_shader_float8`, and the promoted ones the device lists. The three tooling extensions
+upstream enables (pipeline executable properties, shader clock, SM built-ins) are not: no kernel
+uses them. robustBufferAccess is left as the game asked. A device that lacks a requirement, or a
+request the driver refuses, is created exactly as the game asked, and the log names the first
+missing requirement.
+
+### 1.3 The game's device, and which queue does what
+
+- **Loading** (the model, the weights' device copies, the kernels, the first run that makes the
+  driver compile the PTX, the graph's recording): a queue the layer adds in a compute family without
+  graphics (family 2 on the RTX 5070), used by the network's loader thread only. Buffers are
+  `CONCURRENT` over that family and the game's graphics family. The first version used a queue of
+  the game's graphics family and faulted the game's channel (Xid 32, device lost) while GTA rendered;
+  the layer had already met this with its side queue (Xid 69, Crimson Desert). Nothing else uses the
+  loader's queue, so no lock is needed there; every wait on it is bounded (5 s).
+- **Every frame**: the game's own queue, inside the game's own DLSS submit, which the layer already
+  splits (`preupscale::submit_around`, under the game's external synchronization of that queue: the
+  layer is inside the game's `vkQueueSubmit` call). Order: the capture `C` (exposure, encode, the
+  motion vectors' copy), `N[parity]` (preprocess, the recorded graph, composite), the write-back `W`
+  (decode over the colour input), then DLSS. Each opens with a barrier from `ALL_COMMANDS/MEMORY_WRITE`
+  to what it reads; the ordering argument is the helper hold's, minus the host round trip. No
+  semaphores, and no CPU wait in the frame: the only wait is the next hold's bounded wait for the
+  previous hold's `W` fence (which covers `C` and `N`, submitted before it on the same queue).
+- **One network frame in flight**: activations, chain counters and the status word are single
+  instances; frames on one queue in submission order never overlap, and the previous hold's work is
+  complete before parameters for the same parity are written.
+- **The network's functions** are loaded through the next layer's `vkGetInstanceProcAddr`, so its calls
+  never pass through this layer; its queue and command buffers get the loader's dispatch pointer
+  (`loader_data::initialize_object`).
+- **Lazily**: the model is loaded on the first hold of the device DLSS runs on (GTA creates a dozen
+  devices at start; loading on each cost 0.5 s and VRAM). Load 0.53-0.66 s with hash verification,
+  build for 1485x836 0.73-1.15 s.
+
+### 1.4 The frame path
+
+`crates/layer/src/preupscale/native.rs`, shaders `native_preprocess.comp` and `native_composite.comp`
+(ported from OpenDLSS-NR's demo shaders: lane layout, half roundings, noise hash, Catmull-Rom filter
+and composite bit for bit; ATTRIBUTION.md).
+
+- **Proxy**: the layer's existing encode (`preupscale_encode.comp`, `hdr.rs`): one implementation.
+- **History rule**: the helper's (`history.rs`), moved into `neural-forge-protocol` and made generic,
+  used by both: a reset after a frame that went to DLSS untouched, after 500 ms without a frame, or
+  on another extent or identification. Plus per pixel: no history where the previous position is
+  outside the frame, and none after a frame whose exposure was unusable (a GPU flag the composite
+  writes).
+- **Motion vectors** (measured on consecutive GTA V frames, `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES`):
+  DLSS's are in render pixels, y down, current to previous (`prev = x + mv`, scale +1 on both axes
+  by a 7x7 search). They exclude the camera jitter: the warp error falls a further 20% with a global
+  sub-pixel offset that changes every frame. The jitter DLSS is given is word 3 of the 310.x input
+  kernel's parameters (x low, y high; found with `NEURAL_FORGE_PROBE_PARAMS=1`): a 23-frame Halton
+  (2,3) sequence in ±0.5 px. Three consecutive pairs fit only `prev = x + mv + (jitter[t-1] -
+  jitter[t])`, measured (-0.25, 0.31), (0.44, -0.50), (-0.94, 0.38) against (-0.25, 0.33), (0.50,
+  -0.56), (-0.91, 0.33). Other DLSS versions' input kernels have no known jitter word: they get
+  `jitter = 0` (history off by up to a pixel, which the network's blend weight then has to absorb).
+- **Seed**: 0 on a frame without history, then counting, so the first frame after a reset is NGX's
+  exactly (0.6).
+- **Settings**: Phase 1 runs the defaults (style 0, tone 1, structure 1, skin -1, auto-mask, intensity
+  1), the values Alex runs. The Model tab's mapping is 2.2.
+- **Cost per frame** in GTA V at 1485x836: the hold's CPU time 0.08 ms (the helper path: about
+  10 ms, of which 3.6-4.4 ms draining the game's queue); `W` on the GPU 0.11-0.12 ms; the network
+  frame `N` (preprocess, network, composite) **6.46-6.66 ms** on the GPU (median per 300 holds, the
+  `network_gpu_ms` field of the `[preupscale]` summary, `nat-3`), against 5.50 ms for the network alone
+  on the idle GPU: sharing the GPU with the game costs about 1 ms, as the handoff expected.
+
+### 1.5 The switch
+
+`NEURAL_FORGE_BACKEND=native` (the default on this branch) or `helper`. With `helper` nothing of the
+native path is reachable: no extensions added, no loader, the helper hold exactly as on main. For
+A/B runs only; Phase 5 deletes it.
+
+### 1.6 Failure paths, tested in GTA V
+
+| Case | How | What happened |
+|---|---|---|
+| Network not ready | first frames | frames to DLSS untouched ("the native network is still loading"), one frame in the first run |
+| Build fails | `NEURAL_FORGE_FAIL_CREATE=3` | retried after 0.5, 1, 2 s (the helper's schedule, now shared), the 4th attempt closed and reopened the network, built, "up again after 3 failed attempt(s)"; frames untouched meanwhile; no Xid |
+| Chain watchdog | `NEURAL_FORGE_NATIVE_FAIL=chain` | the timeout read at the next hold, the graph rebuilt with barriers in 56 ms (`chained false`), the history reset, frames untouched for that time; no Xid |
+| Model missing | model directory moved aside for a run | frames untouched all run; status "native network not running: no model at …: extract it in the Setup tab (neural-forge-cli extract-model)"; retried 0.5, 1, 2 s, then every 30 s; directory put back |
+| Hash mismatch | not run in game: `load_check` refuses a stage whose digest differs (0.4), and the loader logs and retries like a missing model | |
+
+The Status tab's pre-upscaler row now ends with the layer's status line (`layer_reason`): "native
+network running", or "native network not running: <why>". `shmctl status` prints it.
+
+### First numbers (not the Phase 3 measurement)
+
+GTA V Enhanced benchmark, 1440p DLSS Balanced, script mods off, pass 4:
+
+| Run | Real fps | GPU | Power | Notes |
+|---|---|---|---|---|
+| helper (`hlp-cap-1`) | 68.3 | 93% | 185 W | same day, same settings |
+| native (`nat-2`) | 70.4 | 96% | 218 W | |
+| native (`nat-cap-1`) | 70.2 | 96% | 218 W | a build ran on the CPU during passes 2-3 |
+| native, after the fallback to barriers, frame generation 4x (`fail-1`) | 49.2 real, 197 shown | 96% | 215 W | |
+| effect off (no model, `nomodel-1`), frame generation 4x | 74.6 real, 301 shown | 95% | 200 W | |
+| native, chained, frame generation 4x (`nat-3`) | 50.2 real, 201 shown | 98% | 218 W | network frame 6.5 ms on the GPU |
+
+The 2 fps between helper and native is inside the run-to-run spread (about 3 fps): not a result
+yet. Frame generation engaged only in `fail-1`; the others ran at 1.0x, which the benchmark does in
+about half its launches.
+
+### Open items from Phase 1
+
+- **The same moment, native and helper**: captures at fixed seconds after launch were seconds apart
+  (the loading time varies), so in-game pictures could not be diffed; both look alike. Phase 3 needs
+  captures keyed to the game's frame count.
+- **The temporal path is not compared with NGX's.** NGX reprojects with the helper's optical flow;
+  the native path with DLSS's motion vectors and the jitter. Watch for ghosting or shimmer in Phase 3
+  and in Alex's play.
+- **One frame of the layer's work in flight**: each hold waits (bounded) for the previous hold's
+  write-back fence before recording, as the helper hold does. With the CPU no longer waiting on the
+  GPU inside the hold, this is now the one place the game's CPU can wait for its own GPU work.
+  Double-buffering `C`/`W` would remove it; measure in Phase 3 first.
+- **Inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077's `inline` hold): still the helper's
+  path. Not needed for GTA V.
+
+## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL
    so they can run outside NGX. It reads only resource data (no code, nothing decrypted, no check
@@ -261,6 +416,7 @@ captures stay on the test machine.
    written. But running the weights outside NVIDIA's runtime is a different use than those rules
    were written for, and the NGX licence's terms on it are yours to judge. Nothing has been pushed;
    the commit is on the local `native-backend` branch only.
+   *Alex said move on to Phase 1 (2026-10-07). Still nothing pushed: pushing is Phase 4.*
 2. **The 1440p margin.** The network alone is about 0.7 ms slower than the helper's evaluate at
    1485x836 on an idle GPU. Phase 3 will say whether the removed hand-off costs make up for it in
    game; if they do not, success criterion 2 fails at 1440p and passes at 4K.
@@ -275,6 +431,12 @@ captures stay on the test machine.
 | 2026-10-07 | Stage hashes in lower-case hex | `nr::Model` refused them (`stage SHA-256 mismatch`): its `sha256.h` prints upper case and compares strings. Changed to upper case. |
 | 2026-10-07 | `hdr_encode.py encode` output sent straight to the helper | Refused: the script crops to 1485 columns; the layer pads to 1486. Added the padding step. |
 | 2026-10-07 | Comparison at 1485 columns | 50.7 dB, not bit-exact; at 1486 (NGX's bytes) bit-exact. See 0.6. |
+| 2026-10-07 | The network's loading queue in the game's graphics family (queue 5 of family 0) | Xid 32 on GTA's channel and device lost during the load, GTA exited. Moved to a compute-only family's queue with `CONCURRENT` buffers: no Xid since. |
+| 2026-10-07 | The model loaded at every device creation | GTA creates a dozen devices at start; each loaded the model. Now loaded on the first hold. |
+| 2026-10-07 | The graph's head buffer on binding 3 of the composite, the features' binding in the preprocess | One set per parity cannot bind both; the head moved to binding 9. |
+| 2026-10-07 | The native composite's `.spv` not rebuilt after an edit | The first committed layer had the old binding; `check_shaders.py` caught it. Rebuilt. |
+| 2026-10-07 | The layer's GPU tests in parallel on the test machine | 10 fail on main and 16 on the branch with `ERROR_OUT_OF_DEVICE_MEMORY` or "failed to create the test's own target image"; the 6 extra pass one at a time (`--test-threads=1`). A machine limit, not a regression. |
+| 2026-10-07 | In-game captures at fixed seconds after launch, native and helper | The moments were seconds apart (loading time varies): not comparable pixel by pixel. |
 
 ## Checklist
 
@@ -285,12 +447,12 @@ captures stay on the test machine.
 - [x] 0.5 bench numbers on the rig at four sizes
 - [x] 0.6 output compared against the helper
 - [x] Phase 0 report written, go or no-go stated, stopped for Alex
-- [ ] 1.1 sources vendored, built from build.rs
-- [ ] 1.2 device extensions and features added in the layer
-- [ ] 1.3 game device adopted, queue use documented
-- [ ] 1.4 native frame path before the upscaler works in GTA V
-- [ ] 1.5 backend switch in place
-- [ ] 1.6 failure paths tested (missing model, watchdog, allocation failure)
+- [x] 1.1 sources vendored, built from build.rs
+- [x] 1.2 device extensions and features added in the layer
+- [x] 1.3 game device adopted, queue use documented
+- [x] 1.4 native frame path before the upscaler works in GTA V
+- [x] 1.5 backend switch in place
+- [x] 1.6 failure paths tested (missing model, watchdog, allocation failure)
 - [ ] 2.1 after-the-upscaler path native
 - [ ] 2.2 settings mapping table written, unmapped controls listed
 - [ ] 2.3 Setup tab reduced to extract-model
@@ -299,4 +461,4 @@ captures stay on the test machine.
 - [ ] Phase 4 report written, branch pushed, stopped for Alex
 - [ ] Phase 5 (only on Alex's yes)
 
-Blockers: none technical. Phase 1 waits for Alex's go and the two decisions above.
+Blockers: none. Phase 2 next.
