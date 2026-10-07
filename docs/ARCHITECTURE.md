@@ -19,7 +19,7 @@ flowchart LR
     end
     subgraph helperproc["Helper process (Windows .exe under Wine/Proton)"]
         helper["neural-forge-helper.exe<br/>own Vulkan device<br/>optical flow + NGX"]
-        ngx["nvngx.dll + nvngx_dlssnr.dll<br/>(NVIDIA, Feature 18)"]
+        ngx["nvngx_dlssnr.dll<br/>(NVIDIA, Feature 18)"]
         helper --> ngx
     end
     shm[("/tmp/neural-forge-$UID/shm.bin<br/>header + 4 frame regions")]
@@ -45,9 +45,11 @@ flowchart LR
 ([NATIVE_NGX_HELPER_DESIGN.md](NATIVE_NGX_HELPER_DESIGN.md)). So the model runs in a Windows
 process under Wine, with its own Vulkan device, and the frames cross through shared memory.
 
-**Caller identity.** `nvngx_dlssnr.dll` and `nvngx.dll` check which module calls them with
-`GetModuleFileNameW`. The helper patches its own import-table slot for that function so the DLLs
-see `nvngx.dll` (`crates/helper/src/spoof.rs`; README, "Legal"). NGX's own `AllocateParameters`
+**Caller identity.** `nvngx_dlssnr.dll` checks which module calls it with `GetModuleFileNameW`. The
+helper patches its own import-table slot for that function so the DLL sees `nvngx.dll`
+(`crates/helper/src/spoof.rs`; README, "Legal"). The helper loads only `nvngx_dlssnr.dll`; any
+dependency it has on `nvngx.dll` is resolved by the Wine loader, and NVAPI comes from the runner.
+NGX's own `AllocateParameters`
 fails with `0xbad00002` in this environment, so the helper uses its own implementation of the
 `NVSDK_NGX_Parameter` object (`crates/helper/src/selfparam.rs`). Every NGX call runs inside a
 fault guard (`crates/helper/src/guard.rs`).
@@ -496,8 +498,8 @@ output"), which is why this path falls to 28.7 fps there.
 
 The supervisor starts the helper under the chosen runner with `WINEPREFIX` (the managed prefix
 in `~/.local/share/neural-forge/prefix`), `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID`,
-`NEURAL_FORGE_LOG`, `NEURAL_FORGE_BIN_DIR`, and for Proton `PROTON_ENABLE_NVAPI=1` and
-`NEURAL_FORGE_SKIP_NVAPI=1`. Game-rendering layer selections are stripped from its environment.
+`NEURAL_FORGE_LOG`, `NEURAL_FORGE_BIN_DIR`, and for Proton `PROTON_ENABLE_NVAPI=1`.
+Game-rendering layer selections are stripped from its environment.
 The helper creates its Vulkan device (with an optical-flow queue when the GPU has one), loads the
 NGX DLLs with the caller-identity spoof installed, and runs `NVSDK_NGX_VULKAN_Init_Ext`. It
 builds a 64K-entry table for the scene-cut thumbnail of half-float frames (2.4 ms under Wine).

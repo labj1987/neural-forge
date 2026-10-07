@@ -1,9 +1,13 @@
-//! Importing NVIDIA's NGX DLLs into `neural_forge_supervisor::paths::binaries_dir()` --
+//! Importing NVIDIA's Neural Rendering DLL into `neural_forge_supervisor::paths::binaries_dir()` --
 //! the same destination `neural-forge-cli import-binaries` uses. The path itself now comes
 //! from the shared `neural-forge-supervisor` crate; only the actual file-copy loop is kept
 //! here, since it's a handful of lines with nothing else in `supervisor` needing it.
+//!
+//! `nvngx_dlssnr.dll` is the only binary the helper needs. NVAPI is supplied by the runner
+//! (Proton's DXVK-NVAPI, or the prefix's for plain Wine; see `supervisor::provision`), and the
+//! model's dependency on `nvngx.dll` is resolved by the Wine loader without a separate import.
 
-const NGX_FILES: [&str; 3] = ["nvngx_dlssnr.dll", "nvngx.dll", "nvapi64.dll"];
+const NGX_FILES: [&str; 1] = ["nvngx_dlssnr.dll"];
 
 pub fn dir() -> std::path::PathBuf {
     std::path::PathBuf::from(neural_forge_supervisor::paths::binaries_dir())
@@ -71,20 +75,13 @@ mod tests {
         let src = std::env::temp_dir().join(format!("neural-forge-binaries-bad-src-{}", std::process::id()));
         let dest_home = std::env::temp_dir().join(format!("neural-forge-binaries-bad-home-{}", std::process::id()));
         std::fs::create_dir_all(&src).unwrap();
-        std::fs::write(src.join("nvapi64.dll"), fake_dll()).unwrap();
         std::fs::write(src.join("nvngx_dlssnr.dll"), b"not a dll").unwrap();
-        let mut wrong_magic = fake_dll();
-        wrong_magic[..2].copy_from_slice(b"PK");
-        std::fs::write(src.join("nvngx.dll"), wrong_magic).unwrap();
 
         let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", &dest_home);
 
         assert_eq!(import_from(&src).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
-        assert!(!dir().join("nvapi64.dll").exists());
-
-        std::fs::write(src.join("nvngx_dlssnr.dll"), fake_dll()).unwrap();
-        assert_eq!(import_from(&src).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(!dir().join("nvngx_dlssnr.dll").exists());
 
         match prev_xdg {
             Some(v) => std::env::set_var("XDG_DATA_HOME", v),
@@ -102,15 +99,17 @@ mod tests {
         std::fs::create_dir_all(&src).unwrap();
         std::fs::write(src.join("nvngx_dlssnr.dll"), fake_dll()).unwrap();
         std::fs::write(src.join("nvapi64.dll"), fake_dll()).unwrap();
+        std::fs::write(src.join("nvngx.dll"), fake_dll()).unwrap();
         std::fs::write(src.join("unrelated.txt"), b"ignore me").unwrap();
 
         let prev_xdg = std::env::var("XDG_DATA_HOME").ok();
         std::env::set_var("XDG_DATA_HOME", &dest_home);
 
         let copied = import_from(&src).unwrap();
-        assert_eq!(copied, 2);
+        assert_eq!(copied, 1);
         assert!(dir().join("nvngx_dlssnr.dll").is_file());
-        assert!(dir().join("nvapi64.dll").is_file());
+        // The old bundled NGX files are no longer imported, even when present in the source.
+        assert!(!dir().join("nvapi64.dll").exists());
         assert!(!dir().join("unrelated.txt").exists());
         assert!(!dir().join("nvngx.dll").exists());
 

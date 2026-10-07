@@ -1,10 +1,11 @@
 //! Preparing the managed prefix for the system-Wine runner.
 //!
-//! A Proton runner brings its own DXVK and DXVK-NVAPI, and the helper leaves NVAPI to it
-//! (`NEURAL_FORGE_SKIP_NVAPI`). Plain Wine brings neither, and NGX needs NVAPI to find the GPU,
-//! which DXVK-NVAPI can only do through DXVK's `dxgi.dll`. So for `runner_type = "wine"` the
-//! managed prefix gets both DLLs, a `dxvk.conf` reporting the NVIDIA vendor/device, and the
-//! helper is started with native overrides for them.
+//! A Proton runner brings its own DXVK and DXVK-NVAPI, and the model's NVAPI calls resolve to
+//! those. Plain Wine brings neither, and NGX needs NVAPI to find the GPU, which DXVK-NVAPI can
+//! only do through DXVK's `dxgi.dll`. So for `runner_type = "wine"` the managed prefix gets both
+//! DLLs, a `dxvk.conf` reporting the NVIDIA vendor/device, and the helper is started with native
+//! overrides for them. (This is DXVK-NVAPI, downloaded and verified here, not NVIDIA's own
+//! `nvapi64.dll`; the helper imports and loads only `nvngx_dlssnr.dll`.)
 //!
 //! Ported from upstream DLSS5VKLayer's `dlssnr-helper` (`setup_prefix`,
 //! `install_wine_runtime_dll`, `download_runtime_dll`, `ensure_dxvk_config`), with the same

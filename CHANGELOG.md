@@ -6,9 +6,6 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
-- Scripts: `install.py --cli PATH` uses that CLI or fails; it no longer falls back to another copy
-  when PATH is missing (the install test then ran the fake CLI its first install had put in place,
-  "Exec format error"). `test_install.py` builds the debug CLI itself when it is missing.
 - Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
   `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
@@ -17,6 +14,23 @@ first shipped them; their phase is kept as a subheading.
   Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
 - Deferred (layer): the unit-test target still carries clippy lints (mostly
   `chunks_exact` with a constant size in test helpers); the library and examples are clean.
+
+## 2.0.10 — 2026-10-07
+
+No change to the picture or the frame rate. The helper now needs only NVIDIA's
+`nvngx_dlssnr.dll`; `nvngx.dll` and `nvapi64.dll` are no longer imported, shipped, validated or
+loaded. Both were carried over from DLSS5VKLayer. Confirmed on the RTX 5070: the model initialises
+and evaluates with only `nvngx_dlssnr.dll` present, byte-identical to before.
+
+- Helper: loads only `nvngx_dlssnr.dll`. It no longer loads `nvngx.dll` (the loader resolves the
+  model's dependency on it when the model itself is loaded) or an `nvapi64.dll` of its own (NVAPI
+  comes from the runner: Proton's DXVK-NVAPI, or the managed prefix's for plain Wine). The dead
+  `NEURAL_FORGE_SKIP_NVAPI` variable is gone.
+- Setup: `import-binaries` and the GUI's Setup tab handle only `nvngx_dlssnr.dll`. An existing
+  `nvngx.dll` / `nvapi64.dll` in the binaries folder is now unused and can be deleted.
+- Scripts: `install.py --cli PATH` uses that CLI or fails; it no longer falls back to another copy
+  when PATH is missing (the install test then ran the fake CLI its first install had put in place,
+  "Exec format error"). `test_install.py` builds the debug CLI itself when it is missing.
 
 ## 2.0.9 — 2026-10-07
 

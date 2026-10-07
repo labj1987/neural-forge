@@ -51,11 +51,6 @@ fn utf16(s: &str) -> Vec<u16> {
 /// DLSS5VKLayer (bmitch87), commit `4aa730c0` -- see `ATTRIBUTION.md`.
 pub(crate) const FENCE_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// `NEURAL_FORGE_SKIP_NVAPI` semantics: set to anything that doesn't start with `0`.
-fn skip_nvapi() -> bool {
-    neural_forge_protocol::env::var("NEURAL_FORGE_SKIP_NVAPI").is_some_and(|v| !v.is_empty() && !v.starts_with('0'))
-}
-
 fn resolve_bin_dir() -> Option<String> {
     // `std::env::var` already goes through the real `GetEnvironmentVariableW` on this
     // target -- no reason to hand-rolled that call the way `spoof.rs`'s PE parsing
@@ -69,9 +64,7 @@ fn resolve_bin_dir() -> Option<String> {
 
 pub struct NgxSnippet {
     snippet: *mut c_void,
-    core: *mut c_void,
     snippet_spoof: Option<InstalledSpoof>,
-    core_spoof: Option<InstalledSpoof>,
 
     init_ext: Option<abi::FnVkInitExt>,
     create_feature: Option<abi::FnVkCreateFeature>,
@@ -89,11 +82,6 @@ pub struct NgxSnippet {
     /// The Vulkan device NGX was initialized against — `Shutdown1` must be called with
     /// this exact device, not a null placeholder.
     device: vk::Device,
-
-    /// `nvapi64.dll`, loaded only so a snippet that resolves NVAPI by name finds this
-    /// copy; never called into. Null when the runner supplies NVAPI (`NEURAL_FORGE_SKIP_NVAPI`)
-    /// or the load failed.
-    nvapi: *mut c_void,
 
     pub disabled: bool,
     /// The NGX binaries are missing or unusable (no binaries folder, no `nvngx_dlssnr.dll` in it,
@@ -226,9 +214,7 @@ impl Default for NgxSnippet {
     fn default() -> Self {
         Self {
             snippet: std::ptr::null_mut(),
-            core: std::ptr::null_mut(),
             snippet_spoof: None,
-            core_spoof: None,
             init_ext: None,
             create_feature: None,
             evaluate_feature: None,
@@ -238,7 +224,6 @@ impl Default for NgxSnippet {
             params_destroy: None,
             self_params: false,
             device: vk::Device::null(),
-            nvapi: std::ptr::null_mut(),
             disabled: false,
             no_binaries: false,
             passes: Vec::new(),
@@ -331,135 +316,36 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
     if s.snippet_spoof.is_none() {
         return s.fail_no_binaries("could not install the caller-identity spoof on nvngx_dlssnr.dll (unexpected binaries)".to_string());
     }
-    crate::log!("[ngx] caller-identity spoof installed, loading core (nvngx.dll) next");
+    crate::log!("[ngx] caller-identity spoof installed, resolving NGX exports next");
     crate::logging::flush();
 
-    // NVAPI. Never called into -- `nvapi64.dll` is loaded only so a snippet that resolves NVAPI
-    // by name finds this copy. When the runner already supplies NVAPI (Proton's DXVK-NVAPI, which
-    // the supervisor announces with NEURAL_FORGE_SKIP_NVAPI) it is skipped outright: forcing the
-    // vendored copy in bypasses the DXVK-NVAPI override and can fault inside its DllMain. The
-    // load is deliberately not guarded: a fault inside a DllMain leaves the loader lock held, so
-    // jumping out of it would only turn the crash into a deadlock at the next LoadLibrary.
-    if skip_nvapi() {
-        crate::log!("[ngx] nvapi64.dll load skipped (runner supplies NVAPI)");
-    } else {
-        let path = utf16(&format!("{bin_dir}\\nvapi64.dll"));
-        // SAFETY: `path` is a valid NUL-terminated UTF-16 string.
-        s.nvapi = unsafe {
-            LoadLibraryExW(path.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS)
-        };
-        if s.nvapi.is_null() {
-            // Not in the binaries folder: the normal search path, which under system Wine finds the
-            // DXVK-NVAPI copy the supervisor installed in the prefix (with its native override).
-            let by_name = utf16("nvapi64.dll");
-            // SAFETY: `by_name` is a valid NUL-terminated UTF-16 string.
-            s.nvapi = unsafe { LoadLibraryExW(by_name.as_ptr(), std::ptr::null_mut(), 0) };
-        }
-        // SAFETY: a non-null result is a just-loaded PE image (a null one is ignored).
-        unsafe { crate::guard::register_module(crate::guard::Module::Nvapi, s.nvapi) };
-        if s.nvapi.is_null() {
-            crate::log!("[ngx] nvapi64.dll not loaded; continuing without it");
-        } else {
-            crate::log!("[ngx] nvapi64.dll loaded");
-        }
-    }
+    // `nvngx_dlssnr.dll` is the only NGX binary this helper loads. Any dependency it
+    // declares on another module (`nvngx.dll`) is satisfied by the Windows/Wine loader
+    // when the snippet itself is loaded above; the helper does not load one itself, and
+    // the model initialises and evaluates without one present (confirmed on real
+    // hardware). NVAPI is left entirely to the runner (Proton's DXVK-NVAPI); the helper
+    // never loads an `nvapi64.dll` of its own.
 
-    // Core (nvngx.dll) must be loaded for the snippet's own Vulkan exports to resolve
-    // at all -- confirmed via a real bisection on `lordnikon` (2026-09-11): with Core
-    // deliberately kept unloaded, `NVSDK_NGX_VULKAN_AllocateParameters` couldn't be
-    // found via `GetProcAddress` on the snippet either ("no AllocateParameters export
-    // found on core or snippet", matching an identical, independently-observed note
-    // earlier in this same investigation when `nvngx.dll` was genuinely missing from
-    // this machine). That means `nvngx_dlssnr.dll`'s own `NVSDK_NGX_VULKAN_*` exports
-    // are PE forwarders into Core, not a separate implementation -- there is no real
-    // "prefer snippet vs. prefer core" choice to make for this call family; both
-    // resolve to the exact same code either way. (Still resolving from `s.snippet`
-    // first below, since that's harmless and matches how every export above this one
-    // is resolved, but don't mistake it for a meaningful behavior switch.) This also
-    // means the `0xbad00002` (`FAIL_PLATFORM_ERROR`) `AllocateParameters` now returns
-    // (see the doc comment below on why `VULKAN_Init_ProjectID` isn't the cause) is a
-    // real rejection from Core's own NGX runtime, reproduced identically against both
-    // a freshly-recreated Wine prefix and the real, untouched, previously-working game
-    // prefix -- not an environment/prefix difference, and not fixable by choosing a
-    // different module to call through.
-    let core_path = utf16(&format!("{bin_dir}\\nvngx.dll"));
-    // SAFETY: `core_path` is a valid NUL-terminated UTF-16 string.
-    s.core = unsafe {
-        LoadLibraryExW(
-            core_path.as_ptr(),
-            std::ptr::null_mut(),
-            LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_DEFAULT_DIRS,
-        )
-    };
-    // SAFETY: a non-null result is a just-loaded PE image (a null one is ignored).
-    unsafe { crate::guard::register_module(crate::guard::Module::Core, s.core) };
-    crate::log!("[ngx] core (nvngx.dll) load: {}", if s.core.is_null() { "not found, degrading to snippet allocator" } else { "loaded" });
-    crate::logging::flush();
-    if !s.core.is_null() {
-        // SAFETY: `s.core` just confirmed non-null.
-        s.core_spoof = unsafe { spoof::install(s.core) };
-        crate::log!("[ngx] core caller-identity spoof install: {}", if s.core_spoof.is_some() { "ok" } else { "FAILED (core will see our real caller identity)" });
-        crate::logging::flush();
-    }
-
-    // Deliberately NOT calling `NVSDK_NGX_VULKAN_Init_ProjectID`, even though the DLL
-    // exports it. Upstream's own reverse-engineered notes (extracted_pipeline_notes.md,
-    // section 3.1) show the only *proven* ProjectID-based init route is
-    // `NVSDK_NGX_D3D12_Init_with_ProjectID` against a dedicated D3D12 device -- a
-    // different API family entirely from this helper's Vulkan device; the Vulkan
-    // export exists on the DLL but was never exercised/proven by upstream at all
-    // (section 11: "exists" as an export, not a tested route).
-    //
-    // Real, reproduced evidence this session (2026-09-11, `lordnikon`), not just
-    // theory: calling `VULKAN_Init_ProjectID` against Core returned `0xbad00002`
-    // (`FAIL_PLATFORM_ERROR`). Removing the call entirely was then tested in
-    // isolation -- `AllocateParameters` (see the doc comment above on why it always
-    // resolves to Core's own code regardless of which module you ask) still returns
-    // the identical `0xbad00002` with `VULKAN_Init_ProjectID` never called at all, so
-    // that call was NOT poisoning later calls the way an earlier pass of this
-    // investigation first assumed -- it's simply irrelevant to the real, remaining
-    // rejection. `VULKAN_Init_Ext` (below, snippet-only, no ProjectID involved) is
-    // what every actually-confirmed-working run of this project used (see CLAUDE.md's
-    // "First confirmed neural-rendering success") -- restoring that exact sequence,
-    // not extending it with an unproven call, is what real evidence supports here.
-    // `s.core` stays loaded/spoofed above because it's load-bearing for the snippet's
-    // own exports to resolve at all (see above), not because anything calls into it
-    // directly.
+    // `NVSDK_NGX_VULKAN_Init_ProjectID` is exported but deliberately not called: the only
+    // proven ProjectID init route is the D3D12 one, a different API family from this
+    // helper's Vulkan device, and `VULKAN_Init_Ext` (below) is what every confirmed-working
+    // run used (see CLAUDE.md's "First confirmed neural-rendering success").
     if unsafe { resolve_export::<abi::FnVkInitProjectId>(s.snippet, "NVSDK_NGX_VULKAN_Init_ProjectID") }.is_some() {
         crate::log!("[ngx] VULKAN_Init_ProjectID export present but deliberately not called, see ngx.rs doc comment");
         crate::logging::flush();
     }
 
-    // Snippet first, Core only as a fallback -- see the doc comment above `core_path`
-    // for why this order, not Core-first, is the one actually proven to work.
     // SAFETY: `s.snippet` is a valid, loaded module.
     let alloc: Option<abi::FnVkAllocateParameters> = unsafe { resolve_export(s.snippet, "NVSDK_NGX_VULKAN_AllocateParameters") };
-    let alloc = alloc.or_else(|| {
-        if s.core.is_null() {
-            None
-        } else {
-            // SAFETY: `s.core` just confirmed non-null.
-            unsafe { resolve_export(s.core, "NVSDK_NGX_VULKAN_AllocateParameters") }
-        }
-    });
     // SAFETY: `s.snippet` is a valid, loaded module.
-    s.params_destroy = unsafe { resolve_export(s.snippet, "NVSDK_NGX_VULKAN_DestroyParameters") }.or_else(|| {
-        if s.core.is_null() {
-            None
-        } else {
-            // SAFETY: `s.core` just confirmed non-null.
-            unsafe { resolve_export(s.core, "NVSDK_NGX_VULKAN_DestroyParameters") }
-        }
-    });
+    s.params_destroy = unsafe { resolve_export(s.snippet, "NVSDK_NGX_VULKAN_DestroyParameters") };
 
     // Falls back to a self-implemented `NVSDK_NGX_Parameter` object
     // (`crate::selfparam`) whenever the DLL doesn't export `AllocateParameters` at
-    // all, or its real call rejects -- confirmed via a real side-by-side run against
-    // upstream's own compiled helper on `lordnikon` (2026-09-11) that this is not a
-    // corner case to treat as fatal: upstream hits the identical rejection from
-    // Core's own allocator in this exact environment and recovers exactly this way,
-    // going on to a real, successful `CreateFeature(18)` afterward. See
-    // `selfparam`'s module doc comment for the full evidence.
+    // all, or its real call rejects -- not a corner case to treat as fatal: the
+    // rejection is recovered exactly this way, going on to a real, successful
+    // `CreateFeature(18)` afterward. See `selfparam`'s module doc comment for the
+    // full evidence.
     let params = match alloc {
         Some(alloc) => {
             crate::log!("[ngx] calling AllocateParameters now");
@@ -484,7 +370,7 @@ pub fn load_and_init(instance: vk::Instance, physical_device: vk::PhysicalDevice
             }
         }
         None => {
-            crate::log!("[ngx] no AllocateParameters export found on core or snippet");
+            crate::log!("[ngx] no AllocateParameters export found on the snippet");
             crate::logging::flush();
             None
         }
@@ -1210,15 +1096,6 @@ pub fn teardown(mut s: NgxSnippet) {
     if let Some(spoofed) = s.snippet_spoof.take() {
         // SAFETY: the snippet module is still loaded at this point.
         unsafe { spoof::remove(spoofed) };
-    }
-    if let Some(spoofed) = s.core_spoof.take() {
-        unsafe { spoof::remove(spoofed) };
-    }
-    if !s.nvapi.is_null() {
-        unsafe { FreeLibrary(s.nvapi) };
-    }
-    if !s.core.is_null() {
-        unsafe { FreeLibrary(s.core) };
     }
     if !s.snippet.is_null() {
         unsafe { FreeLibrary(s.snippet) };

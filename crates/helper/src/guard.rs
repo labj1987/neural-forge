@@ -94,12 +94,10 @@ const MAX_GUARDED_HITS: u32 = 24;
 #[derive(Clone, Copy)]
 pub enum Module {
     Snippet = 0,
-    Core = 1,
-    Nvapi = 2,
 }
-const MODULE_NAMES: [&str; 3] = ["nvngx_dlssnr.dll", "nvngx.dll", "nvapi64.dll"];
-static RANGE_BASE: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
-static RANGE_SIZE: [AtomicUsize; 3] = [AtomicUsize::new(0), AtomicUsize::new(0), AtomicUsize::new(0)];
+const MODULE_NAMES: [&str; 1] = ["nvngx_dlssnr.dll"];
+static RANGE_BASE: [AtomicUsize; 1] = [AtomicUsize::new(0)];
+static RANGE_SIZE: [AtomicUsize; 1] = [AtomicUsize::new(0)];
 
 /// Records a loaded PE image's address range, from its own header's `SizeOfImage`.
 ///

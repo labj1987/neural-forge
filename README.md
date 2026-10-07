@@ -134,8 +134,9 @@ Setup notes for these games:
 - A runner for the Windows helper: a Steam compatibility tool that bundles DXVK-NVAPI
   (Proton-CachyOS, Proton-GE), or system Wine (the app installs DXVK and DXVK-NVAPI into its own
   prefix). Valve's stock Proton builds don't bundle DXVK-NVAPI, so they are not supported.
-- NVIDIA's own NGX DLLs (`nvngx_dlssnr.dll`, `nvngx.dll`, `nvapi64.dll`). This project does not
-  and cannot ship them.
+- NVIDIA's own Neural Rendering DLL (`nvngx_dlssnr.dll`). This project does not and cannot ship it.
+  It is the only NGX binary the helper needs; NVAPI comes from the runner, and the model's
+  dependency on `nvngx.dll` is resolved by the Wine loader without a separate import.
 - For the model before the upscaler: a game that uses DLSS Super Resolution through Vulkan
   (under Proton, a DX12 game through vkd3d-proton and DXVK-NVAPI). Only GTA V Enhanced has been
   measured.
@@ -176,7 +177,7 @@ stay; Neural Forge does not touch its files.
 
 ## Usage
 
-1. Open Neural Forge. On the Setup tab, check the three DLLs say "present" and pick a runner.
+1. Open Neural Forge. On the Setup tab, check `nvngx_dlssnr.dll` says "present" and pick a runner.
 2. Put this in the game's Steam launch options (the Setup tab builds and copies it):
 
    ```text
@@ -285,7 +286,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID` | all | The shared-memory file, and the uid its directory is named after. Normally left alone. |
 | `NEURAL_FORGE_INSTALL_DIR` | supervisor (GUI, CLI) | Where to find the helper (default: the installed copy, then the AppImage's). |
 | `NEURAL_FORGE_AUTO_DOWNLOAD=0` | supervisor | System-Wine runner: never download DXVK or DXVK-NVAPI (put them in the binaries folder). |
-| `NEURAL_FORGE_BIN_DIR`, `NEURAL_FORGE_SKIP_NVAPI` | helper | Set by the supervisor: the binaries folder as a `Z:` path, and (Proton) do not load the vendored `nvapi64.dll`. |
+| `NEURAL_FORGE_BIN_DIR` | helper | Set by the supervisor: the binaries folder as a `Z:` path. |
 | `NEURAL_FORGE_PROBE_NGX=1` | layer | Testing aid: log the game's DLSS work as it reaches Vulkan ([docs/PRE_UPSCALER_PROBE.md](docs/PRE_UPSCALER_PROBE.md)). |
 | `NEURAL_FORGE_WARMUP_SECS=N` | layer | Testing aid: seconds of steady rendering before the layer engages (default 5). |
 | `NEURAL_FORGE_HDR_FLAGS=hdr\|sdr\|autoexp0` | helper | Testing aid: the NGX creation flags for an RGBA16F frame. They make no measurable difference. |

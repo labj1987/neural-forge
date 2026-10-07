@@ -26,7 +26,7 @@ fn usage() {
          \x20 config               print effective config\n\
          \x20 runners              list discovered custom compatibility tool runners\n\
          \x20 detect-gpu           print detected NVIDIA PCI vendor/device\n\
-         \x20 import-binaries DIR  copy NVIDIA NGX DLLs into user data dir\n\
+         \x20 import-binaries DIR  copy NVIDIA's nvngx_dlssnr.dll into user data dir\n\
          \x20 install --appdir DIR install an extracted AppImage AppDir into\n\
          \x20                     persistent user storage (see scripts/install.py --\n\
          \x20                     same operation, same record, either tool works)\n\
@@ -440,17 +440,19 @@ fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
         eprintln!("failed to create {dest}: {e}");
         return ExitCode::FAILURE;
     }
-    let mut copied = 0;
-    for name in ["nvngx_dlssnr.dll", "nvngx.dll", "nvapi64.dll"] {
-        let from = src.join(name);
-        if from.is_file() {
-            if let Err(e) = std::fs::copy(&from, std::path::Path::new(&dest).join(name)) {
-                eprintln!("failed to copy {name}: {e}");
-                return ExitCode::FAILURE;
-            }
-            copied += 1;
+    // Only `nvngx_dlssnr.dll` is needed: NVAPI comes from the runner, and the model's dependency
+    // on `nvngx.dll` is resolved by the Wine loader without a separate import.
+    let name = "nvngx_dlssnr.dll";
+    let from = src.join(name);
+    let copied = if from.is_file() {
+        if let Err(e) = std::fs::copy(&from, std::path::Path::new(&dest).join(name)) {
+            eprintln!("failed to copy {name}: {e}");
+            return ExitCode::FAILURE;
         }
-    }
+        1
+    } else {
+        0
+    };
     println!("imported {copied} file(s) to {dest}");
     ExitCode::SUCCESS
 }

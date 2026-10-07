@@ -932,8 +932,8 @@ fn refresh_profile_combo(combo: &adw::ComboRow) {
     }
 }
 
-/// Asks for a folder and imports the NGX DLLs from it on a worker thread (the DLLs are
-/// hundreds of megabytes). `on_imported` runs on the main thread after a successful
+/// Asks for a folder and imports the NGX DLL from it on a worker thread (it is
+/// tens of megabytes). `on_imported` runs on the main thread after a successful
 /// import, to refresh whatever status the caller shows.
 fn import_ngx_binaries(button: &gtk4::Button, toasts: &adw::ToastOverlay, on_imported: impl Fn() + 'static) {
     let toasts = toasts.clone();
@@ -961,8 +961,8 @@ fn import_ngx_binaries(button: &gtk4::Button, toasts: &adw::ToastOverlay, on_imp
 
 fn build_ngx_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
-    group.set_title("NVIDIA NGX binaries");
-    group.set_description(Some("From your own NVIDIA driver/SDK install -- this project doesn't and can't ship them"));
+    group.set_title("NVIDIA NGX binary");
+    group.set_description(Some("From your own NVIDIA driver/SDK install -- this project doesn't and can't ship it"));
 
     let mut status_rows: Vec<(String, adw::ActionRow, gtk4::Image)> = Vec::new();
     for (name, present) in crate::binaries::status() {
@@ -977,7 +977,7 @@ fn build_ngx_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
 
     let import_row = adw::ActionRow::new();
     import_row.set_title("Import");
-    import_row.set_subtitle("Copy the DLLs above from a folder (an extracted NVIDIA driver/SDK) in one step");
+    import_row.set_subtitle("Copy the DLL above from a folder (an extracted NVIDIA driver/SDK)");
     let import_button = gtk4::Button::with_label("Import…");
     import_button.set_valign(gtk4::Align::Center);
     import_row.add_suffix(&import_button);

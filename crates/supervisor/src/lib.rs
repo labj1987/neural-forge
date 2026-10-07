@@ -280,7 +280,6 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
 
     let (program, args): (String, Vec<String>) = if cfg.runner_type == "proton" {
         envs.push(("PROTON_ENABLE_NVAPI".to_string(), "1".to_string()));
-        envs.push(("NEURAL_FORGE_SKIP_NVAPI".to_string(), "1".to_string()));
         envs.push(("STEAM_COMPAT_DATA_PATH".to_string(), paths::prefix_dir()));
         // Proton's own launch script reads this directly out of the environment
         // (`os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]`, no fallback) during
@@ -298,8 +297,8 @@ pub fn start(cfg: &Config) -> Result<StartedHelper, StartError> {
     } else {
         if cfg.runner_type == "wine" {
             // Plain Wine has no DXVK-NVAPI of its own: the managed prefix is given DXVK's dxgi and
-            // DXVK-NVAPI (see `provision`), and the helper loads NVAPI itself. Without them NGX
-            // cannot find the GPU, so a failure here fails the start.
+            // DXVK-NVAPI (see `provision`), with native overrides, so the model's own NVAPI calls
+            // resolve to them. Without them NGX cannot find the GPU, so a failure here fails the start.
             if let Err(e) = provision::prepare_wine_prefix(cfg) {
                 crate::process::append_log(&cfg.log, &format!("[neural-forge] system-Wine prefix setup failed: {e}"));
                 return Err(StartError::Provision(e));
