@@ -631,7 +631,8 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
 /// Counts what the hold inside DLSS's buffer did with its jobs and logs the counts every 5 s: a hold
 /// that stops running there otherwise says nothing (each skip releases the buffer silently).
 fn inline_tally(what: &'static str) {
-    static TALLY: Mutex<Option<(std::time::Instant, Vec<(&'static str, u32)>)>> = Mutex::new(None);
+    type Tally = Option<(std::time::Instant, Vec<(&'static str, u32)>)>;
+    static TALLY: Mutex<Tally> = Mutex::new(None);
     let mut t = TALLY.lock().unwrap();
     let (since, counts) = t.get_or_insert_with(|| (std::time::Instant::now(), Vec::new()));
     match counts.iter_mut().find(|(w, _)| *w == what) {

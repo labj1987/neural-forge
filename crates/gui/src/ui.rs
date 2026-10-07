@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use neural_forge_protocol::enums::{colour_mode, downscaler, mvec_quality, mvec_scale_mode, reversible_mode};
+use neural_forge_protocol::enums::{colour_mode, mvec_quality, mvec_scale_mode, reversible_mode};
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -281,7 +281,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_group.add(&pass_row);
 
     let (interval, set_interval) = bind_u32(&shm, Some("model_interval"), |h| &h.model_interval);
-    model_group.add(&spin_row(
+    let interval_row = spin_row(
         "Model every Nth frame",
         "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own",
         interval as f32,
@@ -289,10 +289,11 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         4.0,
         1.0,
         move |v| set_interval(v as u32),
-    ));
+    );
+    model_group.add(&interval_row);
 
     let (settle, set_settle) = bind_u32(&shm, Some("rebuild_settle_ms"), |h| &h.rebuild_settle_ms);
-    model_group.add(&spin_row(
+    let settle_row = spin_row(
         "Rebuild spacing",
         "Milliseconds to wait after a tuning change before the model is rebuilt with it",
         settle as f32,
@@ -300,7 +301,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         5000.0,
         50.0,
         move |v| set_settle(v as u32),
-    ));
+    );
+    model_group.add(&settle_row);
 
     let (toggle_key, set_toggle_key) = bind_u32(&shm, Some("toggle_key"), |h| &h.toggle_key);
     model_group.add(&hotkey_row(toggle_key, set_toggle_key));
@@ -345,21 +347,9 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     comp_group.add(&spin_row("Highlight guard", "The most the pass may brighten or darken a pixel by (x)", max_ratio, 1.0, 30.0, 0.1, set_max_ratio));
 
     let (working_scale, set_working_scale) = bind_float(&shm, Some("working_scale"), |h| &h.working_scale_bits);
-    comp_group.add(&spin_row_scaled("Model resolution", "Percent of the frame the model works at; lower is faster and softer", working_scale, 25.0, 100.0, 5.0, 100.0, set_working_scale));
+    let scale_row = spin_row_scaled("Model resolution", "Percent of the frame the model works at; lower is faster and softer", working_scale, 25.0, 100.0, 5.0, 100.0, set_working_scale);
+    comp_group.add(&scale_row);
 
-    let (downscaler_v, set_downscaler) = bind_u32(&shm, Some("scaling_downscaler"), |h| &h.scaling_downscaler);
-    let filter_row = combo_row(
-        "Supersampling filter",
-        &["FSR1 (unsupported)", "Bicubic", "Catmull-Rom", "Lanczos2", "Lanczos3", "Kaiser2", "Kaiser3", "Magic"],
-        downscaler_v,
-        set_downscaler,
-    );
-    // Supersampling (model resolution above 100%) is not available: the answer would be larger
-    // than the frame, which the composition rejects. Kept so the saved value round-trips.
-    filter_row.set_subtitle("Unavailable: model resolution cannot go above 100%");
-    filter_row.set_sensitive(false);
-    comp_group.add(&filter_row);
-    debug_assert_eq!(downscaler::LANCZOS3, 4);
 
     let (reversible, set_reversible) = bind_u32(&shm, Some("reversible_mode"), |h| &h.reversible_mode);
     comp_group.add(&combo_row(
@@ -515,9 +505,11 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     motion_page.add(&motion_group);
     let motion_tab = view_stack.add_titled_with_icon(&motion_page, Some("motion"), "Motion", "camera-video-symbolic");
 
-    // Passes, per-pass settings and motion only reach the helper. The native backend (the
-    // default before the upscaler) runs the model once per frame on DLSS's own motion vectors,
-    // so they are shown only while a game is running on the helper.
+    // Settings the native backend never reads before the upscaler (its default place): passes,
+    // per-pass settings and motion (the network runs once per frame on DLSS's own motion
+    // vectors), rebuild spacing (it applies a change at the next frame), and model resolution and
+    // every-Nth-frame (after the upscaler only). Shown only while a game runs and the model is not
+    // running natively before the upscaler.
     {
         let shm = std::sync::Arc::clone(&shm);
         let view_stack = view_stack.clone();
@@ -535,7 +527,14 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                 };
                 active && hdr.native_running.load(Ordering::Relaxed) == 0
             };
-            for row in [passes_row.upcast_ref::<gtk4::Widget>(), pass_row.upcast_ref(), unlock_row.upcast_ref()] {
+            for row in [
+                passes_row.upcast_ref::<gtk4::Widget>(),
+                pass_row.upcast_ref(),
+                unlock_row.upcast_ref(),
+                interval_row.upcast_ref(),
+                settle_row.upcast_ref(),
+                scale_row.upcast_ref(),
+            ] {
                 row.set_visible(helper_in_use);
             }
             motion_tab.set_visible(helper_in_use);

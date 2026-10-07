@@ -17,6 +17,10 @@ first shipped them; their phase is kept as a subheading.
 - Native backend: games held inside DLSS's command buffer (Crimson Desert, Cyberpunk 2077, Black
   Myth: Wukong) run the network in the layer too, on the layer's compute queue, with DLSS's motion
   vectors copied beside the colour input for the history and the jitter from the input launch.
+- Settings: the Supersampling filter (Downscaler) is removed (SHM v14); nothing read it, since the
+  model never runs above the frame's size. Model resolution, Model every Nth frame and Rebuild
+  spacing are shown only while the model is not running natively before the upscaler: the first
+  two apply after the upscaler only and the native backend applies changes at the next frame.
 - Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
   `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,

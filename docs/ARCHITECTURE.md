@@ -143,6 +143,7 @@ re-initialising it; the GUI and CLI say which versions disagree.
 | 11 | `seq_eval` (model answer vs echo) | 2.0.0 |
 | 12 | `preset` and `sharpness` removed (the 310.8 model never reads them) | unreleased |
 | 13 | `native_running` (the layer runs the model itself) | unreleased |
+| 14 | `scaling_downscaler` removed (nothing read it) | unreleased |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11.

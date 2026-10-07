@@ -153,10 +153,9 @@ pub struct ShmHeader {
     pub white_point_scale_bits: AtomicU32,
     pub white_point_source: AtomicU32,
     pub white_point_trim_bits: AtomicU32,
-    /// What fraction of the frame's resolution the model works at. The frame itself is
-    /// never reduced: only the model's contribution is computed at this scale and
-    /// resized. Above 1.0 is supersampling; below 1.0 also cuts what crosses the shared
-    /// memory, quadratically.
+    /// What fraction of the frame's resolution the model works at, after the upscaler only
+    /// (the swapchain capture is blitted down before the request and the answer back up).
+    /// Capped at 1.0. Before the upscaler the model always works at DLSS's input size.
     pub working_scale_bits: AtomicU32,
     /// 0 off, 1 side by side, 2 a wipe.
     pub compare_mode: AtomicU32,
@@ -181,9 +180,6 @@ pub struct ShmHeader {
     /// composition over the same picture instead of over whatever the game has drawn
     /// since.
     pub hold_frame: AtomicU32,
-    /// The filter for the supersampling down-leg. See [`crate::enums::downscaler`]; only
-    /// read when `working_scale > 1`.
-    pub scaling_downscaler: AtomicU32,
 
     // --- status, written by the helper ----------------------------------------------
     pub helper_state: AtomicU32,
@@ -380,42 +376,42 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1780, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1776, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
     std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 80,
     "layout changed -- bump SHM_VERSION"
 );
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_state) == 168, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 772, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, mvec_enabled) == 1612, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1684, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_state) == 164, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 768, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, mvec_enabled) == 1608, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1680, "layout changed -- bump SHM_VERSION");
 // v3's second slot, appended after everything else -- same reasoning as `pass`'s own
 // comment above about why a new field belongs at the end, not inserted higher up.
-const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1704, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1724, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1732, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1736, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1700, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1720, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1728, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1732, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
-    std::mem::offset_of!(ShmHeader, layer_capture_gpu_ms_bits) == 1740,
+    std::mem::offset_of!(ShmHeader, layer_capture_gpu_ms_bits) == 1736,
     "layout changed -- bump SHM_VERSION"
 );
 const _: () = assert!(
-    std::mem::offset_of!(ShmHeader, layer_compose_gpu_ms_bits) == 1744,
+    std::mem::offset_of!(ShmHeader, layer_compose_gpu_ms_bits) == 1740,
     "layout changed -- bump SHM_VERSION"
 );
-const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1748, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 1764, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_busy_us) == 1768, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 1772, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, native_running) == 1776, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1744, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 1760, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_busy_us) == 1764, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 1768, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, native_running) == 1772, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::size_of::<PassControl>() == 28, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
 const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_of(4));
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_reason) == 252, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 448, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 644, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_reason) == 248, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 444, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 640, "layout changed -- bump SHM_VERSION");
 
 impl ShmHeader {
     /// Resets every field to the defaults a freshly created mapping should hold. Takes
@@ -471,7 +467,6 @@ impl ShmHeader {
         self.colour_trust_bits.store(2.0f32.to_bits(), Ordering::Relaxed);
         self.ratio_smooth_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.model_interval.store(1, Ordering::Relaxed);
-        self.scaling_downscaler.store(crate::enums::downscaler::LANCZOS3, Ordering::Relaxed);
 
         self.helper_state.store(crate::enums::helper_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
@@ -626,7 +621,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 40] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 39] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -649,7 +644,6 @@ impl ShmHeader {
             ("colour_strength", true, self.colour_strength_bits.load(Ordering::Relaxed)),
             ("max_ratio", true, self.max_ratio_bits.load(Ordering::Relaxed)),
             ("working_scale", true, self.working_scale_bits.load(Ordering::Relaxed)),
-            ("scaling_downscaler", false, self.scaling_downscaler.load(Ordering::Relaxed)),
             ("reversible_mode", false, self.reversible_mode.load(Ordering::Relaxed)),
             ("hdr_mode", false, self.hdr_mode.load(Ordering::Relaxed)),
             // Added 2026-09-10 alongside the GUI rows that expose them -- see this
@@ -700,7 +694,6 @@ impl ShmHeader {
             "colour_strength" => &self.colour_strength_bits,
             "max_ratio" => &self.max_ratio_bits,
             "working_scale" => &self.working_scale_bits,
-            "scaling_downscaler" => &self.scaling_downscaler,
             "reversible_mode" => &self.reversible_mode,
             "hdr_mode" => &self.hdr_mode,
             "transfer" => &self.transfer,

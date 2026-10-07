@@ -99,11 +99,8 @@ impl CaptureBuffer {
 /// the proxy -- smaller proxy, smaller `DLSSNR.Width`/`Height` at `CreateFeature`,
 /// faster model evaluation, the whole point of `working_scale`.
 ///
-/// Deliberately only `VK_FILTER_LINEAR`: a hardware blit has no concept of the
-/// Lanczos/Catmull-Rom/Mitchell-Netravali/Kaiser kernels `scaling_downscaler` selects
-/// (that field stays meaningful only for a hypothetical future compute-shader
-/// implementation, not this one) -- a real, honest quality/speed tradeoff, not an
-/// oversight.
+/// Deliberately only `VK_FILTER_LINEAR`: the hardware blit, sub-millisecond, is the
+/// quality/speed tradeoff chosen here.
 ///
 /// Never touches [`CaptureBuffer`]'s own full-resolution buffer/copy at all: the
 /// full-resolution bytes this slot always still produces are what `run` swaps into

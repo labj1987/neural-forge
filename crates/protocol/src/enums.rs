@@ -56,24 +56,6 @@ pub mod reversible_mode {
     pub const COUNT: u32 = 5;
 }
 
-/// The filter that brings the model's answer back down when it ran above native
-/// resolution. Only consulted when the working scale is above 1.0.
-pub mod downscaler {
-    /// Reserved; not a downscaler this pipeline can run (it wants a different constant
-    /// block and is an upscaler, not the averaging filter the down-leg needs). A header
-    /// asking for it falls back to `LANCZOS3`.
-    pub const FSR1: u32 = 0;
-    pub const BICUBIC: u32 = 1;
-    pub const CATMULL_ROM: u32 = 2;
-    pub const LANCZOS2: u32 = 3;
-    /// The default: the sharp one.
-    pub const LANCZOS3: u32 = 4;
-    pub const KAISER2: u32 = 5;
-    pub const KAISER3: u32 = 6;
-    pub const MAGIC: u32 = 7;
-    pub const COUNT: u32 = 8;
-}
-
 /// What the helper has managed to do, for the GUI and for the layer's fail-open
 /// decision. The layer reads this to decide whether anything is listening, so
 /// "nobody" has to be the value a freshly initialized header holds — not a state that
