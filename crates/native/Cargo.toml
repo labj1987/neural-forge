@@ -1,0 +1,16 @@
+[package]
+name = "neural-forge-native"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+description = "Native backend: the vendored OpenDLSS-NR host code, its SPIR-V and PTX kernels embedded, behind a small C API"
+build = "build.rs"
+links = "neural_forge_native"
+
+[lib]
+name = "neural_forge_native"
+crate-type = ["rlib"]
+
+[build-dependencies]
+cc = { version = "1.2", features = ["parallel"] }

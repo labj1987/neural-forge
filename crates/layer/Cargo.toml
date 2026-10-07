@@ -24,3 +24,8 @@ libc = "0.2"
 # encode-only PNG writer is the minimal real dependency for "write these RGBA8 bytes
 # out as a file a human can actually look at", not something worth hand-rolling.
 png = "0.17"
+
+# The native backend (vendored OpenDLSS-NR, C++ and embedded kernels) exists for the 64-bit layer only; the
+# i686 layer (`--target i686-unknown-linux-gnu -p neural-forge-layer`) never builds it.
+[target.'cfg(target_arch = "x86_64")'.dependencies]
+neural-forge-native = { path = "../native" }

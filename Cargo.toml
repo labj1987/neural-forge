@@ -7,6 +7,7 @@ members = [
     "crates/supervisor",
     "crates/gui",
     "crates/cli",
+    "crates/native",
 ]
 # `helper` targets x86_64-pc-windows-gnu only and is built explicitly
 # (`cargo build --target x86_64-pc-windows-gnu -p neural-forge-helper`), never as
@@ -17,6 +18,7 @@ default-members = [
     "crates/supervisor",
     "crates/gui",
     "crates/cli",
+    "crates/native",
 ]
 
 [workspace.package]

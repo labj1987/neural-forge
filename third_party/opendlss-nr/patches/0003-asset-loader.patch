@@ -1,0 +1,145 @@
+diff --git a/src/kernels.cpp b/src/kernels.cpp
+index 62bb8c3..a6a2c7c 100644
+--- a/src/kernels.cpp
++++ b/src/kernels.cpp
+@@ -37,6 +37,27 @@ void chooseGemmShape(uint32_t N, uint32_t rows, uint32_t batches, uint32_t smCou
+ void check(bool condition, const char* message) {
+   if (!condition) throw std::runtime_error(message);
+ }
++
++// A PTX file through the asset loader when one is set (name without ".ptx"), else from the directory.
++bool ptxAvailable(const std::string& directory, const std::string& file) {
++  if (AssetLoader loader = assetLoader()) {
++    const uint8_t* data = nullptr; size_t size = 0;
++    return loader("ptx", file.substr(0, file.size() - 4).c_str(), &data, &size);
++  }
++  return std::ifstream(directory + "/" + file).good();
++}
++
++std::string readPtx(const std::string& directory, const std::string& file) {
++  if (AssetLoader loader = assetLoader()) {
++    const uint8_t* data = nullptr; size_t size = 0;
++    if (!loader("ptx", file.substr(0, file.size() - 4).c_str(), &data, &size)) throw std::runtime_error("missing PTX kernel " + file);
++    return std::string(reinterpret_cast<const char*>(data), size);
++  }
++  std::ifstream in(directory + "/" + file);
++  if (!in) throw std::runtime_error("cannot read PTX kernel " + directory + "/" + file);
++  std::stringstream buffer; buffer << in.rdbuf();
++  return buffer.str();
++}
+ }  // namespace
+ 
+ Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : context_(context) {
+@@ -254,9 +275,9 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
+     const uint32_t vflags = (a.residual ? 1u : 0u) | (a.silu ? 2u : 0u) | ((a.quantize || a.dualOutput) ? 4u : 0u) | (a.quantize ? 0u : 8u);
+     const std::string entry = "gemmv_e4m3_K" + std::to_string(a.K) + "_f" + std::to_string(vflags) + "_s" + std::to_string(vsplits) +
+                               (bm != 192 ? "_m" + std::to_string(bm) : "");
+-    std::ifstream probe(ptxDirectory_ + "/" + entry + ".ptx");
++    const bool available = ptxAvailable(ptxDirectory_, entry + ".ptx");
+     const VkDeviceSize partialBytes = (VkDeviceSize)vsplits * rowGroups * colGroups * warps * 48 * 128;   // fragment-order slices
+-    if (probe.good() && rowGroups <= 65535) {
++    if (available && rowGroups <= 65535) {
+       PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
+       if (vsplits > 1 && splitScratch_.buffer == VK_NULL_HANDLE) {
+         // sized once (launches already recorded hold its address): four times the first split shape covers the
+@@ -303,8 +324,7 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
+     const uint32_t gflags = (a.residual ? 1u : 0u) | (tsplits == 1 ? outFlags : 0u);
+     const std::string entry = "gemmt_e4m3_K" + std::to_string(a.K) + "_f" + std::to_string(gflags) + "_p" + std::to_string(partSteps) +
+                               "_s" + std::to_string(tsplits);
+-    std::ifstream probe(ptxDirectory_ + "/" + entry + ".ptx");
+-    if (probe.good()) {
++    if (ptxAvailable(ptxDirectory_, entry + ".ptx")) {
+       check(!a.chainWaitRows && !a.chainWaitBands && !a.chainSignal && !a.chained,
+             "the tall-tile PTX GEMM does not implement counter chaining");
+       PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
+@@ -708,11 +728,8 @@ void Kernels::fusedBlock32(VkCommandBuffer commands, const FusedBlock32Args& a)
+ Kernels::PtxKernel& Kernels::ptxKernel(const std::string& file, const std::string& entry) {
+   auto it = ptxKernels_.find(file);
+   if (it != ptxKernels_.end()) return it->second;
+-  std::ifstream in(ptxDirectory_ + "/" + file);
+-  if (!in) throw std::runtime_error("cannot read PTX kernel " + ptxDirectory_ + "/" + file);
+-  std::stringstream buffer; buffer << in.rdbuf();
+   PtxKernel kernel;
+-  const std::string text = buffer.str();
++  const std::string text = readPtx(ptxDirectory_, file);
+   if (size_t at = text.find("// dynamic_shared "); at != std::string::npos) kernel.dynamicShared = (uint32_t)atoi(text.c_str() + at + 18);
+   if (size_t at = text.find("// threads "); at != std::string::npos) kernel.threads = (uint32_t)atoi(text.c_str() + at + 11);
+   kernel.module = context_.createCudaModule(text);
+@@ -922,8 +939,8 @@ bool Kernels::globalAttentionStreamPtx(uint32_t paddedTokens) const {
+   static const int mode = getenv("DLSS5VK_ATTN_STREAM") ? atoi(getenv("DLSS5VK_ATTN_STREAM")) : -1;
+   if (!ptxGlobalAttentionEnabled() || mode == 0) return false;
+   if (mode < 0 && paddedTokens <= 256) return false;
+-  static const bool available = std::ifstream(ptxDirectory_ + "/global_attention_stream_e4m3.ptx").good() &&
+-                                std::ifstream(ptxDirectory_ + "/global_normalize_e4m3.ptx").good();
++  static const bool available = ptxAvailable(ptxDirectory_, "global_attention_stream_e4m3.ptx") &&
++                                ptxAvailable(ptxDirectory_, "global_normalize_e4m3.ptx");
+   return available;
+ }
+ 
+diff --git a/src/vk_context.cpp b/src/vk_context.cpp
+index 5b02732..5fe064e 100644
+--- a/src/vk_context.cpp
++++ b/src/vk_context.cpp
+@@ -374,12 +374,23 @@ std::vector<uint8_t> Context::download(const Buffer& source, VkDeviceSize size,
+ }
+ 
+ VkShaderModule Context::loadShaderModule(const std::string& spvPath) {
+-  std::ifstream file(spvPath, std::ios::binary | std::ios::ate);
+-  if (!file) throw std::runtime_error("missing shader " + spvPath);
+-  std::streamsize size = file.tellg();
+-  file.seekg(0);
+-  std::vector<uint32_t> words((size + 3) / 4);
+-  file.read(reinterpret_cast<char*>(words.data()), size);
++  std::vector<uint32_t> words;
++  size_t size = 0;
++  if (nr::AssetLoader loader = nr::assetLoader()) {
++    std::string name = spvPath.substr(spvPath.find_last_of('/') + 1);
++    if (name.size() > 4 && name.compare(name.size() - 4, 4, ".spv") == 0) name.resize(name.size() - 4);
++    const uint8_t* data = nullptr;
++    if (!loader("spv", name.c_str(), &data, &size)) throw std::runtime_error("missing shader " + name);
++    words.resize((size + 3) / 4);
++    memcpy(words.data(), data, size);
++  } else {
++    std::ifstream file(spvPath, std::ios::binary | std::ios::ate);
++    if (!file) throw std::runtime_error("missing shader " + spvPath);
++    size = (size_t)file.tellg();
++    file.seekg(0);
++    words.resize((size + 3) / 4);
++    file.read(reinterpret_cast<char*>(words.data()), size);
++  }
+   VkShaderModuleCreateInfo info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+   info.codeSize = size;
+   info.pCode = words.data();
+@@ -582,6 +593,14 @@ std::vector<double> Context::readTimestampsMs(VkQueryPool pool, uint32_t count)
+ 
+ }  // namespace vk
+ 
++namespace nr {
++namespace {
++AssetLoader g_assetLoader = nullptr;
++}
++void setAssetLoader(AssetLoader loader) { g_assetLoader = loader; }
++AssetLoader assetLoader() { return g_assetLoader; }
++}  // namespace nr
++
+ namespace vk {
+ 
+ VkDeviceAddress Context::deviceAddress(const Buffer& buffer) const {
+diff --git a/src/vk_context.h b/src/vk_context.h
+index 9a195b0..972b8d6 100644
+--- a/src/vk_context.h
++++ b/src/vk_context.h
+@@ -175,3 +175,13 @@ class Context {
+ };
+ 
+ }  // namespace vk
++
++namespace nr {
++// Where SPIR-V and PTX come from. When a loader is set, every shader and PTX read goes through it instead of the
++// filesystem: kind is "spv" or "ptx", name is the file name without its extension (e.g. "gemm_fp8",
++// "gemmv_e4m3_K1024_f6_s1"). It returns false when it has no such asset; the bytes must stay valid for the
++// process lifetime. Unset (the default), shaderDir and DLSS5VK_PTX_DIR are read as before.
++using AssetLoader = bool (*)(const char* kind, const char* name, const uint8_t** data, size_t* size);
++void setAssetLoader(AssetLoader loader);
++AssetLoader assetLoader();
++}  // namespace nr
