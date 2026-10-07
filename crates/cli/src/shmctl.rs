@@ -81,6 +81,7 @@ fn cmd_status(header: &ShmHeader) {
     let preupscale = header.preupscale_state.load(Ordering::Relaxed);
     println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", 3 => "paused: no model answer, forwarding untouched", _ => "unknown" });
     println!("layer_reason={}", header.layer_reason());
+    println!("native_running={}", header.native_running.load(Ordering::Relaxed));
     println!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed));
     println!("preupscale_hold_ms={}", f32::from_bits(header.preupscale_hold_ms_bits.load(Ordering::Relaxed)));
     println!("preupscale_misses={}", header.preupscale_misses.load(Ordering::Relaxed));

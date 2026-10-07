@@ -444,6 +444,16 @@ formats. Such inputs are held here even with nothing in the buffer before the la
 `NEURAL_FORGE_INLINE=off` turns it off (no queue is added either). A `dump` taken here has the colour
 input and the exposure only.
 
+**Native backend.** With the native backend the worker runs `run_native` instead of `run_hold`, on the
+same side queue, with the network's graph recorded for that queue's family. For its history the buffer
+also copies DLSS's RG16F motion vectors into a slot image of their own beside the colour input (moved to
+`TRANSFER_SRC_OPTIMAL` and back when they are in a sampled or attachment layout); the camera jitter is
+read from the input launch's parameters at the submit (NATIVE_BACKEND.md, "Phase 4b"). Each job keeps
+the post path off before the worker takes the device's state (`keep_post_off`): the post path would
+otherwise hold that state while its frame waits on the GPU, which waits at this hold. Each job keeps
+the post path off before the worker takes the device's state (`keep_post_off`): the post path would
+otherwise hold that state while its frame waits on the GPU, which waits at this hold.
+
 ### The HDR encode and decode (model, roundtrip)
 
 The model treats its input as a display-referred [0, 1] picture (E1b), so the capture encodes and

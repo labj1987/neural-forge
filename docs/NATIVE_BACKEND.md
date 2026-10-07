@@ -405,8 +405,8 @@ about half its launches.
   write-back fence before recording, as the helper hold does. With the CPU no longer waiting on the
   GPU inside the hold, this is now the one place the game's CPU can wait for its own GPU work.
   Double-buffering `C`/`W` would remove it; measure in Phase 3 first.
-- **Inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077's `inline` hold): still the helper's
-  path. Not needed for GTA V.
+- **Inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077's `inline` hold): ported after Phase 4
+  ("Phase 4b").
 
 ## Phase 2: the rest of the app on the native path
 
@@ -467,7 +467,7 @@ Every other Model and Composition control (model interval, working scale, detail
 strength, highlight guard, white point, transfer mode, compare, debug) belongs to the after-the-upscaler
 composition, which is unchanged, and has no network-side meaning.
 
-The native hold reads pass 0's resolved settings from the header every frame (`ShmClient::pass_tuning`),
+The native hold reads the Model tab's settings from the header every frame (`ShmClient::global_tuning`, no per-pass overrides),
 with the helper's clamps, so a change applies at the next frame (the helper rebuilt its feature after a
 settle delay instead).
 
@@ -545,7 +545,7 @@ matrix as too long once the answer was clear; what was measured:
 - **The temporal path differs from NGX's**: DLSS's motion vectors plus the jitter instead of optical flow. Not
   compared in game; whether DLSS's motion vectors are read one frame stale is open (inconclusive on a still
   scene).
-- **Games held inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077) still use the helper.
+- **Games held inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077): native since Phase 4b.
 - **32-bit**: not possible as built (no `VK_NV_cuda_kernel_launch` in a 32-bit process).
 - **Passes, the motion controls**: helper only, hidden in the GUI while native runs (SHM v13). Preset and
   sharpness did nothing on either backend and are removed (SHM v12).
@@ -565,7 +565,70 @@ branch once to judge the temporal look (ghosting, shimmer) against the helper.
 **Alex's answer (2026-10-07):** 4K and the after-the-upscaler path don't matter. He plays at 1440p, 288 Hz,
 VRR, HDR, and the games he plays now and later have an upscaler. Passes and the motion controls are not
 wanted on native (2.2). The games held inside DLSS's command buffer (Crimson Desert, Cyberpunk 2077) still
-need the helper, so whether Phase 5 removes it is still his call.
+need the helper, so whether Phase 5 removes it is still his call. Then: "port the mode now, all games
+should work on the native backend when everything is said and done" (Phase 4b).
+
+## Phase 4b: the hold inside DLSS's command buffer
+
+Games that render their frame in DLSS's own command buffer (Crimson Desert, Cyberpunk 2077, Black Myth:
+Wukong) are held inside that buffer (PRE_UPSCALER_DESIGN.md, "Inside DLSS's command buffer"): the buffer
+copies the colour input to a staging image and waits on an event while the layer's worker runs the hold
+on the layer's side queue. That hold now runs the native network instead of asking the helper:
+
+- **Queue and graph.** The side queue is in the network's compute family (the loader's), so the frames
+  use the graph recorded for that family (`Built::graph_own`, as the after-the-upscaler path does);
+  `run_native_hold` picks the graph by the hold's queue family and refuses any other family.
+- **Motion vectors.** The buffer also copies DLSS's RG16F motion vectors (from `GENERAL`,
+  `TRANSFER_SRC_OPTIMAL`, `SHADER_READ_ONLY_OPTIMAL` or `COLOR_ATTACHMENT_OPTIMAL`, moved to the
+  transfer layout and back when needed) into a slot image of their own, shared with the side queue's
+  family; the native capture reads that copy. Without it (another format, an unknown layout) the
+  network runs with no history.
+- **Jitter.** The launch's parameters are read at record time; the job takes the jitter at the submit.
+- **Waiting.** The worker waits for the write-back as before, then releases the buffer: the network's
+  frame is inside the time the game's GPU waits at the hold.
+- No helper, no slot 0: the slot-0 gates are skipped in native mode, as in the split hold.
+- **The post path stays off.** The worker needs the device's state, which the after-the-upscaler path
+  holds while its frame waits on the GPU, and the GPU is parked at the hold. The first in-game run
+  (`cdn-5`): the network was still loading at the first holds, so the device never engaged, the post
+  path took over, and every hold after that gave up on the lock (139 every 5 s, 27 fps). Now each job
+  keeps the post path off (`preupscale::keep_post_off`) and the loader's pre-upscaler claim fresh before
+  taking the lock (`Loader::note_pre`). A line every 5 s counts what the hold did with its jobs.
+
+### Result (Crimson Desert, 2026-10-07)
+
+One run (`cdn-7`, title screen, E, 60 s in game, Ray Reconstruction on, settings as found), driver
+615.78.08:
+
+- Held inside DLSS's buffer at 52/s, every real frame (52.0 fps presented), 0 misses, no fence timeout,
+  no Xid. Network 5.88 ms on the GPU at 1516x852, hold 7.0 ms (the worker's time, inside the GPU's wait).
+- Motion vectors copied (RG16F, in `GENERAL` there).
+- **No jitter**: the game runs DLSS Ray Reconstruction (`rr2_*` kernels); the jitter word is only known
+  for the 310.x Super Resolution input kernel (`hiluma_engine_input*`, word 3). The history is
+  reprojected with the motion vectors alone, so off by the jitter difference (under a pixel). Open:
+  find the word in RR's encoder parameters (`NEURAL_FORGE_PROBE_PARAMS`).
+- Not compared with the helper in the same scene, and the picture was not captured (the installed CLI
+  speaks SHM v11). Cyberpunk 2077 and Black Myth: Wukong are not installed on the rig: not run.
+- **The post path stays off.** The worker needs the device's state, which the after-the-upscaler path
+  holds while its frame waits on the GPU, and the GPU is parked at the hold. The first in-game run
+  (`cdn-5`): the network was still loading at the first holds, so the device never engaged, the post
+  path took over, and every hold after that gave up on the lock (139 every 5 s, 27 fps). Now each job
+  keeps the post path off (`preupscale::keep_post_off`) and the loader's pre-upscaler claim fresh before
+  taking the lock (`Loader::note_pre`). A line every 5 s counts what the hold did with its jobs.
+
+### Result (Crimson Desert, 2026-10-07)
+
+One run (`cdn-7`, title screen, E, 60 s in game, Ray Reconstruction on, settings as found), driver
+615.78.08:
+
+- Held inside DLSS's buffer at 52/s, every real frame (52.0 fps presented), 0 misses, no fence timeout,
+  no Xid. Network 5.88 ms on the GPU at 1516x852, hold 7.0 ms (the worker's time, inside the GPU's wait).
+- Motion vectors copied (RG16F, in `GENERAL` there).
+- **No jitter**: the game runs DLSS Ray Reconstruction (`rr2_*` kernels); the jitter word is only known
+  for the 310.x Super Resolution input kernel (`hiluma_engine_input*`, word 3). The history is
+  reprojected with the motion vectors alone, so off by the jitter difference (under a pixel). Open:
+  find the word in RR's encoder parameters (`NEURAL_FORGE_PROBE_PARAMS`).
+- Not compared with the helper in the same scene, and the picture was not captured (the installed CLI
+  speaks SHM v11). Cyberpunk 2077 and Black Myth: Wukong are not installed on the rig: not run.
 
 ## Decided before Phase 1
 
@@ -623,4 +686,4 @@ need the helper, so whether Phase 5 removes it is still his call.
 - [x] Phase 4 report written, branch pushed, stopped for Alex
 - [ ] Phase 5 (only on Alex's yes)
 
-Blockers: none. Waiting for Alex: Phase 5, and what it does about the games held inside DLSS's command buffer.
+Blockers: none. Waiting for Alex: Phase 5.

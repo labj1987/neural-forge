@@ -14,6 +14,9 @@ first shipped them; their phase is kept as a subheading.
   so the GUI shows them only while a game runs on it. The native backend runs the model once
   per frame with the Model tab's values (per-pass overrides no longer leak in through pass 0)
   and reports itself in the new `native_running` field (SHM v13).
+- Native backend: games held inside DLSS's command buffer (Crimson Desert, Cyberpunk 2077, Black
+  Myth: Wukong) run the network in the layer too, on the layer's compute queue, with DLSS's motion
+  vectors copied beside the colour input for the history and the jitter from the input launch.
 - Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
   `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,

@@ -106,6 +106,7 @@ pub(crate) mod native_post;
 #[cfg(target_arch = "x86_64")]
 pub(crate) type NativeLoader = Arc<native::Loader>;
 #[cfg(not(target_arch = "x86_64"))]
+#[derive(Clone)]
 pub(crate) enum NativeLoader {}
 
 /// Whether model-mode holds on a device with `loader` go to the native backend.
@@ -1256,6 +1257,15 @@ pub(crate) struct LaunchRefs {
 /// The word of a 310.x SR input kernel's parameters that holds the camera jitter ([`LaunchRefs::jitter`]).
 const HILUMA_JITTER_WORD: usize = 3;
 
+/// The layouts the hold inside DLSS's buffer copies the motion vectors from (moved to
+/// `TRANSFER_SRC_OPTIMAL` and back when not already readable there).
+pub(crate) const MVEC_COPY_LAYOUTS: [vk::ImageLayout; 4] = [
+    vk::ImageLayout::GENERAL,
+    vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
+    vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
+    vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL,
+];
+
 /// What a command buffer held at the point a launch was recorded into it: how many of its
 /// barriers on watched images come before the launch ([`Tracker`]'s `pending` list is in recording
 /// order), and the global synchronization recorded by then.
@@ -1275,6 +1285,8 @@ pub(crate) struct InlinePoint {
     /// The colour input's layout at the hold (restored after it).
     pub layout: vk::ImageLayout,
     pub exposure_input: Option<Aux>,
+    /// DLSS's motion vectors at the hold (the native backend's history), where they can be copied.
+    pub mvec_input: Option<Aux>,
     pub identification: u64,
     pub hazard: Hazard,
 }
@@ -1762,7 +1774,24 @@ impl Tracker {
                 .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
             Aux { image, format: d.format, layout, readable: d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == (1, 1) }
         });
-        Some(InlinePoint { colour, desc, layout, exposure_input, identification: self.generation, hazard })
+        // DLSS's motion vectors, copied beside the colour input for the native backend's history: RG16F
+        // at the colour input's extent, in a layout known here (or GENERAL for a storage image).
+        let mvec_input = {
+            let (image, d) = inputs.mvec;
+            let layout = self
+                .pending
+                .get(&cb)
+                .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
+                .or_else(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
+                .or_else(|| self.committed.get(&image).copied())
+                .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
+            let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+                && d.format == vk::Format::R16G16_SFLOAT
+                && (d.width, d.height) == (desc.width, desc.height)
+                && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
+            Some(Aux { image, format: d.format, layout, readable })
+        };
+        Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, identification: self.generation, hazard })
     }
 
     /// Takes the mark [`Self::launch_kernel`] left for the launch just recorded.
@@ -2595,6 +2624,13 @@ impl Tracking {
         let tracking = Arc::new(Self { device: device.as_raw(), ..Self::default() });
         lock(&TRACKING).insert(device, tracking.clone());
         tracking
+    }
+
+    /// The camera jitter (x, y, render pixels) `cb`'s DLSS input launch was given, if read: for the
+    /// hold inside DLSS's buffer, whose job is made at the submit.
+    pub(crate) fn jitter_px_of(&self, cb: vk::CommandBuffer) -> Option<[f32; 2]> {
+        let v = self.lock().launch.get(&cb).and_then(|r| r.jitter)?;
+        Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Tracker> {
@@ -5060,6 +5096,20 @@ static POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// `now` before it.
 fn post_off_until(model: bool, engaged: bool, last_dlss: Option<Instant>) -> Option<Instant> {
     last_dlss.filter(|_| model && engaged).map(|t| t + HAND_BACK)
+}
+
+/// Keeps the post path off for [`HAND_BACK`] from now, for the native backend's hold inside DLSS's
+/// buffer. That hold needs the device's state, which the post path holds while its frame waits on
+/// the GPU, and the GPU waits at the hold: with the post path on, the hold never gets the state, so
+/// it never engages the device the way [`post_off_until`] wants. The network is the same one either
+/// path would use, so nothing is lost by not waiting for that.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn keep_post_off() {
+    let until = Instant::now() + HAND_BACK;
+    let mut off = lock(&POST_OFF_UNTIL);
+    if off.is_none_or(|t| t < until) {
+        *off = Some(until);
+    }
 }
 
 /// Whether some device of the process keeps the post path off at `now` (its [`Session`]
@@ -8427,6 +8477,7 @@ mod tests {
                 desc: ImageDesc { width: w, height: h, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true },
                 layout: vk::ImageLayout::GENERAL,
                 exposure_input: exposure_aux(exposure),
+                mvec_input: None,
                 identification: 1,
                 hazard: Hazard::MemoryBarrier,
             };

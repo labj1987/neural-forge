@@ -628,43 +628,85 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
 /// write-back waited on so that the staging image holds the answer when the worker releases the
 /// GPU. The device's state is only ever try-locked, for at most `INLINE_LOCK_WAIT`: a present
 /// holding it may itself be waiting on the GPU, which is waiting on this hold.
+/// Counts what the hold inside DLSS's buffer did with its jobs and logs the counts every 5 s: a hold
+/// that stops running there otherwise says nothing (each skip releases the buffer silently).
+fn inline_tally(what: &'static str) {
+    static TALLY: Mutex<Option<(std::time::Instant, Vec<(&'static str, u32)>)>> = Mutex::new(None);
+    let mut t = TALLY.lock().unwrap();
+    let (since, counts) = t.get_or_insert_with(|| (std::time::Instant::now(), Vec::new()));
+    match counts.iter_mut().find(|(w, _)| *w == what) {
+        Some((_, n)) => *n += 1,
+        None => counts.push((what, 1)),
+    }
+    if since.elapsed() >= std::time::Duration::from_secs(5) {
+        let line: Vec<String> = counts.iter().map(|(w, n)| format!("{w} {n}")).collect();
+        crate::log!("[preupscale] inside DLSS's buffer, last {:.1} s: {}", since.elapsed().as_secs_f32(), line.join(", "));
+        *t = None;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn inline_hold(
     device: &Arc<ash::Device>, instance: &Arc<ash::Instance>, physical_device: vk::PhysicalDevice, state: &Arc<Mutex<State>>,
-    job: &crate::preupscale::inline::Job, queue: vk::Queue,
+    native_loader: Option<&crate::preupscale::NativeLoader>, job: &crate::preupscale::inline::Job, queue: vk::Queue,
 ) {
     use crate::preupscale::{Mode, Which};
     const INLINE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
     let mode = crate::preupscale::mode();
     if !mode.holds_inline() || !crate::layer_enabled() || crate::device_lost() || !presenting_steadily() {
+        inline_tally("skipped (off, device lost or not presenting steadily)");
         return;
     }
+    // The after-the-upscaler path holds the device's state while its frame waits on the GPU, which
+    // waits here: told before the lock, it stays off and stops taking the network, so the lock
+    // comes free for this path (`preupscale::keep_post_off`).
+    #[cfg(target_arch = "x86_64")]
+    if mode == Mode::Model && crate::preupscale::native_on(native_loader) {
+        crate::preupscale::keep_post_off();
+        if let Some(loader) = native_loader {
+            loader.note_pre();
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = native_loader;
     let started = std::time::Instant::now();
     let mut state = loop {
         match state.try_lock() {
             Ok(guard) => break guard,
             Err(std::sync::TryLockError::Poisoned(_)) => return,
             Err(std::sync::TryLockError::WouldBlock) if started.elapsed() < INLINE_LOCK_WAIT => std::thread::sleep(std::time::Duration::from_micros(100)),
-            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                inline_tally("skipped (the device's state stayed locked)");
+                return;
+            }
         }
     };
     let State { shm, preupscale: session, external_memory_host, direct_capture, gpu_compose, inflight, .. } = &mut *state;
     session.saw_dlss();
     if !shm.open() {
+        inline_tally("skipped (no shared memory)");
         return;
     }
+    // The native backend runs the network itself, on this side queue: no helper, no slot 0.
+    let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
     // A dump here has the colour input only (no depth or motion-vector layouts to wait for).
-    let Some(dump) = crate::preupscale::gate(mode, session, shm, true) else {
-        return;
+    let dump = if native {
+        false
+    } else {
+        let Some(dump) = crate::preupscale::gate(mode, session, shm, true) else {
+            return;
+        };
+        dump
     };
     let extent = (job.point.desc.width, job.point.desc.height);
-    if shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
+    if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
         session.note_busy_slot(shm, mode, extent);
         return;
     }
-    if capture::direct_slot_busy(direct_capture, Slot::Primary) {
+    if !native && capture::direct_slot_busy(direct_capture, Slot::Primary) {
         return;
     }
-    if mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(device)) {
+    if !native && mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(device)) {
         return;
     }
     // Staged, never imported: work on imported host memory from the layer's queue waited on the
@@ -683,7 +725,8 @@ fn inline_hold(
         width: extent.0,
         height: extent.1,
         depth: None,
-        mvec: None,
+        // The copy the buffer made beside the colour input (the native backend's history).
+        mvec: job.point.mvec_input.filter(|_| native),
         exposure: [None; crate::preupscale::MAX_EXPOSURE],
         exposure_input: job.exposure.filter(|_| session.game_exposure_trusted(job.point.identification)),
         paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
@@ -695,10 +738,16 @@ fn inline_hold(
         // SAFETY: the side queue is used by this worker thread only.
         unsafe { device.queue_submit(queue, &[info], fence) }
     };
+    let loader = session.native.as_ref().filter(|_| native);
     // SAFETY: `res` was built on this device for this extent and the side queue's family; the
     // staging image is live, in GENERAL, and holds this frame's colour input (`captured` was set).
-    let mut hold = unsafe {
-        crate::preupscale::run_hold(device, instance, physical_device, res, shm, &target, mode, dump, 0, crate::preupscale::ANSWER_BUDGET, &mut submit)
+    let mut hold = match loader {
+        // SAFETY: as below; the loader belongs to this device, and the side queue's family is the
+        // network's own (its graph is recorded for it too).
+        Some(loader) => unsafe { crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, shm, &mut submit) },
+        None => unsafe {
+            crate::preupscale::run_hold(device, instance, physical_device, res, shm, &target, mode, dump, 0, crate::preupscale::ANSWER_BUDGET, &mut submit)
+        },
     };
     if hold.wrote_back {
         let mut writeback_gpu = None;
@@ -714,6 +763,14 @@ fn inline_hold(
         inflight[0].forget_answer();
     }
     hold.mark_local(mode);
+    if hold.native {
+        session.note_native(shm, &hold);
+    }
+    inline_tally(match (hold.wrote_back, job.jitter.is_some()) {
+        (true, true) => "held",
+        (true, false) => "held without the jitter",
+        (false, _) => hold.miss.unwrap_or("not held"),
+    });
     session.check_exposure(job.point.identification, &hold);
     session.note(shm, &hold, started.elapsed(), extent);
     if let Some(frame) = hold.dump.take() {
@@ -942,7 +999,9 @@ impl NeuralForgeDeviceInfo {
                     None
                 } else {
                     let (dev, inst, pd, st) = (device.clone(), instance.clone(), physical_device, state.clone());
-                    let hold: crate::preupscale::inline::HoldFn = Box::new(move |job, queue| inline_hold(&dev, &inst, pd, &st, job, queue));
+                    let native_loader = state.lock().unwrap().preupscale.native.clone();
+                    let hold: crate::preupscale::inline::HoldFn =
+                        Box::new(move |job, queue| inline_hold(&dev, &inst, pd, &st, native_loader.as_ref(), job, queue));
                     crate::preupscale::inline::Inline::start(device.clone(), instance, physical_device, queue, family, app_family, hold)
                 }
             }
@@ -1041,7 +1100,13 @@ impl NeuralForgeDeviceInfo {
     fn inline_jobs(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
         let Some(inline) = &self.inline else { return Vec::new() };
         let family = self.state.lock().unwrap().queue_families.get(&queue).copied();
-        inline.jobs_for(cbs, family)
+        let mut jobs = inline.jobs_for(cbs, family);
+        if let Some(tracking) = &self.preupscale {
+            for job in &mut jobs {
+                job.jitter = tracking.jitter_px_of(job.cb);
+            }
+        }
+        jobs
     }
 
     /// Hands `jobs` to the worker once the submission was accepted; a refused one runs nothing.

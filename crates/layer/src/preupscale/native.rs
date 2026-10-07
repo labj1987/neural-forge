@@ -192,6 +192,13 @@ impl Loader {
         !self.post_busy.load(SeqCst) && epoch_ms().saturating_sub(self.last_post.load(SeqCst)) >= PATH_SWITCH_MS
     }
 
+    /// Keeps the after-the-upscaler path off the network without claiming it: the hold inside DLSS's
+    /// buffer says it wants the network before it waits for the device's state, which the
+    /// after-the-upscaler path may be holding while its own frames run.
+    pub(crate) fn note_pre(&self) {
+        self.last_pre.store(epoch_ms(), std::sync::atomic::Ordering::SeqCst);
+    }
+
     /// Starts the loading thread the first time.
     fn spawn(&self) {
         let Some((device, setup)) = self.pending.lock().unwrap().take() else { return };
@@ -618,7 +625,8 @@ impl NativePass {
     ///
     /// # Safety
     /// `device` is live; `encoded` and `exposure` are the HDR pass's (live for as long as this pass).
-    pub(crate) unsafe fn record(&mut self, device: &ash::Device, built: &Built, encoded: vk::ImageView, exposure: vk::Buffer) -> bool {
+    /// `graph` is `built`'s graph recorded for this pass's queue family.
+    pub(crate) unsafe fn record(&mut self, device: &ash::Device, built: &Built, graph: vk::CommandBuffer, encoded: vk::ImageView, exposure: vk::Buffer) -> bool {
         if self.recorded == Some(built.generation) {
             return true;
         }
@@ -657,7 +665,7 @@ impl NativePass {
         }
         let ok = (0..2).all(|p| {
             // SAFETY: forwarded from this function's contract.
-            unsafe { self.record_frame(device, p, built) }.is_ok()
+            unsafe { self.record_frame(device, p, built, graph) }.is_ok()
         });
         // SAFETY: as above.
         let ok = ok && unsafe { self.record_init(device) }.is_ok();
@@ -667,7 +675,7 @@ impl NativePass {
 
     /// # Safety
     /// As [`Self::record`].
-    unsafe fn record_frame(&self, device: &ash::Device, p: usize, built: &Built) -> ash::prelude::VkResult<()> {
+    unsafe fn record_frame(&self, device: &ash::Device, p: usize, built: &Built, graph: vk::CommandBuffer) -> ash::prelude::VkResult<()> {
         let cmd = self.commands[p];
         let f = built.frame;
         let compute = |src: vk::AccessFlags, dst: vk::AccessFlags| vk::MemoryBarrier::builder().src_access_mask(src).dst_access_mask(dst).build();
@@ -702,7 +710,7 @@ impl NativePass {
                 &[],
                 &[],
             );
-            device.cmd_execute_commands(cmd, &[built.graph]);
+            device.cmd_execute_commands(cmd, &[graph]);
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -945,6 +953,17 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     }
     let (encoded, exposure) = (pass.encoded_view(), pass.exposure_buffer());
+    // The graph for the queue the frames go to: the game's graphics family (the split hold) or the
+    // network's own compute family (the hold inside DLSS's buffer, on the layer's side queue).
+    let setup = loader.setup();
+    let graph = if res.queue_family == setup.frame_family {
+        built.graph
+    } else if res.queue_family == setup.family {
+        built.graph_own
+    } else {
+        result.miss = Some("the hold's queue family is not one the network was recorded for");
+        return result;
+    };
     // The native pass for this extent, its buffers recorded for this build.
     let mut native = match res.native.take().filter(|n| n.matches(target.width, target.height)) {
         Some(n) => n,
@@ -960,7 +979,7 @@ pub(crate) unsafe fn run_native_hold(
         }
     };
     // SAFETY: nothing of the pass is pending (`wait_idle` above); the HDR pass outlives it in `res`.
-    if !unsafe { native.record(device, &built, encoded, exposure) } {
+    if !unsafe { native.record(device, &built, graph, encoded, exposure) } {
         res.native = Some(native);
         result.miss = Some("recording the native frame failed");
         return result;
@@ -1164,7 +1183,7 @@ mod tests {
                 device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
             });
             let mut pass = NativePass::build(device, instance, physical, family, W, H).expect("the native pass builds");
-            assert!(pass.record(device, &built, encoded.view, exposure.buffer));
+            assert!(pass.record(device, &built, graph, encoded.view, exposure.buffer));
             fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.mvec.buffer, 0, vk::WHOLE_SIZE, 0));
             let write_head = |frame: u32, logit: f32| {
                 let h: Vec<f32> = (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, frame), residual(x, y, 1, frame), residual(x, y, 2, frame), logit])).collect();
