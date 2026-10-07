@@ -26,6 +26,9 @@ disagree, the more recent measurement wins.
 
 ## Decisions and history
 
+- [DLSSNR_EXPERIMENTS.md](DLSSNR_EXPERIMENTS.md): API-based preset comparison tooling and the
+  validation gates for real depth and game motion-vector inputs.
+
 - [LESSONS.md](LESSONS.md): what was tried, what worked, what didn't, and why, from 0.1.0 to 2.0.0.
 - [GHOSTING_PLAN.md](GHOSTING_PLAN.md): why the held answer ghosted, what upstream does instead,
   the model-resolution blit and the move of optical flow into the helper.
@@ -37,6 +40,9 @@ disagree, the more recent measurement wins.
   run Feature 18.
 - [OPENDLSS_REVIEW.md](OPENDLSS_REVIEW.md): Neural Forge compared stage by stage with OpenDLSS-NR's
   documented pipeline, the history reset rule, and the GTA script-mod finding.
+- [DLSS_KERNEL_CATALOGUE.md](DLSS_KERNEL_CATALOGUE.md): DLSS's kernel names and input-kernel parameter
+  layouts for every DLSS version on the test machine (2.2.11 to 310.9.1), which kernels are SR, FG and
+  Ray Reconstruction, and what the layer could stop guessing.
 - [DLSSNR_PARAMETERS.md](DLSSNR_PARAMETERS.md): which NGX parameters the Neural Rendering feature
   reads, the five the helper never sets, the helper writes nothing reads, and when the history
   reset is set, against the public SDK and the open-source consumers.
