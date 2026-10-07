@@ -118,6 +118,40 @@ impl Region {
     }
 }
 
+/// The mapping as the native backend's after-the-upscaler server reads it from its own thread: the header
+/// and the two slots' regions, which stay mapped for the life of the process once opened.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub struct ShmView {
+    header: *const neural_forge_protocol::ShmHeader,
+    regions: [*mut u8; 4],
+}
+
+// SAFETY: the pointers stay valid for the process's life (never unmapped once open); the header is atomics,
+// and each slot's regions are owned by whoever saw that slot's `seq_req`, as with the helper.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Send for ShmView {}
+#[cfg(target_arch = "x86_64")]
+unsafe impl Sync for ShmView {}
+
+#[cfg(target_arch = "x86_64")]
+impl ShmView {
+    pub fn header(&self) -> &neural_forge_protocol::ShmHeader {
+        // SAFETY: see the type's Send impl.
+        unsafe { &*self.header }
+    }
+
+    /// The slot's proxy and answer regions.
+    pub fn regions(&self, slot: Slot) -> (*mut u8, *mut u8) {
+        (self.regions[Region::proxy(slot) as usize], self.regions[Region::answer(slot) as usize])
+    }
+
+    /// Each region's size.
+    pub fn capacity(&self) -> usize {
+        REGION_CAP
+    }
+}
+
 pub struct ShmClient {
     fd: Option<OwnedFd>,
     header: *mut neural_forge_protocol::ShmHeader,
@@ -373,12 +407,20 @@ impl ShmClient {
     /// `layer_attached`/`layer_heartbeat`/`layer_width`/`layer_height`/`layer_format`/
     /// `layer_frames` are status telemetry, not part of the handshake -- deliberately
     /// not per-slot; they just reflect whichever slot most recently captured.
+    /// The mapping for another thread of this process, once open.
+    #[cfg(target_arch = "x86_64")]
+    pub fn view(&self) -> Option<ShmView> {
+        (!self.header.is_null() && self.regions.iter().all(|r| !r.is_null())).then_some(ShmView { header: self.header, regions: self.regions })
+    }
+
     /// Pass `pass`'s settings, its overrides merged over the global ones (the Model tab's).
+    #[cfg(target_arch = "x86_64")]
     pub fn pass_tuning(&self, pass: usize) -> Option<neural_forge_protocol::PassTuning> {
         self.header().map(|hdr| hdr.resolve_pass(pass))
     }
 
     /// The layer's status line for the GUI (the native backend's state, or why it is not running).
+    #[cfg(target_arch = "x86_64")]
     pub fn set_layer_reason(&self, reason: &str) {
         if let Some(hdr) = self.header() {
             hdr.set_layer_reason(reason);

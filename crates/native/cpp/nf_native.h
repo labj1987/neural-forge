@@ -85,6 +85,11 @@ uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame);
 // orders its own writes of `features` before it and its reads of `head` after it.
 VkCommandBuffer nf_native_graph_commands(const NfNative* n);
 
+// The same graph recorded a second time, as a secondary of `queue_family` (the network's own queue's
+// family): for work the layer submits on a queue of that family (the after-the-upscaler path). Both
+// recordings share the activations: they must never run at the same time.
+VkCommandBuffer nf_native_graph_commands_own(const NfNative* n);
+
 // Records the graph straight into `primary` (descriptor pool 0, which the warm-up also uses). For
 // measurements beside the secondary; the frame path uses nf_native_graph_commands.
 uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err, size_t err_len);

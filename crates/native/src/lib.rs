@@ -48,6 +48,7 @@ mod ffi {
         pub fn nf_native_build(n: *mut c_void, width: u32, height: u32, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_frame(n: *const c_void, frame: *mut super::Frame) -> u32;
         pub fn nf_native_graph_commands(n: *const c_void) -> vk::CommandBuffer;
+        pub fn nf_native_graph_commands_own(n: *const c_void) -> vk::CommandBuffer;
         pub fn nf_native_record_graph(n: *mut c_void, primary: vk::CommandBuffer, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_chain_timeouts(n: *const c_void, at: *mut c_char, len: usize) -> u32;
         pub fn nf_native_reset_chain_timeouts(n: *mut c_void);
@@ -235,6 +236,13 @@ impl Network {
     pub fn graph_commands(&self) -> vk::CommandBuffer {
         // SAFETY: `raw` is live.
         unsafe { ffi::nf_native_graph_commands(self.raw) }
+    }
+
+    /// The same graph as a secondary of the network's own queue family (`queue_family`). Never run at
+    /// the same time as [`Self::graph_commands`]: they share the activations.
+    pub fn graph_commands_own(&self) -> vk::CommandBuffer {
+        // SAFETY: `raw` is live.
+        unsafe { ffi::nf_native_graph_commands_own(self.raw) }
     }
 
     /// Records the graph straight into `primary` (for measurements; the frame path executes

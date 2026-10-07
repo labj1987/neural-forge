@@ -99,10 +99,12 @@ pub(crate) mod hdr;
 pub(crate) mod inline;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod native_post;
 
 /// The native backend's per-device network ([`native::Loader`]); none exists on 32-bit builds.
 #[cfg(target_arch = "x86_64")]
-pub(crate) type NativeLoader = native::Loader;
+pub(crate) type NativeLoader = Arc<native::Loader>;
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) enum NativeLoader {}
 
@@ -132,7 +134,7 @@ pub(crate) unsafe fn run_native(
         return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, conditioning, submit) };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = shm;
+    let _ = (device, instance, physical_device, res, target, jitter, shm, submit);
     #[cfg(not(target_arch = "x86_64"))]
     match *loader {}
 }
@@ -3582,6 +3584,7 @@ pub(crate) enum Which {
     /// The capture: carries the moved wait semaphores.
     Capture,
     /// The native backend's network (`native`), between the capture and the write-back.
+    #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
     Native,
     WriteBack,
 }
@@ -4607,7 +4610,13 @@ pub(crate) struct Session {
     exposure_untrusted: Option<u64>,
     /// The native backend's network on this device, when it was created for it.
     pub(crate) native: Option<NativeLoader>,
+    /// The native backend's after-the-upscaler server (`native_post`), once the mapping is open.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) post_server: Option<native_post::PostServer>,
+    #[cfg(target_arch = "x86_64")]
+    post_server_tried: bool,
     /// The native backend's status line last published (`layer_reason`), so it is written on change only.
+    #[cfg(target_arch = "x86_64")]
     native_status: String,
     /// Consecutive frames still to dump after the one just taken ([`dump_frames`]).
     burst: u32,
@@ -4941,6 +4950,26 @@ impl Session {
         if let Some(ms) = ms {
             self.stats.writeback_gpu_ms.push(ms);
         }
+    }
+
+    /// Starts the native backend's after-the-upscaler server once the shared memory is open (once per
+    /// device), on a device with the native network.
+    pub(crate) fn ensure_post_server(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, import: bool, shm: &ShmClient) {
+        #[cfg(target_arch = "x86_64")]
+        if !self.post_server_tried && native_on(self.native.as_ref()) {
+            let (Some(loader), Some(view)) = (self.native.clone(), shm.view()) else { return };
+            self.post_server_tried = true;
+            self.post_server = native_post::PostServer::start(device.clone(), instance.clone(), physical_device, loader.setup(), import, loader, view);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (device, instance, physical_device, import, shm);
+    }
+
+    /// Stops the after-the-upscaler server and drops the network (the device is being destroyed).
+    pub(crate) fn stop_native(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        drop(self.post_server.take());
+        drop(self.native.take());
     }
 
     /// Publishes the native backend's status line after a native hold, when it changed.

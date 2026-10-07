@@ -410,6 +410,39 @@ about half its launches.
 
 ## Phase 2: the rest of the app on the native path
 
+### 2.1 After the upscaler
+
+Games without DLSS Super Resolution keep the after-the-upscaler path: the 8-bit swapchain capture into slot
+0/1's proxy region and the composition from the answer region, both unchanged. What answers the requests is
+new: `preupscale::native_post::PostServer`, a thread in the game's process that does what the helper's
+request loop did (`process_request`), minus NGX. Per slot, a new `seq_req` with an 8-bit frame the model is
+wanted for runs through `native_post_preprocess.comp` (the 16 lanes from the RGBA8/BGRA8 proxy), the network
+(its graph recorded a second time, for the layer's compute family) and `native_post_composite.comp` (the
+residual, style operator and intensity, 8 bits out in the proxy's channel order), on a second compute queue
+of the layer's own, waited for (bounded). Anything else is echoed, as the helper fails open. Then
+`answered_w/h`, `seq_eval`, the helper's stage times, `helper_busy_us` and `seq_resp`, in the helper's order;
+the heartbeat and `helper_state` keep the layer's `helper_alive` true. The regions are imported as host
+memory where the device allows (staged copies otherwise).
+
+- **No history**: there are no motion vectors after the upscaler, so every frame is a first frame, with a
+  fixed seed (a changing seed with nothing blending frames would shimmer). The helper's NGX had a history
+  fed by its optical flow. **For Alex**: worth a look for shimmer in a game on this path.
+- **Never both paths at once**: the pre-upscaler hold and this server share the network's frame state; each
+  refuses for a second after the other used it (`Loader::claim_pre`, `claim_post`).
+- **A helper process that is running wins**: the server does not start if the helper's heartbeat moves.
+- The loader is now created on every NVIDIA device with the network's additions, not only on devices with
+  DLSS's tracking: a game without DLSS has no `VK_NVX_image_view_handle`.
+
+Tested with the `pan` reproducer (2492x1370 window, no DLSS, helper stopped): the server answered every
+request, the network built for 2492x1370 in 1.3 s, 67-68 fps with every frame composited, the composited
+picture the original with the model's edit (mean 3.7/255, no channel swap). The same run through the
+helper: 75-79 fps. The answer takes 15.7 ms native against 11.1 ms through the helper (NGX's evaluate 10.8
+ms): **NVIDIA's network is about 20% faster than OpenDLSS-NR's at the same size on this GPU** (also at
+1485x836: about 4.8 ms in game against 5.5 ms idle), presumably its kernels built for Blackwell against
+upstream's sm_89 PTX that the driver compiles here. On the pre-upscaler path the native backend still comes
+out even or ahead because the hold's round trip is gone; after the upscaler, where the helper already ran
+off the game's queue, it costs about 12% of the frame rate in `pan`.
+
 ### 2.2 The Model tab on the network
 
 What each control does with NGX (the helper) and natively. "Checked" is the same frame (GTA frame d1, the
@@ -509,7 +542,7 @@ Not built, as the handoff asks.
 - [x] 1.4 native frame path before the upscaler works in GTA V
 - [x] 1.5 backend switch in place
 - [x] 1.6 failure paths tested (missing model, watchdog, allocation failure)
-- [ ] 2.1 after-the-upscaler path native
+- [x] 2.1 after-the-upscaler path native
 - [x] 2.2 settings mapping table written, unmapped controls listed
 - [x] 2.3 Setup tab reduced to extract-model
 - [x] 2.4 32-bit layer answer recorded

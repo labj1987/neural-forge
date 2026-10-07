@@ -612,6 +612,7 @@ impl HdrPass {
     }
 
     /// The encoded picture's view (padded extent, `GENERAL` after the capture's opening barrier).
+    #[cfg(target_arch = "x86_64")]
     pub(crate) fn encoded_view(&self) -> vk::ImageView {
         self.encoded.view
     }

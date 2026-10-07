@@ -212,12 +212,16 @@ struct NfNative {
   nr::Activation* features = nullptr;
   VkCommandPool secondaryPool = VK_NULL_HANDLE;
   VkCommandBuffer secondary = VK_NULL_HANDLE;
+  VkCommandPool ownPool = VK_NULL_HANDLE;
+  VkCommandBuffer ownSecondary = VK_NULL_HANDLE;
   float blendScale = 1.0f;
   uint64_t fenceTimeoutNs = 5'000'000'000ull;
 
   void dropGraph() {
     if (secondary) vkFreeCommandBuffers(context->device(), secondaryPool, 1, &secondary);
     secondary = VK_NULL_HANDLE;
+    if (ownSecondary) vkFreeCommandBuffers(context->device(), ownPool, 1, &ownSecondary);
+    ownSecondary = VK_NULL_HANDLE;
     graph.reset();
     features = nullptr;
   }
@@ -238,23 +242,30 @@ struct NfNative {
     context->endAndSubmit(warm, true);
     const nr::Kernels::ChainTimeouts timeouts = kernels->chainTimeouts();
     if (timeouts.waits) throw std::runtime_error("the warm-up run's counter chain timed out at " + timeouts.counter);
-    // The frame recording: descriptor pool 1 stays reserved for it.
+    // The frame recordings (one per queue family they run on): descriptor pool 1 stays reserved for them.
     context->resetDescriptorPool(1);
+    secondary = recordSecondary(secondaryPool);
+    ownSecondary = recordSecondary(ownPool);
+  }
+
+  VkCommandBuffer recordSecondary(VkCommandPool pool) {
+    VkCommandBuffer commands = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    allocate.commandPool = secondaryPool;
+    allocate.commandPool = pool;
     allocate.level = VK_COMMAND_BUFFER_LEVEL_SECONDARY;
     allocate.commandBufferCount = 1;
-    VK_CHECK(vkAllocateCommandBuffers(context->device(), &allocate, &secondary));
-    context->initDispatchable(secondary);
+    VK_CHECK(vkAllocateCommandBuffers(context->device(), &allocate, &commands));
+    context->initDispatchable(commands);
     VkCommandBufferInheritanceInfo inheritance{VK_STRUCTURE_TYPE_COMMAND_BUFFER_INHERITANCE_INFO};
     VkCommandBufferBeginInfo begin{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
     begin.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
     begin.pInheritanceInfo = &inheritance;
-    VK_CHECK(vkBeginCommandBuffer(secondary, &begin));
-    context->computeBarrier(secondary);
-    graph->record(secondary, *features);
-    context->computeBarrier(secondary);
-    VK_CHECK(vkEndCommandBuffer(secondary));
+    VK_CHECK(vkBeginCommandBuffer(commands, &begin));
+    context->computeBarrier(commands);
+    graph->record(commands, *features);
+    context->computeBarrier(commands);
+    VK_CHECK(vkEndCommandBuffer(commands));
+    return commands;
   }
 };
 
@@ -363,6 +374,8 @@ NfNative* nf_native_open(const NfNativeOpen* open, char* err, size_t err_len) {
     VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
     pool.queueFamilyIndex = open->frame_family;
     VK_CHECK(vkCreateCommandPool(open->device, &pool, nullptr, &n->secondaryPool));
+    pool.queueFamilyIndex = open->queue_family;
+    VK_CHECK(vkCreateCommandPool(open->device, &pool, nullptr, &n->ownPool));
     const nr::Tensor& blend = n->model->tensor(70, 0, "blend_scale");
     if (blend.byteLength >= 2) {
       uint16_t half;
@@ -374,6 +387,7 @@ NfNative* nf_native_open(const NfNativeOpen* open, char* err, size_t err_len) {
     say(err, err_len, e.what());
     if (n->context) {
       if (n->secondaryPool) vkDestroyCommandPool(n->context->device(), n->secondaryPool, nullptr);
+      if (n->ownPool) vkDestroyCommandPool(n->context->device(), n->ownPool, nullptr);
       n->kernels.reset();
       n->model.reset();
       n->context.reset();
@@ -408,6 +422,8 @@ uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame) {
 
 VkCommandBuffer nf_native_graph_commands(const NfNative* n) { return n->secondary; }
 
+VkCommandBuffer nf_native_graph_commands_own(const NfNative* n) { return n->ownSecondary; }
+
 uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err, size_t err_len) {
   try {
     n->context->resetDescriptorPool(0);
@@ -438,6 +454,7 @@ void nf_native_close(NfNative* n) {
   try {
     n->dropGraph();
     if (n->secondaryPool) vkDestroyCommandPool(n->context->device(), n->secondaryPool, nullptr);
+    if (n->ownPool) vkDestroyCommandPool(n->context->device(), n->ownPool, nullptr);
     n->kernels.reset();
     n->model.reset();
     n->context.reset();

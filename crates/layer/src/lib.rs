@@ -344,11 +344,12 @@ pub(crate) fn take_native(device: vk::Device) -> Option<preupscale::native::Setu
     NATIVE_DEVICES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
 }
 
-/// `infos` with one more queue for the native network's loading, in a compute family without graphics
+/// `infos` with two more queues for the native network (its loading, and the after-the-upscaler path's
+/// frames), in a compute family without graphics
 /// (like the side queue, and for the same reason: the layer's own work on a queue of the game's
 /// graphics family faulted its channel, Xid 69 in Crimson Desert and Xid 32 in GTA V with the network's
-/// uploads, 2026-10-07): the game's graphics family, the new queue's family and index, the extended
-/// infos, and the priorities they point into. `None` without such a family to spare a queue in.
+/// uploads, 2026-10-07): the game's graphics family, the new queues' family and first index, the extended
+/// infos, and the priorities they point into. `None` without such a family to spare two queues in.
 #[cfg(target_arch = "x86_64")]
 fn native_queue_request(
     instance: &ash::Instance, physical_device: vk::PhysicalDevice, infos: &[vk::DeviceQueueCreateInfo],
@@ -368,18 +369,21 @@ fn native_queue_request(
     match infos.iter().position(|q| q.queue_family_index == family) {
         Some(at) => {
             let q = infos[at];
-            if !q.flags.is_empty() || q.queue_count >= families[family as usize].queue_count || q.p_queue_priorities.is_null() {
+            if !q.flags.is_empty() || q.queue_count + 2 > families[family as usize].queue_count || q.p_queue_priorities.is_null() {
                 return None;
             }
             // SAFETY: `pQueuePriorities` holds `queueCount` floats.
             priorities = Box::new(unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec());
-            priorities.push(1.0);
-            extended[at].queue_count = q.queue_count + 1;
+            priorities.extend([1.0, 1.0]);
+            extended[at].queue_count = q.queue_count + 2;
             extended[at].p_queue_priorities = priorities.as_ptr();
             index = q.queue_count;
         }
         None => {
-            priorities = Box::new(vec![1.0]);
+            if families[family as usize].queue_count < 2 {
+                return None;
+            }
+            priorities = Box::new(vec![1.0, 1.0]);
             extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
             index = 0;
         }
@@ -566,7 +570,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                                     if let Some(sq) = &side {
                                         SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.queue);
                                     }
-                                    let setup = preupscale::native::Setup { gipa, instance: instance.instance.handle(), physical: physical_device, frame_family, family, index };
+                                    let setup = preupscale::native::Setup { gipa, instance: instance.instance.handle(), physical: physical_device, frame_family, family, index, post_index: index + 1 };
                                     NATIVE_DEVICES.lock().unwrap().get_or_insert_default().insert(device, setup);
                                     log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
                                     return result;

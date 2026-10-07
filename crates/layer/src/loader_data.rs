@@ -65,6 +65,7 @@ unsafe fn initialize(device: vk::Device, object: *mut c_void) -> VkResult<()> {
 /// # Safety
 /// `queue` is a live queue of `device`, obtained below the loader trampoline.
 /// Any dispatchable object of `device` obtained from below the loader (the native network's).
+#[cfg(target_arch = "x86_64")]
 pub unsafe fn initialize_object(device: vk::Device, object: *mut c_void) -> VkResult<()> {
     unsafe { initialize(device, object) }
 }

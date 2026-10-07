@@ -609,7 +609,7 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
         }
         // The native network: its loading thread is joined and its own queue waited for; its frame
         // work, if any ran, was drained with the device above.
-        drop(state.preupscale.native.take());
+        state.preupscale.stop_native();
         // SAFETY: a series never leaves GPU work pending once a present returns (it waits on
         // its own fences), so no idle wait is needed; this also finishes writing its files.
         unsafe { state.series.destroy(&device); }
@@ -923,8 +923,10 @@ impl NeuralForgeDeviceInfo {
         };
         #[cfg(target_arch = "x86_64")]
         if let Some(setup) = crate::take_native(handle) {
-            if preupscale.is_some() && nvidia {
-                state.lock().unwrap().preupscale.native = Some(crate::preupscale::native::Loader::start(handle, setup));
+            // Also without DLSS's tracking (no VK_NVX_image_view_handle): the after-the-upscaler path
+            // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
+            if nvidia {
+                state.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup)));
             }
         }
         let side = crate::take_side_queue(handle);
@@ -2557,6 +2559,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             crate::logging::flush();
                         }
                     }
+                    // The native backend answers this path's requests itself (`preupscale::native_post`).
+                    preupscale.ensure_post_server(&self.device, instance, self.physical_device, *external_memory_host, shm);
                     let observing = readable && series.running();
                     if observing {
                         // SAFETY: as for `capture::run` below; `readable` checked TRANSFER_SRC, and

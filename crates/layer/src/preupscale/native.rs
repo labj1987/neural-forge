@@ -81,6 +81,8 @@ pub(crate) struct Setup {
     /// uploads and warm-up only.
     pub family: u32,
     pub index: u32,
+    /// A second queue of that family: the after-the-upscaler path's network frames (`native_post`).
+    pub post_index: u32,
 }
 
 /// The network for one frame size, as the hold uses it.
@@ -90,6 +92,8 @@ pub(crate) struct Built {
     pub height: u32,
     pub frame: nn::Frame,
     pub graph: vk::CommandBuffer,
+    /// The same graph recorded for the layer's own compute family (`native_post`).
+    pub graph_own: vk::CommandBuffer,
     /// Changes with every build: [`NativePass`] re-records its buffers when it does.
     pub generation: u64,
 }
@@ -119,7 +123,23 @@ pub(crate) struct Loader {
     shared: Arc<(Mutex<LoaderState>, Condvar)>,
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     pending: Mutex<Option<(vk::Device, Setup)>>,
+    setup: Setup,
+    /// Who uses the network's frame (activations, counters), which the two paths share: the last
+    /// pre-upscaler hold and the last after-the-upscaler frame (ms since [`epoch_ms`]'s start), and
+    /// whether the latter is running now ([`Self::claim_post`], [`Self::claim_pre`]).
+    last_pre: std::sync::atomic::AtomicU64,
+    last_post: std::sync::atomic::AtomicU64,
+    post_busy: std::sync::atomic::AtomicBool,
 }
+
+/// Milliseconds since the first call in this process (a monotonic stamp for [`Loader`]'s claims).
+fn epoch_ms() -> u64 {
+    static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
+    START.elapsed().as_millis() as u64 + 1
+}
+
+/// How long after one path last used the network the other may.
+const PATH_SWITCH_MS: u64 = 1000;
 
 unsafe extern "C" fn init_dispatchable(_user: *mut std::ffi::c_void, device: vk::Device, object: *mut std::ffi::c_void) {
     // SAFETY: a dispatchable object of `device` the network just got from below the loader.
@@ -128,7 +148,48 @@ unsafe extern "C" fn init_dispatchable(_user: *mut std::ffi::c_void, device: vk:
 
 impl Loader {
     pub(crate) fn start(device: vk::Device, setup: Setup) -> Self {
-        Self { shared: Arc::default(), worker: Mutex::new(None), pending: Mutex::new(Some((device, setup))) }
+        Self {
+            shared: Arc::default(),
+            worker: Mutex::new(None),
+            pending: Mutex::new(Some((device, setup))),
+            setup,
+            last_pre: Default::default(),
+            last_post: Default::default(),
+            post_busy: Default::default(),
+        }
+    }
+
+    pub(crate) fn setup(&self) -> Setup {
+        self.setup
+    }
+
+    /// The after-the-upscaler path may run a frame now (no pre-upscaler hold for a second). Pair with
+    /// [`Self::release_post`] once its work completed.
+    pub(crate) fn claim_post(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        if epoch_ms().saturating_sub(self.last_pre.load(SeqCst)) < PATH_SWITCH_MS {
+            return false;
+        }
+        self.post_busy.store(true, SeqCst);
+        if epoch_ms().saturating_sub(self.last_pre.load(SeqCst)) < PATH_SWITCH_MS {
+            self.post_busy.store(false, SeqCst);
+            return false;
+        }
+        true
+    }
+
+    pub(crate) fn release_post(&self) {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.last_post.store(epoch_ms(), SeqCst);
+        self.post_busy.store(false, SeqCst);
+    }
+
+    /// The pre-upscaler path may submit a frame now (the after-the-upscaler path is not running one and
+    /// has not for a second). Notes the hold either way, which keeps the other path off.
+    pub(crate) fn claim_pre(&self) -> bool {
+        use std::sync::atomic::Ordering::SeqCst;
+        self.last_pre.store(epoch_ms(), SeqCst);
+        !self.post_busy.load(SeqCst) && epoch_ms().saturating_sub(self.last_post.load(SeqCst)) >= PATH_SWITCH_MS
     }
 
     /// Starts the loading thread the first time.
@@ -229,7 +290,7 @@ impl Loader {
                 Ok((n, built)) => {
                     if let Some((w, h, frame)) = built {
                         state.generation += 1;
-                        state.built = Some(Built { width: w, height: h, frame, graph: n.graph_commands(), generation: state.generation });
+                        state.built = Some(Built { width: w, height: h, frame, graph: n.graph_commands(), graph_own: n.graph_commands_own(), generation: state.generation });
                         crate::log!(
                             "[native] network {}built for {w}x{h} (field {}x{}, chained {}) in {} ms",
                             if fall_back { "re" } else { "" },
@@ -845,6 +906,10 @@ pub(crate) unsafe fn run_native_hold(
             n.gap.skipped();
         }
         result.miss = Some("the network's counter chain timed out; it is being rebuilt with barriers");
+        return result;
+    }
+    if !loader.claim_pre() {
+        result.miss = Some("the network is serving the after-the-upscaler path");
         return result;
     }
     let Some(built) = loader.ready(target.width, target.height) else {
