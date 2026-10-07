@@ -54,6 +54,12 @@ pub(crate) fn backend() -> Backend {
     *BACKEND
 }
 
+/// `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`: the frames record everything but the network's launches.
+fn skip_graph() -> bool {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_SKIP_GRAPH").as_deref() == Some("1"));
+    *ON
+}
+
 /// `NEURAL_FORGE_NATIVE_CHAIN=0`: barriers between the network's launches instead of counter chaining.
 fn chain_wanted() -> bool {
     neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_CHAIN").is_none_or(|v| v != "0")
@@ -509,7 +515,7 @@ pub(crate) struct NativePass {
     frames: u64,
     seed: u32,
     last_jitter: Option<[f32; 2]>,
-    pub(crate) gap: HistoryGap<(u32, u32, u64)>,
+    pub(crate) gap: HistoryGap<(u32, u32)>,
 }
 
 // SAFETY: plain handles and the layer's own mappings, only used behind the device's `State` mutex.
@@ -710,7 +716,11 @@ impl NativePass {
                 &[],
                 &[],
             );
-            device.cmd_execute_commands(cmd, &[graph]);
+            // `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`: everything but the network's launches (diagnostic: the
+            // answer is then the head left from before).
+            if !skip_graph() {
+                device.cmd_execute_commands(cmd, &[graph]);
+            }
             device.cmd_pipeline_barrier(
                 cmd,
                 vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -875,9 +885,11 @@ pub(crate) fn note_reset(stale: Option<Stale>) {
     }
 }
 
-/// Every hold's view of the target and its time, for [`HistoryGap`].
-pub(crate) fn format_of(target: &Target) -> (u32, u32, u64) {
-    (target.width, target.height, target.identification)
+/// Every hold's view of the target, for [`HistoryGap`]: the input's size. Not its identification: DLSS's
+/// input alternates between two colour images every frame in Black Myth: Wukong with frame generation on,
+/// and each switch reset the history.
+pub(crate) fn format_of(target: &Target) -> (u32, u32) {
+    (target.width, target.height)
 }
 
 

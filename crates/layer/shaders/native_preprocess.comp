@@ -126,6 +126,10 @@ void main() {
   int reflectedY = id.y < p.dims.w ? int(id.y) : 2 * int(p.dims.w) - int(id.y) - 2;
   uvec2 source = uvec2(clamp(reflectedX, 0, int(p.dims.z) - 1), clamp(reflectedY, 0, int(p.dims.w) - 1));
   vec3 proxy = imageLoad(u_encoded, ivec2(source)).rgb;
+  // The encode gives [0, 1]; a NaN or an infinity from the game's frame (or its exposure) must not reach
+  // the network, whose kernels faulted the GPU on some frames (Black Myth: Wukong, frame generation on).
+  // A no-op on every valid frame.
+  proxy = clamp(mix(proxy, vec3(0.0), isnan(proxy)), 0.0, 1.0);
   vec3 centered = centre(proxy);
   vec3 noise = gaussian3(id.x, id.y, p.frame.y);
   uint base = (id.y * p.dims.x + id.x) * 4u;

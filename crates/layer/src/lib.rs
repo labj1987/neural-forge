@@ -530,6 +530,14 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         // the pre-upscaler path on. A request with it that the driver refuses is made again without.
         // SAFETY: `physical_device` belongs to this instance.
         let nvidia = unsafe { instance.instance.get_physical_device_properties(physical_device) }.vendor_id == 0x10DE;
+        if !create_info.p_queue_create_infos.is_null() {
+            // SAFETY: `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures (checked non-null).
+            let asked: Vec<String> = unsafe { std::slice::from_raw_parts(create_info.p_queue_create_infos, create_info.queue_create_info_count as usize) }
+                .iter()
+                .map(|q| format!("family {} x{}", q.queue_family_index, q.queue_count))
+                .collect();
+            log!("[queues] the application asks for {}", asked.join(", "));
+        }
         let side = (nvidia && preupscale::active() && preupscale::inline::enabled())
             .then(|| side_queue_request(&instance.instance, physical_device, create_info))
             .flatten();

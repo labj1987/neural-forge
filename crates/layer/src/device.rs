@@ -628,6 +628,30 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
 /// write-back waited on so that the staging image holds the answer when the worker releases the
 /// GPU. The device's state is only ever try-locked, for at most `INLINE_LOCK_WAIT`: a present
 /// holding it may itself be waiting on the GPU, which is waiting on this hold.
+/// `NEURAL_FORGE_LOG_LAUNCH_QUEUES=1`: every 5 s, how many submitted command buffers carried CUDA launches,
+/// by device and queue family (which queues DLSS's and Frame Generation's work runs on). Diagnostic only.
+fn launch_queues_logged() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_LOG_LAUNCH_QUEUES").as_deref() == Some("1"));
+    *ON
+}
+
+fn launch_queue_tally(device: u64, family: Option<u32>, n: u32) {
+    type Tally = Option<(std::time::Instant, Vec<((u64, Option<u32>), u32)>)>;
+    static TALLY: Mutex<Tally> = Mutex::new(None);
+    let mut t = TALLY.lock().unwrap();
+    let (since, counts) = t.get_or_insert_with(|| (std::time::Instant::now(), Vec::new()));
+    match counts.iter_mut().find(|(k, _)| *k == (device, family)) {
+        Some((_, c)) => *c += n,
+        None => counts.push(((device, family), n)),
+    }
+    if since.elapsed() >= std::time::Duration::from_secs(5) {
+        let line: Vec<String> = counts.iter().map(|((d, f), c)| format!("device {d:#x} family {f:?}: {c}")).collect();
+        crate::log!("[queues] buffers with CUDA launches, last {:.1} s: {}", since.elapsed().as_secs_f32(), line.join(", "));
+        *t = None;
+    }
+}
+
 /// Counts what the hold inside DLSS's buffer did with its jobs and logs the counts every 5 s: a hold
 /// that stops running there otherwise says nothing (each skip releases the buffer silently).
 fn inline_tally(what: &'static str) {
@@ -1113,6 +1137,21 @@ impl NeuralForgeDeviceInfo {
     /// The jobs of the hold inside DLSS's buffer (`crate::preupscale::inline`) for a submission on
     /// `queue` of `cbs`, taken before the submission is made.
     fn inline_jobs(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
+        if launch_queues_logged() {
+            let cbs: Vec<vk::CommandBuffer> = cbs.into_iter().collect();
+            let family = self.state.lock().unwrap().queue_families.get(&queue).copied();
+            if let Some(tracking) = &self.preupscale {
+                let n = cbs.iter().filter(|cb| tracking.has_launches(**cb)).count() as u32;
+                if n > 0 {
+                    launch_queue_tally(vk::Handle::as_raw(self.device.handle()), family, n);
+                }
+            }
+            return self.inline_jobs_of(queue, cbs);
+        }
+        self.inline_jobs_of(queue, cbs)
+    }
+
+    fn inline_jobs_of(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
         let Some(inline) = &self.inline else { return Vec::new() };
         let family = self.state.lock().unwrap().queue_families.get(&queue).copied();
         let mut jobs = inline.jobs_for(cbs, family);
@@ -1504,7 +1543,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // table; `queue_family_index`/`queue_index` are the caller's own, forwarded
         // unchanged.
         unsafe { next(self.device.handle(), queue_family_index, queue_index, &mut queue) };
-        self.state.lock().unwrap().queue_families.insert(queue, queue_family_index);
+        if self.state.lock().unwrap().queue_families.insert(queue, queue_family_index).is_none() {
+            crate::log!("[queues] device {:#x}: the application took queue {queue_index} of family {queue_family_index} ({queue:?})", vk::Handle::as_raw(self.device.handle()));
+        }
         LayerResult::Handled(queue)
     }
 
@@ -1515,7 +1556,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // table; `queue_info` is valid for the duration of this call (handed to us by
         // the loader for exactly this call).
         unsafe { next(self.device.handle(), queue_info, &mut queue) };
-        self.state.lock().unwrap().queue_families.insert(queue, queue_info.queue_family_index);
+        if self.state.lock().unwrap().queue_families.insert(queue, queue_info.queue_family_index).is_none() {
+            crate::log!(
+                "[queues] device {:#x}: the application took queue {} of family {} ({queue:?}, vkGetDeviceQueue2)",
+                vk::Handle::as_raw(self.device.handle()),
+                queue_info.queue_index,
+                queue_info.queue_family_index
+            );
+        }
         LayerResult::Handled(queue)
     }
 
@@ -1853,8 +1901,16 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next) = self.next_create_image else { return LayerResult::Unhandled };
         let mut image = vk::Image::null();
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // The native backend copies DLSS's motion vectors for its history; a game that made them
+        // without `TRANSFER_SRC` (Black Myth: Wukong) gets it added to its two-channel float images.
+        let mut info = *create_info;
+        if self.preupscale.is_some() && crate::preupscale::wants_copyable(create_info) {
+            info.usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        let create_info = &info;
         // SAFETY: `next` is the next layer/driver's own `vkCreateImage`; `create_info` (with
-        // its whole pNext chain) and the allocator are the application's, passed unchanged.
+        // its whole pNext chain) and the allocator are the application's, passed unchanged but
+        // for that usage bit.
         let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut image) };
         if result != vk::Result::SUCCESS {
             return LayerResult::Handled(Err(result));

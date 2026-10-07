@@ -109,6 +109,21 @@ pub(crate) type NativeLoader = Arc<native::Loader>;
 #[derive(Clone)]
 pub(crate) enum NativeLoader {}
 
+/// Whether an image the application creates gets `TRANSFER_SRC` added (with the native backend on): a 2D,
+/// single-sample, single-level RG16F or RG32F image without it, which DLSS's motion vectors are.
+pub(crate) fn wants_copyable(info: &vk::ImageCreateInfo) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    let native = native::backend() == native::Backend::Native;
+    #[cfg(not(target_arch = "x86_64"))]
+    let native = false;
+    native
+        && matches!(info.format, vk::Format::R16G16_SFLOAT | vk::Format::R32G32_SFLOAT)
+        && info.image_type == vk::ImageType::TYPE_2D
+        && info.samples == vk::SampleCountFlags::TYPE_1
+        && info.tiling == vk::ImageTiling::OPTIMAL
+        && !info.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+}
+
 /// Whether model-mode holds on a device with `loader` go to the native backend.
 pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
     #[cfg(target_arch = "x86_64")]
@@ -2662,6 +2677,11 @@ impl Tracking {
     pub(crate) fn jitter_px_of(&self, cb: vk::CommandBuffer) -> Option<[f32; 2]> {
         let v = self.lock().launch.get(&cb).and_then(|r| r.jitter)?;
         Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+    }
+
+    /// Whether `cb` has CUDA launches recorded (diagnostics: `NEURAL_FORGE_LOG_LAUNCH_QUEUES`).
+    pub(crate) fn has_launches(&self, cb: vk::CommandBuffer) -> bool {
+        self.lock().launch.contains_key(&cb)
     }
 
     pub(crate) fn lock(&self) -> MutexGuard<'_, Tracker> {

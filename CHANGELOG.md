@@ -25,6 +25,10 @@ first shipped them; their phase is kept as a subheading.
   buffer runs the network with barriers instead of counter chaining (chaining faulted the GPU in Wukong); the
   post path's "keep off" from that hold has its own slot. Diagnostics: `NEURAL_FORGE_PROBE_KERNEL`,
   `NEURAL_FORGE_LOG_TIME`, `NEURAL_FORGE_NATIVE_INLINE_CHAIN`.
+- Native backend: the history is keyed on the input's extent, not its identification (DLSS's input alternates
+  between two colour images every frame in Wukong with frame generation); RG16F images get `TRANSFER_SRC` so the
+  motion vectors can be copied; the network's input is cleared of NaN and clamped to [0, 1] (a no-op on valid
+  frames). Diagnostics: `[queues]` lines, `NEURAL_FORGE_LOG_LAUNCH_QUEUES`, `NEURAL_FORGE_NATIVE_SKIP_GRAPH`.
 - Settings: the Supersampling filter (Downscaler) is removed (SHM v14); nothing read it, since the
   model never runs above the frame's size. Model resolution, Model every Nth frame and Rebuild
   spacing are shown only while the model is not running natively before the upscaler: the first

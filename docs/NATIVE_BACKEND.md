@@ -638,10 +638,30 @@ is out of scope).
   - The native hold ignored the on/off toggle (F11, the GUI, `apply_model`): it now goes to DLSS untouched
     when the model is off, as the helper's does (checked in Crimson Desert).
 - **Open: an intermittent GPU fault in Wukong.** Xid 13 (`Subchannel Mismatch`, class `cec0`, a compute
-  channel of the game) then Xid 32, 28-52 s after launch, in the benchmark tool's menu, while the hold inside
-  DLSS's buffer runs the network. With counter chaining 3 runs of 4 faulted, with barriers 1 of 5; never in
-  Crimson Desert, never with the helper. The hold inside DLSS's buffer now rebuilds the network with barriers
-  (`NEURAL_FORGE_NATIVE_INLINE_CHAIN=1` keeps chaining, to reproduce). Cause not found yet.
+  channel of the game) then Xid 32, in the first frames the hold inside DLSS's buffer runs the network (a frame
+  is submitted and never completes; timestamped with `NEURAL_FORGE_LOG_TIME`). Never in Crimson Desert, never
+  with the helper. Short runs (`ab.sh wks`, two minutes each):
+
+  | Variant (counter chaining kept, `NEURAL_FORGE_NATIVE_INLINE_CHAIN=1`, to make it frequent) | Faults |
+  |---|---|
+  | as is | 5 of 8 |
+  | frame generation off in the game | 0 of 4 |
+  | the network's launches skipped (`NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`) | 0 of 6 |
+  | the network waits for Frame Generation's compute submits made before it (timeline) | 4 of 6 |
+  | ... and those submits wait while the network runs (mutual exclusion) | 3 of 6 |
+  | ... for every submit outside the graphics family | 3 of 6 |
+  | the network's input cleared of NaN and clamped | 2 of 6 |
+
+  With barriers between the network's launches (the default now) 1 of 5 full runs faulted, and 4 later ones
+  did not. Frame generation on also makes DLSS's input alternate every frame between an RGBA16F and an
+  R11G11B10 image (only R11G11B10 with it off). Not overlap with Frame Generation's GPU work (the exclusion
+  rows), not a queue collision (the game only takes its own queues: `[queues]` lines), not bad input. The
+  ordering code is not kept; the diagnostics are. Next: what in the network's own work differs on the
+  alternating frames, and whether it reproduces on the previous driver (615.71.09).
+- **Wukong's motion vectors are not copied** (the image is not readable for the copy at the hold, although
+  `TRANSFER_SRC` is now added to RG16F images when the native backend is on), so the network runs there
+  without history. The history no longer resets when the colour input alternates (keyed on the extent only).
+
 
 ## Decided before Phase 1
 
