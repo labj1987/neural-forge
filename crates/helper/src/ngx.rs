@@ -149,12 +149,11 @@ pub struct NgxTuning {
     /// -1 follows local structure; it is not a strength of zero.
     pub skin_structure: f32,
     pub auto_mask: u32,
-    pub preset: u32,
 }
 
 impl Default for NgxTuning {
     fn default() -> Self {
-        Self { style: 0, intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, auto_mask: 1, preset: 0 }
+        Self { style: 0, intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, auto_mask: 1 }
     }
 }
 
@@ -167,7 +166,6 @@ impl From<neural_forge_protocol::PassTuning> for NgxTuning {
             local_structure: p.local_structure.clamp(0.0, 4.0),
             skin_structure: p.skin_structure.clamp(-1.0, 4.0),
             auto_mask: u32::from(p.auto_mask != 0),
-            preset: p.preset,
         }
     }
 }
@@ -179,7 +177,8 @@ fn set_create_tuning(params: NgxParameter, t: &NgxTuning) -> u32 {
         || {
             // SAFETY: `params` was allocated and validated in `load_and_init`.
             unsafe {
-                abi::ngx_set_u32(params, name("DLSSNR.Hint.Render.Preset").as_ptr(), t.preset);
+                // 0, "the model chooses": the only value there is; 310.8.0 answers any other the same.
+                abi::ngx_set_u32(params, name("DLSSNR.Hint.Render.Preset").as_ptr(), 0);
                 abi::ngx_set_u32(params, name("DLSSNR.Style").as_ptr(), t.style);
                 abi::ngx_set_f32(params, name("DLSSNR.Intensity").as_ptr(), t.intensity);
                 abi::ngx_set_f32(params, name("DLSSNR.LocalToneStrength").as_ptr(), t.local_tone);
@@ -194,8 +193,8 @@ fn set_create_tuning(params: NgxParameter, t: &NgxTuning) -> u32 {
         crate::log!("[params] create tuning FAILED (seh={seh:#x})");
     } else {
         crate::log!(
-            "[params] create tuning: preset={} style={} intensity={:.2} tone={:.2} structure={:.2} skin={:.2} automask={}",
-            t.preset, t.style, t.intensity, t.local_tone, t.local_structure, t.skin_structure, t.auto_mask
+            "[params] create tuning: style={} intensity={:.2} tone={:.2} structure={:.2} skin={:.2} automask={}",
+            t.style, t.intensity, t.local_tone, t.local_structure, t.skin_structure, t.auto_mask
         );
     }
     // A one-shot milestone, not the per-frame hot path: flushed so a killed helper still shows it.

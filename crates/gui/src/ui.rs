@@ -249,9 +249,6 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (style, set_style) = bind_u32(&shm, Some("style"), |h| &h.style);
     model_group.add(&combo_row("Style", &["Default", "Natural", "Cinematic"], style, set_style));
 
-    let (preset, set_preset) = bind_u32(&shm, Some("preset"), |h| &h.preset);
-    model_group.add(&spin_row("Preset", "Model-defined preset, 0-15", preset as f32, 0.0, 15.0, 1.0, move |v| set_preset(v as u32)));
-
     let (intensity, set_intensity) = bind_float(&shm, Some("intensity"), |h| &h.intensity_bits);
     model_group.add(&spin_row("Intensity", "Applied when the model is rebuilt (after a short pause)", intensity, 0.0, 4.0, 0.05, set_intensity));
 
@@ -263,9 +260,6 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     let (skin_structure, set_skin_structure) = bind_float(&shm, Some("skin_structure"), |h| &h.skin_structure_bits);
     model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, -1.0, 4.0, 0.05, set_skin_structure));
-
-    let (sharpness, set_sharpness) = bind_float(&shm, Some("sharpness"), |h| &h.sharpness_bits);
-    model_group.add(&spin_row("Sharpness", "", sharpness, 0.0, 1.0, 0.05, set_sharpness));
 
     let (auto_mask, set_auto_mask) = bind_bool(&shm, Some("auto_mask"), |h| &h.auto_mask);
     model_group.add(&switch_row("Auto mask", "Automatic skin/detail masking", auto_mask, set_auto_mask));
@@ -757,7 +751,6 @@ struct PassField {
 
 enum PassFieldKind {
     Float { lower: f64, upper: f64, step: f64 },
-    Int { lower: f64, upper: f64 },
     Choice(&'static [&'static str]),
     Toggle,
 }
@@ -774,9 +767,7 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
         PassField { title: "Local tone", bit: po::LOCAL_TONE, kind: PassFieldKind::Float { lower: 0.0, upper: 4.0, step: 0.05 }, get: |p| &p.local_tone_bits },
         PassField { title: "Local structure", bit: po::LOCAL_STRUCTURE, kind: PassFieldKind::Float { lower: 0.0, upper: 4.0, step: 0.05 }, get: |p| &p.local_structure_bits },
         PassField { title: "Skin structure", bit: po::SKIN_STRUCTURE, kind: PassFieldKind::Float { lower: -1.0, upper: 4.0, step: 0.05 }, get: |p| &p.skin_structure_bits },
-        PassField { title: "Sharpness", bit: po::SHARPNESS, kind: PassFieldKind::Float { lower: 0.0, upper: 1.0, step: 0.05 }, get: |p| &p.sharpness_bits },
         PassField { title: "Style", bit: po::STYLE, kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]), get: |p| &p.style },
-        PassField { title: "Preset", bit: po::PRESET, kind: PassFieldKind::Int { lower: 0.0, upper: 15.0 }, get: |p| &p.preset },
         PassField { title: "Auto mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |p| &p.auto_mask },
     ];
 
@@ -831,15 +822,6 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
                 adj.connect_value_changed(move |a| w((a.value() as f32).to_bits()));
                 expander.add_row(&row);
                 Box::new(move |bits| adj.set_value(f64::from(f32::from_bits(bits))))
-            }
-            PassFieldKind::Int { lower, upper } => {
-                let adj = gtk4::Adjustment::new(0.0, *lower, *upper, 1.0, 5.0, 0.0);
-                let row = adw::SpinRow::new(Some(&adj), 1.0, 0);
-                row.set_title("Value");
-                let w = Rc::clone(&write);
-                adj.connect_value_changed(move |a| w(a.value() as u32));
-                expander.add_row(&row);
-                Box::new(move |bits| adj.set_value(f64::from(bits)))
             }
             PassFieldKind::Choice(options) => {
                 let row = adw::ComboRow::new();

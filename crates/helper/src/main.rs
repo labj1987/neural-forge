@@ -529,18 +529,10 @@ fn process_request(
                 neural_forge_helper::log!("[mvec] scene cut detected, resetting motion history");
             }
             let reset_history = scene_cut || stale.is_some();
-            // Sharpness is per pass (the model reads it at evaluate); the header index of a pass
-            // is its position in the chain, holes excluded only from the *built* handles, so the
-            // pass numbers here are the first `live_passes` of the header's list.
             let chain: Vec<frame::ChainPass> = snippet
                 .chain_handles()
                 .into_iter()
-                .enumerate()
-                .map(|(i, handle)| frame::ChainPass {
-                    handle,
-                    reset: snippet.take_needs_reset(handle),
-                    sharpness: hdr.resolve_pass(i).sharpness,
-                })
+                .map(|handle| frame::ChainPass { handle, reset: snippet.take_needs_reset(handle) })
                 .collect();
             let flow = if want_motion.is_some() { motion.session(instance, device, physical_device, flow_queue, width, height, hdr.mvec_quality.load(Ordering::Relaxed), key.hdr, reset_history) } else { None };
             f.evaluate(device, queue, eval_fn, &chain, params, proxy, flow, motion_scale, reset_history, answer)

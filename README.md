@@ -16,7 +16,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab: the Neural rendering switch, style, preset, intensity, local tone and structure, sharpness, auto mask and passes](screenshots/settings.png) | ![Setup tab: NGX binaries present, the compatibility tool (runner) picker and the Steam launch option NEURAL_FORGE_ENABLE=1 %command%](screenshots/setup.png) | ![Status tab: telemetry, helper and layer state, and the Model placement line](screenshots/status.png) |
+| ![Model tab: the Neural rendering switch, style, intensity, local tone and structure, auto mask and passes](screenshots/settings.png) | ![Setup tab: NGX binaries present, the compatibility tool (runner) picker and the Steam launch option NEURAL_FORGE_ENABLE=1 %command%](screenshots/setup.png) | ![Status tab: telemetry, helper and layer state, and the Model placement line](screenshots/status.png) |
 
 The screenshots show 2.0.0 with default settings and no game running.
 
@@ -226,7 +226,7 @@ shared-memory version, remove `/tmp/neural-forge-$UID/shm.bin` while nothing has
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the model's style, preset, intensity, local tone, local structure, skin structure, sharpness, auto mask, passes (with per-pass settings), model every Nth frame, rebuild spacing and the toggle key. |
+| Model | The Neural rendering switch, the model's style, intensity, local tone, local structure, skin structure, auto mask, passes (with per-pass settings), model every Nth frame, rebuild spacing and the toggle key. |
 | Motion | Estimated motion vectors (on by default; optical flow in the helper), their units and quality. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap) and debug views (original/proxy, raw answer, amplified diff, colour trust). |

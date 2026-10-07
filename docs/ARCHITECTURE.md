@@ -93,8 +93,8 @@ are only ever appended; offsets are pinned by compile-time asserts. Groups:
 - **Liveness:** `heartbeat` (helper), `layer_heartbeat`, `quit`.
 - **Change counters:** `control_seq` (any setting changed), `tuning_seq` (a setting the model
   latches at feature creation changed; the helper rebuilds on it).
-- **Model settings:** `enabled`, `passes`, `preset`, `style`, `auto_mask`, intensity, local tone,
-  local structure, skin structure, sharpness, `model_interval` (v6), `rebuild_settle_ms`, the
+- **Model settings:** `enabled`, `passes`, `style`, `auto_mask`, intensity, local tone,
+  local structure, skin structure, `model_interval` (v6), `rebuild_settle_ms`, the
   per-pass array (`pass[30]`).
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
   transfer mode, white point fields, `working_scale`, compare and debug views, `reversible_mode`,

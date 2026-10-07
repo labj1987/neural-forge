@@ -8,15 +8,13 @@ use std::collections::BTreeMap;
 use crate::ShmHeader;
 
 /// One pass's persisted fields: (key suffix, is_float, field).
-fn pass_fields(p: &crate::PassControl) -> [(&'static str, bool, &std::sync::atomic::AtomicU32); 8] {
+fn pass_fields(p: &crate::PassControl) -> [(&'static str, bool, &std::sync::atomic::AtomicU32); 6] {
     [
         ("intensity", true, &p.intensity_bits),
         ("local_tone", true, &p.local_tone_bits),
         ("local_structure", true, &p.local_structure_bits),
         ("skin_structure", true, &p.skin_structure_bits),
-        ("sharpness", true, &p.sharpness_bits),
         ("style", false, &p.style),
-        ("preset", false, &p.preset),
         ("auto_mask", false, &p.auto_mask),
     ]
 }

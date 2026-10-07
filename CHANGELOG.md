@@ -6,6 +6,10 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Settings: Preset and Sharpness are removed from the GUI, the CLI, profiles and the channel
+  (SHM v12). Neither changes the 310.8.0 model's output on either backend: every preset gives
+  preset 0's answer byte for byte, and the feature never reads `Sharpness`. The helper always
+  sends preset 0. `scripts/preset-sweep.py`, which established this, is removed with them.
 - Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
   `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,

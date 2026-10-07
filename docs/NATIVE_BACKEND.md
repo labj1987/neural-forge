@@ -458,8 +458,8 @@ setting: bit-exact, or within one half-float step where the native side applies 
 | Local structure | `DLSSNR.LocalStructureStrength` | lanes 12-14 | 0.5 with skin 2: bit-exact |
 | Skin structure (-1 follows structure) | `DLSSNR.SkinStructureStrength` | lane 13 | as above |
 | Auto mask | `DLSSNR.UseAutoMask` | lanes 12-14 (off: structure, -1, -1) | off: bit-exact |
-| Preset | `DLSSNR.Hint.Render.Preset` | none | preset 1 gives NGX's preset-0 answer byte for byte: **it does nothing on 310.8.0**, with either backend. **For Alex: keep or remove the control.** |
-| Sharpness | `Sharpness`, which the 310.8 feature never reads (DLSSNR_PARAMETERS.md) | none | **No effect on either backend. For Alex: keep or remove.** |
+| Preset | `DLSSNR.Hint.Render.Preset` | none | preset 1 gives NGX's preset-0 answer byte for byte: it does nothing on 310.8.0, with either backend. **Removed (SHM v12); the helper always sends 0.** |
+| Sharpness | `Sharpness`, which the 310.8 feature never reads (DLSSNR_PARAMETERS.md) | none | No effect on either backend. **Removed (SHM v12).** |
 | Passes, per-pass settings | the helper chains one NGX feature per pass | not built: the network once per frame, pass 0's settings. Possible: the graph run N times on the previous pass's output, about 6.5 ms per pass at 1485x836 in game. **For Alex: wanted?** (Alex runs 1 pass.) |  |
 | Motion: estimate motion vectors, units, quality | the helper's optical flow feeds NGX's `MVec` | before the upscaler: DLSS's own motion vectors and jitter, nothing to set; after the upscaler: no motion at all (2.1). **For Alex: these controls only matter to the helper.** |  |
 
@@ -547,7 +547,8 @@ matrix as too long once the answer was clear; what was measured:
   scene).
 - **Games held inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077) still use the helper.
 - **32-bit**: not possible as built (no `VK_NV_cuda_kernel_launch` in a 32-bit process).
-- **Preset, sharpness, passes, the motion controls**: no native meaning (2.2); Alex to decide.
+- **Passes, the motion controls**: no native meaning (2.2); Alex to decide. Preset and sharpness did nothing on
+  either backend and are removed (SHM v12).
 - The layer grew to 8.9 MB and needs glibc 2.38.
 
 ### Recommendation

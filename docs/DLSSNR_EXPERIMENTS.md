@@ -8,73 +8,10 @@ decompiled, extracted or added to this repository.
 
 The uploaded 310.8 DLL's interface diagnostics explicitly describe unavailable presets falling
 back to the shipping default. A successful creation therefore cannot establish that two preset
-numbers select different networks. The first experiment measures what the API actually does.
-
-Build on the development machine with Rust installed:
-
-```bash
-cargo +stable build --release -p neural-forge-protocol --example trigger_helper_roundtrip
-```
-
-Build the CLI with the effective-preset status fields too:
-
-```bash
-cargo +stable build --release -p neural-forge-cli
-```
-
-Run on the NVIDIA machine, with the helper already started, all games closed, and pass 0's
-overrides cleared. Use a real encoded pre-upscaler dump (not an unencoded HDR image); the
-runbook's HDR encode procedure applies. Paths below are examples; `--dll` must name the DLL
-actually loaded by the helper.
-
-The CLI built in `target/release` finds no helper beside itself, so point it at the installed one
-(the script refuses to start otherwise, rather than stop a helper it cannot restart):
-
-```bash
-export NEURAL_FORGE_INSTALL_DIR=$HOME/.local/share/neural-forge/lib/neural-forge
-```
-
-```bash
-python3 scripts/preset-sweep.py \
-  --cli ./target/release/neural-forge-cli \
-  --roundtrip ./target/release/examples/trigger_helper_roundtrip \
-  --shm /tmp/neural-forge-1000/shm.bin \
-  --dll ~/.local/share/neural-forge/binaries/nvngx_dlssnr.dll \
-  --frame /tmp/encoded-colour.rgba16f --format rgba16f --width 1486 --height 836 \
-  --presets 0 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 \
-  --trials 3 --warmup 32 --samples 64 --out /tmp/nf-preset-sweep
-```
-
-Before anything else the script checks that `--shm` is the channel the CLI reports (config.ini's
-`shm=` wins over `$NEURAL_FORGE_SHM` for the CLI and the helper, while the roundtrip tool reads only
-the variable, which the script sets) and that `--dll` is `nvngx_dlssnr.dll` in the CLI's `binaries`
-directory. The roundtrip tool waits for the helper's heartbeat to move twice before its first
-request: a helper treats the `seq_req` it finds when its main loop starts as already answered, so a
-request sent straight after `restart` was never answered. A preset whose trial never reaches the
-warmup and sample counts (a value the feature refuses) is recorded with its error and the sweep goes
-on; a failing tool or helper still stops it.
-
-The script leases the same channel ownership file as the game layer, restarts the helper before
-each trial to clear model/flow history, rotates order, and tests one pass. It preserves the
-existing motion, resolution, style and strength settings. It restores and verifies preset,
-pass count, enabled and apply-model preferences on success, failure or ordinary interruption.
-It requires an unused output directory, records DLL/frame/tool hashes and the initial settings,
-and saves request CSVs, raw answers and per-trial summaries. SIGKILL or power loss cannot run
-restoration; the original values remain in `metadata.json`.
-
-Warmup counts real evaluations, excluding build-time echoes. Slot 0 uses the protocol's
-`seq_eval` rather than pixel equality: a valid unchanged answer is still an evaluation. CSV
-times include helper evaluation, helper busy time and polled request/response wall time; the
-last includes the tool's 5 ms polling interval and is not a GPU benchmark. VRAM is the helper's
-reported estimate, not whole-device VRAM; zero (currently not populated by the helper) is
-reported as unavailable in summaries. Output hashes describe the final answer, while timing
-summaries use the first requested sample count after warmup.
-
-Equal hashes on a still frame are **not proof of fallback or equivalent temporal behaviour**.
-Only promote a preset after repeated game benchmarks (real frame times, not generated FPS)
-and moving-scene visual checks: faces, foliage, signs, disocclusions and camera cuts. Use the
-existing `gta-bench.sh --set preset=N` and matched baseline, with mods off. Do not change default
-preset 0 from a still-frame experiment alone.
+numbers select different networks, so presets 0-15 were swept through the helper on a real
+encoded pre-upscaler dump, with no game running. The sweep script (`scripts/preset-sweep.py`) was
+removed together with the Preset setting once the result below showed it does nothing; it is in
+the git history.
 
 ## Result: presets 0-15 on 310.8 (2026-10-06)
 

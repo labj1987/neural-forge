@@ -16,9 +16,7 @@ pub mod pass_override {
     pub const LOCAL_TONE: u32 = 1 << 2;
     pub const SKIN_STRUCTURE: u32 = 1 << 3;
     pub const STYLE: u32 = 1 << 4;
-    pub const PRESET: u32 = 1 << 5;
     pub const AUTO_MASK: u32 = 1 << 6;
-    pub const SHARPNESS: u32 = 1 << 7;
 }
 
 /// Where the white point comes from: the slider, or the calibration grid measured off

@@ -756,11 +756,9 @@ impl FrameResources {
                 abi::ngx_set_ptr(params, name("DLSSNR.Output").as_ptr(), std::ptr::from_mut(&mut output).cast());
                 abi::ngx_set_f32(params, name("DLSSNR.MVecScaleX").as_ptr(), motion_scale[0]);
                 abi::ngx_set_f32(params, name("DLSSNR.MVecScaleY").as_ptr(), motion_scale[1]);
-                // Only sharpness is written per evaluate. The 310.8 feature does not read it
-                // (docs/DLSSNR_PARAMETERS.md), so it has no effect there. Style, intensity, the local strengths and auto mask
-                // are latched by the model at creation (`ngx::set_create_tuning`); writing them here
-                // does nothing to a running feature and poisons the block for the next create.
-                abi::ngx_set_f32(params, name("Sharpness").as_ptr(), pass.sharpness.clamp(0.0, 1.0));
+                // Style, intensity, the local strengths and auto mask are latched by the model at
+                // creation (`ngx::set_create_tuning`); writing them here does nothing to a running
+                // feature and poisons the block for the next create.
                 let mut mvec = NgxResourceVk::from_image_view(mvec_info, false);
                 abi::ngx_set_ptr(params, name("DLSSNR.MVec").as_ptr(), std::ptr::from_mut(&mut mvec).cast());
                 let mut depth = NgxResourceVk::from_image_view(depth_info, false);
@@ -1281,7 +1279,6 @@ pub struct ChainPass {
     pub handle: abi::NgxHandle,
     /// This feature was just (re)built and has no history.
     pub reset: bool,
-    pub sharpness: f32,
 }
 
 enum TransferKind {

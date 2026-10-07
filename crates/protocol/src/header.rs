@@ -17,9 +17,7 @@ pub struct PassControl {
     pub local_tone_bits: AtomicU32,
     pub local_structure_bits: AtomicU32,
     pub skin_structure_bits: AtomicU32,
-    pub sharpness_bits: AtomicU32,
     pub style: AtomicU32,
-    pub preset: AtomicU32,
     pub auto_mask: AtomicU32,
 }
 
@@ -31,12 +29,10 @@ impl PassControl {
         self.local_structure_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         // -1 follows local structure; it is not a strength of zero.
         self.skin_structure_bits.store((-1.0f32).to_bits(), Ordering::Relaxed);
-        self.sharpness_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
         // Inert until override_mask names them, but initialized to the global defaults
         // so a pass that is switched on later starts from what the rest of the frame is
         // already doing.
         self.style.store(0, Ordering::Relaxed);
-        self.preset.store(0, Ordering::Relaxed);
         self.auto_mask.store(1, Ordering::Relaxed);
     }
 }
@@ -50,9 +46,7 @@ pub struct PassTuning {
     pub local_structure: f32,
     /// -1 follows local structure; it is not a strength of zero.
     pub skin_structure: f32,
-    pub sharpness: f32,
     pub style: u32,
-    pub preset: u32,
     pub auto_mask: u32,
 }
 
@@ -63,25 +57,20 @@ impl Default for PassTuning {
             local_tone: 1.0,
             local_structure: 1.0,
             skin_structure: -1.0,
-            sharpness: 0.0,
             style: 0,
-            preset: 0,
             auto_mask: 1,
         }
     }
 }
 
 impl PassTuning {
-    /// Everything the model latches when its feature is built. Sharpness is absent
-    /// because it is read at evaluate, and so is the only one of these a running
-    /// feature will actually follow.
+    /// Everything the model latches when its feature is built.
     pub fn same_create_params(&self, other: &PassTuning) -> bool {
         self.intensity == other.intensity
             && self.local_tone == other.local_tone
             && self.local_structure == other.local_structure
             && self.skin_structure == other.skin_structure
             && self.style == other.style
-            && self.preset == other.preset
             && self.auto_mask == other.auto_mask
     }
 }
@@ -133,14 +122,12 @@ pub struct ShmHeader {
     pub enabled: AtomicU32,
     pub passes: AtomicU32,
     pub unlock_passes: AtomicU32,
-    pub preset: AtomicU32,
     pub style: AtomicU32,
     pub auto_mask: AtomicU32,
     pub intensity_bits: AtomicU32,
     pub local_tone_bits: AtomicU32,
     pub local_structure_bits: AtomicU32,
     pub skin_structure_bits: AtomicU32,
-    pub sharpness_bits: AtomicU32,
 
     // --- the composition ------------------------------------------------------------
     /// How much of the model's edit reaches the frame, and how much of it is allowed to
@@ -387,41 +374,41 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2024, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1776, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
-    std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 88,
+    std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 80,
     "layout changed -- bump SHM_VERSION"
 );
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_state) == 176, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 780, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, mvec_enabled) == 1860, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1932, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_state) == 168, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 772, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, mvec_enabled) == 1612, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1684, "layout changed -- bump SHM_VERSION");
 // v3's second slot, appended after everything else -- same reasoning as `pass`'s own
 // comment above about why a new field belongs at the end, not inserted higher up.
-const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1952, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1972, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1980, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1984, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1704, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1724, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1732, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1736, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(
-    std::mem::offset_of!(ShmHeader, layer_capture_gpu_ms_bits) == 1988,
+    std::mem::offset_of!(ShmHeader, layer_capture_gpu_ms_bits) == 1740,
     "layout changed -- bump SHM_VERSION"
 );
 const _: () = assert!(
-    std::mem::offset_of!(ShmHeader, layer_compose_gpu_ms_bits) == 1992,
+    std::mem::offset_of!(ShmHeader, layer_compose_gpu_ms_bits) == 1744,
     "layout changed -- bump SHM_VERSION"
 );
-const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1996, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 2012, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_busy_us) == 2016, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 2020, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::size_of::<PassControl>() == 36, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1748, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 1764, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_busy_us) == 1768, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 1772, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<PassControl>() == 28, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
 const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_of(4));
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_reason) == 260, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 456, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 652, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_reason) == 252, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 448, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 644, "layout changed -- bump SHM_VERSION");
 
 impl ShmHeader {
     /// Resets every field to the defaults a freshly created mapping should hold. Takes
@@ -444,14 +431,12 @@ impl ShmHeader {
         self.enabled.store(1, Ordering::Relaxed);
         self.passes.store(1, Ordering::Relaxed);
         self.unlock_passes.store(0, Ordering::Relaxed);
-        self.preset.store(0, Ordering::Relaxed);
         self.style.store(0, Ordering::Relaxed);
         self.auto_mask.store(1, Ordering::Relaxed);
         self.intensity_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.local_tone_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.local_structure_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.skin_structure_bits.store((-1.0f32).to_bits(), Ordering::Relaxed);
-        self.sharpness_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
 
         self.transfer_strength_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.colour_strength_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
@@ -633,7 +618,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 42] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 40] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -642,12 +627,10 @@ impl ShmHeader {
             ("toggle_key", false, self.toggle_key.load(Ordering::Relaxed)),
             ("enabled", false, self.enabled.load(Ordering::Relaxed)),
             ("style", false, self.style.load(Ordering::Relaxed)),
-            ("preset", false, self.preset.load(Ordering::Relaxed)),
             ("intensity", true, self.intensity_bits.load(Ordering::Relaxed)),
             ("local_tone", true, self.local_tone_bits.load(Ordering::Relaxed)),
             ("local_structure", true, self.local_structure_bits.load(Ordering::Relaxed)),
             ("skin_structure", true, self.skin_structure_bits.load(Ordering::Relaxed)),
-            ("sharpness", true, self.sharpness_bits.load(Ordering::Relaxed)),
             ("auto_mask", false, self.auto_mask.load(Ordering::Relaxed)),
             ("passes", false, self.passes.load(Ordering::Relaxed)),
             ("mvec_enabled", false, self.mvec_enabled.load(Ordering::Relaxed)),
@@ -695,12 +678,10 @@ impl ShmHeader {
             "toggle_key" => &self.toggle_key,
             "enabled" => &self.enabled,
             "style" => &self.style,
-            "preset" => &self.preset,
             "intensity" => &self.intensity_bits,
             "local_tone" => &self.local_tone_bits,
             "local_structure" => &self.local_structure_bits,
             "skin_structure" => &self.skin_structure_bits,
-            "sharpness" => &self.sharpness_bits,
             "auto_mask" => &self.auto_mask,
             "passes" => &self.passes,
             "mvec_enabled" => &self.mvec_enabled,
@@ -787,9 +768,7 @@ impl ShmHeader {
             local_tone: f32::from_bits(self.local_tone_bits.load(Ordering::Relaxed)),
             local_structure: f32::from_bits(self.local_structure_bits.load(Ordering::Relaxed)),
             skin_structure: f32::from_bits(self.skin_structure_bits.load(Ordering::Relaxed)),
-            sharpness: f32::from_bits(self.sharpness_bits.load(Ordering::Relaxed)),
             style: self.style.load(Ordering::Relaxed),
-            preset: self.preset.load(Ordering::Relaxed),
             auto_mask: self.auto_mask.load(Ordering::Relaxed),
         };
 
@@ -811,14 +790,8 @@ impl ShmHeader {
         if mask & SKIN_STRUCTURE != 0 {
             t.skin_structure = f32::from_bits(p.skin_structure_bits.load(Ordering::Relaxed));
         }
-        if mask & SHARPNESS != 0 {
-            t.sharpness = f32::from_bits(p.sharpness_bits.load(Ordering::Relaxed));
-        }
         if mask & STYLE != 0 {
             t.style = p.style.load(Ordering::Relaxed);
-        }
-        if mask & PRESET != 0 {
-            t.preset = p.preset.load(Ordering::Relaxed);
         }
         if mask & AUTO_MASK != 0 {
             t.auto_mask = p.auto_mask.load(Ordering::Relaxed);
