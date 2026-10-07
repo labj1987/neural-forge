@@ -97,6 +97,38 @@ use neural_forge_protocol::Slot;
 
 pub(crate) mod hdr;
 pub(crate) mod inline;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod native;
+
+/// The native backend's per-device network ([`native::Loader`]); none exists on 32-bit builds.
+#[cfg(target_arch = "x86_64")]
+pub(crate) type NativeLoader = native::Loader;
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) enum NativeLoader {}
+
+/// Whether model-mode holds on a device with `loader` go to the native backend.
+pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return loader.is_some() && native::backend() == native::Backend::Native;
+    #[cfg(not(target_arch = "x86_64"))]
+    return loader.is_some();
+}
+
+/// A native hold ([`native::run_native_hold`]).
+///
+/// # Safety
+/// As [`run_hold`].
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn run_native(
+    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target,
+    loader: &NativeLoader, jitter: Option<[f32; 2]>, submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
+) -> HoldResult {
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: forwarded.
+    return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, native::Conditioning::default(), submit) };
+    #[cfg(not(target_arch = "x86_64"))]
+    match *loader {}
+}
 
 /// The variable that selects the mode. Read through `neural_forge_protocol::env`.
 pub(crate) const ENV: &str = "NEURAL_FORGE_PREUPSCALE";
@@ -1160,9 +1192,17 @@ pub(crate) struct Scan {
     pub dump_hazard: Option<Hazard>,
     /// The queue family that owns the colour input, when a submitted ownership transfer said so.
     pub colour_owner: Option<u32>,
+    /// The camera jitter DLSS was given for this frame, when its input kernel's parameters say
+    /// ([`LaunchRefs::jitter`]; [`Self::jitter_px`] reads it).
+    pub jitter: Option<u64>,
 }
 
 impl Scan {
+    /// The camera jitter (x, y, render pixels), if known.
+    pub(crate) fn jitter_px(&self) -> Option<[f32; 2]> {
+        self.jitter.map(|v| [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
+    }
+
     /// Whether the colour input can be taken to be in `GENERAL` at this submit: its last committed
     /// barrier left it there, or no barrier on it was seen since it was watched. Never on the
     /// submit that (re)identified the inputs ([`Self::identified_now`]): that one goes to DLSS
@@ -1198,7 +1238,14 @@ pub(crate) struct LaunchRefs {
     pub before_first: Option<Before>,
     /// The same for the first launch naming each image of [`Self::images`].
     pub before_named: Vec<(vk::Image, Before)>,
+    /// The camera jitter the buffer's DLSS Super Resolution input launch was given: word 3 of a 310.x
+    /// `hiluma_engine_input*` kernel's parameters, x in its low and y in its high 32 bits, render
+    /// pixels (docs/NATIVE_BACKEND.md, "Motion vectors"). `None` for other kernels.
+    pub jitter: Option<u64>,
 }
+
+/// The word of a 310.x SR input kernel's parameters that holds the camera jitter ([`LaunchRefs::jitter`]).
+const HILUMA_JITTER_WORD: usize = 3;
 
 /// What a command buffer held at the point a launch was recorded into it: how many of its
 /// barriers on watched images come before the launch ([`Tracker`]'s `pending` list is in recording
@@ -1447,6 +1494,11 @@ impl Tracker {
         };
         if kernel == Some(Kernel::SrInput) {
             probe_params(bytes);
+            let hiluma = self.functions.get(&function).is_some_and(|(_, name)| name.starts_with("hiluma_engine_input"));
+            if let Some(word) = bytes.chunks_exact(8).nth(HILUMA_JITTER_WORD).filter(|_| hiluma) {
+                let value = u64::from_le_bytes(word.try_into().unwrap_or_default());
+                self.launch.entry(command_buffer).or_default().jitter.get_or_insert(value);
+            }
         }
         let mut named: Vec<vk::Image> = Vec::new();
         for word in bytes.chunks_exact(8) {
@@ -2390,6 +2442,7 @@ impl Tracker {
                         hazard,
                         dump_hazard,
                         colour_owner,
+                        jitter: self.launch.get(&cb).and_then(|r| r.jitter),
                     });
                 }
                 if found.is_none() {
@@ -3273,6 +3326,9 @@ pub(crate) struct Resources {
     dump: Option<DumpBuffers>,
     /// The HDR encode and decode (model and roundtrip modes), built on first use.
     hdr: Option<hdr::HdrPass>,
+    /// The native backend's frame resources (`native`), built on its first hold.
+    #[cfg(target_arch = "x86_64")]
+    native: Option<native::NativePass>,
     capture_pending: bool,
     writeback_pending: bool,
 }
@@ -3357,6 +3413,8 @@ impl Resources {
             answer_region,
             dump: None,
             hdr: None,
+            #[cfg(target_arch = "x86_64")]
+            native: None,
             capture_pending: false,
             writeback_pending: false,
         })
@@ -3431,6 +3489,10 @@ impl Resources {
             }
             if let Some(hdr) = &self.hdr {
                 hdr.destroy(device);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(native) = &self.native {
+                native.destroy(device);
             }
         }
     }
@@ -3512,6 +3574,8 @@ impl ExposureSource {
 pub(crate) enum Which {
     /// The capture: carries the moved wait semaphores.
     Capture,
+    /// The native backend's network (`native`), between the capture and the write-back.
+    Native,
     WriteBack,
 }
 
@@ -3552,6 +3616,8 @@ pub(crate) struct HoldResult {
     pub auto_exposure: Option<hdr::AutoState>,
     /// Where the hold's CPU time went (wall time on this thread).
     pub timing: HoldTiming,
+    /// The native backend ran this hold (no helper request; `evaluated` means the network ran).
+    pub native: bool,
 }
 
 impl HoldResult {
@@ -3571,7 +3637,7 @@ impl HoldResult {
     /// Sets [`Self::local_failure`] for a finished hold: in model mode, a miss with no request
     /// started and no answer missing (those are the helper's: `over_budget`, `echoed`).
     pub(crate) fn mark_local(&mut self, mode: Mode) {
-        self.local_failure = mode == Mode::Model && self.miss.is_some() && self.request.is_none() && !self.over_budget && !self.echoed;
+        self.local_failure = mode == Mode::Model && !self.native && self.miss.is_some() && self.request.is_none() && !self.over_budget && !self.echoed;
     }
 }
 
@@ -3645,6 +3711,8 @@ enum DumpPart {
     Exposure(usize),
     /// [`Target::exposure_input`], into the HDR pass's exposure buffer.
     ExposureInput,
+    /// [`Target::mvec`], into the native backend's motion buffer.
+    NativeMvec,
 }
 
 /// One image a dump copies into a readback buffer.
@@ -3663,7 +3731,7 @@ struct DumpRead {
 /// render extent and each 1x1 exposure candidate at its [`EXPOSURE_STRIDE`] slot; for the HDR
 /// encode (`exposure_buffer`), the exposure input. Each readable one in a layout it can be copied
 /// from (see [`aux_copy_layout`]).
-fn capture_reads(target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: Option<vk::Buffer>) -> Vec<DumpRead> {
+fn capture_reads(target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: Option<vk::Buffer>, native_mvec: Option<vk::Buffer>) -> Vec<DumpRead> {
     let full = (target.width, target.height);
     let mut parts = Vec::new();
     if let Some(bufs) = bufs {
@@ -3675,6 +3743,9 @@ fn capture_reads(target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: O
     }
     if let Some(buffer) = exposure_buffer {
         parts.push((DumpPart::ExposureInput, target.exposure_input, buffer, 0, (1, 1)));
+    }
+    if let Some(buffer) = native_mvec {
+        parts.push((DumpPart::NativeMvec, target.mvec, buffer, 0, full));
     }
     parts
         .into_iter()
@@ -3697,7 +3768,9 @@ fn capture_reads(target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: O
 /// # Safety
 /// `res`'s capture command buffer must not be pending; with `hdr`, its colour view is bound to
 /// `target.colour` and, for [`ExposureSource::Auto`], its auto-exposure is built.
-unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>) -> ash::prelude::VkResult<()> {
+unsafe fn record_capture(
+    device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>, native_mvec: Option<vk::Buffer>,
+) -> ash::prelude::VkResult<()> {
     let auto = hdr.is_some() && ExposureSource::of(target) == ExposureSource::Auto;
     let cmd = res.capture_cmd;
     // SAFETY: the pool allows resetting buffers individually; the buffer is not pending.
@@ -3705,7 +3778,7 @@ unsafe fn record_capture(device: &ash::Device, res: &Resources, target: &Target,
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
     }
-    let aux: Vec<DumpRead> = capture_reads(target, dump, hdr.filter(|_| !auto).map(hdr::HdrPass::exposure_buffer));
+    let aux: Vec<DumpRead> = capture_reads(target, dump, hdr.filter(|_| !auto).map(hdr::HdrPass::exposure_buffer), native_mvec);
     let mut to_read: Vec<vk::ImageMemoryBarrier> = aux
         .iter()
         .filter(|r| r.transition)
@@ -3931,7 +4004,7 @@ pub(crate) unsafe fn run_hold(
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     let dump_bufs = if dump { res.dump.as_ref() } else { None };
     // SAFETY: the capture buffer is idle (`wait_idle` above); the colour view was bound above.
-    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass) }.is_err() {
+    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, None) }.is_err() {
         result.miss = Some("recording the capture failed");
         return result;
     }
@@ -3989,7 +4062,7 @@ pub(crate) unsafe fn run_hold(
                 // SAFETY: the capture finished; each buffer holds at least `at + len` bytes (`n`,
                 // `bytes`, `MAX_EXPOSURE * EXPOSURE_STRIDE`).
                 let read = |buf: &HostBuffer, at: usize, len: usize| unsafe { std::slice::from_raw_parts(buf.ptr.add(at), len) }.to_vec();
-                let reads = res.dump.as_ref().map(|bufs| capture_reads(target, Some(bufs), None)).unwrap_or_default();
+                let reads = res.dump.as_ref().map(|bufs| capture_reads(target, Some(bufs), None, None)).unwrap_or_default();
                 let was_read = |part: DumpPart| reads.iter().any(|r| r.part == part);
                 result.dump = Some(DumpFrame {
                     width: target.width,
@@ -4521,6 +4594,8 @@ pub(crate) struct Session {
     /// The identification whose game exposure read implausibly high ([`Self::check_exposure`]): its
     /// holds measure the exposure from the frame instead.
     exposure_untrusted: Option<u64>,
+    /// The native backend's network on this device, when it was created for it.
+    pub(crate) native: Option<NativeLoader>,
     /// Consecutive frames still to dump after the one just taken ([`dump_frames`]).
     burst: u32,
 }
@@ -4729,7 +4804,7 @@ impl Session {
             self.last_hold = Some(now);
             self.last_dlss = Some(now);
         }
-        if result.request.is_some() {
+        if result.request.is_some() || (result.native && result.evaluated) {
             self.engaged = true;
             self.own_request = result.request;
             self.local_misses = 0;

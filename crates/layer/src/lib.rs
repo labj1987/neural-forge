@@ -332,6 +332,43 @@ pub(crate) struct SideQueue {
     pub app_family: u32,
 }
 
+/// Devices created with the native backend's additions (`preupscale::native`): its extensions and
+/// features, and one more queue in the game's graphics family for the network's loading. Taken once by
+/// `NeuralForgeDeviceInfo::new`.
+#[cfg(target_arch = "x86_64")]
+static NATIVE_DEVICES: Mutex<Option<HashMap<vk::Device, preupscale::native::Setup>>> = Mutex::new(None);
+
+/// Checks and clears the native backend's setup for `device`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn take_native(device: vk::Device) -> Option<preupscale::native::Setup> {
+    NATIVE_DEVICES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
+}
+
+/// `infos` with one more queue in the first family that has graphics and compute (the game's, where
+/// DLSS runs): the family and the new queue's index, the extended infos, and the priorities they point
+/// into. `None` when that family's request has flags or no queue to spare.
+#[cfg(target_arch = "x86_64")]
+fn native_queue_request(
+    instance: &ash::Instance, physical_device: vk::PhysicalDevice, infos: &[vk::DeviceQueueCreateInfo],
+) -> Option<(u32, u32, Vec<vk::DeviceQueueCreateInfo>, Box<Vec<f32>>)> {
+    // SAFETY: `physical_device` belongs to `instance`.
+    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+    let at = infos
+        .iter()
+        .position(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?;
+    let q = infos[at];
+    if !q.flags.is_empty() || q.queue_count >= families[q.queue_family_index as usize].queue_count || q.p_queue_priorities.is_null() {
+        return None;
+    }
+    // SAFETY: `pQueuePriorities` holds `queueCount` floats.
+    let mut priorities = Box::new(unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec());
+    priorities.push(1.0);
+    let mut extended = infos.to_vec();
+    extended[at].queue_count = q.queue_count + 1;
+    extended[at].p_queue_priorities = priorities.as_ptr();
+    Some((q.queue_family_index, q.queue_count, extended, priorities))
+}
+
 /// Checks and clears the side queue [`NeuralForgeInstanceHooks::create_device`] added to `device`.
 pub(crate) fn take_side_queue(device: vk::Device) -> Option<SideQueue> {
     SIDE_QUEUES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
@@ -474,7 +511,55 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         let side = (nvidia && preupscale::active() && preupscale::inline::enabled())
             .then(|| side_queue_request(&instance.instance, physical_device, create_info))
             .flatten();
+        // The native backend: the network's extensions and features and a loading queue of its own.
+        // A request with them that the driver refuses is made again without (frames then go to DLSS
+        // untouched in native mode, and the log says why).
+        #[cfg(target_arch = "x86_64")]
+        let native = nvidia
+            && preupscale::active()
+            && preupscale::native::backend() == preupscale::native::Backend::Native
+            && preupscale::native::model_present();
         let create = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| -> vk::Result {
+            #[cfg(target_arch = "x86_64")]
+            if native {
+                let gipa = layer_device_link.pfnNextGetInstanceProcAddr;
+                let base: Vec<vk::DeviceQueueCreateInfo> = match &side {
+                    Some(sq) => sq.infos.clone(),
+                    // SAFETY: `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures (checked non-null).
+                    None if !info.p_queue_create_infos.is_null() => unsafe { std::slice::from_raw_parts(info.p_queue_create_infos, info.queue_create_info_count as usize) }.to_vec(),
+                    None => Vec::new(),
+                };
+                match native_queue_request(&instance.instance, physical_device, &base) {
+                    None => log!("[native] no queue to spare in the game's graphics family for the network; native backend off on this device"),
+                    Some((family, index, queues, _priorities)) => {
+                        let mut with = *info;
+                        with.queue_create_info_count = queues.len() as u32;
+                        with.p_queue_create_infos = queues.as_ptr();
+                        // SAFETY: the next layer's gipa for this instance; `with` and everything it
+                        // points to outlive the extension, which outlives the call.
+                        match unsafe { neural_forge_native::device_extend(gipa, instance.instance.handle(), physical_device, &with) } {
+                            Err(why) => log!("[native] the device cannot run the network: {why}; native backend off on this device"),
+                            Ok(extension) => {
+                                // SAFETY: the extended request; `p_device` is the framework's out-parameter.
+                                let result = unsafe { next_create_device(physical_device, &extension.info, allocator_ptr, p_device.as_mut_ptr()) };
+                                drop(extension);
+                                if result == vk::Result::SUCCESS {
+                                    // SAFETY: written by the successful call.
+                                    let device = unsafe { p_device.assume_init() };
+                                    if let Some(sq) = &side {
+                                        SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.queue);
+                                    }
+                                    let setup = preupscale::native::Setup { gipa, instance: instance.instance.handle(), physical: physical_device, family, index };
+                                    NATIVE_DEVICES.lock().unwrap().get_or_insert_default().insert(device, setup);
+                                    log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
+                                    return result;
+                                }
+                                log!("[native] creating the device with the network's additions was refused ({result:?}); creating it without");
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(sq) = &side {
                 let mut with = *info;
                 with.queue_create_info_count = sq.infos.len() as u32;
@@ -522,7 +607,11 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 })
             });
         if !supported {
-            if side.is_none() {
+            #[cfg(target_arch = "x86_64")]
+            let unhandled = side.is_none() && !native;
+            #[cfg(not(target_arch = "x86_64"))]
+            let unhandled = side.is_none();
+            if unhandled {
                 return LayerResult::Unhandled;
             }
             return LayerResult::Handled(create(create_info, p_device).result());

@@ -13,7 +13,7 @@ pub mod frame;
 #[cfg(windows)]
 pub mod guard;
 pub mod hdr;
-pub mod history;
+pub use neural_forge_protocol::history;
 pub mod idle;
 pub mod images;
 pub mod logging;

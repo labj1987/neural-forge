@@ -223,16 +223,16 @@ pub(crate) fn exposure_ok(e: f32) -> bool {
 }
 
 /// A device-local RGBA16F storage image of the layer's own, with its view.
-struct OwnImage {
-    image: vk::Image,
+pub(super) struct OwnImage {
+    pub(super) image: vk::Image,
     memory: vk::DeviceMemory,
-    view: vk::ImageView,
+    pub(super) view: vk::ImageView,
 }
 
 impl OwnImage {
     /// # Safety
     /// `device` is live.
-    unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32, usage: vk::ImageUsageFlags) -> Option<Self> {
+    pub(super) unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32, usage: vk::ImageUsageFlags) -> Option<Self> {
         let info = vk::ImageCreateInfo::builder()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R16G16B16A16_SFLOAT)
@@ -281,7 +281,7 @@ impl OwnImage {
 
     /// # Safety
     /// Nothing submitted may still use it.
-    unsafe fn destroy(&self, device: &ash::Device) {
+    pub(super) unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded.
         unsafe {
             device.destroy_image_view(self.view, None);
@@ -611,6 +611,11 @@ impl HdrPass {
         Some(pass)
     }
 
+    /// The encoded picture's view (padded extent, `GENERAL` after the capture's opening barrier).
+    pub(crate) fn encoded_view(&self) -> vk::ImageView {
+        self.encoded.view
+    }
+
     /// The exposure buffer (the capture copies the texel to offset 0).
     pub(crate) fn exposure_buffer(&self) -> vk::Buffer {
         self.exposure.buffer
@@ -848,7 +853,7 @@ fn to_general(image: vk::Image, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier 
 ///
 /// # Safety
 /// `device` is live; `layout` matches the shader's interface.
-unsafe fn compute_pipeline(device: &ash::Device, layout: vk::PipelineLayout, spv: &[u8]) -> Option<vk::Pipeline> {
+pub(super) unsafe fn compute_pipeline(device: &ash::Device, layout: vk::PipelineLayout, spv: &[u8]) -> Option<vk::Pipeline> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).ok()?;
     // SAFETY: valid SPIR-V, compiled by `glslangValidator -V` and checked by spirv-val.
     let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&code), None) }.ok()?;

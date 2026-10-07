@@ -44,6 +44,7 @@ mod header;
 #[cfg(unix)]
 pub mod mapping;
 pub mod env;
+pub mod history;
 mod path;
 pub mod persist;
 #[cfg(unix)]

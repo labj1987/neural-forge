@@ -255,7 +255,7 @@ fn main() {
     // Slot 0 only: slot 1 always evaluates with empty motion (see `process_request`).
     let mut motion = MotionState::default();
     // Per slot, like `frame_resources`: when each slot last reached the model.
-    let mut history_gaps: [history::HistoryGap; 2] = Default::default();
+    let mut history_gaps: [history::HistoryGap<FormatClass>; 2] = Default::default();
     // Resized (not reallocated fresh every frame) to whatever the current frame's
     // real byte count is -- never the full `MAX_FRAME` reservation, which is sized for
     // the protocol's absolute ceiling (7680x4320 float16), not a typical frame.
@@ -379,7 +379,7 @@ fn process_request(
     frame_resources: &mut Option<frame::FrameResources>,
     flow_queue: Option<&optical_flow::FlowQueue>,
     motion: &mut MotionState,
-    history_gap: &mut history::HistoryGap,
+    history_gap: &mut history::HistoryGap<FormatClass>,
     slot: Slot,
     seq_req: u32,
     helper_delay: Duration,

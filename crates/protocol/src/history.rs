@@ -11,20 +11,28 @@
 //! reset, or a pixel whose previous position the model never saw all get blend weight zero.
 //! See `docs/OPENDLSS_REVIEW.md`, rows "has-history flag" and "reset on idle".
 //!
-//! Pure bookkeeping with no Win32 or Vulkan calls, so it builds and tests natively.
+//! Pure bookkeeping with no Win32 or Vulkan calls, shared by the helper (NGX's history) and the
+//! layer's native backend (its own history images). `F` is what counts as a change of input format
+//! for the slot: the helper's 8-bit/HDR class, the layer's extent and identification.
 
 use std::time::{Duration, Instant};
 
 /// Per-slot record of when the model last evaluated, and whether a request since then went
 /// without an evaluate.
-#[derive(Debug, Default)]
-pub struct HistoryGap {
+#[derive(Debug)]
+pub struct HistoryGap<F = ()> {
     last: Option<Instant>,
     broken: bool,
-    /// The proxy format class of the latest request on this slot, and whether it changed
-    /// since the last evaluate.
-    format: Option<crate::hdr::FormatClass>,
+    /// The input format of the latest request on this slot, and whether it changed since the
+    /// last evaluate.
+    format: Option<F>,
     format_changed: bool,
+}
+
+impl<F> Default for HistoryGap<F> {
+    fn default() -> Self {
+        Self { last: None, broken: false, format: None, format_changed: false }
+    }
 }
 
 /// Why a history reset was asked for, for the log line.
@@ -36,12 +44,12 @@ pub enum Stale {
     /// No evaluate for longer than [`HistoryGap::MAX_GAP`] (the layer stopped sending: pass
     /// through, warm-up, a long hitch).
     Idle(Duration),
-    /// The slot's proxy switched between 8-bit and RGBA16F: the model's history (and the flow's
-    /// reference frame) describe a picture in the other encoding.
+    /// The slot's input format changed (the helper: between 8-bit and RGBA16F; the layer: another
+    /// extent or another identification of DLSS's inputs): the history describes another picture.
     FormatChanged,
 }
 
-impl HistoryGap {
+impl<F: Copy + PartialEq> HistoryGap<F> {
     /// The longest pause after which the previous answer still counts as the last frame. At
     /// 4K with the model on every 2nd frame the gap is about 100 ms, so this leaves a wide
     /// margin for ordinary frame-time spikes.
@@ -55,7 +63,7 @@ impl HistoryGap {
     /// Every request on this slot, with its proxy's format class (before deciding whether it
     /// reaches the model). A change from the previous request's class makes the next
     /// [`Self::begin`] report [`Stale::FormatChanged`].
-    pub fn note_format(&mut self, class: crate::hdr::FormatClass) {
+    pub fn note_format(&mut self, class: F) {
         if self.format.is_some_and(|f| f != class) {
             self.format_changed = true;
         }
@@ -86,15 +94,21 @@ impl HistoryGap {
 mod tests {
     use super::*;
 
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum FormatClass {
+        Sdr8,
+        Hdr16,
+    }
+
     #[test]
     fn first_evaluate_is_not_stale() {
-        let mut g = HistoryGap::default();
+        let mut g: HistoryGap = HistoryGap::default();
         assert_eq!(g.begin(Instant::now()), None);
     }
 
     #[test]
     fn steady_frames_keep_history() {
-        let mut g = HistoryGap::default();
+        let mut g: HistoryGap = HistoryGap::default();
         let t0 = Instant::now();
         g.begin(t0);
         for i in 1..20u64 {
@@ -105,7 +119,7 @@ mod tests {
 
     #[test]
     fn skipped_request_resets_once() {
-        let mut g = HistoryGap::default();
+        let mut g: HistoryGap = HistoryGap::default();
         let t0 = Instant::now();
         g.begin(t0);
         g.skipped();
@@ -117,33 +131,33 @@ mod tests {
     #[test]
     fn skipped_before_first_evaluate_is_not_stale() {
         // Requests while the model was still building: the new feature resets on its own.
-        let mut g = HistoryGap::default();
+        let mut g: HistoryGap = HistoryGap::default();
         g.skipped();
         assert_eq!(g.begin(Instant::now()), None);
     }
 
     #[test]
     fn long_pause_resets() {
-        let mut g = HistoryGap::default();
+        let mut g: HistoryGap = HistoryGap::default();
         let t0 = Instant::now();
         g.begin(t0);
-        let later = t0 + HistoryGap::MAX_GAP + Duration::from_millis(1);
+        let later = t0 + HistoryGap::<()>::MAX_GAP + Duration::from_millis(1);
         assert!(matches!(g.begin(later), Some(Stale::Idle(_))));
         assert_eq!(g.begin(later + Duration::from_millis(16)), None);
     }
 
     #[test]
     fn pause_at_the_limit_keeps_history() {
-        let mut g = HistoryGap::default();
+        let mut g: HistoryGap = HistoryGap::default();
         let t0 = Instant::now();
         g.begin(t0);
-        assert_eq!(g.begin(t0 + HistoryGap::MAX_GAP), None);
+        assert_eq!(g.begin(t0 + HistoryGap::<()>::MAX_GAP), None);
     }
 
     #[test]
     fn format_change_resets_once() {
-        use crate::hdr::FormatClass::{Hdr16, Sdr8};
-        let mut g = HistoryGap::default();
+        use FormatClass::{Hdr16, Sdr8};
+        let mut g = HistoryGap::<FormatClass>::default();
         let t0 = Instant::now();
         g.note_format(Sdr8);
         g.begin(t0);
@@ -161,8 +175,8 @@ mod tests {
 
     #[test]
     fn format_seen_before_first_evaluate_is_not_stale() {
-        use crate::hdr::FormatClass::{Hdr16, Sdr8};
-        let mut g = HistoryGap::default();
+        use FormatClass::{Hdr16, Sdr8};
+        let mut g = HistoryGap::<FormatClass>::default();
         g.note_format(Sdr8);
         g.note_format(Hdr16);
         assert_eq!(g.begin(Instant::now()), None, "a new feature resets on its own");

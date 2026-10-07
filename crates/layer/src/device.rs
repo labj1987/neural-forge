@@ -607,6 +607,9 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                 Err(error) => crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources", error),
             }
         }
+        // The native network: its loading thread is joined and its own queue waited for; its frame
+        // work, if any ran, was drained with the device above.
+        drop(state.preupscale.native.take());
         // SAFETY: a series never leaves GPU work pending once a present returns (it waits on
         // its own fences), so no idle wait is needed; this also finishes writing its files.
         unsafe { state.series.destroy(&device); }
@@ -918,6 +921,12 @@ impl NeuralForgeDeviceInfo {
             // Cannot ask, so do not gate: same fail-open stance as everywhere else.
             None => true,
         };
+        #[cfg(target_arch = "x86_64")]
+        if let Some(setup) = crate::take_native(handle) {
+            if preupscale.is_some() && nvidia {
+                state.lock().unwrap().preupscale.native = Some(crate::preupscale::native::Loader::start(handle, setup));
+            }
+        }
         let side = crate::take_side_queue(handle);
         let inline = match (&preupscale, side, get_queue, &instance) {
             (Some(_), Some(crate::SideQueue { family, index, app_family }), Some(get_queue), Some(instance)) if nvidia => {
@@ -1117,20 +1126,22 @@ impl NeuralForgeDeviceInfo {
         if !shm.open() {
             return None;
         }
-        let dump = crate::preupscale::gate(mode, session, shm, scan.depth_layout.is_some() && scan.mvec_layout.is_some())?;
+        // The native backend runs the network itself: no helper to ask, no slot 0 to share.
+        let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
+        let dump = if native { false } else { crate::preupscale::gate(mode, session, shm, scan.depth_layout.is_some() && scan.mvec_layout.is_some())? };
         // Slot 0 must be free: no request (the post path's, or an earlier hold's that ran over
         // budget) still with the helper, no zero-copy capture still writing its proxy region, and
         // in model mode no compose still reading its answer region.
-        if shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
+        if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
             // Booked as a late answer only when the request is this path's own; the post path's
             // says nothing about this path (and must not engage the device).
             session.note_busy_slot(shm, mode, (colour.width, colour.height));
             return None;
         }
-        if capture::direct_slot_busy(direct_capture, Slot::Primary) {
+        if !native && capture::direct_slot_busy(direct_capture, Slot::Primary) {
             return None;
         }
-        if mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(&self.device)) {
+        if !native && mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(&self.device)) {
             return None;
         }
         // Failures from here on repeat every frame in a game where they happen at all: in model
@@ -1188,6 +1199,8 @@ impl NeuralForgeDeviceInfo {
             paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
             identification: scan.identification,
         };
+        let loader = session.native.as_ref().filter(|_| native);
+        let jitter = scan.jitter_px();
         let res = session.res.as_mut()?;
         let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;
         let mut accepted: Vec<vk::CommandBuffer> = Vec::new();
@@ -1200,11 +1213,17 @@ impl NeuralForgeDeviceInfo {
             // SAFETY: `res` was built on this device for this extent; the colour input is live and
             // in GENERAL; `layer_submit` submits on the application's queue, which it holds for the
             // duration of its call.
-            let hold = unsafe {
-                crate::preupscale::run_hold(
-                    &self.device, instance, self.physical_device, res, shm, &target, mode, dump, scan.evaluation,
-                    crate::preupscale::ANSWER_BUDGET, &mut layer_submit,
-                )
+            let hold = match loader {
+                // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
+                Some(loader) => unsafe {
+                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, &mut layer_submit)
+                },
+                None => unsafe {
+                    crate::preupscale::run_hold(
+                        &self.device, instance, self.physical_device, res, shm, &target, mode, dump, scan.evaluation,
+                        crate::preupscale::ANSWER_BUDGET, &mut layer_submit,
+                    )
+                },
             };
             let consumed = hold.waits_consumed;
             held = Some((hold, started.elapsed()));
