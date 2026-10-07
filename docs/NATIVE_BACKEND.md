@@ -526,6 +526,9 @@ Not built, as the handoff asks.
 | 2026-10-07 | The native composite's `.spv` not rebuilt after an edit | The first committed layer had the old binding; `check_shaders.py` caught it. Rebuilt. |
 | 2026-10-07 | The layer's GPU tests in parallel on the test machine | 10 fail on main and 16 on the branch with `ERROR_OUT_OF_DEVICE_MEMORY` or "failed to create the test's own target image"; the 6 extra pass one at a time (`--test-threads=1`). A machine limit, not a regression. |
 | 2026-10-07 | In-game captures at fixed seconds after launch, native and helper | The moments were seconds apart (loading time varies): not comparable pixel by pixel. |
+| 2026-10-07 | Driver 615.71.09 -> 615.78.08 (Alex's request, installed with GreenLight's install script, rebooted) between the first and the second Phase 3 pass | Same capabilities (32-bit still has no `VK_NV_cuda_kernel_launch`); the rig test still bit-exact; network time unchanged (1485x836 5.505 ms, 2228x1253 10.672, 2560x1440 13.349, 3840x2160 30.018; chaining off 5.947, 10.939, 13.731, 30.118). Phase 3 runs again in full on 615.78.08; the 615.71.09 pass of 1440p without frame generation is kept as a reference. |
+| 2026-10-07 | `NEURAL_FORGE_CAPTURE_AT=5:20000` in the first Phase 3 runs | Nothing captured: the trigger never fired. Resumes are now logged when it is set; the captures move to dedicated runs. |
+| 2026-10-07 | Stale motion vectors? (DLSS's buffer synchronizes them before its launch) | Consecutive dumps 393-396: inconclusive, the scene barely moves (median 0.33 px). Open. |
 
 ## Checklist
 
