@@ -6,6 +6,24 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
+  `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
+- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
+  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
+  earlier needs proof that the presentation engine's wait on them has completed, which core
+  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
+- Deferred (layer): the unit-test target still carries clippy lints (mostly
+  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
+
+## 2.0.9 — 2026-10-07
+
+No change to the picture or the frame rate. The layer and helper in this release held GTA V
+Enhanced before the upscaler at 48.5 holds/s against 2.0.8's 48.7 (same benchmark, frame
+generation on, 2026-10-06). It ships the diagnostics and tools from the Neural Rendering parameter
+audit, the DLSS kernel catalogue and the preset comparison, with their documents:
+docs/DLSSNR_PARAMETERS.md, docs/DLSS_KERNEL_CATALOGUE.md, docs/DLSSNR_EXPERIMENTS.md and
+docs/RE_TOOLKIT.md, and the agent rules for NVIDIA's binaries in CLAUDE.md/AGENTS.md.
+
 - Tools: `scripts/preset-sweep.py` compares Feature 18 presets through the helper with no game running
   (channel lease, helper restart per trial, settings restored and verified). `neural-forge-cli shmctl
   status` shows `pass0_override_mask` and `pass0_effective_preset`. `trigger_helper_roundtrip` writes a
@@ -25,14 +43,6 @@ first shipped them; their phase is kept as a subheading.
 - Helper: `abi::feature_flags` now has the public SDK's bit values. It used `0x4 | 0x8` for
   DoSharpening | AutoExposure, which the SDK reads as MVJittered | DepthInverted. No visible effect:
   the feature does not read `Feature_Flags`, and four alternating runs gave byte-identical answers.
-- Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
-  `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
-- Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
-  `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
-  earlier needs proof that the presentation engine's wait on them has completed, which core
-  Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
-- Deferred (layer): the unit-test target still carries clippy lints (mostly
-  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
 
 ## 2.0.8 — 2026-10-06
 
