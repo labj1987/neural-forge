@@ -59,7 +59,10 @@ disagree, the more recent measurement wins.
 - [RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md): building, deploying to a test machine, the
   unattended GTA benchmark, the pan reproducer and agreement metric, the diagnostic modes and
   probe, driving the helper without a game, reading the logs and `shmctl status`, validation
-  layers, checking the picture by eye, and the release checklist.
+  layers, checking the picture by eye, the release checklist, and the reverse-engineering toolkit
+  installed on the test machine.
+- [RE_TOOLKIT.md](RE_TOOLKIT.md): agent-driven reverse-engineering tools surveyed (what each attaches
+  to, headless or GUI, licence) and why each was or was not installed.
 
 ## For contributors and agents
 
