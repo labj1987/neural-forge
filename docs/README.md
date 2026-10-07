@@ -37,6 +37,9 @@ disagree, the more recent measurement wins.
   run Feature 18.
 - [OPENDLSS_REVIEW.md](OPENDLSS_REVIEW.md): Neural Forge compared stage by stage with OpenDLSS-NR's
   documented pipeline, the history reset rule, and the GTA script-mod finding.
+- [DLSSNR_PARAMETERS.md](DLSSNR_PARAMETERS.md): which NGX parameters the Neural Rendering feature
+  reads, the five the helper never sets, the helper writes nothing reads, and when the history
+  reset is set, against the public SDK and the open-source consumers.
 - [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md): what was and was not carried over from DLSS5VKLayer
   0.3.1-1.
 - [PHASE1.md](PHASE1.md): the namespace contract, installation contract and target ownership rules
