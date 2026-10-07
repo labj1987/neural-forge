@@ -6,6 +6,14 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Helper: logs once per run each NGX parameter the DLLs read from its parameter object, with its
+  type and whether the helper set it (`[params] read <key> as <type>: set|unset`). The model's
+  answers are unchanged. What it showed on 310.8 is in docs/DLSSNR_PARAMETERS.md: 41 keys read, 5
+  of them optional resources the helper never sets, and 18 helper writes never read, among them
+  `Sharpness` (so the per-pass sharpness setting does nothing on this DLL).
+- Helper: `abi::feature_flags` now has the public SDK's bit values. It used `0x4 | 0x8` for
+  DoSharpening | AutoExposure, which the SDK reads as MVJittered | DepthInverted. No visible effect:
+  the feature does not read `Feature_Flags`, and four alternating runs gave byte-identical answers.
 - Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
   `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,

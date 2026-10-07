@@ -756,8 +756,8 @@ impl FrameResources {
                 abi::ngx_set_ptr(params, name("DLSSNR.Output").as_ptr(), std::ptr::from_mut(&mut output).cast());
                 abi::ngx_set_f32(params, name("DLSSNR.MVecScaleX").as_ptr(), motion_scale[0]);
                 abi::ngx_set_f32(params, name("DLSSNR.MVecScaleY").as_ptr(), motion_scale[1]);
-                // Only sharpness is written per evaluate: DoSharpening is enabled at create and this is
-                // the per-frame amount it applies. Style, intensity, the local strengths and auto mask
+                // Only sharpness is written per evaluate. The 310.8 feature does not read it
+                // (docs/DLSSNR_PARAMETERS.md), so it has no effect there. Style, intensity, the local strengths and auto mask
                 // are latched by the model at creation (`ngx::set_create_tuning`); writing them here
                 // does nothing to a running feature and poisons the block for the next create.
                 abi::ngx_set_f32(params, name("Sharpness").as_ptr(), pass.sharpness.clamp(0.0, 1.0));

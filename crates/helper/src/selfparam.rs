@@ -131,12 +131,26 @@ unsafe fn set(this: *mut c_void, name: *const i8, value: Value) {
     unsafe { store(this) }.insert(k, value);
 }
 
+/// Logs, once per key for the helper's lifetime, each name the DLLs read from this object, its
+/// type, and whether the helper had set it. An unset key means the feature falls back to its own
+/// default. This is how docs/DLSSNR_PARAMETERS.md knows which parameters the feature asks for.
+fn note_read(k: &str, ty: &str, set: bool) {
+    static SEEN: Mutex<Option<std::collections::HashSet<String>>> = Mutex::new(None);
+    let mut seen = SEEN.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let seen = seen.get_or_insert_with(Default::default);
+    if !seen.contains(k) {
+        seen.insert(k.to_string());
+        crate::log!("[params] read {k} as {ty}: {}", if set { "set" } else { "unset" });
+    }
+}
+
 /// # Safety
 /// `this`/`name` as for [`store`]/[`key`]; `out` valid to write a `T` through.
 unsafe fn get<T: FromValue>(this: *mut c_void, name: *const i8, out: *mut T) -> NgxResult {
     // SAFETY: forwarded.
     let k = unsafe { key(name) };
     let stored = unsafe { store(this) }.get(&k).copied();
+    note_read(&k, std::any::type_name::<T>(), stored.is_some());
     match stored {
         None => abi::result::FAIL_INVALID_PARAMETER,
         Some(v) => match T::from_value(v) {

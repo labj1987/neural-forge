@@ -697,9 +697,9 @@ fn create_feature_at(s: &mut NgxSnippet, device: &ash::Device, queue: vk::Queue,
                 abi::ngx_set_u32(params, name("DLSSNR.Upscaling").as_ptr(), 0);
                 abi::ngx_set_f32(params, name("DLSSNR.Scale").as_ptr(), 1.0);
                 abi::ngx_set_f32(params, name("DLSSNR.ScalingRatio").as_ptr(), 1.0);
-                // Balanced (`NVSDK_NGX_PerfQuality_Value_Balanced` = 3), under both the bare and the
-                // prefixed key: the model reads the bare one, and setting only the prefixed one
-                // left it at MaxPerf.
+                // 3 is `UltraPerformance` in the public enum (Balanced is 1). The 310.8 feature reads
+                // neither key, nor most others in this block: docs/DLSSNR_PARAMETERS.md lists what
+                // it does read (the `[params] read` log).
                 abi::ngx_set_u32(params, name("PerfQualityValue").as_ptr(), 3);
                 abi::ngx_set_u32(params, name("NVSDK_NGX_Parameter_PerfQualityValue").as_ptr(), 3);
                 // The rest of this block: real parameter names confirmed present in

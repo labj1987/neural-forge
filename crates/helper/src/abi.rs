@@ -79,14 +79,15 @@ pub const FEATURE_DLSSNR: i32 = 18;
 
 pub const SIGNED_SNIPPET_APPLICATION_ID: u64 = 0x0876_232C;
 
+/// `NVSDK_NGX_DLSS_Feature_Flags`, bit for bit as the public NGX SDK's `nvsdk_ngx_defs.h` has them
+/// (NVIDIA/DLSS v310.9.1).
 pub mod feature_flags {
-    pub const IS_HDR: u32 = 0x1;
-    pub const DEPTH_INVERTED: u32 = 0x2;
-    pub const DO_SHARPENING: u32 = 0x4;
-    pub const AUTO_EXPOSURE: u32 = 0x8;
-    pub const MV_LOW_RES: u32 = 0x10;
-    pub const MV_JITTERED: u32 = 0x20;
-    pub const RESET_RENDER_PROFILE: u32 = 0x100;
+    pub const IS_HDR: u32 = 1 << 0;
+    pub const MV_LOW_RES: u32 = 1 << 1;
+    pub const MV_JITTERED: u32 = 1 << 2;
+    pub const DEPTH_INVERTED: u32 = 1 << 3;
+    pub const DO_SHARPENING: u32 = 1 << 5;
+    pub const AUTO_EXPOSURE: u32 = 1 << 6;
 }
 
 /// Opaque; NGX hands one of these back from `CreateFeature` and expects it back
