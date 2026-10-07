@@ -36,6 +36,8 @@ disagree, the more recent measurement wins.
   layer-order problem, and the 1.x frame generation measurements (superseded by 2.0).
 - [DMABUF_TRANSPORT_DESIGN.md](DMABUF_TRANSPORT_DESIGN.md): why DMA-BUF sharing between the layer
   and the Wine helper is blocked in both directions.
+- [NATIVE_BACKEND.md](NATIVE_BACKEND.md): the native model backend (branch `native-backend`): Phase 0
+  go/no-go, the model directory and its extractor, network timings, bit-exact comparison with the helper.
 - [NATIVE_NGX_HELPER_DESIGN.md](NATIVE_NGX_HELPER_DESIGN.md): why a native Linux NGX helper cannot
   run Feature 18.
 - [OPENDLSS_REVIEW.md](OPENDLSS_REVIEW.md): Neural Forge compared stage by stage with OpenDLSS-NR's

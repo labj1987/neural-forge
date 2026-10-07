@@ -8,6 +8,7 @@ pub mod config;
 pub mod gpu;
 pub mod install;
 pub mod install_dir;
+pub mod model;
 pub mod paths;
 pub mod profiles;
 pub mod provision;

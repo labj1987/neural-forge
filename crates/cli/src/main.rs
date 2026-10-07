@@ -27,6 +27,8 @@ fn usage() {
          \x20 runners              list discovered custom compatibility tool runners\n\
          \x20 detect-gpu           print detected NVIDIA PCI vendor/device\n\
          \x20 import-binaries DIR  copy NVIDIA's nvngx_dlssnr.dll into user data dir\n\
+         \x20 extract-model DIR    write the native model directory from nvngx_dlssnr.dll\n\
+         \x20                     (DIR holds it, or is the DLL) into the user data dir\n\
          \x20 install --appdir DIR install an extracted AppImage AppDir into\n\
          \x20                     persistent user storage (see scripts/install.py --\n\
          \x20                     same operation, same record, either tool works)\n\
@@ -457,6 +459,30 @@ fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+fn cmd_extract_model(source: Option<&String>) -> ExitCode {
+    let Some(source) = source else {
+        eprintln!("usage: neural-forge-cli extract-model DIR");
+        return ExitCode::FAILURE;
+    };
+    let out = neural_forge_supervisor::model::model_dir();
+    match neural_forge_supervisor::model::extract(std::path::Path::new(source), std::path::Path::new(&out)) {
+        Ok(done) => {
+            println!(
+                "extracted build {} ({} tensors, {} bytes) to {}",
+                done.build,
+                done.tensors,
+                done.bytes,
+                done.dir.display()
+            );
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("extract-model failed: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
 fn main() -> ExitCode {
     // `args_os`: `args()` panics on an argument that is not valid UTF-8 (a path, say).
     let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
@@ -480,6 +506,7 @@ fn main() -> ExitCode {
         "runners" => cmd_runners(),
         "detect-gpu" => cmd_detect_gpu(),
         "import-binaries" => cmd_import_binaries(args.get(2)),
+        "extract-model" => cmd_extract_model(args.get(2)),
         "install" => {
             let appdir = args.iter().position(|a| a == "--appdir").and_then(|i| args.get(i + 1));
             cmd_install(appdir)
