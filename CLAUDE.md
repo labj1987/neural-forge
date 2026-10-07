@@ -69,6 +69,39 @@ review licenses before source reuse.
 Current target-machine evidence and unresolved Vulkan errors are in
 [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
 
+## Working with NVIDIA's binaries
+
+The line is between interface and behaviour, which are fair game, and NVIDIA's code, which is not
+read. It applies to `nvngx.dll`, `nvngx_dlss*.dll`, `nvngx_dlssnr.dll` and game executables alike.
+
+Do, freely:
+
+- Run the DLLs through their API and observe what they do: outputs, timing, A/B runs, the helper's
+  `[params] read` log (every key the feature reads, `selfparam.rs`), and API-boundary tracing of
+  exports, imports or Vulkan calls (for example Frida).
+- Log what the layer sees of DLSS through Vulkan: NVX registrations, kernel names
+  (`vkCreateCuFunctionNVX`), launch parameter blocks and how their words map to views per DLSS
+  version (`NEURAL_FORGE_PROBE_NGX=1`), and record those layouts in `docs/` as tables.
+- Read a DLL's interface metadata: PE headers, export and import tables, the version resource,
+  `strings` for parameter and kernel names, and `cuobjdump --list-elf`/`--list-ptx` for the names
+  of embedded kernels.
+- Use NVIDIA's public SDK headers and docs, and open-source consumers of the same features (check
+  the licence before taking code; record it in ATTRIBUTION.md).
+
+Don't:
+
+- Disassemble or decompile NVIDIA's code: no Ghidra, IDA, Hopper or REA on these DLLs, no
+  `cuobjdump --dump-ptx`/`--dump-sass` or `nvdisasm` on their kernels. The NGX licence forbids it,
+  and behaviour observed from outside has answered every question so far.
+- Commit NVIDIA bytes: DLLs, PTX or SASS, weights, byte excerpts.
+- Reimplement NVIDIA's kernels or network from their code.
+- Build, extend or repair anything that gets past NVIDIA's access, licensing or integrity checks.
+  The caller-identity spoof (`crates/helper/src/spoof.rs`, README "Legal") stays as it is: agents do
+  not change its behaviour, and if a driver or DLL update breaks it, Alex fixes it.
+
+The reverse-engineering tools on the test machine (docs/RUNNING_AND_MEASURING.md, section 10) are
+for everything else: this project's own binaries and open-source ones.
+
 ## Pre-upscaler path
 
 Since 2.0 the model runs **before** DLSS Super Resolution by default (`crates/layer/src/preupscale.rs`,

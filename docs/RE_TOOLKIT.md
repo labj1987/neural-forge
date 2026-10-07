@@ -5,10 +5,10 @@ from [darbra/awesome-ai-reverse](https://github.com/darbra/awesome-ai-reverse) (
 section) plus tools already identified. What is installed on the test machine, where, and how to
 check it is in [RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md), section 10.
 
-**Scope.** These are general-purpose tools. None of them is used on NVIDIA's DLLs: the DLSS and NGX
-SDK licence prohibits decompiling or disassembling them. What this project knows about the Neural
-Rendering feature comes from NVIDIA's public headers and from open-source consumers
-([DLSSNR_PARAMETERS.md](DLSSNR_PARAMETERS.md)).
+**Scope.** The decompilers here are not used on NVIDIA's code; interface metadata and observed
+behaviour are. The full rule is in [CLAUDE.md](../CLAUDE.md), "Working with NVIDIA's binaries".
+[DLSSNR_PARAMETERS.md](DLSSNR_PARAMETERS.md) shows the approach: the feature's parameters come from
+the helper's own read log, public headers and open-source consumers.
 
 **Rule for installing.** Beyond the three installed first, a tool is installed only if it is free,
 headless, and does something those three cannot.

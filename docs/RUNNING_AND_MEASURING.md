@@ -423,12 +423,11 @@ of play at DLSS Frame Generation 4x, "everything is working beautifully" (HARDWA
 
 ## 10. Reverse-engineering toolkit
 
-Installed on the test machine 2026-10-06 for general use. **Not for NVIDIA's DLLs**: the DLSS and
-NGX SDK licence prohibits decompiling or disassembling them, so none of these tools is pointed at
-`nvngx_dlss.dll`, `nvngx_dlssnr.dll` or `nvngx.dll`, and nothing derived from those binaries goes
-into this repository. Parameter names, defaults and behaviour come from NVIDIA's public SDK headers
-and from open-source consumers of the same feature ([DLSSNR_PARAMETERS.md](DLSSNR_PARAMETERS.md)).
-The wider survey is [RE_TOOLKIT.md](RE_TOOLKIT.md).
+Installed on the test machine 2026-10-06. What may be done with NVIDIA's DLLs is in
+[CLAUDE.md](../CLAUDE.md), "Working with NVIDIA's binaries". In short: their interface metadata
+(exports, imports, version, `strings`, `cuobjdump --list-*`) and their observed behaviour are fair
+game; their code is not disassembled, so the decompilers below are for this project's own binaries
+and open-source ones. The wider survey is [RE_TOOLKIT.md](RE_TOOLKIT.md).
 
 | Tool | Where | Registered as | Health check |
 |---|---|---|---|
