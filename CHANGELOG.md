@@ -6,6 +6,10 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Layer: with `NEURAL_FORGE_PROBE_NGX=1`, one `[probe-ngx] layout` line per kernel and parameter-buffer
+  size: what each 8-byte word of the launch's parameters holds (a view with its role, two packed
+  views, two integers, two floats, or raw). docs/DLSS_KERNEL_CATALOGUE.md is built from these lines.
+  Nothing changes with the probe off.
 - Helper: logs once per run each NGX parameter the DLLs read from its parameter object, with its
   type and whether the helper set it (`[params] read <key> as <type>: set|unset`). The model's
   answers are unchanged. What it showed on 310.8 is in docs/DLSSNR_PARAMETERS.md: 41 keys read, 5

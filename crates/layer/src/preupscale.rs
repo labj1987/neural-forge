@@ -1100,6 +1100,9 @@ pub(crate) struct Tracker {
     said_layout_miss: bool,
     /// Diagnostics: the kernels seen making a buffer's first launch naming a colour candidate.
     said_first_kernels: Vec<String>,
+    /// The probe's parameter-layout lines already written, by kernel name and buffer size
+    /// ([`Self::probe_layout`]).
+    layouts_said: Vec<(String, usize)>,
     /// The launch-bearing submit at which the current gap without a depth image began: the inputs
     /// are kept for at most [`SR_RECENT`] launch-bearing submits from it.
     depth_gap: Option<u64>,
@@ -1570,6 +1573,76 @@ impl Tracker {
             }
         }
         self.inline_at = first_colour.map(|c| (command_buffer, c));
+        if crate::probe_ngx::enabled() {
+            self.probe_layout(function, bytes, input_colour);
+        }
+    }
+
+    /// With `NEURAL_FORGE_PROBE_NGX=1`: logs once per kernel and parameter-buffer size what each
+    /// 8-byte word of the launch's parameters holds (docs/DLSS_KERNEL_CATALOGUE.md is built from
+    /// these lines). `colour` is the buffer's identified colour input, if any.
+    fn probe_layout(&mut self, function: vk::CuFunctionNVX, bytes: &[u8], colour: Option<vk::Image>) {
+        const MAX_LAYOUTS: usize = 96;
+        let name = self.functions.get(&function).map_or_else(|| "unnamed".to_string(), |(_, n)| n.clone());
+        let id = (name, bytes.len());
+        if self.layouts_said.len() >= MAX_LAYOUTS || self.layouts_said.contains(&id) {
+            return;
+        }
+        let words: Vec<String> = bytes
+            .chunks_exact(8)
+            .map(|w| u64::from_le_bytes(w.try_into().unwrap_or_default()))
+            .enumerate()
+            .map(|(i, value)| format!("{i}={}", self.describe_word(value, colour)))
+            .collect();
+        crate::log!("[probe-ngx] layout {} bytes={}: {}", id.0, id.1, words.join(" "));
+        crate::logging::flush();
+        self.layouts_said.push(id);
+    }
+
+    /// One parameter word for [`Self::probe_layout`]: a registered view (whole word, or two packed
+    /// 32-bit halves) with its role, else the value read as two 32-bit halves.
+    fn describe_word(&self, value: u64, colour: Option<vk::Image>) -> String {
+        if value == 0 {
+            return "0".into();
+        }
+        let view = |key: u64| -> Option<String> {
+            let &(_, _, image) = self.keys.iter().find(|k| k.0 == key)?;
+            let Some(d) = self.images.get(&image) else { return Some("view(unregistered)".into()) };
+            let role = if Some(image) == colour {
+                "colour-in"
+            } else if (d.width, d.height) == (1, 1) {
+                "exposure"
+            } else if DEPTH_FORMATS.contains(&d.format) {
+                "depth"
+            } else if MVEC_FORMATS.contains(&d.format) {
+                "mvec"
+            } else if self.inputs.is_some_and(|n| (d.width, d.height) == n.output) {
+                "output-size"
+            } else {
+                "image"
+            };
+            Some(format!("view:{role}({}x{},{:?})", d.width, d.height, d.format))
+        };
+        if let Some(v) = view(value) {
+            return v;
+        }
+        let (lo, hi) = (value & 0xffff_ffff, value >> 32);
+        if let (Some(a), Some(b)) = (view(lo), view(hi)) {
+            return format!("[{a}|{b}]");
+        }
+        // Not a view: the two halves as integers when both are small, else as floats when both
+        // look like ordinary floats, else raw.
+        let float = |h: u64| {
+            let f = f32::from_bits(h as u32);
+            (h == 0 || (f.is_normal() && (1e-6..1e7).contains(&f.abs()))).then_some(f)
+        };
+        if lo < 1 << 20 && hi < 1 << 20 {
+            format!("i({lo},{hi})")
+        } else if let (Some(a), Some(b)) = (float(lo), float(hi)) {
+            format!("f({a},{b})")
+        } else {
+            format!("{value:#x}")
+        }
     }
 
     /// Whether a hold should run inside `cb`, right before the launch just recorded, which is the
@@ -6038,6 +6111,28 @@ mod tests {
         t.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
         assert!(t.refresh().unwrap().starts_with("colour input: image 0x100 (1485x836"));
         (t, set.map(|s| s.4))
+    }
+
+    /// The probe's layout line names each parameter word: views with their role (whole words and
+    /// Unreal Engine 5's two packed halves), then integers and floats.
+    #[test]
+    fn probe_layout_names_each_word() {
+        let (mut t, [colour, sr_out, _, depth, mvec]) = fg_tracker();
+        let c = Some(vk::Image::from_raw(0x100));
+        assert_eq!(t.describe_word(colour, c), "view:colour-in(1485x836,R16G16B16A16_SFLOAT)");
+        assert_eq!(t.describe_word(depth, c), "view:depth(1485x836,D32_SFLOAT_S8_UINT)");
+        assert_eq!(t.describe_word(mvec, c), "view:mvec(1485x836,R16G16_SFLOAT)");
+        assert_eq!(t.describe_word(sr_out, c), "view:output-size(2560x1440,R16G16B16A16_SFLOAT)");
+        assert_eq!(t.describe_word(colour, None), "view:image(1485x836,R16G16B16A16_SFLOAT)");
+        t.record_view(vk::ImageView::from_raw(0x701), vk::Image::from_raw(0x400));
+        t.register(vk::ImageView::from_raw(0x701), Some(0x0140_1c00));
+        t.record_view(vk::ImageView::from_raw(0x702), vk::Image::from_raw(0x500));
+        t.register(vk::ImageView::from_raw(0x702), Some(0x0320_1c23));
+        assert_eq!(t.describe_word(0x0320_1c23_0140_1c00, c), "[view:depth(1485x836,D32_SFLOAT_S8_UINT)|view:mvec(1485x836,R16G16_SFLOAT)]");
+        let words: Vec<String> = param_block(&[]).chunks_exact(8).map(|w| t.describe_word(u64::from_le_bytes(w.try_into().unwrap()), c)).collect();
+        assert_eq!(words, ["i(1485,836)", "f(0.5,0)"]);
+        assert_eq!(t.describe_word(0, c), "0");
+        assert_eq!(t.describe_word(0x7f12_3456_789a_bcde, c), "0x7f123456789abcde");
     }
 
     /// DLSS Frame Generation's launch-bearing buffers (they read depth, motion vectors and the
