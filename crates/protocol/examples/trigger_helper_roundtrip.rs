@@ -36,6 +36,10 @@
 //! the HDR encode experiments (`docs/PRE_UPSCALER_DESIGN.md`, "E1b"). Its answer is written to
 //! `--out` the same way, and the statistics are per channel on the 0..255 bytes.
 //!
+//! `--csv FILE` records every request's evaluation flag, pixel-change flag, wall time,
+//! helper evaluation/busy times and VRAM estimate. Available on slot 0 only, where the
+//! v11 `seq_eval` flag distinguishes evaluations from echoes even if pixels are unchanged.
+//!
 //! Respects `$NEURAL_FORGE_SHM`/`$NEURAL_FORGE_UID`, same as every other tool in this
 //! workspace. Maps the *full* `shm_total_bytes()` region (unlike
 //! `neural_forge_protocol::mapping::open`, which only maps the header -- the GUI/CLI's own
@@ -66,11 +70,13 @@ struct Args {
     rgba8: Option<String>,
     out: Option<String>,
     repeat: u32,
+    /// Per-request evidence for preset experiments (primary slot only).
+    csv: Option<String>,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: trigger_helper_roundtrip [W H [SLOT]]\n       trigger_helper_roundtrip --rgba16f FILE --width W --height H [--slot N] [--out FILE] [--repeat N]\n       trigger_helper_roundtrip --rgba8 FILE --width W --height H [--slot N] [--out FILE] [--repeat N]"
+        "usage: trigger_helper_roundtrip [W H [SLOT]]\n       trigger_helper_roundtrip --rgba16f FILE --width W --height H [--slot N] [--out FILE] [--repeat N] [--csv FILE]\n       trigger_helper_roundtrip --rgba8 FILE --width W --height H [--slot N] [--out FILE] [--repeat N] [--csv FILE]"
     );
     std::process::exit(2);
 }
@@ -80,9 +86,9 @@ fn parse_args() -> Args {
     if !raw.iter().any(|a| a.starts_with("--")) {
         // The original positional form.
         let num = |i: usize, default: u32| raw.get(i).map(|s| s.parse().unwrap_or_else(|_| usage())).unwrap_or(default);
-        return Args { width: num(0, 64), height: num(1, 64), slot: Slot::new(num(2, 0) as usize).unwrap_or_else(|| usage()), rgba16f: None, rgba8: None, out: None, repeat: 1 };
+        return Args { width: num(0, 64), height: num(1, 64), slot: Slot::new(num(2, 0) as usize).unwrap_or_else(|| usage()), rgba16f: None, rgba8: None, out: None, repeat: 1, csv: None };
     }
-    let mut args = Args { width: 0, height: 0, slot: Slot::Primary, rgba16f: None, rgba8: None, out: None, repeat: 4 };
+    let mut args = Args { width: 0, height: 0, slot: Slot::Primary, rgba16f: None, rgba8: None, out: None, repeat: 4, csv: None };
     let mut it = raw.into_iter();
     while let Some(flag) = it.next() {
         let mut value = || it.next().unwrap_or_else(|| usage());
@@ -90,6 +96,7 @@ fn parse_args() -> Args {
             "--rgba16f" => args.rgba16f = Some(value()),
             "--rgba8" => args.rgba8 = Some(value()),
             "--out" => args.out = Some(value()),
+            "--csv" => args.csv = Some(value()),
             "--width" => args.width = value().parse().unwrap_or_else(|_| usage()),
             "--height" => args.height = value().parse().unwrap_or_else(|_| usage()),
             "--slot" => args.slot = value().parse().ok().and_then(Slot::new).unwrap_or_else(|| usage()),
@@ -97,7 +104,7 @@ fn parse_args() -> Args {
             _ => usage(),
         }
     }
-    if args.width == 0 || args.height == 0 || (args.rgba16f.is_some() && args.rgba8.is_some()) {
+    if args.width == 0 || args.height == 0 || (args.rgba16f.is_some() && args.rgba8.is_some()) || (args.csv.is_some() && args.slot != Slot::Primary) {
         usage();
     }
     args
@@ -262,6 +269,25 @@ fn main() {
 
     // SAFETY: same reasoning as the proxy write above, mirrored for the answer region.
     let answer = unsafe { std::slice::from_raw_parts(base.add(answer_offset_slot(slot)), frame_bytes) };
+    use std::io::Write;
+    let mut csv = args.csv.as_ref().map(|path| {
+        let mut file = std::fs::File::create(path).expect("create request CSV");
+        writeln!(file, "round,evaluated,pixels_changed,roundtrip_ms,eval_ms,busy_ms,vram_mb").expect("write CSV header");
+        file
+    });
+    // A helper takes the current `seq_req` as already answered when its main loop starts, after
+    // NGX initialises (helper `main.rs`), so a request sent right after `neural-forge-cli restart`
+    // is never answered. The heartbeat moves once at attach and then once per loop pass: two
+    // moves mean the loop is running.
+    let beat = hdr.heartbeat.load(Ordering::Relaxed);
+    let ready_by = Instant::now() + Duration::from_secs(120);
+    while hdr.heartbeat.load(Ordering::Relaxed).wrapping_sub(beat) < 2 {
+        if Instant::now() > ready_by {
+            eprintln!("trigger_helper_roundtrip: the helper's heartbeat did not move for 120 s -- is it running?");
+            std::process::exit(1);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
     let mut evaluated = false;
     for round in 1..=args.repeat {
         let seq = next_request(hdr.seq_req_slot(slot).load(Ordering::Relaxed));
@@ -281,11 +307,22 @@ fn main() {
         let ok = hdr.seq_ok.load(Ordering::Relaxed) == seq;
         // The helper echoes the proxy whenever the model did not run (feature still building,
         // wrong format, a failed evaluate).
-        evaluated = answer != input.as_slice();
+        let pixels_changed = answer != input.as_slice();
+        // v11 supplies an authoritative flag for slot 0. A successful model evaluation
+        // can return identical pixels; equality alone cannot classify it as an echo.
+        // Slot 1 has no equivalent flag and keeps the old heuristic.
+        evaluated = if slot == Slot::Primary { hdr.seq_eval.load(Ordering::Relaxed) == seq } else { pixels_changed };
+        if let Some(file) = csv.as_mut() {
+            writeln!(file, "{round},{evaluated},{pixels_changed},{:.4},{:.4},{:.4},{}",
+                sent.elapsed().as_secs_f64() * 1000.0,
+                f32::from_bits(hdr.helper_eval_ms_bits.load(Ordering::Relaxed)),
+                f64::from(hdr.helper_busy_us.load(Ordering::Relaxed)) / 1000.0,
+                hdr.helper_vram_mb.load(Ordering::Relaxed)).expect("write request CSV");
+        }
         println!(
             "trigger_helper_roundtrip: response in {:.1} ms (seq_ok match: {ok}): {} eval={:.2} ms features={}",
             sent.elapsed().as_secs_f64() * 1000.0,
-            if evaluated { "evaluated" } else { "ECHO (answer identical to input; the model did not run)" },
+            if evaluated { "evaluated" } else { "ECHO (no confirmed model evaluation)" },
             f32::from_bits(hdr.helper_eval_ms_bits.load(Ordering::Relaxed)),
             hdr.helper_features.load(Ordering::Relaxed)
         );

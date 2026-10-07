@@ -6,6 +6,13 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Tools: `scripts/preset-sweep.py` compares Feature 18 presets through the helper with no game running
+  (channel lease, helper restart per trial, settings restored and verified). `neural-forge-cli shmctl
+  status` shows `pass0_override_mask` and `pass0_effective_preset`. `trigger_helper_roundtrip` writes a
+  per-request `--csv`, tells evaluations from echoes by `seq_eval` on slot 0, and waits for the helper's
+  heartbeat before its first request (a request sent straight after a restart was never answered).
+  Result on 310.8 (docs/DLSSNR_EXPERIMENTS.md): presets 0-15 give a byte-identical answer at the same
+  cost; default preset 0 unchanged.
 - Layer: with `NEURAL_FORGE_PROBE_NGX=1`, one `[probe-ngx] layout` line per kernel and parameter-buffer
   size: what each 8-byte word of the launch's parameters holds (a view with its role, two packed
   views, two integers, two floats, or raw). docs/DLSS_KERNEL_CATALOGUE.md is built from these lines.
