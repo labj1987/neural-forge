@@ -646,6 +646,14 @@ fn inline_tally(what: &'static str) {
     }
 }
 
+/// `NEURAL_FORGE_NATIVE_INLINE_CHAIN=1`: the hold inside DLSS's buffer keeps the network's counter
+/// chaining instead of rebuilding it with barriers. Diagnostic only (it faulted the GPU in Black Myth: Wukong).
+fn inline_chain_kept() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_INLINE_CHAIN").as_deref() == Some("1"));
+    *ON
+}
+
 #[allow(clippy::too_many_arguments)]
 fn inline_hold(
     device: &Arc<ash::Device>, instance: &Arc<ash::Instance>, physical_device: vk::PhysicalDevice, state: &Arc<Mutex<State>>,
@@ -749,7 +757,9 @@ fn inline_hold(
     let mut hold = match loader {
         // SAFETY: as below; the loader belongs to this device, and the side queue's family is the
         // network's own (its graph is recorded for it too).
-        Some(loader) => unsafe { crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, shm, &mut submit) },
+        Some(loader) => unsafe {
+            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, &mut submit)
+        },
         None => unsafe {
             crate::preupscale::run_hold(device, instance, physical_device, res, shm, &target, mode, dump, 0, crate::preupscale::ANSWER_BUDGET, &mut submit)
         },
@@ -1293,7 +1303,7 @@ impl NeuralForgeDeviceInfo {
             let hold = match loader {
                 // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
                 Some(loader) => unsafe {
-                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, shm, &mut layer_submit)
+                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, &mut layer_submit)
                 },
                 None => unsafe {
                     crate::preupscale::run_hold(

@@ -124,7 +124,7 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_native(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target,
-    loader: &NativeLoader, jitter: Option<[f32; 2]>, shm: &ShmClient,
+    loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient,
     submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
@@ -132,10 +132,10 @@ pub(crate) unsafe fn run_native(
         // The Model tab's settings; per-pass overrides are the helper's (NATIVE_BACKEND.md, "2.2").
         let conditioning = shm.global_tuning().map_or_else(native::Conditioning::default, native::Conditioning::from);
         // SAFETY: forwarded.
-        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, conditioning, submit) };
+        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, submit) };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (device, instance, physical_device, res, target, jitter, shm, submit);
+    let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, submit);
     #[cfg(not(target_arch = "x86_64"))]
     match *loader {}
 }
@@ -1257,6 +1257,33 @@ pub(crate) struct LaunchRefs {
 /// The word of a 310.x SR input kernel's parameters that holds the camera jitter ([`LaunchRefs::jitter`]).
 const HILUMA_JITTER_WORD: usize = 3;
 
+/// The same in the `cuda_engine_input_kernel*` family (Black Myth: Wukong's DLSS): bytes 80-87, a
+/// Halton(2,3) sequence minus 0.5 in render pixels, 24 frames long (`NEURAL_FORGE_PROBE_KERNEL`, 2026-10-07).
+const CUDA_ENGINE_JITTER_WORD: usize = 10;
+
+/// The same in DLSS Ray Reconstruction's first encoder, `rr2_enc0_kernel` (Crimson Desert): bytes 400-407,
+/// render pixels; bytes 392-399 hold the previous frame's (`NEURAL_FORGE_PROBE_KERNEL`, 2026-10-07).
+const RR_ENC0_JITTER_WORD: usize = 50;
+
+/// Which 8-byte word of a DLSS kernel's parameters holds the camera jitter, by kernel name.
+fn jitter_word(name: &str) -> Option<usize> {
+    if name.starts_with("hiluma_engine_input") {
+        Some(HILUMA_JITTER_WORD)
+    } else if name.starts_with("cuda_engine_input_kernel") {
+        Some(CUDA_ENGINE_JITTER_WORD)
+    } else if name == "rr2_enc0_kernel" {
+        Some(RR_ENC0_JITTER_WORD)
+    } else {
+        None
+    }
+}
+
+/// A jitter word holds two finite floats within a pixel of the centre; anything else is not one
+/// (another parameter layout), and the frame goes without.
+fn jitter_plausible(v: u64) -> bool {
+    [f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)].iter().all(|x| x.is_finite() && x.abs() <= 1.0)
+}
+
 /// The layouts the hold inside DLSS's buffer copies the motion vectors from (moved to
 /// `TRANSFER_SRC_OPTIMAL` and back when not already readable there).
 pub(crate) const MVEC_COPY_LAYOUTS: [vk::ImageLayout; 4] = [
@@ -1513,13 +1540,17 @@ impl Tracker {
             self.launch.entry(command_buffer).or_default().opaque = true;
             return;
         };
+        if let Some((_, name)) = self.functions.get(&function) {
+            probe_kernel(name, bytes);
+        }
         if kernel == Some(Kernel::SrInput) {
             probe_params(bytes);
-            let hiluma = self.functions.get(&function).is_some_and(|(_, name)| name.starts_with("hiluma_engine_input"));
-            if let Some(word) = bytes.chunks_exact(8).nth(HILUMA_JITTER_WORD).filter(|_| hiluma) {
-                let value = u64::from_le_bytes(word.try_into().unwrap_or_default());
-                self.launch.entry(command_buffer).or_default().jitter.get_or_insert(value);
-            }
+        }
+        // The camera jitter, from the first launch of the buffer whose kernel is known to carry it
+        // (SR's input kernels, Ray Reconstruction's first encoder).
+        let at = self.functions.get(&function).and_then(|(_, name)| jitter_word(name));
+        if let Some(value) = at.and_then(|at| bytes.chunks_exact(8).nth(at)).map(|w| u64::from_le_bytes(w.try_into().unwrap_or_default())).filter(|&v| jitter_plausible(v)) {
+            self.launch.entry(command_buffer).or_default().jitter.get_or_insert(value);
         }
         let mut named: Vec<vk::Image> = Vec::new();
         for word in bytes.chunks_exact(8) {
@@ -4685,6 +4716,26 @@ fn probe_params(bytes: &[u8]) {
     crate::log!("[probe-params] {}", words.join(" "));
 }
 
+/// `NEURAL_FORGE_PROBE_KERNEL=<name prefix>`: logs the parameters of the first 3000 launches of kernels
+/// whose name starts with the prefix, as 4-byte words (hex and f32), for finding a field such as the
+/// camera jitter in a kernel the layer does not know yet. Diagnostic only.
+fn probe_kernel(name: &str, bytes: &[u8]) {
+    static PREFIX: LazyLock<Option<String>> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PROBE_KERNEL").ok().filter(|p| !p.is_empty()));
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let Some(prefix) = PREFIX.as_deref() else { return };
+    if !name.starts_with(prefix) || COUNT.fetch_add(1, Ordering::Relaxed) >= 3000 {
+        return;
+    }
+    let words: Vec<String> = bytes
+        .chunks_exact(4)
+        .map(|w| {
+            let v = u32::from_le_bytes(w.try_into().unwrap_or_default());
+            format!("{v:08x}:{}", f32::from_bits(v))
+        })
+        .collect();
+    crate::log!("[probe-kernel] {name} {}", words.join(" "));
+}
+
 /// `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore`: dump even when DLSS's launch buffer synchronizes
 /// the depth or motion vectors before its launch ([`Scan::dump_hazard`]). Diagnostic only: those
 /// images may then be read before the game finished them, which consecutive dumps show.
@@ -5103,21 +5154,24 @@ fn post_off_until(model: bool, engaged: bool, last_dlss: Option<Instant>) -> Opt
 /// the GPU, and the GPU waits at the hold: with the post path on, the hold never gets the state, so
 /// it never engages the device the way [`post_off_until`] wants. The network is the same one either
 /// path would use, so nothing is lost by not waiting for that.
+///
+/// Its own slot: [`POST_OFF_UNTIL`] is rewritten from the session's state at every hold and present,
+/// and the session never learns of these holds while the post path keeps its state (Black Myth: Wukong,
+/// 2026-10-07: the post path started, then the GPU faulted when the holds took over).
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn keep_post_off() {
-    let until = Instant::now() + HAND_BACK;
-    let mut off = lock(&POST_OFF_UNTIL);
-    if off.is_none_or(|t| t < until) {
-        *off = Some(until);
-    }
+    *lock(&NATIVE_POST_OFF_UNTIL) = Some(Instant::now() + HAND_BACK);
 }
+
+/// Until when the native backend's hold inside DLSS's buffer keeps the post path off ([`keep_post_off`]).
+static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Whether some device of the process keeps the post path off at `now` (its [`Session`]
 /// suppresses it, [`Session::suppresses_post`]). On the device that holds this is the same as its
 /// own [`Session::suppresses_post`]; it matters when DLSS runs on another device than the swapchain
 /// (only ever set in model mode).
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
-    lock(&POST_OFF_UNTIL).is_some_and(|until| now < until)
+    lock(&POST_OFF_UNTIL).is_some_and(|until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)
 }
 
 /// Whether a launch-bearing submit is held in `mode`, given the live switches: `None` forwards it
@@ -5151,6 +5205,35 @@ pub(crate) fn write_dump_async(frame: DumpFrame) {
     });
     if spawned.is_err() {
         crate::log!("[preupscale] could not start the dump writer thread");
+    }
+}
+
+#[cfg(test)]
+mod jitter_tests {
+    use super::*;
+
+    fn word(x: f32, y: f32) -> u64 {
+        u64::from(x.to_bits()) | (u64::from(y.to_bits()) << 32)
+    }
+
+    /// Each kernel family's jitter word, as found with `NEURAL_FORGE_PROBE_KERNEL`, and nothing for others.
+    #[test]
+    fn the_jitter_word_follows_the_kernel() {
+        assert_eq!(jitter_word("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"), Some(3));
+        assert_eq!(jitter_word("cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi"), Some(10));
+        assert_eq!(jitter_word("rr2_enc0_kernel"), Some(50));
+        assert_eq!(jitter_word("rr2_enc1_kernel"), None);
+        assert_eq!(jitter_word("main_kernel"), None);
+    }
+
+    /// A Halton jitter passes; a handle, an address or a NaN in that word does not.
+    #[test]
+    fn only_a_plausible_jitter_is_taken() {
+        assert!(jitter_plausible(word(-0.25, 0.1667)));
+        assert!(jitter_plausible(word(0.4688, -0.463)));
+        assert!(!jitter_plausible(word(1.5, 0.0)));
+        assert!(!jitter_plausible(word(f32::NAN, 0.0)));
+        assert!(!jitter_plausible(word(2560.0, 1440.0)));
     }
 }
 

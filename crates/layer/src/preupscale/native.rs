@@ -892,7 +892,7 @@ pub(crate) fn format_of(target: &Target) -> (u32, u32, u64) {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_native_hold(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut super::Resources, target: &Target,
-    loader: &Loader, jitter: Option<[f32; 2]>, conditioning: Conditioning,
+    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, conditioning: Conditioning,
     submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> super::HoldResult {
     let mut result = super::HoldResult { native: true, ..Default::default() };
@@ -927,6 +927,19 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some(if loader.failed().is_some() { "the native network could not be loaded or built" } else { "the native network is still loading" });
         return result;
     };
+    // Counter chaining faulted the GPU from the hold inside DLSS's buffer (Black Myth: Wukong, 3 runs
+    // of 4: Xid 13 then 32 within seconds; none of 2 with barriers): that hold rebuilds the network
+    // with barriers between its launches, for the rest of the process (`fall_back_to_barriers`).
+    if !chain_ok && built.frame.chained != 0 {
+        crate::log!("[native] the hold inside DLSS's buffer runs the network with barriers between its launches, not counter chaining; rebuilding it");
+        crate::logging::flush();
+        loader.fall_back();
+        if let Some(n) = res.native.as_mut() {
+            n.gap.skipped();
+        }
+        result.miss = Some("the network is being rebuilt without counter chaining");
+        return result;
+    }
     // The HDR encode and decode, exactly as the helper hold uses them.
     let source = super::ExposureSource::of(target);
     result.exposure_source = Some(source);

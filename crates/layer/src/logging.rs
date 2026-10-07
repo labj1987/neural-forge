@@ -62,8 +62,16 @@ fn sink() -> &'static Mutex<Sink> {
 /// Writes one `[neural-forge-layer] ...` line. Never called directly -- use the
 /// [`crate::log!`] macro so every call site gets the same prefix and newline handling.
 pub fn log(args: Arguments<'_>) {
+    // `NEURAL_FORGE_LOG_TIME=1`: each line starts with the wall-clock time (Unix seconds, milliseconds),
+    // to line the log up with the kernel's (an Xid's time).
+    static TIME: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_LOG_TIME").as_deref() == Some("1"));
     let Ok(mut sink) = sink().lock() else { return };
-    let _ = writeln!(sink, "[neural-forge-layer] {args}");
+    let _ = if *TIME {
+        let t = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default();
+        writeln!(sink, "[neural-forge-layer] {}.{:03} {args}", t.as_secs(), t.subsec_millis())
+    } else {
+        writeln!(sink, "[neural-forge-layer] {args}")
+    };
     if FLUSH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed).is_multiple_of(64) {
         let _ = sink.flush();
     }

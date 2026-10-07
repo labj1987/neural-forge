@@ -609,33 +609,39 @@ One run (`cdn-7`, title screen, E, 60 s in game, Ray Reconstruction on, settings
 
 ### Against the helper (2026-10-07, released 2.0.10 against this branch)
 
-One run per game and backend through the same direct launch, 60 s measured, settings as found. Cyberpunk 2077
-is not installed on the rig.
+One run per game and backend through the same direct launch, 60 s measured, settings as found (Cyberpunk 2077
+is out of scope).
 
 | | Native | Helper (2.0.10) |
 |---|---|---|
-| Crimson Desert, in game | 52 fps presented, the model on every frame (52 held/s), 0 misses | 85 fps presented, the model on 44.5 of them a second (about half) |
-| Crimson Desert, model switched off | 85.2 fps | 85.4 fps |
+| Crimson Desert in game (Nas River, `ig-cd-*`) | 148.5 fps presented, 24.7 held/s, 0 misses | 146.3 fps presented, 24.3 held/s, 0 misses |
 | Wukong benchmark, results screen | 107 fps presented = 54 real, every one held; frame generation 2x | 164 fps presented = about 82 real, 32 held/s (39%); frame generation 2x |
 | Wukong benchmark, first half / second half | 66-76 / 63-81 fps presented | 64-73 / 86-115 fps presented |
 
-- **The helper skips frames there, native does not.** The helper's hold inside DLSS's buffer gives a frame up
-  silently whenever slot 0 is still busy (the request, the zero-copy capture or the compose), so the game runs
-  faster with the model on only some of its frames. Native runs the model on every frame and the game's GPU
-  waits for it inside the frame: about 7 ms a frame at 1516x852 (network 5.9 ms).
-- **Frame generation is not affected by the backend.** Crimson Desert generates no frames under Proton with
-  either backend or with the model off (one DLSS submit per present, 85 fps either way), although its options
-  ask for dynamic multi frame generation (also with the dynamic option off: 51.8 fps native). Wukong's
-  frame generation doubles native's frames as it does the helper's; GTA V's 4x does too (Phase 3, about 200
-  presented from 50).
+- **Crimson Desert: parity.** Frame generation works with both (about 6 presented frames per held one). The
+  pictures (captures 20 s apart at the same spot) match in tone, contrast and detail; the mean colour differs
+  by 1-3 levels in 255 with the camera drift between captures; no ghosting on the falcon's wings or the
+  character. An earlier set of runs (`ab-cd-*`, `cd-*-off*`, `cd-nat-fixed`) never left the title screen
+  (the E key was not taken) and showed no frame generation there with either backend: not a driver problem.
+- **Wukong: the helper skips frames there, native does not.** The helper's hold inside DLSS's buffer gives a
+  frame up silently whenever slot 0 is still busy, so the game runs faster with the model on only some of its
+  frames. Native runs the model on every frame and the game's GPU waits for it inside the frame.
+- **Jitter.** Found with `NEURAL_FORGE_PROBE_KERNEL` (a dump of a named kernel's parameters): Wukong's
+  `cuda_engine_input_kernel*` keeps it in bytes 80-87, Crimson Desert's Ray Reconstruction encoder
+  `rr2_enc0_kernel` in bytes 400-407 (the previous frame's in 392-399); both a Halton(2,3) sequence minus 0.5 in
+  render pixels. Both holds now run with it ("held", not "held without the jitter").
 - **Fixed on the way:**
-  - The after-the-upscaler path kept its claim on the network when the network was not built at its size, so
-    the paths fought over the build. In Wukong (`ab-wk-nat`) the network then faulted the game's channel
-    (Xid 13, class `cec0`, then Xid 32) at the first hold that ran it; with the claim always released, the
-    benchmark ran through (`wk-nat-2`, 29,400 holds, 0 misses, no Xid).
-  - The native hold ignored the on/off toggle (F11, the GUI, `apply_model`): it now goes to DLSS untouched when
-    the model is off, as the helper's does (checked in Crimson Desert: "skipped (the model is switched off)").
-- The pictures were not compared.
+  - The after-the-upscaler path kept its claim on the network when the network was not built at its size,
+    so the paths fought over the build. The claim is now always released.
+  - `keep_post_off` shared the post path's "off until" with the session, which rewrote it at every present:
+    the post path still started before the first holds. It has its own slot now.
+  - The native hold ignored the on/off toggle (F11, the GUI, `apply_model`): it now goes to DLSS untouched
+    when the model is off, as the helper's does (checked in Crimson Desert).
+- **Open: an intermittent GPU fault in Wukong.** Xid 13 (`Subchannel Mismatch`, class `cec0`, a compute
+  channel of the game) then Xid 32, 28-52 s after launch, in the benchmark tool's menu, while the hold inside
+  DLSS's buffer runs the network. With counter chaining 3 runs of 4 faulted, with barriers 1 of 5; never in
+  Crimson Desert, never with the helper. The hold inside DLSS's buffer now rebuilds the network with barriers
+  (`NEURAL_FORGE_NATIVE_INLINE_CHAIN=1` keeps chaining, to reproduce). Cause not found yet.
 
 ## Decided before Phase 1
 

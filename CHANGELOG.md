@@ -20,6 +20,11 @@ first shipped them; their phase is kept as a subheading.
 - Native backend: the after-the-upscaler path always releases its claim on the network (a claim kept while
   the network was not built at its size faulted the GPU in Black Myth: Wukong), and the hold before the
   upscaler follows the on/off toggle (F11, the GUI, `apply_model`), which it ignored.
+- Native backend: the camera jitter is read from Wukong's SR input kernel (`cuda_engine_input_kernel*`, bytes
+  80-87) and Ray Reconstruction's first encoder (`rr2_enc0_kernel`, bytes 400-407) too; the hold inside DLSS's
+  buffer runs the network with barriers instead of counter chaining (chaining faulted the GPU in Wukong); the
+  post path's "keep off" from that hold has its own slot. Diagnostics: `NEURAL_FORGE_PROBE_KERNEL`,
+  `NEURAL_FORGE_LOG_TIME`, `NEURAL_FORGE_NATIVE_INLINE_CHAIN`.
 - Settings: the Supersampling filter (Downscaler) is removed (SHM v14); nothing read it, since the
   model never runs above the frame's size. Model resolution, Model every Nth frame and Rebuild
   spacing are shown only while the model is not running natively before the upscaler: the first
