@@ -65,6 +65,10 @@ jobs:
       # Windows-only crate that must never be built for the host. See the project's
       # CLAUDE.md "Workspace layout" section for why `--workspace`/`--all` must not be
       # used here.
+      # Pinned glslang, Vulkan-Headers and volk for crates/native (SHA-256-checked; tools/ is git-ignored).
+      - name: Fetch the native backend toolchain
+        run: bash scripts/fetch-native-tools.sh
+
       - name: cargo test (native crates)
         run: |
           cargo test 2>&1 | tee test-native.log

@@ -54,6 +54,10 @@ jobs:
           echo "VK_DRIVER_FILES=$icds" >> "$GITHUB_ENV"
           echo "VK_DRIVER_FILES=$icds"
 
+      # Pinned glslang, Vulkan-Headers and volk for crates/native (SHA-256-checked; tools/ is git-ignored).
+      - name: Fetch the native backend toolchain
+        run: bash scripts/fetch-native-tools.sh
+
       - name: cargo test (native crates)
         run: |
           cargo test 2>&1 | tee test-native.log

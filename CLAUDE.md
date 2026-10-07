@@ -31,6 +31,8 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 
 ## Build and test
 
+- Run `bash scripts/fetch-native-tools.sh` once before building: it fetches the pinned glslang,
+  Vulkan-Headers and volk that `crates/native` builds with into `tools/native/`.
 - `cargo test` and `cargo build --release` build the native default members.
 - Do not use `--workspace` on Linux: the helper targets Windows only.
 - `cargo +stable build --release --target x86_64-pc-windows-gnu -p neural-forge-helper`

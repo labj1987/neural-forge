@@ -9,3 +9,6 @@
 # NVIDIA weights written by extract-model: never committed
 /model/
 *.e4m3
+
+# Native backend toolchain (scripts/fetch-native-tools.sh)
+/tools/

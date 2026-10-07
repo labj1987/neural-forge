@@ -38,6 +38,11 @@ mod probe_ngx;
 mod probe_seq;
 mod preupscale;
 
+// The native backend (crates/native), linked into the 64-bit layer; nothing calls it yet.
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_imports)]
+pub(crate) use neural_forge_native as native;
+
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
 use std::ops::Deref;
