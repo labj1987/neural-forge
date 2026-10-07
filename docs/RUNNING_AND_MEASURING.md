@@ -420,3 +420,40 @@ of play at DLSS Frame Generation 4x, "everything is working beautifully" (HARDWA
    tests, the shader check, the smoke test, then builds the AppImage and its `.zsync` and publishes
    the release. The build fails rather than publish without the `.zsync`.
 6. Deploy the release to the test machine and confirm the installed hashes (section 2).
+
+## 10. Reverse-engineering toolkit
+
+Installed on the test machine 2026-10-06 for general use. **Not for NVIDIA's DLLs**: the DLSS and
+NGX SDK licence prohibits decompiling or disassembling them, so none of these tools is pointed at
+`nvngx_dlss.dll`, `nvngx_dlssnr.dll` or `nvngx.dll`, and nothing derived from those binaries goes
+into this repository. Parameter names, defaults and behaviour come from NVIDIA's public SDK headers
+and from open-source consumers of the same feature ([DLSSNR_PARAMETERS.md](DLSSNR_PARAMETERS.md)).
+The wider survey is [RE_TOOLKIT.md](RE_TOOLKIT.md).
+
+| Tool | Where | Registered as | Health check |
+|---|---|---|---|
+| REA 4.1.0 (MCP + CLI) | `~/.local/bin/rea`; MCP runs `npx -y rea-agents@4.1.0 mcp` | `rea` (Claude Code, user scope) | `rea doctor --format json` |
+| Ghidra 12.1.4 | `/opt/ghidra`, JDK 21 at `/usr/lib/jvm/java-21-openjdk-amd64` | (used by both MCP servers) | `rea doctor --provider ghidra --format json` |
+| ghidra-headless-mcp 0.1.0 | `/opt/ghidra-headless-mcp`, venv in `.venv` | `ghidra` (Claude Code, user scope) | `/opt/ghidra-headless-mcp/.venv/bin/ghidra_cli --fake-backend call health.ping` |
+| Hopper 6 demo (REA's optional provider) | `/opt/hopper/bin/Hopper`, run by REA on a private Xvfb display | (through REA) | `rea doctor --provider hopper --format json` |
+| cuobjdump, nvdisasm 13.4.92 | `/opt/cuda-binutils-13.4`, linked from `/usr/local/bin` | none | `cuobjdump --version` |
+
+Notes:
+
+- **CUDA binutils come from NVIDIA's redistributable tarballs**
+  (`developer.download.nvidia.com/compute/cuda/redist/`, SHA-256 checked against
+  `redistrib_13.4.2.json`), not from Ubuntu's `nvidia-cuda-toolkit`. That package is CUDA 12.4,
+  too old for Blackwell's `sm_120`, and it installs `libnvidia-compute-595`/`-590` and
+  `nvidia-kernel-common-595`, which would sit on top of the runfile driver Greenlight installs. Do
+  not install it.
+- **REA needs a provider named** when more than one supports a target: set
+  `REA_ANALYSIS_PROVIDER=ghidra` (the `--provider` flag exists on `doctor` but not on
+  `inspect-artifact`). REA's Ghidra path rejects Windows DLLs; the Hopper demo cannot save and
+  stops after 30 minutes.
+- **Ghidra's first analysis of a binary is slow**: `program.open` on the 2 MB Rust coreutils
+  `/bin/ls` took about 15 minutes of auto-analysis. Pass `--update-analysis false` to open without
+  it when only symbols, strings or bytes are needed. For multi-step work start the persistent server
+  (`ghidra_cli --ghidra-install-dir /opt/ghidra server start`, then `server stop`) so the JVM starts
+  once.
+- **Neither Ghidra MCP server needs a GUI.** `rea` and `ghidra` appear in `claude mcp list` from any
+  directory.
