@@ -1,4 +1,5 @@
-//! When the model's first feature (pass 0) is built again after it failed to build.
+//! When the model is built again after it failed to build: the helper's first NGX feature (pass 0), and
+//! the layer's native network (where re-initialising means closing and opening the network again).
 //!
 //! A failed `CreateFeature` used to be retried on the rebuild spacing (250 ms) for ever, with
 //! nothing in between: no backoff, no re-initialisation of NGX, and `model_up` left at 1. On the

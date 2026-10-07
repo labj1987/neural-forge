@@ -25,6 +25,7 @@ mod ffi {
         pub device: vk::Device,
         pub queue_family: u32,
         pub queue_index: u32,
+        pub frame_family: u32,
         pub model_dir: *const c_char,
         pub chain: u32,
         pub fence_timeout_ms: u32,
@@ -161,9 +162,11 @@ pub struct OpenInfo<'a> {
     pub instance: vk::Instance,
     pub physical: vk::PhysicalDevice,
     pub device: vk::Device,
+    /// The network's own queue (loading, warm-up): used by nothing else.
     pub queue_family: u32,
-    /// A queue of `queue_family` used by nothing else.
     pub queue_index: u32,
+    /// The family of the queue the recorded graph is executed on (buffers are shared with it).
+    pub frame_family: u32,
     pub model_dir: &'a Path,
     pub chain: bool,
     pub fence_timeout_ms: u32,
@@ -194,6 +197,7 @@ impl Network {
             device: info.device,
             queue_family: info.queue_family,
             queue_index: info.queue_index,
+            frame_family: info.frame_family,
             model_dir: dir.as_ptr(),
             chain: u32::from(info.chain),
             fence_timeout_ms: info.fence_timeout_ms,
@@ -227,7 +231,7 @@ impl Network {
         (unsafe { ffi::nf_native_frame(self.raw, &mut frame) } == 1).then_some(frame)
     }
 
-    /// The recorded graph (a simultaneous-use secondary of the queue family given at open).
+    /// The recorded graph (a simultaneous-use secondary of `frame_family`).
     pub fn graph_commands(&self) -> vk::CommandBuffer {
         // SAFETY: `raw` is live.
         unsafe { ffi::nf_native_graph_commands(self.raw) }

@@ -344,29 +344,47 @@ pub(crate) fn take_native(device: vk::Device) -> Option<preupscale::native::Setu
     NATIVE_DEVICES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
 }
 
-/// `infos` with one more queue in the first family that has graphics and compute (the game's, where
-/// DLSS runs): the family and the new queue's index, the extended infos, and the priorities they point
-/// into. `None` when that family's request has flags or no queue to spare.
+/// `infos` with one more queue for the native network's loading, in a compute family without graphics
+/// (like the side queue, and for the same reason: the layer's own work on a queue of the game's
+/// graphics family faulted its channel, Xid 69 in Crimson Desert and Xid 32 in GTA V with the network's
+/// uploads, 2026-10-07): the game's graphics family, the new queue's family and index, the extended
+/// infos, and the priorities they point into. `None` without such a family to spare a queue in.
 #[cfg(target_arch = "x86_64")]
 fn native_queue_request(
     instance: &ash::Instance, physical_device: vk::PhysicalDevice, infos: &[vk::DeviceQueueCreateInfo],
-) -> Option<(u32, u32, Vec<vk::DeviceQueueCreateInfo>, Box<Vec<f32>>)> {
+) -> Option<(u32, u32, u32, Vec<vk::DeviceQueueCreateInfo>, Box<Vec<f32>>)> {
     // SAFETY: `physical_device` belongs to `instance`.
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-    let at = infos
+    let app_family = infos
         .iter()
-        .position(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?;
-    let q = infos[at];
-    if !q.flags.is_empty() || q.queue_count >= families[q.queue_family_index as usize].queue_count || q.p_queue_priorities.is_null() {
-        return None;
-    }
-    // SAFETY: `pQueuePriorities` holds `queueCount` floats.
-    let mut priorities = Box::new(unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec());
-    priorities.push(1.0);
+        .find(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?
+        .queue_family_index;
+    let family = families
+        .iter()
+        .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && f.queue_count > 0)? as u32;
     let mut extended = infos.to_vec();
-    extended[at].queue_count = q.queue_count + 1;
-    extended[at].p_queue_priorities = priorities.as_ptr();
-    Some((q.queue_family_index, q.queue_count, extended, priorities))
+    let mut priorities: Box<Vec<f32>>;
+    let index;
+    match infos.iter().position(|q| q.queue_family_index == family) {
+        Some(at) => {
+            let q = infos[at];
+            if !q.flags.is_empty() || q.queue_count >= families[family as usize].queue_count || q.p_queue_priorities.is_null() {
+                return None;
+            }
+            // SAFETY: `pQueuePriorities` holds `queueCount` floats.
+            priorities = Box::new(unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec());
+            priorities.push(1.0);
+            extended[at].queue_count = q.queue_count + 1;
+            extended[at].p_queue_priorities = priorities.as_ptr();
+            index = q.queue_count;
+        }
+        None => {
+            priorities = Box::new(vec![1.0]);
+            extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
+            index = 0;
+        }
+    }
+    Some((app_family, family, index, extended, priorities))
 }
 
 /// Checks and clears the side queue [`NeuralForgeInstanceHooks::create_device`] added to `device`.
@@ -517,8 +535,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         #[cfg(target_arch = "x86_64")]
         let native = nvidia
             && preupscale::active()
-            && preupscale::native::backend() == preupscale::native::Backend::Native
-            && preupscale::native::model_present();
+            && preupscale::native::backend() == preupscale::native::Backend::Native;
         let create = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| -> vk::Result {
             #[cfg(target_arch = "x86_64")]
             if native {
@@ -530,8 +547,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                     None => Vec::new(),
                 };
                 match native_queue_request(&instance.instance, physical_device, &base) {
-                    None => log!("[native] no queue to spare in the game's graphics family for the network; native backend off on this device"),
-                    Some((family, index, queues, _priorities)) => {
+                    None => log!("[native] no compute queue to spare for the network's loading; native backend off on this device"),
+                    Some((frame_family, family, index, queues, _priorities)) => {
                         let mut with = *info;
                         with.queue_create_info_count = queues.len() as u32;
                         with.p_queue_create_infos = queues.as_ptr();
@@ -549,7 +566,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                                     if let Some(sq) = &side {
                                         SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.queue);
                                     }
-                                    let setup = preupscale::native::Setup { gipa, instance: instance.instance.handle(), physical: physical_device, family, index };
+                                    let setup = preupscale::native::Setup { gipa, instance: instance.instance.handle(), physical: physical_device, frame_family, family, index };
                                     NATIVE_DEVICES.lock().unwrap().get_or_insert_default().insert(device, setup);
                                     log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
                                     return result;

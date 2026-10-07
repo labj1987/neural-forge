@@ -355,12 +355,13 @@ NfNative* nf_native_open(const NfNativeOpen* open, char* err, size_t err_len) {
     nf_native::installAssetLoader();
     nr::Kernels::setChainEnabled(open->chain != 0);
     n->context = std::make_unique<vk::Context>(open->gipa, open->instance, open->physical, open->device, open->queue_family,
-                                               open->queue_index, n->fenceTimeoutNs, open->init_dispatchable, open->init_user);
+                                               open->queue_index, n->fenceTimeoutNs, open->init_dispatchable, open->init_user,
+                                               open->frame_family);
     n->model = std::make_unique<nr::Model>(*n->context, open->model_dir, true);
     n->kernels = std::make_unique<nr::Kernels>(*n->context, std::string());
     n->kernels->setSiluTable(ref::siluTable());
     VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    pool.queueFamilyIndex = open->queue_family;
+    pool.queueFamilyIndex = open->frame_family;
     VK_CHECK(vkCreateCommandPool(open->device, &pool, nullptr, &n->secondaryPool));
     const nr::Tensor& blend = n->model->tensor(70, 0, "blend_scale");
     if (blend.byteLength >= 2) {

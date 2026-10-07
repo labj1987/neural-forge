@@ -46,8 +46,9 @@ typedef struct NfNativeOpen {
   VkInstance instance;
   VkPhysicalDevice physical;
   VkDevice device;
-  uint32_t queue_family;            // the family of the game's queue the frames run on
-  uint32_t queue_index;             // a queue of that family the layer added for itself (uploads, warm-up)
+  uint32_t queue_family;            // the family of a queue the layer added for the network (uploads, warm-up)
+  uint32_t queue_index;             // that queue's index; nothing else may use it
+  uint32_t frame_family;            // the family of the game's queue the recorded graph runs on
   const char* model_dir;            // the extract-model output
   uint32_t chain;                   // 1: counter chaining between PTX launches; 0: barriers
   uint32_t fence_timeout_ms;        // bound on every wait this side makes
@@ -79,7 +80,7 @@ typedef struct NfNativeFrame {
 
 uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame);
 
-// The recorded graph: a secondary command buffer (simultaneous use, no render pass) of `queue_family`,
+// The recorded graph: a secondary command buffer (simultaneous use, no render pass) of `frame_family`,
 // reading `features` and writing `head`. It opens and closes with compute barriers only; the caller
 // orders its own writes of `features` before it and its reads of `head` after it.
 VkCommandBuffer nf_native_graph_commands(const NfNative* n);

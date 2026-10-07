@@ -27,6 +27,7 @@ use std::time::Instant;
 use ash::vk;
 use neural_forge_native as nn;
 use neural_forge_protocol::history::{HistoryGap, Stale};
+use neural_forge_protocol::rebuild::{BuildRetry, FailInject, Step};
 
 use super::hdr::{self, OwnImage};
 use super::{own_host_buffer_with, HostBuffer, Target};
@@ -75,8 +76,10 @@ pub(crate) struct Setup {
     pub instance: vk::Instance,
     pub physical: vk::PhysicalDevice,
     /// The game's graphics family, where DLSS runs and the frame work goes.
+    pub frame_family: u32,
+    /// The layer's own queue for the network (a compute family without graphics): the loader's
+    /// uploads and warm-up only.
     pub family: u32,
-    /// The layer's own queue in that family: the loader's uploads and warm-up only.
     pub index: u32,
 }
 
@@ -93,8 +96,10 @@ pub(crate) struct Built {
 
 #[derive(Default)]
 struct LoaderState {
-    /// `None` while the worker has it out (opening, building) or after a failure.
+    /// `None` while the worker has it out (opening, building), before it is opened, and after a
+    /// re-initialisation closed it.
     network: Option<nn::Network>,
+    /// Why the network is not usable right now (the Status tab shows it); cleared by a success.
     failed: Option<String>,
     built: Option<Built>,
     /// The size the holds want; the worker builds it.
@@ -102,12 +107,18 @@ struct LoaderState {
     fall_back: bool,
     quit: bool,
     generation: u64,
+    /// Opened at least once (a later `None` network means closed for a re-initialisation).
+    opened: bool,
 }
 
-/// The network on one device, opened and built off the game's threads.
+/// The network on one device, opened and built off the game's threads. Nothing is loaded until the
+/// first hold asks for it ([`Self::ready`]): only the device DLSS runs on pays for the model. A
+/// failed open or build is tried again on the helper's schedule (`neural_forge_protocol::rebuild`):
+/// 0.5, 1 and 2 s, then a re-initialisation (the network closed and opened again), then every 30 s.
 pub(crate) struct Loader {
     shared: Arc<(Mutex<LoaderState>, Condvar)>,
-    worker: Option<std::thread::JoinHandle<()>>,
+    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
+    pending: Mutex<Option<(vk::Device, Setup)>>,
 }
 
 unsafe extern "C" fn init_dispatchable(_user: *mut std::ffi::c_void, device: vk::Device, object: *mut std::ffi::c_void) {
@@ -117,22 +128,26 @@ unsafe extern "C" fn init_dispatchable(_user: *mut std::ffi::c_void, device: vk:
 
 impl Loader {
     pub(crate) fn start(device: vk::Device, setup: Setup) -> Self {
-        let shared: Arc<(Mutex<LoaderState>, Condvar)> = Arc::default();
-        let worker_shared = shared.clone();
-        let worker = std::thread::Builder::new()
-            .name("nf-native-load".into())
-            .spawn(move || Self::work(&worker_shared, device, setup))
-            .ok();
-        if worker.is_none() {
-            crate::log!("[native] could not start the loader thread; frames go to DLSS untouched");
-        }
-        Self { shared, worker }
+        Self { shared: Arc::default(), worker: Mutex::new(None), pending: Mutex::new(Some((device, setup))) }
     }
 
-    fn work(shared: &(Mutex<LoaderState>, Condvar), device: vk::Device, setup: Setup) {
-        let (lock, wake) = shared;
+    /// Starts the loading thread the first time.
+    fn spawn(&self) {
+        let Some((device, setup)) = self.pending.lock().unwrap().take() else { return };
+        let shared = self.shared.clone();
+        let worker = std::thread::Builder::new().name("nf-native-load".into()).spawn(move || Self::work(&shared, device, setup)).ok();
+        if worker.is_none() {
+            crate::log!("[native] could not start the loader thread; frames go to DLSS untouched");
+            self.shared.0.lock().unwrap().failed = Some("the loader thread could not be started".into());
+        }
+        *self.worker.lock().unwrap() = worker;
+    }
+
+    fn open(device: vk::Device, setup: Setup) -> Result<nn::Network, String> {
         let dir = model_dir();
-        let t = Instant::now();
+        if !model_present() {
+            return Err(format!("no model at {}: extract it in the Setup tab (neural-forge-cli extract-model)", dir.display()));
+        }
         let open = nn::OpenInfo {
             gipa: setup.gipa,
             instance: setup.instance,
@@ -140,59 +155,104 @@ impl Loader {
             device,
             queue_family: setup.family,
             queue_index: setup.index,
+            frame_family: setup.frame_family,
             model_dir: &dir,
             chain: chain_wanted(),
             fence_timeout_ms: crate::FENCE_WAIT_TIMEOUT.as_millis() as u32,
             init_dispatchable: Some(init_dispatchable),
         };
-        // SAFETY: the device was created with the network's additions and the queue is the loader's
-        // alone (`crate::NativeQueue`).
-        let network = match unsafe { nn::Network::open(&open) } {
-            Ok(n) => n,
-            Err(why) => {
-                crate::log!("[native] the model could not be loaded from {}: {why}; frames go to DLSS untouched", dir.display());
-                crate::logging::flush();
-                lock.lock().unwrap().failed = Some(why);
-                return;
-            }
-        };
+        let t = Instant::now();
+        // SAFETY: the device was created with the network's additions, and the queue is the loader's
+        // alone (`crate::take_native`).
+        let network = unsafe { nn::Network::open(&open) }.map_err(|why| format!("the model at {} could not be loaded: {why}", dir.display()))?;
         crate::log!("[native] model loaded and verified from {} in {} ms (chaining {})", dir.display(), t.elapsed().as_millis(), if chain_wanted() { "on" } else { "off" });
-        crate::logging::flush();
+        Ok(network)
+    }
+
+    fn work(shared: &(Mutex<LoaderState>, Condvar), device: vk::Device, setup: Setup) {
+        let (lock, wake) = shared;
+        let mut retry = BuildRetry::default();
+        let mut inject = neural_forge_protocol::env::var(FailInject::ENV).and_then(|v| FailInject::parse(&v));
+        if let Some(f) = inject {
+            crate::log!("[native] {}: the next {} network builds will fail on purpose", FailInject::ENV, f.remaining());
+        }
         let mut state = lock.lock().unwrap();
-        state.network = Some(network);
         loop {
-            while !state.quit && !state.fall_back && (state.wanted.is_none() || state.wanted == state.built.map(|b| (b.width, b.height))) {
-                state = wake.wait(state).unwrap();
-            }
+            // Work is wanted when the network is not open yet, a size is wanted that is not built, or
+            // the graph is to fall back to barriers; it is due when the retry schedule says so.
+            let wanted = |s: &LoaderState| !s.opened || s.fall_back || (s.wanted.is_some() && s.wanted != s.built.map(|b| (b.width, b.height)));
             if state.quit {
                 return;
             }
-            let Some(mut network) = state.network.take() else { return };
+            if !wanted(&state) {
+                state = wake.wait(state).unwrap();
+                continue;
+            }
+            let step = retry.step(Instant::now());
+            if let Step::Wait(d) = step {
+                state = wake.wait_timeout(state, d).unwrap().0;
+                continue;
+            }
+            let mut network = state.network.take();
             let fall_back = std::mem::take(&mut state.fall_back);
-            let (w, h) = state.wanted.or(state.built.map(|b| (b.width, b.height))).unwrap_or_default();
+            let size = state.wanted.or(state.built.map(|b| (b.width, b.height)));
             state.built = None;
             drop(state);
+            if step == Step::ReinitThenBuild && network.take().is_some() {
+                crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
+            }
             let t = Instant::now();
-            let result = if fall_back { network.fall_back_to_barriers() } else { network.build(w, h) };
+            let result = match network.take() {
+                Some(n) => Ok(n),
+                None => Self::open(device, setup),
+            }
+            .and_then(|mut n| match size {
+                None => Ok((n, None)),
+                Some(_) if inject.as_mut().is_some_and(FailInject::should_fail) => {
+                    network = Some(n);
+                    Err(format!("{} asked this build to fail", FailInject::ENV))
+                }
+                Some((w, h)) => {
+                    let built = if fall_back { n.fall_back_to_barriers() } else { n.build(w, h) };
+                    match built {
+                        Ok(frame) => Ok((n, Some((w, h, frame)))),
+                        Err(why) => {
+                            network = Some(n);
+                            Err(format!("building the network for {w}x{h} failed: {why}"))
+                        }
+                    }
+                }
+            });
             state = lock.lock().unwrap();
+            state.opened = true;
             match result {
-                Ok(frame) => {
-                    state.generation += 1;
-                    state.built = Some(Built { width: w, height: h, frame, graph: network.graph_commands(), generation: state.generation });
-                    crate::log!(
-                        "[native] network {}built for {w}x{h} (field {}x{}, chained {}) in {} ms",
-                        if fall_back { "re" } else { "" },
-                        frame.field_width,
-                        frame.field_height,
-                        frame.chained != 0,
-                        t.elapsed().as_millis()
-                    );
-                    state.network = Some(network);
+                Ok((n, built)) => {
+                    if let Some((w, h, frame)) = built {
+                        state.generation += 1;
+                        state.built = Some(Built { width: w, height: h, frame, graph: n.graph_commands(), generation: state.generation });
+                        crate::log!(
+                            "[native] network {}built for {w}x{h} (field {}x{}, chained {}) in {} ms",
+                            if fall_back { "re" } else { "" },
+                            frame.field_width,
+                            frame.field_height,
+                            frame.chained != 0,
+                            t.elapsed().as_millis()
+                        );
+                        retry.succeeded();
+                        if let Some(streak) = retry.take_recovered() {
+                            crate::log!("[native] the network is up again after {streak} failed attempt(s)");
+                        }
+                        state.failed = None;
+                    }
+                    state.network = Some(n);
                 }
                 Err(why) => {
-                    crate::log!("[native] building the network for {w}x{h} failed: {why}; frames go to DLSS untouched");
+                    let wait = retry.failed(Instant::now());
+                    crate::log!("[native] {why}; frames go to DLSS untouched, trying again in {} ms", wait.as_millis());
                     state.failed = Some(why);
-                    drop(network);
+                    state.network = network;
+                    // A failed build leaves no graph; a fallback that failed is asked for again.
+                    state.fall_back |= fall_back;
                 }
             }
             crate::logging::flush();
@@ -201,11 +261,9 @@ impl Loader {
 
     /// The network built for `width` x `height`, or `None` (and the build is asked for) while it is not.
     pub(crate) fn ready(&self, width: u32, height: u32) -> Option<Built> {
+        self.spawn();
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap();
-        if state.failed.is_some() {
-            return None;
-        }
         if let Some(b) = state.built.filter(|b| (b.width, b.height) == (width, height)) {
             return Some(b);
         }
@@ -216,6 +274,7 @@ impl Loader {
         None
     }
 
+    /// Why the network is not usable right now, if a load or build failed.
     pub(crate) fn failed(&self) -> Option<String> {
         self.shared.0.lock().unwrap().failed.clone()
     }
@@ -244,7 +303,7 @@ impl Drop for Loader {
             lock.lock().unwrap().quit = true;
             wake.notify_all();
         }
-        if let Some(worker) = self.worker.take() {
+        if let Some(worker) = self.worker.lock().unwrap().take() {
             let _ = worker.join();
         }
         // The network (closed here) must not be pending: the device's teardown drained the layer's work.
@@ -674,6 +733,26 @@ impl NativePass {
     }
 }
 
+/// `NEURAL_FORGE_NATIVE_FAIL=chain`: reports one counter-chain timeout at the 300th network frame, to
+/// exercise the fallback to barriers on the rig. Unset (the default) does nothing.
+fn fake_chain_timeout(frames: u64) -> Option<(u32, String)> {
+    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_FAIL").as_deref() == Some("chain"));
+    static DONE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    (*ON && frames >= 300 && !DONE.swap(true, std::sync::atomic::Ordering::Relaxed)).then(|| (1, "NEURAL_FORGE_NATIVE_FAIL=chain".to_string()))
+}
+
+/// What the Status tab says about the native backend after a hold: running, or why not.
+pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
+    if result.evaluated {
+        return "native network running".to_string();
+    }
+    match (loader.failed(), result.miss) {
+        (Some(why), _) => format!("native network not running: {why}"),
+        (None, Some(miss)) => format!("native network: {miss}"),
+        (None, None) => String::new(),
+    }
+}
+
 /// Logs a history reset's reason (the helper logs the same reasons for NGX's).
 pub(crate) fn note_reset(stale: Option<Stale>) {
     match stale {
@@ -713,7 +792,8 @@ pub(crate) unsafe fn run_native_hold(
     }
     result.writeback_gpu_ms = writeback_gpu;
     // Every frame that ran the graph has completed: the chain watchdog's count is final for them.
-    if let Some((waits, at)) = loader.chain_timeouts().filter(|(n, _)| *n > 0) {
+    let fake = fake_chain_timeout(res.native.as_ref().map_or(0, |n| n.frames));
+    if let Some((waits, at)) = loader.chain_timeouts().filter(|(n, _)| *n > 0).or(fake) {
         crate::log!("[native] {waits} counter-chain wait(s) of the network gave up ({at}); rebuilding it with barriers between its launches");
         crate::logging::flush();
         loader.fall_back();

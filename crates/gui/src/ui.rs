@@ -1368,13 +1368,16 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         } else {
             "no game attached yet"
         });
-        preupscale_row.set_subtitle(&preupscale_label(
+        let label = preupscale_label(
             layer_active,
             hdr.preupscale_state.load(Ordering::Relaxed),
             hdr.preupscale_width.load(Ordering::Relaxed),
             hdr.preupscale_height.load(Ordering::Relaxed),
             hdr.preupscale_misses.load(Ordering::Relaxed),
-        ));
+        );
+        // The layer's own status line: the native backend running, or why it is not.
+        let layer_reason = if layer_active { hdr.layer_reason() } else { String::new() };
+        preupscale_row.set_subtitle(&if layer_reason.is_empty() { label } else { format!("{label} -- {layer_reason}") });
         // Keyed off the actual OS-level pid-file check (what start/stop manage), not
         // the SHM helper_state above -- those can briefly disagree right after a
         // start/stop (e.g. STARTING vs. the process not existing yet) and the button

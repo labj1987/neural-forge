@@ -83,9 +83,11 @@ class Context {
   // `initDispatchable`, when set, is called on every dispatchable object this object gets from below the loader
   // (its queue, every command buffer it allocates) to give it the loader's dispatch pointer.
   using InitDispatchable = void (*)(void* user, VkDevice device, void* object);
+  // `sharedFamily`, when not VK_QUEUE_FAMILY_IGNORED, is a second queue family the buffers are used on (the
+  // application's, where the recorded graph runs): every buffer is created VK_SHARING_MODE_CONCURRENT over both.
   Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
           uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable = nullptr,
-          void* initUser = nullptr);
+          void* initUser = nullptr, uint32_t sharedFamily = VK_QUEUE_FAMILY_IGNORED);
   void initDispatchable(void* object) const { if (initDispatchable_) initDispatchable_(initUser_, device_, object); }
   ~Context();
   uint32_t queueFamily() const { return queueFamily_; }
@@ -179,6 +181,7 @@ class Context {
   bool owned_ = true;
   uint64_t waitTimeoutNs_ = 0;
   InitDispatchable initDispatchable_ = nullptr;
+  uint32_t sharedFamily_ = VK_QUEUE_FAMILY_IGNORED;
   void* initUser_ = nullptr;        // 0: unbounded waits (the tool); otherwise every wait is bounded
   VkFence waitFence_ = VK_NULL_HANDLE;
   void adopt();

@@ -22,7 +22,7 @@ pub mod ngx;
 #[cfg(windows)]
 pub mod optical_flow;
 pub mod pe;
-pub mod rebuild;
+pub use neural_forge_protocol::rebuild;
 pub mod scene;
 pub mod selfparam;
 #[cfg(windows)]

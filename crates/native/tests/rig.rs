@@ -1,6 +1,7 @@
 //! The network through the C API on a real GPU, against `dlss5vk parity --dump` of the same frame:
-//! the device made with `device_extend`, the network opened on its own queue, the recorded graph run
-//! from another queue's primary, and the head compared byte for byte.
+//! the device made with `device_extend`, the network opened on a queue of a compute-only family (as
+//! the layer opens it), the recorded graph run from a graphics-family queue's primary (buffers shared
+//! between the two), and the head compared byte for byte.
 //!
 //! Runs only with `NEURAL_FORGE_NATIVE_RIG=<dump dir>` (holding `features.f32` and `head.f32` of a
 //! 1486x836 frame); `NEURAL_FORGE_NATIVE_MODEL` overrides the model directory (default: the user data
@@ -19,6 +20,8 @@ struct Gpu {
     device: ash::Device,
     physical: vk::PhysicalDevice,
     family: u32,
+    /// A compute family without graphics, where the network loads (as in the layer).
+    compute: u32,
     memory: vk::PhysicalDeviceMemoryProperties,
 }
 
@@ -38,12 +41,18 @@ fn gpu() -> Gpu {
     // SAFETY: as above.
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical) };
     let family = families.iter().position(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)).unwrap() as u32;
-    assert!(families[family as usize].queue_count >= 2);
+    let compute = families
+        .iter()
+        .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS))
+        .expect("a compute-only family") as u32;
     let gipa = entry.static_fn().get_instance_proc_addr;
     // SAFETY: the loader's gipa for this instance.
     unsafe { device_supported(gipa, instance.handle(), physical) }.expect("device support");
-    let priorities = [1.0f32, 1.0];
-    let queues = [vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build()];
+    let priorities = [1.0f32];
+    let queues = [
+        vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build(),
+        vk::DeviceQueueCreateInfo::builder().queue_family_index(compute).queue_priorities(&priorities).build(),
+    ];
     let info = vk::DeviceCreateInfo::builder().queue_create_infos(&queues).build();
     // SAFETY: valid create info, outlives the extension.
     let extension = unsafe { device_extend(gipa, instance.handle(), physical, &info) }.expect("extend");
@@ -52,7 +61,7 @@ fn gpu() -> Gpu {
     drop(extension);
     // SAFETY: as above.
     let memory = unsafe { instance.get_physical_device_memory_properties(physical) };
-    Gpu { _entry: entry, instance, device, physical, family, memory }
+    Gpu { _entry: entry, instance, device, physical, family, compute, memory }
 }
 
 impl Gpu {
@@ -91,8 +100,9 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
         instance: g.instance.handle(),
         physical: g.physical,
         device: g.device.handle(),
-        queue_family: g.family,
-        queue_index: 1,
+        queue_family: g.compute,
+        queue_index: 0,
+        frame_family: g.family,
         model_dir: &model,
         chain: std::env::var("NEURAL_FORGE_NATIVE_CHAIN").map_or(true, |v| v != "0"),
         fence_timeout_ms: 5000,

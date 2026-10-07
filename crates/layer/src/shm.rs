@@ -373,6 +373,13 @@ impl ShmClient {
     /// `layer_attached`/`layer_heartbeat`/`layer_width`/`layer_height`/`layer_format`/
     /// `layer_frames` are status telemetry, not part of the handshake -- deliberately
     /// not per-slot; they just reflect whichever slot most recently captured.
+    /// The layer's status line for the GUI (the native backend's state, or why it is not running).
+    pub fn set_layer_reason(&self, reason: &str) {
+        if let Some(hdr) = self.header() {
+            hdr.set_layer_reason(reason);
+        }
+    }
+
     pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32) {
         self.frames += 1;
         let frames = self.frames;

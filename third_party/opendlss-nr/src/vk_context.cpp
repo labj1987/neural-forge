@@ -172,8 +172,9 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
 
 Context::Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
                  uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable,
-                 void* initUser) {
+                 void* initUser, uint32_t sharedFamily) {
   initDispatchable_ = initDispatchable;
+  sharedFamily_ = sharedFamily == queueFamily ? VK_QUEUE_FAMILY_IGNORED : sharedFamily;
   initUser_ = initUser;
   volkInitializeCustom(getInstanceProcAddr);
   instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
@@ -342,6 +343,12 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
   info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | extra;
   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+  const uint32_t families[2] = {queueFamily_, sharedFamily_};
+  if (sharedFamily_ != VK_QUEUE_FAMILY_IGNORED) {
+    info.sharingMode = VK_SHARING_MODE_CONCURRENT;
+    info.queueFamilyIndexCount = 2;
+    info.pQueueFamilyIndices = families;
+  }
   VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &result.buffer));
   VkMemoryRequirements requirements;
   vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);

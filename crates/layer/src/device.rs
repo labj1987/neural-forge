@@ -1236,6 +1236,9 @@ impl NeuralForgeDeviceInfo {
                 inflight[0].forget_answer();
             }
             hold.mark_local(mode);
+            if hold.native {
+                session.note_native(shm, &hold);
+            }
             session.check_exposure(scan.identification, &hold);
             session.note_exposure_source(scan.identification, &inputs, &hold);
             session.note(shm, &hold, cpu, extent);

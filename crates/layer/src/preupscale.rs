@@ -4596,6 +4596,8 @@ pub(crate) struct Session {
     exposure_untrusted: Option<u64>,
     /// The native backend's network on this device, when it was created for it.
     pub(crate) native: Option<NativeLoader>,
+    /// The native backend's status line last published (`layer_reason`), so it is written on change only.
+    native_status: String,
     /// Consecutive frames still to dump after the one just taken ([`dump_frames`]).
     burst: u32,
 }
@@ -4923,6 +4925,20 @@ impl Session {
         if let Some(ms) = ms {
             self.stats.writeback_gpu_ms.push(ms);
         }
+    }
+
+    /// Publishes the native backend's status line after a native hold, when it changed.
+    pub(crate) fn note_native(&mut self, shm: &ShmClient, result: &HoldResult) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(loader) = self.native.as_ref() {
+            let status = native::status(result, loader);
+            if status != self.native_status {
+                shm.set_layer_reason(&status);
+                self.native_status = status;
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (shm, result);
     }
 
     /// Marks the dump as done (a pending one-shot request is consumed by the caller).
