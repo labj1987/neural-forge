@@ -497,6 +497,70 @@ query on the RTX 5070), so none of the PTX kernels can launch. What it would tak
 
 Not built, as the handoff asks.
 
+## Phase 3: measurements (cut short)
+
+GTA V Enhanced benchmark, pass 4 (116 s), script mods off, real fps from GTA's frame times. Alex stopped the
+matrix as too long once the answer was clear; what was measured:
+
+| Configuration | Driver | Native | Helper |
+|---|---|---|---|
+| 2560x1440, DLSS Balanced, frame generation off | 615.71.09 | 70.7, 71.5, 71.6 (GPU 96%, 218 W) | 65.4, 69.9, 69.3 (GPU 88-95%, 185 W) |
+| same | 615.78.08 | 70.9, 71.8 (one launch exited early) | 69.8, 69.8, 69.5 |
+| 2560x1440, DLSS Balanced, frame generation 4x (engaged) | 615.78.08 | 49.7 real, 199.5 shown | 50.1 real, 200.4 shown |
+| same settings, frame generation did not engage | 615.78.08 | 70.2, 70.5 | 68.6, 68.3 |
+| 3840x2160, DLSS Balanced, frame generation off | 615.78.08 | 21.9 (GPU 99% at only 157 W) | not measured |
+
+- **1440p**: native 71.3 against helper 68.2 on the old driver, 71.4 against 69.7 on the new. About 2-3 fps,
+  at the edge of the run-to-run spread (about 3 fps): equal or slightly ahead, not a demonstrated gain.
+  With frame generation 4x they are level (49.7 against 50.1, one run each).
+- **4K: native is probably worse.** One run, 21.9 fps. The network frame took 18.8-19.5 ms on the GPU in game
+  (10.7 ms on the idle GPU; 6.5 against 5.5 at 1440p), and the GPU ran at 99% busy but only 157 W: it is
+  waiting on memory, most likely VRAM (12 GB) with 4K, ray tracing and the network's 1.5 GB at this size.
+  The network was also built for 3840x2160 (3.4 GB) on the menus before DLSS started (the after-the-upscaler
+  path) and rebuilt smaller after. NGX's evaluate at 4K Balanced was 10.7-11 ms through the helper
+  (ARCHITECTURE.md 4.8). A helper run at 4K was not taken.
+- Not done: the 30-minute session, chaining off in game, the matched native/helper/off captures (the
+  frame-keyed trigger works now: `NEURAL_FORGE_CAPTURE_AT=5:20000` captured a 4K frame), more frame
+  generation launches. No Xid, no watchdog timeout, no hang in any native run of the day (about 15 runs),
+  including the injected failures.
+
+## Phase 4: report
+
+### What works
+
+- The network runs inside the layer, on the game's device, in the game's DLSS submit: no helper, no Wine, no
+  shared-memory round trip, no NGX DLL at run time, no spoof on the native path. Bit-exact with NGX's own
+  answer for the same input frame (0.6), also through the layer's C API and on driver 615.78.08.
+- Every Model-tab setting that does something with NGX does the same natively (2.2), checked against NGX.
+- The after-the-upscaler path runs on it too (2.1), the Setup tab is one extract step (2.3).
+- Failure paths: a missing model, failed builds, a chain timeout: frames go to DLSS untouched and the Status
+  tab says why; nothing hung or crashed once the loading moved off the game's graphics queue family.
+
+### What did not carry over, or is worse
+
+- **4K is probably slower** (above). Likely VRAM; needs a look before 3.0 if 4K matters.
+- **After the upscaler: about 12% fewer fps** in `pan` (67 against 77): NVIDIA's network is about 20%
+  faster than OpenDLSS-NR's on this GPU at the same size, and the helper already ran off the game's queue there.
+  And that path has **no history** (no motion vectors), where NGX had the helper's optical flow.
+- **The temporal path differs from NGX's**: DLSS's motion vectors plus the jitter instead of optical flow. Not
+  compared in game; whether DLSS's motion vectors are read one frame stale is open (inconclusive on a still
+  scene).
+- **Games held inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077) still use the helper.
+- **32-bit**: not possible as built (no `VK_NV_cuda_kernel_launch` in a 32-bit process).
+- **Preset, sharpness, passes, the motion controls**: no native meaning (2.2); Alex to decide.
+- The layer grew to 8.9 MB and needs glibc 2.38.
+
+### Recommendation
+
+Not 3.0 yet. At 1440p, the configuration Alex plays, native is at least as fast as the helper with a
+bit-exact picture and a much simpler setup, which is what the plan asked for. But 4K looks worse, the
+after-the-upscaler path is slower and loses its history, and two game families still need the helper, so
+removing the helper (Phase 5) now would make those cases worse. Suggested next steps, smallest first: one
+4K helper run to confirm the 4K gap; if VRAM is the cause, don't build the network at output size on the
+menus and drop the model's host and raw copies after upload; then decide whether the inline hold and the
+post path are worth porting or whether 3.0 keeps the helper for them. Alex should also play GTA V on this
+branch once to judge the temporal look (ghosting, shimmer) against the helper.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL
@@ -549,8 +613,8 @@ Not built, as the handoff asks.
 - [x] 2.2 settings mapping table written, unmapped controls listed
 - [x] 2.3 Setup tab reduced to extract-model
 - [x] 2.4 32-bit layer answer recorded
-- [ ] Phase 3 benchmarks and long session done
-- [ ] Phase 4 report written, branch pushed, stopped for Alex
+- [x] Phase 3 benchmarks (cut short on Alex's request; long session not run)
+- [x] Phase 4 report written, branch pushed, stopped for Alex
 - [ ] Phase 5 (only on Alex's yes)
 
-Blockers: none. Phase 2 next.
+Blockers: none. Waiting for Alex: the recommendation above, the 2.2 decisions, and whether 4K needs the follow-up.
