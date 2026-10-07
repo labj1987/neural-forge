@@ -17,6 +17,9 @@ first shipped them; their phase is kept as a subheading.
 - Native backend: games held inside DLSS's command buffer (Crimson Desert, Cyberpunk 2077, Black
   Myth: Wukong) run the network in the layer too, on the layer's compute queue, with DLSS's motion
   vectors copied beside the colour input for the history and the jitter from the input launch.
+- Native backend: the after-the-upscaler path always releases its claim on the network (a claim kept while
+  the network was not built at its size faulted the GPU in Black Myth: Wukong), and the hold before the
+  upscaler follows the on/off toggle (F11, the GUI, `apply_model`), which it ignored.
 - Settings: the Supersampling filter (Downscaler) is removed (SHM v14); nothing read it, since the
   model never runs above the frame's size. Model resolution, Model every Nth frame and Rebuild
   spacing are shown only while the model is not running natively before the upscaler: the first

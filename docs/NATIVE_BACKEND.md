@@ -606,29 +606,36 @@ One run (`cdn-7`, title screen, E, 60 s in game, Ray Reconstruction on, settings
   for the 310.x Super Resolution input kernel (`hiluma_engine_input*`, word 3). The history is
   reprojected with the motion vectors alone, so off by the jitter difference (under a pixel). Open:
   find the word in RR's encoder parameters (`NEURAL_FORGE_PROBE_PARAMS`).
-- Not compared with the helper in the same scene, and the picture was not captured (the installed CLI
-  speaks SHM v11). Cyberpunk 2077 and Black Myth: Wukong are not installed on the rig: not run.
-- **The post path stays off.** The worker needs the device's state, which the after-the-upscaler path
-  holds while its frame waits on the GPU, and the GPU is parked at the hold. The first in-game run
-  (`cdn-5`): the network was still loading at the first holds, so the device never engaged, the post
-  path took over, and every hold after that gave up on the lock (139 every 5 s, 27 fps). Now each job
-  keeps the post path off (`preupscale::keep_post_off`) and the loader's pre-upscaler claim fresh before
-  taking the lock (`Loader::note_pre`). A line every 5 s counts what the hold did with its jobs.
 
-### Result (Crimson Desert, 2026-10-07)
+### Against the helper (2026-10-07, released 2.0.10 against this branch)
 
-One run (`cdn-7`, title screen, E, 60 s in game, Ray Reconstruction on, settings as found), driver
-615.78.08:
+One run per game and backend through the same direct launch, 60 s measured, settings as found. Cyberpunk 2077
+is not installed on the rig.
 
-- Held inside DLSS's buffer at 52/s, every real frame (52.0 fps presented), 0 misses, no fence timeout,
-  no Xid. Network 5.88 ms on the GPU at 1516x852, hold 7.0 ms (the worker's time, inside the GPU's wait).
-- Motion vectors copied (RG16F, in `GENERAL` there).
-- **No jitter**: the game runs DLSS Ray Reconstruction (`rr2_*` kernels); the jitter word is only known
-  for the 310.x Super Resolution input kernel (`hiluma_engine_input*`, word 3). The history is
-  reprojected with the motion vectors alone, so off by the jitter difference (under a pixel). Open:
-  find the word in RR's encoder parameters (`NEURAL_FORGE_PROBE_PARAMS`).
-- Not compared with the helper in the same scene, and the picture was not captured (the installed CLI
-  speaks SHM v11). Cyberpunk 2077 and Black Myth: Wukong are not installed on the rig: not run.
+| | Native | Helper (2.0.10) |
+|---|---|---|
+| Crimson Desert, in game | 52 fps presented, the model on every frame (52 held/s), 0 misses | 85 fps presented, the model on 44.5 of them a second (about half) |
+| Crimson Desert, model switched off | 85.2 fps | 85.4 fps |
+| Wukong benchmark, results screen | 107 fps presented = 54 real, every one held; frame generation 2x | 164 fps presented = about 82 real, 32 held/s (39%); frame generation 2x |
+| Wukong benchmark, first half / second half | 66-76 / 63-81 fps presented | 64-73 / 86-115 fps presented |
+
+- **The helper skips frames there, native does not.** The helper's hold inside DLSS's buffer gives a frame up
+  silently whenever slot 0 is still busy (the request, the zero-copy capture or the compose), so the game runs
+  faster with the model on only some of its frames. Native runs the model on every frame and the game's GPU
+  waits for it inside the frame: about 7 ms a frame at 1516x852 (network 5.9 ms).
+- **Frame generation is not affected by the backend.** Crimson Desert generates no frames under Proton with
+  either backend or with the model off (one DLSS submit per present, 85 fps either way), although its options
+  ask for dynamic multi frame generation (also with the dynamic option off: 51.8 fps native). Wukong's
+  frame generation doubles native's frames as it does the helper's; GTA V's 4x does too (Phase 3, about 200
+  presented from 50).
+- **Fixed on the way:**
+  - The after-the-upscaler path kept its claim on the network when the network was not built at its size, so
+    the paths fought over the build. In Wukong (`ab-wk-nat`) the network then faulted the game's channel
+    (Xid 13, class `cec0`, then Xid 32) at the first hold that ran it; with the claim always released, the
+    benchmark ran through (`wk-nat-2`, 29,400 holds, 0 misses, no Xid).
+  - The native hold ignored the on/off toggle (F11, the GUI, `apply_model`): it now goes to DLSS untouched when
+    the model is off, as the helper's does (checked in Crimson Desert: "skipped (the model is switched off)").
+- The pictures were not compared.
 
 ## Decided before Phase 1
 
