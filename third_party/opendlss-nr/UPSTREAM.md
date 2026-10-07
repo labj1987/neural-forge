@@ -18,8 +18,8 @@ and embedded into the library.
 
 ## Not included
 
-- `src/main.cpp` (the `dlss5vk` command-line tool), and `src/verify.cpp`, `src/reference.cpp`,
-  `src/reference.h`, which only that tool uses (`runVerify` and the CPU reference).
+- `src/main.cpp` (the `dlss5vk` command-line tool) and `src/verify.cpp`, which only that tool uses
+  (`runVerify`). `src/reference.*` stays: `ref::siluTable()` feeds `Kernels::setSiluTable`.
 - `demo/`, `ports/`, `docs/`, `third_party/` (Filament patch), and the PowerShell/Node build scripts
   (`scripts/*.ps1`, `scripts/*.mjs`, `scripts/*.py` outside `scripts/ptx/`). `build.rs` reproduces
   `scripts/build_shaders.ps1`: the same glslang flags and the same PTX generator invocations.
@@ -43,3 +43,13 @@ Each one is also a patch in `patches/`, relative to this directory and applied i
    `<shaderDir>/<name>.spv` or `$DLSS5VK_PTX_DIR/<name>.ptx`. Unset, behaviour is unchanged. Reason: a
    Vulkan layer is a single `.so` loaded into a game process and cannot rely on a kernel directory next to
    it; neural-forge-native embeds the kernels and installs a loader (`nf_native::installAssetLoader`).
+4. `patches/0004-layer-adoption.patch`: a second adopting `vk::Context` constructor for use inside a Vulkan
+   layer (`src/vk_context.h/.cpp`). It loads every function through the `vkGetInstanceProcAddr` it is given
+   (the next layer's, `volkInitializeCustom`) instead of the loader, so the network's own calls never pass
+   through the layer that issues them; falls back to the KHR/EXT spellings of `vkCmdPipelineBarrier2`,
+   `vkGetBufferDeviceAddress` and `vkResetQueryPool` on a device created below 1.3; bounds every wait it
+   makes (`endAndSubmit`, `waitIdle`) with a fence and a timeout, throwing on expiry instead of hanging; on an
+   adopted device waits only for its own queue in the destructor, never `vkDeviceWaitIdle`; and calls an
+   optional `InitDispatchable` hook on its queue and every command buffer it allocates, so a layer can set
+   the loader's dispatch pointer on objects it got from below the loader. The original constructors are
+   unchanged.

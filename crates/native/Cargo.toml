@@ -14,3 +14,7 @@ crate-type = ["rlib"]
 
 [build-dependencies]
 cc = { version = "1.2", features = ["parallel"] }
+
+[dependencies]
+# The same ash as the layer (its handles cross this crate's API).
+ash = "=0.37.3"

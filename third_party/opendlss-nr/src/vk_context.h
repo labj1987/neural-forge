@@ -77,6 +77,16 @@ class Context {
   // Adopt a device created elsewhere (the demo renderer) with DeviceRequirements applied; the instance / device
   // are not destroyed by this object.
   Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device, uint32_t queueFamily, uint32_t queueIndex = 0);
+  // Adopt a device from inside a Vulkan layer: every function is loaded through `getInstanceProcAddr` (the next
+  // layer's), never the loader, and every wait this object makes on its queue gives up after `waitTimeoutNs`
+  // (std::runtime_error). The queue must be this object's alone.
+  // `initDispatchable`, when set, is called on every dispatchable object this object gets from below the loader
+  // (its queue, every command buffer it allocates) to give it the loader's dispatch pointer.
+  using InitDispatchable = void (*)(void* user, VkDevice device, void* object);
+  Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+          uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable = nullptr,
+          void* initUser = nullptr);
+  void initDispatchable(void* object) const { if (initDispatchable_) initDispatchable_(initUser_, device_, object); }
   ~Context();
   uint32_t queueFamily() const { return queueFamily_; }
   uint32_t queueIndex() const { return queueIndex_; }
@@ -127,7 +137,7 @@ class Context {
   // Commands --------------------------------------------------------------------
   VkCommandBuffer beginCommands();
   void endAndSubmit(VkCommandBuffer commands, bool wait = true);
-  void waitIdle() { VK_CHECK(vkQueueWaitIdle(queue_)); }
+  void waitIdle();
   void computeBarrier(VkCommandBuffer commands);   // compute -> compute
   // VK_NV_cuda_kernel_launch: PTX modules launched from the command buffer on buffer device addresses.
   VkDeviceAddress deviceAddress(const Buffer& buffer) const;
@@ -167,6 +177,11 @@ class Context {
   uint32_t smCount_ = 0;   // streaming multiprocessors (co-residency bound of spinning grids)
   bool captureStatistics_ = false;
   bool owned_ = true;
+  uint64_t waitTimeoutNs_ = 0;
+  InitDispatchable initDispatchable_ = nullptr;
+  void* initUser_ = nullptr;        // 0: unbounded waits (the tool); otherwise every wait is bounded
+  VkFence waitFence_ = VK_NULL_HANDLE;
+  void adopt();
   std::string deviceName_;
   void initCommon();   // properties, memory types, command pool, layouts, pools, staging
   Buffer dummy_;

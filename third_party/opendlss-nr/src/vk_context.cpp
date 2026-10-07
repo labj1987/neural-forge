@@ -167,6 +167,31 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
   instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
   volkLoadInstance(instance_);
   volkLoadDevice(device_);
+  adopt();
+}
+
+Context::Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+                 uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable,
+                 void* initUser) {
+  initDispatchable_ = initDispatchable;
+  initUser_ = initUser;
+  volkInitializeCustom(getInstanceProcAddr);
+  instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
+  waitTimeoutNs_ = waitTimeoutNs;
+  volkLoadInstanceOnly(instance_);
+  volkLoadDevice(device_);
+  // A device created at an API version below 1.3 has only the extension spellings of these.
+  if (!vkCmdPipelineBarrier2) vkCmdPipelineBarrier2 = vkCmdPipelineBarrier2KHR;
+  if (!vkGetBufferDeviceAddress) vkGetBufferDeviceAddress = vkGetBufferDeviceAddressKHR;
+  if (!vkResetQueryPool) vkResetQueryPool = vkResetQueryPoolEXT;
+  if (!vkCmdPipelineBarrier2 || !vkGetBufferDeviceAddress || !vkCreateCudaModuleNV || !vkCmdCudaLaunchKernelNV)
+    throw std::runtime_error("the device does not expose the functions the network needs");
+  VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+  VK_CHECK(vkCreateFence(device_, &fenceInfo, nullptr, &waitFence_));
+  adopt();
+}
+
+void Context::adopt() {
   VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
   VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
   VkPhysicalDeviceShaderSMBuiltinsPropertiesNV smBuiltins{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV};
@@ -239,6 +264,7 @@ DeviceRequirements::DeviceRequirements() {
 
 void Context::initCommon() {
   vkGetDeviceQueue(device_, queueFamily_, queueIndex_, &queue_);
+  initDispatchable(queue_);
 
   VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
   poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
@@ -277,7 +303,12 @@ void Context::initCommon() {
 
 Context::~Context() {
   if (!device_) return;
-  vkDeviceWaitIdle(device_);
+  // An adopted device is the application's: only this object's own queue is waited for.
+  if (owned_) vkDeviceWaitIdle(device_);
+  else {
+    try { waitIdle(); } catch (...) {}   // a destructor must not throw; the caller already drained it
+  }
+  if (waitFence_) vkDestroyFence(device_, waitFence_, nullptr);
   for (VkShaderModule module : modules_) vkDestroyShaderModule(device_, module, nullptr);
   destroyBuffer(dummy_);
   destroyBuffer(staging_);
@@ -526,6 +557,7 @@ VkCommandBuffer Context::beginCommands() {
   allocateInfo.commandBufferCount = 1;
   VkCommandBuffer commands;
   VK_CHECK(vkAllocateCommandBuffers(device_, &allocateInfo, &commands));
+  initDispatchable(commands);
   VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
   beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
   VK_CHECK(vkBeginCommandBuffer(commands, &beginInfo));
@@ -537,11 +569,34 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit.commandBufferCount = 1;
   submit.pCommandBuffers = &commands;
+  if (waitTimeoutNs_ && wait) {
+    VK_CHECK(vkResetFences(device_, 1, &waitFence_));
+    VK_CHECK(vkQueueSubmit(queue_, 1, &submit, waitFence_));
+    const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
+    // A timed-out buffer may still run: it is leaked, not freed.
+    if (waited == VK_TIMEOUT) throw std::runtime_error("a submit on the network's queue did not finish in time");
+    VK_CHECK(waited);
+    vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
+    return;
+  }
   VK_CHECK(vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE));
   if (wait) {
     VK_CHECK(vkQueueWaitIdle(queue_));
     vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
   }
+}
+
+void Context::waitIdle() {
+  if (!waitTimeoutNs_) {
+    VK_CHECK(vkQueueWaitIdle(queue_));
+    return;
+  }
+  // An empty submit's fence signals once everything before it on the queue has completed.
+  VK_CHECK(vkResetFences(device_, 1, &waitFence_));
+  VK_CHECK(vkQueueSubmit(queue_, 0, nullptr, waitFence_));
+  const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
+  if (waited == VK_TIMEOUT) throw std::runtime_error("the network's queue did not go idle in time");
+  VK_CHECK(waited);
 }
 
 void Context::computeBarrier(VkCommandBuffer commands) {

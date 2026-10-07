@@ -693,6 +693,7 @@ dependencies = [
 name = "neural-forge-native"
 version = "2.0.10"
 dependencies = [
+ "ash",
  "cc",
 ]
 

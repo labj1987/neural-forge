@@ -1445,6 +1445,9 @@ impl Tracker {
             self.launch.entry(command_buffer).or_default().opaque = true;
             return;
         };
+        if kernel == Some(Kernel::SrInput) {
+            probe_params(bytes);
+        }
         let mut named: Vec<vk::Image> = Vec::new();
         for word in bytes.chunks_exact(8) {
             let value = u64::from_le_bytes(word.try_into().unwrap_or_default());
@@ -4520,6 +4523,26 @@ pub(crate) struct Session {
     exposure_untrusted: Option<u64>,
     /// Consecutive frames still to dump after the one just taken ([`dump_frames`]).
     burst: u32,
+}
+
+/// `NEURAL_FORGE_PROBE_PARAMS=1`: logs every word of DLSS Super Resolution's input-kernel parameters
+/// (hex, and its two halves as f32) for the first 2000 launches, to find the per-frame scalars
+/// (the camera jitter) beside the documented ones (docs/DLSS_KERNEL_CATALOGUE.md).
+fn probe_params(bytes: &[u8]) {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PROBE_PARAMS").is_ok_and(|v| v == "1"));
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    if !*ON || COUNT.fetch_add(1, Ordering::Relaxed) >= 2000 {
+        return;
+    }
+    let words: Vec<String> = bytes
+        .chunks_exact(8)
+        .enumerate()
+        .map(|(i, w)| {
+            let v = u64::from_le_bytes(w.try_into().unwrap_or_default());
+            format!("w{i}={v:016x}({},{})", f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32))
+        })
+        .collect();
+    crate::log!("[probe-params] {}", words.join(" "));
 }
 
 /// `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore`: dump even when DLSS's launch buffer synchronizes
