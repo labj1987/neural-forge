@@ -408,6 +408,62 @@ about half its launches.
 - **Inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077's `inline` hold): still the helper's
   path. Not needed for GTA V.
 
+## Phase 2: the rest of the app on the native path
+
+### 2.2 The Model tab on the network
+
+What each control does with NGX (the helper) and natively. "Checked" is the same frame (GTA frame d1, the
+first after a history reset) through the helper with the setting changed, against dlss5vk with the same
+setting: bit-exact, or within one half-float step where the native side applies a post-network operator
+(the 0.0005 maximum is the numpy port used for the check, not the shader).
+
+| Control | With NGX (helper) | Native | Checked |
+|---|---|---|---|
+| Style (Default, Natural, Cinematic) | `DLSSNR.Style` | lane 10 (`style / 128`) **and** the Natural/Cinematic operator after the network (exposure, contrast, saturation in HSL, scaled by local tone; OpenDLSS-NR's `nrStyle`), in `native_composite.comp` | style 1 and 2: NGX = network + operator, within one half step; the network alone differs (max 0.12) |
+| Intensity | `DLSSNR.Intensity` | `proxy + intensity * (styled - proxy)`, truncated to half, in the composite | 0.5: within one half step; the network alone differs (max 0.13) |
+| Local tone | `DLSSNR.LocalToneStrength` | lane 11 (and the style operator's strength) | 0.5: bit-exact |
+| Local structure | `DLSSNR.LocalStructureStrength` | lanes 12-14 | 0.5 with skin 2: bit-exact |
+| Skin structure (-1 follows structure) | `DLSSNR.SkinStructureStrength` | lane 13 | as above |
+| Auto mask | `DLSSNR.UseAutoMask` | lanes 12-14 (off: structure, -1, -1) | off: bit-exact |
+| Preset | `DLSSNR.Hint.Render.Preset` | none | preset 1 gives NGX's preset-0 answer byte for byte: **it does nothing on 310.8.0**, with either backend. **For Alex: keep or remove the control.** |
+| Sharpness | `Sharpness`, which the 310.8 feature never reads (DLSSNR_PARAMETERS.md) | none | **No effect on either backend. For Alex: keep or remove.** |
+| Passes, per-pass settings | the helper chains one NGX feature per pass | not built: the network once per frame, pass 0's settings. Possible: the graph run N times on the previous pass's output, about 6.5 ms per pass at 1485x836 in game. **For Alex: wanted?** (Alex runs 1 pass.) |  |
+| Motion: estimate motion vectors, units, quality | the helper's optical flow feeds NGX's `MVec` | before the upscaler: DLSS's own motion vectors and jitter, nothing to set; after the upscaler: no motion at all (2.1). **For Alex: these controls only matter to the helper.** |  |
+
+Every other Model and Composition control (model interval, working scale, detail strength, colour
+strength, highlight guard, white point, transfer mode, compare, debug) belongs to the after-the-upscaler
+composition, which is unchanged, and has no network-side meaning.
+
+The native hold reads pass 0's resolved settings from the header every frame (`ShmClient::pass_tuning`),
+with the helper's clamps, so a change applies at the next frame (the helper rebuilt its feature after a
+settle delay instead).
+
+### 2.3 The Setup tab
+
+The NGX import group, the runner picker and the Status page's "NGX binaries" row are gone, and with them
+`crates/gui/src/binaries.rs`. In their place one group, "Neural rendering model": a row saying "present,
+from build 310.8.0.0" or "missing", and "Extract…", which asks for `nvngx_dlssnr.dll` and runs the same
+extractor as `neural-forge-cli extract-model` on a worker thread (a wrong build is refused with the build it
+found). The first-run banner now fires on a missing model. The Status page shows the model's state. The
+helper's runner stays in `config.ini` (and `neural-forge-cli`) for the A/B runs on this branch.
+
+### 2.4 The 32-bit layer
+
+**The native path cannot run there as built.** A 32-bit process on driver 615.71.09 gets
+`VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2`, `VK_EXT_shader_float8` and
+`VK_KHR_buffer_device_address`, but **not `VK_NV_cuda_kernel_launch`** (checked with a 32-bit extension
+query on the RTX 5070), so none of the PTX kernels can launch. What it would take:
+
+- the GLSL route only (every `DLSS5VK_PTX_*` family off, no counter chaining): 7.56 ms at 1485x836 and
+  19.7 ms at 2560x1440 on the idle GPU (+37% and +48% against PTX). The fully unfused reference route is
+  77 ms and 220 ms: not usable;
+- an i686 build of the vendored C++ (the `cc` target, a 32-bit static libstdc++) and a requirement list
+  without `VK_NV_cuda_kernel_launch`;
+- a smaller staging window (256 MiB mapped in a 32-bit address space is too much) and the model's host
+  copy dropped after upload (141 MiB).
+
+Not built, as the handoff asks.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL
@@ -454,9 +510,9 @@ about half its launches.
 - [x] 1.5 backend switch in place
 - [x] 1.6 failure paths tested (missing model, watchdog, allocation failure)
 - [ ] 2.1 after-the-upscaler path native
-- [ ] 2.2 settings mapping table written, unmapped controls listed
-- [ ] 2.3 Setup tab reduced to extract-model
-- [ ] 2.4 32-bit layer answer recorded
+- [x] 2.2 settings mapping table written, unmapped controls listed
+- [x] 2.3 Setup tab reduced to extract-model
+- [x] 2.4 32-bit layer answer recorded
 - [ ] Phase 3 benchmarks and long session done
 - [ ] Phase 4 report written, branch pushed, stopped for Alex
 - [ ] Phase 5 (only on Alex's yes)

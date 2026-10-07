@@ -121,11 +121,18 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_native(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target,
-    loader: &NativeLoader, jitter: Option<[f32; 2]>, submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
+    loader: &NativeLoader, jitter: Option<[f32; 2]>, shm: &ShmClient,
+    submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
-    // SAFETY: forwarded.
-    return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, native::Conditioning::default(), submit) };
+    {
+        // The Model tab's settings for the first pass (NATIVE_BACKEND.md, "2.2").
+        let conditioning = shm.pass_tuning(0).map_or_else(native::Conditioning::default, native::Conditioning::from);
+        // SAFETY: forwarded.
+        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, conditioning, submit) };
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = shm;
     #[cfg(not(target_arch = "x86_64"))]
     match *loader {}
 }

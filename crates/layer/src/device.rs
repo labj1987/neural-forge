@@ -1216,7 +1216,7 @@ impl NeuralForgeDeviceInfo {
             let hold = match loader {
                 // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
                 Some(loader) => unsafe {
-                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, &mut layer_submit)
+                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, shm, &mut layer_submit)
                 },
                 None => unsafe {
                     crate::preupscale::run_hold(

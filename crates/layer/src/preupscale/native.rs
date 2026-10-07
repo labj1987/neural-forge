@@ -335,6 +335,20 @@ pub(crate) struct Conditioning {
     pub auto_mask: bool,
 }
 
+impl From<neural_forge_protocol::PassTuning> for Conditioning {
+    /// With the helper's clamps (`ngx.rs::NgxTuning`): the same values reach the network.
+    fn from(t: neural_forge_protocol::PassTuning) -> Self {
+        Self {
+            style: t.style,
+            intensity: t.intensity.clamp(0.0, 4.0),
+            local_tone: t.local_tone.clamp(0.0, 4.0),
+            local_structure: t.local_structure.clamp(0.0, 4.0),
+            skin_structure: t.skin_structure.clamp(-1.0, 4.0),
+            auto_mask: t.auto_mask != 0,
+        }
+    }
+}
+
 impl Default for Conditioning {
     fn default() -> Self {
         Self { style: 0, intensity: 1.0, local_tone: 1.0, local_structure: 1.0, skin_structure: -1.0, auto_mask: true }

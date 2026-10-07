@@ -373,6 +373,11 @@ impl ShmClient {
     /// `layer_attached`/`layer_heartbeat`/`layer_width`/`layer_height`/`layer_format`/
     /// `layer_frames` are status telemetry, not part of the handshake -- deliberately
     /// not per-slot; they just reflect whichever slot most recently captured.
+    /// Pass `pass`'s settings, its overrides merged over the global ones (the Model tab's).
+    pub fn pass_tuning(&self, pass: usize) -> Option<neural_forge_protocol::PassTuning> {
+        self.header().map(|hdr| hdr.resolve_pass(pass))
+    }
+
     /// The layer's status line for the GUI (the native backend's state, or why it is not running).
     pub fn set_layer_reason(&self, reason: &str) {
         if let Some(hdr) = self.header() {

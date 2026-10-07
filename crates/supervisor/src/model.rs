@@ -321,6 +321,14 @@ pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Vec
     files
 }
 
+/// The build of the DLL the installed model directory came from (the manifest's `source.build`),
+/// or `None` when there is no readable manifest there.
+pub fn installed(dir: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
+    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
+    manifest["source"]["build"].as_str().map(str::to_string)
+}
+
 #[derive(Debug)]
 pub struct Extracted {
     pub dir: PathBuf,
@@ -528,6 +536,8 @@ mod tests {
         let done = extract(&dir, &out).unwrap();
         assert_eq!((done.build.as_str(), done.tensors), ("310.8.0", TENSOR_COUNT));
         assert!(out.join("manifest.json").is_file() && out.join("model/vit.e4m3").is_file());
+        assert_eq!(installed(&out).as_deref(), Some("310.8.0.0"));
+        assert_eq!(installed(&dir.join("nowhere")), None);
         assert!(!out.join("manifest.json.partial").exists());
 
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 9, 1, 0])).unwrap();

@@ -531,8 +531,6 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // and (like AdwPreferencesGroup::title) are Pango markup, so no bare "&" either.
     view_stack.add_titled_with_icon(&debug_page, Some("debug"), "Debug", "edit-find-symbolic");
 
-    // Built before the Status group: on a first run the Setup page saves the default runner,
-    // which the helper auto-start depends on.
     let setup_page = build_setup_page(&toasts);
 
     let status_page = adw::PreferencesPage::new();
@@ -543,17 +541,16 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", "preferences-system-symbolic");
 
-    // First-run flow: `nvngx_dlssnr.dll` missing means neural rendering can't work at
-    // all yet (fail-open just presents untouched frames, no error a first-time user
-    // would ever see) -- land on Setup instead of Model, with a banner explaining why,
-    // rather than a silently-inert app.
-    let missing_ngx = !crate::binaries::dir().join("nvngx_dlssnr.dll").is_file();
-    if missing_ngx {
+    // First-run flow: no model means neural rendering can't work at all yet (fail-open just
+    // presents untouched frames, which a first-time user would never notice) -- land on Setup
+    // instead of Model, with a banner explaining why, rather than a silently-inert app.
+    let missing_model = !model_status().1;
+    if missing_model {
         view_stack.set_visible_child_name("setup");
     }
-    let banner = adw::Banner::new("NVIDIA NGX binaries are missing -- neural rendering can't run without them");
+    let banner = adw::Banner::new("The neural rendering model is missing -- extract it in Setup");
     banner.set_button_label(Some("Open Setup"));
-    banner.set_revealed(missing_ngx);
+    banner.set_revealed(missing_model);
     {
         let view_stack = view_stack.clone();
         let banner_for_closure = banner.clone();
@@ -932,131 +929,6 @@ fn refresh_profile_combo(combo: &adw::ComboRow) {
     }
 }
 
-/// Asks for a folder and imports the NGX DLL from it on a worker thread (it is
-/// tens of megabytes). `on_imported` runs on the main thread after a successful
-/// import, to refresh whatever status the caller shows.
-fn import_ngx_binaries(button: &gtk4::Button, toasts: &adw::ToastOverlay, on_imported: impl Fn() + 'static) {
-    let toasts = toasts.clone();
-    let parent = button.root().and_downcast::<gtk4::Window>();
-    let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
-    dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
-        let Ok(folder) = result else { return };
-        let Some(path) = folder.path() else {
-            toasts.add_toast(adw::Toast::new("That folder has no local path -- choose a folder on this computer"));
-            return;
-        };
-        glib::spawn_future_local(async move {
-            match gio::spawn_blocking(move || crate::binaries::import_from(&path)).await {
-                Ok(Ok(0)) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
-                Ok(Ok(n)) => {
-                    toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
-                    on_imported();
-                }
-                Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
-                Err(_) => toasts.add_toast(adw::Toast::new("Import failed: the import worker panicked")),
-            }
-        });
-    });
-}
-
-fn build_ngx_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::new();
-    group.set_title("NVIDIA NGX binary");
-    group.set_description(Some("From your own NVIDIA driver/SDK install -- this project doesn't and can't ship it"));
-
-    let mut status_rows: Vec<(String, adw::ActionRow, gtk4::Image)> = Vec::new();
-    for (name, present) in crate::binaries::status() {
-        let row = adw::ActionRow::new();
-        row.set_title(name);
-        row.set_subtitle(if present { "present" } else { "missing" });
-        let icon = gtk4::Image::from_icon_name(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" });
-        row.add_prefix(&icon);
-        group.add(&row);
-        status_rows.push((name.to_string(), row, icon));
-    }
-
-    let import_row = adw::ActionRow::new();
-    import_row.set_title("Import");
-    import_row.set_subtitle("Copy the DLL above from a folder (an extracted NVIDIA driver/SDK)");
-    let import_button = gtk4::Button::with_label("Import…");
-    import_button.set_valign(gtk4::Align::Center);
-    import_row.add_suffix(&import_button);
-    import_row.set_activatable_widget(Some(&import_button));
-    group.add(&import_row);
-
-    {
-        let toasts = toasts.clone();
-        import_button.connect_clicked(move |button| {
-            let status_rows = status_rows.clone();
-            import_ngx_binaries(button, &toasts, move || {
-                for (name, row, icon) in &status_rows {
-                    let present = crate::binaries::dir().join(name).is_file();
-                    row.set_subtitle(if present { "present" } else { "missing" });
-                    icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
-                }
-            });
-        });
-    }
-
-    group
-}
-
-fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::new();
-    group.set_title("Compatibility tool");
-    group.set_description(Some("Needs DXVK-NVAPI (Proton-CachyOS, Proton-GE) or a system Wine with it installed -- \
-                            Valve's stock Proton builds don't bundle it"));
-
-    let mut options: Vec<(String, String)> = neural_forge_supervisor::runners::discover_proton()
-        .into_iter()
-        .map(|runner| (runner.name, runner.path.to_string_lossy().into_owned()))
-        .collect();
-    if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
-        options.push(("System Wine".to_string(), wine.to_string_lossy().into_owned()));
-    }
-
-    let combo = adw::ComboRow::new();
-    combo.set_title("Runner");
-    if options.is_empty() {
-        combo.set_model(Some(&gtk4::StringList::new(&["No compatibility tool found"])));
-        combo.set_sensitive(false);
-    } else {
-        let mut cfg = neural_forge_supervisor::Config::load();
-        // First run: nothing is configured yet, so save the runner `neural-forge-cli init`
-        // would pick. Showing it selected without saving it left the helper with no runner.
-        if cfg.runner_path.is_empty() {
-            if let Some((runner_type, path)) = neural_forge_supervisor::runners::default_runner() {
-                cfg.runner_type = runner_type.to_string();
-                cfg.runner_path = path.to_string_lossy().into_owned();
-                if let Err(e) = cfg.save() {
-                    toasts.add_toast(adw::Toast::new(&format!("Failed to save the runner: {e}")));
-                }
-            }
-        }
-        let names: Vec<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
-        combo.set_model(Some(&gtk4::StringList::new(&names)));
-        let selected = options.iter().position(|(_, path)| *path == cfg.runner_path).unwrap_or(0);
-        combo.set_selected(selected as u32);
-    }
-    group.add(&combo);
-
-    if !options.is_empty() {
-        let toasts = toasts.clone();
-        combo.connect_selected_notify(move |combo| {
-            let Some((name, path)) = options.get(combo.selected() as usize) else { return };
-            let mut cfg = neural_forge_supervisor::Config::load();
-            cfg.runner_type = if name == "System Wine" { "wine".to_string() } else { "proton".to_string() };
-            cfg.runner_path = path.clone();
-            match cfg.save() {
-                Ok(()) => toasts.add_toast(adw::Toast::new(&format!("Runner set to {name} -- restart the helper to use it"))),
-                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Failed to save: {e}"))),
-            }
-        });
-    }
-
-    group
-}
-
 /// The exact Steam launch-option string for these settings -- pulled out of the
 /// closure below so it's a plain, unit-testable function instead of only ever being
 /// exercised live through GTK signal handlers.
@@ -1107,10 +979,70 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     group
 }
 
+/// The model's row text: present with the build it came from, or missing.
+fn model_status() -> (String, bool) {
+    let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+    match neural_forge_supervisor::model::installed(&dir) {
+        Some(build) => (format!("present, from build {build}"), true),
+        None => ("missing: extract it from nvngx_dlssnr.dll below".to_string(), false),
+    }
+}
+
+/// The native backend's one setup step: point at NVIDIA's DLL once and extract the model from it.
+fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Neural rendering model");
+    group.set_description(Some(
+        "Taken from your own nvngx_dlssnr.dll (build 310.8.0) -- this project doesn't and can't ship it",
+    ));
+    let (text, present) = model_status();
+    let status_row = adw::ActionRow::new();
+    status_row.set_title("Model");
+    status_row.set_subtitle(&text);
+    let icon = gtk4::Image::from_icon_name(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" });
+    status_row.add_prefix(&icon);
+    group.add(&status_row);
+
+    let extract_row = adw::ActionRow::new();
+    extract_row.set_title("Extract from DLL");
+    extract_row.set_subtitle("Choose nvngx_dlssnr.dll; the model is written to Neural Forge's data folder");
+    let button = gtk4::Button::with_label("Extract…");
+    button.set_valign(gtk4::Align::Center);
+    extract_row.add_suffix(&button);
+    extract_row.set_activatable_widget(Some(&button));
+    group.add(&extract_row);
+
+    let toasts = toasts.clone();
+    button.connect_clicked(move |button| {
+        let toasts = toasts.clone();
+        let (status_row, icon) = (status_row.clone(), icon.clone());
+        let parent = button.root().and_downcast::<gtk4::Window>();
+        let dialog = gtk4::FileDialog::builder().title("Select nvngx_dlssnr.dll").build();
+        dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+            let Ok(file) = result else { return };
+            let Some(path) = file.path() else {
+                toasts.add_toast(adw::Toast::new("That file has no local path -- choose a file on this computer"));
+                return;
+            };
+            glib::spawn_future_local(async move {
+                let out = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+                match gio::spawn_blocking(move || neural_forge_supervisor::model::extract(&path, &out).map_err(|e| e.to_string())).await {
+                    Ok(Ok(done)) => toasts.add_toast(adw::Toast::new(&format!("Model extracted from build {} -- restart the game to use it", done.build))),
+                    Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Extraction failed: {e}"))),
+                    Err(_) => toasts.add_toast(adw::Toast::new("Extraction failed: the worker panicked")),
+                }
+                let (text, present) = model_status();
+                status_row.set_subtitle(&text);
+                icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
+            });
+        });
+    });
+    group
+}
+
 fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
-    page.add(&build_ngx_group(toasts));
-    page.add(&build_runner_group(toasts));
+    page.add(&build_model_group(toasts));
     page.add(&build_launch_option_group());
     page
 }
@@ -1426,21 +1358,10 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         });
     }
 
-    let binaries_row = adw::ActionRow::new();
-    binaries_row.set_title("NGX binaries");
-    binaries_row.set_subtitle(&binaries_status_subtitle());
-    let import_button = gtk4::Button::with_label("Import…");
-    import_button.set_valign(gtk4::Align::Center);
-    binaries_row.add_suffix(&import_button);
-    group.add(&binaries_row);
-
-    {
-        let toasts = toasts.clone();
-        import_button.connect_clicked(move |button| {
-            let binaries_row = binaries_row.clone();
-            import_ngx_binaries(button, &toasts, move || binaries_row.set_subtitle(&binaries_status_subtitle()));
-        });
-    }
+    let model_row = adw::ActionRow::new();
+    model_row.set_title("Model");
+    model_row.set_subtitle(&model_status().0);
+    group.add(&model_row);
 
     let settings_row = adw::ActionRow::new();
     settings_row.set_title("Settings");
@@ -1578,14 +1499,6 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     }
 
     (group, start_stop_button)
-}
-
-fn binaries_status_subtitle() -> String {
-    if crate::binaries::dir().join("nvngx_dlssnr.dll").is_file() {
-        "nvngx_dlssnr.dll present".to_string()
-    } else {
-        "nvngx_dlssnr.dll missing".to_string()
-    }
 }
 
 /// The Status page's one line on the pre-upscaler path, from the header's `preupscale_*` fields

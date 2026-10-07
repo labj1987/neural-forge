@@ -1,4 +1,3 @@
-mod binaries;
 mod shm;
 mod ui;
 
