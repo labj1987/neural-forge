@@ -2447,6 +2447,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         // carries the model's edit made before DLSS, is read back as both halves of
                         // each pair. The one-shot request is served as a series of one frame.
                         if let Some(instance) = &self.instance {
+                            if readable && preupscale.capture_at_due() {
+                                series.start(1, &crate::dump::captures_dir());
+                            }
                             if let Some(frames) = crate::series::take_request(shm, true) {
                                 if readable {
                                     series.start(frames, &crate::dump::captures_dir());
