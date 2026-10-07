@@ -15,6 +15,12 @@ def scratch_env(root, data):
     return {**os.environ, 'XDG_DATA_HOME': str(data), 'XDG_CONFIG_HOME': str(root / 'config'),
             'XDG_STATE_HOME': str(root / 'state'), 'NEURAL_FORGE_UID': f'installtest-{os.getpid()}'}
 class InstallTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # The tests drive the real CLI: build the debug one when it is the default and missing.
+        if 'NEURAL_FORGE_CLI' not in os.environ and not CLI.is_file():
+            subprocess.run(['cargo', 'build', '-p', 'neural-forge-cli'], cwd=CLI.parents[2], check=True)
+
     def test_coexistence_and_owned_removal(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -6,6 +6,9 @@ first shipped them; their phase is kept as a subheading.
 
 ## Unreleased
 
+- Scripts: `install.py --cli PATH` uses that CLI or fails; it no longer falls back to another copy
+  when PATH is missing (the install test then ran the fake CLI its first install had put in place,
+  "Exec format error"). `test_install.py` builds the debug CLI itself when it is missing.
 - Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
   `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,

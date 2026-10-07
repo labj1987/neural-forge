@@ -31,6 +31,12 @@ def main():
 def find_cli(args):
     """The neural-forge-cli to delegate to: --cli, $NEURAL_FORGE_CLI, the AppDir being
     installed, an already-installed copy, then a local cargo build."""
+    # Named explicitly, it is the one to use: falling back past a missing one could run another copy
+    # (even one the previous install just put in place).
+    if args.cli is not None:
+        if not (args.cli.is_file() and os.access(args.cli, os.X_OK)):
+            raise SystemExit(f'--cli {args.cli} is not an executable file')
+        return args.cli
     repo = Path(__file__).resolve().parent.parent
     data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
     candidates = [args.cli, os.environ.get('NEURAL_FORGE_CLI') and Path(os.environ['NEURAL_FORGE_CLI'])]
