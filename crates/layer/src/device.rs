@@ -2551,6 +2551,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // one-shot dump's, and each path only ever consumes its own values. Before
                     // `capture::run` has opened the mapping this finds nothing, and the series
                     // starts one present later.
+                    if readable && preupscale.capture_at_due() {
+                        series.start(1, &crate::dump::captures_dir());
+                    }
                     if let Some(frames) = crate::series::take_request(shm, false) {
                         if readable {
                             series.start(frames, &crate::dump::captures_dir());

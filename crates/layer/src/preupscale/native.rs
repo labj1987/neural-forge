@@ -1025,3 +1025,217 @@ pub(crate) unsafe fn run_native_hold(
     result.timing.writeback = Some(t_hold.elapsed());
     result
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const W: u32 = 20;
+    const H: u32 = 12;
+    const FW: u32 = 32;
+    const FH: u32 = 16;
+
+    fn half(v: f32) -> u16 {
+        // Truncates toward zero, which is also the composite's rounding; the test's values are exact halves.
+        let b = v.to_bits();
+        let sign = ((b >> 16) & 0x8000) as u16;
+        let exp = ((b >> 23) & 0xff) as i32 - 127 + 15;
+        let mant = b & 0x7f_ffff;
+        if v == 0.0 {
+            return sign;
+        }
+        assert!(exp > 0 && exp < 31, "test values stay normal halves");
+        sign | ((exp as u16) << 10) | ((mant >> 13) as u16)
+    }
+
+    fn f16(h: u16) -> f32 {
+        super::super::f16_to_f32(h)
+    }
+
+    /// The composite's truncation to the half grid (toward zero), on the CPU.
+    fn trunc_half(v: f32) -> f32 {
+        let h = half(v);
+        let back = f16(h);
+        if back.abs() > v.abs() { f16(h - 1) } else { back }
+    }
+
+    fn centre(v: f32) -> f32 {
+        // f16(f16(f16(v) - 0.5) * 0.125): exact for the test's values.
+        (v - 0.5) * 0.125
+    }
+
+    fn proxy(x: u32, y: u32, c: u32) -> f32 {
+        ((x * 7 + y * 3 + c * 5) % 64) as f32 / 64.0
+    }
+
+    fn residual(x: u32, y: u32, c: u32, frame: u32) -> f32 {
+        (((x + y + c + frame * 3) % 9) as f32 - 4.0) * 0.25
+    }
+
+    fn neural(x: u32, y: u32, c: u32, frame: u32) -> f32 {
+        let inner = residual(x, y, c, frame) * 0.03125 + (proxy(x, y, c) * 0.125 - 0.0625);
+        trunc_half((inner * 8.0 + 0.5).clamp(0.0, 1.0))
+    }
+
+    struct Fixture {
+        gpu: (ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32),
+        pool: vk::CommandPool,
+    }
+
+    impl Fixture {
+        fn one_shot(&self, record: impl FnOnce(vk::CommandBuffer)) {
+            let d = &self.gpu.3;
+            // SAFETY: the test's own pool, queue and device.
+            unsafe {
+                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(self.pool).command_buffer_count(1)).unwrap()[0];
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+                record(cmd);
+                d.end_command_buffer(cmd).unwrap();
+                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], vk::Fence::null()).unwrap();
+                d.queue_wait_idle(self.gpu.4).unwrap();
+                d.free_command_buffers(self.pool, &[cmd]);
+            }
+        }
+
+        fn submit(&self, cmds: &[vk::CommandBuffer]) {
+            let d = &self.gpu.3;
+            // SAFETY: recorded, idle command buffers of this device.
+            unsafe {
+                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::builder().command_buffers(cmds).build()], vk::Fence::null()).unwrap();
+                d.queue_wait_idle(self.gpu.4).unwrap();
+            }
+        }
+    }
+
+    /// The native frame around the network (preprocess, the recorded graph, composite), with an empty
+    /// secondary in the graph's place and a head written by the test: the input lanes, a first frame's
+    /// answer, the blend toward the previous answer on a frame with history, and the intensity blend, each
+    /// against the CPU (bit for bit where the arithmetic is exact).
+    #[test]
+    fn the_native_frame_builds_the_lanes_and_composites_the_head_with_its_history() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            // The encoded proxy, the exposure (1.0), the network's features and head buffers, an empty "graph".
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let blend = 0.5f32;
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: blend,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+            };
+            // The proxy into the encoded image (padded; the composite reads the valid part).
+            let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            fx.one_shot(|cmd| {
+                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
+                let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
+                device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+            let mut pass = NativePass::build(device, instance, physical, family, W, H).expect("the native pass builds");
+            assert!(pass.record(device, &built, encoded.view, exposure.buffer));
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.mvec.buffer, 0, vk::WHOLE_SIZE, 0));
+            let write_head = |frame: u32, logit: f32| {
+                let h: Vec<f32> = (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, frame), residual(x, y, 1, frame), residual(x, y, 2, frame), logit])).collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+            };
+            let answer = pass.answer();
+            let read_answer = || -> Vec<f32> {
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }]));
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).iter().map(|&h| f16(h)).collect()
+            };
+            let lanes = |x: u32, y: u32| -> Vec<f32> { std::slice::from_raw_parts(features.ptr.cast::<f32>().add(((y * FW + x) * 16) as usize), 16).to_vec() };
+
+            // Frame 1: no history. Lanes 4-6 and 7-9 are the centred proxy; the answer is the residual on it.
+            write_head(0, 10.0);
+            let cmds = pass.frame(&built, false, None, Conditioning::default());
+            assert_eq!(cmds.len(), 2, "the initialisation, then the frame");
+            fx.submit(&cmds);
+            let l = lanes(5, 3);
+            for c in 0..3 {
+                assert_eq!(l[4 + c as usize], centre(proxy(5, 3, c)), "proxy lane {c}");
+                assert_eq!(l[7 + c as usize], centre(proxy(5, 3, c)), "history lane {c} without history");
+            }
+            assert_eq!((l[3], l[10], l[11], l[12], l[13], l[14], l[15]), (1.0, 0.0, 1.0, 1.0, 1.0, 1.0, 0.0), "constant and conditioning lanes");
+            // Padding mirrors the image without repeating the edge: field column W maps to W - 2.
+            assert_eq!(lanes(W, 2)[4], centre(proxy(W - 2, 2, 0)), "the padding mirrors");
+            let a1 = read_answer();
+            for y in 0..H {
+                for x in 0..W {
+                    for c in 0..3 {
+                        assert_eq!(a1[((y * pw + x) * 4 + c) as usize], neural(x, y, c, 0), "frame 1 at {x},{y} channel {c}");
+                    }
+                }
+            }
+
+            // Frame 2: history (no motion, no jitter): lanes 7-9 are the previous answer, and the answer blends
+            // toward it by sigmoid(logit) * blendScale.
+            write_head(1, 10.0);
+            let cmds = pass.frame(&built, true, None, Conditioning::default());
+            fx.submit(&cmds);
+            let l = lanes(5, 3);
+            assert_eq!(l[7], centre(neural(5, 3, 0, 0)), "history lane from the previous answer");
+            let a2 = read_answer();
+            let weight = blend / (1.0 + (10.0f32 * -std::f32::consts::LOG2_E).exp2());
+            for y in 0..H {
+                for x in 0..W {
+                    for c in 0..3 {
+                        let n = neural(x, y, c, 1);
+                        let want = trunc_half(weight.mul_add(neural(x, y, c, 0) - n, n));
+                        let got = a2[((y * pw + x) * 4 + c) as usize];
+                        assert!((got - want).abs() <= 2.0 * 2f32.powi(-11), "frame 2 at {x},{y} channel {c}: {got} vs {want}");
+                    }
+                }
+            }
+
+            // Frame 3: intensity 0.5, no history: the answer halfway from the proxy to the network's.
+            write_head(2, 10.0);
+            let cmds = pass.frame(&built, false, None, Conditioning { intensity: 0.5, ..Conditioning::default() });
+            fx.submit(&cmds);
+            let a3 = read_answer();
+            for c in 0..3 {
+                let (p, n) = (proxy(7, 4, c), neural(7, 4, c, 2));
+                assert_eq!(a3[((4 * pw + 7) * 4 + c) as usize], trunc_half(0.5f32.mul_add(n - p, p).clamp(0.0, 1.0)), "intensity channel {c}");
+            }
+
+            pass.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+}

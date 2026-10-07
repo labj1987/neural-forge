@@ -4615,6 +4615,11 @@ pub(crate) struct Session {
     pub(crate) post_server: Option<native_post::PostServer>,
     #[cfg(target_arch = "x86_64")]
     post_server_tried: bool,
+    /// `NEURAL_FORGE_CAPTURE_AT`: how many times DLSS frames resumed after a gap, when the last resume was,
+    /// and whether the capture was taken ([`Self::capture_at_due`]).
+    resumes: u32,
+    resumed_at: Option<Instant>,
+    captured_at: bool,
     /// The native backend's status line last published (`layer_reason`), so it is written on change only.
     #[cfg(target_arch = "x86_64")]
     native_status: String,
@@ -4650,6 +4655,9 @@ pub(crate) fn dump_ignores_hazard() -> bool {
     *IGNORE
 }
 
+/// A pause in DLSS frames that counts as a resume for `NEURAL_FORGE_CAPTURE_AT` ([`Session::capture_at_due`]).
+const CAPTURE_GAP: Duration = Duration::from_secs(3);
+
 /// `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES`: how many consecutive DLSS frames each dump takes (default
 /// 1). Two or more give frame pairs for checking the motion vectors' convention.
 pub(crate) fn dump_frames() -> u32 {
@@ -4668,6 +4676,11 @@ impl Session {
 
     /// A launch-bearing submit with DLSS's inputs identified reached the hold point.
     pub(crate) fn saw_dlss(&mut self) {
+        // A resume after a gap: a loading screen, the start of a benchmark pass.
+        if self.last_dlss.is_none_or(|t| t.elapsed() >= CAPTURE_GAP) {
+            self.resumes += 1;
+            self.resumed_at = Some(Instant::now());
+        }
         self.last_dlss = Some(Instant::now());
         self.share_post_off();
     }
@@ -4970,6 +4983,25 @@ impl Session {
         #[cfg(target_arch = "x86_64")]
         drop(self.post_server.take());
         drop(self.native.take());
+    }
+
+    /// `NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>`: whether to capture the presented frame now, once, `<ms>` after
+    /// the `<resume>`-th time DLSS frames resumed after a gap of [`CAPTURE_GAP`] or more (1 is the first
+    /// frames). A scripted benchmark restarts its camera with every pass, so the same values capture the same
+    /// moment in every run, whatever the loading took (the A/B captures of docs/NATIVE_BACKEND.md, Phase 3).
+    pub(crate) fn capture_at_due(&mut self) -> bool {
+        static AT: LazyLock<Option<(u32, Duration)>> = LazyLock::new(|| {
+            let v = std::env::var("NEURAL_FORGE_CAPTURE_AT").ok()?;
+            let (n, ms) = v.split_once(':')?;
+            Some((n.trim().parse().ok()?, Duration::from_millis(ms.trim().parse().ok()?)))
+        });
+        let Some((n, after)) = *AT else { return false };
+        let due = !self.captured_at && self.resumes == n && self.resumed_at.is_some_and(|t| t.elapsed() >= after);
+        if due {
+            self.captured_at = true;
+            crate::log!("[preupscale] NEURAL_FORGE_CAPTURE_AT: capturing the frame {} ms after resume {n}", after.as_millis());
+        }
+        due
     }
 
     /// Publishes the native backend's status line after a native hold, when it changed.
