@@ -51,5 +51,7 @@ Each one is also a patch in `patches/`, relative to this directory and applied i
    makes (`endAndSubmit`, `waitIdle`) with a fence and a timeout, throwing on expiry instead of hanging; on an
    adopted device waits only for its own queue in the destructor, never `vkDeviceWaitIdle`; and calls an
    optional `InitDispatchable` hook on its queue and every command buffer it allocates, so a layer can set
-   the loader's dispatch pointer on objects it got from below the loader. The original constructors are
-   unchanged.
+   the loader's dispatch pointer on objects it got from below the loader; and, given a second queue family
+   (the application's, where the recorded graph runs), creates every buffer `VK_SHARING_MODE_CONCURRENT` over
+   its own family and that one, so the network can load on a queue of another family without ownership
+   transfers. The original constructors are unchanged.
