@@ -684,6 +684,13 @@ helper and everything associated with it". Done on `release-3.0`:
   imported DLL lives). `config.ini` keeps only `binaries=`, `shm=` and the `set_` settings, and the
   layer applies the saved settings itself when it creates the channel. Alex's machines get their old
   keys removed by hand; there is no migration code.
+- **Smoke test of the 3.0.0 AppImage** (installed on the test machine, driver 615.78.08, one run each):
+  GTA V benchmark pass 4 69.1 fps, every frame held (native before: 70.9-71.8; spread about 3 fps);
+  Crimson Desert in game 151.6 fps presented, 25.9 held/s inside DLSS's buffer, 0 misses (the first run
+  after the update compiled the game's shaders and stayed on its title screen: 50.5 held/s, 0 misses);
+  Lords of the Fallen (Unreal Engine 5, first launch, its privacy-policy screen: not accepted for Alex)
+  held inside DLSS's buffer at 109.4/s, R11G11B10 input at 1488x836, network 6.19 ms, 0 misses. No Xid,
+  no fence timeout in any run.
 - **Checks:** every crate builds without warnings, `cargo test` (layer on lavapipe) passes, as do
   `test_install.py`, `check_shaders.py` and `check_namespace.py`.
 
@@ -744,5 +751,6 @@ helper and everything associated with it". Done on `release-3.0`:
 - [x] Phase 4b hold inside DLSS's command buffer native
 - [x] Phase 5 helper removed (3.0.0)
 
-Open: the Wukong startup fault (Unreal Engine 5, frame generation on), Wukong's motion vectors not
+Open: Lords of the Fallen in play (its privacy policy needs accepting first) and Remnant II (installing);
+the Wukong startup fault (Unreal Engine 5, frame generation on), Wukong's motion vectors not
 copyable, Spider-Man and Shadow Warrior 3 measured in play (menus only so far).

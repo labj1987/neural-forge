@@ -14,7 +14,8 @@ unless noted): GTA V Enhanced benchmark 71.4 against 69.7 fps (two and three run
 shown against 50.1 / 200.4 with frame generation 4x), Crimson Desert in game 148.5 against 146.3 fps,
 GTA San Andreas - The Definitive Edition 87.6 against 77.1 frames held per second, Spider-Man
 Remastered (menu) 120 against 109 fps, Shadow Warrior 3 (menu) 115.7 against 99.3 fps, God of War
-27-30 against 27.5 fps. At 4K the network is probably slower than NGX was (one run, 21.9 fps), and
+27-30 against 27.5 fps. Lords of the Fallen (Unreal Engine 5, its first-launch menus only) is held inside
+DLSS's buffer every frame at 109 frames/s with no GPU fault. At 4K the network is probably slower than NGX was (one run, 21.9 fps), and
 after the upscaler it is about 12% slower and has no history. Details:
 [docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md).
 
