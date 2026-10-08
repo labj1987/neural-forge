@@ -2330,6 +2330,24 @@ impl Tracker {
         }
     }
 
+    /// Several entries whose buffers all name the same exposure image (`with`), with colour inputs of
+    /// one extent: one DLSS Super Resolution evaluation alternating its input between images, not
+    /// several evaluations (each evaluation has its own exposure input). Remnant II's Unreal Engine 5
+    /// alternates its input between two 1488x836 images (2026-10-08). The lowest handle;
+    /// [`Self::scan`] holds each submit with the input its buffer names ([`Self::retarget`]). Only
+    /// when the size rule identifies nothing (Remnant II's motion vectors are 1485x836): where it
+    /// does (Crimson Desert), its pick and [`Self::switch_by_evidence`] already follow the
+    /// alternation, and a new identification here would cost the identifying submit's hold.
+    fn one_evaluation(&self, with: &[Named]) -> Option<Named> {
+        if identify(&self.registered_set(), self.swapchain_extent()).is_some() {
+            return None;
+        }
+        let first = with.iter().min_by_key(|n| n.colour.as_raw())?;
+        let extent = |n: &Named| self.images.get(&n.colour).map(|d| (d.width, d.height));
+        (with.len() > 1 && extent(first).is_some() && with.iter().all(|n| n.exposure == first.exposure && extent(n) == extent(first)))
+            .then_some(*first)
+    }
+
     /// Whether `image` is one of the size rule's colour candidates ([`Self::candidates`]).
     fn is_candidate(&self, image: vk::Image) -> bool {
         self.candidates.iter().any(|c| c.0 == image)
@@ -2426,6 +2444,16 @@ impl Tracker {
                         self.said_named |= 2;
                         lines.push(format!(
                             "input launches in different command buffers name different colour inputs ({}): {} chosen, the one whose buffer names the 1x1 R16_SFLOAT exposure",
+                            describe(self, &counted),
+                            hex(one.colour)
+                        ));
+                    }
+                    Some(one)
+                } else if let Some(one) = self.one_evaluation(&with) {
+                    if self.said_named & 128 == 0 {
+                        self.said_named |= 128;
+                        lines.push(format!(
+                            "input launches in different command buffers name different colour inputs ({}): one evaluation alternating its input (every buffer names the same 1x1 R16_SFLOAT exposure, the inputs share one extent), {} chosen; each submit is held with the input its buffer names",
                             describe(self, &counted),
                             hex(one.colour)
                         ));
@@ -6436,6 +6464,56 @@ mod tests {
         assert!(t.inputs.is_none() && t.named_pick.is_none());
         assert_eq!(t.named.len(), 1, "seen, but not counted");
         assert_eq!(lines.iter().filter(|l| l.contains("names no 1x1 R16_SFLOAT exposure")).count(), 1, "{lines:#?}");
+    }
+
+    /// Two buffers naming different colour inputs of one extent, both with the same exposure, where
+    /// the size rule finds nothing: one evaluation alternating its input (Remnant II), so the lower
+    /// handle is chosen by the parameters. Each with its own exposure (two evaluations), or of
+    /// different extents: none is chosen.
+    #[test]
+    fn one_evaluation_alternating_its_input_is_chosen_by_its_shared_exposure() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let mut set = gta_registered();
+        set.insert(0x110, (img(0x110), desc(1707, 960, rgba, vk::ImageUsageFlags::STORAGE)));
+        set.insert(0x630, (img(0x630), desc(1, 1, vk::Format::R16_SFLOAT, storage)));
+        set.insert(0x120, (img(0x120), desc(1664, 936, rgba, vk::ImageUsageFlags::STORAGE)));
+        // Motion vectors a few pixels narrower than the colour input and depth (Remnant II: 1485x836
+        // against 1488x836), so the size rule finds nothing and the parameters decide.
+        set.insert(0x300, (img(0x300), desc(1704, 960, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT)));
+        // A second view at its own extent, with its own depth and motion vectors.
+        let set_second_view = |set: &mut BTreeMap<u64, (vk::Image, ImageDesc)>| {
+            set.insert(0x210, (img(0x210), desc(1664, 936, vk::Format::D32_SFLOAT_S8_UINT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)));
+            set.insert(0x310, (img(0x310), desc(1664, 936, vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT)));
+        };
+        let run = |set: &BTreeMap<u64, (vk::Image, ImageDesc)>, buffers: &[&[u64]]| {
+            let mut t = tracker_with(set, Some((2560, 1440)));
+            for (k, words) in buffers.iter().enumerate() {
+                let words: Vec<u64> = words.iter().map(|&w| h(w)).collect();
+                t.launch(cb(k as u64 + 1), Some(&param_block(&words)));
+            }
+            let mut lines = Vec::new();
+            for _ in 0..40 {
+                for k in 0..buffers.len() {
+                    let (_, l) = submit(&mut t, &[vec![cb(k as u64 + 1)]]);
+                    lines.extend(l);
+                }
+            }
+            (t.named_pick.map(|n| n.colour.as_raw()), t.inputs.map(|i| (i.colour.0.as_raw(), i.rule)), lines)
+        };
+        // One exposure for both: chosen by the parameters, the lower handle.
+        let (pick, inputs, lines) = run(&set, &[&[0x110, 0x200, 0x300, 0x610], &[0x100, 0x200, 0x300, 0x610]]);
+        assert_eq!((pick, inputs), (Some(0x100), Some((0x100, Rule::Params))));
+        assert_eq!(lines.iter().filter(|l| l.contains("one evaluation alternating its input")).count(), 1, "{lines:#?}");
+        // An exposure each: two evaluations, none chosen by the parameters.
+        let (pick, _, lines) = run(&set, &[&[0x100, 0x200, 0x300, 0x610], &[0x110, 0x200, 0x300, 0x630]]);
+        assert_eq!(pick, None);
+        assert!(lines.iter().any(|l| l.contains("none chosen")), "{lines:#?}");
+        // One exposure, but inputs of different extents: none.
+        set_second_view(&mut set);
+        let (pick, _, lines) = run(&set, &[&[0x100, 0x200, 0x300, 0x610], &[0x120, 0x210, 0x310, 0x610]]);
+        assert!(lines.iter().any(|l| l.contains("none chosen")), "{lines:#?}");
+        assert_eq!(pick, None);
     }
 
     /// (d) One launch naming two colour candidates at the depth's extent: the first in parameter
