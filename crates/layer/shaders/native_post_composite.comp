@@ -1,6 +1,6 @@
 #version 450
 // The native backend after the upscaler (docs/NATIVE_BACKEND.md, "2.1"): the network's head on the 8-bit
-// proxy, as the helper's answer was, for the unchanged after-the-upscaler composition to use. The residual,
+// proxy, in the proxy's own format, for the unchanged after-the-upscaler composition to use. The residual,
 // the half-grid truncation, the style operator and the intensity blend are native_composite.comp's
 // (OpenDLSS-NR's, MIT, commit 9d08f41). No history: there are no motion vectors here. The answer is 8 bits in
 // the proxy's own channel order, rounded to nearest (as an RGBA8 image store rounds), alpha copied.

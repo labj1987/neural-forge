@@ -1,5 +1,5 @@
 //! When the native network is built again after it failed to build (re-initialising means closing and
-//! opening the network again). The schedule was made for the 2.x helper's NGX feature:
+//! opening the network again). The schedule was first made for NVIDIA's NGX feature in 2.x:
 //!
 //! A failed `CreateFeature` used to be retried on the rebuild spacing (250 ms) for ever, with
 //! nothing in between: no backoff, no re-initialisation of NGX, and `model_up` left at 1. On the

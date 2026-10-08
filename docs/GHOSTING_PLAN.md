@@ -1,5 +1,10 @@
 # Ghosting: what upstream does differently, and the plan to fix it
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02):** this plan is finished history. Step 2 (the synchronous present) shipped
 > as the default in 0.1.78 and removed the ghosting; step 4 (motion vectors in the helper) shipped
 > in 0.1.93-0.1.98 and is on by default. The proposed `working_scale` default of 0.75 was not

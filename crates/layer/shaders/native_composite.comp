@@ -5,9 +5,9 @@
 // (neural = clamp(proxy + rgb/4)), the blend toward the reprojected history by sigmoid(logit) *
 // blendScale, the truncation to the half grid, the Natural/Cinematic style operator and the intensity
 // blend are theirs, bit for bit. NGX applies the same two after its network (style 1 and 2, intensity
-// 0.5 against the helper's answers: within one half-float step; NATIVE_BACKEND.md, "2.2"). The demo's
-// tone upgrade and display transform are not needed: the answer is a proxy-domain picture like the
-// helper's, and preupscale_decode.comp turns it back into scene-linear values.
+// 0.5 checked against NGX's answers: within one half-float step; NATIVE_BACKEND.md, "2.2"). The demo's
+// tone upgrade and display transform are not needed: the answer is a proxy-domain picture, as NGX's
+// was, and preupscale_decode.comp turns it back into scene-linear values.
 //
 // Shares the set layout, Params and the common functions with native_preprocess.comp (see there).
 layout(local_size_x = 8, local_size_y = 8) in;

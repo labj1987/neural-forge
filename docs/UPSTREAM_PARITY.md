@@ -1,5 +1,10 @@
 # Upstream parity
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02, 2.0.0):** the "Frame generation" item below is resolved. With the model
 > before DLSS Super Resolution (the 2.0 default), DLSS Frame Generation was measured on the rig at
 > 53.0 real / 159 shown fps against 28.7 / 86 on the 1.x path

@@ -1,5 +1,10 @@
 # NeuralForge target-machine validation — 2026-09-14
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02):** entries are dated and kept as written; later entries correct earlier ones.
 > One forward-looking line no longer holds: "2.0 baseline" says the copy path below 100% model
 > resolution is "what Phase 2 removes". Phases 2 and 3 of the 2.0 plan were not built; running the

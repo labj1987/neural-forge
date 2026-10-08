@@ -1,5 +1,10 @@
 # Zero-copy host transport: device-extension injection
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02):** the "not yet validated" items about GTA are done. Since 0.1.96 the layer
 > also recognises the extension when the game (vkd3d-proton) enables it itself, and GTA V's
 > `[sync]` lines show `zc=true` (HARDWARE_VALIDATION.md, "2.0 baseline"); the copies this removed

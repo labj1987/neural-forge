@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Install an extracted NeuralForge AppDir; remove only unchanged tracked files.
-No system package, upstream path, config, runtime file or Wine prefix is removed.
+No system package, upstream path, config or runtime file is removed.
 
 install/uninstall delegate to `neural-forge-cli` (the single implementation, in
 crates/supervisor/src/install.rs).

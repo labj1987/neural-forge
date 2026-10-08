@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Vulkan implicit layer: captures presented frames, runs the composition, talks to the helper over shared memory"
+description = "Vulkan implicit layer: runs the neural rendering network on the game's GPU, before or after the upscaler"
 
 [lib]
 name = "neural_forge_layer"

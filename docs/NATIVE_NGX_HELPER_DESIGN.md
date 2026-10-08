@@ -1,5 +1,10 @@
 # Native Linux NGX helper — investigation and current status
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 **Status: not implementable today, for a data-availability reason, not an architecture
 one.** This document exists so a future session doesn't re-derive (or re-spend real
 GPU time re-discovering) what this one already found. Read this before spending time

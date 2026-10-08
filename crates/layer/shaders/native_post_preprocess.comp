@@ -1,6 +1,6 @@
 #version 450
 // The native backend after the upscaler (docs/NATIVE_BACKEND.md, "2.1"): the network's 16 input lanes from
-// the layer's 8-bit swapchain proxy, as the helper's NGX feature got it (sRGB code values, display-referred).
+// the layer's 8-bit swapchain proxy (sRGB code values, display-referred).
 // The lane layout, roundings and noise are OpenDLSS-NR's (MIT, commit 9d08f41), as in
 // native_preprocess.comp. There are no motion vectors after the upscaler, so there is no history: lanes 7-9
 // copy the proxy, as on a first frame.

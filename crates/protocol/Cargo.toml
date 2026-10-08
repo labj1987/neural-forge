@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Shared-memory wire format between the NeuralForge layer, helper, GUI and CLI"
+description = "Shared-memory channel between the Neural Forge layer, GUI and CLI"
 
 [lib]
 name = "neural_forge_protocol"

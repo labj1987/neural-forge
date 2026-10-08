@@ -1,5 +1,10 @@
 # DLSS Neural Rendering parameters: what the feature reads, what the helper sets
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 2026-10-06. Which NGX parameters Feature 18 (`nvngx_dlssnr.dll`, the 310.8 copy imported into the
 app's binaries directory) actually reads; which of those the helper never sets; what the helper
 sets that nothing reads; and when the history reset is set. Compiled from public sources and from

@@ -1,5 +1,10 @@
 # Pre-upscaler probe (`NEURAL_FORGE_PROBE_NGX`)
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 **Status: hooks built, two rig runs done 2026-10-02** (the second, inside the launch command
 buffer, is at the end). Diagnostic only, nothing user-facing.
 

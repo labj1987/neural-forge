@@ -99,7 +99,7 @@ pub(crate) mod native;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native_post;
 
-/// The native backend's per-device network ([`native::Loader`]); none exists on 32-bit builds.
+/// The native backend's per-device network ([`native::Loader`]); the native crate builds for x86_64 only.
 #[cfg(target_arch = "x86_64")]
 pub(crate) type NativeLoader = Arc<native::Loader>;
 #[cfg(not(target_arch = "x86_64"))]

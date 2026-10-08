@@ -56,12 +56,8 @@ pub struct CompositionSettings {
     pub reversible_mode: u32,
 }
 
-/// One process's connection to the mapping. Not `Clone` — there is exactly one of these
-/// per device, guarded by a `Mutex` in [`crate::device::NeuralForgeDeviceInfo`].
-/// How many bytes of each pixel region this process maps: the protocol's full `MAX_FRAME` on
-/// 64-bit; on 32-bit a 4K 8-bit frame, so the whole set fits a 32-bit address space (a larger
-/// frame is simply passed through, see [`region_capacity`]).
-const REGION_CAP: usize = if cfg!(target_pointer_width = "64") { MAX_FRAME } else { 3840 * 2160 * 4 };
+/// How many bytes of each pixel region this process maps: the protocol's full `MAX_FRAME`.
+const REGION_CAP: usize = MAX_FRAME;
 
 /// The largest frame this process can send or receive.
 pub fn region_capacity() -> usize {
@@ -134,12 +130,13 @@ impl ShmView {
     }
 }
 
+/// One process's connection to the mapping. Not `Clone` — there is exactly one of these
+/// per device, guarded by a `Mutex` in [`crate::device::NeuralForgeDeviceInfo`].
 pub struct ShmClient {
     fd: Option<OwnedFd>,
     header: *mut neural_forge_protocol::ShmHeader,
     /// Where each pixel region is mapped in this process (proxy 0, answer 0, proxy 1,
-    /// answer 1), `REGION_CAP` bytes each. One contiguous mapping on 64-bit; separate small
-    /// mappings on 32-bit, where the protocol's full ~1.1 GB would not fit the address space.
+    /// answer 1), `REGION_CAP` bytes each, inside the one mapping of the whole file.
     regions: [*mut u8; 4],
     path: String,
     timeouts: u32,
@@ -177,28 +174,6 @@ pub struct ShmClient {
 // `ShmClient` is always accessed from behind a `Mutex`, so only `Send` is needed, never
 // concurrent access from two threads at once.
 unsafe impl Send for ShmClient {}
-
-/// Test builds on 32-bit only: unmap on drop. The shipped layer keeps its mapping for the
-/// process's life on purpose, but the 32-bit test binary opens a fresh ~130 MB set of mappings
-/// in test after test and ran out of address space on CI (`open_at` failing).
-#[cfg(all(test, target_pointer_width = "32"))]
-impl Drop for ShmClient {
-    fn drop(&mut self) {
-        // Only a client that mapped the file itself (it keeps the fd) owns the mapping;
-        // `test_over_header` borrows a header in ordinary memory.
-        if self.header.is_null() || self.fd.is_none() {
-            return;
-        }
-        // SAFETY: on 32-bit `open_at` maps the header (`HEADER_BYTES`) and each region
-        // (`REGION_CAP`) separately; nothing derived from them outlives the client in the tests.
-        unsafe {
-            libc::munmap(self.header.cast(), neural_forge_protocol::HEADER_BYTES);
-            for r in self.regions.iter().filter(|p| !p.is_null()) {
-                libc::munmap(r.cast(), REGION_CAP);
-            }
-        }
-    }
-}
 
 impl Default for ShmClient {
     fn default() -> Self {
@@ -242,9 +217,7 @@ impl ShmClient {
     }
 
     /// Test-only: a client over a header in ordinary memory, with no pixel regions and no file.
-    /// For tests of header-only logic (switches, requests, liveness): a real mapping costs ~130 MB
-    /// of address space, which a 32-bit test run cannot spare for every test (mappings are never
-    /// unmapped).
+    /// For tests of header-only logic (switches, requests, liveness), which need no real mapping.
     #[cfg(test)]
     pub(crate) fn test_over_header(header: &neural_forge_protocol::ShmHeader) -> Self {
         let mut client = Self::default();
@@ -683,42 +656,15 @@ impl ShmClient {
             let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), offset as libc::off_t);
             (p != libc::MAP_FAILED).then_some(p.cast::<u8>())
         };
-        // 64-bit: the whole file in one mapping. 32-bit: the header, then each region on its own
-        // at its fixed offset, capped (the offsets are page-aligned by construction).
-        let (map, regions) = if cfg!(target_pointer_width = "64") {
-            let Some(base) = map_at(0, total) else {
-                crate::log!("[shm] mmap {path} failed; not retrying");
-                self.map_refused = true;
-                return false;
-            };
-            // SAFETY: every offset is inside the `total`-byte mapping just made.
-            let regions = Region::ALL.map(|r| unsafe { base.add(r.offset()) });
-            (base.cast::<libc::c_void>(), regions)
-        } else {
-            let Some(base) = map_at(0, neural_forge_protocol::HEADER_BYTES) else {
-                crate::log!("[shm] mmap {path} (header) failed; not retrying");
-                self.map_refused = true;
-                return false;
-            };
-            let mut regions: [*mut u8; 4] = [std::ptr::null_mut(); 4];
-            for r in Region::ALL {
-                let Some(p) = map_at(r.offset(), REGION_CAP) else {
-                    crate::log!("[shm] mmap {path} region {r:?} failed; not retrying");
-                    // SAFETY: each of these was mapped just above with exactly this length and
-                    // nothing has used it yet.
-                    unsafe {
-                        libc::munmap(base.cast(), neural_forge_protocol::HEADER_BYTES);
-                        for mapped in regions.iter().filter(|p| !p.is_null()) {
-                            libc::munmap(mapped.cast(), REGION_CAP);
-                        }
-                    }
-                    self.map_refused = true;
-                    return false;
-                };
-                regions[r as usize] = p;
-            }
-            (base.cast::<libc::c_void>(), regions)
+        // The whole file in one mapping.
+        let Some(base) = map_at(0, total) else {
+            crate::log!("[shm] mmap {path} failed; not retrying");
+            self.map_refused = true;
+            return false;
         };
+        // SAFETY: every offset is inside the `total`-byte mapping just made.
+        let regions = Region::ALL.map(|r| unsafe { base.add(r.offset()) });
+        let map = base.cast::<libc::c_void>();
         self.regions = regions;
 
         let header = map as *mut neural_forge_protocol::ShmHeader;

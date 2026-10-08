@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
-description = "Helper-manager CLI: init/start/stop/status/doctor/runner-discovery/import-binaries"
+description = "Command-line front end: config, model extraction, install, live settings (shmctl) and profiles"
 
 [[bin]]
 name = "neural-forge-cli"

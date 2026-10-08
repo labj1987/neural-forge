@@ -1,5 +1,10 @@
 # Review against OpenDLSS-NR (2026-10-01)
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02):** two rows below are out of date. GPU timestamps now exist (1.1.0,
 > `layer_capture_gpu_ms`/`layer_compose_gpu_ms`). And an HDR path was built: since 2.0 the model
 > runs before DLSS on the game's HDR input, with the game's exposure value and a paper white of 3

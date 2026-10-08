@@ -1,5 +1,10 @@
 # Phase 4: DMA-BUF transport -- investigation and current status
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02):** the measurement this document waited for exists. The model's evaluate
 > dominates (about 10 ms at 1440p, 25 ms at 4K) and the zero-copy host-memory path leaves the
 > layer's own capture and compose at about 0.8 and 1.9 ms of GPU time (HARDWARE_VALIDATION.md,

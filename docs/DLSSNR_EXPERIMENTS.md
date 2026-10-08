@@ -1,5 +1,10 @@
 # Feature 18 improvement experiments
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 2026-10-07. Baseline reviewed: `5f8b7eb` (2.0.8 plus the parameter-read audit).
 This work uses interface strings and API observations only. No NVIDIA code or weights were
 decompiled, extracted or added to this repository.

@@ -65,7 +65,7 @@ pub fn ensure_dirs() -> std::io::Result<()> {
 /// staged file over it -- never truncates the destination in place, so an
 /// already-running process that has the old inode mapped (a GUI, a game) keeps reading the old content until it reopens the path, exactly like
 /// `install.py`'s own `os.replace` step. A crash part-way leaves the old file whole, never an
-/// empty one: `config.ini`, `profiles.ini` and `dxvk.conf` are written through this too.
+/// empty one: `config.ini` and `profiles.ini` are written through this too.
 pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
     let parent = path.parent().ok_or_else(|| std::io::Error::other(format!("{} has no parent directory", path.display())))?;
     std::fs::create_dir_all(parent)?;
