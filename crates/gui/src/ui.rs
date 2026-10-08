@@ -704,10 +704,14 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     group
 }
 
-/// The model's row text: present with the build it came from, or missing.
+/// The model's row text: present with the build it came from (and whether that build is verified),
+/// or missing.
 fn model_status() -> (String, bool) {
     let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
     match neural_forge_supervisor::model::installed(&dir) {
+        Some(build) if neural_forge_supervisor::model::installed_verified(&dir) == Some(false) => {
+            (format!("present, from build {build}, not verified against NVIDIA's runtime"), true)
+        }
         Some(build) => (format!("present, from build {build}"), true),
         None => ("missing: extract it from nvngx_dlssnr.dll below".to_string(), false),
     }
@@ -718,7 +722,7 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Neural rendering model");
     group.set_description(Some(
-        "Taken from your own nvngx_dlssnr.dll (build 310.8.0) -- this project doesn't and can't ship it",
+        "Taken from your own nvngx_dlssnr.dll -- this project doesn't and can't ship it",
     ));
     let (text, present) = model_status();
     let status_row = adw::ActionRow::new();
@@ -751,8 +755,20 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
             };
             glib::spawn_future_local(async move {
                 let out = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
-                match gio::spawn_blocking(move || neural_forge_supervisor::model::extract(&path, &out).map_err(|e| e.to_string())).await {
-                    Ok(Ok(done)) => toasts.add_toast(adw::Toast::new(&format!("Model extracted from build {} -- restart the game to use it", done.build))),
+                match gio::spawn_blocking(move || neural_forge_supervisor::model::extract(&path, &out)).await {
+                    Ok(Ok(done)) => {
+                        let unverified = if done.verified { "" } else { " (not verified against NVIDIA's runtime)" };
+                        toasts.add_toast(adw::Toast::new(&format!(
+                            "Model extracted from build {}{unverified} -- restart the game to use it",
+                            done.build
+                        )))
+                    }
+                    // The report is too long for a toast: its summary line there, all of it in the log.
+                    Ok(Err(neural_forge_supervisor::model::ModelError::Shape(report))) => {
+                        eprintln!("neural-forge: extraction refused:\n{report}");
+                        let summary = report.lines().next().unwrap_or_default();
+                        toasts.add_toast(adw::Toast::new(&format!("Extraction refused, a different network: {summary}")));
+                    }
                     Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Extraction failed: {e}"))),
                     Err(_) => toasts.add_toast(adw::Toast::new("Extraction failed: the worker panicked")),
                 }

@@ -17,18 +17,25 @@
 //! | the tensor | tensor length |
 //! | trailer, unread | the rest of `a` |
 //!
+//! The gate is the network, not the DLL's version: a build is extracted when its records hold
+//! exactly the tensors in [`model_shape::EXPECTED`] (same names, same byte lengths), which is what
+//! the graph implements. A build outside [`VERIFIED_BUILDS`] is marked unverified in the manifest.
+//!
 //! Nothing produced here is ever committed, uploaded or packaged.
 
+use crate::model_shape;
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// The only build whose network the graph implements (71 blocks).
-pub const SUPPORTED_BUILD: [u16; 3] = [310, 8, 0];
+/// The builds whose output was compared bit for bit with NVIDIA's runtime. Not a gate: another build
+/// with the same network is extracted too, and marked unverified.
+pub const VERIFIED_BUILDS: &[[u16; 3]] = &[[310, 8, 0]];
 pub const DLL_NAME: &str = "nvngx_dlssnr.dll";
 const RESOURCE_NAME: &str = "WEIGHTS_HT";
-const BLOCK_COUNT: u32 = 71;
-const TENSOR_COUNT: usize = 153;
+/// How many names each list of a shape report shows.
+const REPORT_NAMES: usize = 10;
 const RT_RCDATA: u32 = 10;
 const RT_VERSION: u32 = 16;
 
@@ -51,8 +58,9 @@ const STAGES: [(&str, u32, u32); 11] = [
 pub enum ModelError {
     Io(PathBuf, std::io::Error),
     Pe(String),
-    Build(String),
     Weights(String),
+    /// The records do not hold the tensors the graph implements; the text is [`check_shape`]'s report.
+    Shape(String),
 }
 
 impl fmt::Display for ModelError {
@@ -60,12 +68,8 @@ impl fmt::Display for ModelError {
         match self {
             ModelError::Io(path, e) => write!(f, "{}: {e}", path.display()),
             ModelError::Pe(m) => write!(f, "not a readable DLL: {m}"),
-            ModelError::Build(found) => write!(
-                f,
-                "{DLL_NAME} is build {found}; the native model needs build {}.{}.{}",
-                SUPPORTED_BUILD[0], SUPPORTED_BUILD[1], SUPPORTED_BUILD[2]
-            ),
             ModelError::Weights(m) => write!(f, "weights resource: {m}"),
+            ModelError::Shape(report) => f.write_str(report),
         }
     }
 }
@@ -224,6 +228,7 @@ fn parse_name(name: &str) -> Option<(u32, u32, String)> {
 }
 
 /// Walks the `WEIGHTS_HT` records (module docs). Every field is checked; any surprise is refused.
+/// Which tensors the records hold is [`check_shape`]'s question.
 pub fn parse_weights(blob: &[u8]) -> Result<Vec<Tensor<'_>>, ModelError> {
     let total = u64_at(blob, 0).ok_or_else(|| w_err("shorter than its header"))?;
     if total != blob.len() as u64 {
@@ -258,14 +263,67 @@ pub fn parse_weights(blob: &[u8]) -> Result<Vec<Tensor<'_>>, ModelError> {
         tensors.push(Tensor { name, block, layer, parameter, bytes: &blob[start..end] });
         at = next;
     }
-    if tensors.len() != TENSOR_COUNT {
-        return Err(w_err(format!("{} tensors, expected {TENSOR_COUNT}", tensors.len())));
-    }
-    let blocks = tensors.iter().map(|t| t.block).max().map_or(0, |m| m + 1);
-    if blocks != BLOCK_COUNT || (0..BLOCK_COUNT).any(|b| !tensors.iter().any(|t| t.block == b)) {
-        return Err(w_err(format!("blocks 0..{blocks}, expected exactly 0..{BLOCK_COUNT}")));
-    }
     Ok(tensors)
+}
+
+/// `count`, then up to [`REPORT_NAMES`] of `lines`, one per line.
+fn report_list(report: &mut String, title: &str, lines: &[String]) {
+    report.push_str(&format!("\n{title}: {}", lines.len()));
+    for line in lines.iter().take(REPORT_NAMES) {
+        report.push_str(&format!("\n  {line}"));
+    }
+    if lines.len() > REPORT_NAMES {
+        report.push_str(&format!("\n  and {} more", lines.len() - REPORT_NAMES));
+    }
+}
+
+/// "71 blocks (0-70)": how many blocks the names cover, and the lowest and highest.
+fn blocks_of<'n>(names: impl Iterator<Item = &'n str>) -> String {
+    let blocks: BTreeSet<u32> = names.filter_map(|n| parse_name(n).map(|(block, _, _)| block)).collect();
+    match (blocks.first(), blocks.last()) {
+        (Some(first), Some(last)) => format!("{} blocks ({first}-{last})", blocks.len()),
+        _ => "0 blocks".to_string(),
+    }
+}
+
+/// Whether the records hold exactly the tensors in `expected` (`model_shape::EXPECTED` outside tests):
+/// the same set of names, each the same length. Otherwise a report of what differs.
+pub fn check_shape(tensors: &[Tensor], expected: &[(&str, u64)]) -> Result<(), ModelError> {
+    let wanted: HashMap<&str, u64> = expected.iter().copied().collect();
+    let mut found: HashMap<&str, u64> = HashMap::new();
+    let mut unexpected = Vec::new();
+    for t in tensors {
+        if found.contains_key(t.name.as_str()) {
+            unexpected.push(format!("{} (a second time)", t.name));
+        } else {
+            found.insert(&t.name, t.bytes.len() as u64);
+            if !wanted.contains_key(t.name.as_str()) {
+                unexpected.push(t.name.clone());
+            }
+        }
+    }
+    let missing: Vec<String> = expected.iter().filter(|(n, _)| !found.contains_key(n)).map(|(n, _)| n.to_string()).collect();
+    let differing: Vec<String> = expected
+        .iter()
+        .filter_map(|(n, want)| found.get(n).filter(|got| *got != want).map(|got| format!("{n}: found {got}, expected {want}")))
+        .collect();
+    if missing.is_empty() && unexpected.is_empty() && differing.is_empty() {
+        return Ok(());
+    }
+    let mut report = format!(
+        "{DLL_NAME} holds {} tensors in {}, {} bytes; the graph expects {} tensors in {}, {} bytes.",
+        tensors.len(),
+        blocks_of(tensors.iter().map(|t| t.name.as_str())),
+        tensors.iter().map(|t| t.bytes.len() as u64).sum::<u64>(),
+        expected.len(),
+        blocks_of(expected.iter().map(|(n, _)| *n)),
+        expected.iter().map(|(_, len)| len).sum::<u64>(),
+    );
+    report_list(&mut report, "Expected but missing", &missing);
+    report_list(&mut report, "Present but not expected", &unexpected);
+    report_list(&mut report, "Different length", &differing);
+    report.push_str("\nThis DLL carries a different network. Neural Forge needs new graph code for it.");
+    Err(ModelError::Shape(report))
 }
 
 fn stage_of(block: u32) -> &'static str {
@@ -275,6 +333,11 @@ fn stage_of(block: u32) -> &'static str {
 /// Upper case: `nr::Model` compares its own upper-case digest (`sha256.h`) as a string.
 fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02X}")).collect()
+}
+
+/// Whether `build` is one of [`VERIFIED_BUILDS`].
+pub fn is_verified(build: [u16; 4]) -> bool {
+    VERIFIED_BUILDS.iter().any(|v| v[..] == build[..3])
 }
 
 /// Lays the tensors into the stage files and the manifest. Returns (relative path, bytes) pairs.
@@ -307,9 +370,10 @@ pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Vec
             "build": format!("{}.{}.{}.{}", build[0], build[1], build[2], build[3]),
             "sha256": dll_sha256,
             "resource": RESOURCE_NAME,
+            "verified": is_verified(build),
         },
         "totals": {
-            "blockCount": BLOCK_COUNT,
+            "blockCount": tensors.iter().map(|t| t.block).collect::<BTreeSet<_>>().len(),
             "tensorCount": tensors.len(),
             "byteLength": tensors.iter().map(|t| t.bytes.len()).sum::<usize>(),
         },
@@ -321,36 +385,51 @@ pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Vec
     files
 }
 
+fn read_manifest(dir: &Path) -> Option<serde_json::Value> {
+    serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).ok()?).ok()
+}
+
 /// The build of the DLL the installed model directory came from (the manifest's `source.build`),
 /// or `None` when there is no readable manifest there.
 pub fn installed(dir: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(dir.join("manifest.json")).ok()?;
-    let manifest: serde_json::Value = serde_json::from_str(&text).ok()?;
-    manifest["source"]["build"].as_str().map(str::to_string)
+    read_manifest(dir)?["source"]["build"].as_str().map(str::to_string)
+}
+
+/// Whether the installed model came from a build in [`VERIFIED_BUILDS`] (the manifest's
+/// `source.verified`), or `None` when there is no readable manifest. A manifest without the field
+/// was written by 3.0.0, which took only 310.8.0.
+pub fn installed_verified(dir: &Path) -> Option<bool> {
+    Some(read_manifest(dir)?["source"]["verified"].as_bool().unwrap_or(true))
 }
 
 #[derive(Debug)]
 pub struct Extracted {
     pub dir: PathBuf,
     pub build: String,
+    /// The build is in [`VERIFIED_BUILDS`].
+    pub verified: bool,
     pub tensors: usize,
     pub bytes: usize,
 }
 
 /// `source` is the DLL or a directory holding it. Writes into `out`, each file through a temporary
 /// name and a rename, so a model directory is never half old and half new file by file.
+/// Any build is taken whose records hold the tensors the graph implements ([`check_shape`]); nothing
+/// is written otherwise.
 pub fn extract(source: &Path, out: &Path) -> Result<Extracted, ModelError> {
+    extract_shaped(source, out, model_shape::EXPECTED)
+}
+
+fn extract_shaped(source: &Path, out: &Path, expected: &[(&str, u64)]) -> Result<Extracted, ModelError> {
     let dll = if source.is_dir() { source.join(DLL_NAME) } else { source.to_path_buf() };
     let image = std::fs::read(&dll).map_err(|e| ModelError::Io(dll.clone(), e))?;
     let resources = Resources::parse(&image)?;
     let version = file_version(&resources).ok_or_else(|| pe_err("no version resource"))?;
-    if version[..3] != SUPPORTED_BUILD {
-        return Err(ModelError::Build(format!("{}.{}.{}.{}", version[0], version[1], version[2], version[3])));
-    }
     let blob = resources
         .get(RT_RCDATA, Key::Name(RESOURCE_NAME))
         .ok_or_else(|| w_err(format!("no RCDATA resource named {RESOURCE_NAME}")))?;
     let tensors = parse_weights(blob)?;
+    check_shape(&tensors, expected)?;
     let files = build_model(&tensors, version, &sha256_hex(&image));
     std::fs::create_dir_all(out.join("model")).map_err(|e| ModelError::Io(out.to_path_buf(), e))?;
     for (relative, bytes) in &files {
@@ -362,6 +441,7 @@ pub fn extract(source: &Path, out: &Path) -> Result<Extracted, ModelError> {
     Ok(Extracted {
         dir: out.to_path_buf(),
         build: format!("{}.{}.{}", version[0], version[1], version[2]),
+        verified: is_verified(version),
         tensors: tensors.len(),
         bytes: tensors.iter().map(|t| t.bytes.len()).sum(),
     })
@@ -384,8 +464,11 @@ mod tests {
         r
     }
 
-    /// A blob with every block present and exactly 153 records, like the real one.
-    fn weights() -> Vec<u8> {
+    const TENSOR_COUNT: usize = 153;
+
+    /// Names and lengths with every block present and exactly 153 records, like the real ones but
+    /// small: tensor `i` is `20 + i` bytes.
+    fn shape() -> Vec<(String, u64)> {
         let mut names: Vec<String> = (0..71).map(|b| format!("block{b}.layer0.layer")).collect();
         for b in 23..=47 {
             for l in 1..=4 {
@@ -396,13 +479,37 @@ mod tests {
         }
         names.push("block70.layer0.blend_scale".to_string());
         assert_eq!(names.len(), TENSOR_COUNT);
+        names.into_iter().enumerate().map(|(i, n)| (n, 20 + i as u64)).collect()
+    }
+
+    /// `shape` as the table `check_shape` takes.
+    fn table(shape: &[(String, u64)]) -> Vec<(&str, u64)> {
+        shape.iter().map(|(n, len)| (n.as_str(), *len)).collect()
+    }
+
+    /// A `WEIGHTS_HT` blob holding `shape`'s tensors, in its order.
+    fn blob_of(shape: &[(String, u64)]) -> Vec<u8> {
         let mut body = Vec::new();
-        for (i, n) in names.iter().enumerate() {
-            body.extend(record(n, &vec![i as u8 + 1; 20 + i], 20));
+        for (i, (n, len)) in shape.iter().enumerate() {
+            body.extend(record(n, &vec![i as u8 + 1; *len as usize], 20));
         }
         let mut blob = ((body.len() + 8) as u64).to_le_bytes().to_vec();
         blob.extend(body);
         blob
+    }
+
+    fn weights() -> Vec<u8> {
+        blob_of(&shape())
+    }
+
+    /// `check_shape`'s report for `found` against the fixture's shape.
+    fn shape_report(found: &[(String, u64)]) -> String {
+        let blob = blob_of(found);
+        let tensors = parse_weights(&blob).unwrap();
+        match check_shape(&tensors, &table(&shape())) {
+            Err(ModelError::Shape(report)) => report,
+            other => panic!("expected a shape error, got {other:?}"),
+        }
     }
 
     /// A minimal PE32+ image: one section holding a resource tree with WEIGHTS_HT and a version.
@@ -482,17 +589,85 @@ mod tests {
     }
 
     #[test]
-    fn refuses_a_wrong_total_or_a_missing_record() {
+    fn refuses_a_wrong_total() {
         let mut blob = weights();
         blob.push(0);
         assert!(parse_weights(&blob).unwrap_err().to_string().contains("header says"));
-        let blob = weights();
-        let first = 8 + record("block0.layer0.layer", &[1; 20], 20).len();
-        let mut short = blob[..8].to_vec();
-        short.extend_from_slice(&blob[first..]);
-        let total = short.len() as u64;
-        short[..8].copy_from_slice(&total.to_le_bytes());
-        assert!(parse_weights(&short).is_err());
+    }
+
+    #[test]
+    fn accepts_the_expected_shape_in_any_order() {
+        let mut found = shape();
+        found.reverse();
+        let blob = blob_of(&found);
+        assert!(check_shape(&parse_weights(&blob).unwrap(), &table(&shape())).is_ok());
+    }
+
+    const CLOSING: &str = "This DLL carries a different network. Neural Forge needs new graph code for it.";
+
+    #[test]
+    fn reports_a_changed_length() {
+        let mut found = shape();
+        found[5].1 += 16;
+        let report = shape_report(&found);
+        assert!(report.contains("Different length: 1\n  block5.layer0.layer: found 41, expected 25"), "{report}");
+        assert!(report.contains("Expected but missing: 0") && report.contains("Present but not expected: 0"), "{report}");
+        assert!(report.ends_with(CLOSING), "{report}");
+    }
+
+    #[test]
+    fn reports_a_missing_tensor() {
+        let mut found = shape();
+        found.remove(3);
+        let report = shape_report(&found);
+        assert!(report.starts_with("nvngx_dlssnr.dll holds 152 tensors in 70 blocks (0-70)"), "{report}");
+        assert!(report.contains("Expected but missing: 1\n  block3.layer0.layer"), "{report}");
+        assert!(report.ends_with(CLOSING), "{report}");
+    }
+
+    #[test]
+    fn reports_an_extra_tensor() {
+        let mut found = shape();
+        found.push(("block70.layer1.layer".to_string(), 30));
+        let report = shape_report(&found);
+        assert!(report.contains("Present but not expected: 1\n  block70.layer1.layer"), "{report}");
+        assert!(report.ends_with(CLOSING), "{report}");
+    }
+
+    #[test]
+    fn reports_an_extra_block() {
+        let mut found = shape();
+        found.push(("block71.layer0.layer".to_string(), 30));
+        let report = shape_report(&found);
+        let summary = report.lines().next().unwrap();
+        assert!(summary.contains("154 tensors in 72 blocks (0-71)") && summary.contains("153 tensors in 71 blocks (0-70)"), "{report}");
+        assert!(report.contains("Present but not expected: 1\n  block71.layer0.layer"), "{report}");
+    }
+
+    #[test]
+    fn reports_a_repeated_name_and_caps_each_list() {
+        let mut found = shape();
+        found.push(found[0].clone());
+        for (_, len) in found.iter_mut().take(12) {
+            *len += 1;
+        }
+        let report = shape_report(&found);
+        assert!(report.contains("block0.layer0.layer (a second time)"), "{report}");
+        assert!(report.contains("Different length: 12") && report.contains("  and 2 more"), "{report}");
+    }
+
+    #[test]
+    fn the_real_table_is_the_310_8_0_network() {
+        let rows = model_shape::EXPECTED;
+        assert_eq!(rows.len(), TENSOR_COUNT);
+        assert_eq!(rows.iter().map(|(n, _)| n).collect::<BTreeSet<_>>().len(), rows.len());
+        assert!(rows.iter().all(|(n, _)| parse_name(n).is_some()));
+        let blocks: BTreeSet<u32> = rows.iter().map(|(n, _)| parse_name(n).unwrap().0).collect();
+        assert_eq!(blocks, (0..=70).collect());
+        assert_eq!(rows.iter().map(|(_, len)| len).sum::<u64>(), 147_683_778);
+        // The manifest the table came from lists block 70's parameters by name: blend_scale, then layer.
+        assert_eq!(rows[rows.len() - 2], ("block70.layer0.blend_scale", 2));
+        assert_eq!(rows.iter().filter(|(n, _)| n.ends_with(".blend_scale")).count(), 1);
     }
 
     #[test]
@@ -529,20 +704,50 @@ mod tests {
     }
 
     #[test]
-    fn extracts_from_a_dll_and_refuses_another_build() {
-        let dir = scratch("extract");
+    fn extracts_a_verified_build() {
+        let dir = scratch("verified");
+        std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 8, 0, 3])).unwrap();
+        let out = dir.join("model");
+        let done = extract_shaped(&dir, &out, &table(&shape())).unwrap();
+        assert_eq!((done.build.as_str(), done.verified, done.tensors), ("310.8.0", true, TENSOR_COUNT));
+        assert!(out.join("manifest.json").is_file() && out.join("model/vit.e4m3").is_file());
+        assert_eq!(installed(&out).as_deref(), Some("310.8.0.3"));
+        assert_eq!(installed_verified(&out), Some(true));
+        assert_eq!((installed(&dir.join("nowhere")), installed_verified(&dir.join("nowhere"))), (None, None));
+        assert!(!out.join("manifest.json.partial").exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extracts_another_build_with_the_same_network_unverified() {
+        let dir = scratch("unverified");
+        std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 9, 1, 0])).unwrap();
+        let out = dir.join("model");
+        let done = extract_shaped(&dir, &out, &table(&shape())).unwrap();
+        assert_eq!((done.build.as_str(), done.verified), ("310.9.1", false));
+        assert_eq!(installed(&out).as_deref(), Some("310.9.1.0"));
+        assert_eq!(installed_verified(&out), Some(false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_manifest_without_the_verified_field_came_from_310_8_0() {
+        let dir = scratch("manifest-3-0");
+        std::fs::write(dir.join("manifest.json"), r#"{"source": {"build": "310.8.0.0"}}"#).unwrap();
+        assert_eq!(installed_verified(&dir), Some(true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn another_network_is_refused_and_nothing_is_written() {
+        let dir = scratch("other-network");
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 8, 0, 0])).unwrap();
         let out = dir.join("model");
-        let done = extract(&dir, &out).unwrap();
-        assert_eq!((done.build.as_str(), done.tensors), ("310.8.0", TENSOR_COUNT));
-        assert!(out.join("manifest.json").is_file() && out.join("model/vit.e4m3").is_file());
-        assert_eq!(installed(&out).as_deref(), Some("310.8.0.0"));
-        assert_eq!(installed(&dir.join("nowhere")), None);
-        assert!(!out.join("manifest.json.partial").exists());
-
-        std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 9, 1, 0])).unwrap();
-        let err = extract(&dir, &out).unwrap_err().to_string();
-        assert!(err.contains("build 310.9.1.0") && err.contains("needs build 310.8.0"), "{err}");
+        // The fixture's tiny tensors are not the real network.
+        let err = extract(&dir, &out).unwrap_err();
+        assert!(matches!(err, ModelError::Shape(_)), "{err}");
+        assert!(err.to_string().contains("the graph expects 153 tensors in 71 blocks (0-70), 147683778 bytes"), "{err}");
+        assert!(!out.exists());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

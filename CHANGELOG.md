@@ -4,6 +4,25 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.1.0 — 2026-10-08
+
+**Extract from DLL** (and `neural-forge-cli extract-model`) takes any build of `nvngx_dlssnr.dll`
+that carries the network the graph implements, not only build 310.8.0, so a retrained model in a new
+DLL build works by extracting it once. The frame path is unchanged.
+
+- The extractor checks the network's shape instead of the DLL's version: `WEIGHTS_HT` must hold
+  exactly the 153 tensors the graph implements, with the same names and byte lengths
+  (`crates/supervisor/src/model_shape.rs`, generated from build 310.8.0.0's manifest by
+  `scripts/gen_model_shape.py`). Any other DLL is refused, and nothing is written, with a report:
+  tensors, blocks and bytes found against expected, then the names missing, the names not expected
+  and the tensors whose length differs, ten of each.
+- Build 310.8.0 stays the verified build: its output was compared bit for bit with NVIDIA's runtime.
+  Another build with the same network is extracted and marked not verified: the manifest's new
+  `source.verified` field, a second line from `extract-model`, and the Setup tab's model row,
+  `status` and `doctor` say so.
+- The layer logs the model's build, and whether it is verified, when it loads the model.
+- The Setup tab's description no longer names build 310.8.0.
+
 ## 3.0.0 — 2026-10-07
 
 The model runs inside the Vulkan layer. The layer runs OpenDLSS-NR's implementation of the DLSS 5

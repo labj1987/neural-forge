@@ -167,8 +167,10 @@ Setup notes for these games:
 - 64-bit games. There is no 32-bit layer: a 32-bit process has no `VK_NV_cuda_kernel_launch`.
 - GTK 4.12 or newer and libadwaita 1.5 or newer, from the system. The AppImage uses the host's
   GTK and libadwaita. Release builds are made on Ubuntu 24.04 (GTK 4.14, libadwaita 1.5).
-- NVIDIA's own Neural Rendering DLL (`nvngx_dlssnr.dll`, build 310.8.0), once, to extract the
-  model's weights from. This project does not and cannot ship the DLL or the weights.
+- NVIDIA's own Neural Rendering DLL (`nvngx_dlssnr.dll`), once, to extract the model's weights
+  from. Build 310.8.0 is the verified build: its output was compared bit for bit with NVIDIA's
+  runtime. Another build that carries the same network is accepted and flagged as not verified.
+  This project does not and cannot ship the DLL or the weights.
 - For the model before the upscaler: a game that uses DLSS through Vulkan (under Proton, a DX12 game
   through vkd3d-proton and DXVK-NVAPI).
 
@@ -202,6 +204,10 @@ neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll
 
 The weights are written to `~/.local/share/neural-forge/model` (about 141 MB), with hashes the
 layer checks when it loads them. The DLL is not needed after that. Restart the game afterwards.
+
+Build 310.8.0 is the verified build. Any other build is accepted when it carries the same network
+(the same tensors, each the same size), and the Setup tab and `extract-model` mark it "not verified
+against NVIDIA's runtime". A DLL with a different network is refused with a report of what differs.
 
 Nothing needs root: everything lives under `~/.config/neural-forge`, `~/.local/share/neural-forge`,
 `~/.local/state/neural-forge` and `/tmp/neural-forge-$UID/`. An upstream DLSS5VKLayer install can

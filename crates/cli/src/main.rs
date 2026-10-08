@@ -186,11 +186,20 @@ fn model_build() -> Option<String> {
     neural_forge_supervisor::model::installed(std::path::Path::new(&neural_forge_supervisor::model::model_dir()))
 }
 
+/// ", not verified against NVIDIA's runtime" when the installed model came from such a build.
+fn unverified_note() -> &'static str {
+    let dir = neural_forge_supervisor::model::model_dir();
+    match neural_forge_supervisor::model::installed_verified(std::path::Path::new(&dir)) {
+        Some(false) => ", not verified against NVIDIA's runtime",
+        _ => "",
+    }
+}
+
 fn cmd_status() -> ExitCode {
     println!("config: {}", paths::config_file());
     println!("channel: {}", neural_forge_supervisor::channel_path(&Config::load()));
     match model_build() {
-        Some(build) => println!("model: build {build} in {}", neural_forge_supervisor::model::model_dir()),
+        Some(build) => println!("model: build {build}{} in {}", unverified_note(), neural_forge_supervisor::model::model_dir()),
         None => println!("model: not extracted (see `neural-forge-cli extract-model DIR`)"),
     }
     println!("state: {}", paths::state_dir());
@@ -220,7 +229,7 @@ fn cmd_doctor() -> ExitCode {
 
     print!("model: {}\n  ", neural_forge_supervisor::model::model_dir());
     match model_build() {
-        Some(build) => println!("ok (build {build})"),
+        Some(build) => println!("ok (build {build}{})", unverified_note()),
         None => {
             println!("missing (run `neural-forge-cli extract-model DIR`)");
             ok = false;
@@ -331,7 +340,18 @@ fn cmd_extract_model(source: Option<&String>) -> ExitCode {
                 done.bytes,
                 done.dir.display()
             );
+            if !done.verified {
+                let v = neural_forge_supervisor::model::VERIFIED_BUILDS[0];
+                println!(
+                    "Build {} has the same network as the verified build {}.{}.{}, but its output has not been compared with NVIDIA's runtime.",
+                    done.build, v[0], v[1], v[2]
+                );
+            }
             ExitCode::SUCCESS
+        }
+        Err(neural_forge_supervisor::model::ModelError::Shape(report)) => {
+            eprintln!("extract-model refused the DLL:\n{report}");
+            ExitCode::FAILURE
         }
         Err(e) => {
             eprintln!("extract-model failed: {e}");

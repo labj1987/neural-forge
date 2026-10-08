@@ -56,6 +56,19 @@ pub(crate) fn model_present() -> bool {
     model_dir().join("manifest.json").is_file()
 }
 
+/// "build 310.8.0.0, verified": the manifest's `source.build` and `source.verified`, for the log.
+/// Both keys appear once in `extract-model`'s manifest, so a string scan is enough. A manifest
+/// without `verified` was written by 3.0.0, which took only the verified build.
+fn model_source(text: &str) -> String {
+    let field = |key: &str| {
+        let (_, rest) = text.split_once(&format!("\"{key}\": "))?;
+        Some(rest.split([',', '\n', '}']).next()?.trim().trim_matches('"').to_string())
+    };
+    let build = field("build").unwrap_or_else(|| "unknown".to_string());
+    let verified = field("verified").is_none_or(|v| v == "true");
+    format!("build {build}, {}", if verified { "verified" } else { "not verified against NVIDIA's runtime" })
+}
+
 /// Where the network runs on a device: what `create_device` added for it.
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Setup {
@@ -221,6 +234,7 @@ impl Loader {
         // alone (`crate::take_native`).
         let network = unsafe { nn::Network::open(&open) }.map_err(|why| format!("the model at {} could not be loaded: {why}", dir.display()))?;
         crate::log!("[native] model loaded and verified from {} in {} ms (chaining {})", dir.display(), t.elapsed().as_millis(), if chain_wanted() { "on" } else { "off" });
+        crate::log!("[native] model source: {}", model_source(&std::fs::read_to_string(dir.join("manifest.json")).unwrap_or_default()));
         Ok(network)
     }
 
@@ -1054,6 +1068,15 @@ pub(crate) unsafe fn run_native_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn model_source_reads_build_and_verified() {
+        let source = |extra: &str| format!("{{\n  \"source\": {{\n    \"build\": \"310.9.1.0\",\n    \"resource\": \"WEIGHTS_HT\"{extra}\n  }}\n}}");
+        assert_eq!(model_source(&source(",\n    \"verified\": false")), "build 310.9.1.0, not verified against NVIDIA's runtime");
+        assert_eq!(model_source(&source(",\n    \"verified\": true")), "build 310.9.1.0, verified");
+        assert_eq!(model_source(&source("")), "build 310.9.1.0, verified");
+        assert_eq!(model_source(""), "build unknown, verified");
+    }
 
     const W: u32 = 20;
     const H: u32 = 12;

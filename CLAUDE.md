@@ -40,6 +40,12 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   CI does. On a machine with an NVIDIA GPU, never run them without it.
 - Run `python3 scripts/check_namespace.py`, `python3 scripts/test_install.py`,
   and `bash scripts/smoke-test.sh` for namespace, installation and Vulkan checks.
+- `extract-model` gates on the network's shape, not the DLL's version: it takes any build of
+  `nvngx_dlssnr.dll` whose `WEIGHTS_HT` holds exactly the tensors in
+  `crates/supervisor/src/model_shape.rs` (names and byte lengths). That table changes together with
+  the vendored graph in `third_party/opendlss-nr`: regenerate it with `scripts/gen_model_shape.py`
+  when the vendored copy moves to a new network. `VERIFIED_BUILDS` only marks builds compared with
+  NVIDIA's runtime; it gates nothing.
 
 ## Runtime constraints
 
