@@ -1,40 +1,30 @@
-//! `neural-forge-cli` — the helper-manager: init/setup/start/stop/restart/status/doctor/
-//! config/runners/detect-gpu/import-binaries. Replaces upstream's ~900-line bash
-//! `neural-forge-helper` script with the same command surface (a CLI contract, not
-//! upstream's expression of it) reimplemented in Rust, sharing logic with the GUI
-//! through `neural_forge_protocol` instead of duplicating it in shell.
+//! `neural-forge-cli` -- the command-line front end: config, the NVIDIA DLL import and the model
+//! extraction, install/uninstall, the live settings channel (`shmctl`) and settings profiles. Shares
+//! its logic with the GUI through `neural_forge_supervisor` and `neural_forge_protocol`.
 
-use neural_forge_supervisor::gpu;
 mod shmctl;
 
 use std::process::ExitCode;
-use std::time::Duration;
 
-use neural_forge_supervisor::{install_dir, paths, Config};
+use neural_forge_supervisor::{paths, Config};
 
 fn usage() {
     eprintln!(
         "usage: neural-forge-cli <command>\n\n\
          commands:\n\
-         \x20 init                 create default config\n\
-         \x20 setup                init config, dxvk config, and managed prefix if needed\n\
-         \x20 start                start helper using configured runner\n\
-         \x20 stop                 stop helper process tree\n\
-         \x20 restart              stop then start\n\
-         \x20 status               show helper status\n\
-         \x20 doctor               check runner, prefix, dxvk, binaries, and paths\n\
-         \x20 config               print effective config\n\
-         \x20 runners              list discovered custom compatibility tool runners\n\
-         \x20 detect-gpu           print detected NVIDIA PCI vendor/device\n\
-         \x20 import-binaries DIR  copy NVIDIA's nvngx_dlssnr.dll into user data dir\n\
-         \x20 extract-model DIR    write the native model directory from nvngx_dlssnr.dll\n\
+         \x20 init                 create the default config\n\
+         \x20 status               show the config, channel and model\n\
+         \x20 doctor               check the config, NVIDIA DLL, model and paths\n\
+         \x20 config               print the effective config\n\
+         \x20 import-binaries DIR  copy NVIDIA's nvngx_dlssnr.dll into the user data dir\n\
+         \x20 extract-model DIR    write the model directory from nvngx_dlssnr.dll\n\
          \x20                     (DIR holds it, or is the DLL) into the user data dir\n\
          \x20 install --appdir DIR install an extracted AppImage AppDir into\n\
          \x20                     persistent user storage (see scripts/install.py --\n\
          \x20                     same operation, same record, either tool works)\n\
          \x20 uninstall [--purge]  remove unchanged tracked installed files; --purge also\n\
-         \x20                     removes config, data (imported DLLs, managed prefix),\n\
-         \x20                     state and /tmp/neural-forge-$UID\n\
+         \x20                     removes config, data (the DLL, the model), state and\n\
+         \x20                     /tmp/neural-forge-$UID\n\
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
@@ -155,22 +145,9 @@ fn cmd_profile(args: &[String]) -> ExitCode {
 }
 
 fn default_config() -> Config {
-    let mut cfg = Config::default();
-    if let Some((runner_type, path)) = neural_forge_supervisor::runners::default_runner() {
-        cfg.runner_type = runner_type.to_string();
-        cfg.runner_path = path.to_string_lossy().into_owned();
-    } else {
-        cfg.runner_type = "custom".to_string();
-    }
-    cfg.binaries = paths::binaries_dir();
-    if let Some((vendor, device)) = gpu::detect_nvidia_gpu() {
-        cfg.dxvk_vendor = format!("{vendor:04x}");
-        cfg.dxvk_device = format!("{device:04x}");
-    }
     // `shm` stays unset: the channel then follows $NEURAL_FORGE_SHM or the default (see
     // `neural_forge_supervisor::channel_path`) rather than pinning today's default for good.
-    cfg.log = paths::log_file();
-    cfg
+    Config { binaries: paths::binaries_dir(), ..Config::default() }
 }
 
 fn cmd_init() -> ExitCode {
@@ -178,8 +155,7 @@ fn cmd_init() -> ExitCode {
         println!("config already exists: {}", paths::config_file());
         return ExitCode::SUCCESS;
     }
-    let cfg = default_config();
-    match cfg.save() {
+    match default_config().save() {
         Ok(()) => {
             println!("wrote {}", paths::config_file());
             ExitCode::SUCCESS
@@ -196,59 +172,28 @@ fn cmd_config() -> ExitCode {
     println!("config_file={}", paths::config_file());
     println!("data_dir={}", paths::data_dir());
     println!("state_dir={}", paths::state_dir());
-    println!("prefix_dir={}", paths::prefix_dir());
-    println!("runner_type={}", cfg.runner_type);
-    println!("runner_path={}", cfg.runner_path);
     println!("binaries={}", cfg.binaries);
     println!("shm={}", neural_forge_supervisor::channel_path(&cfg));
-    println!("log={}", cfg.log);
-    println!("dxvk_vendor={}", cfg.dxvk_vendor);
-    println!("dxvk_device={}", cfg.dxvk_device);
-    println!("helper_exe={}", install_dir::helper_exe().map(|p| p.display().to_string()).unwrap_or_else(|| "missing".to_string()));
+    println!("model_dir={}", neural_forge_supervisor::model::model_dir());
     for (k, v) in &cfg.settings {
         println!("{k}={v}");
     }
     ExitCode::SUCCESS
 }
 
-fn cmd_runners() -> ExitCode {
-    let found = neural_forge_supervisor::runners::discover_proton();
-    if found.is_empty() {
-        if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
-            println!("wine\t{}", wine.display());
-            return ExitCode::SUCCESS;
-        }
-        eprintln!("no custom compatibility tools or system wine found");
-        return ExitCode::FAILURE;
-    }
-    for runner in found {
-        println!("{}\t{}", runner.name, runner.path.display());
-    }
-    ExitCode::SUCCESS
-}
-
-fn cmd_detect_gpu() -> ExitCode {
-    match gpu::detect_nvidia_gpu() {
-        Some((vendor, device)) => {
-            println!("{vendor:04x}:{device:04x}");
-            ExitCode::SUCCESS
-        }
-        None => {
-            eprintln!("no NVIDIA GPU detected");
-            ExitCode::FAILURE
-        }
-    }
+/// The extracted model's build, if one is installed.
+fn model_build() -> Option<String> {
+    neural_forge_supervisor::model::installed(std::path::Path::new(&neural_forge_supervisor::model::model_dir()))
 }
 
 fn cmd_status() -> ExitCode {
-    match neural_forge_supervisor::is_running() {
-        Some(pid) => println!("helper running (pid {pid})"),
-        None => println!("helper not running"),
+    println!("config: {}", paths::config_file());
+    println!("channel: {}", neural_forge_supervisor::channel_path(&Config::load()));
+    match model_build() {
+        Some(build) => println!("model: build {build} in {}", neural_forge_supervisor::model::model_dir()),
+        None => println!("model: not extracted (see `neural-forge-cli extract-model DIR`)"),
     }
-    println!("  config: {}", paths::config_file());
-    println!("  runtime: {}", neural_forge_protocol::shm_runtime_dir());
-    println!("  channel: {}", neural_forge_supervisor::channel_path(&Config::load()));
-    println!("  state: {}", paths::state_dir());
+    println!("state: {}", paths::state_dir());
     ExitCode::SUCCESS
 }
 
@@ -264,55 +209,22 @@ fn cmd_doctor() -> ExitCode {
         ok = false;
     }
 
-    let helper = install_dir::helper_exe();
-    print!("helper exe: {}\n  ", helper.as_deref().map(|p| p.display().to_string()).unwrap_or_else(|| "missing".to_string()));
-    if helper.is_some() {
-        println!("ok");
-    } else {
-        println!("missing");
-        ok = false;
-    }
-
-    let (runner_type, runner_path) = if !cfg.runner_path.is_empty() {
-        (cfg.runner_type.clone(), cfg.runner_path.clone())
-    } else if let Some(proton) = neural_forge_supervisor::runners::best_proton() {
-        ("proton".to_string(), proton.path.display().to_string())
-    } else if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
-        ("wine".to_string(), wine.display().to_string())
-    } else {
-        ("none".to_string(), String::new())
-    };
-    print!("runner: {runner_type} {runner_path}\n  ");
-    if !runner_path.is_empty() && std::path::Path::new(&runner_path).exists() {
-        println!("ok");
-    } else {
-        println!("missing/not executable");
-        ok = false;
-    }
-
     let binaries = if cfg.binaries.is_empty() { paths::binaries_dir() } else { cfg.binaries.clone() };
     let ngx_dll = std::path::Path::new(&binaries).join("nvngx_dlssnr.dll");
     print!("binaries: {binaries}\n  nvngx_dlssnr.dll: ");
     if ngx_dll.exists() {
         println!("ok");
     } else {
-        println!("error -- missing (required; see `neural-forge-cli import-binaries DIR`)");
-        ok = false;
+        println!("missing (only needed to extract the model; see `neural-forge-cli import-binaries DIR`)");
     }
 
-    if cfg.runner_type == "wine" {
-        for name in neural_forge_supervisor::provision::RUNTIME_DLLS {
-            let target = neural_forge_supervisor::provision::prefix_dll(name);
-            print!("prefix {name}: {}\n  ", target.display());
-            if neural_forge_supervisor::provision::prefix_dll_installed(name) {
-                println!("ok");
-            } else {
-                ok = false;
-                println!("missing or Wine's placeholder (run `neural-forge-cli setup`)");
-            }
+    print!("model: {}\n  ", neural_forge_supervisor::model::model_dir());
+    match model_build() {
+        Some(build) => println!("ok (build {build})"),
+        None => {
+            println!("missing (run `neural-forge-cli extract-model DIR`)");
+            ok = false;
         }
-    } else {
-        println!("DXVK/NVAPI prefix DLLs: not needed ({} runner supplies them)", cfg.runner_type);
     }
 
     print!("runtime dir: {}\n  ", neural_forge_protocol::shm_runtime_dir());
@@ -325,60 +237,6 @@ fn cmd_doctor() -> ExitCode {
     }
 
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
-}
-
-fn cmd_setup() -> ExitCode {
-    let init_result = cmd_init();
-    if init_result != ExitCode::SUCCESS {
-        return init_result;
-    }
-    let cfg = Config::load();
-    match neural_forge_supervisor::provision::prepare_wine_prefix(&cfg) {
-        Ok(notes) => notes.iter().for_each(|n| println!("{n}")),
-        Err(e) => {
-            eprintln!("system-Wine prefix setup failed: {e}");
-            return ExitCode::FAILURE;
-        }
-    }
-    println!("setup complete");
-    ExitCode::SUCCESS
-}
-
-fn cmd_start() -> ExitCode {
-    let cfg = Config::load();
-    match neural_forge_supervisor::start(&cfg) {
-        Ok(started) => {
-            println!("helper started (pid {})", started.pid);
-            println!("  runner: {} {}", started.runner_type, started.runner_path);
-            println!("  log: {}", started.log);
-            ExitCode::SUCCESS
-        }
-        Err(neural_forge_supervisor::StartError::AlreadyRunning(_)) => {
-            println!("helper already running");
-            ExitCode::SUCCESS
-        }
-        Err(e @ neural_forge_supervisor::StartError::Busy) => {
-            eprintln!("{e}; try again once it has finished");
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-fn cmd_stop() -> ExitCode {
-    match neural_forge_supervisor::stop(Duration::from_secs(5)) {
-        Ok(()) => {
-            println!("helper stopped");
-            ExitCode::SUCCESS
-        }
-        Err(e) => {
-            eprintln!("failed to stop helper: {e}");
-            ExitCode::FAILURE
-        }
-    }
 }
 
 fn cmd_install(appdir: Option<&String>) -> ExitCode {
@@ -442,8 +300,7 @@ fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
         eprintln!("failed to create {dest}: {e}");
         return ExitCode::FAILURE;
     }
-    // Only `nvngx_dlssnr.dll` is needed: NVAPI comes from the runner, and the model's dependency
-    // on `nvngx.dll` is resolved by the Wine loader without a separate import.
+    // Only `nvngx_dlssnr.dll`: the model's weights are extracted from it (`extract-model`).
     let name = "nvngx_dlssnr.dll";
     let from = src.join(name);
     let copied = if from.is_file() {
@@ -493,18 +350,9 @@ fn main() -> ExitCode {
 
     match command.as_str() {
         "init" => cmd_init(),
-        "setup" => cmd_setup(),
-        "start" => cmd_start(),
-        "stop" => cmd_stop(),
-        "restart" => {
-            cmd_stop();
-            cmd_start()
-        }
         "status" => cmd_status(),
         "doctor" => cmd_doctor(),
         "config" => cmd_config(),
-        "runners" => cmd_runners(),
-        "detect-gpu" => cmd_detect_gpu(),
         "import-binaries" => cmd_import_binaries(args.get(2)),
         "extract-model" => cmd_extract_model(args.get(2)),
         "install" => {

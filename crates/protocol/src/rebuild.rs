@@ -1,10 +1,10 @@
-//! When the model is built again after it failed to build: the helper's first NGX feature (pass 0), and
-//! the layer's native network (where re-initialising means closing and opening the network again).
+//! When the native network is built again after it failed to build (re-initialising means closing and
+//! opening the network again). The schedule was made for the 2.x helper's NGX feature:
 //!
 //! A failed `CreateFeature` used to be retried on the rebuild spacing (250 ms) for ever, with
 //! nothing in between: no backoff, no re-initialisation of NGX, and `model_up` left at 1. On the
 //! rig (4K, VRAM full) one `0xbad00002` was followed by every later creation failing too, across
-//! game launches, until the helper process was restarted (docs/PRE_UPSCALER_DESIGN.md,
+//! game launches, until the model server process was restarted (docs/PRE_UPSCALER_DESIGN.md,
 //! "Robustness: failed feature builds"). [`BuildRetry`] is the schedule that replaced it:
 //!
 //! - after the 1st, 2nd and 3rd consecutive failure: wait [`BuildRetry::SHORT`] (0.5, 1, 2 s);
@@ -17,29 +17,29 @@
 //! spin.
 //!
 //! [`FailInject`] is the `NEURAL_FORGE_FAIL_CREATE` fault injection used to exercise all of this
-//! on the rig. Pure bookkeeping with no Win32 or Vulkan calls, so it builds and tests natively.
+//! on the rig. Pure bookkeeping with no Vulkan calls.
 
 use std::time::{Duration, Instant};
 
-/// What to do about pass 0 now.
+/// What to do about the network now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Step {
     /// Not yet: the next attempt is due in this long.
     Wait(Duration),
     /// Build it.
     Build,
-    /// Shut NGX down and initialise it again, then build.
+    /// Close and reopen the network, then build.
     ReinitThenBuild,
 }
 
-/// The retry schedule for pass 0 (see the module doc).
+/// The retry schedule for the network (see the module doc).
 #[derive(Debug, Default, Clone)]
 pub struct BuildRetry {
     /// Consecutive failed builds.
     streak: u32,
     /// When the next attempt is due (`None`: now).
     next_at: Option<Instant>,
-    /// The streak value at which NGX was last re-initialised, so a step asked twice at the same
+    /// The streak value at which the network was last re-initialised, so a step asked twice at the same
     /// streak re-initialises once.
     reinit_at: Option<u32>,
     /// Re-initialisations in this streak.
@@ -53,7 +53,7 @@ impl BuildRetry {
     pub const SHORT: [Duration; 3] = [Duration::from_millis(500), Duration::from_secs(1), Duration::from_secs(2)];
     /// The wait once the short ones are used up.
     pub const LONG: Duration = Duration::from_secs(30);
-    /// The attempt after this many consecutive failures re-initialises NGX first.
+    /// The attempt after this many consecutive failures re-initialises the network first.
     pub const REINIT_AFTER: u32 = 3;
     /// After the first re-initialisation, again every this many failures.
     pub const REINIT_EVERY: u32 = 4;
@@ -98,7 +98,7 @@ impl BuildRetry {
         self.streak
     }
 
-    /// Re-initialisations of NGX in this streak.
+    /// Re-initialisations of the network in this streak.
     pub fn reinits(&self) -> u32 {
         self.reinits
     }
@@ -123,7 +123,7 @@ pub fn after_key_change(build_after: Option<Instant>, now: Instant) -> Option<In
 }
 
 /// `NEURAL_FORGE_FAIL_CREATE=N` or `N@K`: let `K` creations through (default 0), then fail the next
-/// `N` without calling NGX. A debug switch for the rig; unset (the default) does nothing.
+/// `N` without building. A debug switch for the rig; unset (the default) does nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct FailInject {
     skip: u32,

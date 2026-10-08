@@ -648,7 +648,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "gio",
@@ -661,7 +661,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-cli"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "anyhow",
  "neural-forge-protocol",
@@ -669,17 +669,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "neural-forge-helper"
-version = "2.0.10"
-dependencies = [
- "ash",
- "cc",
- "neural-forge-protocol",
-]
-
-[[package]]
 name = "neural-forge-layer"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "ash",
  "libc",
@@ -691,7 +682,7 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-native"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "ash",
  "cc",
@@ -699,14 +690,14 @@ dependencies = [
 
 [[package]]
 name = "neural-forge-protocol"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "neural-forge-supervisor"
-version = "2.0.10"
+version = "3.0.0"
 dependencies = [
  "libc",
  "neural-forge-protocol",

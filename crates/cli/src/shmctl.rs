@@ -30,9 +30,9 @@ fn usage() {
          \x20                     original+composited pairs, whichever present path runs\n\
          \x20                     (see neural_forge_layer::series)\n\
          \x20 reset               reset every setting to its default; preserves the\n\
-         \x20                     live helper/layer session (see ShmHeader::reset_persisted_settings)\n\n\
+         \x20                     live layer session (see ShmHeader::reset_persisted_settings)\n\n\
          Opens config.ini's shm= channel, else $NEURAL_FORGE_SHM, else the default under\n\
-         /tmp/neural-forge-$UID -- the same one `start` gives the helper."
+         /tmp/neural-forge-$UID -- the same one the layer uses."
     );
 }
 
@@ -48,12 +48,9 @@ fn extra_field<'a>(header: &'a ShmHeader, name: &str) -> Option<(&'a std::sync::
     })
 }
 
-fn helper_state_name(v: u32) -> &'static str {
-    use neural_forge_protocol::enums::helper_state::*;
+fn server_state_name(v: u32) -> &'static str {
+    use neural_forge_protocol::enums::server_state::*;
     match v {
-        STARTING => "starting",
-        NO_VULKAN => "no_vulkan",
-        NO_BINARIES => "no_binaries",
         MODEL_FAILED => "model_failed",
         RUNNING => "running",
         STOPPED => "stopped",
@@ -63,23 +60,21 @@ fn helper_state_name(v: u32) -> &'static str {
 
 fn cmd_status(header: &ShmHeader) {
     println!("# live status");
-    println!("helper_state={} ({})", header.helper_state.load(Ordering::Relaxed), helper_state_name(header.helper_state.load(Ordering::Relaxed)));
+    println!("server_state={} ({})", header.server_state.load(Ordering::Relaxed), server_state_name(header.server_state.load(Ordering::Relaxed)));
     println!("model_up={}", header.model_up.load(Ordering::Relaxed));
-    println!("helper_reason={}", header.helper_reason());
-    let frames = (u64::from(header.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.helper_frames_lo.load(Ordering::Relaxed));
-    println!("helper_frames={frames}");
-    println!("helper_upload_ms={}", f32::from_bits(header.helper_upload_ms_bits.load(Ordering::Relaxed)));
-    println!("helper_eval_ms={}", f32::from_bits(header.helper_eval_ms_bits.load(Ordering::Relaxed)));
-    println!("helper_readback_ms={}", f32::from_bits(header.helper_readback_ms_bits.load(Ordering::Relaxed)));
-    println!("helper_busy_ms={}", f64::from(header.helper_busy_us.load(Ordering::Relaxed)) / 1000.0);
-    println!("pass0_override_mask={}", header.pass[0].override_mask.load(Ordering::Relaxed));
+    let frames = (u64::from(header.server_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.server_frames_lo.load(Ordering::Relaxed));
+    println!("server_frames={frames}");
+    println!("server_upload_ms={}", f32::from_bits(header.server_upload_ms_bits.load(Ordering::Relaxed)));
+    println!("server_eval_ms={}", f32::from_bits(header.server_eval_ms_bits.load(Ordering::Relaxed)));
+    println!("server_readback_ms={}", f32::from_bits(header.server_readback_ms_bits.load(Ordering::Relaxed)));
+    println!("server_busy_ms={}", f64::from(header.server_busy_us.load(Ordering::Relaxed)) / 1000.0);
     let layer_frames = (u64::from(header.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.layer_frames_lo.load(Ordering::Relaxed));
     println!("layer_frames={layer_frames}");
     println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
     println!("layer_capture_gpu_ms={}", f32::from_bits(header.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)));
     println!("layer_compose_gpu_ms={}", f32::from_bits(header.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)));
     let preupscale = header.preupscale_state.load(Ordering::Relaxed);
-    println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", 3 => "paused: no model answer, forwarding untouched", _ => "unknown" });
+    println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", _ => "unknown" });
     println!("layer_reason={}", header.layer_reason());
     println!("native_running={}", header.native_running.load(Ordering::Relaxed));
     println!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed));
@@ -108,7 +103,7 @@ fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
     extra_field(header, name).map(|(field, is_float)| (is_float, field.load(Ordering::Relaxed)))
 }
 
-/// Writes one setting and bumps the sequence numbers the helper and layer watch. The
+/// Writes one setting and bumps the sequence numbers the layer watches. The
 /// `tuning_seq` bump also marks the header as configured: left at 0 (a header nothing had
 /// applied `config.ini` to yet), the next `start()` would overwrite this value from it.
 fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
@@ -237,7 +232,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         Some("capture") => cmd_capture(header, &args[1..]),
         Some("reset") => {
             header.reset_persisted_settings();
-            println!("settings reset to defaults; helper/layer session preserved");
+            println!("settings reset to defaults; layer session preserved");
             true
         }
         _ => {
@@ -352,11 +347,11 @@ mod tests {
     }
 
     #[test]
-    fn helper_state_name_covers_every_real_state() {
-        use neural_forge_protocol::enums::helper_state::*;
-        for state in [STARTING, NO_VULKAN, NO_BINARIES, MODEL_FAILED, RUNNING, STOPPED] {
-            assert_ne!(helper_state_name(state), "unknown");
+    fn server_state_name_covers_every_real_state() {
+        use neural_forge_protocol::enums::server_state::*;
+        for state in [MODEL_FAILED, RUNNING, STOPPED] {
+            assert_ne!(server_state_name(state), "unknown");
         }
-        assert_eq!(helper_state_name(9999), "unknown");
+        assert_eq!(server_state_name(9999), "unknown");
     }
 }

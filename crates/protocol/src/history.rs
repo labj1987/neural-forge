@@ -11,9 +11,9 @@
 //! reset, or a pixel whose previous position the model never saw all get blend weight zero.
 //! See `docs/OPENDLSS_REVIEW.md`, rows "has-history flag" and "reset on idle".
 //!
-//! Pure bookkeeping with no Win32 or Vulkan calls, shared by the helper (NGX's history) and the
+//! Pure bookkeeping with no Win32 or Vulkan calls, shared by the model server (NGX's history) and the
 //! layer's native backend (its own history images). `F` is what counts as a change of input format
-//! for the slot: the helper's 8-bit/HDR class, the layer's extent and identification.
+//! for the slot: the model server's 8-bit/HDR class, the layer's extent and identification.
 
 use std::time::{Duration, Instant};
 
@@ -38,13 +38,13 @@ impl<F> Default for HistoryGap<F> {
 /// Why a history reset was asked for, for the log line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stale {
-    /// A request on this slot reached the helper but not the model (effect off, model not
+    /// A request on this slot reached the model server but not the model (effect off, model not
     /// ready, or a failed evaluate).
     Skipped,
     /// No evaluate for longer than [`HistoryGap::MAX_GAP`] (the layer stopped sending: pass
     /// through, warm-up, a long hitch).
     Idle(Duration),
-    /// The slot's input format changed (the helper: between 8-bit and RGBA16F; the layer: another
+    /// The slot's input format changed (the model server: between 8-bit and RGBA16F; the layer: another
     /// extent or another identification of DLSS's inputs): the history describes another picture.
     FormatChanged,
 }

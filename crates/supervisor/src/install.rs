@@ -137,16 +137,6 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     let manifest_out = serde_json::to_string_pretty(&manifest)? + "\n";
     files.insert(data_home.join(format!("vulkan/implicit_layer.d/{MANIFEST}")), manifest_out.into_bytes());
 
-    // The 32-bit layer's own manifest (its own layer name), when the AppDir carries it.
-    let manifest32_src = usr.join("share/vulkan/implicit_layer.d/neural_forge_layer_i686.json");
-    if manifest32_src.is_file() {
-        let mut manifest32: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&manifest32_src)?)?;
-        let library32 = root.join("lib/neural-forge/i686/libneural_forge_layer.so");
-        manifest32["layer"]["library_path"] = serde_json::Value::String(library32.to_string_lossy().into_owned());
-        let out = serde_json::to_string_pretty(&manifest32)? + "\n";
-        files.insert(data_home.join("vulkan/implicit_layer.d/neural_forge_layer_i686.json"), out.into_bytes());
-    }
-
     // No `.desktop` file, icon or AppStream metainfo: every install comes from an
     // AppImage, and menu integration belongs to whatever integrates that AppImage
     // (Gear Lever, AppImageLauncher, ...). Installing a second entry here gave users two
@@ -263,11 +253,10 @@ fn remove_empty_parents(path: &Path) {
 }
 
 /// `uninstall`, then everything else Neural Forge ever wrote: its config, data (the imported
-/// NGX DLLs and the managed Wine prefix included), state and `/tmp/neural-forge-$UID`. Stops a
-/// running helper first. Each directory must be one of Neural Forge's own (named
-/// `neural-forge` or `neural-forge-<uid>`) or it is left alone. Returns what was removed.
+/// NVIDIA DLL and the extracted model included), state and `/tmp/neural-forge-$UID`. Each directory
+/// must be one of Neural Forge's own (named `neural-forge` or `neural-forge-<uid>`) or it is left
+/// alone. Returns what was removed.
 pub fn purge() -> std::io::Result<Vec<PathBuf>> {
-    let _ = crate::stop(std::time::Duration::from_secs(5));
     let preserved = uninstall()?;
     for path in &preserved {
         if path.is_file() {
@@ -314,8 +303,8 @@ mod tests {
             std::fs::create_dir_all(&dir).unwrap();
             let prev = std::env::var("XDG_DATA_HOME").ok();
             std::env::set_var("XDG_DATA_HOME", &dir);
-            // Keep the tests away from the real config/state dirs and from any real
-            // helper's pid file: a unique uid names a runtime dir that cannot exist.
+            // Keep the tests away from the real config/state dirs and runtime dir: a unique uid
+            // names a runtime dir that cannot exist.
             let mut prev_extra = Vec::new();
             for (var, value) in [
                 ("XDG_CONFIG_HOME", dir.join("config-home").display().to_string()),
@@ -352,7 +341,6 @@ mod tests {
             ("usr/bin/neural-forge", "gui"),
             ("usr/bin/neural-forge-cli", "cli"),
             ("usr/lib/neural-forge/libneural_forge_layer.so", "layer"),
-            ("usr/lib/neural-forge/helper/neural-forge-helper.exe", "helper"),
             (&format!("usr/share/applications/{APP_ID}.desktop"), "[Desktop Entry]\nExec=neural-forge\n"),
             ("usr/share/icons/hicolor/scalable/apps/neural-forge.svg", "<svg/>"),
             (&format!("usr/share/metainfo/{APP_ID}.appdata.xml"), "<component/>"),
@@ -377,7 +365,6 @@ mod tests {
         assert_eq!(std::fs::read_to_string(root.join("bin/neural-forge")).unwrap(), "gui");
         assert_eq!(std::fs::read_to_string(root.join("bin/neural-forge-cli")).unwrap(), "cli");
         assert_eq!(std::fs::read_to_string(root.join("lib/neural-forge/libneural_forge_layer.so")).unwrap(), "layer");
-        assert_eq!(std::fs::read_to_string(root.join("lib/neural-forge/helper/neural-forge-helper.exe")).unwrap(), "helper");
 
         let manifest_path = PathBuf::from(paths::data_home()).join(format!("vulkan/implicit_layer.d/{MANIFEST}"));
         let manifest: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(manifest_path).unwrap()).unwrap();
@@ -415,10 +402,10 @@ mod tests {
         let scratch = ScratchDataHome::new("stale-cleanup");
         let appdir = scratch.dir.join("AppDir");
         write_fixture_appdir(&appdir);
-        let extra = appdir.join("usr/lib/neural-forge/helper/old-only.dll");
+        let extra = appdir.join("usr/lib/neural-forge/old-only.so");
         std::fs::write(&extra, "old").unwrap();
         install(&appdir).unwrap();
-        let installed = PathBuf::from(paths::data_dir()).join("lib/neural-forge/helper/old-only.dll");
+        let installed = PathBuf::from(paths::data_dir()).join("lib/neural-forge/old-only.so");
         assert!(installed.exists());
 
         std::fs::remove_file(&extra).unwrap();
@@ -432,10 +419,10 @@ mod tests {
         let scratch = ScratchDataHome::new("stale-edited");
         let appdir = scratch.dir.join("AppDir");
         write_fixture_appdir(&appdir);
-        let extra = appdir.join("usr/lib/neural-forge/helper/old-only.dll");
+        let extra = appdir.join("usr/lib/neural-forge/old-only.so");
         std::fs::write(&extra, "old").unwrap();
         install(&appdir).unwrap();
-        let installed = PathBuf::from(paths::data_dir()).join("lib/neural-forge/helper/old-only.dll");
+        let installed = PathBuf::from(paths::data_dir()).join("lib/neural-forge/old-only.so");
         std::fs::write(&installed, "edited by hand").unwrap();
 
         std::fs::remove_file(&extra).unwrap();
@@ -455,7 +442,7 @@ mod tests {
         // up-front validation passes (nothing exists at the destination itself) but
         // the write fails, after earlier files (BTreeMap order) have already landed.
         let root = PathBuf::from(paths::data_dir());
-        let blocked = root.join("lib/neural-forge/helper");
+        let blocked = root.join("lib/neural-forge");
         std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
         std::fs::write(&blocked, "in the way").unwrap();
         let err = install(&appdir);

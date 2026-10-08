@@ -109,7 +109,7 @@ struct Slots {
 }
 
 /// What runs the hold for a job on the worker thread (`device.rs`): the device's state and the
-/// helper. It is only called once `captured` is set; `release` is set by the worker afterwards.
+/// network. It is only called once `captured` is set; `release` is set by the worker afterwards.
 pub(crate) type HoldFn = Box<dyn FnMut(&Job, vk::Queue) + Send>;
 
 pub(crate) struct Inline {
@@ -759,7 +759,7 @@ mod tests {
     /// GPU stops at the hold until the worker releases it, the colour input comes back exactly as
     /// it was (a hold that writes nothing changes nothing), both events are reset afterwards, and
     /// the same buffer submitted again is held again. The worker's hold here only waits; the side
-    /// queue's encode, helper round trip and decode are `run_hold`'s, tested on their own.
+    /// queue's encode, model server round trip and decode are `run_hold`'s, tested on their own.
     #[test]
     fn the_gpu_waits_at_the_hold_until_the_worker_releases_it_and_the_frame_round_trips() {
         let Some((_entry, instance, physical_device, device, queue, family)) = crate::composition::gpu::test_device() else { return };

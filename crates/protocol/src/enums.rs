@@ -3,21 +3,7 @@
 //! shared memory written by another process (possibly a stale or foreign one), and
 //! reinterpreting an arbitrary `u32` as a Rust enum via a transmute is immediate
 //! undefined behavior the moment the bytes don't match a declared variant. Read the
-//! raw `u32` and clamp/validate it at the call site instead (see e.g.
-//! [`ShmHeader::mvec_scale_mode`](crate::ShmHeader::mvec_scale_mode)).
-
-/// Which fields a per-pass entry actually overrides. Sparse by design: a pass with no
-/// entry, or an entry that does not name a field, follows the global setting — which is
-/// what makes "pass 3 is gentler" expressible without restating everything else about
-/// pass 3.
-pub mod pass_override {
-    pub const INTENSITY: u32 = 1 << 0;
-    pub const LOCAL_STRUCTURE: u32 = 1 << 1;
-    pub const LOCAL_TONE: u32 = 1 << 2;
-    pub const SKIN_STRUCTURE: u32 = 1 << 3;
-    pub const STYLE: u32 = 1 << 4;
-    pub const AUTO_MASK: u32 = 1 << 6;
-}
+//! raw `u32` and clamp/validate it at the call site instead.
 
 /// Where the white point comes from: the slider, or the calibration grid measured off
 /// the untouched copy of the frame.
@@ -56,16 +42,9 @@ pub mod reversible_mode {
     pub const COUNT: u32 = 5;
 }
 
-/// What the helper has managed to do, for the GUI and for the layer's fail-open
-/// decision. The layer reads this to decide whether anything is listening, so
-/// "nobody" has to be the value a freshly initialized header holds — not a state that
-/// also means "starting".
-pub mod helper_state {
-    pub const STARTING: u32 = 0;
-    /// No NVIDIA device with the required extensions.
-    pub const NO_VULKAN: u32 = 1;
-    /// The NGX model DLL was not found.
-    pub const NO_BINARIES: u32 = 2;
+/// What the model server (`native_post`, the after-the-upscaler path's) is doing: the layer's post
+/// path asks it for answers only while it runs. "Stopped" is what a freshly initialised header holds.
+pub mod server_state {
     pub const MODEL_FAILED: u32 = 3;
     pub const RUNNING: u32 = 4;
     pub const STOPPED: u32 = 5;
@@ -73,8 +52,7 @@ pub mod helper_state {
 
 /// The HDR input path. `hdr_mode` is the user's choice; `hdr_detected`/`hdr_kind` are
 /// the layer's reading of the swapchain; `hdr_active` is what the layer actually
-/// encoded the frame as; `proxy_format` is what the helper actually built the crossing
-/// images as. The float path is only taken while both agree it exists.
+/// encoded the frame as; `proxy_format` is what the proxy actually is. The float path is only taken while both agree it exists.
 pub mod hdr_mode {
     /// HDR when the swapchain is HDR.
     pub const AUTO: u32 = 0;
@@ -93,7 +71,7 @@ pub mod hdr_kind {
     pub const PQ10: u32 = 2;
 }
 
-/// What the crossing images actually are, published by the helper: the model decides,
+/// What the crossing images actually are, published by the model server: the model decides,
 /// and the layer encodes to match rather than to hope.
 pub mod proxy_format {
     pub const UNKNOWN: u32 = 0;
@@ -106,7 +84,7 @@ pub mod proxy_format {
     }
 
     /// Bytes per pixel for a raw dump in this format -- shared by the layer (which
-    /// writes the proxy region at this size) and the helper (which needs to know how
+    /// writes the proxy region at this size) and the model server (which needs to know how
     /// many of the region's bytes are real for a given frame, not the full
     /// `MAX_FRAME`-sized reservation). Unknown formats are treated as the smaller,
     /// 8-bit encoding: a format this crate doesn't recognize should never have been
@@ -121,15 +99,3 @@ pub mod proxy_format {
     }
 }
 
-pub mod mvec_scale_mode {
-    pub const NORMALIZED: u32 = 0;
-    pub const PIXELS: u32 = 1;
-    pub const UV01: u32 = 2;
-}
-
-/// What the optical-flow engine is asked for. Higher costs more of the frame's budget.
-pub mod mvec_quality {
-    pub const FAST: u32 = 0;
-    pub const BALANCED: u32 = 1;
-    pub const QUALITY: u32 = 2;
-}

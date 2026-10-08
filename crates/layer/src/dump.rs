@@ -43,7 +43,7 @@ pub(crate) fn write_png(path: &std::path::Path, rgba: &[u8], width: u32, height:
     let Ok(file) = std::fs::File::create(path) else { return false };
     let mut encoder = png::Encoder::new(BufWriter::new(file), width, height);
     // Forced fully opaque, on purpose: this is `RGBA8` straight off a real present
-    // path (an opaque swapchain's own image, or the helper's `Output` resource), and
+    // path (an opaque swapchain's own image, or the model server's `Output` resource), and
     // neither source is under any obligation to write a meaningful alpha channel --
     // a real opaque-composite-mode present never reads it either. Writing the real
     // (frequently 0) alpha through unmodified would make a real, correctly-composited

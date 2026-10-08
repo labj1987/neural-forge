@@ -1,46 +1,10 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use crate::enums::{mvec_quality, mvec_scale_mode};
-use crate::{Slot, DEFAULT_MAX_PASSES, HEADER_BYTES, MAX_PASSES, NAME_BYTES, REASON_BYTES, SHM_MAGIC, SHM_VERSION};
+use crate::{Slot, HEADER_BYTES, NAME_BYTES, REASON_BYTES, SHM_MAGIC, SHM_VERSION};
 
-/// One pass's overrides. Every field is present; `override_mask` says which of them
-/// mean anything — see [`crate::enums::pass_override`].
-///
-/// `Default` gives the all-zero value a fresh (or `ftruncate`d, zero-filled) mapping
-/// naturally starts with; [`PassControl::reset_to_defaults`] is the separate,
-/// explicit "what a pass should actually mean until told otherwise" values.
-#[repr(C)]
-#[derive(Default)]
-pub struct PassControl {
-    pub override_mask: AtomicU32,
-    pub intensity_bits: AtomicU32,
-    pub local_tone_bits: AtomicU32,
-    pub local_structure_bits: AtomicU32,
-    pub skin_structure_bits: AtomicU32,
-    pub style: AtomicU32,
-    pub auto_mask: AtomicU32,
-}
-
-impl PassControl {
-    fn reset_to_defaults(&self) {
-        self.override_mask.store(0, Ordering::Relaxed);
-        self.intensity_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
-        self.local_tone_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
-        self.local_structure_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
-        // -1 follows local structure; it is not a strength of zero.
-        self.skin_structure_bits.store((-1.0f32).to_bits(), Ordering::Relaxed);
-        // Inert until override_mask names them, but initialized to the global defaults
-        // so a pass that is switched on later starts from what the rest of the frame is
-        // already doing.
-        self.style.store(0, Ordering::Relaxed);
-        self.auto_mask.store(1, Ordering::Relaxed);
-    }
-}
-
-/// A pass's settings after the global values and its own overrides have been merged.
-/// Plain floats: this is the resolved answer, not shared state.
+/// The model's settings (the Model tab's), read out of the header as plain values.
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PassTuning {
+pub struct Tuning {
     pub intensity: f32,
     pub local_tone: f32,
     pub local_structure: f32,
@@ -50,7 +14,7 @@ pub struct PassTuning {
     pub auto_mask: u32,
 }
 
-impl Default for PassTuning {
+impl Default for Tuning {
     fn default() -> Self {
         Self {
             intensity: 1.0,
@@ -63,27 +27,14 @@ impl Default for PassTuning {
     }
 }
 
-impl PassTuning {
-    /// Everything the model latches when its feature is built.
-    pub fn same_create_params(&self, other: &PassTuning) -> bool {
-        self.intensity == other.intensity
-            && self.local_tone == other.local_tone
-            && self.local_structure == other.local_structure
-            && self.skin_structure == other.skin_structure
-            && self.style == other.style
-            && self.auto_mask == other.auto_mask
-    }
-}
-
 /// The shared-memory header. See the crate-level docs for the mapping this sits at the
 /// front of.
 ///
 /// `#[repr(C)]` and built entirely from `AtomicU32` fields (the free-text fields are
 /// arrays of them, holding the UTF-8 bytes little-endian four to a word):
 /// every field here has to land at the offset a same-order, same-width C struct would
-/// put it at, because the whole point is that two different toolchains (this crate on
-/// Linux, and whatever builds the Windows helper) agree on the layout without either
-/// one reading the other's header file.
+/// put it at, so every process that maps it (the layer in each game, the GUI, the CLI) agrees
+/// on the layout.
 ///
 /// `Default` gives the all-zero value that a fresh, `ftruncate`d mapping already holds
 /// before anyone touches it — useful for tests and for constructing one off the heap.
@@ -96,32 +47,28 @@ pub struct ShmHeader {
     pub magic: AtomicU32,
     pub version: AtomicU32,
 
-    /// The frame handshake. The layer bumps `seq_req` after writing a proxy; the helper
-    /// answers by storing the same number into `seq_resp` once the model's answer is in
-    /// the output region.
+    /// The frame handshake of the after-the-upscaler path. The layer bumps `seq_req` after
+    /// writing a proxy; the model server (`native_post`, in the game's process) answers by storing
+    /// the same number into `seq_resp` once the model's answer is in the output region.
     pub seq_req: AtomicU32,
     pub seq_resp: AtomicU32,
     pub width: AtomicU32,
     pub height: AtomicU32,
-    /// Always 1 (RGBA byte order); kept so a mismatched-version helper is not silently
-    /// wrong.
+    /// Always 1 (RGBA byte order).
     pub format: AtomicU32,
     pub quit: AtomicU32,
-    pub heartbeat: AtomicU32,
+    /// Bumped by the model server while it runs (the post path waits for it only then).
+    pub server_heartbeat: AtomicU32,
 
-    /// Bumped by whoever writes a setting. The layer and the helper watch this rather
-    /// than re-reading every field every frame.
+    /// Bumped by whoever writes a setting. The layer watches this rather than re-reading every
+    /// field every frame.
     pub control_seq: AtomicU32,
-    /// Bumped only when something the model latches at feature creation changes. The
-    /// helper rebuilds its features on this and debounces the rebuild — bumping it
-    /// every frame exhausts the driver's latches and the model stops responding until
-    /// the process restarts.
+    /// Bumped when a saved setting changes (`persist::apply`); 0 means the saved settings were never
+    /// applied to this mapping (`persist::apply_saved`).
     pub tuning_seq: AtomicU32,
 
     // --- the model ----------------------------------------------------------------
     pub enabled: AtomicU32,
-    pub passes: AtomicU32,
-    pub unlock_passes: AtomicU32,
     pub style: AtomicU32,
     pub auto_mask: AtomicU32,
     pub intensity_bits: AtomicU32,
@@ -181,19 +128,14 @@ pub struct ShmHeader {
     /// since.
     pub hold_frame: AtomicU32,
 
-    // --- status, written by the helper ----------------------------------------------
-    pub helper_state: AtomicU32,
+    // --- status, written by the model server (`native_post`) ----------------------------
+    pub server_state: AtomicU32,
     pub model_up: AtomicU32,
-    pub helper_frames_lo: AtomicU32,
-    pub helper_frames_hi: AtomicU32,
-    pub helper_eval_ms_bits: AtomicU32,
-    pub helper_upload_ms_bits: AtomicU32,
-    pub helper_readback_ms_bits: AtomicU32,
-    pub helper_vram_mb: AtomicU32,
-    /// How many NGX features are actually built.
-    pub helper_features: AtomicU32,
-    /// What the VRAM budget currently allows.
-    pub helper_pass_ceiling: AtomicU32,
+    pub server_frames_lo: AtomicU32,
+    pub server_frames_hi: AtomicU32,
+    pub server_eval_ms_bits: AtomicU32,
+    pub server_upload_ms_bits: AtomicU32,
+    pub server_readback_ms_bits: AtomicU32,
 
     // --- status, written by the layer -------------------------------------------------
     pub layer_attached: AtomicU32,
@@ -210,21 +152,12 @@ pub struct ShmHeader {
     // --- free text, each guarded by its own sequence number --------------------------
     // Bumped after the bytes are written, so a reader that sees an unchanged number is
     // looking at a whole string. See `store_seq_guarded`/`load_seq_guarded` below.
-    pub helper_reason_seq: AtomicU32,
-    helper_reason: [AtomicU32; REASON_BYTES / 4],
     pub layer_reason_seq: AtomicU32,
     layer_reason: [AtomicU32; REASON_BYTES / 4],
     pub game_name_seq: AtomicU32,
     game_name: [AtomicU32; NAME_BYTES / 4],
 
-    pub pass: [PassControl; MAX_PASSES],
-
-    // Appended after the pass array on purpose: everything before it has a pinned
-    // offset, and a new field inserted higher up would move all of them.
-    pub mvec_enabled: AtomicU32,
-    pub mvec_scale_mode: AtomicU32,
-    pub mvec_quality: AtomicU32,
-    /// How far the helper has answered *successfully*. `seq_resp` says a frame came
+    /// How far the model server has answered *successfully*. `seq_resp` says a frame came
     /// back; this says it was worth using, so the layer can present the game's own
     /// frame when it was not.
     pub seq_ok: AtomicU32,
@@ -233,34 +166,11 @@ pub struct ShmHeader {
     /// guard limits. 1: no composition at all — the model's raw answer IS the presented
     /// frame. Default 0: the composition is on; bypass is an explicit debug choice.
     pub composition_bypass: AtomicU32,
-    /// Wall-clock milliseconds the helper waits after the last tuning change before it
-    /// rebuilds a feature, and between one rebuild and the next.
-    pub rebuild_settle_ms: AtomicU32,
-
-    /// The raster the helper actually answered, echoed before `seq_resp`. Without this
+    /// The raster the model server actually answered, echoed before `seq_resp`. Without this
     /// echo a swapchain waiting on its own request could be satisfied by another
     /// swapchain's answer and copy the wrong number of bytes.
     pub answered_w: AtomicU32,
     pub answered_h: AtomicU32,
-
-    // --- the dma-buf exchange, carried entirely through this header ------------------
-    /// Bumped when the fd or the image behind it changes; the importer re-opens on a
-    /// new sequence.
-    pub proxy_export_seq: AtomicU32,
-    /// The helper's Linux pid.
-    pub proxy_pid: AtomicU32,
-    /// Its fd number for the proxy image.
-    pub proxy_fd: AtomicU32,
-    /// Rebuilt (size or channel) since.
-    pub proxy_gen: AtomicU32,
-    pub answer_export_seq: AtomicU32,
-    pub answer_pid: AtomicU32,
-    pub answer_fd: AtomicU32,
-    pub answer_gen: AtomicU32,
-    /// The importer's echo: the export sequence each side has taken a reference at,
-    /// restated every frame, 0 for none.
-    pub layer_proxy_seq: AtomicU32,
-    pub layer_answer_seq: AtomicU32,
 
     // --- the HDR input path ----------------------------------------------------------
     pub hdr_mode: AtomicU32,
@@ -268,13 +178,13 @@ pub struct ShmHeader {
     pub hdr_active: AtomicU32,
     pub proxy_format: AtomicU32,
     /// What the proxy bytes in the shared region actually are for the request being
-    /// made: the layer writes this immediately before `seq_req`, so the helper reads
+    /// made: the layer writes this immediately before `seq_req`, so the model server reads
     /// the width from the same statement that announced the pixels.
     pub hdr_encode: AtomicU32,
 
     // --- v3: the second, independent request/response slot ---------------------------
-    // Appended after everything else on purpose, same reasoning as `pass` above: a
-    // new field inserted higher up would move every field below it. See
+    // Appended after everything else on purpose: a new field inserted higher up would move
+    // every field below it. See
     // `docs/PROTOCOL_V3_DESIGN.md` for why only these five are duplicated (not, say,
     // `format`/`hdr_encode`/`answered_w`/`answered_h`, which are dead fields on slot 0
     // too -- nothing in this workspace reads or writes them today).
@@ -319,37 +229,32 @@ pub struct ShmHeader {
     /// 0 off (`NEURAL_FORGE_PREUPSCALE=off`, or no device with NVX: nothing is held, the model runs
     /// after the upscaler), 1 waiting for the game's DLSS input (the mode is on, as it is by default,
     /// but no launch-bearing submit was held in the last 500 ms: no DLSS, DLAA, input not
-    /// identified, or the toggle is off), 2 holding the DLSS submit, 3 paused: DLSS input is there
-    /// but the helper has no model (it reports `model_up` 0, or the last holds all came back as
-    /// echoes or late), so submits are forwarded untouched until a probe hold gets a model answer.
+    /// identified, or the toggle is off), 2 holding the DLSS submit.
     pub preupscale_state: AtomicU32,
     /// The identified DLSS colour input's extent (the render resolution), 0 before one is found.
     pub preupscale_width: AtomicU32,
     pub preupscale_height: AtomicU32,
     /// CPU milliseconds the last hold blocked the game's submit (f32 bits).
     pub preupscale_hold_ms_bits: AtomicU32,
-    /// Holds whose answer did not come back within the budget (or failed), so the frame went to
-    /// DLSS untouched. Counts up for the life of the layer's session.
+    /// Held frames that went to DLSS untouched (the network not ready, a failed submit, ...).
+    /// Counts up for the life of the layer's session.
     pub preupscale_misses: AtomicU32,
 
     // --- v10 -----------------------------------------------------------------------------
-    /// Microseconds the helper spent on its last slot-0 request, from the loop seeing `seq_req`
-    /// move to just before it stored `seq_resp` (its own clock; an interval, so the two
-    /// processes' clocks never have to agree). Written before `seq_resp`, so a layer that has
-    /// seen the answer reads this request's value. 0 before the first answer.
-    pub helper_busy_us: AtomicU32,
+    /// Microseconds the model server spent on its last slot-0 request, from seeing `seq_req` move to
+    /// just before it stored `seq_resp`. Written before `seq_resp`. 0 before the first answer.
+    pub server_busy_us: AtomicU32,
 
     // --- v11 -----------------------------------------------------------------------------
-    /// The last slot-0 request the helper actually ran the model on (`seq_req`'s value), written
+    /// The last slot-0 request the model server actually ran the model on (`seq_req`'s value), written
     /// before `seq_resp`. A layer that sees `seq_resp` reach its request and this field equal to it
     /// got a model answer; anything else is an echo of its own frame (no feature built, an
     /// evaluate that failed, a refused frame). 0 before the first evaluated request.
     pub seq_eval: AtomicU32,
 
     // --- v13 -----------------------------------------------------------------------------
-    /// 1 while the layer runs the model itself (the native backend) before the upscaler, 0
-    /// otherwise. Passes, per-pass settings and the motion controls only reach the helper, so
-    /// the GUI shows them only while a game runs on it.
+    /// 1 while the layer runs the model before the upscaler, 0 otherwise (the GUI shows the
+    /// after-the-upscaler settings only then).
     pub native_running: AtomicU32,
 }
 
@@ -359,8 +264,7 @@ pub struct ShmHeader {
 impl Default for ShmHeader {
     fn default() -> Self {
         // SAFETY: every field is an `AtomicU32` (valid for any `u32` bit pattern,
-        // including all-zero), an array of them, or an array of `PassControl`, itself
-        // made only of `AtomicU32`s — so
+        // including all-zero) or an array of them — so
         // the all-zero bit pattern `zeroed()` produces is a valid value of every field,
         // and therefore of the whole struct. This is exactly the value a fresh,
         // `ftruncate`d (zero-filled) mapping already holds before anyone touches it.
@@ -376,42 +280,27 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1776, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 664, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(
-    std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 80,
-    "layout changed -- bump SHM_VERSION"
-);
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_state) == 164, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 768, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, mvec_enabled) == 1608, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 1680, "layout changed -- bump SHM_VERSION");
-// v3's second slot, appended after everything else -- same reasoning as `pass`'s own
-// comment above about why a new field belongs at the end, not inserted higher up.
-const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 1700, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 1720, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 1728, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 1732, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(
-    std::mem::offset_of!(ShmHeader, layer_capture_gpu_ms_bits) == 1736,
-    "layout changed -- bump SHM_VERSION"
-);
-const _: () = assert!(
-    std::mem::offset_of!(ShmHeader, layer_compose_gpu_ms_bits) == 1740,
-    "layout changed -- bump SHM_VERSION"
-);
-const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 1744, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 1760, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_busy_us) == 1764, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 1768, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, native_running) == 1772, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::size_of::<PassControl>() == 28, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 72, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 568, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_req_b) == 588, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ghost_guard_bits) == 608, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, ratio_smooth_bits) == 616, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, model_interval) == 620, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_capture_gpu_ms_bits) == 624, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_compose_gpu_ms_bits) == 628, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 632, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 648, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 656, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, native_running) == 660, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 228, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 424, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, server_state) == 156, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, server_busy_us) == 652, "layout changed -- bump SHM_VERSION");
 // The free-text fields are whole words; their byte offsets are the ones they had as byte
 // arrays (every field before them is a word, so none gained padding).
 const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_of(4));
-const _: () = assert!(std::mem::offset_of!(ShmHeader, helper_reason) == 248, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 444, "layout changed -- bump SHM_VERSION");
-const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 640, "layout changed -- bump SHM_VERSION");
 
 impl ShmHeader {
     /// Resets every field to the defaults a freshly created mapping should hold. Takes
@@ -427,13 +316,11 @@ impl ShmHeader {
         self.height.store(0, Ordering::Relaxed);
         self.format.store(1, Ordering::Relaxed);
         self.quit.store(0, Ordering::Relaxed);
-        self.heartbeat.store(0, Ordering::Relaxed);
+        self.server_heartbeat.store(0, Ordering::Relaxed);
         self.control_seq.store(0, Ordering::Relaxed);
         self.tuning_seq.store(0, Ordering::Relaxed);
 
         self.enabled.store(1, Ordering::Relaxed);
-        self.passes.store(1, Ordering::Relaxed);
-        self.unlock_passes.store(0, Ordering::Relaxed);
         self.style.store(0, Ordering::Relaxed);
         self.auto_mask.store(1, Ordering::Relaxed);
         self.intensity_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
@@ -468,16 +355,13 @@ impl ShmHeader {
         self.ratio_smooth_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.model_interval.store(1, Ordering::Relaxed);
 
-        self.helper_state.store(crate::enums::helper_state::STOPPED, Ordering::Relaxed);
+        self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
-        self.helper_frames_lo.store(0, Ordering::Relaxed);
-        self.helper_frames_hi.store(0, Ordering::Relaxed);
-        self.helper_eval_ms_bits.store(0, Ordering::Relaxed);
-        self.helper_upload_ms_bits.store(0, Ordering::Relaxed);
-        self.helper_readback_ms_bits.store(0, Ordering::Relaxed);
-        self.helper_vram_mb.store(0, Ordering::Relaxed);
-        self.helper_features.store(0, Ordering::Relaxed);
-        self.helper_pass_ceiling.store(DEFAULT_MAX_PASSES, Ordering::Relaxed);
+        self.server_frames_lo.store(0, Ordering::Relaxed);
+        self.server_frames_hi.store(0, Ordering::Relaxed);
+        self.server_eval_ms_bits.store(0, Ordering::Relaxed);
+        self.server_upload_ms_bits.store(0, Ordering::Relaxed);
+        self.server_readback_ms_bits.store(0, Ordering::Relaxed);
 
         self.layer_attached.store(0, Ordering::Relaxed);
         self.layer_frames_lo.store(0, Ordering::Relaxed);
@@ -494,43 +378,21 @@ impl ShmHeader {
         self.preupscale_height.store(0, Ordering::Relaxed);
         self.preupscale_hold_ms_bits.store(0, Ordering::Relaxed);
         self.preupscale_misses.store(0, Ordering::Relaxed);
-        self.helper_busy_us.store(0, Ordering::Relaxed);
+        self.server_busy_us.store(0, Ordering::Relaxed);
         self.seq_eval.store(0, Ordering::Relaxed);
         self.native_running.store(0, Ordering::Relaxed);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
-        self.set_helper_reason("");
         self.set_layer_reason("");
         self.set_game_name("");
 
-        for p in &self.pass {
-            p.reset_to_defaults();
-        }
-
-        // Motion vectors on: estimated on the GPU they cost ~2-3% fps (0.65 ms per frame at
-        // 2560x1440 on an RTX 5070). Quality FAST.
-        self.mvec_enabled.store(1, Ordering::Relaxed);
-        self.mvec_scale_mode.store(mvec_scale_mode::PIXELS, Ordering::Relaxed);
-        self.mvec_quality.store(mvec_quality::FAST, Ordering::Relaxed);
         self.seq_ok.store(0, Ordering::Relaxed);
         // Neural rendering should affect the presented image by default. A
         // bypassed composition is an explicit debug choice, not the normal mode.
         self.composition_bypass.store(0, Ordering::Relaxed);
-        self.rebuild_settle_ms.store(250, Ordering::Relaxed);
         self.answered_w.store(0, Ordering::Relaxed);
         self.answered_h.store(0, Ordering::Relaxed);
-
-        self.proxy_export_seq.store(0, Ordering::Relaxed);
-        self.proxy_pid.store(0, Ordering::Relaxed);
-        self.proxy_fd.store(0, Ordering::Relaxed);
-        self.proxy_gen.store(0, Ordering::Relaxed);
-        self.answer_export_seq.store(0, Ordering::Relaxed);
-        self.answer_pid.store(0, Ordering::Relaxed);
-        self.answer_fd.store(0, Ordering::Relaxed);
-        self.answer_gen.store(0, Ordering::Relaxed);
-        self.layer_proxy_seq.store(0, Ordering::Relaxed);
-        self.layer_answer_seq.store(0, Ordering::Relaxed);
 
         self.hdr_mode.store(crate::enums::hdr_mode::AUTO, Ordering::Relaxed);
         self.hdr_detected.store(crate::enums::hdr_kind::NONE, Ordering::Relaxed);
@@ -545,13 +407,11 @@ impl ShmHeader {
         self.proxy_format_b.store(crate::enums::proxy_format::RGBA8, Ordering::Relaxed);
     }
 
-    /// Resets every user-tunable setting -- [`Self::persisted_settings`]'s own list,
-    /// plus each pass's overrides -- to its default value, on a live mapping a
-    /// helper/layer may be actively using. Deliberately narrower than
+    /// Resets every user-tunable setting -- [`Self::persisted_settings`]'s own list -- to its
+    /// default value, on a live mapping the layer may be actively using. Deliberately narrower than
     /// [`Self::init_defaults`]: upstream shipped a real bug here (PR #16), where its own
-    /// "reset settings" wiped the live session out from under a running helper/layer --
-    /// seq words, helper/layer status and counters, the DMA-BUF transport fields, HDR
-    /// detection, the free-text reason/name fields -- not just the tuning knobs a user
+    /// "reset settings" wiped the live session out from under a running process --
+    /// seq words, status and counters, HDR detection, the free-text reason/name fields -- not just the tuning knobs a user
     /// actually meant to reset. This never touches the ownership lease either; that lives
     /// in a separate file (`shm.bin.owner`), entirely outside this struct.
     ///
@@ -559,18 +419,15 @@ impl ShmHeader {
     /// is no second list of defaults to drift from the first, and only the user-tunable
     /// fields are then stored onto `self`. Nothing else in the live header is written at
     /// all: an earlier version snapshotted the live fields, reinitialized everything and
-    /// restored the snapshot, which reverted any helper or layer write landing in between
+    /// restored the snapshot, which reverted any live write landing in between
     /// and made this a second writer on the single-writer reason strings. Bumps
-    /// `tuning_seq` and `control_seq` so the helper and layer pick the change up and a
+    /// `tuning_seq` and `control_seq` so the layer picks the change up and a
     /// later `apply_saved_settings` does not read the header as never configured.
     pub fn reset_persisted_settings(&self) {
         let defaults = ShmHeader::default();
         defaults.init_defaults();
         for (name, _, bits) in defaults.persisted_settings() {
             self.apply_persisted_setting(name, bits);
-        }
-        for p in &self.pass {
-            p.reset_to_defaults();
         }
         self.tuning_seq.fetch_add(1, Ordering::Relaxed);
         self.control_seq.fetch_add(1, Ordering::Relaxed);
@@ -582,9 +439,8 @@ impl ShmHeader {
     }
 
     /// v3's two request/response slots (`docs/PROTOCOL_V3_DESIGN.md`) share every field
-    /// name and type; these are the one place that picks slot 0's or slot 1's field, so the
-    /// layer and the helper -- both of which poll both slots -- never hand-write their own
-    /// choice per field. A [`Slot`] is one of exactly two, so there is no third case.
+    /// name and type; these are the one place that picks slot 0's or slot 1's field, so no caller
+    /// hand-writes its own choice per field. A [`Slot`] is one of exactly two, so there is no third case.
     pub fn seq_req_slot(&self, slot: Slot) -> &AtomicU32 {
         match slot {
             Slot::Primary => &self.seq_req,
@@ -621,7 +477,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 39] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 33] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -635,10 +491,6 @@ impl ShmHeader {
             ("local_structure", true, self.local_structure_bits.load(Ordering::Relaxed)),
             ("skin_structure", true, self.skin_structure_bits.load(Ordering::Relaxed)),
             ("auto_mask", false, self.auto_mask.load(Ordering::Relaxed)),
-            ("passes", false, self.passes.load(Ordering::Relaxed)),
-            ("mvec_enabled", false, self.mvec_enabled.load(Ordering::Relaxed)),
-            ("mvec_scale_mode", false, self.mvec_scale_mode.load(Ordering::Relaxed)),
-            ("mvec_quality", false, self.mvec_quality.load(Ordering::Relaxed)),
             ("composition_bypass", false, self.composition_bypass.load(Ordering::Relaxed)),
             ("transfer_strength", true, self.transfer_strength_bits.load(Ordering::Relaxed)),
             ("colour_strength", true, self.colour_strength_bits.load(Ordering::Relaxed)),
@@ -659,8 +511,6 @@ impl ShmHeader {
             ("colour_trust", true, self.colour_trust_bits.load(Ordering::Relaxed)),
             ("ratio_smooth", true, self.ratio_smooth_bits.load(Ordering::Relaxed)),
             ("model_interval", false, self.model_interval.load(Ordering::Relaxed)),
-            ("unlock_passes", false, self.unlock_passes.load(Ordering::Relaxed)),
-            ("rebuild_settle_ms", false, self.rebuild_settle_ms.load(Ordering::Relaxed)),
             ("apply_model", false, self.apply_model.load(Ordering::Relaxed)),
             ("debug_view", false, self.debug_view.load(Ordering::Relaxed)),
             ("debug_scale", true, self.debug_scale_bits.load(Ordering::Relaxed)),
@@ -685,10 +535,6 @@ impl ShmHeader {
             "local_structure" => &self.local_structure_bits,
             "skin_structure" => &self.skin_structure_bits,
             "auto_mask" => &self.auto_mask,
-            "passes" => &self.passes,
-            "mvec_enabled" => &self.mvec_enabled,
-            "mvec_scale_mode" => &self.mvec_scale_mode,
-            "mvec_quality" => &self.mvec_quality,
             "composition_bypass" => &self.composition_bypass,
             "transfer_strength" => &self.transfer_strength_bits,
             "colour_strength" => &self.colour_strength_bits,
@@ -707,8 +553,6 @@ impl ShmHeader {
             "colour_trust" => &self.colour_trust_bits,
             "ratio_smooth" => &self.ratio_smooth_bits,
             "model_interval" => &self.model_interval,
-            "unlock_passes" => &self.unlock_passes,
-            "rebuild_settle_ms" => &self.rebuild_settle_ms,
             "apply_model" => &self.apply_model,
             "debug_view" => &self.debug_view,
             "debug_scale" => &self.debug_scale_bits,
@@ -717,54 +561,13 @@ impl ShmHeader {
         field.store(bits, Ordering::Relaxed);
     }
 
-    pub fn pass_ceiling(&self) -> u32 {
-        if self.unlock_passes.load(Ordering::Relaxed) != 0 {
-            MAX_PASSES as u32
-        } else {
-            DEFAULT_MAX_PASSES
-        }
-    }
-
-    pub fn resolved_passes(&self) -> u32 {
-        let p = self.passes.load(Ordering::Relaxed);
-        let ceiling = self.pass_ceiling();
-        if p == 0 {
-            1
-        } else {
-            p.min(ceiling)
-        }
-    }
-
     pub fn neural_enabled(&self) -> bool {
         self.enabled.load(Ordering::Relaxed) != 0
     }
 
-    pub fn mvec_enabled(&self) -> bool {
-        self.mvec_enabled.load(Ordering::Relaxed) != 0
-    }
-
-    pub fn mvec_scale_mode(&self) -> u32 {
-        let m = self.mvec_scale_mode.load(Ordering::Relaxed);
-        if m <= mvec_scale_mode::UV01 {
-            m
-        } else {
-            mvec_scale_mode::NORMALIZED
-        }
-    }
-
-    pub fn mvec_quality(&self) -> u32 {
-        let q = self.mvec_quality.load(Ordering::Relaxed);
-        if q <= mvec_quality::QUALITY {
-            q
-        } else {
-            mvec_quality::BALANCED
-        }
-    }
-
-    /// The Model tab's settings, without any pass's overrides: what the native backend, which
-    /// runs the model once per frame, uses.
-    pub fn global_tuning(&self) -> PassTuning {
-        PassTuning {
+    /// The Model tab's settings, as the network uses them.
+    pub fn global_tuning(&self) -> Tuning {
+        Tuning {
             intensity: f32::from_bits(self.intensity_bits.load(Ordering::Relaxed)),
             local_tone: f32::from_bits(self.local_tone_bits.load(Ordering::Relaxed)),
             local_structure: f32::from_bits(self.local_structure_bits.load(Ordering::Relaxed)),
@@ -774,44 +577,6 @@ impl ShmHeader {
         }
     }
 
-    /// The global settings with one pass's overrides applied. A field the pass does not
-    /// name follows the global value, which is what keeps a sparse override sparse.
-    pub fn resolve_pass(&self, pass: usize) -> PassTuning {
-        let mut t = self.global_tuning();
-
-        let Some(p) = self.pass.get(pass) else { return t };
-        let mask = p.override_mask.load(Ordering::Relaxed);
-        if mask == 0 {
-            return t;
-        }
-        use crate::enums::pass_override::*;
-        if mask & INTENSITY != 0 {
-            t.intensity = f32::from_bits(p.intensity_bits.load(Ordering::Relaxed));
-        }
-        if mask & LOCAL_TONE != 0 {
-            t.local_tone = f32::from_bits(p.local_tone_bits.load(Ordering::Relaxed));
-        }
-        if mask & LOCAL_STRUCTURE != 0 {
-            t.local_structure = f32::from_bits(p.local_structure_bits.load(Ordering::Relaxed));
-        }
-        if mask & SKIN_STRUCTURE != 0 {
-            t.skin_structure = f32::from_bits(p.skin_structure_bits.load(Ordering::Relaxed));
-        }
-        if mask & STYLE != 0 {
-            t.style = p.style.load(Ordering::Relaxed);
-        }
-        if mask & AUTO_MASK != 0 {
-            t.auto_mask = p.auto_mask.load(Ordering::Relaxed);
-        }
-        t
-    }
-
-    pub fn set_helper_reason(&self, s: &str) {
-        store_seq_guarded(&self.helper_reason_seq, &self.helper_reason, s);
-    }
-    pub fn helper_reason(&self) -> String {
-        load_seq_guarded(&self.helper_reason_seq, &self.helper_reason)
-    }
     pub fn set_layer_reason(&self, s: &str) {
         store_seq_guarded(&self.layer_reason_seq, &self.layer_reason, s);
     }
@@ -907,35 +672,34 @@ fn load_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W]) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::enums::pass_override;
 
     #[test]
     fn seqlock_is_odd_only_while_writing_and_readers_never_see_a_torn_string() {
         let h = std::sync::Arc::new(ShmHeader::default());
-        h.set_helper_reason("first");
-        assert_eq!(h.helper_reason_seq.load(Ordering::Relaxed) & 1, 0, "idle sequence must be even");
-        assert_eq!(h.helper_reason(), "first");
+        h.set_layer_reason("first");
+        assert_eq!(h.layer_reason_seq.load(Ordering::Relaxed) & 1, 0, "idle sequence must be even");
+        assert_eq!(h.layer_reason(), "first");
         // A reader arriving while a (simulated, stalled) write holds the sequence odd
         // must refuse to return the half-written field rather than trust it.
-        h.helper_reason_seq.store(1, Ordering::Release);
-        assert_eq!(h.helper_reason(), "");
-        h.helper_reason_seq.store(2, Ordering::Release);
-        assert_eq!(h.helper_reason(), "first");
+        h.layer_reason_seq.store(1, Ordering::Release);
+        assert_eq!(h.layer_reason(), "");
+        h.layer_reason_seq.store(2, Ordering::Release);
+        assert_eq!(h.layer_reason(), "first");
 
         let writer = {
             let h = h.clone();
             std::thread::spawn(move || {
                 for i in 0..20_000 {
-                    h.set_helper_reason(if i % 2 == 0 { "aaaaaaaaaaaaaaaaaaaa" } else { "bbbbbbbbbbbbbbbbbbbb" });
+                    h.set_layer_reason(if i % 2 == 0 { "aaaaaaaaaaaaaaaaaaaa" } else { "bbbbbbbbbbbbbbbbbbbb" });
                 }
             })
         };
         for _ in 0..20_000 {
-            let s = h.helper_reason();
+            let s = h.layer_reason();
             assert!(s.is_empty() || s.chars().all(|c| c == 'a') || s.chars().all(|c| c == 'b') || s == "first", "torn read: {s:?}");
         }
         writer.join().unwrap();
-        assert_eq!(h.helper_reason_seq.load(Ordering::Relaxed) & 1, 0);
+        assert_eq!(h.layer_reason_seq.load(Ordering::Relaxed) & 1, 0);
     }
 
     #[test]
@@ -952,7 +716,7 @@ mod tests {
         let h = ShmHeader::default();
         assert_eq!(h.magic.load(Ordering::Relaxed), 0);
         assert_eq!(h.enabled.load(Ordering::Relaxed), 0);
-        assert_eq!(h.helper_reason(), "");
+        assert_eq!(h.layer_reason(), "");
     }
 
     #[test]
@@ -985,7 +749,6 @@ mod tests {
         h.init_defaults();
         assert!(h.is_valid());
         assert!(h.neural_enabled());
-        assert_eq!(h.resolved_passes(), 1);
         assert_eq!(f32::from_bits(h.intensity_bits.load(Ordering::Relaxed)), 1.0);
         // The composition is on by default; bypass is an explicit debug choice.
         assert_eq!(h.composition_bypass.load(Ordering::Relaxed), 0);
@@ -1004,7 +767,7 @@ mod tests {
         h.intensity_bits.store(0.4f32.to_bits(), Ordering::Relaxed);
         h.style.store(2, Ordering::Relaxed);
 
-        // Live session/transport state a real helper and layer would have built up --
+        // Live session/transport state a running layer would have built up --
         // exactly what upstream's PR #16 bug wiped out from under a running process.
         h.seq_req.store(41, Ordering::Relaxed);
         h.seq_resp.store(40, Ordering::Relaxed);
@@ -1018,15 +781,13 @@ mod tests {
         h.width_b.store(1920, Ordering::Relaxed);
         h.height_b.store(1080, Ordering::Relaxed);
         h.proxy_format_b.store(crate::enums::proxy_format::BGRA8, Ordering::Relaxed);
-        h.helper_state.store(crate::enums::helper_state::RUNNING, Ordering::Relaxed);
+        h.server_state.store(crate::enums::server_state::RUNNING, Ordering::Relaxed);
         h.model_up.store(1, Ordering::Relaxed);
-        store64(&h.helper_frames_lo, &h.helper_frames_hi, 12_345);
+        store64(&h.server_frames_lo, &h.server_frames_hi, 12_345);
         h.layer_attached.store(1, Ordering::Relaxed);
         store64(&h.layer_frames_lo, &h.layer_frames_hi, 6_789);
-        h.proxy_fd.store(17, Ordering::Relaxed);
-        h.proxy_pid.store(99, Ordering::Relaxed);
         h.hdr_active.store(1, Ordering::Relaxed);
-        h.set_helper_reason("model ready");
+        h.set_layer_reason("native network running");
         h.set_game_name("GTA5_Enhanced.exe");
 
         h.reset_persisted_settings();
@@ -1045,19 +806,17 @@ mod tests {
         assert_eq!(h.width_b.load(Ordering::Relaxed), 1920);
         assert_eq!(h.height_b.load(Ordering::Relaxed), 1080);
         assert_eq!(h.proxy_format_b.load(Ordering::Relaxed), crate::enums::proxy_format::BGRA8);
-        assert_eq!(h.helper_state.load(Ordering::Relaxed), crate::enums::helper_state::RUNNING);
+        assert_eq!(h.server_state.load(Ordering::Relaxed), crate::enums::server_state::RUNNING);
         assert_eq!(h.model_up.load(Ordering::Relaxed), 1);
-        assert_eq!(load64(&h.helper_frames_lo, &h.helper_frames_hi), 12_345);
+        assert_eq!(load64(&h.server_frames_lo, &h.server_frames_hi), 12_345);
         assert_eq!(h.layer_attached.load(Ordering::Relaxed), 1);
         assert_eq!(load64(&h.layer_frames_lo, &h.layer_frames_hi), 6_789);
-        assert_eq!(h.proxy_fd.load(Ordering::Relaxed), 17);
-        assert_eq!(h.proxy_pid.load(Ordering::Relaxed), 99);
         assert_eq!(h.hdr_active.load(Ordering::Relaxed), 1);
-        assert_eq!(h.helper_reason(), "model ready");
+        assert_eq!(h.layer_reason(), "native network running");
         assert_eq!(h.game_name(), "GTA5_Enhanced.exe");
     }
 
-    /// A reset racing a live helper/layer must never revert what they write: the old
+    /// A reset racing a live layer must never revert what it writes: the old
     /// snapshot/init_defaults/restore sequence briefly zeroed every live field.
     #[test]
     fn reset_never_touches_live_fields_even_transiently() {
@@ -1067,14 +826,14 @@ mod tests {
         h.init_defaults();
         h.seq_req.store(41, Ordering::Relaxed);
         h.width.store(2560, Ordering::Relaxed);
-        h.helper_state.store(crate::enums::helper_state::RUNNING, Ordering::Relaxed);
+        h.server_state.store(crate::enums::server_state::RUNNING, Ordering::Relaxed);
         let done = Arc::new(AtomicBool::new(false));
         let reader = {
             let (h, done) = (h.clone(), done.clone());
             std::thread::spawn(move || {
                 let mut reads = 0u64;
                 while !done.load(Ordering::Relaxed) || reads == 0 {
-                    for (name, v) in [("seq_req", &h.seq_req), ("width", &h.width), ("helper_state", &h.helper_state)] {
+                    for (name, v) in [("seq_req", &h.seq_req), ("width", &h.width), ("server_state", &h.server_state)] {
                         assert_ne!(v.load(Ordering::Relaxed), 0, "{name} observed as zero during a reset");
                     }
                     reads += 1;
@@ -1103,61 +862,12 @@ mod tests {
     fn seq_guarded_string_round_trips() {
         let h = ShmHeader::default();
         h.init_defaults();
-        h.set_helper_reason("no NGX binaries");
-        assert_eq!(h.helper_reason(), "no NGX binaries");
+        h.set_layer_reason("native network running");
+        assert_eq!(h.layer_reason(), "native network running");
         // A field longer than its buffer is truncated, not rejected.
         let long = "x".repeat(REASON_BYTES + 50);
-        h.set_helper_reason(&long);
-        assert_eq!(h.helper_reason().len(), REASON_BYTES - 1);
+        h.set_layer_reason(&long);
+        assert_eq!(h.layer_reason().len(), REASON_BYTES - 1);
     }
 
-    #[test]
-    fn resolve_pass_follows_global_when_no_override() {
-        let h = ShmHeader::default();
-        h.init_defaults();
-        h.intensity_bits.store(0.75f32.to_bits(), Ordering::Relaxed);
-        let t = h.resolve_pass(0);
-        assert_eq!(t.intensity, 0.75);
-        assert_eq!(t.style, 0);
-    }
-
-    #[test]
-    fn resolve_pass_applies_named_overrides_only() {
-        let h = ShmHeader::default();
-        h.init_defaults();
-        h.intensity_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
-        h.style.store(0, Ordering::Relaxed);
-
-        let p = &h.pass[3];
-        p.intensity_bits.store(0.4f32.to_bits(), Ordering::Relaxed);
-        p.style.store(2, Ordering::Relaxed);
-        // Only intensity is named as overridden; style must still follow the global
-        // value even though the pass's own `style` field holds something else.
-        p.override_mask.store(pass_override::INTENSITY, Ordering::Relaxed);
-
-        let t = h.resolve_pass(3);
-        assert_eq!(t.intensity, 0.4);
-        assert_eq!(t.style, 0);
-    }
-
-    #[test]
-    fn global_tuning_ignores_pass_overrides() {
-        let h = ShmHeader::default();
-        h.init_defaults();
-        h.intensity_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
-        let p = &h.pass[0];
-        p.intensity_bits.store(0.4f32.to_bits(), Ordering::Relaxed);
-        p.override_mask.store(pass_override::INTENSITY, Ordering::Relaxed);
-        // The native backend runs the model once with the Model tab's values.
-        assert_eq!(h.resolve_pass(0).intensity, 0.4);
-        assert_eq!(h.global_tuning().intensity, 1.0);
-    }
-
-    #[test]
-    fn mvec_scale_mode_clamps_out_of_range() {
-        let h = ShmHeader::default();
-        h.init_defaults();
-        h.mvec_scale_mode.store(99, Ordering::Relaxed);
-        assert_eq!(h.mvec_scale_mode(), crate::enums::mvec_scale_mode::NORMALIZED);
-    }
 }

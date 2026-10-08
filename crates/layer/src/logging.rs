@@ -10,17 +10,15 @@ use std::sync::{Mutex, OnceLock};
 // Both variants are wrapped in `BufWriter`, not just the file one: this crate's own
 // `set_frame_info`/`capture::run` log unconditionally once (now twice, with the added
 // timing line) per frame, from inside the game's own `vkQueuePresentKHR` override --
-// truly the hottest of hot paths. `NEURAL_FORGE_LOG` is only ever set for
-// `neural-forge-helper.exe` by `neural_forge_supervisor::start()` (confirmed by grep) -- nothing
-// sets it for the game's own launch environment, so in every real deployment this
-// crate has ever run in, `sink()` falls into `Stderr`, never `File`. A 2026-09-10
+// truly the hottest of hot paths. Nothing sets `NEURAL_FORGE_LOG` for the game's own launch
+// environment unless asked, so in a normal deployment `sink()` falls into `Stderr`, never `File`. A 2026-09-10
 // `strace -e trace=write` on a live game process on `lordnikon` confirmed the
 // consequence directly at the syscall level: with the un-wrapped `Stderr` this used to
 // be, a *single* `crate::log!` call fragmented into several separate blocking
 // `write()` syscalls against a pipe (one per literal/formatted segment -- `Write`'s
 // `write_fmt` doesn't coalesce them), every frame, forever -- a real, syscall-level-
 // verified explanation for the multi-hundred-ms/frame stalls this session spent a long
-// time chasing through GPU timing and helper-side-only logging fixes that (correctly
+// time chasing through GPU timing and other-process logging fixes that (correctly
 // diagnosed the same *pattern* elsewhere, but) touched the wrong sink to matter here.
 enum Sink {
     File(BufWriter<File>),

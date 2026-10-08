@@ -26,21 +26,16 @@ jobs:
 
       # Same package list build-appimage.sh installs on a from-scratch image --
       # libgtk-4-dev/libadwaita-1-dev for the gui crate (glib-sys and friends need the
-      # real system libraries via pkg-config, not just a Rust toolchain), mingw for the
-      # Windows-only helper crate, and a software Vulkan ICD (lavapipe), 64- and 32-bit,
-      # so neural-forge-layer's real-device tests run in both the native and the i686
-      # test steps. NEURAL_FORGE_REQUIRE_VULKAN above makes that an assertion, not a hope.
+      # real system libraries via pkg-config, not just a Rust toolchain), and a software
+      # Vulkan ICD (lavapipe), so neural-forge-layer's real-device tests run.
+      # NEURAL_FORGE_REQUIRE_VULKAN above makes that an assertion, not a hope.
       - name: Install build dependencies
         run: |
-          sudo dpkg --add-architecture i386
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib \
-            libvulkan1 mesa-vulkan-drivers vulkan-tools \
-            libvulkan1:i386 mesa-vulkan-drivers:i386
+            libvulkan1 mesa-vulkan-drivers vulkan-tools
 
-      # Only lavapipe, never whatever other ICD the runner image happens to carry. The
-      # loader skips the manifest whose bitness does not match the test binary.
+      # Only lavapipe, never whatever other ICD the runner image happens to carry.
       - name: Select the lavapipe Vulkan driver
         run: |
           icds="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:)"
@@ -48,23 +43,6 @@ jobs:
           echo "VK_DRIVER_FILES=$icds" >> "$GITHUB_ENV"
           echo "VK_DRIVER_FILES=$icds"
 
-      - name: Install Rust
-        run: rustup target add x86_64-pc-windows-gnu i686-unknown-linux-gnu
-
-      - name: Configure the mingw linker
-        run: |
-          mkdir -p ~/.cargo
-          cat >> ~/.cargo/config.toml <<'EOF'
-          [target.x86_64-pc-windows-gnu]
-          linker = "x86_64-w64-mingw32-gcc"
-          ar = "x86_64-w64-mingw32-ar"
-          EOF
-
-      # Plain `cargo test`/`cargo check` respect the workspace's `default-members`
-      # (see root Cargo.toml), which deliberately excludes `neural-forge-helper` -- a
-      # Windows-only crate that must never be built for the host. See the project's
-      # CLAUDE.md "Workspace layout" section for why `--workspace`/`--all` must not be
-      # used here.
       # Pinned glslang, Vulkan-Headers and volk for crates/native (SHA-256-checked; tools/ is git-ignored).
       - name: Fetch the native backend toolchain
         run: bash scripts/fetch-native-tools.sh
@@ -74,19 +52,6 @@ jobs:
           cargo test 2>&1 | tee test-native.log
           ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-native.log || true)"
           echo "GPU tests that ran (native): $ran" | tee -a "$GITHUB_STEP_SUMMARY"
-          test "$ran" -gt 0
-
-      - name: cargo check (helper, cross-compiled)
-        run: cargo check --target x86_64-pc-windows-gnu -p neural-forge-helper
-
-      - name: 32-bit layer tests
-        run: |
-          # Two test threads: each GPU test maps four shared-memory regions and a Vulkan device,
-          # and run on every core at once they exhausted the 32-bit address space (a test's
-          # open_at failed on the runner while the same suite passed locally).
-          cargo test --target i686-unknown-linux-gnu -p neural-forge-layer -- --test-threads=2 2>&1 | tee test-i686.log
-          ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-i686.log || true)"
-          echo "GPU tests that ran (i686): $ran" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$ran" -gt 0
 
       # scripts/install.py delegates install/uninstall to neural-forge-cli (the single

@@ -1,4 +1,4 @@
-# Native model backend (candidate 3.0)
+# Native model backend (3.0)
 
 The plan: run the neural rendering network inside the layer, on the game's own device, with
 [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (MIT), and retire the Windows helper, the
@@ -662,6 +662,30 @@ is out of scope).
   `TRANSFER_SRC` is now added to RG16F images when the native backend is on), so the network runs there
   without history. The history no longer resets when the colour input alternates (keyed on the extent only).
 
+## Phase 5: the helper removed (3.0.0, 2026-10-07)
+
+Alex (2026-10-07), after the game comparison above: "push for the 3.0.0 release, where you remove the
+helper and everything associated with it". Done on `release-3.0`:
+
+- **Gone:** `crates/helper` and its scripts (`helper-test.sh`, `rig-test.sh`), the supervisor's
+  process, runner, provisioning, install-dir and GPU-detection modules, the CLI's `setup`, `start`,
+  `stop`, `restart`, `runners` and `detect-gpu`, the GUI's helper start/stop, the Windows target in the
+  AppImage build and CI, `NEURAL_FORGE_BACKEND` (native is the only model mode), the helper hold's
+  round trip, circuit breaker and slot-0 gates in `preupscale.rs`, and the examples that drove the
+  helper.
+- **Gone with it:** the 32-bit layer (2.4: without the helper it only passed frames through), its
+  manifest, build and CI test step.
+- **Settings:** passes, per-pass settings, the pass limit, rebuild spacing and the motion controls
+  (2.2) are removed, not hidden. The channel is SHM v15: those fields, the helper's VRAM, feature
+  counts, reason string and the DMA-BUF exchange removed; what the in-process model server writes
+  renamed `server_*` (`server_state`, `server_heartbeat`, `server_busy_us`, ...).
+- **Kept:** the shared-memory channel (settings, status, and the after-the-upscaler request slots,
+  answered by `native_post::PostServer`); the extractor; `binaries=` in `config.ini` (where an
+  imported DLL lives). `config.ini` keeps only `binaries=`, `shm=` and the `set_` settings, and the
+  layer applies the saved settings itself when it creates the channel. Alex's machines get their old
+  keys removed by hand; there is no migration code.
+- **Checks:** every crate builds without warnings, `cargo test` (layer on lavapipe) passes, as do
+  `test_install.py`, `check_shaders.py` and `check_namespace.py`.
 
 ## Decided before Phase 1
 
@@ -717,6 +741,8 @@ is out of scope).
 - [x] 2.4 32-bit layer answer recorded
 - [x] Phase 3 benchmarks (cut short on Alex's request; long session not run)
 - [x] Phase 4 report written, branch pushed, stopped for Alex
-- [ ] Phase 5 (only on Alex's yes)
+- [x] Phase 4b hold inside DLSS's command buffer native
+- [x] Phase 5 helper removed (3.0.0)
 
-Blockers: none. Waiting for Alex: Phase 5.
+Open: the Wukong startup fault (Unreal Engine 5, frame generation on), Wukong's motion vectors not
+copyable, Spider-Man and Shadow Warrior 3 measured in play (menus only so far).

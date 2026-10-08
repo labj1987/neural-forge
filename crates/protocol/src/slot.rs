@@ -49,7 +49,7 @@ impl std::fmt::Display for Slot {
 /// wraps; 0 is never issued (it is what a freshly initialised header holds, and what "no request
 /// yet" reads as in `seq_resp`, `seq_ok` and `seq_eval`), so after `u32::MAX` comes 1.
 ///
-/// A slot has one request outstanding at a time, and the helper answers by storing the request's
+/// A slot has one request outstanding at a time, and the model server answers by storing the request's
 /// own number in `seq_resp`: the request is answered when `seq_resp == request`, never "at least".
 pub const fn next_request(current: u32) -> u32 {
     match current.wrapping_add(1) {

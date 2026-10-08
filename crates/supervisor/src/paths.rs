@@ -50,63 +50,20 @@ pub fn state_dir() -> String {
     format!("{}/neural-forge", xdg("XDG_STATE_HOME", ".local/state"))
 }
 
-pub fn log_file() -> String {
-    format!("{}/helper.log", state_dir())
-}
-
 pub fn binaries_dir() -> String {
     format!("{}/binaries", data_dir())
 }
 
-/// The managed Wine/Proton prefix `neural-forge` creates and owns, distinct from any
-/// prefix a game or Steam manages -- so importing NGX DLLs into it, or a bad prefix
-/// state, never touches anything else.
-pub fn prefix_dir() -> String {
-    format!("{}/neural-forge/prefix", xdg("XDG_DATA_HOME", ".local/share"))
-}
-
 pub fn ensure_dirs() -> std::io::Result<()> {
-    // `prefix_dir()` included since 2026-09-10: a real, confirmed bug on `lordnikon`
-    // -- `start()` passes it as both `WINEPREFIX` and `STEAM_COMPAT_DATA_PATH`, but
-    // nothing ever created the directory itself first. Normally invisible (Proton
-    // creates everything *inside* it on first successful init, so it already exists
-    // on every subsequent run), until the directory is missing for any reason (a
-    // fresh install, or this parent being removed/reset by hand) -- then Proton's own
-    // `setup_prefix()` fails with a `FileNotFoundError` opening `pfx.lock`, since it
-    // assumes the directory it's locking already exists. `start()` itself also
-    // creates this directly (see its own comment) so this doesn't depend on whatever
-    // called `ensure_dirs()` last having actually run recently.
-    for dir in [config_dir(), data_dir(), state_dir(), binaries_dir(), prefix_dir()] {
+    for dir in [config_dir(), data_dir(), state_dir(), binaries_dir()] {
         std::fs::create_dir_all(dir)?;
     }
     Ok(())
 }
 
-/// The real Steam client install root (the directory containing `steamapps/`,
-/// `compatibilitytools.d/`, etc.) -- what `STEAM_COMPAT_CLIENT_INSTALL_PATH` needs to
-/// point at for Proton's own launch script to run at all (`start()`'s own doc comment
-/// explains why this has to be set). Same candidate list `neural-forge-cli`'s own Proton
-/// discovery (`runners.rs::candidate_dirs`) already scans for
-/// `compatibilitytools.d` -- this just checks the *parent* of each and returns the
-/// first that's a real directory, since a real Steam install is what actually creates
-/// these paths, in this same order of likelihood (native package first, then the
-/// sandboxed variants).
-pub fn steam_install_dir() -> Option<String> {
-    let xdg_data_home = xdg("XDG_DATA_HOME", ".local/share");
-    let home = home();
-    [
-        format!("{xdg_data_home}/Steam"),
-        format!("{home}/.var/app/com.valvesoftware.Steam/data/Steam"),
-        format!("{home}/snap/steam/common/.local/share/Steam"),
-    ]
-    .into_iter()
-    .find(|dir| std::path::Path::new(dir).is_dir())
-}
-
 /// Writes `content` to `path`, replacing any existing file by renaming a same-directory
 /// staged file over it -- never truncates the destination in place, so an
-/// already-running process that has the old inode mapped (a GUI, a game, a Wine
-/// helper) keeps reading the old content until it reopens the path, exactly like
+/// already-running process that has the old inode mapped (a GUI, a game) keeps reading the old content until it reopens the path, exactly like
 /// `install.py`'s own `os.replace` step. A crash part-way leaves the old file whole, never an
 /// empty one: `config.ini`, `profiles.ini` and `dxvk.conf` are written through this too.
 pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
@@ -133,8 +90,6 @@ pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<(
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-
     // Guards every test in this crate that mutates `XDG_DATA_HOME` (a real,
     // process-wide environment variable, not something scoped per-test) -- Rust's
     // default test harness runs tests in parallel threads within the same process,
@@ -149,48 +104,4 @@ pub(crate) mod tests {
     // crate that touches this env var must acquire this lock for its entire
     // duration, restoring the prior value (or removing it) before releasing.
     pub(crate) static XDG_DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-    /// Real filesystem, real env var override -- confirms `steam_install_dir` actually
-    /// finds a directory that exists (not just "returns some string unconditionally"),
-    /// and returns `None` when nothing does. Found and fixed as a real bug 2026-09-10:
-    /// `start()` never set `STEAM_COMPAT_CLIENT_INSTALL_PATH` at all before this
-    /// existed, causing a real `KeyError` crash in Proton's own script on every single
-    /// start attempt with `runner_type = "proton"`.
-    #[test]
-    fn finds_a_real_steam_install_under_xdg_data_home() {
-        let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = std::env::temp_dir().join(format!("neural-forge-steam-detect-test-{}", std::process::id()));
-        let steam_dir = scratch.join("Steam");
-        std::fs::create_dir_all(&steam_dir).unwrap();
-
-        let prev = std::env::var("XDG_DATA_HOME").ok();
-        std::env::set_var("XDG_DATA_HOME", &scratch);
-
-        let found = steam_install_dir();
-        assert_eq!(found.as_deref(), steam_dir.to_str());
-
-        match prev {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
-        std::fs::remove_dir_all(&scratch).ok();
-    }
-
-    #[test]
-    fn returns_none_when_no_candidate_exists() {
-        let _guard = XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let scratch = std::env::temp_dir().join(format!("neural-forge-steam-detect-test-none-{}", std::process::id()));
-        // Deliberately do not create `scratch` itself -- every candidate under it is
-        // real-but-nonexistent, the case this function must fail open on.
-
-        let prev = std::env::var("XDG_DATA_HOME").ok();
-        std::env::set_var("XDG_DATA_HOME", &scratch);
-
-        assert_eq!(steam_install_dir(), None);
-
-        match prev {
-            Some(v) => std::env::set_var("XDG_DATA_HOME", v),
-            None => std::env::remove_var("XDG_DATA_HOME"),
-        }
-    }
 }

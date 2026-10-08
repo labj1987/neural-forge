@@ -4,16 +4,43 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
-## Unreleased
+## 3.0.0 — 2026-10-07
 
-- Settings: Preset and Sharpness are removed from the GUI, the CLI, profiles and the channel
-  (SHM v12). Neither changes the 310.8.0 model's output on either backend: every preset gives
-  preset 0's answer byte for byte, and the feature never reads `Sharpness`. The helper always
-  sends preset 0. `scripts/preset-sweep.py`, which established this, is removed with them.
-- Settings: Passes, Per-pass settings, Unlock pass limit and the Motion tab only reach the helper,
-  so the GUI shows them only while a game runs on it. The native backend runs the model once
-  per frame with the Model tab's values (per-pass overrides no longer leak in through pass 0)
-  and reports itself in the new `native_running` field (SHM v13).
+The model runs inside the Vulkan layer. The layer runs OpenDLSS-NR's implementation of the DLSS 5
+Neural Rendering network on the game's own GPU, from weights extracted once from NVIDIA's
+`nvngx_dlssnr.dll`; its answer for an input frame is bit-exact with NGX's. The Windows helper, Wine,
+the runners and NVIDIA's runtime are gone. Against 2.0.10 on the RTX 5070 at 1440p (one run per game
+unless noted): GTA V Enhanced benchmark 71.4 against 69.7 fps (two and three runs; 49.7 real / 199.5
+shown against 50.1 / 200.4 with frame generation 4x), Crimson Desert in game 148.5 against 146.3 fps,
+GTA San Andreas - The Definitive Edition 87.6 against 77.1 frames held per second, Spider-Man
+Remastered (menu) 120 against 109 fps, Shadow Warrior 3 (menu) 115.7 against 99.3 fps, God of War
+27-30 against 27.5 fps. At 4K the network is probably slower than NGX was (one run, 21.9 fps), and
+after the upscaler it is about 12% slower and has no history. Details:
+[docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md).
+
+- Removed: the Windows helper (`crates/helper`, `neural-forge-helper.exe`), its runners (Proton
+  builds, system Wine), the managed Wine prefix, DXVK and DXVK-NVAPI provisioning, the helper's
+  start/stop/restart and its log, GPU detection, the caller-identity spoof, and the CLI commands
+  `setup`, `start`, `stop`, `restart`, `runners` and `detect-gpu`. The GUI no longer starts or stops
+  anything. The AppImage no longer carries a Windows build.
+- Removed: the 32-bit layer (`VK_LAYER_neuralforge_neural_32`). Without the helper it did nothing,
+  and the network cannot run in a 32-bit process (no `VK_NV_cuda_kernel_launch` there). The installer
+  removes the old 32-bit files on update.
+- Removed settings: Passes, Per-pass settings, Unlock pass limit, Rebuild spacing and the Motion tab
+  (estimated motion vectors), which only the helper read: the network runs once per frame with the
+  Model tab's values and DLSS's own motion vectors and jitter. Preset and Sharpness (SHM v12; neither
+  changes the 310.8.0 model's output, `scripts/preset-sweep.py` established it and goes with them),
+  and the Supersampling filter (Downscaler, SHM v14; nothing read it). Model resolution and Model
+  every Nth frame are shown only while the model runs after the upscaler.
+- Setup: one step, **Extract from DLL** (or `neural-forge-cli extract-model`), which writes the
+  model directory under `~/.local/share/neural-forge/model`. The DLL is not needed afterwards.
+- Channel (SHM v15): the helper's fields are removed (per-pass array, motion settings, rebuild
+  spacing, VRAM and feature counts, its reason string, the DMA-BUF exchange); what the in-process
+  model server writes is renamed `server_*`. `native_running` (v13) says the layer runs the model
+  before the upscaler. The layer applies the saved settings from `config.ini` itself when it creates
+  the channel; `config.ini` keeps only `binaries=`, `shm=` and the `set_` settings.
+- After the upscaler: frames are answered by the network on a thread of the layer
+  (`preupscale/native_post.rs`), through the same shared-memory request slots.
 - Native backend: games held inside DLSS's command buffer (Crimson Desert, Cyberpunk 2077, Black
   Myth: Wukong) run the network in the layer too, on the layer's compute queue, with DLSS's motion
   vectors copied beside the colour input for the history and the jitter from the input launch.
@@ -29,18 +56,24 @@ first shipped them; their phase is kept as a subheading.
   between two colour images every frame in Wukong with frame generation); RG16F images get `TRANSFER_SRC` so the
   motion vectors can be copied; the network's input is cleared of NaN and clamped to [0, 1] (a no-op on valid
   frames). Diagnostics: `[queues]` lines, `NEURAL_FORGE_LOG_LAUNCH_QUEUES`, `NEURAL_FORGE_NATIVE_SKIP_GRAPH`.
-- Settings: the Supersampling filter (Downscaler) is removed (SHM v14); nothing read it, since the
-  model never runs above the frame's size. Model resolution, Model every Nth frame and Rebuild
-  spacing are shown only while the model is not running natively before the upscaler: the first
-  two apply after the upscaler only and the native backend applies changes at the next frame.
+- Status: "paused" is gone from the Model placement line (the circuit breaker went with the
+  helper); the line ends with the network's own status ("native network running" or why not).
+- Requirements: the layer needs glibc 2.38 and a device with `VK_NV_cuda_kernel_launch`,
+  `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2` and `VK_EXT_shader_float8`; it grew to
+  about 9 MB (the network's embedded kernels).
+- Not tested with 3.0: Cyberpunk 2077 (out of scope), and the Black Myth: Wukong Benchmark Tool,
+  where the network faulted the GPU intermittently in its first frames with frame generation on
+  (`Xid 13` then `Xid 32`, about 1 run in 5 with the default barriers) and DLSS's motion vectors could
+  not be copied. Open for Unreal Engine 5 games.
 - Deferred (layer): the frame path's capture fence bound is not shortened; it needs the worst-case
   `capture_wait` numbers from real play (loading, resolution change, alt-tab, shutdown) first.
 - Deferred (layer): retired present and relay semaphores (`present_sync.rs`,
   `GpuCompose::retire_present_images`) are still only freed at device teardown; freeing them
   earlier needs proof that the presentation engine's wait on them has completed, which core
   Vulkan cannot give without `VK_EXT_swapchain_maintenance1`.
-- Deferred (layer): the unit-test target still carries clippy lints (mostly
-  `chunks_exact` with a constant size in test helpers); the library and examples are clean.
+- Deferred (layer): clippy still flags a few functions with too many arguments (the native hold
+  and its resources) and test helpers' `chunks_exact` use; CI does not run clippy.
+
 
 ## 2.0.10 — 2026-10-07
 

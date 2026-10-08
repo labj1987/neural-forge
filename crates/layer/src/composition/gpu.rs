@@ -329,7 +329,7 @@ struct ZeroCopyFrames {
     gen_answer: DeviceBuffer,
 }
 
-/// The helper's slot-0 answer region, imported as device memory (`VK_EXT_external_memory_host`).
+/// The model server's slot-0 answer region, imported as device memory (`VK_EXT_external_memory_host`).
 struct AnswerImport {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -349,7 +349,7 @@ struct ZeroCopy {
     /// The generation `gen_*` hold (0: none).
     generation: u64,
     /// The fence of the async slot whose submission read the answer region (the fresh copy),
-    /// until it has been seen signaled. The helper, another process on another device, may only
+    /// until it has been seen signaled. The model server, another process on another device, may only
     /// write the region again after that: see [`GpuCompose::wait_answer_region_reads`].
     answer_reader: Option<vk::Fence>,
     /// The queue the last zero-copy compose was submitted on. Queue order is what orders the
@@ -525,7 +525,7 @@ impl ComposeSlot {
         };
 
         // Keep the held raw model frame in device-local memory.  The staging buffer
-        // stays CPU-visible only for the infrequent helper-answer update; regular
+        // stays CPU-visible only for the infrequent model-answer update; regular
         // presents copy this cached buffer straight to the swapchain image.
         let cache_info = vk::BufferCreateInfo::builder()
             .size(frame_bytes)
@@ -773,7 +773,7 @@ impl ComposeSlot {
     /// own stage 1 having *already* transitioned it that far as a side effect of its
     /// own unrelated readback. That coupling is exactly what made stage 1 and
     /// composition inseparable, which is what forced every single present call through
-    /// a full, synchronous, helper-round-trip-gated capture+composite cycle in the
+    /// a full, synchronous, model-round-trip-gated capture+composite cycle in the
     /// first place (see `capture.rs`'s own doc comment on the pipelined redesign this
     /// enabled) -- a real Vulkan-layout bug waiting to happen the moment anything tried
     /// to call this without stage 1 having just run.
@@ -821,7 +821,7 @@ impl ComposeSlot {
 
     /// Records a raw held-answer update (only when `update` is true) followed by a
     /// device-local buffer-to-swapchain copy.  This is deliberately shader-free: the
-    /// helper answer is already encoded in the swapchain's byte order, and copying
+    /// model answer is already encoded in the swapchain's byte order, and copying
     /// through a buffer preserves those bytes without assuming the target format.
     ///
     /// # Safety
@@ -912,7 +912,7 @@ impl ComposeSlot {
 
             if let Some(copies) = fresh_copy {
                 // The capture's own closing barrier made the capture target's write visible to
-                // this read; submission made the helper's host writes to the answer region
+                // this read; submission made the model server's host writes to the answer region
                 // visible. The barriers after the copies cover this slot's reads below and every
                 // later submission's (the other slot's carried frames).
                 let copy = vk::BufferCopy::builder().src_offset(0).dst_offset(0).size(frame_bytes).build();
@@ -1601,7 +1601,7 @@ impl GpuCompose {
         crate::note_fence_wait(wait, "gpu::zero-copy drain").is_ok()
     }
 
-    /// Imports the helper's answer region (`host_ptr`, `bytes`: aligned and sized to the driver's
+    /// Imports the model server's answer region (`host_ptr`, `bytes`: aligned and sized to the driver's
     /// `minImportedHostPointerAlignment` by the caller) for the zero-copy compose, or confirms the
     /// existing import already covers it. `false` when it cannot be imported: that present, and
     /// every later one with the same region, takes the CPU path. A replaced import is only freed
@@ -1698,8 +1698,8 @@ impl GpuCompose {
         Some(target)
     }
 
-    /// Waits until no submission still reads the helper's answer region. Called before every new
-    /// request is handed to the helper, which writes that region from another process the GPU's
+    /// Waits until no submission still reads the model server's answer region. Called before every new
+    /// request is handed to the model server, which writes that region from another process the GPU's
     /// own ordering cannot reach. Normally already signaled (the capture that precedes a request
     /// was queued behind the compose that read the region). `false` if the wait failed: the
     /// request must not be sent.
@@ -1720,8 +1720,8 @@ impl GpuCompose {
         generation != 0 && self.zc.generation == generation && self.zc.frames.is_some()
     }
 
-    /// Presents a raw helper answer every frame while uploading it only when the
-    /// helper produces a newer generation.  The normal compose path remains for
+    /// Presents a raw model answer every frame while uploading it only when the
+    /// model server produces a newer generation.  The normal compose path remains for
     /// callers that need its math; this path is for the held-answer presentation
     /// policy in `capture::run`.
     #[allow(clippy::too_many_arguments)]
@@ -2823,7 +2823,7 @@ mod tests {
         assert!(gpu.holds_generation(1));
         assert!(gpu.wait_answer_region_reads(&device));
 
-        // The helper answers the next request (or a late one) into the region, and the next capture
+        // The model server answers the next request (or a late one) into the region, and the next capture
         // overwrites the capture target. The carried present (the other async slot, which has never
         // seen this generation) must still compose the pair it was given.
         unsafe { std::ptr::write_bytes(region, 0x5a, region_len as usize) };

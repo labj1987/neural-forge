@@ -23,16 +23,16 @@
 //! hooks, no waits; the hooked-command list is exactly 1.1.0's), `dump`
 //! (capture colour, depth, motion vectors and the 1x1 exposure images once and write them to
 //! disk), `identity` (capture and write the same bytes back: the hold's own cost,
-//! picture-neutral), `model` (the colour input is encoded for the model, [`hdr`], and the helper's
-//! answer decoded back over it), `roundtrip` (the same encode and decode with the proxy itself as the
-//! answer, no helper: the transform's neutrality). Every failure forwards the game's submit untouched.
+//! picture-neutral), `model` (the network runs on the colour input on the GPU: the native backend,
+//! [`native`]), `roundtrip` (the model's encode and decode, [`hdr`], with the proxy itself as the
+//! answer: the transform's neutrality). Every failure forwards the game's submit untouched.
 //!
 //! # The dependency chain of a hold
 //!
 //! The game's call is submitted as: `head` (batches before the launch batch, plus the launch
 //! batch's command buffers before the launch buffer, with the launch batch's wait semaphores),
-//! then the layer's capture batch `C`, then (after the CPU waited for `C`'s fence and, in model
-//! mode, for the helper) the layer's write-back batch `W`, then `tail` (the launch buffer onward,
+//! then the layer's capture batch `C`, then (after the CPU waited for `C`'s fence) the layer's
+//! write-back batch `W`, then `tail` (the launch buffer onward,
 //! with the launch batch's signal semaphores, then the call's later batches, with the fence).
 //!
 //! - Game work before the launch buffer -> `C`: every such command is earlier in submission order
@@ -46,10 +46,7 @@
 //!   after those signals exactly as the game asked. When the launch buffer is not first, the waits
 //!   stay on the prefix in `head`, which is earlier in submission order than `C`: same argument.
 //! - `C` -> host: `C` ends with `TRANSFER/TRANSFER_WRITE -> HOST/HOST_READ`; the CPU waits on `C`'s
-//!   fence before anyone reads the bytes (the helper only starts after `seq_req` is bumped).
-//! - Helper (host writes into the answer region) -> `W`: the helper's writes complete before it
-//!   publishes `seq_resp`, which the layer reads with acquire ordering before submitting `W`;
-//!   queue submission makes earlier host writes visible to the device.
+//!   fence before anyone reads the bytes.
 //! - `C` -> `W`: `W` opens with `ALL_COMMANDS|HOST -> TRANSFER` (write-after-read on the colour
 //!   input after `C`'s read; `C`'s fence was also waited on).
 //! - `W` -> DLSS: `W` ends with `TRANSFER/TRANSFER_WRITE -> ALL_COMMANDS/MEMORY_READ|MEMORY_WRITE`.
@@ -109,15 +106,11 @@ pub(crate) type NativeLoader = Arc<native::Loader>;
 #[derive(Clone)]
 pub(crate) enum NativeLoader {}
 
-/// Whether an image the application creates gets `TRANSFER_SRC` added (with the native backend on): a 2D,
-/// single-sample, single-level RG16F or RG32F image without it, which DLSS's motion vectors are.
+/// Whether an image the application creates gets `TRANSFER_SRC` added: a 2D, single-sample RG16F image
+/// without it (DLSS's motion vectors; the hold copies only RG16F, for the native backend's history).
 pub(crate) fn wants_copyable(info: &vk::ImageCreateInfo) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    let native = native::backend() == native::Backend::Native;
-    #[cfg(not(target_arch = "x86_64"))]
-    let native = false;
-    native
-        && matches!(info.format, vk::Format::R16G16_SFLOAT | vk::Format::R32G32_SFLOAT)
+    cfg!(target_arch = "x86_64")
+        && info.format == vk::Format::R16G16_SFLOAT
         && info.image_type == vk::ImageType::TYPE_2D
         && info.samples == vk::SampleCountFlags::TYPE_1
         && info.tiling == vk::ImageTiling::OPTIMAL
@@ -126,10 +119,7 @@ pub(crate) fn wants_copyable(info: &vk::ImageCreateInfo) -> bool {
 
 /// Whether model-mode holds on a device with `loader` go to the native backend.
 pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    return loader.is_some() && native::backend() == native::Backend::Native;
-    #[cfg(not(target_arch = "x86_64"))]
-    return loader.is_some();
+    loader.is_some()
 }
 
 /// A native hold ([`native::run_native_hold`]).
@@ -144,7 +134,7 @@ pub(crate) unsafe fn run_native(
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
     {
-        // The Model tab's settings; per-pass overrides are the helper's (NATIVE_BACKEND.md, "2.2").
+        // The Model tab's settings.
         let conditioning = shm.global_tuning().map_or_else(native::Conditioning::default, native::Conditioning::from);
         // SAFETY: forwarded.
         return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, submit) };
@@ -163,26 +153,15 @@ pub(crate) const RECENT: Duration = Duration::from_millis(500);
 
 /// In model mode, on a device that has held, how long after the last DLSS submit seen the
 /// post-upscaler path stays off (frames are presented as DLSS made them). Covers loading screens,
-/// where DLSS does not run: handing back to the post path there rebuilt the helper's feature at the
-/// output size and back at every loading screen (twice per screen, at 4K near full VRAM; see
-/// "Robustness: failed feature builds" in docs/PRE_UPSCALER_DESIGN.md). Loading screens do not need
+/// where DLSS does not run: handing back to the post path there rebuilt the model at the
+/// output size and back at every loading screen (twice per screen, at 4K near full VRAM). Loading screens do not need
 /// the model. Longer than this without DLSS (switched off, DLAA) and the post path runs as before.
 pub(crate) const HAND_BACK: Duration = Duration::from_secs(30);
-
-/// Model-mode holds in a row without a model answer (an echo, late, or none) that open the
-/// [`Breaker`].
-pub(crate) const BREAKER_MISSES: u32 = 8;
 
 /// The largest value of the game's exposure image the HDR encode trusts. Measured exposures:
 /// GTA V 0.15-0.34, Crimson Desert 0.02-0.06, Cyberpunk 2077 2.7-3.3; Wukong's DLSS-internal 1x1
 /// read up to 59,456 ([`Session::check_exposure`]).
 pub(crate) const EXPOSURE_TRUST_MAX: f32 = 1000.0;
-
-/// How long an open [`Breaker`] forwards DLSS submits untouched before one probe hold.
-pub(crate) const BREAKER_COOL_DOWN: Duration = Duration::from_secs(2);
-
-/// The longest a model-mode hold waits for the helper's answer.
-pub(crate) const ANSWER_BUDGET: Duration = Duration::from_millis(30);
 
 /// The fence waits of this path, by class. Both are the layer-wide bound today
 /// ([`crate::FENCE_WAIT_TIMEOUT`], 5 s, there against a driver that stalls without losing the
@@ -210,7 +189,7 @@ pub(crate) enum Mode {
     Dump,
     Identity,
     Model,
-    /// The HDR encode and its inverse with the answer := the proxy itself (no helper call): checks
+    /// The HDR encode and its inverse with the answer := the proxy itself (no model): checks
     /// the transform's neutrality on the rig.
     Roundtrip,
 }
@@ -2716,7 +2695,7 @@ impl Tracking {
         self.rearm(&t);
         let (cb, colour) = t.take_inline_at()?;
         let point = t.inline_point(cb, colour);
-        if point.is_none() && !t.said_layout_miss && t.images.get(&colour).is_some() {
+        if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) {
             let own = t.pending.get(&cb).is_some_and(|p| p.iter().any(|s| s.image == colour)) || t.attached.get(&cb).is_some_and(|a| a.iter().any(|(i, _)| *i == colour));
             if !own && !t.committed.contains_key(&colour) {
                 t.said_layout_miss = true;
@@ -3256,7 +3235,7 @@ pub(crate) fn build2(batches: &[Batch2]) -> Vec<vk::SubmitInfo2> {
 
 // ---- The hold itself: capture, round trip, write-back. ----
 
-/// `(width, height)` rounded up to even: the helper's feature needs even sizes. The padding column
+/// `(width, height)` rounded up to even: the model needs even sizes. The padding column
 /// and row duplicate the edge.
 pub(crate) fn padded(width: u32, height: u32) -> (u32, u32) {
     (width + (width & 1), height + (height & 1))
@@ -3415,9 +3394,6 @@ pub(crate) struct Resources {
     /// Slot 0's proxy region (the capture's destination, identity's write-back source).
     proxy: HostBuffer,
     proxy_region: *mut u8,
-    /// Slot 0's answer region (model's write-back source).
-    answer: HostBuffer,
-    answer_region: *mut u8,
     /// Dump-mode depth, motion-vector and exposure readbacks, built on first use.
     dump: Option<DumpBuffers>,
     /// The HDR encode and decode (model and roundtrip modes), built on first use.
@@ -3444,23 +3420,15 @@ impl Resources {
         let (pw, ph) = padded(width, height);
         let bytes = u64::from(pw) * u64::from(ph) * TEXEL;
         let (proxy_region, proxy_capacity) = shm.proxy_region(Slot::Primary)?;
-        let (answer_region, answer_capacity) = shm.answer_region(Slot::Primary)?;
-        if bytes > proxy_capacity as u64 || bytes > answer_capacity as u64 {
+        if bytes > proxy_capacity as u64 {
             return None;
         }
-        // SAFETY: the regions are mapped for the life of the process.
+        // SAFETY: the region is mapped for the life of the process.
         let proxy = unsafe { region_buffer(device, instance, physical_device, import, proxy_region, proxy_capacity, bytes) }?;
-        // SAFETY: as above.
-        let Some(answer) = (unsafe { region_buffer(device, instance, physical_device, import, answer_region, answer_capacity, bytes) }) else {
-            // SAFETY: never used.
-            unsafe { proxy.destroy(device) };
-            return None;
-        };
         let cleanup = |pool: Option<vk::CommandPool>, fences: &[vk::Fence]| {
             // SAFETY: none of these was ever submitted.
             unsafe {
                 proxy.destroy(device);
-                answer.destroy(device);
                 for &f in fences {
                     device.destroy_fence(f, None);
                 }
@@ -3505,8 +3473,6 @@ impl Resources {
             writeback_timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family),
             proxy,
             proxy_region,
-            answer,
-            answer_region,
             dump: None,
             hdr: None,
             #[cfg(target_arch = "x86_64")]
@@ -3521,7 +3487,7 @@ impl Resources {
     }
 
     pub(crate) fn imported(&self) -> bool {
-        !self.proxy.staged && !self.answer.staged
+        !self.proxy.staged
     }
 
     pub(crate) fn pending(&self) -> bool {
@@ -3577,7 +3543,6 @@ impl Resources {
             device.destroy_fence(self.writeback_fence, None);
             device.destroy_command_pool(self.pool, None);
             self.proxy.destroy(device);
-            self.answer.destroy(device);
             if let Some(dump) = &self.dump {
                 dump.depth.destroy(device);
                 dump.mvec.destroy(device);
@@ -3685,20 +3650,9 @@ pub(crate) struct HoldResult {
     pub wrote_back: bool,
     /// Why the hold did not do its full job (a model answer over budget, a failed submit, ...).
     pub miss: Option<&'static str>,
-    /// The answer was late or missing (counted in `preupscale_misses`).
-    pub over_budget: bool,
-    /// The helper answered in time with an echo of the frame, not the model's answer (no feature
-    /// built, a failed evaluate): nothing is written back. Counted in `preupscale_misses`.
-    pub echoed: bool,
-    /// Model mode: the helper's answer was the model's and was written back.
+    /// Model mode: the network ran and its answer was written back. Only such a hold engages the
+    /// device ([`Session::note`]).
     pub evaluated: bool,
-    /// Model mode: the slot-0 request (`seq_req`) this hold started, so it reached the helper
-    /// (whatever came back). Only such a hold engages the device ([`Session::note`]).
-    pub request: Option<u32>,
-    /// Model mode: the hold failed on the layer's side before any request reached the helper
-    /// (an unusable exposure value, a submit it cannot parse, resources it cannot build, ...).
-    /// Counted toward the breaker like a missing answer ([`Self::mark_local`]).
-    pub local_failure: bool,
     pub capture_gpu_ms: Option<f32>,
     /// The previous hold's write-back GPU time, read when its fence was found signalled here.
     pub writeback_gpu_ms: Option<f32>,
@@ -3713,7 +3667,7 @@ pub(crate) struct HoldResult {
     pub auto_exposure: Option<hdr::AutoState>,
     /// Where the hold's CPU time went (wall time on this thread).
     pub timing: HoldTiming,
-    /// The native backend ran this hold (no helper request; `evaluated` means the network ran).
+    /// The native backend ran this hold (`evaluated` means the network ran).
     pub native: bool,
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
@@ -3721,24 +3675,11 @@ pub(crate) struct HoldResult {
 }
 
 impl HoldResult {
-    /// A model-mode hold that failed on the layer's side before reaching the helper, for `why`.
+    /// A model-mode hold that failed before the network ran, for `why`.
     pub(crate) fn local(why: &'static str) -> Self {
-        Self { miss: Some(why), local_failure: true, ..Default::default() }
+        Self { miss: Some(why), ..Default::default() }
     }
 
-    /// Whether the post path must forget its own slot-0 answer (`capture::Inflight::forget_answer`)
-    /// after this hold: it started a slot-0 request, so the answer region holds, or will hold once
-    /// a late answer lands, this path's answer. Not only after a write-back: a request left in
-    /// flight over budget would otherwise be read by the pipelined post path as its own answer.
-    pub(crate) fn claims_slot0(&self) -> bool {
-        self.request.is_some()
-    }
-
-    /// Sets [`Self::local_failure`] for a finished hold: in model mode, a miss with no request
-    /// started and no answer missing (those are the helper's: `over_budget`, `echoed`).
-    pub(crate) fn mark_local(&mut self, mode: Mode) {
-        self.local_failure = mode == Mode::Model && !self.native && self.miss.is_some() && self.request.is_none() && !self.over_budget && !self.echoed;
-    }
 }
 
 /// Wall-clock phases of one hold, for the periodic `[preupscale]` line. `None` for a phase the
@@ -3750,13 +3691,7 @@ pub(crate) struct HoldTiming {
     pub prep: Option<Duration>,
     /// The capture fence wait (it also drains the game's work queued before the capture).
     pub capture_wait: Option<Duration>,
-    /// Model mode: `seq_req` bumped -> `seq_resp` seen.
-    pub round_trip: Option<Duration>,
-    /// Model mode: the helper's own wall time for this request (`helper_busy_us`), so
-    /// `round_trip - helper_busy` is the hand-off: the helper noticing the request plus this
-    /// thread noticing the answer.
-    pub helper_busy: Option<Duration>,
-    /// From the answer (or the capture, without a helper) to the write-back submit returning.
+    /// From the capture to the write-back submit returning.
     pub writeback: Option<Duration>,
 }
 
@@ -4029,15 +3964,15 @@ unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Targe
     }
 }
 
-/// One hold: capture the colour input into slot 0's proxy region, then per `mode` write the same
-/// bytes back (identity), hand them to the helper and write its answer back (model), or keep them
-/// for a dump. In model and roundtrip modes the capture encodes the frame for the model and the
-/// write-back decodes the answer ([`hdr`]; roundtrip's answer is the encoded proxy itself); with no
+/// One diagnostic hold (model mode runs on the native backend, [`run_native`]): capture the colour
+/// input into slot 0's proxy region, then per `mode` write the same bytes back (identity), encode and
+/// decode them (roundtrip), or keep them for a dump. In roundtrip mode the capture encodes the frame
+/// as for the model and the write-back decodes it ([`hdr`]); with no
 /// readable exposure image the exposure is measured from the frame ([`ExposureSource::Auto`]), and
 /// with an unusable exposure value nothing is written back. Both the encode and the decode read the
 /// exposure from the same buffer, so they use the same value. `submit` makes the layer's two submissions on the game's queue (the capture one with
-/// the moved wait semaphores). Never blocks longer than the capture's bounded fence wait plus, in
-/// model mode, `budget`. The write-back is not waited on: its fence is checked at the next hold
+/// the moved wait semaphores). Never blocks longer than the capture's bounded fence wait. The
+/// write-back is not waited on: its fence is checked at the next hold
 /// ([`Resources::wait_idle`]).
 ///
 /// # Safety
@@ -4045,8 +3980,8 @@ unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Targe
 /// `device`, the colour input in GENERAL; `submit` must submit on the queue the game's submit is
 /// for, which the caller holds.
 pub(crate) unsafe fn run_hold(
-    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, shm: &mut ShmClient,
-    target: &Target, mode: Mode, dump: bool, frame: u64, budget: Duration,
+    device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target, mode: Mode,
+    dump: bool, frame: u64,
     submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> HoldResult {
     let mut result = HoldResult::default();
@@ -4198,31 +4133,10 @@ pub(crate) unsafe fn run_hold(
         }
         // The encoded picture itself is the answer: the decode must give the frame back.
         Mode::Identity | Mode::Roundtrip => res.proxy.buffer,
+        // Model mode runs on the native backend (`run_native`), never here.
         Mode::Model => {
-            let (pw, ph) = padded(target.width, target.height);
-            let before = shm.last_request(Slot::Primary);
-            let answer = await_answer(shm, pw, ph, budget, &mut result.timing);
-            // A request was started (`seq_req` bumped): it reached the helper.
-            result.request = Some(shm.last_request(Slot::Primary)).filter(|&r| r != before);
-            match answer {
-                Answer::Model => result.evaluated = true,
-                Answer::Echo => {
-                    // The frame itself came back: nothing to write, and the breaker counts it.
-                    result.miss = Some("the helper echoed the frame (no model answer)");
-                    result.echoed = true;
-                    return result;
-                }
-                Answer::Missed(why) => {
-                    result.miss = Some(why);
-                    result.over_budget = true;
-                    return result;
-                }
-            }
-            if res.answer.staged {
-                // SAFETY: both valid for `bytes`; the helper finished writing before `seq_resp`.
-                unsafe { std::ptr::copy_nonoverlapping(res.answer_region, res.answer.ptr, bytes) };
-            }
-            res.answer.buffer
+            result.miss = Some("model mode runs on the native backend");
+            return result;
         }
     };
     let t_writeback = Instant::now();
@@ -4250,202 +4164,6 @@ pub(crate) unsafe fn run_hold(
     result.timing.writeback = Some(t_writeback.elapsed());
     result
 }
-
-/// What came back for a model-mode hold's request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Answer {
-    /// The model's answer, for this size.
-    Model,
-    /// In time and for this size, but the helper echoed the frame (`seq_eval` not this request).
-    Echo,
-    /// No usable answer: over budget, the helper stopped, the request could not be started, or an
-    /// answer for another size.
-    Missed(&'static str),
-}
-
-/// Sends slot 0's proxy (already written, `pw`x`ph` RGBA16F) to the helper and waits for the
-/// answer, at most `budget` (or until the helper stops being alive), spinning. Fills `timing`'s
-/// round trip and helper time.
-pub(crate) fn await_answer(shm: &mut ShmClient, pw: u32, ph: u32, budget: Duration, timing: &mut HoldTiming) -> Answer {
-    shm.set_frame_info(Slot::Primary, pw, ph, neural_forge_protocol::enums::proxy_format::RGBA16F);
-    if !shm.begin_async_request(Slot::Primary) {
-        return Answer::Missed("the request could not be started");
-    }
-    let start = Instant::now();
-    let mut spins = 0u32;
-    let mut why = "the helper did not answer";
-    let answered = loop {
-        match shm.poll_async_request(Slot::Primary) {
-            Some(true) => break true,
-            None => break false,
-            Some(false) => {}
-        }
-        if start.elapsed() >= budget {
-            why = "the answer was over budget";
-            break false;
-        }
-        if !shm.helper_alive() {
-            why = "the helper stopped answering";
-            break false;
-        }
-        // Spin, not sleep: this is vkd3d-proton's submission thread, held anyway, and a
-        // sleep's wake-up is latency added to every frame (see "Hand-off latency" in
-        // docs/PRE_UPSCALER_DESIGN.md). Yielding keeps it polite to a busy core.
-        relax(&mut spins);
-    };
-    timing.round_trip = Some(start.elapsed());
-    if !answered {
-        return Answer::Missed(why);
-    }
-    timing.helper_busy = shm.helper_busy();
-    if shm.answered_dims() != Some((pw, ph)) {
-        return Answer::Missed("the answer is for another size");
-    }
-    if shm.answer_evaluated() { Answer::Model } else { Answer::Echo }
-}
-
-/// The pre-upscaler path's circuit breaker (model mode). Closed, every DLSS submit is held. When
-/// the helper reports no model (`model_up` 0) or [`BREAKER_MISSES`] holds in a row got no model
-/// answer, it opens: submits are forwarded untouched with no wait for [`BREAKER_COOL_DOWN`], then
-/// one probe hold is let through; a model answer closes it, anything else opens it again. Without
-/// it a helper that could not build its feature still cost every frame a drained queue and the
-/// full answer budget (the rig's stuck-feature run, docs/PRE_UPSCALER_DESIGN.md "Robustness: failed
-/// feature builds"). Starts as a probe: the first hold decides.
-#[derive(Debug)]
-pub(crate) struct Breaker {
-    state: BreakerState,
-    /// Holds in a row without a model answer.
-    misses: u32,
-    /// When it opened (the first time since it was last closed).
-    opened_at: Option<Instant>,
-    /// Submits forwarded untouched while open, and probes that failed, since it opened.
-    forwarded: u64,
-    failed_probes: u32,
-    last_log: Option<Instant>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BreakerState {
-    Closed,
-    Open { until: Instant },
-    Probing,
-}
-
-impl Default for Breaker {
-    fn default() -> Self {
-        Self { state: BreakerState::Probing, misses: 0, opened_at: None, forwarded: 0, failed_probes: 0, last_log: None }
-    }
-}
-
-impl Breaker {
-    /// Whether this DLSS submit may be held, at `now`; `model_up` is the helper's flag. A `false`
-    /// is counted as a submit forwarded untouched.
-    pub(crate) fn allow(&mut self, now: Instant, model_up: bool) -> bool {
-        match self.state {
-            BreakerState::Closed if model_up => true,
-            BreakerState::Closed => {
-                self.open(now, "the helper reports no model (model_up=0)".to_string());
-                self.forwarded += 1;
-                false
-            }
-            BreakerState::Open { until } if now >= until => {
-                self.state = BreakerState::Probing;
-                true
-            }
-            BreakerState::Open { .. } => {
-                self.forwarded += 1;
-                false
-            }
-            BreakerState::Probing => true,
-        }
-    }
-
-    /// A held submit's outcome: `true` when the model's answer was written back, `false` for an
-    /// echo, a late answer or none, or a hold that failed before asking ([`HoldResult::local_failure`]).
-    pub(crate) fn record(&mut self, now: Instant, model_answer: bool) {
-        if model_answer {
-            self.misses = 0;
-            if self.state != BreakerState::Closed {
-                if let Some(t) = self.opened_at.take() {
-                    crate::log!(
-                        "[preupscale] breaker closed: the helper answered with the model again; holding resumes after {:.1}s open ({} DLSS submits forwarded untouched, {} probes without a model answer)",
-                        now.duration_since(t).as_secs_f32(),
-                        self.forwarded,
-                        self.failed_probes
-                    );
-                    crate::logging::flush();
-                }
-                self.state = BreakerState::Closed;
-                self.last_log = None;
-            }
-            return;
-        }
-        self.misses = self.misses.saturating_add(1);
-        match self.state {
-            BreakerState::Probing => {
-                let why = if self.opened_at.is_some() { "the probe hold got no model answer" } else { "the first hold got no model answer" };
-                self.open(now, why.to_string());
-            }
-            BreakerState::Closed if self.misses >= BREAKER_MISSES => {
-                self.open(now, format!("{} holds in a row got no model answer (echoed, late, or failed before reaching the helper)", self.misses));
-            }
-            _ => {}
-        }
-    }
-
-    fn open(&mut self, now: Instant, why: String) {
-        self.state = BreakerState::Open { until: now + BREAKER_COOL_DOWN };
-        if self.opened_at.is_none() {
-            self.opened_at = Some(now);
-            self.forwarded = 0;
-            self.failed_probes = 0;
-            self.last_log = Some(now);
-            crate::log!(
-                "[preupscale] breaker open: {why}; DLSS submits go through untouched (no wait), one probe hold every {}s",
-                BREAKER_COOL_DOWN.as_secs()
-            );
-            crate::logging::flush();
-            return;
-        }
-        self.failed_probes += 1;
-        if self.last_log.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(30)) {
-            self.last_log = Some(now);
-            crate::log!(
-                "[preupscale] breaker still open after {:.0}s: {why} ({} probes without a model answer, {} DLSS submits forwarded untouched)",
-                self.opened_at.map_or(0.0, |t| now.duration_since(t).as_secs_f32()),
-                self.failed_probes,
-                self.forwarded
-            );
-            crate::logging::flush();
-        }
-    }
-
-    /// Whether it has opened and not closed since: holds are paused (or one is probing).
-    pub(crate) fn paused(&self) -> bool {
-        self.opened_at.is_some()
-    }
-
-    /// Whether the next submit would be held at `now` without changing anything (tests).
-    #[cfg(test)]
-    pub(crate) fn is_closed(&self) -> bool {
-        self.state == BreakerState::Closed
-    }
-}
-
-/// One step of a busy wait: a few CPU spin hints, then a yield to any other runnable thread on
-/// this core every [`YIELD_EVERY`] steps. Never sleeps (a sleep's wake-up granularity is what the
-/// busy wait is there to avoid), so the caller bounds the wait itself.
-pub(crate) fn relax(spins: &mut u32) {
-    *spins = spins.wrapping_add(1);
-    if (*spins).is_multiple_of(YIELD_EVERY) {
-        std::thread::yield_now();
-    } else {
-        std::hint::spin_loop();
-    }
-}
-
-/// [`relax`] yields on every this-many-th step.
-pub(crate) const YIELD_EVERY: u32 = 16;
 
 // ---- Dump files. ----
 
@@ -4577,16 +4295,12 @@ struct Stats {
     capture_gpu_ms: Vec<f32>,
     writeback_gpu_ms: Vec<f32>,
     network_gpu_ms: Vec<f32>,
-    /// [`HoldTiming`]'s phases in milliseconds, per hold that reached them; `handoff` is
-    /// `round_trip - helper_busy` per answered hold.
+    /// [`HoldTiming`]'s phases in milliseconds, per hold that reached them.
     prep_ms: Vec<f32>,
     capture_wait_ms: Vec<f32>,
     /// The longest capture fence wait since the path started (the window's is the maximum of
     /// `capture_wait_ms`): the worst case [`FRAME_CAPTURE_WAIT`] has to leave room for.
     capture_wait_session_max_ms: f32,
-    round_trip_ms: Vec<f32>,
-    helper_busy_ms: Vec<f32>,
-    handoff_ms: Vec<f32>,
     writeback_cpu_ms: Vec<f32>,
     misses: u32,
     window_misses: u32,
@@ -4612,17 +4326,12 @@ impl Stats {
         let pairs = [
             (&mut self.prep_ms, t.prep),
             (&mut self.capture_wait_ms, t.capture_wait),
-            (&mut self.round_trip_ms, t.round_trip),
-            (&mut self.helper_busy_ms, t.helper_busy),
             (&mut self.writeback_cpu_ms, t.writeback),
         ];
         for (v, d) in pairs {
             if let Some(d) = d {
                 v.push(ms(d));
             }
-        }
-        if let (Some(rt), Some(busy)) = (t.round_trip, t.helper_busy) {
-            self.handoff_ms.push(ms(rt.saturating_sub(busy)));
         }
         if let Some(wait) = t.capture_wait {
             self.capture_wait_session_max_ms = self.capture_wait_session_max_ms.max(ms(wait));
@@ -4632,12 +4341,9 @@ impl Stats {
     /// The phase medians, for the periodic line.
     fn phases(&self) -> String {
         format!(
-            "phases ms (median): prep={:.2} capture_wait={:.2} round_trip={:.2} helper_busy={:.2} handoff={:.2} writeback={:.2}; capture_wait max={:.2} (session max {:.2}, bound {} ms)",
+            "phases ms (median): prep={:.2} capture_wait={:.2} writeback={:.2}; capture_wait max={:.2} (session max {:.2}, bound {} ms)",
             median(&self.prep_ms),
             median(&self.capture_wait_ms),
-            median(&self.round_trip_ms),
-            median(&self.helper_busy_ms),
-            median(&self.handoff_ms),
             median(&self.writeback_cpu_ms),
             self.capture_wait_ms.iter().copied().fold(0.0, f32::max),
             self.capture_wait_session_max_ms,
@@ -4646,7 +4352,7 @@ impl Stats {
     }
 
     fn clear_phases(&mut self) {
-        for v in [&mut self.prep_ms, &mut self.capture_wait_ms, &mut self.round_trip_ms, &mut self.helper_busy_ms, &mut self.handoff_ms, &mut self.writeback_cpu_ms] {
+        for v in [&mut self.prep_ms, &mut self.capture_wait_ms, &mut self.writeback_cpu_ms] {
             v.clear();
         }
     }
@@ -4674,24 +4380,11 @@ pub(crate) struct Session {
     /// Launch-bearing submits a due dump waited for the depth and motion-vector layouts.
     dump_waits: u32,
     said: HashSet<&'static str>,
-    /// Model mode: whether to hold at all right now.
-    pub(crate) breaker: Breaker,
     /// The last launch-bearing submit with DLSS's inputs identified (held or not).
     last_dlss: Option<Instant>,
-    /// A model-mode hold on this device has asked the helper (whatever came back): the
-    /// pre-upscaler path works here, so the post path stays off while DLSS runs, also while the
-    /// breaker is open (otherwise the post path's output-size requests and the probes' render-size
-    /// ones would rebuild the helper's feature back and forth, and no probe would ever find it
-    /// built). Set only by a hold whose own request reached the helper ([`HoldResult::request`]),
-    /// never by a slot 0 the post path left busy; cleared after [`BREAKER_MISSES`] holds in a row
-    /// failed on the layer's side (the pre path cannot work here right now, so the post path
-    /// takes over again).
+    /// A model-mode hold on this device ran the network: the pre-upscaler path works here, so the
+    /// post path stays off while DLSS runs ([`post_off`]).
     engaged: bool,
-    /// The last slot-0 request a hold started, so a request still with the helper can be told to
-    /// be this path's (an answer over budget) or the post path's.
-    own_request: Option<u32>,
-    /// Holds in a row that failed on the layer's side ([`HoldResult::local_failure`]).
-    local_misses: u32,
     /// The identification and exposure source last logged ([`Self::note_exposure_source`]).
     exposure_said: Option<(u64, ExposureSource)>,
     /// The identification whose game exposure read implausibly high ([`Self::check_exposure`]): its
@@ -4952,31 +4645,8 @@ impl Session {
             self.last_hold_native = result.native;
             self.last_dlss = Some(now);
         }
-        if result.request.is_some() || (result.native && result.evaluated) {
+        if result.native && result.evaluated {
             self.engaged = true;
-            self.own_request = result.request;
-            self.local_misses = 0;
-        }
-        // The breaker hears about holds that asked the helper (a model answer, or an echo, a late
-        // answer or none) and about model-mode holds that failed on the layer's side before asking
-        // (an unusable exposure value, a refused submit, no resources): those repeat every frame
-        // in a game where they happen at all, each costing a capture or nothing for no model.
-        // Contention for slot 0 is not reported here at all.
-        if result.evaluated {
-            self.breaker.record(now, true);
-        } else if result.over_budget || result.echoed {
-            self.breaker.record(now, false);
-        } else if result.local_failure {
-            self.breaker.record(now, false);
-            self.local_misses = self.local_misses.saturating_add(1);
-            if self.local_misses == BREAKER_MISSES && self.engaged {
-                self.engaged = false;
-                crate::log!(
-                    "[preupscale] {BREAKER_MISSES} holds in a row failed before reaching the helper ({}); the post-upscaler compose runs again until a hold does",
-                    result.miss.unwrap_or("?")
-                );
-                crate::logging::flush();
-            }
         }
         self.share_post_off();
         let holding = self.holding();
@@ -5003,7 +4673,8 @@ impl Session {
             s.exposure.push(e);
             s.exposure_source = result.exposure_source;
         }
-        if result.over_budget || result.echoed {
+        // A held frame that went to DLSS untouched (the network not ready, a failed submit, ...).
+        if result.waits_consumed && !result.wrote_back && result.dump.is_none() {
             s.misses += 1;
             s.window_misses += 1;
         }
@@ -5017,7 +4688,7 @@ impl Session {
             }
         }
         shm.publish_preupscale_hold(s.last_hold_ms, s.misses);
-        shm.publish_preupscale_state(if holding { 2 } else if self.breaker.paused() && self.engaged { 3 } else { 1 }, self.last_hold_native, extent.0, extent.1);
+        shm.publish_preupscale_state(if holding { 2 } else { 1 }, self.last_hold_native, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
             // The window's rate: frames the model ran on before the upscaler (the post path's
@@ -5056,18 +4727,6 @@ impl Session {
             s.network_gpu_ms.clear();
             s.clear_phases();
             s.window_misses = 0;
-        }
-    }
-
-    /// A DLSS submit found slot 0 with a request still in flight, so it is not held. When that
-    /// request is this path's own (a hold's answer that ran over budget), it is booked as another
-    /// late answer; when it is the post path's (it often has one pending before the device first
-    /// holds), nothing is booked: no request of this path reached the helper, so neither the
-    /// device's engagement nor the breaker may hear of it.
-    pub(crate) fn note_busy_slot(&mut self, shm: &ShmClient, mode: Mode, extent: (u32, u32)) {
-        if mode == Mode::Model && self.own_request.is_some() && shm.pending_request(Slot::Primary) == self.own_request {
-            let result = HoldResult { miss: Some("an earlier request is still with the helper"), over_budget: true, ..Default::default() };
-            self.note(shm, &result, Duration::ZERO, extent);
         }
     }
 
@@ -5137,24 +4796,15 @@ impl Session {
         self.dumped = true;
     }
 
-    /// The header state for a present: holding when a hold happened within [`RECENT`]; paused
-    /// while the breaker is open, DLSS is still running and the device is engaged (the post path is off).
+    /// The header state for a present: holding when a hold happened within [`RECENT`].
     pub(crate) fn publish_status(&self, shm: &ShmClient, extent: Option<(u32, u32)>) {
         let (w, h) = extent.unwrap_or((0, 0));
-        let dlss_running = self.last_dlss.is_some_and(|t| t.elapsed() < RECENT);
-        let state = if self.holding() {
-            2
-        } else if self.breaker.paused() && dlss_running && self.engaged {
-            3
-        } else {
-            1
-        };
-        shm.publish_preupscale_state(state, self.last_hold_native, w, h);
+        shm.publish_preupscale_state(if self.holding() { 2 } else { 1 }, self.last_hold_native, w, h);
     }
 }
 
-/// Whether the post-upscaler path stays off at `now` in model mode: a hold on the device has asked
-/// the helper (`engaged`) and DLSS ran within [`HAND_BACK`] (`last_dlss`).
+/// Whether the post-upscaler path stays off at `now` in model mode: a hold on the device has run
+/// the model (`engaged`) and DLSS ran within [`HAND_BACK`] (`last_dlss`).
 pub(crate) fn post_off(engaged: bool, last_dlss: Option<Instant>, now: Instant) -> bool {
     engaged && last_dlss.is_some_and(|t| now.saturating_duration_since(t) < HAND_BACK)
 }
@@ -5196,18 +4846,14 @@ pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
 
 /// Whether a launch-bearing submit is held in `mode`, given the live switches: `None` forwards it
 /// untouched; `Some(dump)` holds it, `dump` saying whether this hold writes a dump. In model mode the
-/// live toggle (F11, the GUI, `shmctl set enabled 0`), `apply_model` off or the model reported
-/// unavailable mean no hold at all (the post path then sees the toggle too and presents the game's
-/// frame as it is), a helper that is not running is never waited for, and an open [`Breaker`]
-/// forwards the submit untouched. `layouts_known`: the depth and motion-vector layouts are known (a
+/// live toggle (F11, the GUI, `shmctl set enabled 0`) or `apply_model` off mean no hold at all (the
+/// post path then sees the toggle too and presents the game's frame as it is). `layouts_known`: the depth and motion-vector layouts are known (a
 /// dump waits for them, [`Session::dump_ready`]).
 pub(crate) fn gate(mode: Mode, session: &mut Session, shm: &mut ShmClient, layouts_known: bool) -> Option<bool> {
     match mode {
         Mode::Off => None,
         Mode::Dump => (session.dump_due(shm) && session.dump_ready(layouts_known)).then_some(true),
-        Mode::Model => {
-            (shm.model_wanted() && shm.helper_alive() && session.breaker.allow(Instant::now(), shm.model_up())).then_some(false)
-        }
+        Mode::Model => shm.model_enabled().then_some(false),
         Mode::Identity | Mode::Roundtrip => Some(false),
     }
 }
@@ -5289,21 +4935,6 @@ mod tests {
     fn the_summary_rate_is_holds_over_the_window() {
         assert_eq!(per_second(300, Duration::from_secs(5)), 60.0);
         assert_eq!(per_second(300, Duration::ZERO), 0.0);
-    }
-
-    #[test]
-    fn relax_counts_its_steps_and_never_sleeps() {
-        let mut spins = 0;
-        let started = Instant::now();
-        for _ in 0..(YIELD_EVERY * 1000) {
-            relax(&mut spins);
-        }
-        assert_eq!(spins, YIELD_EVERY * 1000);
-        // 16000 steps with 1000 yields: microseconds each at most, never a sleep's granularity.
-        assert!(started.elapsed() < Duration::from_secs(1), "{:?}", started.elapsed());
-        let mut near_wrap = u32::MAX;
-        relax(&mut near_wrap);
-        assert_eq!(near_wrap, 0, "the counter wraps instead of overflowing");
     }
 
     #[test]
@@ -7665,87 +7296,6 @@ mod tests {
         out
     }
 
-    /// The fake helper's "model": swaps red and blue, bit-exactly.
-    fn swap_rb(texels: &mut [u8]) {
-        for t in texels.chunks_exact_mut(TEXEL as usize) {
-            let (r, rest) = t.split_at_mut(2);
-            r.swap_with_slice(&mut rest[2..4]);
-        }
-    }
-
-    /// Another fake "model", in the encoded domain: `0.9 * v + 0.05` per colour channel, clamped
-    /// to [0, 0.9995] as the real model's answers are; alpha 1.
-    fn affine(texels: &mut [u8]) {
-        for t in texels.chunks_exact_mut(TEXEL as usize) {
-            for c in 0..3 {
-                let v = f16_to_f32(u16::from_le_bytes([t[c * 2], t[c * 2 + 1]]));
-                t[c * 2..c * 2 + 2].copy_from_slice(&f32_to_f16((0.9 * v + 0.05).clamp(0.0, 0.9995)).to_le_bytes());
-            }
-            t[6..8].copy_from_slice(&f32_to_f16(1.0).to_le_bytes());
-        }
-    }
-
-    /// A stand-in helper on the header: keeps its heartbeat moving and, unless muted, answers each
-    /// slot-0 request by transforming the proxy region into the answer region at the size the
-    /// layer published (marking it evaluated in `seq_eval`), or, with `echo` set, by copying the
-    /// proxy back unchanged without marking it, as the real helper does with no feature built.
-    struct FakeHelper {
-        stop: Arc<AtomicBool>,
-        mute: Arc<AtomicBool>,
-        echo: Arc<AtomicBool>,
-        thread: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl FakeHelper {
-        fn start(shm: &ShmClient, transform: fn(&mut [u8])) -> Self {
-            let header = shm.test_header_ptr();
-            let proxy = shm.proxy_region(Slot::Primary).unwrap().0 as usize;
-            let answer = shm.answer_region(Slot::Primary).unwrap().0 as usize;
-            let stop = Arc::new(AtomicBool::new(false));
-            let mute = Arc::new(AtomicBool::new(false));
-            let echo = Arc::new(AtomicBool::new(false));
-            let (s, m, e) = (stop.clone(), mute.clone(), echo.clone());
-            let thread = std::thread::spawn(move || {
-                // SAFETY: the mapping outlives the thread (joined before the test ends).
-                let hdr = unsafe { &*(header as *const neural_forge_protocol::ShmHeader) };
-                hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
-                while !s.load(Ordering::Relaxed) {
-                    hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
-                    let req = hdr.seq_req.load(Ordering::Acquire);
-                    if !m.load(Ordering::Relaxed) && req != 0 && hdr.seq_resp.load(Ordering::Relaxed) != req {
-                        let (w, h) = (hdr.width.load(Ordering::Relaxed), hdr.height.load(Ordering::Relaxed));
-                        assert_eq!(hdr.proxy_format.load(Ordering::Relaxed), neural_forge_protocol::enums::proxy_format::RGBA16F);
-                        let n = w as usize * h as usize * TEXEL as usize;
-                        // SAFETY: both regions are `MAX_FRAME`-sized and mapped for the process.
-                        let mut texels = unsafe { std::slice::from_raw_parts(proxy as *const u8, n) }.to_vec();
-                        let echoing = e.load(Ordering::Relaxed);
-                        if !echoing {
-                            transform(&mut texels);
-                        }
-                        unsafe { std::ptr::copy_nonoverlapping(texels.as_ptr(), answer as *mut u8, n) };
-                        hdr.answered_w.store(w, Ordering::Relaxed);
-                        hdr.answered_h.store(h, Ordering::Relaxed);
-                        if !echoing {
-                            hdr.seq_eval.store(req, Ordering::Relaxed);
-                        }
-                        hdr.seq_resp.store(req, Ordering::Release);
-                    }
-                    std::thread::sleep(Duration::from_micros(100));
-                }
-            });
-            Self { stop, mute, echo, thread: Some(thread) }
-        }
-    }
-
-    impl Drop for FakeHelper {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(t) = self.thread.take() {
-                let _ = t.join();
-            }
-        }
-    }
-
     fn scratch_shm(tag: &str) -> ShmClient {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -7758,228 +7308,9 @@ mod tests {
         shm
     }
 
-    /// The live toggle switches the model off in the pre-upscaler path: with `enabled` off (what F11
-    /// flips), `apply_model` off, or the helper gone, model mode holds nothing, and toggling back on
-    /// holds again. The diagnostics ignore the toggle; off never holds.
-    #[test]
-    fn the_live_toggle_switches_model_mode_holds_off_and_on() {
-        let header = Box::new(neural_forge_protocol::ShmHeader::default());
-        let mut shm = ShmClient::test_over_header(&header);
-        let (enabled, apply_model) = (&header.enabled, &header.apply_model);
-        // A running helper: its heartbeat moves before every check (the first sample only primes).
-        header.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
-        let _ = shm.helper_alive();
-        let beat = || {
-            header.heartbeat.fetch_add(1, Ordering::Relaxed);
-        };
-        let mut session = Session::default();
-        enabled.store(1, Ordering::Relaxed);
-        apply_model.store(1, Ordering::Relaxed);
-        beat();
-        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), Some(false), "on: held, no dump");
-        // F11 (the hotkey poller flips exactly this field).
-        enabled.store(0, Ordering::Relaxed);
-        beat();
-        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), None, "toggled off: nothing held");
-        assert_eq!(gate(Mode::Identity, &mut session, &mut shm, true), Some(false), "identity ignores the toggle");
-        assert_eq!(gate(Mode::Roundtrip, &mut session, &mut shm, true), Some(false), "roundtrip ignores the toggle");
-        assert_eq!(gate(Mode::Off, &mut session, &mut shm, true), None);
-        enabled.store(1, Ordering::Relaxed);
-        beat();
-        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), Some(false), "toggled back on: held again");
-        apply_model.store(0, Ordering::Relaxed);
-        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), None, "apply_model off: nothing held");
-        apply_model.store(1, Ordering::Relaxed);
-        // The helper stops: its heartbeat freezes, and after the liveness window nothing is held.
-        std::thread::sleep(Duration::from_millis(600));
-        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), None, "no helper: never waited for");
-        beat();
-        assert_eq!(gate(Mode::Model, &mut session, &mut shm, true), Some(false), "the helper is back: held again");
-    }
+    // ---- The hand-back window. ----
 
-    fn wait_for_helper(shm: &mut ShmClient) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !shm.helper_alive() {
-            assert!(Instant::now() < deadline, "the fake helper's heartbeat is never seen");
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    }
-
-    // ---- The circuit breaker and the hand-back window. ----
-
-    /// What [`HeaderHelper`] does with each slot-0 request.
-    const SILENT: u32 = 0;
-    const ECHO: u32 = 1;
-    const MODEL: u32 = 2;
-
-    /// A header-only stand-in helper (no pixel regions): keeps its heartbeat moving and answers
-    /// each slot-0 request at once at the published size, as the model (`seq_eval`), as an echo,
-    /// or not at all.
-    struct HeaderHelper {
-        stop: Arc<AtomicBool>,
-        mode: Arc<std::sync::atomic::AtomicU32>,
-        thread: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl HeaderHelper {
-        fn start(header: &neural_forge_protocol::ShmHeader, mode: u32) -> Self {
-            let ptr = std::ptr::from_ref(header) as usize;
-            let stop = Arc::new(AtomicBool::new(false));
-            let mode = Arc::new(std::sync::atomic::AtomicU32::new(mode));
-            let (s, m) = (stop.clone(), mode.clone());
-            let thread = std::thread::spawn(move || {
-                // SAFETY: the header outlives the thread (joined on drop, before the test ends).
-                let hdr = unsafe { &*(ptr as *const neural_forge_protocol::ShmHeader) };
-                hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
-                while !s.load(Ordering::Relaxed) {
-                    hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
-                    let req = hdr.seq_req.load(Ordering::Acquire);
-                    let mode = m.load(Ordering::Relaxed);
-                    if mode != SILENT && req != 0 && hdr.seq_resp.load(Ordering::Relaxed) != req {
-                        hdr.answered_w.store(hdr.width.load(Ordering::Relaxed), Ordering::Relaxed);
-                        hdr.answered_h.store(hdr.height.load(Ordering::Relaxed), Ordering::Relaxed);
-                        if mode == MODEL {
-                            hdr.seq_eval.store(req, Ordering::Relaxed);
-                        }
-                        hdr.seq_resp.store(req, Ordering::Release);
-                    }
-                    std::thread::sleep(Duration::from_micros(100));
-                }
-            });
-            Self { stop, mode, thread: Some(thread) }
-        }
-
-        fn set(&self, mode: u32) {
-            self.mode.store(mode, Ordering::Relaxed);
-        }
-    }
-
-    impl Drop for HeaderHelper {
-        fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            if let Some(t) = self.thread.take() {
-                let _ = t.join();
-            }
-        }
-    }
-
-    /// One model-mode DLSS submit as the device hook sees it, minus the GPU: the breaker decides
-    /// (at the simulated time `now`), and a held submit waits for the helper's answer within
-    /// `budget`. Returns the answer (`None`: forwarded untouched) and the time spent waiting.
-    fn submit_once(breaker: &mut Breaker, shm: &mut ShmClient, now: Instant, budget: Duration) -> (Option<Answer>, Duration) {
-        if !breaker.allow(now, shm.model_up()) {
-            return (None, Duration::ZERO);
-        }
-        let started = Instant::now();
-        let answer = await_answer(shm, 64, 64, budget, &mut HoldTiming::default());
-        let waited = started.elapsed();
-        breaker.record(now, answer == Answer::Model);
-        (Some(answer), waited)
-    }
-
-    /// The rig's stuck-feature case: the helper keeps answering in time, but only with echoes (no
-    /// feature built), and still says `model_up=1`. Within [`BREAKER_MISSES`] holds the breaker
-    /// opens; while it is open nothing is held and nothing waits; after the cool-down one probe goes
-    /// through (an echo again: open again); once the model answers, the probe closes it and every
-    /// submit is held again. With `model_up=0` it opens at once, and the probes still go out (so a
-    /// helper that has not built yet is asked to).
-    #[test]
-    fn the_breaker_opens_on_echoes_stops_waiting_and_closes_when_the_model_answers() {
-        let header = Box::new(neural_forge_protocol::ShmHeader::default());
-        header.model_up.store(1, Ordering::Relaxed);
-        let mut shm = ShmClient::test_over_header(&header);
-        let helper = HeaderHelper::start(&header, MODEL);
-        wait_for_helper(&mut shm);
-        let budget = ANSWER_BUDGET;
-        let mut breaker = Breaker::default();
-        let t0 = Instant::now();
-
-        // The first hold is a probe; a model answer closes the breaker.
-        assert_eq!(submit_once(&mut breaker, &mut shm, t0, budget).0, Some(Answer::Model));
-        assert!(breaker.is_closed() && !breaker.paused());
-
-        // Echoes: held (and waited for, briefly) until the breaker opens, within BREAKER_MISSES.
-        helper.set(ECHO);
-        let mut held = 0;
-        while let (Some(answer), _) = submit_once(&mut breaker, &mut shm, t0, budget) {
-            assert_eq!(answer, Answer::Echo);
-            held += 1;
-            assert!(held <= BREAKER_MISSES, "the breaker never opened");
-        }
-        assert_eq!(held, BREAKER_MISSES, "opens after exactly BREAKER_MISSES echoed holds");
-        assert!(breaker.paused());
-
-        // Open: a frame's worth of submits for the whole cool-down, none held, no wait at all.
-        let started = Instant::now();
-        for i in 0..240u32 {
-            let now = t0 + BREAKER_COOL_DOWN * i / 240;
-            let (answer, waited) = submit_once(&mut breaker, &mut shm, now, budget);
-            assert_eq!((answer, waited), (None, Duration::ZERO), "submit {i} at +{:?} was held", now - t0);
-        }
-        assert!(started.elapsed() < budget, "forwarding 240 submits took {:?}", started.elapsed());
-
-        // After the cool-down: one probe, an echo again, so it opens again for another cool-down.
-        let t1 = t0 + BREAKER_COOL_DOWN;
-        assert_eq!(submit_once(&mut breaker, &mut shm, t1, budget).0, Some(Answer::Echo));
-        assert_eq!(submit_once(&mut breaker, &mut shm, t1, budget).0, None, "a failed probe opens it again");
-        assert_eq!(submit_once(&mut breaker, &mut shm, t1 + BREAKER_COOL_DOWN / 2, budget).0, None);
-
-        // The helper recovers: the next probe gets the model's answer and holding resumes.
-        helper.set(MODEL);
-        let t2 = t1 + BREAKER_COOL_DOWN;
-        assert_eq!(submit_once(&mut breaker, &mut shm, t2, budget).0, Some(Answer::Model));
-        assert!(breaker.is_closed() && !breaker.paused());
-        for _ in 0..20 {
-            assert_eq!(submit_once(&mut breaker, &mut shm, t2, budget).0, Some(Answer::Model), "closed: every submit held");
-        }
-
-        // The helper says it has no model: open at once, without a single wait.
-        header.model_up.store(0, Ordering::Relaxed);
-        assert_eq!(submit_once(&mut breaker, &mut shm, t2, budget), (None, Duration::ZERO));
-        assert!(breaker.paused());
-        // The probe still goes out with model_up=0 (a helper that has not built yet builds on a
-        // request), and a model answer closes it.
-        header.model_up.store(1, Ordering::Relaxed);
-        assert_eq!(submit_once(&mut breaker, &mut shm, t2 + BREAKER_COOL_DOWN, budget).0, Some(Answer::Model));
-        assert!(breaker.is_closed());
-    }
-
-    /// A helper that has stopped answering in time (alive, but silent): each hold costs the whole
-    /// budget, so the breaker caps the damage at BREAKER_MISSES budgets and then waits no more.
-    #[test]
-    fn the_breaker_opens_on_late_answers_after_breaker_misses_budgets() {
-        let header = Box::new(neural_forge_protocol::ShmHeader::default());
-        header.model_up.store(1, Ordering::Relaxed);
-        let mut shm = ShmClient::test_over_header(&header);
-        let helper = HeaderHelper::start(&header, MODEL);
-        wait_for_helper(&mut shm);
-        let budget = Duration::from_millis(5);
-        let mut breaker = Breaker::default();
-        let t0 = Instant::now();
-        assert_eq!(submit_once(&mut breaker, &mut shm, t0, budget).0, Some(Answer::Model));
-        helper.set(SILENT);
-        // Only the misses that open the breaker are held, each waiting about one budget; every
-        // submit after that goes through without a wait. (Not a total over all 100: a shared CI
-        // runner's scheduling jitter on the eight bounded waits alone pushed that past its margin.)
-        let mut held = 0;
-        let mut longest = Duration::ZERO;
-        for _ in 0..100 {
-            let (answer, w) = submit_once(&mut breaker, &mut shm, t0, budget);
-            match answer {
-                Some(answer) => {
-                    assert!(matches!(answer, Answer::Missed(_)), "{answer:?}");
-                    held += 1;
-                    longest = longest.max(w);
-                }
-                None => assert_eq!(w, Duration::ZERO, "a submit forwarded by the open breaker waited"),
-            }
-        }
-        assert_eq!(held, BREAKER_MISSES);
-        assert!(longest < budget * 4, "a held miss waited {longest:?} against a {budget:?} budget");
-        drop(helper);
-    }
-
-    /// The post-upscaler hand-back: once a hold on a device has asked the helper, the post path
+    /// The post-upscaler hand-back: once a hold on a device has run the model, the post path
     /// stays off until DLSS has not run for HAND_BACK, so a loading screen (no DLSS for a few to
     /// ~20 s) never hands back, while DLSS switched off does after HAND_BACK. A device that never
     /// got that far is never affected.
@@ -8004,118 +7335,17 @@ mod tests {
         let shm = ShmClient::test_over_header(&header);
         let mut session = Session::default();
         session.saw_dlss();
-        assert!(!post_off(session.engaged, session.last_dlss, Instant::now()), "not before the first hold asked the helper");
-        let skipped = HoldResult { miss: Some("the exposure value is not usable (zero, negative or not finite)"), waits_consumed: true, ..Default::default() };
+        assert!(!post_off(session.engaged, session.last_dlss, Instant::now()), "not before the first hold ran the network");
+        let skipped = HoldResult { miss: Some("the native network is still loading"), waits_consumed: true, native: true, ..Default::default() };
         session.note(&shm, &skipped, Duration::from_millis(1), (64, 64));
-        assert!(!session.engaged, "a hold that never reached the helper does not engage the device");
-        let held = HoldResult { waits_consumed: true, wrote_back: true, evaluated: true, request: Some(1), ..Default::default() };
+        assert!(!session.engaged, "a hold that did not run the network does not engage the device");
+        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 1, "a held frame that went untouched is a miss");
+        let held = HoldResult { waits_consumed: true, wrote_back: true, evaluated: true, native: true, ..Default::default() };
         session.note(&shm, &held, Duration::from_millis(10), (64, 64));
-        assert!(session.engaged && session.breaker.is_closed());
+        assert!(session.engaged);
+        assert_eq!(header.preupscale_state.load(Ordering::Relaxed), 2, "holding");
         let last = session.last_dlss.expect("a hold is a DLSS submit");
         assert!(post_off(session.engaged, session.last_dlss, last + Duration::from_secs(10)));
-        // An echoed first hold engages the device (the post path stays off, so its output-size
-        // requests cannot fight the probes over the helper's feature) and opens the breaker.
-        let mut fresh = Session::default();
-        let echoed = HoldResult { waits_consumed: true, echoed: true, request: Some(1), ..Default::default() };
-        fresh.note(&shm, &echoed, Duration::from_millis(1), (64, 64));
-        assert!(fresh.engaged && fresh.breaker.paused(), "the first hold was an echo: engaged, paused");
-        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 1, "an echo is counted as a miss");
-        assert_eq!(header.preupscale_state.load(Ordering::Relaxed), 3, "and the state says paused");
-    }
-
-    /// Before the device first holds, the post path often has a slot-0 request in flight. A DLSS
-    /// submit that finds it is not held, and must neither engage the device (which would switch
-    /// the post path off with no pre-path request ever made) nor feed the breaker. A request of
-    /// this path's own still in flight (an answer over budget) is booked as a late answer.
-    #[test]
-    fn a_slot_the_post_path_left_busy_does_not_engage_the_device() {
-        let header = Box::new(neural_forge_protocol::ShmHeader::default());
-        let mut shm = ShmClient::test_over_header(&header);
-        let mut session = Session::default();
-        session.saw_dlss();
-        // The post path's request, unanswered (no helper here).
-        assert!(shm.begin_async_request(Slot::Primary));
-        for _ in 0..(2 * BREAKER_MISSES) {
-            session.note_busy_slot(&shm, Mode::Model, (64, 64));
-        }
-        assert!(!session.engaged, "no request of the pre path reached the helper");
-        assert!(!post_off(session.engaged, session.last_dlss, Instant::now()), "the post path keeps running");
-        assert!(!session.breaker.paused(), "the breaker heard nothing");
-        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 0);
-
-        // A hold of this path's own that ran over budget: its request is still in flight.
-        let mut shm = ShmClient::test_over_header(&header);
-        assert!(shm.begin_async_request(Slot::Primary));
-        let late = HoldResult { waits_consumed: true, over_budget: true, request: shm.pending_request(Slot::Primary), miss: Some("the answer was over budget"), ..Default::default() };
-        session.note(&shm, &late, Duration::from_millis(30), (64, 64));
-        assert!(session.engaged, "a request that reached the helper engages the device");
-        session.note_busy_slot(&shm, Mode::Model, (64, 64));
-        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 2, "the late answer and the busy slot it left");
-        // Identity and the other diagnostics never book it.
-        session.note_busy_slot(&shm, Mode::Identity, (64, 64));
-        assert_eq!(header.preupscale_misses.load(Ordering::Relaxed), 2);
-    }
-
-    /// Holds that fail on the layer's side before asking the helper (an exposure value of 0 every
-    /// frame, a submit whose pNext chain is refused, resources that cannot be built) count toward
-    /// the breaker, so they stop costing a capture and a fence drain per frame; and after
-    /// BREAKER_MISSES of them in a row an engaged device hands back to the post path (which would
-    /// otherwise stay off for as long as DLSS runs while the model is never applied).
-    #[test]
-    fn holds_failing_before_the_helper_open_the_breaker_and_hand_back_to_the_post_path() {
-        let header = Box::new(neural_forge_protocol::ShmHeader::default());
-        let shm = ShmClient::test_over_header(&header);
-        let extent = (64, 64);
-
-        // Classification: only model-mode misses with no request and no missing answer are local.
-        let mut exposure = HoldResult { waits_consumed: true, miss: Some("the exposure value is not usable (zero, negative or not finite)"), ..Default::default() };
-        exposure.mark_local(Mode::Model);
-        assert!(exposure.local_failure);
-        let mut roundtrip = HoldResult { miss: Some("x"), ..Default::default() };
-        roundtrip.mark_local(Mode::Roundtrip);
-        assert!(!roundtrip.local_failure);
-        let mut late = HoldResult { miss: Some("the answer was over budget"), over_budget: true, request: Some(3), ..Default::default() };
-        late.mark_local(Mode::Model);
-        assert!(!late.local_failure);
-        // A request left in flight over budget claims slot 0's answer as much as a written-back one
-        // (the pipelined post path would otherwise read the late answer as its own); a hold that
-        // never asked does not.
-        assert!(late.claims_slot0() && !late.wrote_back);
-        assert!(HoldResult { wrote_back: true, evaluated: true, request: Some(4), ..Default::default() }.claims_slot0());
-        assert!(!HoldResult { wrote_back: true, ..Default::default() }.claims_slot0(), "identity");
-        assert!(!exposure.claims_slot0());
-        let mut unstarted = HoldResult { miss: Some("the request could not be started"), over_budget: true, ..Default::default() };
-        unstarted.mark_local(Mode::Model);
-        assert!(!unstarted.local_failure, "the helper's side, counted as a late answer already");
-
-        // A device that has run the model before the upscaler, then fails every hold locally.
-        let mut session = Session::default();
-        session.saw_dlss();
-        let good = HoldResult { waits_consumed: true, wrote_back: true, evaluated: true, request: Some(1), ..Default::default() };
-        session.note(&shm, &good, Duration::from_millis(10), extent);
-        assert!(session.engaged && session.breaker.is_closed());
-        for k in 1..BREAKER_MISSES {
-            session.note(&shm, &exposure, Duration::from_millis(5), extent);
-            session.saw_dlss();
-            assert!(session.breaker.is_closed() && session.engaged, "only {k} in a row");
-        }
-        // A request that reaches the helper resets the streak.
-        session.note(&shm, &good, Duration::from_millis(10), extent);
-        for _ in 0..BREAKER_MISSES {
-            session.note(&shm, &exposure, Duration::from_millis(5), extent);
-            session.saw_dlss();
-        }
-        assert!(session.breaker.paused(), "BREAKER_MISSES local failures in a row open the breaker");
-        assert!(!session.engaged && !post_off(session.engaged, session.last_dlss, Instant::now()), "and the post path takes over although DLSS still runs");
-        assert_ne!(header.preupscale_state.load(Ordering::Relaxed), 3, "not 'paused before the upscaler': the post path runs");
-
-        // A device that never asked the helper: a local failure neither engages it nor stalls.
-        let mut fresh = Session::default();
-        fresh.saw_dlss();
-        let parse = HoldResult::local("a VkSubmitInfo pNext chain the hold does not handle");
-        fresh.note(&shm, &parse, Duration::ZERO, extent);
-        assert!(!fresh.engaged && fresh.breaker.paused(), "the first hold failed: probe again later, post path on");
-        assert!(!post_off(fresh.engaged, fresh.last_dlss, Instant::now()));
     }
 
     // ---- The HDR encode: a CPU reference and the GPU checks against it. ----
@@ -8227,10 +7457,6 @@ mod tests {
         unsafe { std::slice::from_raw_parts(shm.proxy_region(Slot::Primary).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec()
     }
 
-    fn answer_bytes(shm: &ShmClient, pw: u32, ph: u32) -> Vec<u8> {
-        unsafe { std::slice::from_raw_parts(shm.answer_region(Slot::Primary).unwrap().0, (pw * ph) as usize * TEXEL as usize) }.to_vec()
-    }
-
     /// Check (a): every texel of the padded proxy is the CPU encode of the colour input's texel
     /// (the edge texel for the padding) within 1e-3, alpha exactly 1. Returns how many channels in
     /// the real extent the encode clamped (>= 0.999).
@@ -8323,102 +7549,6 @@ mod tests {
         }
     }
 
-    /// The hold on a 17x9 RGBA16F image in GENERAL (odd in both directions): identity leaves the
-    /// image bit-identical and pads the proxy with the edge (the raw copy-through); model sends the
-    /// HDR-encoded frame and writes the fake helper's answer (red and blue swapped, in the encoded
-    /// domain) back through the inverse with the padding cropped and clamped highlights kept
-    /// (check (c)); a helper that does not answer leaves the image untouched and the hold returns
-    /// within its budget. Once with the SHM regions imported (zero-copy), once staged.
-    #[test]
-    fn a_hold_is_picture_neutral_in_identity_applies_the_answer_in_model_and_fails_open_on_timeout() {
-        for import in [true, false] {
-            let Some(gpu) = Gpu::open(import) else {
-                eprintln!("preupscale hold test (import={import}): no suitable Vulkan device, skipping");
-                continue;
-            };
-            let (w, h) = (17u32, 9u32);
-            let (pw, ph) = padded(w, h);
-            let (image, memory) = gpu.image(w, h);
-            let original = hdr_pattern(w, h);
-            gpu.upload(image, w, h, &original);
-            assert_eq!(gpu.read(image, w, h), original, "the test's own upload round-trips");
-            let (exposure, exposure_mem) = exposure_image(&gpu, 0.128);
-
-            let mut shm = scratch_shm(if import { "import" } else { "staged" });
-            let helper = FakeHelper::start(&shm, swap_rb);
-            let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
-            if cfg!(target_pointer_width = "64") {
-                assert_eq!(res.imported(), import, "imported exactly when the device can");
-            }
-            let white = hdr::DEFAULT_PAPER_WHITE;
-            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
-            let (device, queue) = (&gpu.device, gpu.queue);
-            let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
-            };
-
-            // Identity: same bytes back, and the proxy region holds the padded capture.
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Identity, false, 0, ANSWER_BUDGET, &mut submit) };
-            assert!(result.waits_consumed && result.wrote_back, "{result:?}");
-            assert_eq!(result.miss, None);
-            assert_eq!(result.request, None, "identity never asks the helper");
-            assert_eq!(gpu.read(image, w, h), original, "identity is bit-identical");
-            let proxy = proxy_bytes(&shm, pw, ph);
-            let texel = |buf: &[u8], x: u32, y: u32, row: u32| buf[((y * row + x) as usize * TEXEL as usize)..][..TEXEL as usize].to_vec();
-            for y in 0..h {
-                for x in 0..w {
-                    assert_eq!(texel(&proxy, x, y, pw), texel(&original, x, y, w), "proxy texel {x},{y}");
-                }
-                assert_eq!(texel(&proxy, pw - 1, y, pw), texel(&original, w - 1, y, w), "padding column duplicates the edge, row {y}");
-            }
-            for x in 0..pw {
-                assert_eq!(texel(&proxy, x, ph - 1, pw), texel(&proxy, x, h - 1, pw), "padding row duplicates the edge, column {x}");
-            }
-
-            // Model: the frame goes out encoded, the helper's answer comes back decoded, padding
-            // cropped, clamped highlights kept.
-            wait_for_helper(&mut shm);
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 1, Duration::from_secs(10), &mut submit) };
-            assert!(result.wrote_back, "{result:?}");
-            assert_eq!(result.request, Some(shm.last_request(Slot::Primary)), "the request that reached the helper");
-            assert_eq!(shm.answered_dims(), Some((pw, ph)), "the helper was asked for the padded size");
-            let e = result.exposure.expect("the exposure value was read");
-            assert!((e - 0.128).abs() < 1e-3, "the exposure image's value: {e}");
-            let proxy = proxy_bytes(&shm, pw, ph);
-            let clamped = check_encode(&proxy, &original, w, h, e, white);
-            assert!(clamped > 0, "the pattern reaches the shoulder's top");
-            let mut answer = proxy.clone();
-            swap_rb(&mut answer);
-            assert_eq!(answer_bytes(&shm, pw, ph), answer, "the fake helper answered");
-            let after_model = gpu.read(image, w, h);
-            assert_ne!(after_model, original, "the answer was applied");
-            check_decode(&after_model, &original, &proxy, &answer, w, h, e, white);
-
-            // Echo: the helper answers in time but with the frame itself (no model built): nothing
-            // is written back, and the hold says so (the breaker counts it).
-            helper.echo.store(true, Ordering::Relaxed);
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 2, ANSWER_BUDGET, &mut submit) };
-            assert!(result.echoed && !result.evaluated && !result.wrote_back && !result.over_budget, "{result:?}");
-            assert_eq!(gpu.read(image, w, h), after_model, "an echo leaves the frame untouched");
-            helper.echo.store(false, Ordering::Relaxed);
-
-            // Timeout: the helper is alive but silent; the image is left alone, promptly.
-            helper.mute.store(true, Ordering::Relaxed);
-            let started = Instant::now();
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 2, ANSWER_BUDGET, &mut submit) };
-            let took = started.elapsed();
-            assert!(!result.wrote_back && result.over_budget, "{result:?}");
-            assert!(result.request.is_some() && shm.pending_request(Slot::Primary) == result.request, "its own request is still in flight");
-            assert!(result.waits_consumed, "the capture itself went out (the waits are consumed either way)");
-            assert!(took < Duration::from_secs(1), "a late answer must not hold the submit beyond its budget (took {took:?})");
-            assert_eq!(gpu.read(image, w, h), after_model, "a missed answer leaves the frame untouched");
-
-            eprintln!("preupscale hold test (import={import}): identity, model (HDR encode/decode, {clamped} clamped channels kept) and timeout checked");
-            drop(helper);
-            finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
-        }
-    }
-
     /// Checks (a) and (b): roundtrip mode on a 17x9 scene-linear frame with the game's exposure.
     /// The proxy is the CPU reference encode within 1e-3 (padding included, alpha 1); the
     /// write-back gives the frame back: channels the encode clamped (>= 0.999) bit-exactly, every
@@ -8427,7 +7557,7 @@ mod tests {
     /// rather than a flat 2e-3: lavapipe's (and Intel's) float-to-half store truncates, which alone makes
     /// midtones come back up to ~2.6e-3 off, and towards the shoulder's top the inverse steepens
     /// so one proxy step is several percent (the maxima per band are printed). The write-back is
-    /// also checked against the CPU inverse of the proxy within 2e-3 (`check_decode`). No helper is
+    /// also checked against the CPU inverse of the proxy within 2e-3 (`check_decode`). No model is
     /// involved. A second hold on the result is again its own inverse. Imported and staged.
     #[test]
     fn roundtrip_encodes_like_the_cpu_reference_and_decodes_back_to_the_frame() {
@@ -8442,7 +7572,7 @@ mod tests {
             let original = hdr_pattern(w, h);
             gpu.upload(image, w, h, &original);
             let (exposure, exposure_mem) = exposure_image(&gpu, 0.128);
-            let mut shm = scratch_shm(if import { "rt-import" } else { "rt-staged" });
+            let shm = scratch_shm(if import { "rt-import" } else { "rt-staged" });
             let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
             let white = 2.5;
             let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
@@ -8452,9 +7582,9 @@ mod tests {
                 submits.push(which);
                 device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
             };
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut submit) };
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
             assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{result:?}");
-            assert!(!shm.has_pending_request(Slot::Primary), "roundtrip never calls the helper");
+            assert!(!shm.has_pending_request(Slot::Primary), "roundtrip never requests an answer");
             let e = result.exposure.expect("exposure read");
             let proxy = proxy_bytes(&shm, pw, ph);
             let clamped = check_encode(&proxy, &original, w, h, e, white);
@@ -8504,7 +7634,7 @@ mod tests {
             assert_eq!(kept, clamped);
             assert!(kept > 0, "the pattern has clamped highlights");
             // Stable: a second roundtrip on the written-back frame is again its own inverse.
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Roundtrip, false, 1, ANSWER_BUDGET, &mut submit) };
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 1, &mut submit) };
             assert!(result.wrote_back, "{result:?}");
             assert_eq!(submits, vec![Which::Capture, Which::WriteBack, Which::Capture, Which::WriteBack]);
             let again = gpu.read(image, w, h);
@@ -8546,7 +7676,7 @@ mod tests {
         let hold: inline::HoldFn = Box::new(move |job, queue| {
             assert_eq!(queue, side);
             let mut g = held.lock().unwrap();
-            let (res, shm, out) = &mut *g;
+            let (res, _shm, out) = &mut *g;
             let target = Target {
                 colour: job.image,
                 width: w,
@@ -8561,7 +7691,7 @@ mod tests {
             let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
                 dev.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
             };
-            let result = unsafe { run_hold(&dev, &inst, phys, res, shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut submit) };
+            let result = unsafe { run_hold(&dev, &inst, phys, res, &target, Mode::Roundtrip, false, 0, &mut submit) };
             let mut ms = None;
             assert!(res.wait_idle(&dev, &mut ms), "the write-back finished");
             *out = Some(result);
@@ -8616,50 +7746,8 @@ mod tests {
         finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
     }
 
-    /// Check (c) with a non-trivial answer: the fake helper maps every encoded channel through
-    /// `0.9 v + 0.05` (clamped to the model's [0, 0.9995]); the write-back is the CPU inverse of
-    /// that answer, the clamped highlights the original. Even size (no padding), staged.
-    #[test]
-    fn model_mode_writes_back_the_inverse_of_the_answer() {
-        let Some(gpu) = Gpu::open(false) else {
-            eprintln!("preupscale model inverse test: no Vulkan device, skipping");
-            return;
-        };
-        let (w, h) = (16u32, 6u32);
-        let (image, memory) = gpu.image(w, h);
-        let original = hdr_pattern(w, h);
-        gpu.upload(image, w, h, &original);
-        let (exposure, exposure_mem) = exposure_image(&gpu, 0.1581);
-        let mut shm = scratch_shm("affine");
-        let helper = FakeHelper::start(&shm, affine);
-        wait_for_helper(&mut shm);
-        let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
-        let white = hdr::DEFAULT_PAPER_WHITE;
-        let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
-        let (device, queue) = (&gpu.device, gpu.queue);
-        let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
-        };
-        let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Model, false, 0, Duration::from_secs(10), &mut submit) };
-        assert!(result.wrote_back, "{result:?}");
-        let e = result.exposure.unwrap();
-        let proxy = proxy_bytes(&shm, w, h);
-        check_encode(&proxy, &original, w, h, e, white);
-        let mut answer = proxy.clone();
-        affine(&mut answer);
-        assert_eq!(answer_bytes(&shm, w, h), answer);
-        let after = gpu.read(image, w, h);
-        check_decode(&after, &original, &proxy, &answer, w, h, e, white);
-        // Not the identity: a midtone moved by the answer's change, through the inverse.
-        let mid = f16_to_f32(half_at(&original, w, 8, 2, 1));
-        let moved = f16_to_f32(half_at(&after, w, 8, 2, 1));
-        assert!((moved - mid).abs() > 0.01 * mid, "{mid} -> {moved}");
-        drop(helper);
-        finish(&gpu, res, &[(image, memory), (exposure, exposure_mem)]);
-    }
-
     /// Check (d): a readable exposure image holding 0: model and roundtrip modes leave the frame
-    /// untouched and never call the helper (the capture runs, the write-back is skipped). No
+    /// untouched and never run the model (the capture runs, the write-back is skipped). No
     /// exposure image, or an unreadable one, is no longer a reason to leave the frame alone: the
     /// exposure is measured from the frame ([`ExposureSource::Auto`]), and those holds write back.
     #[test]
@@ -8673,9 +7761,7 @@ mod tests {
         let original = hdr_pattern(w, h);
         gpu.upload(image, w, h, &original);
         let (zero, zero_mem) = exposure_image(&gpu, 0.0);
-        let mut shm = scratch_shm("noexposure");
-        let helper = FakeHelper::start(&shm, swap_rb);
-        wait_for_helper(&mut shm);
+        let shm = scratch_shm("noexposure");
         let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
         let (device, queue) = (&gpu.device, gpu.queue);
         let mut submits = Vec::new();
@@ -8684,15 +7770,15 @@ mod tests {
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
         };
         let base = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification: 1 };
-        for mode in [Mode::Model, Mode::Roundtrip] {
+        {
             let target = Target { exposure_input: exposure_aux(zero), ..base };
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, mode, false, 0, ANSWER_BUDGET, &mut submit) };
-            assert!(result.waits_consumed && !result.wrote_back && !result.over_budget, "{mode:?}: {result:?}");
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
+            assert!(result.waits_consumed && !result.wrote_back, "{result:?}");
             assert_eq!((result.exposure, result.exposure_source), (Some(0.0), Some(ExposureSource::Game)));
             assert!(result.miss.is_some_and(|m| m.contains("exposure value")), "{result:?}");
         }
-        assert_eq!(submits, vec![Which::Capture, Which::Capture], "captures only, no write-back, with a zero one");
-        assert!(!shm.has_pending_request(Slot::Primary), "the helper was never asked");
+        assert_eq!(submits, vec![Which::Capture], "a capture only, no write-back, with a zero one");
+        assert!(!shm.has_pending_request(Slot::Primary));
         assert_eq!(gpu.read(image, w, h), original, "the frame is untouched");
         let unreadable = Some(Aux { readable: false, ..exposure_aux(zero).unwrap() });
         let unknown_layout = Some(Aux { layout: None, ..exposure_aux(zero).unwrap() });
@@ -8701,12 +7787,11 @@ mod tests {
         };
         for exposure_input in [None, unreadable, unknown_layout] {
             let target = Target { exposure_input, ..base };
-            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut plain) };
+            let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut plain) };
             assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{exposure_input:?}: {result:?}");
             assert_eq!(result.exposure_source, Some(ExposureSource::Auto), "{exposure_input:?}");
             assert!(result.exposure.is_some_and(hdr::exposure_ok), "{result:?}");
         }
-        drop(helper);
         finish(&gpu, res, &[(image, memory), (zero, zero_mem)]);
     }
 
@@ -8856,13 +7941,13 @@ mod tests {
     }
 
     /// Runs one auto-exposure hold (roundtrip mode, no exposure image) on `texels` and returns it.
-    fn auto_hold(gpu: &Gpu, res: &mut Resources, shm: &mut ShmClient, image: vk::Image, w: u32, h: u32, identification: u64) -> HoldResult {
+    fn auto_hold(gpu: &Gpu, res: &mut Resources, image: vk::Image, w: u32, h: u32, identification: u64) -> HoldResult {
         let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification };
         let (device, queue) = (&gpu.device, gpu.queue);
         let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
         };
-        let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, res, shm, &target, Mode::Roundtrip, false, 0, ANSWER_BUDGET, &mut submit) };
+        let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, res, &target, Mode::Roundtrip, false, 0, &mut submit) };
         assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{result:?}");
         assert_eq!(result.exposure_source, Some(ExposureSource::Auto));
         result
@@ -8882,7 +7967,7 @@ mod tests {
         };
         let (w, h) = (200u32, 130u32);
         let (image, memory) = gpu.image(w, h);
-        let mut shm = scratch_shm("auto");
+        let shm = scratch_shm("auto");
         let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
         let sky = |x: u32, y: u32| match (x % 16, y % 8) {
             (0, 0) => [f32::NAN, 1.0, 1.0],
@@ -8897,7 +7982,7 @@ mod tests {
             gpu.upload(image, w, h, texels);
             // A new identification each: the first frame takes the target.
             identification += 1;
-            let result = auto_hold(&gpu, &mut res, &mut shm, image, w, h, identification);
+            let result = auto_hold(&gpu, &mut res, image, w, h, identification);
             let got = result.auto_exposure.expect("the state was read");
             let want = hdr::auto_exposure_reference(texels, w, h, None);
             assert_eq!(got.samples, want.samples, "{name}: samples");
@@ -8910,19 +7995,19 @@ mod tests {
         }
         // Adaptation on the same identification: 4x brighter moves 5% of 2 EV.
         let (_, last) = &frames[2];
-        let before = auto_hold(&gpu, &mut res, &mut shm, image, w, h, identification).auto_exposure.unwrap();
+        let before = auto_hold(&gpu, &mut res, image, w, h, identification).auto_exposure.unwrap();
         let brighter = frame(w, h, |x, y| {
             let at = ((y * w + x) as usize) * TEXEL as usize;
             let v = f16_to_f32(u16::from_le_bytes([last[at], last[at + 1]]));
             grey(v * 4.0)
         });
         gpu.upload(image, w, h, &brighter);
-        let after = auto_hold(&gpu, &mut res, &mut shm, image, w, h, identification).auto_exposure.unwrap();
+        let after = auto_hold(&gpu, &mut res, image, w, h, identification).auto_exposure.unwrap();
         let want = hdr::auto_exposure_reference(&brighter, w, h, Some(before.log2_e));
         assert!((after.log2_e - want.log2_e).abs() < 0.01, "adapted: GPU {} vs CPU {}", after.log2_e, want.log2_e);
         assert!((before.log2_e - after.log2_e - 0.05 * 2.0).abs() < 0.02, "5% of 2 EV: {} -> {}", before.log2_e, after.log2_e);
         // A new identification starts over: the target at once.
-        let reset = auto_hold(&gpu, &mut res, &mut shm, image, w, h, identification + 1).auto_exposure.unwrap();
+        let reset = auto_hold(&gpu, &mut res, image, w, h, identification + 1).auto_exposure.unwrap();
         assert!((reset.log2_e - reset.target_log2_e).abs() < 1e-6 && (reset.log2_e - after.log2_e).abs() > 1.5, "{reset:?} after {after:?}");
         finish(&gpu, res, &[(image, memory)]);
     }
@@ -8941,7 +8026,7 @@ mod tests {
         let (w, h) = (17u32, 9u32);
         let (pw, ph) = padded(w, h);
         let (image, memory) = gpu.image(w, h);
-        let mut shm = scratch_shm("auto-rt");
+        let shm = scratch_shm("auto-rt");
         let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
         let white = hdr::DEFAULT_PAPER_WHITE;
         let mut last_e = None;
@@ -8955,7 +8040,7 @@ mod tests {
                 }).collect()
             };
             gpu.upload(image, w, h, &original);
-            let result = auto_hold(&gpu, &mut res, &mut shm, image, w, h, 1);
+            let result = auto_hold(&gpu, &mut res, image, w, h, 1);
             let e = result.exposure.unwrap();
             assert_ne!(Some(e), last_e, "the exposure changed with the frame");
             last_e = Some(e);
@@ -9064,7 +8149,7 @@ mod tests {
                 to(exp16, colour_range, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL),
             ]);
         });
-        let mut shm = scratch_shm("dump");
+        let shm = scratch_shm("dump");
         let mut res = unsafe { Resources::build(d, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
         let target = Target {
             colour: image,
@@ -9088,7 +8173,7 @@ mod tests {
             submits.push(which);
             d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
         };
-        let mut result = unsafe { run_hold(d, &gpu.instance, gpu.physical, &mut res, &mut shm, &target, Mode::Dump, true, 7, ANSWER_BUDGET, &mut submit) };
+        let mut result = unsafe { run_hold(d, &gpu.instance, gpu.physical, &mut res, &target, Mode::Dump, true, 7, &mut submit) };
         assert_eq!(submits, vec![Which::Capture], "a dump never writes back");
         assert!(!result.wrote_back && result.miss.is_none(), "{result:?}");
         let frame = result.dump.take().expect("dump bytes");

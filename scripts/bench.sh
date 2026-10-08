@@ -108,7 +108,7 @@ else
     echo "    started by hand (Shift_L+F2) right now, within the next few seconds" >&2
 fi
 
-# Layer/helper telemetry sample, same pattern as the ad hoc collector used
+# Layer telemetry sample, same pattern as the ad hoc collector used
 # 2026-09-14 (see /tmp/collect_neuralforge.py on this machine). Native mode has no
 # layer in the loop, so it only gets the GPU-side sample.
 SAMPLE_JSON="$OUT_DIR/samples.jsonl"

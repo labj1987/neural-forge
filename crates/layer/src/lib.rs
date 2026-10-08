@@ -1,10 +1,9 @@
 //! `VK_LAYER_neuralforge_neural` — the Linux-side Vulkan implicit layer.
 //!
 //! Hooks the swapchain lifecycle (`vkCreateSwapchainKHR`/`vkDestroySwapchainKHR`/
-//! `vkQueuePresentKHR`) and exchanges frames with the helper over the shared-memory
-//! transport defined in `neural_forge_protocol`. This crate never knows or cares whether the
-//! helper on the other end of that mapping is running under Wine/Proton today or a
-//! native Linux process later — that's the whole point of the seam.
+//! `vkQueuePresentKHR`), holds DLSS's input to run the model before the upscaler (the native
+//! backend, `preupscale`), and after the upscaler exchanges frames with its in-process model server
+//! over the shared-memory transport defined in `neural_forge_protocol`.
 //!
 //! Built on Google's [`vulkan_layer`](https://github.com/google/vk-layer-for-rust)
 //! crate, which supplies the actual `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`
@@ -545,9 +544,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         // A request with them that the driver refuses is made again without (frames then go to DLSS
         // untouched in native mode, and the log says why).
         #[cfg(target_arch = "x86_64")]
-        let native = nvidia
-            && preupscale::active()
-            && preupscale::native::backend() == preupscale::native::Backend::Native;
+        let native = nvidia && preupscale::active();
         let create = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| -> vk::Result {
             #[cfg(target_arch = "x86_64")]
             if native {

@@ -1,18 +1,14 @@
-//! Shared-memory contract between the three processes that make up neural-forge:
+//! Shared-memory contract between the processes of neural-forge:
 //!
-//!   the Linux Vulkan layer   captures the frame, runs the composition, presents the result
-//!   the Windows helper       owns the NGX model and runs it (today under Wine/Proton; a
-//!                            future native-Linux NGX helper drops in here unchanged, since
-//!                            this crate is the whole contract either side needs to agree on)
-//!   the GTK4 GUI / CLI       write settings and read status
+//!   the Vulkan layer   in each game: holds DLSS's input and runs the model (the native backend),
+//!                      or captures the frame after the upscaler and composes the model's answer,
+//!                      which its in-process model server (`native_post`) computes
+//!   the GTK4 GUI / CLI write settings and read status
 //!
-//! Everything here is plain atomics in a file mapping, so no side needs the others'
-//! toolchain and a process dying leaves the others reading a consistent — if stale —
-//! picture. `ShmHeader` is `#[repr(C)]` and built entirely from `AtomicU32` fields (the
-//! free-text fields are arrays of them) specifically so its layout matches what a C11/C++
-//! `std::atomic<uint32_t>` of the same field, in the same position, would produce —
-//! that's what makes a single mmap'd region a valid contract between two different
-//! toolchains/processes in the first place.
+//! Everything here is plain atomics in a file mapping, so a process dying leaves the others reading
+//! a consistent — if stale — picture. `ShmHeader` is `#[repr(C)]` and built entirely from
+//! `AtomicU32` fields (the free-text fields are arrays of them), so its layout is fixed by the
+//! field order alone.
 //!
 //! Layout of the mapping:
 //!
@@ -22,15 +18,8 @@
 //!   `[HEADER_BYTES + MAX_FRAME*2, +MAX_FRAME)`  slot 1's proxy
 //!   `[HEADER_BYTES + MAX_FRAME*3, +MAX_FRAME)`  slot 1's answer
 //!
-//! v7 dropped the old layer->helper motion payload region (and its per-request header
-//! fields): motion vectors are now estimated entirely inside the helper, on its own
-//! device, from consecutive proxies.
-//!
 //! v3 (`docs/PROTOCOL_V3_DESIGN.md`) added the second slot so the layer can have two
-//! requests outstanding at once — never blocked with an idle wire slot while a
-//! GPU-captured frame is ready to send, even though the helper still drains both
-//! slots' NGX evaluation one at a time (see that doc for why the model side stays
-//! serialized while the transport pipelines).
+//! requests outstanding at once.
 //!
 //! This is a from-scratch protocol for a from-scratch implementation — it is not wire
 //! compatible with, and never attaches to, a mapping left behind by any other DLSS
@@ -50,10 +39,9 @@ mod path;
 pub mod persist;
 #[cfg(unix)]
 pub mod private_dir;
-pub mod motion;
 mod slot;
 
-pub use header::{load64, store64, PassControl, PassTuning, ShmHeader};
+pub use header::{load64, store64, ShmHeader, Tuning};
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
 
@@ -65,15 +53,18 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// The wire contract version (v2 added BGRA8 and a motion payload region; v3 adds a
 /// second independent request/response slot — see `docs/PROTOCOL_V3_DESIGN.md`; v7
 /// removes the motion payload region and `frame_mvec_valid` again, since motion is now
-/// estimated inside the helper; v8 appends the layer's GPU timestamps; v9 the pre-upscaler path's status; v10 the helper's
+/// estimated inside the model server; v8 appends the layer's GPU timestamps; v9 the pre-upscaler path's status; v10 the model server's
 /// per-request wall time, for the hold's hand-off breakdown; v11 `seq_eval`, which tells a model
 /// answer from an echo; v12 drops `preset` and `sharpness`, which the 310.8 model never reads; v13
 /// `native_running`, so the GUI can hide the helper-only settings while the native backend runs; v14
-/// drops `scaling_downscaler`, which nothing read: the model never runs above the frame's size).
+/// drops `scaling_downscaler`, which nothing read: the model never runs above the frame's size; v15
+/// removes the Windows helper's fields (the per-pass settings, motion settings, rebuild spacing, its VRAM and
+/// feature counts, its reason string, the DMA-BUF exchange) and renames what the in-process model
+/// server still writes from `helper_*` to `server_*`).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 14;
+pub const SHM_VERSION: u32 = 15;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;
@@ -84,7 +75,7 @@ pub const MAX_H: u32 = 4320;
 pub const MAX_FRAME: usize = MAX_W as usize * MAX_H as usize * 8;
 
 /// Whether a `(width, height, proxy_format)` triple read out of shared memory is one
-/// the helper may size image resources from. The mapping is written by another
+/// the model server may size image resources from. The mapping is written by another
 /// process, so none of it is trusted: dimensions must be non-zero, within
 /// `MAX_W`/`MAX_H`, and even (the proxy's chroma-friendly grid), and the format one the
 /// protocol defines.
@@ -100,11 +91,6 @@ pub fn frame_dims_valid(width: u32, height: u32, proxy_format: u32) -> bool {
 }
 
 pub const HEADER_BYTES: usize = 65536;
-
-/// The ceiling on how many times the model runs over one frame, and what the slider
-/// offers unless the ceiling is lifted.
-pub const MAX_PASSES: usize = 30;
-pub const DEFAULT_MAX_PASSES: u32 = 5;
 
 pub const REASON_BYTES: usize = 192;
 pub const NAME_BYTES: usize = 128;

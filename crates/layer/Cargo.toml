@@ -25,7 +25,6 @@ libc = "0.2"
 # out as a file a human can actually look at", not something worth hand-rolling.
 png = "0.17"
 
-# The native backend (vendored OpenDLSS-NR, C++ and embedded kernels) exists for the 64-bit layer only; the
-# i686 layer (`--target i686-unknown-linux-gnu -p neural-forge-layer`) never builds it.
+# The native backend (vendored OpenDLSS-NR, C++ and embedded kernels) is x86_64-only.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
 neural-forge-native = { path = "../native" }

@@ -4,9 +4,7 @@
 //!
 //! No `VK_EXT_external_memory_host` import yet -- every byte crosses an explicit CPU
 //! `memcpy` between a host-visible/host-coherent staging buffer and the mapping
-//! `ShmClient` owns. That is exactly the "staging copy" fallback
-//! `crates/helper/src/shm.rs`'s own doc comment already describes as always-correct,
-//! just not zero-copy; importing the mapping directly as device memory is a later
+//! `ShmClient` owns: the always-correct "staging copy" fallback, just not zero-copy; importing the mapping directly as device memory is a later
 //! optimization on top of this, not a prerequisite for it working.
 //!
 //! Stage 1 (capture into a staging buffer) is one command buffer + one fence,
@@ -118,7 +116,7 @@ struct ModelScratch {
     /// The encode's storage-image view and its descriptor set, both `None` when the
     /// encode isn't available on this device/format (see
     /// [`crate::composition::encode_pass::supports_storage`]) -- in which case the
-    /// proxy crosses to the helper unencoded, exactly as it did before the encode
+    /// proxy crosses to the model server unencoded, exactly as it did before the encode
     /// existed, and the resolve is told so.
     ///
     /// The view is always `R8G8B8A8_UNORM` even when `image` is `B8G8R8A8_UNORM`: the
@@ -424,7 +422,7 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
     // own present thread every capture -- see `pick_readback_memory_type`'s own doc
     // comment for why the memory type chosen for it dominates that cost (the
     // 87ms->5.7ms/present fix). The Vulkan spec guarantees at least one
-    // HOST_VISIBLE|HOST_COHERENT type, so that helper returning `None` would mean a
+    // HOST_VISIBLE|HOST_COHERENT type, so that function returning `None` would mean a
     // spec-non-compliant driver, not a real device limitation -- still handled as a
     // plain "skip capture" rather than assumed away.
     let Some(type_index) = pick_readback_memory_type(reqs, &mem_props) else {
@@ -534,7 +532,7 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
 }
 
 /// What [`run`] is carrying forward from the round trip it most recently *sent* **on
-/// one wire slot**, across as many present calls as the helper takes to answer it.
+/// one wire slot**, across as many present calls as the model server takes to answer it.
 /// `original` holds the exact pixels captured at send time -- needed again once the
 /// answer finally arrives, since composition combines the two -- alongside the
 /// dimensions/format that capture was taken at, so a resolution change mid-flight is
@@ -569,12 +567,6 @@ pub struct Inflight {
 }
 
 impl Inflight {
-    /// Forgets which frame slot 0's last answer belongs to, so the synchronous present never
-    /// carries it onto a later frame. The pre-upscaler path (`crate::preupscale`) calls this when
-    /// it uses slot 0 itself: the answer region then holds its answers, not this path's.
-    pub(crate) fn forget_answer(&mut self) {
-        self.dims = None;
-    }
 }
 
 /// Whether the zero-copy capture of wire slot `slot` still has a GPU write into that slot's
@@ -585,7 +577,7 @@ pub(crate) fn direct_slot_busy(direct: &[Option<DirectCapture>; 2], slot: Slot) 
 }
 
 /// `working_scale × (width, height)`, rounded to the nearest even number (several
-/// paths in this crate and the helper implicitly assume even dimensions are safe, not
+/// paths in this crate and the model server implicitly assume even dimensions are safe, not
 /// a hazard) and floored at 64px per axis -- upstream (DLSS5VKLayer) hit and fixed a
 /// real GPU hang from a smaller probe swapchain (`0.2.6-3`'s changelog), and this
 /// project has no reason to retest a smaller floor itself. Returns `(width, height)`
@@ -626,7 +618,7 @@ fn effective_working_scale(width: u32, height: u32, requested: f32) -> f32 {
 
 fn scaled_dims(width: u32, height: u32, scale: f32) -> (u32, u32) {
     if !scale.is_finite() || scale <= 0.0 || (scale - 1.0).abs() < 0.01 {
-        // Full size, but never odd: the helper (and the model) only take even dimensions, and an
+        // Full size, but never odd: the model server (and the model) only take even dimensions, and an
         // odd-width window (measured: a 2493x1408 window) was rejected outright, silently
         // presenting every frame without the effect. Dropping one row or column hands the model
         // a raster one pixel smaller, and the answer is scaled back to the exact frame size.
@@ -645,7 +637,7 @@ fn scaled_dims(width: u32, height: u32, scale: f32) -> (u32, u32) {
 /// 8-bit formats: an HDR float16 proxy's blit-filtering and byte-layout behavior
 /// differ enough from the 8-bit case that this first cut deliberately does not attempt
 /// it (matches the same `is_8bit` gate several other advanced paths in this crate and
-/// the helper already use).
+/// the model server already use).
 fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format> {
     if !neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         return None;
@@ -653,7 +645,7 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
     Some(if bgr_order { vk::Format::B8G8R8A8_UNORM } else { vk::Format::R8G8B8A8_UNORM })
 }
 
-/// Real per-frame NR compute (a helper round trip through a Wine-hosted process, plus
+/// Real per-frame NR compute (a model server round trip, plus
 /// whatever GPU work either side does) does not run at anywhere close to swapchain
 /// present rate -- measured on real hardware (`lordnikon`, 2026-09-10, see
 /// `CLAUDE.md`) at roughly 100-150ms end to end even once every other bottleneck
@@ -947,9 +939,9 @@ struct SyncTiming {
     meter: std::time::Duration,
     /// Sending the request until the answer was seen.
     wait_answer: std::time::Duration,
-    /// What the helper published as its own upload + evaluate + readback for that answer, so
-    /// `wait_answer - helper` is the handoff overhead.
-    helper: std::time::Duration,
+    /// What the model server published as its own upload + evaluate + readback for that answer, so
+    /// `wait_answer - server` is the handoff overhead.
+    server: std::time::Duration,
     zero_copy: bool,
 }
 
@@ -1061,8 +1053,8 @@ fn zero_copy_allowed() -> bool {
 }
 
 /// The zero-copy compose's answer-region guard ([`crate::composition::gpu::GpuCompose::wait_answer_region_reads`]),
-/// checked before every request is handed to the helper: `true` when nothing on the GPU still
-/// reads the region the helper is about to overwrite.
+/// checked before every request is handed to the model server: `true` when nothing on the GPU still
+/// reads the region the model server is about to overwrite.
 fn answer_region_free(gpu_compose: &mut Option<crate::composition::gpu::GpuCompose>, device: &ash::Device) -> bool {
     gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(device))
 }
@@ -1191,7 +1183,7 @@ pub unsafe fn run(
         }
     }
     if sync_debug && shm.capture_request_pending() {
-        // `run_sync` does its own round trip, which lets the helper write the answer region.
+        // `run_sync` does its own round trip, which lets the model server write the answer region.
         if !answer_region_free(gpu_compose, device) {
             return None;
         }
@@ -1232,7 +1224,7 @@ pub unsafe fn run(
     }
 
     let disabled = !settings.apply_model || !settings.neural_enabled || shm.model_known_unavailable();
-    // The helper cannot allocate its NGX images until it knows the game's actual
+    // The model server cannot allocate its NGX images until it knows the game's actual
     // swapchain dimensions.  Waiting until the user enables NR often means GTA has
     // already consumed nearly all VRAM, making that first allocation fail forever.
     // Send exactly one frame while disabled to create the feature early, then discard
@@ -1297,7 +1289,7 @@ pub unsafe fn run(
     // It is only correct when the model works on exactly the frame, which rules it out for any
     // working_scale, the model pixel cap, and odd-sized frames (rounded to even above). Missing
     // this sent full-size and odd-size frames past every one of those limits on devices that
-    // support host-memory import, and the helper rejected them.
+    // support host-memory import, and the model server rejected them.
     let use_direct = use_direct && (model_width, model_height) == (width, height);
     // The zero-copy compose (see the synchronous present below) also imports slot 0's answer
     // region: the same live alignment check as the proxy regions above, with the import sized to
@@ -1457,7 +1449,7 @@ pub unsafe fn run(
         //
         // The wait is bounded: a frame whose answer is not back within `SYNC_BUDGET` is
         // presented untouched, and the late request is never waited on again, so a slow,
-        // warming-up, restarted or missing helper can delay a frame by at most the budget and
+        // warming-up, restarted or missing model server can delay a frame by at most the budget and
         // can never hang the game.
         const SLOT: Slot = Slot::Primary;
         // Model interval: on the presents between model runs, carry the last answer onto this
@@ -1475,9 +1467,9 @@ pub unsafe fn run(
         if carry {
             carried_answer = true;
         }
-        // No live helper (never started, stopped, killed, restarting): present untouched and
-        // do not wait for anything. This is what keeps a missing helper from costing a stall.
-        if !carry && !shm.helper_alive() {
+        // No live model server (never started, stopped, killed, restarting): present untouched and
+        // do not wait for anything. This is what keeps a missing model server from costing a stall.
+        if !carry && !shm.server_alive() {
             shm.publish_frame_timing(pipeline_start.elapsed(), false);
             return None;
         }
@@ -1581,7 +1573,7 @@ pub unsafe fn run(
                     let frame: &[u8] = if zero_copy {
                         // Zero-copy leaves `original_scratch` empty; the same frame is in the proxy
                         // region. SAFETY: the capture that wrote it was just seen complete (its fence,
-                        // host-coherent memory), no request is out yet, and the helper only ever
+                        // host-coherent memory), no request is out yet, and the model server only ever
                         // reads this region.
                         shm.proxy_region(SLOT).map_or(&[], |(ptr, capacity)| unsafe { std::slice::from_raw_parts(ptr, capacity.min(frame_bytes as usize)) })
                     } else {
@@ -1599,23 +1591,23 @@ pub unsafe fn run(
             }
             inflight[SLOT.index()].dims = Some((width, height, proxy_format));
             inflight[SLOT.index()].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
-            let helper_ms = loop {
+            let server_ms = loop {
                 match shm.poll_async_request(SLOT) {
                     Some(true) => {
-                        // Only this frame's own answer: the helper echoes the raster it answered.
+                        // Only this frame's own answer: the model server echoes the raster it answered.
                         // A mismatch is someone else's (or a stale) answer; present untouched. No echo
-                        // at all is a helper from before 0.1.81, which is trusted as before.
+                        // at all is a model server from before 0.1.81, which is trusted as before.
                         if shm.answered_dims().is_some_and(|d| d != (sent_w, sent_h)) {
                             shm.publish_frame_timing(pipeline_start.elapsed(), false);
                             return None;
                         }
                         // Published before the answer, so it is this answer's.
-                        break shm.helper_stage_ms();
+                        break shm.server_stage_ms();
                     }
                     Some(false) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_micros(100)),
-                    // Out of time, or the helper is gone: this frame goes out untouched.
+                    // Out of time, or the model server is gone: this frame goes out untouched.
                     // Deliberately no breadcrumb dump here, unlike the bounded fence
-                    // waits: a slow/warming-up/restarting helper routinely exceeds
+                    // waits: a slow/warming-up/restarting model server routinely exceeds
                     // `SYNC_BUDGET` (see this function's own comment above), so this
                     // path is expected and already explained -- dumping on every
                     // occurrence would spam the log instead of flagging something
@@ -1655,7 +1647,7 @@ pub unsafe fn run(
                     copy_out,
                     meter: t_metered - t_captured,
                     wait_answer: t_answered - t_metered,
-                    helper: std::time::Duration::try_from_secs_f32(helper_ms / 1000.0).unwrap_or_default(),
+                    server: std::time::Duration::try_from_secs_f32(server_ms / 1000.0).unwrap_or_default(),
                     zero_copy,
                 }))
             });
@@ -1678,7 +1670,7 @@ pub unsafe fn run(
     // encoded-proxy ratio transfer) only when the capture leg really did encode the
     // proxy this answer came from, mode 1 otherwise. See `compose.comp`.
     let proxy_encoded = pipeline.as_ref().is_some_and(CapturePipeline::proxy_encoded);
-    // Cache each helper answer in device-local memory once, then copy that cached
+    // Cache each model server answer in device-local memory once, then copy that cached
     // frame to every presented swapchain image.  The prior path re-uploaded two 4K
     // CPU buffers and ran the compose shader on every present, which made the counter
     // read in the 50s while frame pacing felt like the teens.  This leaves only one
@@ -1748,12 +1740,12 @@ pub unsafe fn run(
                     // cannot time). `capture_gpu` is the CPU-observed submit-to-completion time.
                     let (gpu_capture_ms, gpu_compose_ms) = shm.published_gpu_ms();
                     crate::log!(
-                        "[sync] {width}x{height}: total={total:.1?} capture_gpu={:.1?} copy_out={:.1?} meter={:.1?} wait_answer={:.1?} helper={:.1?} rest(readback+compose)={:.1?} zc={} gpu_capture={gpu_capture_ms:.2}ms gpu_compose={gpu_compose_ms:.2}ms",
+                        "[sync] {width}x{height}: total={total:.1?} capture_gpu={:.1?} copy_out={:.1?} meter={:.1?} wait_answer={:.1?} server={:.1?} rest(readback+compose)={:.1?} zc={} gpu_capture={gpu_capture_ms:.2}ms gpu_compose={gpu_compose_ms:.2}ms",
                         t.capture_wait,
                         t.copy_out,
                         t.meter,
                         t.wait_answer,
-                        t.helper,
+                        t.server,
                         total.saturating_sub(t.capture_wait + t.copy_out + t.meter + t.wait_answer),
                         t.zero_copy,
                     );
@@ -2039,7 +2031,7 @@ pub struct CapturePipeline {
     /// The proxy encode's pipeline (see [`crate::composition::encode_pass`]), built
     /// once on first use and shared by both slots -- each slot owns only its own
     /// descriptor set, allocated from this pass's pool. `None` means the encode is
-    /// unavailable on this device, in which case every proxy crosses to the helper
+    /// unavailable on this device, in which case every proxy crosses to the model server
     /// unencoded exactly as it did before the encode existed.
     encode: Option<crate::composition::encode_pass::EncodePass>,
 }
@@ -2863,7 +2855,7 @@ fn write_bytes_to_image(device: &ash::Device, r: &CaptureResources, queue: vk::Q
 /// its own `queue` argument, which is what makes submitting here, from inside the
 /// present hook, sound without any additional locking).
 /// The old, fully-synchronous, one-frame-at-a-time path: capture *this* frame, block
-/// on the helper round trip for *this* frame's own answer (up to a real timeout
+/// on the model server round trip for *this* frame's own answer (up to a real timeout
 /// budget), composite, write back -- all within the same present call. Kept
 /// unchanged and still used for the two cases that genuinely need same-frame
 /// correctness: a pending `capture_request` (its dump must show *this* frame's real
@@ -2997,13 +2989,12 @@ unsafe fn run_sync(
     let t_stage1 = t_stage1_start.elapsed();
 
     // CPU side: the captured bytes are now in `r.ptr` (host-coherent, no explicit
-    // flush/invalidate needed). Hand them to the helper, then, if it actually
+    // flush/invalidate needed). Hand them to the model server, then, if it actually
     // answered, overwrite `r.ptr` in place with that answer -- stage 2 below copies
     // whatever is sitting in `r.ptr` back into `image`, so this is what makes the
-    // helper's answer (a real NGX evaluation, or the helper's own proxy-echo fallback
-    // when the model isn't ready -- `neural_forge_helper::main`'s per-frame loop guarantees
+    // model server's answer (the network's, or its proxy echo when the model isn't ready --
     // the answer region is always the same size/format as the proxy either way)
-    // actually reach the screen. A helper that never answers (not running, or the
+    // actually reach the screen. A model server that never answers (not running, or the
     // round trip timed out) leaves `r.ptr` untouched -- it still holds the bytes
     // stage 1 just captured, so stage 2 below presents those unmodified, same fail-open
     // behavior as every other error path in this function.
@@ -3045,7 +3036,7 @@ unsafe fn run_sync(
         // writes past the slice's length, which is exactly `frame_bytes` here.
         let answer_dst = unsafe { std::slice::from_raw_parts_mut(r.ptr, frame_bytes as usize) };
         shm.read_answer(SLOT, answer_dst);
-        // Only `RGBA8` is handled -- `RGBA16F` still passes the helper's raw answer
+        // Only `RGBA8` is handled -- `RGBA16F` still passes the model server's raw answer
         // through untouched (see `composition::apply`'s own doc comment for why, and
         // `neural_forge_protocol::enums::proxy_format` for the format codes).
         if neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
@@ -3423,7 +3414,7 @@ mod tests {
         // A real wait (not `poll_direct_capture`'s own non-blocking check) is correct
         // here: this test cares whether the capture is *correct*, not whether `run`'s
         // own present-hook discipline of never blocking holds -- that's
-        // `run_never_blocks_on_a_slow_helper_and_eventually_composites`'s job, not
+        // `run_never_blocks_on_a_slow_server_and_eventually_composites`'s job, not
         // this test's.
         crate::note_vk(unsafe { device.wait_for_fences(&[d.buf.fence], true, u64::MAX) }).expect("capture fence wait failed");
         assert_eq!(poll_direct_capture(d, &device).map(|(w, h, f, t, _)| (w, h, f, t)), Some((width, height, neural_forge_protocol::enums::proxy_format::RGBA8, None)));
@@ -3452,13 +3443,13 @@ mod tests {
         }
     }
 
-    /// Synchronous present (the default): with a helper that answers within the budget, the
+    /// Synchronous present (the default): with a model server that answers within the budget, the
     /// first present call captures, waits for that frame's own answer and composites it.
     #[test]
     fn synchronous_present_composites_the_same_frame_it_captured() {
         let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
-            eprintln!("run_never_blocks_on_a_slow_helper_and_eventually_composites: no Vulkan loader/ICD, skipping");
+            eprintln!("run_never_blocks_on_a_slow_server_and_eventually_composites: no Vulkan loader/ICD, skipping");
             return;
         };
 
@@ -3468,27 +3459,27 @@ mod tests {
         let mut shm = ShmClient::default();
         assert!(shm.test_open_at(&path), "test-only open_at should always succeed against a scratch path");
         let hdr_ptr = shm.test_header_ptr();
-        // A live helper (matters for `poll_async_request`'s timeout budget: the long
+        // A live model server (matters for `poll_async_request`'s timeout budget: the long
         // "steady state" one, not the short "nobody's listening" one, since this test
         // deliberately answers slower than that short budget).
-        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
 
-        // A fake helper that only answers `HELPER_DELAY` after it sees a new request --
+        // A fake model server that only answers `SERVER_DELAY` after it sees a new request --
         // long enough that if `run` ever blocked waiting for it, a handful of calls
         // spaced much closer together than that would visibly take just as long.
-        const HELPER_DELAY: Duration = Duration::from_millis(30);
+        const SERVER_DELAY: Duration = Duration::from_millis(30);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
-        let helper = std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = 0u32;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
                 if req != 0 && req != last_seen {
                     last_seen = req;
-                    std::thread::sleep(HELPER_DELAY);
+                    std::thread::sleep(SERVER_DELAY);
                     hdr.answered_w.store(hdr.width.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
                     hdr.answered_h.store(hdr.height.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
                     hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
@@ -3524,7 +3515,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         // Real usage calls this once per present, indefinitely -- loop until either a
         // real composited result shows up or the deadline (comfortably several
-        // `HELPER_DELAY`-long round trips) is exhausted, not a fixed iteration count.
+        // `SERVER_DELAY`-long round trips) is exhausted, not a fixed iteration count.
         while Instant::now() < deadline {
             iteration += 1;
             let hdr_now = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
@@ -3576,17 +3567,17 @@ mod tests {
             // allocation, first-touch driver/shader-cache warmup).
             //
             // The real invariant this guards is "`run()` never synchronously waits
-            // for the helper's own answer". A single call occasionally running long
+            // for the model server's own answer". A single call occasionally running long
             // is not, by itself, evidence of that: GitHub's shared runners saw calls
-            // up to 466ms (nearly *double* `HELPER_DELAY`) with no code change
+            // up to 466ms (nearly *double* `SERVER_DELAY`) with no code change
             // involved, purely from real scheduler/software-rasterizer contention on
-            // that infra -- worse than this test's own fake helper thread's sleep, so
+            // that infra -- worse than this test's own fake model server thread's sleep, so
             // no fixed per-call ceiling can both reject that noise and still allow a
             // real hardware/local run through. What a genuine synchronous-wait
             // regression looks like instead is *every* call converging near
-            // `HELPER_DELAY`, not one noisy outlier -- so tally slow calls across the
+            // `SERVER_DELAY`, not one noisy outlier -- so tally slow calls across the
             // whole loop and judge the pattern, not any single sample, below.
-            if iteration > 1 && call_time >= HELPER_DELAY * 9 / 10 {
+            if iteration > 1 && call_time >= SERVER_DELAY * 9 / 10 {
                 slow_calls.push(call_time);
             }
             if let Some(sem) = sem {
@@ -3650,7 +3641,7 @@ mod tests {
         hdr_now.model_interval.store(1, AtomicOrdering::Relaxed);
 
         stop.store(true, AtomicOrdering::Relaxed);
-        helper.join().unwrap();
+        server.join().unwrap();
 
         // A capture pipeline slot can legitimately still be `pending` here (the test
         // loop can exit as soon as `last_answer` is non-empty, with no guarantee the
@@ -3774,7 +3765,7 @@ mod tests {
     }
 
     /// Drives the synchronous present with direct capture (`VK_EXT_external_memory_host` enabled
-    /// on a real device) against a fake helper whose answer is the proxy with RGB inverted, from
+    /// on a real device) against a fake model server whose answer is the proxy with RGB inverted, from
     /// the same starting frame every time: `warm-up` presents until the first composite, then
     /// `presents` more with `model_interval`. `zero_copy: false` runs the identical present with
     /// the CPU copies, the reference. `scribble` overwrites the answer and proxy regions before
@@ -3811,7 +3802,7 @@ mod tests {
         // An earlier sequence on the same file may have left these set.
         hdr.model_interval.store(1, AtomicOrdering::Relaxed);
         hdr.seq_resp.store(hdr.seq_req.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
-        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
         // The measured white point would depend on the meter's process-wide phase.
         hdr.white_point_source.store(neural_forge_protocol::enums::white_point_source::MANUAL, AtomicOrdering::Relaxed);
         hdr.hold_frame.store(u32::from(hold), AtomicOrdering::Relaxed);
@@ -3824,12 +3815,12 @@ mod tests {
         // request as already seen.
         // SAFETY: the mapping outlives this read.
         let first_seen = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.seq_req.load(AtomicOrdering::Relaxed);
-        let helper = std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the sequence returns).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = first_seen;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
                 if req != 0 && req != last_seen {
                     last_seen = req;
@@ -3841,7 +3832,7 @@ mod tests {
                     for (a, p) in answer.chunks_exact_mut(4).zip(proxy.chunks_exact(4)) {
                         a.copy_from_slice(&[255 - p[0], 255 - p[1], 255 - p[2], p[3]]);
                     }
-                    hdr.helper_eval_ms_bits.store(1.5f32.to_bits(), AtomicOrdering::Relaxed);
+                    hdr.server_eval_ms_bits.store(1.5f32.to_bits(), AtomicOrdering::Relaxed);
                     hdr.answered_w.store(hdr.width.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
                     hdr.answered_h.store(hdr.height.load(AtomicOrdering::Relaxed), AtomicOrdering::Relaxed);
                     std::sync::atomic::fence(AtomicOrdering::Release);
@@ -3933,7 +3924,7 @@ mod tests {
         }
 
         stop.store(true, AtomicOrdering::Relaxed);
-        helper.join().unwrap();
+        server.join().unwrap();
         unsafe {
             device.device_wait_idle().unwrap();
             device.destroy_image(image, None);
@@ -4001,7 +3992,7 @@ mod tests {
         assert!(held.iter().all(|p| p.composed && !p.cpu_pair_empty), "frame hold composes from the CPU copies");
     }
 
-    /// Runs synchronous presents (the default mode) against a fake helper that answers at once,
+    /// Runs synchronous presents (the default mode) against a fake model server that answers at once,
     /// until `composes` of them have composed, and returns the GPU timings the layer published
     /// afterwards: `(capture, compose)` milliseconds. `direct` drives the direct capture
     /// (`VK_EXT_external_memory_host` enabled on `device`), otherwise the capture pipeline. Tears
@@ -4017,7 +4008,7 @@ mod tests {
         assert!(shm.test_open_at(&path));
         let hdr_ptr = shm.test_header_ptr();
         let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
-        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
         assert_eq!(shm.published_gpu_ms(), (0.0, 0.0), "nothing is published before the first reading");
 
         let stop = Arc::new(AtomicBool::new(false));
@@ -4026,12 +4017,12 @@ mod tests {
         // request as already seen.
         // SAFETY: the mapping outlives this read.
         let first_seen = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.seq_req.load(AtomicOrdering::Relaxed);
-        let helper = std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the function returns).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = first_seen;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
                 if req != 0 && req != last_seen {
                     last_seen = req;
@@ -4097,7 +4088,7 @@ mod tests {
         let published = shm.published_gpu_ms();
 
         stop.store(true, AtomicOrdering::Relaxed);
-        helper.join().unwrap();
+        server.join().unwrap();
         unsafe {
             device.device_wait_idle().unwrap();
             device.destroy_image(image, None);
@@ -4160,7 +4151,7 @@ mod tests {
     }
 
     /// The synchronous one-shot path (`run_sync`, used for a capture dump): captures, waits for
-    /// the helper's answer, composes it into the image and leaves the image presentable.
+    /// the model server's answer, composes it into the image and leaves the image presentable.
     /// Stage 1 now hands the image back in PRESENT_SRC_KHR before stage 2 takes it again, so an
     /// early return between the two can no longer leave it in TRANSFER_DST_OPTIMAL.
     #[test]
@@ -4175,7 +4166,7 @@ mod tests {
         assert!(shm.test_open_at(&path));
         let hdr_ptr = shm.test_header_ptr();
         let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
-        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
         let (width, height) = (16u32, 16u32);
         let frame_bytes = (width * height * 4) as usize;
         let proxy_region = shm.proxy_region(Slot::Primary).unwrap().0 as usize;
@@ -4186,12 +4177,12 @@ mod tests {
         // `seq_req` would otherwise take that request as already seen and never answer it (the
         // test's intermittent CI failure, which looked like starvation).
         let first_seen = hdr.seq_req.load(AtomicOrdering::Relaxed);
-        let helper = std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = first_seen;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
                 if req != 0 && req != last_seen {
                     last_seen = req;
@@ -4230,7 +4221,7 @@ mod tests {
         assert_ne!(presented, game_frame, "the answer was composed into the image");
 
         stop.store(true, AtomicOrdering::Relaxed);
-        helper.join().unwrap();
+        server.join().unwrap();
         unsafe {
             device.device_wait_idle().unwrap();
             device.destroy_image(image, None);
@@ -4331,15 +4322,15 @@ mod tests {
         assert!(shm.test_open_at(&path));
         let hdr_ptr = shm.test_header_ptr();
         let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
-        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
-        let helper = std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = 0u32;
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
                 if req != 0 && req != last_seen {
                     last_seen = req;
@@ -4378,7 +4369,7 @@ mod tests {
                 &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
             )
         };
-        // Presents before the fake helper's first heartbeat go out untouched without trying
+        // Presents before the fake model server's first heartbeat go out untouched without trying
         // to capture; the first present that tries is the one that meets the failed setup.
         let deadline = Instant::now() + Duration::from_secs(2);
         let (first, took) = loop {
@@ -4420,7 +4411,7 @@ mod tests {
         assert!(pipeline.is_some() && direct.iter().all(Option::is_none), "the fallback is the staging-buffer pipeline");
 
         stop.store(true, AtomicOrdering::Relaxed);
-        helper.join().unwrap();
+        server.join().unwrap();
         unsafe {
             device.device_wait_idle().unwrap();
             device.destroy_image(image, None);
@@ -4441,11 +4432,11 @@ mod tests {
 
     /// The real point of the pipelined redesign, exercised end to end against a real
     /// (if software) Vulkan device: `run` must never block a present call waiting on
-    /// the helper, even when the helper genuinely takes far longer than one frame to
+    /// the model server, even when the model server genuinely takes far longer than one frame to
     /// answer -- and once it does answer, the result must actually reach `image` via
     /// a real, verifiable composited write (not just "a semaphore came back").
     #[test]
-    fn run_never_blocks_on_a_slow_helper_and_eventually_composites() {
+    fn run_never_blocks_on_a_slow_server_and_eventually_composites() {
         let _mode = TEST_MODE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         TEST_PIPELINED.store(true, std::sync::atomic::Ordering::Relaxed);
         struct Reset;
@@ -4456,7 +4447,7 @@ mod tests {
         }
         let _reset = Reset;
         let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
-            eprintln!("run_never_blocks_on_a_slow_helper_and_eventually_composites: no Vulkan loader/ICD, skipping");
+            eprintln!("run_never_blocks_on_a_slow_server_and_eventually_composites: no Vulkan loader/ICD, skipping");
             return;
         };
 
@@ -4466,18 +4457,18 @@ mod tests {
         let mut shm = ShmClient::default();
         assert!(shm.test_open_at(&path), "test-only open_at should always succeed against a scratch path");
         let hdr_ptr = shm.test_header_ptr();
-        // A live helper (matters for `poll_async_request`'s timeout budget: the long
+        // A live model server (matters for `poll_async_request`'s timeout budget: the long
         // "steady state" one, not the short "nobody's listening" one, since this test
         // deliberately answers slower than that short budget).
-        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
 
-        // A fake helper that only answers `HELPER_DELAY` after it sees a new request --
+        // A fake model server that only answers `SERVER_DELAY` after it sees a new request --
         // long enough that if `run` ever blocked waiting for it, a handful of calls
         // spaced much closer together than that would visibly take just as long.
-        const HELPER_DELAY: Duration = Duration::from_millis(250);
+        const SERVER_DELAY: Duration = Duration::from_millis(250);
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
-        let helper = std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = 0u32;
@@ -4485,7 +4476,7 @@ mod tests {
                 let req = hdr.seq_req.load(AtomicOrdering::Relaxed);
                 if req != 0 && req != last_seen {
                     last_seen = req;
-                    std::thread::sleep(HELPER_DELAY);
+                    std::thread::sleep(SERVER_DELAY);
                     hdr.seq_resp.store(req, AtomicOrdering::Relaxed);
                 }
                 std::thread::sleep(Duration::from_millis(2));
@@ -4519,7 +4510,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         // Real usage calls this once per present, indefinitely -- loop until either a
         // real composited result shows up or the deadline (comfortably several
-        // `HELPER_DELAY`-long round trips) is exhausted, not a fixed iteration count.
+        // `SERVER_DELAY`-long round trips) is exhausted, not a fixed iteration count.
         while Instant::now() < deadline {
             iteration += 1;
             let call_start = Instant::now();
@@ -4569,17 +4560,17 @@ mod tests {
             // allocation, first-touch driver/shader-cache warmup).
             //
             // The real invariant this guards is "`run()` never synchronously waits
-            // for the helper's own answer". A single call occasionally running long
+            // for the model server's own answer". A single call occasionally running long
             // is not, by itself, evidence of that: GitHub's shared runners saw calls
-            // up to 466ms (nearly *double* `HELPER_DELAY`) with no code change
+            // up to 466ms (nearly *double* `SERVER_DELAY`) with no code change
             // involved, purely from real scheduler/software-rasterizer contention on
-            // that infra -- worse than this test's own fake helper thread's sleep, so
+            // that infra -- worse than this test's own fake model server thread's sleep, so
             // no fixed per-call ceiling can both reject that noise and still allow a
             // real hardware/local run through. What a genuine synchronous-wait
             // regression looks like instead is *every* call converging near
-            // `HELPER_DELAY`, not one noisy outlier -- so tally slow calls across the
+            // `SERVER_DELAY`, not one noisy outlier -- so tally slow calls across the
             // whole loop and judge the pattern, not any single sample, below.
-            if iteration > 1 && call_time >= HELPER_DELAY * 9 / 10 {
+            if iteration > 1 && call_time >= SERVER_DELAY * 9 / 10 {
                 slow_calls.push(call_time);
             }
             if let Some(sem) = sem {
@@ -4604,21 +4595,21 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(got_semaphore, "the pipeline must eventually composite a real answer within 5s of real time, not just avoid blocking forever");
-        // A real synchronous-wait-on-the-helper regression makes *every* call take
-        // close to `HELPER_DELAY`; isolated scheduler noise makes at most a rare one.
+        // A real synchronous-wait-on-the-model-server regression makes *every* call take
+        // close to `SERVER_DELAY`; isolated scheduler noise makes at most a rare one.
         // `iteration` counts the exempted first call too, so this ratio is
         // deliberately conservative (slightly stricter than "out of every later
         // call") rather than needing a second counter just to be exact about it.
         assert!(
             slow_calls.len() * 10 < iteration as usize,
-            "{}/{iteration} run() calls took close to the helper's own {HELPER_DELAY:?} answer \
+            "{}/{iteration} run() calls took close to the model server's own {SERVER_DELAY:?} answer \
              delay ({slow_calls:?}) -- an isolated slow call is real-world scheduler noise, but \
-             this many looks like run() is actually waiting on the helper again",
+             this many looks like run() is actually waiting on the model server again",
             slow_calls.len()
         );
 
         stop.store(true, AtomicOrdering::Relaxed);
-        helper.join().unwrap();
+        server.join().unwrap();
 
         // A capture pipeline slot can legitimately still be `pending` here (the test
         // loop can exit as soon as `last_answer` is non-empty, with no guarantee the
@@ -4670,16 +4661,16 @@ mod tests {
         // SAFETY: `hdr_ptr` is this test's own live mapping, same technique the
         // sibling test above already uses.
         let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
-        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
         // 0.5 -- comfortably clear of `scaled_dims`' own 64px floor at this test's
         // resolution, so the assertions below are testing the scale factor, not the
         // floor.
         hdr.working_scale_bits.store(0.5f32.to_bits(), AtomicOrdering::Relaxed);
 
-        // A fake helper that watches BOTH slots (protocol v3) and, on seeing a new
+        // A fake model server that watches BOTH slots (protocol v3) and, on seeing a new
         // request, immediately asserts the proxy it was actually sent is at the
         // scaled resolution -- not the swapchain's own -- before answering. Any
-        // mismatch fails the test from inside the helper thread via `sent_wrong_size`
+        // mismatch fails the test from inside the model server thread via `sent_wrong_size`
         // rather than silently accepting whatever arrived, which a "does it
         // eventually composite" check alone would not catch.
         let (width, height) = (256u32, 192u32);
@@ -4688,7 +4679,7 @@ mod tests {
         let sent_wrong_size = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let (stop_clone, wrong_clone) = (Arc::clone(&stop), Arc::clone(&sent_wrong_size));
-        let helper = std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             // SAFETY: the mapping outlives this thread (joined before the test ends).
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last_seen = [0u32; 2];
@@ -4754,13 +4745,13 @@ mod tests {
             } else if !last_answer.is_empty() {
                 composited = true;
             }
-            assert!(!sent_wrong_size.load(AtomicOrdering::Relaxed), "the helper observed a proxy request at the wrong resolution -- working_scale did not shrink it");
+            assert!(!sent_wrong_size.load(AtomicOrdering::Relaxed), "the model server observed a proxy request at the wrong resolution -- working_scale did not shrink it");
             std::thread::sleep(Duration::from_millis(5));
         }
         assert!(composited, "the scaled pipeline must eventually composite a real answer within 5s, same as the unscaled path already does");
 
         stop.store(true, AtomicOrdering::Relaxed);
-        helper.join().unwrap();
+        server.join().unwrap();
 
         unsafe { device.device_wait_idle() }.unwrap();
         // SAFETY: every semaphore this test waited on has a completed, waited-for
@@ -4819,21 +4810,21 @@ mod tests {
         let mut shm = ShmClient::default();
         assert!(shm.test_open_at(&path));
         let hdr_ptr = shm.test_header_ptr();
-        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, AtomicOrdering::Relaxed);
+        unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) }.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, AtomicOrdering::Relaxed);
 
-        // A fake helper that answers as fast as it can see the request -- the real
+        // A fake model server that answers as fast as it can see the request -- the real
         // steady state, where the layer has a fresh answer nearly every present and so
         // submits capture+compose work on nearly every call. That is the worst case for
         // per-present cost, which is exactly what we want to measure.
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = Arc::clone(&stop);
-        let helper = std::thread::spawn(move || {
+        let server = std::thread::spawn(move || {
             let hdr = unsafe { &*(hdr_ptr as *mut neural_forge_protocol::ShmHeader) };
             let mut last = [0u32; 2];
             while !stop_clone.load(AtomicOrdering::Relaxed) {
-                // A helper whose heartbeat stands still reads as dead, and `run` then returns
+                // A model server whose heartbeat stands still reads as dead, and `run` then returns
                 // before capturing: without this the benchmark timed mostly no-op presents.
-                hdr.heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
+                hdr.server_heartbeat.fetch_add(1, AtomicOrdering::Relaxed);
                 for slot in Slot::ALL {
                     let req = hdr.seq_req_slot(slot).load(AtomicOrdering::Relaxed);
                     if req != 0 && req != last[slot.index()] {
@@ -4900,7 +4891,7 @@ mod tests {
                 cpu.push(cpu_cost);
                 gpu.push(gpu_cost);
             }
-            // A touch of spacing so the fake helper reliably flips a fresh answer
+            // A touch of spacing so the fake model server reliably flips a fresh answer
             // between presents, matching the steady state rather than starving itself.
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -4918,7 +4909,7 @@ mod tests {
         report("gpu (queue drain after run())", &mut gpu);
 
         stop.store(true, AtomicOrdering::Relaxed);
-        helper.join().unwrap();
+        server.join().unwrap();
         unsafe { device.device_wait_idle() }.unwrap();
         unsafe {
             device.destroy_image(image, None);

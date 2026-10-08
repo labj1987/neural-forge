@@ -1,5 +1,5 @@
 //! The GPU half of the proxy encode: the compute pipeline that runs
-//! [`super::encode`]'s curves over the captured frame before it crosses to the helper.
+//! [`super::encode`]'s curves over the captured frame before it crosses to the model server.
 //!
 //! Deliberately its own pipeline rather than a mode of [`super::gpu::GpuCompose`]:
 //! this runs on the *capture* leg (one dispatch over the model's raster, in place,
@@ -8,7 +8,7 @@
 //! share nothing but the device.
 //!
 //! Every failure path here is fail-open: `None`/`false` means "the proxy goes to the
-//! helper unencoded, exactly as it did before this existed", never a reason to stop
+//! model server unencoded, exactly as it did before this existed", never a reason to stop
 //! presenting. The resolve is told which it got (see `compose.comp`'s `mode`), so an
 //! unencoded proxy keeps the old composition math rather than being fed to one that
 //! assumes an encode ran.

@@ -1,5 +1,5 @@
 //! The native backend (docs/NATIVE_BACKEND.md, "Phase 1"): the network runs on the game's own device,
-//! inside the game's own DLSS submit, instead of in the helper.
+//! inside the game's own DLSS submit, instead of in the model server.
 //!
 //! A hold in native mode submits three command buffers in front of DLSS's launch buffer, with no CPU
 //! wait between them and none for them:
@@ -13,7 +13,7 @@
 //! - `W`, the write-back (`super::record_writeback`): the answer decoded over DLSS's colour input.
 //!
 //! The ordering is submission order on the game's queue plus each buffer's opening barrier
-//! (`ALL_COMMANDS/MEMORY_WRITE` to what it reads), the same chain as the helper hold's
+//! (`ALL_COMMANDS/MEMORY_WRITE` to what it reads), the same chain as the model server hold's
 //! (`super`, "The dependency chain of a hold"), minus the host round trip.
 //!
 //! The network itself (model, kernels, the graph for one size) is loaded and built on a thread of its
@@ -34,25 +34,6 @@ use super::{own_host_buffer_with, HostBuffer, Target};
 
 const PREPROCESS_SPV: &[u8] = include_bytes!("../../shaders/native_preprocess.spv");
 const COMPOSITE_SPV: &[u8] = include_bytes!("../../shaders/native_composite.spv");
-
-/// `NEURAL_FORGE_BACKEND`: which runs the model before the upscaler (this branch only, for A/B runs).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Backend {
-    Native,
-    Helper,
-}
-
-pub(crate) fn backend() -> Backend {
-    static BACKEND: std::sync::LazyLock<Backend> = std::sync::LazyLock::new(|| match neural_forge_protocol::env::var("NEURAL_FORGE_BACKEND").as_deref() {
-        Some("helper") => Backend::Helper,
-        Some("native") | None | Some("") => Backend::Native,
-        Some(other) => {
-            crate::log!("[native] NEURAL_FORGE_BACKEND={other:?} is not native or helper; using native");
-            Backend::Native
-        }
-    });
-    *BACKEND
-}
 
 /// `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`: the frames record everything but the network's launches.
 fn skip_graph() -> bool {
@@ -123,7 +104,7 @@ struct LoaderState {
 
 /// The network on one device, opened and built off the game's threads. Nothing is loaded until the
 /// first hold asks for it ([`Self::ready`]): only the device DLSS runs on pays for the model. A
-/// failed open or build is tried again on the helper's schedule (`neural_forge_protocol::rebuild`):
+/// failed open or build is tried again on the model server's schedule (`neural_forge_protocol::rebuild`):
 /// 0.5, 1 and 2 s, then a re-initialisation (the network closed and opened again), then every 30 s.
 pub(crate) struct Loader {
     shared: Arc<(Mutex<LoaderState>, Condvar)>,
@@ -409,9 +390,9 @@ pub(crate) struct Conditioning {
     pub auto_mask: bool,
 }
 
-impl From<neural_forge_protocol::PassTuning> for Conditioning {
-    /// With the helper's clamps (`ngx.rs::NgxTuning`): the same values reach the network.
-    fn from(t: neural_forge_protocol::PassTuning) -> Self {
+impl From<neural_forge_protocol::Tuning> for Conditioning {
+    /// With the model server's clamps (`ngx.rs::NgxTuning`): the same values reach the network.
+    fn from(t: neural_forge_protocol::Tuning) -> Self {
         Self {
             style: t.style,
             intensity: t.intensity.clamp(0.0, 4.0),
@@ -875,7 +856,7 @@ pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     }
 }
 
-/// Logs a history reset's reason (the helper logs the same reasons for NGX's).
+/// Logs a history reset's reason (the model server logs the same reasons for NGX's).
 pub(crate) fn note_reset(stale: Option<Stale>) {
     match stale {
         Some(Stale::Skipped) => crate::log!("[native] resetting the history (frames went to DLSS untouched since the last one)"),
@@ -952,7 +933,7 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("the network is being rebuilt without counter chaining");
         return result;
     }
-    // The HDR encode and decode, exactly as the helper hold uses them.
+    // The HDR encode and decode, exactly as the model server hold uses them.
     let source = super::ExposureSource::of(target);
     result.exposure_source = Some(source);
     if res.hdr.is_none() {

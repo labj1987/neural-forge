@@ -32,7 +32,6 @@ jobs:
         uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
           toolchain: stable
-          targets: x86_64-pc-windows-gnu, i686-unknown-linux-gnu
 
       # The release used to build and publish without running a single test. Same
       # dependencies and checks as ci.yml, before anything gets packaged. zsync and
@@ -43,7 +42,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib \
             libvulkan1 mesa-vulkan-drivers vulkan-tools \
             zsync desktop-file-utils
 
@@ -71,12 +69,10 @@ jobs:
       - name: Vulkan loader smoke test
         run: bash scripts/smoke-test.sh
 
-      # CARGO_HELPER picks the rustup-managed "stable" toolchain dtolnay/rust-toolchain
-      # just set up, matching docs/PHASE1.md's own documented CI-appropriate invocation.
       # CI=true (set by GitHub Actions, kept by `sudo -E`) makes a missing or failing
       # zsyncmake fatal in build-appimage.sh.
       - name: Build AppImage
-        run: sudo -E env "PATH=$PATH" CARGO_HELPER='cargo +stable' bash build-appimage.sh
+        run: sudo -E env "PATH=$PATH" bash build-appimage.sh
 
       - name: Check the release files
         run: |

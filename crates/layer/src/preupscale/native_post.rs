@@ -1,13 +1,13 @@
 //! The native backend after the upscaler (docs/NATIVE_BACKEND.md, "2.1"): the requests the after-the-upscaler
-//! path writes into shared memory for the helper are answered here, in the game's process, by the native
+//! path writes into shared memory for the model server are answered here, in the game's process, by the native
 //! network, so the capture and the composition stay exactly as they are.
 //!
-//! [`PostServer`] is the helper's request loop (`crates/helper/src/main.rs`, `process_request`) without NGX:
+//! [`PostServer`] is the model server, the after-the-upscaler path's request loop:
 //! per slot, a new `seq_req` is read with its size and format; an 8-bit frame the model is wanted for runs
 //! through `native_post_preprocess.comp`, the network (its recording for the layer's own compute family) and
 //! `native_post_composite.comp`, on a compute queue of the layer's own, waited for (bounded); anything else is
-//! echoed, as the helper fails open. Then `answered_w/h`, `seq_eval`, `helper_busy_us` and `seq_resp` are
-//! published in the helper's order, and the heartbeat keeps the layer's `helper_alive` true.
+//! echoed (failing open). Then `answered_w/h`, `seq_eval`, `server_busy_us` and `seq_resp` are published in that
+//! order, and the heartbeat keeps the layer's `server_alive` true.
 //!
 //! There are no motion vectors after the upscaler: every frame runs without history, with a fixed seed (a
 //! seed that changed every frame, with nothing blending frames, would shimmer). It never runs the network
@@ -28,7 +28,7 @@ use crate::shm::ShmView;
 const PREPROCESS_SPV: &[u8] = include_bytes!("../../shaders/native_post_preprocess.spv");
 const COMPOSITE_SPV: &[u8] = include_bytes!("../../shaders/native_post_composite.spv");
 
-/// The helper's smallest frame (`ngx::MIN_FEATURE_DIM`): smaller ones are echoed.
+/// The model server's smallest frame (`ngx::MIN_FEATURE_DIM`): smaller ones are echoed.
 const MIN_DIM: u32 = 64;
 
 #[repr(C)]
@@ -55,14 +55,14 @@ pub(crate) struct PostServer {
 }
 
 impl PostServer {
-    /// Starts serving, unless a helper process is answering already (its heartbeat moves): two answerers
+    /// Starts serving, unless a model server process is answering already (its heartbeat moves): two answerers
     /// would race for every request.
     pub(crate) fn start(device: ash::Device, instance: ash::Instance, physical: vk::PhysicalDevice, setup: Setup, import: bool, loader: Arc<Loader>, view: ShmView) -> Option<Self> {
         let hdr = view.header();
-        let before = hdr.heartbeat.load(Ordering::Relaxed);
+        let before = hdr.server_heartbeat.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(300));
-        if hdr.heartbeat.load(Ordering::Relaxed) != before {
-            crate::log!("[native] a helper process is answering requests: the after-the-upscaler path stays with it");
+        if hdr.server_heartbeat.load(Ordering::Relaxed) != before {
+            crate::log!("[native] a model server process is answering requests: the after-the-upscaler path stays with it");
             return None;
         }
         let quit = Arc::new(AtomicBool::new(false));
@@ -189,7 +189,7 @@ fn serve(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalD
     let mut frames: u64 = 0;
     let mut last_request = Instant::now();
     while !quit.load(Ordering::Relaxed) && !gpu.stalled {
-        hdr.helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+        hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, Ordering::Relaxed);
         hdr.model_up.store(u32::from(loader.failed().is_none()), Ordering::Relaxed);
         for slot in Slot::ALL {
             let seq = hdr.seq_req_slot(slot).load(Ordering::Acquire);
@@ -200,8 +200,8 @@ fn serve(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalD
             last_request = Instant::now();
             process(device, instance, physical, import, loader, view, gpu, slot, seq, &mut frames);
         }
-        hdr.heartbeat.fetch_add(1, Ordering::Relaxed);
-        // The helper's idle policy, simplified: poll fast while requests come, slowly when none have for a while.
+        hdr.server_heartbeat.fetch_add(1, Ordering::Relaxed);
+        // The model server's idle policy, simplified: poll fast while requests come, slowly when none have for a while.
         if last_request.elapsed() < Duration::from_secs(1) {
             std::thread::sleep(Duration::from_micros(200));
         } else {
@@ -241,18 +241,18 @@ fn process(
     };
     let (proxy, answer) = view.regions(slot);
     if !evaluated && bytes > 0 {
-        // Fail open, as the helper does: the frame itself comes back.
+        // Fail open, as the model server does: the frame itself comes back.
         // SAFETY: both regions hold at least `bytes` (`frame_dims_valid` bounds the frame by the region size).
         unsafe { std::ptr::copy_nonoverlapping(proxy, answer, bytes) };
     }
     hdr.seq_ok.store(seq, Ordering::Relaxed);
-    // The helper's per-stage times, as the `[sync]` line and the Status tab read them: the whole frame on
+    // The model server's per-stage times, as the `[sync]` line and the Status tab read them: the whole frame on
     // the GPU, waited for, counts as the evaluate; nothing is uploaded or read back separately.
     if evaluated {
         let ms = |v: f32| v.to_bits();
-        hdr.helper_upload_ms_bits.store(ms(0.0), Ordering::Relaxed);
-        hdr.helper_eval_ms_bits.store(ms(t.elapsed().as_secs_f32() * 1000.0), Ordering::Relaxed);
-        hdr.helper_readback_ms_bits.store(ms(0.0), Ordering::Relaxed);
+        hdr.server_upload_ms_bits.store(ms(0.0), Ordering::Relaxed);
+        hdr.server_eval_ms_bits.store(ms(t.elapsed().as_secs_f32() * 1000.0), Ordering::Relaxed);
+        hdr.server_readback_ms_bits.store(ms(0.0), Ordering::Relaxed);
     }
     if slot == Slot::Primary {
         if evaluated {
@@ -260,11 +260,11 @@ fn process(
         }
         hdr.answered_w.store(if dims_ok { width } else { 0 }, Ordering::Relaxed);
         hdr.answered_h.store(if dims_ok { height } else { 0 }, Ordering::Relaxed);
-        hdr.helper_busy_us.store(u32::try_from(t.elapsed().as_micros()).unwrap_or(u32::MAX), Ordering::Relaxed);
+        hdr.server_busy_us.store(u32::try_from(t.elapsed().as_micros()).unwrap_or(u32::MAX), Ordering::Relaxed);
     }
     hdr.seq_resp_slot(slot).store(seq, Ordering::Release);
     *frames += 1;
-    neural_forge_protocol::store64(&hdr.helper_frames_lo, &hdr.helper_frames_hi, *frames);
+    neural_forge_protocol::store64(&hdr.server_frames_lo, &hdr.server_frames_hi, *frames);
 }
 
 /// One frame through the network. `false` (and the caller echoes) on anything short of a written answer.

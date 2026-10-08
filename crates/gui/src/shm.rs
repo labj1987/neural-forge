@@ -63,7 +63,7 @@ impl Shm {
     pub fn open() -> Result<Self, neural_forge_protocol::mapping::OpenError> {
         let cfg = neural_forge_supervisor::Config::load();
         let mapping = neural_forge_supervisor::open_channel(&cfg)?;
-        // Not only when this call created the file: the layer or helper may have initialised it
+        // Not only when this call created the file: the layer may have initialised it
         // with defaults first (see `neural_forge_supervisor::apply_saved_settings`).
         if mapping.freshly_created || mapping.header().tuning_seq.load(Ordering::Relaxed) == 0 {
             neural_forge_protocol::persist::apply(mapping.header(), &cfg.settings);
@@ -84,17 +84,9 @@ fn persist_one(name: &str, is_float: bool, bits: u32) {
     let _ = cfg.save();
 }
 
-/// Saves every persisted value, per-pass overrides included, into `config.ini`. Used by the
-/// per-pass dialog, whose fields are not individual `persisted_settings` entries.
-pub fn persist_all(header: &neural_forge_protocol::ShmHeader) {
-    let mut cfg = neural_forge_supervisor::Config::load();
-    cfg.settings.extend(neural_forge_protocol::persist::snapshot(header));
-    let _ = cfg.save();
-}
-
 /// Binds a GTK `Scale`/`SpinButton`-shaped float control to one `f32`-bits field:
 /// reads the current value to initialize the widget, and writes back (bumping
-/// `control_seq` so the layer/helper notice) whenever the widget changes. `name` must
+/// `control_seq` so the layer notices) whenever the widget changes. `name` must
 /// match one of `ShmHeader::persisted_settings`'s names for the value to survive a
 /// reboot; pass `None` for a field that isn't meant to (there are none of those among
 /// the GUI's rows today, but the option exists for e.g. a future debug-only control).
@@ -184,7 +176,7 @@ mod tests {
         let intensity_after = f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed));
         assert_eq!(intensity_after, 1.75, "persisted value should have been applied on the fresh mapping");
 
-        // The layer or helper re-initialising the header (a game started first, or a version
+        // The layer re-initialising the header (a game started first, or a version
         // change) must not lose the saved settings either: the next open puts them back.
         shm.0.header().init_defaults();
         assert_eq!(f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed)), 1.0);

@@ -18,7 +18,7 @@ use crate::swapchain::{self, SwapchainState};
 /// The one swapchain (across every device in this process) allowed to drive the
 /// shared-memory channel. A process can present more than one swapchain -- the game
 /// window and the Steam overlay, or, mid-resize, the old and new windows at once.
-/// Routing all of them through one channel would make the helper rebuild its feature on
+/// Routing all of them through one channel would make the model server rebuild its feature on
 /// every size switch, and could hand one swapchain another's answer; the largest by
 /// area is assumed to be the game, and the rest present untouched.
 struct Primary {
@@ -82,7 +82,7 @@ pub struct NeuralForgeDeviceInfo {
     instance: Option<Arc<ash::Instance>>,
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
     physical_device: vk::PhysicalDevice,
-    /// False on any non-NVIDIA physical device: Neural Rendering is an NGX feature and the helper
+    /// False on any non-NVIDIA physical device: Neural Rendering is an NGX feature and the model server
     /// only ever creates its own device on an NVIDIA GPU, so on anything else there is nothing for
     /// the layer to do but cost a round trip. Hybrid machines are the case that matters -- an
     /// implicit layer is loaded for every device the loader builds, including the integrated one
@@ -192,11 +192,11 @@ struct State {
     original_scratch: Vec<u8>,
     /// The pipelined redesign's own persistent state -- see `capture::run`'s own doc
     /// comment for why a round trip's original frame has to outlive the present call
-    /// that sent it, across however many present calls it takes the helper to answer.
+    /// that sent it, across however many present calls it takes the model server to answer.
     /// One per protocol v3 wire slot: each slot's in-flight request has its own,
     /// completely independent original frame and dims.
     inflight: [capture::Inflight; 2],
-    /// A single disabled-state evaluation reserves the helper's images and NGX
+    /// A single disabled-state evaluation reserves the model server's images and NGX
     /// feature before the game's working set fills available VRAM (see
     /// `capture::run`'s own doc comment on why) -- one flag for the whole process,
     /// not per-slot: it only ever uses wire slot 0.
@@ -714,14 +714,18 @@ fn inline_hold(
             }
         }
     };
-    let State { shm, preupscale: session, external_memory_host, direct_capture, gpu_compose, inflight, .. } = &mut *state;
+    let State { shm, preupscale: session, external_memory_host, direct_capture, .. } = &mut *state;
     session.saw_dlss();
     if !shm.open() {
         inline_tally("skipped (no shared memory)");
         return;
     }
-    // The native backend runs the network itself, on this side queue: no helper, no slot 0.
+    // The native backend runs the network itself, on this side queue (no slot 0).
     let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
+    if mode == Mode::Model && !native {
+        inline_tally("skipped (the native backend is not available on this device)");
+        return;
+    }
     if native && !shm.model_enabled() {
         inline_tally("skipped (the model is switched off)");
         return;
@@ -736,14 +740,11 @@ fn inline_hold(
         dump
     };
     let extent = (job.point.desc.width, job.point.desc.height);
+    // The diagnostic modes capture into slot 0: not while the post path has it.
     if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
-        session.note_busy_slot(shm, mode, extent);
         return;
     }
     if !native && capture::direct_slot_busy(direct_capture, Slot::Primary) {
-        return;
-    }
-    if !native && mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(device)) {
         return;
     }
     // Staged, never imported: work on imported host memory from the layer's queue waited on the
@@ -785,7 +786,7 @@ fn inline_hold(
             crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, &mut submit)
         },
         None => unsafe {
-            crate::preupscale::run_hold(device, instance, physical_device, res, shm, &target, mode, dump, 0, crate::preupscale::ANSWER_BUDGET, &mut submit)
+            crate::preupscale::run_hold(device, instance, physical_device, res, &target, mode, dump, 0, &mut submit)
         },
     };
     if hold.wrote_back {
@@ -798,10 +799,6 @@ fn inline_hold(
             hold.miss = Some("the write-back inside DLSS's buffer did not finish in time");
         }
     }
-    if hold.claims_slot0() {
-        inflight[0].forget_answer();
-    }
-    hold.mark_local(mode);
     if hold.native {
         session.note_native(shm, &hold);
     }
@@ -1195,7 +1192,7 @@ impl NeuralForgeDeviceInfo {
         let instance = self.instance.as_ref()?;
         let inputs = scan.inputs?;
         let mut state = self.state.lock().unwrap();
-        let State { shm, preupscale: session, queue_families, external_memory_host, direct_capture, gpu_compose, inflight, .. } = &mut *state;
+        let State { shm, preupscale: session, queue_families, external_memory_host, direct_capture, .. } = &mut *state;
         // DLSS is running on this device (held or not): the post path stays off for
         // `preupscale::HAND_BACK` after this once the device has held.
         session.saw_dlss();
@@ -1247,27 +1244,21 @@ impl NeuralForgeDeviceInfo {
         if !shm.open() {
             return None;
         }
-        // The native backend runs the network itself: no helper to ask, no slot 0 to share.
+        // The native backend runs the network itself (no slot 0 to share). Without it on this device,
+        // model mode has nothing to run.
         let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
-        // The native backend has no helper to gate on, but follows the toggle (F11, the GUI) as the helper's
-        // hold does: off, the submit goes to DLSS untouched.
-        if native && !shm.model_enabled() {
+        if mode == Mode::Model && !native {
+            session.say_once("the native backend is not available on this device; frames go to DLSS untouched");
             return None;
         }
-        let dump = if native { false } else { crate::preupscale::gate(mode, session, shm, scan.depth_layout.is_some() && scan.mvec_layout.is_some())? };
-        // Slot 0 must be free: no request (the post path's, or an earlier hold's that ran over
-        // budget) still with the helper, no zero-copy capture still writing its proxy region, and
-        // in model mode no compose still reading its answer region.
+        // Follows the toggle (F11, the GUI): off, the submit goes to DLSS untouched.
+        let dump = crate::preupscale::gate(mode, session, shm, scan.depth_layout.is_some() && scan.mvec_layout.is_some())?;
+        // The diagnostic modes capture into slot 0: it must be free (no request of the post path's
+        // still out, no zero-copy capture still writing its proxy region).
         if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
-            // Booked as a late answer only when the request is this path's own; the post path's
-            // says nothing about this path (and must not engage the device).
-            session.note_busy_slot(shm, mode, (colour.width, colour.height));
             return None;
         }
         if !native && capture::direct_slot_busy(direct_capture, Slot::Primary) {
-            return None;
-        }
-        if !native && mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(&self.device)) {
             return None;
         }
         // Failures from here on repeat every frame in a game where they happen at all: in model
@@ -1345,10 +1336,7 @@ impl NeuralForgeDeviceInfo {
                     crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, &mut layer_submit)
                 },
                 None => unsafe {
-                    crate::preupscale::run_hold(
-                        &self.device, instance, self.physical_device, res, shm, &target, mode, dump, scan.evaluation,
-                        crate::preupscale::ANSWER_BUDGET, &mut layer_submit,
-                    )
+                    crate::preupscale::run_hold(&self.device, instance, self.physical_device, res, &target, mode, dump, scan.evaluation, &mut layer_submit)
                 },
             };
             let consumed = hold.waits_consumed;
@@ -1356,12 +1344,6 @@ impl NeuralForgeDeviceInfo {
             consumed
         }, &mut |part| accepted.extend(part));
         if let Some((mut hold, cpu)) = held {
-            if hold.claims_slot0() {
-                // Slot 0's answer region now holds (or, for a late answer, will hold) the
-                // pre-upscaler answer: neither present path may take it for its own.
-                inflight[0].forget_answer();
-            }
-            hold.mark_local(mode);
             if hold.native {
                 session.note_native(shm, &hold);
             }
@@ -2567,7 +2549,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // Model mode: once this device (or another of the process) has held, the
                     // post-upscaler compose stays off while DLSS ran within `preupscale::HAND_BACK`
                     // (30 s), loading screens included: the model is not applied a second time, and
-                    // the helper's feature is not rebuilt at the output size and back at every
+                    // the model server's feature is not rebuilt at the output size and back at every
                     // loading screen. Logged on change.
                     static SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     let suppressed = preupscale.suppresses_post() || held_elsewhere;
@@ -2639,10 +2621,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 if shm.model_known_unavailable() {
                     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        crate::log!("[layer] present skipped: the helper reported the model permanently unavailable for this session");
+                        crate::log!("[layer] present skipped: the model server reported the model permanently unavailable for this session");
                         crate::logging::flush();
                     }
-                    // The helper has permanently disabled itself for this session
+                    // The model server has permanently disabled itself for this session
                     // (see `ngx::ensure_feature`'s one-shot design) -- nothing will
                     // ever evaluate a captured frame, so paying for the capture
                     // itself (a full image<->buffer round trip plus a whole-frame

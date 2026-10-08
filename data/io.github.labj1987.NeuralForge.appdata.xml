@@ -9,9 +9,9 @@
   <project_license>AGPL-3.0-or-later</project_license>
   <description>
     <p>
-      A Vulkan implicit layer and settings GUI for running NVIDIA DLSS 5 Neural
-      Rendering on native Linux and Proton games, with the Windows-side NGX model
-      running under Wine/Proton.
+      A Vulkan implicit layer and settings GUI for running the DLSS 5 Neural
+      Rendering model in native Linux and Proton games. The layer runs the network
+      itself on the game's GPU, from weights extracted once from NVIDIA's DLL.
     </p>
   </description>
   <launchable type="desktop-id">io.github.labj1987.NeuralForge.desktop</launchable>
@@ -21,19 +21,20 @@
   </provides>
   <screenshots>
     <screenshot type="default">
-      <caption>Settings window with Model, Motion, Composition, Debug, Status, and Setup tabs</caption>
+      <caption>Settings window with Model, Composition, Debug, Status, and Setup tabs</caption>
       <image>https://raw.githubusercontent.com/labj1987/neural-forge/main/screenshots/settings.png</image>
     </screenshot>
     <screenshot>
-      <caption>Setup tab: NGX binaries status, compatibility tool picker, Steam install and launch-option generator</caption>
+      <caption>Setup tab: the model's status and extraction, and the launch-option generator</caption>
       <image>https://raw.githubusercontent.com/labj1987/neural-forge/main/screenshots/setup.png</image>
     </screenshot>
     <screenshot>
-      <caption>Status tab: helper, model and timings, and where the model runs (before or after the game's upscaler)</caption>
+      <caption>Status tab: model and timings, and where the model runs (before or after the game's upscaler)</caption>
       <image>https://raw.githubusercontent.com/labj1987/neural-forge/main/screenshots/status.png</image>
     </screenshot>
   </screenshots>
   <releases>
+    <release version="3.0.0" date="2026-10-07"/>
     <release version="2.0.10" date="2026-10-07"/>
     <release version="2.0.9" date="2026-10-07"/>
     <release version="2.0.8" date="2026-10-06"/>
