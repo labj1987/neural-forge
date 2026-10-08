@@ -1686,9 +1686,16 @@ input, depth and motion vectors.
   entry without exposure is otherwise logged once and not used: `a CUDA launch names an
   output-size colour image with depth and motion vectors (0x... 2560x1440), but its command buffer
   names no 1x1 R16_SFLOAT exposure: ... not used`. If one entry counts, it is chosen. If several
-  count, the only one whose buffer names the exposure is chosen. If that leaves no single entry,
-  none is chosen, and this is logged once: `... name different colour inputs (...): none chosen by
-  the input kernel's parameters, the size rule decides`.
+  count, the only one whose buffer names the exposure is chosen. If several name the exposure,
+  all the same exposure image, with inputs of one extent, and the size rule finds nothing, they are
+  one evaluation alternating its input (each DLSS evaluation has its own exposure input): the
+  lowest handle is chosen, `Tracker::retarget` holds each submit with the input its buffer names,
+  and this is logged once: `... name different colour inputs (...): one evaluation alternating its
+  input (...), 0x... chosen`. Remnant II (3.1.2, 2026-10-08) alternates between two 1488x836 inputs
+  with 1485x836 motion vectors, so the size rule has no candidate; where the size rule has one
+  (Crimson Desert) its pick and the switch already follow the alternation, and nothing changes. If
+  that leaves no single entry, none is chosen, and this is logged once: `... name different colour
+  inputs (...): none chosen by the input kernel's parameters, the size rule decides`.
 - **Precedence.** `Tracker::refresh` uses the chosen evidence (`Rule::Params`) when its images are
   still registered, and the size rule (`Rule::Size`, `identify`, unchanged) otherwise. The
   identification key is the images only. So in a game where both rules pick the same images (GTA V,

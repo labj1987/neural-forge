@@ -114,11 +114,13 @@ the full record of earlier versions is in [docs/HARDWARE_VALIDATION.md](docs/HAR
 | Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Menu | 119.7 fps shown |
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Menu | 115.4 fps shown |
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | In game, held inside DLSS's buffer | 56.3 real / 117.7 fps shown (without frame generation: 70.7 fps, 164.9 with NR off) |
-| Remnant II | Unreal Engine 5, DX12 | Super Resolution | First-launch menu, held inside DLSS's buffer | 121.1 fps shown |
+| Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Character select, held inside DLSS's buffer (3.1.2) | 68.7 real / 139.0 fps shown |
 
 The two Unreal Engine 5 games ran without the GPU fault the Black Myth: Wukong Benchmark Tool showed
 with 3.0 ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), Phase 4b): Lords of the Fallen in game
-with frame generation on, Remnant II on its menu. The network costs about 8 ms per real frame at
+with frame generation on, Remnant II at its character select screen with frame generation on. Before
+3.1.2 Remnant II ran the model after the upscaler (77.8 fps shown there), because its DLSS input
+alternates between two images. The network costs about 8 ms per real frame at
 DLSS Balanced's 1488x836 input; in a game this light without it (Lords of the Fallen, 164.9 fps with
 NR off) that is more than half the frame rate, which frame generation largely hides. Cyberpunk 2077, Resident Evil Requiem and the Wukong tool are no longer installed on the test
 machine and were last tested with 2.0.8.
@@ -274,7 +276,10 @@ Settings are live: the GUI and the running layer share them through shared memor
   Balanced, likely VRAM: the network needs about 1.5 GB at that size). A network build that fails is
   retried on a schedule, and frames go to DLSS untouched meanwhile.
 - **Unreal Engine 5 games are only partly tested.** Lords of the Fallen ran in game with frame
-  generation, and Remnant II on its menu, with 3.1.0 and no GPU fault. The Black Myth: Wukong Benchmark Tool faulted the GPU
+  generation, and Remnant II at its character select screen with frame generation, with no GPU fault
+  in those measurements. One Remnant II launch of seven hit `Xid 32` and froze as the model started
+  after the upscaler with frame generation running, on a build that did not yet hold it before the
+  upscaler; the two runs since 3.1.2 holds it there had none. The cause is not known. The Black Myth: Wukong Benchmark Tool faulted the GPU
   intermittently (`Xid 13` then `Xid 32`) in the first frames with frame generation on, and its
   motion vectors cannot be copied, so the network runs there without history.
 - **NVIDIA `Xid 109` (`CTX_SWITCH_TIMEOUT`) or `Xid 119` GPU hangs.** This is a widely reported

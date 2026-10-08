@@ -226,7 +226,11 @@ one precondition:
   entry. The decision waits for 16 launch-bearing submits
   without new evidence, so both SR's and FG's buffers have been seen. Ambiguity (two candidates in
   one launch, or different colour inputs from different buffers that the exposure does not settle)
-  is logged once, and the size rule decides. Only an `RGBA16F` colour input is held.
+  is logged once, and the size rule decides. One exception (3.1.2): when the size rule finds
+  nothing, and every such entry's buffer names the same exposure image and the inputs share one
+  extent, they are one evaluation alternating its input (Remnant II, whose motion vectors are 3
+  pixels narrower than its colour input); the lowest handle is chosen and each submit is held with
+  the input its buffer names. Only an `RGBA16F` colour input is held.
 - **By size** (`Rule::Size`, `preupscale::identify`), the fallback: the registered `RGBA16F` storage image (2D, single sample) whose extent equals
   a registered depth image's (any depth format: `D32_SFLOAT`, `D32_SFLOAT_S8_UINT`,
   `D24_UNORM_S8_UINT`, ...) and a registered motion-vector image's (`RG16F`, else `RG32F`), and is

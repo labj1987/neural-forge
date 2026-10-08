@@ -4,6 +4,16 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.1.2 — 2026-10-08
+
+- Remnant II: the model runs before the upscaler, inside DLSS's buffer, instead of after it. Its DLSS
+  alternates its input between two 1488x836 images that share one exposure image, and its motion
+  vectors are 1485x836, so neither the input kernel's parameters nor the size rule chose an input.
+  Several inputs whose buffers all name the same exposure image, with one extent, are now taken as
+  one evaluation alternating its input when the size rule finds nothing; each frame is held with the
+  input DLSS reads. At the character select screen with frame generation on: 139.0 fps shown (68.7
+  real frames held) against 77.8 with the model after the upscaler; no missed frames, no GPU fault.
+
 ## 3.1.1 — 2026-10-08
 
 - Status tab: with the model before the upscaler, the Game row read "none attached", the Layer row
