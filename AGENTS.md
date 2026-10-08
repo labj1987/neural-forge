@@ -47,6 +47,19 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   when the vendored copy moves to a new network. `VERIFIED_BUILDS` only marks builds compared with
   NVIDIA's runtime; it gates nothing.
 
+## Changelog
+
+- One `## X.Y.Z — YYYY-MM-DD` heading per released version, newest first. No entries for builds
+  that were never released.
+- Write each entry for the people using the app: what changed for them and anything they need to
+  do. Leave out implementation detail (file paths, flags, internal names, CI and packaging changes)
+  unless a user needs it to act.
+- The release page is the version's section written out in full (`scripts/release_notes.py`), never
+  a link to the changelog. The release fails if the section is missing.
+- The AppStream `<releases>` list is generated from the headings
+  (`scripts/sync_appdata_releases.py`, run by `build-appimage.sh` and checked in CI). Don't edit it
+  by hand.
+
 ## Runtime constraints
 
 Use only NeuralForge-owned paths, `NEURAL_FORGE_*` variables, and the
