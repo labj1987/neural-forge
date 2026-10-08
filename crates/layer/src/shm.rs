@@ -380,34 +380,17 @@ impl ShmClient {
         }
     }
 
-    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32) {
+    /// The layer's "attached and presenting" telemetry, once per present while the game renders
+    /// steadily, whichever path the model takes. It was only written by the after-the-upscaler
+    /// capture (`set_frame_info`), so with the model before the upscaler -- which captures nothing at
+    /// present -- the Status tab read "none attached" while the model ran. Does nothing until the
+    /// channel is open (the capture and the hold open it).
+    pub fn beat(&mut self) {
         self.frames += 1;
         let frames = self.frames;
         let Some(hdr) = self.header() else { return };
-        hdr.width_slot(slot).store(width, Ordering::Relaxed);
-        hdr.height_slot(slot).store(height, Ordering::Relaxed);
-        hdr.proxy_format_slot(slot).store(proxy_format, Ordering::Relaxed);
-
-        // The layer's own "I am alive and capturing" telemetry -- mirrors what
-        // the model server's loop does for `hdr.server_*`/`server_heartbeat`.
-        // Nothing else in this crate ever wrote these fields before this (confirmed by
-        // grep, 2026-09-10): `layer_attached` was declared, reset to 0 by
-        // `ShmHeader::init_defaults`, and read by the GUI (`ui.rs`'s "not attached"
-        // label) -- but never once set to 1 anywhere, so that label was always wrong,
-        // regardless of whether the layer was actually attached. Confirmed on
-        // `lordnikon` the same day: `/proc/<pid>/maps` and a live, advancing answer
-        // frame counter both proved the real Vulkan layer was loaded and working the
-        // whole time the GUI displayed "not attached". Setting this every frame (not
-        // just once at `open()`) also survives a model server restart resetting the shared
-        // header out from under an already-open, never-reconnecting layer -- exactly
-        // what happened here: `open_at`'s own idempotent early return means a layer
-        // that was already attached before the reset never calls it again to re-set a
-        // one-shot flag.
         hdr.layer_attached.store(1, Ordering::Relaxed);
         hdr.layer_heartbeat.fetch_add(1, Ordering::Relaxed);
-        hdr.layer_width.store(width, Ordering::Relaxed);
-        hdr.layer_height.store(height, Ordering::Relaxed);
-        hdr.layer_format.store(proxy_format, Ordering::Relaxed);
         neural_forge_protocol::store64(&hdr.layer_frames_lo, &hdr.layer_frames_hi, frames);
         // Restated now and then rather than once: a model server restart re-initialises the header and
         // clears it. Rarely, because it is a seqlock-guarded string write.
@@ -417,6 +400,19 @@ impl ShmClient {
                 hdr.set_game_name(name);
             }
         }
+    }
+
+    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.width_slot(slot).store(width, Ordering::Relaxed);
+        hdr.height_slot(slot).store(height, Ordering::Relaxed);
+        hdr.proxy_format_slot(slot).store(proxy_format, Ordering::Relaxed);
+
+        // The captured frame's size and format; liveness (`layer_attached`, the heartbeat, the
+        // frame count and the game's name) is `beat`'s, every present.
+        hdr.layer_width.store(width, Ordering::Relaxed);
+        hdr.layer_height.store(height, Ordering::Relaxed);
+        hdr.layer_format.store(proxy_format, Ordering::Relaxed);
     }
 
     /// Publishes the layer's host-observed cost for a frame. This is deliberately a

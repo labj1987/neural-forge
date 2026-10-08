@@ -827,8 +827,8 @@ fn inline_hold(
 /// `queue` must be the queue the present was requested on, externally synchronized for
 /// the duration of the call, and `app_waits` the present's own wait semaphores.
 /// Logs the real presented frame rate every 5 s, whether or not the effect is on --
-/// `layer_frames` only counts captured frames, so it stops when the effect is off and
-/// cannot say whether turning it off actually gave the frames back.
+/// `layer_frames` counts only the presents the layer engages on, so it stops on loading screens
+/// and cannot say whether turning the effect off actually gave the frames back.
 fn note_present_rate(composited: bool) {
     const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
     static RATE: std::sync::Mutex<Option<(std::time::Instant, u32, u32)>> = std::sync::Mutex::new(None);
@@ -2405,6 +2405,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 if !engaged {
                     break;
                 }
+                // Before the format and capture checks: with the model before the upscaler (or an HDR
+                // swapchain) nothing is captured here, and the game is attached all the same.
+                state.shm.beat();
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
                 let Some(&image) = sw.images.get(image_index as usize) else { break };
                 if !swapchain::is_supported_format(sw.format) {
