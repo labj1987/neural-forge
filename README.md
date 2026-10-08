@@ -23,28 +23,23 @@ The screenshots show 3.0.0 with default settings and no game running.
 
 ### In games
 
-The same moment with the effect on (left) and off (right), toggled in game. Screenshots from an
-RTX 5070 at 2560x1440 (the 4K pair at 3840x2160). The fps counter in the top-left corner is
-MangoHud, counting frame-generated frames.
+The same moment with the effect on (left) and off (right), toggled in game. GTA V Enhanced on 3.0.0,
+2026-10-07: RTX 5070 at 2560x1440, DLSS Balanced, DLSS Frame Generation 4x, ray tracing on, the
+model before the upscaler. The fps counter in the top-left corner is MangoHud, counting
+frame-generated frames. Each pair was taken a few seconds apart, so the camera and traffic moved a
+little.
 
-**GTA V Enhanced** (2.0.6, through NVIDIA's runtime; DLSS Balanced, DLSS Frame Generation 4x; the
-model before the upscaler):
-188 fps shown with the effect, 255 without.
+A shop front: 201 fps shown with the effect, 305 without.
 
-![GTA V Enhanced, a Los Santos street, Neural Forge on and off](screenshots/gta-v-street.jpg)
+![GTA V Enhanced on 3.0.0, a shop front, Neural Forge on and off](screenshots/gta-v-3.0-shop.jpg)
 
-**GTA V Enhanced at 4K** (2.0, 2026-10-03, DLSS Balanced, DLSS Frame Generation on): 116 fps shown
-with the effect, 190 without.
+A parking lot: 192 fps shown with the effect, 233 without.
 
-![GTA V Enhanced at 4K, Neural Forge on and off](screenshots/gta-v-4k.jpg)
+![GTA V Enhanced on 3.0.0, a parking lot, Neural Forge on and off](screenshots/gta-v-3.0-parking.jpg)
 
-**Resident Evil Requiem** (2.0, 2026-10-03, ray tracing on, so DLSS runs as Ray Reconstruction and
-the model runs after the upscaler; DLSS Frame Generation on): 89 and 203 fps shown with the effect,
-195 and 304 without. Each pair is a few seconds apart, so people and signs have moved.
+A residential street: 215 fps shown with the effect, 276 without.
 
-![Resident Evil Requiem, a rainy street, Neural Forge on and off](screenshots/re-requiem-street.jpg)
-
-![Resident Evil Requiem, a bus stop, Neural Forge on and off](screenshots/re-requiem-bus-stop.jpg)
+![GTA V Enhanced on 3.0.0, a residential street, Neural Forge on and off](screenshots/gta-v-3.0-street.jpg)
 
 ## What 3.0 does
 

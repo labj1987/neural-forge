@@ -52,7 +52,7 @@ helper's side; the DLL is not inspected.
 
 How it was measured: the helper, started by the CLI with no game running, was driven by
 `trigger_helper_roundtrip` (RUNNING_AND_MEASURING.md, "Driving the helper without a game") with a
-1280x720 frame from `screenshots/gta-v-street.jpg`, 48 requests, once as RGBA8 and once as RGBA16F
+1280x720 frame from `screenshots/gta-v-street.jpg` (a 2.0 screenshot, removed in 3.0; in git history), 48 requests, once as RGBA8 and once as RGBA16F
 (created with `DLSSNR.Hdr=1`). Defaults otherwise: one pass, motion vectors on, auto mask on,
 preset 0, style 0, strengths 1, skin -1. A key the feature reads only in a state not exercised here
 (more passes, a UI image bound) would not appear.
