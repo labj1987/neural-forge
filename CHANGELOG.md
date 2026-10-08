@@ -4,6 +4,17 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.1.1 — 2026-10-08
+
+- Status tab: with the model before the upscaler, the Game row read "none attached", the Layer row
+  "idle" and the presents/s row 0 while the model ran (seen in Lords of the Fallen). The layer only
+  updated its heartbeat, frame count and the game's name when it captured a frame after the
+  upscaler, which it does not do when the model runs before it. It now updates them on every present
+  once the game renders steadily, whichever path the model takes; presents/s counts presents.
+- README: 3.1.0 measurements for every game installed on the test machine, frame generation on
+  wherever the game has it; Lords of the Fallen in game with frame generation (`-DLSSFG`) and its
+  setup note. The 2.0 against 1.x comparison is removed.
+
 ## 3.1.0 — 2026-10-08
 
 **Extract from DLL** (and `neural-forge-cli extract-model`) takes any build of `nvngx_dlssnr.dll`
