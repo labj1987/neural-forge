@@ -73,80 +73,56 @@ How it works, step by step: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Measured results
 
-### 3.0 against 2.0.10 (NVIDIA's runtime through the helper)
+### 3.1.0, 3.0 and 2.0.10 (NVIDIA's runtime through the helper)
 
-Same machine and settings for both. Machine: RTX 5070 (12 GB), NVIDIA driver 615.78.08, desktop
-2560x1440 at 288 Hz with HDR on. GTA V is its built-in benchmark, pass 4 (116 s), DLSS Balanced,
-script mods off; the others are one run each through the same launch, 60 s measured, settings as
-found. Sources: [docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md) (Phase 3, Phase 4b) and
-[CHANGELOG.md](CHANGELOG.md) (3.0.0).
+Same machine for all three. Machine: RTX 5070 (12 GB), NVIDIA driver 615.78.08, desktop 2560x1440 at
+288 Hz with HDR on. GTA V is its built-in benchmark, pass 4 (116 s), DLSS Balanced, script mods off;
+the others are one run each through the same launch, 60 s measured, settings as found (frame
+generation on wherever the game has it). 3.1.0 was measured on 2026-10-08. Sources:
+[docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md) (Phase 3, Phase 4b) and [CHANGELOG.md](CHANGELOG.md).
 
-| Game | 3.0 | 2.0.10 |
-|---|---|---|
-| GTA V Enhanced, frame generation off | **71.4 fps** (70.9, 71.8) | 69.7 fps (69.8, 69.8, 69.5) |
-| GTA V Enhanced, frame generation 4x | 49.7 real / 199.5 shown | 50.1 real / 200.4 shown |
-| Crimson Desert, in game (held inside DLSS's buffer, Ray Reconstruction) | **148.5 fps** shown | 146.3 fps shown |
-| GTA San Andreas - The Definitive Edition | **87.6 frames/s** held | 77.1 frames/s held |
-| Marvel's Spider-Man Remastered (menu) | **120 fps** shown | 109 fps shown |
-| Shadow Warrior 3 (menu) | **115.7 fps** shown | 99.3 fps shown |
-| God of War (2018) | 27-30 fps | 27.5 fps |
-
-At 1440p the gap in GTA V is at the edge of its run-to-run spread (about 3 fps): equal or slightly
-ahead. At 4K (not a configuration the test machine plays) the network is probably slower than
-NVIDIA's runtime: one run, 21.9 fps, likely VRAM-bound. The after-the-upscaler path is about 12%
-slower than NVIDIA's runtime was there.
-
-### 2.0 against 1.x
-
-GTA V Enhanced's built-in benchmark, pass 4 (about 117 s of free roam), run unattended with
-`scripts/gta-bench.sh`. Machine: RTX 5070 (12 GB), NVIDIA driver 615.71.09, desktop 2560x1440 at
-288 Hz with HDR on. Game: DLSS Balanced (render resolution 1485x836 at 1440p, 2228x1253 at 4K),
-script mods off, VSync off. "Real" is GTA's own frame-time file. "Shown" is MangoHud, placed below
-any frame generator. Both ran NVIDIA's model through the helper. Sources: [CHANGELOG.md](CHANGELOG.md)
-(2.0.0) and [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) ("2.0 baseline" and "2.0.0").
-
-| Setting | Effect off | 1.x path (after the upscaler) | 2.0 (before the upscaler) |
+| Game | 3.1.0 | 3.0 | 2.0.10 |
 |---|---|---|---|
-| 2560x1440 | 93.2 fps | 61.6 fps (1.0.1, model every 2nd frame) | **64.6 fps** (64.6 / 64.2 / 65.0, model every frame) |
-| 3840x2160 | 81.9 fps | 28.7 fps (model every 2nd frame) | **39.0 fps** (two runs) |
-| 2560x1440, DLSS Frame Generation 3x | - | 28.7 real / 86 shown | **53.0 real / 159 shown** |
-| 2560x1440, DLSS Frame Generation 4x, an hour of real play, mods on | - | - | ~50 real / ~198 shown, 0 misses in steady play |
+| GTA V Enhanced, frame generation 4x | **50.2 real / 201.4 shown** | 49.7 real / 199.5 shown | 50.1 real / 200.4 shown |
+| GTA V Enhanced, frame generation off | 71.6 fps | 71.4 fps (70.9, 71.8) | 69.7 fps (69.8, 69.8, 69.5) |
+| Crimson Desert, in game (held inside DLSS's buffer, Ray Reconstruction, frame generation) | **150.9 fps** shown | 148.5 fps shown | 146.3 fps shown |
+| GTA San Andreas - The Definitive Edition, in game | 87.0 frames/s held | 87.6 frames/s held | 77.1 frames/s held |
+| Marvel's Spider-Man Remastered (menu) | 119.7 fps shown | 120 fps shown | 109 fps shown |
+| Shadow Warrior 3 (menu) | 115.4 fps shown | 115.7 fps shown | 99.3 fps shown |
+| God of War (2018), in game | 37.6 fps | 27-30 fps | 27.5 fps |
 
-The run-to-run spread at 1440p is about 3 fps, so single-run differences of 1-2 fps are noise.
-At 4K the gain is larger because the 1.x path's cost grows with the output size, and the 2.0
-path's cost grows with DLSS's render size. The full record of every run is in
-[docs/PRE_UPSCALER_DESIGN.md](docs/PRE_UPSCALER_DESIGN.md).
+3.1.0 did not change the frame path, and its numbers are within run-to-run spread of 3.0's (about
+3 fps in GTA V), except God of War: one run, in a different spot from 3.0's, so it is not yet a
+demonstrated gain. At 4K (not a configuration the test machine plays) the network is probably slower
+than NVIDIA's runtime: one run with 3.0, 21.9 fps, likely VRAM-bound. The after-the-upscaler path is
+about 12% slower than NVIDIA's runtime was there.
 
 ## Tested games
 
-Each game was run on the test machine (RTX 5070, 2560x1440, Proton) with its own settings as found:
-DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. "Before the upscaler"
-means the model ran on DLSS's input every real frame; "after" means the 1.x path on the finished
-frame. Numbers are from one run each with 2.0.7 and 2.0.8 (NVIDIA's runtime through the helper); the
-full record is in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md). For 3.0 see
-[Measured results](#measured-results) above. Cyberpunk 2077 and the Black Myth: Wukong Benchmark Tool
-are not tested with 3.0: in the Wukong tool the network faulted the GPU intermittently in its first
-frames with frame generation on ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), Phase 4b), an
-open item for Unreal Engine 5 games.
+Each game was run with 3.1.0 on the test machine (RTX 5070, 2560x1440, Proton) with its own settings
+as found: DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. One run
+each, 60 s measured, 2026-10-08. In every game the model ran before the upscaler on every real frame,
+with no missed frames and no GPU fault. Numbers are in [Measured results](#measured-results) above;
+the full record of earlier versions is in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
 
-| Game | Engine, API | DLSS used | 2.0.7 | 2.0.8 |
+| Game | Engine, API | DLSS used | Where measured | 3.1.0 |
 |---|---|---|---|---|
-| GTA V Enhanced (built-in benchmark) | RAGE, DX12 | Super Resolution, Frame Generation 4x | Before the upscaler: 49.7 real / 198.9 fps shown | Same |
-| Cyberpunk 2077 (built-in benchmark) | REDengine 4, DX12 | Super Resolution, Frame Generation 3x | Before the upscaler: 116 fps shown on average (106 minimum) | Same |
-| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | Before the upscaler: 139-146 fps shown | Same |
-| Black Myth: Wukong Benchmark Tool | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler without frame generation; **with frame generation on, no effect at all** | Before the upscaler with frame generation: 69 fps average, 29 minimum (the tool's results) |
-| GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | After the upscaler (60 fps, capped) | Before the upscaler: 79 fps uncapped |
-| Resident Evil Requiem | RE Engine, DX12 | Super Resolution with ray tracing, Frame Generation 4x | Not measured | Before the upscaler: 159.7 fps shown |
-| Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Not measured | Before the upscaler: 83.9 fps in play (High preset, DLSS Balanced) |
-| God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | Not measured | Before the upscaler: 49.5 fps in play (DLSS Quality, Ultra) |
-| Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Not measured | Before the upscaler: 49 real / about 98 fps shown in play (DLSS Quality, frame generation on) |
+| GTA V Enhanced (built-in benchmark) | RAGE, DX12 | Super Resolution, Frame Generation 4x | Benchmark pass 4 | 50.2 real / 201.4 fps shown |
+| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | In game, held inside DLSS's buffer | 150.9 fps shown |
+| GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | In game | 87.0 frames/s held |
+| God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | In game | 37.6 fps |
+| Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Menu | 119.7 fps shown |
+| Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Menu | 115.4 fps shown |
+| Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution | Title screen, held inside DLSS's buffer | 104.9 fps shown |
+| Remnant II | Unreal Engine 5, DX12 | Super Resolution | First-launch menu, held inside DLSS's buffer | 121.1 fps shown |
+
+The two Unreal Engine 5 games ran without the GPU fault the Black Myth: Wukong Benchmark Tool showed
+with 3.0 ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), Phase 4b), but only on their menus so
+far. Cyberpunk 2077, Resident Evil Requiem and the Wukong tool are no longer installed on the test
+machine and were last tested with 2.0.8.
 
 Setup notes for these games:
 
-- **Black Myth: Wukong** refuses DLSS Frame Generation under Proton ("hardware-accelerated GPU
-  scheduling"). Fix: in its Proton prefix, add the DWORD `HwSchMode` = `2` under
-  `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\GraphicsDrivers` (for example with
-  `protontricks <appid> regedit`). The game then believes hardware scheduling is on.
 - **GTA San Andreas - The Definitive Edition** resets its Frame Rate setting to 60 at every launch,
   whatever its settings files say (a game bug). Set it to Unlocked in Options > Graphics each time.
 - **Shadow Warrior 3** greys out its NVIDIA DLSS option while FidelityFX CAS is on (Settings >
@@ -289,7 +265,8 @@ Settings are live: the GUI and the running layer share them through shared memor
 - **4K is probably slower than NVIDIA's runtime was** (one run, 21.9 fps in GTA V at 4K DLSS
   Balanced, likely VRAM: the network needs about 1.5 GB at that size). A network build that fails is
   retried on a schedule, and frames go to DLSS untouched meanwhile.
-- **Unreal Engine 5 games are untested.** The Black Myth: Wukong Benchmark Tool faulted the GPU
+- **Unreal Engine 5 games are tested only on their menus.** Lords of the Fallen and Remnant II ran
+  there with 3.1.0 and no GPU fault. The Black Myth: Wukong Benchmark Tool faulted the GPU
   intermittently (`Xid 13` then `Xid 32`) in the first frames with frame generation on, and its
   motion vectors cannot be copied, so the network runs there without history.
 - **NVIDIA `Xid 109` (`CTX_SWITCH_TIMEOUT`) or `Xid 119` GPU hangs.** This is a widely reported
