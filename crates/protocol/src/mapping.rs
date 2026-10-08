@@ -60,7 +60,7 @@ impl std::fmt::Display for OpenError {
             OpenError::Foreign => write!(f, "the shared memory path names a file that is not a Neural Forge mapping; it was left untouched (point shm= / NEURAL_FORGE_SHM at another path, or remove the file)"),
             OpenError::WrongVersion { found } => write!(
                 f,
-                "shared memory is version {found}, this build speaks {SHM_VERSION} -- restart the model server and the game on the same Neural Forge version"
+                "shared memory is version {found}, this build speaks {SHM_VERSION} -- the next game started with this version re-creates it (close a game still running an older one)"
             ),
         }
     }

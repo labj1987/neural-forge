@@ -1166,7 +1166,7 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
             "Another Neural Forge version is running",
             format!(
                 "The shared memory was set up by a build that speaks version {found}; this app speaks {}. \
-                 Close the game, then open Neural Forge again so every part runs the same version.",
+                 Close the game if one is running: the next game started with this version re-creates it, and Neural Forge then opens normally.",
                 neural_forge_protocol::SHM_VERSION
             ),
         ),

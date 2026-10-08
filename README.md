@@ -255,8 +255,8 @@ changes the key, and `NEURAL_FORGE_HOTKEY_BACKEND=evdev` or `x11` forces one bac
 be opened or closed at any time.
 
 **Updating.** The layer and the GUI must come from the same version: restart the game after an
-update. If the GUI says another version is running, close the game; if it still says so, remove
-`/tmp/neural-forge-$UID/shm.bin` while nothing has it open.
+update. If the GUI says another version is running, close the game: the next game started with
+this version re-creates the shared memory.
 
 ### The app's tabs
 
