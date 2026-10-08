@@ -3,35 +3,34 @@
 How to build Neural Forge, put a build on a test machine, measure it, and read what it reports.
 Everything here is how the numbers in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) and
 [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md) were taken. The test machine in the examples is
-reached as `ssh lordnikon` (RTX 5070, NVIDIA 615.71.09, Steam with GTA V Enhanced and
-Proton-CachyOS); substitute your own host.
+reached as `ssh lordnikon` (RTX 5070, NVIDIA 615.78.08, Steam with GTA V Enhanced and
+Proton-CachyOS); substitute your own host. Up to 2.0.10 the model ran in a Windows helper; sections
+that measured it say so.
 
 ## 1. Build and test
 
-Native crates (protocol, layer, GUI, CLI, supervisor). Don't use `--workspace`: the helper targets
-Windows only.
+Once, the pinned tools the native backend (`crates/native`) builds with:
+
+```bash
+bash scripts/fetch-native-tools.sh
+```
+
+Every crate (protocol, layer, native, GUI, CLI, supervisor):
 
 ```bash
 cargo build --release
 ```
 
-The Windows helper, cross-compiled (needs `mingw-w64` and the `x86_64-pc-windows-gnu` target in the
-stable rustup toolchain; [CLAUDE.md](../CLAUDE.md) has the toolchain notes):
+The AppImage (layer, GUI, CLI):
 
 ```bash
-cargo +stable build --release --target x86_64-pc-windows-gnu -p neural-forge-helper
-```
-
-The AppImage (layer 64- and 32-bit, helper, GUI, CLI):
-
-```bash
-CARGO_HELPER='cargo +stable' bash build-appimage.sh
+bash build-appimage.sh
 ```
 
 Checks, in the order CI runs them:
 
 ```bash
-cargo test
+VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:) cargo test
 ```
 
 ```bash
@@ -47,9 +46,8 @@ bash scripts/smoke-test.sh && python3 scripts/check_namespace.py
   caught a null-pointer slice and a panicking loader helper that validation layers and unit tests
   missed (EXTERNAL_MEMORY_HOST_DESIGN.md). It also checks that `NEURAL_FORGE_PREUPSCALE=off` logs
   no `[preupscale]` line and that the probe stays off unless asked.
-- `scripts/helper-test.sh` cross-compiles the helper's examples and runs its self-tests under Wine
-  (`guard_test`, `spoof_test`, `spoof_install_test`).
-- GPU tests run on lavapipe in CI. `NEURAL_FORGE_REQUIRE_VULKAN=1` makes a test fail instead of
+- GPU tests run on lavapipe, in CI and locally with `VK_DRIVER_FILES` as above. Without it, on a
+  machine with an NVIDIA GPU, they run on the real device, in parallel, and can run out of memory. `NEURAL_FORGE_REQUIRE_VULKAN=1` makes a test fail instead of
   skipping when no Vulkan device exists.
 - Tests never touch real XDG directories: point `XDG_*_HOME` at a scratch directory when running
   the CLI or `install` by hand.
@@ -61,29 +59,19 @@ scripts/deploy-rig.sh lordnikon
 ```
 
 It builds the AppImage from the working tree, copies it to `~/AppImages/neural-forge.appimage` on
-the host, installs the layer and helper from it with `neural-forge-cli install`, and prints the
-SHA-256 of the installed `libneural_forge_layer.so` and `neural-forge-helper.exe` next to the
-AppImage's copies. It fails if they differ. It leaves no local build and no backup behind.
-
-Then restart the helper on the host so it runs the new build, and check it:
+the host, installs it with `neural-forge-cli install`, and prints the SHA-256 of the installed
+`libneural_forge_layer.so` next to the AppImage's copy. It fails if they differ. It leaves no local
+build and no backup behind. The next game started uses the new layer; check it with:
 
 ```bash
-ssh lordnikon '~/.local/share/neural-forge/bin/neural-forge-cli restart && ~/.local/share/neural-forge/bin/neural-forge-cli shmctl status | head -12'
+ssh lordnikon '~/.local/share/neural-forge/bin/neural-forge-cli doctor && ~/.local/share/neural-forge/bin/neural-forge-cli shmctl status | head -12'
 ```
 
 (`install` puts the CLI in `~/.local/share/neural-forge/bin`; the shorter `neural-forge-cli` in the
 commands below assumes that directory is on the PATH.)
 
-**After a shared-memory protocol change** (`SHM_VERSION`), the helper refuses an old `shm.bin`.
-Stop the helper, make sure nothing has the file open (no game running), then remove it:
-
-```bash
-ssh lordnikon 'neural-forge-cli stop; D=/tmp/neural-forge-$(id -u); fuser "$D/shm.bin" || rm "$D/shm.bin" "$D/shm.bin.owner"'
-```
-
-`scripts/rig-test.sh [host] [seconds]` is the older end-to-end check: it builds and deploys both
-halves, launches the game, and reports frame rate, round-trip timings, composition mode and any
-`Xid`, read from shared memory and the layer log.
+**After a shared-memory protocol change** (`SHM_VERSION`), the GUI and CLI refuse the old
+`shm.bin` until a game with the new layer has started: the layer re-creates it.
 
 ## 3. The unattended GTA benchmark
 
@@ -168,8 +156,8 @@ and FrameTimes files, MangoHud's CSV, `nvidia-smi` samples, and `launch.log` wit
 `vkcube`'s background never moves, so it cannot show an edit landing on the wrong frame.
 `crates/layer/examples/pan.rs` presents a detailed picture moving `--px-per-frame` right and half
 that down every frame, with the frame number stamped in the top-left corner. Frame N is the same
-picture in every run. The layer engages on it like on a game (helper running,
-`NEURAL_FORGE_ENABLE=1`).
+picture in every run. The layer engages on it like on a game (`NEURAL_FORGE_ENABLE=1`); its frames
+are answered by the layer's own model server.
 
 ```bash
 cargo build --release -p neural-forge-layer --example pan
@@ -235,11 +223,11 @@ once on any new game before claiming the model before the upscaler works there.
 
 | Value | What it does | Use |
 |---|---|---|
-| unset or `model` | Encode, model, decode, every frame (the default). | Normal play. |
+| unset or `model` | Encode, the network, decode, every frame (the default). | Normal play. |
 | `off` | Nothing; the 1.x path everywhere, byte-identical to 1.1.0. | A/B comparisons, rollback. |
 | `dump` | Once (and again on each `shmctl capture`): write DLSS's colour, depth, motion vectors and the 1x1 exposure images to `~/.local/share/neural-forge/captures/preupscale-<ms>/` (`colour.rgba16f`, `depth.r32f`, `mvec.rg16f`, `exposure.json`, `meta.json`, `colour-preview.png`). The frame goes on untouched. | Getting real DLSS input for offline experiments. |
-| `identity` | Capture and write the same bytes back, raw; no helper. | The hold's own cost. Set `--set enabled=0` so the 1.x path does not run too. |
-| `roundtrip` | The HDR encode and decode with the encoded frame as the answer; no helper. | That the transform alone leaves the picture unchanged. |
+| `identity` | Capture and write the same bytes back, raw; no network. | The hold's own cost. Set `--set enabled=0` so the 1.x path does not run too. |
+| `roundtrip` | The HDR encode and decode with the encoded frame as the answer; no network. | That the transform alone leaves the picture unchanged. |
 
 ```bash
 scripts/gta-bench.sh --host lordnikon pu-identity-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
@@ -248,50 +236,22 @@ scripts/gta-bench.sh --host lordnikon pu-identity-1 VK_LAYER_neuralforge_neural 
 `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=2.5` (or 4) tries another paper white in `model` or
 `roundtrip` mode.
 
-### Driving the helper without a game
+### Offline tools
 
-`crates/protocol/examples/trigger_helper_roundtrip.rs` plays the layer against a running helper.
-With `--rgba16f` it sends a raw frame (for example a `dump`'s `colour.rgba16f`) as an RGBA16F
-request, prints whether each answer was a model evaluation or an echo, and statistics of input and
-answer:
-
-```bash
-cargo +stable build --release -p neural-forge-protocol --example trigger_helper_roundtrip
-```
-
-```bash
-scp target/release/examples/trigger_helper_roundtrip lordnikon:/tmp/nf-roundtrip
-```
-
-```bash
-ssh lordnikon 'export NEURAL_FORGE_SHM=/tmp/neural-forge-1000/shm.bin NEURAL_FORGE_UID=1000; /tmp/nf-roundtrip --rgba16f /tmp/colour.rgba16f --width 1486 --height 836 --out /tmp/answer.rgba16f --repeat 64'
-```
-
-Run it with the helper started by the CLI and no game running (the layer would drive slot 0 too).
-Use `--repeat 32` or more: the first requests after a size or format change are echoed while the
-feature builds. `--rgba8 FILE` sends an 8-bit frame instead; with no file it sends one synthetic
-64x64 frame on the slot given. `scripts/hdr_encode.py` (numpy, Pillow) encodes a dump for the model
-and judges the answer (`info`, `encode`, `judge`, `montage`); it is how E1b chose the encode.
-
-`crates/helper/examples/optical_flow_rig_check.rs` runs the helper's optical-flow path on real
-hardware under the helper's runner and checks the vectors and for stalls; `--hdr` checks the
-RGBA16F input pass.
+`scripts/hdr_encode.py` (numpy, Pillow) encodes a `dump` for the model and judges an answer
+(`info`, `encode`, `judge`, `montage`); it is how E1b chose the encode. `crates/native/tests/rig.rs`
+runs the network on a dumped frame on the real device (`NEURAL_FORGE_NATIVE_RIG=<dump dir>`,
+`NEURAL_FORGE_NATIVE_MODEL` for another model directory) and compares the head with a reference.
 
 ### Fault injection
 
-Helper variables are read when the helper starts. `neural-forge-cli restart` passes its own
-environment to the helper, so prefix the restart; a plain restart afterwards undoes it:
+Set in the game's launch environment (for `gta-bench.sh`, as extra arguments):
 
-```bash
-ssh lordnikon 'NEURAL_FORGE_FAIL_CREATE=6@2 neural-forge-cli restart'
-```
-
-- `NEURAL_FORGE_FAIL_CREATE=N[@K]`: let K model builds through, then fail the next N without
-  calling NGX. Exercises the retry schedule, the NGX re-initialisation, `model_up=0` and the
-  layer's circuit breaker. Force a rebuild mid-run with a tuning change, for example
-  `neural-forge-cli shmctl set intensity 1.01` (and set it back to 1 afterwards).
-- `NEURAL_FORGE_HDR_FLAGS=hdr|sdr|autoexp0`: NGX creation flags for RGBA16F frames.
-- `NEURAL_FORGE_HELPER_DELAY_MS=N`: delay every answer.
+- `NEURAL_FORGE_FAIL_CREATE=N[@K]`: let K network builds through, then fail the next N. Exercises
+  the retry schedule and the network's re-initialisation; frames go to DLSS untouched meanwhile.
+- `NEURAL_FORGE_NATIVE_FAIL=chain`: report one counter-chain timeout at the 300th network frame
+  (the graph is rebuilt with barriers, the history reset).
+- `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`: record everything but the network's launches.
 
 ### The hold inside DLSS's command buffer (2.0.4)
 
@@ -313,8 +273,8 @@ fail there).
 ## 6. Reading the logs
 
 **Where they are.** The layer logs to `NEURAL_FORGE_LOG` if set, otherwise to the game's stderr
-(the Proton log; in `gta-bench.sh` runs, `launch.log`). The helper logs to
-`~/.local/state/neural-forge/helper.log` (moved to `helper.log.1` past 20 MB at a helper start).
+(the Proton log; in `gta-bench.sh` runs, `launch.log`). `NEURAL_FORGE_LOG_TIME=1` puts a Unix
+timestamp on every line (to match them with `journalctl -k`).
 `scripts/check-stalls.sh [LOG]` checks a layer log for fence-wait timeouts and breadcrumb dumps
 and summarises engage/disengage transitions and the frame rate.
 
@@ -323,29 +283,23 @@ and summarises engage/disengage transitions and the frame rate.
 | Line | When | What it says |
 |---|---|---|
 | `[present] N fps (M/s composited by the effect) over Ts` | every 5 s, per presenting process | The real presented frame rate, effect on or off. |
-| `[sync] WxH: total= capture_gpu= copy_out= meter= wait_answer= helper= rest(readback+compose)= zc= gpu_capture= gpu_compose=` | every 300 composed frames (after the upscaler) | Per model frame: total time on the present thread; capture submit to observed completion (includes the game's own frame); CPU copy out (0 with zero copy); the white meter; the wait for the answer; the helper's own time; readback and compose; whether zero copy was used; the layer's own GPU time from timestamps. |
+| `[sync] WxH: total= capture_gpu= copy_out= meter= wait_answer= server= rest(readback+compose)= zc= gpu_capture= gpu_compose=` | every 300 composed frames (after the upscaler) | Per model frame: total time on the present thread; capture submit to observed completion (includes the game's own frame); CPU copy out (0 with zero copy); the white meter; the wait for the answer; the model server's own time; readback and compose; whether zero copy was used; the layer's own GPU time from timestamps. |
 | `[preupscale] mode <mode> (default) in pid N` | once | The mode for this process. |
 | `[preupscale] device ...: vkGetImageViewHandleNVX present, ...` or `no VK_NVX_image_view_handle, ...` | per device | Whether the device can hold at all. |
 | `[preupscale] colour input: image 0x... (WxH R16G16B16A16_SFLOAT ...), depth ..., motion vectors ..., exposure input 0x...` | on (re)identification | What the layer recognised as DLSS's inputs. |
 | `[preupscale] resources for WxH (padded PWxPH) built: zero-copy (SHM regions imported)` | per extent | The hold's resources. |
-| `[preupscale] mode=model extent=WxH ... holds=N hold_ms median= capture_gpu_ms median= writeback_gpu_ms median= misses= (total ) holds_per_s=` | every 300 holds | The hold's cost and rate. `holds_per_s` equals real fps when every frame is held. |
-| `[preupscale] phases ms (median): prep= capture_wait= round_trip= helper_busy= handoff= writeback=; capture_wait max= (session max , bound  ms)` | after each summary | Where the hold's time goes (see [ARCHITECTURE.md](ARCHITECTURE.md), 4.8). `capture_wait max` is the longest capture fence wait of the window and of the session, next to the bound it is waited with (`preupscale::FRAME_CAPTURE_WAIT`): the numbers to collect across loading, resolution changes, alt-tab and shutdown before that bound is changed. |
-| `[preupscale] frame went to DLSS untouched: <why>` | at most once per 5 s | A miss: exposure not usable, answer late, an echo, a failure. |
-| `[preupscale] breaker open: ...`, `breaker still open after Ns ...`, `breaker closed ...` | on change, every 30 s while open | The circuit breaker. |
+| `[preupscale] mode=model extent=WxH ... holds=N hold_ms median= capture_gpu_ms median= writeback_gpu_ms median= network_gpu_ms median= misses= (total ) holds_per_s=` | every 300 holds | The hold's cost and rate; `network_gpu_ms` is the network frame's GPU time. `holds_per_s` equals real fps when every frame is held. |
+| `[preupscale] inside DLSS's buffer, last 5.0 s: held N, ...` | every 5 s while holding inside DLSS's buffer | What the hold did with its jobs (held, skipped and why). |
+| `[preupscale] phases ms (median): prep= capture_wait= writeback=; capture_wait max= (session max , bound  ms)` | after each summary | Where the hold's CPU time goes. `capture_wait max` is the longest capture fence wait of the window and of the session, next to the bound it is waited with (`preupscale::FRAME_CAPTURE_WAIT`): the numbers to collect across loading, resolution changes, alt-tab and shutdown before that bound is changed. |
+| `[preupscale] frame went to DLSS untouched: <why>` | at most once per 5 s | A miss: exposure not usable, the network not ready, a failure. |
+| `[native] device created with the network's extensions and features, ...` or `the device cannot run the network: <why>` | per device | Whether the device can run the network. |
+| `[native] model loaded and verified from <dir> in N ms`, `network built for WxH (field ..., chained ...) in N ms` | on the first hold, per extent | Loading and building the network. |
+| `[native] <why>; frames go to DLSS untouched, trying again in N ms`, `the network is up again after N failed attempt(s)` | on a failed build | The retry schedule. |
+| `[native] resetting the history (...)` | on a reset | A gap, another extent, or untouched frames. |
+| `[native] answering the after-the-upscaler path's requests on queue N of family M` | once per device | The model server for the after-the-upscaler path is up. |
 | `[preupscale] launch-bearing submits: N held reading the colour input, N held undecided, N forwarded untouched` | every 3000 forwarded submits | Frame generation's submits being left alone. |
 | `[hotkey] watching N keyboard(s) through evdev` / `watching XInput2 raw keys on :0` / `no way to read the keyboard here ...` | first poll | Which keyboard backend the toggle key uses. |
 | `[layer] fence wait timed out after 5s at <site> ...` | on a timeout | A driver stall without device loss; a breadcrumb dump follows. |
-
-### Helper lines
-
-| Line | What it says |
-|---|---|
-| `[ngx] feature WxH hdr=1: DLSSNR.Hdr=1 DLSSNR.SDR=0 AutoExposure=1` and `VULKAN_CreateFeature(18) -> 0x1 ... size=WxH hdr=1` | A feature build and its result (`0x1` is success; `0xbad00002` and others are failures). |
-| `[helper] frame A -> B; rebuilding N pass(es)` | A size or format change. |
-| `[helper] the model built again at ... after N failed attempt(s)` | Recovery after failed builds. |
-| `[frame] stages ms (median) WxH: n= idle= setup= thumb= upload= flow= ngx_rec= eval= download= fence_waits= publish= busy=` | Every 300 evaluated slot-0 requests: the helper's own time per stage. `upload`, `flow` and `eval` are record-and-submit times; `fence_waits` is the one wait for the GPU work; `busy` is the whole request. |
-| `resetting model history (...)` | The model's history was reset after a gap, a failed evaluate or a format change. |
-| `[mvec] scene cut detected` | A scene cut reset the flow and history. |
 
 ### `neural-forge-cli shmctl status`
 
@@ -353,15 +307,16 @@ The `# live status` block:
 
 | Field | Meaning |
 |---|---|
-| `helper_state` | 0 starting, 1 no Vulkan, 2 no binaries, 3 model failed, 4 running, 5 stopped (named in the output). |
-| `model_up` | 1 when the model is built; 0 while it cannot be. |
-| `helper_reason` | Why the model is not up (empty when it is). |
-| `helper_frames` | Requests the helper has answered. |
-| `helper_upload_ms`, `helper_eval_ms`, `helper_readback_ms` | Record-and-submit times of the last request, and its one wait. |
-| `helper_busy_ms` | The helper's whole time for its last slot-0 request. |
+| `server_state` | The after-the-upscaler model server: 3 model failed, 4 running, 5 stopped (named in the output). |
+| `model_up` | 1 when the network is built; 0 while it cannot be. |
+| `server_frames` | Requests the model server has answered. |
+| `server_upload_ms`, `server_eval_ms`, `server_readback_ms` | Its stage times for the last request. |
+| `server_busy_ms` | Its whole time for its last slot-0 request. |
+| `layer_reason` | The native network's status line ("native network running", or why not). |
+| `native_running` | 1 while the layer runs the network before the upscaler. |
 | `layer_frames`, `layer_ms` | Frames the layer captured, and its last per-frame time. |
 | `layer_capture_gpu_ms`, `layer_compose_gpu_ms` | The layer's own GPU time from timestamps (after the upscaler). |
-| `preupscale_state` | 0 off, 1 waiting for DLSS input, 2 holding, 3 paused. |
+| `preupscale_state` | 0 off, 1 waiting for DLSS input, 2 holding. |
 | `preupscale_extent`, `preupscale_hold_ms`, `preupscale_misses` | DLSS's render size, the last hold's CPU time, and holds whose answer did not make it. |
 | `layer_measured_white`, `layer_composition_up`, `capture_request` | The white meter, whether the compose is up, a pending capture. |
 

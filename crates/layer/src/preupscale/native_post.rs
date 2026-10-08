@@ -55,14 +55,14 @@ pub(crate) struct PostServer {
 }
 
 impl PostServer {
-    /// Starts serving, unless a model server process is answering already (its heartbeat moves): two answerers
-    /// would race for every request.
+    /// Starts serving, unless another server (another device's, in this process) is answering already (its
+    /// heartbeat moves): two answerers would race for every request.
     pub(crate) fn start(device: ash::Device, instance: ash::Instance, physical: vk::PhysicalDevice, setup: Setup, import: bool, loader: Arc<Loader>, view: ShmView) -> Option<Self> {
         let hdr = view.header();
         let before = hdr.server_heartbeat.load(Ordering::Relaxed);
         std::thread::sleep(Duration::from_millis(300));
         if hdr.server_heartbeat.load(Ordering::Relaxed) != before {
-            crate::log!("[native] a model server process is answering requests: the after-the-upscaler path stays with it");
+            crate::log!("[native] another device's server is answering the after-the-upscaler requests: it keeps them");
             return None;
         }
         let quit = Arc::new(AtomicBool::new(false));
