@@ -250,7 +250,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_group.add(&combo_row("Style", &["Default", "Natural", "Cinematic"], style, set_style));
 
     let (intensity, set_intensity) = bind_float(&shm, Some("intensity"), |h| &h.intensity_bits);
-    model_group.add(&spin_row("Intensity", "Applied when the model is rebuilt (after a short pause)", intensity, 0.0, 4.0, 0.05, set_intensity));
+    model_group.add(&spin_row("Intensity", "How strongly the model's answer replaces the frame", intensity, 0.0, 4.0, 0.05, set_intensity));
 
     let (local_tone, set_local_tone) = bind_float(&shm, Some("local_tone"), |h| &h.local_tone_bits);
     model_group.add(&spin_row("Local tone", "", local_tone, 0.0, 4.0, 0.05, set_local_tone));

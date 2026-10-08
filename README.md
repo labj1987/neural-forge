@@ -17,10 +17,9 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab: the Neural rendering switch, style, intensity, local tone and structure, auto mask and passes](screenshots/settings.png) | ![Setup tab: NGX binaries present, the compatibility tool (runner) picker and the Steam launch option NEURAL_FORGE_ENABLE=1 %command%](screenshots/setup.png) | ![Status tab: telemetry, helper and layer state, and the Model placement line](screenshots/status.png) |
+| ![Model tab: the Neural rendering switch, style, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present from build 310.8.0.0, Extract from DLL, and the Steam launch option NEURAL_FORGE_ENABLE=1 %command%](screenshots/setup.png) | ![Status tab: telemetry, layer state, the Model placement line and the model](screenshots/status.png) |
 
-The screenshots show 2.0.0 with default settings and no game running. 3.0 has no passes, no
-runner picker and no helper row: Setup holds the model's extraction and the launch option.
+The screenshots show 3.0.0 with default settings and no game running.
 
 ### In games
 
