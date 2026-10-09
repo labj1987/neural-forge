@@ -5,7 +5,8 @@
 //!
 //! Runs only with `NEURAL_FORGE_NATIVE_RIG=<dump dir>` (holding `features.f32` and `head.f32` of a
 //! 1486x836 frame); `NEURAL_FORGE_NATIVE_MODEL` overrides the model directory (default: the user data
-//! dir's `neural-forge/model`).
+//! dir's `neural-forge/model`). The same variable runs the rebuild test (a small build, then a large one
+//! on the same network).
 
 use ash::vk;
 use neural_forge_native::{device_extend, device_supported, Network, OpenInfo};
@@ -82,15 +83,73 @@ impl Gpu {
     }
 }
 
+fn model_dir() -> PathBuf {
+    std::env::var_os("NEURAL_FORGE_NATIVE_MODEL")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/neural-forge/model"))
+}
+
+/// A build after a smaller one on the same network: the kernels outlive the graph, and their split-K
+/// scratch must be sized again for the larger graph, not kept from the first build.
+#[test]
+fn a_larger_build_after_a_smaller_one_on_one_network() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let model = model_dir();
+    let g = gpu();
+    let open = OpenInfo {
+        gipa: g._entry.static_fn().get_instance_proc_addr,
+        instance: g.instance.handle(),
+        physical: g.physical,
+        device: g.device.handle(),
+        queue_family: g.compute,
+        queue_index: 0,
+        frame_family: g.family,
+        model_dir: &model,
+        chain: std::env::var("NEURAL_FORGE_NATIVE_CHAIN").map_or(true, |v| v != "0"),
+        fence_timeout_ms: 5000,
+        init_dispatchable: None,
+    };
+    // SAFETY: the device was made with device_extend; the compute queue is the network's alone.
+    let mut net = unsafe { Network::open(&open) }.expect("open");
+    let small = net.build(1280, 720).expect("the 1280x720 build");
+    eprintln!("1280x720: {small:?}");
+    let large = net.build(3840, 2160).expect("the 3840x2160 build after the 1280x720 one");
+    eprintln!("3840x2160: {large:?}");
+    assert!(large.field_width >= 3840 && large.field_height >= 2160);
+    let d = &g.device;
+    // SAFETY: live device and handles; the graph's frame completes before anything is destroyed.
+    unsafe {
+        let queue = d.get_device_queue(g.family, 0);
+        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.family), None).unwrap();
+        let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+        let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+        d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+        d.cmd_fill_buffer(cmd, large.features, 0, vk::WHOLE_SIZE, 0);
+        let to_compute = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute.build()], &[], &[]);
+        d.cmd_execute_commands(cmd, &[net.graph_commands()]);
+        d.end_command_buffer(cmd).unwrap();
+        d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+        d.wait_for_fences(&[fence], true, 5_000_000_000).expect("the 3840x2160 graph completes");
+        assert_eq!(net.chain_timeouts().0, 0);
+        d.destroy_fence(fence, None);
+        d.destroy_command_pool(pool, None);
+        drop(net);
+        d.destroy_device(None);
+        g.instance.destroy_instance(None);
+    }
+}
+
 #[test]
 fn the_network_through_the_c_api_matches_dlss5vk() {
     let Some(dump) = std::env::var_os("NEURAL_FORGE_NATIVE_RIG").map(PathBuf::from) else {
         eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
         return;
     };
-    let model = std::env::var_os("NEURAL_FORGE_NATIVE_MODEL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/neural-forge/model"));
+    let model = model_dir();
     let features = std::fs::read(dump.join("features.f32")).unwrap();
     let expected = std::fs::read(dump.join("head.f32")).unwrap();
     let g = gpu();

@@ -55,3 +55,7 @@ Each one is also a patch in `patches/`, relative to this directory and applied i
    (the application's, where the recorded graph runs), creates every buffer `VK_SHARING_MODE_CONCURRENT` over
    its own family and that one, so the network can load on a queue of another family without ownership
    transfers. The original constructors are unchanged.
+5. `patches/0005-split-scratch-release.patch`: `Kernels::releaseScratch()` (`src/kernels.h/.cpp`) destroys the split-K
+   scratch, so the next recording sizes it again. It was sized once, from the first graph's split shapes, and
+   `Kernels` outlives graph rebuilds: a later, larger graph threw "split-K partials exceed the scratch buffer".
+   neural-forge-native calls it when it drops a graph, when nothing recorded holds the scratch's address.

@@ -87,6 +87,11 @@ void Kernels::setSiluTable(const std::vector<uint16_t>& table) {
   context_.upload(siluTable_, table.data(), 65536 * 2);
 }
 
+void Kernels::releaseScratch() {
+  context_.destroyBuffer(splitScratch_);
+  splitScratchBytes_ = 0;
+}
+
 VkPipeline Kernels::pipeline(const char* shader, const vk::SpecConstants& constants, uint32_t requiredSubgroupSize) {
   std::string key = shader;
   for (uint32_t value : constants.data) key += ":" + std::to_string(value);
@@ -280,8 +285,9 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
     if (available && rowGroups <= 65535) {
       PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
       if (vsplits > 1 && splitScratch_.buffer == VK_NULL_HANDLE) {
-        // sized once (launches already recorded hold its address): four times the first split shape covers the
-        // widest ViT GEMM of the same token count (qkv: 24 column groups x 2 splits vs the contract's 8 x 4)
+        // sized once per graph (launches already recorded hold its address; releaseScratch() between graphs): four
+        // times the first split shape covers the widest ViT GEMM of the same token count (qkv: 24 column groups x 2
+        // splits vs the contract's 8 x 4)
         splitScratchBytes_ = std::max<VkDeviceSize>(16u << 20, 4 * partialBytes);
         splitScratch_ = context_.createBuffer(splitScratchBytes_, false, "split-K partials");
       }

@@ -224,6 +224,9 @@ struct NfNative {
     ownSecondary = VK_NULL_HANDLE;
     graph.reset();
     features = nullptr;
+    // Nothing recorded holds the split-K scratch's address now: the next build sizes it for its own graph
+    // (a larger frame needs more than the first build's).
+    if (kernels) kernels->releaseScratch();
   }
 
   // Build (or rebuild) the graph for `geometry`: a warm-up run on the layer's queue, then the
