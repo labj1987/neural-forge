@@ -13,4 +13,3 @@ path = "src/main.rs"
 [dependencies]
 neural-forge-protocol = { path = "../protocol" }
 neural-forge-supervisor = { path = "../supervisor" }
-anyhow = "1"

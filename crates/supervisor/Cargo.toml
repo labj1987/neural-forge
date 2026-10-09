@@ -8,11 +8,6 @@ description = "Shared config, paths, model extraction and install for neural-for
 
 [dependencies]
 neural-forge-protocol = { path = "../protocol" }
-libc = "0.2"
-# Process-group supervision (setsid, signaling a whole group) -- see process.rs's
-# doc comment for why this needed care to actually replicate upstream's bash script's
-# `setsid ...` / `kill -TERM -- -$pid` semantics.
-nix = { version = "0.29", features = ["process", "signal"] }
 # install.rs's file-integrity digest and installation.json record must produce
 # exactly what scripts/install.py's own hashlib.sha256/json.dumps do (both tools
 # read/write the same record, on purpose) -- worth a real, audited implementation

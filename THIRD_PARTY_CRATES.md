@@ -7,7 +7,6 @@ Each crate's own license text is in its published source (crates.io / the reposi
 | Crate | Version | License | Source |
 |---|---|---|---|
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 | https://github.com/oyvindln/adler2 |
-| anyhow | 1.0.104 | MIT OR Apache-2.0 | https://github.com/dtolnay/anyhow |
 | ash | 0.37.3+1.3.251 | MIT OR Apache-2.0 | https://github.com/MaikKlein/ash |
 | bitflags | 1.3.2 | MIT/Apache-2.0 | https://github.com/bitflags/bitflags |
 | bitflags | 2.13.1 | MIT OR Apache-2.0 | https://github.com/bitflags/bitflags |
@@ -62,7 +61,6 @@ Each crate's own license text is in its published source (crates.io / the reposi
 | memoffset | 0.9.1 | MIT | https://github.com/Gilnaa/memoffset |
 | miniz_oxide | 0.8.9 | MIT OR Zlib OR Apache-2.0 | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
 | miniz_oxide | 0.9.1 | MIT OR Zlib OR Apache-2.0 | https://github.com/Frommi/miniz_oxide/tree/master/miniz_oxide |
-| nix | 0.29.0 | MIT | https://github.com/nix-rust/nix |
 | num-traits | 0.2.19 | MIT OR Apache-2.0 | https://github.com/rust-num/num-traits |
 | once_cell | 1.21.4 | MIT OR Apache-2.0 | https://github.com/matklad/once_cell |
 | pango | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
