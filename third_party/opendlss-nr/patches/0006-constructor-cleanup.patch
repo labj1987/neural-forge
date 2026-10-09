@@ -1,0 +1,238 @@
+diff --git a/src/nr_model.cpp b/src/nr_model.cpp
+index 9f4eb9f..455fd97 100644
+--- a/src/nr_model.cpp
++++ b/src/nr_model.cpp
+@@ -73,52 +73,64 @@ uint32_t tiledToken(uint32_t token) {
+ }  // namespace
+ 
+ Model::Model(vk::Context& context, const std::string& directory, bool verifyHashes) : context_(context) {
+-  json::Value manifest = json::parse(readText(directory + "/manifest.json"));
+-  blockCount_ = (uint32_t)manifest["totals"]["blockCount"].integer();
+-  for (const json::Value& stage : manifest["stages"].array) {
+-    Stage loaded;
+-    loaded.id = stage["id"].str();
+-    loaded.bytes = readBinary(directory + "/model/" + stage["file"].str());
+-    if (loaded.bytes.size() != (size_t)stage["packedByteLength"].integer())
+-      throw std::runtime_error("stage size mismatch: " + loaded.id);
+-    if (verifyHashes) {
+-      std::string digest = sha256Hex(loaded.bytes.data(), loaded.bytes.size());
+-      if (digest != stage["sha256"].str()) throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
++  // A throw destroys what was made so far (the destructor does not run for a constructor that throws).
++  try {
++    json::Value manifest = json::parse(readText(directory + "/manifest.json"));
++    blockCount_ = (uint32_t)manifest["totals"]["blockCount"].integer();
++    for (const json::Value& stage : manifest["stages"].array) {
++      Stage loaded;
++      loaded.id = stage["id"].str();
++      loaded.bytes = readBinary(directory + "/model/" + stage["file"].str());
++      if (loaded.bytes.size() != (size_t)stage["packedByteLength"].integer())
++        throw std::runtime_error("stage size mismatch: " + loaded.id);
++      if (verifyHashes) {
++        std::string digest = sha256Hex(loaded.bytes.data(), loaded.bytes.size());
++        if (digest != stage["sha256"].str()) throw std::runtime_error("stage SHA-256 mismatch: " + loaded.id);
++      }
++      stages_.push_back(std::move(loaded));
+     }
+-    stages_.push_back(std::move(loaded));
+-  }
+-  for (const json::Value& entry : manifest["tensors"].array) {
+-    Tensor tensor;
+-    tensor.name = entry["name"].str();
+-    tensor.block = (int)entry["block"].integer();
+-    tensor.layer = (int)entry["layer"].integer();
+-    tensor.parameter = entry["parameter"].str();
+-    tensor.stage = entry["stage"].str();
+-    tensor.stageOffset = (uint32_t)entry["stageOffset"].integer();
+-    tensor.byteLength = (uint32_t)entry["byteLength"].integer();
+-    const Stage* stage = nullptr;
+-    for (const Stage& candidate : stages_) if (candidate.id == tensor.stage) stage = &candidate;
+-    if (!stage) throw std::runtime_error("tensor references unknown stage " + tensor.stage);
+-    if ((size_t)tensor.stageOffset + tensor.byteLength > stage->bytes.size())
+-      throw std::runtime_error("tensor exceeds stage " + tensor.name);
+-    tensor.bytes = stage->bytes.data() + tensor.stageOffset;
+-    // Raw bytes on the GPU for per-column aux vectors (padded to 4 bytes).
+-    size_t padded = (tensor.byteLength + 3) & ~3u;
+-    std::vector<uint8_t> paddedBytes(padded, 0);
+-    memcpy(paddedBytes.data(), tensor.bytes, tensor.byteLength);
+-    tensor.raw = context_.createBuffer(padded, false, "tensor raw");
+-    context_.upload(tensor.raw, paddedBytes.data(), padded);
+-    tensors_[tensor.name] = std::move(tensor);
+-  }
+-  for (uint32_t k = 0; k < 64; ++k) {
+-    if (inversePackedInputIndex(packedInputIndex(k)) != k)
+-      throw std::runtime_error("chained index permutation is not invertible");
++    for (const json::Value& entry : manifest["tensors"].array) {
++      Tensor tensor;
++      tensor.name = entry["name"].str();
++      tensor.block = (int)entry["block"].integer();
++      tensor.layer = (int)entry["layer"].integer();
++      tensor.parameter = entry["parameter"].str();
++      tensor.stage = entry["stage"].str();
++      tensor.stageOffset = (uint32_t)entry["stageOffset"].integer();
++      tensor.byteLength = (uint32_t)entry["byteLength"].integer();
++      const Stage* stage = nullptr;
++      for (const Stage& candidate : stages_) if (candidate.id == tensor.stage) stage = &candidate;
++      if (!stage) throw std::runtime_error("tensor references unknown stage " + tensor.stage);
++      if ((size_t)tensor.stageOffset + tensor.byteLength > stage->bytes.size())
++        throw std::runtime_error("tensor exceeds stage " + tensor.name);
++      tensor.bytes = stage->bytes.data() + tensor.stageOffset;
++      // Raw bytes on the GPU for per-column aux vectors (padded to 4 bytes).
++      size_t padded = (tensor.byteLength + 3) & ~3u;
++      std::vector<uint8_t> paddedBytes(padded, 0);
++      memcpy(paddedBytes.data(), tensor.bytes, tensor.byteLength);
++      // Owned by tensors_ before anything that can throw, so a failure releases it.
++      const std::string name = tensor.name;
++      Tensor& stored = tensors_[name] = std::move(tensor);
++      stored.raw = context_.createBuffer(padded, false, "tensor raw");
++      context_.upload(stored.raw, paddedBytes.data(), padded);
++    }
++    for (uint32_t k = 0; k < 64; ++k) {
++      if (inversePackedInputIndex(packedInputIndex(k)) != k)
++        throw std::runtime_error("chained index permutation is not invertible");
++    }
++  } catch (...) {
++    release();
++    throw;
+   }
+ }
+ 
+-Model::~Model() {
++Model::~Model() { release(); }
++
++void Model::release() {
+   for (auto& [name, buffer] : matrices_) context_.destroyBuffer(buffer);
+   for (auto& [name, tensor] : tensors_) context_.destroyBuffer(tensor.raw);
++  matrices_.clear();
++  tensors_.clear();
+ }
+ 
+ const Tensor& Model::tensor(int block, int layer, const std::string& parameter) const {
+diff --git a/src/nr_model.h b/src/nr_model.h
+index 867c97e..7e5dc4a 100644
+--- a/src/nr_model.h
++++ b/src/nr_model.h
+@@ -59,6 +59,7 @@ class Model {
+   uint32_t blockCount() const { return blockCount_; }
+ 
+  private:
++  void release();   // the destructor's cleanup (also a constructor's that throws)
+   struct Stage {
+     std::string id;
+     std::vector<uint8_t> bytes;
+diff --git a/src/vk_context.cpp b/src/vk_context.cpp
+index 7502dd7..556f2de 100644
+--- a/src/vk_context.cpp
++++ b/src/vk_context.cpp
+@@ -167,7 +167,13 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
+   instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
+   volkLoadInstance(instance_);
+   volkLoadDevice(device_);
+-  adopt();
++  // A throw destroys what was made so far on the application's device (no destructor runs for it).
++  try {
++    adopt();
++  } catch (...) {
++    release();
++    throw;
++  }
+ }
+ 
+ Context::Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
+@@ -187,9 +193,15 @@ Context::Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance insta
+   if (!vkResetQueryPool) vkResetQueryPool = vkResetQueryPoolEXT;
+   if (!vkCmdPipelineBarrier2 || !vkGetBufferDeviceAddress || !vkCreateCudaModuleNV || !vkCmdCudaLaunchKernelNV)
+     throw std::runtime_error("the device does not expose the functions the network needs");
+-  VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+-  VK_CHECK(vkCreateFence(device_, &fenceInfo, nullptr, &waitFence_));
+-  adopt();
++  // A throw destroys what was made so far on the application's device (no destructor runs for it).
++  try {
++    VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++    VK_CHECK(vkCreateFence(device_, &fenceInfo, nullptr, &waitFence_));
++    adopt();
++  } catch (...) {
++    release();
++    throw;
++  }
+ }
+ 
+ void Context::adopt() {
+@@ -302,11 +314,13 @@ void Context::initCommon() {
+   staging_ = createBuffer(kStagingBytes, true, "staging");
+ }
+ 
+-Context::~Context() {
++Context::~Context() { release(); }
++
++void Context::release() {
+   if (!device_) return;
+   // An adopted device is the application's: only this object's own queue is waited for.
+   if (owned_) vkDeviceWaitIdle(device_);
+-  else {
++  else if (queue_) {
+     try { waitIdle(); } catch (...) {}   // a destructor must not throw; the caller already drained it
+   }
+   if (waitFence_) vkDestroyFence(device_, waitFence_, nullptr);
+@@ -322,6 +336,7 @@ Context::~Context() {
+     if (messenger_) vkDestroyDebugUtilsMessengerEXT(instance_, messenger_, nullptr);
+     vkDestroyInstance(instance_, nullptr);
+   }
++  device_ = VK_NULL_HANDLE;
+ }
+ 
+ uint32_t Context::findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required) {
+@@ -350,20 +365,28 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
+     info.pQueueFamilyIndices = families;
+   }
+   VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &result.buffer));
+-  VkMemoryRequirements requirements;
+-  vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
+-  VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+-  allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+-  VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+-  allocateInfo.pNext = &allocateFlags;
+-  allocateInfo.allocationSize = requirements.size;
+-  allocateInfo.memoryTypeIndex = findMemoryType(
+-      requirements.memoryTypeBits,
+-      hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
+-                  : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
+-  VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &result.memory));
+-  VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
+-  if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
++  // A failure past here (no memory type, an allocation the device refuses) destroys the buffer.
++  try {
++    VkMemoryRequirements requirements;
++    vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
++    VkMemoryAllocateFlagsInfo allocateFlags{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
++    allocateFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
++    VkMemoryAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
++    allocateInfo.pNext = &allocateFlags;
++    allocateInfo.allocationSize = requirements.size;
++    allocateInfo.memoryTypeIndex = findMemoryType(
++        requirements.memoryTypeBits,
++        hostVisible ? (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
++                    : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT);
++    VkDeviceMemory memory = VK_NULL_HANDLE;   // written only on success
++    VK_CHECK(vkAllocateMemory(device_, &allocateInfo, nullptr, &memory));
++    result.memory = memory;
++    VK_CHECK(vkBindBufferMemory(device_, result.buffer, result.memory, 0));
++    if (hostVisible) VK_CHECK(vkMapMemory(device_, result.memory, 0, VK_WHOLE_SIZE, 0, &result.mapped));
++  } catch (...) {
++    destroyBuffer(result);
++    throw;
++  }
+   return result;
+ }
+ 
+diff --git a/src/vk_context.h b/src/vk_context.h
+index 56f5e39..b2c8cc8 100644
+--- a/src/vk_context.h
++++ b/src/vk_context.h
+@@ -185,6 +185,7 @@ class Context {
+   void* initUser_ = nullptr;        // 0: unbounded waits (the tool); otherwise every wait is bounded
+   VkFence waitFence_ = VK_NULL_HANDLE;
+   void adopt();
++  void release();   // the destructor's cleanup (also an adopting constructor's that throws)
+   std::string deviceName_;
+   void initCommon();   // properties, memory types, command pool, layouts, pools, staging
+   Buffer dummy_;

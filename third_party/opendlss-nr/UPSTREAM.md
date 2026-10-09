@@ -59,3 +59,9 @@ Each one is also a patch in `patches/`, relative to this directory and applied i
    scratch, so the next recording sizes it again. It was sized once, from the first graph's split shapes, and
    `Kernels` outlives graph rebuilds: a later, larger graph threw "split-K partials exceed the scratch buffer".
    neural-forge-native calls it when it drops a graph, when nothing recorded holds the scratch's address.
+6. `patches/0006-constructor-cleanup.patch`: constructors that throw release what they made. `nr::Model`'s constructor
+   and both adopting `vk::Context` constructors (with `initCommon`, which they call) catch any exception, run the
+   destructor's cleanup (`release()`, which the destructors now call too) and rethrow: no destructor runs for a
+   constructor that throws, and on an adopted device every object left behind leaked on the application's device.
+   A tensor's buffer is owned by the model before its upload, and `createBuffer` destroys the buffer (and any
+   memory) when allocating, binding or mapping it fails.
