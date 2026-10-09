@@ -18,6 +18,7 @@ comes from reading NVIDIA's code.
 | Marvel's Spider-Man Remastered (own) | 3.7.10 | `cuda_engine_*_rel_<flags>` | Continue (save loaded) | `~/nf-spike/runs/layout-spiderman` |
 | Black Myth: Wukong Benchmark Tool (UE5) | 3.1.30 | `cuda_engine_*_rel_<flags>` | benchmark menu | `~/nf-spike/runs/layout-wukong` |
 | Crimson Desert (own, Streamline 2.14.1) | 310.9.1 | `hiluma_*` created; **Ray Reconstruction `rr2_*` launched** with it on, **`rrlite_*` + `cuda_dldn_engine_*` (Super Resolution)** with it off | `cd-launch.sh` + `cd-play.sh`; `~/scratch/rr/cd-rr.sh` (2026-10-09) | `~/nf-spike/cd/layout-cd2`, `~/nf-spike/runs/rr-probe-on`, `rr-probe-off` |
+| Hogwarts Legacy (UE4) | 310.0 | `hiluma_*` (Super Resolution) with Ray Reconstruction off; **Ray Reconstruction `cuda_dldn_engine_swin_*` + `cuda_dldn_engine_hkpn_*` launched** with it on | `~/scratch/rr/hl-rr.sh` (2026-10-09) | `~/nf-spike/runs/hl-learn`, `hl-rr-on`, `hl-new-rr-on` |
 
 Each game used the DLL in its own folder: none of the logs shows Proton replacing it. Cyberpunk
 2077 and Resident Evil Requiem were not installed. Labels in packed words come from the layer's
@@ -73,17 +74,21 @@ GTA V launches `hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`; Spider-Man
 | `hiluma_engine_*`, `cuda_engine_*`, `dltss_*`, `cuda_luma_convert_kernel`, `cuda_reduce_sum_kernel`, `cuda_*exposure*`, `cuda_upscale_sum_kernel`, `cuda_downsample_kernel` | DLSS Super Resolution | every SR game, menu or play |
 | `main_kernel` (many buffer sizes), `k_conv_fp16_nhwc`, `k_pooling`, `k_upscale`, `k_element_wise`, `Kernel_*` (optical flow, warp, blend), **`k_initial_merge`, `custom_block*`, `k_central_block`, `custom_upsample*`** | DLSS Frame Generation | GTA V with frame generation on, which has no Ray Reconstruction, launches all of them |
 | `rr2_*` (`rr2_enc0_kernel` ... `rr2_dec0_kernel_1`, `rr2_post_kernel`, `rr2_downsample_kernel_*`, `rr2_histogram_auto_exposure_basic_kernel`) | DLSS Ray Reconstruction | Crimson Desert with its Ray Reconstruction option on; `rr2_enc0_kernel` names a render-size colour image, depth and motion vectors, and the guide buffers (albedo, normals, roughness, hit distance) |
-| `rrlite_*`, `cuda_dldn_engine_*` | DLSS Super Resolution (310.9.1) | Crimson Desert with its Ray Reconstruction option off; no guide buffers |
+| `cuda_dldn_engine_swin_enc*`, `cuda_dldn_engine_swin_dec*`, `cuda_dldn_engine_hkpn_output_kernel_transformer` | DLSS Ray Reconstruction (310.0) | Hogwarts Legacy with its Ray Reconstruction option on; `cuda_dldn_engine_swin_enc0_kernel` names the colour input with two `B10G11R11` albedo images, `R8G8B8A8_SNORM` normals and an `R32_SFLOAT` image |
+| `rrlite_*` | DLSS Super Resolution (310.9.1) | Crimson Desert with its Ray Reconstruction option off; no guide buffers |
+| `cuda_dldn_engine_{luma_convert,reduce_sum,auto_exposure_copy,multiscale_downsample}_kernel` | helpers of both | launched beside `rrlite_*` (Crimson Desert) and beside the `swin`/`hkpn` network (Hogwarts Legacy), so they tell nothing apart |
 
 ## What the layer could stop guessing
 
 Candidates only; nothing in the layer was changed for this catalogue.
 
-1. **Ray Reconstruction has a real signature: `rr2_`.** Done in 3.1.4 (PRE_UPSCALER_DESIGN.md, "DLSS
-   Ray Reconstruction"): `Kernel::of` classes `rr2_*` as Ray Reconstruction and nothing else (the
-   `custom_block*` family is Frame Generation's), and while it runs nothing is held and the model
-   runs after the upscaler. Crimson Desert with Ray Reconstruction off launches `rrlite_*`, held as
-   Super Resolution.
+1. **Ray Reconstruction has a real signature: `rr2_`, or the denoiser engine's `swin`/`hkpn`
+   network.** Done in 3.1.4 (PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction"): `Kernel::of`
+   classes `rr2_*`, `cuda_dldn_engine_swin_*` and `cuda_dldn_engine_hkpn_*` as Ray Reconstruction and
+   nothing else (the `custom_block*` family is Frame Generation's, the other `cuda_dldn_engine_*`
+   kernels are shared helpers), and while it runs nothing is held and the model runs after the
+   upscaler. Crimson Desert with Ray Reconstruction off launches `rrlite_*`, Hogwarts Legacy
+   `hiluma_*`, both held as Super Resolution.
 2. **Handle packing by family.** `launch_kernel` tries every word whole and as two halves. The
    catalogue says which form a kernel uses: `hiluma_*` whole, `cuda_engine_*` halves. The current
    rule already gets both right; reading the form from the name would only remove the chance of a

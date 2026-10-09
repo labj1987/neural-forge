@@ -187,7 +187,7 @@ CUDA kernels: `vkCmdCuLaunchKernelNVX`, on image views registered with
 - The NVX registration calls: the layer records every registered view and the handle or address
   it got back.
 - `vkCreateCuFunctionNVX` / `vkDestroyCuFunctionNVX`: the layer records each kernel's name and
-  what it is (`preupscale::Kernel`: DLSS SR's input kernel, Ray Reconstruction's `rr2_*`, other).
+  what it is (`preupscale::Kernel`: DLSS SR's input kernel, Ray Reconstruction's `rr2_*`, `cuda_dldn_engine_swin_*` and `cuda_dldn_engine_hkpn_*`, other).
 - `vkCmdCuLaunchKernelNVX`: marks the command buffer as launch-bearing (also through
   `vkCmdExecuteCommands`), with which kernels it launches. When the launch's parameters use CUDA's
   "extra" buffer form (what vkd3d-proton uses), the layer reads that parameter buffer (never writes
@@ -205,7 +205,7 @@ winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameter
 one precondition:
 
 - **DLSS Ray Reconstruction must not be running** (PRE_UPSCALER_DESIGN.md, "DLSS Ray
-  Reconstruction"). Its input is the noisy ray-traced frame. While one of its `rr2_*` kernels
+  Reconstruction"). Its input is the noisy ray-traced frame. While one of its kernels (`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`)
   launched within the last 64 launch-bearing submits, nothing is identified; a buffer launching
   one is never the hold point or evidence, whatever its shape; and the post path runs the model
   after the upscaler at once. Logged on each change: `DLSS Ray Reconstruction runs (...)` and
@@ -265,7 +265,7 @@ another queue. Each launch-bearing buffer is classified (`LaunchRefs::kind`):
 | Kind | Rule | Action |
 |---|---|---|
 | Colour | a launch's parameters name the identified colour input | held (the split point) |
-| Foreign | every launch readable, naming registered views, never the colour input; or a launch of DLSS Ray Reconstruction (`rr2_*`) | forwarded untouched (DLSS FG's, Ray Reconstruction's, other NGX features') |
+| Foreign | every launch readable, naming registered views, never the colour input; or a launch of DLSS Ray Reconstruction (`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`) | forwarded untouched (DLSS FG's, Ray Reconstruction's, other NGX features') |
 | Unknown | an unreadable launch, parameters naming no registered view, or a launch before identification | held, as before the fix (only with inputs identified) |
 
 Before this rule, the layer held FG's submits too and ran the model three times per real frame,
@@ -335,7 +335,8 @@ the layer encodes DLSS's scene-linear input before sending it, and inverts that 
 
 ```
 e     = the game's 1x1 R16_SFLOAT exposure value (read on the GPU every frame),
-        else measured from the frame (auto-exposure, below)
+        else, or once it read over 1,000 or kept jumping by over 32x between holds,
+        measured from the frame (auto-exposure, below)
 v     = max(scene, 0) * e / W                     W = paper white, default 3
 y     = v                                          v <= 0.75
         0.75 + 0.25 * (1 - exp(-5.770780 * (v - 0.75)))   above, per channel
