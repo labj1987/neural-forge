@@ -5,7 +5,7 @@ for every DLSS version installed on the test machine. Observed from the layer's 
 `NEURAL_FORGE_PROBE_NGX=1`: `vkCreateCuFunctionNVX` gives the names, and the `[probe-ngx] layout`
 lines (`preupscale.rs::probe_layout`) describe each 8-byte word of a launch's parameter buffer,
 matched against the views the game registered through `VK_NVX_image_view_handle`. Nothing here
-comes from reading NVIDIA's code (CLAUDE.md, "Working with NVIDIA's binaries").
+comes from reading NVIDIA's code.
 
 ## Runs
 
@@ -83,10 +83,10 @@ Candidates only; nothing in the layer was changed for this catalogue.
    Reconstruction, but those are Frame Generation's network. That misattribution is why gating by
    kernel name had to be switched off (`GATE_BY_KERNEL_NAME`, 2026-10-03: "Crimson Desert's SR
    launches custom_block*"). With the gate off, **Crimson Desert with Ray Reconstruction on is held
-   at `rr2_enc0_kernel`'s colour image, that is, RR's input**, which CLAUDE.md says must never be
-   held. Recognising RR by `rr2_` and re-enabling the gate would restore that rule. It would also
+   at `rr2_enc0_kernel`'s colour image, that is, RR's input**, which the rule as first designed
+   (PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction") says must never be held. Recognising RR by `rr2_` and re-enabling the gate would restore that rule. It would also
    change what Crimson Desert looks like with RR on (the model would stop running there), so it is
-   Alex's call. The obvious alternative is to keep the hold and treat Crimson Desert's RR as
+   the maintainer's call. The obvious alternative is to keep the hold and treat Crimson Desert's RR as
    validated by play.
 2. **Handle packing by family.** `launch_kernel` tries every word whole and as two halves. The
    catalogue says which form a kernel uses: `hiluma_*` whole, `cuda_engine_*` halves. The current

@@ -19,8 +19,8 @@
 #                    `shmctl status`. The model resolution must never be left below 1.0.
 #
 # Examples (NR off, then NR on at model interval 2, both with GTA's script mods off):
-#   gta-bench.sh --host lordnikon p0-nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
-#   gta-bench.sh --host lordnikon --set model_interval=2 p0-nron-1 VK_LAYER_neuralforge_neural \
+#   gta-bench.sh --host rig p0-nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+#   gta-bench.sh --host rig --set model_interval=2 p0-nron-1 VK_LAYER_neuralforge_neural \
 #       NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 #
 # Rig paths can be overridden with NF_BENCH_STEAM_LIBRARY (the library holding GTA),
@@ -42,9 +42,13 @@ if [ $# -lt 2 ]; then
     exit 2
 fi
 label=$1; mid=$2; shift 2
+# The label names a directory that is deleted and recreated below: never empty, never a path.
+case $label in
+    ''|.|..|*/*) echo "error: label must be a plain name (not empty, no '/')" >&2; exit 2;;
+esac
 
-S=${NF_BENCH_STEAM_LIBRARY:-/mnt/Storage/Steam}
 C=${NF_BENCH_STEAM_ROOT:-$HOME/.local/share/Steam}
+S=${NF_BENCH_STEAM_LIBRARY:-$C}
 PROTON=${NF_BENCH_PROTON:-$C/compatibilitytools.d/Proton-CachyOS Latest}
 GAME="$S/steamapps/common/Grand Theft Auto V Enhanced"
 SLR=$S/steamapps/common/SteamLinuxRuntime_4

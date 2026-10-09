@@ -1,7 +1,7 @@
 #version 450
 // The pre-upscaler path's HDR encode (docs/PRE_UPSCALER_DESIGN.md, "E1b: the HDR encode" and
 // "Implementation (layer)"): turns DLSS's scene-linear, pre-exposure RGBA16F colour input into the
-// display-referred [0, 1] picture the model expects, at the padded size the helper is sent.
+// display-referred [0, 1] picture the model expects, at the padded size the network runs on.
 //
 // Per channel: v = max(scene, 0) * e / paper_white (e: the game's 1x1 R16_SFLOAT exposure value,
 // multiplied in); above 0.75 the shoulder 0.75 + 0.25 * (1 - exp(-K * (v - 0.75))); then the sRGB

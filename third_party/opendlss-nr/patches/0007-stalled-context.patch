@@ -1,0 +1,149 @@
+diff --git a/src/kernels.cpp b/src/kernels.cpp
+index 86780a6..777e8df 100644
+--- a/src/kernels.cpp
++++ b/src/kernels.cpp
+@@ -69,6 +69,7 @@ Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : con
+ }
+ 
+ Kernels::~Kernels() {
++  if (context_.stalled()) return;   // the GPU may still use the pipelines and buffers: leaked
+   for (auto& [key, pipeline] : pipelines_) context_.destroyPipeline(pipeline);
+   for (auto& [file, kernel] : ptxKernels_) {
+     context_.destroyCudaFunction(kernel.function);
+diff --git a/src/nr_graph.cpp b/src/nr_graph.cpp
+index 5c8a2e1..2f10067 100644
+--- a/src/nr_graph.cpp
++++ b/src/nr_graph.cpp
+@@ -167,6 +167,7 @@ Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometr
+ }
+ 
+ Graph::~Graph() {
++  if (context_.stalled()) return;   // the GPU may still use the activations: leaked
+   for (auto& activation : activations_) context_.destroyBuffer(activation->buffer);
+ }
+ 
+diff --git a/src/nr_model.cpp b/src/nr_model.cpp
+index 455fd97..31ca1d5 100644
+--- a/src/nr_model.cpp
++++ b/src/nr_model.cpp
+@@ -127,6 +127,7 @@ Model::Model(vk::Context& context, const std::string& directory, bool verifyHash
+ Model::~Model() { release(); }
+ 
+ void Model::release() {
++  if (context_.stalled()) return;   // the GPU may still use the weights: leaked
+   for (auto& [name, buffer] : matrices_) context_.destroyBuffer(buffer);
+   for (auto& [name, tensor] : tensors_) context_.destroyBuffer(tensor.raw);
+   matrices_.clear();
+diff --git a/src/vk_context.cpp b/src/vk_context.cpp
+index 556f2de..a2e0f93 100644
+--- a/src/vk_context.cpp
++++ b/src/vk_context.cpp
+@@ -318,6 +318,8 @@ Context::~Context() { release(); }
+ 
+ void Context::release() {
+   if (!device_) return;
++  // Stalled: the GPU may still use any of it. Leaked, never destroyed.
++  if (stalled_) return;
+   // An adopted device is the application's: only this object's own queue is waited for.
+   if (owned_) vkDeviceWaitIdle(device_);
+   else if (queue_) {
+@@ -391,6 +393,7 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
+ }
+ 
+ void Context::destroyBuffer(Buffer& buffer) {
++  if (stalled_) { buffer = Buffer{}; return; }   // leaked: the GPU may still use it
+   if (buffer.mapped) vkUnmapMemory(device_, buffer.memory);
+   if (buffer.buffer) vkDestroyBuffer(device_, buffer.buffer, nullptr);
+   if (buffer.memory) vkFreeMemory(device_, buffer.memory, nullptr);
+@@ -540,6 +543,7 @@ std::string Context::pipelineStatistics(const Pipeline& pipeline, bool includeIn
+ }
+ 
+ void Context::destroyPipeline(Pipeline& pipeline) {
++  if (stalled_) { pipeline = Pipeline{}; return; }
+   if (pipeline.pipeline) vkDestroyPipeline(device_, pipeline.pipeline, nullptr);
+   pipeline = Pipeline{};
+ }
+@@ -581,6 +585,7 @@ void Context::resetDescriptorPool(uint32_t slot) {
+ }
+ 
+ VkCommandBuffer Context::beginCommands() {
++  if (stalled_) throw std::runtime_error("the network's queue stalled earlier; it takes no more work");
+   VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+   allocateInfo.commandPool = commandPool_;
+   allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+@@ -595,6 +600,7 @@ VkCommandBuffer Context::beginCommands() {
+ }
+ 
+ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
++  if (stalled_) throw std::runtime_error("the network's queue stalled earlier; it takes no more work");
+   VK_CHECK(vkEndCommandBuffer(commands));
+   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+   submit.commandBufferCount = 1;
+@@ -603,8 +609,11 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
+     VK_CHECK(vkResetFences(device_, 1, &waitFence_));
+     VK_CHECK(vkQueueSubmit(queue_, 1, &submit, waitFence_));
+     const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
+-    // A timed-out buffer may still run: it is leaked, not freed.
+-    if (waited == VK_TIMEOUT) throw std::runtime_error("a submit on the network's queue did not finish in time");
++    // A timed-out buffer may still run: it is leaked, not freed, and so is everything it may use.
++    if (waited == VK_TIMEOUT) {
++      stalled_ = true;
++      throw std::runtime_error("a submit on the network's queue did not finish in time");
++    }
+     VK_CHECK(waited);
+     vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
+     return;
+@@ -621,11 +630,15 @@ void Context::waitIdle() {
+     VK_CHECK(vkQueueWaitIdle(queue_));
+     return;
+   }
++  if (stalled_) throw std::runtime_error("the network's queue stalled earlier; it takes no more work");
+   // An empty submit's fence signals once everything before it on the queue has completed.
+   VK_CHECK(vkResetFences(device_, 1, &waitFence_));
+   VK_CHECK(vkQueueSubmit(queue_, 0, nullptr, waitFence_));
+   const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
+-  if (waited == VK_TIMEOUT) throw std::runtime_error("the network's queue did not go idle in time");
++  if (waited == VK_TIMEOUT) {
++    stalled_ = true;
++    throw std::runtime_error("the network's queue did not go idle in time");
++  }
+   VK_CHECK(waited);
+ }
+ 
+@@ -713,11 +726,11 @@ VkCudaFunctionNV Context::createCudaFunction(VkCudaModuleNV module, const char*
+ }
+ 
+ void Context::destroyCudaFunction(VkCudaFunctionNV function) {
+-  if (function) vkDestroyCudaFunctionNV(device_, function, nullptr);
++  if (function && !stalled_) vkDestroyCudaFunctionNV(device_, function, nullptr);
+ }
+ 
+ void Context::destroyCudaModule(VkCudaModuleNV module) {
+-  if (module) vkDestroyCudaModuleNV(device_, module, nullptr);
++  if (module && !stalled_) vkDestroyCudaModuleNV(device_, module, nullptr);
+ }
+ 
+ void Context::cudaLaunch(VkCommandBuffer commands, VkCudaFunctionNV function, uint32_t gridX, uint32_t gridY, uint32_t gridZ,
+diff --git a/src/vk_context.h b/src/vk_context.h
+index b2c8cc8..7c3582e 100644
+--- a/src/vk_context.h
++++ b/src/vk_context.h
+@@ -140,6 +140,10 @@ class Context {
+   VkCommandBuffer beginCommands();
+   void endAndSubmit(VkCommandBuffer commands, bool wait = true);
+   void waitIdle();
++  // A bounded wait that timed out latches this: work of this object may still be running on the GPU, so it
++  // submits nothing more (beginCommands/endAndSubmit/waitIdle throw) and destroys nothing (destroyBuffer,
++  // destroyPipeline, destroyCuda*, the destructor and its owners' destructors leak instead).
++  bool stalled() const { return stalled_; }
+   void computeBarrier(VkCommandBuffer commands);   // compute -> compute
+   // VK_NV_cuda_kernel_launch: PTX modules launched from the command buffer on buffer device addresses.
+   VkDeviceAddress deviceAddress(const Buffer& buffer) const;
+@@ -184,6 +188,7 @@ class Context {
+   uint32_t sharedFamily_ = VK_QUEUE_FAMILY_IGNORED;
+   void* initUser_ = nullptr;        // 0: unbounded waits (the tool); otherwise every wait is bounded
+   VkFence waitFence_ = VK_NULL_HANDLE;
++  bool stalled_ = false;
+   void adopt();
+   void release();   // the destructor's cleanup (also an adopting constructor's that throws)
+   std::string deviceName_;

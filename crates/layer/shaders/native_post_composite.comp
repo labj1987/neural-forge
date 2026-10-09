@@ -1,0 +1,114 @@
+#version 450
+// The native backend after the upscaler (docs/NATIVE_BACKEND.md, "2.1"): the network's head on the 8-bit
+// proxy, in the proxy's own format, for the unchanged after-the-upscaler composition to use. The residual,
+// the half-grid truncation, the style operator and the intensity blend are native_composite.comp's
+// (OpenDLSS-NR's, MIT, commit 9d08f41). No history: there are no motion vectors here. The answer is 8 bits in
+// the proxy's own channel order, rounded to nearest (as an RGBA8 image store rounds), alpha copied.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Proxy { uint texel[]; } u_proxy;
+// f32 [field][4]: RGB residual, blend logit.
+layout(set = 0, binding = 1, std430) readonly buffer Head { float head[]; } u_head;
+layout(set = 0, binding = 2, std430) writeonly buffer Answer { uint texel[]; } u_answer;
+
+layout(push_constant) uniform Params {
+  uvec4 dims;      // field width, field height, valid width, valid height
+  uvec4 frame;     // unused, BGRA (1) or RGBA (0), unused x2
+  vec4 control;    // style, local tone, intensity, unused
+} p;
+
+float truncateHalf(float value) {
+  uint bits = floatBitsToUint(value);
+  uint signBit = (bits >> 16u) & 0x8000u;
+  uint exponent = (bits >> 23u) & 0xffu;
+  uint mantissa = bits & 0x7fffffu;
+  uint halfBits;
+  if (exponent == 0xffu) {
+    halfBits = signBit | (mantissa != 0u ? 0x7e00u : 0x7c00u);
+  } else {
+    int halfExponent = int(exponent) - 112;
+    if (halfExponent >= 31) halfBits = signBit | 0x7c00u;
+    else if (halfExponent <= 0) {
+      if (halfExponent < -10) halfBits = signBit;
+      else halfBits = signBit | ((mantissa | 0x800000u) >> uint(14 - halfExponent));
+    } else halfBits = signBit | (uint(halfExponent) << 10u) | (mantissa >> 13u);
+  }
+  return unpackHalf2x16(halfBits).x;
+}
+
+// ---- cg2r styles (Natural / Cinematic): native_composite.comp's, OpenDLSS-NR's nrStyle.
+vec3 nrHsl(vec3 rgb) {
+  float high = max(max(rgb.r, rgb.g), rgb.b);
+  float low = min(min(rgb.r, rgb.g), rgb.b);
+  float sum = high + low;
+  float light = sum * 0.5;
+  float hue = 0.0, saturation = 0.0;
+  if (high > low) {
+    float delta = high - low;
+    saturation = light > 0.5 ? delta / ((2.0 - high) - low) : delta / sum;
+    if (high == rgb.r) hue = fma(rgb.g - rgb.b, 1.0 / delta, rgb.g < rgb.b ? 6.0 : 0.0) / 6.0;
+    else if (high == rgb.g) hue = fma(rgb.b - rgb.r, 1.0 / delta, 2.0) / 6.0;
+    else hue = fma(rgb.r - rgb.g, 1.0 / delta, 4.0) / 6.0;
+  }
+  return vec3(hue, saturation, light);
+}
+
+float nrHue(float p, float q, float hue) {
+  float h = hue;
+  if (h < 0.0) h += 1.0;
+  if (h > 1.0) h -= 1.0;
+  if (h < uintBitsToFloat(0x3e2aaaabu)) return fma(h, (q - p) * 6.0, p);
+  if (h < 0.5) return q;
+  if (h < uintBitsToFloat(0x3f2aaaabu)) return fma((uintBitsToFloat(0x3f2aaaabu) - h) * (q - p), 6.0, p);
+  return p;
+}
+
+vec3 nrRgb(vec3 hsl) {
+  if (hsl.y <= 0.0) return vec3(hsl.z);
+  float q = hsl.z < 0.5 ? hsl.z * (hsl.y + 1.0) : fma(-hsl.z, hsl.y, hsl.z + hsl.y);
+  float p = (hsl.z + hsl.z) - q;
+  return vec3(nrHue(p, q, hsl.x + uintBitsToFloat(0x3eaaaaabu)), nrHue(p, q, hsl.x), nrHue(p, q, hsl.x - uintBitsToFloat(0x3eaaaaabu)));
+}
+
+vec3 nrStyle(vec3 neural, float style, float tone) {
+  float styleTone = clamp(tone, 0.0, 1.0);
+  float exposure = style == 1.0 ? -0.1 * styleTone : 0.0;
+  float contrast = style == 1.0 ? -0.25 * styleTone : 0.0;
+  float saturation = style == 1.0 ? -0.1 * styleTone : -0.15 * styleTone;
+  vec3 color;
+  for (int c = 0; c < 3; c++) {
+    float value = clamp(neural[c], 0.0, 1.0);
+    float exposed = clamp(value * exp2(exposure), 0.0, 1.0);
+    float square = exposed * exposed;
+    float curveDelta = fma(square, 3.0 - (exposed + exposed), -exposed);
+    float curved = clamp(fma(contrast, curveDelta, exposed), 0.0, 1.0);
+    float firstGamma = exp2(log2(curved));
+    color[c] = exp2(log2(max(0.0, firstGamma)));
+  }
+  vec3 hsl = nrHsl(color);
+  vec3 adjusted = nrRgb(vec3(hsl.x, clamp(hsl.y * (saturation + 1.0), 0.0, 1.0), hsl.z));
+  vec3 again = nrHsl(adjusted);
+  return clamp(nrRgb(vec3(again.x, clamp(exp2(log2(again.y)), 0.0, 1.0), again.z)), vec3(0.0), vec3(1.0));
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= p.dims.z || id.y >= p.dims.w) return;
+  uint at = id.y * p.dims.z + id.x;
+  vec4 texel = unpackUnorm4x8(u_proxy.texel[at]);
+  bool bgra = p.frame.y != 0u;
+  vec3 proxy = bgra ? texel.bgr : texel.rgb;
+  uint feature = (id.y * p.dims.x + id.x) * 4u;
+  vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);
+  vec3 neural = clamp(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5, vec3(0.0), vec3(1.0));
+  vec3 history = vec3(truncateHalf(neural.r), truncateHalf(neural.g), truncateHalf(neural.b));
+  float style = p.control.x;
+  float intensity = p.control.z;
+  vec3 styled = style != 0.0 ? nrStyle(history, style, p.control.y) : history;
+  vec3 published = history;
+  if (style != 0.0 || intensity != 1.0) {
+    for (int c = 0; c < 3; c++) published[c] = truncateHalf(clamp(fma(intensity, styled[c] - proxy[c], proxy[c]), 0.0, 1.0));
+  }
+  vec3 out3 = bgra ? published.bgr : published;
+  u_answer.texel[at] = packUnorm4x8(vec4(out3, texel.a));
+}

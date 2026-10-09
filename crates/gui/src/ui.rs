@@ -5,7 +5,7 @@
 
 use std::sync::atomic::Ordering;
 
-use neural_forge_protocol::enums::{colour_mode, downscaler, mvec_quality, mvec_scale_mode, reversible_mode};
+use neural_forge_protocol::enums::{colour_mode, reversible_mode};
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
@@ -28,6 +28,19 @@ fn register_refresher(f: impl Fn() + 'static) {
     REFRESHERS.with(|r| r.borrow_mut().push(Box::new(f)));
 }
 
+thread_local! {
+    /// Everything that shows whether the model is installed, brought up to date after an extract.
+    static MODEL_WATCHERS: std::cell::RefCell<Vec<Box<dyn Fn()>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn on_model_changed(f: impl Fn() + 'static) {
+    MODEL_WATCHERS.with(|w| w.borrow_mut().push(Box::new(f)));
+}
+
+fn model_changed() {
+    MODEL_WATCHERS.with(|w| w.borrow().iter().for_each(|f| f()));
+}
+
 /// Brings every bound row up to date with the header -- run once a second, so a change made
 /// with `shmctl`, a loaded profile or Reset shows up without restarting the app.
 fn refresh_all_rows() {
@@ -36,14 +49,17 @@ fn refresh_all_rows() {
     REFRESHING.with(|f| f.set(false));
 }
 
-fn spin_row(title: &str, subtitle: &str, value: f32, lower: f64, upper: f64, step: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
-    spin_row_scaled(title, subtitle, value, lower, upper, step, 1.0, setter)
+/// A spin row for the persisted setting `setting`, bounded by its range in
+/// `neural_forge_protocol::SETTING_BOUNDS`.
+fn spin_row(title: &str, subtitle: &str, value: f32, setting: &str, step: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
+    spin_row_scaled(title, subtitle, value, setting, step, 1.0, setter)
 }
 
 /// A spin row that shows the field multiplied by `scale` (100.0 shows a fraction as a percent).
-/// `lower`/`upper`/`step` are in displayed units; the setter still receives the stored value.
-#[allow(clippy::too_many_arguments)]
-fn spin_row_scaled(title: &str, subtitle: &str, value: f32, lower: f64, upper: f64, step: f64, scale: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
+/// `step` is in displayed units; the setter still receives the stored value.
+fn spin_row_scaled(title: &str, subtitle: &str, value: f32, setting: &str, step: f64, scale: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
+    let (lower, upper) = neural_forge_protocol::setting_bounds(setting).unwrap_or_else(|| panic!("{setting} has no bounds"));
+    let (lower, upper) = (f64::from(lower) * scale, f64::from(upper) * scale);
     let adjustment = gtk4::Adjustment::new(f64::from(value) * scale, lower, upper, step, step * 10.0, 0.0);
     let digits = if step >= 1.0 { 0 } else if step >= 0.1 { 1 } else { 2 };
     let row = adw::SpinRow::new(Some(&adjustment), step, digits);
@@ -249,122 +265,52 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (style, set_style) = bind_u32(&shm, Some("style"), |h| &h.style);
     model_group.add(&combo_row("Style", &["Default", "Natural", "Cinematic"], style, set_style));
 
-    let (preset, set_preset) = bind_u32(&shm, Some("preset"), |h| &h.preset);
-    model_group.add(&spin_row("Preset", "Model-defined preset, 0-15", preset as f32, 0.0, 15.0, 1.0, move |v| set_preset(v as u32)));
-
     let (intensity, set_intensity) = bind_float(&shm, Some("intensity"), |h| &h.intensity_bits);
-    model_group.add(&spin_row("Intensity", "Applied when the model is rebuilt (after a short pause)", intensity, 0.0, 4.0, 0.05, set_intensity));
+    model_group.add(&spin_row("Intensity", "How strongly the model's answer replaces the frame", intensity, "intensity", 0.05, set_intensity));
 
     let (local_tone, set_local_tone) = bind_float(&shm, Some("local_tone"), |h| &h.local_tone_bits);
-    model_group.add(&spin_row("Local tone", "", local_tone, 0.0, 4.0, 0.05, set_local_tone));
+    model_group.add(&spin_row("Local tone", "", local_tone, "local_tone", 0.05, set_local_tone));
 
     let (local_structure, set_local_structure) = bind_float(&shm, Some("local_structure"), |h| &h.local_structure_bits);
-    model_group.add(&spin_row("Local structure", "", local_structure, 0.0, 4.0, 0.05, set_local_structure));
+    model_group.add(&spin_row("Local structure", "", local_structure, "local_structure", 0.05, set_local_structure));
 
     let (skin_structure, set_skin_structure) = bind_float(&shm, Some("skin_structure"), |h| &h.skin_structure_bits);
-    model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, -1.0, 4.0, 0.05, set_skin_structure));
-
-    let (sharpness, set_sharpness) = bind_float(&shm, Some("sharpness"), |h| &h.sharpness_bits);
-    model_group.add(&spin_row("Sharpness", "", sharpness, 0.0, 1.0, 0.05, set_sharpness));
+    model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, "skin_structure", 0.05, set_skin_structure));
 
     let (auto_mask, set_auto_mask) = bind_bool(&shm, Some("auto_mask"), |h| &h.auto_mask);
     model_group.add(&switch_row("Auto mask", "Automatic skin/detail masking", auto_mask, set_auto_mask));
 
-    let (passes, set_passes) = bind_u32(&shm, Some("passes"), |h| &h.passes);
-    model_group.add(&spin_row("Passes", "How many times the model runs over one frame", passes as f32, 1.0, 30.0, 1.0, move |v| set_passes(v as u32)));
-
-    let pass_row = adw::ActionRow::new();
-    pass_row.set_title("Per-pass settings");
-    pass_row.set_subtitle("Give individual passes their own values");
-    let pass_button = gtk4::Button::with_label("Edit…");
-    pass_button.set_valign(gtk4::Align::Center);
-    pass_row.add_suffix(&pass_button);
-    {
-        let shm = std::sync::Arc::clone(&shm);
-        pass_button.connect_clicked(move |b| open_pass_dialog(&shm, b.upcast_ref()));
-    }
-    model_group.add(&pass_row);
-
     let (interval, set_interval) = bind_u32(&shm, Some("model_interval"), |h| &h.model_interval);
-    model_group.add(&spin_row(
+    let interval_row = spin_row(
         "Model every Nth frame",
         "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own",
         interval as f32,
-        1.0,
-        4.0,
+        "model_interval",
         1.0,
         move |v| set_interval(v as u32),
-    ));
-
-    let (settle, set_settle) = bind_u32(&shm, Some("rebuild_settle_ms"), |h| &h.rebuild_settle_ms);
-    model_group.add(&spin_row(
-        "Rebuild spacing",
-        "Milliseconds to wait after a tuning change before the model is rebuilt with it",
-        settle as f32,
-        0.0,
-        5000.0,
-        50.0,
-        move |v| set_settle(v as u32),
-    ));
+    );
+    model_group.add(&interval_row);
 
     let (toggle_key, set_toggle_key) = bind_u32(&shm, Some("toggle_key"), |h| &h.toggle_key);
     model_group.add(&hotkey_row(toggle_key, set_toggle_key));
-
-    // --- Motion --------------------------------------------------------------------
-    let motion_group = adw::PreferencesGroup::new();
-    motion_group.set_title("Motion");
-    motion_group.set_description(Some(
-        "Estimates how the picture moved between frames with the GPU's optical-flow \
-         hardware and gives it to the model. Turning it on or off takes effect the next \
-         time the helper starts.",
-    ));
-
-    let (mvec_enabled, set_mvec_enabled) = bind_bool(&shm, Some("mvec_enabled"), |h| &h.mvec_enabled);
-    let mvec_switch = switch_row("Estimate motion vectors", "On by default. Needs an NVIDIA GPU with optical-flow hardware", mvec_enabled, set_mvec_enabled);
-    motion_group.add(&mvec_switch);
-
-    let (mvec_scale, set_mvec_scale) = bind_u32(&shm, Some("mvec_scale_mode"), |h| &h.mvec_scale_mode);
-    let mvec_scale_row = combo_row("Motion units", &["Normalised", "Pixels", "UV 0..1"], mvec_scale, set_mvec_scale);
-    motion_group.add(&mvec_scale_row);
-    debug_assert_eq!(mvec_scale_mode::PIXELS, 1);
-
-    let (mvec_quality, set_mvec_quality) = bind_u32(&shm, Some("mvec_quality"), |h| &h.mvec_quality);
-    let mvec_quality_row = combo_row("Motion quality", &["Fast", "Balanced", "Quality"], mvec_quality, set_mvec_quality);
-    motion_group.add(&mvec_quality_row);
-    debug_assert_eq!(mvec_quality::BALANCED, 1);
 
     // --- Composition -----------------------------------------------------------------
     let comp_group = adw::PreferencesGroup::new();
     comp_group.set_title("Composition");
 
-    let (bypass, set_bypass) = bind_bool(&shm, Some("composition_bypass"), |h| &h.composition_bypass);
-    comp_group.add(&switch_row("Bypass composition", "On: the model's raw answer is the presented frame", bypass, set_bypass));
-
     let (transfer_strength, set_transfer_strength) = bind_float(&shm, Some("transfer_strength"), |h| &h.transfer_strength_bits);
-    comp_group.add(&spin_row("Detail strength", "How much of the model's edit reaches the frame; above 1 amplifies it", transfer_strength, 0.0, 4.0, 0.05, set_transfer_strength));
+    comp_group.add(&spin_row("Detail strength", "How much of the model's edit reaches the frame; above 1 amplifies it", transfer_strength, "transfer_strength", 0.05, set_transfer_strength));
 
     let (colour_strength, set_colour_strength) = bind_float(&shm, Some("colour_strength"), |h| &h.colour_strength_bits);
-    comp_group.add(&spin_row("Colour strength", "How much of the transfer is allowed to be colour, not just luminance", colour_strength, 0.0, 1.0, 0.05, set_colour_strength));
+    comp_group.add(&spin_row("Colour strength", "How much of the transfer is allowed to be colour, not just luminance", colour_strength, "colour_strength", 0.05, set_colour_strength));
 
     let (max_ratio, set_max_ratio) = bind_float(&shm, Some("max_ratio"), |h| &h.max_ratio_bits);
-    comp_group.add(&spin_row("Highlight guard", "The most the pass may brighten or darken a pixel by (x)", max_ratio, 1.0, 30.0, 0.1, set_max_ratio));
+    comp_group.add(&spin_row("Highlight guard", "The most the pass may brighten or darken a pixel by (x)", max_ratio, "max_ratio", 0.1, set_max_ratio));
 
     let (working_scale, set_working_scale) = bind_float(&shm, Some("working_scale"), |h| &h.working_scale_bits);
-    comp_group.add(&spin_row_scaled("Model resolution", "Percent of the frame the model works at; lower is faster and softer", working_scale, 25.0, 100.0, 5.0, 100.0, set_working_scale));
+    let scale_row = spin_row_scaled("Model resolution", "Percent of the frame the model works at; lower is faster and softer", working_scale, "working_scale", 5.0, 100.0, set_working_scale);
+    comp_group.add(&scale_row);
 
-    let (downscaler_v, set_downscaler) = bind_u32(&shm, Some("scaling_downscaler"), |h| &h.scaling_downscaler);
-    let filter_row = combo_row(
-        "Supersampling filter",
-        &["FSR1 (unsupported)", "Bicubic", "Catmull-Rom", "Lanczos2", "Lanczos3", "Kaiser2", "Kaiser3", "Magic"],
-        downscaler_v,
-        set_downscaler,
-    );
-    // Supersampling (model resolution above 100%) is not available: the answer would be larger
-    // than the frame, which the composition rejects. Kept so the saved value round-trips.
-    filter_row.set_subtitle("Unavailable: model resolution cannot go above 100%");
-    filter_row.set_sensitive(false);
-    comp_group.add(&filter_row);
-    debug_assert_eq!(downscaler::LANCZOS3, 4);
 
     let (reversible, set_reversible) = bind_u32(&shm, Some("reversible_mode"), |h| &h.reversible_mode);
     comp_group.add(&combo_row(
@@ -377,15 +323,15 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     let (hdr_mode, set_hdr_mode) = bind_u32(&shm, Some("hdr_mode"), |h| &h.hdr_mode);
     let hdr_row = combo_row("HDR input", &["Auto", "Off", "Force float16"], hdr_mode, set_hdr_mode);
-    // Neither the layer nor the helper reads `hdr_mode` or `colour_mode` yet. Kept, like the
+    // The layer does not read `hdr_mode` or `colour_mode` yet. Kept, like the
     // supersampling filter, so the saved value round-trips.
-    hdr_row.set_subtitle("Unavailable: not used by the layer or helper yet");
+    hdr_row.set_subtitle("Unavailable: not used by the layer yet");
     hdr_row.set_sensitive(false);
     comp_group.add(&hdr_row);
 
     let (colour_mode, set_colour_mode) = bind_u32(&shm, Some("colour_mode"), |h| &h.colour_mode);
     let colour_mode_row = combo_row("Colour mode", &["Auto", "Force display-referred", "Force linear HDR"], colour_mode, set_colour_mode);
-    colour_mode_row.set_subtitle("Unavailable: not used by the layer or helper yet");
+    colour_mode_row.set_subtitle("Unavailable: not used by the layer yet");
     colour_mode_row.set_sensitive(false);
     comp_group.add(&colour_mode_row);
     debug_assert_eq!(colour_mode::AUTO, 0);
@@ -399,11 +345,11 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (source, set_source) = bind_u32(&shm, Some("white_point_source"), |h| &h.white_point_source);
     hdr_group.add(&combo_row("White point source", &["Manual", "Measured"], source, set_source));
     let (white, set_white) = bind_float(&shm, Some("white_point"), |h| &h.white_point_bits);
-    hdr_group.add(&spin_row("Manual white point", "Linear-light reference", white, 0.01, 10000.0, 0.1, set_white));
+    hdr_group.add(&spin_row("Manual white point", "Linear-light reference", white, "white_point", 0.1, set_white));
     let (scale, set_scale) = bind_float(&shm, Some("white_point_scale"), |h| &h.white_point_scale_bits);
-    hdr_group.add(&spin_row("White point scale", "Multiplier", scale, 0.01, 100.0, 0.05, set_scale));
+    hdr_group.add(&spin_row("White point scale", "Multiplier", scale, "white_point_scale", 0.05, set_scale));
     let (trim, set_trim) = bind_float(&shm, Some("white_point_trim"), |h| &h.white_point_trim_bits);
-    hdr_group.add(&spin_row("White point trim", "Calibration multiplier", trim, 0.01, 100.0, 0.05, set_trim));
+    hdr_group.add(&spin_row("White point trim", "Calibration multiplier", trim, "white_point_trim", 0.05, set_trim));
 
     let (transfer, set_transfer) = bind_u32(&shm, Some("transfer"), |h| &h.transfer);
     let transfer_row = combo_row("Transfer mode", &["Classic", "Matched residual", "Native + edit"], transfer, set_transfer);
@@ -415,8 +361,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Colour trust",
         "How far the model may change a pixel's colour; larger changes (edge fringing) are shortened. 0 = no model colour",
         colour_trust,
-        0.0,
-        4.0,
+        "colour_trust",
         0.1,
         set_colour_trust,
     ));
@@ -426,8 +371,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Ratio smoothing",
         "Percent of the relighting taken from the neighbourhood rather than each pixel; removes speckle",
         ratio_smooth,
-        0.0,
-        100.0,
+        "ratio_smooth",
         5.0,
         100.0,
         set_ratio_smooth,
@@ -438,14 +382,10 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Ghost guard",
         "Only matters in pipelined mode (NEURAL_FORGE_PIPELINED=1): hides a late answer's detail where the frame has moved",
         ghost_guard,
-        0.0,
-        1.0,
+        "ghost_guard",
         0.05,
         set_ghost_guard,
     ));
-
-    let (unlock_passes, set_unlock_passes) = bind_bool(&shm, Some("unlock_passes"), |h| &h.unlock_passes);
-    comp_group.add(&switch_row("Unlock pass limit", "Allow more passes than the normal ceiling", unlock_passes, set_unlock_passes));
 
     let (apply_model, set_apply_model) = bind_bool(&shm, Some("apply_model"), |h| &h.apply_model);
     comp_group.add(&switch_row("Apply model edit", "Off presents the clean frame — capture/transport/round-trip still run, for an honest A/B", apply_model, set_apply_model));
@@ -464,10 +404,10 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     debug_group.add(&combo_row("Compare mode", &["Off", "Side by side", "Wipe"], compare_mode, set_compare_mode));
 
     let (compare_split, set_compare_split) = bind_float(&shm, Some("compare_split"), |h| &h.compare_split_bits);
-    debug_group.add(&spin_row("Compare split", "Wipe position, 0=left edge, 1=right edge", compare_split, 0.0, 1.0, 0.05, set_compare_split));
+    debug_group.add(&spin_row("Compare split", "Wipe position, 0=left edge, 1=right edge", compare_split, "compare_split", 0.05, set_compare_split));
 
     let (compare_zoom, set_compare_zoom) = bind_float(&shm, Some("compare_zoom"), |h| &h.compare_zoom_bits);
-    debug_group.add(&spin_row("Compare zoom", "", compare_zoom, 1.0, 2.0, 0.1, set_compare_zoom));
+    debug_group.add(&spin_row("Compare zoom", "", compare_zoom, "compare_zoom", 0.1, set_compare_zoom));
 
     let (compare_swap, set_compare_swap) = bind_bool(&shm, Some("compare_swap"), |h| &h.compare_swap);
     debug_group.add(&switch_row("Swap compare sides", "", compare_swap, set_compare_swap));
@@ -494,8 +434,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Debug view 5 amplification",
         "Multiplies the pre-colour-trust colour view 5 shows, to make a subtle difference easier to see",
         debug_scale,
-        0.1,
-        10.0,
+        "debug_scale",
         0.1,
         set_debug_scale,
     ));
@@ -515,9 +454,34 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_page.add(&model_group);
     view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
 
-    let motion_page = adw::PreferencesPage::new();
-    motion_page.add(&motion_group);
-    view_stack.add_titled_with_icon(&motion_page, Some("motion"), "Motion", "camera-video-symbolic");
+    // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
+    // and the model is not running before the upscaler.
+    {
+        let shm = std::sync::Arc::clone(&shm);
+        let beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
+        let update = move || {
+            let after_upscaler = {
+                let hdr = shm.header();
+                let now = hdr.layer_heartbeat.load(Ordering::Relaxed);
+                let (seen, at) = beat.get();
+                let active = if now != seen {
+                    beat.set((now, std::time::Instant::now()));
+                    seen != 0
+                } else {
+                    at.elapsed() < std::time::Duration::from_secs(2)
+                };
+                active && hdr.native_running.load(Ordering::Relaxed) == 0
+            };
+            for row in [interval_row.upcast_ref::<gtk4::Widget>(), scale_row.upcast_ref()] {
+                row.set_visible(after_upscaler);
+            }
+        };
+        update();
+        glib::timeout_add_seconds_local(1, move || {
+            update();
+            glib::ControlFlow::Continue
+        });
+    }
 
     let composition_page = adw::PreferencesPage::new();
     composition_page.add(&comp_group);
@@ -531,29 +495,30 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // and (like AdwPreferencesGroup::title) are Pango markup, so no bare "&" either.
     view_stack.add_titled_with_icon(&debug_page, Some("debug"), "Debug", "edit-find-symbolic");
 
-    // Built before the Status group: on a first run the Setup page saves the default runner,
-    // which the helper auto-start depends on.
     let setup_page = build_setup_page(&toasts);
 
     let status_page = adw::PreferencesPage::new();
     status_page.add(&build_telemetry_group(&shm));
-    let (status_group, start_stop_button) = build_status_group(&shm, &toasts);
+    let status_group = build_status_group(&shm, &toasts);
     status_page.add(&status_group);
     view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", "network-transmit-receive-symbolic");
 
     view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", "preferences-system-symbolic");
 
-    // First-run flow: `nvngx_dlssnr.dll` missing means neural rendering can't work at
-    // all yet (fail-open just presents untouched frames, no error a first-time user
-    // would ever see) -- land on Setup instead of Model, with a banner explaining why,
-    // rather than a silently-inert app.
-    let missing_ngx = !crate::binaries::dir().join("nvngx_dlssnr.dll").is_file();
-    if missing_ngx {
+    // First-run flow: no model means neural rendering can't work at all yet (fail-open just
+    // presents untouched frames, which a first-time user would never notice) -- land on Setup
+    // instead of Model, with a banner explaining why, rather than a silently-inert app.
+    let missing_model = !model_status().1;
+    if missing_model {
         view_stack.set_visible_child_name("setup");
     }
-    let banner = adw::Banner::new("NVIDIA NGX binaries are missing -- neural rendering can't run without them");
+    let banner = adw::Banner::new("The neural rendering model is missing -- extract it in Setup");
     banner.set_button_label(Some("Open Setup"));
-    banner.set_revealed(missing_ngx);
+    banner.set_revealed(missing_model);
+    {
+        let banner = banner.clone();
+        on_model_changed(move || banner.set_revealed(!model_status().1));
+    }
     {
         let view_stack = view_stack.clone();
         let banner_for_closure = banner.clone();
@@ -566,8 +531,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // `AdwViewSwitcherTitle`/`Bar` are deprecated since libadwaita 1.4 in favor of a
     // plain `AdwViewSwitcher` plus `AdwBreakpoint` -- previously left as the
     // version-compatible choice because whether CI's own libadwaita was actually new
-    // enough was never confirmed (see CLAUDE.md's now-resolved "Deliberately not done"
-    // item). Confirmed 2026-09-15 directly against a real CI run's own `apt-get
+    // enough was never confirmed. Confirmed 2026-09-15 directly against a real CI run's own `apt-get
     // install` log, not assumed: GitHub Actions' `ubuntu-latest` (Ubuntu 24.04
     // "noble") installs libadwaita 1.5.0, comfortably past the v1_4 this needs, and
     // that same run's build output was already emitting deprecation warnings for the
@@ -601,20 +565,11 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     toolbar_view.add_bottom_bar(&switcher_bar);
     toasts.set_child(Some(&toolbar_view));
 
-    // Developer aid: `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog at startup, and
-    // `NEURAL_FORGE_GUI_OPEN=<tab id>` (model/motion/composition/debug/status/setup) selects that
-    // tab at startup, so either can be screenshotted where synthetic input cannot reliably reach
-    // a page navigated to after the window opens.
-    match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
-        Some("passes") => {
-            let shm = std::sync::Arc::clone(&shm);
-            let view = view_stack.clone();
-            glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || open_pass_dialog(&shm, view.upcast_ref()));
-        }
-        Some(tab @ ("model" | "motion" | "composition" | "debug" | "status" | "setup")) => {
-            view_stack.set_visible_child_name(tab);
-        }
-        _ => {}
+    // Developer aid: `NEURAL_FORGE_GUI_OPEN=<tab id>` (model/composition/debug/status/setup) selects
+    // that tab at startup, so it can be screenshotted where synthetic input cannot reliably reach a
+    // page navigated to after the window opens.
+    if let Some(tab @ ("model" | "composition" | "debug" | "status" | "setup")) = neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
+        view_stack.set_visible_child_name(tab);
     }
 
     // Follow the header: a change made with `shmctl`, a loaded profile, Reset or another
@@ -631,6 +586,18 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         .default_height(700)
         .content(&toasts)
         .build();
+
+    {
+        let toasts = toasts.clone();
+        crate::shm::on_save_error(move |message| toasts.add_toast(adw::Toast::new(&message)));
+    }
+    // A change made in the last moment before closing is still saved.
+    window.connect_close_request(|_| {
+        if let Err(e) = crate::shm::flush_settings() {
+            eprintln!("neural-forge: saving config.ini failed: {e}");
+        }
+        glib::Propagation::Proceed
+    });
 
     // Below 1400sp wide: hide the header's inline switcher, reveal the bottom bar
     // instead. 1400, not the far narrower value an adaptive/mobile-first app would
@@ -662,8 +629,9 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                 .application_name("Neural Forge")
                 .version(env!("CARGO_PKG_VERSION"))
                 .developers(vec!["Linnard Alex Brown Jr."])
-                .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering on Linux/Proton games.")
+                .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering natively in Linux/Proton games.")
                 .website("https://github.com/labj1987/neural-forge")
+                .issue_url("https://github.com/labj1987/neural-forge/issues")
                 // Matches Cargo.toml's `AGPL-3.0-or-later`; the upstream project's own
                 // license is AGPL-3.0, which is what requires it for the adapted code.
                 .license_type(gtk4::License::Agpl30)
@@ -678,7 +646,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                     "Dagherbou and cdozdil (OptiScaler) — the DLSS-NR shader lineage",
                 ],
             );
-            dialog.add_acknowledgement_section(
+            dialog.add_credit_section(
                 Some("Built with"),
                 &["Claude Code (Anthropic)", "Codex (OpenAI)"],
             );
@@ -687,234 +655,21 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     }
 
     window.present();
-
-    // Auto-start the helper when neural rendering is already enabled and it isn't running,
-    // instead of leaving that to an easy-to-miss manual Start click: `enabled=1` with no
-    // helper makes the layer pay per-frame capture overhead chasing a helper that never
-    // answers (found 2026-09-16 after a reboot). Queued for after the window is up, and
-    // run off the main thread by `start_helper`, so a slow first System Wine start
-    // (wineboot, a DXVK download) never keeps the window from appearing.
-    if shm.header().enabled.load(Ordering::Relaxed) != 0 {
-        let toasts = toasts.clone();
-        glib::idle_add_local_once(move || {
-            if neural_forge_supervisor::is_running().is_none() && start_stop_button.is_sensitive() {
-                start_helper(&start_stop_button, &toasts, true);
-            }
-        });
-    }
-}
-
-/// Pid of the helper this GUI instance started, 0 if none. Closing the window stops only
-/// this one: a helper started by `neural-forge-cli start` or an earlier session keeps
-/// running, so closing the settings mid-game doesn't drop the effect.
-pub static STARTED_PID: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-
-/// Starts the helper on a worker thread. `supervisor::start` can take a while (for the
-/// System Wine runner it runs `wineboot --init` and may download DXVK), so doing it on
-/// the main thread froze the window. The button stays insensitive until the result is
-/// back, which the one-second status timer relies on.
-fn start_helper(button: &gtk4::Button, toasts: &adw::ToastOverlay, auto: bool) {
-    button.set_sensitive(false);
-    button.set_label("Starting…");
-    let wine = neural_forge_supervisor::Config::load().runner_type == "wine";
-    let progress = adw::Toast::builder()
-        .title(if wine {
-            "Starting the helper -- preparing the Wine prefix, which can take a minute the first time"
-        } else {
-            "Starting the helper…"
-        })
-        .timeout(0)
-        .build();
-    toasts.add_toast(progress.clone());
-    let button = button.clone();
-    let toasts = toasts.clone();
-    glib::spawn_future_local(async move {
-        let result = gio::spawn_blocking(|| {
-            let cfg = neural_forge_supervisor::Config::load();
-            neural_forge_supervisor::start(&cfg).map(|started| started.pid).map_err(|e| e.to_string())
-        })
-        .await;
-        progress.dismiss();
-        let message = match result {
-            Ok(Ok(pid)) => {
-                STARTED_PID.store(pid, Ordering::Relaxed);
-                if auto { format!("Helper auto-started (pid {pid})") } else { format!("Helper started (pid {pid})") }
-            }
-            Ok(Err(e)) if auto => format!("Neural rendering is on, but the helper failed to auto-start: {e}"),
-            Ok(Err(e)) => format!("Start failed: {e}"),
-            Err(_) => "Start failed: the start worker panicked".to_string(),
-        };
-        toasts.add_toast(adw::Toast::new(&message));
-        button.set_label(if neural_forge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
-        button.set_sensitive(true);
-    });
-}
-
-/// One per-pass field in the per-pass dialog.
-struct PassField {
-    title: &'static str,
-    bit: u32,
-    kind: PassFieldKind,
-    get: fn(&neural_forge_protocol::PassControl) -> &std::sync::atomic::AtomicU32,
-}
-
-enum PassFieldKind {
-    Float { lower: f64, upper: f64, step: f64 },
-    Int { lower: f64, upper: f64 },
-    Choice(&'static [&'static str]),
-    Toggle,
-}
-
-/// Per-pass overrides: each pass of the chain can replace any of the Model tab's values with
-/// its own. A pass that overrides nothing follows the Model tab. Written straight into the
-/// header's pass array and saved as `set_pass_<n>_*`.
-fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, parent: &gtk4::Widget) {
-    use neural_forge_protocol::enums::pass_override as po;
-    use std::cell::Cell;
-    use std::rc::Rc;
-    const FIELDS: &[PassField] = &[
-        PassField { title: "Intensity", bit: po::INTENSITY, kind: PassFieldKind::Float { lower: 0.0, upper: 4.0, step: 0.05 }, get: |p| &p.intensity_bits },
-        PassField { title: "Local tone", bit: po::LOCAL_TONE, kind: PassFieldKind::Float { lower: 0.0, upper: 4.0, step: 0.05 }, get: |p| &p.local_tone_bits },
-        PassField { title: "Local structure", bit: po::LOCAL_STRUCTURE, kind: PassFieldKind::Float { lower: 0.0, upper: 4.0, step: 0.05 }, get: |p| &p.local_structure_bits },
-        PassField { title: "Skin structure", bit: po::SKIN_STRUCTURE, kind: PassFieldKind::Float { lower: -1.0, upper: 4.0, step: 0.05 }, get: |p| &p.skin_structure_bits },
-        PassField { title: "Sharpness", bit: po::SHARPNESS, kind: PassFieldKind::Float { lower: 0.0, upper: 1.0, step: 0.05 }, get: |p| &p.sharpness_bits },
-        PassField { title: "Style", bit: po::STYLE, kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]), get: |p| &p.style },
-        PassField { title: "Preset", bit: po::PRESET, kind: PassFieldKind::Int { lower: 0.0, upper: 15.0 }, get: |p| &p.preset },
-        PassField { title: "Auto mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |p| &p.auto_mask },
-    ];
-
-    let dialog = adw::PreferencesDialog::new();
-    dialog.set_title("Per-pass settings");
-    let page = adw::PreferencesPage::new();
-    let pick = adw::PreferencesGroup::new();
-    pick.set_description(Some(
-        "Each pass of the model can override any Model-tab value with its own. A pass that \
-         overrides nothing follows the Model tab. Changes rebuild that pass after the rebuild spacing.",
-    ));
-    let pass_adj = gtk4::Adjustment::new(1.0, 1.0, neural_forge_protocol::MAX_PASSES as f64, 1.0, 5.0, 0.0);
-    let pass_row = adw::SpinRow::new(Some(&pass_adj), 1.0, 0);
-    pass_row.set_title("Pass");
-    pick.add(&pass_row);
-    page.add(&pick);
-    let fields_group = adw::PreferencesGroup::new();
-    page.add(&fields_group);
-
-    let loading = Rc::new(Cell::new(false));
-    let current_pass = move |adj: &gtk4::Adjustment| (adj.value() as usize).saturating_sub(1).min(neural_forge_protocol::MAX_PASSES - 1);
-    // Each field's "load this pass into the widgets" closure.
-    let mut reloads: Vec<Box<dyn Fn(usize)>> = Vec::new();
-
-    for field in FIELDS {
-        let expander = adw::ExpanderRow::new();
-        expander.set_title(field.title);
-        expander.set_subtitle("Override for this pass");
-        expander.set_show_enable_switch(true);
-        let write = {
-            let shm = std::sync::Arc::clone(shm);
-            let pass_adj = pass_adj.clone();
-            let loading = Rc::clone(&loading);
-            let get = field.get;
-            Rc::new(move |bits: u32| {
-                if loading.get() {
-                    return;
-                }
-                let h = shm.header();
-                get(&h.pass[current_pass(&pass_adj)]).store(bits, Ordering::Relaxed);
-                h.tuning_seq.fetch_add(1, Ordering::Relaxed);
-                h.control_seq.fetch_add(1, Ordering::Relaxed);
-                crate::shm::persist_all(h);
-            })
-        };
-        let set_widget: Box<dyn Fn(u32)> = match &field.kind {
-            PassFieldKind::Float { lower, upper, step } => {
-                let adj = gtk4::Adjustment::new(0.0, *lower, *upper, *step, step * 10.0, 0.0);
-                let row = adw::SpinRow::new(Some(&adj), *step, 2);
-                row.set_title("Value");
-                let w = Rc::clone(&write);
-                adj.connect_value_changed(move |a| w((a.value() as f32).to_bits()));
-                expander.add_row(&row);
-                Box::new(move |bits| adj.set_value(f64::from(f32::from_bits(bits))))
-            }
-            PassFieldKind::Int { lower, upper } => {
-                let adj = gtk4::Adjustment::new(0.0, *lower, *upper, 1.0, 5.0, 0.0);
-                let row = adw::SpinRow::new(Some(&adj), 1.0, 0);
-                row.set_title("Value");
-                let w = Rc::clone(&write);
-                adj.connect_value_changed(move |a| w(a.value() as u32));
-                expander.add_row(&row);
-                Box::new(move |bits| adj.set_value(f64::from(bits)))
-            }
-            PassFieldKind::Choice(options) => {
-                let row = adw::ComboRow::new();
-                row.set_title("Value");
-                row.set_model(Some(&gtk4::StringList::new(options)));
-                let w = Rc::clone(&write);
-                row.connect_selected_notify(move |r| w(r.selected()));
-                expander.add_row(&row);
-                let last = options.len() as u32 - 1;
-                Box::new(move |bits| row.set_selected(bits.min(last)))
-            }
-            PassFieldKind::Toggle => {
-                let row = adw::SwitchRow::new();
-                row.set_title("On");
-                let w = Rc::clone(&write);
-                row.connect_active_notify(move |r| w(u32::from(r.is_active())));
-                expander.add_row(&row);
-                Box::new(move |bits| row.set_active(bits != 0))
-            }
-        };
-        {
-            let shm = std::sync::Arc::clone(shm);
-            let pass_adj = pass_adj.clone();
-            let loading = Rc::clone(&loading);
-            let bit = field.bit;
-            expander.connect_enable_expansion_notify(move |e| {
-                if loading.get() {
-                    return;
-                }
-                let h = shm.header();
-                let mask = &h.pass[current_pass(&pass_adj)].override_mask;
-                if e.enables_expansion() {
-                    mask.fetch_or(bit, Ordering::Relaxed);
-                } else {
-                    mask.fetch_and(!bit, Ordering::Relaxed);
-                }
-                h.tuning_seq.fetch_add(1, Ordering::Relaxed);
-                h.control_seq.fetch_add(1, Ordering::Relaxed);
-                crate::shm::persist_all(h);
-            });
-        }
-        fields_group.add(&expander);
-        let shm = std::sync::Arc::clone(shm);
-        let get = field.get;
-        let bit = field.bit;
-        reloads.push(Box::new(move |pass| {
-            let p = &shm.header().pass[pass];
-            expander.set_enable_expansion(p.override_mask.load(Ordering::Relaxed) & bit != 0);
-            set_widget(get(p).load(Ordering::Relaxed));
-        }));
-    }
-
-    let reload = {
-        let loading = Rc::clone(&loading);
-        let reloads = Rc::new(reloads);
-        move |pass: usize| {
-            loading.set(true);
-            reloads.iter().for_each(|r| r(pass));
-            loading.set(false);
-        }
-    };
-    reload(0);
-    pass_adj.connect_value_changed(move |a| reload(current_pass(a)));
-
-    dialog.add(&page);
-    dialog.present(Some(parent));
 }
 
 fn profile_names() -> Vec<String> {
     let mut names: Vec<String> = neural_forge_supervisor::profiles::load_all().into_keys().collect();
     names.sort();
     names
+}
+
+/// The profile name the combo shows as selected, read from the combo's own model (the list on disk
+/// may have changed since it was built); `None` when nothing real is selected.
+fn selected_profile(combo: &adw::ComboRow) -> Option<String> {
+    if !combo.is_sensitive() {
+        return None; // the "No saved profiles" placeholder
+    }
+    combo.selected_item().and_downcast::<gtk4::StringObject>().map(|item| item.string().to_string())
 }
 
 /// Rebuilds the combo's model from disk -- called on init and after every
@@ -932,131 +687,6 @@ fn refresh_profile_combo(combo: &adw::ComboRow) {
     }
 }
 
-/// Asks for a folder and imports the NGX DLL from it on a worker thread (it is
-/// tens of megabytes). `on_imported` runs on the main thread after a successful
-/// import, to refresh whatever status the caller shows.
-fn import_ngx_binaries(button: &gtk4::Button, toasts: &adw::ToastOverlay, on_imported: impl Fn() + 'static) {
-    let toasts = toasts.clone();
-    let parent = button.root().and_downcast::<gtk4::Window>();
-    let dialog = gtk4::FileDialog::builder().title("Select folder containing NVIDIA NGX DLLs").build();
-    dialog.select_folder(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
-        let Ok(folder) = result else { return };
-        let Some(path) = folder.path() else {
-            toasts.add_toast(adw::Toast::new("That folder has no local path -- choose a folder on this computer"));
-            return;
-        };
-        glib::spawn_future_local(async move {
-            match gio::spawn_blocking(move || crate::binaries::import_from(&path)).await {
-                Ok(Ok(0)) => toasts.add_toast(adw::Toast::new("No matching DLLs found in that folder")),
-                Ok(Ok(n)) => {
-                    toasts.add_toast(adw::Toast::new(&format!("Imported {n} file(s) -- restart the helper to load them")));
-                    on_imported();
-                }
-                Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Import failed: {e}"))),
-                Err(_) => toasts.add_toast(adw::Toast::new("Import failed: the import worker panicked")),
-            }
-        });
-    });
-}
-
-fn build_ngx_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::new();
-    group.set_title("NVIDIA NGX binary");
-    group.set_description(Some("From your own NVIDIA driver/SDK install -- this project doesn't and can't ship it"));
-
-    let mut status_rows: Vec<(String, adw::ActionRow, gtk4::Image)> = Vec::new();
-    for (name, present) in crate::binaries::status() {
-        let row = adw::ActionRow::new();
-        row.set_title(name);
-        row.set_subtitle(if present { "present" } else { "missing" });
-        let icon = gtk4::Image::from_icon_name(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" });
-        row.add_prefix(&icon);
-        group.add(&row);
-        status_rows.push((name.to_string(), row, icon));
-    }
-
-    let import_row = adw::ActionRow::new();
-    import_row.set_title("Import");
-    import_row.set_subtitle("Copy the DLL above from a folder (an extracted NVIDIA driver/SDK)");
-    let import_button = gtk4::Button::with_label("Import…");
-    import_button.set_valign(gtk4::Align::Center);
-    import_row.add_suffix(&import_button);
-    import_row.set_activatable_widget(Some(&import_button));
-    group.add(&import_row);
-
-    {
-        let toasts = toasts.clone();
-        import_button.connect_clicked(move |button| {
-            let status_rows = status_rows.clone();
-            import_ngx_binaries(button, &toasts, move || {
-                for (name, row, icon) in &status_rows {
-                    let present = crate::binaries::dir().join(name).is_file();
-                    row.set_subtitle(if present { "present" } else { "missing" });
-                    icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
-                }
-            });
-        });
-    }
-
-    group
-}
-
-fn build_runner_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
-    let group = adw::PreferencesGroup::new();
-    group.set_title("Compatibility tool");
-    group.set_description(Some("Needs DXVK-NVAPI (Proton-CachyOS, Proton-GE) or a system Wine with it installed -- \
-                            Valve's stock Proton builds don't bundle it"));
-
-    let mut options: Vec<(String, String)> = neural_forge_supervisor::runners::discover_proton()
-        .into_iter()
-        .map(|runner| (runner.name, runner.path.to_string_lossy().into_owned()))
-        .collect();
-    if let Some(wine) = neural_forge_supervisor::runners::find_wine() {
-        options.push(("System Wine".to_string(), wine.to_string_lossy().into_owned()));
-    }
-
-    let combo = adw::ComboRow::new();
-    combo.set_title("Runner");
-    if options.is_empty() {
-        combo.set_model(Some(&gtk4::StringList::new(&["No compatibility tool found"])));
-        combo.set_sensitive(false);
-    } else {
-        let mut cfg = neural_forge_supervisor::Config::load();
-        // First run: nothing is configured yet, so save the runner `neural-forge-cli init`
-        // would pick. Showing it selected without saving it left the helper with no runner.
-        if cfg.runner_path.is_empty() {
-            if let Some((runner_type, path)) = neural_forge_supervisor::runners::default_runner() {
-                cfg.runner_type = runner_type.to_string();
-                cfg.runner_path = path.to_string_lossy().into_owned();
-                if let Err(e) = cfg.save() {
-                    toasts.add_toast(adw::Toast::new(&format!("Failed to save the runner: {e}")));
-                }
-            }
-        }
-        let names: Vec<&str> = options.iter().map(|(name, _)| name.as_str()).collect();
-        combo.set_model(Some(&gtk4::StringList::new(&names)));
-        let selected = options.iter().position(|(_, path)| *path == cfg.runner_path).unwrap_or(0);
-        combo.set_selected(selected as u32);
-    }
-    group.add(&combo);
-
-    if !options.is_empty() {
-        let toasts = toasts.clone();
-        combo.connect_selected_notify(move |combo| {
-            let Some((name, path)) = options.get(combo.selected() as usize) else { return };
-            let mut cfg = neural_forge_supervisor::Config::load();
-            cfg.runner_type = if name == "System Wine" { "wine".to_string() } else { "proton".to_string() };
-            cfg.runner_path = path.clone();
-            match cfg.save() {
-                Ok(()) => toasts.add_toast(adw::Toast::new(&format!("Runner set to {name} -- restart the helper to use it"))),
-                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Failed to save: {e}"))),
-            }
-        });
-    }
-
-    group
-}
-
 /// The exact Steam launch-option string for these settings -- pulled out of the
 /// closure below so it's a plain, unit-testable function instead of only ever being
 /// exercised live through GTK signal handlers.
@@ -1067,10 +697,20 @@ fn launch_option(target_exe: &str) -> String {
     let mut parts = vec!["NEURAL_FORGE_ENABLE=1".to_string()];
     let target_exe = target_exe.trim();
     if !target_exe.is_empty() {
-        parts.push(format!("NEURAL_FORGE_TARGET_EXE={target_exe}"));
+        parts.push(format!("NEURAL_FORGE_TARGET_EXE={}", shell_quote(target_exe)));
     }
     parts.push("%command%".to_string());
     parts.join(" ")
+}
+
+/// Steam runs the launch option through a shell, so a value with a space or any other
+/// shell character is single-quoted (a `'` inside becomes `'\''`).
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 fn build_launch_option_group() -> adw::PreferencesGroup {
@@ -1107,23 +747,100 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     group
 }
 
+/// The model's row text: present with the build it came from (and whether that build is verified),
+/// or missing.
+fn model_status() -> (String, bool) {
+    let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+    match neural_forge_supervisor::model::installed(&dir) {
+        Some(build) if neural_forge_supervisor::model::installed_verified(&dir) == Some(false) => {
+            (format!("present, from build {build}, not verified against NVIDIA's runtime"), true)
+        }
+        Some(build) => (format!("present, from build {build}"), true),
+        None => ("missing: extract it from nvngx_dlssnr.dll below".to_string(), false),
+    }
+}
+
+/// The native backend's one setup step: point at NVIDIA's DLL once and extract the model from it.
+fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Neural rendering model");
+    group.set_description(Some(
+        "Taken from your own nvngx_dlssnr.dll -- this project doesn't and can't ship it",
+    ));
+    let (text, present) = model_status();
+    let status_row = adw::ActionRow::new();
+    status_row.set_title("Model");
+    status_row.set_subtitle(&text);
+    let icon = gtk4::Image::from_icon_name(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" });
+    status_row.add_prefix(&icon);
+    group.add(&status_row);
+
+    let extract_row = adw::ActionRow::new();
+    extract_row.set_title("Extract from DLL");
+    extract_row.set_subtitle("Choose nvngx_dlssnr.dll; the model is written to Neural Forge's data folder");
+    let button = gtk4::Button::with_label("Extract…");
+    button.set_valign(gtk4::Align::Center);
+    extract_row.add_suffix(&button);
+    extract_row.set_activatable_widget(Some(&button));
+    group.add(&extract_row);
+
+    let toasts = toasts.clone();
+    button.connect_clicked(move |button| {
+        let toasts = toasts.clone();
+        let (status_row, icon) = (status_row.clone(), icon.clone());
+        let parent = button.root().and_downcast::<gtk4::Window>();
+        let dialog = gtk4::FileDialog::builder().title("Select nvngx_dlssnr.dll").build();
+        dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+            let Ok(file) = result else { return };
+            let Some(path) = file.path() else {
+                toasts.add_toast(adw::Toast::new("That file has no local path -- choose a file on this computer"));
+                return;
+            };
+            glib::spawn_future_local(async move {
+                let out = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+                match gio::spawn_blocking(move || neural_forge_supervisor::model::extract(&path, &out)).await {
+                    Ok(Ok(done)) => {
+                        let unverified = if done.verified { "" } else { " (not verified against NVIDIA's runtime)" };
+                        toasts.add_toast(adw::Toast::new(&format!(
+                            "Model extracted from build {}{unverified} -- restart the game to use it",
+                            done.build
+                        )))
+                    }
+                    // The report is too long for a toast: its summary line there, all of it in the log.
+                    Ok(Err(neural_forge_supervisor::model::ModelError::Shape(report))) => {
+                        eprintln!("neural-forge: extraction refused:\n{report}");
+                        let summary = report.lines().next().unwrap_or_default();
+                        toasts.add_toast(adw::Toast::new(&format!("Extraction refused, a different network: {summary}")));
+                    }
+                    Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Extraction failed: {e}"))),
+                    Err(_) => toasts.add_toast(adw::Toast::new("Extraction failed: the worker panicked")),
+                }
+                let (text, present) = model_status();
+                status_row.set_subtitle(&text);
+                icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
+                model_changed();
+            });
+        });
+    });
+    group
+}
+
 fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
-    page.add(&build_ngx_group(toasts));
-    page.add(&build_runner_group(toasts));
+    page.add(&build_model_group(toasts));
     page.add(&build_launch_option_group());
     page
 }
 
-/// One sample of the three timing series the sparkline plots, all already published
-/// by the layer/helper for `neural-forge-cli shmctl status` -- this just samples them
-/// on a faster timer than the once-a-second status labels above need, and keeps the
-/// last few seconds of them for the drawing area to plot.
+/// One sample of the two timing series the sparkline plots, both already published by the layer for
+/// `neural-forge-cli shmctl status` -- this just samples them on a faster timer than the
+/// once-a-second status labels need, and keeps the last few seconds for the drawing area to plot.
 #[derive(Clone, Copy)]
 struct TelemetrySample {
+    /// After the upscaler: capture and compose.
     layer_ms: f32,
-    helper_round_trip_ms: f32,
-    helper_eval_ms: f32,
+    /// Before the upscaler: how long the last hold took.
+    hold_ms: f32,
 }
 
 const TELEMETRY_INTERVAL_MS: u32 = 200;
@@ -1161,10 +878,8 @@ fn draw_telemetry_sparkline(cr: &gtk4::cairo::Context, width: i32, height: i32, 
     };
 
     cr.set_line_width(1.6);
-    cr.set_source_rgb(0.988, 0.686, 0.243); // helper round trip -- amber
-    plot(cr, |s| s.helper_round_trip_ms);
-    cr.set_source_rgb(0.204, 0.780, 0.678); // model eval -- teal
-    plot(cr, |s| s.helper_eval_ms);
+    cr.set_source_rgb(0.204, 0.780, 0.678); // hold before the upscaler -- teal
+    plot(cr, |s| s.hold_ms);
     cr.set_source_rgb(0.596, 0.478, 0.953); // layer (capture+compose) -- violet, matches the app's own accent
     plot(cr, |s| s.layer_ms);
 
@@ -1190,7 +905,7 @@ fn legend_label(text: &str, rgb: (f64, f64, f64)) -> gtk4::Box {
 fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Telemetry");
-    group.set_description(Some("Live from the running helper/layer -- all zero until a targeted game attaches"));
+    group.set_description(Some("Live from the layer -- all zero until a targeted game attaches"));
 
     let model_row = adw::ActionRow::new();
     model_row.set_title("Model");
@@ -1206,9 +921,8 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     legend.set_margin_top(10);
     legend.set_margin_start(10);
     legend.set_margin_end(10);
-    legend.append(&legend_label("Layer", (0.596, 0.478, 0.953)));
-    legend.append(&legend_label("Helper round trip", (0.988, 0.686, 0.243)));
-    legend.append(&legend_label("Model eval", (0.204, 0.780, 0.678)));
+    legend.append(&legend_label("Hold (before the upscaler)", (0.204, 0.780, 0.678)));
+    legend.append(&legend_label("Layer (after the upscaler)", (0.596, 0.478, 0.953)));
 
     let sparkline = gtk4::DrawingArea::new();
     // A minimum, not a ceiling: `AdwPreferencesGroup` still stretches this row taller
@@ -1249,13 +963,12 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
 
     let shm_for_timer = std::sync::Arc::clone(shm);
     let sparkline_for_timer = sparkline.clone();
-    let mut last_helper_frames: Option<u64> = None;
     let mut last_layer_frames: Option<u64> = None;
     let mut layer_beat_seen = (0u32, std::time::Instant::now());
     glib::timeout_add_local(std::time::Duration::from_millis(u64::from(TELEMETRY_INTERVAL_MS)), move || {
         let hdr = shm_for_timer.header();
 
-        model_row.set_subtitle(if hdr.model_up.load(Ordering::Relaxed) != 0 { "loaded" } else { "not loaded" });
+        model_row.set_subtitle(if hdr.native_running.load(Ordering::Relaxed) != 0 { "running before the upscaler" } else { "not running before the upscaler" });
         // The name is only as current as the frames: a closed game leaves its name behind.
         let beat = hdr.layer_heartbeat.load(Ordering::Relaxed);
         if beat != layer_beat_seen.0 {
@@ -1269,24 +982,18 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
             (false, true) => game,
         });
 
-        let helper_frames = neural_forge_protocol::load64(&hdr.helper_frames_lo, &hdr.helper_frames_hi);
         let layer_frames = neural_forge_protocol::load64(&hdr.layer_frames_lo, &hdr.layer_frames_hi);
         let per_second = 1000.0 / f64::from(TELEMETRY_INTERVAL_MS);
-        let helper_fps = last_helper_frames.map(|prev| (helper_frames.saturating_sub(prev)) as f64 * per_second);
         let layer_fps = last_layer_frames.map(|prev| (layer_frames.saturating_sub(prev)) as f64 * per_second);
-        last_helper_frames = Some(helper_frames);
         last_layer_frames = Some(layer_frames);
-        match (layer_fps, helper_fps) {
-            (Some(l), Some(h)) => fps_row.set_subtitle(&format!("layer {l:.1}/s, helper {h:.1}/s")),
-            _ => fps_row.set_subtitle("—"),
+        match layer_fps {
+            Some(l) => fps_row.set_subtitle(&format!("{l:.1} presents/s")),
+            None => fps_row.set_subtitle("—"),
         }
 
         let sample = TelemetrySample {
             layer_ms: f32::from_bits(hdr.layer_ms_bits.load(Ordering::Relaxed)),
-            helper_round_trip_ms: f32::from_bits(hdr.helper_upload_ms_bits.load(Ordering::Relaxed))
-                + f32::from_bits(hdr.helper_eval_ms_bits.load(Ordering::Relaxed))
-                + f32::from_bits(hdr.helper_readback_ms_bits.load(Ordering::Relaxed)),
-            helper_eval_ms: f32::from_bits(hdr.helper_eval_ms_bits.load(Ordering::Relaxed)),
+            hold_ms: f32::from_bits(hdr.preupscale_hold_ms_bits.load(Ordering::Relaxed)),
         };
         {
             let mut history = history.borrow_mut();
@@ -1303,43 +1010,23 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     group
 }
 
-/// The Status group -- helper/layer liveness refreshed on a timer, plus the helper
-/// Start/Stop, NGX import, reset and profile actions -- and its Start/Stop button (for
-/// the launch-time auto-start).
-fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> (adw::PreferencesGroup, gtk4::Button) {
+/// The Status group -- the layer's liveness and where the model runs, refreshed on a timer, plus the
+/// model, reset and profile actions.
+fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Status");
 
-    let helper_row = adw::ActionRow::new();
-    helper_row.set_title("Helper");
-    let start_stop_button = gtk4::Button::with_label("Start");
-    start_stop_button.set_valign(gtk4::Align::Center);
-    helper_row.add_suffix(&start_stop_button);
     let layer_row = adw::ActionRow::new();
     layer_row.set_title("Layer");
     // Where the model runs: before DLSS's upscaler (when the game uses DLSS Super Resolution) or
     // after it (everything else). Read-only; there is no setting for it.
     let preupscale_row = adw::ActionRow::new();
     preupscale_row.set_title("Model placement");
-    group.add(&helper_row);
     group.add(&layer_row);
     group.add(&preupscale_row);
 
-    let log_button = gtk4::Button::from_icon_name("text-x-generic-symbolic");
-    log_button.set_tooltip_text(Some("Open the helper log"));
-    log_button.set_valign(gtk4::Align::Center);
-    helper_row.add_suffix(&log_button);
-    log_button.connect_clicked(|_| {
-        let log = neural_forge_supervisor::Config::load().log;
-        let _ = gio::AppInfo::launch_default_for_uri(&gio::File::for_path(&log).uri(), None::<&gio::AppLaunchContext>);
-    });
-
     let shm_for_timer = std::sync::Arc::clone(shm);
-    let start_stop_button_for_timer = start_stop_button.clone();
-    // Liveness is read from the heartbeats, not the state fields: a killed helper never writes
-    // STOPPED and a closed game never clears `layer_attached`, so those fields alone go on
-    // claiming "running" and "attached" forever.
-    let helper_beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
+    // Liveness is read from the heartbeat, not `layer_attached`: a closed game never clears it.
     let layer_beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
     let fresh = |cell: &std::cell::Cell<(u32, std::time::Instant)>, now_value: u32| {
         let (seen, at) = cell.get();
@@ -1354,89 +1041,35 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         let hdr = shm_for_timer.header();
         // A header laid out by another build is refused at open (see `Shm::open`), so the
         // version needs no check here.
-        let helper_alive = fresh(&helper_beat, hdr.heartbeat.load(Ordering::Relaxed));
-        let helper_state = hdr.helper_state.load(Ordering::Relaxed);
-        let reason = hdr.helper_reason();
-        let state = if helper_alive || neural_forge_supervisor::is_running().is_some() { helper_state_label(helper_state) } else { "not running" };
-        helper_row.set_subtitle(&if reason.is_empty() { state.to_string() } else { format!("{state} -- {reason}") });
         let layer_active = fresh(&layer_beat, hdr.layer_heartbeat.load(Ordering::Relaxed));
         let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
         layer_row.set_subtitle(if layer_active {
             "active: processing the game's frames"
         } else if attached {
-            "idle: a game attached, but no frames are being processed (loading screen, paused, closed, or no helper)"
+            "idle: a game attached, but no frames are being processed (loading screen, paused or closed)"
         } else {
             "no game attached yet"
         });
-        preupscale_row.set_subtitle(&preupscale_label(
+        let label = preupscale_label(
             layer_active,
             hdr.preupscale_state.load(Ordering::Relaxed),
             hdr.preupscale_width.load(Ordering::Relaxed),
             hdr.preupscale_height.load(Ordering::Relaxed),
             hdr.preupscale_misses.load(Ordering::Relaxed),
-        ));
-        // Keyed off the actual OS-level pid-file check (what start/stop manage), not
-        // the SHM helper_state above -- those can briefly disagree right after a
-        // start/stop (e.g. STARTING vs. the process not existing yet) and the button
-        // should reflect what clicking it will actually do, not the helper's own
-        // self-reported state.
-        if start_stop_button_for_timer.is_sensitive() {
-            start_stop_button_for_timer.set_label(if neural_forge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
-        }
+        );
+        // The layer's own status line: the model running, or why it is not.
+        let layer_reason = if layer_active { hdr.layer_reason() } else { String::new() };
+        preupscale_row.set_subtitle(&if layer_reason.is_empty() { label } else { format!("{label} -- {layer_reason}") });
         glib::ControlFlow::Continue
     });
 
+    let model_row = adw::ActionRow::new();
+    model_row.set_title("Model");
+    model_row.set_subtitle(&model_status().0);
+    group.add(&model_row);
     {
-        let toasts = toasts.clone();
-        start_stop_button.connect_clicked(move |button| {
-            let toasts = toasts.clone();
-            if neural_forge_supervisor::is_running().is_some() {
-                // Stopping waits up to 5s for a graceful exit before escalating to
-                // SIGKILL, then shells out to `wineserver -k` (see
-                // neural_forge_supervisor::stop). Run on a worker thread: doing it inline
-                // blocked the main loop, so the "Stopping…" label below never painted.
-                // The button stays insensitive until the result is back on the main
-                // thread (which the one-second status timer also relies on).
-                button.set_sensitive(false);
-                button.set_label("Stopping…");
-                let button = button.clone();
-                glib::spawn_future_local(async move {
-                    let result = gio::spawn_blocking(|| neural_forge_supervisor::stop(std::time::Duration::from_secs(5))).await;
-                    match result {
-                        Ok(Ok(())) => {
-                            STARTED_PID.store(0, Ordering::Relaxed);
-                            toasts.add_toast(adw::Toast::new("Helper stopped"));
-                        }
-                        // Another start or stop (the CLI, or another window) holds the helper lock.
-                        Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                            toasts.add_toast(adw::Toast::new("The helper is being started or stopped elsewhere -- try again in a moment"));
-                        }
-                        Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Stop failed: {e}"))),
-                        Err(_) => toasts.add_toast(adw::Toast::new("Stop failed: the stop worker panicked")),
-                    }
-                    button.set_label(if neural_forge_supervisor::is_running().is_some() { "Stop" } else { "Start" });
-                    button.set_sensitive(true);
-                });
-            } else {
-                start_helper(button, &toasts, false);
-            }
-        });
-    }
-
-    let binaries_row = adw::ActionRow::new();
-    binaries_row.set_title("NGX binaries");
-    binaries_row.set_subtitle(&binaries_status_subtitle());
-    let import_button = gtk4::Button::with_label("Import…");
-    import_button.set_valign(gtk4::Align::Center);
-    binaries_row.add_suffix(&import_button);
-    group.add(&binaries_row);
-
-    {
-        let toasts = toasts.clone();
-        import_button.connect_clicked(move |button| {
-            let binaries_row = binaries_row.clone();
-            import_ngx_binaries(button, &toasts, move || binaries_row.set_subtitle(&binaries_status_subtitle()));
-        });
+        let model_row = model_row.clone();
+        on_model_changed(move || model_row.set_subtitle(&model_status().0));
     }
 
     let settings_row = adw::ActionRow::new();
@@ -1457,7 +1090,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             let parent = button.root().and_downcast::<gtk4::Window>();
             let dialog = adw::AlertDialog::builder()
                 .heading("Reset all settings?")
-                .body("Every tuning value returns to its default. The running helper/layer \
+                .body("Every tuning value returns to its default. The running layer \
                        session (frame counters, transport state) is not affected.")
                 .default_response("cancel")
                 .close_response("cancel")
@@ -1467,7 +1100,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
             dialog.set_response_appearance("reset", adw::ResponseAppearance::Destructive);
             dialog.choose(parent.as_ref(), None::<&gio::Cancellable>, move |response| {
                 if response != "reset" { return; }
-                // Reset the live mapping the running helper/layer are already
+                // Reset the live mapping the running layer is already
                 // attached to, then overwrite config.ini with the same defaults so a
                 // restart doesn't just reload the values this just cleared -- the
                 // same two places `persist_one` already keeps in sync for a single
@@ -1533,13 +1166,16 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         let toasts = toasts.clone();
         let profile_combo = profile_combo.clone();
         load_profile_button.connect_clicked(move |_| {
-            let names = profile_names();
-            let Some(name) = names.get(profile_combo.selected() as usize) else {
+            let Some(name) = selected_profile(&profile_combo) else {
                 toasts.add_toast(adw::Toast::new("No profile selected"));
                 return;
             };
             let profiles = neural_forge_supervisor::profiles::load_all();
-            let Some(settings) = profiles.get(name) else { return };
+            let Some(settings) = profiles.get(&name) else {
+                toasts.add_toast(adw::Toast::new(&format!("Profile \"{name}\" is gone")));
+                refresh_profile_combo(&profile_combo);
+                return;
+            };
             neural_forge_protocol::persist::apply(shm.header(), settings);
             // Same reasoning as the reset button above: applying to the live header
             // only affects the running session, so also fold the result into
@@ -1558,8 +1194,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         let toasts = toasts.clone();
         let profile_combo = profile_combo.clone();
         delete_profile_button.connect_clicked(move |_| {
-            let names = profile_names();
-            let Some(name) = names.get(profile_combo.selected() as usize).cloned() else {
+            let Some(name) = selected_profile(&profile_combo) else {
                 toasts.add_toast(adw::Toast::new("No profile selected"));
                 return;
             };
@@ -1574,15 +1209,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         });
     }
 
-    (group, start_stop_button)
-}
-
-fn binaries_status_subtitle() -> String {
-    if crate::binaries::dir().join("nvngx_dlssnr.dll").is_file() {
-        "nvngx_dlssnr.dll present".to_string()
-    } else {
-        "nvngx_dlssnr.dll missing".to_string()
-    }
+    group
 }
 
 /// The Status page's one line on the pre-upscaler path, from the header's `preupscale_*` fields
@@ -1594,21 +1221,7 @@ fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, mis
         _ if !layer_active => "no game running".to_string(),
         2 => format!("before the upscaler: holding DLSS's {width}x{height} input every frame{missed}"),
         1 => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
-        3 => format!("paused: DLSS's {width}x{height} input goes to DLSS untouched until the helper's model answers again{missed}"),
         _ => "after the upscaler".to_string(),
-    }
-}
-
-fn helper_state_label(state: u32) -> &'static str {
-    use neural_forge_protocol::enums::helper_state::*;
-    match state {
-        STARTING => "starting",
-        NO_VULKAN => "no NVIDIA Vulkan device",
-        NO_BINARIES => "NGX binaries missing",
-        MODEL_FAILED => "model failed to load",
-        RUNNING => "running",
-        STOPPED => "stopped",
-        _ => "unknown",
     }
 }
 
@@ -1619,14 +1232,13 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
             "Another Neural Forge version is running",
             format!(
                 "The shared memory was set up by a build that speaks version {found}; this app speaks {}. \
-                 Close the game and stop the helper (neural-forge-cli stop), then open Neural Forge again \
-                 so every part runs the same version.",
+                 Close the game if one is running: the next game started with this version re-creates it, and Neural Forge then opens normally.",
                 neural_forge_protocol::SHM_VERSION
             ),
         ),
         OpenError::Unavailable => (
             "Couldn't open the shared-memory mapping",
-            "Check the helper's log; neural-forge-cli doctor may also help.".to_string(),
+            "neural-forge-cli doctor may help.".to_string(),
         ),
         OpenError::Foreign => (
             "The shared-memory path names another file",
@@ -1652,7 +1264,6 @@ mod preupscale_label_tests {
         assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input every frame");
         assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input every frame, 1 frame missed");
         assert_eq!(preupscale_label(true, 1, 1485, 836, 85), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
-        assert_eq!(preupscale_label(true, 3, 1485, 836, 8), "paused: DLSS's 1485x836 input goes to DLSS untouched until the helper's model answers again, 8 frames missed");
     }
 }
 
@@ -1696,5 +1307,11 @@ mod launch_option_tests {
     #[test]
     fn whitespace_only_target_exe_is_treated_as_empty() {
         assert_eq!(launch_option("   "), "NEURAL_FORGE_ENABLE=1 %command%");
+    }
+
+    #[test]
+    fn quotes_a_target_exe_with_a_space_or_a_quote() {
+        assert_eq!(launch_option("My Game.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' %command%");
+        assert_eq!(launch_option("it's.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='it'\\''s.exe' %command%");
     }
 }

@@ -1,0 +1,181 @@
+#version 450
+// The native backend's composite (docs/NATIVE_BACKEND.md, "Phase 1"): the network's head turned into the
+// answer the write-back decodes, and the history the next frame reprojects. Ported from OpenDLSS-NR's
+// demo/shaders/nr_composite.comp (MIT, commit 9d08f41), up to the published picture: the residual
+// (neural = clamp(proxy + rgb/4)), the blend toward the reprojected history by sigmoid(logit) *
+// blendScale, the truncation to the half grid, the Natural/Cinematic style operator and the intensity
+// blend are theirs, bit for bit. NGX applies the same two after its network (style 1 and 2, intensity
+// 0.5 checked against NGX's answers: within one half-float step; NATIVE_BACKEND.md, "2.2"). The demo's
+// tone upgrade and display transform are not needed: the answer is a proxy-domain picture, as NGX's
+// was, and preupscale_decode.comp turns it back into scene-linear values.
+//
+// Shares the set layout, Params and the common functions with native_preprocess.comp (see there).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_encoded;
+layout(set = 0, binding = 1) uniform sampler2D u_history;
+layout(set = 0, binding = 2, std430) readonly buffer Motion { uint mv[]; } u_motion;
+// f32 [field][4]: RGB residual, blend logit. (Binding 3 is the preprocess's features.)
+layout(set = 0, binding = 9, std430) readonly buffer Head { float head[]; } u_head;
+layout(set = 0, binding = 4, std140) uniform Params {
+  uvec4 dims;
+  uvec4 frame;
+  vec4 motion;
+  vec4 control;
+  vec4 more;
+} p;
+layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; } u_state;
+// The exposure texel the encode used (R16_SFLOAT in the low 16 bits).
+layout(set = 0, binding = 6, std430) readonly buffer Exposure { uint bits; } u_exposure;
+// The next frame's history, valid extent.
+layout(set = 0, binding = 7, rgba16f) uniform writeonly image2D u_next;
+// The answer for preupscale_decode.comp: RGBA16F rows of the padded width, as packed half4.
+layout(set = 0, binding = 8, std430) writeonly buffer Answer { uvec2 texel[]; } u_answer;
+
+float truncateHalf(float value) {
+  uint bits = floatBitsToUint(value);
+  uint signBit = (bits >> 16u) & 0x8000u;
+  uint exponent = (bits >> 23u) & 0xffu;
+  uint mantissa = bits & 0x7fffffu;
+  uint halfBits;
+  if (exponent == 0xffu) {
+    halfBits = signBit | (mantissa != 0u ? 0x7e00u : 0x7c00u);
+  } else {
+    int halfExponent = int(exponent) - 112;
+    if (halfExponent >= 31) halfBits = signBit | 0x7c00u;
+    else if (halfExponent <= 0) {
+      if (halfExponent < -10) halfBits = signBit;
+      else halfBits = signBit | ((mantissa | 0x800000u) >> uint(14 - halfExponent));
+    } else halfBits = signBit | (uint(halfExponent) << 10u) | (mantissa >> 13u);
+  }
+  return unpackHalf2x16(halfBits).x;
+}
+
+// ---- cg2r styles (Natural / Cinematic), OpenDLSS-NR's nrHsl / nrHue / nrRgb / nrStyle.
+vec3 nrHsl(vec3 rgb) {
+  float high = max(max(rgb.r, rgb.g), rgb.b);
+  float low = min(min(rgb.r, rgb.g), rgb.b);
+  float sum = high + low;
+  float light = sum * 0.5;
+  float hue = 0.0, saturation = 0.0;
+  if (high > low) {
+    float delta = high - low;
+    saturation = light > 0.5 ? delta / ((2.0 - high) - low) : delta / sum;
+    if (high == rgb.r) hue = fma(rgb.g - rgb.b, 1.0 / delta, rgb.g < rgb.b ? 6.0 : 0.0) / 6.0;
+    else if (high == rgb.g) hue = fma(rgb.b - rgb.r, 1.0 / delta, 2.0) / 6.0;
+    else hue = fma(rgb.r - rgb.g, 1.0 / delta, 4.0) / 6.0;
+  }
+  return vec3(hue, saturation, light);
+}
+
+float nrHue(float p, float q, float hue) {
+  float h = hue;
+  if (h < 0.0) h += 1.0;
+  if (h > 1.0) h -= 1.0;
+  if (h < uintBitsToFloat(0x3e2aaaabu)) return fma(h, (q - p) * 6.0, p);
+  if (h < 0.5) return q;
+  if (h < uintBitsToFloat(0x3f2aaaabu)) return fma((uintBitsToFloat(0x3f2aaaabu) - h) * (q - p), 6.0, p);
+  return p;
+}
+
+vec3 nrRgb(vec3 hsl) {
+  if (hsl.y <= 0.0) return vec3(hsl.z);
+  float q = hsl.z < 0.5 ? hsl.z * (hsl.y + 1.0) : fma(-hsl.z, hsl.y, hsl.z + hsl.y);
+  float p = (hsl.z + hsl.z) - q;
+  return vec3(nrHue(p, q, hsl.x + uintBitsToFloat(0x3eaaaaabu)), nrHue(p, q, hsl.x), nrHue(p, q, hsl.x - uintBitsToFloat(0x3eaaaaabu)));
+}
+
+vec3 nrStyle(vec3 neural, float style, float tone) {
+  float styleTone = clamp(tone, 0.0, 1.0);
+  float exposure = style == 1.0 ? -0.1 * styleTone : 0.0;
+  float contrast = style == 1.0 ? -0.25 * styleTone : 0.0;
+  float saturation = style == 1.0 ? -0.1 * styleTone : -0.15 * styleTone;
+  vec3 color;
+  for (int c = 0; c < 3; c++) {
+    float value = clamp(neural[c], 0.0, 1.0);
+    float exposed = clamp(value * exp2(exposure), 0.0, 1.0);
+    float square = exposed * exposed;
+    float curveDelta = fma(square, 3.0 - (exposed + exposed), -exposed);
+    float curved = clamp(fma(contrast, curveDelta, exposed), 0.0, 1.0);
+    float firstGamma = exp2(log2(curved));
+    color[c] = exp2(log2(max(0.0, firstGamma)));
+  }
+  vec3 hsl = nrHsl(color);
+  vec3 adjusted = nrRgb(vec3(hsl.x, clamp(hsl.y * (saturation + 1.0), 0.0, 1.0), hsl.z));
+  vec3 again = nrHsl(adjusted);
+  return clamp(nrRgb(vec3(again.x, clamp(exp2(log2(again.y)), 0.0, 1.0), again.z)), vec3(0.0), vec3(1.0));
+}
+
+bool exposure_ok(float e) {
+  return e > 1e-6 && e < 65504.0;
+}
+
+vec2 previousPosition(uvec2 xy) {
+  vec2 mv = unpackHalf2x16(u_motion.mv[xy.y * p.dims.z + xy.x]);
+  return vec2(xy) + 0.5 + mv + p.motion.xy;
+}
+
+bool hasHistory(uvec2 xy) {
+  if (p.frame.z == 0u || u_state.ok[1u - p.frame.w] == 0u) return false;
+  vec2 at = previousPosition(xy);
+  vec2 valid = vec2(p.dims.zw);
+  return all(greaterThanEqual(at, vec2(0.0))) && all(lessThan(at, valid));
+}
+
+vec3 historySample(uvec2 xy) {
+  vec2 valid = vec2(p.dims.zw);
+  vec2 position = previousPosition(xy);
+  vec2 base = floor(position - 0.5) + 0.5;
+  vec2 f = clamp(position - base, vec2(0.0), vec2(1.0));
+  vec2 square = f * f; vec2 cube = f * square;
+  vec2 w0 = fma(f + cube, vec2(-0.5), square);
+  vec2 w1 = (cube * 1.5 - square * 2.5) + 1.0;
+  vec2 w3 = (cube - square) * 0.5;
+  vec2 w2 = ((1.0 - w0) - w1) - w3;
+  vec2 middle = w1 + w2;
+  vec2 low = clamp(base - 1.0, vec2(0.5), valid - 0.5) / valid;
+  vec2 center = clamp(base + w2 / middle, vec2(0.5), valid - 0.5) / valid;
+  vec2 high = clamp(base + 2.0, vec2(0.5), valid - 0.5) / valid;
+  vec3 left = textureLod(u_history, vec2(low.x, center.y), 0.0).rgb;
+  vec3 top = textureLod(u_history, vec2(center.x, low.y), 0.0).rgb;
+  vec3 mid = textureLod(u_history, center, 0.0).rgb;
+  vec3 bottom = textureLod(u_history, vec2(center.x, high.y), 0.0).rgb;
+  vec3 right = textureLod(u_history, vec2(high.x, center.y), 0.0).rgb;
+  float a = w0.x * middle.y; float b = w0.y * middle.x;
+  float c = middle.x * middle.y; float d = w3.y * middle.x; float e = w3.x * middle.y;
+  vec3 value = fma(left, vec3(a), top * b);
+  value = fma(mid, vec3(c), value);
+  value = fma(bottom, vec3(d), value);
+  value = fma(right, vec3(e), value);
+  return value * (1.0 / (e + (d + (c + (a + b)))));
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= p.dims.z || id.y >= p.dims.w) return;
+  if (id == uvec2(0u)) u_state.ok[p.frame.w] = exposure_ok(unpackHalf2x16(u_exposure.bits).x) ? 1u : 0u;
+  vec3 proxy = imageLoad(u_encoded, ivec2(id)).rgb;
+  uint feature = (id.y * p.dims.x + id.x) * 4u;
+  vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);
+  vec3 neural = clamp(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5, vec3(0.0), vec3(1.0));
+  // Without a history (a reset, the previous frame unusable, or a pixel whose previous position was off
+  // screen) the blend weight is 0.
+  if (hasHistory(id)) {
+    float scale = clamp(p.motion.z, 0.0, 1.0);
+    float weight = clamp((1.0 / (1.0 + exp2(u_head.head[feature + 3u] * uintBitsToFloat(0xbfb8aa3bu)))) * scale, 0.0, 1.0);
+    vec3 hist = historySample(id);
+    neural = fma(vec3(weight), hist - neural, neural);
+  }
+  vec3 history = vec3(truncateHalf(neural.r), truncateHalf(neural.g), truncateHalf(neural.b));
+  imageStore(u_next, ivec2(id), vec4(history, 1.0));
+  // The style operator on the history, then the intensity blend toward it from the proxy, as the demo
+  // publishes them (the defaults, style 0 and intensity 1, publish the history itself).
+  float style = p.control.x;
+  float intensity = p.motion.w;
+  vec3 styled = style != 0.0 ? nrStyle(history, style, p.control.y) : history;
+  vec3 published = history;
+  if (style != 0.0 || intensity != 1.0) {
+    for (int c = 0; c < 3; c++) published[c] = truncateHalf(clamp(fma(intensity, styled[c] - proxy[c], proxy[c]), 0.0, 1.0));
+  }
+  u_answer.texel[id.y * p.frame.x + id.x] = uvec2(packHalf2x16(published.rg), packHalf2x16(vec2(published.b, 1.0)));
+}

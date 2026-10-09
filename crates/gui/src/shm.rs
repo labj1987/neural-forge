@@ -63,38 +63,81 @@ impl Shm {
     pub fn open() -> Result<Self, neural_forge_protocol::mapping::OpenError> {
         let cfg = neural_forge_supervisor::Config::load();
         let mapping = neural_forge_supervisor::open_channel(&cfg)?;
-        // Not only when this call created the file: the layer or helper may have initialised it
-        // with defaults first (see `neural_forge_supervisor::apply_saved_settings`).
-        if mapping.freshly_created || mapping.header().tuning_seq.load(Ordering::Relaxed) == 0 {
-            neural_forge_protocol::persist::apply(mapping.header(), &cfg.settings);
-        }
+        neural_forge_supervisor::apply_saved_settings(&cfg, &mapping);
         Ok(Shm(Arc::new(mapping)))
     }
 }
 
-/// After every write, also persists this one setting to `config.ini` -- a full
-/// load-modify-save of the file rather than threading a shared `Config` through every
-/// binder closure, since this is a small local file and correctness (never writing a
-/// stale copy of some other field) matters more than avoiding a few extra syscalls on
-/// a settings change a human just triggered by hand.
-fn persist_one(name: &str, is_float: bool, bits: u32) {
-    let mut cfg = neural_forge_supervisor::Config::load();
-    let value = if is_float { f32::from_bits(bits).to_string() } else { bits.to_string() };
-    cfg.settings.insert(format!("set_{name}"), value);
-    let _ = cfg.save();
+/// How long after the last change a setting is written to `config.ini`: a spin button held down
+/// or dragged changes the value many times a second, and each change was a full rewrite.
+const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+#[derive(Default)]
+struct PendingSave {
+    /// Settings changed since the last save; their values are read from the header when saved, so
+    /// a Reset or profile load in between is never overwritten with an older value.
+    names: std::collections::BTreeSet<&'static str>,
+    mapping: Option<Arc<Mapping>>,
+    timer: Option<glib::SourceId>,
+    on_error: Option<std::rc::Rc<dyn Fn(String)>>,
 }
 
-/// Saves every persisted value, per-pass overrides included, into `config.ini`. Used by the
-/// per-pass dialog, whose fields are not individual `persisted_settings` entries.
-pub fn persist_all(header: &neural_forge_protocol::ShmHeader) {
+thread_local! {
+    static PENDING_SAVE: std::cell::RefCell<PendingSave> = std::cell::RefCell::new(PendingSave::default());
+}
+
+/// Where a failed save is reported (the window's toasts).
+pub fn on_save_error(f: impl Fn(String) + 'static) {
+    PENDING_SAVE.with(|p| p.borrow_mut().on_error = Some(std::rc::Rc::new(f)));
+}
+
+/// Marks `name` changed and (re)starts the save timer, so a burst of changes is one write.
+fn persist_later(shm: &Arc<Mapping>, name: &'static str) {
+    PENDING_SAVE.with(|p| {
+        let mut p = p.borrow_mut();
+        p.names.insert(name);
+        p.mapping = Some(Arc::clone(shm));
+        if let Some(timer) = p.timer.take() {
+            timer.remove();
+        }
+        p.timer = Some(glib::timeout_add_local_once(SAVE_DELAY, || {
+            PENDING_SAVE.with(|p| p.borrow_mut().timer = None);
+            if let Err(e) = flush_settings() {
+                let on_error = PENDING_SAVE.with(|p| p.borrow().on_error.clone());
+                match on_error {
+                    Some(report) => report(format!("Saving config.ini failed: {e}")),
+                    None => eprintln!("neural-forge: saving config.ini failed: {e}"),
+                }
+            }
+        }));
+    });
+}
+
+/// Writes every changed setting to `config.ini` now (the timer does this on its own; the window
+/// calls it on close). A full load-modify-save of the file, so no other key is written stale.
+pub fn flush_settings() -> std::io::Result<()> {
+    let (names, mapping) = PENDING_SAVE.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(timer) = p.timer.take() {
+            timer.remove();
+        }
+        (std::mem::take(&mut p.names), p.mapping.clone())
+    });
+    let Some(mapping) = mapping.filter(|_| !names.is_empty()) else { return Ok(()) };
+    let snapshot = neural_forge_protocol::persist::snapshot(mapping.header());
     let mut cfg = neural_forge_supervisor::Config::load();
-    cfg.settings.extend(neural_forge_protocol::persist::snapshot(header));
-    let _ = cfg.save();
+    for name in names {
+        let key = format!("set_{name}");
+        if let Some(value) = snapshot.get(&key) {
+            cfg.settings.insert(key, value.clone());
+        }
+    }
+    cfg.save()
 }
 
 /// Binds a GTK `Scale`/`SpinButton`-shaped float control to one `f32`-bits field:
 /// reads the current value to initialize the widget, and writes back (bumping
-/// `control_seq` so the layer/helper notice) whenever the widget changes. `name` must
+/// `control_seq` so the layer notices) whenever the widget changes. `name` must
 /// match one of `ShmHeader::persisted_settings`'s names for the value to survive a
 /// reboot; pass `None` for a field that isn't meant to (there are none of those among
 /// the GUI's rows today, but the option exists for e.g. a future debug-only control).
@@ -110,7 +153,7 @@ pub fn bind_float(
         get(shm.header()).store(value.to_bits(), Ordering::Relaxed);
         shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
         if let Some(name) = name {
-            persist_one(name, true, value.to_bits());
+            persist_later(&shm, name);
         }
     };
     (initial, setter)
@@ -130,7 +173,7 @@ pub fn bind_u32(
         get(shm.header()).store(value, Ordering::Relaxed);
         shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
         if let Some(name) = name {
-            persist_one(name, false, value);
+            persist_later(&shm, name);
         }
     };
     (initial, setter)
@@ -162,16 +205,29 @@ mod tests {
         let shm_path = scratch.join("shm.bin");
         std::fs::create_dir_all(&config_home).unwrap();
 
-        let prev_xdg_config = std::env::var("XDG_CONFIG_HOME").ok();
-        let prev_shm = std::env::var("NEURAL_FORGE_SHM").ok();
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::set_var("NEURAL_FORGE_SHM", &shm_path);
+        // Config, data and state all go to the scratch dir, so the test never creates the real
+        // XDG dirs.
+        let vars = [
+            ("XDG_CONFIG_HOME", config_home.clone()),
+            ("XDG_DATA_HOME", scratch.join("data")),
+            ("XDG_STATE_HOME", scratch.join("state")),
+            ("NEURAL_FORGE_SHM", shm_path.clone()),
+        ];
+        let prev: Vec<(&str, Option<String>)> = vars.iter().map(|(var, _)| (*var, std::env::var(var).ok())).collect();
+        for (var, value) in &vars {
+            std::env::set_var(var, value);
+        }
 
         {
             let shm = Shm::open().expect("first open should succeed and create a fresh mapping");
             let (initial, set_intensity) = bind_float(&shm.0, Some("intensity"), |h| &h.intensity_bits);
             assert_eq!(initial, 1.0, "default intensity should be the hardcoded default on a fresh mapping");
+            set_intensity(1.5);
             set_intensity(1.75);
+            // Debounced: nothing is written until the timer fires or the window flushes.
+            let early = std::fs::read_to_string(config_home.join("neural-forge/config.ini")).unwrap_or_default();
+            assert!(!early.contains("set_intensity"), "a change is saved after a pause, not on every step:\n{early}");
+            flush_settings().expect("save config.ini");
         }
 
         let saved = std::fs::read_to_string(config_home.join("neural-forge/config.ini")).expect("config.ini should exist");
@@ -184,7 +240,7 @@ mod tests {
         let intensity_after = f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed));
         assert_eq!(intensity_after, 1.75, "persisted value should have been applied on the fresh mapping");
 
-        // The layer or helper re-initialising the header (a game started first, or a version
+        // The layer re-initialising the header (a game started first, or a version
         // change) must not lose the saved settings either: the next open puts them back.
         shm.0.header().init_defaults();
         assert_eq!(f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed)), 1.0);
@@ -202,13 +258,11 @@ mod tests {
         assert_eq!(f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed)), 0.5);
         drop(shm);
 
-        match prev_xdg_config {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        match prev_shm {
-            Some(v) => std::env::set_var("NEURAL_FORGE_SHM", v),
-            None => std::env::remove_var("NEURAL_FORGE_SHM"),
+        for (var, value) in prev {
+            match value {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
         }
         std::fs::remove_dir_all(&scratch).ok();
     }

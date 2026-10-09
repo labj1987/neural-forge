@@ -1,0 +1,83 @@
+#version 450
+// The native backend after the upscaler (docs/NATIVE_BACKEND.md, "2.1"): the network's 16 input lanes from
+// the layer's 8-bit swapchain proxy (sRGB code values, display-referred).
+// The lane layout, roundings and noise are OpenDLSS-NR's (MIT, commit 9d08f41), as in
+// native_preprocess.comp. There are no motion vectors after the upscaler, so there is no history: lanes 7-9
+// copy the proxy, as on a first frame.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The proxy: one packed RGBA8 (or BGRA8) texel per pixel, rows of the valid width.
+layout(set = 0, binding = 0, std430) readonly buffer Proxy { uint texel[]; } u_proxy;
+// f32 [field][16] as 4 x vec4 per pixel.
+layout(set = 0, binding = 1, std430) writeonly buffer Features { vec4 features[]; } u_features;
+
+layout(push_constant) uniform Params {
+  uvec4 dims;      // field width, field height, valid width, valid height
+  uvec4 frame;     // seed, BGRA (1) or RGBA (0), unused x2
+  vec4 control;    // style, local tone, local structure, skin structure (< 0: follow structure)
+  vec4 more;       // auto mask (> 0 on), unused x3
+} p;
+
+float roundF16(float value) {
+  uint bits = floatBitsToUint(value);
+  uint sign = bits & 0x80000000u;
+  uint magnitude = bits & 0x7fffffffu;
+  if (magnitude >= 0x7f800000u) return value;
+  if (magnitude >= 0x477ff000u) return uintBitsToFloat(sign | 0x7f800000u);
+  if (magnitude < 0x38800000u) {
+    float scaled = roundEven(uintBitsToFloat(magnitude) * 16777216.0);
+    return uintBitsToFloat(sign) + uintBitsToFloat(sign | floatBitsToUint(scaled * 0.000000059604644775390625));
+  }
+  uint lsb = (magnitude >> 13u) & 1u;
+  uint rounded = (magnitude + 0xfffu + lsb) & ~0x1fffu;
+  return uintBitsToFloat(sign | rounded);
+}
+
+float hashUniform(uint value) {
+  uint mixed = value;
+  mixed = (mixed >> ((mixed >> 28u) + 4u)) ^ mixed;
+  mixed *= 0x108ef2d9u;
+  uint integer = ((mixed >> 30u) ^ (mixed >> 8u)) + 1u;
+  return float(integer) * uintBitsToFloat(0x33800000u);
+}
+
+vec3 gaussian3(uint x, uint y, uint seed) {
+  uint base = (x * 0x8da6b343u) ^ (y * 0xd8163841u) ^ (seed * 0x9e3779b9u) ^ 0x243f6a88u;
+  base = (base >> ((base >> 28u) + 4u)) ^ base;
+  base *= 0x108ef2d9u;
+  base = (base >> 22u) ^ base;
+  float u0 = hashUniform(base * 0x2c9277b5u + 0xac564b05u);
+  float u1 = hashUniform(base * 0xfa6dc5f9u + 0x4712a88eu);
+  float u2 = hashUniform(base * 0xcaa5b80du + 0x21dd796bu);
+  float u3 = hashUniform(base * 0x83232c31u + 0x3463e0acu);
+  float radius0 = sqrt(log2(u0) * uintBitsToFloat(0x3f317218u) * -2.0);
+  float radius1 = sqrt(log2(u2) * uintBitsToFloat(0x3f317218u) * -2.0);
+  float tau = uintBitsToFloat(0x40c90fdbu);
+  return vec3(roundF16(radius0 * cos(u1 * tau)), roundF16(radius0 * sin(u1 * tau)), roundF16(radius1 * cos(u3 * tau)));
+}
+
+vec3 centre(vec3 v) {
+  return vec3(roundF16(roundF16(roundF16(v.r) - 0.5) * 0.125), roundF16(roundF16(roundF16(v.g) - 0.5) * 0.125),
+              roundF16(roundF16(roundF16(v.b) - 0.5) * 0.125));
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= p.dims.x || id.y >= p.dims.y) return;
+  int reflectedX = id.x < p.dims.z ? int(id.x) : 2 * int(p.dims.z) - int(id.x) - 2;
+  int reflectedY = id.y < p.dims.w ? int(id.y) : 2 * int(p.dims.w) - int(id.y) - 2;
+  uvec2 source = uvec2(clamp(reflectedX, 0, int(p.dims.z) - 1), clamp(reflectedY, 0, int(p.dims.w) - 1));
+  vec4 texel = unpackUnorm4x8(u_proxy.texel[source.y * p.dims.z + source.x]);
+  vec3 proxy = p.frame.y != 0u ? texel.bgr : texel.rgb;
+  vec3 centered = centre(proxy);
+  uint base = (id.y * p.dims.x + id.x) * 4u;
+  u_features.features[base + 0u] = vec4(gaussian3(id.x, id.y, p.frame.x), 1.0);
+  float autoMask = p.more.x;
+  float structure = p.control.z;
+  float skin = p.control.w;
+  u_features.features[base + 1u] = vec4(centered, centered.r);
+  u_features.features[base + 2u] = vec4(centered.g, centered.b, p.control.x / 128.0, roundF16(p.control.y));
+  u_features.features[base + 3u] = vec4(roundF16(autoMask > 0.0 ? 1.0 : structure),
+                                        roundF16(autoMask > 0.0 ? (skin < 0.0 ? structure : skin) : -1.0),
+                                        roundF16(autoMask > 0.0 ? structure : -1.0), 0.0);
+}

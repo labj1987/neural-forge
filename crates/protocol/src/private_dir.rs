@@ -269,7 +269,7 @@ mod tests {
     #[test]
     fn atomic_write_replaces_by_rename() {
         let dir = scratch_dir();
-        let path = format!("{dir}/helper.pid");
+        let path = format!("{dir}/lease.pid");
         write_private_file_atomic(&path, b"1").unwrap();
         let before = std::fs::File::open(&path).unwrap();
         write_private_file_atomic(&path, b"22").unwrap();

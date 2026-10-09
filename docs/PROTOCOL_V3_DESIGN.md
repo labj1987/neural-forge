@@ -1,5 +1,10 @@
 # Protocol v3: a second independent request/response slot
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02):** the helper no longer waits on a fence per stage. Since 2.0 it records
 > each request as two command buffers (upload; every pass's evaluate plus the download), with the
 > optical flow's submissions between them, and waits once
@@ -91,7 +96,7 @@ occupying.
 
 ## Validation
 
-Real hardware, `lordnikon`, RTX 5070, driver 615.71.09 -- a fresh clone at each
+Real hardware, the test machine, RTX 5070, driver 615.71.09 -- a fresh clone at each
 commit, not just this dev machine's own software ICD:
 
 - `cargo test -p neural-forge-layer` (48 tests, including the new
@@ -119,7 +124,7 @@ commit, not just this dev machine's own software ICD:
 - One real process lesson, not a code bug: the first two "concurrent" test attempts
   looked like a serious cross-slot race (both processes reporting the same sequence
   number, one request going permanently unanswered) until re-checked against a
-  freshly `git pull`ed clone on `lordnikon` -- the diagnostic tool's own slot
+  freshly `git pull`ed clone on the test machine -- the diagnostic tool's own slot
   argument hadn't been pulled yet, so both invocations were silently racing for slot
   0 alone. Confirmed by comparing `git log` on the remote clone before concluding
   anything about the actual code. Worth remembering next time a real-hardware result

@@ -1,5 +1,10 @@
 # Review against OpenDLSS-NR (2026-10-01)
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02):** two rows below are out of date. GPU timestamps now exist (1.1.0,
 > `layer_capture_gpu_ms`/`layer_compose_gpu_ms`). And an HDR path was built: since 2.0 the model
 > runs before DLSS on the game's HDR input, with the game's exposure value and a paper white of 3
@@ -34,7 +39,7 @@ that doesn't exist yet.
 
 | Item | OpenDLSS-NR | Neural Forge today | Gap | Recommendation | Risk | Evidence needed | Status |
 |---|---|---|---|---|---|---|---|
-| Proxy transform and shoulder | `v = scene / max(paperWhite, 0.05)`, per-channel shoulder above 0.75 (`0.75 + 0.25(1 - exp(-5.770780(v - 0.75)))`), sRGB, f16. Built from linear HDR scene radiance. | NGX is told `DLSSNR.SDR=1`, `Hdr=0`, `AutoExposure=1` and is handed the swapchain's 8-bit sRGB bytes (`ngx.rs` `create_feature_at`). At working scale 1 (Alex's setting) the frame goes over untouched (direct capture). Below 1, `encode.comp` applies a **luminance** soft knee with `exp(-(l - 0.75) / 0.25)` and a peak-channel step, over an already tone-mapped frame. | Different curve (luminance vs per-channel, slope 1 vs 1.44 at the knee), but it only runs below 100% model resolution. The 8-bit swapchain frame is already a display proxy, so a second shoulder over it is not what the reference describes either. | Keep. The luminance knee was adopted on purpose: a per-channel knee shifts hue on saturated highlights, which upstream measured as a green cast in GTA V. | Medium (changes every highlight) | A/B captures at 75% model resolution on saturated highlights | Confirmed (different, not adopted) |
+| Proxy transform and shoulder | `v = scene / max(paperWhite, 0.05)`, per-channel shoulder above 0.75 (`0.75 + 0.25(1 - exp(-5.770780(v - 0.75)))`), sRGB, f16. Built from linear HDR scene radiance. | NGX is told `DLSSNR.SDR=1`, `Hdr=0`, `AutoExposure=1` and is handed the swapchain's 8-bit sRGB bytes (`ngx.rs` `create_feature_at`). At working scale 1 (the maintainer's setting) the frame goes over untouched (direct capture). Below 1, `encode.comp` applies a **luminance** soft knee with `exp(-(l - 0.75) / 0.25)` and a peak-channel step, over an already tone-mapped frame. | Different curve (luminance vs per-channel, slope 1 vs 1.44 at the knee), but it only runs below 100% model resolution. The 8-bit swapchain frame is already a display proxy, so a second shoulder over it is not what the reference describes either. | Keep. The luminance knee was adopted on purpose: a per-channel knee shifts hue on saturated highlights, which upstream measured as a green cast in GTA V. | Medium (changes every highlight) | A/B captures at 75% model resolution on saturated highlights | Confirmed (different, not adopted) |
 | Feature lane layout | 16 lanes: noise, constant 1, proxy, reprojected history, style/128, local tone, structure triple. | Built by NVIDIA's runtime from the NGX tuning block (`DLSSNR.Style`, `LocalToneStrength`, `LocalStructureStrength`, `SkinStructureStrength`, `UseAutoMask`). Neural Forge's defaults (skin -1 = follow structure, auto-mask on) match the reference's `NrControls`. | None that Neural Forge can act on. | None. | n/a | n/a | Not applicable |
 | History source (previous output, not previous scene) | Lanes 7-9 are the reprojected previous **output**. | Inside NGX. Neural Forge's own frames between model runs (model every Nth frame) reuse the last answer on the new frame in the composite; that is not the network's history. | None. | None. | n/a | n/a | Not applicable |
 | History filter | Five-tap Catmull-Rom, clamped to the valid rectangle; bilinear softens over time. | Inside NGX. Neural Forge resamples only spatially (working scale below 1: GPU blit down, answer enlarged in the composite), never across time. | None for history. | None. | n/a | n/a | Not applicable |
@@ -55,7 +60,7 @@ that doesn't exist yet.
 | Barrier scope | Compute-to-compute only; transfer stages made the driver flush caches between dispatches, tens of µs each. | Neural Forge's work is mostly copies, so transfer barriers are inherent. The helper brackets NGX with `TRANSFER -> ALL_COMMANDS` and `ALL_COMMANDS -> TRANSFER`; the compose has 9-11 barriers. Several could be narrowed (`TRANSFER -> ALL_COMMANDS` before present to `BOTTOM_OF_PIPE`, `UNDEFINED` sources to `TOP_OF_PIPE`). | Small: tens of µs at most, against 12-13 ms of model time. | Follow-up, bundled with any future compose rework. | Low | GPU trace (Nsight) | Confirmed (not worth it now) |
 | Separate submits and host waits | One command stream, no host synchronisation. | Helper: upload, optional flow, evaluate and download are separate submits, each with a blocking fence wait. Layer: capture and compose submits, a 100 µs fence-status poll and a 100 µs shared-memory poll. Measured hand-off overhead was about 0.2 ms per model frame (`[sync]`, 0.1.95). | About 0.2-0.4 ms per model frame, under 2% of a composite. | Follow-up. AGENTS.md forbids re-applying the reverted capture/composition fence changes, so this needs its own design. | Medium | Matched `[sync]` traces | Confirmed (follow-up) |
 | Timestamp readback lag | Six GPU timestamps per frame, read two frames later, never stalling. | No GPU timestamps anywhere. All timings are host `Instant`s around waits Neural Forge already makes. | No stall exists to remove. GPU timestamps would only make the numbers more precise. | Follow-up for diagnostics only. | Low | n/a | Confirmed (no stall) |
-| Model resolution scaling | Below about 768x768 launch- and occupancy-bound (2.1x the work in 1.04x the time); 1080p to 4K linear (2560x1440 12.6 ms, 1920x1080 7.77 ms on an RTX 4070 SUPER). | Working scale is applied in the layer (GPU blit down, answer enlarged in the composite). | None. See the measurement below. | Keep 100% (Alex's setting). | n/a | GTA V runs below | Confirmed (measured) |
+| Model resolution scaling | Below about 768x768 launch- and occupancy-bound (2.1x the work in 1.04x the time); 1080p to 4K linear (2560x1440 12.6 ms, 1920x1080 7.77 ms on an RTX 4070 SUPER). | Working scale is applied in the layer (GPU blit down, answer enlarged in the composite). | None. See the measurement below. | Keep 100% (the maintainer's setting). | n/a | GTA V runs below | Confirmed (measured) |
 | Queue priority | DLSS-NR-on-AMD's "priority queue mode" reports +9% under heavy load (no details). | The helper's queue has priority 1.0 and no global priority. The RTX 5070 driver exposes `VK_KHR_global_priority`. | None that can be closed: NVIDIA's Linux driver answered a HIGH request with `ERROR_NOT_PERMITTED_KHR` (tested on the rig, 615.71.09). Raising it needs elevated privileges for the helper's Wine process. | Dropped. Lowering the game's own queues to LOW from the layer is the only unprivileged variant; not tried. | Medium (changes the game's scheduling) | A/B with the game's queues at LOW | Confirmed (not possible unprivileged) |
 | Fast arithmetic mode | DLSS-NR-on-AMD's Fast mode trades exactness for speed in its own kernels. OpenDLSS-NR has none (byte-identical output). | NGX `PerfQualityValue` = 3 (Balanced), the same as upstream. The kernels are NVIDIA's. | Can't be changed from outside the runtime. | None. | n/a | n/a | Not applicable |
 | PTX counter chaining | Barrier-free chaining through device counters (NVIDIA-only, `VK_NV_cuda_kernel_launch`). | Neural Forge doesn't run kernels. | n/a | Out of scope. | n/a | n/a | Not applicable |
@@ -87,7 +92,7 @@ identical afterwards):
 
 | Run | Real fps | GPU |
 |---|---|---|
-| Mods loaded (Alex's setup) | 63.3 | 47% |
+| Mods loaded (the maintainer's setup) | 63.3 | 47% |
 | Mods loaded, Smooth Motion on | 62.4 real / 124.8 displayed | 52% |
 | Mods loaded: Reflex off / VSync on / native res / `descriptor_heap` / latency 3 / 4 images | 62.6-63.7 | 46-61% |
 | Mods loaded, ray tracing off | 83.2 | 38% |
@@ -131,6 +136,6 @@ answer)`).
 - **Replacing the poll loops.** At most about 0.3 ms per model frame, and AGENTS.md rules out
   re-applying the reverted fence changes. Needs its own design.
 - **Fixing the copy path below 100% model resolution.** A real cost (about 4 ms per model frame),
-  but a larger change than this review covers. Alex runs at 100%.
+  but a larger change than this review covers. The maintainer runs at 100%.
 - **San Andreas DE and Crimson Desert benchmarks.** Not run: both need someone at the rig to get
   into gameplay, and the only shipped change adds no per-frame work (GTA V confirms it).

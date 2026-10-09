@@ -1,0 +1,162 @@
+diff --git a/src/vk_context.cpp b/src/vk_context.cpp
+index 5fe064e..7502dd7 100644
+--- a/src/vk_context.cpp
++++ b/src/vk_context.cpp
+@@ -167,6 +167,32 @@ Context::Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device
+   instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
+   volkLoadInstance(instance_);
+   volkLoadDevice(device_);
++  adopt();
++}
++
++Context::Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
++                 uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable,
++                 void* initUser, uint32_t sharedFamily) {
++  initDispatchable_ = initDispatchable;
++  sharedFamily_ = sharedFamily == queueFamily ? VK_QUEUE_FAMILY_IGNORED : sharedFamily;
++  initUser_ = initUser;
++  volkInitializeCustom(getInstanceProcAddr);
++  instance_ = instance; physical_ = physical; device_ = device; queueFamily_ = queueFamily; queueIndex_ = queueIndex; owned_ = false;
++  waitTimeoutNs_ = waitTimeoutNs;
++  volkLoadInstanceOnly(instance_);
++  volkLoadDevice(device_);
++  // A device created at an API version below 1.3 has only the extension spellings of these.
++  if (!vkCmdPipelineBarrier2) vkCmdPipelineBarrier2 = vkCmdPipelineBarrier2KHR;
++  if (!vkGetBufferDeviceAddress) vkGetBufferDeviceAddress = vkGetBufferDeviceAddressKHR;
++  if (!vkResetQueryPool) vkResetQueryPool = vkResetQueryPoolEXT;
++  if (!vkCmdPipelineBarrier2 || !vkGetBufferDeviceAddress || !vkCreateCudaModuleNV || !vkCmdCudaLaunchKernelNV)
++    throw std::runtime_error("the device does not expose the functions the network needs");
++  VkFenceCreateInfo fenceInfo{VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
++  VK_CHECK(vkCreateFence(device_, &fenceInfo, nullptr, &waitFence_));
++  adopt();
++}
++
++void Context::adopt() {
+   VkPhysicalDeviceProperties2 properties{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
+   VkPhysicalDeviceSubgroupProperties subgroup{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES};
+   VkPhysicalDeviceShaderSMBuiltinsPropertiesNV smBuiltins{VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_SM_BUILTINS_PROPERTIES_NV};
+@@ -239,6 +265,7 @@ DeviceRequirements::DeviceRequirements() {
+ 
+ void Context::initCommon() {
+   vkGetDeviceQueue(device_, queueFamily_, queueIndex_, &queue_);
++  initDispatchable(queue_);
+ 
+   VkCommandPoolCreateInfo poolInfo{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+   poolInfo.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+@@ -277,7 +304,12 @@ void Context::initCommon() {
+ 
+ Context::~Context() {
+   if (!device_) return;
+-  vkDeviceWaitIdle(device_);
++  // An adopted device is the application's: only this object's own queue is waited for.
++  if (owned_) vkDeviceWaitIdle(device_);
++  else {
++    try { waitIdle(); } catch (...) {}   // a destructor must not throw; the caller already drained it
++  }
++  if (waitFence_) vkDestroyFence(device_, waitFence_, nullptr);
+   for (VkShaderModule module : modules_) vkDestroyShaderModule(device_, module, nullptr);
+   destroyBuffer(dummy_);
+   destroyBuffer(staging_);
+@@ -311,6 +343,12 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
+   info.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT |
+                VK_BUFFER_USAGE_TRANSFER_DST_BIT | VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT | extra;
+   info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++  const uint32_t families[2] = {queueFamily_, sharedFamily_};
++  if (sharedFamily_ != VK_QUEUE_FAMILY_IGNORED) {
++    info.sharingMode = VK_SHARING_MODE_CONCURRENT;
++    info.queueFamilyIndexCount = 2;
++    info.pQueueFamilyIndices = families;
++  }
+   VK_CHECK(vkCreateBuffer(device_, &info, nullptr, &result.buffer));
+   VkMemoryRequirements requirements;
+   vkGetBufferMemoryRequirements(device_, result.buffer, &requirements);
+@@ -526,6 +564,7 @@ VkCommandBuffer Context::beginCommands() {
+   allocateInfo.commandBufferCount = 1;
+   VkCommandBuffer commands;
+   VK_CHECK(vkAllocateCommandBuffers(device_, &allocateInfo, &commands));
++  initDispatchable(commands);
+   VkCommandBufferBeginInfo beginInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+   beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+   VK_CHECK(vkBeginCommandBuffer(commands, &beginInfo));
+@@ -537,6 +576,16 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
+   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
+   submit.commandBufferCount = 1;
+   submit.pCommandBuffers = &commands;
++  if (waitTimeoutNs_ && wait) {
++    VK_CHECK(vkResetFences(device_, 1, &waitFence_));
++    VK_CHECK(vkQueueSubmit(queue_, 1, &submit, waitFence_));
++    const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
++    // A timed-out buffer may still run: it is leaked, not freed.
++    if (waited == VK_TIMEOUT) throw std::runtime_error("a submit on the network's queue did not finish in time");
++    VK_CHECK(waited);
++    vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
++    return;
++  }
+   VK_CHECK(vkQueueSubmit(queue_, 1, &submit, VK_NULL_HANDLE));
+   if (wait) {
+     VK_CHECK(vkQueueWaitIdle(queue_));
+@@ -544,6 +593,19 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
+   }
+ }
+ 
++void Context::waitIdle() {
++  if (!waitTimeoutNs_) {
++    VK_CHECK(vkQueueWaitIdle(queue_));
++    return;
++  }
++  // An empty submit's fence signals once everything before it on the queue has completed.
++  VK_CHECK(vkResetFences(device_, 1, &waitFence_));
++  VK_CHECK(vkQueueSubmit(queue_, 0, nullptr, waitFence_));
++  const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
++  if (waited == VK_TIMEOUT) throw std::runtime_error("the network's queue did not go idle in time");
++  VK_CHECK(waited);
++}
++
+ void Context::computeBarrier(VkCommandBuffer commands) {
+   // Compute -> compute only. Including the transfer stages here made NVIDIA flush
+   // caches between every dispatch (tens of microseconds per barrier once L2 is dirty).
+diff --git a/src/vk_context.h b/src/vk_context.h
+index 972b8d6..56f5e39 100644
+--- a/src/vk_context.h
++++ b/src/vk_context.h
+@@ -77,6 +77,18 @@ class Context {
+   // Adopt a device created elsewhere (the demo renderer) with DeviceRequirements applied; the instance / device
+   // are not destroyed by this object.
+   Context(VkInstance instance, VkPhysicalDevice physical, VkDevice device, uint32_t queueFamily, uint32_t queueIndex = 0);
++  // Adopt a device from inside a Vulkan layer: every function is loaded through `getInstanceProcAddr` (the next
++  // layer's), never the loader, and every wait this object makes on its queue gives up after `waitTimeoutNs`
++  // (std::runtime_error). The queue must be this object's alone.
++  // `initDispatchable`, when set, is called on every dispatchable object this object gets from below the loader
++  // (its queue, every command buffer it allocates) to give it the loader's dispatch pointer.
++  using InitDispatchable = void (*)(void* user, VkDevice device, void* object);
++  // `sharedFamily`, when not VK_QUEUE_FAMILY_IGNORED, is a second queue family the buffers are used on (the
++  // application's, where the recorded graph runs): every buffer is created VK_SHARING_MODE_CONCURRENT over both.
++  Context(PFN_vkGetInstanceProcAddr getInstanceProcAddr, VkInstance instance, VkPhysicalDevice physical, VkDevice device,
++          uint32_t queueFamily, uint32_t queueIndex, uint64_t waitTimeoutNs, InitDispatchable initDispatchable = nullptr,
++          void* initUser = nullptr, uint32_t sharedFamily = VK_QUEUE_FAMILY_IGNORED);
++  void initDispatchable(void* object) const { if (initDispatchable_) initDispatchable_(initUser_, device_, object); }
+   ~Context();
+   uint32_t queueFamily() const { return queueFamily_; }
+   uint32_t queueIndex() const { return queueIndex_; }
+@@ -127,7 +139,7 @@ class Context {
+   // Commands --------------------------------------------------------------------
+   VkCommandBuffer beginCommands();
+   void endAndSubmit(VkCommandBuffer commands, bool wait = true);
+-  void waitIdle() { VK_CHECK(vkQueueWaitIdle(queue_)); }
++  void waitIdle();
+   void computeBarrier(VkCommandBuffer commands);   // compute -> compute
+   // VK_NV_cuda_kernel_launch: PTX modules launched from the command buffer on buffer device addresses.
+   VkDeviceAddress deviceAddress(const Buffer& buffer) const;
+@@ -167,6 +179,12 @@ class Context {
+   uint32_t smCount_ = 0;   // streaming multiprocessors (co-residency bound of spinning grids)
+   bool captureStatistics_ = false;
+   bool owned_ = true;
++  uint64_t waitTimeoutNs_ = 0;
++  InitDispatchable initDispatchable_ = nullptr;
++  uint32_t sharedFamily_ = VK_QUEUE_FAMILY_IGNORED;
++  void* initUser_ = nullptr;        // 0: unbounded waits (the tool); otherwise every wait is bounded
++  VkFence waitFence_ = VK_NULL_HANDLE;
++  void adopt();
+   std::string deviceName_;
+   void initCommon();   // properties, memory types, command pool, layouts, pools, staging
+   Buffer dummy_;

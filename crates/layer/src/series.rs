@@ -329,7 +329,9 @@ unsafe fn create_readback(
         return None;
     };
     let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
-    let Some(cmd) = unsafe { device.allocate_command_buffers(&alloc) }.ok().and_then(|v| v.first().copied()) else {
+    // The buffer is submitted through the loader's trampolines: it needs the device's loader data,
+    // like every buffer the layer allocates.
+    let Some(cmd) = unsafe { crate::loader_data::allocate_commands(device, &alloc) }.ok().and_then(|v| v.first().copied()) else {
         cleanup();
         return None;
     };
@@ -516,8 +518,7 @@ mod tests {
     /// and after that write, the files must be named by sequence, and the series must end by
     /// itself after the requested count, with an index row per frame.
     ///
-    /// Then, on the same device (a second Vulkan device per test does not fit the i686 test run's
-    /// address space): while frames are held before the upscaler the present composes nothing, so a
+    /// Then, on the same device (one device per test keeps the suite's memory small): while frames are held before the upscaler the present composes nothing, so a
     /// one-shot request taken there reads the presented frame twice, both halves of its pair are the
     /// final picture, and the request is served (no longer left pending).
     #[test]

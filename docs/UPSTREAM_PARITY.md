@@ -1,5 +1,10 @@
 # Upstream parity
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 > **Note (2026-10-02, 2.0.0):** the "Frame generation" item below is resolved. With the model
 > before DLSS Super Resolution (the 2.0 default), DLSS Frame Generation was measured on the rig at
 > 53.0 real / 159 shown fps against 28.7 / 86 on the 1.x path
@@ -38,7 +43,7 @@ other's mapping.
 | Transfer modes 0/1/2 (classic, matched residual, native + edit) | `compose.comp` + small-proxy enlargement in `composition/gpu.rs` (0.1.80) |
 | White meter (tile peaks, 90th percentile, lit acceptance) and the Measured source | `capture::meter_white` on the CPU, smoothed (0.1.80) |
 | Frame hold | synchronous present + `composition/gpu.rs` held-frame input (0.1.80) |
-| `DEVELOPMENT.md` invariants | `CLAUDE.md`, "Composition invariants" |
+| `DEVELOPMENT.md` invariants | `AGENTS.md`, "Composition invariants" |
 | System-Wine prefix: DXVK 3.1 `dxgi.dll` + DXVK-NVAPI 0.9.2 (supplied, from Proton, or SHA256-pinned download), `dxvk.conf`, native overrides | `supervisor::provision` (0.1.81); verified end to end under Wine 10 on the rig |
 | 32-bit layer (`VK_LAYER_neuralforge_neural_32`, its own manifest) | per-region shared-memory mapping capped at a 4K 8-bit frame on 32-bit; built and packaged by `build-appimage.sh`, tested in CI (0.1.83) |
 | 16-bit multipass intermediates (`sdr16_multipass`) | `frame.rs` RGBA16F working images, falls back to 8-bit if refused (0.1.83) |

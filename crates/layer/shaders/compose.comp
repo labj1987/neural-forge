@@ -6,8 +6,8 @@
 // (`composition::gpu`) as of 2026-09-10 -- kept in sync by hand with `color.rs` (GLSL
 // and Rust can't literally share source) and, for the sRGB encode/decode this file
 // adds itself below, with `composition::apply`'s `srgb_decode`/`srgb_encode`, the
-// already-real-hardware-verified CPU reference this shader is the GPU twin of (see the
-// layer crate's `CLAUDE.md` entry for that verification).
+// already-real-hardware-verified CPU reference this shader is the GPU twin of (see
+// docs/history/development-before-neuralforge.md for that verification).
 //
 // Bindings match the transport this pass reads/writes: the original frame (capture),
 // the proxy the model was shown, the model's raw answer, and the composed output.
@@ -308,6 +308,15 @@ vec3 EncodeProxy(vec3 normalized) {
   return NeutwoEncode(normalized);
 }
 
+// A proxy tap in the space the model answered in: the raw frame through the encode's white divide and
+// knee, unless the model ran small (then the proxy input already is the encoded proxy, enlarged). Every
+// tap of the proxy that is compared with the answer goes through this, so model / proxy never compares
+// an encoded answer with a raw frame.
+vec3 ProxyTap(ivec2 q, bool bgr, float wp) {
+  vec3 p = SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb);
+  return params.model_small == 0u ? clamp(EncodeProxy(p / wp), 0.0, 1.0) : p;
+}
+
 // Moves from `p` toward `t` as far as the unit cube allows, along the same direction (hhkbble's
 // cube scaling, via upstream `CubeScaleResidual`): the residual never leaves the 8-bit proxy's
 // range, and is shortened rather than clipped per channel, which would shift hue.
@@ -426,9 +435,7 @@ void main() {
     // proxy, enlarged). Put the raw frame through the same white divide and knee the encode used,
     // so model / proxy is the model's verdict and not the encode's own roll-off: comparing an
     // encoded answer with the raw frame dimmed every highlight above the knee.
-    if (params.model_small == 0u) {
-      proxy = clamp(EncodeProxy(proxy / wp), 0.0, 1.0);
-    }
+    proxy = ProxyTap(src, bgr, wp);
 
     // Transfer modes (only when the model worked below the frame's size; at full size all three
     // are the same, bit for bit). Each rewrites the pair the ratio below is taken from.
@@ -457,7 +464,7 @@ void main() {
         for (int k = 0; k < 4; ++k) {
           ivec2 q = clamp(src + kNTaps[k], ivec2(0), last_px);
           m_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb));
-          p_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb));
+          p_acc += Luminance(ProxyTap(q, bgr, wp));
         }
         float gain_smooth_n = (m_acc / 5.0 + kEditFloor) / (p_acc / 5.0 + kEditFloor);
         vec3 upgraded = max(original + edit * wp * clamp(params.transfer_strength, 0.0, 1.0), vec3(0.0));
@@ -504,7 +511,7 @@ void main() {
         for (int k = 0; k < 4; ++k) {
           ivec2 q = clamp(src + kTaps[k], ivec2(0), last_px);
           m_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb));
-          p_acc += Luminance(SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb));
+          p_acc += Luminance(ProxyTap(q, bgr, wp));
         }
         float gain_smooth = (m_acc / 5.0 + kRatioFloor) / (p_acc / 5.0 + kRatioFloor);
         edit_ratio = mix(edit_ratio, gain_smooth, clamp(params.ratio_smooth, 0.0, 1.0));
@@ -527,9 +534,9 @@ void main() {
       // "Changed" is the worst mismatch between the current frame and the proxy over a 5x5
       // neighbourhood at a stride of 3 pixels -- a stroke three pixels wide always has a tap
       // on it -- read as a fraction of the local light, with a floor so sensor-level noise in
-      // dark areas is not motion. The proxy is the frame itself below the encode's knee, so the
-      // comparison is only meaningful there; taps over highlights, where the encode
-      // legitimately differs, are ignored. The mask is soft, not a hard threshold, so a
+      // dark areas is not motion. The frame is put through the same encode as the proxy taps, so
+      // both are compared in one space; taps over highlights, where the encode compresses the
+      // differences, are still ignored. The mask is soft, not a hard threshold, so a
       // pixel hovering near it does not flicker between the two ratios.
       if (params.ghost_guard > 0.0) {
         const int kGhostStep = 3;
@@ -540,9 +547,9 @@ void main() {
         for (int j = -2; j <= 2; ++j) {
           for (int i = -2; i <= 2; ++i) {
             ivec2 q = clamp(src + ivec2(i, j) * kGhostStep, ivec2(0), last);
-            vec3 pq = SrgbDecode(bgr ? imageLoad(u_proxy, q).bgr : imageLoad(u_proxy, q).rgb);
+            vec3 pq = ProxyTap(q, bgr, wp);
             vec3 mq = SrgbDecode(bgr ? imageLoad(u_model_answer, q).bgr : imageLoad(u_model_answer, q).rgb);
-            vec3 oq = SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb);
+            vec3 oq = clamp(EncodeProxy(SrgbDecode(bgr ? imageLoad(u_original, q).bgr : imageLoad(u_original, q).rgb) / wp), 0.0, 1.0);
             float pl = Luminance(pq);
             proxy_sum += pl;
             model_sum += Luminance(mq);
@@ -554,11 +561,11 @@ void main() {
         float moved = smoothstep(0.35, 1.2, worst);
         edit_ratio = mix(edit_ratio, smooth_ratio, moved * clamp(params.ghost_guard, 0.0, 1.0));
       }
-      // Detail strength above 1 as a power on the ratio, not an extended blend: it
-      // cannot go negative, leaves an unchanged pixel alone (one to any power is one),
-      // moves brightening and darkening by the same factor, and stays a ratio, so the
-      // guard below still binds it.
-      float amplified = pow(max(edit_ratio, 1e-6), 1.0 + max(params.transfer_strength - 1.0, 0.0));
+      // Detail strength as a power on the ratio, not a blend: 0 leaves the frame as it is, 1 takes
+      // the model's ratio, and above 1 amplifies it. It cannot go negative, leaves an unchanged
+      // pixel alone (one to any power is one), moves brightening and darkening by the same
+      // factor, and stays a ratio, so the guard below still binds it.
+      float amplified = pow(max(edit_ratio, 1e-6), max(params.transfer_strength, 0.0));
 
       float guard = max(params.max_ratio, 1.0);
       // Relighting cannot invent light, so the room to brighten shrinks toward none as
@@ -605,7 +612,9 @@ void main() {
         // shortened. Debug view 5: the composed colour as it stood before that bound.
         colour_allow_debug = vec3(1.0 - colour_allow, colour_allow, 0.0);
         pre_bound_debug = fully_upgraded;
-        result = GamutCompressReversible(mix(luminance_only, bounded_colour, clamp(params.colour_strength, 0.0, 1.0) * hue_trust));
+        // The model's colour follows the detail strength below 1 as its light does (none at 0).
+        float colour_weight = clamp(params.colour_strength, 0.0, 1.0) * hue_trust * clamp(params.transfer_strength, 0.0, 1.0);
+        result = GamutCompressReversible(mix(luminance_only, bounded_colour, colour_weight));
       }
     }
   } else if (params.mode == 1u) {

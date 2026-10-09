@@ -1,9 +1,8 @@
-//! The shared-memory round trip with the helper.
+//! The shared-memory round trip with the model server.
 //!
 //! This is the seam: everything here only ever touches `neural_forge_protocol::ShmHeader`'s
-//! atomics, never anything Windows/NGX-specific. What answers on the other end of the
-//! mapping — a Wine-wrapped helper today, a native one later — is none of this
-//! module's business.
+//! atomics. What answers on the other end of the mapping (the in-process model server,
+//! `preupscale::native_post`) is none of this module's business.
 //!
 //! Milestone 2 scope: the request/response sequence-number handshake and the fail-open
 //! timing budget, ported for shape from upstream's `ShmOpen`/`ShmNeuralEnabled`/
@@ -19,7 +18,7 @@ use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use neural_forge_protocol::{enums::helper_state, shm_default_path, Slot, MAX_FRAME, SHM_MAGIC};
+use neural_forge_protocol::{enums::server_state, shm_default_path, Slot, MAX_FRAME, SHM_MAGIC};
 
 /// The subset of `ShmHeader`'s composition fields `composition::apply::apply_rgba8`
 /// needs, decoded once per frame from the raw atomics. See that field's own doc
@@ -44,27 +43,10 @@ pub struct CompositionSettings {
     pub debug_scale: f32,
     pub apply_model: bool,
     pub neural_enabled: bool,
-    /// What fraction of the frame's resolution the model works at -- see
-    /// [`neural_forge_protocol::ShmHeader::working_scale_bits`]'s own doc comment.
-    /// `1.0` (the default) means "model resolution == frame resolution", the only
-    /// value this pipeline supported before 2026-09-17 -- callers that skip scaling
-    /// whenever this is exactly `1.0` get the identical, unmodified code path.
-    ///
-    /// Read here but genuinely unused by any caller as of 2026-09-17 (hence the
-    /// `dead_code` allow): a real attempt to wire it into `capture::run`'s per-present
-    /// hot path used `composition::downscale::resample_rgba8` (a plain CPU resize) and
-    /// measured it at 315-546 ms at GTA's own resolution -- far worse than the 87 ms
-    /// PCIe-BAR bug this same session fixed, and unusable on the present thread. The
-    /// resample function itself is real, tested, and kept (`downscale.rs`'s own tests);
-    /// what's missing is a GPU-blit-based version (`vkCmdBlitImage`, a hardware unit,
-    /// sub-millisecond) wired into `CapturePipeline`'s capture-side buffer and
-    /// `composition::gpu`'s answer-upload step -- real Vulkan surgery in this project's
-    /// most crash-prone area, deliberately not attempted unsupervised overnight. See
-    /// `docs/GHOSTING_PLAN.md`'s step 1 for the full account and the corrected plan.
-    #[allow(dead_code)]
+    /// What fraction of the frame's resolution the model works at after the upscaler -- see
+    /// [`neural_forge_protocol::ShmHeader::working_scale_bits`]. `capture::run` blits the
+    /// swapchain capture down to it and `composition::gpu` blits the answer back up.
     pub working_scale: f32,
-    #[allow(dead_code)]
-    pub scaling_downscaler: u32,
     /// What the model should treat as white, as the encode divides by it (see
     /// [`crate::composition::encode`]). The three header fields are one number here:
     /// the manual value times the scale, times the trim when the reading came from a
@@ -74,12 +56,8 @@ pub struct CompositionSettings {
     pub reversible_mode: u32,
 }
 
-/// One process's connection to the mapping. Not `Clone` — there is exactly one of these
-/// per device, guarded by a `Mutex` in [`crate::device::NeuralForgeDeviceInfo`].
-/// How many bytes of each pixel region this process maps: the protocol's full `MAX_FRAME` on
-/// 64-bit; on 32-bit a 4K 8-bit frame, so the whole set fits a 32-bit address space (a larger
-/// frame is simply passed through, see [`region_capacity`]).
-const REGION_CAP: usize = if cfg!(target_pointer_width = "64") { MAX_FRAME } else { 3840 * 2160 * 4 };
+/// How many bytes of each pixel region this process maps: the protocol's full `MAX_FRAME`.
+const REGION_CAP: usize = MAX_FRAME;
 
 /// The largest frame this process can send or receive.
 pub fn region_capacity() -> usize {
@@ -118,12 +96,47 @@ impl Region {
     }
 }
 
+/// The mapping as the native backend's after-the-upscaler server reads it from its own thread: the header
+/// and the two slots' regions, which stay mapped for the life of the process once opened.
+#[cfg(target_arch = "x86_64")]
+#[derive(Clone, Copy)]
+pub struct ShmView {
+    header: *const neural_forge_protocol::ShmHeader,
+    regions: [*mut u8; 4],
+}
+
+// SAFETY: the pointers stay valid for the process's life (never unmapped once open); the header is atomics,
+// and each slot's regions are owned by whoever saw that slot's `seq_req`, as with the model server.
+#[cfg(target_arch = "x86_64")]
+unsafe impl Send for ShmView {}
+#[cfg(target_arch = "x86_64")]
+unsafe impl Sync for ShmView {}
+
+#[cfg(target_arch = "x86_64")]
+impl ShmView {
+    pub fn header(&self) -> &neural_forge_protocol::ShmHeader {
+        // SAFETY: see the type's Send impl.
+        unsafe { &*self.header }
+    }
+
+    /// The slot's proxy and answer regions.
+    pub fn regions(&self, slot: Slot) -> (*mut u8, *mut u8) {
+        (self.regions[Region::proxy(slot) as usize], self.regions[Region::answer(slot) as usize])
+    }
+
+    /// Each region's size.
+    pub fn capacity(&self) -> usize {
+        REGION_CAP
+    }
+}
+
+/// One process's connection to the mapping. Not `Clone` — there is exactly one of these
+/// per device, guarded by a `Mutex` in [`crate::device::NeuralForgeDeviceInfo`].
 pub struct ShmClient {
     fd: Option<OwnedFd>,
     header: *mut neural_forge_protocol::ShmHeader,
     /// Where each pixel region is mapped in this process (proxy 0, answer 0, proxy 1,
-    /// answer 1), `REGION_CAP` bytes each. One contiguous mapping on 64-bit; separate small
-    /// mappings on 32-bit, where the protocol's full ~1.1 GB would not fit the address space.
+    /// answer 1), `REGION_CAP` bytes each, inside the one mapping of the whole file.
     regions: [*mut u8; 4],
     path: String,
     timeouts: u32,
@@ -131,7 +144,7 @@ pub struct ShmClient {
     retry_after: Option<Instant>,
     last_control_seq: u32,
     last_heartbeat: u32,
-    /// The helper heartbeat as last sampled by [`Self::helper_alive`], and when it last moved.
+    /// The model server heartbeat as last sampled by [`Self::server_alive`], and when it last moved.
     alive_heartbeat: u32,
     alive_since: Option<Instant>,
     dead: bool,
@@ -150,7 +163,7 @@ pub struct ShmClient {
     pending: [Option<(u32, Instant)>; Slot::COUNT],
     /// Per-slot: the request number of the last round trip started with
     /// [`Self::begin_async_request`], kept after it resolves so [`Self::answer_evaluated`] can
-    /// compare it with the helper's `seq_eval`.
+    /// compare it with the model server's `seq_eval`.
     last_req: [u32; Slot::COUNT],
 }
 
@@ -161,28 +174,6 @@ pub struct ShmClient {
 // `ShmClient` is always accessed from behind a `Mutex`, so only `Send` is needed, never
 // concurrent access from two threads at once.
 unsafe impl Send for ShmClient {}
-
-/// Test builds on 32-bit only: unmap on drop. The shipped layer keeps its mapping for the
-/// process's life on purpose, but the 32-bit test binary opens a fresh ~130 MB set of mappings
-/// in test after test and ran out of address space on CI (`open_at` failing).
-#[cfg(all(test, target_pointer_width = "32"))]
-impl Drop for ShmClient {
-    fn drop(&mut self) {
-        // Only a client that mapped the file itself (it keeps the fd) owns the mapping;
-        // `test_over_header` borrows a header in ordinary memory.
-        if self.header.is_null() || self.fd.is_none() {
-            return;
-        }
-        // SAFETY: on 32-bit `open_at` maps the header (`HEADER_BYTES`) and each region
-        // (`REGION_CAP`) separately; nothing derived from them outlives the client in the tests.
-        unsafe {
-            libc::munmap(self.header.cast(), neural_forge_protocol::HEADER_BYTES);
-            for r in self.regions.iter().filter(|p| !p.is_null()) {
-                libc::munmap(r.cast(), REGION_CAP);
-            }
-        }
-    }
-}
 
 impl Default for ShmClient {
     fn default() -> Self {
@@ -209,7 +200,7 @@ impl Default for ShmClient {
 
 impl ShmClient {
     /// Cross-module test access to the raw header pointer -- `capture::tests` needs
-    /// to poke `helper_state`/`seq_resp` directly to stand in for a fake helper, the
+    /// to poke `server_state`/`seq_resp` directly to stand in for a fake model server, the
     /// same way this module's own tests do, but `header` is private to this module
     /// and those tests live in a sibling one. Test-only; never called from real code.
     #[cfg(test)]
@@ -226,14 +217,10 @@ impl ShmClient {
     }
 
     /// Test-only: a client over a header in ordinary memory, with no pixel regions and no file.
-    /// For tests of header-only logic (switches, requests, liveness): a real mapping costs ~130 MB
-    /// of address space, which the i686 test run cannot spare for every test (mappings are never
-    /// unmapped).
+    /// For tests of header-only logic (switches, requests, liveness), which need no real mapping.
     #[cfg(test)]
     pub(crate) fn test_over_header(header: &neural_forge_protocol::ShmHeader) -> Self {
-        let mut client = Self::default();
-        client.header = std::ptr::from_ref(header).cast_mut();
-        client
+        Self { header: std::ptr::from_ref(header).cast_mut(), ..Self::default() }
     }
 
     fn header(&self) -> Option<&neural_forge_protocol::ShmHeader> {
@@ -244,8 +231,7 @@ impl ShmClient {
     }
 
     /// Whether it's worth paying for a real capture this frame at all. `false` once
-    /// the helper has reported the model permanently unavailable (see
-    /// `neural_forge_helper::ngx::ensure_feature`'s own one-shot-then-disable design) --
+    /// the model server has reported the model permanently unavailable --
     /// capturing and writing back a frame nobody will ever evaluate is pure overhead
     /// (a full image<->buffer round trip plus a `memcpy` of the whole frame, every
     /// single present call) for zero chance of a different outcome. Reads a single
@@ -254,7 +240,7 @@ impl ShmClient {
     /// [`crate::capture::run`] at all.
     pub fn model_known_unavailable(&self) -> bool {
         let Some(hdr) = self.header() else { return false };
-        hdr.helper_state.load(Ordering::Relaxed) == helper_state::MODEL_FAILED
+        hdr.server_state.load(Ordering::Relaxed) == server_state::MODEL_FAILED
     }
 
     /// Consumes a pending "dump one matched before/after frame pair" request (see
@@ -282,6 +268,11 @@ impl ShmClient {
     /// CPU-visible result, vs. a path that leaves the result somewhere
     /// [`Self::take_capture_request`]'s caller can dump) before committing to either,
     /// without losing/duplicating the actual one-shot request in the process.
+    /// Whether any capture is asked for: the one-shot dump (1) or a frame series (more).
+    pub fn capture_requested(&self) -> bool {
+        self.header().is_some_and(|hdr| hdr.capture_request.load(Ordering::Relaxed) != 0)
+    }
+
     pub fn capture_request_pending(&self) -> bool {
         let Some(hdr) = self.header() else { return false };
         hdr.capture_request.load(Ordering::Relaxed) == 1
@@ -291,7 +282,7 @@ impl ShmClient {
     /// (each is a single atomic load) so a live GUI change takes effect on the very
     /// next present rather than needing a restart. `None` before the mapping is open.
     /// Applies the configured in-game toggle on a physical key press.  It changes
-    /// the same shared atomic the GUI uses, so the helper and layer agree immediately.
+    /// the same shared atomic the GUI uses, so the model server and layer agree immediately.
     pub fn poll_toggle_hotkey(&mut self, poller: &mut crate::hotkey::Poller) {
         let Some(hdr) = self.header() else { return };
         // Existing installations may have persisted the historical default `0`.
@@ -304,7 +295,7 @@ impl ShmClient {
         }
     }
 
-    /// The raster the helper says its last slot-0 answer was for (`None` before any).
+    /// The raster the model server says its last slot-0 answer was for (`None` before any).
     pub fn answered_dims(&self) -> Option<(u32, u32)> {
         let hdr = self.header()?;
         let dims = (hdr.answered_w.load(Ordering::Relaxed), hdr.answered_h.load(Ordering::Relaxed));
@@ -342,7 +333,6 @@ impl ShmClient {
             apply_model: hdr.apply_model.load(Ordering::Relaxed) != 0,
             neural_enabled: hdr.neural_enabled(),
             working_scale: f32::from_bits(hdr.working_scale_bits.load(Ordering::Relaxed)),
-            scaling_downscaler: hdr.scaling_downscaler.load(Ordering::Relaxed),
             white_point: {
                 let manual = f32::from_bits(hdr.white_point_bits.load(Ordering::Relaxed));
                 let scale = f32::from_bits(hdr.white_point_scale_bits.load(Ordering::Relaxed));
@@ -363,46 +353,49 @@ impl ShmClient {
     }
 
     /// Records what the proxy bytes about to be written actually are, for the given
-    /// slot -- the helper (and, on the way back, this same layer reading the answer)
+    /// slot -- the model server (and, on the way back, this same layer reading the answer)
     /// needs `width`/`height`/`proxy_format` to know how many of the region's bytes
     /// are real for this frame, not the full `MAX_FRAME`-sized reservation. Call
     /// before [`Self::write_proxy`]/[`Self::begin_async_request`]/[`Self::try_round_trip`]
-    /// (the last of which only ever uses slot 0) so the helper never observes the
+    /// (the last of which only ever uses slot 0) so the model server never observes the
     /// `seq_req` bump before it can see what raster it describes.
     ///
     /// `layer_attached`/`layer_heartbeat`/`layer_width`/`layer_height`/`layer_format`/
     /// `layer_frames` are status telemetry, not part of the handshake -- deliberately
     /// not per-slot; they just reflect whichever slot most recently captured.
-    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32) {
+    /// The mapping for another thread of this process, once open.
+    #[cfg(target_arch = "x86_64")]
+    pub fn view(&self) -> Option<ShmView> {
+        (!self.header.is_null() && self.regions.iter().all(|r| !r.is_null())).then_some(ShmView { header: self.header, regions: self.regions })
+    }
+
+    /// The Model tab's settings without per-pass overrides (the native backend's).
+    #[cfg(target_arch = "x86_64")]
+    pub fn global_tuning(&self) -> Option<neural_forge_protocol::Tuning> {
+        self.header().map(|hdr| hdr.global_tuning())
+    }
+
+    /// The layer's status line for the GUI (the native backend's state, or why it is not running).
+    #[cfg(target_arch = "x86_64")]
+    pub fn set_layer_reason(&self, reason: &str) {
+        if let Some(hdr) = self.header() {
+            hdr.set_layer_reason(reason);
+        }
+    }
+
+    /// The layer's "attached and presenting" telemetry, once per present while the game renders
+    /// steadily, whichever path the model takes. It was only written by the after-the-upscaler
+    /// capture (`set_frame_info`), so with the model before the upscaler -- which captures nothing at
+    /// present -- the Status tab read "none attached" while the model ran. Does nothing until the
+    /// channel is open (the capture and the hold open it).
+    pub fn beat(&mut self) {
         self.frames += 1;
         let frames = self.frames;
         let Some(hdr) = self.header() else { return };
-        hdr.width_slot(slot).store(width, Ordering::Relaxed);
-        hdr.height_slot(slot).store(height, Ordering::Relaxed);
-        hdr.proxy_format_slot(slot).store(proxy_format, Ordering::Relaxed);
-
-        // The layer's own "I am alive and capturing" telemetry -- mirrors what
-        // `neural_forge_helper::main`'s loop already does for `hdr.helper_*`/`heartbeat`.
-        // Nothing else in this crate ever wrote these fields before this (confirmed by
-        // grep, 2026-09-10): `layer_attached` was declared, reset to 0 by
-        // `ShmHeader::init_defaults`, and read by the GUI (`ui.rs`'s "not attached"
-        // label) -- but never once set to 1 anywhere, so that label was always wrong,
-        // regardless of whether the layer was actually attached. Confirmed on
-        // `lordnikon` the same day: `/proc/<pid>/maps` and a live, advancing helper
-        // frame counter both proved the real Vulkan layer was loaded and working the
-        // whole time the GUI displayed "not attached". Setting this every frame (not
-        // just once at `open()`) also survives a helper restart resetting the shared
-        // header out from under an already-open, never-reconnecting layer -- exactly
-        // what happened here: `open_at`'s own idempotent early return means a layer
-        // that was already attached before the reset never calls it again to re-set a
-        // one-shot flag.
         hdr.layer_attached.store(1, Ordering::Relaxed);
         hdr.layer_heartbeat.fetch_add(1, Ordering::Relaxed);
-        hdr.layer_width.store(width, Ordering::Relaxed);
-        hdr.layer_height.store(height, Ordering::Relaxed);
-        hdr.layer_format.store(proxy_format, Ordering::Relaxed);
         neural_forge_protocol::store64(&hdr.layer_frames_lo, &hdr.layer_frames_hi, frames);
-        // Restated now and then rather than once: a helper restart re-initialises the header and
+        // Restated now and then rather than once: a model server restart re-initialises the header and
         // clears it. Rarely, because it is a seqlock-guarded string write.
         if frames % 120 == 1 {
             let name = crate::ownership::process_name();
@@ -410,6 +403,19 @@ impl ShmClient {
                 hdr.set_game_name(name);
             }
         }
+    }
+
+    pub fn set_frame_info(&mut self, slot: Slot, width: u32, height: u32, proxy_format: u32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.width_slot(slot).store(width, Ordering::Relaxed);
+        hdr.height_slot(slot).store(height, Ordering::Relaxed);
+        hdr.proxy_format_slot(slot).store(proxy_format, Ordering::Relaxed);
+
+        // The captured frame's size and format; liveness (`layer_attached`, the heartbeat, the
+        // frame count and the game's name) is `beat`'s, every present.
+        hdr.layer_width.store(width, Ordering::Relaxed);
+        hdr.layer_height.store(height, Ordering::Relaxed);
+        hdr.layer_format.store(proxy_format, Ordering::Relaxed);
     }
 
     /// Publishes the layer's host-observed cost for a frame. This is deliberately a
@@ -438,9 +444,10 @@ impl ShmClient {
     }
 
     /// The pre-upscaler path's state and identified input extent (`ShmHeader::preupscale_*`).
-    pub fn publish_preupscale_state(&self, state: u32, width: u32, height: u32) {
+    pub fn publish_preupscale_state(&self, state: u32, native: bool, width: u32, height: u32) {
         let Some(hdr) = self.header() else { return };
         hdr.preupscale_state.store(state, Ordering::Relaxed);
+        hdr.native_running.store(u32::from(state == 2 && native), Ordering::Relaxed);
         hdr.preupscale_width.store(width, Ordering::Relaxed);
         hdr.preupscale_height.store(height, Ordering::Relaxed);
     }
@@ -452,12 +459,12 @@ impl ShmClient {
         hdr.preupscale_misses.store(misses, Ordering::Relaxed);
     }
 
-    /// Whether the model is wanted at all right now: the live `enabled` toggle (F11 / the GUI /
-    /// `shmctl set enabled`), `apply_model`, and not reported permanently unavailable. `false`
-    /// before the mapping is open.
-    pub fn model_wanted(&self) -> bool {
+    /// Whether the model is switched on: the live `enabled` toggle (F11 / the GUI / `shmctl set
+    /// enabled`) and `apply_model`. What the native backend checks: it has no model server to report the
+    /// model unavailable. `false` before the mapping is open.
+    pub fn model_enabled(&self) -> bool {
         let Some(hdr) = self.header() else { return false };
-        hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0 && !self.model_known_unavailable()
+        hdr.neural_enabled() && hdr.apply_model.load(Ordering::Relaxed) != 0
     }
 
     /// The published `(capture, compose)` GPU milliseconds, for the `[sync]` log line. Zeros
@@ -474,7 +481,7 @@ impl ShmClient {
     /// fields in `ShmHeader`) into the given slot's proxy region -- the frame the
     /// layer is about to hand the model. Call before bumping that slot's `seq_req`
     /// (via [`Self::begin_async_request`]/[`Self::try_round_trip`], the latter always
-    /// slot 0): the helper only starts reading once it observes that bump, so there
+    /// slot 0): the model server only starts reading once it observes that bump, so there
     /// is no concurrent-write hazard to guard against the way the header's atomics do.
     ///
     /// # Safety
@@ -499,7 +506,7 @@ impl ShmClient {
     /// slot's answer region into `out`, returning the number of bytes copied.
     /// Meaningful only after [`Self::poll_async_request`]/[`Self::try_round_trip`] has
     /// returned a real answer for the request this goes with -- reading it any
-    /// earlier just observes whatever the helper last wrote (stale or all-zero),
+    /// earlier just observes whatever the model server last wrote (stale or all-zero),
     /// which is why this never blocks or checks sequence numbers itself; the caller
     /// already knows from the round trip's own return value whether there is a real
     /// answer to read.
@@ -538,26 +545,19 @@ impl ShmClient {
 
     /// The given slot's answer region address and capacity, mirroring
     /// [`Self::proxy_region`]. For `composition::gpu::GpuCompose`'s zero-copy compose, which
-    /// imports it as device memory so the GPU reads the helper's answer where it landed instead
+    /// imports it as device memory so the GPU reads the model server's answer where it landed instead
     /// of [`Self::read_answer`] copying it out first.
     pub fn answer_region(&self, slot: Slot) -> Option<(*mut u8, usize)> {
         self.region(Region::answer(slot))
     }
 
-    /// What the helper says its last evaluation cost it (upload + evaluate + readback, in
+    /// What the model server says its last evaluation cost it (upload + evaluate + readback, in
     /// milliseconds), as published in the header before it answered. 0 before any answer.
-    pub fn helper_stage_ms(&self) -> f32 {
+    pub fn server_stage_ms(&self) -> f32 {
         let Some(hdr) = self.header() else { return 0.0 };
         let ms = |bits: &std::sync::atomic::AtomicU32| f32::from_bits(bits.load(Ordering::Relaxed));
-        let total = ms(&hdr.helper_upload_ms_bits) + ms(&hdr.helper_eval_ms_bits) + ms(&hdr.helper_readback_ms_bits);
+        let total = ms(&hdr.server_upload_ms_bits) + ms(&hdr.server_eval_ms_bits) + ms(&hdr.server_readback_ms_bits);
         if total.is_finite() && total > 0.0 { total } else { 0.0 }
-    }
-
-    /// The helper's own wall time for its last slot-0 request (`helper_busy_us`), `None` before
-    /// the first one (or before the mapping is open).
-    pub fn helper_busy(&self) -> Option<Duration> {
-        let us = self.header()?.helper_busy_us.load(Ordering::Relaxed);
-        (us > 0).then(|| Duration::from_micros(u64::from(us)))
     }
 
     /// Opens (or creates) the mapping if not already attached. Idempotent.
@@ -567,7 +567,17 @@ impl ShmClient {
             .filter(|s| !s.is_empty())
             .unwrap_or_else(shm_default_path);
         if !neural_forge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) || !crate::ownership::claim(&path) { return false; }
-        self.open_at(&path)
+        if !self.open_at(&path) {
+            return false;
+        }
+        // A fresh mapping holds the defaults: the saved settings (config.ini's `set_*`) go on it here,
+        // since no other process (the GUI may not be running) does it before the game's first frame.
+        if let Some(hdr) = self.header() {
+            if neural_forge_protocol::persist::apply_saved(hdr) {
+                crate::log!("[shm] applied the saved settings from {}", neural_forge_protocol::persist::config_file());
+            }
+        }
+        true
     }
 
     /// The actual implementation, taking the path explicitly so tests can point it at a
@@ -645,42 +655,15 @@ impl ShmClient {
             let p = libc::mmap(std::ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), offset as libc::off_t);
             (p != libc::MAP_FAILED).then_some(p.cast::<u8>())
         };
-        // 64-bit: the whole file in one mapping. 32-bit: the header, then each region on its own
-        // at its fixed offset, capped (the offsets are page-aligned by construction).
-        let (map, regions) = if cfg!(target_pointer_width = "64") {
-            let Some(base) = map_at(0, total) else {
-                crate::log!("[shm] mmap {path} failed; not retrying");
-                self.map_refused = true;
-                return false;
-            };
-            // SAFETY: every offset is inside the `total`-byte mapping just made.
-            let regions = Region::ALL.map(|r| unsafe { base.add(r.offset()) });
-            (base.cast::<libc::c_void>(), regions)
-        } else {
-            let Some(base) = map_at(0, neural_forge_protocol::HEADER_BYTES) else {
-                crate::log!("[shm] mmap {path} (header) failed; not retrying");
-                self.map_refused = true;
-                return false;
-            };
-            let mut regions: [*mut u8; 4] = [std::ptr::null_mut(); 4];
-            for r in Region::ALL {
-                let Some(p) = map_at(r.offset(), REGION_CAP) else {
-                    crate::log!("[shm] mmap {path} region {r:?} failed; not retrying");
-                    // SAFETY: each of these was mapped just above with exactly this length and
-                    // nothing has used it yet.
-                    unsafe {
-                        libc::munmap(base.cast(), neural_forge_protocol::HEADER_BYTES);
-                        for mapped in regions.iter().filter(|p| !p.is_null()) {
-                            libc::munmap(mapped.cast(), REGION_CAP);
-                        }
-                    }
-                    self.map_refused = true;
-                    return false;
-                };
-                regions[r as usize] = p;
-            }
-            (base.cast::<libc::c_void>(), regions)
+        // The whole file in one mapping.
+        let Some(base) = map_at(0, total) else {
+            crate::log!("[shm] mmap {path} failed; not retrying");
+            self.map_refused = true;
+            return false;
         };
+        // SAFETY: every offset is inside the `total`-byte mapping just made.
+        let regions = Region::ALL.map(|r| unsafe { base.add(r.offset()) });
+        let map = base.cast::<libc::c_void>();
         self.regions = regions;
 
         let header = map as *mut neural_forge_protocol::ShmHeader;
@@ -693,7 +676,7 @@ impl ShmClient {
             // half-read a layout we don't agree on.
             hdr.init_defaults();
         }
-        self.last_heartbeat = hdr.heartbeat.load(Ordering::Relaxed);
+        self.last_heartbeat = hdr.server_heartbeat.load(Ordering::Relaxed);
         self.last_control_seq = hdr.control_seq.load(Ordering::Relaxed);
         self.fd = Some(fd);
         self.header = header;
@@ -708,12 +691,12 @@ impl ShmClient {
     }
 
     /// One request/response cycle: bump `seq_req`, wait up to a budget for `seq_resp` to
-    /// catch up. Returns whether the helper answered in time.
+    /// catch up. Returns whether the model server answered in time.
     ///
-    /// This is a fail-open state machine, same as upstream: a helper that never answers
+    /// This is a fail-open state machine, same as upstream: a model server that never answers
     /// four times in a row is marked dead and not retried for 5 seconds, so a missing
-    /// helper costs one short wait per frame rather than the full budget forever. A
-    /// live-but-busy helper (building its first feature) gets a much longer budget on
+    /// one costs one short wait per frame rather than the full budget forever. A
+    /// live-but-busy one (building its network) gets a much longer budget on
     /// its very first frame, since that is expected to be slow.
     pub fn try_round_trip(&mut self) -> bool {
         if !self.open() {
@@ -737,7 +720,7 @@ impl ShmClient {
 
     fn round_trip_after_open(&mut self) -> bool {
         // Re-check liveness before every attempt: a dead connection can come back
-        // either because its retry timer elapsed, or because the helper's control_seq
+        // either because its retry timer elapsed, or because the model server's control_seq
         // or heartbeat moved, meaning something changed on the other end worth trying
         // again for.
         if self.dead && !self.should_retry() {
@@ -755,16 +738,16 @@ impl ShmClient {
         std::sync::atomic::fence(Ordering::Release);
         hdr.seq_req.store(req, Ordering::Relaxed);
 
-        let helper_present = hdr.helper_state.load(Ordering::Relaxed) != helper_state::STOPPED;
+        let server_present = hdr.server_state.load(Ordering::Relaxed) != server_state::STOPPED;
         // This blocks inside `vkQueuePresentKHR` (the debug-view/capture-request path),
-        // so it is capped at one second even while the helper is still warming up --
+        // so it is capped at one second even while the model server is still warming up --
         // the game's presents must never stall for ten. A slow first answer costs a
         // timeout that the retry logic below absorbs; the async path (`begin_async_request`)
         // keeps the longer warm-up allowance because it never blocks.
         // Tests answer from a thread that an oversubscribed CI runner (lavapipe rendering
         // other tests on every core) can starve for over a second, which turned a slow
         // answer into a flaky failure; their budget only bounds how long a broken test hangs.
-        let budget = if !helper_present {
+        let budget = if !server_present {
             Duration::from_millis(20)
         } else if cfg!(test) {
             Duration::from_secs(30)
@@ -797,9 +780,9 @@ impl ShmClient {
             self.dead = true;
             self.retry_after = Some(Instant::now() + Duration::from_secs(5));
             crate::log!(
-                "[shm] no answer in {:?} x4 (helper {}); passing frames through, retrying in 5s",
+                "[shm] no answer in {:?} x4 (model server {}); passing frames through, retrying in 5s",
                 budget,
-                if helper_present { "is present but silent" } else { "not running" }
+                if server_present { "is present but silent" } else { "not running" }
             );
         }
         false
@@ -814,16 +797,6 @@ impl ShmClient {
     /// slots to ask this about instead of one.
     pub fn has_pending_request(&self, slot: Slot) -> bool {
         self.pending[slot.index()].is_some()
-    }
-
-    /// The request number (`seq_req`) of the round trip in flight on this slot, if any.
-    pub fn pending_request(&self, slot: Slot) -> Option<u32> {
-        self.pending[slot.index()].map(|(req, _)| req)
-    }
-
-    /// The request number the last [`Self::begin_async_request`] on this slot started (0: none).
-    pub fn last_request(&self, slot: Slot) -> u32 {
-        self.last_req[slot.index()]
     }
 
     /// Starts a round trip on the given slot without waiting for it: bumps that
@@ -865,19 +838,6 @@ impl ShmClient {
         true
     }
 
-    /// Slot 0: whether the answer to the last request [`Self::begin_async_request`] started (and
-    /// [`Self::poll_async_request`] saw answered) is the model's, not an echo of the frame. The
-    /// helper writes `seq_eval` before `seq_resp`, and only for a request it ran the model on.
-    pub fn answer_evaluated(&self) -> bool {
-        self.header().is_some_and(|hdr| self.last_req[Slot::Primary.index()] != 0 && hdr.seq_eval.load(Ordering::Relaxed) == self.last_req[Slot::Primary.index()])
-    }
-
-    /// Whether the helper says the model is built (`model_up`). 0 before the first build too, not
-    /// only after a failure; `false` before the mapping is open.
-    pub fn model_up(&self) -> bool {
-        self.header().is_some_and(|hdr| hdr.model_up.load(Ordering::Relaxed) != 0)
-    }
-
     /// Non-blocking: checks whether the request [`Self::begin_async_request`] started
     /// on this slot has answered yet. `Some(true)` once, the instant that slot's
     /// `seq_resp` catches up (clears its pending state, so
@@ -908,9 +868,9 @@ impl ShmClient {
             self.dead = true;
             return None;
         }
-        let helper_present = hdr.helper_state.load(Ordering::Relaxed) != helper_state::STOPPED;
+        let server_present = hdr.server_state.load(Ordering::Relaxed) != server_state::STOPPED;
         let warming_up = !self.ever_answered;
-        let budget = if !helper_present {
+        let budget = if !server_present {
             Duration::from_millis(20)
         } else if warming_up {
             Duration::from_secs(10)
@@ -926,21 +886,21 @@ impl ShmClient {
             self.dead = true;
             self.retry_after = Some(Instant::now() + Duration::from_secs(5));
             crate::log!(
-                "[shm] no answer in {:?} x4 (helper {}); passing frames through, retrying in 5s",
+                "[shm] no answer in {:?} x4 (model server {}); passing frames through, retrying in 5s",
                 budget,
-                if helper_present { "is present but silent" } else { "not running" }
+                if server_present { "is present but silent" } else { "not running" }
             );
         }
         None
     }
 
-    /// Whether a helper is actually running right now: its heartbeat (bumped every loop,
-    /// thousands of times a second) has moved within the last 500 ms. `helper_state` is not
-    /// enough -- a helper that is killed never writes STOPPED, so the header keeps saying
-    /// RUNNING -- and waiting on a dead helper is a stall on every frame that asks.
-    pub fn helper_alive(&mut self) -> bool {
+    /// Whether a model server is actually running right now: its heartbeat (bumped every loop,
+    /// thousands of times a second) has moved within the last 500 ms. `server_state` is not
+    /// enough -- a model server that is killed never writes STOPPED, so the header keeps saying
+    /// RUNNING -- and waiting on a dead one is a stall on every frame that asks.
+    pub fn server_alive(&mut self) -> bool {
         let Some(hdr) = self.header() else { return false };
-        let hb = hdr.heartbeat.load(Ordering::Relaxed);
+        let hb = hdr.server_heartbeat.load(Ordering::Relaxed);
         let now = Instant::now();
         if hb != self.alive_heartbeat || self.alive_since.is_none() {
             let first = self.alive_since.is_none();
@@ -958,15 +918,15 @@ impl ShmClient {
     fn should_retry(&mut self) -> bool {
         let Some(hdr) = self.header() else { return false };
         let control_seq = hdr.control_seq.load(Ordering::Relaxed);
-        let heartbeat = hdr.heartbeat.load(Ordering::Relaxed);
+        let heartbeat = hdr.server_heartbeat.load(Ordering::Relaxed);
         let changed = control_seq != self.last_control_seq || heartbeat != self.last_heartbeat;
         self.last_control_seq = control_seq;
         self.last_heartbeat = heartbeat;
         if !changed {
             return false;
         }
-        // A heartbeat alone is not a reason to try again immediately -- the helper
-        // ticks it while it sits idle, so a helper that is up but not answering would
+        // A heartbeat alone is not a reason to try again immediately -- the model server
+        // ticks it while it sits idle, so a model server that is up but not answering would
         // otherwise re-enable the moment it had just given up, costing another full
         // wait every time. The retry timer is what actually paces retries; a change
         // just means it's worth checking whether that timer has elapsed yet.
@@ -1039,7 +999,7 @@ mod tests {
         format!("{}/shm-{pid}-{n}/shm.bin", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display())
     }
 
-    fn header_of<'a>(client: &'a ShmClient) -> &'a ShmHeader {
+    fn header_of(client: &ShmClient) -> &ShmHeader {
         client.header().expect("open_at should have attached")
     }
 
@@ -1072,10 +1032,10 @@ mod tests {
     }
 
     #[test]
-    fn round_trip_with_no_helper_times_out_then_marks_dead() {
+    fn round_trip_with_no_server_times_out_then_marks_dead() {
         let path = scratch_path();
         let mut client = ShmClient::default();
-        // helper_state defaults to STOPPED, so each attempt's budget is the short
+        // server_state defaults to STOPPED, so each attempt's budget is the short
         // "nobody's listening" one -- four of them should complete quickly.
         for _ in 0..3 {
             assert!(!client.try_round_trip_at(&path));
@@ -1100,7 +1060,7 @@ mod tests {
         assert!(client.open_at(&path));
         let hdr_ptr = client.header as usize;
 
-        // A minimal stand-in for the helper: echo every seq_req into seq_resp as soon
+        // A minimal stand-in for the model server: echo every seq_req into seq_resp as soon
         // as it changes. Exactly the contract `try_round_trip` waits on -- nothing
         // upstream-specific about it.
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1132,11 +1092,11 @@ mod tests {
         let mut client = ShmClient::default();
         assert!(client.open_at(&path));
         let hdr_ptr = client.header as usize;
-        // A live helper, so `poll_async_request`'s budget is the long "steady state"
+        // A live model server, so `poll_async_request`'s budget is the long "steady state"
         // one rather than the short "nobody's listening" one -- doesn't matter here
         // since the echo thread answers almost immediately either way, but matches
         // what a real run looks like.
-        header_of(&client).helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+        header_of(&client).server_state.store(neural_forge_protocol::enums::server_state::RUNNING, Ordering::Relaxed);
 
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let stop_clone = std::sync::Arc::clone(&stop);
@@ -1177,12 +1137,12 @@ mod tests {
         // The actual point of protocol v3 (docs/PROTOCOL_V3_DESIGN.md): slot 1 can have a
         // request outstanding while slot 0's is still pending, and each resolves on
         // its own seq_req/seq_resp pair without disturbing the other -- proven here
-        // with a helper that only ever answers slot 0, confirming slot 1 staying
+        // with a model server that only ever answers slot 0, confirming slot 1 staying
         // genuinely pending is not somehow a side effect of slot 0's own state.
         let path = scratch_path();
         let mut client = ShmClient::default();
         assert!(client.open_at(&path));
-        header_of(&client).helper_state.store(neural_forge_protocol::enums::helper_state::RUNNING, Ordering::Relaxed);
+        header_of(&client).server_state.store(neural_forge_protocol::enums::server_state::RUNNING, Ordering::Relaxed);
 
         assert!(client.begin_async_request(Slot::Primary));
         assert!(client.begin_async_request(Slot::Secondary));
@@ -1214,11 +1174,11 @@ mod tests {
     }
 
     #[test]
-    fn async_request_with_no_helper_times_out_without_blocking_and_clears_pending() {
+    fn async_request_with_no_server_times_out_without_blocking_and_clears_pending() {
         let path = scratch_path();
         let mut client = ShmClient::default();
         assert!(client.open_at(&path));
-        // helper_state defaults to STOPPED -- short "nobody's listening" budget (20ms),
+        // server_state defaults to STOPPED -- short "nobody's listening" budget (20ms),
         // so this test still runs fast despite exercising a real timeout.
         assert!(client.begin_async_request(Slot::Primary));
         assert!(client.has_pending_request(Slot::Primary));
@@ -1233,7 +1193,7 @@ mod tests {
         assert!(!client.has_pending_request(Slot::Primary), "a timed-out request must clear pending state too");
     }
 
-    /// Echoes each slot's `seq_req` into its `seq_resp`, as the helper does, until dropped.
+    /// Echoes each slot's `seq_req` into its `seq_resp`, as the model server does, until dropped.
     struct Echo {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         thread: Option<std::thread::JoinHandle<()>>,
@@ -1277,7 +1237,7 @@ mod tests {
     fn synchronous_requests_stay_paired_with_their_answers_across_the_wrap() {
         let header = Box::new(ShmHeader::default());
         header.init_defaults();
-        header.helper_state.store(helper_state::RUNNING, Ordering::Relaxed);
+        header.server_state.store(server_state::RUNNING, Ordering::Relaxed);
         header.seq_req.store(u32::MAX - 2, Ordering::Relaxed);
         header.seq_resp.store(u32::MAX - 2, Ordering::Relaxed);
         let mut client = ShmClient::test_over_header(&header);
@@ -1291,7 +1251,7 @@ mod tests {
         }
         // The answer to the last request before the wrap is still in `seq_resp` when the first
         // one after it goes out, and nothing answers: 0xffffffff must not pass for request 1.
-        header.helper_state.store(helper_state::STOPPED, Ordering::Relaxed);
+        header.server_state.store(server_state::STOPPED, Ordering::Relaxed);
         header.seq_req.store(u32::MAX, Ordering::Relaxed);
         header.seq_resp.store(u32::MAX, Ordering::Relaxed);
         assert!(!client.round_trip_after_open(), "an old, larger answer is not this request's");
@@ -1303,26 +1263,18 @@ mod tests {
         for slot in Slot::ALL {
             let header = Box::new(ShmHeader::default());
             header.init_defaults();
-            header.helper_state.store(helper_state::RUNNING, Ordering::Relaxed);
+            header.server_state.store(server_state::RUNNING, Ordering::Relaxed);
             header.seq_req_slot(slot).store(u32::MAX - 2, Ordering::Relaxed);
             header.seq_resp_slot(slot).store(u32::MAX - 2, Ordering::Relaxed);
             let mut client = ShmClient::test_over_header(&header);
             for expected in ACROSS_THE_WRAP {
                 assert!(client.begin_async_request(slot));
-                assert_eq!(client.pending_request(slot), Some(expected), "slot {slot}");
-                assert_eq!(client.last_request(slot), expected);
                 // Not answered yet: the previous answer (larger than the request, once the
                 // counter has wrapped) does not resolve it.
                 assert_eq!(client.poll_async_request(slot), Some(false), "slot {slot}, request {expected:#x}");
                 header.seq_resp_slot(slot).store(expected, Ordering::Relaxed);
                 assert_eq!(client.poll_async_request(slot), Some(true), "slot {slot}, request {expected:#x}");
                 assert!(!client.has_pending_request(slot));
-            }
-            // Slot 0's model answers are told from echoes by `seq_eval == request`: still true
-            // for a request numbered after the wrap, since 0 was skipped.
-            if slot == Slot::Primary {
-                header.seq_eval.store(2, Ordering::Relaxed);
-                assert!(client.answer_evaluated());
             }
         }
     }

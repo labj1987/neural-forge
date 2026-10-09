@@ -523,14 +523,13 @@ mod tests {
     #[test]
     fn evdev_ioctl_numbers_match_the_kernel_macros() {
         // Values from <linux/input.h> on x86-64: EVIOCGVERSION and EVIOCGBIT(EV_KEY, 96).
-        assert_eq!(EVIOCGVERSION as u64, 0x8004_4501);
+        assert_eq!(EVIOCGVERSION, 0x8004_4501);
         assert_eq!(eviocgbit(1, 96) as u64, 0x8060_4521);
     }
 
     #[test]
     fn a_press_seen_by_one_drain_is_delivered_once() {
-        let mut p = Poller::default();
-        p.backend = Backend::None;
+        let mut p = Poller { backend: Backend::None, ..Poller::default() };
         p.pending.push(87);
         p.last_poll = Some(Instant::now());
         assert!(p.pressed(87));

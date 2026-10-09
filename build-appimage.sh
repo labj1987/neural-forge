@@ -1,16 +1,14 @@
 #!/usr/bin/env bash
 # build-appimage.sh — build the Neural Forge AppImage.
-# Run from the repo root on Ubuntu (the GitHub Actions runner). Run as root in CI.
+# Run from the repo root on Ubuntu (the GitHub Actions runner), as an ordinary user: it writes
+# only inside the checkout. Only its from-scratch dependency install below needs root.
 #
 # Packaging is appimagetool run directly on a hand-built AppDir, plus zsyncmake for the
 # update sidecar. GTK 4 and libadwaita come from the host system and are not bundled.
-# This app needs no polkit/pkexec step at all -- every path it touches (~/.local/share,
-# ~/.config, /tmp/neural-forge-$UID/) is already user-owned, so AppRun just execs the
-# GUI directly.
 set -euo pipefail
 
 # LIBDIR/LIB/MANIFEST are the layer's install identity (VK_LAYER_neuralforge_neural, libneural_forge_layer.so,
-# lib/neural-forge/); NAME is the user-facing binary/AppImage name. See CLAUDE.md "Naming convention".
+# lib/neural-forge/); NAME is the user-facing binary/AppImage name. See AGENTS.md "Naming convention".
 LIBDIR="neural-forge"
 LIB="libneural_forge_layer.so"
 MANIFEST="neural_forge_layer.json"
@@ -19,15 +17,6 @@ VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 ARCH="x86_64"
 BUILD_DIR="build-appimage"
 APPDIR="$BUILD_DIR/AppDir"
-WIN_TARGET="x86_64-pc-windows-gnu"
-
-# On a from-scratch CI image, `cargo`/`rustup` are already the only Rust toolchain, so
-# plain `cargo` and `rustup target add` are correct there. On this repo's own dev
-# machine specifically, a pre-existing non-rustup toolchain was deliberately kept as
-# the `system` default (see CLAUDE.md's "helper gotchas") and the cross-compile
-# toolchain lives under a separate `stable-x86_64-unknown-linux-gnu` rustup toolchain
-# instead -- override CARGO_HELPER via the environment if building there.
-CARGO_HELPER="${CARGO_HELPER:-cargo}"
 
 echo "==> Building $NAME $VERSION AppImage"
 
@@ -39,48 +28,22 @@ if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null;
     # for that repo and still refreshes everything else; only `apt-get install`
     # failing on a package we actually need should be fatal.
     apt-get update -qq || true
-    apt-get install -y -qq cargo rustc libgtk-4-dev libadwaita-1-dev \
-        pkg-config libssl-dev wget file desktop-file-utils zsync \
-        mingw-w64 gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib
+    # g++ brings the static libstdc++ that crates/native links; curl and python3 are what
+    # scripts/fetch-native-tools.sh and the crate's build script run.
+    apt-get install -y -qq cargo rustc g++ curl python3 libgtk-4-dev libadwaita-1-dev \
+        pkg-config wget desktop-file-utils zsync
 fi
-# Add the target to whichever toolchain `$CARGO_HELPER` will actually invoke, not
-# necessarily the default one -- on a clean CI image there's exactly one toolchain and
-# `+something` never appears in `$CARGO_HELPER`, so this reduces to the obvious
-# `rustup target add`. On this repo's own dev machine, the default toolchain is a
-# linked, non-rustup-managed one that `rustup target add` can't touch at all (see
-# CLAUDE.md) -- `CARGO_HELPER="cargo +stable-..."` there means the target has to be
-# added to *that* toolchain instead.
-rustup_toolchain_arg=""
-for word in $CARGO_HELPER; do
-    case "$word" in
-        +*) rustup_toolchain_arg="--toolchain ${word#+}" ;;
-    esac
-done
-# The 32-bit layer, for 32-bit games (a separate layer name and manifest, as upstream does).
-I686_TARGET="i686-unknown-linux-gnu"
-if ! rustup target list --installed ${rustup_toolchain_arg:+$rustup_toolchain_arg} 2>/dev/null | grep -q "$I686_TARGET"; then
-    # shellcheck disable=SC2086
-    rustup target add $rustup_toolchain_arg "$I686_TARGET"
-fi
-if ! rustup target list --installed ${rustup_toolchain_arg:+$rustup_toolchain_arg} 2>/dev/null | grep -q "$WIN_TARGET"; then
-    # shellcheck disable=SC2086 -- word-splitting $rustup_toolchain_arg is intentional here.
-    rustup target add $rustup_toolchain_arg "$WIN_TARGET"
-fi
-
+# The pinned glslang, Vulkan-Headers and volk that crates/native builds with (SHA-256-checked,
+# skipped when already in tools/native/).
+bash scripts/fetch-native-tools.sh
 # ── Release build ─────────────────────────────────────────────────────
-echo "==> cargo build --release (protocol/layer/gui/cli)"
-cargo build --release
-
-echo "==> $CARGO_HELPER build --release --target $WIN_TARGET -p neural-forge-helper"
-$CARGO_HELPER build --release --target "$WIN_TARGET" -p neural-forge-helper
-
-echo "==> $CARGO_HELPER build --release --target $I686_TARGET -p neural-forge-layer"
-$CARGO_HELPER build --release --target "$I686_TARGET" -p neural-forge-layer
+echo "==> cargo build --release (protocol/layer/native/gui/cli)"
+cargo build --release --locked
 
 # ── AppDir layout ─────────────────────────────────────────────────────
 rm -rf "$BUILD_DIR"
 mkdir -p "$APPDIR/usr/bin" \
-         "$APPDIR/usr/lib/$LIBDIR/helper" \
+         "$APPDIR/usr/lib/$LIBDIR" \
          "$APPDIR/usr/share/applications" \
          "$APPDIR/usr/share/icons/hicolor/scalable/apps" \
          "$APPDIR/usr/share/metainfo" \
@@ -89,11 +52,6 @@ mkdir -p "$APPDIR/usr/bin" \
 cp "target/release/$NAME"                      "$APPDIR/usr/bin/"
 cp "target/release/$NAME-cli"                       "$APPDIR/usr/bin/"
 cp "target/release/$LIB"                            "$APPDIR/usr/lib/$LIBDIR/"
-cp "target/$WIN_TARGET/release/${NAME}-helper.exe"  "$APPDIR/usr/lib/$LIBDIR/helper/"
-mkdir -p "$APPDIR/usr/lib/$LIBDIR/i686"
-cp "target/$I686_TARGET/release/$LIB" "$APPDIR/usr/lib/$LIBDIR/i686/"
-sed "s#\./i686/libneural_forge_layer\.so#../../../lib/$LIBDIR/i686/$LIB#" \
-    data/neural_forge_layer_i686.json > "$APPDIR/usr/share/vulkan/implicit_layer.d/neural_forge_layer_i686.json"
 sed "s#\./libneural_forge_layer\.so#../../../lib/$LIBDIR/$LIB#" \
     "data/$MANIFEST" > "$APPDIR/usr/share/vulkan/implicit_layer.d/$MANIFEST"
 cp data/io.github.labj1987.NeuralForge.desktop                               "$APPDIR/usr/share/applications/"
@@ -121,10 +79,6 @@ cat > "$APPDIR/AppRun" << 'APPRUN'
 #!/usr/bin/env bash
 HERE="$(dirname "$(readlink -f "$0")")"
 export PATH="$HERE/usr/bin:$PATH"
-# The Vulkan layer manifest ships inside the AppImage's own read-only tree, so the
-# loader needs an explicit path to it -- there is no writable implicit_layer.d this
-# install owns to drop it into (this app needs no root/install step at all).
-export VK_ADD_LAYER_PATH="$HERE/usr/share/vulkan/implicit_layer.d${VK_ADD_LAYER_PATH:+:$VK_ADD_LAYER_PATH}"
 exec "$HERE/usr/bin/neural-forge" "$@"
 APPRUN
 chmod 755 "$APPDIR/AppRun"
@@ -136,7 +90,10 @@ chmod 755 "$APPDIR/AppRun"
 # x86_64 asset's sha256 from that release page.
 APPIMAGETOOL_VERSION="1.9.1"
 APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
-TOOL="$BUILD_DIR/appimagetool-$APPIMAGETOOL_VERSION"
+# Kept in .cache/, outside the build directory this script wipes, so a second build reuses it.
+TOOL_DIR=".cache"
+mkdir -p "$TOOL_DIR"
+TOOL="$TOOL_DIR/appimagetool-$APPIMAGETOOL_VERSION"
 if [[ ! -f "$TOOL" ]] || ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --status; then
     echo "==> Downloading appimagetool $APPIMAGETOOL_VERSION"
     wget -q -O "$TOOL" \
@@ -149,13 +106,31 @@ if [[ ! -f "$TOOL" ]] || ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --s
     chmod +x "$TOOL"
 fi
 
+# The runtime appimagetool puts in front of the squashfs. Without --runtime-file it downloads
+# the moving `continuous` build at pack time, so it is pinned and checked the same way.
+# To bump: pick a release at https://github.com/AppImage/type2-runtime/releases and take the
+# sha256 of its runtime-x86_64 asset (download it and run sha256sum).
+RUNTIME_VERSION="20251108"
+RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
+RUNTIME="$TOOL_DIR/runtime-x86_64-$RUNTIME_VERSION"
+if [[ ! -f "$RUNTIME" ]] || ! echo "$RUNTIME_SHA256  $RUNTIME" | sha256sum -c --status; then
+    echo "==> Downloading type2-runtime $RUNTIME_VERSION"
+    wget -q -O "$RUNTIME" \
+        "https://github.com/AppImage/type2-runtime/releases/download/$RUNTIME_VERSION/runtime-x86_64"
+    if ! echo "$RUNTIME_SHA256  $RUNTIME" | sha256sum -c --status; then
+        echo "error: type2-runtime $RUNTIME_VERSION does not match the pinned checksum" >&2
+        rm -f "$RUNTIME"
+        exit 1
+    fi
+fi
+
 echo "==> Packing AppImage"
 OUT="neural-forge-$VERSION-$ARCH.AppImage"
 
 # Use the canonical renamed repository for release updates.
 UPDATE_INFORMATION="gh-releases-zsync|labj1987|neural-forge|latest|neural-forge-*-x86_64.AppImage.zsync"
 VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
-    -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
+    --runtime-file "$RUNTIME" -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
 
 echo "==> Done: $OUT"
 ls -lh "$OUT"

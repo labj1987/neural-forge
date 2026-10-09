@@ -5,18 +5,24 @@ Every document in this folder, one line each. New to the project: read
 top-level [README](../README.md).
 
 Older documents are kept as they were written, with a dated note at the top where something in
-them is no longer true. When a document and the code disagree, the code wins; when two documents
+them is no longer true. Up to 2.0.10 the model ran in a Windows helper under Wine through NVIDIA's
+NGX runtime; 3.0 removed the helper, so what older documents say about it, the runners, the
+Wine prefix or NGX is history. When a document and the code disagree, the code wins; when two documents
 disagree, the more recent measurement wins.
 
 ## How it works
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): the processes, the shared-memory protocol (versions 1-11),
-  both frame paths step by step, the helper's per-request work, and the timing of each stage.
+- [ARCHITECTURE.md](ARCHITECTURE.md): the layer, the shared-memory channel (versions 1-15), both
+  frame paths step by step, the network the layer runs, and the timing of each stage.
+- [NATIVE_BACKEND.md](NATIVE_BACKEND.md): how the network moved into the layer for 3.0 (OpenDLSS-NR,
+  the model directory and its extractor, the device setup, the hold inside DLSS's buffer), and every
+  measurement against NVIDIA's runtime through the 2.x helper.
 - [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md): the 2.0 design for running the model before
   DLSS Super Resolution, and the full record of its experiments (E1-E3, hand-off latency, 4K,
   robustness, frame generation).
 - [EXTERNAL_MEMORY_HOST_DESIGN.md](EXTERNAL_MEMORY_HOST_DESIGN.md): zero-copy transport by
-  importing shared memory as Vulkan memory (`VK_EXT_external_memory_host`), on both sides.
+  importing shared memory as Vulkan memory (`VK_EXT_external_memory_host`), on both sides (written
+  for the 2.x helper; the after-the-upscaler path's model server imports it the same way).
 - [PROTOCOL_V3_DESIGN.md](PROTOCOL_V3_DESIGN.md): the second request/response slot, and why the
   model still runs one request at a time.
 - [RENDER_TAP_DESIGN.md](RENDER_TAP_DESIGN.md): capturing from the image a game blits into its
@@ -35,9 +41,9 @@ disagree, the more recent measurement wins.
 - [FRAMEGEN_SPIKE.md](FRAMEGEN_SPIKE.md): Smooth Motion and lsfg-vk below the layer, the Vulkan
   layer-order problem, and the 1.x frame generation measurements (superseded by 2.0).
 - [DMABUF_TRANSPORT_DESIGN.md](DMABUF_TRANSPORT_DESIGN.md): why DMA-BUF sharing between the layer
-  and the Wine helper is blocked in both directions.
+  and the 2.x Wine helper was blocked in both directions.
 - [NATIVE_NGX_HELPER_DESIGN.md](NATIVE_NGX_HELPER_DESIGN.md): why a native Linux NGX helper cannot
-  run Feature 18.
+  run Feature 18 (which is why 3.0 runs an open implementation of the network instead).
 - [OPENDLSS_REVIEW.md](OPENDLSS_REVIEW.md): Neural Forge compared stage by stage with OpenDLSS-NR's
   documented pipeline, the history reset rule, and the GTA script-mod finding.
 - [DLSS_KERNEL_CATALOGUE.md](DLSS_KERNEL_CATALOGUE.md): DLSS's kernel names and input-kernel parameter
@@ -48,8 +54,9 @@ disagree, the more recent measurement wins.
   reset is set, against the public SDK and the open-source consumers.
 - [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md): what was and was not carried over from DLSS5VKLayer
   0.3.1-1.
-- [PHASE1.md](PHASE1.md): the namespace contract, installation contract and target ownership rules
-  (its benchmark plan is historical).
+- [PHASE1.md](PHASE1.md): the namespace contract, installation contract and target ownership rules.
+- [history/phase1-benchmark-plan.md](history/phase1-benchmark-plan.md): the 2.x-era Phase 1 benchmark
+  plan and later phases, moved out of PHASE1.md.
 - [history/development-before-neuralforge.md](history/development-before-neuralforge.md): the
   development log from before the rename (codename dlssnr), 2026-09-09 to 09-12.
 - [history/handoff-2026-09-12-fps-freeze-regression.md](history/handoff-2026-09-12-fps-freeze-regression.md):
@@ -67,7 +74,7 @@ disagree, the more recent measurement wins.
 
 - [RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md): building, deploying to a test machine, the
   unattended GTA benchmark, the pan reproducer and agreement metric, the diagnostic modes and
-  probe, driving the helper without a game, reading the logs and `shmctl status`, validation
+  probe, reading the logs and `shmctl status`, validation
   layers, checking the picture by eye, the release checklist, and the reverse-engineering toolkit
   installed on the test machine.
 - [RE_TOOLKIT.md](RE_TOOLKIT.md): agent-driven reverse-engineering tools surveyed (what each attaches
@@ -75,7 +82,7 @@ disagree, the more recent measurement wins.
 
 ## For contributors and agents
 
-- [../CLAUDE.md](../CLAUDE.md) (identical to [../AGENTS.md](../AGENTS.md)): naming rules, build and
+- [../AGENTS.md](../AGENTS.md): naming rules, build and
   test commands, runtime constraints, the pre-upscaler rules and the composition invariants.
 - [../ATTRIBUTION.md](../ATTRIBUTION.md): what was taken from DLSS5VKLayer and others, function by
   function.

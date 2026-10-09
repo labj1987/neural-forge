@@ -1,12 +1,17 @@
 # Reverse-engineering toolkit survey
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 Surveyed 2026-10-06: agent-driven (MCP) reverse-engineering tools for native binaries, starting
 from [darbra/awesome-ai-reverse](https://github.com/darbra/awesome-ai-reverse) (its binary/native
 section) plus tools already identified. What is installed on the test machine, where, and how to
 check it is in [RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md), section 10.
 
 **Scope.** The decompilers here are not used on NVIDIA's code; interface metadata and observed
-behaviour are. The full rule is in [CLAUDE.md](../CLAUDE.md), "Working with NVIDIA's binaries".
+behaviour are.
 [DLSSNR_PARAMETERS.md](DLSSNR_PARAMETERS.md) shows the approach: the feature's parameters come from
 the helper's own read log, public headers and open-source consumers.
 

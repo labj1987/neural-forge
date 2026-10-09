@@ -1,5 +1,10 @@
 # DLSS Neural Rendering parameters: what the feature reads, what the helper sets
 
+> **Note (2026-10-07, 3.0.0):** written before 3.0. Since 3.0 the model runs inside the layer
+> (the native backend, [NATIVE_BACKEND.md](NATIVE_BACKEND.md)); the Windows helper, Wine, the
+> runners, NGX at run time and the 32-bit layer are gone. What this document says about them is
+> history; [ARCHITECTURE.md](ARCHITECTURE.md) describes the current design.
+
 2026-10-06. Which NGX parameters Feature 18 (`nvngx_dlssnr.dll`, the 310.8 copy imported into the
 app's binaries directory) actually reads; which of those the helper never sets; what the helper
 sets that nothing reads; and when the history reset is set. Compiled from public sources and from
@@ -52,7 +57,7 @@ helper's side; the DLL is not inspected.
 
 How it was measured: the helper, started by the CLI with no game running, was driven by
 `trigger_helper_roundtrip` (RUNNING_AND_MEASURING.md, "Driving the helper without a game") with a
-1280x720 frame from `screenshots/gta-v-street.jpg`, 48 requests, once as RGBA8 and once as RGBA16F
+1280x720 frame from `screenshots/gta-v-street.jpg` (a 2.0 screenshot, removed in 3.0; in git history), 48 requests, once as RGBA8 and once as RGBA16F
 (created with `DLSSNR.Hdr=1`). Defaults otherwise: one pass, motion vectors on, auto mask on,
 preset 0, style 0, strengths 1, skin -1. A key the feature reads only in a state not exercised here
 (more passes, a UI image bound) would not appear.
@@ -181,7 +186,7 @@ section 5).
 
 ## Candidates considered for a release
 
-Alex's bar: a change ships only if it raises fps or improves image quality.
+The maintainer's bar: a change ships only if it raises fps or improves image quality.
 
 | Candidate | Small | Risk-free | Measurable with `gta-bench.sh` | Raises fps or improves the picture | Shipped |
 |---|---|---|---|---|---|
@@ -189,6 +194,6 @@ Alex's bar: a change ships only if it raises fps or improves image quality.
 | Remove the 18 unread writes | yes | yes | no | no | no |
 | Bind `UI`, `UIAlpha` or `ControlMask` | no (no source image; mask meaning not public) | no | | unknown | no |
 | Scene-cut reset with motion vectors off | yes | yes | no (the bench runs with motion on) | only in a configuration nobody runs | no |
-| Hide or remove the sharpness setting | yes | yes | no | no (it already does nothing) | no; Alex's call, since it is a GUI change |
+| Hide or remove the sharpness setting | yes | yes | no | no (it already does nothing) | no; the maintainer's call, since it is a GUI change |
 
 No 2.0.9.

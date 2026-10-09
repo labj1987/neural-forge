@@ -1,24 +1,17 @@
-//! `neural-forge-cli shmctl` — raw status/set/toggle/capture against the live SHM header,
-//! the real equivalent of upstream's own separate `neural-forge-shmctl` debug/introspection
-//! tool (see the workspace `CLAUDE.md`'s "compared against a real, installed upstream
-//! instance" entry: this project had no equivalent of it before now). Deliberately a
-//! subcommand of `neural-forge-cli` rather than its own binary -- one fewer thing to build,
-//! package, and document for what is fundamentally the same "attach to the mapping and
-//! poke it" job `cmd_config`/the GUI's settings binding already do.
+//! `neural-forge-cli shmctl`: raw status/set/toggle/capture against the live shared-memory header,
+//! for debugging and scripted measurements. A subcommand rather than its own binary: it is the same
+//! "attach to the mapping and poke it" job the GUI's settings binding does.
 //!
-//! `status`/`set`/`toggle` operate on the same 21-setting surface
-//! `neural_forge_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` already
-//! define (so a value changed here also gets written to `config.ini` on the GUI's next
-//! save, the same as changing it from the GUI would), plus a handful of real,
-//! genuinely useful fields that aren't user-facing "settings" in that sense --
-//! `debug_view`/`capture_request` in particular, which is what makes this the actual
-//! tool this project first used to visually confirm the composition pipeline produces
-//! correct output (see `CLAUDE.md`'s "First confirmed *correct visual output*" entry).
+//! `status`/`set`/`toggle` operate on the setting surface
+//! `neural_forge_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` define (a value
+//! changed here is saved to `config.ini`, as a change from the GUI is), plus a few fields that are not
+//! user-facing settings: `debug_view` and `capture_request` in particular, which make this the tool
+//! for confirming the composition visually.
 
 use neural_forge_protocol::ShmHeader;
 use std::sync::atomic::Ordering;
 
-fn usage() {
+pub fn usage() {
     eprintln!(
         "usage: neural-forge-cli shmctl <status|set|toggle|capture|reset>\n\n\
          \x20 status              print every setting and live status field\n\
@@ -30,9 +23,9 @@ fn usage() {
          \x20                     original+composited pairs, whichever present path runs\n\
          \x20                     (see neural_forge_layer::series)\n\
          \x20 reset               reset every setting to its default; preserves the\n\
-         \x20                     live helper/layer session (see ShmHeader::reset_persisted_settings)\n\n\
+         \x20                     live layer session (see ShmHeader::reset_persisted_settings)\n\n\
          Opens config.ini's shm= channel, else $NEURAL_FORGE_SHM, else the default under\n\
-         /tmp/neural-forge-$UID -- the same one `start` gives the helper."
+         /tmp/neural-forge-$UID -- the same one the layer uses."
     );
 }
 
@@ -48,12 +41,9 @@ fn extra_field<'a>(header: &'a ShmHeader, name: &str) -> Option<(&'a std::sync::
     })
 }
 
-fn helper_state_name(v: u32) -> &'static str {
-    use neural_forge_protocol::enums::helper_state::*;
+fn server_state_name(v: u32) -> &'static str {
+    use neural_forge_protocol::enums::server_state::*;
     match v {
-        STARTING => "starting",
-        NO_VULKAN => "no_vulkan",
-        NO_BINARIES => "no_binaries",
         MODEL_FAILED => "model_failed",
         RUNNING => "running",
         STOPPED => "stopped",
@@ -63,24 +53,23 @@ fn helper_state_name(v: u32) -> &'static str {
 
 fn cmd_status(header: &ShmHeader) {
     println!("# live status");
-    println!("helper_state={} ({})", header.helper_state.load(Ordering::Relaxed), helper_state_name(header.helper_state.load(Ordering::Relaxed)));
+    println!("server_state={} ({})", header.server_state.load(Ordering::Relaxed), server_state_name(header.server_state.load(Ordering::Relaxed)));
     println!("model_up={}", header.model_up.load(Ordering::Relaxed));
-    println!("helper_reason={}", header.helper_reason());
-    let frames = (u64::from(header.helper_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.helper_frames_lo.load(Ordering::Relaxed));
-    println!("helper_frames={frames}");
-    println!("helper_upload_ms={}", f32::from_bits(header.helper_upload_ms_bits.load(Ordering::Relaxed)));
-    println!("helper_eval_ms={}", f32::from_bits(header.helper_eval_ms_bits.load(Ordering::Relaxed)));
-    println!("helper_readback_ms={}", f32::from_bits(header.helper_readback_ms_bits.load(Ordering::Relaxed)));
-    println!("helper_busy_ms={}", f64::from(header.helper_busy_us.load(Ordering::Relaxed)) / 1000.0);
-    println!("pass0_override_mask={}", header.pass[0].override_mask.load(Ordering::Relaxed));
-    println!("pass0_effective_preset={}", header.resolve_pass(0).preset);
+    let frames = (u64::from(header.server_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.server_frames_lo.load(Ordering::Relaxed));
+    println!("server_frames={frames}");
+    println!("server_upload_ms={}", f32::from_bits(header.server_upload_ms_bits.load(Ordering::Relaxed)));
+    println!("server_eval_ms={}", f32::from_bits(header.server_eval_ms_bits.load(Ordering::Relaxed)));
+    println!("server_readback_ms={}", f32::from_bits(header.server_readback_ms_bits.load(Ordering::Relaxed)));
+    println!("server_busy_ms={}", f64::from(header.server_busy_us.load(Ordering::Relaxed)) / 1000.0);
     let layer_frames = (u64::from(header.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.layer_frames_lo.load(Ordering::Relaxed));
     println!("layer_frames={layer_frames}");
     println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
     println!("layer_capture_gpu_ms={}", f32::from_bits(header.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)));
     println!("layer_compose_gpu_ms={}", f32::from_bits(header.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)));
     let preupscale = header.preupscale_state.load(Ordering::Relaxed);
-    println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", 3 => "paused: no model answer, forwarding untouched", _ => "unknown" });
+    println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", _ => "unknown" });
+    println!("layer_reason={}", header.layer_reason());
+    println!("native_running={}", header.native_running.load(Ordering::Relaxed));
     println!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed));
     println!("preupscale_hold_ms={}", f32::from_bits(header.preupscale_hold_ms_bits.load(Ordering::Relaxed)));
     println!("preupscale_misses={}", header.preupscale_misses.load(Ordering::Relaxed));
@@ -97,7 +86,7 @@ fn cmd_status(header: &ShmHeader) {
     }
 }
 
-/// Shared by `set`/`toggle`: resolves `name` against the 21 persisted settings first,
+/// Shared by `set`/`toggle`: resolves `name` against the persisted settings first,
 /// then the extra live-status fields, returning whether it's float-valued and its
 /// current raw bits -- `None` if `name` isn't recognized by either.
 fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
@@ -107,12 +96,14 @@ fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
     extra_field(header, name).map(|(field, is_float)| (is_float, field.load(Ordering::Relaxed)))
 }
 
-/// Writes one setting and bumps the sequence numbers the helper and layer watch. The
+/// Writes one setting and bumps the sequence numbers the layer watches. The
 /// `tuning_seq` bump also marks the header as configured: left at 0 (a header nothing had
 /// applied `config.ini` to yet), the next `start()` would overwrite this value from it.
 fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
     if header.persisted_settings().iter().any(|(n, ..)| *n == name) {
-        header.apply_persisted_setting(name, bits);
+        if !header.apply_persisted_setting(name, bits) {
+            return false;
+        }
         header.tuning_seq.fetch_add(1, Ordering::Relaxed);
         header.control_seq.fetch_add(1, Ordering::Relaxed);
         return true;
@@ -147,7 +138,17 @@ fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
             }
         }
     };
-    store(header, name, bits);
+    if let Some((min, max)) = neural_forge_protocol::setting_bounds(name) {
+        let v = if is_float { f32::from_bits(bits) } else { bits as f32 };
+        if !(min..=max).contains(&v) {
+            eprintln!("shmctl set: {name} takes a value from {min} to {max}, got {value:?}");
+            return false;
+        }
+    }
+    if !store(header, name, bits) {
+        eprintln!("shmctl set: {name} was not stored");
+        return false;
+    }
     println!("{name}={value}");
     true
 }
@@ -203,6 +204,21 @@ fn cmd_capture(header: &ShmHeader, args: &[String]) -> bool {
     true
 }
 
+/// Checks the argument count of a `shmctl` command line before anything is opened, so an extra
+/// or missing argument is a usage error. `capture`'s own options are checked by `cmd_capture`.
+pub fn check_args(args: &[String]) -> Result<(), String> {
+    let n = args.len();
+    match args.first().map(String::as_str) {
+        None => Err("shmctl takes a subcommand".into()),
+        Some("status" | "reset") if n == 1 => Ok(()),
+        Some("set") if n == 3 => Ok(()),
+        Some("toggle") if n == 2 => Ok(()),
+        Some("capture") => Ok(()),
+        Some(sub @ ("status" | "reset" | "set" | "toggle")) => Err(format!("wrong number of arguments for shmctl {sub}")),
+        Some(other) => Err(format!("unknown shmctl subcommand {other:?}")),
+    }
+}
+
 pub fn run(args: &[String]) -> std::process::ExitCode {
     let cfg = neural_forge_supervisor::Config::load();
     let mapping = match neural_forge_supervisor::open_channel(&cfg) {
@@ -212,6 +228,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    neural_forge_supervisor::apply_saved_settings(&cfg, &mapping);
     let header = mapping.header();
 
     let ok = match args.first().map(String::as_str) {
@@ -236,7 +253,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         Some("capture") => cmd_capture(header, &args[1..]),
         Some("reset") => {
             header.reset_persisted_settings();
-            println!("settings reset to defaults; helper/layer session preserved");
+            println!("settings reset to defaults; layer session preserved");
             true
         }
         _ => {
@@ -244,6 +261,15 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             false
         }
     };
+    // A changed setting is saved the way the GUI and `profile load` save one, so it survives a
+    // reboot and the next cold start does not put the old value back.
+    let changes_settings = matches!(args.first().map(String::as_str), Some("set" | "toggle" | "reset"));
+    if ok && changes_settings {
+        if let Err(e) = neural_forge_supervisor::save_settings(header) {
+            eprintln!("shmctl: applied to the live channel, but saving config.ini failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
     if ok {
         std::process::ExitCode::SUCCESS
     } else {
@@ -351,11 +377,27 @@ mod tests {
     }
 
     #[test]
-    fn helper_state_name_covers_every_real_state() {
-        use neural_forge_protocol::enums::helper_state::*;
-        for state in [STARTING, NO_VULKAN, NO_BINARIES, MODEL_FAILED, RUNNING, STOPPED] {
-            assert_ne!(helper_state_name(state), "unknown");
+    fn cmd_set_rejects_non_finite_negative_and_out_of_range_values() {
+        let header = ShmHeader::default();
+        header.init_defaults();
+        for bad in ["nan", "inf", "-inf", "-0.5", "4.5"] {
+            assert!(!cmd_set(&header, "intensity", bad), "{bad}");
         }
-        assert_eq!(helper_state_name(9999), "unknown");
+        assert_eq!(f32::from_bits(header.intensity_bits.load(Ordering::Relaxed)), 1.0);
+        assert!(!cmd_set(&header, "model_interval", "0"));
+        assert!(!cmd_set(&header, "style", "-1"));
+        assert!(!cmd_set(&header, "debug_view", "6"));
+        assert_eq!(header.tuning_seq.load(Ordering::Relaxed), 0, "a refused value changes nothing");
+        assert!(cmd_set(&header, "intensity", "4"));
+        assert_eq!(f32::from_bits(header.intensity_bits.load(Ordering::Relaxed)), 4.0);
+    }
+
+    #[test]
+    fn server_state_name_covers_every_real_state() {
+        use neural_forge_protocol::enums::server_state::*;
+        for state in [MODEL_FAILED, RUNNING, STOPPED] {
+            assert_ne!(server_state_name(state), "unknown");
+        }
+        assert_eq!(server_state_name(9999), "unknown");
     }
 }

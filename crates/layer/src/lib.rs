@@ -1,10 +1,9 @@
 //! `VK_LAYER_neuralforge_neural` — the Linux-side Vulkan implicit layer.
 //!
 //! Hooks the swapchain lifecycle (`vkCreateSwapchainKHR`/`vkDestroySwapchainKHR`/
-//! `vkQueuePresentKHR`) and exchanges frames with the helper over the shared-memory
-//! transport defined in `neural_forge_protocol`. This crate never knows or cares whether the
-//! helper on the other end of that mapping is running under Wine/Proton today or a
-//! native Linux process later — that's the whole point of the seam.
+//! `vkQueuePresentKHR`), holds DLSS's input to run the model before the upscaler (the native
+//! backend, `preupscale`), and after the upscaler exchanges frames with its in-process model server
+//! over the shared-memory transport defined in `neural_forge_protocol`.
 //!
 //! Built on Google's [`vulkan_layer`](https://github.com/google/vk-layer-for-rust)
 //! crate, which supplies the actual `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`
@@ -13,10 +12,9 @@
 //! [`vulkan_layer::DeviceHooks`] for the handful of functions it actually cares about;
 //! everything else falls through to the next layer/driver automatically.
 //!
-//! Host shared-memory capture and GPU composition are implemented. Cross-process
-//! ownership and executable filtering guard the channel; the swapchain size filter
-//! additionally excludes small overlays. DMA-BUF remains experimental. See
-//! docs/HARDWARE_VALIDATION.md for presentation-validation failures still under review.
+//! Cross-process ownership and executable filtering guard the channel; the swapchain size
+//! filter additionally excludes small overlays. See docs/HARDWARE_VALIDATION.md for
+//! presentation-validation failures still under review.
 
 mod breadcrumbs;
 mod capture;
@@ -37,6 +35,11 @@ mod present_sync;
 mod probe_ngx;
 mod probe_seq;
 mod preupscale;
+
+// The native backend (crates/native), linked into the 64-bit layer (`preupscale::native`).
+#[cfg(target_arch = "x86_64")]
+#[allow(unused_imports)]
+pub(crate) use neural_forge_native as native;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::CStr;
@@ -229,8 +232,8 @@ fn env_flag(name: &str) -> bool {
 
 /// Works around a crash inside Mesa's `device_select` implicit layer, confirmed
 /// reproducible even with `vulkan-layer`'s own pristine `hello-world` example under
-/// implicit activation on this machine's Mesa build (see `CLAUDE.md`'s "CRITICAL,
-/// confirmed" section for the full bisection) -- so this is a bug in the interaction
+/// implicit activation on this machine's Mesa build (see the "CRITICAL,
+/// confirmed" section of docs/history/development-before-neuralforge.md for the full bisection) -- so this is a bug in the interaction
 /// between the pinned `vulkan-layer` commit and this Mesa build, not anything specific
 /// to this crate. `vulkan_layer::Global::create_instance`'s default fallback path
 /// (taken whenever `GlobalHooks::create_instance` is `Unhandled`) eagerly resolves all
@@ -277,8 +280,7 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
     }
 }
 
-/// The one device extension this layer ever asks a game's own device creation to add,
-/// for Phase 3's zero-copy capture path (`docs/ASYNC_CAPTURE_DESIGN.md`): importing the SHM
+/// The extension the layer adds to a game's own device creation for the zero-copy capture path (`docs/ASYNC_CAPTURE_DESIGN.md`): importing the SHM
 /// proxy region directly as device memory needs it on whichever device the layer's own
 /// capture commands submit against -- the game's, not a private one, since the image
 /// being copied is the game's own swapchain/render-tap source.
@@ -327,61 +329,157 @@ pub(crate) struct SideQueue {
     pub app_family: u32,
 }
 
+/// Devices created with the native backend's additions (`preupscale::native`): its extensions and
+/// features, and one more queue in the game's graphics family for the network's loading. Taken once by
+/// `NeuralForgeDeviceInfo::new`.
+#[cfg(target_arch = "x86_64")]
+static NATIVE_DEVICES: Mutex<Option<HashMap<vk::Device, preupscale::native::Setup>>> = Mutex::new(None);
+
+/// Checks and clears the native backend's setup for `device`.
+#[cfg(target_arch = "x86_64")]
+pub(crate) fn take_native(device: vk::Device) -> Option<preupscale::native::Setup> {
+    NATIVE_DEVICES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
+}
+
 /// Checks and clears the side queue [`NeuralForgeInstanceHooks::create_device`] added to `device`.
 pub(crate) fn take_side_queue(device: vk::Device) -> Option<SideQueue> {
     SIDE_QUEUES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
 }
 
-/// The application's queue requests with one queue more for the layer, in a compute family without
-/// graphics (NVIDIA's family 2): queues of the game's own graphics family share its GPU context,
-/// and the layer's compute work there while the game's queue waits at the hold inside DLSS's buffer
-/// faulted the channel (Xid 69, Crimson Desert, 2026-10-05). The application's request for that
-/// family is extended by one when it has a queue to spare and is a plain one (no flags); without
-/// one, a request for one queue is added. `priorities` backs the extended `pQueuePriorities`.
-struct SideQueueRequest {
+/// The application's queue requests `infos` with `n` more queues for the layer, in a compute family without
+/// graphics (NVIDIA's family 2): queues of the game's own graphics family share its GPU context, and the
+/// layer's work there faulted the channel (Xid 69 in Crimson Desert with the hold inside DLSS's buffer,
+/// 2026-10-05; Xid 69 and Xid 32 in GTA V with the network's uploads, 2026-10-07). Every such family is
+/// considered, in order, and the first with room for `n` more is taken: the application's request for it is
+/// extended when it is a plain one (no flags), or a request for `n` queues is added.
+struct ExtraQueues {
+    /// The first family the application requests with graphics and compute: where DLSS runs.
+    app_family: u32,
+    family: u32,
+    /// The first of the new queues' indices.
+    index: u32,
     infos: Vec<vk::DeviceQueueCreateInfo>,
+    /// Backs the extended `pQueuePriorities`.
     _priorities: Vec<f32>,
-    queue: SideQueue,
 }
 
-fn side_queue_request(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &vk::DeviceCreateInfo) -> Option<SideQueueRequest> {
-    if create_info.queue_create_info_count == 0 || create_info.p_queue_create_infos.is_null() {
-        return None;
+impl ExtraQueues {
+    fn side_queue(&self) -> SideQueue {
+        SideQueue { family: self.family, index: self.index, app_family: self.app_family }
     }
-    // SAFETY: a non-null `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures.
-    let infos = unsafe { std::slice::from_raw_parts(create_info.p_queue_create_infos, create_info.queue_create_info_count as usize) };
-    // SAFETY: `physical_device` belongs to `instance`.
-    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+}
+
+fn extra_queues(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQueueCreateInfo], n: u32) -> Option<ExtraQueues> {
     let app_family = infos
         .iter()
         .find(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?
         .queue_family_index;
-    let family = families
-        .iter()
-        .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && f.queue_count > 0)? as u32;
-    let mut extended = infos.to_vec();
-    let mut priorities: Vec<f32>;
-    let index;
-    match infos.iter().position(|q| q.queue_family_index == family) {
-        Some(at) => {
-            let q = infos[at];
-            if !q.flags.is_empty() || q.queue_count >= families[family as usize].queue_count || q.p_queue_priorities.is_null() {
-                return None;
+    for (family, props) in families.iter().enumerate() {
+        if !props.queue_flags.contains(vk::QueueFlags::COMPUTE) || props.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+            continue;
+        }
+        let family = family as u32;
+        let mut extended = infos.to_vec();
+        let (priorities, index) = match infos.iter().position(|q| q.queue_family_index == family) {
+            Some(at) => {
+                let q = infos[at];
+                if !q.flags.is_empty() || q.queue_count + n > props.queue_count || q.p_queue_priorities.is_null() {
+                    continue;
+                }
+                // SAFETY: `pQueuePriorities` holds `queueCount` floats.
+                let mut priorities = unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec();
+                priorities.extend(std::iter::repeat_n(1.0, n as usize));
+                extended[at].queue_count = q.queue_count + n;
+                extended[at].p_queue_priorities = priorities.as_ptr();
+                (priorities, q.queue_count)
             }
-            // SAFETY: `pQueuePriorities` holds `queueCount` floats.
-            priorities = unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec();
-            priorities.push(1.0);
-            extended[at].queue_count = q.queue_count + 1;
-            extended[at].p_queue_priorities = priorities.as_ptr();
-            index = q.queue_count;
-        }
-        None => {
-            priorities = vec![1.0];
-            extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
-            index = 0;
-        }
+            None => {
+                if props.queue_count < n {
+                    continue;
+                }
+                let priorities = vec![1.0; n as usize];
+                extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
+                (priorities, 0)
+            }
+        };
+        return Some(ExtraQueues { app_family, family, index, infos: extended, _priorities: priorities });
     }
-    Some(SideQueueRequest { infos: extended, _priorities: priorities, queue: SideQueue { family, index, app_family } })
+    None
+}
+
+/// `create_info`'s queue requests, and the physical device's families.
+fn queue_requests<'a>(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &'a vk::DeviceCreateInfo) -> (&'a [vk::DeviceQueueCreateInfo], Vec<vk::QueueFamilyProperties>) {
+    let infos = if create_info.queue_create_info_count == 0 || create_info.p_queue_create_infos.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: a non-null `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures.
+        unsafe { std::slice::from_raw_parts(create_info.p_queue_create_infos, create_info.queue_create_info_count as usize) }
+    };
+    // SAFETY: `physical_device` belongs to `instance`.
+    (infos, unsafe { instance.get_physical_device_queue_family_properties(physical_device) })
+}
+
+/// The loader's `VkLayerDeviceCreateInfo` (`vk_layer.h`), which `vulkan_layer` does not export:
+/// the `VK_LAYER_LINK_INFO` node of a `VkDeviceCreateInfo`'s chain.
+#[repr(C)]
+struct LoaderDeviceCreateInfo {
+    s_type: vk::StructureType,
+    p_next: *const std::ffi::c_void,
+    function: i32,
+    layer_info: *mut VkLayerDeviceLink,
+}
+
+/// `VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO` and `VK_LAYER_LINK_INFO`.
+const LOADER_DEVICE_CREATE_INFO: vk::StructureType = vk::StructureType::from_raw(48);
+const LAYER_LINK_INFO: i32 = 0;
+
+/// The link node of a `vkCreateDevice` request and the `pLayerInfo` the framework left in it for
+/// the layer below. Every layer below advances `pLayerInfo` in place on each `vkCreateDevice` it
+/// receives, so when one application call is tried more than once (with the layer's additions,
+/// then without), each attempt must start from this value again, or the layer below reads its own
+/// successor's link (a crash, or a layer skipped).
+struct DeviceLink {
+    node: *mut LoaderDeviceCreateInfo,
+    info: *mut VkLayerDeviceLink,
+}
+
+impl DeviceLink {
+    /// # Safety
+    /// `create_info`'s chain is valid and its link node writable (the loader's own).
+    unsafe fn find(create_info: &vk::DeviceCreateInfo) -> Option<Self> {
+        let mut next = create_info.p_next.cast::<LoaderDeviceCreateInfo>();
+        while !next.is_null() {
+            // SAFETY: every node of a valid chain starts with `sType` and `pNext`; the fields past
+            // them are read only on the loader's own node.
+            let node = unsafe { &*next };
+            if node.s_type == LOADER_DEVICE_CREATE_INFO && node.function == LAYER_LINK_INFO {
+                return Some(Self { node: next.cast_mut(), info: node.layer_info });
+            }
+            next = node.p_next.cast();
+        }
+        None
+    }
+
+    fn restore(&self) {
+        // SAFETY: the node `find` found, alive for the `vkCreateDevice` call this is made in.
+        unsafe { (*self.node).layer_info = self.info };
+    }
+}
+
+/// Calls the next layer's `vkCreateDevice` with `link` (if the request has one) put back first: the
+/// one way this layer's device creation reaches the layer below, however many attempts it makes.
+///
+/// # Safety
+/// As `vkCreateDevice`; `link` was found in `info`'s chain.
+unsafe fn call_next_create_device(
+    next: vk::PFN_vkCreateDevice, link: Option<&DeviceLink>, physical_device: vk::PhysicalDevice, info: &vk::DeviceCreateInfo,
+    allocator: *const vk::AllocationCallbacks, p_device: &mut std::mem::MaybeUninit<vk::Device>,
+) -> vk::Result {
+    if let Some(link) = link {
+        link.restore();
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe { next(physical_device, info, allocator, p_device.as_mut_ptr()) }
 }
 
 /// Per-instance hooks, carrying that instance's own context. Dropped by the framework when
@@ -410,16 +508,15 @@ impl Drop for NeuralForgeInstanceHooks {
 }
 
 impl InstanceHooks for NeuralForgeInstanceHooks {
-    /// Adds [`EXTERNAL_MEMORY_HOST_EXTENSION`] to the game's own `vkCreateDevice` call
-    /// when (and only when) it's safe to: the physical device actually advertises it
-    /// and the app hasn't already requested it either way. Every other case returns
-    /// [`LayerResult::Unhandled`], which hands the *unmodified* call straight to the
-    /// framework's own default `create_device` path -- identical to this hook not
-    /// existing at all. This function never changes device creation in any other way,
-    /// and never makes a request that would otherwise have succeeded start failing:
-    /// if creating the device with the extra extension is refused for any reason
-    /// `vkEnumerateDeviceExtensionProperties` didn't predict, it retries with the
-    /// exact, byte-identical original request before giving up.
+    /// In a process the layer is on in and the target filter admits, adds what the layer needs to
+    /// the game's own `vkCreateDevice` call: [`EXTERNAL_MEMORY_HOST_EXTENSION`] when the physical
+    /// device advertises it, the side queue for the hold inside DLSS's command buffer, and the
+    /// native backend's extensions, features and queues. Every other case returns
+    /// [`LayerResult::Unhandled`], which hands the *unmodified* call straight to the framework's
+    /// own default `create_device` path -- identical to this hook not existing at all. It never
+    /// makes a request that would otherwise have succeeded start failing: an addition the driver
+    /// refuses is dropped and the request made again, down to the application's own, every attempt
+    /// through [`call_next_create_device`].
     fn create_device(
         &self,
         physical_device: vk::PhysicalDevice,
@@ -429,6 +526,11 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         p_device: &mut std::mem::MaybeUninit<vk::Device>,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         self.remember(physical_device);
+        // A process the layer is off in, or one the target filter excludes (launchers, overlays),
+        // gets its device exactly as it asked for it: no queues, features, extensions or worker.
+        if !(layer_enabled() && ownership::eligible()) {
+            return LayerResult::Unhandled;
+        }
         let Some(instance) = self.ctx.clone() else {
             return LayerResult::Unhandled;
         };
@@ -461,32 +563,86 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             None => return LayerResult::Unhandled,
         };
         let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the framework's copy of the request, whose chain is the loader's.
+        let link = unsafe { DeviceLink::find(create_info) };
+        // SAFETY: `vkCreateDevice` for this call's physical device, with the request each attempt
+        // passes and the framework's out-parameter.
+        let next_create_device = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| unsafe {
+            call_next_create_device(next_create_device, link.as_ref(), physical_device, info, allocator_ptr, p_device)
+        };
         // The hold inside DLSS's command buffer needs a queue of the layer's own beside the game's
-        // (`preupscale::inline`): one more in the game's graphics family, on an NVIDIA device with
-        // the pre-upscaler path on. A request with it that the driver refuses is made again without.
+        // (`preupscale::inline`): one more in a compute family without graphics ([`extra_queues`]), on
+        // an NVIDIA device with the pre-upscaler path on. A request with it that the driver refuses is
+        // made again without.
         // SAFETY: `physical_device` belongs to this instance.
         let nvidia = unsafe { instance.instance.get_physical_device_properties(physical_device) }.vendor_id == 0x10DE;
-        let side = (nvidia && preupscale::active() && preupscale::inline::enabled())
-            .then(|| side_queue_request(&instance.instance, physical_device, create_info))
-            .flatten();
+        if !create_info.p_queue_create_infos.is_null() {
+            // SAFETY: `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures (checked non-null).
+            let asked: Vec<String> = unsafe { std::slice::from_raw_parts(create_info.p_queue_create_infos, create_info.queue_create_info_count as usize) }
+                .iter()
+                .map(|q| format!("family {} x{}", q.queue_family_index, q.queue_count))
+                .collect();
+            log!("[queues] the application asks for {}", asked.join(", "));
+        }
+        let (app_queues, families) = queue_requests(&instance.instance, physical_device, create_info);
+        // The hold inside DLSS's buffer: one queue of the layer's own.
+        let side = (nvidia && preupscale::active() && preupscale::inline::enabled()).then(|| extra_queues(&families, app_queues, 1)).flatten();
+        // The native backend: the network's extensions and features and a loading queue of its own.
+        // A request with them that the driver refuses is made again without (frames then go to DLSS
+        // untouched in native mode, and the log says why).
+        #[cfg(target_arch = "x86_64")]
+        let native = nvidia && preupscale::active();
         let create = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| -> vk::Result {
+            #[cfg(target_arch = "x86_64")]
+            if native {
+                let gipa = layer_device_link.pfnNextGetInstanceProcAddr;
+                // Two more (the network's loading, and the after-the-upscaler path's frames), on top of the side queue.
+                let base = side.as_ref().map_or(app_queues, |sq| &sq.infos[..]);
+                match extra_queues(&families, base, 2) {
+                    None => log!("[native] no compute queue to spare for the network's loading; native backend off on this device"),
+                    Some(ExtraQueues { app_family: frame_family, family, index, infos: queues, .. }) => {
+                        let mut with = *info;
+                        with.queue_create_info_count = queues.len() as u32;
+                        with.p_queue_create_infos = queues.as_ptr();
+                        // SAFETY: the next layer's gipa for this instance; `with` and everything it
+                        // points to outlive the extension, which outlives the call.
+                        match unsafe { neural_forge_native::device_extend(gipa, instance.instance.handle(), physical_device, &with) } {
+                            Err(why) => log!("[native] the device cannot run the network: {why}; native backend off on this device"),
+                            Ok(extension) => {
+                                let result = next_create_device(&extension.info, p_device);
+                                drop(extension);
+                                if result == vk::Result::SUCCESS {
+                                    // SAFETY: written by the successful call.
+                                    let device = unsafe { p_device.assume_init() };
+                                    if let Some(sq) = &side {
+                                        SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.side_queue());
+                                    }
+                                    let setup = preupscale::native::Setup { gipa, instance: instance.instance.handle(), physical: physical_device, frame_family, family, index, post_index: index + 1 };
+                                    NATIVE_DEVICES.lock().unwrap().get_or_insert_default().insert(device, setup);
+                                    log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
+                                    return result;
+                                }
+                                log!("[native] creating the device with the network's additions was refused ({result:?}); creating it without");
+                            }
+                        }
+                    }
+                }
+            }
             if let Some(sq) = &side {
                 let mut with = *info;
                 with.queue_create_info_count = sq.infos.len() as u32;
                 with.p_queue_create_infos = sq.infos.as_ptr();
-                // SAFETY: `with` is the request with `sq`'s queue infos, which outlive the call;
-                // `p_device` is the framework's out-parameter.
-                let result = unsafe { next_create_device(physical_device, &with, allocator_ptr, p_device.as_mut_ptr()) };
+                // `with` is the request with `sq`'s queue infos, which outlive the call.
+                let result = next_create_device(&with, p_device);
                 if result == vk::Result::SUCCESS {
                     // SAFETY: written by the successful call.
                     let device = unsafe { p_device.assume_init() };
-                    SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.queue);
+                    SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.side_queue());
                     return result;
                 }
                 log!("[preupscale] adding a queue for the hold inside DLSS's command buffer was refused ({result:?}); creating the device without it");
             }
-            // SAFETY: the request as given; `p_device` as above.
-            unsafe { next_create_device(physical_device, info, allocator_ptr, p_device.as_mut_ptr()) }
+            next_create_device(info, p_device)
         };
         // The application already enables it (vkd3d-proton does): nothing to add, but the
         // device is created here, unmodified, so it can be recorded like one this hook
@@ -517,7 +673,11 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 })
             });
         if !supported {
-            if side.is_none() {
+            #[cfg(target_arch = "x86_64")]
+            let unhandled = side.is_none() && !native;
+            #[cfg(not(target_arch = "x86_64"))]
+            let unhandled = side.is_none();
+            if unhandled {
                 return LayerResult::Unhandled;
             }
             return LayerResult::Handled(create(create_info, p_device).result());
@@ -805,5 +965,160 @@ mod device_lost_tests {
         assert_eq!(note_vk::<u32>(Err(vk::Result::ERROR_DEVICE_LOST)), Err(vk::Result::ERROR_DEVICE_LOST));
         assert!(device_lost());
         DEVICE_LOST.store(false, std::sync::atomic::Ordering::Relaxed); // other tests share the process
+    }
+}
+
+#[cfg(test)]
+mod device_link_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::ffi::c_char;
+
+    thread_local! {
+        static SEEN: RefCell<Vec<*mut VkLayerDeviceLink>> = const { RefCell::new(Vec::new()) };
+        static REFUSE: Cell<u32> = const { Cell::new(0) };
+        static CALLED: Cell<u32> = const { Cell::new(0) };
+    }
+
+    unsafe extern "system" fn gipa(_: vk::Instance, _: *const c_char) -> vk::PFN_vkVoidFunction {
+        None
+    }
+
+    unsafe extern "system" fn gdpa(_: vk::Device, _: *const c_char) -> vk::PFN_vkVoidFunction {
+        None
+    }
+
+    /// The layer below, as a real one behaves: it takes its link and advances `pLayerInfo` in place
+    /// for the layer under it, then refuses the first `REFUSE` requests.
+    unsafe extern "system" fn next_layer(
+        _: vk::PhysicalDevice, info: *const vk::DeviceCreateInfo, _: *const vk::AllocationCallbacks, _: *mut vk::Device,
+    ) -> vk::Result {
+        CALLED.set(CALLED.get() + 1);
+        // SAFETY: the test's own request. Without a link node (a request the hook made itself, in
+        // the ineligible-process test) it is refused; unwinding out of here would abort.
+        let Some(link) = (unsafe { DeviceLink::find(&*info) }) else {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        };
+        // SAFETY: the test's node and links, alive for the call.
+        unsafe {
+            let node = &mut *link.node;
+            SEEN.with_borrow_mut(|seen| seen.push(node.layer_info));
+            if !node.layer_info.is_null() {
+                node.layer_info = (*node.layer_info).pNext;
+            }
+        }
+        let refuse = REFUSE.get();
+        if refuse > 0 {
+            REFUSE.set(refuse - 1);
+            return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        }
+        vk::Result::SUCCESS
+    }
+
+    /// Every attempt of one application call reaches the layer below with the link the framework
+    /// left for it, however many attempts were refused before it.
+    #[test]
+    fn every_attempt_sees_the_original_link() {
+        let mut lower = VkLayerDeviceLink { pNext: std::ptr::null_mut(), pfnNextGetInstanceProcAddr: gipa, pfnNextGetDeviceProcAddr: gdpa };
+        let mut below = VkLayerDeviceLink { pNext: &mut lower, pfnNextGetInstanceProcAddr: gipa, pfnNextGetDeviceProcAddr: gdpa };
+        let original: *mut VkLayerDeviceLink = &mut below;
+        let mut node = LoaderDeviceCreateInfo { s_type: LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::null(), function: LAYER_LINK_INFO, layer_info: original };
+        // Another structure ahead of the link node, as applications chain features.
+        let mut features = vk::PhysicalDeviceFeatures2 { p_next: std::ptr::from_mut(&mut node).cast(), ..Default::default() };
+        let info = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut features).cast(), ..Default::default() };
+        // SAFETY: the chain above.
+        let link = unsafe { DeviceLink::find(&info) }.expect("found past the features");
+        assert_eq!(link.info, original);
+        REFUSE.set(5);
+        let mut p_device = std::mem::MaybeUninit::uninit();
+        // Six attempts, as `create_device` can make: the first five refused, each with its own copy
+        // of the request (the additions differ, the chain is the application's).
+        let mut results = Vec::new();
+        for _ in 0..6 {
+            let with = info;
+            // SAFETY: the fake layer below; the request and link above.
+            results.push(unsafe { call_next_create_device(next_layer, Some(&link), vk::PhysicalDevice::null(), &with, std::ptr::null(), &mut p_device) });
+        }
+        assert_eq!(results.last(), Some(&vk::Result::SUCCESS));
+        SEEN.with_borrow(|seen| {
+            assert_eq!(seen.len(), 6);
+            assert!(seen.iter().all(|&l| l == original), "an attempt saw an advanced link: {seen:?} (original {original:?})");
+        });
+    }
+
+    /// In a process the layer is off in (`NEURAL_FORGE_ENABLE` is unset in tests), the hook hands the
+    /// request to the framework untouched and never calls the layer below itself.
+    #[test]
+    fn an_ineligible_process_gets_its_device_unmodified() {
+        let Some(entry) = (unsafe { ash::Entry::load() }).ok() else {
+            eprintln!("ineligible device test: no Vulkan loader, skipping");
+            return;
+        };
+        let Some(instance) = (unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder(), None) }).ok().map(Arc::new) else {
+            eprintln!("ineligible device test: no Vulkan ICD, skipping");
+            return;
+        };
+        let Some(&physical) = unsafe { instance.enumerate_physical_devices() }.ok().as_ref().and_then(|d| d.first()) else {
+            eprintln!("ineligible device test: no physical device, skipping");
+            unsafe { instance.destroy_instance(None) };
+            return;
+        };
+        assert!(!layer_enabled(), "tests run with the layer off");
+        unsafe extern "system" fn gipa_next(_: vk::Instance, name: *const c_char) -> vk::PFN_vkVoidFunction {
+            // SAFETY: a NUL-terminated name from the hook.
+            (unsafe { CStr::from_ptr(name) } == c"vkCreateDevice")
+                // SAFETY: the same signature as `vkCreateDevice`, which the caller transmutes back.
+                .then(|| unsafe { std::mem::transmute::<vk::PFN_vkCreateDevice, unsafe extern "system" fn()>(next_layer) })
+        }
+        let link = VkLayerDeviceLink { pNext: std::ptr::null_mut(), pfnNextGetInstanceProcAddr: gipa_next, pfnNextGetDeviceProcAddr: gdpa };
+        let priorities = [1.0];
+        let queue = vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities).build();
+        let info = vk::DeviceCreateInfo::builder().queue_create_infos(std::slice::from_ref(&queue)).build();
+        let hooks = NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None }) };
+        let mut p_device = std::mem::MaybeUninit::uninit();
+        CALLED.set(0);
+        let result = hooks.create_device(physical, &info, &link, None, &mut p_device);
+        assert!(matches!(result, LayerResult::Unhandled), "the framework forwards the application's own request");
+        assert_eq!(CALLED.get(), 0, "the hook made no request of its own");
+        drop(hooks);
+        unsafe { instance.destroy_instance(None) };
+    }
+}
+
+#[cfg(test)]
+mod extra_queue_tests {
+    use super::*;
+
+    fn family(flags: vk::QueueFlags, queue_count: u32) -> vk::QueueFamilyProperties {
+        vk::QueueFamilyProperties { queue_flags: flags, queue_count, ..Default::default() }
+    }
+
+    const GRAPHICS: vk::QueueFlags = vk::QueueFlags::from_raw(vk::QueueFlags::GRAPHICS.as_raw() | vk::QueueFlags::COMPUTE.as_raw() | vk::QueueFlags::TRANSFER.as_raw());
+    const COMPUTE: vk::QueueFlags = vk::QueueFlags::from_raw(vk::QueueFlags::COMPUTE.as_raw() | vk::QueueFlags::TRANSFER.as_raw());
+
+    /// The first compute-only family is full (the application asks for all its queues): the next one with room
+    /// is taken, not none.
+    #[test]
+    fn a_full_compute_family_is_passed_over_for_one_with_room() {
+        let families = [family(GRAPHICS, 16), family(COMPUTE, 2), family(vk::QueueFlags::TRANSFER, 2), family(COMPUTE, 8)];
+        let priorities = [1.0f32; 2];
+        let app = [
+            vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities[..1]).build(),
+            vk::DeviceQueueCreateInfo::builder().queue_family_index(1).queue_priorities(&priorities).build(),
+        ];
+        let q = extra_queues(&families, &app, 2).expect("family 3 has room");
+        assert_eq!((q.app_family, q.family, q.index), (0, 3, 0));
+        assert_eq!(q.infos.len(), 3);
+        assert_eq!((q.infos[2].queue_family_index, q.infos[2].queue_count), (3, 2));
+        // One more in family 1 would fit only without the application's two.
+        assert!(extra_queues(&families[..3], &app, 1).is_none());
+        // The application's own request for the family is extended when it has room.
+        let one = [app[0], vk::DeviceQueueCreateInfo::builder().queue_family_index(1).queue_priorities(&priorities[..1]).build()];
+        let q = extra_queues(&families, &one, 1).expect("family 1 has one to spare");
+        assert_eq!((q.family, q.index, q.infos.len(), q.infos[1].queue_count), (1, 1, 2, 2));
+        // SAFETY: the extended priorities hold the new count.
+        assert_eq!(unsafe { std::slice::from_raw_parts(q.infos[1].p_queue_priorities, 2) }, &[1.0, 1.0]);
+        // No graphics family requested: nothing to add beside.
+        assert!(extra_queues(&families, &app[1..], 1).is_none());
     }
 }

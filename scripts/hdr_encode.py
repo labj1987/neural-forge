@@ -9,7 +9,7 @@ registered 1x1 float image at the DLSS submit). This script:
   info   DUMP                       exposure values and the colour's statistics under each
                                     exposure convention
   encode DUMP ENC OUT               writes the frame to send (RGBA16F, or RGBA8 for `sdr8`),
-                                    unpadded (trigger_helper_roundtrip pads it itself)
+                                    unpadded
   judge  DUMP ENC ANSWER OUTDIR     applies ENC's inverse to the answer, writes
                                     <tag>-input.png, <tag>-answer.png and <tag>-diff.png and
                                     prints the statistics (one JSON line, also <tag>.json)

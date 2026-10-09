@@ -18,7 +18,7 @@ use crate::swapchain::{self, SwapchainState};
 /// The one swapchain (across every device in this process) allowed to drive the
 /// shared-memory channel. A process can present more than one swapchain -- the game
 /// window and the Steam overlay, or, mid-resize, the old and new windows at once.
-/// Routing all of them through one channel would make the helper rebuild its feature on
+/// Routing all of them through one channel would make the model server rebuild its feature on
 /// every size switch, and could hand one swapchain another's answer; the largest by
 /// area is assumed to be the game, and the rest present untouched.
 struct Primary {
@@ -82,7 +82,7 @@ pub struct NeuralForgeDeviceInfo {
     instance: Option<Arc<ash::Instance>>,
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
     physical_device: vk::PhysicalDevice,
-    /// False on any non-NVIDIA physical device: Neural Rendering is an NGX feature and the helper
+    /// False on any non-NVIDIA physical device: Neural Rendering is an NGX feature and the model server
     /// only ever creates its own device on an NVIDIA GPU, so on anything else there is nothing for
     /// the layer to do but cost a round trip. Hybrid machines are the case that matters -- an
     /// implicit layer is loaded for every device the loader builds, including the integrated one
@@ -185,18 +185,18 @@ struct State {
     /// instead of a fresh `frame_bytes`-sized heap allocation every single present
     /// call -- see that function's own doc comment on why the snapshot exists at all.
     /// At 4K RGBA8 that's a ~31.6MiB allocation avoided every frame; measured on
-    /// `lordnikon` (2026-09-10) at ~78ms per fresh allocation+copy, a real, if not
+    /// the test machine (2026-09-10) at ~78ms per fresh allocation+copy, a real, if not
     /// fully explained (a `perf stat` on the same machine at the same time showed the
     /// process 97% backend-bound with an IPC of 0.1 -- a severe memory-subsystem
     /// stall this allocation likely aggravates without being its root cause), cost.
     original_scratch: Vec<u8>,
     /// The pipelined redesign's own persistent state -- see `capture::run`'s own doc
     /// comment for why a round trip's original frame has to outlive the present call
-    /// that sent it, across however many present calls it takes the helper to answer.
+    /// that sent it, across however many present calls it takes the model server to answer.
     /// One per protocol v3 wire slot: each slot's in-flight request has its own,
     /// completely independent original frame and dims.
     inflight: [capture::Inflight; 2],
-    /// A single disabled-state evaluation reserves the helper's images and NGX
+    /// A single disabled-state evaluation reserves the model server's images and NGX
     /// feature before the game's working set fills available VRAM (see
     /// `capture::run`'s own doc comment on why) -- one flag for the whole process,
     /// not per-slot: it only ever uses wire slot 0.
@@ -222,6 +222,8 @@ struct State {
     /// doc comment. Meaningless while `last_answer` is empty; always set together
     /// with it otherwise.
     last_answer_dims: (u32, u32),
+    /// The proxy `last_answer` answers went through the encode (`capture::run`).
+    last_answer_encoded: bool,
     hotkey: crate::hotkey::Poller,
     /// Per-swapchain-image relay semaphores -- see `queue_present_khr`'s own comment on
     /// why the application's present wait semaphores are relayed through the layer's
@@ -607,6 +609,9 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                 Err(error) => crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources", error),
             }
         }
+        // The native network: its loading thread is joined and its own queue waited for; its frame
+        // work, if any ran, was drained with the device above.
+        state.preupscale.stop_native();
         // SAFETY: a series never leaves GPU work pending once a present returns (it waits on
         // its own fences), so no idle wait is needed; this also finishes writing its files.
         unsafe { state.series.destroy(&device); }
@@ -625,43 +630,123 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
 /// write-back waited on so that the staging image holds the answer when the worker releases the
 /// GPU. The device's state is only ever try-locked, for at most `INLINE_LOCK_WAIT`: a present
 /// holding it may itself be waiting on the GPU, which is waiting on this hold.
+/// `NEURAL_FORGE_LOG_LAUNCH_QUEUES=1`: every 5 s, how many submitted command buffers carried CUDA launches,
+/// by device and queue family (which queues DLSS's and Frame Generation's work runs on). Diagnostic only.
+fn launch_queues_logged() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_LOG_LAUNCH_QUEUES").as_deref() == Some("1"));
+    *ON
+}
+
+fn launch_queue_tally(device: u64, family: Option<u32>, n: u32) {
+    type Tally = Option<(std::time::Instant, Vec<((u64, Option<u32>), u32)>)>;
+    static TALLY: Mutex<Tally> = Mutex::new(None);
+    let mut t = TALLY.lock().unwrap();
+    let (since, counts) = t.get_or_insert_with(|| (std::time::Instant::now(), Vec::new()));
+    match counts.iter_mut().find(|(k, _)| *k == (device, family)) {
+        Some((_, c)) => *c += n,
+        None => counts.push(((device, family), n)),
+    }
+    if since.elapsed() >= std::time::Duration::from_secs(5) {
+        let line: Vec<String> = counts.iter().map(|((d, f), c)| format!("device {d:#x} family {f:?}: {c}")).collect();
+        crate::log!("[queues] buffers with CUDA launches, last {:.1} s: {}", since.elapsed().as_secs_f32(), line.join(", "));
+        *t = None;
+    }
+}
+
+/// Counts what the hold inside DLSS's buffer did with its jobs and logs the counts every 5 s: a hold
+/// that stops running there otherwise says nothing (each skip releases the buffer silently).
+fn inline_tally(what: &'static str) {
+    type Tally = Option<(std::time::Instant, Vec<(&'static str, u32)>)>;
+    static TALLY: Mutex<Tally> = Mutex::new(None);
+    let mut t = TALLY.lock().unwrap();
+    let (since, counts) = t.get_or_insert_with(|| (std::time::Instant::now(), Vec::new()));
+    match counts.iter_mut().find(|(w, _)| *w == what) {
+        Some((_, n)) => *n += 1,
+        None => counts.push((what, 1)),
+    }
+    if since.elapsed() >= std::time::Duration::from_secs(5) {
+        let line: Vec<String> = counts.iter().map(|(w, n)| format!("{w} {n}")).collect();
+        crate::log!("[preupscale] inside DLSS's buffer, last {:.1} s: {}", since.elapsed().as_secs_f32(), line.join(", "));
+        *t = None;
+    }
+}
+
+/// `NEURAL_FORGE_NATIVE_INLINE_CHAIN=1`: the hold inside DLSS's buffer keeps the network's counter
+/// chaining instead of rebuilding it with barriers. Diagnostic only (it faulted the GPU in Black Myth: Wukong).
+fn inline_chain_kept() -> bool {
+    static ON: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_INLINE_CHAIN").as_deref() == Some("1"));
+    *ON
+}
+
+#[allow(clippy::too_many_arguments)]
 fn inline_hold(
     device: &Arc<ash::Device>, instance: &Arc<ash::Instance>, physical_device: vk::PhysicalDevice, state: &Arc<Mutex<State>>,
-    job: &crate::preupscale::inline::Job, queue: vk::Queue,
+    native_loader: Option<&crate::preupscale::NativeLoader>, job: &crate::preupscale::inline::Job, queue: vk::Queue,
 ) {
     use crate::preupscale::{Mode, Which};
     const INLINE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
     let mode = crate::preupscale::mode();
     if !mode.holds_inline() || !crate::layer_enabled() || crate::device_lost() || !presenting_steadily() {
+        inline_tally("skipped (off, device lost or not presenting steadily)");
         return;
     }
+    // The after-the-upscaler path holds the device's state while its frame waits on the GPU, which
+    // waits here: told before the lock, it stays off and stops taking the network, so the lock
+    // comes free for this path (`preupscale::keep_post_off`).
+    #[cfg(target_arch = "x86_64")]
+    if mode == Mode::Model && crate::preupscale::native_on(native_loader) {
+        crate::preupscale::keep_post_off();
+        if let Some(loader) = native_loader {
+            loader.note_pre();
+        }
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = native_loader;
     let started = std::time::Instant::now();
     let mut state = loop {
         match state.try_lock() {
             Ok(guard) => break guard,
             Err(std::sync::TryLockError::Poisoned(_)) => return,
             Err(std::sync::TryLockError::WouldBlock) if started.elapsed() < INLINE_LOCK_WAIT => std::thread::sleep(std::time::Duration::from_micros(100)),
-            Err(std::sync::TryLockError::WouldBlock) => return,
+            Err(std::sync::TryLockError::WouldBlock) => {
+                inline_tally("skipped (the device's state stayed locked)");
+                return;
+            }
         }
     };
-    let State { shm, preupscale: session, external_memory_host, direct_capture, gpu_compose, inflight, .. } = &mut *state;
+    let State { shm, preupscale: session, external_memory_host, direct_capture, .. } = &mut *state;
     session.saw_dlss();
     if !shm.open() {
+        inline_tally("skipped (no shared memory)");
+        return;
+    }
+    // The native backend runs the network itself, on this side queue (no slot 0).
+    let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
+    if mode == Mode::Model && !native {
+        inline_tally("skipped (the native backend is not available on this device)");
+        return;
+    }
+    if native && !shm.model_enabled() {
+        inline_tally("skipped (the model is switched off)");
         return;
     }
     // A dump here has the colour input only (no depth or motion-vector layouts to wait for).
-    let Some(dump) = crate::preupscale::gate(mode, session, shm, true) else {
-        return;
+    let dump = if native {
+        false
+    } else {
+        let Some(dump) = crate::preupscale::gate(mode, session, shm, true) else {
+            return;
+        };
+        dump
     };
     let extent = (job.point.desc.width, job.point.desc.height);
-    if shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
-        session.note_busy_slot(shm, mode, extent);
+    // The diagnostic modes capture into slot 0: not while the post path has it.
+    if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
         return;
     }
-    if capture::direct_slot_busy(direct_capture, Slot::Primary) {
-        return;
-    }
-    if mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(device)) {
+    if !native && capture::direct_slot_busy(direct_capture, Slot::Primary) {
         return;
     }
     // Staged, never imported: work on imported host memory from the layer's queue waited on the
@@ -680,7 +765,8 @@ fn inline_hold(
         width: extent.0,
         height: extent.1,
         depth: None,
-        mvec: None,
+        // The copy the buffer made beside the colour input (the native backend's history).
+        mvec: job.point.mvec_input.filter(|_| native),
         exposure: [None; crate::preupscale::MAX_EXPOSURE],
         exposure_input: job.exposure.filter(|_| session.game_exposure_trusted(job.point.identification)),
         paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
@@ -692,10 +778,18 @@ fn inline_hold(
         // SAFETY: the side queue is used by this worker thread only.
         unsafe { device.queue_submit(queue, &[info], fence) }
     };
+    let loader = session.native.as_ref().filter(|_| native);
     // SAFETY: `res` was built on this device for this extent and the side queue's family; the
     // staging image is live, in GENERAL, and holds this frame's colour input (`captured` was set).
-    let mut hold = unsafe {
-        crate::preupscale::run_hold(device, instance, physical_device, res, shm, &target, mode, dump, 0, crate::preupscale::ANSWER_BUDGET, &mut submit)
+    let mut hold = match loader {
+        // SAFETY: as below; the loader belongs to this device, and the side queue's family is the
+        // network's own (its graph is recorded for it too).
+        Some(loader) => unsafe {
+            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, &mut submit)
+        },
+        None => unsafe {
+            crate::preupscale::run_hold(device, instance, physical_device, res, &target, mode, dump, 0, &mut submit)
+        },
     };
     if hold.wrote_back {
         let mut writeback_gpu = None;
@@ -707,10 +801,14 @@ fn inline_hold(
             hold.miss = Some("the write-back inside DLSS's buffer did not finish in time");
         }
     }
-    if hold.claims_slot0() {
-        inflight[0].forget_answer();
+    if hold.native {
+        session.note_native(shm, &hold);
     }
-    hold.mark_local(mode);
+    inline_tally(match (hold.wrote_back, job.jitter.is_some()) {
+        (true, true) => "held",
+        (true, false) => "held without the jitter",
+        (false, _) => hold.miss.unwrap_or("not held"),
+    });
     session.check_exposure(job.point.identification, &hold);
     session.note(shm, &hold, started.elapsed(), extent);
     if let Some(frame) = hold.dump.take() {
@@ -731,8 +829,8 @@ fn inline_hold(
 /// `queue` must be the queue the present was requested on, externally synchronized for
 /// the duration of the call, and `app_waits` the present's own wait semaphores.
 /// Logs the real presented frame rate every 5 s, whether or not the effect is on --
-/// `layer_frames` only counts captured frames, so it stops when the effect is off and
-/// cannot say whether turning it off actually gave the frames back.
+/// `layer_frames` counts only the presents the layer engages on, so it stops on loading screens
+/// and cannot say whether turning the effect off actually gave the frames back.
 fn note_present_rate(composited: bool) {
     const WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
     static RATE: std::sync::Mutex<Option<(std::time::Instant, u32, u32)>> = std::sync::Mutex::new(None);
@@ -773,6 +871,30 @@ unsafe fn preupscale_slice<'a, T>(ptr: *const T, len: u32) -> &'a [T] {
     } else {
         // SAFETY: forwarded from this function's contract.
         unsafe { std::slice::from_raw_parts(ptr, len as usize) }
+    }
+}
+
+/// Whether the post path has nothing to do on this present: the effect is off (the model not applied, or the
+/// Enabled toggle off), the one-shot bootstrap request is done, and no capture or series is asked for or
+/// running. Unknown settings (the mapping not open yet) are not idle: `capture::run` opens it.
+fn post_path_idle(effect_off: Option<bool>, bootstrap_complete: bool, capture_requested: bool, series_running: bool) -> bool {
+    effect_off == Some(true) && bootstrap_complete && !capture_requested && !series_running
+}
+
+#[cfg(test)]
+mod post_path_idle_tests {
+    use super::post_path_idle;
+
+    /// Off, bootstrapped and nothing asked for: the present submits nothing of the layer's. Anything
+    /// else still runs the post path (and its relay).
+    #[test]
+    fn a_disabled_effect_skips_the_post_path_only_when_nothing_else_needs_it() {
+        assert!(post_path_idle(Some(true), true, false, false));
+        assert!(!post_path_idle(Some(false), true, false, false), "the effect is on");
+        assert!(!post_path_idle(None, true, false, false), "the mapping is not open yet");
+        assert!(!post_path_idle(Some(true), false, false, false), "the one-shot bootstrap request is still due");
+        assert!(!post_path_idle(Some(true), true, true, false), "a capture or series is asked for");
+        assert!(!post_path_idle(Some(true), true, false, true), "a series is running");
     }
 }
 
@@ -918,9 +1040,20 @@ impl NeuralForgeDeviceInfo {
             // Cannot ask, so do not gate: same fail-open stance as everywhere else.
             None => true,
         };
+        // The network's loader and the hold's worker only start where the layer is on and the
+        // process is the game (`create_device` adds their queues only then too).
+        let active = crate::layer_enabled() && crate::ownership::eligible();
+        #[cfg(target_arch = "x86_64")]
+        if let Some(setup) = crate::take_native(handle) {
+            // Also without DLSS's tracking (no VK_NVX_image_view_handle): the after-the-upscaler path
+            // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
+            if nvidia && active {
+                state.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup)));
+            }
+        }
         let side = crate::take_side_queue(handle);
         let inline = match (&preupscale, side, get_queue, &instance) {
-            (Some(_), Some(crate::SideQueue { family, index, app_family }), Some(get_queue), Some(instance)) if nvidia => {
+            (Some(_), Some(crate::SideQueue { family, index, app_family }), Some(get_queue), Some(instance)) if nvidia && active => {
                 let mut queue = vk::Queue::null();
                 // SAFETY: the next layer's `vkGetDeviceQueue` for the queue this layer added to the
                 // device's creation (`crate::take_side_queue`).
@@ -931,7 +1064,9 @@ impl NeuralForgeDeviceInfo {
                     None
                 } else {
                     let (dev, inst, pd, st) = (device.clone(), instance.clone(), physical_device, state.clone());
-                    let hold: crate::preupscale::inline::HoldFn = Box::new(move |job, queue| inline_hold(&dev, &inst, pd, &st, job, queue));
+                    let native_loader = state.lock().unwrap().preupscale.native.clone();
+                    let hold: crate::preupscale::inline::HoldFn =
+                        Box::new(move |job, queue| inline_hold(&dev, &inst, pd, &st, native_loader.as_ref(), job, queue));
                     crate::preupscale::inline::Inline::start(device.clone(), instance, physical_device, queue, family, app_family, hold)
                 }
             }
@@ -1028,9 +1163,30 @@ impl NeuralForgeDeviceInfo {
     /// The jobs of the hold inside DLSS's buffer (`crate::preupscale::inline`) for a submission on
     /// `queue` of `cbs`, taken before the submission is made.
     fn inline_jobs(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
+        if launch_queues_logged() {
+            let cbs: Vec<vk::CommandBuffer> = cbs.into_iter().collect();
+            let family = self.state.lock().unwrap().queue_families.get(&queue).copied();
+            if let Some(tracking) = &self.preupscale {
+                let n = cbs.iter().filter(|cb| tracking.has_launches(**cb)).count() as u32;
+                if n > 0 {
+                    launch_queue_tally(vk::Handle::as_raw(self.device.handle()), family, n);
+                }
+            }
+            return self.inline_jobs_of(queue, cbs);
+        }
+        self.inline_jobs_of(queue, cbs)
+    }
+
+    fn inline_jobs_of(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
         let Some(inline) = &self.inline else { return Vec::new() };
         let family = self.state.lock().unwrap().queue_families.get(&queue).copied();
-        inline.jobs_for(cbs, family)
+        let mut jobs = inline.jobs_for(cbs, family);
+        if let Some(tracking) = &self.preupscale {
+            for job in &mut jobs {
+                job.jitter = tracking.jitter_px_of(job.cb);
+            }
+        }
+        jobs
     }
 
     /// Hands `jobs` to the worker once the submission was accepted; a refused one runs nothing.
@@ -1065,7 +1221,7 @@ impl NeuralForgeDeviceInfo {
         let instance = self.instance.as_ref()?;
         let inputs = scan.inputs?;
         let mut state = self.state.lock().unwrap();
-        let State { shm, preupscale: session, queue_families, external_memory_host, direct_capture, gpu_compose, inflight, .. } = &mut *state;
+        let State { shm, preupscale: session, queue_families, external_memory_host, direct_capture, .. } = &mut *state;
         // DLSS is running on this device (held or not): the post path stays off for
         // `preupscale::HAND_BACK` after this once the device has held.
         session.saw_dlss();
@@ -1082,7 +1238,7 @@ impl NeuralForgeDeviceInfo {
         }
         // Synchronization the application recorded for DLSS's inputs inside the launch buffer, or a
         // render pass suspended across the split point: the layer does not run ahead of either.
-        if let Some(hazard) = scan.hazard.or(scan.dump_hazard.filter(|_| mode == Mode::Dump)) {
+        if let Some(hazard) = scan.hazard.or(scan.dump_hazard.filter(|_| mode == Mode::Dump && !crate::preupscale::dump_ignores_hazard())) {
             session.say_once(hazard.why());
             return None;
         }
@@ -1117,20 +1273,21 @@ impl NeuralForgeDeviceInfo {
         if !shm.open() {
             return None;
         }
+        // The native backend runs the network itself (no slot 0 to share). Without it on this device,
+        // model mode has nothing to run.
+        let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
+        if mode == Mode::Model && !native {
+            session.say_once("the native backend is not available on this device; frames go to DLSS untouched");
+            return None;
+        }
+        // Follows the toggle (F11, the GUI): off, the submit goes to DLSS untouched.
         let dump = crate::preupscale::gate(mode, session, shm, scan.depth_layout.is_some() && scan.mvec_layout.is_some())?;
-        // Slot 0 must be free: no request (the post path's, or an earlier hold's that ran over
-        // budget) still with the helper, no zero-copy capture still writing its proxy region, and
-        // in model mode no compose still reading its answer region.
-        if shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
-            // Booked as a late answer only when the request is this path's own; the post path's
-            // says nothing about this path (and must not engage the device).
-            session.note_busy_slot(shm, mode, (colour.width, colour.height));
+        // The diagnostic modes capture into slot 0: it must be free (no request of the post path's
+        // still out, no zero-copy capture still writing its proxy region).
+        if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
             return None;
         }
-        if capture::direct_slot_busy(direct_capture, Slot::Primary) {
-            return None;
-        }
-        if mode == Mode::Model && !gpu_compose.as_mut().is_none_or(|gpu| gpu.wait_answer_region_reads(&self.device)) {
+        if !native && capture::direct_slot_busy(direct_capture, Slot::Primary) {
             return None;
         }
         // Failures from here on repeat every frame in a game where they happen at all: in model
@@ -1188,6 +1345,8 @@ impl NeuralForgeDeviceInfo {
             paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
             identification: scan.identification,
         };
+        let loader = session.native.as_ref().filter(|_| native);
+        let jitter = scan.jitter_px();
         let res = session.res.as_mut()?;
         let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;
         let mut accepted: Vec<vk::CommandBuffer> = Vec::new();
@@ -1200,23 +1359,23 @@ impl NeuralForgeDeviceInfo {
             // SAFETY: `res` was built on this device for this extent; the colour input is live and
             // in GENERAL; `layer_submit` submits on the application's queue, which it holds for the
             // duration of its call.
-            let hold = unsafe {
-                crate::preupscale::run_hold(
-                    &self.device, instance, self.physical_device, res, shm, &target, mode, dump, scan.evaluation,
-                    crate::preupscale::ANSWER_BUDGET, &mut layer_submit,
-                )
+            let hold = match loader {
+                // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
+                Some(loader) => unsafe {
+                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, &mut layer_submit)
+                },
+                None => unsafe {
+                    crate::preupscale::run_hold(&self.device, instance, self.physical_device, res, &target, mode, dump, scan.evaluation, &mut layer_submit)
+                },
             };
             let consumed = hold.waits_consumed;
             held = Some((hold, started.elapsed()));
             consumed
         }, &mut |part| accepted.extend(part));
         if let Some((mut hold, cpu)) = held {
-            if hold.claims_slot0() {
-                // Slot 0's answer region now holds (or, for a late answer, will hold) the
-                // pre-upscaler answer: neither present path may take it for its own.
-                inflight[0].forget_answer();
+            if hold.native {
+                session.note_native(shm, &hold);
             }
-            hold.mark_local(mode);
             session.check_exposure(scan.identification, &hold);
             session.note_exposure_source(scan.identification, &inputs, &hold);
             session.note(shm, &hold, cpu, extent);
@@ -1395,7 +1554,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // table; `queue_family_index`/`queue_index` are the caller's own, forwarded
         // unchanged.
         unsafe { next(self.device.handle(), queue_family_index, queue_index, &mut queue) };
-        self.state.lock().unwrap().queue_families.insert(queue, queue_family_index);
+        if self.state.lock().unwrap().queue_families.insert(queue, queue_family_index).is_none() {
+            crate::log!("[queues] device {:#x}: the application took queue {queue_index} of family {queue_family_index} ({queue:?})", vk::Handle::as_raw(self.device.handle()));
+        }
         LayerResult::Handled(queue)
     }
 
@@ -1406,7 +1567,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // table; `queue_info` is valid for the duration of this call (handed to us by
         // the loader for exactly this call).
         unsafe { next(self.device.handle(), queue_info, &mut queue) };
-        self.state.lock().unwrap().queue_families.insert(queue, queue_info.queue_family_index);
+        if self.state.lock().unwrap().queue_families.insert(queue, queue_info.queue_family_index).is_none() {
+            crate::log!(
+                "[queues] device {:#x}: the application took queue {} of family {} ({queue:?}, vkGetDeviceQueue2)",
+                vk::Handle::as_raw(self.device.handle()),
+                queue_info.queue_index,
+                queue_info.queue_family_index
+            );
+        }
         LayerResult::Handled(queue)
     }
 
@@ -1744,8 +1912,16 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next) = self.next_create_image else { return LayerResult::Unhandled };
         let mut image = vk::Image::null();
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // The native backend copies DLSS's motion vectors for its history; a game that made them
+        // without `TRANSFER_SRC` (Black Myth: Wukong) gets it added to its two-channel float images.
+        let mut info = *create_info;
+        if self.preupscale.is_some() && crate::preupscale::wants_copyable(create_info) {
+            info.usage |= vk::ImageUsageFlags::TRANSFER_SRC;
+        }
+        let create_info = &info;
         // SAFETY: `next` is the next layer/driver's own `vkCreateImage`; `create_info` (with
-        // its whole pNext chain) and the allocator are the application's, passed unchanged.
+        // its whole pNext chain) and the allocator are the application's, passed unchanged but
+        // for that usage bit.
         let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut image) };
         if result != vk::Result::SUCCESS {
             return LayerResult::Handled(Err(result));
@@ -2258,6 +2434,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 if !engaged {
                     break;
                 }
+                // Before the format and capture checks: with the model before the upscaler (or an HDR
+                // swapchain) nothing is captured here, and the game is attached all the same.
+                state.shm.beat();
+                // Before the HDR/10-bit and pass-through skips, so the toggle hotkey works on every
+                // swapchain the layer presents through.
+                {
+                    let State { shm, hotkey, .. } = &mut *state;
+                    shm.poll_toggle_hotkey(hotkey);
+                }
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
                 let Some(&image) = sw.images.get(image_index as usize) else { break };
                 if !swapchain::is_supported_format(sw.format) {
@@ -2393,8 +2578,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
                 };
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
-                shm.poll_toggle_hotkey(hotkey);
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, last_answer_encoded, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
                 // Another device's hold counts too (DLSS on a device without the swapchain); never
                 // set with `NEURAL_FORGE_PREUPSCALE=off`, where no device holds.
                 let held_elsewhere = crate::preupscale::active() && crate::preupscale::post_off_by_any_device(std::time::Instant::now());
@@ -2402,7 +2586,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // Model mode: once this device (or another of the process) has held, the
                     // post-upscaler compose stays off while DLSS ran within `preupscale::HAND_BACK`
                     // (30 s), loading screens included: the model is not applied a second time, and
-                    // the helper's feature is not rebuilt at the output size and back at every
+                    // the model server's feature is not rebuilt at the output size and back at every
                     // loading screen. Logged on change.
                     static SUPPRESSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     let suppressed = preupscale.suppresses_post() || held_elsewhere;
@@ -2423,6 +2607,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         // carries the model's edit made before DLSS, is read back as both halves of
                         // each pair. The one-shot request is served as a series of one frame.
                         if let Some(instance) = &self.instance {
+                            if readable && preupscale.capture_at_due() {
+                                series.start(1, &crate::dump::captures_dir());
+                            }
                             if let Some(frames) = crate::series::take_request(shm, true) {
                                 if readable {
                                     series.start(frames, &crate::dump::captures_dir());
@@ -2471,16 +2658,24 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 if shm.model_known_unavailable() {
                     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                        crate::log!("[layer] present skipped: the helper reported the model permanently unavailable for this session");
+                        crate::log!("[layer] present skipped: the model server reported the model permanently unavailable for this session");
                         crate::logging::flush();
                     }
-                    // The helper has permanently disabled itself for this session
+                    // The model server has permanently disabled itself for this session
                     // (see `ngx::ensure_feature`'s one-shot design) -- nothing will
                     // ever evaluate a captured frame, so paying for the capture
                     // itself (a full image<->buffer round trip plus a whole-frame
                     // `memcpy`, every single present call) is pure waste. Skip
                     // straight to a real no-op present, matching what "fail-open"
                     // should actually cost: nothing.
+                    break;
+                }
+                // The effect switched off costs nothing: once the one-shot bootstrap is done and no
+                // capture or series is asked for, `capture::run` would do nothing, so the relay below
+                // (a submit of the layer's own) is skipped too and the frame presents with the
+                // application's own waits.
+                let effect_off = shm.composition_settings().map(|s| !s.apply_model || !s.neural_enabled);
+                if post_path_idle(effect_off, *bootstrap_complete, shm.capture_requested(), series.running()) {
                     break;
                 }
                 // The application's present waits (its "rendering finished" semaphores)
@@ -2527,6 +2722,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // one-shot dump's, and each path only ever consumes its own values. Before
                     // `capture::run` has opened the mapping this finds nothing, and the series
                     // starts one present later.
+                    if readable && preupscale.capture_at_due() {
+                        series.start(1, &crate::dump::captures_dir());
+                    }
                     if let Some(frames) = crate::series::take_request(shm, false) {
                         if readable {
                             series.start(frames, &crate::dump::captures_dir());
@@ -2535,6 +2733,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             crate::logging::flush();
                         }
                     }
+                    // The native backend answers this path's requests itself (`preupscale::native_post`).
+                    preupscale.ensure_post_server(&self.device, instance, self.physical_device, *external_memory_host, shm);
                     let observing = readable && series.running();
                     if observing {
                         // SAFETY: as for `capture::run` below; `readable` checked TRANSFER_SRC, and
@@ -2577,6 +2777,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             raw_answer_generation,
                             last_answer,
                             last_answer_dims,
+                            last_answer_encoded,
                         );
                     }
                     if observing {

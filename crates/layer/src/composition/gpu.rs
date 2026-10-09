@@ -1,7 +1,7 @@
 //! GPU dispatch of `shaders/compose.comp`, wired into `capture.rs`'s write-back as of
 //! 2026-09-10 -- the real fix for [`super::apply`]'s CPU path's real, measured
-//! performance cost (see that module's own doc comment, and the crate's `CLAUDE.md`
-//! entry, for the actual numbers: ~800ms/frame single-threaded, ~97/10s even
+//! performance cost (see that module's own doc comment, and docs/history/development-before-neuralforge.md,
+//! for the actual numbers: ~800ms/frame single-threaded, ~97/10s even
 //! multi-threaded on a 16-core machine, both far short of the no-composition
 //! baseline). Same algorithm (`compose.comp` is the hand-translated GPU twin of the
 //! exact `color.rs` functions `apply.rs` calls directly), same real-hardware
@@ -9,13 +9,10 @@
 //! identical math, not a rewrite of it.
 //!
 //! Three storage images bound as inputs (`u_original`, `u_proxy`, `u_model_answer`)
-//! and one as output (`u_output`), all `R8G8B8A8_UNORM` -- matching the real, only-
-//! currently-supported `RGBA8` proxy format (`RGBA16F` still falls back to
-//! [`super::apply`]'s CPU path, same gap that path already has, unchanged by this
-//! module). `u_original` and `u_proxy` are bound to the *same* image view: no separate
-//! downscaled proxy exists yet (`capture.rs` sends the full captured frame as the
-//! proxy), so uploading it twice would be pure waste, on the GPU exactly as it already
-//! was on the CPU path.
+//! and one as output (`u_output`), all `R8G8B8A8_UNORM` (the 8-bit proxy formats). When the
+//! model saw the full frame, `u_original` and `u_proxy` are the same image and the shader
+//! encodes the proxy itself; when it ran below the frame's size, `u_proxy` is the small
+//! encoded proxy, enlarged.
 //!
 //! Two execution paths, both real and tested:
 //! - [`GpuCompose::dispatch`]/[`GpuCompose::dispatch_into_image`]: one command buffer,
@@ -329,7 +326,7 @@ struct ZeroCopyFrames {
     gen_answer: DeviceBuffer,
 }
 
-/// The helper's slot-0 answer region, imported as device memory (`VK_EXT_external_memory_host`).
+/// The model server's slot-0 answer region, imported as device memory (`VK_EXT_external_memory_host`).
 struct AnswerImport {
     buffer: vk::Buffer,
     memory: vk::DeviceMemory,
@@ -349,7 +346,7 @@ struct ZeroCopy {
     /// The generation `gen_*` hold (0: none).
     generation: u64,
     /// The fence of the async slot whose submission read the answer region (the fresh copy),
-    /// until it has been seen signaled. The helper, another process on another device, may only
+    /// until it has been seen signaled. The model server, another process on another device, may only
     /// write the region again after that: see [`GpuCompose::wait_answer_region_reads`].
     answer_reader: Option<vk::Fence>,
     /// The queue the last zero-copy compose was submitted on. Queue order is what orders the
@@ -387,6 +384,10 @@ struct ComposeSlot {
     descriptor_set: vk::DescriptorSet,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// The fence will signal: it starts signaled, or a submission of this slot's went in after its
+    /// last reset. A submit that fails after `vkResetFences` leaves it unsignaled with nothing to
+    /// signal it, so every wait skips a slot without this.
+    armed: bool,
     sized: Option<Sized_>,
     cached_generation: u64,
     /// `working_scale`'s compose-side scratch: an intermediate image at the answer's
@@ -421,8 +422,43 @@ impl ComposeSlot {
         // SAFETY: starting signaled means this slot's first real use never blocks on a
         // fence nothing has submitted work against yet.
         let Ok(fence) = (unsafe { device.create_fence(&fence_info, None) }) else { return None };
-        Some(Self { descriptor_set, cmd, fence, sized: None, cached_generation: 0, small_answer: None, small_proxy: None })
+        Some(Self { descriptor_set, cmd, fence, armed: true, sized: None, cached_generation: 0, small_answer: None, small_proxy: None })
     }
+
+    /// The fence, when it will signal (see `armed`).
+    fn armed_fence(&self) -> Option<vk::Fence> {
+        self.armed.then_some(self.fence)
+    }
+
+    /// Resets the fence for a submission; nothing will signal it until [`Self::submit`] succeeds.
+    fn reset(&mut self, device: &ash::Device) -> bool {
+        self.armed = false;
+        // SAFETY: callers wait for the fence (or know it was never submitted) before resetting it.
+        unsafe { device.reset_fences(&[self.fence]) }.is_ok()
+    }
+
+    /// Submits `submit` with the slot's fence (after [`Self::reset`]).
+    fn submit(&mut self, device: &ash::Device, queue: vk::Queue, submit: vk::SubmitInfo) -> bool {
+        // SAFETY: the caller recorded and ended the buffers `submit` names; the fence is reset.
+        let ok = crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.fence) }).is_ok();
+        self.armed = ok;
+        ok
+    }
+}
+
+/// Waits (bounded) for every fence that will signal: an unsignaled fence nothing will signal is skipped
+/// instead of timing out on it.
+fn wait_armed(device: &ash::Device, fences: &[Option<vk::Fence>], site: &'static str) -> bool {
+    let fences: Vec<vk::Fence> = fences.iter().flatten().copied().collect();
+    if fences.is_empty() {
+        return true;
+    }
+    // SAFETY: the callers' own fences. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
+    let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    crate::note_fence_wait(wait, site).is_ok()
+}
+
+impl ComposeSlot {
 
     /// (Re)builds this slot's own images/staging buffer if `width`/`height` changed
     /// (or this is the first use). Never touches any *other* slot's resources.
@@ -525,7 +561,7 @@ impl ComposeSlot {
         };
 
         // Keep the held raw model frame in device-local memory.  The staging buffer
-        // stays CPU-visible only for the infrequent helper-answer update; regular
+        // stays CPU-visible only for the infrequent model-answer update; regular
         // presents copy this cached buffer straight to the swapchain image.
         let cache_info = vk::BufferCreateInfo::builder()
             .size(frame_bytes)
@@ -726,7 +762,7 @@ impl ComposeSlot {
         // contract); every image below was just (re)created by `ensure_sized` and is
         // still `UNDEFINED` (or is being deliberately discarded via `UNDEFINED` as
         // `oldLayout`, spec-legal and exactly what a fresh per-frame result needs --
-        // see the crash-fix writeup in `CLAUDE.md` for why this specific pattern is
+        // see the crash-fix writeup in docs/history/development-before-neuralforge.md for why this specific pattern is
         // safe, unlike blindly assuming a *different* real prior layout).
         unsafe {
             let to_dst = [
@@ -773,7 +809,7 @@ impl ComposeSlot {
     /// own stage 1 having *already* transitioned it that far as a side effect of its
     /// own unrelated readback. That coupling is exactly what made stage 1 and
     /// composition inseparable, which is what forced every single present call through
-    /// a full, synchronous, helper-round-trip-gated capture+composite cycle in the
+    /// a full, synchronous, model-round-trip-gated capture+composite cycle in the
     /// first place (see `capture.rs`'s own doc comment on the pipelined redesign this
     /// enabled) -- a real Vulkan-layout bug waiting to happen the moment anything tried
     /// to call this without stage 1 having just run.
@@ -821,7 +857,7 @@ impl ComposeSlot {
 
     /// Records a raw held-answer update (only when `update` is true) followed by a
     /// device-local buffer-to-swapchain copy.  This is deliberately shader-free: the
-    /// helper answer is already encoded in the swapchain's byte order, and copying
+    /// model answer is already encoded in the swapchain's byte order, and copying
     /// through a buffer preserves those bytes without assuming the target format.
     ///
     /// # Safety
@@ -912,7 +948,7 @@ impl ComposeSlot {
 
             if let Some(copies) = fresh_copy {
                 // The capture's own closing barrier made the capture target's write visible to
-                // this read; submission made the helper's host writes to the answer region
+                // this read; submission made the model server's host writes to the answer region
                 // visible. The barriers after the copies cover this slot's reads below and every
                 // later submission's (the other slot's carried frames).
                 let copy = vk::BufferCopy::builder().src_offset(0).dst_offset(0).size(frame_bytes).build();
@@ -1348,14 +1384,10 @@ impl GpuCompose {
         if unsafe { device.end_command_buffer(self.sync.cmd) }.is_err() {
             return false;
         }
-        // SAFETY: `self.sync.fence` starts signaled or was reset+waited-on by this
-        // same function's previous call.
-        if unsafe { device.reset_fences(&[self.sync.fence]) }.is_err() {
-            return false;
-        }
+        // `self.sync.fence` starts signaled or was reset+waited-on by this same function's previous
+        // call; `self.sync.cmd` was just recorded and ended above.
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.sync.cmd)).build();
-        // SAFETY: `self.sync.cmd` was just recorded and ended above.
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }).is_err() {
+        if !self.sync.reset(device) || !self.sync.submit(device, queue, submit) {
             return false;
         }
         // SAFETY: `self.sync.fence` was just submitted against above. Bounded, not
@@ -1444,14 +1476,10 @@ impl GpuCompose {
         if unsafe { device.end_command_buffer(self.sync.cmd) }.is_err() {
             return false;
         }
-        // SAFETY: `self.sync.fence` starts signaled or was reset+waited-on by this
-        // same function's previous call.
-        if unsafe { device.reset_fences(&[self.sync.fence]) }.is_err() {
-            return false;
-        }
+        // `self.sync.fence` starts signaled or was reset+waited-on by this same function's previous
+        // call; `self.sync.cmd` was just recorded and ended above.
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.sync.cmd)).build();
-        // SAFETY: `self.sync.cmd` was just recorded and ended above.
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }).is_err() {
+        if !self.sync.reset(device) || !self.sync.submit(device, queue, submit) {
             return false;
         }
         // SAFETY: `self.sync.fence` was just submitted against above. Bounded, not
@@ -1521,8 +1549,7 @@ impl GpuCompose {
         }
         let idx = self.next_async_slot; self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let slot = &mut self.async_slots[idx];
-        let wait = unsafe { device.wait_for_fences(&[slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "gpu::present_temporal_delta_async slot reuse").is_err() { return None; }
+        if !wait_armed(device, &[slot.slot.armed_fence()], "gpu::present_temporal_delta_async slot reuse") { return None; }
         if self.zc.answer_reader == Some(slot.slot.fence) { self.zc.answer_reader = None; }
         // The reuse wait just above (which this path always had) is what makes the slot's last
         // timestamps readable; no wait of its own.
@@ -1576,9 +1603,9 @@ impl GpuCompose {
             // SAFETY: `slot.slot.cmd` is recording and `record_start` went into it above.
             unsafe { timer.record_end(device, slot.slot.cmd) };
         }
-        if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
+        if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || !slot.slot.reset(device) { return None; }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }).is_err() { return None; }
+        if !slot.slot.submit(device, queue, submit) { return None; }
         if let Some(timer) = slot.timer.as_mut() { timer.mark_submitted(); }
         if update { slot.slot.cached_generation = generation; }
         if zero_copy.is_some() {
@@ -1594,14 +1621,11 @@ impl GpuCompose {
     /// Waits for every async slot's last submission. Used before anything a slot's submission
     /// may still read or write is replaced, and when a zero-copy compose changes queue.
     fn wait_async_slots(&self, device: &ash::Device) -> bool {
-        let fences = self.async_slots.each_ref().map(|s| s.slot.fence);
-        // SAFETY: every fence belongs to this `GpuCompose`; starts signaled, so never-used slots
-        // do not block. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
-        let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        crate::note_fence_wait(wait, "gpu::zero-copy drain").is_ok()
+        let fences = self.async_slots.each_ref().map(|s| s.slot.armed_fence());
+        wait_armed(device, &fences, "gpu::zero-copy drain")
     }
 
-    /// Imports the helper's answer region (`host_ptr`, `bytes`: aligned and sized to the driver's
+    /// Imports the model server's answer region (`host_ptr`, `bytes`: aligned and sized to the driver's
     /// `minImportedHostPointerAlignment` by the caller) for the zero-copy compose, or confirms the
     /// existing import already covers it. `false` when it cannot be imported: that present, and
     /// every later one with the same region, takes the CPU path. A replaced import is only freed
@@ -1698,8 +1722,8 @@ impl GpuCompose {
         Some(target)
     }
 
-    /// Waits until no submission still reads the helper's answer region. Called before every new
-    /// request is handed to the helper, which writes that region from another process the GPU's
+    /// Waits until no submission still reads the model server's answer region. Called before every new
+    /// request is handed to the model server, which writes that region from another process the GPU's
     /// own ordering cannot reach. Normally already signaled (the capture that precedes a request
     /// was queued behind the compose that read the region). `false` if the wait failed: the
     /// request must not be sent.
@@ -1720,8 +1744,8 @@ impl GpuCompose {
         generation != 0 && self.zc.generation == generation && self.zc.frames.is_some()
     }
 
-    /// Presents a raw helper answer every frame while uploading it only when the
-    /// helper produces a newer generation.  The normal compose path remains for
+    /// Presents a raw model answer every frame while uploading it only when the
+    /// model server produces a newer generation.  The normal compose path remains for
     /// callers that need its math; this path is for the held-answer presentation
     /// policy in `capture::run`.
     #[allow(clippy::too_many_arguments)]
@@ -1743,8 +1767,7 @@ impl GpuCompose {
         let idx = self.next_async_slot;
         self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let async_slot = &mut self.async_slots[idx];
-        let wait = unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "gpu::present_cached_raw_async slot reuse").is_err() {
+        if !wait_armed(device, &[async_slot.slot.armed_fence()], "gpu::present_cached_raw_async slot reuse") {
             return None;
         }
         if self.zc.answer_reader == Some(async_slot.slot.fence) {
@@ -1775,24 +1798,21 @@ impl GpuCompose {
         if unsafe { device.begin_command_buffer(async_slot.slot.cmd, &begin_info) }.is_err() { return None; }
         unsafe { async_slot.slot.record_cached_raw_into_image(device, width, height, frame_bytes as u64, update, target_image); }
         if unsafe { device.end_command_buffer(async_slot.slot.cmd) }.is_err() { return None; }
-        if unsafe { device.reset_fences(&[async_slot.slot.fence]) }.is_err() { return None; }
+        if !async_slot.slot.reset(device) { return None; }
         let submit = vk::SubmitInfo::builder()
             .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
             .signal_semaphores(std::slice::from_ref(&semaphore))
             .build();
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }).is_err() { return None; }
+        if !async_slot.slot.submit(device, queue, submit) { return None; }
         Some(semaphore)
     }
 
     /// Waits for every compose this `GpuCompose` has submitted (the async slots and the
     /// synchronous one). Only its own fences, so it is legal from any hook on any thread.
     pub fn wait_in_flight(&self, device: &ash::Device) -> bool {
-        let mut fences: Vec<vk::Fence> = self.async_slots.iter().map(|s| s.slot.fence).collect();
-        fences.push(self.sync.fence);
-        // SAFETY: every fence belongs to this `GpuCompose` and starts signaled, so an
-        // unused slot does not block. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
-        let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        crate::note_fence_wait(wait, "gpu::wait_in_flight").is_ok()
+        let mut fences: Vec<Option<vk::Fence>> = self.async_slots.iter().map(|s| s.slot.armed_fence()).collect();
+        fences.push(self.sync.armed_fence());
+        wait_armed(device, &fences, "gpu::wait_in_flight")
     }
 
     /// The latest async compose GPU time read back since the last call (see
@@ -1887,6 +1907,7 @@ fn open_test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, 
 /// `None` without a Vulkan device or when family 0 has a single queue (lavapipe); the tests that
 /// need it skip then.
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 pub(crate) fn test_device_two_queues() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, vk::Queue, u32, bool)> {
     // SAFETY: same reasoning as `test_device`.
     let entry = unsafe { ash::Entry::load() }.ok()?;
@@ -1946,8 +1967,8 @@ mod tests {
     /// The real correctness check for this whole module: dispatches
     /// `shaders/compose.comp` on a real (if software) Vulkan device and confirms
     /// its output matches [`super::super::apply::apply_rgba8`] -- the same
-    /// already-real-hardware-verified CPU reference (see the crate's `CLAUDE.md`
-    /// entry) -- to within a small per-channel tolerance (GPU and CPU `pow`/`cbrt`
+    /// already-real-hardware-verified CPU reference (see
+    /// docs/history/development-before-neuralforge.md) -- to within a small per-channel tolerance (GPU and CPU `pow`/`cbrt`
     /// implementations are never bit-identical, only close). A real, non-uniform
     /// test image (not one flat color) so the tone-mapping/OkLab branches this
     /// algorithm actually has are exercised, not just the identity case.
@@ -2388,16 +2409,21 @@ mod tests {
         let knee = |l: f32| if l > 0.75 { 0.75 + 0.25 * (1.0 - (-(l - 0.75) / 0.25).exp()) } else { l };
         let (w, h) = (16u32, 16u32);
         let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
-        for (value, wp) in [(90u8, 1.0f32), (90, 0.5), (230, 1.0), (240, 1.0)] {
-            let frame: Vec<u8> = (0..w * h).flat_map(|_| [value, value, value, 255]).collect();
-            let encoded = lin_to_srgb(knee(srgb_to_lin(value) / wp));
-            let answer: Vec<u8> = (0..w * h).flat_map(|_| [encoded, encoded, encoded, 255]).collect();
-            let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { white_point: wp, ..base }) else {
-                eprintln!("white point test: no Vulkan device, skipping");
-                return;
-            };
-            let got = out[((8 * w + 8) * 4) as usize];
-            assert!((i32::from(got) - i32::from(value)).abs() <= 2, "frame {value} at white point {wp}: expected ~{value}, got {got}");
+        // Also with ratio smoothing and the ghost guard on: their neighbourhood taps of the proxy go
+        // through the same encode as the centre's.
+        for (smooth, ghost) in [(0.0f32, 0.0f32), (1.0, 1.0)] {
+            for (value, wp) in [(90u8, 1.0f32), (90, 0.5), (230, 1.0), (240, 1.0)] {
+                let frame: Vec<u8> = (0..w * h).flat_map(|_| [value, value, value, 255]).collect();
+                let encoded = lin_to_srgb(knee(srgb_to_lin(value) / wp));
+                let answer: Vec<u8> = (0..w * h).flat_map(|_| [encoded, encoded, encoded, 255]).collect();
+                let params = ComposeParams { white_point: wp, ratio_smooth: smooth, ghost_guard: ghost, ..base };
+                let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else {
+                    eprintln!("white point test: no Vulkan device, skipping");
+                    return;
+                };
+                let got = out[((8 * w + 8) * 4) as usize];
+                assert!((i32::from(got) - i32::from(value)).abs() <= 2, "frame {value} at white point {wp} (smoothing {smooth}, ghost guard {ghost}): expected ~{value}, got {got}");
+            }
         }
     }
 
@@ -2412,10 +2438,15 @@ mod tests {
         let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         let colours: [[u8; 3]; 4] = [[250, 60, 20], [30, 90, 245], [200, 200, 200], [120, 140, 60]];
         let frame: Vec<u8> = (0..w * h).flat_map(|i| { let c = colours[(i % 4) as usize]; [c[0], c[1], c[2], 255] }).collect();
-        for mode in [reversible_mode::KNEE, reversible_mode::NEUTWO, reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID, reversible_mode::HYBRID_REPLACE] {
-            for wp in [1.0f32, 0.8] {
+        for (mode, wp, smooth) in [reversible_mode::KNEE, reversible_mode::NEUTWO, reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID, reversible_mode::HYBRID_REPLACE]
+            .into_iter()
+            .flat_map(|m| [1.0f32, 0.8].into_iter().flat_map(move |wp| [0.0f32, 1.0].map(|s| (m, wp, s))))
+        {
+            {
                 let answer: Vec<u8> = frame.chunks_exact(4).flat_map(|p| crate::composition::encode::reference_encode_pixel([p[0], p[1], p[2], p[3]], false, wp, mode)).collect();
-                let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { white_point: wp, reversible_mode: mode, ..base }) else {
+                // Ratio smoothing and the ghost guard on as well (`smooth`): their taps are encoded too.
+                let params = ComposeParams { white_point: wp, reversible_mode: mode, ratio_smooth: smooth, ghost_guard: smooth, ..base };
+                let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else {
                     eprintln!("encode curve test: no Vulkan device, skipping");
                     return;
                 };
@@ -2423,8 +2454,52 @@ mod tests {
                     .flat_map(|(o, f)| (0..3).map(move |c| (i32::from(o[c]) - i32::from(f[c])).abs()))
                     .max()
                     .unwrap_or(0);
-                assert!(worst <= 3, "curve {mode} at white point {wp}: an unedited answer moved the frame by up to {worst}");
+                assert!(worst <= 3, "curve {mode} at white point {wp} (smoothing and ghost guard {smooth}): an unedited answer moved the frame by up to {worst}");
             }
+        }
+    }
+
+    /// A submit that fails after its fence was reset leaves that fence unsignaled with nothing to
+    /// signal it: no wait may then sit on it for the whole timeout (and report a stall).
+    #[test]
+    fn a_failed_submit_leaves_no_slot_waiting_on_its_fence() {
+        let Some((_entry, _instance, _physical, device, _queue, family)) = test_device() else { return };
+        let mut gpu = GpuCompose::new(&device, family).expect("compose resources");
+        // What every submit site does when `vkQueueSubmit` fails: the fence was reset, nothing was submitted.
+        assert!(gpu.async_slots[0].slot.reset(&device));
+        assert!(gpu.sync.reset(&device));
+        let started = std::time::Instant::now();
+        assert!(gpu.wait_in_flight(&device), "waited on a fence nothing will signal");
+        assert!(gpu.wait_async_slots(&device));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "the waits sat out the timeout ({:?})", started.elapsed());
+        // SAFETY: nothing of it was submitted.
+        unsafe { gpu.destroy(&device) };
+    }
+
+    /// Detail strength in the ratio transfer: 0 returns the frame untouched (light and colour), 1 applies
+    /// the model's answer, and values between land between.
+    #[test]
+    fn detail_strength_scales_the_ratio_transfer_down_to_nothing() {
+        let (w, h) = (16u32, 16u32);
+        let original = [100u8, 110, 70];
+        let frame: Vec<u8> = (0..w * h).flat_map(|_| [original[0], original[1], original[2], 255]).collect();
+        // A brighter answer of another hue: an edit of both light and colour.
+        let answer: Vec<u8> = (0..w * h).flat_map(|_| [160u8, 120, 90, 255]).collect();
+        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let centre = ((8 * w + 8) * 4) as usize;
+        let at = |strength: f32| compose_once(w, h, &frame, &frame, &answer, ComposeParams { transfer_strength: strength, ..base }).map(|o| [o[centre], o[centre + 1], o[centre + 2]]);
+        let Some(none) = at(0.0) else {
+            eprintln!("detail strength test: no Vulkan device, skipping");
+            return;
+        };
+        assert!(none.iter().zip(original).all(|(&c, o)| (i32::from(c) - i32::from(o)).abs() <= 1), "strength 0 changed the frame: {none:?}");
+        let full = at(1.0).unwrap();
+        let half = at(0.5).unwrap();
+        assert_ne!(half, full);
+        assert!(full[0] > original[0] + 10, "strength 1 applies the brighter answer: {full:?}");
+        for c in 0..3 {
+            let (lo, hi) = (none[c].min(full[c]), none[c].max(full[c]));
+            assert!((lo..=hi).contains(&half[c]), "strength 0.5 lands between 0 and 1: {none:?} {half:?} {full:?}");
         }
     }
 
@@ -2823,7 +2898,7 @@ mod tests {
         assert!(gpu.holds_generation(1));
         assert!(gpu.wait_answer_region_reads(&device));
 
-        // The helper answers the next request (or a late one) into the region, and the next capture
+        // The model server answers the next request (or a late one) into the region, and the next capture
         // overwrites the capture target. The carried present (the other async slot, which has never
         // seen this generation) must still compose the pair it was given.
         unsafe { std::ptr::write_bytes(region, 0x5a, region_len as usize) };
@@ -2954,9 +3029,9 @@ mod tests {
         let target = make_target_image(&device, &mem_props, width, height);
         transition_to_present_src(&device, queue, pool, target.image);
 
-        let mut model_answer_for_direct = model_answer.clone();
+        let model_answer_for_direct = model_answer.clone();
         let ok = gpu.dispatch_into_image(
-            &device, &instance, physical_device, queue, width, height, &original, &mut model_answer_for_direct,
+            &device, &instance, physical_device, queue, width, height, &original, &model_answer_for_direct,
             colour_strength, transfer_strength, max_ratio, false, target.image,
         );
         assert!(ok, "dispatch_into_image returned false");

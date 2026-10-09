@@ -1,0 +1,52 @@
+diff --git a/src/kernels.cpp b/src/kernels.cpp
+index a6a2c7c..86780a6 100644
+--- a/src/kernels.cpp
++++ b/src/kernels.cpp
+@@ -87,6 +87,11 @@ void Kernels::setSiluTable(const std::vector<uint16_t>& table) {
+   context_.upload(siluTable_, table.data(), 65536 * 2);
+ }
+ 
++void Kernels::releaseScratch() {
++  context_.destroyBuffer(splitScratch_);
++  splitScratchBytes_ = 0;
++}
++
+ VkPipeline Kernels::pipeline(const char* shader, const vk::SpecConstants& constants, uint32_t requiredSubgroupSize) {
+   std::string key = shader;
+   for (uint32_t value : constants.data) key += ":" + std::to_string(value);
+@@ -280,8 +285,9 @@ void Kernels::gemmFp8(VkCommandBuffer commands, const GemmFp8Args& a) {
+     if (available && rowGroups <= 65535) {
+       PtxKernel& kernel = ptxKernel(entry + ".ptx", entry);
+       if (vsplits > 1 && splitScratch_.buffer == VK_NULL_HANDLE) {
+-        // sized once (launches already recorded hold its address): four times the first split shape covers the
+-        // widest ViT GEMM of the same token count (qkv: 24 column groups x 2 splits vs the contract's 8 x 4)
++        // sized once per graph (launches already recorded hold its address; releaseScratch() between graphs): four
++        // times the first split shape covers the widest ViT GEMM of the same token count (qkv: 24 column groups x 2
++        // splits vs the contract's 8 x 4)
+         splitScratchBytes_ = std::max<VkDeviceSize>(16u << 20, 4 * partialBytes);
+         splitScratch_ = context_.createBuffer(splitScratchBytes_, false, "split-K partials");
+       }
+diff --git a/src/kernels.h b/src/kernels.h
+index 713c859..8c9817a 100644
+--- a/src/kernels.h
++++ b/src/kernels.h
+@@ -143,7 +143,8 @@ class Kernels {
+   static uint32_t vitGemmSignals(uint32_t rows, uint32_t N);   // chain signals of a gemmv launch: one per published tile
+   void fusedBlock32Ptx(VkCommandBuffer commands, const FusedBlock32Args& args);
+ 
+-  // Split-K partial sums (one fixed scratch: launches already recorded hold its address).
++  // Split-K partial sums (one fixed scratch per recorded graph: launches already recorded hold its address;
++  // releaseScratch() between graphs).
+   vk::Buffer splitScratch_{};
+   VkDeviceSize splitScratchBytes_ = 0;
+ 
+@@ -254,6 +255,9 @@ class Kernels {
+   const std::map<std::string, vk::Pipeline>& pipelines() const { return pipelines_; }
+   // Replace the SiLU table (65536 f16 codes indexed by f16 input bits).
+   void setSiluTable(const std::vector<uint16_t>& table);
++  // Releases the split-K scratch: the next recording sizes it again for its own shapes. Only while no recording
++  // that used it is kept or pending (they hold its address).
++  void releaseScratch();
+ 
+  private:
+   // requiredSubgroupSize 0: no subgroup requirement (kernels without subgroup operations and a workgroup that is not a

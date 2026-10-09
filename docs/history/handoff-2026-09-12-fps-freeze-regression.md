@@ -1,19 +1,19 @@
 > Historical record: pre-NeuralForge names and deployment instructions below are
 > archival, not current instructions. Do not remove or modify upstream installations.
-> See ../PHASE1.md for current paths, safety constraints and the benchmark plan.
+> See ../PHASE1.md for current paths and safety constraints (the old benchmark plan: phase1-benchmark-plan.md).
 
 # NeuralForge pre-rename handoff — 2026-09-12, FPS/freeze regression unresolved
 
 ## Current state
 
-Historical checkout: `/home/alex/Projects/dlssnr` (now `/home/alex/Projects/neural-forge`). Current repository: `labj1987/neural-forge`.
+Historical checkout: `/home/<user>/Projects/dlssnr` (now `/home/<user>/Projects/neural-forge`). Current repository: `labj1987/neural-forge`.
 Latest release: **v0.1.35** — https://github.com/labj1987/NeuralForge/releases/tag/v0.1.35
 This is a **rollback release**. The underlying bug is still open.
 
-Deployed live on the test machine `lordnikon` (SSH alias `lordnikon`, reachable from
-this dev machine): the v0.1.35 AppImage at `/home/alex/AppImages/dlssnr.appimage`
+Deployed live on the test machine (reachable by SSH from
+this dev machine): the v0.1.35 AppImage at `/home/<user>/AppImages/dlssnr.appimage`
 (the real, desktop-launched app — confirmed via its `.desktop` file's `Exec=`), and
-the matching layer at `/home/alex/.local/share/dlssnr/lib/libdlssnr_layer.so`
+the matching layer at `/home/<user>/.local/share/dlssnr/lib/libdlssnr_layer.so`
 (a separate, manually-deployed copy the game actually loads — see "Deployment"
 below). Both are current as of this handoff.
 
@@ -23,7 +23,7 @@ With `dlssnr`'s Vulkan layer active (`enabled=1` in its settings, `VKLayer_DLSS5
 in a game's Steam launch options) and a real NVIDIA GPU (RTX 5070, driver
 `615.71.09`), real gameplay is unplayable:
 
-- **Confirmed, reproducible, real measurement**: GTA V Enhanced on `lordnikon` ran at
+- **Confirmed, reproducible, real measurement**: GTA V Enhanced on the test machine ran at
   **196–274 FPS with neural rendering off**, collapsing to a **steady 9 FPS with it
   on** — reproduced twice, both directions, instantly. GPU utilization *dropped*
   when it turned on (21–26% vs. 99%) — the signature of CPU-side blocking, not more
@@ -31,7 +31,7 @@ in a game's Steam launch options) and a real NVIDIA GPU (RTX 5070, driver
 - **Ruled out**: motion vectors / optical flow specifically (toggling `mvec_enabled`
   off while `enabled` stayed on made no difference — still 9 FPS).
 - **Ruled out**: a separate, real, already-fixed bug — upstream's own C++ package
-  (`dlssnr` 0.2.6-3, apt) was still installed and running on `lordnikon` from an
+  (`dlssnr` 0.2.6-3, apt) was still installed and running on the test machine from an
   earlier comparison session, sharing the *same* `VKLayer_DLSS5` trigger and the
   *same* `/tmp/dlssnr-$UID/shm.bin` mapping. Uninstalled (`apt remove dlssnr`),
   confirmed gone. This was real but is **not** the current problem — it was fixed
@@ -44,7 +44,7 @@ in a game's Steam launch options) and a real NVIDIA GPU (RTX 5070, driver
 ## What's confirmed fixed and safe to keep
 
 1. **Upstream package conflict** (environment, not code): `dlssnr` 0.2.6-3 apt
-   package uninstalled from `lordnikon`. No code change; nothing to revert. Confirmed
+   package uninstalled from the test machine. No code change; nothing to revert. Confirmed
    gone via `dpkg -l dlssnr` (shows `rc`, removed) and no files under
    `/usr/share/vulkan/implicit_layer.d/` matching `dlssnr`.
 2. **GUI retabbed like upstream** (`crates/gui/src/ui.rs`, shipped in v0.1.32):
@@ -144,7 +144,7 @@ re-attempt this class of fix without validation layers running first.**
 
 ## Environment and how to reproduce/test
 
-**Test machine**: `lordnikon`, reachable via `ssh lordnikon` from this dev machine
+**Test machine**: the test machine, reachable via `ssh <host>` from this dev machine
 (passwordless SSH already configured). Real desktop session (GNOME/Wayland +
 Xwayland), NVIDIA RTX 5070, driver `615.71.09`. The user is often physically present
 at this machine.
@@ -152,14 +152,14 @@ at this machine.
 **Extracting the CLI for debugging** (the AppImage's `AppRun` always execs the GUI,
 never the CLI, so extract it to invoke `dlssnr-cli` directly):
 ```bash
-ssh lordnikon "mkdir -p /tmp/dlssnr-appimage-extract && cd /tmp/dlssnr-appimage-extract && /home/alex/AppImages/dlssnr.appimage --appimage-extract >/dev/null 2>&1"
+ssh <host> "mkdir -p /tmp/dlssnr-appimage-extract && cd /tmp/dlssnr-appimage-extract && /home/<user>/AppImages/dlssnr.appimage --appimage-extract >/dev/null 2>&1"
 ```
 Then the CLI is at `/tmp/dlssnr-appimage-extract/squashfs-root/usr/bin/dlssnr-cli`.
 Useful subcommands: `doctor`, `status`, `start`/`stop`, `shmctl status` (dumps every
 live setting plus `helper_state`/`model_up`/`helper_frames`), `shmctl toggle <name>`,
 `shmctl set <name> <value>`, `shmctl capture` (one-shot forced capture dump).
 
-**Helper log**: `~/.local/state/dlssnr/helper.log` on `lordnikon` — cumulative across
+**Helper log**: `~/.local/state/dlssnr/helper.log` on the test machine — cumulative across
 restarts (append-only), so `tail` the very end, not `grep` for old matches.
 
 **Layer log**: the layer's own log goes to `DLSSNR_LOG` if set, otherwise stderr —
@@ -175,17 +175,17 @@ sets it for the *helper*). To see it for a real game:
 
 **Vulkan layer deployment** (this project's own real gotcha, easy to get wrong):
 the *managed*, actually-loaded layer library is
-`~/.local/share/dlssnr/lib/libdlssnr_layer.so` on `lordnikon` — a **separate,
+`~/.local/share/dlssnr/lib/libdlssnr_layer.so` on the test machine — a **separate,
 manually-maintained copy**, not something the AppImage installs itself. The AppImage
 at `~/AppImages/dlssnr.appimage` is the real, desktop-launched GUI/CLI bundle
 (confirmed via `~/.local/share/applications/dlssnr.desktop`'s `Exec=`). Deploying a
 new build means **both**:
 ```bash
-scp target/release/libdlssnr_layer.so lordnikon:/home/alex/.local/share/dlssnr/lib/libdlssnr_layer.so
+scp target/release/libdlssnr_layer.so <host>:/home/<user>/.local/share/dlssnr/lib/libdlssnr_layer.so
 # and, for a full release:
 CARGO_HELPER="cargo +stable-x86_64-unknown-linux-gnu" bash build-appimage.sh
-scp dlssnr-<version>-x86_64.AppImage lordnikon:/home/alex/AppImages/dlssnr.appimage.new
-ssh lordnikon "mv ~/AppImages/dlssnr.appimage.new ~/AppImages/dlssnr.appimage && chmod +x ~/AppImages/dlssnr.appimage && sed -i 's/X-AppImage-Version=<old>/X-AppImage-Version=<new>/' ~/.local/share/applications/dlssnr.desktop"
+scp dlssnr-<version>-x86_64.AppImage <host>:/home/<user>/AppImages/dlssnr.appimage.new
+ssh <host> "mv ~/AppImages/dlssnr.appimage.new ~/AppImages/dlssnr.appimage && chmod +x ~/AppImages/dlssnr.appimage && sed -i 's/X-AppImage-Version=<old>/X-AppImage-Version=<new>/' ~/.local/share/applications/dlssnr.desktop"
 ```
 An already-running game process won't pick up a new `.so` until relaunched (the old
 one stays mapped from its original inode).
@@ -202,7 +202,7 @@ support components`.
 launch options already): GTA V Enhanced (appid `3240220`), GTA San Andreas — The
 Definitive Edition (appid `1547000`), Crimson Desert (appid `3321460`). Launch via
 the already-running Steam client: `DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000
-/home/alex/.local/share/Steam/ubuntu12_32/steam steam://rungameid/<appid>`.
+/home/<user>/.local/share/Steam/ubuntu12_32/steam steam://rungameid/<appid>`.
 
 **Rockstar Games Launcher flakiness — real, separate, costs significant time if not
 anticipated**: GTA V Enhanced and San Andreas both launch through the full Rockstar
@@ -224,7 +224,7 @@ Xwayland-session auth file, find via `ls /run/user/1000/.mutter-Xwaylandauth.*`>
 
 ## Full narrative writeup
 
-`/home/alex/Projects/neural-forge/CLAUDE.md` (formerly `/home/alex/Projects/dlssnr/CLAUDE.md`) has the complete, dated, in-depth writeup of
+`/home/<user>/Projects/neural-forge/CLAUDE.md` (formerly `/home/<user>/Projects/dlssnr/CLAUDE.md`; since replaced by AGENTS.md) has the complete, dated, in-depth writeup of
 every finding this session (and prior sessions) made, in far more detail than this
 handoff — read the top few sections (2026-09-12 entries) for the full reasoning
 trail behind everything summarized above, including the exact code-level detail of

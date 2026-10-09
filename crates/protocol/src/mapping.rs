@@ -4,10 +4,7 @@
 //! there because it's entangled with that crate's request/response round-trip state
 //! machine, which the GUI/CLI have no reason to duplicate or depend on).
 //!
-//! Linux-only (`cfg(unix)`, though in practice only ever built for Linux in this
-//! workspace) — the Windows-side equivalent is `neural_forge_helper::shm`, a different
-//! enough set of Win32 APIs that sharing this module across the OS boundary would
-//! cost more in `cfg` noise than it would save in shared logic.
+//! Linux-only.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::Ordering;
@@ -63,7 +60,7 @@ impl std::fmt::Display for OpenError {
             OpenError::Foreign => write!(f, "the shared memory path names a file that is not a Neural Forge mapping; it was left untouched (point shm= / NEURAL_FORGE_SHM at another path, or remove the file)"),
             OpenError::WrongVersion { found } => write!(
                 f,
-                "shared memory is version {found}, this build speaks {SHM_VERSION} -- restart the helper and the game on the same Neural Forge version"
+                "shared memory is version {found}, this build speaks {SHM_VERSION} -- the next game started with this version re-creates it (close a game still running an older one)"
             ),
         }
     }

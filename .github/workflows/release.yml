@@ -5,12 +5,14 @@ on:
     tags:
       - 'v*'
 
-# This workflow can write to the repository (it publishes the release), so every action it
-# runs is pinned to a full commit SHA: a tag such as `v3` can be moved to other code, a SHA
-# cannot. The trailing comment names the release the SHA is; Dependabot proposes the updates
-# (.github/dependabot.yml).
+# Nothing here can write to the repository except the `publish` job, which only downloads the
+# build job's files and attaches them to the release. The `build` job runs the whole toolchain
+# (cargo, build scripts, apt packages) with a read-only token and no stored git credentials, so
+# a compromised dependency has nothing to publish with. Every action is pinned to a full commit
+# SHA: a tag such as `v3` can be moved to other code, a SHA cannot. The trailing comment names
+# the release the SHA is; Dependabot proposes the updates (.github/dependabot.yml).
 permissions:
-  contents: write
+  contents: read
 
 # An explicit `shell: bash` runs every step with `-eo pipefail`, so a failing `cargo test`
 # piped through `tee` still fails the step.
@@ -20,31 +22,58 @@ defaults:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    # The README states Ubuntu 24.04 as the release baseline: keep this label in step with it.
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
     env:
       # A GPU test that finds no Vulkan device panics instead of skipping (see ci.yml).
       NEURAL_FORGE_REQUIRE_VULKAN: "1"
+      # Makes a missing or failing zsyncmake fatal in build-appimage.sh (GitHub Actions sets it
+      # already; stated here so the build does not depend on that).
+      CI: "true"
     steps:
       - name: Checkout code
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-
-      - name: Set up Rust Toolchain
-        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
         with:
-          toolchain: stable
-          targets: x86_64-pc-windows-gnu, i686-unknown-linux-gnu
+          persist-credentials: false
 
-      # The release used to build and publish without running a single test. Same
-      # dependencies and checks as ci.yml, before anything gets packaged. zsync and
+      # The tag names the version that is released: refuse a tag that is not the workspace
+      # version before anything is built.
+      - name: Tag matches the Cargo version
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+              echo "error: tag $GITHUB_REF_NAME does not match the Cargo version $version" >&2
+              exit 1
+          fi
+
+      # The release page carries this version's changes in full, from CHANGELOG.md: no link to it.
+      # The release fails here, before the build, when the section is missing.
+      - name: Release notes from the changelog
+        run: python3 scripts/release_notes.py "${GITHUB_REF_NAME#v}" > release-notes.md && cat release-notes.md
+
+      # The version in rust-toolchain.toml; keep the two in step (the build fails on a mismatch).
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: 1.96.0
+          components: clippy
+
+      - name: Toolchain matches rust-toolchain.toml
+        run: grep -q '^channel = "1.96.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.96\.0 '
+
+      # Same dependencies and checks as ci.yml, before anything gets packaged. zsync and
       # desktop-file-utils are packaging tools build-appimage.sh needs: it only installs
       # its own dependencies when cargo or gtk4 is missing, which is never the case here,
-      # and without zsyncmake the release would ship without its .zsync sidecar.
+      # and without zsyncmake the release would ship without its .zsync sidecar. spirv-tools
+      # makes check_shaders.py validate the SPIR-V instead of only comparing it. This is the
+      # only privileged step: the AppImage build below runs as the runner user.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
-            gcc-mingw-w64-x86-64 binutils-mingw-w64-x86-64 gcc-multilib \
-            libvulkan1 mesa-vulkan-drivers vulkan-tools \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools spirv-tools \
             zsync desktop-file-utils
 
       - name: Select the lavapipe Vulkan driver
@@ -54,12 +83,32 @@ jobs:
           echo "VK_DRIVER_FILES=$icds" >> "$GITHUB_ENV"
           echo "VK_DRIVER_FILES=$icds"
 
+      # Pinned glslang, Vulkan-Headers and volk for crates/native (SHA-256-checked; tools/ is git-ignored).
+      - name: Fetch the native backend toolchain
+        run: bash scripts/fetch-native-tools.sh
+
       - name: cargo test (native crates)
         run: |
-          cargo test 2>&1 | tee test-native.log
+          cargo test --locked 2>&1 | tee test-native.log
           ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-native.log || true)"
           echo "GPU tests that ran (native): $ran" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$ran" -gt 0
+
+      # The checks ci.yml runs on every push, run again on the tagged commit.
+      - name: Build the CLI for the installation tests
+        run: cargo build --locked -p neural-forge-cli
+
+      - name: Installation coexistence tests
+        run: python3 scripts/test_install.py
+
+      - name: Namespace contract
+        run: python3 scripts/check_namespace.py
+
+      - name: Release notes script self-test
+        run: python3 scripts/release_notes.py --self-test
+
+      - name: AppStream releases match the changelog
+        run: python3 scripts/sync_appdata_releases.py --check
 
       - name: Shader sources match committed SPIR-V
         run: python3 scripts/check_shaders.py
@@ -67,12 +116,10 @@ jobs:
       - name: Vulkan loader smoke test
         run: bash scripts/smoke-test.sh
 
-      # CARGO_HELPER picks the rustup-managed "stable" toolchain dtolnay/rust-toolchain
-      # just set up, matching docs/PHASE1.md's own documented CI-appropriate invocation.
-      # CI=true (set by GitHub Actions, kept by `sudo -E`) makes a missing or failing
-      # zsyncmake fatal in build-appimage.sh.
+      # Runs as the runner user: the script writes only inside the checkout and its own build
+      # directory, and installs packages itself only on a machine without a toolchain.
       - name: Build AppImage
-        run: sudo -E env "PATH=$PATH" CARGO_HELPER='cargo +stable' bash build-appimage.sh
+        run: bash build-appimage.sh
 
       - name: Check the release files
         run: |
@@ -81,9 +128,67 @@ jobs:
           test -s "$appimage.zsync"
           ls -l "$appimage" "$appimage.zsync"
 
-      # The release page carries this version's changes in full, from CHANGELOG.md: no link to it.
-      - name: Release notes from the changelog
-        run: python3 scripts/release_notes.py "${GITHUB_REF_NAME}" > release-notes.md && cat release-notes.md
+      # Unpack the file that gets published, not the build tree: what users run is what is checked.
+      - name: Extract the AppImage
+        run: |
+          appimage="$(ls neural-forge-*-x86_64.AppImage)"
+          rm -rf squashfs-root
+          "./$appimage" --appimage-extract > /dev/null
+          test -x squashfs-root/usr/bin/neural-forge-cli
+
+      # The README documents the oldest glibc a release runs on; a build on a newer base image
+      # or a newer dependency must not quietly raise it.
+      - name: glibc baseline
+        run: |
+          documented="$(grep -o 'glibc [0-9][0-9.]* or newer' README.md | head -1 | cut -d' ' -f2)"
+          test -n "$documented"
+          for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/neural-forge-cli \
+              squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so; do
+              needed="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1)"
+              echo "$bin needs glibc $needed (README documents $documented)"
+              test -n "$needed"
+              highest="$(printf '%s\n%s\n' "$needed" "$documented" | sort -V | tail -1)"
+              if [ "$highest" != "$documented" ]; then
+                  echo "error: $bin needs glibc $needed, newer than the documented $documented" >&2
+                  exit 1
+              fi
+          done
+
+      # Install the extracted AppImage's files with its own CLI into scratch XDG directories (never
+      # the runner user's real ones), then run the smoke example through the Vulkan loader against
+      # the installed release library, so the packaged layer is the one that gets exercised.
+      - name: Install the AppImage and smoke-test the installed layer
+        run: |
+          scratch="$(mktemp -d)"
+          export XDG_DATA_HOME="$scratch/data" XDG_CONFIG_HOME="$scratch/config" XDG_STATE_HOME="$scratch/state"
+          export NEURAL_FORGE_UID="release-$$"
+          squashfs-root/usr/bin/neural-forge-cli install --appdir "$PWD/squashfs-root"
+          so="$XDG_DATA_HOME/neural-forge/lib/neural-forge/libneural_forge_layer.so"
+          test -f "$so"
+          cmp "$so" squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so
+          NEURAL_FORGE_SMOKE_SO="$so" bash scripts/smoke-test.sh
+
+      - name: Upload the release files
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: |
+            neural-forge-*-x86_64.AppImage
+            neural-forge-*-x86_64.AppImage.zsync
+            release-notes.md
+          if-no-files-found: error
+
+  # The only job with write access, and it runs no project code: it attaches what `build` made.
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download the release files
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-files
 
       - name: Create Release
         uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3

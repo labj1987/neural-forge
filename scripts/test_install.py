@@ -11,7 +11,7 @@ SCRIPT = Path(__file__).with_name('install.py')
 CLI = Path(os.environ.get('NEURAL_FORGE_CLI', Path(__file__).resolve().parent.parent / 'target/debug/neural-forge-cli'))
 def scratch_env(root, data):
     # Every XDG home lives in the scratch dir, so the CLI never sees the real ones. The unique uid names a
-    # runtime dir (and pid file) that cannot belong to a real helper.
+    # runtime dir that cannot belong to a real session.
     return {**os.environ, 'XDG_DATA_HOME': str(data), 'XDG_CONFIG_HOME': str(root / 'config'),
             'XDG_STATE_HOME': str(root / 'state'), 'NEURAL_FORGE_UID': f'installtest-{os.getpid()}'}
 class InstallTests(unittest.TestCase):
@@ -19,7 +19,7 @@ class InstallTests(unittest.TestCase):
     def setUpClass(cls):
         # The tests drive the real CLI: build the debug one when it is the default and missing.
         if 'NEURAL_FORGE_CLI' not in os.environ and not CLI.is_file():
-            subprocess.run(['cargo', 'build', '-p', 'neural-forge-cli'], cwd=CLI.parents[2], check=True)
+            subprocess.run(['cargo', 'build', '--locked', '-p', 'neural-forge-cli'], cwd=CLI.parents[2], check=True)
 
     def test_coexistence_and_owned_removal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -30,7 +30,6 @@ class InstallTests(unittest.TestCase):
             contents = {
                 'bin/neural-forge': 'gui', 'bin/neural-forge-cli': 'cli',
                 'lib/neural-forge/libneural_forge_layer.so': 'layer',
-                'lib/neural-forge/helper/neural-forge-helper.exe': 'helper',
                 f'share/applications/{identity}.desktop': '[Desktop Entry]\nExec=neural-forge\n',
                 'share/icons/hicolor/scalable/apps/neural-forge.svg': '<svg/>',
                 f'share/metainfo/{identity}.appdata.xml': '<component/>',
@@ -70,7 +69,6 @@ class InstallTests(unittest.TestCase):
             for name, text in {
                 'bin/neural-forge': 'gui', 'bin/neural-forge-cli': 'cli',
                 'lib/neural-forge/libneural_forge_layer.so': 'layer',
-                'lib/neural-forge/helper/neural-forge-helper.exe': 'helper',
                 f'share/applications/{identity}.desktop': '[Desktop Entry]\nExec=neural-forge\n',
                 'share/icons/hicolor/scalable/apps/neural-forge.svg': '<svg/>',
                 f'share/metainfo/{identity}.appdata.xml': '<component/>',
@@ -93,7 +91,7 @@ class InstallTests(unittest.TestCase):
             (root / 'config/neural-forge').mkdir(parents=True, exist_ok=True)
             (root / 'config/neural-forge/config.ini').write_text('set_intensity=1\n')
             (root / 'state/neural-forge').mkdir(parents=True, exist_ok=True)
-            (root / 'state/neural-forge/helper.log').write_text('log')
+            (root / 'state/neural-forge/state.txt').write_text('state')
             runtime.mkdir(mode=0o700, exist_ok=True)
             (runtime / 'shm.bin').write_text('shm')
             cli('uninstall', '--purge')

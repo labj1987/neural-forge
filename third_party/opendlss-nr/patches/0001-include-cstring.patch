@@ -1,0 +1,12 @@
+diff --git a/src/vk_context.h b/src/vk_context.h
+index 13a19e9..9a195b0 100644
+--- a/src/vk_context.h
++++ b/src/vk_context.h
+@@ -7,6 +7,7 @@
+ #include <array>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstring>
+ #include <stdexcept>
+ #include <string>
+ #include <vector>
