@@ -96,12 +96,11 @@ writes the answer back before DLSS runs. Games that record their frame in DLSS's
 are held inside it (`preupscale/inline.rs`, on the layer's side compute queue). The colour input is
 what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's
 output-size input), with the older size rule as the fallback (docs/PRE_UPSCALER_DESIGN.md,
-"Identification by the input kernel's parameters (DLAA)"). Kernel names
-(`vkCreateCuFunctionNVX`) only feed the logs: gating on them (`GATE_BY_KERNEL_NAME`, off) switched
-Crimson Desert off, whose newer DLSS Super Resolution launches `custom_block*`/`k_initial_merge` kernels. So DLSS Ray
-Reconstruction is not kept out by name: it is held when its colour input has Super Resolution's shape
-(RGBA16F with depth and motion vectors), and refused when the input is another format
-("DLSS Ray Reconstruction"; Crimson Desert with Ray Reconstruction on is held, docs/DLSS_KERNEL_CATALOGUE.md); without a readable exposure image the
+"Identification by the input kernel's parameters (DLAA)"). DLSS Ray
+Reconstruction is never held: its input is the noisy ray-traced frame, so while its `rr2_*` kernels
+(`vkCreateCuFunctionNVX`) launch nothing is identified and the model runs after the upscaler ("DLSS
+Ray Reconstruction"). Only that positive sign gates: Super Resolution needs no kernel name (Crimson
+Desert's is `rrlite_*`, and `custom_block*`/`k_initial_merge` are Frame Generation's); without a readable exposure image the
 exposure is measured from the frame ("Auto-exposure when the game gives DLSS none"). Everything else (no NVX, no DLSS, native)
 keeps the post-upscaler path. Only the launch-bearing command buffer whose
 kernel parameters name the identified colour input is held, so DLSS Frame Generation's submits go

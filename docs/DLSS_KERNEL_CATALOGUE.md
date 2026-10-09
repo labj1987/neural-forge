@@ -17,7 +17,7 @@ comes from reading NVIDIA's code.
 | GTA San Andreas DE (UE4) | 2.3.4 | `cuda_engine_*` (no suffix) | main menu | `~/nf-spike/runs/layout-gtasa` |
 | Marvel's Spider-Man Remastered (own) | 3.7.10 | `cuda_engine_*_rel_<flags>` | Continue (save loaded) | `~/nf-spike/runs/layout-spiderman` |
 | Black Myth: Wukong Benchmark Tool (UE5) | 3.1.30 | `cuda_engine_*_rel_<flags>` | benchmark menu | `~/nf-spike/runs/layout-wukong` |
-| Crimson Desert (own, Streamline 2.14.1) | 310.9.1 | `hiluma_*` created, **Ray Reconstruction `rr2_*` launched** | `cd-launch.sh` + `cd-play.sh` | `~/nf-spike/cd/layout-cd2` |
+| Crimson Desert (own, Streamline 2.14.1) | 310.9.1 | `hiluma_*` created; **Ray Reconstruction `rr2_*` launched** with it on, **`rrlite_*` + `cuda_dldn_engine_*` (Super Resolution)** with it off | `cd-launch.sh` + `cd-play.sh`; `~/scratch/rr/cd-rr.sh` (2026-10-09) | `~/nf-spike/cd/layout-cd2`, `~/nf-spike/runs/rr-probe-on`, `rr-probe-off` |
 
 Each game used the DLL in its own folder: none of the logs shows Proton replacing it. Cyberpunk
 2077 and Resident Evil Requiem were not installed. Labels in packed words come from the layer's
@@ -72,22 +72,18 @@ GTA V launches `hiluma_engine_input_depthinv_mvlo_hdr_v2_rel`; Spider-Man
 |---|---|---|
 | `hiluma_engine_*`, `cuda_engine_*`, `dltss_*`, `cuda_luma_convert_kernel`, `cuda_reduce_sum_kernel`, `cuda_*exposure*`, `cuda_upscale_sum_kernel`, `cuda_downsample_kernel` | DLSS Super Resolution | every SR game, menu or play |
 | `main_kernel` (many buffer sizes), `k_conv_fp16_nhwc`, `k_pooling`, `k_upscale`, `k_element_wise`, `Kernel_*` (optical flow, warp, blend), **`k_initial_merge`, `custom_block*`, `k_central_block`, `custom_upsample*`** | DLSS Frame Generation | GTA V with frame generation on, which has no Ray Reconstruction, launches all of them |
-| `rr2_*` (`rr2_enc0_kernel` ... `rr2_dec0_kernel_1`, `rr2_post_kernel`, `rr2_downsample_kernel_*`, `rr2_histogram_auto_exposure_basic_kernel`) | DLSS Ray Reconstruction | Crimson Desert in play with ray tracing; `rr2_enc0_kernel` names a render-size colour image, depth and motion vectors |
+| `rr2_*` (`rr2_enc0_kernel` ... `rr2_dec0_kernel_1`, `rr2_post_kernel`, `rr2_downsample_kernel_*`, `rr2_histogram_auto_exposure_basic_kernel`) | DLSS Ray Reconstruction | Crimson Desert with its Ray Reconstruction option on; `rr2_enc0_kernel` names a render-size colour image, depth and motion vectors, and the guide buffers (albedo, normals, roughness, hit distance) |
+| `rrlite_*`, `cuda_dldn_engine_*` | DLSS Super Resolution (310.9.1) | Crimson Desert with its Ray Reconstruction option off; no guide buffers |
 
 ## What the layer could stop guessing
 
 Candidates only; nothing in the layer was changed for this catalogue.
 
-1. **Ray Reconstruction has a real signature: `rr2_`.** `preupscale.rs::Kernel::of` classes
-   `custom_block*`, `k_central_block`, `k_initial_merge` and `custom_upsample*` as Ray
-   Reconstruction, but those are Frame Generation's network. That misattribution is why gating by
-   kernel name had to be switched off (`GATE_BY_KERNEL_NAME`, 2026-10-03: "Crimson Desert's SR
-   launches custom_block*"). With the gate off, **Crimson Desert with Ray Reconstruction on is held
-   at `rr2_enc0_kernel`'s colour image, that is, RR's input**, which the rule as first designed
-   (PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction") says must never be held. Recognising RR by `rr2_` and re-enabling the gate would restore that rule. It would also
-   change what Crimson Desert looks like with RR on (the model would stop running there), so it is
-   the maintainer's call. The obvious alternative is to keep the hold and treat Crimson Desert's RR as
-   validated by play.
+1. **Ray Reconstruction has a real signature: `rr2_`.** Done in 3.1.4 (PRE_UPSCALER_DESIGN.md, "DLSS
+   Ray Reconstruction"): `Kernel::of` classes `rr2_*` as Ray Reconstruction and nothing else (the
+   `custom_block*` family is Frame Generation's), and while it runs nothing is held and the model
+   runs after the upscaler. Crimson Desert with Ray Reconstruction off launches `rrlite_*`, held as
+   Super Resolution.
 2. **Handle packing by family.** `launch_kernel` tries every word whole and as two halves. The
    catalogue says which form a kernel uses: `hiluma_*` whole, `cuda_engine_*` halves. The current
    rule already gets both right; reading the form from the name would only remove the chance of a
