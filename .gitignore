@@ -3,6 +3,7 @@
 
 # Packaging artifacts
 /build-appimage/
+/.cache/
 *.AppImage
 *.AppImage.zsync
 

@@ -90,7 +90,10 @@ chmod 755 "$APPDIR/AppRun"
 # x86_64 asset's sha256 from that release page.
 APPIMAGETOOL_VERSION="1.9.1"
 APPIMAGETOOL_SHA256="ed4ce84f0d9caff66f50bcca6ff6f35aae54ce8135408b3fa33abfc3cb384eb0"
-TOOL="$BUILD_DIR/appimagetool-$APPIMAGETOOL_VERSION"
+# Kept in .cache/, outside the build directory this script wipes, so a second build reuses it.
+TOOL_DIR=".cache"
+mkdir -p "$TOOL_DIR"
+TOOL="$TOOL_DIR/appimagetool-$APPIMAGETOOL_VERSION"
 if [[ ! -f "$TOOL" ]] || ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --status; then
     echo "==> Downloading appimagetool $APPIMAGETOOL_VERSION"
     wget -q -O "$TOOL" \
@@ -109,7 +112,7 @@ fi
 # sha256 of its runtime-x86_64 asset (download it and run sha256sum).
 RUNTIME_VERSION="20251108"
 RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d"
-RUNTIME="$BUILD_DIR/runtime-x86_64-$RUNTIME_VERSION"
+RUNTIME="$TOOL_DIR/runtime-x86_64-$RUNTIME_VERSION"
 if [[ ! -f "$RUNTIME" ]] || ! echo "$RUNTIME_SHA256  $RUNTIME" | sha256sum -c --status; then
     echo "==> Downloading type2-runtime $RUNTIME_VERSION"
     wget -q -O "$RUNTIME" \
