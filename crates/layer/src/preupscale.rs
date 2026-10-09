@@ -126,7 +126,8 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
 ///
 /// # Safety
 /// As [`run_hold`].
-#[allow(clippy::too_many_arguments)]
+// The `return` is needless only where the other targets' lines below are compiled out.
+#[allow(clippy::too_many_arguments, clippy::needless_return)]
 pub(crate) unsafe fn run_native(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target,
     loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient,
@@ -3446,6 +3447,7 @@ impl Resources {
     /// # Safety
     /// `shm` must stay open (its regions mapped) for the life of the result, which it does: the
     /// mapping is never unmapped.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn build(
         device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
         width: u32, height: u32, shm: &ShmClient, import: bool,
@@ -4014,6 +4016,7 @@ unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Targe
 /// `res` must belong to `device` and match `target`'s extent; `target`'s images must be live on
 /// `device`, the colour input in GENERAL; `submit` must submit on the queue the game's submit is
 /// for, which the caller holds.
+#[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_hold(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target, mode: Mode,
     dump: bool, frame: u64,
@@ -4591,6 +4594,7 @@ impl Session {
     ///
     /// # Safety
     /// As [`Resources::build`].
+    #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn ensure(
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
         width: u32, height: u32, shm: &ShmClient, import: bool,
@@ -5742,6 +5746,7 @@ mod tests {
     /// the hold would run ahead of: each kind makes the submit one to forward untouched, also when
     /// the layout stays `GENERAL`.
     #[test]
+    #[allow(clippy::type_complexity)]
     fn synchronization_before_the_launch_in_its_buffer_forbids_the_hold() {
         let transfer = ImageSync { src_queue_family: 0, dst_queue_family: 1, ..general_to_general(colour()) };
         let cases: [(&str, &dyn Fn(&mut Tracker), Hazard); 5] = [

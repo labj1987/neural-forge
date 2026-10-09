@@ -316,6 +316,7 @@ impl Drop for Partial<'_> {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn serve(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: &Loader, view: ShmView, quit: &AtomicBool, gpu: &mut Gpu) {
     let hdr = view.header();
     let mut last = Slot::ALL.map(|s| hdr.seq_req_slot(s).load(Ordering::Acquire));

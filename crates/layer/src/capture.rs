@@ -3678,6 +3678,7 @@ mod tests {
         }
     }
     /// Copies `bytes` into `image` (any layout, contents discarded) and leaves it `PRESENT_SRC_KHR`.
+    #[allow(clippy::too_many_arguments)]
     fn upload_present_src(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image, width: u32, height: u32, bytes: &[u8]) {
         let (buffer, memory, ptr) = host_buffer(device, mem_props, bytes.len() as u64);
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
@@ -3877,7 +3878,7 @@ mod tests {
             if out.len() == 1 {
                 hdr.model_interval.store(model_interval, AtomicOrdering::Relaxed);
             }
-            let carrying = !out.is_empty() && model_interval > 1 && inflight[0].presents % u64::from(model_interval) != 0;
+            let carrying = !out.is_empty() && model_interval > 1 && !inflight[0].presents.is_multiple_of(u64::from(model_interval));
             if scribble && carrying {
                 // SAFETY: no request is outstanding (every present so far resolved its own).
                 unsafe {

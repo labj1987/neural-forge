@@ -1907,6 +1907,7 @@ fn open_test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, 
 /// `None` without a Vulkan device or when family 0 has a single queue (lavapipe); the tests that
 /// need it skip then.
 #[cfg(test)]
+#[allow(clippy::type_complexity)]
 pub(crate) fn test_device_two_queues() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, vk::Queue, u32, bool)> {
     // SAFETY: same reasoning as `test_device`.
     let entry = unsafe { ash::Entry::load() }.ok()?;
@@ -3028,9 +3029,9 @@ mod tests {
         let target = make_target_image(&device, &mem_props, width, height);
         transition_to_present_src(&device, queue, pool, target.image);
 
-        let mut model_answer_for_direct = model_answer.clone();
+        let model_answer_for_direct = model_answer.clone();
         let ok = gpu.dispatch_into_image(
-            &device, &instance, physical_device, queue, width, height, &original, &mut model_answer_for_direct,
+            &device, &instance, physical_device, queue, width, height, &original, &model_answer_for_direct,
             colour_strength, transfer_strength, max_ratio, false, target.image,
         );
         assert!(ok, "dispatch_into_image returned false");

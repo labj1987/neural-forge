@@ -220,9 +220,7 @@ impl ShmClient {
     /// For tests of header-only logic (switches, requests, liveness), which need no real mapping.
     #[cfg(test)]
     pub(crate) fn test_over_header(header: &neural_forge_protocol::ShmHeader) -> Self {
-        let mut client = Self::default();
-        client.header = std::ptr::from_ref(header).cast_mut();
-        client
+        Self { header: std::ptr::from_ref(header).cast_mut(), ..Self::default() }
     }
 
     fn header(&self) -> Option<&neural_forge_protocol::ShmHeader> {
@@ -1001,7 +999,7 @@ mod tests {
         format!("{}/shm-{pid}-{n}/shm.bin", std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join("target/test-scratch").display())
     }
 
-    fn header_of<'a>(client: &'a ShmClient) -> &'a ShmHeader {
+    fn header_of(client: &ShmClient) -> &ShmHeader {
         client.header().expect("open_at should have attached")
     }
 
