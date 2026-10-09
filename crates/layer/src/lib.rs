@@ -343,108 +343,82 @@ pub(crate) fn take_native(device: vk::Device) -> Option<preupscale::native::Setu
     NATIVE_DEVICES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
 }
 
-/// `infos` with two more queues for the native network (its loading, and the after-the-upscaler path's
-/// frames), in a compute family without graphics
-/// (like the side queue, and for the same reason: the layer's own work on a queue of the game's
-/// graphics family faulted its channel, Xid 69 in Crimson Desert and Xid 32 in GTA V with the network's
-/// uploads, 2026-10-07): the game's graphics family, the new queues' family and first index, the extended
-/// infos, and the priorities they point into. `None` without such a family to spare two queues in.
-#[cfg(target_arch = "x86_64")]
-fn native_queue_request(
-    instance: &ash::Instance, physical_device: vk::PhysicalDevice, infos: &[vk::DeviceQueueCreateInfo],
-) -> Option<(u32, u32, u32, Vec<vk::DeviceQueueCreateInfo>, Box<Vec<f32>>)> {
-    // SAFETY: `physical_device` belongs to `instance`.
-    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-    let app_family = infos
-        .iter()
-        .find(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?
-        .queue_family_index;
-    let family = families
-        .iter()
-        .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && f.queue_count > 0)? as u32;
-    let mut extended = infos.to_vec();
-    let mut priorities: Box<Vec<f32>>;
-    let index;
-    match infos.iter().position(|q| q.queue_family_index == family) {
-        Some(at) => {
-            let q = infos[at];
-            if !q.flags.is_empty() || q.queue_count + 2 > families[family as usize].queue_count || q.p_queue_priorities.is_null() {
-                return None;
-            }
-            // SAFETY: `pQueuePriorities` holds `queueCount` floats.
-            priorities = Box::new(unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec());
-            priorities.extend([1.0, 1.0]);
-            extended[at].queue_count = q.queue_count + 2;
-            extended[at].p_queue_priorities = priorities.as_ptr();
-            index = q.queue_count;
-        }
-        None => {
-            if families[family as usize].queue_count < 2 {
-                return None;
-            }
-            priorities = Box::new(vec![1.0, 1.0]);
-            extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
-            index = 0;
-        }
-    }
-    Some((app_family, family, index, extended, priorities))
-}
-
 /// Checks and clears the side queue [`NeuralForgeInstanceHooks::create_device`] added to `device`.
 pub(crate) fn take_side_queue(device: vk::Device) -> Option<SideQueue> {
     SIDE_QUEUES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
 }
 
-/// The application's queue requests with one queue more for the layer, in a compute family without
-/// graphics (NVIDIA's family 2): queues of the game's own graphics family share its GPU context,
-/// and the layer's compute work there while the game's queue waits at the hold inside DLSS's buffer
-/// faulted the channel (Xid 69, Crimson Desert, 2026-10-05). The application's request for that
-/// family is extended by one when it has a queue to spare and is a plain one (no flags); without
-/// one, a request for one queue is added. `priorities` backs the extended `pQueuePriorities`.
-struct SideQueueRequest {
+/// The application's queue requests `infos` with `n` more queues for the layer, in a compute family without
+/// graphics (NVIDIA's family 2): queues of the game's own graphics family share its GPU context, and the
+/// layer's work there faulted the channel (Xid 69 in Crimson Desert with the hold inside DLSS's buffer,
+/// 2026-10-05; Xid 69 and Xid 32 in GTA V with the network's uploads, 2026-10-07). Every such family is
+/// considered, in order, and the first with room for `n` more is taken: the application's request for it is
+/// extended when it is a plain one (no flags), or a request for `n` queues is added.
+struct ExtraQueues {
+    /// The first family the application requests with graphics and compute: where DLSS runs.
+    app_family: u32,
+    family: u32,
+    /// The first of the new queues' indices.
+    index: u32,
     infos: Vec<vk::DeviceQueueCreateInfo>,
+    /// Backs the extended `pQueuePriorities`.
     _priorities: Vec<f32>,
-    queue: SideQueue,
 }
 
-fn side_queue_request(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &vk::DeviceCreateInfo) -> Option<SideQueueRequest> {
-    if create_info.queue_create_info_count == 0 || create_info.p_queue_create_infos.is_null() {
-        return None;
+impl ExtraQueues {
+    fn side_queue(&self) -> SideQueue {
+        SideQueue { family: self.family, index: self.index, app_family: self.app_family }
     }
-    // SAFETY: a non-null `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures.
-    let infos = unsafe { std::slice::from_raw_parts(create_info.p_queue_create_infos, create_info.queue_create_info_count as usize) };
-    // SAFETY: `physical_device` belongs to `instance`.
-    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
+}
+
+fn extra_queues(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQueueCreateInfo], n: u32) -> Option<ExtraQueues> {
     let app_family = infos
         .iter()
         .find(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?
         .queue_family_index;
-    let family = families
-        .iter()
-        .position(|f| f.queue_flags.contains(vk::QueueFlags::COMPUTE) && !f.queue_flags.contains(vk::QueueFlags::GRAPHICS) && f.queue_count > 0)? as u32;
-    let mut extended = infos.to_vec();
-    let mut priorities: Vec<f32>;
-    let index;
-    match infos.iter().position(|q| q.queue_family_index == family) {
-        Some(at) => {
-            let q = infos[at];
-            if !q.flags.is_empty() || q.queue_count >= families[family as usize].queue_count || q.p_queue_priorities.is_null() {
-                return None;
+    for (family, props) in families.iter().enumerate() {
+        if !props.queue_flags.contains(vk::QueueFlags::COMPUTE) || props.queue_flags.contains(vk::QueueFlags::GRAPHICS) {
+            continue;
+        }
+        let family = family as u32;
+        let mut extended = infos.to_vec();
+        let (priorities, index) = match infos.iter().position(|q| q.queue_family_index == family) {
+            Some(at) => {
+                let q = infos[at];
+                if !q.flags.is_empty() || q.queue_count + n > props.queue_count || q.p_queue_priorities.is_null() {
+                    continue;
+                }
+                // SAFETY: `pQueuePriorities` holds `queueCount` floats.
+                let mut priorities = unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec();
+                priorities.extend(std::iter::repeat_n(1.0, n as usize));
+                extended[at].queue_count = q.queue_count + n;
+                extended[at].p_queue_priorities = priorities.as_ptr();
+                (priorities, q.queue_count)
             }
-            // SAFETY: `pQueuePriorities` holds `queueCount` floats.
-            priorities = unsafe { std::slice::from_raw_parts(q.p_queue_priorities, q.queue_count as usize) }.to_vec();
-            priorities.push(1.0);
-            extended[at].queue_count = q.queue_count + 1;
-            extended[at].p_queue_priorities = priorities.as_ptr();
-            index = q.queue_count;
-        }
-        None => {
-            priorities = vec![1.0];
-            extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
-            index = 0;
-        }
+            None => {
+                if props.queue_count < n {
+                    continue;
+                }
+                let priorities = vec![1.0; n as usize];
+                extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
+                (priorities, 0)
+            }
+        };
+        return Some(ExtraQueues { app_family, family, index, infos: extended, _priorities: priorities });
     }
-    Some(SideQueueRequest { infos: extended, _priorities: priorities, queue: SideQueue { family, index, app_family } })
+    None
+}
+
+/// `create_info`'s queue requests, and the physical device's families.
+fn queue_requests<'a>(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &'a vk::DeviceCreateInfo) -> (&'a [vk::DeviceQueueCreateInfo], Vec<vk::QueueFamilyProperties>) {
+    let infos = if create_info.queue_create_info_count == 0 || create_info.p_queue_create_infos.is_null() {
+        &[][..]
+    } else {
+        // SAFETY: a non-null `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures.
+        unsafe { std::slice::from_raw_parts(create_info.p_queue_create_infos, create_info.queue_create_info_count as usize) }
+    };
+    // SAFETY: `physical_device` belongs to `instance`.
+    (infos, unsafe { instance.get_physical_device_queue_family_properties(physical_device) })
 }
 
 /// The loader's `VkLayerDeviceCreateInfo` (`vk_layer.h`), which `vulkan_layer` does not export:
@@ -611,9 +585,9 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 .collect();
             log!("[queues] the application asks for {}", asked.join(", "));
         }
-        let side = (nvidia && preupscale::active() && preupscale::inline::enabled())
-            .then(|| side_queue_request(&instance.instance, physical_device, create_info))
-            .flatten();
+        let (app_queues, families) = queue_requests(&instance.instance, physical_device, create_info);
+        // The hold inside DLSS's buffer: one queue of the layer's own.
+        let side = (nvidia && preupscale::active() && preupscale::inline::enabled()).then(|| extra_queues(&families, app_queues, 1)).flatten();
         // The native backend: the network's extensions and features and a loading queue of its own.
         // A request with them that the driver refuses is made again without (frames then go to DLSS
         // untouched in native mode, and the log says why).
@@ -623,15 +597,11 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             #[cfg(target_arch = "x86_64")]
             if native {
                 let gipa = layer_device_link.pfnNextGetInstanceProcAddr;
-                let base: Vec<vk::DeviceQueueCreateInfo> = match &side {
-                    Some(sq) => sq.infos.clone(),
-                    // SAFETY: `pQueueCreateInfos` holds `queueCreateInfoCount` valid structures (checked non-null).
-                    None if !info.p_queue_create_infos.is_null() => unsafe { std::slice::from_raw_parts(info.p_queue_create_infos, info.queue_create_info_count as usize) }.to_vec(),
-                    None => Vec::new(),
-                };
-                match native_queue_request(&instance.instance, physical_device, &base) {
+                // Two more (the network's loading, and the after-the-upscaler path's frames), on top of the side queue.
+                let base = side.as_ref().map_or(app_queues, |sq| &sq.infos[..]);
+                match extra_queues(&families, base, 2) {
                     None => log!("[native] no compute queue to spare for the network's loading; native backend off on this device"),
-                    Some((frame_family, family, index, queues, _priorities)) => {
+                    Some(ExtraQueues { app_family: frame_family, family, index, infos: queues, .. }) => {
                         let mut with = *info;
                         with.queue_create_info_count = queues.len() as u32;
                         with.p_queue_create_infos = queues.as_ptr();
@@ -646,7 +616,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                                     // SAFETY: written by the successful call.
                                     let device = unsafe { p_device.assume_init() };
                                     if let Some(sq) = &side {
-                                        SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.queue);
+                                        SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.side_queue());
                                     }
                                     let setup = preupscale::native::Setup { gipa, instance: instance.instance.handle(), physical: physical_device, frame_family, family, index, post_index: index + 1 };
                                     NATIVE_DEVICES.lock().unwrap().get_or_insert_default().insert(device, setup);
@@ -668,7 +638,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 if result == vk::Result::SUCCESS {
                     // SAFETY: written by the successful call.
                     let device = unsafe { p_device.assume_init() };
-                    SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.queue);
+                    SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.side_queue());
                     return result;
                 }
                 log!("[preupscale] adding a queue for the hold inside DLSS's command buffer was refused ({result:?}); creating the device without it");
@@ -1113,5 +1083,43 @@ mod device_link_tests {
         assert_eq!(CALLED.get(), 0, "the hook made no request of its own");
         drop(hooks);
         unsafe { instance.destroy_instance(None) };
+    }
+}
+
+#[cfg(test)]
+mod extra_queue_tests {
+    use super::*;
+
+    fn family(flags: vk::QueueFlags, queue_count: u32) -> vk::QueueFamilyProperties {
+        vk::QueueFamilyProperties { queue_flags: flags, queue_count, ..Default::default() }
+    }
+
+    const GRAPHICS: vk::QueueFlags = vk::QueueFlags::from_raw(vk::QueueFlags::GRAPHICS.as_raw() | vk::QueueFlags::COMPUTE.as_raw() | vk::QueueFlags::TRANSFER.as_raw());
+    const COMPUTE: vk::QueueFlags = vk::QueueFlags::from_raw(vk::QueueFlags::COMPUTE.as_raw() | vk::QueueFlags::TRANSFER.as_raw());
+
+    /// The first compute-only family is full (the application asks for all its queues): the next one with room
+    /// is taken, not none.
+    #[test]
+    fn a_full_compute_family_is_passed_over_for_one_with_room() {
+        let families = [family(GRAPHICS, 16), family(COMPUTE, 2), family(vk::QueueFlags::TRANSFER, 2), family(COMPUTE, 8)];
+        let priorities = [1.0f32; 2];
+        let app = [
+            vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities[..1]).build(),
+            vk::DeviceQueueCreateInfo::builder().queue_family_index(1).queue_priorities(&priorities).build(),
+        ];
+        let q = extra_queues(&families, &app, 2).expect("family 3 has room");
+        assert_eq!((q.app_family, q.family, q.index), (0, 3, 0));
+        assert_eq!(q.infos.len(), 3);
+        assert_eq!((q.infos[2].queue_family_index, q.infos[2].queue_count), (3, 2));
+        // One more in family 1 would fit only without the application's two.
+        assert!(extra_queues(&families[..3], &app, 1).is_none());
+        // The application's own request for the family is extended when it has room.
+        let one = [app[0], vk::DeviceQueueCreateInfo::builder().queue_family_index(1).queue_priorities(&priorities[..1]).build()];
+        let q = extra_queues(&families, &one, 1).expect("family 1 has one to spare");
+        assert_eq!((q.family, q.index, q.infos.len(), q.infos[1].queue_count), (1, 1, 2, 2));
+        // SAFETY: the extended priorities hold the new count.
+        assert_eq!(unsafe { std::slice::from_raw_parts(q.infos[1].p_queue_priorities, 2) }, &[1.0, 1.0]);
+        // No graphics family requested: nothing to add beside.
+        assert!(extra_queues(&families, &app[1..], 1).is_none());
     }
 }
