@@ -4,6 +4,29 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.1.4 — 2026-10-09
+
+DLSS Ray Reconstruction, and Hogwarts Legacy.
+
+- With DLSS Ray Reconstruction on, the model now runs after the upscaler instead of before it. Ray
+  Reconstruction's input is the noisy ray-traced frame before its denoising, so running the model on
+  it gave the model a frame it can't improve and wrote its answer into what Ray Reconstruction then
+  denoises. Neural Forge now recognises Ray Reconstruction (Crimson Desert's and Hogwarts Legacy's)
+  and leaves its input alone; switching Ray Reconstruction on or off in a game moves the model within
+  a few frames. This costs frame rate with Ray Reconstruction on (Crimson Desert about 68 fps shown,
+  Hogwarts Legacy about 64), because the model then runs on every frame shown. With it off, the model
+  runs before the upscaler as before.
+- Hogwarts Legacy with the model before the upscaler: the picture no longer turns into green noise
+  within seconds. The game's exposure value reacts to the frames the model changes and ran away from
+  frame to frame; Neural Forge now notices an exposure that keeps jumping and measures it from the
+  frame instead. The check for an implausible game exposure (Black Myth: Wukong) works with the
+  built-in network again too.
+- Hogwarts Legacy: the model no longer rebuilds itself and loses its history on most frames. Some of
+  the game's frames were held in one place and some in another; all are held in the same place now.
+- Crimson Desert with Ray Reconstruction off: the model's history now uses the camera jitter, so it
+  lines up with the previous frame exactly instead of to within a pixel.
+- The About window links to the issue tracker.
+
 ## 3.1.3 — 2026-10-09
 
 Fixes from two code reviews of 3.1.2.
