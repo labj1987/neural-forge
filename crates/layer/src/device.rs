@@ -2435,6 +2435,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // Before the format and capture checks: with the model before the upscaler (or an HDR
                 // swapchain) nothing is captured here, and the game is attached all the same.
                 state.shm.beat();
+                // Before the HDR/10-bit and pass-through skips, so the toggle hotkey works on every
+                // swapchain the layer presents through.
+                {
+                    let State { shm, hotkey, .. } = &mut *state;
+                    shm.poll_toggle_hotkey(hotkey);
+                }
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
                 let Some(&image) = sw.images.get(image_index as usize) else { break };
                 if !swapchain::is_supported_format(sw.format) {
@@ -2570,8 +2576,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
                 };
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, hotkey, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
-                shm.poll_toggle_hotkey(hotkey);
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
                 // Another device's hold counts too (DLSS on a device without the swapchain); never
                 // set with `NEURAL_FORGE_PREUPSCALE=off`, where no device holds.
                 let held_elsewhere = crate::preupscale::active() && crate::preupscale::post_off_by_any_device(std::time::Instant::now());
