@@ -2087,7 +2087,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // DLSS's buffer renders its own input before this launch: the hold goes here, inside
                 // it (`crate::preupscale::inline`), when the mode holds at all.
                 if let Some(inline) = self.inline.as_ref().filter(|_| crate::preupscale::mode().holds_inline()) {
-                    inline.record(command_buffer, point);
+                    let identification = point.identification;
+                    if inline.record(command_buffer, point) {
+                        t.inline_recorded(identification);
+                    }
                 }
             }
         }
