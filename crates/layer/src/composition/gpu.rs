@@ -387,6 +387,10 @@ struct ComposeSlot {
     descriptor_set: vk::DescriptorSet,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
+    /// The fence will signal: it starts signaled, or a submission of this slot's went in after its
+    /// last reset. A submit that fails after `vkResetFences` leaves it unsignaled with nothing to
+    /// signal it, so every wait skips a slot without this.
+    armed: bool,
     sized: Option<Sized_>,
     cached_generation: u64,
     /// `working_scale`'s compose-side scratch: an intermediate image at the answer's
@@ -421,8 +425,43 @@ impl ComposeSlot {
         // SAFETY: starting signaled means this slot's first real use never blocks on a
         // fence nothing has submitted work against yet.
         let Ok(fence) = (unsafe { device.create_fence(&fence_info, None) }) else { return None };
-        Some(Self { descriptor_set, cmd, fence, sized: None, cached_generation: 0, small_answer: None, small_proxy: None })
+        Some(Self { descriptor_set, cmd, fence, armed: true, sized: None, cached_generation: 0, small_answer: None, small_proxy: None })
     }
+
+    /// The fence, when it will signal (see `armed`).
+    fn armed_fence(&self) -> Option<vk::Fence> {
+        self.armed.then_some(self.fence)
+    }
+
+    /// Resets the fence for a submission; nothing will signal it until [`Self::submit`] succeeds.
+    fn reset(&mut self, device: &ash::Device) -> bool {
+        self.armed = false;
+        // SAFETY: callers wait for the fence (or know it was never submitted) before resetting it.
+        unsafe { device.reset_fences(&[self.fence]) }.is_ok()
+    }
+
+    /// Submits `submit` with the slot's fence (after [`Self::reset`]).
+    fn submit(&mut self, device: &ash::Device, queue: vk::Queue, submit: vk::SubmitInfo) -> bool {
+        // SAFETY: the caller recorded and ended the buffers `submit` names; the fence is reset.
+        let ok = crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.fence) }).is_ok();
+        self.armed = ok;
+        ok
+    }
+}
+
+/// Waits (bounded) for every fence that will signal: an unsignaled fence nothing will signal is skipped
+/// instead of timing out on it.
+fn wait_armed(device: &ash::Device, fences: &[Option<vk::Fence>], site: &'static str) -> bool {
+    let fences: Vec<vk::Fence> = fences.iter().flatten().copied().collect();
+    if fences.is_empty() {
+        return true;
+    }
+    // SAFETY: the callers' own fences. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
+    let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
+    crate::note_fence_wait(wait, site).is_ok()
+}
+
+impl ComposeSlot {
 
     /// (Re)builds this slot's own images/staging buffer if `width`/`height` changed
     /// (or this is the first use). Never touches any *other* slot's resources.
@@ -1348,14 +1387,10 @@ impl GpuCompose {
         if unsafe { device.end_command_buffer(self.sync.cmd) }.is_err() {
             return false;
         }
-        // SAFETY: `self.sync.fence` starts signaled or was reset+waited-on by this
-        // same function's previous call.
-        if unsafe { device.reset_fences(&[self.sync.fence]) }.is_err() {
-            return false;
-        }
+        // `self.sync.fence` starts signaled or was reset+waited-on by this same function's previous
+        // call; `self.sync.cmd` was just recorded and ended above.
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.sync.cmd)).build();
-        // SAFETY: `self.sync.cmd` was just recorded and ended above.
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }).is_err() {
+        if !self.sync.reset(device) || !self.sync.submit(device, queue, submit) {
             return false;
         }
         // SAFETY: `self.sync.fence` was just submitted against above. Bounded, not
@@ -1444,14 +1479,10 @@ impl GpuCompose {
         if unsafe { device.end_command_buffer(self.sync.cmd) }.is_err() {
             return false;
         }
-        // SAFETY: `self.sync.fence` starts signaled or was reset+waited-on by this
-        // same function's previous call.
-        if unsafe { device.reset_fences(&[self.sync.fence]) }.is_err() {
-            return false;
-        }
+        // `self.sync.fence` starts signaled or was reset+waited-on by this same function's previous
+        // call; `self.sync.cmd` was just recorded and ended above.
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.sync.cmd)).build();
-        // SAFETY: `self.sync.cmd` was just recorded and ended above.
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.sync.fence) }).is_err() {
+        if !self.sync.reset(device) || !self.sync.submit(device, queue, submit) {
             return false;
         }
         // SAFETY: `self.sync.fence` was just submitted against above. Bounded, not
@@ -1521,8 +1552,7 @@ impl GpuCompose {
         }
         let idx = self.next_async_slot; self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let slot = &mut self.async_slots[idx];
-        let wait = unsafe { device.wait_for_fences(&[slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "gpu::present_temporal_delta_async slot reuse").is_err() { return None; }
+        if !wait_armed(device, &[slot.slot.armed_fence()], "gpu::present_temporal_delta_async slot reuse") { return None; }
         if self.zc.answer_reader == Some(slot.slot.fence) { self.zc.answer_reader = None; }
         // The reuse wait just above (which this path always had) is what makes the slot's last
         // timestamps readable; no wait of its own.
@@ -1576,9 +1606,9 @@ impl GpuCompose {
             // SAFETY: `slot.slot.cmd` is recording and `record_start` went into it above.
             unsafe { timer.record_end(device, slot.slot.cmd) };
         }
-        if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || unsafe { device.reset_fences(&[slot.slot.fence]) }.is_err() { return None; }
+        if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || !slot.slot.reset(device) { return None; }
         let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], slot.slot.fence) }).is_err() { return None; }
+        if !slot.slot.submit(device, queue, submit) { return None; }
         if let Some(timer) = slot.timer.as_mut() { timer.mark_submitted(); }
         if update { slot.slot.cached_generation = generation; }
         if zero_copy.is_some() {
@@ -1594,11 +1624,8 @@ impl GpuCompose {
     /// Waits for every async slot's last submission. Used before anything a slot's submission
     /// may still read or write is replaced, and when a zero-copy compose changes queue.
     fn wait_async_slots(&self, device: &ash::Device) -> bool {
-        let fences = self.async_slots.each_ref().map(|s| s.slot.fence);
-        // SAFETY: every fence belongs to this `GpuCompose`; starts signaled, so never-used slots
-        // do not block. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
-        let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        crate::note_fence_wait(wait, "gpu::zero-copy drain").is_ok()
+        let fences = self.async_slots.each_ref().map(|s| s.slot.armed_fence());
+        wait_armed(device, &fences, "gpu::zero-copy drain")
     }
 
     /// Imports the model server's answer region (`host_ptr`, `bytes`: aligned and sized to the driver's
@@ -1743,8 +1770,7 @@ impl GpuCompose {
         let idx = self.next_async_slot;
         self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
         let async_slot = &mut self.async_slots[idx];
-        let wait = unsafe { device.wait_for_fences(&[async_slot.slot.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "gpu::present_cached_raw_async slot reuse").is_err() {
+        if !wait_armed(device, &[async_slot.slot.armed_fence()], "gpu::present_cached_raw_async slot reuse") {
             return None;
         }
         if self.zc.answer_reader == Some(async_slot.slot.fence) {
@@ -1775,24 +1801,21 @@ impl GpuCompose {
         if unsafe { device.begin_command_buffer(async_slot.slot.cmd, &begin_info) }.is_err() { return None; }
         unsafe { async_slot.slot.record_cached_raw_into_image(device, width, height, frame_bytes as u64, update, target_image); }
         if unsafe { device.end_command_buffer(async_slot.slot.cmd) }.is_err() { return None; }
-        if unsafe { device.reset_fences(&[async_slot.slot.fence]) }.is_err() { return None; }
+        if !async_slot.slot.reset(device) { return None; }
         let submit = vk::SubmitInfo::builder()
             .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
             .signal_semaphores(std::slice::from_ref(&semaphore))
             .build();
-        if crate::note_vk(unsafe { device.queue_submit(queue, &[submit], async_slot.slot.fence) }).is_err() { return None; }
+        if !async_slot.slot.submit(device, queue, submit) { return None; }
         Some(semaphore)
     }
 
     /// Waits for every compose this `GpuCompose` has submitted (the async slots and the
     /// synchronous one). Only its own fences, so it is legal from any hook on any thread.
     pub fn wait_in_flight(&self, device: &ash::Device) -> bool {
-        let mut fences: Vec<vk::Fence> = self.async_slots.iter().map(|s| s.slot.fence).collect();
-        fences.push(self.sync.fence);
-        // SAFETY: every fence belongs to this `GpuCompose` and starts signaled, so an
-        // unused slot does not block. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
-        let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        crate::note_fence_wait(wait, "gpu::wait_in_flight").is_ok()
+        let mut fences: Vec<Option<vk::Fence>> = self.async_slots.iter().map(|s| s.slot.armed_fence()).collect();
+        fences.push(self.sync.armed_fence());
+        wait_armed(device, &fences, "gpu::wait_in_flight")
     }
 
     /// The latest async compose GPU time read back since the last call (see
@@ -2436,6 +2459,23 @@ mod tests {
                 assert!(worst <= 3, "curve {mode} at white point {wp} (smoothing and ghost guard {smooth}): an unedited answer moved the frame by up to {worst}");
             }
         }
+    }
+
+    /// A submit that fails after its fence was reset leaves that fence unsignaled with nothing to
+    /// signal it: no wait may then sit on it for the whole timeout (and report a stall).
+    #[test]
+    fn a_failed_submit_leaves_no_slot_waiting_on_its_fence() {
+        let Some((_entry, _instance, _physical, device, _queue, family)) = test_device() else { return };
+        let mut gpu = GpuCompose::new(&device, family).expect("compose resources");
+        // What every submit site does when `vkQueueSubmit` fails: the fence was reset, nothing was submitted.
+        assert!(gpu.async_slots[0].slot.reset(&device));
+        assert!(gpu.sync.reset(&device));
+        let started = std::time::Instant::now();
+        assert!(gpu.wait_in_flight(&device), "waited on a fence nothing will signal");
+        assert!(gpu.wait_async_slots(&device));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "the waits sat out the timeout ({:?})", started.elapsed());
+        // SAFETY: nothing of it was submitted.
+        unsafe { gpu.destroy(&device) };
     }
 
     /// Detail strength in the ratio transfer: 0 returns the frame untouched (light and colour), 1 applies

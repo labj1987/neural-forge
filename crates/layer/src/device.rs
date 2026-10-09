@@ -222,6 +222,8 @@ struct State {
     /// doc comment. Meaningless while `last_answer` is empty; always set together
     /// with it otherwise.
     last_answer_dims: (u32, u32),
+    /// The proxy `last_answer` answers went through the encode (`capture::run`).
+    last_answer_encoded: bool,
     hotkey: crate::hotkey::Poller,
     /// Per-swapchain-image relay semaphores -- see `queue_present_khr`'s own comment on
     /// why the application's present wait semaphores are relayed through the layer's
@@ -2576,7 +2578,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
                 };
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
+                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, last_answer_encoded, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
                 // Another device's hold counts too (DLSS on a device without the swapchain); never
                 // set with `NEURAL_FORGE_PREUPSCALE=off`, where no device holds.
                 let held_elsewhere = crate::preupscale::active() && crate::preupscale::post_off_by_any_device(std::time::Instant::now());
@@ -2775,6 +2777,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             raw_answer_generation,
                             last_answer,
                             last_answer_dims,
+                            last_answer_encoded,
                         );
                     }
                     if observing {

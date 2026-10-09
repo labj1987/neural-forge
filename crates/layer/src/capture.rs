@@ -564,6 +564,8 @@ pub struct Inflight {
     /// which must keep comparing against the swapchain's own resolution regardless of
     /// what the proxy itself was scaled to.
     proxy_dims: Option<(u32, u32)>,
+    /// The outstanding request's proxy went through the encode ([`Captured::encoded`]).
+    encoded: bool,
 }
 
 impl Inflight {
@@ -811,7 +813,7 @@ fn poll_or_submit_capture(
                     // reads, so there is nothing to copy out here.
                     original_scratch.clear();
                     shm.set_frame_info(slot, width, height, proxy_format);
-                    return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: true, copy_out: std::time::Duration::ZERO });
+                    return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: true, copy_out: std::time::Duration::ZERO, encoded: false });
                 }
                 let t_copy = std::time::Instant::now();
                 let n = capacity.min(frame_bytes as usize);
@@ -823,7 +825,7 @@ fn poll_or_submit_capture(
                 // imported or not).
                 original_scratch.extend_from_slice(unsafe { std::slice::from_raw_parts(host_ptr, n) });
                 shm.set_frame_info(slot, width, height, proxy_format);
-                return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed() });
+                return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed(), encoded: false });
             }
             // A capture of another frame size, or of an earlier frame: dropped, and a fresh
             // one submitted below in its place.
@@ -876,11 +878,12 @@ fn poll_or_submit_capture(
                 }
                 shm.set_frame_info(slot, mw, mh, proxy_format);
                 shm.write_proxy(slot, model_scratch);
-                return CaptureStep::Captured(Captured { sent: (mw, mh), gpu_original: false, copy_out: t_copy.elapsed() });
+                let encoded = p.slots[slot.index()].model.as_ref().is_some_and(|m| m.encode_set.is_some());
+                return CaptureStep::Captured(Captured { sent: (mw, mh), gpu_original: false, copy_out: t_copy.elapsed(), encoded });
             }
             shm.set_frame_info(slot, width, height, proxy_format);
             shm.write_proxy(slot, original_scratch);
-            return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed() });
+            return CaptureStep::Captured(Captured { sent: (width, height), gpu_original: false, copy_out: t_copy.elapsed(), encoded: false });
         }
         // Nothing completed, or what completed was of another frame size or an earlier frame
         // (dropped: its slot is free again and a fresh capture goes in below).
@@ -925,6 +928,9 @@ struct Captured {
     gpu_original: bool,
     /// How long getting the frame's bytes out onto the CPU took (zero when `gpu_original`).
     copy_out: std::time::Duration,
+    /// The proxy sent went through the encode (the model scratch with its encode pass), which decides
+    /// the composition mode for the answer to it (see `compose.comp`).
+    encoded: bool,
 }
 
 /// The synchronous present's stage timings for the frame being composed, for the `[sync]` log.
@@ -1010,6 +1016,7 @@ struct HeldFrame {
     original: Vec<u8>,
     proxy: Vec<u8>,
     sent: (u32, u32),
+    encoded: bool,
 }
 static HELD: std::sync::Mutex<Option<HeldFrame>> = std::sync::Mutex::new(None);
 
@@ -1107,6 +1114,7 @@ pub unsafe fn run(
     raw_answer_generation: &mut u64,
     last_answer: &mut Vec<u8>,
     last_answer_dims: &mut (u32, u32),
+    last_answer_encoded: &mut bool,
 ) -> Option<vk::Semaphore> {
     // Cheap enough to leave on every frame: this is what turns the bounded fence-wait
     // markers in `note_fence_wait` into a trail with frame boundaries in it, not just
@@ -1187,6 +1195,9 @@ pub unsafe fn run(
         if !answer_region_free(gpu_compose, device) {
             return None;
         }
+        // Taken here, not where the dump is written: a frame `run_sync` gives up on early (resources
+        // it cannot build) would otherwise leave the request pending, and this path taken, for good.
+        let dump = shm.take_capture_request();
         return unsafe {
             run_sync(
                 device,
@@ -1204,6 +1215,7 @@ pub unsafe fn run(
                 shm,
                 original_scratch,
                 last_answer,
+                dump,
             )
         };
     }
@@ -1394,6 +1406,7 @@ pub unsafe fn run(
                         // function fell back to full-resolution (a scratch build/resize
                         // failure, or `use_direct`) despite scaling being requested.
                         inflight[slot.index()].proxy_dims = (sent_w != width || sent_h != height).then_some((sent_w, sent_h));
+                        inflight[slot.index()].encoded = captured.encoded;
                     }
                 }
             }
@@ -1415,6 +1428,7 @@ pub unsafe fn run(
                 last_answer.clear();
                 last_answer.extend_from_slice(answer_scratch);
                 *last_answer_dims = answer_dims;
+                *last_answer_encoded = inflight[slot.index()].encoded;
                 *raw_answer_generation = raw_answer_generation.wrapping_add(1).max(1);
             }
         }
@@ -1510,6 +1524,7 @@ pub unsafe fn run(
             let t_start = std::time::Instant::now();
             let mut sent = None;
             let mut gpu_original = false;
+            let mut encoded = false;
             let mut copy_out = std::time::Duration::ZERO;
             let mut held = HELD.lock().unwrap_or_else(|e| e.into_inner());
             if !settings.hold_frame || held.as_ref().is_some_and(|h| (h.width, h.height) != (width, height)) {
@@ -1523,6 +1538,7 @@ pub unsafe fn run(
                 shm.set_frame_info(SLOT, h.sent.0, h.sent.1, proxy_format);
                 shm.write_proxy(SLOT, &h.proxy);
                 sent = Some(h.sent);
+                encoded = h.encoded;
                 copy_out = t_copy.elapsed();
             }
             while sent.is_none() {
@@ -1534,6 +1550,7 @@ pub unsafe fn run(
                     CaptureStep::Captured(captured) => {
                         sent = Some(captured.sent);
                         gpu_original = captured.gpu_original;
+                        encoded = captured.encoded;
                         copy_out = captured.copy_out;
                         break;
                     }
@@ -1558,7 +1575,7 @@ pub unsafe fn run(
                 // capture wrote the whole frame straight into shared memory.
                 let t_copy = std::time::Instant::now();
                 let proxy = if (sent_w, sent_h) == (width, height) && use_direct { original_scratch.clone() } else { model_scratch.clone() };
-                *held = Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h) });
+                *held = Some(HeldFrame { width, height, original: original_scratch.clone(), proxy, sent: (sent_w, sent_h), encoded });
                 copy_out += t_copy.elapsed();
             }
             drop(held);
@@ -1638,6 +1655,7 @@ pub unsafe fn run(
                 std::mem::swap(raw_answer_base, original_scratch);
             }
             *last_answer_dims = (sent_w, sent_h);
+            *last_answer_encoded = encoded;
             compose_small_proxy = (sent_w, sent_h) != (width, height) && model_scratch.len() >= answer_bytes;
             compose_held = settings.hold_frame;
             let capture_total = t_captured - t_start;
@@ -1668,8 +1686,9 @@ pub unsafe fn run(
     }
     // Which composition formula the answer below is eligible for: mode 2 (the
     // encoded-proxy ratio transfer) only when the capture leg really did encode the
-    // proxy this answer came from, mode 1 otherwise. See `compose.comp`.
-    let proxy_encoded = pipeline.as_ref().is_some_and(CapturePipeline::proxy_encoded);
+    // proxy this answer came from, mode 1 otherwise. See `compose.comp`. Recorded with the
+    // answer when its request was sent, not read from whatever the pipeline holds now.
+    let proxy_encoded = *last_answer_encoded;
     // Cache each model server answer in device-local memory once, then copy that cached
     // frame to every presented swapchain image.  The prior path re-uploaded two 4K
     // CPU buffers and ran the compose shader on every present, which made the counter
@@ -1755,6 +1774,11 @@ pub unsafe fn run(
             shm.publish_frame_timing(pipeline_start.elapsed(), true);
             return Some(sem);
         }
+    }
+    // The GPU compose exists but refused this frame: it goes out untouched. A CPU write-back of the
+    // raw answer here would present it uncomposed.
+    if gpu_compose.is_some() {
+        return None;
     }
     // No GPU compose available at all (`GpuCompose::new` failed) -- last resort: the
     // same CPU-visible write-back every other fallback path in this module already
@@ -2034,17 +2058,6 @@ pub struct CapturePipeline {
     /// unavailable on this device, in which case every proxy crosses to the model server
     /// unencoded exactly as it did before the encode existed.
     encode: Option<crate::composition::encode_pass::EncodePass>,
-}
-
-impl CapturePipeline {
-    /// Whether the proxies this pipeline produces actually go through the encode --
-    /// which decides the composition mode (see `compose.comp`). Device- and
-    /// format-stable in practice (it depends on `STORAGE` support for the proxy
-    /// format, not on anything per-frame), so reading it from whichever slot has
-    /// already built its scratch is enough.
-    fn proxy_encoded(&self) -> bool {
-        self.slots.iter().any(|s| s.model.as_ref().is_some_and(|m| m.encode_set.is_some()))
-    }
 }
 
 struct PipelineSlot {
@@ -2880,6 +2893,7 @@ unsafe fn run_sync(
     shm: &mut ShmClient,
     original_scratch: &mut Vec<u8>,
     _last_answer: &mut Vec<u8>,
+    dump: bool,
 ) -> Option<vk::Semaphore> {
     let bytes_per_pixel = neural_forge_protocol::enums::proxy_format::bytes_per_pixel(proxy_format) as u64;
     let frame_bytes = u64::from(width) * u64::from(height) * bytes_per_pixel;
@@ -3100,7 +3114,7 @@ unsafe fn run_sync(
     // (identical) matched pair rather than silently doing nothing -- `write_pair`
     // itself is the only place that would need to special-case a format it can't
     // encode, and today it always gets `RGBA8` bytes either way.
-    if shm.take_capture_request() && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
+    if dump && neural_forge_protocol::enums::proxy_format::is_8bit(proxy_format) {
         // SAFETY: same reasoning as every other read of `r.ptr` in this function --
         // still a live mapping of at least `frame_bytes` bytes, and stage 2 below
         // hasn't started overwriting it yet.
@@ -3506,6 +3520,7 @@ mod tests {
         let mut raw_answer_generation = 0u64;
         let mut last_answer = Vec::new();
         let mut last_answer_dims = (0u32, 0u32);
+        let mut last_answer_encoded = false;
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
 
@@ -3558,7 +3573,7 @@ mod tests {
                     &mut raw_answer_base,
                     &mut raw_answer_generation,
                     &mut last_answer,
-                    &mut last_answer_dims,
+                    &mut last_answer_dims, &mut last_answer_encoded,
                 )
             };
             let call_time = call_start.elapsed();
@@ -3622,7 +3637,7 @@ mod tests {
                     &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
                     width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, &mut false, &mut gpu_compose,
                     &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
+                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
                 )
             };
             assert!(sem.is_some(), "every present is composited, carried or not");
@@ -3860,6 +3875,7 @@ mod tests {
         let mut raw_answer_generation = 0u64;
         let mut last_answer = Vec::new();
         let mut last_answer_dims = (0u32, 0u32);
+        let mut last_answer_encoded = false;
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
 
@@ -3887,7 +3903,7 @@ mod tests {
                     &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
                     width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, &mut true, &mut gpu_compose,
                     &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
+                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
                 )
             };
             let Some(sem) = sem else {
@@ -4049,6 +4065,7 @@ mod tests {
         let (mut original_scratch, mut model_scratch, mut answer_scratch) = (Vec::new(), Vec::new(), Vec::new());
         let (mut raw_answer_base, mut raw_answer_generation) = (Vec::new(), 0u64);
         let (mut last_answer, mut last_answer_dims) = (Vec::new(), (0u32, 0u32));
+        let mut last_answer_encoded = false;
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
         let mut external_memory_host = direct_capture;
@@ -4063,7 +4080,7 @@ mod tests {
                     device, instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
                     width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, &mut external_memory_host,
                     &mut gpu_compose, &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete,
-                    &mut answer_scratch, &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
+                    &mut answer_scratch, &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
                 )
             };
             let Some(sem) = sem else {
@@ -4213,7 +4230,7 @@ mod tests {
             run_sync(
                 &device, &instance, physical_device, queue, queue_family, image, width, height,
                 neural_forge_protocol::enums::proxy_format::RGBA8, false, &mut resources, &mut gpu_compose, &mut shm,
-                &mut original_scratch, &mut last_answer,
+                &mut original_scratch, &mut last_answer, false,
             )
         };
         assert!(sem.is_none(), "the synchronous path leaves nothing to wait on");
@@ -4357,6 +4374,7 @@ mod tests {
         let (mut original_scratch, mut model_scratch, mut answer_scratch, mut raw_answer_base, mut last_answer) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         let mut raw_answer_generation = 0u64;
         let mut last_answer_dims = (0u32, 0u32);
+        let mut last_answer_encoded = false;
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
         let mut external_memory_host = true;
@@ -4366,7 +4384,7 @@ mod tests {
                 &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image,
                 width, height, proxy_format, false, &mut resources, &mut pipeline, &mut direct, external_memory_host, &mut gpu_compose,
                 &mut shm, &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims,
+                &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
             )
         };
         // Presents before the fake model server's first heartbeat go out untouched without trying
@@ -4501,6 +4519,7 @@ mod tests {
         let mut raw_answer_generation = 0u64;
         let mut last_answer = Vec::new();
         let mut last_answer_dims = (0u32, 0u32);
+        let mut last_answer_encoded = false;
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
 
@@ -4551,7 +4570,7 @@ mod tests {
                     &mut raw_answer_base,
                     &mut raw_answer_generation,
                     &mut last_answer,
-                    &mut last_answer_dims,
+                    &mut last_answer_dims, &mut last_answer_encoded,
                 )
             };
             let call_time = call_start.elapsed();
@@ -4716,6 +4735,7 @@ mod tests {
         let mut raw_answer_generation = 0u64;
         let mut last_answer = Vec::new();
         let mut last_answer_dims = (0u32, 0u32);
+        let mut last_answer_encoded = false;
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
 
@@ -4729,7 +4749,7 @@ mod tests {
                     &device, &instance, physical_device, queue, queue_family, image, vk::ImageLayout::PRESENT_SRC_KHR, image, width, height,
                     proxy_format, false, &mut resources, &mut pipeline, &mut direct, &mut false, &mut gpu_compose, &mut shm, &mut original_scratch,
                     &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch, &mut raw_answer_base, &mut raw_answer_generation,
-                    &mut last_answer, &mut last_answer_dims,
+                    &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded,
                 )
             };
             if let Some(sem) = sem {
@@ -4854,6 +4874,7 @@ mod tests {
         let mut raw_answer_generation = 0u64;
         let mut last_answer = Vec::new();
         let mut last_answer_dims = (0u32, 0u32);
+        let mut last_answer_encoded = false;
         let mut inflight: [Inflight; 2] = Default::default();
         let mut bootstrap_complete = false;
 
@@ -4877,7 +4898,7 @@ mod tests {
                     vk::ImageLayout::PRESENT_SRC_KHR, image, width, height, proxy_format, false,
                     &mut resources, &mut pipeline, &mut direct, &mut false, &mut gpu_compose, &mut shm,
                     &mut original_scratch, &mut model_scratch, &mut inflight, &mut bootstrap_complete, &mut answer_scratch,
-                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims)
+                    &mut raw_answer_base, &mut raw_answer_generation, &mut last_answer, &mut last_answer_dims, &mut last_answer_encoded)
             };
             let cpu_cost = c.elapsed();
             if sem.is_some() {
