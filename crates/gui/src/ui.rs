@@ -631,6 +631,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                 .developers(vec!["Linnard Alex Brown Jr."])
                 .comments("Vulkan layer and settings GUI for running NVIDIA DLSS 5 Neural Rendering natively in Linux/Proton games.")
                 .website("https://github.com/labj1987/neural-forge")
+                .issue_url("https://github.com/labj1987/neural-forge/issues")
                 // Matches Cargo.toml's `AGPL-3.0-or-later`; the upstream project's own
                 // license is AGPL-3.0, which is what requires it for the adapted code.
                 .license_type(gtk4::License::Agpl30)
@@ -645,7 +646,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                     "Dagherbou and cdozdil (OptiScaler) — the DLSS-NR shader lineage",
                 ],
             );
-            dialog.add_acknowledgement_section(
+            dialog.add_credit_section(
                 Some("Built with"),
                 &["Claude Code (Anthropic)", "Codex (OpenAI)"],
             );
