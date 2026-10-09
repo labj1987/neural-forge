@@ -28,6 +28,19 @@ fn register_refresher(f: impl Fn() + 'static) {
     REFRESHERS.with(|r| r.borrow_mut().push(Box::new(f)));
 }
 
+thread_local! {
+    /// Everything that shows whether the model is installed, brought up to date after an extract.
+    static MODEL_WATCHERS: std::cell::RefCell<Vec<Box<dyn Fn()>>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn on_model_changed(f: impl Fn() + 'static) {
+    MODEL_WATCHERS.with(|w| w.borrow_mut().push(Box::new(f)));
+}
+
+fn model_changed() {
+    MODEL_WATCHERS.with(|w| w.borrow().iter().for_each(|f| f()));
+}
+
 /// Brings every bound row up to date with the header -- run once a second, so a change made
 /// with `shmctl`, a loaded profile or Reset shows up without restarting the app.
 fn refresh_all_rows() {
@@ -503,6 +516,10 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     banner.set_button_label(Some("Open Setup"));
     banner.set_revealed(missing_model);
     {
+        let banner = banner.clone();
+        on_model_changed(move || banner.set_revealed(!model_status().1));
+    }
+    {
         let view_stack = view_stack.clone();
         let banner_for_closure = banner.clone();
         banner.connect_button_clicked(move |_| {
@@ -571,6 +588,18 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         .content(&toasts)
         .build();
 
+    {
+        let toasts = toasts.clone();
+        crate::shm::on_save_error(move |message| toasts.add_toast(adw::Toast::new(&message)));
+    }
+    // A change made in the last moment before closing is still saved.
+    window.connect_close_request(|_| {
+        if let Err(e) = crate::shm::flush_settings() {
+            eprintln!("neural-forge: saving config.ini failed: {e}");
+        }
+        glib::Propagation::Proceed
+    });
+
     // Below 1400sp wide: hide the header's inline switcher, reveal the bottom bar
     // instead. 1400, not the far narrower value an adaptive/mobile-first app would
     // use, because this window's own `PreferencesPage` content already wants ~1340px
@@ -632,6 +661,15 @@ fn profile_names() -> Vec<String> {
     let mut names: Vec<String> = neural_forge_supervisor::profiles::load_all().into_keys().collect();
     names.sort();
     names
+}
+
+/// The profile name the combo shows as selected, read from the combo's own model (the list on disk
+/// may have changed since it was built); `None` when nothing real is selected.
+fn selected_profile(combo: &adw::ComboRow) -> Option<String> {
+    if !combo.is_sensitive() {
+        return None; // the "No saved profiles" placeholder
+    }
+    combo.selected_item().and_downcast::<gtk4::StringObject>().map(|item| item.string().to_string())
 }
 
 /// Rebuilds the combo's model from disk -- called on init and after every
@@ -780,6 +818,7 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 let (text, present) = model_status();
                 status_row.set_subtitle(&text);
                 icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
+                model_changed();
             });
         });
     });
@@ -1028,6 +1067,10 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     model_row.set_title("Model");
     model_row.set_subtitle(&model_status().0);
     group.add(&model_row);
+    {
+        let model_row = model_row.clone();
+        on_model_changed(move || model_row.set_subtitle(&model_status().0));
+    }
 
     let settings_row = adw::ActionRow::new();
     settings_row.set_title("Settings");
@@ -1123,13 +1166,16 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         let toasts = toasts.clone();
         let profile_combo = profile_combo.clone();
         load_profile_button.connect_clicked(move |_| {
-            let names = profile_names();
-            let Some(name) = names.get(profile_combo.selected() as usize) else {
+            let Some(name) = selected_profile(&profile_combo) else {
                 toasts.add_toast(adw::Toast::new("No profile selected"));
                 return;
             };
             let profiles = neural_forge_supervisor::profiles::load_all();
-            let Some(settings) = profiles.get(name) else { return };
+            let Some(settings) = profiles.get(&name) else {
+                toasts.add_toast(adw::Toast::new(&format!("Profile \"{name}\" is gone")));
+                refresh_profile_combo(&profile_combo);
+                return;
+            };
             neural_forge_protocol::persist::apply(shm.header(), settings);
             // Same reasoning as the reset button above: applying to the live header
             // only affects the running session, so also fold the result into
@@ -1148,8 +1194,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         let toasts = toasts.clone();
         let profile_combo = profile_combo.clone();
         delete_profile_button.connect_clicked(move |_| {
-            let names = profile_names();
-            let Some(name) = names.get(profile_combo.selected() as usize).cloned() else {
+            let Some(name) = selected_profile(&profile_combo) else {
                 toasts.add_toast(adw::Toast::new("No profile selected"));
                 return;
             };

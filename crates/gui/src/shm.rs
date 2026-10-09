@@ -68,16 +68,71 @@ impl Shm {
     }
 }
 
-/// After every write, also persists this one setting to `config.ini` -- a full
-/// load-modify-save of the file rather than threading a shared `Config` through every
-/// binder closure, since this is a small local file and correctness (never writing a
-/// stale copy of some other field) matters more than avoiding a few extra syscalls on
-/// a settings change a human just triggered by hand.
-fn persist_one(name: &str, is_float: bool, bits: u32) {
+/// How long after the last change a setting is written to `config.ini`: a spin button held down
+/// or dragged changes the value many times a second, and each change was a full rewrite.
+const SAVE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+
+#[derive(Default)]
+struct PendingSave {
+    /// Settings changed since the last save; their values are read from the header when saved, so
+    /// a Reset or profile load in between is never overwritten with an older value.
+    names: std::collections::BTreeSet<&'static str>,
+    mapping: Option<Arc<Mapping>>,
+    timer: Option<glib::SourceId>,
+    on_error: Option<std::rc::Rc<dyn Fn(String)>>,
+}
+
+thread_local! {
+    static PENDING_SAVE: std::cell::RefCell<PendingSave> = std::cell::RefCell::new(PendingSave::default());
+}
+
+/// Where a failed save is reported (the window's toasts).
+pub fn on_save_error(f: impl Fn(String) + 'static) {
+    PENDING_SAVE.with(|p| p.borrow_mut().on_error = Some(std::rc::Rc::new(f)));
+}
+
+/// Marks `name` changed and (re)starts the save timer, so a burst of changes is one write.
+fn persist_later(shm: &Arc<Mapping>, name: &'static str) {
+    PENDING_SAVE.with(|p| {
+        let mut p = p.borrow_mut();
+        p.names.insert(name);
+        p.mapping = Some(Arc::clone(shm));
+        if let Some(timer) = p.timer.take() {
+            timer.remove();
+        }
+        p.timer = Some(glib::timeout_add_local_once(SAVE_DELAY, || {
+            PENDING_SAVE.with(|p| p.borrow_mut().timer = None);
+            if let Err(e) = flush_settings() {
+                let on_error = PENDING_SAVE.with(|p| p.borrow().on_error.clone());
+                match on_error {
+                    Some(report) => report(format!("Saving config.ini failed: {e}")),
+                    None => eprintln!("neural-forge: saving config.ini failed: {e}"),
+                }
+            }
+        }));
+    });
+}
+
+/// Writes every changed setting to `config.ini` now (the timer does this on its own; the window
+/// calls it on close). A full load-modify-save of the file, so no other key is written stale.
+pub fn flush_settings() -> std::io::Result<()> {
+    let (names, mapping) = PENDING_SAVE.with(|p| {
+        let mut p = p.borrow_mut();
+        if let Some(timer) = p.timer.take() {
+            timer.remove();
+        }
+        (std::mem::take(&mut p.names), p.mapping.clone())
+    });
+    let Some(mapping) = mapping.filter(|_| !names.is_empty()) else { return Ok(()) };
+    let snapshot = neural_forge_protocol::persist::snapshot(mapping.header());
     let mut cfg = neural_forge_supervisor::Config::load();
-    let value = if is_float { f32::from_bits(bits).to_string() } else { bits.to_string() };
-    cfg.settings.insert(format!("set_{name}"), value);
-    let _ = cfg.save();
+    for name in names {
+        let key = format!("set_{name}");
+        if let Some(value) = snapshot.get(&key) {
+            cfg.settings.insert(key, value.clone());
+        }
+    }
+    cfg.save()
 }
 
 /// Binds a GTK `Scale`/`SpinButton`-shaped float control to one `f32`-bits field:
@@ -98,7 +153,7 @@ pub fn bind_float(
         get(shm.header()).store(value.to_bits(), Ordering::Relaxed);
         shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
         if let Some(name) = name {
-            persist_one(name, true, value.to_bits());
+            persist_later(&shm, name);
         }
     };
     (initial, setter)
@@ -118,7 +173,7 @@ pub fn bind_u32(
         get(shm.header()).store(value, Ordering::Relaxed);
         shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
         if let Some(name) = name {
-            persist_one(name, false, value);
+            persist_later(&shm, name);
         }
     };
     (initial, setter)
@@ -167,7 +222,12 @@ mod tests {
             let shm = Shm::open().expect("first open should succeed and create a fresh mapping");
             let (initial, set_intensity) = bind_float(&shm.0, Some("intensity"), |h| &h.intensity_bits);
             assert_eq!(initial, 1.0, "default intensity should be the hardcoded default on a fresh mapping");
+            set_intensity(1.5);
             set_intensity(1.75);
+            // Debounced: nothing is written until the timer fires or the window flushes.
+            let early = std::fs::read_to_string(config_home.join("neural-forge/config.ini")).unwrap_or_default();
+            assert!(!early.contains("set_intensity"), "a change is saved after a pause, not on every step:\n{early}");
+            flush_settings().expect("save config.ini");
         }
 
         let saved = std::fs::read_to_string(config_home.join("neural-forge/config.ini")).expect("config.ini should exist");
