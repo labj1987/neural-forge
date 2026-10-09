@@ -536,9 +536,10 @@ impl Drop for NeuralForgeInstanceHooks {
 }
 
 impl InstanceHooks for NeuralForgeInstanceHooks {
-    /// Adds [`EXTERNAL_MEMORY_HOST_EXTENSION`], the side queue for the hold inside DLSS's command
-    /// buffer and the native backend's extensions, features and queues to the game's own
-    /// `vkCreateDevice` call where it's safe to. Every other case returns
+    /// In a process the layer is on in and the target filter admits, adds what the layer needs to
+    /// the game's own `vkCreateDevice` call: [`EXTERNAL_MEMORY_HOST_EXTENSION`] when the physical
+    /// device advertises it, the side queue for the hold inside DLSS's command buffer, and the
+    /// native backend's extensions, features and queues. Every other case returns
     /// [`LayerResult::Unhandled`], which hands the *unmodified* call straight to the framework's
     /// own default `create_device` path -- identical to this hook not existing at all. It never
     /// makes a request that would otherwise have succeeded start failing: an addition the driver
@@ -553,6 +554,11 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         p_device: &mut std::mem::MaybeUninit<vk::Device>,
     ) -> LayerResult<ash::prelude::VkResult<()>> {
         self.remember(physical_device);
+        // A process the layer is off in, or one the target filter excludes (launchers, overlays),
+        // gets its device exactly as it asked for it: no queues, features, extensions or worker.
+        if !(layer_enabled() && ownership::eligible()) {
+            return LayerResult::Unhandled;
+        }
         let Some(instance) = self.ctx.clone() else {
             return LayerResult::Unhandled;
         };
@@ -1069,5 +1075,43 @@ mod device_link_tests {
             assert_eq!(seen.len(), 6);
             assert!(seen.iter().all(|&l| l == original), "an attempt saw an advanced link: {seen:?} (original {original:?})");
         });
+    }
+
+    /// In a process the layer is off in (`NEURAL_FORGE_ENABLE` is unset in tests), the hook hands the
+    /// request to the framework untouched and never calls the layer below itself.
+    #[test]
+    fn an_ineligible_process_gets_its_device_unmodified() {
+        let Some(entry) = (unsafe { ash::Entry::load() }).ok() else {
+            eprintln!("ineligible device test: no Vulkan loader, skipping");
+            return;
+        };
+        let Some(instance) = (unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder(), None) }).ok().map(Arc::new) else {
+            eprintln!("ineligible device test: no Vulkan ICD, skipping");
+            return;
+        };
+        let Some(&physical) = unsafe { instance.enumerate_physical_devices() }.ok().as_ref().and_then(|d| d.first()) else {
+            eprintln!("ineligible device test: no physical device, skipping");
+            unsafe { instance.destroy_instance(None) };
+            return;
+        };
+        assert!(!layer_enabled(), "tests run with the layer off");
+        unsafe extern "system" fn gipa_next(_: vk::Instance, name: *const c_char) -> vk::PFN_vkVoidFunction {
+            // SAFETY: a NUL-terminated name from the hook.
+            (unsafe { CStr::from_ptr(name) } == c"vkCreateDevice")
+                // SAFETY: the same signature as `vkCreateDevice`, which the caller transmutes back.
+                .then(|| unsafe { std::mem::transmute::<vk::PFN_vkCreateDevice, unsafe extern "system" fn()>(next_layer) })
+        }
+        let link = VkLayerDeviceLink { pNext: std::ptr::null_mut(), pfnNextGetInstanceProcAddr: gipa_next, pfnNextGetDeviceProcAddr: gdpa };
+        let priorities = [1.0];
+        let queue = vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities).build();
+        let info = vk::DeviceCreateInfo::builder().queue_create_infos(std::slice::from_ref(&queue)).build();
+        let hooks = NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None }) };
+        let mut p_device = std::mem::MaybeUninit::uninit();
+        CALLED.set(0);
+        let result = hooks.create_device(physical, &info, &link, None, &mut p_device);
+        assert!(matches!(result, LayerResult::Unhandled), "the framework forwards the application's own request");
+        assert_eq!(CALLED.get(), 0, "the hook made no request of its own");
+        drop(hooks);
+        unsafe { instance.destroy_instance(None) };
     }
 }

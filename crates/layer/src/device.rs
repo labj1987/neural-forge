@@ -1014,17 +1014,20 @@ impl NeuralForgeDeviceInfo {
             // Cannot ask, so do not gate: same fail-open stance as everywhere else.
             None => true,
         };
+        // The network's loader and the hold's worker only start where the layer is on and the
+        // process is the game (`create_device` adds their queues only then too).
+        let active = crate::layer_enabled() && crate::ownership::eligible();
         #[cfg(target_arch = "x86_64")]
         if let Some(setup) = crate::take_native(handle) {
             // Also without DLSS's tracking (no VK_NVX_image_view_handle): the after-the-upscaler path
             // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
-            if nvidia {
+            if nvidia && active {
                 state.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup)));
             }
         }
         let side = crate::take_side_queue(handle);
         let inline = match (&preupscale, side, get_queue, &instance) {
-            (Some(_), Some(crate::SideQueue { family, index, app_family }), Some(get_queue), Some(instance)) if nvidia => {
+            (Some(_), Some(crate::SideQueue { family, index, app_family }), Some(get_queue), Some(instance)) if nvidia && active => {
                 let mut queue = vk::Queue::null();
                 // SAFETY: the next layer's `vkGetDeviceQueue` for the queue this layer added to the
                 // device's creation (`crate::take_side_queue`).
