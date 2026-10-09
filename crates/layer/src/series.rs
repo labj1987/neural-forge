@@ -329,7 +329,9 @@ unsafe fn create_readback(
         return None;
     };
     let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
-    let Some(cmd) = unsafe { device.allocate_command_buffers(&alloc) }.ok().and_then(|v| v.first().copied()) else {
+    // The buffer is submitted through the loader's trampolines: it needs the device's loader data,
+    // like every buffer the layer allocates.
+    let Some(cmd) = unsafe { crate::loader_data::allocate_commands(device, &alloc) }.ok().and_then(|v| v.first().copied()) else {
         cleanup();
         return None;
     };
