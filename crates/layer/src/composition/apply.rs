@@ -4,8 +4,8 @@
 //! `UpgradeToneMap` -> the transfer-ratio blend -> `GamutCompressReversible` -- built
 //! on the exact same, already-`#[test]`-verified [`super::color`] primitives that
 //! shader is hand-translated from. The orchestration below is new (previously nothing
-//! called `color`'s functions outside `#[cfg(test)]` at all -- see the crate's
-//! `CLAUDE.md` "composition" entry), but the algorithm itself is not: this file adds
+//! called `color`'s functions outside `#[cfg(test)]` at all -- see
+//! docs/history/development-before-neuralforge.md), but the algorithm itself is not: this file adds
 //! no new math, only the per-pixel loop and sRGB encode/decode needed to run
 //! `color`'s linear-light functions against real `RGBA8` bytes.
 //!

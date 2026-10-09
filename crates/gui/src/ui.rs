@@ -531,8 +531,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // `AdwViewSwitcherTitle`/`Bar` are deprecated since libadwaita 1.4 in favor of a
     // plain `AdwViewSwitcher` plus `AdwBreakpoint` -- previously left as the
     // version-compatible choice because whether CI's own libadwaita was actually new
-    // enough was never confirmed (see CLAUDE.md's now-resolved "Deliberately not done"
-    // item). Confirmed 2026-09-15 directly against a real CI run's own `apt-get
+    // enough was never confirmed. Confirmed 2026-09-15 directly against a real CI run's own `apt-get
     // install` log, not assumed: GitHub Actions' `ubuntu-latest` (Ubuntu 24.04
     // "noble") installs libadwaita 1.5.0, comfortably past the v1_4 this needs, and
     // that same run's build output was already emitting deprecation warnings for the

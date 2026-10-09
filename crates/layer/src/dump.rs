@@ -3,7 +3,7 @@
 //! defined in the protocol from early on but never acted on anywhere until now.
 //! Doubles as the tool this project first used to visually confirm
 //! `composition::apply`'s output looks right at all, rather than just "doesn't crash
-//! and the round trip reports success" (see the crate's `CLAUDE.md` entry).
+//! and the round trip reports success" (see docs/history/development-before-neuralforge.md).
 
 use std::io::BufWriter;
 use std::path::PathBuf;

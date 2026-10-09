@@ -12,10 +12,9 @@
 //! [`vulkan_layer::DeviceHooks`] for the handful of functions it actually cares about;
 //! everything else falls through to the next layer/driver automatically.
 //!
-//! Host shared-memory capture and GPU composition are implemented. Cross-process
-//! ownership and executable filtering guard the channel; the swapchain size filter
-//! additionally excludes small overlays. DMA-BUF remains experimental. See
-//! docs/HARDWARE_VALIDATION.md for presentation-validation failures still under review.
+//! Cross-process ownership and executable filtering guard the channel; the swapchain size
+//! filter additionally excludes small overlays. See docs/HARDWARE_VALIDATION.md for
+//! presentation-validation failures still under review.
 
 mod breadcrumbs;
 mod capture;
@@ -37,7 +36,7 @@ mod probe_ngx;
 mod probe_seq;
 mod preupscale;
 
-// The native backend (crates/native), linked into the 64-bit layer; nothing calls it yet.
+// The native backend (crates/native), linked into the 64-bit layer (`preupscale::native`).
 #[cfg(target_arch = "x86_64")]
 #[allow(unused_imports)]
 pub(crate) use neural_forge_native as native;
@@ -233,8 +232,8 @@ fn env_flag(name: &str) -> bool {
 
 /// Works around a crash inside Mesa's `device_select` implicit layer, confirmed
 /// reproducible even with `vulkan-layer`'s own pristine `hello-world` example under
-/// implicit activation on this machine's Mesa build (see `CLAUDE.md`'s "CRITICAL,
-/// confirmed" section for the full bisection) -- so this is a bug in the interaction
+/// implicit activation on this machine's Mesa build (see the "CRITICAL,
+/// confirmed" section of docs/history/development-before-neuralforge.md for the full bisection) -- so this is a bug in the interaction
 /// between the pinned `vulkan-layer` commit and this Mesa build, not anything specific
 /// to this crate. `vulkan_layer::Global::create_instance`'s default fallback path
 /// (taken whenever `GlobalHooks::create_instance` is `Unhandled`) eagerly resolves all
@@ -281,8 +280,7 @@ impl GlobalHooks for NeuralForgeGlobalHooks {
     }
 }
 
-/// The one device extension this layer ever asks a game's own device creation to add,
-/// for Phase 3's zero-copy capture path (`docs/ASYNC_CAPTURE_DESIGN.md`): importing the SHM
+/// The extension the layer adds to a game's own device creation for the zero-copy capture path (`docs/ASYNC_CAPTURE_DESIGN.md`): importing the SHM
 /// proxy region directly as device memory needs it on whichever device the layer's own
 /// capture commands submit against -- the game's, not a private one, since the image
 /// being copied is the game's own swapchain/render-tap source.
@@ -573,8 +571,9 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             call_next_create_device(next_create_device, link.as_ref(), physical_device, info, allocator_ptr, p_device)
         };
         // The hold inside DLSS's command buffer needs a queue of the layer's own beside the game's
-        // (`preupscale::inline`): one more in the game's graphics family, on an NVIDIA device with
-        // the pre-upscaler path on. A request with it that the driver refuses is made again without.
+        // (`preupscale::inline`): one more in a compute family without graphics ([`extra_queues`]), on
+        // an NVIDIA device with the pre-upscaler path on. A request with it that the driver refuses is
+        // made again without.
         // SAFETY: `physical_device` belongs to this instance.
         let nvidia = unsafe { instance.instance.get_physical_device_properties(physical_device) }.vendor_id == 0x10DE;
         if !create_info.p_queue_create_infos.is_null() {

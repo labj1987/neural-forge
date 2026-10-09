@@ -185,7 +185,7 @@ struct State {
     /// instead of a fresh `frame_bytes`-sized heap allocation every single present
     /// call -- see that function's own doc comment on why the snapshot exists at all.
     /// At 4K RGBA8 that's a ~31.6MiB allocation avoided every frame; measured on
-    /// `lordnikon` (2026-09-10) at ~78ms per fresh allocation+copy, a real, if not
+    /// the test machine (2026-09-10) at ~78ms per fresh allocation+copy, a real, if not
     /// fully explained (a `perf stat` on the same machine at the same time showed the
     /// process 97% backend-bound with an IPC of 0.1 -- a severe memory-subsystem
     /// stall this allocation likely aggravates without being its root cause), cost.

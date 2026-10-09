@@ -1,7 +1,7 @@
 //! GPU dispatch of `shaders/compose.comp`, wired into `capture.rs`'s write-back as of
 //! 2026-09-10 -- the real fix for [`super::apply`]'s CPU path's real, measured
-//! performance cost (see that module's own doc comment, and the crate's `CLAUDE.md`
-//! entry, for the actual numbers: ~800ms/frame single-threaded, ~97/10s even
+//! performance cost (see that module's own doc comment, and docs/history/development-before-neuralforge.md,
+//! for the actual numbers: ~800ms/frame single-threaded, ~97/10s even
 //! multi-threaded on a 16-core machine, both far short of the no-composition
 //! baseline). Same algorithm (`compose.comp` is the hand-translated GPU twin of the
 //! exact `color.rs` functions `apply.rs` calls directly), same real-hardware
@@ -9,13 +9,10 @@
 //! identical math, not a rewrite of it.
 //!
 //! Three storage images bound as inputs (`u_original`, `u_proxy`, `u_model_answer`)
-//! and one as output (`u_output`), all `R8G8B8A8_UNORM` -- matching the real, only-
-//! currently-supported `RGBA8` proxy format (`RGBA16F` still falls back to
-//! [`super::apply`]'s CPU path, same gap that path already has, unchanged by this
-//! module). `u_original` and `u_proxy` are bound to the *same* image view: no separate
-//! downscaled proxy exists yet (`capture.rs` sends the full captured frame as the
-//! proxy), so uploading it twice would be pure waste, on the GPU exactly as it already
-//! was on the CPU path.
+//! and one as output (`u_output`), all `R8G8B8A8_UNORM` (the 8-bit proxy formats). When the
+//! model saw the full frame, `u_original` and `u_proxy` are the same image and the shader
+//! encodes the proxy itself; when it ran below the frame's size, `u_proxy` is the small
+//! encoded proxy, enlarged.
 //!
 //! Two execution paths, both real and tested:
 //! - [`GpuCompose::dispatch`]/[`GpuCompose::dispatch_into_image`]: one command buffer,
@@ -765,7 +762,7 @@ impl ComposeSlot {
         // contract); every image below was just (re)created by `ensure_sized` and is
         // still `UNDEFINED` (or is being deliberately discarded via `UNDEFINED` as
         // `oldLayout`, spec-legal and exactly what a fresh per-frame result needs --
-        // see the crash-fix writeup in `CLAUDE.md` for why this specific pattern is
+        // see the crash-fix writeup in docs/history/development-before-neuralforge.md for why this specific pattern is
         // safe, unlike blindly assuming a *different* real prior layout).
         unsafe {
             let to_dst = [
@@ -1969,8 +1966,8 @@ mod tests {
     /// The real correctness check for this whole module: dispatches
     /// `shaders/compose.comp` on a real (if software) Vulkan device and confirms
     /// its output matches [`super::super::apply::apply_rgba8`] -- the same
-    /// already-real-hardware-verified CPU reference (see the crate's `CLAUDE.md`
-    /// entry) -- to within a small per-channel tolerance (GPU and CPU `pow`/`cbrt`
+    /// already-real-hardware-verified CPU reference (see
+    /// docs/history/development-before-neuralforge.md) -- to within a small per-channel tolerance (GPU and CPU `pow`/`cbrt`
     /// implementations are never bit-identical, only close). A real, non-uniform
     /// test image (not one flat color) so the tone-mapping/OkLab branches this
     /// algorithm actually has are exercised, not just the identity case.

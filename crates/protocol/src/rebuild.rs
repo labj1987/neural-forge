@@ -1,14 +1,11 @@
 //! When the native network is built again after it failed to build (re-initialising means closing and
-//! opening the network again). The schedule was first made for NVIDIA's NGX feature in 2.x:
-//!
-//! A failed `CreateFeature` used to be retried on the rebuild spacing (250 ms) for ever, with
-//! nothing in between: no backoff, no re-initialisation of NGX, and `model_up` left at 1. On the
-//! rig (4K, VRAM full) one `0xbad00002` was followed by every later creation failing too, across
-//! game launches, until the model server process was restarted (docs/PRE_UPSCALER_DESIGN.md,
-//! "Robustness: failed feature builds"). [`BuildRetry`] is the schedule that replaced it:
+//! opening the network again), and when the layer's other rebuilt objects (the native hold's passes,
+//! the after-the-upscaler server) are tried again. Retrying on a fixed short spacing for ever, with no
+//! backoff, is what kept a failed build failing (docs/PRE_UPSCALER_DESIGN.md, "Robustness: failed
+//! feature builds"). [`BuildRetry`] is the schedule:
 //!
 //! - after the 1st, 2nd and 3rd consecutive failure: wait [`BuildRetry::SHORT`] (0.5, 1, 2 s);
-//! - the 4th attempt re-initialises NGX first (`Shutdown1` + `VULKAN_Init_Ext`), once;
+//! - the 4th attempt re-initialises the network first, once;
 //! - from then on: wait [`BuildRetry::LONG`] (30 s) between attempts, re-initialising again on
 //!   every [`BuildRetry::REINIT_EVERY`]th of them (so at most every two minutes).
 //!

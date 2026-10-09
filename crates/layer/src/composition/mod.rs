@@ -1,12 +1,7 @@
-//! The composition pass: color math (`color.rs`) plus, eventually,
-//! the GPU pipeline that runs it (compute shader, descriptor sets, image resources).
-//! See the plan's milestone 4 and `color.rs`'s module doc comment for what's
-//! rederived from where.
-//!
-//! As of 2026-09-10, `apply.rs` wires `color.rs`'s math into `capture.rs`'s real
-//! write-back, on the CPU (see that module's own doc comment for exactly what it does
-//! and doesn't handle, and the crate's `CLAUDE.md` "composition" entry for the GPU
-//! path this is a correctness-first stand-in for).
+//! The composition pass: the colour math (`color.rs`), its CPU reference (`apply.rs`, which the
+//! GPU tests compare against), the proxy encode (`encode.rs`, `encode_pass.rs`) and the GPU
+//! pipeline that runs it on every present (`gpu.rs`, `shaders/compose.comp`). See `color.rs`'s
+//! module doc comment for what is rederived from where.
 #![allow(dead_code)]
 
 pub mod apply;

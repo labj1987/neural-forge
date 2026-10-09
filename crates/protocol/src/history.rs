@@ -1,8 +1,8 @@
 //! When the model's temporal history no longer belongs to the frame about to be evaluated.
 //!
-//! NGX keeps its own history inside each feature: the previous output, blended into the next
-//! one by the model's own per-pixel weight. That history is only meaningful for the frame that
-//! directly follows it. A feature that sat idle (the effect switched off and on again, the layer
+//! The network keeps a history: the previous output, blended into the next one by the model's own
+//! per-pixel weight. That history is only meaningful for the frame that directly follows it. A
+//! network that sat idle (the effect switched off and on again, the layer
 //! passing frames through during a loading screen, a request that failed open) still holds the
 //! last picture it produced, and without a reset the first frames after the gap are blended with
 //! a scene that may be minutes old.
@@ -11,9 +11,8 @@
 //! reset, or a pixel whose previous position the model never saw all get blend weight zero.
 //! See `docs/OPENDLSS_REVIEW.md`, rows "has-history flag" and "reset on idle".
 //!
-//! Pure bookkeeping with no Win32 or Vulkan calls, shared by the model server (NGX's history) and the
-//! layer's native backend (its own history images). `F` is what counts as a change of input format
-//! for the slot: the model server's 8-bit/HDR class, the layer's extent and identification.
+//! Pure bookkeeping with no Vulkan calls, used by the layer's native backend for its history images.
+//! `F` is what counts as a change of input format for the slot (the extent and identification).
 
 use std::time::{Duration, Instant};
 

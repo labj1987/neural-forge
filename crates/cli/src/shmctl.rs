@@ -1,19 +1,12 @@
-//! `neural-forge-cli shmctl` — raw status/set/toggle/capture against the live SHM header,
-//! the real equivalent of upstream's own separate `neural-forge-shmctl` debug/introspection
-//! tool (see the workspace `CLAUDE.md`'s "compared against a real, installed upstream
-//! instance" entry: this project had no equivalent of it before now). Deliberately a
-//! subcommand of `neural-forge-cli` rather than its own binary -- one fewer thing to build,
-//! package, and document for what is fundamentally the same "attach to the mapping and
-//! poke it" job `cmd_config`/the GUI's settings binding already do.
+//! `neural-forge-cli shmctl`: raw status/set/toggle/capture against the live shared-memory header,
+//! for debugging and scripted measurements. A subcommand rather than its own binary: it is the same
+//! "attach to the mapping and poke it" job the GUI's settings binding does.
 //!
-//! `status`/`set`/`toggle` operate on the same setting surface
-//! `neural_forge_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` already
-//! define (so a value changed here also gets written to `config.ini` on the GUI's next
-//! save, the same as changing it from the GUI would), plus a handful of real,
-//! genuinely useful fields that aren't user-facing "settings" in that sense --
-//! `debug_view`/`capture_request` in particular, which is what makes this the actual
-//! tool this project first used to visually confirm the composition pipeline produces
-//! correct output (see `CLAUDE.md`'s "First confirmed *correct visual output*" entry).
+//! `status`/`set`/`toggle` operate on the setting surface
+//! `neural_forge_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` define (a value
+//! changed here is saved to `config.ini`, as a change from the GUI is), plus a few fields that are not
+//! user-facing settings: `debug_view` and `capture_request` in particular, which make this the tool
+//! for confirming the composition visually.
 
 use neural_forge_protocol::ShmHeader;
 use std::sync::atomic::Ordering;

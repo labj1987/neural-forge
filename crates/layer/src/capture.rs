@@ -1,19 +1,11 @@
-//! Milestone 4 phase A/B: capture the image `queue_present_khr` is about to present
-//! into the shared-memory proxy region, run the round trip, and copy a result back
-//! before the real present call.
+//! The after-the-upscaler path: capture the image `queue_present_khr` is about to present into
+//! the shared-memory proxy region, have the model server answer it (in this process, the native
+//! backend: `preupscale::native_post`), and compose the answer back before the real present.
 //!
-//! No `VK_EXT_external_memory_host` import yet -- every byte crosses an explicit CPU
-//! `memcpy` between a host-visible/host-coherent staging buffer and the mapping
-//! `ShmClient` owns: the always-correct "staging copy" fallback, just not zero-copy; importing the mapping directly as device memory is a later
-//! optimization on top of this, not a prerequisite for it working.
-//!
-//! Stage 1 (capture into a staging buffer) is one command buffer + one fence,
-//! synchronous -- the CPU needs those bytes before it can even start the SHM round
-//! trip, so there's no way around blocking on it. What happens after the round trip
-//! is the original synchronous stage-2 write-back below (a synchronous GPU or CPU
-//! compose into the staging bytes, then one more command buffer + fence wait).
-//! The per-frame path (`run`) composes asynchronously through
-//! `composition::gpu::GpuCompose::present_temporal_delta_async` instead.
+//! The capture goes into the mapping either directly (`VK_EXT_external_memory_host`, zero-copy)
+//! or through a host-visible staging buffer and a CPU copy. The per-frame path (`run`) composes
+//! through `composition::gpu::GpuCompose::present_temporal_delta_async`; [`run_sync`] is the
+//! synchronous one-shot path a capture request takes.
 
 use ash::vk;
 
@@ -649,8 +641,8 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 
 /// Real per-frame NR compute (a model server round trip, plus
 /// whatever GPU work either side does) does not run at anywhere close to swapchain
-/// present rate -- measured on real hardware (`lordnikon`, 2026-09-10, see
-/// `CLAUDE.md`) at roughly 100-150ms end to end even once every other bottleneck
+/// present rate -- measured on real hardware (the test machine, 2026-09-10, see
+/// docs/history/development-before-neuralforge.md) at roughly 100-150ms end to end even once every other bottleneck
 /// found that same session was fixed. [`run_sync`] (this crate's entire capture path
 /// before this) called that round trip, and blocked waiting for it, from *inside*
 /// every single present call -- meaning the game's own presentation rate could never
@@ -667,7 +659,7 @@ fn model_scratch_format(proxy_format: u32, bgr_order: bool) -> Option<vk::Format
 /// that was captured alongside it. Every other frame (which, once the pipeline is
 /// running, is most of them) touches `image` not at all and returns `None`
 /// immediately, at effectively zero cost. The tradeoff this accepts, deliberately,
-/// per Alex's own explicit authorization ("do it if it gives us the most frames when
+/// on the maintainer's explicit decision ("do it if it gives us the most frames when
 /// NR is on"): the visible NR enhancement updates at whatever rate the round trip
 /// actually achieves, not every frame, and is very occasionally composited against a
 /// slightly newer frame than the one it was computed from (a few frames of temporal
@@ -1126,7 +1118,7 @@ pub unsafe fn run(
     // open the mapping (`try_round_trip`/`begin_async_request`) lives later in this
     // same function, gated behind the `composition_settings()` check right below.
     // Real bug, found and fixed 2026-09-11 via a live `vkcube` bisection on
-    // `lordnikon`: on a brand-new process the mapping is never open yet, so this used
+    // the test machine: on a brand-new process the mapping is never open yet, so this used
     // to return `None` here on literally every single frame, forever -- this function
     // was being called every present call (confirmed real, not theoretical) but never
     // actually captured or sent a single frame, because it always bailed out before
@@ -1420,7 +1412,7 @@ pub unsafe fn run(
                 // doc comments) makes that true on every pixel, which doesn't just dilute the
                 // model's edit but actively fights it: a *stronger* raw answer gets *more*
                 // aggressively cancelled by the same ratio-based rescale, confirmed by direct
-                // measurement on `lordnikon` 2026-09-12 (maxing every tuning parameter nearly
+                // measurement on the test machine 2026-09-12 (maxing every tuning parameter nearly
                 // doubled the raw model's own delta from original, then the compositor's
                 // output delta *dropped* below the unmodified baseline). No tuning knob fixes
                 // that; it's this pipeline's proxy/original conflation actively working
@@ -4801,7 +4793,7 @@ mod tests {
     /// would report meaningless numbers) and is a benchmark, so it only runs when
     /// `NEURAL_FORGE_BENCH` is set in the environment, and only prints. The established
     /// way to use it (see `docs/HARDWARE_VALIDATION.md`) is to build the release test binary,
-    /// copy it to `lordnikon`, and run it there with `NEURAL_FORGE_BENCH=1
+    /// copy it to the test machine, and run it there with `NEURAL_FORGE_BENCH=1
     /// <bin> capture_hot_path_cost_per_present --nocapture --exact`.
     ///
     /// Why this is the right metric: `run` submits its capture copy and its compose onto

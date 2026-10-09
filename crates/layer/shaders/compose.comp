@@ -6,8 +6,8 @@
 // (`composition::gpu`) as of 2026-09-10 -- kept in sync by hand with `color.rs` (GLSL
 // and Rust can't literally share source) and, for the sRGB encode/decode this file
 // adds itself below, with `composition::apply`'s `srgb_decode`/`srgb_encode`, the
-// already-real-hardware-verified CPU reference this shader is the GPU twin of (see the
-// layer crate's `CLAUDE.md` entry for that verification).
+// already-real-hardware-verified CPU reference this shader is the GPU twin of (see
+// docs/history/development-before-neuralforge.md for that verification).
 //
 // Bindings match the transport this pass reads/writes: the original frame (capture),
 // the proxy the model was shown, the model's raw answer, and the composed output.
