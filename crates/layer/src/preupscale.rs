@@ -1248,6 +1248,10 @@ const HILUMA_JITTER_WORD: usize = 3;
 /// Halton(2,3) sequence minus 0.5 in render pixels, 24 frames long (`NEURAL_FORGE_PROBE_KERNEL`, 2026-10-07).
 const CUDA_ENGINE_JITTER_WORD: usize = 10;
 
+/// The same in Crimson Desert's 310.9 Super Resolution encoder (`rrlite_enc0_*`, with Ray Reconstruction off):
+/// bytes 168-175, Halton(2,3) minus 0.5 in render pixels; bytes 176-183 hold the previous frame's
+/// (`NEURAL_FORGE_PROBE_KERNEL`, 3000 launches, 2026-10-09).
+const RRLITE_ENC0_JITTER_WORD: usize = 21;
 
 /// Which 8-byte word of a DLSS kernel's parameters holds the camera jitter, by kernel name.
 fn jitter_word(name: &str) -> Option<usize> {
@@ -1255,6 +1259,8 @@ fn jitter_word(name: &str) -> Option<usize> {
         Some(HILUMA_JITTER_WORD)
     } else if name.starts_with("cuda_engine_input_kernel") {
         Some(CUDA_ENGINE_JITTER_WORD)
+    } else if name.starts_with("rrlite_enc0_") {
+        Some(RRLITE_ENC0_JITTER_WORD)
     } else {
         None
     }
@@ -4954,6 +4960,8 @@ mod jitter_tests {
     fn the_jitter_word_follows_the_kernel() {
         assert_eq!(jitter_word("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"), Some(3));
         assert_eq!(jitter_word("cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi"), Some(10));
+        assert_eq!(jitter_word("rrlite_enc0_4x4_mvlo_hdr_folded"), Some(21));
+        assert_eq!(jitter_word("rrlite_enc1_4x4"), None);
         assert_eq!(jitter_word("rr2_enc0_kernel"), None, "Ray Reconstruction is never held");
         assert_eq!(jitter_word("rr2_enc1_kernel"), None);
         assert_eq!(jitter_word("main_kernel"), None);
