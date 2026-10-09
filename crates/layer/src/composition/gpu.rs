@@ -2438,6 +2438,33 @@ mod tests {
         }
     }
 
+    /// Detail strength in the ratio transfer: 0 returns the frame untouched (light and colour), 1 applies
+    /// the model's answer, and values between land between.
+    #[test]
+    fn detail_strength_scales_the_ratio_transfer_down_to_nothing() {
+        let (w, h) = (16u32, 16u32);
+        let original = [100u8, 110, 70];
+        let frame: Vec<u8> = (0..w * h).flat_map(|_| [original[0], original[1], original[2], 255]).collect();
+        // A brighter answer of another hue: an edit of both light and colour.
+        let answer: Vec<u8> = (0..w * h).flat_map(|_| [160u8, 120, 90, 255]).collect();
+        let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let centre = ((8 * w + 8) * 4) as usize;
+        let at = |strength: f32| compose_once(w, h, &frame, &frame, &answer, ComposeParams { transfer_strength: strength, ..base }).map(|o| [o[centre], o[centre + 1], o[centre + 2]]);
+        let Some(none) = at(0.0) else {
+            eprintln!("detail strength test: no Vulkan device, skipping");
+            return;
+        };
+        assert!(none.iter().zip(original).all(|(&c, o)| (i32::from(c) - i32::from(o)).abs() <= 1), "strength 0 changed the frame: {none:?}");
+        let full = at(1.0).unwrap();
+        let half = at(0.5).unwrap();
+        assert_ne!(half, full);
+        assert!(full[0] > original[0] + 10, "strength 1 applies the brighter answer: {full:?}");
+        for c in 0..3 {
+            let (lo, hi) = (none[c].min(full[c]), none[c].max(full[c]));
+            assert!((lo..=hi).contains(&half[c]), "strength 0.5 lands between 0 and 1: {none:?} {half:?} {full:?}");
+        }
+    }
+
     /// The replace modes bring the model's answer straight back (through the inverse of its
     /// curve) instead of composing it: an answer far brighter than the frame arrives whole,
     /// where the composition's relighting guard would hold it to at most twice the frame's light.

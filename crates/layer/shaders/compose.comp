@@ -561,11 +561,11 @@ void main() {
         float moved = smoothstep(0.35, 1.2, worst);
         edit_ratio = mix(edit_ratio, smooth_ratio, moved * clamp(params.ghost_guard, 0.0, 1.0));
       }
-      // Detail strength above 1 as a power on the ratio, not an extended blend: it
-      // cannot go negative, leaves an unchanged pixel alone (one to any power is one),
-      // moves brightening and darkening by the same factor, and stays a ratio, so the
-      // guard below still binds it.
-      float amplified = pow(max(edit_ratio, 1e-6), 1.0 + max(params.transfer_strength - 1.0, 0.0));
+      // Detail strength as a power on the ratio, not a blend: 0 leaves the frame as it is, 1 takes
+      // the model's ratio, and above 1 amplifies it. It cannot go negative, leaves an unchanged
+      // pixel alone (one to any power is one), moves brightening and darkening by the same
+      // factor, and stays a ratio, so the guard below still binds it.
+      float amplified = pow(max(edit_ratio, 1e-6), max(params.transfer_strength, 0.0));
 
       float guard = max(params.max_ratio, 1.0);
       // Relighting cannot invent light, so the room to brighten shrinks toward none as
@@ -612,7 +612,9 @@ void main() {
         // shortened. Debug view 5: the composed colour as it stood before that bound.
         colour_allow_debug = vec3(1.0 - colour_allow, colour_allow, 0.0);
         pre_bound_debug = fully_upgraded;
-        result = GamutCompressReversible(mix(luminance_only, bounded_colour, clamp(params.colour_strength, 0.0, 1.0) * hue_trust));
+        // The model's colour follows the detail strength below 1 as its light does (none at 0).
+        float colour_weight = clamp(params.colour_strength, 0.0, 1.0) * hue_trust * clamp(params.transfer_strength, 0.0, 1.0);
+        result = GamutCompressReversible(mix(luminance_only, bounded_colour, colour_weight));
       }
     }
   } else if (params.mode == 1u) {
