@@ -1790,7 +1790,9 @@ impl Tracker {
             None if rgba16f && layout == vk::ImageLayout::GENERAL => return None,
             None => Hazard::NotSplittable,
         };
-        let exposure_input = inputs.exposure_input.map(|(image, d)| {
+        // The inputs are refreshed on the next submit, not when an image is destroyed: an exposure
+        // input or motion vectors destroyed since are not copied from.
+        let exposure_input = inputs.exposure_input.filter(|(image, _)| self.images.contains_key(image)).map(|(image, d)| {
             let layout = self
                 .pending
                 .get(&cb)
@@ -1801,7 +1803,7 @@ impl Tracker {
         });
         // DLSS's motion vectors, copied beside the colour input for the native backend's history: RG16F
         // at the colour input's extent, in a layout known here (or GENERAL for a storage image).
-        let mvec_input = {
+        let mvec_input = self.images.contains_key(&inputs.mvec.0).then(|| {
             let (image, d) = inputs.mvec;
             let layout = self
                 .pending
@@ -1814,8 +1816,8 @@ impl Tracker {
                 && d.format == vk::Format::R16G16_SFLOAT
                 && (d.width, d.height) == (desc.width, desc.height)
                 && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
-            Some(Aux { image, format: d.format, layout, readable })
-        };
+            Aux { image, format: d.format, layout, readable }
+        });
         Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, identification: self.generation, hazard })
     }
 
@@ -5923,6 +5925,11 @@ mod tests {
         let (b, c) = t.take_inline_at().expect("first colour launch");
         let point = t.inline_point(b, c).expect("held inside the buffer");
         assert_eq!((point.layout, point.hazard), (vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, Hazard::NotSplittable));
+        assert_eq!(point.mvec_input.map(|a| a.image), Some(vk::Image::from_raw(0x300)));
+        // The motion vectors destroyed before the inputs are refreshed: the hold copies nothing from them.
+        t.forget_image(vk::Image::from_raw(0x300));
+        let point = t.inline_point(b, c).expect("still held inside the buffer");
+        assert!(point.mvec_input.is_none(), "a destroyed motion-vector image is copied from");
     }
 
     /// Depth and motion vectors are read only by a dump: a barrier on them before the launch stops
