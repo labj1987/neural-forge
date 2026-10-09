@@ -81,7 +81,7 @@ mod tests {
 
     struct ScratchConfigHome {
         _guard: std::sync::MutexGuard<'static, ()>,
-        prev: Option<String>,
+        prev: Vec<(&'static str, Option<String>)>,
         dir: std::path::PathBuf,
     }
 
@@ -91,17 +91,24 @@ mod tests {
             // XDG_CONFIG_HOME too, and a separate lock here did not exclude them.
             let guard = crate::paths::tests::XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             let dir = std::env::temp_dir().join(format!("neural-forge-profiles-test-{tag}-{}", std::process::id()));
-            let prev = std::env::var("XDG_CONFIG_HOME").ok();
-            std::env::set_var("XDG_CONFIG_HOME", &dir);
+            // Config, data and state all point into the scratch dir: nothing here may create the
+            // real XDG dirs.
+            let mut prev = Vec::new();
+            for (var, sub) in [("XDG_CONFIG_HOME", ""), ("XDG_DATA_HOME", "data-home"), ("XDG_STATE_HOME", "state-home")] {
+                prev.push((var, std::env::var(var).ok()));
+                std::env::set_var(var, if sub.is_empty() { dir.clone() } else { dir.join(sub) });
+            }
             Self { _guard: guard, prev, dir }
         }
     }
 
     impl Drop for ScratchConfigHome {
         fn drop(&mut self) {
-            match self.prev.take() {
-                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            for (var, value) in self.prev.drain(..) {
+                match value {
+                    Some(v) => std::env::set_var(var, v),
+                    None => std::env::remove_var(var),
+                }
             }
             std::fs::remove_dir_all(&self.dir).ok();
         }

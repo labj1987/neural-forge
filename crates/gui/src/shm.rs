@@ -150,10 +150,18 @@ mod tests {
         let shm_path = scratch.join("shm.bin");
         std::fs::create_dir_all(&config_home).unwrap();
 
-        let prev_xdg_config = std::env::var("XDG_CONFIG_HOME").ok();
-        let prev_shm = std::env::var("NEURAL_FORGE_SHM").ok();
-        std::env::set_var("XDG_CONFIG_HOME", &config_home);
-        std::env::set_var("NEURAL_FORGE_SHM", &shm_path);
+        // Config, data and state all go to the scratch dir, so the test never creates the real
+        // XDG dirs.
+        let vars = [
+            ("XDG_CONFIG_HOME", config_home.clone()),
+            ("XDG_DATA_HOME", scratch.join("data")),
+            ("XDG_STATE_HOME", scratch.join("state")),
+            ("NEURAL_FORGE_SHM", shm_path.clone()),
+        ];
+        let prev: Vec<(&str, Option<String>)> = vars.iter().map(|(var, _)| (*var, std::env::var(var).ok())).collect();
+        for (var, value) in &vars {
+            std::env::set_var(var, value);
+        }
 
         {
             let shm = Shm::open().expect("first open should succeed and create a fresh mapping");
@@ -190,13 +198,11 @@ mod tests {
         assert_eq!(f32::from_bits(shm.0.header().intensity_bits.load(Ordering::Relaxed)), 0.5);
         drop(shm);
 
-        match prev_xdg_config {
-            Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
-            None => std::env::remove_var("XDG_CONFIG_HOME"),
-        }
-        match prev_shm {
-            Some(v) => std::env::set_var("NEURAL_FORGE_SHM", v),
-            None => std::env::remove_var("NEURAL_FORGE_SHM"),
+        for (var, value) in prev {
+            match value {
+                Some(v) => std::env::set_var(var, v),
+                None => std::env::remove_var(var),
+            }
         }
         std::fs::remove_dir_all(&scratch).ok();
     }
