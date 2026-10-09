@@ -309,10 +309,11 @@ impl Inline {
             // SAFETY: the slot is not owned by any buffer that could still be pending (`begin`
             // freed it, or it went unsubmitted for `STALE`); the image is rebuilt at the new size.
             unsafe { self.resize_slot(&mut s.slots[index], extent) };
-            if s.slots[index].image == vk::Image::null() {
-                self.say_once(format!("a staging image of {}x{} could not be built; that buffer is not held inside", extent.0, extent.1));
-                return false;
-            }
+        }
+        // Also when the extent did not change: a slot whose build failed has no image to copy into.
+        if s.slots[index].image == vk::Image::null() {
+            self.say_once(format!("a staging image of {}x{} could not be built; that buffer is not held inside", extent.0, extent.1));
+            return false;
         }
         let slot = &mut s.slots[index];
         // DLSS's exposure input, copied beside the colour input when it can be read from where it is
@@ -471,13 +472,15 @@ impl Inline {
         }
     }
 
-    /// (Re)builds the slot's staging image at `extent`. Leaves a null image when that fails.
+    /// (Re)builds the slot's staging image at `extent`. Leaves a null image and no extent when that
+    /// fails, so the next hold at any size builds it again.
     ///
     /// # Safety
     /// Nothing pending may use the slot's current image.
     unsafe fn resize_slot(&self, slot: &mut Slot, extent: (u32, u32)) {
         // SAFETY: not in use (contract).
         unsafe { free_mvec(&self.device, slot) };
+        (slot.mvec, slot.mvec_memory) = Default::default();
         if slot.image != vk::Image::null() {
             // SAFETY: not in use (contract).
             unsafe {
@@ -488,6 +491,10 @@ impl Inline {
         slot.extent = extent;
         // SAFETY: the device is live.
         (slot.image, slot.memory) = unsafe { self.image(vk::Format::R16G16B16A16_SFLOAT, extent) }.unwrap_or_default();
+        if slot.image == vk::Image::null() {
+            slot.extent = (0, 0);
+            return;
+        }
         // Without it the hold still runs, with no history for the native backend.
         // SAFETY: the device is live.
         (slot.mvec, slot.mvec_memory) = unsafe { self.image(vk::Format::R16G16_SFLOAT, extent) }.unwrap_or_default();
@@ -500,6 +507,10 @@ impl Inline {
     /// # Safety
     /// The device is live.
     unsafe fn image(&self, format: vk::Format, extent: (u32, u32)) -> Option<(vk::Image, vk::DeviceMemory)> {
+        #[cfg(test)]
+        if tests::FAIL_IMAGES.get() {
+            return None;
+        }
         let d = &self.device;
         let families = [self.app_family, self.side_family];
         let mut info = vk::ImageCreateInfo::builder()
@@ -754,6 +765,64 @@ mod tests {
     use super::*;
     use crate::preupscale::{Hazard, ImageDesc};
     use std::sync::atomic::AtomicU32;
+
+    thread_local! {
+        /// Makes every staging image this thread asks for fail to build.
+        pub(super) static FAIL_IMAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// A slot whose staging image could not be built is never recorded with a null image: the next
+    /// hold at the same size refuses again while building fails, and builds it once it succeeds.
+    #[test]
+    fn a_failed_staging_image_is_rebuilt_not_recorded_null() {
+        let Some((_entry, instance, physical_device, device, _queue, family)) = crate::composition::gpu::test_device() else { return };
+        let device = Arc::new(device);
+        let hold: HoldFn = Box::new(|_job, _queue| {});
+        let inline = Inline::start(device.clone(), &instance, physical_device, vk::Queue::null(), family, family, hold).expect("worker");
+        let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE;
+        let point = |w, h| InlinePoint {
+            colour: vk::Image::null(),
+            desc: ImageDesc { width: w, height: h, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true },
+            layout: vk::ImageLayout::GENERAL,
+            exposure_input: None,
+            mvec_input: None,
+            identification: 0,
+            hazard: Hazard::MemoryBarrier,
+        };
+        // SAFETY: test-only setup on a live device; every handle is destroyed at the end. The buffers
+        // are never submitted, so the null colour input is never read.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let cbs = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(3)).unwrap();
+            let begin = vk::CommandBufferBeginInfo::default();
+            let record = |cb, w, h| {
+                device.begin_command_buffer(cb, &begin).unwrap();
+                inline.begin(cb, begin.flags);
+                let recorded = inline.record(cb, point(w, h));
+                device.end_command_buffer(cb).unwrap();
+                recorded
+            };
+            let slots = || inline.slots.lock().unwrap().slots.iter().map(|slot| (slot.image, slot.extent)).collect::<Vec<_>>();
+            // One slot, built at 32x16 and freed again by re-recording its buffer.
+            assert!(record(cbs[0], 32, 16));
+            device.begin_command_buffer(cbs[0], &begin).unwrap();
+            inline.begin(cbs[0], begin.flags);
+            device.end_command_buffer(cbs[0]).unwrap();
+            assert_eq!(slots().len(), 1);
+            // The resize to 48x24 fails, and the next hold at 48x24 must not take the slot as built.
+            FAIL_IMAGES.set(true);
+            assert!(!record(cbs[1], 48, 24));
+            assert!(!record(cbs[2], 48, 24), "recorded a hold with no staging image: {:?}", slots());
+            FAIL_IMAGES.set(false);
+            assert!(record(cbs[1], 48, 24), "the slot was not rebuilt once building works again");
+            assert_eq!(slots(), vec![(slots()[0].0, (48, 24))]);
+            assert_ne!(slots()[0].0, vk::Image::null());
+            device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()).unwrap();
+            inline.begin(cbs[1], begin.flags);
+            destroy(device.handle());
+            device.destroy_command_pool(pool, None);
+        }
+    }
 
     /// The commands recorded into the application's buffer on a real device (lavapipe in CI): the
     /// GPU stops at the hold until the worker releases it, the colour input comes back exactly as
