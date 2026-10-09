@@ -991,6 +991,13 @@ pub(crate) enum Hazard {
     /// split needs (it reads and writes it as a storage image); only the hold inside the buffer,
     /// which converts, takes it ([`inline`]).
     NotSplittable,
+    /// Not a hazard: the split could take this buffer, but this identification's holds already run
+    /// inside DLSS's buffer ([`Tracker::inline_recorded`]). Hogwarts Legacy refuses the split for some
+    /// of its DLSS buffers and not others; holding those at the split as well alternated the two
+    /// holds frame by frame, and each switch rebuilt the hold's resources (the split's on DLSS's
+    /// queue family, the inside hold's on the side queue's) and with them the native network's
+    /// pipelines and history (2026-10-09).
+    HeldInside,
 }
 
 impl Hazard {
@@ -1003,6 +1010,7 @@ impl Hazard {
             Self::EventWait => "the DLSS launch buffer waits on an event before its launch; not holding, frames go to DLSS untouched",
             Self::SuspendedRendering => "the DLSS launch buffer resumes dynamic rendering suspended in the buffer before it; not holding (nothing may be submitted between the two), frames go to DLSS untouched",
             Self::NotSplittable => "the colour input is not an RGBA16F image in GENERAL; only the hold inside DLSS's buffer takes it",
+            Self::HeldInside => "this identification's holds run inside DLSS's buffer; every buffer is held there, so the hold keeps one set of resources and the network its history",
         }
     }
 }
@@ -1132,6 +1140,10 @@ pub(crate) struct Tracker {
     colour_barriers: u64,
     last_colour_layout: Option<vk::ImageLayout>,
     said_layout_miss: bool,
+    /// The identification ([`Self::generation`]) a hold inside DLSS's buffer was recorded for: from
+    /// then on [`Self::inline_point`] answers for the buffers the split could take too
+    /// ([`Hazard::HeldInside`]).
+    inline_in_use: Option<u64>,
     /// Diagnostics: the kernels seen making a buffer's first launch naming a colour candidate.
     said_first_kernels: Vec<String>,
     /// The probe's parameter-layout lines already written, by kernel name and buffer size
@@ -1779,6 +1791,7 @@ impl Tracker {
         let at = Inputs { colour: (colour, desc), ..inputs };
         let hazard = match self.launch_hazard(cb, Some(&at)).0 {
             Some(h) => h,
+            None if rgba16f && layout == vk::ImageLayout::GENERAL && self.inline_in_use == Some(self.generation) => Hazard::HeldInside,
             None if rgba16f && layout == vk::ImageLayout::GENERAL => return None,
             None => Hazard::NotSplittable,
         };
@@ -1811,6 +1824,11 @@ impl Tracker {
             Aux { image, format: d.format, layout, readable }
         });
         Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, identification: self.generation, hazard })
+    }
+
+    /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
+    pub(crate) fn inline_recorded(&mut self, identification: u64) {
+        self.inline_in_use = Some(identification);
     }
 
     /// Takes the mark [`Self::launch_kernel`] left for the launch just recorded.
@@ -2736,6 +2754,11 @@ impl Tracking {
     /// `vkCreateCuFunctionNVX` created `function` for the kernel `name`.
     pub(crate) fn record_function(&self, function: vk::CuFunctionNVX, name: &str) {
         self.lock().record_function(function, name);
+    }
+
+    /// [`Tracker::inline_recorded`].
+    pub(crate) fn inline_recorded(&self, identification: u64) {
+        self.lock().inline_recorded(identification);
     }
 
     pub(crate) fn forget_function(&self, function: vk::CuFunctionNVX) {
@@ -5890,6 +5913,34 @@ mod tests {
         let (mut t, _) = held_tracker_with(copyable);
         t.launch(cb(3), Some(&param_block(&[0x1200])));
         assert_eq!(t.take_inline_at(), None);
+    }
+
+    /// Once a hold inside DLSS's buffer was recorded for an identification, a buffer the split
+    /// could take is held inside too (Hogwarts Legacy refuses the split for some of its DLSS
+    /// buffers only): the two holds alternating rebuilt the hold's resources, and the network's
+    /// pipelines and history with them, every frame. Another identification starts over.
+    #[test]
+    fn once_held_inside_every_buffer_of_that_identification_is() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        t.global(cb(2), Hazard::MemoryBarrier);
+        t.launch(cb(2), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        let point = t.inline_point(b, c).expect("held inside the buffer");
+        // GTA V's pattern before any hold inside was recorded: the split's.
+        t.launch(cb(3), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert!(t.inline_point(b, c).is_none());
+        // Recorded: the same pattern is held inside now.
+        t.inline_recorded(point.identification);
+        t.launch(cb(4), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert_eq!(t.inline_point(b, c).map(|p| p.hazard), Some(Hazard::HeldInside));
+        // A hold inside recorded for another identification: the split's again.
+        t.inline_recorded(point.identification + 1);
+        t.launch(cb(5), Some(&params));
+        let (b, c) = t.take_inline_at().expect("first colour launch");
+        assert!(t.inline_point(b, c).is_none());
     }
 
     /// An implausible game exposure (Wukong's DLSS-internal 1x1 read 59,456) stops that
