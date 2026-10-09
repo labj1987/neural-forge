@@ -1127,6 +1127,9 @@ pub(crate) unsafe fn run_native_hold(
     }
     result.writeback_gpu_ms = writeback_gpu;
     result.network_gpu_ms = res.native.as_mut().and_then(|n| n.take_gpu_ms(device));
+    // The game's exposure the previous hold's capture read (finished: waited above), for the
+    // caller's check (`Session::check_exposure`). Only for this identification.
+    let previous_read = res.game_exposure_read.take() == Some(target.identification);
     if !loader.claim_pre() {
         result.miss = Some("the network is serving the after-the-upscaler path");
         return result;
@@ -1185,6 +1188,9 @@ pub(crate) unsafe fn run_native_hold(
             return result;
         }
         pass.auto_for(target.identification);
+    }
+    if previous_read && source == super::ExposureSource::Game {
+        result.previous_exposure = Some(pass.exposure_value());
     }
     pass.clear_exposure();
     // SAFETY: nothing of the pass is pending; the colour input is a live RGBA16F storage image.
@@ -1257,6 +1263,7 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     }
     result.waits_consumed = true;
+    res.game_exposure_read = (source == super::ExposureSource::Game).then_some(target.identification);
     for cmd in frame_cmds {
         if crate::note_vk(submit(super::Which::Native, cmd, vk::Fence::null())).is_err() {
             // The capture ran; nothing reads its result. The decode is not submitted, so DLSS gets

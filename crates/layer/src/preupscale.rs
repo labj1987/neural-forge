@@ -164,6 +164,21 @@ pub(crate) const HAND_BACK: Duration = Duration::from_secs(30);
 /// read up to 59,456 ([`Session::check_exposure`]).
 pub(crate) const EXPOSURE_TRUST_MAX: f32 = 1000.0;
 
+/// The largest factor the game's exposure image may change by between two holds of one
+/// identification without counting as a jump ([`Session::check_exposure`]). A game's eye adaptation
+/// moves a few stops a second at most; Hogwarts Legacy's 1x1 read 0.0027-0.0034 with the frames
+/// untouched, and jumped between about 0.0023 and 0.000013 (180x) from hold to hold once the
+/// model's frames reached the game's own adaptation (2026-10-09): the encode then darkened the frame
+/// to nothing and the network answered noise.
+pub(crate) const EXPOSURE_JUMP_MAX: f32 = 32.0;
+
+/// Jumps within [`EXPOSURE_JUMP_WINDOW`] holds that make the game's exposure untrusted. One jump, or
+/// one there and back, is a cut that resets the game's adaptation (Crimson Desert: 0.0069 to 0.91
+/// once, at its menus, 2026-10-09); Hogwarts Legacy's runaway jumps on most holds.
+pub(crate) const EXPOSURE_JUMPS: u32 = 3;
+/// See [`EXPOSURE_JUMPS`]: the count starts over after this many holds without a jump.
+pub(crate) const EXPOSURE_JUMP_WINDOW: u32 = 120;
+
 /// The fence waits of this path, by class. Both are the layer-wide bound today
 /// ([`crate::FENCE_WAIT_TIMEOUT`], 5 s, there against a driver that stalls without losing the
 /// device); they are named apart so that the one on the game's submit thread can be given its own
@@ -3449,6 +3464,10 @@ pub(crate) struct Resources {
     /// When the native hold builds its passes again after a failed build.
     #[cfg(target_arch = "x86_64")]
     native_retry: native::Retries,
+    /// The identification of the last native hold whose capture read the game's exposure image into
+    /// the HDR pass's exposure buffer ([`HoldResult::previous_exposure`]).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) game_exposure_read: Option<u64>,
     capture_pending: bool,
     writeback_pending: bool,
 }
@@ -3528,6 +3547,8 @@ impl Resources {
             native: None,
             #[cfg(target_arch = "x86_64")]
             native_retry: native::Retries::default(),
+            #[cfg(target_arch = "x86_64")]
+            game_exposure_read: None,
             capture_pending: false,
             writeback_pending: false,
         })
@@ -3714,6 +3735,10 @@ pub(crate) struct HoldResult {
     pub exposure: Option<f32>,
     /// Model and roundtrip modes: where it came from.
     pub exposure_source: Option<ExposureSource>,
+    /// Native holds: the game's exposure the previous hold of the same identification on these
+    /// resources read. The native hold does not wait for its own capture, so its value is read at
+    /// the next hold, once that work has finished.
+    pub previous_exposure: Option<f32>,
     /// With [`ExposureSource::Auto`]: what the auto-exposure measured.
     pub auto_exposure: Option<hdr::AutoState>,
     /// Where the hold's CPU time went (wall time on this thread).
@@ -4439,9 +4464,14 @@ pub(crate) struct Session {
     engaged: bool,
     /// The identification and exposure source last logged ([`Self::note_exposure_source`]).
     exposure_said: Option<(u64, ExposureSource)>,
-    /// The identification whose game exposure read implausibly high ([`Self::check_exposure`]): its
-    /// holds measure the exposure from the frame instead.
+    /// The identification whose game exposure read implausibly high or jumped ([`Self::check_exposure`]):
+    /// its holds measure the exposure from the frame instead.
     exposure_untrusted: Option<u64>,
+    /// The game's exposure the last checked hold read, and its identification.
+    last_game_exposure: Option<(u64, f32)>,
+    /// Jumps of the game's exposure in the identification of [`Self::last_game_exposure`], and the
+    /// holds since the last one ([`EXPOSURE_JUMPS`]).
+    exposure_jumps: (u32, u32),
     /// The native backend's network on this device, when it was created for it.
     pub(crate) native: Option<NativeLoader>,
     /// The native backend's after-the-upscaler server (`native_post`), once the mapping is open.
@@ -4656,20 +4686,42 @@ impl Session {
 
     /// After a hold that read the game's exposure: a value over [`EXPOSURE_TRUST_MAX`] is not an
     /// exposure (Black Myth: Wukong's benchmark uses DLSS's own auto-exposure; the 1x1 R16F its DLSS
-    /// buffer names read 0.22 in some scenes and up to 59,456 in others, 2026-10-05). From then on
-    /// that identification's holds measure the exposure from the frame. Logged once.
+    /// buffer names read 0.22 in some scenes and up to 59,456 in others, 2026-10-05), and one that
+    /// jumped by more than [`EXPOSURE_JUMP_MAX`] between holds [`EXPOSURE_JUMPS`] times within
+    /// [`EXPOSURE_JUMP_WINDOW`] holds is not the game's eye adaptation (Hogwarts Legacy, whose
+    /// adaptation reacts to the frames the model changed). From then on that identification's holds
+    /// measure the exposure from the frame. Logged once.
     pub(crate) fn check_exposure(&mut self, identification: u64, result: &HoldResult) {
-        if result.exposure_source == Some(ExposureSource::Game)
-            && result.exposure.is_some_and(|e| e > EXPOSURE_TRUST_MAX)
-            && self.exposure_untrusted != Some(identification)
-        {
-            self.exposure_untrusted = Some(identification);
-            crate::log!(
-                "[preupscale] the game's exposure image read {:.1} (over {EXPOSURE_TRUST_MAX}): not an exposure; measuring it from the frame for this identification",
-                result.exposure.unwrap_or_default()
-            );
-            crate::logging::flush();
+        if result.exposure_source != Some(ExposureSource::Game) || self.exposure_untrusted == Some(identification) {
+            return;
         }
+        let Some(e) = result.exposure.or(result.previous_exposure).filter(|e| e.is_finite() && *e > 0.0) else { return };
+        let previous = self.last_game_exposure.filter(|(id, _)| *id == identification).map(|(_, p)| p);
+        if previous.is_none() {
+            self.exposure_jumps = (0, 0);
+        }
+        self.last_game_exposure = Some((identification, e));
+        let jump = previous.filter(|p| (e / p).max(p / e) > EXPOSURE_JUMP_MAX);
+        let (jumps, quiet) = &mut self.exposure_jumps;
+        if jump.is_some() {
+            *jumps += 1;
+            *quiet = 0;
+        } else {
+            *quiet += 1;
+            if *quiet > EXPOSURE_JUMP_WINDOW {
+                *jumps = 0;
+            }
+        }
+        let why = if e > EXPOSURE_TRUST_MAX {
+            format!("read {e:.1} (over {EXPOSURE_TRUST_MAX}): not an exposure")
+        } else if let Some(p) = jump.filter(|_| *jumps >= EXPOSURE_JUMPS) {
+            format!("jumped {} times by over {EXPOSURE_JUMP_MAX}x between holds (last from {p} to {e}): not the game's eye adaptation", *jumps)
+        } else {
+            return;
+        };
+        self.exposure_untrusted = Some(identification);
+        crate::log!("[preupscale] the game's exposure image {why}; measuring it from the frame for this identification");
+        crate::logging::flush();
     }
 
     pub(crate) fn note_exposure_source(&mut self, identification: u64, inputs: &Inputs, result: &HoldResult) {
@@ -5950,13 +6002,52 @@ mod tests {
     fn an_implausible_game_exposure_switches_that_identification_to_the_measured_one() {
         let mut session = Session::default();
         let result = |source, e| HoldResult { exposure_source: Some(source), exposure: Some(e), ..HoldResult::default() };
-        session.check_exposure(7, &result(ExposureSource::Game, 0.2195));
+        session.check_exposure(5, &result(ExposureSource::Game, 0.2195));
+        session.check_exposure(6, &result(ExposureSource::Game, 3.32));
+        assert!(session.game_exposure_trusted(5) && session.game_exposure_trusted(6));
         session.check_exposure(7, &result(ExposureSource::Game, 3.32));
         session.check_exposure(7, &result(ExposureSource::Auto, 59456.0));
         assert!(session.game_exposure_trusted(7));
         session.check_exposure(7, &result(ExposureSource::Game, 59456.0));
         assert!(!session.game_exposure_trusted(7));
         assert!(session.game_exposure_trusted(8), "a new identification starts trusted");
+    }
+
+    /// A game exposure that jumps by more than [`EXPOSURE_JUMP_MAX`] between holds, again and again,
+    /// is not eye adaptation (Hogwarts Legacy with the model on: 0.0023, 0.000013, 0.0021, ...): that
+    /// identification switches to the measured exposure. Adaptation over frames (Hogwarts Legacy
+    /// untouched: 0.0027-0.0034; a fast scene change, 16x), a cut there and back (Crimson Desert's
+    /// menus: 0.0069 to 0.91), cuts far apart and a jump across identifications do not; the native
+    /// hold's value, read a hold late, counts the same.
+    #[test]
+    fn a_game_exposure_that_keeps_jumping_switches_to_the_measured_one() {
+        let mut session = Session::default();
+        let game = |e| HoldResult { exposure_source: Some(ExposureSource::Game), exposure: Some(e), ..HoldResult::default() };
+        let native = |e| HoldResult { exposure_source: Some(ExposureSource::Game), previous_exposure: Some(e), ..HoldResult::default() };
+        for e in [0.0032, 0.0027, 0.0034, 0.0031, 0.0496] {
+            session.check_exposure(3, &game(e));
+        }
+        assert!(session.game_exposure_trusted(3), "adaptation, and a 16x step, are not jumps");
+        for e in [0.0069, 0.91, 0.91, 0.0069] {
+            session.check_exposure(3, &game(e));
+        }
+        assert!(session.game_exposure_trusted(3), "a cut there and back");
+        for _ in 0..=EXPOSURE_JUMP_WINDOW {
+            session.check_exposure(3, &game(0.0069));
+        }
+        session.check_exposure(3, &game(0.91));
+        assert!(session.game_exposure_trusted(3), "cuts far apart");
+        session.check_exposure(4, &game(0.000013));
+        assert!(session.game_exposure_trusted(4), "a new identification is compared with nothing");
+        session.check_exposure(9, &native(0.0023));
+        session.check_exposure(9, &HoldResult { exposure_source: Some(ExposureSource::Game), ..HoldResult::default() });
+        assert!(session.game_exposure_trusted(9), "a hold without a value read is not judged");
+        session.check_exposure(9, &native(0.000013));
+        session.check_exposure(9, &native(0.0021));
+        assert!(session.game_exposure_trusted(9), "two jumps");
+        session.check_exposure(9, &native(0.000014));
+        assert!(!session.game_exposure_trusted(9));
+        assert!(session.game_exposure_trusted(3));
     }
 
     /// Unreal Engine 5's DLSS packs two 32-bit view handles into one 8-byte parameter word (Black
