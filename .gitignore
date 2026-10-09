@@ -12,3 +12,8 @@
 
 # Native backend toolchain (scripts/fetch-native-tools.sh)
 /tools/
+
+# Benchmark and test output
+/bench-out/
+test-native.log
+release-notes.md

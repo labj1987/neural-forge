@@ -192,7 +192,7 @@ a real GTA session, or against `vkcube` run through Xwayland specifically, befor
 concluding this needs a fork of the pinned framework -- patching a third-party git
 dependency is a real undertaking and should not be started on an unreproduced report.
 
-Also added `scripts/bench.sh` for Phase 1 item 1 (the repeatable native/upstream/
+Also added `bench.sh` (since replaced by `scripts/gta-bench.sh`) for Phase 1 item 1 (the repeatable native/upstream/
 neuralforge benchmark script). It restarts Steam under each mode's environment (an
 already-running Steam client does not pick up a new shell's exported vars -- confirmed
 the hard way in the 2026-09-14 session above), waits for `GTA5_Enhanced.exe`, and then
@@ -567,7 +567,7 @@ rewritten so the reasoning trail stays honest:
 model" read above -- item 2 is a real NeuralForge bug, not a law of physics).** Every
 earlier "upstream" run that day was invalid two ways at once: the Steam client was
 never restarted between tests (it kept the first launch's `NEURAL_FORGE_ENABLE`
-environment -- the `scripts/bench.sh` gotcha this file documents), *and* GTA's saved
+environment -- the `bench.sh` gotcha this file documents), *and* GTA's saved
 Steam launch options bake in `NEURAL_FORGE_ENABLE=1 ... %command%`, which Steam applies
 per-game regardless of the client environment. The fix was `NEURAL_FORGE_DISABLE=1`
 (the layer manifest's own `disable_environment`, honored at the Vulkan-loader level

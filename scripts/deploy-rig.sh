@@ -4,10 +4,14 @@
 # proves the installed files are byte-identical to the ones inside the AppImage. Leaves nothing
 # behind: no backup of the previous AppImage (releases are the rollback) and no temp files.
 #
-# Usage: scripts/deploy-rig.sh [host]
+# Usage: scripts/deploy-rig.sh <host>      (or NF_DEPLOY_HOST=<host> scripts/deploy-rig.sh)
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
-HOST="${1:-lordnikon}"
+HOST="${1:-${NF_DEPLOY_HOST:-}}"
+if [ -z "$HOST" ]; then
+    echo "usage: scripts/deploy-rig.sh <host>  (or set NF_DEPLOY_HOST)" >&2
+    exit 2
+fi
 VERSION="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
 APPIMAGE="neural-forge-$VERSION-x86_64.AppImage"
 

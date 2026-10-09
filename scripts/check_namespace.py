@@ -16,14 +16,27 @@ meta = ET.parse(root / f'data/{identity}.appdata.xml').getroot()
 assert meta.find('id').text == identity
 assert meta.find('launchable').text == f'{identity}.desktop'
 assert '\nExec=neural-forge\n' in (root / f'data/{identity}.desktop').read_text()
-# The pre-0.1.77 spelling (`NEURALFORGE_*`, `neuralforge` paths) is gone everywhere.
-for path in (root / 'crates').rglob('*.rs'):
-    code = path.read_text()
-    assert 'NEURALFORGE_' not in code, path
-    assert not re.search(r'(?<![A-Za-z_])neuralforge[-_/]', code.replace('VK_LAYER_neuralforge_neural', '')), path
-    assert not re.search(r'(?:var|var_os|set_var)\("(?:DLSSNR_|VKLayer_DLSS5)', code), path
-    assert 'nvngx_neuralforge' not in code, path
-    assert 'NEURALFORGE.Color' not in code, path
+# The pre-0.1.77 spelling (`NEURALFORGE_*`, `neuralforge` paths) is gone everywhere: Rust sources, scripts,
+# data files and the packaging script. Only the two frozen identifiers (and one history file name) keep the old spelling.
+# The history file keeps its name (it records the project before the rename).
+FROZEN = ('VK_LAYER_neuralforge_neural', 'io.github.labj1987.NeuralForge', 'development-before-neuralforge.md')
+scanned = list((root / 'crates').rglob('*.rs'))
+for folder in ('scripts', 'data'):
+    scanned += [p for p in (root / folder).rglob('*') if p.is_file() and p.suffix != '.spv']
+scanned.append(root / 'build-appimage.sh')
+for path in scanned:
+    if path == Path(__file__).resolve():
+        continue
+    try:
+        code = path.read_text()
+    except UnicodeDecodeError:
+        continue  # binary data
+    for frozen in FROZEN:
+        code = code.replace(frozen, '')
+    assert not re.search(r'neuralforge|NEURALFORGE', code), path
+    if path.suffix == '.rs':
+        assert not re.search(r'(?:var|var_os|set_var)\("(?:DLSSNR_|VKLayer_DLSS5)', code), path
+        assert 'NEURALFORGE.Color' not in code, path
 assert (root / 'README.md').read_text().startswith('# Neural Forge\n')
 assert '`dlssnr` is a from-scratch' not in (root / 'ATTRIBUTION.md').read_text()
 assert '|labj1987|neural-forge|latest|' in (root / 'build-appimage.sh').read_text()
