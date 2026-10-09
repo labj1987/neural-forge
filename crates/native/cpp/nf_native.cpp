@@ -6,6 +6,7 @@
 #include <volk.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -22,6 +23,10 @@
 #include "vk_context.h"
 
 namespace {
+
+// A network of this process fell back to barriers (nf_native_fall_back_to_barriers): counter chaining
+// faulted or timed out here, so no network opened later in the process chains again.
+std::atomic<bool> g_fellBack{false};
 
 void say(char* out, size_t len, const std::string& text) {
   if (!out || !len) return;
@@ -377,7 +382,7 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
   try {
     n->fenceTimeoutNs = (uint64_t)open->fence_timeout_ms * 1'000'000ull;
     nf_native::installAssetLoader();
-    nr::Kernels::setChainEnabled(open->chain != 0);
+    nr::Kernels::setChainEnabled(open->chain != 0 && !g_fellBack.load());
     n->context = std::make_unique<vk::Context>(open->gipa, open->instance, open->physical, open->device, open->queue_family,
                                                open->queue_index, n->fenceTimeoutNs, open->init_dispatchable, open->init_user,
                                                open->frame_family);
@@ -465,6 +470,7 @@ uint32_t nf_native_chain_timeouts(const NfNative* n, char* where, size_t where_l
 void nf_native_reset_chain_timeouts(NfNative* n) { n->kernels->resetChainTimeouts(); }
 
 uint32_t nf_native_fall_back_to_barriers(NfNative* n, char* err, size_t err_len) {
+  g_fellBack.store(true);
   nr::Kernels::setChainEnabled(false);
   n->kernels->resetChainTimeouts();
   return nf_native_build(n, n->geometry.validWidth, n->geometry.validHeight, err, err_len);

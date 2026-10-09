@@ -100,7 +100,8 @@ uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err,
 uint32_t nf_native_chain_timeouts(const NfNative* n, char* where, size_t where_len);
 void nf_native_reset_chain_timeouts(NfNative* n);
 
-// Rebuilds the graph with barriers between every launch (process-wide, permanent). The previous
+// Rebuilds the graph with barriers between every launch (process-wide, permanent: a network opened
+// later in the process does not chain either, whatever its `chain`). The previous
 // secondary must not be pending. Same cost as nf_native_build.
 uint32_t nf_native_fall_back_to_barriers(NfNative* n, char* err, size_t err_len);
 
