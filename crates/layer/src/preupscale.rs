@@ -3431,6 +3431,9 @@ pub(crate) struct Resources {
     /// The native backend's frame resources (`native`), built on its first hold.
     #[cfg(target_arch = "x86_64")]
     native: Option<native::NativePass>,
+    /// When the native hold builds its passes again after a failed build.
+    #[cfg(target_arch = "x86_64")]
+    native_retry: native::Retries,
     capture_pending: bool,
     writeback_pending: bool,
 }
@@ -3507,6 +3510,8 @@ impl Resources {
             hdr: None,
             #[cfg(target_arch = "x86_64")]
             native: None,
+            #[cfg(target_arch = "x86_64")]
+            native_retry: native::Retries::default(),
             capture_pending: false,
             writeback_pending: false,
         })

@@ -25,6 +25,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use ash::vk;
+use ash::vk::Handle;
 use neural_forge_native as nn;
 use neural_forge_protocol::history::{HistoryGap, Stale};
 use neural_forge_protocol::rebuild::{BuildRetry, FailInject, Step};
@@ -520,6 +521,18 @@ impl NativePass {
     /// # Safety
     /// `device` is live; `family` is the queue family the frames are submitted on.
     pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32) -> Option<Self> {
+        // SAFETY: forwarded.
+        unsafe { Self::build_failing_at(device, instance, physical_device, family, width, height, None) }
+    }
+
+    /// [`Self::build`], failing on purpose at creation step `fail_at` (`0..BUILD_STEPS`) when given.
+    /// Built piece by piece; [`PassPartial`] destroys whatever exists on an early return.
+    ///
+    /// # Safety
+    /// As [`Self::build`].
+    unsafe fn build_failing_at(
+        device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32, fail_at: Option<usize>,
+    ) -> Option<Self> {
         let (padded_width, padded_height) = super::padded(width, height);
         let binding = |n: u32, ty: vk::DescriptorType| {
             vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build()
@@ -536,72 +549,109 @@ impl NativePass {
             binding(8, vk::DescriptorType::STORAGE_BUFFER),
             binding(9, vk::DescriptorType::STORAGE_BUFFER),
         ];
-        // SAFETY: valid create infos throughout; on a failure part way, the handles made so far leak
-        // (a few small objects, once per extent at most), never anything submitted.
+        let mut steps = 0usize;
+        // `Some` unless this creation step is the one to fail.
+        let mut step = || {
+            let n = steps;
+            steps += 1;
+            (fail_at != Some(n)).then_some(())
+        };
+        let mut p = PassPartial::new(device);
+        // SAFETY: valid create infos throughout; every object created here is owned by `p` until the
+        // end, where it moves into the result.
         unsafe {
-            let set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
-            let pipeline_layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&set_layout)), None).ok()?;
-            let preprocess = hdr::compute_pipeline(device, pipeline_layout, PREPROCESS_SPV)?;
-            let composite = hdr::compute_pipeline(device, pipeline_layout, COMPOSITE_SPV)?;
-            let sampler = device
-                .create_sampler(
-                    &vk::SamplerCreateInfo::builder()
-                        .mag_filter(vk::Filter::LINEAR)
-                        .min_filter(vk::Filter::LINEAR)
-                        .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
-                        .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
-                        .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
-                    None,
-                )
-                .ok()?;
+            step()?;
+            p.set_layout = made(device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?);
+            step()?;
+            p.pipeline_layout = made(device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&p.set_layout)), None).ok()?);
+            step()?;
+            p.preprocess = made(hdr::compute_pipeline(device, p.pipeline_layout, PREPROCESS_SPV)?);
+            step()?;
+            p.composite = made(hdr::compute_pipeline(device, p.pipeline_layout, COMPOSITE_SPV)?);
+            step()?;
+            p.sampler = made(
+                device
+                    .create_sampler(
+                        &vk::SamplerCreateInfo::builder()
+                            .mag_filter(vk::Filter::LINEAR)
+                            .min_filter(vk::Filter::LINEAR)
+                            .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
+                            .address_mode_u(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                            .address_mode_v(vk::SamplerAddressMode::CLAMP_TO_EDGE)
+                            .address_mode_w(vk::SamplerAddressMode::CLAMP_TO_EDGE),
+                        None,
+                    )
+                    .ok()?,
+            );
             let sizes = [
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 4 },
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 2 },
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 12 },
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 2 },
             ];
-            let pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(2).pool_sizes(&sizes), None).ok()?;
-            let layouts = [set_layout, set_layout];
-            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(&layouts)).ok()?;
-            let image = |usage| OwnImage::new(device, instance, physical_device, width, height, usage);
-            let history = [image(vk::ImageUsageFlags::SAMPLED)?, image(vk::ImageUsageFlags::SAMPLED)?];
+            step()?;
+            p.pool = made(device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(2).pool_sizes(&sizes), None).ok()?);
+            let layouts = [p.set_layout, p.set_layout];
+            step()?;
+            // Freed with the pool.
+            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(p.pool).set_layouts(&layouts)).ok()?;
+            for _ in 0..2 {
+                step()?;
+                p.history.push(made(OwnImage::new(device, instance, physical_device, width, height, vk::ImageUsageFlags::SAMPLED)?));
+            }
             let texels = u64::from(width) * u64::from(height);
-            let mvec = OwnBuffer::new(device, instance, physical_device, texels * 4, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?;
+            step()?;
+            p.mvec = Some(made(OwnBuffer::new(device, instance, physical_device, texels * 4, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?));
             let answer_bytes = u64::from(padded_width) * u64::from(padded_height) * 8;
-            let answer = OwnBuffer::new(device, instance, physical_device, answer_bytes, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            let state = OwnBuffer::new(device, instance, physical_device, 16, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?;
-            let params = [
-                own_host_buffer_with(device, instance, physical_device, PARAMS_BYTES, vk::BufferUsageFlags::UNIFORM_BUFFER)?,
-                own_host_buffer_with(device, instance, physical_device, PARAMS_BYTES, vk::BufferUsageFlags::UNIFORM_BUFFER)?,
-            ];
-            let command_pool = device
-                .create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
-                .ok()?;
-            let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(command_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3);
+            step()?;
+            p.answer = Some(made(OwnBuffer::new(device, instance, physical_device, answer_bytes, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER)?));
+            step()?;
+            p.state = Some(made(OwnBuffer::new(device, instance, physical_device, 16, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?));
+            for _ in 0..2 {
+                step()?;
+                p.params.push(made(own_host_buffer_with(device, instance, physical_device, PARAMS_BYTES, vk::BufferUsageFlags::UNIFORM_BUFFER)?));
+            }
+            step()?;
+            p.command_pool = made(
+                device
+                    .create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
+                    .ok()?,
+            );
+            let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(p.command_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3);
+            step()?;
+            // Freed with the command pool.
             let cmds = crate::loader_data::allocate_commands(device, &alloc).ok()?;
+            debug_assert_eq!(steps, BUILD_STEPS);
+            // Optional (`None` where timestamps are not supported): nothing fails from here on.
+            let timers = [
+                crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).map(made),
+                crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).map(made),
+            ];
+            let take_buffer = |b: &mut Option<OwnBuffer>| b.take().expect("built above");
+            let (mvec, answer, state) = (take_buffer(&mut p.mvec), take_buffer(&mut p.answer), take_buffer(&mut p.state));
+            let mut history = std::mem::take(&mut p.history).into_iter();
+            let history = [history.next().expect("built above"), history.next().expect("built above")];
+            let mut params = std::mem::take(&mut p.params).into_iter();
+            let params = [params.next().expect("built above"), params.next().expect("built above")];
             Some(Self {
                 width,
                 height,
                 padded_width,
-                set_layout,
-                pipeline_layout,
-                preprocess,
-                composite,
-                sampler,
-                pool,
+                set_layout: std::mem::take(&mut p.set_layout),
+                pipeline_layout: std::mem::take(&mut p.pipeline_layout),
+                preprocess: std::mem::take(&mut p.preprocess),
+                composite: std::mem::take(&mut p.composite),
+                sampler: std::mem::take(&mut p.sampler),
+                pool: std::mem::take(&mut p.pool),
                 sets: [sets[0], sets[1]],
                 history,
                 mvec,
                 answer,
                 state,
                 params,
-                command_pool,
+                command_pool: std::mem::take(&mut p.command_pool),
                 commands: [cmds[0], cmds[1], cmds[2]],
-                timers: [
-                    crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
-                    crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
-                ],
+                timers,
                 last_parity: None,
                 recorded: None,
                 initialised: false,
@@ -829,7 +879,9 @@ impl NativePass {
         unsafe {
             for t in self.timers.iter().flatten() {
                 t.destroy(device);
+                destroyed(1);
             }
+            destroyed(PASS_OBJECTS);
             device.destroy_command_pool(self.command_pool, None);
             for h in &self.history {
                 h.destroy(device);
@@ -848,6 +900,142 @@ impl NativePass {
             device.destroy_descriptor_set_layout(self.set_layout, None);
         }
     }
+}
+
+/// The creation steps of [`NativePass::build`] that can fail, in order.
+const BUILD_STEPS: usize = 16;
+/// The objects [`NativePass::destroy`] destroys besides its timers.
+const PASS_OBJECTS: isize = 14;
+
+#[cfg(test)]
+thread_local! {
+    /// Objects of the native pass created minus destroyed on this thread (the tests' leak check).
+    static LIVE: std::cell::Cell<isize> = const { std::cell::Cell::new(0) };
+}
+
+/// Notes one object created (counted in tests only).
+fn made<T>(object: T) -> T {
+    #[cfg(test)]
+    LIVE.with(|l| l.set(l.get() + 1));
+    object
+}
+
+/// Notes `n` objects destroyed (counted in tests only).
+fn destroyed(n: isize) {
+    #[cfg(test)]
+    LIVE.with(|l| l.set(l.get() - n));
+    #[cfg(not(test))]
+    let _ = n;
+}
+
+/// [`NativePass::build`]'s objects so far; destroys them unless moved out.
+struct PassPartial<'a> {
+    device: &'a ash::Device,
+    set_layout: vk::DescriptorSetLayout,
+    pipeline_layout: vk::PipelineLayout,
+    preprocess: vk::Pipeline,
+    composite: vk::Pipeline,
+    sampler: vk::Sampler,
+    pool: vk::DescriptorPool,
+    history: Vec<OwnImage>,
+    mvec: Option<OwnBuffer>,
+    answer: Option<OwnBuffer>,
+    state: Option<OwnBuffer>,
+    params: Vec<HostBuffer>,
+    command_pool: vk::CommandPool,
+}
+
+impl<'a> PassPartial<'a> {
+    fn new(device: &'a ash::Device) -> Self {
+        Self {
+            device,
+            set_layout: vk::DescriptorSetLayout::null(),
+            pipeline_layout: vk::PipelineLayout::null(),
+            preprocess: vk::Pipeline::null(),
+            composite: vk::Pipeline::null(),
+            sampler: vk::Sampler::null(),
+            pool: vk::DescriptorPool::null(),
+            history: Vec::new(),
+            mvec: None,
+            answer: None,
+            state: None,
+            params: Vec::new(),
+            command_pool: vk::CommandPool::null(),
+        }
+    }
+}
+
+impl Drop for PassPartial<'_> {
+    fn drop(&mut self) {
+        let d = self.device;
+        let handles = [
+            self.command_pool.as_raw(),
+            self.pool.as_raw(),
+            self.sampler.as_raw(),
+            self.preprocess.as_raw(),
+            self.composite.as_raw(),
+            self.pipeline_layout.as_raw(),
+            self.set_layout.as_raw(),
+        ];
+        let objects = handles.iter().filter(|&&h| h != 0).count() + self.history.len() + self.params.len();
+        let buffers = [self.mvec.take(), self.answer.take(), self.state.take()];
+        destroyed((objects + buffers.iter().flatten().count()) as isize);
+        // SAFETY: nothing here was ever submitted; null handles are ignored by the destroy calls;
+        // freeing the pools frees the sets and command buffers allocated from them.
+        unsafe {
+            d.destroy_command_pool(self.command_pool, None);
+            for h in &self.history {
+                h.destroy(d);
+            }
+            for b in buffers.iter().flatten() {
+                b.destroy(d);
+            }
+            for b in &self.params {
+                b.destroy(d);
+            }
+            d.destroy_descriptor_pool(self.pool, None);
+            d.destroy_sampler(self.sampler, None);
+            d.destroy_pipeline(self.preprocess, None);
+            d.destroy_pipeline(self.composite, None);
+            d.destroy_pipeline_layout(self.pipeline_layout, None);
+            d.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
+}
+
+/// When a hold builds a pass again after building it failed: at once for another extent, else on the
+/// network loader's schedule ([`BuildRetry`]: 0.5, 1 and 2 s, then every 30 s), never on every hold.
+#[derive(Debug, Default)]
+pub(crate) struct PassRetry {
+    failed: Option<(u32, u32)>,
+    retry: BuildRetry,
+}
+
+impl PassRetry {
+    /// The result of `build` for `extent`, or `None` without calling it while a failed build of the
+    /// same extent is not due again.
+    pub(crate) fn build<T>(&mut self, extent: (u32, u32), now: Instant, build: impl FnOnce() -> Option<T>) -> Option<T> {
+        if self.failed == Some(extent) && matches!(self.retry.step(now), Step::Wait(_)) {
+            return None;
+        }
+        let built = build();
+        if built.is_some() {
+            self.failed = None;
+            self.retry.succeeded();
+        } else {
+            self.failed = Some(extent);
+            self.retry.failed(now);
+        }
+        built
+    }
+}
+
+/// The retry state of a device's native hold: the HDR pass, its auto-exposure, the native pass.
+#[derive(Debug, Default)]
+pub(crate) struct Retries {
+    pub(crate) hdr: PassRetry,
+    pub(crate) auto: PassRetry,
+    pub(crate) pass: PassRetry,
 }
 
 /// `NEURAL_FORGE_NATIVE_FAIL=chain`: reports one counter-chain timeout at the 300th network frame, to
@@ -957,9 +1145,12 @@ pub(crate) unsafe fn run_native_hold(
     // The HDR encode and decode, exactly as the model server hold uses them.
     let source = super::ExposureSource::of(target);
     result.exposure_source = Some(source);
+    // A failed build is tried again on the retry schedule or for another extent, not on every hold.
+    let now = Instant::now();
+    let extent = (res.width, res.height);
     if res.hdr.is_none() {
         // SAFETY: `device` is live.
-        res.hdr = unsafe { hdr::HdrPass::build(device, instance, physical_device, res.width, res.height) };
+        res.hdr = res.native_retry.hdr.build(extent, now, || unsafe { hdr::HdrPass::build(device, instance, physical_device, extent.0, extent.1) });
     }
     let Some(pass) = res.hdr.as_mut() else {
         result.miss = Some("the HDR encode/decode pipelines could not be built");
@@ -967,7 +1158,7 @@ pub(crate) unsafe fn run_native_hold(
     };
     if source == super::ExposureSource::Auto {
         // SAFETY: `device` is live; nothing of the pass is pending.
-        if !unsafe { pass.ensure_auto(device, instance, physical_device) } {
+        if res.native_retry.auto.build(extent, now, || unsafe { pass.ensure_auto(device, instance, physical_device) }.then_some(())).is_none() {
             result.miss = Some("the auto-exposure pipeline could not be built (no exposure image to read)");
             return result;
         }
@@ -995,8 +1186,12 @@ pub(crate) unsafe fn run_native_hold(
     let mut native = match res.native.take().filter(|n| n.matches(target.width, target.height)) {
         Some(n) => n,
         None => {
-            // SAFETY: `device` is live; `res.queue_family` is the frames' family.
-            match unsafe { NativePass::build(device, instance, physical_device, res.queue_family, target.width, target.height) } {
+            let family = res.queue_family;
+            // SAFETY: `device` is live; `family` is the frames' family.
+            let built = res.native_retry.pass.build((target.width, target.height), now, || unsafe {
+                NativePass::build(device, instance, physical_device, family, target.width, target.height)
+            });
+            match built {
                 Some(n) => n,
                 None => {
                     result.miss = Some("the native frame resources could not be built");
@@ -1095,6 +1290,55 @@ mod tests {
         assert!(copied_mvec(None).is_none());
         assert!(copied_mvec(aux(Some(vk::ImageLayout::GENERAL), true)).is_some());
         assert!(copied_mvec(aux(Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), true)).is_some(), "transitioned for the copy");
+    }
+
+    /// A failure at every creation step of the native pass destroys everything created before it, and a
+    /// failed build is not tried again by the next hold inside the retry's backoff.
+    #[test]
+    fn a_failed_native_pass_build_destroys_what_it_made_and_waits_before_trying_again() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let live = || LIVE.with(std::cell::Cell::get);
+        for at in 0..BUILD_STEPS {
+            // SAFETY: a fresh device; nothing is submitted.
+            let pass = unsafe { NativePass::build_failing_at(device, instance, physical, family, W, H, Some(at)) };
+            assert!(pass.is_none(), "step {at} fails");
+            assert_eq!(live(), 0, "every object made before step {at} is destroyed");
+        }
+        // SAFETY: as above.
+        let pass = unsafe { NativePass::build_failing_at(device, instance, physical, family, W, H, Some(BUILD_STEPS)) }.expect("no step fails");
+        assert!(live() > 0);
+        // SAFETY: nothing of it was submitted.
+        unsafe { pass.destroy(device) };
+        assert_eq!(live(), 0, "destroy destroys everything build made");
+
+        // The hold's retry: a failure, then a second hold inside the backoff does not build.
+        let mut retry = PassRetry::default();
+        let calls = std::cell::Cell::new(0);
+        let t0 = Instant::now();
+        let hold = |retry: &mut PassRetry, extent: (u32, u32), at: Instant, fail: bool| {
+            retry.build(extent, at, || {
+                calls.set(calls.get() + 1);
+                // SAFETY: as above.
+                unsafe { NativePass::build_failing_at(device, instance, physical, family, extent.0, extent.1, fail.then_some(3)) }
+            })
+        };
+        assert!(hold(&mut retry, (W, H), t0, true).is_none());
+        assert!(hold(&mut retry, (W, H), t0 + std::time::Duration::from_millis(100), true).is_none());
+        assert_eq!(calls.get(), 1, "the second hold inside the backoff does not build");
+        // Another extent is tried at once; the first one again once its backoff passed.
+        assert!(hold(&mut retry, (W + 2, H), t0 + std::time::Duration::from_millis(200), true).is_none());
+        assert_eq!(calls.get(), 2, "another extent builds at once");
+        let later = t0 + BuildRetry::SHORT[0] + BuildRetry::SHORT[1] + std::time::Duration::from_millis(300);
+        let pass = hold(&mut retry, (W, H), later, false).expect("built once the backoff passed");
+        assert_eq!(calls.get(), 3);
+        assert_eq!(retry.failed, None);
+        // SAFETY: nothing of it was submitted.
+        unsafe { pass.destroy(device) };
+        assert_eq!(live(), 0);
     }
 
     const W: u32 = 20;
