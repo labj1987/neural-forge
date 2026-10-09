@@ -372,6 +372,12 @@ fn process(
         loader.release_post();
         ok
     };
+    if !evaluated && gpu.stalled && gpu.slots[slot.index()].as_ref().is_some_and(|b| !b.answer.staged) {
+        // The frame that did not finish writes the shared answer region itself (imported, zero-copy) and may
+        // still be running: no echo into it and no answer published. The client's deadline presents the frame
+        // untouched.
+        return;
+    }
     let (proxy, answer) = view.regions(slot);
     if !evaluated && bytes > 0 {
         // Fail open, as the model server does: the frame itself comes back.
