@@ -291,7 +291,12 @@ impl Loader {
                     Err(format!("{} asked this build to fail", FailInject::ENV))
                 }
                 Some((w, h)) => {
-                    let built = if fall_back { n.fall_back_to_barriers() } else { n.build(w, h) };
+                    // SAFETY: nothing of the previous build is pending: a wanted size or a fallback is only
+                    // asked for once the holds stopped using it (`ready` returns another size's build to
+                    // no hold; `fall_back` is called after the frames that used it were drained).
+                    // The fallback rebuilds at the previous build's size: built again for the size wanted now,
+                    // so `Built` is never labelled with a size it was not built for.
+                    let built = unsafe { if fall_back { n.fall_back_to_barriers().and_then(|_| n.build(w, h)) } else { n.build(w, h) } };
                     match built {
                         Ok(frame) => Ok((n, Some((w, h, frame)))),
                         Err(why) => {
@@ -1122,7 +1127,12 @@ pub(crate) unsafe fn run_native_hold(
     }
     result.writeback_gpu_ms = writeback_gpu;
     result.network_gpu_ms = res.native.as_mut().and_then(|n| n.take_gpu_ms(device));
-    // Every frame that ran the graph has completed: the chain watchdog's count is final for them.
+    if !loader.claim_pre() {
+        result.miss = Some("the network is serving the after-the-upscaler path");
+        return result;
+    }
+    // Every frame that ran the graph has completed (this path's: the hold waited above; the other
+    // path's: `claim_pre` says none ran for a second): the chain watchdog's count is final for them.
     let fake = fake_chain_timeout(res.native.as_ref().map_or(0, |n| n.frames));
     if let Some((waits, at)) = loader.chain_timeouts().filter(|(n, _)| *n > 0).or(fake) {
         crate::log!("[native] {waits} counter-chain wait(s) of the network gave up ({at}); rebuilding it with barriers between its launches");
@@ -1132,10 +1142,6 @@ pub(crate) unsafe fn run_native_hold(
             n.gap.skipped();
         }
         result.miss = Some("the network's counter chain timed out; it is being rebuilt with barriers");
-        return result;
-    }
-    if !loader.claim_pre() {
-        result.miss = Some("the network is serving the after-the-upscaler path");
         return result;
     }
     let Some(built) = loader.ready(target.width, target.height) else {

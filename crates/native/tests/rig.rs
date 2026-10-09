@@ -114,9 +114,11 @@ fn a_larger_build_after_a_smaller_one_on_one_network() {
     };
     // SAFETY: the device was made with device_extend; the compute queue is the network's alone.
     let mut net = unsafe { Network::open(&open) }.expect("open");
-    let small = net.build(1280, 720).expect("the 1280x720 build");
+    // SAFETY: nothing of a previous build exists.
+    let small = unsafe { net.build(1280, 720) }.expect("the 1280x720 build");
     eprintln!("1280x720: {small:?}");
-    let large = net.build(3840, 2160).expect("the 3840x2160 build after the 1280x720 one");
+    // SAFETY: the small build's graph was never submitted.
+    let large = unsafe { net.build(3840, 2160) }.expect("the 3840x2160 build after the 1280x720 one");
     eprintln!("3840x2160: {large:?}");
     assert!(large.field_width >= 3840 && large.field_height >= 2160);
     let d = &g.device;
@@ -171,7 +173,8 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
     // SAFETY: the device was made with device_extend; queue 1 is the network's alone.
     let mut net = unsafe { Network::open(&open) }.expect("open");
     let opened = t.elapsed();
-    let frame = net.build(WIDTH, HEIGHT).expect("build");
+    // SAFETY: nothing of a previous build exists.
+    let frame = unsafe { net.build(WIDTH, HEIGHT) }.expect("build");
     eprintln!("open {:?}, build {:?}, frame {frame:?}", opened, t.elapsed() - opened);
     assert_eq!((frame.field_width, frame.field_height), (1536, 896));
     assert_eq!(features.len() as u64, u64::from(frame.field_width) * u64::from(frame.field_height) * 64);

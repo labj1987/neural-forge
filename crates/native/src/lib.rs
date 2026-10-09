@@ -238,10 +238,13 @@ impl Network {
     }
 
     /// The graph for a `width` x `height` frame, run once (PTX compile, weight copies) and recorded.
-    /// Nothing of a previous build may be pending.
-    pub fn build(&mut self, width: u32, height: u32) -> Result<Frame, String> {
+    ///
+    /// # Safety
+    /// Nothing of a previous build may be pending: no submitted work that executes its graph (either
+    /// recording) or a straight [`Self::record_graph`] may still run, since the build frees them.
+    pub unsafe fn build(&mut self, width: u32, height: u32) -> Result<Frame, String> {
         let mut err = [0 as c_char; MESSAGE];
-        // SAFETY: `raw` is live.
+        // SAFETY: `raw` is live; nothing of the previous build is pending (this function's contract).
         if unsafe { ffi::nf_native_build(self.raw, width, height, err.as_mut_ptr(), MESSAGE) } != 1 {
             return Err(message(&err));
         }
@@ -299,10 +302,14 @@ impl Network {
         unsafe { ffi::nf_native_reset_chain_timeouts(self.raw) }
     }
 
-    /// Rebuilds the graph with barriers between launches (for the rest of the process).
-    pub fn fall_back_to_barriers(&mut self) -> Result<Frame, String> {
+    /// Rebuilds the graph with barriers between launches (for the rest of the process), at the previous
+    /// build's size.
+    ///
+    /// # Safety
+    /// As [`Self::build`]: nothing of a previous build may be pending.
+    pub unsafe fn fall_back_to_barriers(&mut self) -> Result<Frame, String> {
         let mut err = [0 as c_char; MESSAGE];
-        // SAFETY: `raw` is live.
+        // SAFETY: `raw` is live; nothing of the previous build is pending (this function's contract).
         if unsafe { ffi::nf_native_fall_back_to_barriers(self.raw, err.as_mut_ptr(), MESSAGE) } != 1 {
             return Err(message(&err));
         }

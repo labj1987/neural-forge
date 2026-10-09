@@ -32,10 +32,12 @@ std::atomic<bool> g_fellBack{false};
 // the asset loader are process-global, so a second network would repoint the first one's calls.
 std::atomic<bool> g_live{false};
 
-void say(char* out, size_t len, const std::string& text) {
+void say(char* out, size_t len, const char* text) {
   if (!out || !len) return;
-  snprintf(out, len, "%s", text.c_str());
+  snprintf(out, len, "%s", text);
 }
+
+void say(char* out, size_t len, const std::string& text) { say(out, len, text.c_str()); }
 
 // One feature flag the kernels need: where it lives in the Vulkan 1.1/1.2/1.3 aggregate structure
 // (if it was promoted) and in its own structure, with the extension that structure belongs to.
@@ -294,7 +296,13 @@ extern "C" {
 
 uint32_t nf_native_abi_version(void) { return 1; }
 
-uint32_t nf_native_asset_count(const char* kind) { return nf_native::assetCount(kind); }
+uint32_t nf_native_asset_count(const char* kind) {
+  try {
+    return nf_native::assetCount(kind);
+  } catch (...) {
+    return 0;
+  }
+}
 
 uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                                     char* missing, size_t missing_len) {
@@ -304,6 +312,9 @@ uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance i
     return first.empty() ? 1 : 0;
   } catch (const std::exception& e) {
     say(missing, missing_len, e.what());
+    return 0;
+  } catch (...) {
+    say(missing, missing_len, "an unknown C++ exception");
     return 0;
   }
 }
@@ -370,6 +381,10 @@ uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance inst
     *out = *in;
     say(err, err_len, e.what());
     return 0;
+  } catch (...) {
+    *out = *in;
+    say(err, err_len, "an unknown C++ exception");
+    return 0;
   }
 }
 
@@ -377,7 +392,7 @@ void nf_native_device_restore(void* state) {
   auto* x = static_cast<Extension*>(state);
   if (!x) return;
   for (auto it = x->restore.rbegin(); it != x->restore.rend(); ++it) *it->first = it->second;
-  delete x;
+  delete x;   // no throwing destructors in Extension
 }
 
 NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err, size_t err_len) {
@@ -387,8 +402,25 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
     say(err, err_len, "another network is open in this process (one at a time: its Vulkan function table is process-wide)");
     return nullptr;
   }
-  auto n = std::make_unique<NfNative>();
+  std::unique_ptr<NfNative> n;
+  // What a failed open made: destroyed, or leaked when a wait timed out (each part's own rule).
+  auto fail = [&](const char* why) -> NfNative* {
+    say(err, err_len, why);
+    if (n) {
+      if (stalled) *stalled = n->stalled() ? 1 : 0;
+      if (n->context && !n->stalled()) {
+        if (n->secondaryPool) vkDestroyCommandPool(n->context->device(), n->secondaryPool, nullptr);
+        if (n->ownPool) vkDestroyCommandPool(n->context->device(), n->ownPool, nullptr);
+      }
+      n->kernels.reset();
+      n->model.reset();
+      n->context.reset();
+    }
+    g_live.store(false);
+    return nullptr;
+  };
   try {
+    n = std::make_unique<NfNative>();
     n->fenceTimeoutNs = (uint64_t)open->fence_timeout_ms * 1'000'000ull;
     nf_native::installAssetLoader();
     nr::Kernels::setChainEnabled(open->chain != 0 && !g_fellBack.load());
@@ -411,18 +443,9 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
     }
     return n.release();
   } catch (const std::exception& e) {
-    say(err, err_len, e.what());
-    if (stalled) *stalled = n->stalled() ? 1 : 0;
-    if (n->context && !n->stalled()) {
-      if (n->secondaryPool) vkDestroyCommandPool(n->context->device(), n->secondaryPool, nullptr);
-      if (n->ownPool) vkDestroyCommandPool(n->context->device(), n->ownPool, nullptr);
-    }
-    // Stalled, each of these leaks what it made instead of destroying it.
-    n->kernels.reset();
-    n->model.reset();
-    n->context.reset();
-    g_live.store(false);
-    return nullptr;
+    return fail(e.what());
+  } catch (...) {
+    return fail("an unknown C++ exception");
   }
 }
 
@@ -436,9 +459,14 @@ uint32_t nf_native_build(NfNative* n, uint32_t valid_width, uint32_t valid_heigh
     return 1;
   } catch (const std::exception& e) {
     say(err, err_len, e.what());
-    n->dropGraph();
-    return 0;
+  } catch (...) {
+    say(err, err_len, "an unknown C++ exception");
   }
+  try {
+    n->dropGraph();
+  } catch (...) {
+  }
+  return 0;
 }
 
 uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame) {
@@ -468,13 +496,21 @@ uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err,
   } catch (const std::exception& e) {
     say(err, err_len, e.what());
     return 0;
+  } catch (...) {
+    say(err, err_len, "an unknown C++ exception");
+    return 0;
   }
 }
 
 uint32_t nf_native_chain_timeouts(const NfNative* n, char* where, size_t where_len) {
-  const nr::Kernels::ChainTimeouts timeouts = n->kernels->chainTimeouts();
-  say(where, where_len, timeouts.counter);
-  return timeouts.waits;
+  try {
+    const nr::Kernels::ChainTimeouts timeouts = n->kernels->chainTimeouts();
+    say(where, where_len, timeouts.counter);
+    return timeouts.waits;
+  } catch (...) {
+    say(where, where_len, "unreadable");
+    return 0;
+  }
 }
 
 void nf_native_reset_chain_timeouts(NfNative* n) { n->kernels->resetChainTimeouts(); }
