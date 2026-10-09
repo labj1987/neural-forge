@@ -235,6 +235,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             return std::process::ExitCode::FAILURE;
         }
     };
+    neural_forge_supervisor::apply_saved_settings(&cfg, &mapping);
     let header = mapping.header();
 
     let ok = match args.first().map(String::as_str) {
@@ -267,6 +268,15 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             false
         }
     };
+    // A changed setting is saved the way the GUI and `profile load` save one, so it survives a
+    // reboot and the next cold start does not put the old value back.
+    let changes_settings = matches!(args.first().map(String::as_str), Some("set" | "toggle" | "reset"));
+    if ok && changes_settings {
+        if let Err(e) = neural_forge_supervisor::save_settings(header) {
+            eprintln!("shmctl: applied to the live channel, but saving config.ini failed: {e}");
+            return std::process::ExitCode::FAILURE;
+        }
+    }
     if ok {
         std::process::ExitCode::SUCCESS
     } else {

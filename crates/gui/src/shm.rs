@@ -63,11 +63,7 @@ impl Shm {
     pub fn open() -> Result<Self, neural_forge_protocol::mapping::OpenError> {
         let cfg = neural_forge_supervisor::Config::load();
         let mapping = neural_forge_supervisor::open_channel(&cfg)?;
-        // Not only when this call created the file: the layer may have initialised it
-        // with defaults first (see `neural_forge_supervisor::apply_saved_settings`).
-        if mapping.freshly_created || mapping.header().tuning_seq.load(Ordering::Relaxed) == 0 {
-            neural_forge_protocol::persist::apply(mapping.header(), &cfg.settings);
-        }
+        neural_forge_supervisor::apply_saved_settings(&cfg, &mapping);
         Ok(Shm(Arc::new(mapping)))
     }
 }

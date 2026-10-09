@@ -28,24 +28,53 @@ pub fn open_channel(cfg: &Config) -> Result<neural_forge_protocol::mapping::Mapp
     neural_forge_protocol::mapping::open_path(&channel_path(cfg))
 }
 
-/// Applies the saved settings (`config.ini`) to the live header at [`channel_path`] if nothing has
-/// applied them since it was last initialised. The header is initialised with defaults by whichever of
-/// the layer or the GUI finds it missing; the layer applies the saved settings itself then
-/// (`neural_forge_protocol::persist::apply_saved`), and the GUI calls this for the same reason.
-/// `init_defaults` leaves `tuning_seq` at 0 and `persist::apply` bumps it, which is what "not yet
-/// applied" is read from.
-pub fn apply_saved_settings(cfg: &Config) {
-    let Ok(mapping) = open_channel(cfg) else { return };
+/// Applies the saved settings (`config.ini`) to `mapping`, the channel just opened with
+/// [`open_channel`], if nothing has applied them since it was last initialised. The header is
+/// initialised with defaults by whichever of the layer, the GUI or the CLI finds it missing; the
+/// layer applies the saved settings itself then (`neural_forge_protocol::persist::apply_saved`),
+/// and the GUI and CLI call this right after opening the channel for the same reason, so a
+/// command run on a cold boot acts on the saved settings, not the defaults. `init_defaults`
+/// leaves `tuning_seq` at 0 and `persist::apply` bumps it, which is what "not yet applied" is
+/// read from. Returns whether it applied them.
+pub fn apply_saved_settings(cfg: &Config, mapping: &neural_forge_protocol::mapping::Mapping) -> bool {
     let hdr = mapping.header();
-    if hdr.tuning_seq.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-        neural_forge_protocol::persist::apply(hdr, &cfg.settings);
-        hdr.control_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if hdr.tuning_seq.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+        return false;
     }
+    neural_forge_protocol::persist::apply(hdr, &cfg.settings);
+    hdr.control_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    true
+}
+
+/// Writes the live header's settings to `config.ini`, so a change made on the channel also
+/// survives a reboot.
+pub fn save_settings(header: &neural_forge_protocol::ShmHeader) -> std::io::Result<()> {
+    let mut cfg = Config::load();
+    cfg.replace_tuning(neural_forge_protocol::persist::snapshot(header));
+    cfg.save()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn saved_settings_are_applied_to_a_fresh_header_once() {
+        let dir = std::env::temp_dir().join(format!("neural-forge-apply-saved-{}", std::process::id()));
+        let mapping = neural_forge_protocol::mapping::open_path(&dir.join("shm.bin").to_string_lossy()).unwrap();
+        let mut cfg = Config::default();
+        cfg.settings.insert("set_intensity".into(), "2.5".into());
+        let intensity = || f32::from_bits(mapping.header().intensity_bits.load(std::sync::atomic::Ordering::Relaxed));
+        assert_eq!(intensity(), 1.0, "a fresh header holds the defaults");
+        assert!(apply_saved_settings(&cfg, &mapping));
+        assert_eq!(intensity(), 2.5);
+        // Applied once: a later change on the live header is not overwritten.
+        mapping.header().intensity_bits.store(0.5f32.to_bits(), std::sync::atomic::Ordering::Relaxed);
+        assert!(!apply_saved_settings(&cfg, &mapping));
+        assert_eq!(intensity(), 0.5);
+        drop(mapping);
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn channel_path_prefers_config_then_environment_then_default() {

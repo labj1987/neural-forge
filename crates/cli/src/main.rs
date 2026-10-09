@@ -67,6 +67,7 @@ fn cmd_profile_save(name: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    neural_forge_supervisor::apply_saved_settings(&channel_cfg, &mapping);
     let settings = neural_forge_protocol::persist::snapshot(mapping.header());
     match neural_forge_supervisor::profiles::save_profile(name, settings) {
         Ok(()) => {
@@ -94,15 +95,14 @@ fn cmd_profile_load(name: &str) -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    neural_forge_supervisor::apply_saved_settings(&channel_cfg, &mapping);
     let header = mapping.header();
     neural_forge_protocol::persist::apply(header, settings);
     // Matches the GUI's own reset-settings flow: applying to the live header alone
     // only affects the running session, so also fold the new values into config.ini
     // via a fresh snapshot (picks up every persisted setting, not just what this
     // profile happened to list) so the change survives a reboot too.
-    let mut cfg = Config::load();
-    cfg.replace_tuning(neural_forge_protocol::persist::snapshot(header));
-    if let Err(e) = cfg.save() {
+    if let Err(e) = neural_forge_supervisor::save_settings(header) {
         eprintln!("profile load: applied to the running instance, but saving config.ini failed: {e}");
         return ExitCode::FAILURE;
     }
