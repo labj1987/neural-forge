@@ -104,7 +104,7 @@ fn u64_at(b: &[u8], at: usize) -> Option<u64> {
 /// A PE32+ image's resource tree, enough to fetch one resource by type and name or id.
 struct Resources<'a> {
     image: &'a [u8],
-    sections: Vec<(u32, u32, u32)>, // virtual address, virtual size, raw offset
+    sections: Vec<(u32, u32, u32, u32)>, // virtual address, virtual size, raw offset, raw size
     root: usize,                    // file offset of the resource directory
 }
 
@@ -136,7 +136,8 @@ impl<'a> Resources<'a> {
         let sections = (0..sections)
             .map(|i| {
                 let s = table + i * 40;
-                Some((u32_at(image, s + 12)?, u32_at(image, s + 8)?.max(u32_at(image, s + 16)?), u32_at(image, s + 20)?))
+                let raw_size = u32_at(image, s + 16)?;
+                Some((u32_at(image, s + 12)?, u32_at(image, s + 8)?.max(raw_size), u32_at(image, s + 20)?, raw_size))
             })
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| pe_err("truncated section table"))?;
@@ -148,11 +149,15 @@ impl<'a> Resources<'a> {
         Ok(r)
     }
 
+    /// The file offset of `rva`: `None` past the section's data in the file (`SizeOfRawData`) or
+    /// when a malformed raw offset would overflow.
     fn offset(&self, rva: u32) -> Option<usize> {
-        self.sections
-            .iter()
-            .find(|(va, size, _)| rva >= *va && rva - va < *size)
-            .map(|(va, _, raw)| (raw + (rva - va)) as usize)
+        let (va, _, raw, raw_size) = self.sections.iter().find(|(va, size, ..)| rva >= *va && rva - va < *size)?;
+        let delta = rva - va;
+        if delta >= *raw_size {
+            return None;
+        }
+        raw.checked_add(delta).map(|at| at as usize)
     }
 
     fn name_at(&self, at: usize) -> Option<String> {
@@ -412,8 +417,8 @@ pub struct Extracted {
     pub bytes: usize,
 }
 
-/// `source` is the DLL or a directory holding it. Writes into `out`, each file through a temporary
-/// name and a rename, so a model directory is never half old and half new file by file.
+/// `source` is the DLL or a directory holding it. Replaces `out` as a whole ([`replace_tree`]), so a
+/// model directory is never half old and half new.
 /// Any build is taken whose records hold the tensors the graph implements ([`check_shape`]); nothing
 /// is written otherwise.
 pub fn extract(source: &Path, out: &Path) -> Result<Extracted, ModelError> {
@@ -431,13 +436,7 @@ fn extract_shaped(source: &Path, out: &Path, expected: &[(&str, u64)]) -> Result
     let tensors = parse_weights(blob)?;
     check_shape(&tensors, expected)?;
     let files = build_model(&tensors, version, &sha256_hex(&image));
-    std::fs::create_dir_all(out.join("model")).map_err(|e| ModelError::Io(out.to_path_buf(), e))?;
-    for (relative, bytes) in &files {
-        let path = out.join(relative);
-        let temporary = out.join(format!("{relative}.partial"));
-        std::fs::write(&temporary, bytes).map_err(|e| ModelError::Io(temporary.clone(), e))?;
-        std::fs::rename(&temporary, &path).map_err(|e| ModelError::Io(path.clone(), e))?;
-    }
+    replace_tree(out, &files)?;
     Ok(Extracted {
         dir: out.to_path_buf(),
         build: format!("{}.{}.{}", version[0], version[1], version[2]),
@@ -447,9 +446,112 @@ fn extract_shaped(source: &Path, out: &Path, expected: &[(&str, u64)]) -> Result
     })
 }
 
+/// Makes `out` hold exactly `files` (relative path, content): the whole tree is built in a sibling
+/// temporary directory and synced, then swapped in by rename, so a reader sees the old directory or
+/// the new one and never a mix. The temporary directory is removed on any error, leaving `out` as
+/// it was.
+fn replace_tree(out: &Path, files: &[(String, Vec<u8>)]) -> Result<(), ModelError> {
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |e| ModelError::Io(path, e)
+    };
+    let parent = out.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let name = out
+        .file_name()
+        .ok_or_else(|| ModelError::Io(out.to_path_buf(), std::io::Error::new(std::io::ErrorKind::InvalidInput, "no directory name")))?
+        .to_string_lossy()
+        .into_owned();
+    std::fs::create_dir_all(parent).map_err(io(parent))?;
+    let staging = parent.join(format!(".{name}.partial-{}", std::process::id()));
+    let previous = parent.join(format!(".{name}.previous-{}", std::process::id()));
+    // A run that died left its directories behind; they are only ever ours.
+    for leftover in [&staging, &previous] {
+        if leftover.exists() {
+            std::fs::remove_dir_all(leftover).map_err(io(leftover))?;
+        }
+    }
+
+    let build = || -> Result<(), ModelError> {
+        let mut dirs = vec![staging.clone()];
+        std::fs::create_dir(&staging).map_err(io(&staging))?;
+        for (relative, bytes) in files {
+            let path = staging.join(relative);
+            if let Some(dir) = path.parent().filter(|d| !d.exists()) {
+                std::fs::create_dir_all(dir).map_err(io(dir))?;
+                dirs.push(dir.to_path_buf());
+            }
+            let mut file = std::fs::File::create(&path).map_err(io(&path))?;
+            std::io::Write::write_all(&mut file, bytes).map_err(io(&path))?;
+            file.sync_all().map_err(io(&path))?;
+        }
+        for dir in &dirs {
+            std::fs::File::open(dir).and_then(|d| d.sync_all()).map_err(io(dir))?;
+        }
+        Ok(())
+    };
+    if let Err(e) = build() {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e);
+    }
+
+    let had_previous = out.exists();
+    if had_previous {
+        if let Err(e) = std::fs::rename(out, &previous) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(ModelError::Io(out.to_path_buf(), e));
+        }
+    }
+    if let Err(e) = std::fs::rename(&staging, out) {
+        if had_previous {
+            let _ = std::fs::rename(&previous, out);
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(ModelError::Io(out.to_path_buf(), e));
+    }
+    let _ = std::fs::File::open(parent).and_then(|d| d.sync_all());
+    if had_previous {
+        let _ = std::fs::remove_dir_all(&previous);
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_section_offset_is_bounded_by_its_raw_data_and_never_overflows() {
+        let r = Resources { image: &[], sections: vec![(0x1000, 0x2000, 0x400, 0x100), (0x4000, 0x1000, u32::MAX - 4, 0x1000)], root: 0 };
+        assert_eq!(r.offset(0x1010), Some(0x410));
+        assert_eq!(r.offset(0x1100), None, "past SizeOfRawData is not in the file");
+        assert_eq!(r.offset(0x4010), None, "a raw offset that overflows is refused, not wrapped");
+        assert_eq!(r.offset(0x9000), None);
+    }
+
+    #[test]
+    fn replacing_the_model_tree_is_all_or_nothing() {
+        let dir = scratch("replace-tree");
+        let out = dir.join("model");
+        std::fs::create_dir_all(out.join("model")).unwrap();
+        std::fs::write(out.join("manifest.json"), "old").unwrap();
+        std::fs::write(out.join("model/stale.e4m3"), "old").unwrap();
+
+        // "a" as a file and as a directory: the build fails partway, after "a" is written.
+        let bad = vec![("a".to_string(), b"x".to_vec()), ("a/b".to_string(), b"y".to_vec())];
+        assert!(replace_tree(&out, &bad).is_err());
+        assert_eq!(std::fs::read_to_string(out.join("manifest.json")).unwrap(), "old", "a failed build leaves the live tree alone");
+        let mut names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["model"], "the temporary directory is removed on error");
+
+        let good = vec![("manifest.json".to_string(), b"new".to_vec()), ("model/vit.e4m3".to_string(), b"w".to_vec())];
+        replace_tree(&out, &good).unwrap();
+        assert_eq!(std::fs::read_to_string(out.join("manifest.json")).unwrap(), "new");
+        assert!(!out.join("model/stale.e4m3").exists(), "the new tree replaces the old one as a whole");
+        let names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        assert_eq!(names, ["model"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     fn record(name: &str, tensor: &[u8], trailer: usize) -> Vec<u8> {
         let mut r = (name.len() as u64).to_le_bytes().to_vec();
@@ -714,7 +816,7 @@ mod tests {
         assert_eq!(installed(&out).as_deref(), Some("310.8.0.3"));
         assert_eq!(installed_verified(&out), Some(true));
         assert_eq!((installed(&dir.join("nowhere")), installed_verified(&dir.join("nowhere"))), (None, None));
-        assert!(!out.join("manifest.json.partial").exists());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "only the DLL and the model directory");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
