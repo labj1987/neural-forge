@@ -8,6 +8,7 @@
 //! read/write the exact same record on purpose, so either can pick up after the other.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
@@ -94,7 +95,12 @@ pub struct InstallReport {
 fn digest(bytes: &[u8]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
+    // Lowercase hex, as Python's hexdigest() writes it (sha2 0.11's output has no LowerHex).
+    let mut hex = String::with_capacity(64);
+    for byte in hasher.finalize().iter() {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
 }
 
 fn digest_file(path: &Path) -> std::io::Result<String> {

@@ -595,8 +595,8 @@ mod tests {
         let dir = std::fs::read_dir(&base).unwrap().next().unwrap().unwrap().path();
         assert!(dir.file_name().unwrap().to_string_lossy().starts_with("series-"));
         let decode = |name: &str| {
-            let mut reader = png::Decoder::new(std::fs::File::open(dir.join(name)).unwrap()).read_info().unwrap();
-            let mut buf = vec![0; reader.output_buffer_size()];
+            let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(dir.join(name)).unwrap())).read_info().unwrap();
+            let mut buf = vec![0; reader.output_buffer_size().expect("PNG frame size fits in memory")];
             reader.next_frame(&mut buf).unwrap();
             buf
         };
@@ -626,8 +626,8 @@ mod tests {
     }
 
     fn decode_at(dir: &std::path::Path, name: &str) -> Vec<u8> {
-        let mut reader = png::Decoder::new(std::fs::File::open(dir.join(name)).unwrap()).read_info().unwrap();
-        let mut buf = vec![0; reader.output_buffer_size()];
+        let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(dir.join(name)).unwrap())).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().expect("PNG frame size fits in memory")];
         reader.next_frame(&mut buf).unwrap();
         buf
     }

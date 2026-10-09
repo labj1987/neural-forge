@@ -8,17 +8,17 @@ Each crate's own license text is in its published source (crates.io / the reposi
 |---|---|---|---|
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 | https://github.com/oyvindln/adler2 |
 | ash | 0.37.3+1.3.251 | MIT OR Apache-2.0 | https://github.com/MaikKlein/ash |
-| bitflags | 1.3.2 | MIT/Apache-2.0 | https://github.com/bitflags/bitflags |
 | bitflags | 2.13.1 | MIT OR Apache-2.0 | https://github.com/bitflags/bitflags |
-| block-buffer | 0.10.4 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
+| block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck |
 | cairo-rs | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | cairo-sys-rs | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | cfg-if | 1.0.4 | MIT OR Apache-2.0 | https://github.com/rust-lang/cfg-if |
-| cpufeatures | 0.2.17 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
+| const-oid | 0.10.2 | Apache-2.0 OR MIT | https://github.com/RustCrypto/formats |
+| cpufeatures | 0.3.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
 | crc32fast | 1.5.1 | MIT OR Apache-2.0 | https://github.com/srijs/rust-crc32fast |
-| crypto-common | 0.1.7 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
-| digest | 0.10.7 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
+| crypto-common | 0.2.2 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
+| digest | 0.11.3 | MIT OR Apache-2.0 | https://github.com/RustCrypto/traits |
 | equivalent | 1.0.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/equivalent |
 | fdeflate | 0.3.7 | MIT OR Apache-2.0 | https://github.com/image-rs/fdeflate |
 | field-offset | 0.3.6 | MIT OR Apache-2.0 | https://github.com/Diggsey/rust-field-offset |
@@ -34,10 +34,9 @@ Each crate's own license text is in its published source (crates.io / the reposi
 | gdk-pixbuf-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | gdk4 | 0.11.4 | MIT | https://github.com/gtk-rs/gtk4-rs |
 | gdk4-sys | 0.11.4 | MIT | https://github.com/gtk-rs/gtk4-rs |
-| generic-array | 0.14.7 | MIT | https://github.com/fizyk20/generic-array.git |
-| gio | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
+| gio | 0.22.10 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | gio-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
-| glib | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
+| glib | 0.22.10 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | glib-macros | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | glib-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | gobject-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
@@ -50,6 +49,7 @@ Each crate's own license text is in its published source (crates.io / the reposi
 | gtk4-sys | 0.11.4 | MIT | https://github.com/gtk-rs/gtk4-rs |
 | hashbrown | 0.17.1 | MIT OR Apache-2.0 | https://github.com/rust-lang/hashbrown |
 | heck | 0.5.0 | MIT OR Apache-2.0 | https://github.com/withoutboats/heck |
+| hybrid-array | 0.4.15 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hybrid-array |
 | indexmap | 2.14.2 | Apache-2.0 OR MIT | https://github.com/indexmap-rs/indexmap |
 | itoa | 1.0.18 | MIT OR Apache-2.0 | https://github.com/dtolnay/itoa |
 | libadwaita | 0.9.2 | MIT | https://gitlab.gnome.org/World/Rust/libadwaita-rs |
@@ -66,13 +66,13 @@ Each crate's own license text is in its published source (crates.io / the reposi
 | pango | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | pango-sys | 0.22.9 | MIT | https://github.com/gtk-rs/gtk-rs-core |
 | pin-project-lite | 0.2.17 | Apache-2.0 OR MIT | https://github.com/taiki-e/pin-project-lite |
-| png | 0.17.16 | MIT OR Apache-2.0 | https://github.com/image-rs/image-png |
+| png | 0.18.1 | MIT OR Apache-2.0 | https://github.com/image-rs/image-png |
 | proc-macro-crate | 3.5.0 | MIT OR Apache-2.0 | https://github.com/bkchr/proc-macro-crate |
 | proc-macro2 | 1.0.107 | MIT OR Apache-2.0 | https://github.com/dtolnay/proc-macro2 |
 | quote | 1.0.47 | MIT OR Apache-2.0 | https://github.com/dtolnay/quote |
 | serde_core | 1.0.229 | MIT OR Apache-2.0 | https://github.com/serde-rs/serde |
 | serde_json | 1.0.151 | MIT OR Apache-2.0 | https://github.com/serde-rs/json |
-| sha2 | 0.10.9 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes |
+| sha2 | 0.11.0 | MIT OR Apache-2.0 | https://github.com/RustCrypto/hashes |
 | simd-adler32 | 0.3.10 | MIT | https://github.com/mcountryman/simd-adler32 |
 | slab | 0.4.12 | MIT | https://github.com/tokio-rs/slab |
 | smallvec | 1.16.0 | MIT OR Apache-2.0 | https://github.com/servo/rust-smallvec |
