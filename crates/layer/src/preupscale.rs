@@ -312,26 +312,23 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     VulkanCommand::CmdBeginRendering,
 ];
 
-/// Whether kernel names gate identification and holds. Off: names differ between DLSS versions
-/// (see [`Tracker::record_function`]).
-const GATE_BY_KERNEL_NAME: bool = false;
-
-/// What a CUDA kernel is, by the name `vkCreateCuFunctionNVX` gave it. An identification
-/// precondition only (docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction"): the colour input is
-/// found by the registered handles a launch names, as before; the name says whether that launch is
-/// DLSS Super Resolution's input kernel at all.
+/// What a CUDA kernel is, by the name `vkCreateCuFunctionNVX` gave it (docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray
+/// Reconstruction"). Only a positive sign of Ray Reconstruction changes a decision: Super Resolution's
+/// kernels change names between DLSS versions (`hiluma_engine_input*` in 310.4, `rrlite_*` in Crimson
+/// Desert's 310.9 with Ray Reconstruction off), so nothing waits for a Super Resolution name.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Kernel {
     /// DLSS Super Resolution's input kernel (`hiluma_engine_input_*` in GTA V,
     /// `cuda_engine_input_kernel_*` among NGX's modules): it reads the colour input, depth and
-    /// motion vectors.
+    /// motion vectors. Only the logs and the probe use it.
     SrInput,
-    /// The network kernels of DLSS Ray Reconstruction (`custom_block*`, `k_central_block`,
-    /// `k_initial_merge`, `custom_upsample*`; Resident Evil Requiem with ray tracing). Frame
-    /// Generation shares some of these names (`custom_block0_convPre_kernel`, `k_initial_merge` in
-    /// GTA V), so they only mean Ray Reconstruction while no SR input kernel launches.
+    /// DLSS Ray Reconstruction (`rr2_*`): its input is the noisy ray-traced frame with its guide buffers
+    /// (`rr2_enc0_kernel` names the colour input with diffuse and specular albedo, normals, roughness and
+    /// hit distance), so the model must not run before it. Crimson Desert launches `rr2_*` with Ray
+    /// Reconstruction on in its settings and `rrlite_*` (no guide buffers) with it off (2026-10-09).
     RayReconstruction,
-    /// Anything else (SR's network and output kernels, FG's, NGX's helpers).
+    /// Anything else: Super Resolution's network and output kernels, Frame Generation's (`main_kernel`,
+    /// `k_*`, `custom_block*`, `custom_upsample*`, `Kernel_*`), NGX's helpers.
     Other,
 }
 
@@ -339,7 +336,7 @@ impl Kernel {
     pub(crate) fn of(name: &str) -> Self {
         if name.starts_with("hiluma_engine_input") || name.starts_with("cuda_engine_input_kernel") {
             Self::SrInput
-        } else if ["custom_block", "k_central_block", "k_initial_merge", "custom_upsample"].iter().any(|p| name.starts_with(p)) {
+        } else if name.starts_with("rr2_") {
             Self::RayReconstruction
         } else {
             Self::Other
@@ -351,15 +348,15 @@ impl Kernel {
 /// frame-generation buffers, Resident Evil Requiem's) and the network kernels launched beside it
 /// there (`k_conv_fp16_nhwc`, `k_pooling`, `k_upscale`, `k_element_wise`). Everything else reading
 /// the colour input first may be the hold point, as before: DLSS Super Resolution's own kernels
-/// (Cyberpunk 2077's `cuda_luma_convert_kernel`) and Crimson Desert's (`rr2_*` with Ray
-/// Reconstruction on).
+/// (Cyberpunk 2077's `cuda_luma_convert_kernel`, Crimson Desert's `rrlite_*`). DLSS Ray Reconstruction's
+/// buffers are never the hold point ([`Kernel::RayReconstruction`]).
 pub(crate) fn fg_kernel_name(name: &str) -> bool {
     name == "main_kernel" || ["k_conv_fp16_nhwc", "k_pooling", "k_upscale", "k_element_wise"].iter().any(|p| name.starts_with(p))
 }
 
-/// Launch-bearing submits within which an SR input kernel must have launched for the inputs to be
-/// identified, once kernel names are known ([`Tracker::sr_running`]). With frame generation at 6x
-/// there are about 6 per real frame, so this is about 10 real frames.
+/// Launch-bearing submits after DLSS Ray Reconstruction's last launch during which nothing is identified
+/// ([`Tracker::rr_running`]). With frame generation at 6x there are about 6 per real frame, so this is
+/// about 10 real frames: switching Ray Reconstruction off in a game's settings takes effect within it.
 pub(crate) const SR_RECENT: u64 = 64;
 
 /// [`COMMANDS`] when `on`, nothing otherwise.
@@ -1088,20 +1085,14 @@ pub(crate) struct Tracker {
     generation: u64,
     /// The CUDA kernels created on the device (`vkCreateCuFunctionNVX`), with what they are.
     functions: HashMap<vk::CuFunctionNVX, (Kernel, String)>,
-    /// A kernel name was ever seen: from then on only DLSS Super Resolution's input kernel
-    /// identifies ([`Self::sr_running`]). Without names (no `vkCreateCuFunctionNVX` seen) the rules
-    /// work as before.
-    names_known: bool,
     /// Launch-bearing submits seen by [`Self::observe`].
     launch_submits: u64,
-    /// The last of those carrying an SR input kernel launch, and one carrying a Ray
-    /// Reconstruction-family launch.
-    last_sr: Option<u64>,
+    /// The last of those carrying a DLSS Ray Reconstruction launch.
     last_rr: Option<u64>,
     /// The Ray Reconstruction-family kernels seen launching (at most 4 names, for the log).
     rr_names: Vec<String>,
-    /// [`Self::sr_running`] as of the last [`Self::observe`] (a change re-runs the identification).
-    sr_gate: bool,
+    /// [`Self::rr_running`] as of the last [`Self::observe`] (a change re-runs the identification).
+    rr_gate: bool,
     /// The size rule's choice among several candidates overridden by what DLSS's input kernel
     /// names ([`Self::observe`]: the same other candidate in [`SWITCH_AFTER`] consecutive input
     /// launches, or at once when nothing is identified yet). [`Self::refresh`] prefers it while its
@@ -1234,8 +1225,9 @@ pub(crate) struct LaunchRefs {
     /// Whether the input launch's kernel is DLSS Super Resolution's input kernel ([`Kernel`]);
     /// `None` when its name is not known.
     pub input_sr: Option<bool>,
-    /// A launch of an SR input kernel, anywhere in the buffer.
-    pub sr_input: bool,
+    /// The input launch's kernel is DLSS Ray Reconstruction's ([`Kernel::RayReconstruction`]): never
+    /// evidence for the identification.
+    pub input_rr: bool,
     /// The Ray Reconstruction-family kernels launched in the buffer ([`Kernel::RayReconstruction`]),
     /// at most 4 distinct.
     pub rr: Vec<vk::CuFunctionNVX>,
@@ -1256,9 +1248,6 @@ const HILUMA_JITTER_WORD: usize = 3;
 /// Halton(2,3) sequence minus 0.5 in render pixels, 24 frames long (`NEURAL_FORGE_PROBE_KERNEL`, 2026-10-07).
 const CUDA_ENGINE_JITTER_WORD: usize = 10;
 
-/// The same in DLSS Ray Reconstruction's first encoder, `rr2_enc0_kernel` (Crimson Desert): bytes 400-407,
-/// render pixels; bytes 392-399 hold the previous frame's (`NEURAL_FORGE_PROBE_KERNEL`, 2026-10-07).
-const RR_ENC0_JITTER_WORD: usize = 50;
 
 /// Which 8-byte word of a DLSS kernel's parameters holds the camera jitter, by kernel name.
 fn jitter_word(name: &str) -> Option<usize> {
@@ -1266,8 +1255,6 @@ fn jitter_word(name: &str) -> Option<usize> {
         Some(HILUMA_JITTER_WORD)
     } else if name.starts_with("cuda_engine_input_kernel") {
         Some(CUDA_ENGINE_JITTER_WORD)
-    } else if name == "rr2_enc0_kernel" {
-        Some(RR_ENC0_JITTER_WORD)
     } else {
         None
     }
@@ -1485,25 +1472,17 @@ impl Tracker {
     /// `vkCreateCuFunctionNVX` returned `function` for the kernel `name`.
     pub(crate) fn record_function(&mut self, function: vk::CuFunctionNVX, name: &str) {
         self.functions.insert(function, (Kernel::of(name), name.to_string()));
-        // Kernel names only feed the logs, never the decision: Crimson Desert's DLSS Super
-        // Resolution (a newer DLSS than GTA V's) launches `custom_block*`/`k_initial_merge`
-        // kernels and no `hiluma_engine_input*`, so gating on names switched a working game off
-        // (2026-10-03). `names_known` stays false until a reliable Ray Reconstruction signature
-        // exists.
-        self.names_known = GATE_BY_KERNEL_NAME;
     }
 
     pub(crate) fn forget_function(&mut self, function: vk::CuFunctionNVX) {
         self.functions.remove(&function);
     }
 
-    /// Whether DLSS Super Resolution runs, as far as the identification is concerned: no kernel
-    /// name was ever seen (the rules work as before), or an SR input kernel launched within the
-    /// last [`SR_RECENT`] launch-bearing submits. Otherwise (DLSS Ray Reconstruction, or frame
-    /// generation alone) nothing is identified, so nothing is held: the model must not run on Ray
-    /// Reconstruction's noisy input.
-    fn sr_running(&self) -> bool {
-        !self.names_known || self.last_sr.is_some_and(|s| self.launch_submits.saturating_sub(s) < SR_RECENT)
+    /// Whether DLSS Ray Reconstruction runs: one of its kernels launched within the last [`SR_RECENT`]
+    /// launch-bearing submits. Then nothing is identified, so nothing is held: the model must not run on
+    /// Ray Reconstruction's noisy input, and runs after the upscaler instead ([`ray_reconstruction_running`]).
+    fn rr_running(&self) -> bool {
+        self.last_rr.is_some_and(|r| self.launch_submits.saturating_sub(r) < SR_RECENT)
     }
 
     /// [`Self::launch_kernel`] without the kernel (its name unknown).
@@ -1526,7 +1505,6 @@ impl Tracker {
         {
             let refs = self.launch.entry(command_buffer).or_default();
             refs.before_first.get_or_insert(before);
-            refs.sr_input |= kernel == Some(Kernel::SrInput);
             if kernel == Some(Kernel::RayReconstruction) && refs.rr.len() < 4 && !refs.rr.contains(&function) {
                 refs.rr.push(function);
             }
@@ -1542,7 +1520,7 @@ impl Tracker {
             probe_params(bytes);
         }
         // The camera jitter, from the first launch of the buffer whose kernel is known to carry it
-        // (SR's input kernels, Ray Reconstruction's first encoder).
+        // (SR's input kernels).
         let at = self.functions.get(&function).and_then(|(_, name)| jitter_word(name));
         if let Some(value) = at.and_then(|at| bytes.chunks_exact(8).nth(at)).map(|w| u64::from_le_bytes(w.try_into().unwrap_or_default())).filter(|&v| jitter_plausible(v)) {
             self.launch.entry(command_buffer).or_default().jitter.get_or_insert(value);
@@ -1582,6 +1560,7 @@ impl Tracker {
             refs.input = input_launch(&self.images, &named);
             if refs.input.is_some() {
                 refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
+                refs.input_rr = kernel == Some(Kernel::RayReconstruction);
             }
             // DLSS Super Resolution's input kernel by name, but not read as an input launch: say once
             // what it named, so a new engine's input form shows in the log.
@@ -1896,8 +1875,8 @@ impl Tracker {
                 if refs.input.is_none() {
                     refs.input = c.input.clone();
                     refs.input_sr = c.input_sr;
+                    refs.input_rr = c.input_rr;
                 }
-                refs.sr_input |= c.sr_input;
                 for f in c.rr {
                     if refs.rr.len() < 4 && !refs.rr.contains(&f) {
                         refs.rr.push(f);
@@ -2028,9 +2007,9 @@ impl Tracker {
             return None;
         }
         let registered = self.registered_set();
-        // What DLSS's own input kernel names, once settled; the size rule otherwise. Neither while
-        // kernel names say DLSS Super Resolution is not running ([`Self::sr_running`]).
-        let gate = self.sr_running();
+        // What DLSS's own input kernel names, once settled; the size rule otherwise. Nothing while
+        // DLSS Ray Reconstruction runs ([`Self::rr_running`]).
+        let gate = !self.rr_running();
         let size = identify(&registered, self.swapchain_extent()).filter(|_| gate);
         self.candidates = match (&size, self.swapchain_extent().or_else(|| output_candidate(&registered))) {
             (Some(_), Some(output)) => size_candidates(&registered, output),
@@ -2043,6 +2022,7 @@ impl Tracker {
         }
         let inputs = self
             .switched
+            .filter(|_| gate)
             .and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref()))
             .or_else(|| self.named_pick.filter(|_| gate).and_then(|n| by_params(&registered, n, self.swapchain_extent(), size.as_ref())))
             .or(size);
@@ -2144,8 +2124,8 @@ impl Tracker {
                 }
             ),
             None if !gate => format!(
-                "no DLSS input: no DLSS Super Resolution input kernel (hiluma_engine_input*, cuda_engine_input_kernel*) launched in the last {SR_RECENT} launch-bearing submits{}; waiting",
-                if self.rr_names.is_empty() { String::new() } else { format!(" (DLSS Ray Reconstruction's kernels launch: {})", self.rr_names.join(", ")) }
+                "no DLSS input: DLSS Ray Reconstruction runs ({}); its input is not held, the model runs after the upscaler",
+                self.rr_names.join(", ")
             ),
             None => format!(
                 "no DLSS input among {} registered views (swapchain {:?}); waiting",
@@ -2182,9 +2162,9 @@ impl Tracker {
             let Some(refs) = self.launch.get(cb) else { continue };
             any = true;
             match &refs.input {
-                // With kernel names known, only SR's input kernel is evidence (not Ray
-                // Reconstruction's or Frame Generation's first launch, which can have its shape).
-                Some(InputLaunch::Inputs { .. }) if self.names_known && refs.input_sr != Some(true) => {}
+                // DLSS Ray Reconstruction's first launch has SR's shape (its colour input with depth and
+                // motion vectors) but is never evidence.
+                Some(InputLaunch::Inputs { .. }) if refs.input_rr => {}
                 Some(InputLaunch::Inputs { colour, depth, mvec }) => {
                     let (colour, depth, mvec) = (*colour, *depth, *mvec);
                     let exposure = refs.images.iter().filter(|i| self.images.get(i).is_some_and(exposure_like)).min_by_key(|i| i.as_raw()).copied();
@@ -2233,14 +2213,11 @@ impl Tracker {
         if !any {
             return lines;
         }
-        // Whether DLSS Super Resolution runs (by its input kernel's name) or Ray Reconstruction.
+        // Whether DLSS Ray Reconstruction runs.
         self.launch_submits += 1;
         let now = self.launch_submits;
         for cb in batches.iter().flatten() {
             let Some(refs) = self.launch.get(cb) else { continue };
-            if refs.sr_input {
-                self.last_sr = Some(now);
-            }
             if !refs.rr.is_empty() {
                 self.last_rr = Some(now);
             }
@@ -2252,17 +2229,21 @@ impl Tracker {
                 }
             }
         }
-        let gate = self.sr_running();
-        if gate != self.sr_gate {
-            self.sr_gate = gate;
-            self.dirty = true;
+        let rr = self.rr_running();
+        if rr {
+            note_ray_reconstruction();
         }
-        if !gate && self.last_rr == Some(now) && self.said_named & 64 == 0 {
-            self.said_named |= 64;
-            lines.push(format!(
-                "DLSS Ray Reconstruction detected ({} launched, no DLSS Super Resolution input kernel); the model can't run before it (its input is the noisy ray-traced frame): nothing is identified or held, the model runs after the upscaler",
-                self.rr_names.join(", ")
-            ));
+        if rr != self.rr_gate {
+            self.rr_gate = rr;
+            self.dirty = true;
+            lines.push(if rr {
+                format!(
+                    "DLSS Ray Reconstruction runs ({} launched): its input is the noisy ray-traced frame with its guide buffers, so the model can't run before it; nothing is held, the model runs after the upscaler",
+                    self.rr_names.join(", ")
+                )
+            } else {
+                format!("DLSS Ray Reconstruction stopped (no launch in {SR_RECENT} launch-bearing submits): DLSS's input is identified again")
+            });
         }
         self.switch_by_evidence(&evidence, &mut lines);
         self.named_quiet = if changed { 0 } else { self.named_quiet.saturating_add(1) };
@@ -2287,7 +2268,7 @@ impl Tracker {
     /// vectors at their extent) are switched between: a single candidate (GTA V) and DLAA (none)
     /// are never affected.
     fn switch_by_evidence(&mut self, evidence: &[Named], lines: &mut Vec<String>) {
-        if evidence.is_empty() || !self.sr_running() {
+        if evidence.is_empty() || self.rr_running() {
             return;
         }
         let Some(current) = self.inputs else {
@@ -2494,9 +2475,8 @@ impl Tracker {
         for (bi, cbs) in batches.iter().enumerate() {
             for (ci, &cb) in cbs.iter().enumerate() {
                 let colour = self.inputs.map(|i| i.colour.0);
-                // With kernel names known, a buffer that launches no SR input kernel is never DLSS
-                // Super Resolution's (Ray Reconstruction's, Frame Generation's): forwarded.
-                let kind = self.launch.get(&cb).map(|r| if self.names_known && !r.sr_input { LaunchKind::Foreign } else { r.kind(colour) });
+                // A buffer that launches DLSS Ray Reconstruction is never the hold point: forwarded.
+                let kind = self.launch.get(&cb).map(|r| if r.rr.is_empty() { r.kind(colour) } else { LaunchKind::Foreign });
                 // A buffer whose input launch names another of the size rule's candidates with the
                 // colour input's depth and motion vectors: DLSS reads that candidate this frame
                 // (a game alternating its input between images). Held with it as the target.
@@ -2567,12 +2547,11 @@ impl Tracker {
     }
 
     /// The size rule's other candidate `cb`'s input launch names, with the colour input's depth and
-    /// motion vectors (so their layouts are watched), if any. With kernel names known, only an SR
-    /// input kernel's launch.
+    /// motion vectors (so their layouts are watched), if any. Never DLSS Ray Reconstruction's launch.
     fn retarget(&self, cb: vk::CommandBuffer) -> Option<(vk::Image, ImageDesc)> {
         let i = self.inputs?;
         let refs = self.launch.get(&cb)?;
-        if self.names_known && refs.input_sr != Some(true) {
+        if refs.input_rr || !refs.rr.is_empty() {
             return None;
         }
         let Some(InputLaunch::Inputs { colour, mvec, .. }) = refs.input else { return None };
@@ -4516,7 +4495,8 @@ impl Session {
     /// In model mode, whether the post-upscaler compose must stay off for this device's present
     /// ([`post_off`]).
     pub(crate) fn suppresses_post(&self) -> bool {
-        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, Instant::now())
+        let now = Instant::now();
+        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, now) && !ray_reconstruction_running(now)
     }
 
     /// A launch-bearing submit with DLSS's inputs identified reached the hold point.
@@ -4910,7 +4890,25 @@ static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// own [`Session::suppresses_post`]; it matters when DLSS runs on another device than the swapchain
 /// (only ever set in model mode).
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
-    lock(&POST_OFF_UNTIL).is_some_and(|until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)
+    (lock(&POST_OFF_UNTIL).is_some_and(|until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !ray_reconstruction_running(now)
+}
+
+/// When a device of the process last saw DLSS Ray Reconstruction running ([`Tracker::rr_running`]).
+static RAY_RECONSTRUCTION_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// How long after Ray Reconstruction's last launch-bearing submit the post path keeps running in its
+/// place. Its submits come several times per real frame; a second covers a hitch.
+const RAY_RECONSTRUCTION_HAND_BACK: Duration = Duration::from_secs(1);
+
+fn note_ray_reconstruction() {
+    *lock(&RAY_RECONSTRUCTION_AT) = Some(Instant::now());
+}
+
+/// DLSS Ray Reconstruction runs on a device of the process: nothing is held before it, so the post path
+/// runs at once (not [`HAND_BACK`] after the last hold, which left a game that switched Ray
+/// Reconstruction on in its settings without the model for 30 s).
+pub(crate) fn ray_reconstruction_running(now: Instant) -> bool {
+    lock(&RAY_RECONSTRUCTION_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK)
 }
 
 /// Whether a launch-bearing submit is held in `mode`, given the live switches: `None` forwards it
@@ -4956,7 +4954,7 @@ mod jitter_tests {
     fn the_jitter_word_follows_the_kernel() {
         assert_eq!(jitter_word("hiluma_engine_input_depthinv_mvlo_hdr_v2_rel"), Some(3));
         assert_eq!(jitter_word("cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi"), Some(10));
-        assert_eq!(jitter_word("rr2_enc0_kernel"), Some(50));
+        assert_eq!(jitter_word("rr2_enc0_kernel"), None, "Ray Reconstruction is never held");
         assert_eq!(jitter_word("rr2_enc1_kernel"), None);
         assert_eq!(jitter_word("main_kernel"), None);
     }
@@ -7046,18 +7044,34 @@ mod tests {
         assert_eq!(lines.iter().filter(|l| l.contains("another launch-bearing buffer names it too")).count(), 1, "{lines:#?}");
     }
 
-    /// Kernel names as `vkCreateCuFunctionNVX` gives them: GTA V's SR input kernel, NGX's input
-    /// kernel family, Ray Reconstruction's network (some names shared with Frame Generation), and
-    /// everything else.
+    /// Kernel names as `vkCreateCuFunctionNVX` gives them (the probes of docs/DLSS_KERNEL_CATALOGUE.md and
+    /// Crimson Desert's with Ray Reconstruction on and off, 2026-10-09): Super Resolution's input kernels,
+    /// Ray Reconstruction's `rr2_*`, and everything else, Frame Generation's network and Crimson Desert's
+    /// `rrlite_*` Super Resolution included.
     #[test]
     fn kernels_are_told_apart_by_name() {
         for sr in ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "cuda_engine_input_kernel_rel_hdr_colvar_mvlo"] {
             assert_eq!(Kernel::of(sr), Kernel::SrInput, "{sr}");
         }
-        for rr in ["custom_block0_conv0_kernel", "custom_block1_hf_kernel", "custom_upsample_hf_kernel", "k_initial_merge", "k_central_block"] {
+        for rr in ["rr2_enc0_kernel", "rr2_enc4_kernel", "rr2_dec0_kernel_1", "rr2_post_kernel", "rr2_downsample_kernel_static_hdr_no_transparency", "rr2_pooled_history0_kernel", "rr2_histogram_auto_exposure_basic_kernel"] {
             assert_eq!(Kernel::of(rr), Kernel::RayReconstruction, "{rr}");
         }
-        for other in ["main_kernel", "k_conv_fp16_nhwc", "k_pooling", "dltss_pwin_enc0_layer", "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel", "cuda_copy_exposure_kernel"] {
+        for other in [
+            "rrlite_enc0_4x4_mvlo_hdr_folded",
+            "rrlite_post_0_0_mvlo_hdr_folded",
+            "cuda_dldn_engine_luma_convert_kernel",
+            "custom_block0_conv0_kernel",
+            "custom_block0_convPre_kernel",
+            "custom_upsample_hf_kernel",
+            "k_initial_merge",
+            "k_central_block",
+            "Kernel_OutputPush",
+            "main_kernel",
+            "k_conv_fp16_nhwc",
+            "dltss_pwin_enc0_layer",
+            "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel",
+            "cuda_copy_exposure_kernel",
+        ] {
             assert_eq!(Kernel::of(other), Kernel::Other, "{other}");
         }
     }
@@ -7075,142 +7089,72 @@ mod tests {
             .collect()
     }
 
-    /// (h) DLSS Ray Reconstruction (Resident Evil Requiem with ray tracing, at DLAA and at Balanced):
-    /// SR's kernels are created but never launched; RR's network launches, its first launch naming
-    /// an RGBA16F output-size image with depth and motion vectors and a later one that image with
-    /// another (SR's whole shape), and at Balanced the registered set also has a render-size group
-    /// the size rule would take (RR's noisy input). With kernel names known, neither rule identifies
-    /// anything, no buffer is held, and "DLSS Ray Reconstruction detected" is logged once. Without
-    /// the names (the same launches), SR's shape would have been taken: the names are what keep RR out.
-    /// Kernel names never gate identification or holds: a newer DLSS's Super Resolution
-    /// (Crimson Desert) launches `custom_block*` kernels and no `hiluma_engine_input*`, and the
-    /// name gate switched it off. Recording a name must leave the decision to the image rules.
-    #[test]
-    fn kernel_names_do_not_gate_identification() {
-        let mut t = Tracker::default();
-        t.record_function(vk::CuFunctionNVX::from_raw(0x1), "custom_block0_conv0_c8_kernel");
-        t.record_function(vk::CuFunctionNVX::from_raw(0x2), "k_initial_merge");
-        assert!(!t.names_known, "names must not switch the gates on");
-        assert!(t.sr_running(), "with names off, every buffer stays eligible as before");
+    /// GTA V's registered set, a buffer whose first launch names the colour input, depth and motion vectors
+    /// (SR's whole shape) with the kernel `input`, then a launch naming the output, and Frame Generation's
+    /// buffers (`custom_block*`, `k_initial_merge`, `main_kernel`).
+    fn gta_with(input: &str) -> Tracker {
+        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
+        let f = kernels(&mut t, &[input, "custom_block0_convPre_kernel", "k_initial_merge", "main_kernel"]);
+        t.launch_kernel(cb(1), f[0], Some(&param_block(&[h(0x100), h(0x200), h(0x300), h(0x620)])));
+        t.launch_kernel(cb(1), f[0], Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
+        t.launch_kernel(cb(2), f[1], Some(&param_block(&[h(0x410), h(0x200), h(0x300)])));
+        t.launch_kernel(cb(2), f[2], Some(&param_block(&[h(0x410)])));
+        t.launch_kernel(cb(3), f[3], Some(&param_block(&[h(0x400), h(0x410)])));
+        t
     }
 
+    /// DLSS Ray Reconstruction (Crimson Desert with it on): its first encoder names the colour input,
+    /// depth and motion vectors (SR's whole shape) and its guide buffers. Nothing is identified and no
+    /// buffer is held, the line says why once, and the post path is handed the model at once. Without
+    /// the names the same launches are held: the names are what keep Ray Reconstruction out. When the
+    /// game switches to Super Resolution, the inputs are identified within [`SR_RECENT`] submits.
     #[test]
-    #[ignore = "kernel-name gating is off (GATE_BY_KERNEL_NAME): Crimson Desert's DLSS Super Resolution launches custom_block* kernels; see Tracker::record_function"]
     fn ray_reconstruction_is_never_identified_or_held() {
-        let mut set = re_set();
-        set.remove(&0x100);
-        // Balanced: RR's render-size inputs, which the size rule alone would identify.
-        let b10 = vk::Format::B10G11R11_UFLOAT_PACK32;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::TRANSFER_SRC;
-        set.insert(0x700, (img(0x700), desc(1486, 836, vk::Format::R16G16B16A16_SFLOAT, storage)));
-        set.insert(0x710, (img(0x710), desc(1486, 836, b10, storage)));
-        set.insert(0x720, (img(0x720), desc(1486, 836, vk::Format::D32_SFLOAT, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT)));
-        set.insert(0x730, (img(0x730), desc(1486, 836, vk::Format::R16G16_SFLOAT, storage)));
-        assert!(identify(&set, Some((2560, 1440))).is_some(), "the size rule alone takes RR's render-size input");
-        let record = |t: &mut Tracker, f: &[vk::CuFunctionNVX]| {
-            t.launch_kernel(cb(1), f[2], Some(&param_block(&[h(0x120), h(0x200), h(0x300), h(0x500)])));
-            t.launch_kernel(cb(1), f[3], Some(&param_block(&[h(0x600), h(0x610)])));
-            t.launch_kernel(cb(1), f[4], Some(&param_block(&[h(0x120), h(0x130)])));
-            t.launch_kernel(cb(2), f[5], Some(&param_block(&[h(0x400), h(0x200), h(0x300), h(0x620)])));
-            t.launch_kernel(cb(2), f[6], Some(&param_block(&[h(0x410), h(0x630)])));
-        };
-        let names = [
-            "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel",
-            "cuda_engine_input_kernel_rel_hdr_colvar_mvlo",
-            "custom_block0_conv0_kernel",
-            "k_central_block",
-            "custom_upsample_hf_kernel",
-            "main_kernel",
-            "k_conv_fp16_nhwc",
-        ];
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        let f = kernels(&mut t, &names);
-        record(&mut t, &f);
-        assert_eq!(t.launch[&cb(1)].input_sr, Some(false), "RR's first launch is not SR's input kernel");
-        let mut lines = Vec::new();
-        for _ in 0..60 {
-            for b in [cb(1), cb(2)] {
-                let (s, l) = submit(&mut t, &[vec![b]]);
-                lines.extend(l);
-                assert!(s.is_none(), "with kernel names, a buffer launching no SR input kernel is never the hold point");
-            }
-        }
+        let mut t = gta_with("rr2_enc0_kernel");
+        assert!(t.launch[&cb(1)].input_rr);
+        let (first_held, lines) = run_frames(&mut t, 40);
+        assert_eq!(first_held, None, "a Ray Reconstruction buffer was held");
         assert!(t.inputs.is_none() && t.named.is_empty() && t.named_pick.is_none(), "{:?}", t.named);
-        let rr: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS Ray Reconstruction detected")).collect();
+        let rr: Vec<&String> = lines.iter().filter(|l| l.starts_with("DLSS Ray Reconstruction runs")).collect();
         assert_eq!(rr.len(), 1, "{lines:#?}");
-        assert!(rr[0].contains("custom_block0_conv0_kernel, k_central_block, custom_upsample_hf_kernel launched"), "{}", rr[0]);
+        assert!(rr[0].contains("rr2_enc0_kernel launched"), "{}", rr[0]);
         let ids = identification_lines(&lines);
-        assert!(ids.iter().all(|l| l.starts_with("no DLSS input")), "{ids:#?}");
-        assert!(ids.last().unwrap().contains("no DLSS Super Resolution input kernel"), "{}", ids.last().unwrap());
+        assert!(ids.iter().all(|l| l.starts_with("no DLSS input: DLSS Ray Reconstruction runs")), "{ids:#?}");
+        assert!(ray_reconstruction_running(Instant::now()), "the post path is handed the model");
+        assert!(!post_off(false, None, Instant::now()));
 
-        // The same launches without kernel names: SR's shape would be taken (what the names prevent).
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        record(&mut t, &[vk::CuFunctionNVX::null(); 7]);
-        for _ in 0..60 {
-            for b in [cb(1), cb(2)] {
-                submit(&mut t, &[vec![b]]);
-            }
-        }
-        assert!(t.inputs.is_some(), "without names the shape rules alone identify");
+        // The game switches Ray Reconstruction off: Super Resolution's buffer from now on.
+        let rrlite = kernels(&mut t, &["rrlite_enc0_4x4_mvlo_hdr_folded"])[0];
+        t.begin(cb(1));
+        t.launch_kernel(cb(1), rrlite, Some(&param_block(&[h(0x100), h(0x200), h(0x300), h(0x620)])));
+        t.launch_kernel(cb(1), rrlite, Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
+        let (first_held, lines) = run_frames(&mut t, 40);
+        assert!(first_held.is_some_and(|f| f as u64 <= SR_RECENT), "held from frame {first_held:?}");
+        assert!(lines.iter().any(|l| l.starts_with("DLSS Ray Reconstruction stopped")), "{lines:#?}");
+        assert_eq!(t.inputs.map(|i| i.colour.0.as_raw()), Some(0x100));
+
+        // The same Ray Reconstruction launches without kernel names: SR's shape is taken.
+        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x200), h(0x300), h(0x620)])));
+        t.launch(cb(1), Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
+        let (first_held, _) = run_frames(&mut t, 10);
+        assert!(first_held.is_some(), "without names the shape rules alone hold it");
     }
 
-    /// (i) GTA V with kernel names known (SR's input kernel `hiluma_engine_input_*` launching in its
-    /// buffer, FG launching `main_kernel`, `custom_block0_convPre_kernel` and `k_initial_merge`, names
-    /// it shares with Ray Reconstruction): exactly as without names (identified by size at the first
-    /// submit, then by the parameters, SR held every frame, FG forwarded), and no Ray Reconstruction
-    /// line. The same for the DLAA SR set (with an exposure image) and for RE-like DLAA without one.
+    /// Super Resolution under every name it is known by (GTA V's `hiluma_engine_input*`, NGX's
+    /// `cuda_engine_input_kernel*`, Crimson Desert's `rrlite_*` with Ray Reconstruction off), beside Frame
+    /// Generation's `custom_block*`/`k_initial_merge`/`main_kernel`: identified at the first submit and held
+    /// every frame after, Frame Generation forwarded, no Ray Reconstruction line. Names other than
+    /// `rr2_*` never stop a hold.
     #[test]
-    #[ignore = "kernel-name gating is off (GATE_BY_KERNEL_NAME): Crimson Desert's DLSS Super Resolution launches custom_block* kernels; see Tracker::record_function"]
-    fn with_kernel_names_sr_games_keep_their_identification_and_hold_target() {
-        let names = ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "dltss_pwin_enc0_layer", "hiluma_engine_output_depthinv_mvlo_hdr_max_v2_rel", "cuda_copy_exposure_kernel", "main_kernel", "custom_block0_convPre_kernel", "k_initial_merge"];
-        // GTA V.
-        let rgba = vk::Format::R16G16B16A16_SFLOAT;
-        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
-        let mut set = gta_registered();
-        set.insert(0x420, (img(0x420), desc(2560, 1440, rgba, storage)));
-        let mut t = tracker_with(&set, Some((2560, 1440)));
-        let f = kernels(&mut t, &names);
-        t.launch_kernel(cb(1), f[0], Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
-        t.launch_kernel(cb(1), f[1], Some(&param_block(&[h(0x500), h(0x700)])));
-        t.launch_kernel(cb(1), f[2], Some(&param_block(&[h(0x100), h(0x400), h(0x200), h(0x300)])));
-        t.launch_kernel(cb(1), f[3], Some(&param_block(&[h(0x610)])));
-        t.launch_kernel(cb(2), f[5], Some(&param_block(&[h(0x420), h(0x200), h(0x300)])));
-        t.launch_kernel(cb(2), f[4], Some(&param_block(&[h(0x400)])));
-        t.launch_kernel(cb(3), f[6], Some(&param_block(&[h(0x420), h(0x400)])));
-        let mut lines = Vec::new();
-        for frame in 0..40 {
-            let (sr, l) = submit(&mut t, &[vec![cb(1)]]);
-            lines.extend(l);
-            let sr = sr.expect("SR's buffer is the hold point");
-            assert_eq!(sr.identified_now, frame == 0, "frame {frame}");
-            assert_eq!(sr.inputs.map(|i| (i.colour.0.as_raw(), i.exposure_input.map(|e| e.0.as_raw()))), Some((0x100, Some(0x610))));
-            for fg in [cb(2), cb(3)] {
-                let (s, l) = submit(&mut t, &[vec![fg]]);
-                lines.extend(l);
-                assert!(s.is_none(), "frame {frame}: FG forwarded");
-            }
+    fn super_resolution_is_held_whatever_its_kernels_are_called() {
+        for input in ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "cuda_engine_input_kernel_rel_hdr_mvdiff_mvlo", "rrlite_enc0_4x4_mvlo_hdr_folded", "some_future_input_kernel"] {
+            let mut t = gta_with(input);
+            let (first_held, lines) = run_frames(&mut t, 20);
+            assert_eq!(first_held, Some(1), "{input}: held from the frame after the identification");
+            assert_eq!(t.inputs.map(|i| i.colour.0.as_raw()), Some(0x100), "{input}");
+            assert!(lines.iter().all(|l| !l.contains("Ray Reconstruction")), "{input}: {lines:#?}");
         }
-        assert_eq!((t.colour_submits, t.foreign_submits), (40, 80));
-        assert_eq!(t.inputs.map(|i| i.rule), Some(Rule::Params));
-        assert!(lines.iter().all(|l| !l.contains("Ray Reconstruction") && !l.contains("not used")), "{lines:#?}");
-
-        // RE-like DLAA without exposure, SR running: identified as without names.
-        let mut t = tracker_with(&re_set(), Some((2560, 1440)));
-        let f = kernels(&mut t, &names);
-        t.launch_kernel(cb(1), f[0], Some(&param_block(&[h(0x100), h(0x200), h(0x300)])));
-        t.launch_kernel(cb(1), f[1], Some(&param_block(&[h(0x610), h(0x620)])));
-        t.launch_kernel(cb(1), f[2], Some(&param_block(&[h(0x100), h(0x110), h(0x200), h(0x300)])));
-        // FG with SR's whole shape and no second reader: only the names keep it out (it would make
-        // two SR-like entries, and none would be chosen).
-        t.launch_kernel(cb(2), f[5], Some(&param_block(&[h(0x120), h(0x200), h(0x300)])));
-        t.launch_kernel(cb(2), f[4], Some(&param_block(&[h(0x120), h(0x130)])));
-        t.launch_kernel(cb(3), f[6], Some(&param_block(&[h(0x400), h(0x410)])));
-        assert_eq!(t.launch[&cb(2)].input_sr, Some(false));
-        let (first_held, lines) = run_frames(&mut t, 40);
-        assert_eq!(first_held, Some(7));
-        assert_eq!(t.inputs.map(|i| (i.colour.0.as_raw(), i.rule, i.exposure_input)), Some((0x100, Rule::Params, None)));
-        assert_eq!(t.named.len(), 1, "FG's launch is not evidence with names known: {:?}", t.named);
-        assert!(lines.iter().all(|l| !l.contains("Ray Reconstruction") && !l.contains("none used")), "{lines:#?}");
     }
 
     #[test]
