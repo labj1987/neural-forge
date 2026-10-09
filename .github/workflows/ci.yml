@@ -6,6 +6,9 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 # An explicit `shell: bash` runs every step with `-eo pipefail`, so a failing `cargo test`
 # piped through `tee` still fails the step.
 defaults:
@@ -14,7 +17,8 @@ defaults:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Ubuntu 24.04 is the release baseline the README states (release.yml builds on it too).
+    runs-on: ubuntu-24.04
     env:
       # A GPU test that finds no Vulkan device panics instead of skipping, so a broken
       # lavapipe install fails CI instead of passing it with nothing run.
@@ -23,6 +27,18 @@ jobs:
       # Actions are pinned to full commit SHAs (a tag can be moved); Dependabot proposes the
       # updates (.github/dependabot.yml). The trailing comment is the release the SHA is.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The version in rust-toolchain.toml (release.yml uses the same one).
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # v1
+        with:
+          toolchain: 1.96.0
+          components: clippy
+
+      - name: Toolchain matches rust-toolchain.toml
+        run: grep -q '^channel = "1.96.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.96\.0 '
 
       # Same package list build-appimage.sh installs on a from-scratch image --
       # libgtk-4-dev/libadwaita-1-dev for the gui crate (glib-sys and friends need the
@@ -33,7 +49,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
-            libvulkan1 mesa-vulkan-drivers vulkan-tools
+            libvulkan1 mesa-vulkan-drivers vulkan-tools spirv-tools
 
       # Only lavapipe, never whatever other ICD the runner image happens to carry.
       - name: Select the lavapipe Vulkan driver
@@ -49,7 +65,7 @@ jobs:
 
       - name: cargo test (native crates)
         run: |
-          cargo test 2>&1 | tee test-native.log
+          cargo test --locked 2>&1 | tee test-native.log
           ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-native.log || true)"
           echo "GPU tests that ran (native): $ran" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$ran" -gt 0
@@ -57,7 +73,10 @@ jobs:
       # scripts/install.py delegates install/uninstall to neural-forge-cli (the single
       # implementation), so this exercises the same code the GUI's Setup tab runs.
       - name: Build the CLI for the installation tests
-        run: cargo build -p neural-forge-cli
+        run: cargo build --locked -p neural-forge-cli
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
       - name: Installation coexistence tests
         run: python3 scripts/test_install.py
@@ -67,6 +86,9 @@ jobs:
 
       - name: AppStream releases match the changelog
         run: python3 scripts/sync_appdata_releases.py --check && python3 scripts/release_notes.py --self-test && python3 scripts/release_notes.py "$(grep -m1 '^version' Cargo.toml | cut -d\" -f2)" > /dev/null
+
+      - name: Third-party crate listing is current
+        run: python3 scripts/gen_third_party_crates.py --check
 
       - name: Vulkan loader smoke test
         run: bash scripts/smoke-test.sh

@@ -5,12 +5,18 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-cargo build -p neural-forge-layer
+# NEURAL_FORGE_SMOKE_SO names a layer library to test instead of building the debug one (the
+# release workflow points it at the library the AppImage installed).
+SO_PATH="${NEURAL_FORGE_SMOKE_SO:-}"
+if [[ -z "$SO_PATH" ]]; then
+    cargo build --locked -p neural-forge-layer
+    SO_PATH="$(pwd)/target/debug/libneural_forge_layer.so"
+fi
+test -f "$SO_PATH"
 
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
-SO_PATH="$(pwd)/target/debug/libneural_forge_layer.so"
 sed "s#\./libneural_forge_layer\.so#$SO_PATH#" data/neural_forge_layer.json \
     > "$SCRATCH/neural_forge_layer.json"
 
@@ -35,7 +41,7 @@ echo "==> manifest: $SCRATCH/neural_forge_layer.json"
 echo "==> layer library: $SO_PATH"
 echo
 
-cargo run --example smoke -p neural-forge-layer
+cargo run --locked --example smoke -p neural-forge-layer
 
 echo
 echo "==> layer log ($NEURAL_FORGE_LOG):"
@@ -66,7 +72,7 @@ export NEURAL_FORGE_PREUPSCALE=off
 export NEURAL_FORGE_LOG="$SCRATCH/layer-off.log"
 echo
 echo "==> again with NEURAL_FORGE_PREUPSCALE=off"
-cargo run --example smoke -p neural-forge-layer
+cargo run --locked --example smoke -p neural-forge-layer
 echo
 echo "==> layer log ($NEURAL_FORGE_LOG):"
 cat "$NEURAL_FORGE_LOG" 2>/dev/null || echo "(no log written -- the layer never ran)"
@@ -86,7 +92,7 @@ export NEURAL_FORGE_PROBE_NGX=1
 export NEURAL_FORGE_LOG="$SCRATCH/layer-probe.log"
 echo
 echo "==> again with NEURAL_FORGE_PROBE_NGX=1"
-cargo run --example smoke -p neural-forge-layer
+cargo run --locked --example smoke -p neural-forge-layer
 echo
 echo "==> layer log ($NEURAL_FORGE_LOG):"
 cat "$NEURAL_FORGE_LOG" 2>/dev/null || echo "(no log written -- the layer never ran)"
@@ -103,7 +109,7 @@ export NEURAL_FORGE_PREUPSCALE=model
 export NEURAL_FORGE_LOG="$SCRATCH/layer-preupscale.log"
 echo
 echo "==> again with NEURAL_FORGE_PREUPSCALE=model"
-cargo run --example smoke -p neural-forge-layer
+cargo run --locked --example smoke -p neural-forge-layer
 echo
 echo "==> layer log ($NEURAL_FORGE_LOG):"
 cat "$NEURAL_FORGE_LOG" 2>/dev/null || echo "(no log written -- the layer never ran)"

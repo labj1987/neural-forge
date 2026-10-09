@@ -19,7 +19,7 @@ class InstallTests(unittest.TestCase):
     def setUpClass(cls):
         # The tests drive the real CLI: build the debug one when it is the default and missing.
         if 'NEURAL_FORGE_CLI' not in os.environ and not CLI.is_file():
-            subprocess.run(['cargo', 'build', '-p', 'neural-forge-cli'], cwd=CLI.parents[2], check=True)
+            subprocess.run(['cargo', 'build', '--locked', '-p', 'neural-forge-cli'], cwd=CLI.parents[2], check=True)
 
     def test_coexistence_and_owned_removal(self):
         with tempfile.TemporaryDirectory() as tmp:
