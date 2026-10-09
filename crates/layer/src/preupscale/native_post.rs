@@ -428,7 +428,18 @@ unsafe fn evaluate(
                 region_buffer(device, instance, physical, import, answer_region, view.capacity(), bytes),
             )
         };
-        let (Some(proxy), Some(answer)) = buffers else { return false };
+        let (proxy, answer) = match buffers {
+            (Some(proxy), Some(answer)) => (proxy, answer),
+            (proxy, answer) => {
+                // SAFETY: just created, never used.
+                unsafe {
+                    for b in [proxy, answer].into_iter().flatten() {
+                        b.destroy(device);
+                    }
+                }
+                return false;
+            }
+        };
         gpu.slots[s] = Some(SlotBuffers { width, height, proxy, answer });
     }
     let Some(b) = gpu.slots[s].as_ref() else { return false };
