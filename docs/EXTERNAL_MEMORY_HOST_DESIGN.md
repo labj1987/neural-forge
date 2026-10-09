@@ -92,7 +92,7 @@ validation layers here):
 1. `VkBufferCreateInfo` for a buffer that will be bound to imported memory must chain
    `VkExternalMemoryBufferCreateInfo` with the same handle type used at import time
    (`VUID-vkBindBufferMemory-memory-02985`) -- missing entirely in the first version,
-   caught immediately by `VK_LAYER_VALIDATE_SYNC=1` on `lordnikon`.
+   caught immediately by `VK_LAYER_VALIDATE_SYNC=1` on the test machine.
 2. The import's `allocationSize` must be a multiple of `minImportedHostPointerAlignment`
    (`VUID-VkMemoryAllocateInfo-allocationSize-01745`) -- a *test* bug (passing the raw
    pixel byte count instead of the alignment-rounded region size), not the production
@@ -130,7 +130,7 @@ double-buffered protocol, is sound today.
 ## Two real bugs, found via real-hardware validation
 
 Neither was caught by this project's local software Vulkan ICD, which is more
-permissive than NVIDIA's real driver + validation layers on `lordnikon`:
+permissive than NVIDIA's real driver + validation layers on the test machine:
 
 1. `VkBufferCreateInfo` for a buffer that will be bound to imported memory must chain
    `VkExternalMemoryBufferCreateInfo` with the same handle type used at import time
@@ -145,7 +145,7 @@ permissive than NVIDIA's real driver + validation layers on `lordnikon`:
 
 ## A third bug, and a fourth: found only after those two were already fixed and "everything passed"
 
-Both survived a clean `cargo test` and multiple validated `vkcube` runs on `lordnikon`
+Both survived a clean `cargo test` and multiple validated `vkcube` runs on the test machine
 -- neither is a Vulkan validation-layer finding, which is exactly why they're recorded
 separately here as their own lesson, not folded into the list above.
 
@@ -159,14 +159,14 @@ null-plus-zero as "no extensions", same as an empty array), but `slice::from_raw
 requires a non-null, aligned pointer *even for a zero-length slice* -- a real, if
 narrow, gap between C and Rust's aliasing/pointer conventions. Debug builds' optional
 UB checker caught it as a hard abort; every earlier *release*-mode `vkcube` run on
-`lordnikon` this session had the identical UB and simply didn't visibly crash, which is
+The test machine this session had the identical UB and simply didn't visibly crash, which is
 worse, not better -- undefined behavior having no visible symptom yet is not the same
 as it being safe. Fixed by checking `enabled_extension_count == 0` and using `&[]`
 before ever dereferencing the pointer, rather than trusting it's non-null because the
 length says zero.
 
 **`vk::ExtExternalMemoryHostFn::load(...)` panics if the function it's asked to
-resolve doesn't load** -- found live on `lordnikon`: a real `vkcube` run where
+resolve doesn't load** -- found live on the test machine: a real `vkcube` run where
 `external_memory_host: true` at device creation (the extension genuinely enabled) still
 hit `Unable to load get_memory_host_pointer_properties_ext` and aborted the whole
 process, inside `build_imported_capture_buffer`. The extension being enabled at device
@@ -268,7 +268,7 @@ should show `zc=true`.
 
 ## Validation
 
-Real hardware, `lordnikon`, RTX 5070, driver 615.71.09, both via `vkcube` and via
+Real hardware, the test machine, RTX 5070, driver 615.71.09, both via `vkcube` and via
 dedicated tests copied to and run directly against the real driver -- all of the
 following are *after* the two real-hardware VUID fixes and the two crash fixes above,
 not before:
@@ -288,10 +288,10 @@ not before:
   known, checkable color, captures it through `DirectCapture` into a real `mmap`'d
   host region, and asserts every captured byte matches the source exactly. Passes
   locally (this dev machine's software ICD also supports the extension) and on
-  `lordnikon` under full synchronization validation.
+  the test machine under full synchronization validation.
 - `scripts/protocol/examples/trigger_helper_roundtrip.rs` (new -- see its own doc
   comment) drove real request/response round trips against a real, running helper on
-  `lordnikon` outside of any game: `[frame] 64x64 resources: imported_proxy=true
+  the test machine outside of any game: `[frame] 64x64 resources: imported_proxy=true
   imported_answer=true` confirmed the helper-side import succeeds on real Wine +
   Proton-CachyOS + the real NVIDIA driver, no crash across dozens of repeated round
   trips. `EvaluateFeature` itself did not produce a real answer for this synthetic
@@ -307,4 +307,4 @@ driver tested this session has it, so the `Unhandled`/fallback branches are revi
 not exercised live); a real answer from `EvaluateFeature` actually using the imported
 buffers (blocked on the synthetic-input limitation above, needs a real game frame);
 GTA itself, which needs a real session and is the only way to measure whether this
-actually moves layer fps toward upstream's ~74/s on `lordnikon`.
+actually moves layer fps toward upstream's ~74/s on the test machine.

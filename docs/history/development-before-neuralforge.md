@@ -1,6 +1,6 @@
 > Historical record: pre-NeuralForge names and deployment instructions below are
 > archival, not current instructions. Do not remove or modify upstream installations.
-> See ../PHASE1.md for current paths, safety constraints and the benchmark plan.
+> See ../PHASE1.md for current paths and safety constraints (the old benchmark plan: phase1-benchmark-plan.md).
 
 # 2026-09-12 (later still): v0.1.33/v0.1.34's Vulkan sync changes reverted -- made
 # things worse, not better; handed off. Read this section before touching
@@ -18,7 +18,7 @@ v0.1.32 only touched `gui/src/ui.rs`). This undoes every fence-wait/UB change fr
 two sections below. `crates/protocol/src/mapping.rs`'s permission fix (`set_permissions`
 after `create_dir_all`) was kept -- it never touched Vulkan sync, is low-risk, and
 fixes a real, separately-confirmed bug (see below). Rebuilt, full test suite green,
-smoke test green, deployed to `lordnikon` as v0.1.35. **Not yet re-verified live by
+smoke test green, deployed to the test machine as v0.1.35. **Not yet re-verified live by
 the user as of this handoff** -- the state a next session inherits.
 
 **Read this as a warning, not just a log entry**: this session's own fence-wait
@@ -60,7 +60,7 @@ real measurements they're based on -- but their actual code fixes are reverted a
 should be treated as a *disproven* hypothesis, not a starting point to reapply.
 Suggested next steps, roughly in order of how much they'd de-risk any future attempt:
 1. Get Vulkan validation layers running during a real (or at minimum `vkcube`) test
-   session on `lordnikon` before writing any fix -- this alone might immediately
+   session on the test machine before writing any fix -- this alone might immediately
    surface the actual bug.
 2. Consider whether the *real* per-frame cost is even a synchronization bug at all,
    versus genuine GPU/driver-side slowness on this specific hardware (an RTX 5070 on
@@ -75,7 +75,7 @@ Suggested next steps, roughly in order of how much they'd de-risk any future att
    throughput improvement -- this session went straight to real games both times and
    paid for it in wasted RGL-relaunch cycles either way.
 4. Full environment/reproduction details, exact file locations, and every command
-   needed to test on `lordnikon` are in this handoff's companion document (ask the
+   needed to test on the test machine are in this handoff's companion document (ask the
    user for its path if not already provided, or check the session's own summary to
    the user for it) -- SSH access, `dlssnr-cli` usage, log locations, and the
    Rockstar-Games-Launcher-flakiness gotcha (real, separate from this bug, costs
@@ -88,7 +88,7 @@ Suggested next steps, roughly in order of how much they'd de-risk any future att
 **v0.1.33 was verified against real gameplay for the first time, and it worked --
 briefly.** After `chmod 700 /tmp/dlssnr-1000` (the directory's mode was `0775`,
 refused by `dlssnr_layer::shm::ensure_private_parent_dir`'s real security check) and a
-clean game relaunch, real gameplay on `lordnikon` (GTA V Enhanced, menu 483fps, an
+clean game relaunch, real gameplay on the test machine (GTA V Enhanced, menu 483fps, an
 opening cinematic 472fps, live driving-around gameplay 487fps) showed **no freeze at
 all** and no capture-side stalling. But `helper_frames` stayed at 0 the entire time --
 the permission fix let `shm.bin` get touched, but the mapping never actually round-
@@ -160,7 +160,7 @@ it") unconditionally called `device.reset_command_buffer` on `r.cmd` every cycle
 the sole assumption -- stated as a hard safety invariant in both its own and
 `ensure()`'s doc comments -- that the *previous* cycle's submission against
 `r.fence` had already been waited on to completion. That wait used `u64::MAX`
-(unbounded). On real `lordnikon` hardware this did not reliably complete anywhere
+(unbounded). On real the test machine hardware this did not reliably complete anywhere
 near the "a few milliseconds" measured 2026-09-10: A/B'ing `enabled` twice on a real
 GTA V Enhanced session (see the section above) showed FPS collapse from 196-274 to a
 steady 9 the instant neural rendering turned on, with GPU utilization *dropping*
@@ -213,7 +213,7 @@ submission's own bounded wait is still not completing within 8ms, not this entry
 guard (which only concerns *stale*, not fresh, work).
 
 # 2026-09-12: GUI retabbed like upstream, and a real conflict found chasing
-# "games freeze or crash" on `lordnikon`
+# "games freeze or crash" on the test machine
 
 - `gui/src/ui.rs`: the settings window is now an `AdwViewStack` of five tabs (Model,
   Motion, Composition — including the HDR white-point group, Debug, Status) instead
@@ -231,7 +231,7 @@ guard (which only concerns *stale*, not fresh, work).
   active on the dev machine, after a first attempt with un-verified names rendered as
   GTK's broken-icon glyph — confirmed by screenshot, not just plausible-looking code.
 - **Real, separate bug found while investigating "games either freeze or crash" on
-  `lordnikon`**: upstream's real C++ package (`dlssnr` 0.2.6-3, apt, installed
+  the test machine**: upstream's real C++ package (`dlssnr` 0.2.6-3, apt, installed
   2026-09-11 for the earlier behavior-comparison session) was still installed and its
   `dlssnr-gui`/`dlssnr-helper` were still *running* at the same time as this
   rebuild's AppImage. Both implicit Vulkan layers register the same
@@ -242,14 +242,14 @@ guard (which only concerns *stale*, not fresh, work).
   the same process, both racing to init/write the same mapping (one in upstream's
   format, one in this project's v2 header) — a strong, sufficient explanation for
   freezes/crashes on its own, independent of anything in the new v0.1.31 optical-flow/
-  SHM-v2 code. Fix: uninstalled the upstream apt package on `lordnikon`
+  SHM-v2 code. Fix: uninstalled the upstream apt package on the test machine
   (`sudo apt remove dlssnr`) rather than renaming this project's trigger env vars,
   since the whole point of sharing them is drop-in compatibility with a machine that
   isn't also running upstream.
 - **Live re-test after the uninstall, and a second, separate, real bug found**: with
   the conflict gone, launched GTA V Enhanced (already had `VKLayer_DLSS5=1
   %command%` in its own Steam launch options from an earlier session) for real via
-  the actual running Steam client on `lordnikon`'s live desktop, with
+  the actual running Steam client on the test machine's live desktop, with
   `dlssnr_helper` started through `dlssnr-cli start` first. **No freeze, no crash**
   — the game loaded past the legal splash straight into a resumed save, real
   rendering the whole way, and for the first time this project's own testing has
@@ -633,7 +633,7 @@ that crash, since this layer never needed them in the first place.
   5/5 clean runs of `crates/layer/examples/smoke` under real implicit activation
   (`VK_ADD_IMPLICIT_LAYER_PATH` + `VKLayer_DLSS5=1`, no `VK_INSTANCE_LAYERS`) — exit 0,
   full instance/device creation, every time. Previously 100% reproducible crash, 0/5.
-- On `lordnikon` (real GPU/driver, the machine the original crash was found and
+- On the test machine (real GPU/driver, the machine the original crash was found and
   bisected on): 3/3 clean `vkcube --width 1920 --height 1080` runs under the exact
   repro command line from the previous investigation
   (`VK_LOADER_LAYERS_DISABLE=VK_LAYER_NV_dlssnr`, `VKLayer_DLSS5=1`) — each ran the full
@@ -763,7 +763,7 @@ re-testing any of the already-ruled-out hypotheses**:
   easy to mistake for "this layer works fine" when it was actually never loaded at all
   (this cost real time in this investigation itself).
 
-## First confirmed neural-rendering success (2026-09-10, `lordnikon`, real hardware)
+## First confirmed neural-rendering success (2026-09-10, the test machine, real hardware)
 
 **With the crash fix above landed, this project's own `helper` + `layer` produced real,
 repeated, successful DLSS 5 Neural Rendering evaluations against a real,
@@ -774,15 +774,15 @@ been exercised end to end with a model that can say yes.
 
 **What was run**: a fresh cross-compiled release `dlssnr_helper.exe`, launched directly
 under the real `Proton-CachyOS Latest` runner (bypassing `dlssnr-cli`/`dlssnr-gui`,
-neither of which is deployed to `lordnikon` yet — this called `dlssnr_supervisor::start`'s
+neither of which is deployed to the test machine yet — this called `dlssnr_supervisor::start`'s
 exact env var set by hand: `WINEPREFIX`/`STEAM_COMPAT_DATA_PATH` pointed at a fresh,
 throwaway prefix, `STEAM_COMPAT_CLIENT_INSTALL_PATH` at the real Steam install,
-`DLSSNR_BIN_DIR=Z:/home/alex/.local/share/dlssnr/binaries` at the real, hash-verified
+`DLSSNR_BIN_DIR=Z:/home/<user>/.local/share/dlssnr/binaries` at the real, hash-verified
 NGX binaries already on that machine, `PROTON_ENABLE_NVAPI=1`/`DLSSNR_SKIP_NVAPI=1` as
 `start()` itself sets), then real `vkcube` with `VK_LAYER_dlssnr_neural` activated the
 same real, implicit way the crash fix above was verified with. **Both sides were pointed
 at an isolated `DLSSNR_UID=rstest`** (`/tmp/dlssnr-rstest/`, not the real `/tmp/dlssnr-1000/`)
-specifically so this test could never collide with `lordnikon`'s own real, working
+specifically so this test could never collide with the test machine's own real, working
 upstream install, which happens to share this project's exact `~/.config/dlssnr`/
 `~/.local/share/dlssnr` paths by design (see `crates/supervisor/src/paths.rs` — this
 project deliberately mirrors upstream's own layout so it can be a drop-in alternative).
@@ -818,7 +818,7 @@ first machine that's ever had a legitimate DLL to test it against. That question
 answered yes.
 
 ## First confirmed *correct visual output*, plus three real bugs found and fixed along
-## the way, plus one important false alarm (2026-09-10, `lordnikon`)
+## the way, plus one important false alarm (2026-09-10, the test machine)
 
 A real dump of `EvaluateFeature`'s actual answer (via the new `ShmHeader::capture_request`
 support, see `composition::apply`'s section below) initially showed a solid white
@@ -910,7 +910,7 @@ modeled in the protocol.
 
 **Real, measured performance cost, and a real, measured fix**: the naive
 single-threaded version of this loop took ~800ms/frame at 1920x1080 on real hardware
-(`lordnikon`) -- confirmed via real `vkcube` runs, not estimated: a real 10-second run
+(the test machine) -- confirmed via real `vkcube` runs, not estimated: a real 10-second run
 dropped from 244 captured/answered frames (no composition, the crash-fix verification
 run) to 11-12 frames (composition, single-threaded, release build barely different
 from debug -- confirming the cost is the transcendental `powf`/`cbrt` calls themselves,
@@ -1056,7 +1056,7 @@ strategy could hide.
 The section above ended by flagging genuine cross-frame pipelining (submit frame N's
 GPU work without blocking, only wait on frame N-1's before reusing its resources) as a
 real architecture change trading in a frame of added latency -- a product decision, not
-something to make unilaterally. Alex's explicit answer: **do it, if it gives the most
+something to make unilaterally. The maintainer's explicit answer: **do it, if it gives the most
 frames when NR is on** -- authorization for exactly that tradeoff, acted on immediately.
 
 **`GpuCompose::dispatch_into_image_async` (new)**: the same write-straight-into-the-
@@ -1109,7 +1109,7 @@ supervision to catch a subtle mistake:
 
 **Verified thoroughly on real hardware before trusting it**: no local test can exercise
 the real present-call injection (needs a real swapchain), so this went straight to
-`lordnikon` carefully -- a short 5s run first (checking specifically for hangs/crashes,
+The test machine carefully -- a short 5s run first (checking specifically for hangs/crashes,
 the real risk profile of getting Vulkan semaphore sync wrong), then a real 10s
 measurement, then a real `capture_request` dump to confirm visual correctness, then a
 45-second/601-frame stress run specifically to rule out a slot-reuse issue that might
@@ -1136,9 +1136,9 @@ synchronization tweak.
 `ComposeSlot`-based internals) — 30 tests in this crate now, full workspace suite green.
 
 ## First real-game session, and a real production crash that everyone's own testing
-## had been silently working around for a while (2026-09-10, `lordnikon`)
+## had been silently working around for a while (2026-09-10, the test machine)
 
-Alex ran a real, actual game (GTA San Andreas -- The Definitive Edition) via the real
+The maintainer ran a real, actual game (GTA San Andreas -- The Definitive Edition) via the real
 `dlssnr.appimage` GUI for the first time this project has been tested against
 something other than `vkcube`, and hit two real problems -- one a genuine bug in this
 project's own code, one a pre-existing system configuration conflict, unrelated to
@@ -1150,7 +1150,7 @@ anything shipped here.
 launch script reads it directly out of the environment with no fallback
 (`os.environ["STEAM_COMPAT_CLIENT_INSTALL_PATH"]`, a bare `KeyError` if unset) during
 its own prefix setup, *before* it ever gets to running `dlssnr_helper.exe` at all. The
-real irony: every one of this project's own manual SSH test sessions on `lordnikon`
+real irony: every one of this project's own manual SSH test sessions on the test machine
 (the ones that produced the "first confirmed neural-rendering success" and every
 composition/GPU-dispatch verification since) set this exact variable by hand, every
 single time, specifically because it's needed -- but that fix never made it back into
@@ -1190,7 +1190,7 @@ override, or just add the same per-game `VK_LOADER_LAYERS_DISABLE` this project'
 testing always uses to the affected game's own Steam launch options) rather than
 touched on its own judgment.
 
-## `composition` (milestone 4, phase A/B landed 2026-09-09 on `lordnikon`, real GPU —
+## `composition` (milestone 4, phase A/B landed 2026-09-09 on the test machine, real GPU —
 ## capture/transport/NGX-evaluate genuinely run every frame, and as of 2026-09-10 the
 ## helper's answer actually reaches the write-back too, not yet verified against a
 ## real present cycle; this project's own composition math still never gets applied.
@@ -1202,7 +1202,7 @@ presented image, round-trip it through the helper, and the helper now really doe
 NGX's `EvaluateFeature` against real bound Vulkan resources — all four commits
 (`afbb408`, `16bf02e`, `072ea07`, `13de5cd`, 2026-09-09 17:10–19:57) came from a
 session working directly against real hardware (RTX 5070, driver 615.71.09, machine
-`lordnikon`), diagnosing real failures with real tools (`gdb` against a hung driver
+The test machine), diagnosing real failures with real tools (`gdb` against a hung driver
 call, `objdump`/`strings` against both the real `nvngx_dlssnr.dll` and a working
 reference implementation's own compiled helper — binary inspection only, never
 source, same "shape not expression" rule as everywhere else in this project). No new
@@ -1228,11 +1228,11 @@ below) — verification here is real execution and log/gdb output, not `#[test]`
   unchanged. **Still not verified end to end against a real present cycle** — this
   sandbox has no real display/swapchain to drive `queue_present_khr` through (the
   existing smoke test only creates a bare device, never a swapchain), and the other
-  session's real-hardware testing on `lordnikon` predates this specific change.
+  session's real-hardware testing on the test machine predates this specific change.
   Reasoned through carefully (the SAFETY comments spell out exactly why re-reading
   `r.ptr`/`r.buffer` after the CPU-side overwrite is sound) and the full test suite
   stays green, but the next real verification of this path should happen on
-  `lordnikon` against an actual game, not just asserted correct from here. Once this
+  the test machine against an actual game, not just asserted correct from here. Once this
   is confirmed working, `compose.comp`'s blend is the next, still fully separate,
   still-unstarted step — applying the model's raw answer directly (what this fix does)
   and blending it via this project's own composition math are two different things.
@@ -1304,7 +1304,7 @@ below) — verification here is real execution and log/gdb output, not `#[test]`
   transcript: the copies found were either the wrong model entirely or a
   signature-invalid, hash-mismatched file from an unofficial source, declined for use)
   — so none of the above has ever been confirmed against a real, working model
-  evaluation; `CreateFeature`'s return code on `lordnikon` is still a rejection, just
+  evaluation; `CreateFeature`'s return code on the test machine is still a rejection, just
   now a fast, clean one instead of a driver-level hang. That is real, measurable
   progress (a hang is strictly worse than a clean rejection), not proof the integration
   is fully correct.
@@ -1335,7 +1335,7 @@ below) — verification here is real execution and log/gdb output, not `#[test]`
   request/response round-trip state machine the GUI/CLI have no reason to depend on).
 - **NGX binaries import row, added later (2026-09-09)**: the Status group's "NGX
   binaries" row has a real "Import…" button — this was missing when README.md first
-  claimed it existed (a documentation bug, caught when Alex went looking for it in the
+  claimed it existed (a documentation bug, caught when the maintainer went looking for it in the
   running app and couldn't find it). `crates/gui/src/binaries.rs` holds the path
   (`XDG_DATA_HOME/dlssnr/binaries`, duplicated from `cli/src/paths.rs::binaries_dir`
   rather than shared — four lines, not worth a shared crate) and the copy logic, real-
@@ -1350,10 +1350,10 @@ below) — verification here is real execution and log/gdb output, not `#[test]`
   reverting that temporary reduction — the underlying `import_from` logic is what the
   test above actually exercises.
 
-## Compared against a real, installed upstream instance (2026-09-10, on `lordnikon`)
+## Compared against a real, installed upstream instance (2026-09-10, on the test machine)
 
-Alex has upstream DLSS5VKLayer's real package (`dlssnr` 0.2.6-1, dpkg) installed on
-another machine (`lordnikon`, RTX 5070, driver 615.71.09) with real Proton/Wine
+The maintainer has upstream DLSS5VKLayer's real package (`dlssnr` 0.2.6-1, dpkg) installed on
+another machine (the test machine, RTX 5070, driver 615.71.09) with real Proton/Wine
 runners and a real prior helper log to compare against. Used this to find and fix one
 real gap in the port, without ever touching upstream's source (its installed
 binaries/config/logs were read as *behavior* to compare against, same "shape not
@@ -1364,7 +1364,7 @@ reading upstream's C++).
 the SHM mapping (`/tmp/dlssnr-$UID/shm.bin`), which does not survive a reboot —
 `dlssnr_protocol::mapping::open_at` always calls `init_defaults()` on any mapping that
 isn't already valid, with no path to restore prior tuning. Upstream's real,
-installed `~/.config/dlssnr/config.ini` on lordnikon has every tunable persisted as
+installed `~/.config/dlssnr/config.ini` on the test machine has every tunable persisted as
 `set_<name>=<value>` lines and clearly reloads them (the file had `set_intensity=1`,
 `set_passes=1`, etc. sitting there from a session that ended, presumably, well before
 this one started). Fixed by adding `ShmHeader::persisted_settings`/
@@ -1392,7 +1392,7 @@ confirms the value came back), plus the `persist` module's own round-trip tests 
   does this right.
 - `runners.rs`'s Proton scoring (CachyOS > exact-versioned GE-Proton > "GE-Proton
   Latest" alias > generic) matches the *relative ordering* `dlssnr-runner-probe --json`
-  produced for real against lordnikon's actual `compatibilitytools.d` (scores
+  produced for real against the test machine's actual `compatibilitytools.d` (scores
   10000000 / 9011000 / 9000000 respectively) — the exact score values differ (ours
   weren't designed to match upstream's numbers, just the ranking), and that's fine.
 - The SEH guard really does matter in practice, not just in theory: upstream's real
@@ -1402,10 +1402,10 @@ confirms the value came back), plus the `persist` module's own round-trip tests 
   validation that `guard.rs`'s whole reason for existing is a real, observed failure
   mode on real hardware, not a hypothetical one.
 
-**Deliberately not chased further**: upstream's own real run on lordnikon also never
+**Deliberately not chased further**: upstream's own real run on the test machine also never
 got DLSS5 NR actually working end-to-end (`VULKAN_CreateFeature(18)` returned
 `0xbad00002`, `DLSSNR.Available=0`, fail-open kicked in) — this machine's
-`nvngx_dlssnr.dll` is a hash-mismatched, signature-invalid file Alex obtained from an
+`nvngx_dlssnr.dll` is a hash-mismatched, signature-invalid file the maintainer obtained from an
 unofficial source (see the earlier session transcript: verified via `osslsigncode`,
 explicitly declined to use it for anything). That failure is upstream's own
 integration also not working against *that specific file*, not evidence our port's
@@ -1448,7 +1448,7 @@ logic (no real mapping needed for those), full suite still green.
 ## `supervisor` (added 2026-09-09: extracted from `cli` so the GUI can start/stop too)
 
 `crates/cli/src/{paths,config,install_dir,process}.rs` moved verbatim into a new
-`dlssnr-supervisor` lib crate (`git mv`, not rewritten) after Alex noticed the GUI had
+`dlssnr-supervisor` lib crate (`git mv`, not rewritten) after the maintainer noticed the GUI had
 no start/stop control at all — only the CLI did. Rather than duplicate the
 runner-selection/env-var-construction logic `cmd_start` had (a real risk of drift
 between two copies, unlike the four-line NGX-binaries path the GUI already duplicates
@@ -1541,7 +1541,7 @@ beside the `.so`) to the AppImage's real relative layout
 matches if the `AppDir` layout ever changes.
 
 ## Real-machine deploy gotcha: `~/.local/share/dlssnr/lib/libdlssnr_layer.so` is a
-## SEPARATE, manually-maintained copy on `lordnikon` -- not something the app itself
+## SEPARATE, manually-maintained copy on the test machine -- not something the app itself
 ## installs (2026-09-10)
 
 Steam launches the game as a completely separate process tree from `dlssnr-gui`, so
@@ -1555,7 +1555,7 @@ pointing at `~/.local/share/dlssnr/lib/libdlssnr_layer.so`. That manifest and th
 `.so` copy were placed by hand this session; nothing in `crates/gui`, `crates/cli`, or
 `build-appimage.sh` creates, updates, or even references either path -- confirmed by
 grep. **Every time the layer changes, that `.so` has to be copied out by hand** (e.g.
-`scp target/release/libdlssnr_layer.so lordnikon:/tmp/... && ssh lordnikon mv /tmp/...
+`scp target/release/libdlssnr_layer.so <host>:/tmp/... && ssh <host> mv /tmp/...
 ~/.local/share/dlssnr/lib/libdlssnr_layer.so` -- `mv` not `cp`, same "Text file busy"
 reasoning as the AppImage itself, since the old `.so` may still be mapped into a
 running game). Rebuilding and redeploying the AppImage alone does **not** update this
@@ -1570,7 +1570,7 @@ paths), or find why `VK_ADD_LAYER_PATH`/implicit-layer discovery can't reach the
 process directly and drop this second install location entirely. Not yet done --
 flagged here so it isn't rediscovered the hard way again.
 
-## NGX `FAIL_PLATFORM_ERROR` (`0xbad00002`) -- FIXED (2026-09-11, `lordnikon`), plus a
+## NGX `FAIL_PLATFORM_ERROR` (`0xbad00002`) -- FIXED (2026-09-11, the test machine), plus a
 ## second, separate real bug found and fixed the same session: captured frames never
 ## actually reached the helper at all
 
@@ -1616,7 +1616,7 @@ entirely changed nothing about `AllocateParameters`' own rejection -- upstream's
 D3D12 device, a different API family than this helper's Vulkan device entirely; the
 Vulkan export exists on the DLL but was never exercised/proven by anyone.
 
-**Verified**: a real manual helper run on `lordnikon` (bypassing `dlssnr-cli`/
+**Verified**: a real manual helper run on the test machine (bypassing `dlssnr-cli`/
 `dlssnr-gui`, same technique as every prior real-hardware NGX test) showed
 `AllocateParameters -> 0xbad00002` followed immediately by `falling back to a
 self-implemented NVSDK_NGX_Parameter object`, a passing round-trip self-test, and
@@ -1767,7 +1767,7 @@ path at all -- turning it off in the GUI had no effect on anything real. Now gat
 ## Real flicker root-cause, diagnosed and understood -- a known, deliberate tradeoff,
 ## not a new bug (2026-09-11, same live session as the channel-swap fix above)
 
-With the channel-swap fix above deployed, Alex reported (still live, still playing):
+With the channel-swap fix above deployed, the maintainer reported (still live, still playing):
 "when I toggle neural rendering off the flickering stops and the fps goes up but
 the game looks exactly the same with it on or off." Two separate real questions,
 both answered with hard evidence this session, not guessed:
@@ -1783,12 +1783,12 @@ against a slightly newer frame than the one it was computed from"). Verified by 
 real, temporary diagnostic (added, tested, then fully reverted -- `git diff`
 confirms no leftovers): a marker-file-gated flag that forced every frame through
 `run_sync` (same-frame correctness, no `inflight` staleness) instead of the async
-path. Live, real-time result while Alex watched: flicker gone, FPS dropped to
+path. Live, real-time result while the maintainer watched: flicker gone, FPS dropped to
 single digits (matching the pre-0.1.22 fully-synchronous profile). **Root cause
-confirmed. Given the choice, Alex chose to keep the async default and accept the
+confirmed. Given the choice, the maintainer chose to keep the async default and accept the
 flicker** rather than trade back the FPS gain -- this is a real, informed product
 decision, not an open bug. If this comes up again, the fix already exists and is
-already understood (force the synchronous path) -- it just isn't what Alex wants
+already understood (force the synchronous path) -- it just isn't what the maintainer wants
 by default. Don't silently re-implement it as a default without asking again.
 
 **Why NR "looks the same" on/off -- confirmed real and working, just visually
@@ -1810,15 +1810,15 @@ convincing demo is wanted.
 real motion vectors (still an all-zero placeholder) and the NGX model's own
 Color/Output format (still hardcoded RGBA regardless of the real captured format,
 see the channel-swap section above) are both still real, still open. Neither was
-what caused the flicker Alex actually experienced and reported this session --
+what caused the flicker the maintainer actually experienced and reported this session --
 don't reach for either as "the fix" without new evidence pointing at them
 specifically, the way the async-pipeline diagnostic above pointed at frame staleness.
 
 ## `dlssnr_supervisor::stop()` could leave an orphaned Wine-hosted helper running --
 ## FIXED (2026-09-11), found chasing "GTA V Enhanced has no effect and no
-## performance cost" on `lordnikon`
+## performance cost" on the test machine
 
-Alex tested against a second real game (GTA V Enhanced) the same session: "no
+The maintainer tested against a second real game (GTA V Enhanced) the same session: "no
 flickering but doesn't have and[sic] effect on the look or performance." Zero
 performance impact was the real tell -- if NR were genuinely running, even the
 cheapest path costs *something*. Investigation found a real, separate,
@@ -1848,7 +1848,7 @@ over) is *also* gone. Reproduced live: after a `dlssnr-cli stop` that printed
 still running (confirmed via `ps`) alongside the brand-new one. This is the same
 class of problem `crates/supervisor/src/process.rs`'s own `#[ignore]`d test
 (`stop_kills_the_whole_process_group_not_just_the_leader`) flagged as a *dev
-sandbox limitation* -- but this reproduction happened on `lordnikon`, the real
+sandbox limitation* -- but this reproduction happened on the test machine, the real
 target machine, not the sandbox. Wine/Proton's own process management genuinely
 doesn't reliably keep every descendant inside the original process group; this
 isn't purely a sandboxed-signal-delivery artifact.
@@ -1867,7 +1867,7 @@ left to kill, are not real failures worth surfacing.
 
 **Verified**: 4 new tests for `wineserver_binary`'s own resolution logic (proton
 with a real sibling, proton with none, plain wine falling back to `PATH`, no
-runner configured at all) plus manual cleanup + a clean restart on `lordnikon`
+runner configured at all) plus manual cleanup + a clean restart on the test machine
 confirmed `helper_state` reads back `RUNNING` again with exactly one helper
 process alive. A second, unrelated but real bug was found and fixed the same
 pass: `paths::tests::finds_a_real_steam_install_under_xdg_data_home` and
@@ -1904,7 +1904,7 @@ this same bug.
 ## `~/AppImages/dlssnr.appimage` is NOT the real, Gear-Lever-managed app -- a real
 ## deployment mistake this whole session, found and fixed (0.1.30)
 
-**Read this before ever deploying a build to `lordnikon` by hand again.** Every
+**Read this before ever deploying a build to the test machine by hand again.** Every
 AppImage rebuild from v0.1.24 through v0.1.29 this session was deployed via
 `scp`+`mv` to `~/AppImages/dlssnr.appimage` (a plain, unversioned filename) under
 the assumption that was "the" app. It is not. The real, actually-integrated,
@@ -1912,12 +1912,12 @@ desktop-launched app is `~/AppImages/dlssnr.appimage_0_1_25.appimage` --
 confirmed via its own `~/.local/share/applications/dlssnr.appimage_0_1_25.desktop`
 launcher entry (`Exec=`/`TryExec=` both point at that exact versioned filename,
 `X-AppImage-Version=0.1.25`). Gear Lever (`it.mijorus.gearlever`, installed as a
-Flatpak) is what created this versioned-filename-plus-desktop-file pair when Alex
+Flatpak) is what created this versioned-filename-plus-desktop-file pair when the maintainer
 originally integrated the AppImage through it; a raw `scp`+`mv` to a *different*
 path is invisible to it entirely. The two files are completely independent
 (different inodes, different content) -- overwriting the wrong one all session
 meant every GUI/CLI-level fix (the console-window fix, the orphaned-helper
-`stop()` fix) never reached what Alex's own desktop icon actually launches, only
+`stop()` fix) never reached what the maintainer's own desktop icon actually launches, only
 what this project's own manual SSH-based testing exercised. **This did not affect
 the real game-visible fixes** (the NGX/color-channel work) -- those deploy the
 Vulkan layer `.so` to a separate, always-correct path
@@ -1955,11 +1955,11 @@ this fix -- simply publishing v0.1.30 to GitHub does not retroactively fix what
 the stale 0.1.25 file already has embedded. Check what was actually done to
 `dlssnr.appimage_0_1_25.appimage` in this session's own real actions (in-place
 content replacement, preserving the filename/desktop-entry Gear Lever already
-knows about, was the plan discussed with Alex) before assuming Gear Lever's
+knows about, was the plan discussed with the maintainer) before assuming Gear Lever's
 update flow "just works" from here on without verifying it for real.
 
 **Lesson for next time, plainly**: when deploying anything meant to reach a real
-user-facing app on `lordnikon`, find out how that app is *actually* installed and
+user-facing app on the test machine, find out how that app is *actually* installed and
 launched first (check `~/.local/share/applications/*.desktop` for the real
 `Exec=` path) rather than assuming a plausible-looking file path is the right
 target. This cost an entire session's worth of GUI/CLI-level fixes never reaching

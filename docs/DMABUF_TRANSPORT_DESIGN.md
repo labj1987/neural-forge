@@ -84,7 +84,7 @@ for the exact result) does the natural first experiment:
    (wrapped in `guard::guarded`, since Wine does not treat this as a stable ABI a
    wrong guess should be safe to get wrong).
 
-**Result on real hardware** (`lordnikon`, RTX 5070, driver 615.71.09,
+**Result on real hardware** (the test machine, RTX 5070, driver 615.71.09,
 Proton-CachyOS): every step up through getting the win32 handle succeeded --
 `vkGetMemoryWin32HandleKHR` returned a real, non-null handle. `wine_server_handle_to_fd`
 itself did not fault (`guard::guarded` reported `seh=0` -- the guessed function
@@ -130,7 +130,7 @@ usable at all.
 `crates/helper/examples/dmabuf_import_probe.rs` (Windows, run under Wine) takes that
 pid+fd as CLI arguments and calls `CreateFileW` on `Z:\proc\<pid>\fd\<fd>`.
 
-**Result on real hardware** (`lordnikon`, RTX 5070, driver 615.71.09, Proton-CachyOS):
+**Result on real hardware** (the test machine, RTX 5070, driver 615.71.09, Proton-CachyOS):
 `CreateFileW` itself failed. Traced the root cause down to the plain POSIX level,
 *before* Wine is involved at all -- with the exporter process alive and its fd
 confirmed open (`ls -la /proc/<pid>/fd/<fd>` showed a real, present entry), a direct,

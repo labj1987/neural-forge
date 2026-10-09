@@ -54,7 +54,7 @@ resolution (Quality or Balanced, not DLAA), with frame generation off. Then run 
 unattended benchmark runner (`scripts/gta-bench.sh`):
 
 ```bash
-scripts/gta-bench.sh --host lordnikon probe-ngx VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 NEURAL_FORGE_LOG=/tmp/neural-forge-probe-ngx.log
+scripts/gta-bench.sh --host <host> probe-ngx VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 NEURAL_FORGE_LOG=/tmp/neural-forge-probe-ngx.log
 ```
 
 `NEURAL_FORGE_LOG` puts the layer's lines in a file. Without it they go to the game's
@@ -109,7 +109,7 @@ grep -F '[probe-ngx]' /tmp/neural-forge-probe-ngx.log | head -200
 
 ## Rig result
 
-Setup: lordnikon, build `abd56a9` (main, deployed with `scripts/deploy-rig.sh`; version label
+Setup: the test machine, build `abd56a9` (main, deployed with `scripts/deploy-rig.sh`; version label
 1.0.1, shared memory protocol v8), desktop 2560x1440@288 HDR bt2100, NR on (enabled=1,
 working_scale=1, model_interval=2), GTA script mods off (`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`).
 GTA `settings.xml`: only `dlssQuality` changed, 1 -> 2. `ResScalingType` was already 4 (DLSS;
@@ -119,7 +119,7 @@ confirms that 2 = Quality, so the old value 1 was Balanced. The file was restore
 sha256-verified. Run:
 
 ```bash
-scripts/gta-bench.sh --host lordnikon probe-ngx-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> probe-ngx-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 The benchmark completed: passes 61.0 / 60.1 / 62.5 / 65.3 / 64.0 fps, pass 4 real 59.5,
@@ -277,7 +277,7 @@ before touching probe state.
 
 ### Run
 
-Setup as in the first run: lordnikon, worktree build of this commit's code (version label
+Setup as in the first run: the test machine, worktree build of this commit's code (version label
 1.0.1), desktop 2560x1440@288.001 scale 1 HDR bt2100, NR on (helper_state=4, enabled=1,
 working_scale=1, model_interval=2), mods off. `dlssQuality` went 1 -> 2 (Quality;
 `ResScalingType` 4 and `FrameGenType` 0 verified) and was restored afterwards (sha256
@@ -285,7 +285,7 @@ working_scale=1, model_interval=2), mods off. `dlssQuality` went 1 -> 2 (Quality
 was created (no views registered). The rerun five minutes later completed:
 
 ```bash
-scripts/gta-bench.sh --host lordnikon probe-ngx-2 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> probe-ngx-2 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 Passes 60.2 / 60.1 / 61.6 / 65.1 / 63.5 fps, the same as the first probe run (61.0-65.3), so

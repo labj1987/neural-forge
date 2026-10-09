@@ -11,7 +11,7 @@ section) plus tools already identified. What is installed on the test machine, w
 check it is in [RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md), section 10.
 
 **Scope.** The decompilers here are not used on NVIDIA's code; interface metadata and observed
-behaviour are. The full rule is in [CLAUDE.md](../CLAUDE.md), "Working with NVIDIA's binaries".
+behaviour are.
 [DLSSNR_PARAMETERS.md](DLSSNR_PARAMETERS.md) shows the approach: the feature's parameters come from
 the helper's own read log, public headers and open-source consumers.
 

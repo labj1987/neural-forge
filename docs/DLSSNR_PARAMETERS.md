@@ -186,7 +186,7 @@ section 5).
 
 ## Candidates considered for a release
 
-Alex's bar: a change ships only if it raises fps or improves image quality.
+The maintainer's bar: a change ships only if it raises fps or improves image quality.
 
 | Candidate | Small | Risk-free | Measurable with `gta-bench.sh` | Raises fps or improves the picture | Shipped |
 |---|---|---|---|---|---|
@@ -194,6 +194,6 @@ Alex's bar: a change ships only if it raises fps or improves image quality.
 | Remove the 18 unread writes | yes | yes | no | no | no |
 | Bind `UI`, `UIAlpha` or `ControlMask` | no (no source image; mask meaning not public) | no | | unknown | no |
 | Scene-cut reset with motion vectors off | yes | yes | no (the bench runs with motion on) | only in a configuration nobody runs | no |
-| Hide or remove the sharpness setting | yes | yes | no | no (it already does nothing) | no; Alex's call, since it is a GUI change |
+| Hide or remove the sharpness setting | yes | yes | no | no (it already does nothing) | no; the maintainer's call, since it is a GUI change |
 
 No 2.0.9.

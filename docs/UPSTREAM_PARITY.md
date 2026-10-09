@@ -43,7 +43,7 @@ other's mapping.
 | Transfer modes 0/1/2 (classic, matched residual, native + edit) | `compose.comp` + small-proxy enlargement in `composition/gpu.rs` (0.1.80) |
 | White meter (tile peaks, 90th percentile, lit acceptance) and the Measured source | `capture::meter_white` on the CPU, smoothed (0.1.80) |
 | Frame hold | synchronous present + `composition/gpu.rs` held-frame input (0.1.80) |
-| `DEVELOPMENT.md` invariants | `CLAUDE.md`, "Composition invariants" |
+| `DEVELOPMENT.md` invariants | `AGENTS.md`, "Composition invariants" |
 | System-Wine prefix: DXVK 3.1 `dxgi.dll` + DXVK-NVAPI 0.9.2 (supplied, from Proton, or SHA256-pinned download), `dxvk.conf`, native overrides | `supervisor::provision` (0.1.81); verified end to end under Wine 10 on the rig |
 | 32-bit layer (`VK_LAYER_neuralforge_neural_32`, its own manifest) | per-region shared-memory mapping capped at a 4K 8-bit frame on 32-bit; built and packaged by `build-appimage.sh`, tested in CI (0.1.83) |
 | 16-bit multipass intermediates (`sdr16_multipass`) | `frame.rs` RGBA16F working images, falls back to 8-bit if refused (0.1.83) |

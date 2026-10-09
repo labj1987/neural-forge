@@ -8,11 +8,11 @@
 > **Note (2026-10-02, after 2.0.0):** the sections below are kept in the order they were written.
 > Statements like "not yet run on the rig", "Not verified without NVX hardware" and "Left for the
 > rig" were answered by the later sections in this file and by the 2.0.0 entry in
-> [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md), which includes an hour of Alex's real play at
+> [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md), which includes an hour of the maintainer's real play at
 > DLSS Frame Generation 4x. The 4K runs here used Smooth Motion, which the app no longer sets up.
 > The overview of this path is in [ARCHITECTURE.md](ARCHITECTURE.md), section 4.
 
-Status: **shipped as the default in 2.0.0 (2026-10-02)**, HDR input included, approved by Alex. Phases 2 and 3 of the
+Status: **shipped as the default in 2.0.0 (2026-10-02)**, HDR input included, approved by the maintainer. Phases 2 and 3 of the
 original 2.0 plan (working scale on the zero-copy path, the pipelined present) are not built: this
 path replaced them for DLSS games.
 
@@ -24,7 +24,7 @@ path replaced them for DLSS games.
 - DLSS's inputs are stable, registered once: colour **1707x960 R16G16B16A16_SFLOAT**
   (storage; scene-linear HDR, the kernels are the `hdr` variants), depth 1707x960 D32S8,
   motion vectors 1707x960 R16G16_SFLOAT, a 1x1 exposure value. Output 2560x1440 RGBA16F.
-  (1707x960 is DLSS Quality; Alex's setting is Balanced, about 1490x838.)
+  (1707x960 is DLSS Quality; the maintainer's setting is Balanced, about 1490x838.)
 - One DLSS evaluation per frame: 14 launches in one game command buffer, in one
   `vkQueueSubmit` on the present's queue, about 5 submits before the present.
 - In 9006 of 9006 launch-bearing command buffers, nothing touches the colour input before
@@ -145,7 +145,7 @@ path unchanged, so nothing is lost for other games or for DLAA/native settings.
   for depth and motion vectors when they are used, and a flag saying which path a frame came
   from. `SHM_VERSION` bump.
 - **Helper.** RGBA16F input, `Hdr=1`, padding-aware sizes, optional depth and game vectors.
-- **GUI.** None; it is automatic when DLSS SR is detected (Alex never touches settings).
+- **GUI.** None; it is automatic when DLSS SR is detected (the maintainer never touches settings).
 
 ## Experiments before any build (all unattended, in order)
 
@@ -159,7 +159,7 @@ path unchanged, so nothing is lost for other games or for DLAA/native settings.
 - **E3, the full loop**, model every frame, Quality and Balanced, three GTA benchmark runs each:
   real fps, GPU %, timestamps. Gate: at least today's 61.6 at Balanced with the model every
   frame.
-- **Alex at the screen**, after E3: GTA with the new path vs today's, F11 toggling, daylight and
+- **The maintainer at the screen**, after E3: GTA with the new path vs today's, F11 toggling, daylight and
   night, judging whether the enhancement looks right on the HDR input and whether DLSS's
   temporal accumulation shimmers with it.
 
@@ -168,14 +168,14 @@ path unchanged, so nothing is lost for other games or for DLAA/native settings.
 - NGX's DLSS-NR feature may not accept HDR input, or may want a paper-white/exposure hint it
   does not expose (E1 decides).
 - The model sees a jittered frame every frame (DLSS jitters the camera sub-pixel); its own
-  temporal behaviour may fight DLSS's (E3 and Alex's eyes decide).
+  temporal behaviour may fight DLSS's (E3 and the maintainer's eyes decide).
 - vkd3d-proton back-pressure: holding its submission thread could stall the game's CPU if
   vkd3d's queue fills (E2/E3 timing shows it).
 - Other games: only GTA V Enhanced is probed. DX12 games through Streamline under vkd3d should
   look the same; native Vulkan games call NGX through the same NVX extensions, but each needs a
   probe run before it is claimed.
 
-## Decision for Alex
+## Decision for the maintainer
 
 1. Go ahead with E1-E3 (unattended), then build this as 2.0 if E3's gate holds; or
 2. Shelve it and continue with Phases 2 and 3 of the original plan (post-upscaler improvements:
@@ -242,9 +242,9 @@ game running (the layer would drive slot 0 too), with the effect on:
 
 ```bash
 cargo +stable build --release -p neural-forge-protocol --example trigger_helper_roundtrip
-scp target/release/examples/trigger_helper_roundtrip lordnikon:/tmp/nf-roundtrip
-ssh lordnikon 'export NEURAL_FORGE_SHM=/tmp/neural-forge-1000/shm.bin NEURAL_FORGE_UID=1000; /tmp/nf-roundtrip --rgba16f /tmp/gta-color-1708x960.rgba16f --width 1708 --height 960 --out /tmp/gta-color-1708x960.answer.rgba16f --repeat 8'
-ssh lordnikon 'grep -E "\[ngx\] (feature|VULKAN_CreateFeature|EvaluateFeature)|resetting model history|\[frame\]" ~/.local/state/neural-forge/helper.log | tail -20'
+scp target/release/examples/trigger_helper_roundtrip <host>:/tmp/nf-roundtrip
+ssh <host> 'export NEURAL_FORGE_SHM=/tmp/neural-forge-1000/shm.bin NEURAL_FORGE_UID=1000; /tmp/nf-roundtrip --rgba16f /tmp/gta-color-1708x960.rgba16f --width 1708 --height 960 --out /tmp/gta-color-1708x960.answer.rgba16f --repeat 8'
+ssh <host> 'grep -E "\[ngx\] (feature|VULKAN_CreateFeature|EvaluateFeature)|resetting model history|\[frame\]" ~/.local/state/neural-forge/helper.log | tail -20'
 ```
 
 What E1 reads from it: `[ngx] VULKAN_CreateFeature(18) -> 0x1 ... hdr=1` (NGX accepted the HDR
@@ -301,8 +301,8 @@ which are not transfer sources, are never it). Logged once per change:
 `[preupscale] no DLSS input among N registered views ...; waiting`. Without an exposure input,
 model and roundtrip modes held nothing until the auto-exposure ("Auto-exposure when the game gives
 DLSS none (RE Requiem)", end of this document); since then the exposure is measured from the
-frame. Since "DLSS Ray Reconstruction" (end of this document) neither rule identifies anything
-while kernel names show that DLSS Super Resolution's input kernel does not launch.
+frame. "DLSS Ray Reconstruction" (end of this document) describes a precondition on kernel names for
+both rules; it is switched off (`GATE_BY_KERNEL_NAME = false`), so neither rule depends on names.
 
 ### The hold
 
@@ -522,19 +522,19 @@ screens included, and an open circuit breaker forwards DLSS submits untouched.)
 Select DLSS at Quality or Balanced (not DLAA) with frame generation off, then:
 
 ```bash
-scripts/gta-bench.sh --host lordnikon preupscale-dump VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=dump 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> preupscale-dump VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=dump 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-scripts/gta-bench.sh --host lordnikon preupscale-identity VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> preupscale-identity VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-scripts/gta-bench.sh --host lordnikon preupscale-model VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=model 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> preupscale-model VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=model 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-scripts/gta-bench.sh --host lordnikon preupscale-roundtrip VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=roundtrip 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> preupscale-roundtrip VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=roundtrip 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 Add `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=2.5` (or 4) to any of the model/roundtrip runs to try
@@ -578,7 +578,7 @@ at 1486x836, and how NVIDIA rounds float-to-half stores (the tests' drivers trun
 
 ## Rig results (E1-E3)
 
-Run 2026-10-02 on lordnikon (RTX, 2560x1440@288 HDR bt2100, GTA V Enhanced DLSS Balanced, frame
+Run 2026-10-02 on the test machine (RTX, 2560x1440@288 HDR bt2100, GTA V Enhanced DLSS Balanced, frame
 generation off, script mods off), main at 2aa02bf deployed with `scripts/deploy-rig.sh`
 (protocol 9; the old v8 `shm.bin` had to be removed, nothing had it open). **E1 failed on the raw
 scene-linear input, so E2 and E3 were not run**, as the plan says.
@@ -639,7 +639,7 @@ Not run at the time (E1 decides; see above); run after E1b, see "Rig results (E2
 
 ## E1b: the HDR encode
 
-Run 2026-10-02 on lordnikon (same settings as E1: Balanced 1485x836, mods off). Question: which
+Run 2026-10-02 on the test machine (same settings as E1: Balanced 1485x836, mods off). Question: which
 encode of the scene-linear DLSS input makes the model give a correct answer, and what is its
 inverse for the write-back.
 
@@ -758,7 +758,7 @@ DLSS runs and was in `GENERAL` (the first dump had not seen a barrier on it yet,
 
 ## Rig results (E2-E3)
 
-Run 2026-10-02 13:12-14:25 on lordnikon (2560x1440@288 HDR bt2100, scale 1.0; GTA V Enhanced, DLSS
+Run 2026-10-02 13:12-14:25 on the test machine (2560x1440@288 HDR bt2100, scale 1.0; GTA V Enhanced, DLSS
 Balanced 1485x836 unless noted, frame generation off, script mods off via
 `WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), main at 840fc80 deployed with `scripts/deploy-rig.sh`,
 helper restarted (`helper_state=4`). No remote-desktop session during any run. One benchmark
@@ -844,11 +844,11 @@ the dev machine's scratchpad `pu3/` (`model-xgrab-{1,2}.png`, `plain-xgrab-{1,2}
   series 5 s later the downtown flight at a different angle). Mean levels are similar (model
   155/171/188, plain 148-151/167-170/182-191). Whether the model visibly enhances the frame after
   DLSS, and whether DLSS's temporal accumulation shimmers with it, is not decidable from these and is
-  for Alex at the screen.
+  for the maintainer at the screen.
 
 ## Hand-off latency
 
-Run 2026-10-02 14:40-15:55 on lordnikon, same settings as E2-E3 (2560x1440@288 HDR bt2100, GTA V
+Run 2026-10-02 14:40-15:55 on the test machine, same settings as E2-E3 (2560x1440@288 HDR bt2100, GTA V
 Enhanced DLSS Balanced 1485x836 padded 1486x836, frame generation off, script mods off, model
 every frame, `NEURAL_FORGE_PREUPSCALE=model`), `scripts/gta-bench.sh` pass 4 via
 `scripts/bench-report.py`. No remote-desktop session during any run; one early exit at Game Init
@@ -985,13 +985,13 @@ that:
 - **GUI.** The Status page's "Model placement" line: before the upscaler (holding WxH, misses), waiting
   for DLSS Super Resolution, or after the upscaler.
 
-Left for the rig: Alex's on-screen judgement (daylight, night, F11), a three-run confirmation of the
+Left for the rig: the maintainer's on-screen judgement (daylight, night, F11), a three-run confirmation of the
 default with no variable set, a `shmctl capture --frames 2` while holding, and a game without DLSS
 (or DLAA) to see the device stay on the post path at its 1.1.0 frame rate.
 
 ## 4K and HDR output
 
-Run 2026-10-02 15:59-17:10 on lordnikon, main at 346e280 (the build already on the rig;
+Run 2026-10-02 15:59-17:10 on the test machine, main at 346e280 (the build already on the rig;
 `shmctl status` showed `helper_busy_ms`, so no redeploy). GTA V Enhanced, DLSS Balanced, frame
 generation off, script mods off (`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), `model_interval=2`,
 `working_scale=1`, `mvec_enabled=1`. No remote-desktop session during any run. One benchmark
@@ -1219,7 +1219,7 @@ HDR again. That is two creations per loading screen, each near full VRAM.
 
 ### Rig results
 
-Run 2026-10-02 17:40-18:24 on lordnikon.
+Run 2026-10-02 17:40-18:24 on the test machine.
 
 - This build was deployed with `scripts/deploy-rig.sh` (layer `eedf88b2c8f8`, helper
   `43c398d24fd8`). The stale protocol-10 `shm.bin` and `.owner` were removed first; nothing had
@@ -1345,14 +1345,14 @@ has a test that fails without its fix. None of it is run on the rig yet.
 
 ## DLSS Frame Generation
 
-Question (Alex): does the pre-upscaler path help with frame generation? In theory yes: the model
+Question (the maintainer): does the pre-upscaler path help with frame generation? In theory yes: the model
 edits DLSS Super Resolution's render-resolution input, so DLSS Frame Generation builds its generated
 frames from frames that are already enhanced, and the model runs only on real frames (the "run the
 model before frame generation" fix that was shelved in September). The risk: the layer held *any*
 submit whose command buffer recorded a `vkCmdCuLaunchKernelNVX`, and DLSS FG also runs as CUDA
 kernels.
 
-Run 2026-10-02 18:34-19:50 on lordnikon: GTA V Enhanced, DLSS Balanced (1485x836), 2560x1440@288
+Run 2026-10-02 18:34-19:50 on the test machine: GTA V Enhanced, DLSS Balanced (1485x836), 2560x1440@288
 HDR bt2100 desktop, script mods off, `model_interval=2`, `working_scale=1`, `mvec_enabled=1`, no
 remote-desktop session, no Xid. GTA's FG setting is `FrameGenType` (0 off, 1 on; the September FG
 run had 1, not 2, with `dlssFrameGenMode` 2); it was set to 1 for these runs, `dlssFrameGenMode`
@@ -1465,7 +1465,7 @@ top left there is a faint doubled contour along the frame and the lettering, the
 ghosting interpolated frames show on high-contrast edges during camera motion; elsewhere (palms, car
 edges, road markings) nothing stands out. Whether that grab is a generated frame, and whether the
 model adds anything FG then smears, cannot be told from a single grab without a plain comparison;
-that is for Alex's eyes.
+that is for the maintainer's eyes.
 
 ### Restored
 
@@ -1479,7 +1479,7 @@ that is for Alex's eyes.
 
 ## Several colour candidates (2.0.1)
 
-Two reports from the rig, Alex playing (no unattended run):
+Two reports from the rig, the maintainer playing (no unattended run):
 
 - **Crimson Desert Enhanced** (vkd3d-proton, DLSS Balanced 1440p) identified its colour input as
   "first of 2 candidates", later re-identified "first of 3" with another colour and depth image. It
@@ -1798,7 +1798,23 @@ Revert checks, each run with one change reverted:
 
 ## DLSS Ray Reconstruction (RE Requiem with ray tracing)
 
-Two probe runs on the rig (coordinator, Alex playing; `NEURAL_FORGE_PROBE_NGX=1`), Resident Evil
+> **What the code does now.** The name rule below is implemented but **switched off**:
+> `GATE_BY_KERNEL_NAME` is `false` (`crates/layer/src/preupscale.rs`), so `Tracker::names_known`
+> stays false, none of the three gates applies, and kernel names only feed the log lines. It was
+> turned off (2026-10-03) because Crimson Desert's newer DLSS Super Resolution launches
+> `custom_block*`/`k_initial_merge` kernels and no `hiluma_engine_input*`/`cuda_engine_input_kernel*`
+> one, so the gate switched a working game off. Names cannot tell that Super Resolution from Ray
+> Reconstruction, and nothing else tells them apart yet. Consequently Ray Reconstruction **is not
+> kept out**: if its colour input has Super Resolution's shape (RGBA16F, with depth and motion
+> vectors) it can be identified and held (Crimson Desert with Ray Reconstruction on is held at RR's
+> input, `rr2_enc0_kernel`'s colour image: DLSS_KERNEL_CATALOGUE.md). What still refuses it is the format check: a colour
+> input that is not `R16G16B16A16_SFLOAT` (RE Requiem's `B10G11R11` one at Balanced) is not held,
+> and frames go to DLSS untouched. The text below is the design and the evidence as measured;
+> read its "is never identified or held" statements, the `DLSS Ray Reconstruction detected` log
+> line and the gate numbering as describing the rule when it is on. The two tests that pinned
+> the gates are `#[ignore]`d with this reason.
+
+Two probe runs on the rig (coordinator, the maintainer playing; `NEURAL_FORGE_PROBE_NGX=1`), Resident Evil
 Requiem with `RayTracingSetting=High`, HDR10, FG 3x/4x:
 
 - At DLAA (`MaxQuality`) and at Balanced, the kernels **created** include DLSS Super Resolution's
@@ -1960,9 +1976,9 @@ entry:
   FG's frame is read by both FG buffers in the tests' FG data, modelled on GTA V's (not confirmed
   for every game).
 - **Single**: with two or more such entries none is used (logged once).
-- With kernel names known (on the rig the probe saw every kernel's name), the input launch must also be SR's
-  input kernel ("DLSS Ray Reconstruction" above), which keeps FG's and RR's launches out whatever
-  their shape. Shape and readers are what remain when names are unavailable.
+- With kernel names known (on the rig the probe saw every kernel's name), the input launch would also have to be SR's
+  input kernel ("DLSS Ray Reconstruction" above), which would keep FG's and RR's launches out whatever
+  their shape. That gate is off (`GATE_BY_KERNEL_NAME = false`), so shape and readers are what identify.
 - Such an entry's `exposure_input` is `None` even if some other 1x1 R16F is registered (one SR's
   buffer does not name is not DLSS's): the exposure is measured.
 
@@ -2050,10 +2066,11 @@ Revert checks (each change reverted alone, the named tests fail; all tests pass 
 
 ### What to look for on the rig
 
-- **RE Requiem with ray tracing (DLAA or Balanced):** `[preupscale] DLSS Ray Reconstruction
-  detected (...)` once, then `no DLSS input: no DLSS Super Resolution input kernel ...; waiting`;
-  no `colour input:` line, no holds (`preupscale_state` 1), the post path running as before. The
-  Balanced B10G11R11 identification must be gone.
+- **RE Requiem with ray tracing (DLAA or Balanced):** written for the name rule, which is off
+  now (see the note under "DLSS Ray Reconstruction"): there is no `DLSS Ray Reconstruction
+  detected` line and no `no DLSS Super Resolution input kernel` refusal. Expect a `colour input:`
+  line as for any game; a B10G11R11 input is refused by the format check ("not R16G16B16A16_SFLOAT;
+  not holding"), and an RGBA16F one would be held.
 - **RE Requiem with ray tracing off** (if SR runs there): `a CUDA launch names an output-size colour
   image ... taken as DLSS Super Resolution's input at DLAA` (DLAA) or a `colour input:` line by
   size/parameters (SR), then `[preupscale] exposure: measured from the frame (auto) ...`, holds at

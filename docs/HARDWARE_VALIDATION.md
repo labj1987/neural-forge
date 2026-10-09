@@ -11,7 +11,7 @@
 > model before the upscaler replaced them for DLSS games ([PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md)).
 > A summary of the whole record is in [LESSONS.md](LESSONS.md).
 
-Target: `alex@lordnikon`, RTX 5070, NVIDIA 615.71.09. Upstream package 0.3.0-1
+Target: the test machine, RTX 5070, NVIDIA 615.71.09. Upstream package 0.3.0-1
 remains installed. At inspection time GTA and the upstream helper were not running.
 The saved upstream config retains passes=1, model_resolution=1, motion_enabled=0,
 motion_quality=0. No upstream config, package, library, manifest, prefix or Steam
@@ -82,7 +82,7 @@ the acquired swapchain image rather than a rotating command-buffer slot. Retired
 swapchain semaphores remain alive until device teardown. This follows Khronos's
 [swapchain semaphore reuse guidance](https://docs.vulkan.org/guide/latest/swapchain_semaphore_reuse.html).
 
-On `lordnikon`, a 1,800-frame 2560x1440 Wayland `vkcube` run with NeuralForge,
+On the test machine, a 1,800-frame 2560x1440 Wayland `vkcube` run with NeuralForge,
 the full model, host SHM, and `NEURAL_FORGE_DMABUF=0` exited normally in 19.6 seconds.
 Khronos validation reported zero errors. The helper reported `model_up=1` and had
 processed 192 frames at the time of the status capture. A separate 900-frame run
@@ -225,10 +225,10 @@ artificial per-response delay, read once at startup, applied right before
 `seq_resp` is published -- the real-hardware equivalent of the existing Rust
 integration test's fake in-process helper thread.
 
-**Validated on `lordnikon`:**
+**Validated on the test machine:**
 - `cargo test -p neural-forge-layer` (all 45 native tests, 1 ignored) passes unchanged
   on the dev machine.
-- The layer crate's release test binary was copied to `lordnikon` and run directly
+- The layer crate's release test binary was copied to the test machine and run directly
   against the real NVIDIA driver with `VK_LAYER_KHRONOS_validation` and
   `VK_LAYER_VALIDATE_SYNC=1` (the current, non-deprecated sync-validation setting --
   `VK_VALIDATION_FEATURE_ENABLE_SYNCHRONIZATION_VALIDATION_EXT` is deprecated and
@@ -241,7 +241,7 @@ integration test's fake in-process helper thread.
   confirmed pre-existing and unrelated to this phase's change, not a synchronization
   hazard: no `SYNC-HAZARD-*` message appeared anywhere in either run.
 - `neural-forge-helper.exe` with `NEURAL_FORGE_HELPER_DELAY_MS=250` set was run alone
-  against `lordnikon`'s real Proton/Wine runner for 20+ seconds with no crash.
+  against the test machine's real Proton/Wine runner for 20+ seconds with no crash.
   A separate attempt earlier the same session, run immediately after starting a
   *second* helper instance against the same Wine prefix while the first was still
   live, did die silently within seconds -- reproduced once, and explained by
@@ -278,7 +278,7 @@ physical device supports it and the app hasn't already requested it, retries wit
 exact original request if the extended one is refused, and otherwise (the overwhelming
 common case) returns `LayerResult::Unhandled` -- identical to not hooking at all.
 
-**Validated on `lordnikon`** (RTX 5070, driver 615.71.09): `vkcube` at 1280x720 and at
+**Validated on the test machine** (RTX 5070, driver 615.71.09): `vkcube` at 1280x720 and at
 2560x1440 (the real GTA render resolution) under `VK_LAYER_KHRONOS_validation` with
 `VK_LAYER_VALIDATE_SYNC=1`. Both logged `external_memory_host: true` (confirming the
 injection actually happened -- this driver does advertise the extension) with zero
@@ -308,18 +308,18 @@ Wrote a dedicated test (`capture::tests::direct_capture_writes_straight_into_imp
 that builds a device with the extension actually enabled, fills a source image with a
 known color, captures it through `DirectCapture`, and asserts every captured byte
 matches exactly -- not just "ran without crashing". **This test found two real bugs**
-on first real-hardware run (`lordnikon`, `VK_LAYER_VALIDATE_SYNC=1`): a missing
+on first real-hardware run (the test machine, `VK_LAYER_VALIDATE_SYNC=1`): a missing
 `VkExternalMemoryBufferCreateInfo` on the buffer (a real production bug,
 `VUID-vkBindBufferMemory-memory-02985`) and a misaligned `allocationSize` in the test
 itself (`VUID-VkMemoryAllocateInfo-allocationSize-01745`, this NVIDIA driver's real
 `minImportedHostPointerAlignment` is 4096) -- neither was caught by this project's
 local software Vulkan ICD, which accepted both mistakes silently. Both fixed; the test
-now passes on both the local software ICD and `lordnikon`'s real driver under full
+now passes on both the local software ICD and the test machine's real driver under full
 synchronization validation, with zero hazards. The full test suite (47 tests, 1
-ignored) stayed green on `lordnikon` throughout.
+ignored) stayed green on the test machine throughout.
 
 **Not done**: no GTA session. The real payoff this phase promises -- layer fps moving
-toward upstream's ~74/s on `lordnikon` -- is still unmeasured; `DirectCapture` itself
+toward upstream's ~74/s on the test machine -- is still unmeasured; `DirectCapture` itself
 has never run against a real game, only a synthetic single-frame test and (indirectly,
 for device creation only) `vkcube`.
 
@@ -329,7 +329,7 @@ for device creation only) `vkcube`.
 See `EXTERNAL_MEMORY_HOST_DESIGN.md` for the full account. Summary:
 
 - Added the helper-side half of the zero-copy import (`FrameResources::imported_proxy`/
-  `imported_answer` in `crates/helper/src/frame.rs`) -- confirmed live on `lordnikon`
+  `imported_answer` in `crates/helper/src/frame.rs`) -- confirmed live on the test machine
   via a new tool (`crates/protocol/examples/trigger_helper_roundtrip.rs`) that drives a
   real request/response round trip against a real, running helper with no game
   involved: `imported_proxy=true imported_answer=true`, no crash across dozens of
@@ -348,7 +348,7 @@ See `EXTERNAL_MEMORY_HOST_DESIGN.md` for the full account. Summary:
      identical UB and simply never visibly crashed, which is a worse outcome than a
      visible one, not a better one.
   2. `vk::ExtExternalMemoryHostFn::load(...)` panics (not gracefully fails) if the one
-     function it's asked to resolve doesn't load -- hit live on `lordnikon`, inside
+     function it's asked to resolve doesn't load -- hit live on the test machine, inside
      `build_imported_capture_buffer`, on a device that had `external_memory_host: true`
      at creation. Fixed in both the layer and the helper by resolving
      `vkGetMemoryHostPointerPropertiesEXT` by hand via `get_device_proc_addr` (a real
@@ -375,7 +375,7 @@ check in this project that catches this exact class of bug.
 ## request/response slot -- validated end to end on real hardware
 
 See `PROTOCOL_V3_DESIGN.md` for the design; this entry is the real-hardware evidence.
-`lordnikon`, RTX 5070, driver 615.71.09, a fresh `git clone` of each commit (not just
+The test machine, RTX 5070, driver 615.71.09, a fresh `git clone` of each commit (not just
 this dev machine's own software ICD):
 
 - `cargo test -p neural-forge-layer` (48 tests): clean and deterministic across several
@@ -410,7 +410,7 @@ still-current without checking again first.
 **A real process lesson from this session, not a code bug**: the first two attempts
 at the concurrent-slot test above looked like a serious cross-slot race (both
 processes reporting the identical sequence number, one request left permanently
-unanswered) until traced back to a stale deployed clone on `lordnikon` -- the
+unanswered) until traced back to a stale deployed clone on the test machine -- the
 diagnostic tool's own slot-argument support had been pushed but not yet `git pull`ed
 into the scratch clone used to build it, so both invocations silently raced for slot 0
 alone. Re-confirmed clean immediately after pulling. Worth remembering the next time a
@@ -422,7 +422,7 @@ concluding anything about the code itself.
 ## Wine/NVIDIA constraint, not an implementation gap
 
 See `DMABUF_TRANSPORT_DESIGN.md` for the full writeup; this entry is the real-hardware
-evidence. `lordnikon`, RTX 5070, driver 615.71.09, Proton-CachyOS:
+evidence. The test machine, RTX 5070, driver 615.71.09, Proton-CachyOS:
 
 `crates/helper/examples/dmabuf_probe.rs` built a real exportable Vulkan buffer inside
 the Wine-hosted helper (`VkExportMemoryAllocateInfo`/`VkExternalMemoryBufferCreateInfo`
@@ -476,17 +476,17 @@ stale-git-clone lesson above. See `DMABUF_TRANSPORT_DESIGN.md` for the full writ
 what a working transport would actually need (`SCM_RIGHTS`, not `/proc/pid/fd`).
 
 Test processes/prefix wineserver cleaned up afterward; no leftover state on
-`lordnikon`.
+The test machine.
 
 ## 2026-09-16 -- Phase 2 item 6, first real GTA data: fps collapse confirmed. (The
 ## motion-vector explanation this entry originally offered was wrong -- see the
 ## correction at the end of it.)
 
-Alex ran the first real GTA session against this exact codebase (v0.1.59, confirmed:
-the AppImage Alex's desktop launcher runs, `~/AppImages/neuralforge.appimage`, hashes
+The maintainer ran the first real GTA session against this exact codebase (v0.1.59, confirmed:
+the AppImage the maintainer's desktop launcher runs, `~/AppImages/neuralforge.appimage`, hashes
 byte-for-byte identical to the published `v0.1.59` GitHub release asset). FPS capped
 at 120: neural rendering on dropped the game to the mid-to-high 20s, with real,
-noticeable ghosting Alex reports as absent from upstream, alongside a genuinely
+noticeable ghosting the maintainer reports as absent from upstream, alongside a genuinely
 positive signal -- the lower fps itself "feels like it should," not laggy the way
 earlier (pre-Phase-2) testing did, matching Phase 2's own design goal (the two-slot
 non-blocking capture pipeline removing the present-hook's own fence wait).
@@ -505,7 +505,7 @@ any DMA-BUF-style savings, which is exactly why both DMA-BUF directions turning 
 be dead ends (see the two 2026-09-15 entries above) costs this project less than it
 might have.
 
-**Root-caused the ghosting, not yet re-confirmed live**: `config.ini` on `lordnikon`
+**Root-caused the ghosting, not yet re-confirmed live**: `config.ini` on the test machine
 had only ever persisted `set_enabled=1` -- nothing else -- meaning the session ran on
 every other setting's real code default, and `ShmHeader::init_defaults` sets
 `mvec_enabled` to `0` (off), exactly matching `PHASE1.md`'s own documented preserved
@@ -513,7 +513,7 @@ baseline ("motion_enabled=0, motion_quality=0"). No motion-vector input is a
 well-understood, textbook cause of exactly this ghosting/smearing symptom during
 camera or object motion in any temporally-reconstructing neural upscaler. **Not yet
 verified**: whether turning `mvec_enabled` on actually resolves it live -- that's the
-concrete next test, not attempted this session (needs Alex at the keyboard again).
+concrete next test, not attempted this session (needs the maintainer at the keyboard again).
 
 **A real, separate GUI label bug found investigating the config**: the "Estimate
 motion vectors" switch row's subtitle read "On by default" while the actual, documented
@@ -539,7 +539,7 @@ rewritten so the reasoning trail stays honest:
    of its real logic since 2026-09-14 (commit `72d7a55` -- a deliberate stub after a
    real NVIDIA driver crash when the private optical-flow device is created during a
    live swapchain transition). Motion-vector estimation has not run in *any* session,
-   whatever the toggle said. Alex re-tested with the switch flipped on: ghosting
+   whatever the toggle said. The maintainer re-tested with the switch flipped on: ghosting
    unchanged, fps unchanged -- as it had to be, the code path is unreachable. The GUI
    now grays the whole Motion group out and says why (v0.1.62).
 2. The actual mechanism behind the ghosting is documented in this project's own code
@@ -550,11 +550,11 @@ rewritten so the reasoning trail stays honest:
    frame until the next answer lands -- roughly 8-10 real frames at this session's
    rates. During camera or object motion that delta is misaligned with the frame it's
    applied to, which reads exactly as ghosting. That design was chosen deliberately
-   (per the doc comment there, and Alex's own earlier authorization) to remove the
+   (per the doc comment there, and the maintainer's own earlier authorization) to remove the
    native/processed *flicker* an earlier version had, and the comment already names
    the fix for the staleness it trades for: motion-vector reprojection -- the exact
    feature item 1 says is currently stubbed out. The two findings are one story.
-3. On the second, longer session (v0.1.61, after the render-tap leak fix), Alex's own
+3. On the second, longer session (v0.1.61, after the render-tap leak fix), the maintainer's own
    read was "input lag and stuttering", not the smoother feel reported here -- the
    earlier "feels right" line should not be taken as a settled Phase 2 result. Two
    other things were true during both sessions and confound the fps/lag numbers
@@ -575,7 +575,7 @@ over any launch option) plus a genuine full Steam restart. Confirmed isolated vi
 Steam's own `console-linux.txt`: `[dlssnr-layer] ... RTX 5070 (inert=0 enabled=1)`,
 zero `[neural-forge-layer]` lines for the whole session.
 
-Real result, Alex's own eyes plus telemetry: **upstream has no ghosting and much
+Real result, the maintainer's own eyes plus telemetry: **upstream has no ghosting and much
 better fps.** The hard number that explains it -- upstream during real gameplay sat at
 **98% GPU / 227 W** (the GPU saturated, running at native rate), while NeuralForge's
 own earlier sessions sat at **~30-46% GPU / ~90-115 W** (the GPU *starved*, blocked
@@ -604,7 +604,7 @@ resolution-realistic benchmark (`capture::tests::capture_hot_path_cost_per_prese
 env-gated behind `NEURAL_FORGE_BENCH`, runs on real hardware via the release test
 binary) that drives `capture::run` at 2560x1440 with a keeping-up fake helper and
 separately times the CPU cost (the `run` call on the game's present thread) and the GPU
-cost (queue drain). Baseline on `lordnikon`:
+cost (queue drain). Baseline on the test machine:
 
 - **CPU (run() on the present thread): p50 = 87 ms.**
 - GPU (queue drain): p50 = 1.7 ms.
@@ -636,7 +636,7 @@ stays in the tree as the objective metric for any further hot-path work.
 ## 2026-09-16 (same day) -- GUI: migrated off deprecated `ViewSwitcherTitle`/`Bar`,
 ## caught a real layout bug via screenshot before it shipped
 
-`CLAUDE.md`'s "Deliberately not done" item ("AdwViewSwitcherTitle/Bar, not
+An earlier "deliberately not done" item ("AdwViewSwitcherTitle/Bar, not
 AdwToolbarView + AdwViewSwitcher + AdwBreakpoint... revisit only after checking the
 actual CI-installed libadwaita version") got new information: a real CI run's own
 `apt-get install` log confirmed GitHub Actions' `ubuntu-latest` ships libadwaita
@@ -669,10 +669,10 @@ this is exactly the class of thing `feedback-screenshot-workaround-sandbox` (pro
 memory) says to get a real screenshot for before trusting a GTK layout change.
 
 ## 2026-09-16 (later) -- a real GTA crash traced to an NVIDIA driver bug external to
-## this project, not a NeuralForge regression; `lordnikon` left down, needs a physical
+## this project, not a NeuralForge regression; the test machine left down, needs a physical
 ## restart
 
-Alex reproduced the previous session's GTA crash a second time (over RustDesk, at
+The maintainer reproduced the previous session's GTA crash a second time (over RustDesk, at
 work). Real evidence this time, not just an absent log:
 
 - `nvidia-smi` returned `ERR!` across every field -- the driver could no longer query
@@ -692,13 +692,13 @@ work). Real evidence this time, not just an absent log:
 project**: `Xid 109 CTX_SWITCH_TIMEOUT` under Proton is a long-running, widely
 reported issue (NVIDIA forums, `forums.developer.nvidia.com/t/xid109-ctx-switch-timeout-driver-crashes-in-many-applications/283722`,
 and a matching RTX 5090/Blackwell report at `github.com/NVIDIA/open-gpu-kernel-modules/issues/1097`)
-spanning driver branches from at least 545.x through 595.x (lordnikon runs 615.71.09,
+spanning driver branches from at least 545.x through 595.x (the test machine runs 615.71.09,
 newer than every version in those reports) and a wide range of GPUs (RTX 2080 through
 5090) and completely unrelated games (CS2, Elden Ring, Apex Legends, Path of Exile,
 Assassin's Creed Shadows, Crimson Desert) -- none of them running any DLSS/neural
 rendering layer at all. NVIDIA staff acknowledged it internally ("bug 5052028") with
 no fix shipped as of the driver versions discussed. This is strong evidence the crash
-is an external, pre-existing driver/firmware bug lordnikon's session happened to hit,
+is an external, pre-existing driver/firmware bug the test machine's session happened to hit,
 not something this project's Vulkan hooking introduced -- worth remembering the next
 time a GTA crash gets reported: check `journalctl -k` for a real `Xid` line before
 assuming it's this project's own code, the same "verify below the layer you suspect"
@@ -707,21 +707,21 @@ discipline as the DMA-BUF and native-NGX investigations earlier in this file.
 **Workarounds other users report** (none of them applied here yet, no hardware
 access): driver downgrade to the 550.x branch helped some, though with no guarantee it
 still applies to a Blackwell card on 615.71.09; `PROTON_HIDE_NVIDIA_GPU=1
-PROTON_ENABLE_NVAPI=1` combined with Pyroveil (already present in lordnikon's real
+PROTON_ENABLE_NVAPI=1` combined with Pyroveil (already present in the test machine's real
 Proton-CachyOS install at `.../files/share/pyroveil/`, so this may just be a launch-option
 change, not a new install); lower in-game resolution reduced frequency for some users,
 consistent with a timing/scheduling-pressure trigger rather than a hard deterministic
 one.
 
-**Machine state**: rebooted via `sudo reboot` over SSH at Alex's explicit request: the
+**Machine state**: rebooted via `sudo reboot` over SSH at the maintainer's explicit request: the
 GPU was already unusable (`ERR!`) and unrecoverable without at least a driver reload,
 so nothing was lost by rebooting that wasn't already gone. The reboot did not
-complete successfully -- `lordnikon` never came back on Tailscale or plain SSH after
+complete successfully -- the test machine never came back on Tailscale or plain SSH after
 several minutes of polling (genuine connection timeouts, not "connection refused",
-meaning it never even came back on the network, let alone finished booting). Alex
+meaning it never even came back on the network, let alone finished booting). The maintainer
 confirmed it isn't visible in Tailscale from any path and will restart it by hand.
-**Do not attempt further remote recovery of `lordnikon` in a future session without
-Alex confirming it's back up first** -- the machine may be stuck at POST or otherwise
+**Do not attempt further remote recovery of the test machine in a future session without
+The maintainer confirming it's back up first** -- the machine may be stuck at POST or otherwise
 requires physical presence; blind SSH/reboot attempts against a host in this state
 waste a session's time for no possible benefit.
 
@@ -734,10 +734,10 @@ without temporal history. Another DLSS 5 layer measured a fixed threshold trippi
 times a second on steady pans, and at model interval 2 Neural Forge compares frames two presents
 apart, so it could be worse off here.
 
-**Setup:** LordNikon, Neural Forge 1.0.1, GTA V Enhanced built-in benchmark (all five passes,
+**Setup:** the test machine, Neural Forge 1.0.1, GTA V Enhanced built-in benchmark (all five passes,
 pass 4 = 117 s of continuous free roam), 2560x1440 at 288 Hz with the HDR desktop on (GTA's
 swapchain is still 8-bit, so NR composites normally), NR on, model every 2nd frame, model
-resolution 100%, motion vectors on, Alex's mods with the fixed Enable All Interiors.
+resolution 100%, motion vectors on, the maintainer's mods with the fixed Enable All Interiors.
 
 **Result:**
 
@@ -758,7 +758,7 @@ No adaptive baseline was built. Real fps in this run: 55.2 (pass 4).
 
 ## 2026-10-02 -- 2.0 baseline (1.0.1, mods off)
 
-The comparator for every 2.0 performance change. Neural Forge 1.0.1 as installed on LordNikon,
+The comparator for every 2.0 performance change. Neural Forge 1.0.1 as installed on the test machine,
 RTX 5070, driver 615.71.09. Desktop 2560x1440 at 288.001 Hz, scale 1.0, HDR on (bt2100).
 GTA settings.xml: 2560x1440, RefreshRate 288, Windowed 0, VSync 0, FrameLimit 0, ReflexMode 2,
 FrameGenType 0. GTA's script mods off (`WINEDLLOVERRIDES=xinput1_4=b;dinput8=b`), no remote
@@ -792,13 +792,13 @@ references (93.6 / 67% and 61.6 / 89%, `docs/OPENDLSS_REVIEW.md`), which is the 
 - `wait_answer - helper` is about 1.1 ms: the optical flow (0.7 ms, not part of the published
   helper time) and the two poll loops.
 
-4K is not re-run. On record (Alex's notes, real 4K at desktop scale 1.0, mods on with Enable All
+4K is not re-run. On record (the maintainer's notes, real 4K at desktop scale 1.0, mods on with Enable All
 Interiors patched, which matches mods off at 1440p): NR off 82.0 (GPU 93%; mods off 83.0 at 95%),
 NR on every 2nd frame 32.8 (GPU 95%), NR on + Smooth Motion 25.9 real / 52.3 displayed (GPU 97%).
 The older `r-nomods-nroff-4k` run on the rig read 93.0 at 68% GPU: it ran at the 1440p desktop and
 is not a 4K number.
 
-`capture_hot_path_cost_per_present` on LordNikon (release test binary at 9f2c084):
+`capture_hot_path_cost_per_present` on the test machine (release test binary at 9f2c084):
 
 ```
 capture_hot_path_cost_per_present @ 2560x1440 (200 samples, 31 composited a fresh answer):
@@ -814,7 +814,7 @@ GPU timestamps cost nothing measurable. `[sync]` medians: total 18.5 ms, capture
 wait_answer 12.65, helper 11.5, zc=true. The new timestamps: **gpu_capture 0.79 ms,
 gpu_compose 1.85 ms** of the layer's own GPU work per capture and per compose.
 
-`capture_hot_path_cost_per_present` on LordNikon at 1.1.0. Its fake helper now keeps a heartbeat,
+`capture_hot_path_cost_per_present` on the test machine at 1.1.0. Its fake helper now keeps a heartbeat,
 so every present composites (229 fresh answers in 200 samples; at 1.0.1 only 31 did and the CPU
 mean of 54 µs measured mostly presents that returned early, so the two are not comparable). It
 runs the copy path (zc=false):
@@ -828,7 +828,7 @@ gpu (queue drain after run()): mean=1.713983ms p50=1.673638ms p95=1.849431ms max
 ## 2026-10-02 -- 2.0.0
 
 The model runs before DLSS Super Resolution by default (`docs/PRE_UPSCALER_DESIGN.md` has every
-experiment). GTA V Enhanced, LordNikon, RTX 5070, driver 615.71.09, 2560x1440 at 288 Hz, HDR desktop,
+experiment). GTA V Enhanced, the test machine, RTX 5070, driver 615.71.09, 2560x1440 at 288 Hz, HDR desktop,
 DLSS Balanced (render 1485x836), `scripts/gta-bench.sh`, script mods off, pass 4:
 
 | Build / config | Real fps | Shown fps | GPU |
@@ -839,12 +839,12 @@ DLSS Balanced (render 1485x836), `scripts/gta-bench.sh`, script mods off, pass 4
 | 4K, 2.0 default vs 1.x path | 39.0 vs 28.7 | | 96% vs 93% |
 | DLSS Frame Generation 3x, 2.0 default vs 1.x path | 53.0 vs 28.7 | 159 vs 86 | 96% vs 98% |
 
-**Real play, 2.0 (137f24e, same code as 2.0.0), Alex at the screen, about an hour, mods on, DLSS
+**Real play, 2.0 (137f24e, same code as 2.0.0), the maintainer at the screen, about an hour, mods on, DLSS
 Frame Generation 4x.** A 60 s sample: ~50 real frames per second, every one held and run through the
 model (48-50 holds/s), 195-199 fps shown, hold 9.7 ms median (capture wait 3.6, helper 5.9, hand-off
 0.00), 0 misses in the sample and 28 over 29 minutes (loading screens and start-up), DLSS FG's
 launch submits forwarded untouched (228,000 vs 88,655 held), GPU 96% (never below 94%), 9.5 of 12.2
-GB VRAM, 205 W, 68 C, no Xid. Alex: "everything is working beautifully ... nothing I can complain
+GB VRAM, 205 W, 68 C, no Xid. The maintainer: "everything is working beautifully ... nothing I can complain
 about", mods working.
 
 **GTA's start-up crash.** Every early exit today is an access violation at
@@ -854,7 +854,7 @@ relaunching works.
 
 ## 2026-10-02 -- upstream 0.3.1-2 vs Neural Forge 2.0.0
 
-DLSS5VKLayer 0.3.1-2 (release 2026-09-26, commit `9f43793`), installed on LordNikon from the
+DLSS5VKLayer 0.3.1-2 (release 2026-09-26, commit `9f43793`), installed on the test machine from the
 release tarball with `./install.sh --user` (no root): `~/.local/lib/dlssnr`, `~/.local/bin/dlssnr-*`,
 implicit manifests `~/.local/share/vulkan/implicit_layer.d/VK_LAYER_NV_dlssnr.{x86_64,i686}.json`
 (`enable_environment` `VKLayer_DLSS5=1`), a `dlssnr.desktop` launcher (not autostart). NGX DLLs
@@ -869,7 +869,7 @@ Upstream ran at its defaults: model every frame, after the upscaler, at 2560x144
 Only one model helper ran at a time.
 
 **GTA V Enhanced: upstream still cannot run it.** `scripts/gta-bench.sh`, layers
-`VK_LAYER_NV_dlssnr`, `VKLayer_DLSS5=1`, mods off, Alex's settings (DLSS Balanced, FrameGenType 1):
+`VK_LAYER_NV_dlssnr`, `VKLayer_DLSS5=1`, mods off, the maintainer's settings (DLSS Balanced, FrameGenType 1):
 
 - Helper running from the start: 3 of 3 launches crashed at Game Init, about 95 s in, with the known
   access violation at `GTA5_Enhanced.exe+0x12c6eb`. A fourth with `DLSSNR_IDLE_REPAINT=0` did the
@@ -910,7 +910,7 @@ pair was skipped because upstream has no GTA number to pair it with.
 as GTA with Proton-GE Latest. The game skips the menu, runs the 64 s benchmark scene and exits.
 Results go to `Documents/CD Projekt Red/Cyberpunk 2077/benchmarkResults/<time>/summary.json`.
 The runner and summariser are on the rig as `~/nf-spike/cp/cp-bench.sh` and `cp-report.py`.
-Settings were Alex's, unchanged: 2560x1440 fullscreen, DLSS Auto, ray tracing on (reflections, sun
+Settings were the maintainer's, unchanged: 2560x1440 fullscreen, DLSS Auto, ray tracing on (reflections, sun
 shadows, lighting Ultra), FG off, Reflex on.
 
 In Cyberpunk, Neural Forge's pre-upscaler path finds no DLSS input
@@ -921,7 +921,7 @@ at 2560x1440, the same place upstream works, so this is a like-for-like comparis
 |---|---|---|---|
 | Upstream 0.3.1-2 (model every frame), 3 runs | 38.0 / 37.9 / 37.9, mean **37.9** | 89-90% | 218 W |
 | Neural Forge 2.0, model every frame (`model_interval=1`), 2 runs | 38.2 / 38.4, mean **38.3** | 95% | 219 W |
-| Neural Forge 2.0, Alex's setting (`model_interval=2`), 3 runs | 51.9 / 51.8 / 52.1, mean **51.9** | 95-96% | 214 W |
+| Neural Forge 2.0, the maintainer's setting (`model_interval=2`), 3 runs | 51.9 / 51.8 / 52.1, mean **51.9** | 95-96% | 214 W |
 | NR off, 2 runs | 93.0 / 85.3, mean 89.2 | 95% | 206-210 W |
 
 At the same work per frame the two are equal (Neural Forge +0.4 fps). Neural Forge's default of
@@ -937,15 +937,15 @@ The desktop is untouched at 2560x1440@288, scale 1.0.
 ## 2026-10-05 -- 2.0.2
 
 **Correction: 2.0.2 fails with DLSS Frame Generation on, which is how GTA is played.** The runs
-below had `FrameGenType` 0. With Alex's settings as they are (`FrameGenType` 1, `dlssFrameGenMode`
+below had `FrameGenType` 0. With the maintainer's settings as they are (`FrameGenType` 1, `dlssFrameGenMode`
 2), 3 runs: **22.7 real fps, 90.5 shown** (frame generation 4x), no frame held. Every run logs
 `the DLSS launch buffer has a same-layout barrier on a DLSS input before its launch; not holding`,
 and the model ran after the upscaler on every shown frame (91 composited/s). Fixed in 2.0.3 (below).
 
 2.0.2 (0720dfd, deployed with `scripts/deploy-rig.sh`) against 2.0.1's code (d79c82a, the build
-installed on 2026-10-03; 2.0.1 only bumped the version after it), same day. LordNikon, RTX 5070,
+installed on 2026-10-03; 2.0.1 only bumped the version after it), same day. The test machine, RTX 5070,
 driver 615.71.09, 2560x1440 at 288 Hz, HDR desktop, DLSS Balanced (render 1485x836), GTA settings.xml
-as Alex has it except `FrameGenType` 0 for the runs (restored afterwards, sha256 identical),
+as the maintainer has it except `FrameGenType` 0 for the runs (restored afterwards, sha256 identical),
 `scripts/gta-bench.sh`, script mods off, no remote-desktop session, pass 4. Settings as found:
 enabled=1, passes=1, working_scale=1, mvec_enabled=1.
 
@@ -985,7 +985,7 @@ colour or exposure input. A hold reads only those two (depth and motion vectors 
 mode), so 2.0.3 refuses a hold only for synchronization on them; a barrier on depth or motion
 vectors stops only a dump.
 
-2.0.3, Alex's settings as found (`FrameGenType` 1, `dlssFrameGenMode` 2), mods off, pass 4, 3 runs:
+2.0.3, the maintainer's settings as found (`FrameGenType` 1, `dlssFrameGenMode` 2), mods off, pass 4, 3 runs:
 
 | Run | Real fps | Shown fps | Held/s | GPU |
 |---|---|---|---|---|
@@ -1008,7 +1008,7 @@ vectors stops only a dump.
   generated frames shown are on record for the same hold on 2.0 (real play at 4x, about 50 real /
   195 shown; benchmark at 2x, 56.9 real / 114.2 shown).
 
-**After a restart of LordNikon, frame generation engaged with 2.0.3.** Same settings as found, mods
+**After a restart of the test machine, frame generation engaged with 2.0.3.** Same settings as found, mods
 off, no remote-desktop session, 4 launches:
 
 | Run | Real fps | Shown fps | Held/s | GPU | Frame generation |
@@ -1069,12 +1069,12 @@ the RTX 5070 with staged buffers (worst relative error 2.71e-3). With host-memor
 test process, a later 32 KB device-local allocation fails with `ERROR_OUT_OF_DEVICE_MEMORY` (also the
 existing roundtrip test on that machine); the test can run staged with `NEURAL_FORGE_TEST_IMPORT=0`.
 
-**Real play, Alex at the screen** (Steam launch, `NEURAL_FORGE_ENABLE=1 %command%`, 2560x1440, DLSS
+**Real play, the maintainer at the screen** (Steam launch, `NEURAL_FORGE_ENABLE=1 %command%`, 2560x1440, DLSS
 Balanced 1516x852, frame generation with dynamic multi frame generation, Reflex on, SDR): holding,
 24.7-31.3 frames held per second (every real frame), **148-164 fps shown**, hold 8.8-9.0 ms median
 (capture wait 0.83-0.90, helper 5.6), 0 misses, no Xid. Ray Reconstruction switched on in game changed
 nothing in the layer's view (same 1516x852 input held, 24.7/s, 148 shown); whether the game's Ray
-Reconstruction then runs is not measured. Alex: "for the first time I'm actually noticing the neural
+Reconstruction then runs is not measured. The maintainer: "for the first time I'm actually noticing the neural
 rendering being applied ... no real flickering ... with frame gen it's playable".
 
 **GTA V and Cyberpunk 2077 on 2.0.4** (one run each, settings as found):
@@ -1082,7 +1082,7 @@ rendering being applied ... no real flickering ... with frame gen it's playable"
 - GTA V Enhanced (frame generation on in its settings; it did not engage in pass 4 of this benchmark
   launch, as often): the split hold as before, 68.8 held/s against 68.1 real, 0 misses after the
   model's first build, no `not holding`, no hold inside the buffer, no fence timeout, no Xid.
-- Cyberpunk 2077 (SDR, frame generation off as Alex has it, ray tracing on): held inside DLSS's buffer,
+- Cyberpunk 2077 (SDR, frame generation off as the maintainer has it, ray tracing on): held inside DLSS's buffer,
   54.1 held/s, hold 10.7 ms, 0 misses after the first build, no Xid. After about 11 s DLSS's launches
   named another of its two 1485x835 RGBA16F candidates (`a CUDA launch names depth ... with several
   colour candidates at its extent`); its buffers were then classed as not reading the colour input and
@@ -1092,7 +1092,7 @@ rendering being applied ... no real flickering ... with frame gen it's playable"
 ## 2026-10-05 -- 2.0.5: Cyberpunk 2077 with frame generation
 
 Frame generation turned on in Cyberpunk's settings (DLSS FG 3x; it had been off, which is not how
-Alex plays). With it on, the NGX probe (`cp/cp-fgprobe-1`) shows Streamline copying DLSS's inputs in
+The maintainer plays). With it on, the NGX probe (`cp/cp-fgprobe-1`) shows Streamline copying DLSS's inputs in
 DLSS's buffer before the launches: the colour into a fresh 1485x835 RGBA16F image and the depth into a
 1485x835 `R32_SFLOAT` image; no depth-format image is registered. DLSS's input kernel names that R32
 image and two 1485x835 RGBA16F images. `dump` through the hold inside the buffer with
@@ -1109,7 +1109,7 @@ summary: 118.0 average, 106.7 minimum), post-upscaler compose off (0.8/s), no fe
 
 Steam launch, `NEURAL_FORGE_ENABLE=1 %command%`, Proton-GE Latest, the tool's own settings (DLSS,
 super resolution 60, full ray tracing Medium, Very High), driven by a virtual Xbox controller
-(`~/nf-spike/pad/nf-pad.py` on LordNikon: the tool ignores a synthetic mouse).
+(`~/nf-spike/pad/nf-pad.py` on the test machine: the tool ignores a synthetic mouse).
 
 - Why nothing was held before: DLSS's input kernel (`cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi`)
   packs two 32-bit view handles per 8-byte parameter word (`0x3201c2301401c00`), so the layer
@@ -1138,7 +1138,7 @@ wherever the game has it):
 - Crimson Desert (`v206-cd-2`): the title screen held (5,700 holds, 44/s, 0 misses); in game (Nas
   River) nothing was held and the model ran after the upscaler (75.6 fps composited, all presents),
   no fence timeout, no Xid. First put down to Ray Reconstruction (on since 17:18 that day): wrong.
-  Alex's play with 2.0.5 and Ray Reconstruction on held every real frame (3,154 buffers held reading
+  The maintainer's play with 2.0.5 and Ray Reconstruction on held every real frame (3,154 buffers held reading
   the colour input, 7 naming another candidate). In 2.0.6's run two buffers named different colour
   images, the size rule took the lowest handle, and in play DLSS's input kernel read a candidate
   past the three kept beside it (ten registered), so the switch to it never happened. Fixed in
@@ -1277,7 +1277,7 @@ Witcher 3 and Metro Exodus EE were removed from the machine and from the README'
 ## 2026-10-06 -- Marvel's Spider-Man Remastered (DX12), branch build
 
 First launch defaults: V-Sync on, frame generation off, dynamic resolution targeting 60 fps (DLSS
-input 2560x1440 then, held at 37/s, 25 ms holds). Set (by Alex): V-Sync off, Reflex on, DLSS Frame
+input 2560x1440 then, held at 37/s, 25 ms holds). Set (by the maintainer): V-Sync off, Reflex on, DLSS Frame
 Generation, DLSS Super Resolution Quality. In play (F.E.A.S.T. centre, Continue): DLSS input
 1712x960, 49.0 holds/s, 98.0 presents/s (frame generation 2x), 0 misses in the window, nothing
 composited after the upscaler; the game's 1x1 exposure reads over 1000, so it is measured from the

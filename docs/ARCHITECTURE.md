@@ -458,7 +458,7 @@ it reported light, and limits the ratio (highlight guard). Transfer modes decide
 model answer is brought back (classic, matched residual, native + edit). Most of this is ported
 from upstream's `dlssnr.hlsl` ([ATTRIBUTION.md](../ATTRIBUTION.md)); `composition/color.rs` is the
 one clean-room file. The composition invariants every change must keep are in
-[CLAUDE.md](../CLAUDE.md), "Composition invariants".
+[AGENTS.md](../AGENTS.md), "Composition invariants".
 
 ### 5.5 The model server
 

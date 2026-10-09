@@ -25,7 +25,7 @@ it as an assumed future direction.
 
 ## What this session found: NVIDIA does ship a real native Linux NGX runtime
 
-`lordnikon`'s driver package (615.71.09) includes a genuine native Linux ELF library at
+The test machine's driver package (615.71.09) includes a genuine native Linux ELF library at
 `/usr/lib/x86_64-linux-gnu/libnvidia-ngx.so.1`, exporting the same `NVSDK_NGX_VULKAN_*`
 C ABI as Windows' `nvngx.dll` (confirmed via `nm -D`: `Init_Ext`, `CreateFeature`,
 `EvaluateFeature`, `AllocateParameters`, etc., all present).
@@ -36,7 +36,7 @@ documented, cross-platform component:
 
 - `include/nvsdk_ngx_loader.h` defines `NGX_CORE_LIBRARY_NAME "libnvidia-ngx.so.1"` for
   the non-Windows branch and loads it with a plain `dlopen` — the exact file found
-  installed on `lordnikon`.
+  installed on the test machine.
 - `lib/Linux_x86_64/rel/` ships real, redistributable per-feature snippet `.so`s for
   every *officially released* NGX feature: `libnvidia-ngx-dlss.so` (Super Resolution),
   `libnvidia-ngx-dlssd.so` (Ray Reconstruction), `libnvidia-ngx-dlssg.so` (Frame
@@ -71,7 +71,7 @@ declares the app-data-path parameter as `const wchar_t*`, and `wchar_t` is **4 b
 Linux** (UTF-32) vs. **2 bytes on Windows** (UTF-16) — the existing Windows helper's
 UTF-16 encoding is not portable to this call as-is.
 
-**Result on real hardware** (`lordnikon`, RTX 5070, driver 615.71.09):
+**Result on real hardware** (the test machine, RTX 5070, driver 615.71.09):
 
 ```
 NVSDK_NGX_VULKAN_Init_Ext            -> 0x1        (SUCCESS, no fault)
@@ -164,10 +164,10 @@ already-decided scope:
   from the Windows `nvngx_dlssnr.dll` binary itself, rather than calling into NVIDIA's
   own compiled implementation of it. This is a **materially different and larger legal
   and technical undertaking** than anything this project has done so far — the
-  caller-identity spoof Alex already accepted (`ATTRIBUTION.md`, `spoof.rs`) is about
+  caller-identity spoof the maintainer already accepted (`ATTRIBUTION.md`, `spoof.rs`) is about
   *calling* NVIDIA's own compiled code under a false caller identity; this would be
   about *extracting and reusing the proprietary model/inference code itself*, a
-  different category of exposure. Not something to start without Alex explicitly
+  different category of exposure. Not something to start without the maintainer explicitly
   deciding to cross that line, the same way the caller-identity spoof was an explicit,
   named decision rather than something assumed.
 
@@ -178,7 +178,7 @@ Keep the current architecture (Wine-hosted helper running the real
 one more Wine/NVIDIA-API trick away from closing — it's a missing artifact nobody but
 NVIDIA can produce, or a decision to reimplement proprietary model internals that
 hasn't been made and shouldn't be assumed. Don't restart this investigation without new
-information (NVIDIA publishing something for Linux, or Alex deciding to take on the
+information (NVIDIA publishing something for Linux, or the maintainer deciding to take on the
 reimplementation question directly). If DMA-BUF-style zero-copy transport still matters
 after Phase 1's real GTA fps measurement, revisit it as its own problem
 (`DMABUF_TRANSPORT_DESIGN.md`'s own recommendation: real `SCM_RIGHTS` fd-passing) rather

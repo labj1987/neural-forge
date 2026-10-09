@@ -96,7 +96,7 @@ occupying.
 
 ## Validation
 
-Real hardware, `lordnikon`, RTX 5070, driver 615.71.09 -- a fresh clone at each
+Real hardware, the test machine, RTX 5070, driver 615.71.09 -- a fresh clone at each
 commit, not just this dev machine's own software ICD:
 
 - `cargo test -p neural-forge-layer` (48 tests, including the new
@@ -124,7 +124,7 @@ commit, not just this dev machine's own software ICD:
 - One real process lesson, not a code bug: the first two "concurrent" test attempts
   looked like a serious cross-slot race (both processes reporting the same sequence
   number, one request going permanently unanswered) until re-checked against a
-  freshly `git pull`ed clone on `lordnikon` -- the diagnostic tool's own slot
+  freshly `git pull`ed clone on the test machine -- the diagnostic tool's own slot
   argument hadn't been pulled yet, so both invocations were silently racing for slot
   0 alone. Confirmed by comparing `git log` on the remote clone before concluding
   anything about the actual code. Worth remembering next time a real-hardware result

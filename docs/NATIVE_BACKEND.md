@@ -3,14 +3,14 @@
 The plan: run the neural rendering network inside the layer, on the game's own device, with
 [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (MIT), and retire the Windows helper, the
 Wine/Proton runner, the shared-memory hand-off, the NGX DLL at run time and the caller-identity spoof.
-Branch `native-backend` only; nothing merges, tags or releases until Alex has judged the results.
+Branch `native-backend` only; nothing merges, tags or releases until the maintainer has judged the results.
 
 This file is written as the work goes. Every attempt, including the failed ones, is in "Attempt
 log" so the next one starts from it.
 
 ## Phase 0: go or no-go (2026-10-07)
 
-**Verdict: go, with two cautions.** (Alex: go, 2026-10-07.) All three gates hold on the test machine:
+**Verdict: go, with two cautions.** (the maintainer: go, 2026-10-07.) All three gates hold on the test machine:
 
 | Gate | Needed | Measured |
 |---|---|---|
@@ -233,7 +233,7 @@ without `exposure.json` were skipped. No game was run for this. For each frame:
    repeating the last one, as the layer does for an odd width.
 2. Send it to the helper with `trigger_helper_roundtrip --rgba16f` 32 times (the feature builds),
    wait 2 s (the helper resets the model's history after 500 ms without an answer), then once more:
-   that answer is NGX's first frame after a reset, with no history. Helper settings as Alex has
+   that answer is NGX's first frame after a reset, with no history. Helper settings as the maintainer has
    them: style 0, intensity 1, tone 1, structure 1, skin -1, auto-mask on, preset 0.
 3. Run the same 1486x836 bytes through `dlss5vk parity` as a proxy fixture (conditioning style 0,
    tone 1, structure 1, skin -1, auto-mask on, seed 0) with the helper's answer as the f32 native
@@ -369,7 +369,7 @@ and composite bit for bit; ATTRIBUTION.md).
 - **Seed**: 0 on a frame without history, then counting, so the first frame after a reset is NGX's
   exactly (0.6).
 - **Settings**: Phase 1 runs the defaults (style 0, tone 1, structure 1, skin -1, auto-mask, intensity
-  1), the values Alex runs. The Model tab's mapping is 2.2.
+  1), the values the maintainer runs. The Model tab's mapping is 2.2.
 - **Cost per frame** in GTA V at 1485x836: the hold's CPU time 0.08 ms (the helper path: about
   10 ms, of which 3.6-4.4 ms draining the game's queue); `W` on the GPU 0.11-0.12 ms; the network
   frame `N` (preprocess, network, composite) **6.46-6.66 ms** on the GPU (median per 300 holds, the
@@ -419,7 +419,7 @@ about half its launches.
   captures keyed to the game's frame count.
 - **The temporal path is not compared with NGX's.** NGX reprojects with the helper's optical flow;
   the native path with DLSS's motion vectors and the jitter. Watch for ghosting or shimmer in Phase 3
-  and in Alex's play.
+  and in the maintainer's play.
 - **One frame of the layer's work in flight**: each hold waits (bounded) for the previous hold's
   write-back fence before recording, as the helper hold does. With the CPU no longer waiting on the
   GPU inside the hold, this is now the one place the game's CPU can wait for its own GPU work.
@@ -445,7 +445,7 @@ memory where the device allows (staged copies otherwise).
 
 - **No history**: there are no motion vectors after the upscaler, so every frame is a first frame, with a
   fixed seed (a changing seed with nothing blending frames would shimmer). The helper's NGX had a history
-  fed by its optical flow. **For Alex**: worth a look for shimmer in a game on this path.
+  fed by its optical flow. **For the maintainer**: worth a look for shimmer in a game on this path.
 - **Never both paths at once**: the pre-upscaler hold and this server share the network's frame state; each
   refuses for a second after the other used it (`Loader::claim_pre`, `claim_post`).
 - **A helper process that is running wins**: the server does not start if the helper's heartbeat moves.
@@ -479,8 +479,8 @@ setting: bit-exact, or within one half-float step where the native side applies 
 | Auto mask | `DLSSNR.UseAutoMask` | lanes 12-14 (off: structure, -1, -1) | off: bit-exact |
 | Preset | `DLSSNR.Hint.Render.Preset` | none | preset 1 gives NGX's preset-0 answer byte for byte: it does nothing on 310.8.0, with either backend. **Removed (SHM v12); the helper always sends 0.** |
 | Sharpness | `Sharpness`, which the 310.8 feature never reads (DLSSNR_PARAMETERS.md) | none | No effect on either backend. **Removed (SHM v12).** |
-| Passes, per-pass settings | the helper chains one NGX feature per pass | none: the network runs once per frame with the Model tab's values; per-pass overrides are ignored | **Alex (2026-10-07): not wanted on native.** The GUI shows Passes, Per-pass settings and Unlock pass limit only while a game runs on the helper (`native_running`, SHM v13). |
-| Motion: estimate motion vectors, units, quality | the helper's optical flow feeds NGX's `MVec` | none: DLSS's own motion vectors and jitter | **Alex (2026-10-07): helper only.** The Motion tab is shown only while a game runs on the helper. |
+| Passes, per-pass settings | the helper chains one NGX feature per pass | none: the network runs once per frame with the Model tab's values; per-pass overrides are ignored | **The maintainer (2026-10-07): not wanted on native.** The GUI shows Passes, Per-pass settings and Unlock pass limit only while a game runs on the helper (`native_running`, SHM v13). |
+| Motion: estimate motion vectors, units, quality | the helper's optical flow feeds NGX's `MVec` | none: DLSS's own motion vectors and jitter | **The maintainer (2026-10-07): helper only.** The Motion tab is shown only while a game runs on the helper. |
 
 Every other Model and Composition control (model interval, working scale, detail strength, colour
 strength, highlight guard, white point, transfer mode, compare, debug) belongs to the after-the-upscaler
@@ -519,7 +519,7 @@ Not built, as the handoff asks.
 
 ## Phase 3: measurements (cut short)
 
-GTA V Enhanced benchmark, pass 4 (116 s), script mods off, real fps from GTA's frame times. Alex stopped the
+GTA V Enhanced benchmark, pass 4 (116 s), script mods off, real fps from GTA's frame times. The maintainer stopped the
 matrix as too long once the answer was clear; what was measured:
 
 | Configuration | Driver | Native | Helper |
@@ -573,16 +573,16 @@ matrix as too long once the answer was clear; what was measured:
 
 ### Recommendation
 
-Not 3.0 yet. At 1440p, the configuration Alex plays, native is at least as fast as the helper with a
+Not 3.0 yet. At 1440p, the configuration the maintainer plays, native is at least as fast as the helper with a
 bit-exact picture and a much simpler setup, which is what the plan asked for. But 4K looks worse, the
 after-the-upscaler path is slower and loses its history, and two game families still need the helper, so
 removing the helper (Phase 5) now would make those cases worse. Suggested next steps, smallest first: one
 4K helper run to confirm the 4K gap; if VRAM is the cause, don't build the network at output size on the
 menus and drop the model's host and raw copies after upload; then decide whether the inline hold and the
-post path are worth porting or whether 3.0 keeps the helper for them. Alex should also play GTA V on this
+post path are worth porting or whether 3.0 keeps the helper for them. The maintainer should also play GTA V on this
 branch once to judge the temporal look (ghosting, shimmer) against the helper.
 
-**Alex's answer (2026-10-07):** 4K and the after-the-upscaler path don't matter. He plays at 1440p, 288 Hz,
+**The maintainer's answer (2026-10-07):** 4K and the after-the-upscaler path don't matter. He plays at 1440p, 288 Hz,
 VRR, HDR, and the games he plays now and later have an upscaler. Passes and the motion controls are not
 wanted on native (2.2). The games held inside DLSS's command buffer (Crimson Desert, Cyberpunk 2077) still
 need the helper, so whether Phase 5 removes it is still his call. Then: "port the mode now, all games
@@ -684,7 +684,7 @@ is out of scope).
 
 ## Phase 5: the helper removed (3.0.0, 2026-10-07)
 
-Alex (2026-10-07), after the game comparison above: "push for the 3.0.0 release, where you remove the
+The maintainer (2026-10-07), after the game comparison above: "push for the 3.0.0 release, where you remove the
 helper and everything associated with it". Done on `release-3.0`:
 
 - **Gone:** `crates/helper` and its scripts (`helper-test.sh`, `rig-test.sh`), the supervisor's
@@ -702,13 +702,13 @@ helper and everything associated with it". Done on `release-3.0`:
 - **Kept:** the shared-memory channel (settings, status, and the after-the-upscaler request slots,
   answered by `native_post::PostServer`); the extractor; `binaries=` in `config.ini` (where an
   imported DLL lives). `config.ini` keeps only `binaries=`, `shm=` and the `set_` settings, and the
-  layer applies the saved settings itself when it creates the channel. Alex's machines get their old
+  layer applies the saved settings itself when it creates the channel. The maintainer's machines get their old
   keys removed by hand; there is no migration code.
 - **Smoke test of the 3.0.0 AppImage** (installed on the test machine, driver 615.78.08, one run each):
   GTA V benchmark pass 4 69.1 fps, every frame held (native before: 70.9-71.8; spread about 3 fps);
   Crimson Desert in game 151.6 fps presented, 25.9 held/s inside DLSS's buffer, 0 misses (the first run
   after the update compiled the game's shaders and stayed on its title screen: 50.5 held/s, 0 misses);
-  Lords of the Fallen (Unreal Engine 5, first launch, its privacy-policy screen: not accepted for Alex)
+  Lords of the Fallen (Unreal Engine 5, first launch, its privacy-policy screen: not accepted for the maintainer)
   held inside DLSS's buffer at 109.4/s, R11G11B10 input at 1488x836, network 6.19 ms, 0 misses. No Xid,
   no fence timeout in any run.
 - **Checks:** every crate builds without warnings, `cargo test` (layer on lavapipe) passes, as do
@@ -718,11 +718,10 @@ helper and everything associated with it". Done on `release-3.0`:
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL
    so they can run outside NGX. It reads only resource data (no code, nothing decrypted, no check
-   bypassed), which the "Working with NVIDIA's binaries" rules in AGENTS.md/CLAUDE.md allow as
-   written. But running the weights outside NVIDIA's runtime is a different use than those rules
-   were written for, and the NGX licence's terms on it are yours to judge. Nothing has been pushed;
+   bypassed). But running the weights outside NVIDIA's runtime is a different use than reading
+   them, and the NGX licence's terms on it are yours to judge. Nothing has been pushed;
    the commit is on the local `native-backend` branch only.
-   *Alex said move on to Phase 1 (2026-10-07). Still nothing pushed: pushing is Phase 4.*
+   *the maintainer said move on to Phase 1 (2026-10-07). Still nothing pushed: pushing is Phase 4.*
 2. **The 1440p margin.** The network alone is about 0.7 ms slower than the helper's evaluate at
    1485x836 on an idle GPU. Phase 3 will say whether the removed hand-off costs make up for it in
    game; if they do not, success criterion 2 fails at 1440p and passes at 4K.
@@ -731,7 +730,7 @@ helper and everything associated with it". Done on `release-3.0`:
 
 | Date | What | Result |
 |---|---|---|
-| 2026-10-07 | `apt install -y python3-pefile` on the test machine | Refused: the SSH session is user `alex`, not root (the handoff assumed root). Used a venv in `~/scratch/venv` instead. |
+| 2026-10-07 | `apt install -y python3-pefile` on the test machine | Refused: the SSH session is a non-root user, not root (the handoff assumed root). Used a venv in `~/scratch/venv` instead. |
 | 2026-10-07 | tmux for long jobs | Not installed on the test machine; `setsid nohup` and `screen` used instead. |
 | 2026-10-07 | Record walk with the kind as a u8 and the tensor at +25 | Wrong: every tensor came out three bytes early (each started `00 00 00`, each trailer started with three data bytes). Lengths still matched the layouts, so the length check alone did not catch it. The kind is a u32; the tensor starts at +28. |
 | 2026-10-07 | Stage hashes in lower-case hex | `nr::Model` refused them (`stage SHA-256 mismatch`): its `sha256.h` prints upper case and compares strings. Changed to upper case. |
@@ -743,7 +742,7 @@ helper and everything associated with it". Done on `release-3.0`:
 | 2026-10-07 | The native composite's `.spv` not rebuilt after an edit | The first committed layer had the old binding; `check_shaders.py` caught it. Rebuilt. |
 | 2026-10-07 | The layer's GPU tests in parallel on the test machine | 10 fail on main and 16 on the branch with `ERROR_OUT_OF_DEVICE_MEMORY` or "failed to create the test's own target image"; the 6 extra pass one at a time (`--test-threads=1`). A machine limit, not a regression. |
 | 2026-10-07 | In-game captures at fixed seconds after launch, native and helper | The moments were seconds apart (loading time varies): not comparable pixel by pixel. |
-| 2026-10-07 | Driver 615.71.09 -> 615.78.08 (Alex's request, installed with GreenLight's install script, rebooted) between the first and the second Phase 3 pass | Same capabilities (32-bit still has no `VK_NV_cuda_kernel_launch`); the rig test still bit-exact; network time unchanged (1485x836 5.505 ms, 2228x1253 10.672, 2560x1440 13.349, 3840x2160 30.018; chaining off 5.947, 10.939, 13.731, 30.118). Phase 3 runs again in full on 615.78.08; the 615.71.09 pass of 1440p without frame generation is kept as a reference. |
+| 2026-10-07 | Driver 615.71.09 -> 615.78.08 (the maintainer's request, installed with a separate driver install script, rebooted) between the first and the second Phase 3 pass | Same capabilities (32-bit still has no `VK_NV_cuda_kernel_launch`); the rig test still bit-exact; network time unchanged (1485x836 5.505 ms, 2228x1253 10.672, 2560x1440 13.349, 3840x2160 30.018; chaining off 5.947, 10.939, 13.731, 30.118). Phase 3 runs again in full on 615.78.08; the 615.71.09 pass of 1440p without frame generation is kept as a reference. |
 | 2026-10-07 | `NEURAL_FORGE_CAPTURE_AT=5:20000` in the first Phase 3 runs | Nothing captured: the trigger never fired. Resumes are now logged when it is set; the captures move to dedicated runs. |
 | 2026-10-07 | Stale motion vectors? (DLSS's buffer synchronizes them before its launch) | Consecutive dumps 393-396: inconclusive, the scene barely moves (median 0.33 px). Open. |
 
@@ -755,7 +754,7 @@ helper and everything associated with it". Done on `release-3.0`:
 - [x] 0.4 model directory extracted, loads with hash verification
 - [x] 0.5 bench numbers on the rig at four sizes
 - [x] 0.6 output compared against the helper
-- [x] Phase 0 report written, go or no-go stated, stopped for Alex
+- [x] Phase 0 report written, go or no-go stated, stopped for the maintainer
 - [x] 1.1 sources vendored, built from build.rs
 - [x] 1.2 device extensions and features added in the layer
 - [x] 1.3 game device adopted, queue use documented
@@ -766,8 +765,8 @@ helper and everything associated with it". Done on `release-3.0`:
 - [x] 2.2 settings mapping table written, unmapped controls listed
 - [x] 2.3 Setup tab reduced to extract-model
 - [x] 2.4 32-bit layer answer recorded
-- [x] Phase 3 benchmarks (cut short on Alex's request; long session not run)
-- [x] Phase 4 report written, branch pushed, stopped for Alex
+- [x] Phase 3 benchmarks (cut short on the maintainer's request; long session not run)
+- [x] Phase 4 report written, branch pushed, stopped for the maintainer
 - [x] Phase 4b hold inside DLSS's command buffer native
 - [x] Phase 5 helper removed (3.0.0)
 

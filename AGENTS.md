@@ -3,7 +3,9 @@
 Repository: https://github.com/labj1987/neural-forge
 
 Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
-benchmark plan. The former app name was dlssnr; upstream DLSS5VKLayer remains a
+target-ownership rules. Benchmarks run with `scripts/gta-bench.sh`
+([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)); the old Phase 1 plan is in
+[docs/history/phase1-benchmark-plan.md](docs/history/phase1-benchmark-plan.md). The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
 
 All documentation is indexed in [docs/README.md](docs/README.md); start with docs/ARCHITECTURE.md and docs/LESSONS.md.
@@ -84,38 +86,6 @@ review licenses before source reuse.
 Current target-machine evidence and unresolved Vulkan errors are in
 [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
 
-## Working with NVIDIA's binaries
-
-The line is between interface and behaviour, which are fair game, and NVIDIA's code, which is not
-read. It applies to `nvngx.dll`, `nvngx_dlss*.dll`, `nvngx_dlssnr.dll` and game executables alike.
-
-Do, freely:
-
-- Run the DLLs through their API and observe what they do: outputs, timing, A/B runs, and
-  API-boundary tracing of exports, imports or Vulkan calls (for example Frida).
-- Log what the layer sees of DLSS through Vulkan: NVX registrations, kernel names
-  (`vkCreateCuFunctionNVX`), launch parameter blocks and how their words map to views per DLSS
-  version (`NEURAL_FORGE_PROBE_NGX=1`), and record those layouts in `docs/` as tables.
-- Read a DLL's interface metadata: PE headers, export and import tables, the version resource,
-  `strings` for parameter and kernel names, and `cuobjdump --list-elf`/`--list-ptx` for the names
-  of embedded kernels. `extract-model` reads only the weights' resource data (no code).
-- Use NVIDIA's public SDK headers and docs, and open-source consumers of the same features (check
-  the licence before taking code; record it in ATTRIBUTION.md).
-
-Don't:
-
-- Disassemble or decompile NVIDIA's code: no Ghidra, IDA, Hopper or REA on these DLLs, no
-  `cuobjdump --dump-ptx`/`--dump-sass` or `nvdisasm` on their kernels. The NGX licence forbids it,
-  and behaviour observed from outside has answered every question so far.
-- Commit or upload NVIDIA bytes: DLLs, PTX or SASS, weights (the extracted model directory
-  included), byte excerpts.
-- Reimplement NVIDIA's kernels or network from their code.
-- Build, extend or repair anything that gets past NVIDIA's access, licensing or integrity checks.
-  The 2.x caller-identity spoof went with the helper in 3.0; nothing replaces it.
-
-The reverse-engineering tools on the test machine (docs/RUNNING_AND_MEASURING.md, section 10) are
-for everything else: this project's own binaries and open-source ones.
-
 ## Pre-upscaler path
 
 Since 2.0 the model runs **before** DLSS Super Resolution by default (`crates/layer/src/preupscale.rs`,
@@ -126,9 +96,12 @@ writes the answer back before DLSS runs. Games that record their frame in DLSS's
 are held inside it (`preupscale/inline.rs`, on the layer's side compute queue). The colour input is
 what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's
 output-size input), with the older size rule as the fallback (docs/PRE_UPSCALER_DESIGN.md,
-"Identification by the input kernel's parameters (DLAA)"). Once kernel names are known
-(`vkCreateCuFunctionNVX`), nothing is identified unless DLSS SR's input kernel launches, so DLSS Ray
-Reconstruction is never held ("DLSS Ray Reconstruction"); without a readable exposure image the
+"Identification by the input kernel's parameters (DLAA)"). Kernel names
+(`vkCreateCuFunctionNVX`) only feed the logs: gating on them (`GATE_BY_KERNEL_NAME`, off) switched
+Crimson Desert off, whose newer DLSS Super Resolution launches `custom_block*`/`k_initial_merge` kernels. So DLSS Ray
+Reconstruction is not kept out by name: it is held when its colour input has Super Resolution's shape
+(RGBA16F with depth and motion vectors), and refused when the input is another format
+("DLSS Ray Reconstruction"; Crimson Desert with Ray Reconstruction on is held, docs/DLSS_KERNEL_CATALOGUE.md); without a readable exposure image the
 exposure is measured from the frame ("Auto-exposure when the game gives DLSS none"). Everything else (no NVX, no DLSS, native)
 keeps the post-upscaler path. Only the launch-bearing command buffer whose
 kernel parameters name the identified colour input is held, so DLSS Frame Generation's submits go
@@ -138,24 +111,6 @@ and rollback switch; `dump`, `identity` and `roundtrip` are diagnostics. Rule: w
 list is the default set, no NVX entry points resolved, nothing of `preupscale` reachable), and a
 device without NVX must not get the tracking under the default either; the tests in
 `lib.rs::probe_command_tests` and the smoke test's `off` pass guard this.
-
-## Deliberately not done
-
-One item from the completion plan's Phase 6 was considered and intentionally left
-as-is; don't re-raise it without new information:
-
-- **Hotkey capture does not filter non-keyboard evdev devices** (Phase 6 item 6, as
-  literally worded). Note (2026-10-02): since 0.1.78 the layer's hotkey does read evdev
-  (`hotkey.rs`, ported from upstream), and it only opens devices that report keys A-Z, so
-  the item is covered; the 2026-09-15 reasoning below described the older X11 code.
-  Investigated 2026-09-15: neither the layer's in-game hotkey
-  polling (`crates/layer/src/hotkey.rs`, X11 `XQueryKeymap`) nor the GUI's
-  hotkey-capture row (`crates/gui/src/ui.rs`'s `hotkey_row`, GDK key-press events) does
-  raw `/dev/input/eventN` enumeration at all -- both are already inherently
-  keyboard-scoped by construction (`XQueryKeymap` only ever reports keyboard state;
-  GDK key-press events only fire for keyboard input). The item doesn't map onto this
-  architecture without inventing a new raw-evdev capture mechanism neither mechanism
-  currently has any reason to need.
 
 ## Historical evidence
 

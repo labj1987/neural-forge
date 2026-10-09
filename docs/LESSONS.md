@@ -51,7 +51,7 @@ otherwise. "History" means [history/development-before-neuralforge.md](history/d
 - **Result:** the game's frame rate was capped by the round trip, about 100-150 ms per frame on the
   rig at the time.
 - **Change (0.1.22):** capture only when no request is in flight, never block, and compose
-  whatever answer arrives onto whichever frame is current. Alex chose this explicitly for frame
+  whatever answer arrives onto whichever frame is current. The maintainer chose this explicitly for frame
   rate. Its cost (an answer composed onto a newer frame) showed up later as flicker and ghosting.
 - **Evidence:** CHANGELOG 0.1.22; History, "Real flicker root-cause".
 
@@ -94,7 +94,7 @@ otherwise. "History" means [history/development-before-neuralforge.md](history/d
   and compose were bounded and guarded with non-blocking status checks.
 - **Result:** both GTA games crashed on open. The changes were reverted in 0.1.35.
 - **Lesson:** no Vulkan synchronization change ships without validation layers on, and the
-  reverted fence changes are not to be reapplied (CLAUDE.md, "Runtime constraints").
+  reverted fence changes are not to be reapplied (AGENTS.md, "Runtime constraints").
 - **Also found that day:** upstream's apt package was still installed and loaded alongside, with
   the same trigger variable and the same shared-memory path; and the runtime directory's
   permissions depended on the umask of whoever created it first, which silently disabled the
@@ -197,7 +197,7 @@ otherwise. "History" means [history/development-before-neuralforge.md](history/d
   evaluate about 26 ms to about 11.3 ms (p50) at 0.75 on the rig.
 - **Later (1.0.1):** below 100% the layer leaves the zero-copy path for CPU copies, which cancel
   most of the saving: 58.1 fps at 0.75 against 61.6 at 1.0. Model resolution is the wrong lever;
-  model interval (skipping frames) works. Alex runs at 100%.
+  model interval (skipping frames) works. The maintainer runs at 100%.
 - **Evidence:** GHOSTING_PLAN.md §1a, §1c; HARDWARE_VALIDATION.md, "2.0 baseline";
   [OPENDLSS_REVIEW.md](OPENDLSS_REVIEW.md), "Measurements".
 
@@ -399,7 +399,7 @@ The full record is [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md); the probe i
   NVIDIA recommends the in-game generator. The Setup tab's Smooth Motion switch was removed
   (commits `5b7901c`, `137f24e`).
 - **Real play (2.0, an hour, DLSS FG 4x, mods on):** about 50 real / 195-199 shown fps, 0 misses in
-  a 60 s sample. Alex: "everything is working beautifully".
+  a 60 s sample. The maintainer: "everything is working beautifully".
 - **Evidence:** HARDWARE_VALIDATION.md, "2.0.0".
 
 ### Fixes from the 2.0 review
@@ -431,7 +431,7 @@ works (HARDWARE_VALIDATION.md, "2.0.0").
 - **Other games before the upscaler.** Only GTA V Enhanced has been probed.
 - **HDR swapchains on the after-the-upscaler path.** Presented untouched; never tested with a game
   that has real HDR output.
-- **The copy path below 100% model resolution.** About 4 ms per model frame of CPU copies. Alex
+- **The copy path below 100% model resolution.** About 4 ms per model frame of CPU copies. The maintainer
   runs at 100%.
 - **The helper's `device_wait_idle` calls** stay unbounded: the Vulkan call has no timeout.
 - **DMA-BUF and a native Linux helper:** closed (above).

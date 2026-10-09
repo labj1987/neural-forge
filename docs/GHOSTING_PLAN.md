@@ -13,14 +13,14 @@
 > 0.1.94 (the AppImage installs its layer on every launch). Summary: [LESSONS.md](LESSONS.md).
 
 Status: **step 1 done and measured live on real hardware** (2026-09-17, second
-session, Alex live). Step 4 remains a larger, deferred feature (§1b unchanged). See
+session, the maintainer live). Step 4 remains a larger, deferred feature (§1b unchanged). See
 §1c for the real, measured result.
 
-Earlier the same day (overnight, Alex asleep): the first attempt at step 1 used a CPU
+Earlier the same day (overnight, the maintainer asleep): the first attempt at step 1 used a CPU
 resample, measured non-viable (§1a), and both steps were deliberately left unshipped
-rather than risk unsupervised Vulkan surgery. With Alex back and available to test
+rather than risk unsupervised Vulkan surgery. With the maintainer back and available to test
 live, the GPU-blit version §1a called for was built, tested at three levels (unit,
-real-Vulkan integration, and live on `lordnikon`), and deployed.
+real-Vulkan integration, and live on the test machine), and deployed.
 
 ### 1a. Step 1 (`working_scale`) — the CPU approach is measured non-viable
 
@@ -92,9 +92,9 @@ mid-transition second device — not "motion vectors are inherently unsafe") is 
 deliverable from tonight's look at this: it means the helper-side design is still the
 right target, now for a verified reason instead of an assumed one.
 
-### 1c. Step 1, done: the GPU-blit version, measured live on `lordnikon`
+### 1c. Step 1, done: the GPU-blit version, measured live on the test machine
 
-Built exactly what §1a called for, with Alex live to test:
+Built exactly what §1a called for, with the maintainer live to test:
 
 - **Capture side** (`capture.rs`): `CapturePipeline`'s existing full-resolution
   image→buffer copy is untouched. A new, optional per-slot `ModelScratch` (a small
@@ -127,7 +127,7 @@ Built exactly what §1a called for, with Alex live to test:
   that an oversized answer is safely rejected. 61 layer tests pass, zero warnings, in
   both the dev and release (LTO) profiles.
 
-**Measured live on `lordnikon`, `working_scale=0.75`, real GTA session:**
+**Measured live on the test machine, `working_scale=0.75`, real GTA session:**
 
 | | before (v0.1.65) | after (this build) |
 |---|---|---|
@@ -141,7 +141,7 @@ Built exactly what §1a called for, with Alex live to test:
 Layer stayed mapped, GPU stayed loaded (92%/154W), nothing crashed. **Not yet
 confirmed**: the visual result (does the enhancement still look correct at the
 now-blit-upscaled resolution, any softness from the linear-only filter) -- that needs
-Alex's own eyes, same as every visual check this project has ever needed.
+The maintainer's own eyes, same as every visual check this project has ever needed.
 
 ## 1d. Post-relicense: reading upstream's real present hook and helper confirms the
 full architecture (2026-09-17, third pass, licensing no longer a constraint)
@@ -184,13 +184,13 @@ fail-soft, exactly mirroring this proven pattern; it never needs to touch the ga
 process or the layer's own device at all. Step 2 (synchronous mode) is also more
 realistic than earlier estimated: tonight's `working_scale` fix already brought eval
 to ~11ms p50 at 0.75 scale on real hardware — within reach of a real frame budget at
-60-80fps, which is in the range Alex just measured live on the *current* async
+60-80fps, which is in the range the maintainer just measured live on the *current* async
 design anyway. Doing step 2 for real would trade nothing for something: same
 ballpark fps, ghosting eliminated at the root instead of mitigated by the mode-1
 compose formula.
 
 ## 4a. Step 4 (motion vectors) is built, cross-compiled, unit-tested -- not yet
-validated on real hardware (2026-09-17, fourth session, lordnikon down)
+validated on real hardware (2026-09-17, fourth session, the test machine down)
 
 Built the helper-side design §1d confirmed: `crates/helper/src/optical_flow.rs`
 (`OpticalFlow`, an independent reimplementation of the same generic
@@ -216,7 +216,7 @@ duplicating it.
 **Deliberately gated behind an explicit `NEURAL_FORGE_MVEC_HELPER=1` environment
 variable**, on top of the header's own `mvec_enabled` toggle: this is genuinely
 unvalidated on real optical-flow hardware, and some users' persisted config
-(including lordnikon's own `config.ini`, from when the toggle was a no-op) already
+(including the test machine's own `config.ini`, from when the toggle was a no-op) already
 has `mvec_enabled=1` -- without this extra gate the feature would silently start
 doing something new and untested the next time the helper starts. Nothing changes
 for anyone who doesn't set the variable.
@@ -239,7 +239,7 @@ for anyone who doesn't set the variable.
 **What has NOT been validated, and can't be from this machine:**
 - Real `VK_NV_optical_flow` session creation, grid negotiation, and execute on an
   actual NVIDIA GPU.
-- Whether lordnikon's RTX 5070 exposes optical flow on queue family 0 (shared with
+- Whether the test machine's RTX 5070 exposes optical flow on queue family 0 (shared with
   NGX work) or a separate family -- both code paths exist and compile, only one will
   actually run there.
 - Whether this measurably reduces ghosting/shimmer at all, or interacts badly with
@@ -250,13 +250,13 @@ for anyone who doesn't set the variable.
   "doesn't do the thing that caused the old crash" is a design argument, not a
   measurement.
 
-Next step, once lordnikon is back: deploy, set `NEURAL_FORGE_MVEC_HELPER=1`, watch
+Next step, once the test machine is back: deploy, set `NEURAL_FORGE_MVEC_HELPER=1`, watch
 `journalctl -k` for Xid errors the same way every other hardware validation in this
 project has, and check the helper log for `[mvec]` lines confirming a real session
 came up (`optical flow queue: available`, no `session unavailable` line).
 
 ## 4b. The gate above was wrong -- real hang on real hardware, fixed (2026-09-17,
-same day, live during Alex's testing)
+same day, live during the maintainer's testing)
 
 The "nothing changes for anyone who doesn't set the variable" claim in §4a was false.
 `NEURAL_FORGE_MVEC_HELPER` only gated the *runtime* `estimate_motion()` call inside
@@ -268,7 +268,7 @@ optical-flow queue. Wine never exercises this path (its Vulkan implementation al
 reports the extension unavailable), so this ran fully untested until it hit real
 hardware.
 
-It hit real hardware the same day: lordnikon's RTX 5070 does expose optical flow
+It hit real hardware the same day: the test machine's RTX 5070 does expose optical flow
 (`[mvec] optical flow queue: available` in the helper log), a WIP build with this
 code had already been manually deployed there for testing, and during a live test run
 with the enhancement toggled off (to get a native-performance baseline) the helper
@@ -277,7 +277,7 @@ via SSH: GPU idle (8% util, 750MHz, no Xid in `journalctl -k`, so *not* the Xid
 109/119/154 class from §1d/§3), `GTA5_Enhanced.exe` still alive and burning 143% CPU.
 Because the layer calls the helper synchronously on every present (the architecture
 adopted from upstream in §1d), a hung helper freezes the whole game on its last
-composited frame -- which is exactly what Alex saw: ~10fps and a static ghost image
+composited frame -- which is exactly what the maintainer saw: ~10fps and a static ghost image
 that didn't respond to movement, identical whether the enhancement was on or off,
 since the synchronous per-frame call happens either way.
 
@@ -286,7 +286,7 @@ itself, so `flow_family` is unconditionally `None` without the opt-in and device
 creation takes the exact pre-v0.1.69 shape regardless of what the driver supports.
 Cross-compiled (release), re-ran the Wine test suite (can't exercise the real hang
 path there, for the same reason it was missed originally -- Wine has no NVOF-capable
-driver), deployed over the WIP build already on lordnikon, killed the hung game
+driver), deployed over the WIP build already on the test machine, killed the hung game
 process. Not yet re-tested live with a fresh launch as of this writing.
 
 The still-open item from §4a (whether real NVOF execution helps ghosting once
@@ -294,12 +294,12 @@ someone deliberately opts in) remains exactly as untested as before -- this fix 
 restores the "no opt-in, no behavior change" invariant that was supposed to hold
 already.
 
-## 5a. Updated recommendation for Alex
+## 5a. Updated recommendation for the maintainer
 
 Both step 1 and step 4, done properly, are real Vulkan/cross-process features in the
 project's riskiest area — not something to land unsupervised overnight, and not
 something to rush now that the honest scope is known. Suggested next session, with you
-available to test live on lordnikon:
+available to test live on the test machine:
 1. Build the GPU-blit version of step 1 (§1a) — bounded, mechanical, and the existing
    compose shader test harness (`gpu_dispatch_matches_the_cpu_reference`) extends
    naturally to cover it.
@@ -319,7 +319,7 @@ The original status line below (proposal for review, 2026-09-16) is kept for his
   built-in benchmark:
   - v1 (threshold 0.006..0.045, squared): "a little bit less ghosting".
   - **v2 (0.005..0.032, cubed): "still ghosting but closer to upstream"** — this is what
-    is deployed on lordnikon now and ships as v0.1.65.
+    is deployed on the test machine now and ships as v0.1.65.
   - v3 (threshold scaled by the model's own edit strength): "visuals are worse" — reverted.
 - Conclusion: the mask is a band-aid. The ghost is structural, and no threshold fixes it —
   v3 showed that pushing the mask harder only removes the enhancement during motion.
@@ -348,7 +348,7 @@ SPIR-V was read (see §6).
    polls on `seq_resp`; the closing measurement found the wait is the NGX inference itself,
    ~5.8 ms at 1440p). Every displayed frame is the model's answer for that frame; nothing
    stale is ever carried, so it cannot ghost. It is also why upstream's GPU sits at 98%/227W
-   in Alex's test: game and model serialise on one GPU.
+   in the maintainer's test: game and model serialise on one GPU.
 2. **The model runs at reduced resolution.** ~0.75 scale: a 1920x1080 model for a 2560x1440
    swapchain, 2880x1620 for 4K (issue #13's table). NeuralForge evaluates at the full
    2560x1440. `working_scale` exists in the protocol and GUI but is **not wired into the
@@ -378,7 +378,7 @@ SPIR-V was read (see §6).
    NeuralForge's designed-but-unwired `working_scale` path. dlss5-bridge (ReShade add-on)
    uses NVIDIA Optical Flow for games without motion vectors and warns that approximated
    inputs make "text soften and dense foliage smear" — the known cost of the optical-flow
-   route. Alex saw upstream clean on GTA, so it is acceptable there.
+   route. The maintainer saw upstream clean on GTA, so it is acceptable there.
 
 ### 2.3 Why NeuralForge is at 120 fps and upstream is not
 
@@ -401,7 +401,7 @@ original. Default 0.75, matching upstream.
 - Expected: eval 26 ms → roughly 8–10 ms at 1920x1080 (the helper's timing line will say
   exactly). Slight softness in the enhancement is the known cost; the original frame is
   untouched at full resolution.
-- Self-testable: helper eval timing + `capture_hot_path_cost_per_present`. Visual: Alex.
+- Self-testable: helper eval timing + `capture_hot_path_cost_per_present`. Visual: the maintainer.
 - Risk: low–moderate. The compositor path exists but has been dormant; the protocol's
   per-slot width/height must describe the proxy, not the frame, and the helper's frame
   resources must be sized to it.
@@ -448,7 +448,7 @@ device *during the game's swapchain transition*). Two ways, in preference order:
 Then: `Reset` only on frame 1 and scene cuts (mean-luma threshold ~55 like upstream),
 `MVecScale 1.0`, `UseAutoMask=1`, `Depth` null. Payoff: the model's own temporal
 stability — less shimmer, and Quality mode matches upstream fully. Risk: the exact driver
-crash; every run on lordnikon with `journalctl -k` watched for Xid lines.
+crash; every run on the test machine with `journalctl -k` watched for Xid lines.
 
 ### Step 5 — Housekeeping found tonight
 
@@ -465,13 +465,13 @@ crash; every run on lordnikon with `journalctl -k` watched for Xid lines.
 
 | Step | fps (1440p) | Ghosting | Effort | Risk | Tests |
 |---|---|---|---|---|---|
-| 1 scale 0.75 | 120s (async unchanged) | unchanged; answers arrive ~3x sooner, so the ghost window shrinks | 1 session | low–mod | eval timing, benchmark, Alex looks for softness |
-| 2 Quality mode | ~50–70 | **gone** (nothing stale shown) | 1–2 sessions | moderate (hot path) | benchmark for cost; Alex's eyes + GTA benchmark vs upstream |
+| 1 scale 0.75 | 120s (async unchanged) | unchanged; answers arrive ~3x sooner, so the ghost window shrinks | 1 session | low–mod | eval timing, benchmark, the maintainer looks for softness |
+| 2 Quality mode | ~50–70 | **gone** (nothing stale shown) | 1–2 sessions | moderate (hot path) | benchmark for cost; the maintainer's eyes + GTA benchmark vs upstream |
 | 3 Reset policy | — | — | minutes | none | log line |
-| 4 motion vectors | −1–2 ms | gone + less shimmer | several sessions | **high** (driver crash) | journalctl Xid watch, Alex's eyes |
+| 4 motion vectors | −1–2 ms | gone + less shimmer | several sessions | **high** (driver crash) | journalctl Xid watch, the maintainer's eyes |
 | 5 deploy fix | — | — | 1 session | low | Gear Lever update → game loads new hash |
 
-## 5. Decisions for Alex
+## 5. Decisions for the maintainer
 
 1. **Order.** Recommended: 1 → 2 → 3 → 5 → 4. Alternative: Step 2 first at full resolution
    to *see* the ghost-free result quickly, accepting ~30 fps until Step 1 lands.

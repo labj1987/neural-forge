@@ -54,8 +54,9 @@ disagree, the more recent measurement wins.
   reset is set, against the public SDK and the open-source consumers.
 - [UPSTREAM_PARITY.md](UPSTREAM_PARITY.md): what was and was not carried over from DLSS5VKLayer
   0.3.1-1.
-- [PHASE1.md](PHASE1.md): the namespace contract, installation contract and target ownership rules
-  (its benchmark plan is historical).
+- [PHASE1.md](PHASE1.md): the namespace contract, installation contract and target ownership rules.
+- [history/phase1-benchmark-plan.md](history/phase1-benchmark-plan.md): the 2.x-era Phase 1 benchmark
+  plan and later phases, moved out of PHASE1.md.
 - [history/development-before-neuralforge.md](history/development-before-neuralforge.md): the
   development log from before the rename (codename dlssnr), 2026-09-09 to 09-12.
 - [history/handoff-2026-09-12-fps-freeze-regression.md](history/handoff-2026-09-12-fps-freeze-regression.md):
@@ -81,7 +82,7 @@ disagree, the more recent measurement wins.
 
 ## For contributors and agents
 
-- [../CLAUDE.md](../CLAUDE.md) (identical to [../AGENTS.md](../AGENTS.md)): naming rules, build and
+- [../AGENTS.md](../AGENTS.md): naming rules, build and
   test commands, runtime constraints, the pre-upscaler rules and the composition invariants.
 - [../ATTRIBUTION.md](../ATTRIBUTION.md): what was taken from DLSS5VKLayer and others, function by
   function.

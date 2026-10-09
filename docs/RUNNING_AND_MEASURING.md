@@ -3,7 +3,7 @@
 How to build Neural Forge, put a build on a test machine, measure it, and read what it reports.
 Everything here is how the numbers in [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) and
 [PRE_UPSCALER_DESIGN.md](PRE_UPSCALER_DESIGN.md) were taken. The test machine in the examples is
-reached as `ssh lordnikon` (RTX 5070, NVIDIA 615.78.08, Steam with GTA V Enhanced and
+reached as `ssh <host>` (RTX 5070, NVIDIA 615.78.08, Steam with GTA V Enhanced and
 Proton-CachyOS); substitute your own host. Up to 2.0.10 the model ran in a Windows helper; sections
 that measured it say so.
 
@@ -55,7 +55,7 @@ bash scripts/smoke-test.sh && python3 scripts/check_namespace.py
 ## 2. Deploy to a test machine
 
 ```bash
-scripts/deploy-rig.sh lordnikon
+scripts/deploy-rig.sh the test machine
 ```
 
 It builds the AppImage from the working tree, copies it to `~/AppImages/neural-forge.appimage` on
@@ -64,7 +64,7 @@ the host, installs it with `neural-forge-cli install`, and prints the SHA-256 of
 build and no backup behind. The next game started uses the new layer; check it with:
 
 ```bash
-ssh lordnikon '~/.local/share/neural-forge/bin/neural-forge-cli doctor && ~/.local/share/neural-forge/bin/neural-forge-cli shmctl status | head -12'
+ssh <host> '~/.local/share/neural-forge/bin/neural-forge-cli doctor && ~/.local/share/neural-forge/bin/neural-forge-cli shmctl status | head -12'
 ```
 
 (`install` puts the CLI in `~/.local/share/neural-forge/bin`; the shorter `neural-forge-cli` in the
@@ -88,23 +88,23 @@ gta-bench.sh [--host HOST] [--set key=value]... <label> <VK layers above MangoHu
 Effect off (no Neural Forge layer), then on, both with GTA's script mods off:
 
 ```bash
-scripts/gta-bench.sh --host lordnikon nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-scripts/gta-bench.sh --host lordnikon nron-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> nron-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 The 1.x path for comparison:
 
 ```bash
-scripts/gta-bench.sh --host lordnikon post-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=off 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> post-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=off 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 Summarise, and average three runs of one configuration:
 
 ```bash
-scripts/bench-report.py --host lordnikon --mean nron-1 nron-2 nron-3
+scripts/bench-report.py --host <host> --mean nron-1 nron-2 nron-3
 ```
 
 **What the numbers are.** Pass 4 is the long free-roam pass, about 117 s. Real fps is the pass-4
@@ -130,17 +130,17 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
   start-up, with or without Neural Forge. The runner says "launch exited early" and writes no
   `benchmark.txt`. Run it again straight away.
 - **Test as it is played: frame generation on.** Release checks run with GTA's `settings.xml` as
-  Alex has it (`FrameGenType` 1, `dlssFrameGenMode` 0/1/2 = 2x/3x/4x). Frame-generation-off runs
+  the maintainer has it (`FrameGenType` 1, `dlssFrameGenMode` 0/1/2 = 2x/3x/4x). Frame-generation-off runs
   are comparisons only; 2.0.2 passed them and failed with frame generation on.
 - **Automated runs check that the model is applied; frame generation is checked in real play.** One
-  run per game per change, with GTA's settings as Alex has them: every DLSS frame held
+  run per game per change, with GTA's settings as the maintainer has them: every DLSS frame held
   (`holds_per_s` equal to the real frame rate), model answers written back (0 misses, no echoes), no
   `not holding` refusal, no `fence wait timed out`, no Xid. GTA decides at each loading screen whether
   to run DLSS Frame Generation and in benchmark launches it often does not, with or without Neural
   Forge (2026-10-05: about half of the launches; not window focus, VRAM, Reflex or Neural Forge, see
   HARDWARE_VALIDATION.md), so a run is never repeated for it. `bench-report.py` gives each run's
   multiplier, and `--fg` names a run where it did not engage and leaves it out of `--mean`. Whether
-  frame generation works and how the game feels is Alex's check, playing.
+  frame generation works and how the game feels is the maintainer's check, playing.
 
 **4K runs.** GTA renders at the desktop's size under Proton, so switch the host's desktop to
 3840x2160 at scale 1.0 first, temporarily, with GNOME's `gdctl set` (not persistent), and set
@@ -207,11 +207,11 @@ inside the launch-bearing buffer. Set GTA to DLSS Quality or Balanced (not DLAA)
 generation off:
 
 ```bash
-scripts/gta-bench.sh --host lordnikon probe-ngx-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> probe-ngx-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PROBE_NGX=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 ```bash
-ssh lordnikon "grep -F '[probe-ngx]' ~/nf-spike/gta/probe-ngx-1/launch.log | head -200"
+ssh <host> "grep -F '[probe-ngx]' ~/nf-spike/gta/probe-ngx-1/launch.log | head -200"
 ```
 
 What to look for, and what GTA showed, is in [PRE_UPSCALER_PROBE.md](PRE_UPSCALER_PROBE.md). Run it
@@ -230,7 +230,7 @@ once on any new game before claiming the model before the upscaler works there.
 | `roundtrip` | The HDR encode and decode with the encoded frame as the answer; no network. | That the transform alone leaves the picture unchanged. |
 
 ```bash
-scripts/gta-bench.sh --host lordnikon pu-identity-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> pu-identity-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=identity 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=2.5` (or 4) tries another paper white in `model` or
@@ -340,7 +340,7 @@ The `# settings` block lists every live setting by name; `shmctl set NAME VALUE`
 
 ## 8. Checking the picture by eye
 
-Numbers cannot say whether the picture looks right; Alex's eyes decide. The 2.0 check (about 15
+Numbers cannot say whether the picture looks right; the maintainer's eyes decide. The 2.0 check (about 15
 minutes, GTA V Enhanced, launch option `NEURAL_FORGE_ENABLE=1 %command%`, DLSS Balanced):
 
 1. Frame generation off. Story Mode, daylight, a street with signs and trees. Press F11 a few
@@ -378,11 +378,8 @@ of play at DLSS Frame Generation 4x, "everything is working beautifully" (HARDWA
 
 ## 10. Reverse-engineering toolkit
 
-Installed on the test machine 2026-10-06. What may be done with NVIDIA's DLLs is in
-[CLAUDE.md](../CLAUDE.md), "Working with NVIDIA's binaries". In short: their interface metadata
-(exports, imports, version, `strings`, `cuobjdump --list-*`) and their observed behaviour are fair
-game; their code is not disassembled, so the decompilers below are for this project's own binaries
-and open-source ones. The wider survey is [RE_TOOLKIT.md](RE_TOOLKIT.md).
+Installed on the test machine 2026-10-06. The decompilers below are for this project's own binaries
+and open-source ones, not for NVIDIA's DLLs or kernels. The wider survey is [RE_TOOLKIT.md](RE_TOOLKIT.md).
 
 | Tool | Where | Registered as | Health check |
 |---|---|---|---|
@@ -398,7 +395,7 @@ Notes:
   (`developer.download.nvidia.com/compute/cuda/redist/`, SHA-256 checked against
   `redistrib_13.4.2.json`), not from Ubuntu's `nvidia-cuda-toolkit`. That package is CUDA 12.4,
   too old for Blackwell's `sm_120`, and it installs `libnvidia-compute-595`/`-590` and
-  `nvidia-kernel-common-595`, which would sit on top of the runfile driver Greenlight installs. Do
+  `nvidia-kernel-common-595`, which would sit on top of the runfile driver installed separately. Do
   not install it.
 - **REA needs a provider named** when more than one supports a target: set
   `REA_ANALYSIS_PROVIDER=ghidra` (the `--provider` flag exists on `doctor` but not on

@@ -319,7 +319,7 @@ docs/HARDWARE_VALIDATION.md, "2.0.2".
 
 ## 2.0.1 — 2026-10-03
 
-Fixes from Alex's first day of play on 2.0. Measured on the test machine: Crimson Desert (4K, HDR,
+Fixes from the maintainer's first day of play on 2.0. Measured on the test machine: Crimson Desert (4K, HDR,
 DLSS frame generation) and GTA V Enhanced (4K) hold every DLSS frame on the before-the-upscaler path.
 
 - **Pre-upscaler: the colour input follows what DLSS's input kernel reads.** Crimson Desert
@@ -1156,7 +1156,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   and the compositor's motion-mask reference, are unaffected either way.
   `working_scale` above `1.0` (supersampling) is not wired into the compose side yet --
   only `<= 1.0` (downscaling the model's own work) runs end to end tonight. Measured
-  live on `lordnikon` with `working_scale=0.75`, a real GTA session: model evaluation
+  live on the test machine with `working_scale=0.75`, a real GTA session: model evaluation
   resolution 2560x1440 → 1920x1080, helper eval time (p50) **26 ms → 11.3 ms** (~2.3x),
   no Xid/driver errors, no Vulkan validation errors, layer stayed mapped into the game
   process. 61 layer tests pass (two new ones added: a real-Vulkan integration test
@@ -1214,7 +1214,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   mechanism is the deliberate "re-present the held answer every frame" design in
   `capture::run` (one answer's delta re-applied across ~8-10 real frames at native
   rate), not the motion-vector default -- motion-vector estimation has been stubbed
-  out in `shm.rs` since 2026-09-14 and never ran. Alex's read of the longer session was
+  out in `shm.rs` since 2026-09-14 and never ran. The maintainer's read of the longer session was
   "input lag and stuttering". Phase 1's own "~10% of native" fps gate is not met and
   stays open; upstream is still not validly compared (every same-day attempt was
   either accidentally still NeuralForge or crashed before gameplay).
@@ -1244,7 +1244,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 ### Phase 4
 
 - Investigated DMA-BUF transport (see `docs/DMABUF_TRANSPORT_DESIGN.md`): real hardware
-  evidence (`lordnikon`, RTX 5070, driver 615.71.09) that a Wine-hosted Windows guest's
+  evidence (the test machine, RTX 5070, driver 615.71.09) that a Wine-hosted Windows guest's
   `vkGetMemoryWin32HandleKHR` handle cannot be converted to a real Unix fd via Wine's
   own `wine_server_handle_to_fd` -- a well-formed `STATUS_OBJECT_TYPE_MISMATCH`, not a
   crash or a wrong-signature guess. This blocks the specific mechanism the protocol's
@@ -1292,7 +1292,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   the helper side both become slot-indexed (one dedicated GPU resource set per wire
   slot); the single NGX feature/model stays deliberately serialized across both slots
   rather than betting on undocumented concurrent-evaluate safety for a
-  reverse-engineered feature. Validated on `lordnikon`: `cargo test` (48/48, including
+  reverse-engineered feature. Validated on the test machine: `cargo test` (48/48, including
   a new test proving the two slots are fully independent), Khronos validation +
   synchronization validation (no new warnings versus the pre-v3 commit),
   `scripts/smoke-test.sh`, and a real running helper answering both slots correctly
@@ -1430,13 +1430,13 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   "didn't crash") found two real bugs on its first real-hardware run: a missing
   `VkExternalMemoryBufferCreateInfo` on the buffer, and a misaligned allocation size --
   neither caught by this project's local software Vulkan ICD. Both fixed; the test now
-  passes on both, on `lordnikon` under full synchronization validation. GTA fps still
+  passes on both, on the test machine under full synchronization validation. GTA fps still
   unmeasured -- the real payoff of this phase needs a live session.
 - Add the helper-side half of the zero-copy import (`FrameResources::imported_proxy`/
   `imported_answer`, see `docs/EXTERNAL_MEMORY_HOST_DESIGN.md`): `EvaluateFeature`'s
   Color/Output now read from and write to the live SHM regions directly when the
   device extension is available, no staging-buffer copy either direction. Confirmed
-  live on `lordnikon` via a new `trigger_helper_roundtrip` tool that drives a real
+  live on the test machine via a new `trigger_helper_roundtrip` tool that drives a real
   request/response round trip with no game involved.
 - **Fixed two real, live bugs found only after everything above had already validated
   clean** (see `docs/HARDWARE_VALIDATION.md`'s own account): real undefined behavior in the
@@ -1470,7 +1470,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   actually downloads the new bytes once an update is found.
 - **Separate, real mistake found and corrected the same session**: every AppImage
   rebuild from v0.1.24 through v0.1.29 was manually deployed to
-  `~/AppImages/dlssnr.appimage` on `lordnikon` — a plain, unversioned file, *not*
+  `~/AppImages/dlssnr.appimage` on the test machine — a plain, unversioned file, *not*
   the one Gear Lever actually integrates and manages
   (`~/AppImages/dlssnr.appimage_0_1_25.appimage`, confirmed via its own `.desktop`
   launcher entry). The two are completely independent files (different inodes);
@@ -1481,7 +1481,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 
 ## 0.1.29 — 2026-09-11
 
-- **Fixes a real bug in 0.1.28's own fix, caught testing it on `lordnikon` before
+- **Fixes a real bug in 0.1.28's own fix, caught testing it on the test machine before
   trusting it**: `stop()`'s new `wineserver -k` call used `paths::prefix_dir()`
   directly as `WINEPREFIX`, but for `runner_type = "proton"` that's not the real
   prefix Wine itself uses — Proton's own launch script internally re-derives and
@@ -1498,7 +1498,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   success while the actual Wine-hosted `dlssnr_helper.exe` survived anyway, once
   wineserver took it over — Wine's own internal process management doesn't reliably
   stay inside the original `setsid()` process group. Confirmed via a real orphaned
-  helper left running after a `stop()`/`start()` cycle on `lordnikon`: it kept
+  helper left running after a `stop()`/`start()` cycle on the test machine: it kept
   writing to the same live SHM mapping as the newly-started helper, silently
   corrupting shared state (`helper_state` flapping between two independent writers,
   with no crash or error anywhere pointing at the real cause). `stop()` now also
@@ -1567,7 +1567,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 ## 0.1.25 — 2026-09-11
 
 - **Real DLSS 5 Neural Rendering works again, end to end, for the first time since
-  the app-removal/reinstall that broke it.** A real `vkcube` run on `lordnikon`
+  the app-removal/reinstall that broke it.** A real `vkcube` run on the test machine
   showed `model_up=1`, `helper_frames=128` over a 10-second run, real
   `VULKAN_CreateFeature(18) -> 0x1`, and `EvaluateFeature -> 0x1` on essentially
   every frame. Two separate real bugs were found and fixed to get here — see
@@ -1607,7 +1607,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   against a dedicated D3D12 device — a different API family than this helper's
   Vulkan device — and the Vulkan-exports route this helper actually used was never
   exercised by upstream at all, just present as an export. A real bisection on
-  `lordnikon` this session tested and ruled out the leading theory that this failed
+  the test machine this session tested and ruled out the leading theory that this failed
   call was "poisoning" every later NGX call in the process: with the call removed
   entirely, `AllocateParameters` still returns the identical `0xbad00002`.
 - **Real discovery, not a guess**: `nvngx_dlssnr.dll`'s (the "snippet") own
@@ -1642,7 +1642,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 ## 0.1.23 — 2026-09-10
 
 - **Fixed a real crash-on-start after a from-scratch reinstall** (found immediately
-  after reinstalling on `lordnikon` following the full-removal test): `start()`
+  after reinstalling on the test machine following the full-removal test): `start()`
   passes `paths::prefix_dir()` to Proton as both `WINEPREFIX` and
   `STEAM_COMPAT_DATA_PATH`, but nothing ever created that directory -- invisible on
   every normal run (Proton creates everything *inside* it on first successful init,
@@ -1661,7 +1661,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   real clocks/power draw) -- the true cause was `capture::run` (the old function,
   renamed `run_sync` and now used only for `debug_view`/`capture_request`) blocking
   every single `vkQueuePresentKHR` call on a full helper round trip (real per-frame
-  cost on `lordnikon`: ~100-150ms, a cross-process, Wine-hosted IPC call that can
+  cost on the test machine: ~100-150ms, a cross-process, Wine-hosted IPC call that can
   never be as fast as native in-process DLSS), capping the game's own presentation
   rate at the round trip's rate no matter how cheap the actual GPU work involved
   actually was.
@@ -1673,7 +1673,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   existing `dispatch_into_image_async` fast path. Every frame that isn't a capture or
   a fresh-answer frame (the large majority, once the pipeline is running) touches
   `image` not at all and returns immediately. Explicit, deliberate tradeoff (per
-  Alex's own prior authorization, "do it if it gives us the most frames when NR is
+  the maintainer's own prior authorization, "do it if it gives us the most frames when NR is
   on"): NR visibly updates at whatever rate the round trip achieves, not every
   frame, and can be composited against a slightly newer frame than the one it was
   computed from -- a real quality cost, in exchange for the game's own rendering and
@@ -1699,7 +1699,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 ## 0.1.21 — 2026-09-10
 
 - **Root-caused the remaining ~350ms/frame stall to the hardware level on
-  `lordnikon`.** 0.1.20's completed timing breakdown (stage1 ~5ms, snapshot ~78ms,
+  the test machine.** 0.1.20's completed timing breakdown (stage1 ~5ms, snapshot ~78ms,
   write_proxy ~68ms, roundtrip ~128ms, compose ~72ms, all summing correctly to the
   ~355ms total) showed every full-frame-sized (33MB at 4K) operation costing a
   similar ~70-130ms regardless of what it actually was — a heap copy, a write into a
@@ -1727,7 +1727,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 ## 0.1.20 — 2026-09-10
 
 - **Closed a ~150ms/frame gap in `capture.rs`'s own timing instrumentation.** 0.1.18's
-  stage1/roundtrip/compose/stage2 timing summed to only ~208ms on `lordnikon` against
+  stage1/roundtrip/compose/stage2 timing summed to only ~208ms on the test machine against
   a measured ~355ms total -- real data, but with an unaccounted gap exactly where two
   full-frame-sized (33MB at 4K) operations sat untimed: `captured.to_vec()` (a fresh
   heap allocation + copy of the whole frame, taken so composition has an unedited
@@ -1742,7 +1742,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 
 - **Found the real, syscall-verified cause of the per-frame stall via `strace`,**
   after 0.1.16-0.1.18's buffered-file-logging fixes made no measurable difference
-  on `lordnikon` (a separate deploy gap meant those builds were never actually
+  on the test machine (a separate deploy gap meant those builds were never actually
   running in the game at all — see below). `strace -e trace=write` on the live game
   process showed a single `crate::log!()` call in `dlssnr_layer::logging` (called
   once, now twice with 0.1.18's added timing line, per frame from inside the game's
@@ -1756,7 +1756,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   cause here) and `dlssnr_helper::logging` (same latent gap, fixed for consistency
   even though the helper has always had `DLSSNR_LOG` set in practice).
 - **Documented a separate, real deploy gap in `CLAUDE.md`** that silently
-  invalidated the 0.1.17 and 0.1.18 field tests on `lordnikon`: the game loads the
+  invalidated the 0.1.17 and 0.1.18 field tests on the test machine: the game loads the
   layer from a real, fixed path (`~/.local/share/dlssnr/lib/libdlssnr_layer.so`,
   referenced by a real Vulkan implicit-layer manifest under
   `~/.local/share/vulkan/implicit_layer.d/`) that was set up by hand earlier this
@@ -1778,7 +1778,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   `init_defaults`, and read by `crates/gui/src/ui.rs`'s status row — but nothing
   anywhere in `dlssnr-layer` ever wrote `1` to it (confirmed by grep). Found while
   investigating a real report of "still low fps, also still saying layer is not
-  attached" on `lordnikon`: `/proc/<pid>/maps` and a live, steadily-advancing helper
+  attached" on the test machine: `/proc/<pid>/maps` and a live, steadily-advancing helper
   frame counter both proved the real layer was loaded and actively processing frames
   the whole time the GUI displayed "not attached" — the status readout, not the
   pipeline, was broken. Fixed by having `ShmClient::set_frame_info` (already called
@@ -1800,7 +1800,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 
 ## 0.1.17 — 2026-09-10
 
-- **Found and fixed the real cause of the low-FPS reports on `lordnikon`**: the
+- **Found and fixed the real cause of the low-FPS reports on the test machine**: the
   0.1.16 timing instrumentation showed real GPU work costing only ~3ms/frame, yet
   the measured frame interval was ~357ms, with the GPU sitting at 2% utilization
   and one CPU core pegged at 92% iowait — a pure I/O stall, not a compute one. Root
@@ -1822,7 +1822,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 
 ## 0.1.16 — 2026-09-10
 
-- **Diagnosing real low-FPS reports on `lordnikon`** (GTA San Andreas – The
+- **Diagnosing real low-FPS reports on the test machine** (GTA San Andreas – The
   Definitive Edition, real RTX 5070, upstream's conflicting package/layer fully
   purged this session): confirmed via `/proc/<pid>/maps` that this project's own
   `libdlssnr_layer.so` (not upstream's) is loaded directly inside the game's real
@@ -1846,7 +1846,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   `STEAM_COMPAT_CLIENT_INSTALL_PATH`, which Proton's own launch script reads directly
   out of the environment with no fallback (`KeyError` otherwise) during its own
   prefix setup, before ever getting to run the helper .exe. Found running a real game
-  (GTA San Andreas – The Definitive Edition) on `lordnikon` — every manual SSH test
+  (GTA San Andreas – The Definitive Edition) on the test machine — every manual SSH test
   this project's own history has done set this by hand for exactly this reason, but
   the fix never made it back into the actual production code path the GUI's "Start"
   button and `dlssnr-cli start` both use. Added `dlssnr_supervisor::paths::steam_install_dir`
@@ -2019,7 +2019,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
 - **First confirmed real DLSS 5 Neural Rendering success from this project's own
   code.** With the 0.1.6 crash fix in place, ran a fresh `dlssnr_helper.exe` under real
   Proton + real `vkcube`/`VK_LAYER_dlssnr_neural` (implicit activation) against the
-  real, legitimately-signed `nvngx_dlssnr.dll` on `lordnikon`. Result: `VULKAN_CreateFeature(18)
+  real, legitimately-signed `nvngx_dlssnr.dll` on the test machine. Result: `VULKAN_CreateFeature(18)
   -> 0x1` (real non-null handle, 1920x1080) and `EvaluateFeature -> 0x1` on 243/244
   captured frames (the one miss is frame 1, before `CreateFeature` had run) — zero
   evaluation failures across a full 10-second run. This is the exact success shape
@@ -2048,7 +2048,7 @@ Upstream parity (DLSS5VKLayer 0.3.1-1) and live testing on GTA V Enhanced.
   (`crates/layer/src/lib.rs`'s new `DlssnrGlobalHooks`) and resolving only the one
   entry point this layer actually needs, never making the query that crashes.
   Verified fixed: 5/5 clean runs locally (this sandbox has the identical Mesa
-  `device_select` present) and 3/3 clean real `vkcube` runs on `lordnikon` (real
+  `device_select` present) and 3/3 clean real `vkcube` runs on the test machine (real
   GPU/driver, the machine the original crash was found on) — capturing and
   round-tripping real frames the whole time, no crash. Full workspace test suite and
   both smoke tests (explicit and implicit activation) still green.
