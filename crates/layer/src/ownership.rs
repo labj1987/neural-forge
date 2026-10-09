@@ -9,10 +9,23 @@ fn basename(name: &str) -> String {
     name.rsplit(['/', '\\']).next().unwrap_or(name).to_ascii_lowercase()
 }
 
-fn allowed(args: &[String], target: Option<&str>) -> bool {
-    // Wine may expose wine-preloader as argv[0], followed by the Windows exe.
-    let exe = args.iter().find(|s| s.to_ascii_lowercase().ends_with(".exe"))
-        .or_else(|| args.first()).map(|s| basename(s)).unwrap_or_default();
+/// The name the target filter judges a process by, from its arguments and `/proc/self/exe`. Under Wine
+/// (the executable or argv[0] is `wine*`, e.g. `wine64-preloader`) that is the Windows `.exe` among the
+/// arguments, else argv[0]; any other process is its own executable, so a wrapper carrying a game's `.exe`
+/// as an argument (gamescope, a launcher script) is judged as itself.
+fn judged_name(args: &[String], exe: &str) -> String {
+    let wine = [exe, args.first().map_or("", String::as_str)].iter().any(|s| !s.is_empty() && basename(s).starts_with("wine"));
+    if wine {
+        args.iter().find(|s| s.to_ascii_lowercase().ends_with(".exe")).or_else(|| args.first()).map(|s| basename(s)).unwrap_or_default()
+    } else if !exe.is_empty() {
+        basename(exe)
+    } else {
+        args.first().map(|s| basename(s)).unwrap_or_default()
+    }
+}
+
+fn allowed(args: &[String], exe_path: &str, target: Option<&str>) -> bool {
+    let exe = judged_name(args, exe_path);
     let compact = exe.replace([' ', '-', '_'], "");
     if ["rockstar", "socialclub", "xalia"].iter().any(|prefix| compact.starts_with(prefix)) {
         return false;
@@ -20,18 +33,25 @@ fn allowed(args: &[String], target: Option<&str>) -> bool {
     if exe.is_empty() || ["explorer.exe", "xalia.exe", "launcher.exe",
         "launcherpatcher.exe", "rockstarservice.exe", "rockstarlauncher.exe",
         "socialclubhelper.exe", "socialclub.exe", "steam.exe", "steamwebhelper.exe",
-        "gameoverlayui.exe", "winedevice.exe", "services.exe"]
+        "gameoverlayui.exe", "winedevice.exe", "services.exe", "gamescope"]
         .contains(&exe.as_str()) { return false; }
     target.map(|names| names.split(',').any(|name| basename(name.trim()) == exe))
         .unwrap_or(true)
 }
 
-static ELIGIBLE: LazyLock<bool> = LazyLock::new(|| {
+/// This process's arguments and executable path.
+fn this_process() -> (Vec<String>, String) {
     let args = std::fs::read("/proc/self/cmdline").unwrap_or_default()
         .split(|b| *b == 0).filter(|s| !s.is_empty())
         .map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
+    let exe = std::fs::read_link("/proc/self/exe").map(|p| p.to_string_lossy().into_owned()).unwrap_or_default();
+    (args, exe)
+}
+
+static ELIGIBLE: LazyLock<bool> = LazyLock::new(|| {
+    let (args, exe) = this_process();
     let target = neural_forge_protocol::env::var("NEURAL_FORGE_TARGET_EXE");
-    let ok = allowed(&args, target.as_deref());
+    let ok = allowed(&args, &exe, target.as_deref());
     if !ok { crate::log!("[ownership] process excluded from NeuralForge session"); }
     ok
 });
@@ -42,11 +62,8 @@ pub fn eligible() -> bool { *ELIGIBLE }
 /// game), for the GUI's "Game" row.
 pub fn process_name() -> &'static str {
     static NAME: LazyLock<String> = LazyLock::new(|| {
-        let args = std::fs::read("/proc/self/cmdline").unwrap_or_default()
-            .split(|b| *b == 0).filter(|s| !s.is_empty())
-            .map(|s| String::from_utf8_lossy(s).into_owned()).collect::<Vec<_>>();
-        args.iter().find(|s| s.to_ascii_lowercase().ends_with(".exe")).or_else(|| args.first())
-            .map(|s| s.rsplit(['/', '\\']).next().unwrap_or(s).to_owned()).unwrap_or_default()
+        let (args, exe) = this_process();
+        judged_name(&args, &exe)
     });
     &NAME
 }
@@ -92,12 +109,33 @@ mod tests {
     fn launchers_cannot_claim_even_when_explicitly_targeted() {
         for exe in ["explorer.exe", "Xalia.exe", "Launcher.exe", "SocialClubHelper.exe", "RockstarService.exe", "Rockstar Games Launcher.exe", "Social Club Helper.exe"] {
             let args = vec!["wine64-preloader".into(), format!("C:\\Rockstar Games\\{exe}")];
-            assert!(!allowed(&args, None));
-            assert!(!allowed(&args, Some(exe)));
+            assert!(!allowed(&args, "/usr/bin/wine64-preloader", None));
+            assert!(!allowed(&args, "/usr/bin/wine64-preloader", Some(exe)));
         }
-        assert!(allowed(&["Z:\\games\\GTA5_Enhanced.exe".into()], Some("GTA5_Enhanced.exe")));
-        assert!(!allowed(&["another-game.exe".into()], Some("GTA5_Enhanced.exe")));
-        assert!(!allowed(&[], None));
+        let wine = "/home/u/.steam/proton/files/bin/wine64-preloader";
+        assert!(allowed(&["Z:\\games\\GTA5_Enhanced.exe".into()], wine, Some("GTA5_Enhanced.exe")));
+        assert!(!allowed(&["another-game.exe".into()], wine, Some("GTA5_Enhanced.exe")));
+        assert!(!allowed(&[], "", None));
+    }
+
+    /// Only Wine's `.exe` argument names the process: a wrapper carrying the game's `.exe` as an argument is
+    /// judged as itself, gamescope is excluded, and a native binary is its own executable.
+    #[test]
+    fn wrappers_are_judged_by_their_own_executable() {
+        let target = Some("GTA5_Enhanced.exe");
+        // Wine with the preloader as argv[0], followed by the Windows exe.
+        let preloader = vec!["/usr/bin/wine-preloader".to_string(), "Z:\\games\\GTA5_Enhanced.exe".into()];
+        assert!(allowed(&preloader, "/usr/bin/wine-preloader", target));
+        assert_eq!(judged_name(&preloader, "/usr/bin/wine-preloader"), "gta5_enhanced.exe");
+        // gamescope carrying the game's command line.
+        let gamescope = vec!["gamescope".to_string(), "-w".into(), "2560".into(), "--".into(), "wine".into(), "GTA5_Enhanced.exe".into()];
+        assert!(!allowed(&gamescope, "/usr/bin/gamescope", target));
+        assert!(!allowed(&gamescope, "/usr/bin/gamescope", None), "gamescope is never the game");
+        // A native binary, with an argument that happens to end in .exe.
+        let native = vec!["./mygame".to_string(), "--log=out.exe".into()];
+        assert_eq!(judged_name(&native, "/opt/mygame/mygame"), "mygame");
+        assert!(allowed(&native, "/opt/mygame/mygame", Some("mygame")));
+        assert!(!allowed(&native, "/opt/mygame/mygame", Some("out.exe")));
     }
     #[test]
     fn crashed_process_releases_lease() {
