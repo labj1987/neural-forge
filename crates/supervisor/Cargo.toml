@@ -12,5 +12,5 @@ neural-forge-protocol = { path = "../protocol" }
 # exactly what scripts/install.py's own hashlib.sha256/json.dumps do (both tools
 # read/write the same record, on purpose) -- worth a real, audited implementation
 # rather than hand-rolling either, unlike config.ini's own small flat-format parser.
-sha2 = "0.10"
+sha2 = "0.11"
 serde_json = "1"
