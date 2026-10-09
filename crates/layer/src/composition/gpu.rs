@@ -2388,16 +2388,21 @@ mod tests {
         let knee = |l: f32| if l > 0.75 { 0.75 + 0.25 * (1.0 - (-(l - 0.75) / 0.25).exp()) } else { l };
         let (w, h) = (16u32, 16u32);
         let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
-        for (value, wp) in [(90u8, 1.0f32), (90, 0.5), (230, 1.0), (240, 1.0)] {
-            let frame: Vec<u8> = (0..w * h).flat_map(|_| [value, value, value, 255]).collect();
-            let encoded = lin_to_srgb(knee(srgb_to_lin(value) / wp));
-            let answer: Vec<u8> = (0..w * h).flat_map(|_| [encoded, encoded, encoded, 255]).collect();
-            let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { white_point: wp, ..base }) else {
-                eprintln!("white point test: no Vulkan device, skipping");
-                return;
-            };
-            let got = out[((8 * w + 8) * 4) as usize];
-            assert!((i32::from(got) - i32::from(value)).abs() <= 2, "frame {value} at white point {wp}: expected ~{value}, got {got}");
+        // Also with ratio smoothing and the ghost guard on: their neighbourhood taps of the proxy go
+        // through the same encode as the centre's.
+        for (smooth, ghost) in [(0.0f32, 0.0f32), (1.0, 1.0)] {
+            for (value, wp) in [(90u8, 1.0f32), (90, 0.5), (230, 1.0), (240, 1.0)] {
+                let frame: Vec<u8> = (0..w * h).flat_map(|_| [value, value, value, 255]).collect();
+                let encoded = lin_to_srgb(knee(srgb_to_lin(value) / wp));
+                let answer: Vec<u8> = (0..w * h).flat_map(|_| [encoded, encoded, encoded, 255]).collect();
+                let params = ComposeParams { white_point: wp, ratio_smooth: smooth, ghost_guard: ghost, ..base };
+                let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else {
+                    eprintln!("white point test: no Vulkan device, skipping");
+                    return;
+                };
+                let got = out[((8 * w + 8) * 4) as usize];
+                assert!((i32::from(got) - i32::from(value)).abs() <= 2, "frame {value} at white point {wp} (smoothing {smooth}, ghost guard {ghost}): expected ~{value}, got {got}");
+            }
         }
     }
 
@@ -2412,10 +2417,15 @@ mod tests {
         let base = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         let colours: [[u8; 3]; 4] = [[250, 60, 20], [30, 90, 245], [200, 200, 200], [120, 140, 60]];
         let frame: Vec<u8> = (0..w * h).flat_map(|i| { let c = colours[(i % 4) as usize]; [c[0], c[1], c[2], 255] }).collect();
-        for mode in [reversible_mode::KNEE, reversible_mode::NEUTWO, reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID, reversible_mode::HYBRID_REPLACE] {
-            for wp in [1.0f32, 0.8] {
+        for (mode, wp, smooth) in [reversible_mode::KNEE, reversible_mode::NEUTWO, reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID, reversible_mode::HYBRID_REPLACE]
+            .into_iter()
+            .flat_map(|m| [1.0f32, 0.8].into_iter().flat_map(move |wp| [0.0f32, 1.0].map(|s| (m, wp, s))))
+        {
+            {
                 let answer: Vec<u8> = frame.chunks_exact(4).flat_map(|p| crate::composition::encode::reference_encode_pixel([p[0], p[1], p[2], p[3]], false, wp, mode)).collect();
-                let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { white_point: wp, reversible_mode: mode, ..base }) else {
+                // Ratio smoothing and the ghost guard on as well (`smooth`): their taps are encoded too.
+                let params = ComposeParams { white_point: wp, reversible_mode: mode, ratio_smooth: smooth, ghost_guard: smooth, ..base };
+                let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else {
                     eprintln!("encode curve test: no Vulkan device, skipping");
                     return;
                 };
@@ -2423,7 +2433,7 @@ mod tests {
                     .flat_map(|(o, f)| (0..3).map(move |c| (i32::from(o[c]) - i32::from(f[c])).abs()))
                     .max()
                     .unwrap_or(0);
-                assert!(worst <= 3, "curve {mode} at white point {wp}: an unedited answer moved the frame by up to {worst}");
+                assert!(worst <= 3, "curve {mode} at white point {wp} (smoothing and ghost guard {smooth}): an unedited answer moved the frame by up to {worst}");
             }
         }
     }
