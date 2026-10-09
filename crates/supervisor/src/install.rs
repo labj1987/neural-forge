@@ -28,6 +28,33 @@ pub enum InstallError {
     InvalidManifest(String),
     RefusedSymlink(PathBuf),
     RefusedUnowned(PathBuf),
+    CorruptRecord(CorruptRecord),
+}
+
+/// `installation.json` exists but is not a record this installer can read.
+#[derive(Debug)]
+pub struct CorruptRecord {
+    pub path: PathBuf,
+    pub reason: String,
+}
+
+impl std::fmt::Display for CorruptRecord {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the install record {} cannot be read ({}). Move it aside (gio trash {}) and install again: \
+             installed files that match the new version are taken over, and any other file in the way is named",
+            self.path.display(),
+            self.reason,
+            self.path.display()
+        )
+    }
+}
+
+impl From<CorruptRecord> for std::io::Error {
+    fn from(e: CorruptRecord) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())
+    }
 }
 
 impl std::fmt::Display for InstallError {
@@ -38,6 +65,7 @@ impl std::fmt::Display for InstallError {
             Self::InvalidManifest(msg) => write!(f, "{msg}"),
             Self::RefusedSymlink(path) => write!(f, "refusing symlink destination: {}", path.display()),
             Self::RefusedUnowned(path) => write!(f, "refusing to overwrite unowned or changed file: {}", path.display()),
+            Self::CorruptRecord(e) => write!(f, "{e}"),
         }
     }
 }
@@ -77,8 +105,37 @@ fn record_path() -> PathBuf {
     PathBuf::from(paths::data_dir()).join("installation.json")
 }
 
-fn load_record() -> BTreeMap<String, String> {
-    std::fs::read_to_string(record_path()).ok().and_then(|text| serde_json::from_str(&text).ok()).unwrap_or_default()
+/// The install record: empty when there is none yet, an error when one is there but cannot be
+/// read (silently starting from an empty record would refuse every installed file as unowned).
+fn load_record() -> Result<BTreeMap<String, String>, CorruptRecord> {
+    let path = record_path();
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(CorruptRecord { path, reason: e.to_string() }),
+    };
+    serde_json::from_str(&text).map_err(|e| CorruptRecord { path, reason: e.to_string() })
+}
+
+/// The installed layer manifest, the one file the Vulkan loader finds on its own.
+fn manifest_path() -> PathBuf {
+    PathBuf::from(paths::data_home()).join(format!("vulkan/implicit_layer.d/{MANIFEST}"))
+}
+
+/// Whether a recorded path is one this installer may write or remove: under the data dir or
+/// the implicit-layer directory, with no `..` to step out again. Anything else in the record
+/// (a hand-edited or foreign record) is never touched.
+fn is_owned_path(path: &Path) -> bool {
+    use std::path::Component;
+    let plain = path.is_absolute() && path.components().all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    let layer_dir = PathBuf::from(paths::data_home()).join("vulkan/implicit_layer.d");
+    plain && (path.starts_with(paths::data_dir()) || path.starts_with(layer_dir))
+}
+
+/// Splits the record into the entries this installer owns and the names of any it does not.
+fn owned_record(record: BTreeMap<String, String>) -> (BTreeMap<String, String>, Vec<String>) {
+    let (owned, foreign): (BTreeMap<_, _>, BTreeMap<_, _>) = record.into_iter().partition(|(name, _)| is_owned_path(Path::new(name)));
+    (owned, foreign.into_keys().collect())
 }
 
 fn save_record(record: &BTreeMap<String, String>) -> std::io::Result<()> {
@@ -107,9 +164,8 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 /// wrote there -- the same "never touch a file this didn't put there" guarantee
 /// `install.py` makes.
 pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
-    let data_home = PathBuf::from(paths::data_home());
     let root = PathBuf::from(paths::data_dir());
-    let old = load_record();
+    let (old, foreign) = owned_record(load_record().map_err(InstallError::CorruptRecord)?);
     let usr = appdir.join("usr");
 
     let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
@@ -135,7 +191,8 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     let library_path = root.join("lib/neural-forge/libneural_forge_layer.so");
     manifest["layer"]["library_path"] = serde_json::Value::String(library_path.to_string_lossy().into_owned());
     let manifest_out = serde_json::to_string_pretty(&manifest)? + "\n";
-    files.insert(data_home.join(format!("vulkan/implicit_layer.d/{MANIFEST}")), manifest_out.into_bytes());
+    let manifest_dest = manifest_path();
+    files.insert(manifest_dest.clone(), manifest_out.into_bytes());
 
     // No `.desktop` file, icon or AppStream metainfo: every install comes from an
     // AppImage, and menu integration belongs to whatever integrates that AppImage
@@ -145,8 +202,11 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
 
     // Validate every destination before writing any of them, exactly like
     // `install.py`: a failure partway through must leave nothing changed, not a
-    // half-installed mix of old and new files.
-    for path in files.keys() {
+    // half-installed mix of old and new files. A file already holding exactly what is about to
+    // be written is adopted: an install interrupted between writing a file and recording it
+    // left it there, and refusing it would block every later install.
+    let mut adopted = BTreeMap::new();
+    for (path, content) in &files {
         // The destination and the directory it lands in, not every ancestor: a symlinked
         // $HOME or ~/.local/share is an ordinary setup, and refusing it refused every launch.
         if path.is_symlink() || path.parent().is_some_and(Path::is_symlink) {
@@ -154,8 +214,12 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         }
         if path.exists() {
             let current = digest_file(path)?;
-            if old.get(&path.to_string_lossy().into_owned()) != Some(&current) {
-                return Err(InstallError::RefusedUnowned(path.clone()));
+            let name = path.to_string_lossy().into_owned();
+            if old.get(&name) != Some(&current) {
+                if current != digest(content) {
+                    return Err(InstallError::RefusedUnowned(path.clone()));
+                }
+                adopted.insert(name, current);
             }
         }
     }
@@ -163,7 +227,8 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     // Already current (the GUI runs this on every launch from an AppImage): every file is
     // in place with exactly this content, and nothing stale is left to remove.
     let up_to_date = files.iter().all(|(path, content)| path.is_file() && old.get(&path.to_string_lossy().into_owned()) == Some(&digest(content)))
-        && old.keys().all(|name| files.contains_key(Path::new(name)));
+        && old.keys().all(|name| files.contains_key(Path::new(name)))
+        && foreign.is_empty();
     if up_to_date {
         return Ok(InstallReport { changed: false, root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") });
     }
@@ -172,10 +237,13 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     // through must leave every file already written tracked (otherwise the next run
     // sees them as unowned and refuses to touch them). Each file's record entry is
     // saved before the next file is written, so an interruption can orphan at most the
-    // single file in flight.
+    // single file in flight. Entries outside the owned directories are dropped here, never
+    // acted on. The layer manifest goes last, once everything it points at is in place.
     let bin_dir = root.join("bin");
     let mut record = old.clone();
-    for (path, content) in &files {
+    record.extend(adopted);
+    save_record(&record)?;
+    for (path, content) in files.iter().filter(|(path, _)| **path != manifest_dest) {
         let mode = if path.parent() == Some(bin_dir.as_path()) { 0o755 } else { 0o644 };
         write_atomic(path, content, mode)?;
         record.insert(path.to_string_lossy().into_owned(), digest(content));
@@ -199,6 +267,10 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
         }
     }
 
+    write_atomic(&manifest_dest, &files[&manifest_dest], 0o644)?;
+    record.insert(manifest_dest.to_string_lossy().into_owned(), digest(&files[&manifest_dest]));
+    save_record(&record)?;
+
     Ok(InstallReport { changed: true, root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") })
 }
 
@@ -215,11 +287,15 @@ fn prune_empty_dirs(dir: &Path, stop: &Path) {
 
 /// Removes every tracked file whose on-disk content still matches this installer's
 /// own record (a file the user or another program has since changed is left alone,
-/// reported as preserved rather than silently deleted), then clears the record.
+/// reported as preserved rather than silently deleted), then clears the record. The layer
+/// manifest goes first, so no game loads a layer whose files are half gone. A record entry
+/// outside the directories this installer owns is skipped: neither removed nor reported.
 pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
-    let old = load_record();
+    let (old, _foreign) = owned_record(load_record()?);
+    let manifest = manifest_path().to_string_lossy().into_owned();
     let mut preserved = Vec::new();
-    for (name, expected) in &old {
+    let ordered = old.get_key_value(&manifest).into_iter().chain(old.iter().filter(|(name, _)| **name != manifest));
+    for (name, expected) in ordered {
         let path = PathBuf::from(name);
         let matches = path.is_file() && !path.is_symlink() && digest_file(&path).ok().as_ref() == Some(expected);
         if matches {
@@ -380,21 +456,80 @@ mod tests {
     }
 
     #[test]
-    fn install_removes_a_desktop_entry_an_older_install_wrote() {
-        let scratch = ScratchDataHome::new("old-desktop-entry");
+    fn a_record_entry_outside_the_owned_dirs_is_dropped_and_never_touched() {
+        let scratch = ScratchDataHome::new("foreign-entry");
         let appdir = scratch.dir.join("AppDir");
         write_fixture_appdir(&appdir);
-        let desktop = PathBuf::from(paths::data_home()).join(format!("applications/{APP_ID}.desktop"));
-        let old_text = "[Desktop Entry]\nExec=\"/old/bin/neural-forge\"\n";
-        std::fs::create_dir_all(desktop.parent().unwrap()).unwrap();
-        std::fs::write(&desktop, old_text).unwrap();
+        let outside = scratch.dir.join("not-ours.txt");
+        let sneaky = PathBuf::from(paths::data_dir()).join("../not-ours-either.txt");
+        for path in [&outside, &sneaky] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, "someone else's").unwrap();
+        }
         let mut record = BTreeMap::new();
-        record.insert(desktop.to_string_lossy().into_owned(), digest(old_text.as_bytes()));
+        for path in [&outside, &sneaky] {
+            record.insert(path.to_string_lossy().into_owned(), digest(b"someone else's"));
+        }
         save_record(&record).unwrap();
 
         install(&appdir).unwrap();
-        assert!(!desktop.exists(), "the entry an older install wrote must go, leaving the AppImage's own entry as the only one");
-        assert!(!load_record().contains_key(&desktop.to_string_lossy().into_owned()));
+        let record = load_record().unwrap();
+        for path in [&outside, &sneaky] {
+            assert!(path.exists(), "{}: a stale entry outside the owned dirs must not be removed", path.display());
+            assert!(!record.contains_key(&path.to_string_lossy().into_owned()), "{}: must be dropped from the record", path.display());
+        }
+
+        // Uninstall skips such an entry too: it is neither removed nor reported as preserved
+        // (purge deletes what is reported).
+        let mut record = load_record().unwrap();
+        record.insert(outside.to_string_lossy().into_owned(), digest(b"someone else's"));
+        save_record(&record).unwrap();
+        let preserved = uninstall().unwrap();
+        assert!(outside.exists());
+        assert!(!preserved.contains(&outside), "{preserved:?}");
+        assert!(!manifest_path().exists());
+    }
+
+    #[test]
+    fn a_file_left_unrecorded_by_an_interrupted_install_is_adopted() {
+        let scratch = ScratchDataHome::new("orphan");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+        // An install interrupted after writing a file but before recording it.
+        let binary = PathBuf::from(paths::data_dir()).join("bin/neural-forge");
+        let mut record = load_record().unwrap();
+        record.remove(&binary.to_string_lossy().into_owned());
+        save_record(&record).unwrap();
+
+        install(&appdir).expect("a file holding exactly the new content must not block the install");
+        assert_eq!(load_record().unwrap().get(&binary.to_string_lossy().into_owned()), Some(&digest(b"gui")));
+
+        // A different unrecorded file in the way is still refused.
+        let mut record = load_record().unwrap();
+        record.remove(&binary.to_string_lossy().into_owned());
+        save_record(&record).unwrap();
+        std::fs::write(&binary, "someone else's").unwrap();
+        let err = install(&appdir).expect_err("an unowned file with other content must be refused");
+        assert!(matches!(err, InstallError::RefusedUnowned(ref path) if path == &binary), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_corrupt_record_is_a_distinct_error_that_says_what_to_do() {
+        let scratch = ScratchDataHome::new("corrupt-record");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+        std::fs::write(record_path(), "{ not json").unwrap();
+
+        let err = install(&appdir).expect_err("an unreadable record must not read as empty");
+        assert!(matches!(err, InstallError::CorruptRecord(_)), "unexpected error: {err}");
+        let message = err.to_string();
+        assert!(message.contains(&record_path().display().to_string()) && message.contains("Move it aside"), "{message}");
+
+        let err = uninstall().expect_err("uninstall must not act on an unreadable record");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(PathBuf::from(paths::data_dir()).join("bin/neural-forge").exists(), "nothing may be removed");
     }
 
     #[test]
@@ -411,7 +546,7 @@ mod tests {
         std::fs::remove_file(&extra).unwrap();
         install(&appdir).unwrap();
         assert!(!installed.exists(), "a file the new install no longer ships must be removed");
-        assert!(!load_record().contains_key(&installed.to_string_lossy().into_owned()));
+        assert!(!load_record().unwrap().contains_key(&installed.to_string_lossy().into_owned()));
     }
 
     #[test]
@@ -428,7 +563,7 @@ mod tests {
         std::fs::remove_file(&extra).unwrap();
         install(&appdir).unwrap();
         assert_eq!(std::fs::read_to_string(&installed).unwrap(), "edited by hand");
-        assert!(!load_record().contains_key(&installed.to_string_lossy().into_owned()));
+        assert!(!load_record().unwrap().contains_key(&installed.to_string_lossy().into_owned()));
     }
 
     /// A failure partway through writing must leave the files already written tracked,
@@ -447,7 +582,7 @@ mod tests {
         std::fs::write(&blocked, "in the way").unwrap();
         let err = install(&appdir);
         assert!(err.is_err(), "the blocked destination must fail the install");
-        let record = load_record();
+        let record = load_record().unwrap();
         assert!(!record.is_empty(), "files written before the failure must be recorded");
         for (name, digest_recorded) in &record {
             assert_eq!(&digest_file(Path::new(name)).unwrap(), digest_recorded, "{name}");
