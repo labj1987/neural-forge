@@ -197,8 +197,7 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     // No `.desktop` file, icon or AppStream metainfo: every install comes from an
     // AppImage, and menu integration belongs to whatever integrates that AppImage
     // (Gear Lever, AppImageLauncher, ...). Installing a second entry here gave users two
-    // "Neural Forge" launchers. Older installs that did write them get them removed by
-    // the stale-entry pass below, as long as they are still exactly what was written.
+    // "Neural Forge" launchers.
 
     // Validate every destination before writing any of them, exactly like
     // `install.py`: a failure partway through must leave nothing changed, not a

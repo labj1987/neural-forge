@@ -59,14 +59,14 @@ pub(crate) fn model_present() -> bool {
 
 /// "build 310.8.0.0, verified": the manifest's `source.build` and `source.verified`, for the log.
 /// Both keys appear once in `extract-model`'s manifest, so a string scan is enough. A manifest
-/// without `verified` was written by 3.0.0, which took only the verified build.
+/// without `verified` is unverified.
 fn model_source(text: &str) -> String {
     let field = |key: &str| {
         let (_, rest) = text.split_once(&format!("\"{key}\": "))?;
         Some(rest.split([',', '\n', '}']).next()?.trim().trim_matches('"').to_string())
     };
     let build = field("build").unwrap_or_else(|| "unknown".to_string());
-    let verified = field("verified").is_none_or(|v| v == "true");
+    let verified = field("verified").is_some_and(|v| v == "true");
     format!("build {build}, {}", if verified { "verified" } else { "not verified against NVIDIA's runtime" })
 }
 
@@ -1298,8 +1298,8 @@ mod tests {
         let source = |extra: &str| format!("{{\n  \"source\": {{\n    \"build\": \"310.9.1.0\",\n    \"resource\": \"WEIGHTS_HT\"{extra}\n  }}\n}}");
         assert_eq!(model_source(&source(",\n    \"verified\": false")), "build 310.9.1.0, not verified against NVIDIA's runtime");
         assert_eq!(model_source(&source(",\n    \"verified\": true")), "build 310.9.1.0, verified");
-        assert_eq!(model_source(&source("")), "build 310.9.1.0, verified");
-        assert_eq!(model_source(""), "build unknown, verified");
+        assert_eq!(model_source(&source("")), "build 310.9.1.0, not verified against NVIDIA's runtime");
+        assert_eq!(model_source(""), "build unknown, not verified against NVIDIA's runtime");
     }
 
     #[test]

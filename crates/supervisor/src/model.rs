@@ -402,9 +402,9 @@ pub fn installed(dir: &Path) -> Option<String> {
 
 /// Whether the installed model came from a build in [`VERIFIED_BUILDS`] (the manifest's
 /// `source.verified`), or `None` when there is no readable manifest. A manifest without the field
-/// was written by 3.0.0, which took only 310.8.0.
+/// is unverified.
 pub fn installed_verified(dir: &Path) -> Option<bool> {
-    Some(read_manifest(dir)?["source"]["verified"].as_bool().unwrap_or(true))
+    Some(read_manifest(dir)?["source"]["verified"].as_bool().unwrap_or(false))
 }
 
 #[derive(Debug)]
@@ -833,10 +833,10 @@ mod tests {
     }
 
     #[test]
-    fn a_manifest_without_the_verified_field_came_from_310_8_0() {
-        let dir = scratch("manifest-3-0");
+    fn a_manifest_without_the_verified_field_is_unverified() {
+        let dir = scratch("manifest-no-verified");
         std::fs::write(dir.join("manifest.json"), r#"{"source": {"build": "310.8.0.0"}}"#).unwrap();
-        assert_eq!(installed_verified(&dir), Some(true));
+        assert_eq!(installed_verified(&dir), Some(false));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
