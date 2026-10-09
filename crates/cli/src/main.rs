@@ -236,11 +236,22 @@ fn cmd_doctor() -> ExitCode {
         }
     }
 
-    print!("runtime dir: {}\n  ", neural_forge_protocol::shm_runtime_dir());
+    print!("user dirs: {}, {}\n  ", paths::data_dir(), paths::state_dir());
     match paths::ensure_dirs() {
         Ok(()) => println!("ok"),
         Err(e) => {
             println!("not writable: {e}");
+            ok = false;
+        }
+    }
+
+    // The channel itself, opened the way the GUI and the layer open it: a runtime dir that exists
+    // but is not ours or not private, or a header from another build, fails here.
+    print!("channel: {}\n  ", neural_forge_supervisor::channel_path(&cfg));
+    match neural_forge_supervisor::open_channel(&cfg) {
+        Ok(_) => println!("ok"),
+        Err(e) => {
+            println!("cannot open: {e}");
             ok = false;
         }
     }
@@ -304,16 +315,15 @@ fn cmd_import_binaries(dir: &str) -> ExitCode {
     // Only `nvngx_dlssnr.dll`: the model's weights are extracted from it (`extract-model`).
     let name = "nvngx_dlssnr.dll";
     let from = src.join(name);
-    let copied = if from.is_file() {
-        if let Err(e) = std::fs::copy(&from, std::path::Path::new(&dest).join(name)) {
-            eprintln!("failed to copy {name}: {e}");
-            return ExitCode::FAILURE;
-        }
-        1
-    } else {
-        0
-    };
-    println!("imported {copied} file(s) to {dest}");
+    if !from.is_file() {
+        eprintln!("no {name} in {dir}: nothing imported");
+        return ExitCode::FAILURE;
+    }
+    if let Err(e) = std::fs::copy(&from, std::path::Path::new(&dest).join(name)) {
+        eprintln!("failed to copy {name}: {e}");
+        return ExitCode::FAILURE;
+    }
+    println!("imported {name} to {dest}");
     ExitCode::SUCCESS
 }
 
