@@ -322,10 +322,16 @@ pub(crate) enum Kernel {
     /// `cuda_engine_input_kernel_*` among NGX's modules): it reads the colour input, depth and
     /// motion vectors. Only the logs and the probe use it.
     SrInput,
-    /// DLSS Ray Reconstruction (`rr2_*`): its input is the noisy ray-traced frame with its guide buffers
-    /// (`rr2_enc0_kernel` names the colour input with diffuse and specular albedo, normals, roughness and
-    /// hit distance), so the model must not run before it. Crimson Desert launches `rr2_*` with Ray
-    /// Reconstruction on in its settings and `rrlite_*` (no guide buffers) with it off (2026-10-09).
+    /// DLSS Ray Reconstruction: its input is the noisy ray-traced frame with its guide buffers, so the
+    /// model must not run before it. Two families, both seen with the game's Ray Reconstruction option on
+    /// and gone with it off (2026-10-09): `rr2_*` (DLSS 310.9, Crimson Desert; `rr2_enc0_kernel` names the
+    /// colour input with diffuse and specular albedo, normals, roughness and hit distance; with it off the
+    /// game launches `rrlite_*`) and the denoiser engine's network, `cuda_dldn_engine_hkpn_*` and
+    /// `cuda_dldn_engine_swin_*` (DLSS 310.0, Hogwarts Legacy; `cuda_dldn_engine_swin_enc0_kernel` names the
+    /// colour input with two B10G11R11 albedo images, normals and hit distance; with it off the game
+    /// launches Super Resolution's `hiluma_*`). The engine's helpers (`cuda_dldn_engine_luma_convert_kernel`,
+    /// `_reduce_sum_`, `_auto_exposure_copy_`) are not Ray Reconstruction: Crimson Desert's `rrlite_*` Super
+    /// Resolution launches them too.
     RayReconstruction,
     /// Anything else: Super Resolution's network and output kernels, Frame Generation's (`main_kernel`,
     /// `k_*`, `custom_block*`, `custom_upsample*`, `Kernel_*`), NGX's helpers.
@@ -336,7 +342,7 @@ impl Kernel {
     pub(crate) fn of(name: &str) -> Self {
         if name.starts_with("hiluma_engine_input") || name.starts_with("cuda_engine_input_kernel") {
             Self::SrInput
-        } else if name.starts_with("rr2_") {
+        } else if ["rr2_", "cuda_dldn_engine_hkpn_", "cuda_dldn_engine_swin_"].iter().any(|p| name.starts_with(p)) {
             Self::RayReconstruction
         } else {
             Self::Other
@@ -7061,13 +7067,27 @@ mod tests {
         for sr in ["hiluma_engine_input_depthinv_mvlo_hdr_v2_rel", "cuda_engine_input_kernel_rel_hdr_colvar_mvlo"] {
             assert_eq!(Kernel::of(sr), Kernel::SrInput, "{sr}");
         }
-        for rr in ["rr2_enc0_kernel", "rr2_enc4_kernel", "rr2_dec0_kernel_1", "rr2_post_kernel", "rr2_downsample_kernel_static_hdr_no_transparency", "rr2_pooled_history0_kernel", "rr2_histogram_auto_exposure_basic_kernel"] {
+        for rr in [
+            "rr2_enc0_kernel",
+            "rr2_enc4_kernel",
+            "rr2_dec0_kernel_1",
+            "rr2_post_kernel",
+            "rr2_downsample_kernel_static_hdr_no_transparency",
+            "rr2_pooled_history0_kernel",
+            "rr2_histogram_auto_exposure_basic_kernel",
+            "cuda_dldn_engine_swin_enc0_kernel",
+            "cuda_dldn_engine_swin_dec2_kernel",
+            "cuda_dldn_engine_hkpn_input_kernel_preset_1",
+            "cuda_dldn_engine_hkpn_output_kernel_transformer",
+        ] {
             assert_eq!(Kernel::of(rr), Kernel::RayReconstruction, "{rr}");
         }
         for other in [
             "rrlite_enc0_4x4_mvlo_hdr_folded",
             "rrlite_post_0_0_mvlo_hdr_folded",
             "cuda_dldn_engine_luma_convert_kernel",
+            "cuda_dldn_engine_reduce_sum_kernel",
+            "cuda_dldn_engine_auto_exposure_copy_kernel",
             "custom_block0_conv0_kernel",
             "custom_block0_convPre_kernel",
             "custom_upsample_hf_kernel",
@@ -7118,6 +7138,12 @@ mod tests {
     /// game switches to Super Resolution, the inputs are identified within [`SR_RECENT`] submits.
     #[test]
     fn ray_reconstruction_is_never_identified_or_held() {
+        // Hogwarts Legacy's family, its encoder with Super Resolution's whole shape: never held either.
+        let mut t = gta_with("cuda_dldn_engine_swin_enc0_kernel");
+        let (first_held, lines) = run_frames(&mut t, 20);
+        assert_eq!(first_held, None, "a Ray Reconstruction (dldn) buffer was held");
+        assert!(lines.iter().any(|l| l.starts_with("DLSS Ray Reconstruction runs (cuda_dldn_engine_swin_enc0_kernel")), "{lines:#?}");
+
         let mut t = gta_with("rr2_enc0_kernel");
         assert!(t.launch[&cb(1)].input_rr);
         let (first_held, lines) = run_frames(&mut t, 40);
