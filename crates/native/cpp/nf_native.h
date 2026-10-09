@@ -61,6 +61,8 @@ typedef struct NfNativeOpen {
 // Loads and verifies the model (SHA-256), builds the kernels. Slow (seconds): run off the game's
 // threads. Uses only `queue_index`, which nothing else may use while any nf_native call runs. On
 // failure `*stalled` (when not null) says whether a wait on the queue timed out (nf_native_stalled).
+// One network per process at a time (volk's function table is process-global): fails while another
+// is open, until nf_native_close.
 NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err, size_t err_len);
 
 // The graph for a `valid_width` x `valid_height` frame: allocates the activations, runs it once on

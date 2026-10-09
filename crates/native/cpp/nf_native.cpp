@@ -28,6 +28,10 @@ namespace {
 // faulted or timed out here, so no network opened later in the process chains again.
 std::atomic<bool> g_fellBack{false};
 
+// One live network per process: volk's function table (loaded for one device), the chaining switch and
+// the asset loader are process-global, so a second network would repoint the first one's calls.
+std::atomic<bool> g_live{false};
+
 void say(char* out, size_t len, const std::string& text) {
   if (!out || !len) return;
   snprintf(out, len, "%s", text.c_str());
@@ -378,6 +382,11 @@ void nf_native_device_restore(void* state) {
 
 NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err, size_t err_len) {
   if (stalled) *stalled = 0;
+  bool free = false;
+  if (!g_live.compare_exchange_strong(free, true)) {
+    say(err, err_len, "another network is open in this process (one at a time: its Vulkan function table is process-wide)");
+    return nullptr;
+  }
   auto n = std::make_unique<NfNative>();
   try {
     n->fenceTimeoutNs = (uint64_t)open->fence_timeout_ms * 1'000'000ull;
@@ -412,6 +421,7 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
     n->kernels.reset();
     n->model.reset();
     n->context.reset();
+    g_live.store(false);
     return nullptr;
   }
 }
@@ -490,6 +500,7 @@ void nf_native_close(NfNative* n) {
   } catch (...) {
   }
   delete n;
+  g_live.store(false);
 }
 
 }  // extern "C"

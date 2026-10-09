@@ -196,11 +196,15 @@ pub struct Network {
     raw: *mut c_void,
 }
 
-// SAFETY: the C++ object has no thread affinity; every use goes through `&mut self` or is read-only.
+// SAFETY: the C++ object has no thread affinity, and every use goes through `&mut self` or is
+// read-only. What it shares with the rest of the process (volk's function table, the chaining switch,
+// the asset loader) is process-global, which is safe only because `nf_native_open` admits one live
+// network per process: nothing else repoints those while this one is used from another thread.
 unsafe impl Send for Network {}
 
 impl Network {
-    /// Loads and verifies the model and builds the kernels. Seconds.
+    /// Loads and verifies the model and builds the kernels. Seconds. One network per process at a time:
+    /// fails while another is open.
     ///
     /// # Safety
     /// The handles are live and belong together; `gipa` is the next layer's; the device was created with
