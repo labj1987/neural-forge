@@ -318,6 +318,8 @@ Context::~Context() { release(); }
 
 void Context::release() {
   if (!device_) return;
+  // Stalled: the GPU may still use any of it. Leaked, never destroyed.
+  if (stalled_) return;
   // An adopted device is the application's: only this object's own queue is waited for.
   if (owned_) vkDeviceWaitIdle(device_);
   else if (queue_) {
@@ -391,6 +393,7 @@ Buffer Context::createBuffer(VkDeviceSize size, bool hostVisible, const char* la
 }
 
 void Context::destroyBuffer(Buffer& buffer) {
+  if (stalled_) { buffer = Buffer{}; return; }   // leaked: the GPU may still use it
   if (buffer.mapped) vkUnmapMemory(device_, buffer.memory);
   if (buffer.buffer) vkDestroyBuffer(device_, buffer.buffer, nullptr);
   if (buffer.memory) vkFreeMemory(device_, buffer.memory, nullptr);
@@ -540,6 +543,7 @@ std::string Context::pipelineStatistics(const Pipeline& pipeline, bool includeIn
 }
 
 void Context::destroyPipeline(Pipeline& pipeline) {
+  if (stalled_) { pipeline = Pipeline{}; return; }
   if (pipeline.pipeline) vkDestroyPipeline(device_, pipeline.pipeline, nullptr);
   pipeline = Pipeline{};
 }
@@ -581,6 +585,7 @@ void Context::resetDescriptorPool(uint32_t slot) {
 }
 
 VkCommandBuffer Context::beginCommands() {
+  if (stalled_) throw std::runtime_error("the network's queue stalled earlier; it takes no more work");
   VkCommandBufferAllocateInfo allocateInfo{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
   allocateInfo.commandPool = commandPool_;
   allocateInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
@@ -595,6 +600,7 @@ VkCommandBuffer Context::beginCommands() {
 }
 
 void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
+  if (stalled_) throw std::runtime_error("the network's queue stalled earlier; it takes no more work");
   VK_CHECK(vkEndCommandBuffer(commands));
   VkSubmitInfo submit{VK_STRUCTURE_TYPE_SUBMIT_INFO};
   submit.commandBufferCount = 1;
@@ -603,8 +609,11 @@ void Context::endAndSubmit(VkCommandBuffer commands, bool wait) {
     VK_CHECK(vkResetFences(device_, 1, &waitFence_));
     VK_CHECK(vkQueueSubmit(queue_, 1, &submit, waitFence_));
     const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
-    // A timed-out buffer may still run: it is leaked, not freed.
-    if (waited == VK_TIMEOUT) throw std::runtime_error("a submit on the network's queue did not finish in time");
+    // A timed-out buffer may still run: it is leaked, not freed, and so is everything it may use.
+    if (waited == VK_TIMEOUT) {
+      stalled_ = true;
+      throw std::runtime_error("a submit on the network's queue did not finish in time");
+    }
     VK_CHECK(waited);
     vkFreeCommandBuffers(device_, commandPool_, 1, &commands);
     return;
@@ -621,11 +630,15 @@ void Context::waitIdle() {
     VK_CHECK(vkQueueWaitIdle(queue_));
     return;
   }
+  if (stalled_) throw std::runtime_error("the network's queue stalled earlier; it takes no more work");
   // An empty submit's fence signals once everything before it on the queue has completed.
   VK_CHECK(vkResetFences(device_, 1, &waitFence_));
   VK_CHECK(vkQueueSubmit(queue_, 0, nullptr, waitFence_));
   const VkResult waited = vkWaitForFences(device_, 1, &waitFence_, VK_TRUE, waitTimeoutNs_);
-  if (waited == VK_TIMEOUT) throw std::runtime_error("the network's queue did not go idle in time");
+  if (waited == VK_TIMEOUT) {
+    stalled_ = true;
+    throw std::runtime_error("the network's queue did not go idle in time");
+  }
   VK_CHECK(waited);
 }
 
@@ -713,11 +726,11 @@ VkCudaFunctionNV Context::createCudaFunction(VkCudaModuleNV module, const char* 
 }
 
 void Context::destroyCudaFunction(VkCudaFunctionNV function) {
-  if (function) vkDestroyCudaFunctionNV(device_, function, nullptr);
+  if (function && !stalled_) vkDestroyCudaFunctionNV(device_, function, nullptr);
 }
 
 void Context::destroyCudaModule(VkCudaModuleNV module) {
-  if (module) vkDestroyCudaModuleNV(device_, module, nullptr);
+  if (module && !stalled_) vkDestroyCudaModuleNV(device_, module, nullptr);
 }
 
 void Context::cudaLaunch(VkCommandBuffer commands, VkCudaFunctionNV function, uint32_t gridX, uint32_t gridY, uint32_t gridZ,

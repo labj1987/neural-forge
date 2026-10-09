@@ -114,6 +114,9 @@ struct LoaderState {
     generation: u64,
     /// Opened at least once (a later `None` network means closed for a re-initialisation).
     opened: bool,
+    /// A wait on the network's queue timed out ([`nn::Network::stalled`]): the network is dead on this
+    /// device and never opened or built again.
+    dead: bool,
 }
 
 /// The network on one device, opened and built off the game's threads. Nothing is loaded until the
@@ -212,10 +215,10 @@ impl Loader {
         *self.worker.lock().unwrap() = worker;
     }
 
-    fn open(device: vk::Device, setup: Setup) -> Result<nn::Network, String> {
+    fn open(device: vk::Device, setup: Setup) -> Result<nn::Network, nn::OpenError> {
         let dir = model_dir();
         if !model_present() {
-            return Err(format!("no model at {}: extract it in the Setup tab (neural-forge-cli extract-model)", dir.display()));
+            return Err(nn::OpenError { message: format!("no model at {}: extract it in the Setup tab (neural-forge-cli extract-model)", dir.display()), stalled: false });
         }
         let open = nn::OpenInfo {
             gipa: setup.gipa,
@@ -233,7 +236,8 @@ impl Loader {
         let t = Instant::now();
         // SAFETY: the device was created with the network's additions, and the queue is the loader's
         // alone (`crate::take_native`).
-        let network = unsafe { nn::Network::open(&open) }.map_err(|why| format!("the model at {} could not be loaded: {why}", dir.display()))?;
+        let network = unsafe { nn::Network::open(&open) }
+            .map_err(|why| nn::OpenError { message: format!("the model at {} could not be loaded: {}", dir.display(), why.message), stalled: why.stalled })?;
         crate::log!("[native] model loaded and verified from {} in {} ms (chaining {})", dir.display(), t.elapsed().as_millis(), if chain_wanted() { "on" } else { "off" });
         crate::log!("[native] model source: {}", model_source(&std::fs::read_to_string(dir.join("manifest.json")).unwrap_or_default()));
         Ok(network)
@@ -250,7 +254,7 @@ impl Loader {
         loop {
             // Work is wanted when the network is not open yet, a size is wanted that is not built, or
             // the graph is to fall back to barriers; it is due when the retry schedule says so.
-            let wanted = |s: &LoaderState| !s.opened || s.fall_back || (s.wanted.is_some() && s.wanted != s.built.map(|b| (b.width, b.height)));
+            let wanted = |s: &LoaderState| !s.dead && (!s.opened || s.fall_back || (s.wanted.is_some() && s.wanted != s.built.map(|b| (b.width, b.height))));
             if state.quit {
                 return;
             }
@@ -272,9 +276,13 @@ impl Loader {
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
             }
             let t = Instant::now();
+            let mut open_stalled = false;
             let result = match network.take() {
                 Some(n) => Ok(n),
-                None => Self::open(device, setup),
+                None => Self::open(device, setup).map_err(|e| {
+                    open_stalled = e.stalled;
+                    e.message
+                }),
             }
             .and_then(|mut n| match size {
                 None => Ok((n, None)),
@@ -315,6 +323,14 @@ impl Loader {
                         state.failed = None;
                     }
                     state.network = Some(n);
+                }
+                Err(why) if open_stalled || network.as_ref().is_some_and(nn::Network::stalled) => {
+                    // Its work may still run on the GPU: nothing of it is destroyed (dropping it leaks what
+                    // it made) and nothing is tried again on this device.
+                    crate::log!("[native] {why}; a wait on the network's queue timed out, so the network is off on this device until the game restarts; frames go to DLSS untouched");
+                    state.failed = Some(format!("{why} (the network's queue stopped responding; off until the game restarts)"));
+                    state.dead = true;
+                    drop(network);
                 }
                 Err(why) => {
                     let wait = retry.failed(Instant::now());

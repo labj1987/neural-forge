@@ -167,6 +167,7 @@ Graph::Graph(vk::Context& context, Model& model, Kernels& kernels, const Geometr
 }
 
 Graph::~Graph() {
+  if (context_.stalled()) return;   // the GPU may still use the activations: leaked
   for (auto& activation : activations_) context_.destroyBuffer(activation->buffer);
 }
 

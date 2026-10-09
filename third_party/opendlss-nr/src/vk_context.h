@@ -140,6 +140,10 @@ class Context {
   VkCommandBuffer beginCommands();
   void endAndSubmit(VkCommandBuffer commands, bool wait = true);
   void waitIdle();
+  // A bounded wait that timed out latches this: work of this object may still be running on the GPU, so it
+  // submits nothing more (beginCommands/endAndSubmit/waitIdle throw) and destroys nothing (destroyBuffer,
+  // destroyPipeline, destroyCuda*, the destructor and its owners' destructors leak instead).
+  bool stalled() const { return stalled_; }
   void computeBarrier(VkCommandBuffer commands);   // compute -> compute
   // VK_NV_cuda_kernel_launch: PTX modules launched from the command buffer on buffer device addresses.
   VkDeviceAddress deviceAddress(const Buffer& buffer) const;
@@ -184,6 +188,7 @@ class Context {
   uint32_t sharedFamily_ = VK_QUEUE_FAMILY_IGNORED;
   void* initUser_ = nullptr;        // 0: unbounded waits (the tool); otherwise every wait is bounded
   VkFence waitFence_ = VK_NULL_HANDLE;
+  bool stalled_ = false;
   void adopt();
   void release();   // the destructor's cleanup (also an adopting constructor's that throws)
   std::string deviceName_;

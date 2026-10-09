@@ -44,7 +44,7 @@ mod ffi {
             out: *mut vk::DeviceCreateInfo, state: *mut *mut c_void, err: *mut c_char, len: usize,
         ) -> u32;
         pub fn nf_native_device_restore(state: *mut c_void);
-        pub fn nf_native_open(open: *const Open, err: *mut c_char, len: usize) -> *mut c_void;
+        pub fn nf_native_open(open: *const Open, stalled: *mut u32, err: *mut c_char, len: usize) -> *mut c_void;
         pub fn nf_native_build(n: *mut c_void, width: u32, height: u32, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_frame(n: *const c_void, frame: *mut super::Frame) -> u32;
         pub fn nf_native_graph_commands(n: *const c_void) -> vk::CommandBuffer;
@@ -53,6 +53,7 @@ mod ffi {
         pub fn nf_native_chain_timeouts(n: *const c_void, at: *mut c_char, len: usize) -> u32;
         pub fn nf_native_reset_chain_timeouts(n: *mut c_void);
         pub fn nf_native_fall_back_to_barriers(n: *mut c_void, err: *mut c_char, len: usize) -> u32;
+        pub fn nf_native_stalled(n: *const c_void) -> u32;
         pub fn nf_native_close(n: *mut c_void);
     }
 }
@@ -175,6 +176,21 @@ pub struct OpenInfo<'a> {
     pub init_dispatchable: Option<InitDispatchable>,
 }
 
+/// Why [`Network::open`] failed.
+#[derive(Debug, Clone)]
+pub struct OpenError {
+    pub message: String,
+    /// A wait on the network's queue timed out ([`Network::stalled`]): its work may still run on the
+    /// GPU, so the network is dead for this device.
+    pub stalled: bool,
+}
+
+impl std::fmt::Display for OpenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// The network on one device.
 pub struct Network {
     raw: *mut c_void,
@@ -189,8 +205,9 @@ impl Network {
     /// # Safety
     /// The handles are live and belong together; `gipa` is the next layer's; the device was created with
     /// [`device_extend`]'s additions; the queue is used by nothing else while any call runs.
-    pub unsafe fn open(info: &OpenInfo) -> Result<Self, String> {
-        let dir = CString::new(info.model_dir.as_os_str().as_encoded_bytes()).map_err(|_| "a NUL in the model path".to_string())?;
+    pub unsafe fn open(info: &OpenInfo) -> Result<Self, OpenError> {
+        let dir = CString::new(info.model_dir.as_os_str().as_encoded_bytes())
+            .map_err(|_| OpenError { message: "a NUL in the model path".to_string(), stalled: false })?;
         let open = ffi::Open {
             gipa: info.gipa,
             instance: info.instance,
@@ -206,10 +223,11 @@ impl Network {
             init_user: std::ptr::null_mut(),
         };
         let mut err = [0 as c_char; MESSAGE];
-        // SAFETY: forwarded from this function's contract.
-        let raw = unsafe { ffi::nf_native_open(&open, err.as_mut_ptr(), MESSAGE) };
+        let mut stalled = 0;
+        // SAFETY: forwarded from this function's contract; the out-pointers are to locals.
+        let raw = unsafe { ffi::nf_native_open(&open, &mut stalled, err.as_mut_ptr(), MESSAGE) };
         if raw.is_null() {
-            Err(message(&err))
+            Err(OpenError { message: message(&err), stalled: stalled != 0 })
         } else {
             Ok(Self { raw })
         }
@@ -254,6 +272,14 @@ impl Network {
             1 => Ok(()),
             _ => Err(message(&err)),
         }
+    }
+
+    /// A bounded wait on the network's queue timed out: its work may still run on the GPU, so the
+    /// network takes no more work (every build fails) and leaks what it made when dropped instead of
+    /// destroying it. Dead for this device.
+    pub fn stalled(&self) -> bool {
+        // SAFETY: `raw` is live.
+        unsafe { ffi::nf_native_stalled(self.raw) != 0 }
     }
 
     /// Counter waits that gave up since the last reset, and where the first one was.

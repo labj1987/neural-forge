@@ -217,7 +217,16 @@ struct NfNative {
   float blendScale = 1.0f;
   uint64_t fenceTimeoutNs = 5'000'000'000ull;
 
+  bool stalled() const { return context && context->stalled(); }
+
   void dropGraph() {
+    if (stalled()) {
+      // The GPU may still run the graph: its command buffers and activations are leaked, not freed.
+      secondary = ownSecondary = VK_NULL_HANDLE;
+      (void)graph.release();
+      features = nullptr;
+      return;
+    }
     if (secondary) vkFreeCommandBuffers(context->device(), secondaryPool, 1, &secondary);
     secondary = VK_NULL_HANDLE;
     if (ownSecondary) vkFreeCommandBuffers(context->device(), ownPool, 1, &ownSecondary);
@@ -362,7 +371,8 @@ void nf_native_device_restore(void* state) {
   delete x;
 }
 
-NfNative* nf_native_open(const NfNativeOpen* open, char* err, size_t err_len) {
+NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err, size_t err_len) {
+  if (stalled) *stalled = 0;
   auto n = std::make_unique<NfNative>();
   try {
     n->fenceTimeoutNs = (uint64_t)open->fence_timeout_ms * 1'000'000ull;
@@ -388,18 +398,24 @@ NfNative* nf_native_open(const NfNativeOpen* open, char* err, size_t err_len) {
     return n.release();
   } catch (const std::exception& e) {
     say(err, err_len, e.what());
-    if (n->context) {
+    if (stalled) *stalled = n->stalled() ? 1 : 0;
+    if (n->context && !n->stalled()) {
       if (n->secondaryPool) vkDestroyCommandPool(n->context->device(), n->secondaryPool, nullptr);
       if (n->ownPool) vkDestroyCommandPool(n->context->device(), n->ownPool, nullptr);
-      n->kernels.reset();
-      n->model.reset();
-      n->context.reset();
     }
+    // Stalled, each of these leaks what it made instead of destroying it.
+    n->kernels.reset();
+    n->model.reset();
+    n->context.reset();
     return nullptr;
   }
 }
 
 uint32_t nf_native_build(NfNative* n, uint32_t valid_width, uint32_t valid_height, char* err, size_t err_len) {
+  if (n->stalled()) {
+    say(err, err_len, "the network's queue stalled earlier; it takes no more work");
+    return 0;
+  }
   try {
     n->build(valid_width, valid_height);
     return 1;
@@ -422,6 +438,8 @@ uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame) {
   frame->chained = n->graph->chained() ? 1 : 0;
   return 1;
 }
+
+uint32_t nf_native_stalled(const NfNative* n) { return n->stalled() ? 1 : 0; }
 
 VkCommandBuffer nf_native_graph_commands(const NfNative* n) { return n->secondary; }
 
@@ -456,8 +474,10 @@ void nf_native_close(NfNative* n) {
   if (!n) return;
   try {
     n->dropGraph();
-    if (n->secondaryPool) vkDestroyCommandPool(n->context->device(), n->secondaryPool, nullptr);
-    if (n->ownPool) vkDestroyCommandPool(n->context->device(), n->ownPool, nullptr);
+    if (!n->stalled()) {
+      if (n->secondaryPool) vkDestroyCommandPool(n->context->device(), n->secondaryPool, nullptr);
+      if (n->ownPool) vkDestroyCommandPool(n->context->device(), n->ownPool, nullptr);
+    }
     n->kernels.reset();
     n->model.reset();
     n->context.reset();

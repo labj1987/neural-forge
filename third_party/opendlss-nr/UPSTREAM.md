@@ -65,3 +65,10 @@ Each one is also a patch in `patches/`, relative to this directory and applied i
    constructor that throws, and on an adopted device every object left behind leaked on the application's device.
    A tensor's buffer is owned by the model before its upload, and `createBuffer` destroys the buffer (and any
    memory) when allocating, binding or mapping it fails.
+7. `patches/0007-stalled-context.patch`: a `vk::Context` whose bounded wait timed out (`endAndSubmit`, `waitIdle`)
+   latches `stalled()`. The work it gave up on may still run on the GPU, so a stalled context takes no more work
+   (`beginCommands`, `endAndSubmit` and `waitIdle` throw) and destroys nothing: `destroyBuffer`, `destroyPipeline`
+   and `destroyCuda*` forget the handle, and the destructors of `Context`, `Model`, `Kernels` and `Graph` return at
+   once, leaking what they own. Before, a timeout threw and the owners' destructors then freed buffers the
+   timed-out submit could still be using. neural-forge-native reports the flag (`nf_native_stalled`) and the
+   layer stops using the network on that device.

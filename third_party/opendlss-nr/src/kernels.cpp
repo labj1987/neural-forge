@@ -69,6 +69,7 @@ Kernels::Kernels(vk::Context& context, const std::string& shaderDirectory) : con
 }
 
 Kernels::~Kernels() {
+  if (context_.stalled()) return;   // the GPU may still use the pipelines and buffers: leaked
   for (auto& [key, pipeline] : pipelines_) context_.destroyPipeline(pipeline);
   for (auto& [file, kernel] : ptxKernels_) {
     context_.destroyCudaFunction(kernel.function);

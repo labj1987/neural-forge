@@ -127,6 +127,7 @@ Model::Model(vk::Context& context, const std::string& directory, bool verifyHash
 Model::~Model() { release(); }
 
 void Model::release() {
+  if (context_.stalled()) return;   // the GPU may still use the weights: leaked
   for (auto& [name, buffer] : matrices_) context_.destroyBuffer(buffer);
   for (auto& [name, tensor] : tensors_) context_.destroyBuffer(tensor.raw);
   matrices_.clear();

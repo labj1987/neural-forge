@@ -59,8 +59,9 @@ typedef struct NfNativeOpen {
 } NfNativeOpen;
 
 // Loads and verifies the model (SHA-256), builds the kernels. Slow (seconds): run off the game's
-// threads. Uses only `queue_index`, which nothing else may use while any nf_native call runs.
-NfNative* nf_native_open(const NfNativeOpen* open, char* err, size_t err_len);
+// threads. Uses only `queue_index`, which nothing else may use while any nf_native call runs. On
+// failure `*stalled` (when not null) says whether a wait on the queue timed out (nf_native_stalled).
+NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err, size_t err_len);
 
 // The graph for a `valid_width` x `valid_height` frame: allocates the activations, runs it once on
 // the layer's queue (the driver compiles the PTX then, and the weights' device copies are made),
@@ -102,6 +103,11 @@ void nf_native_reset_chain_timeouts(NfNative* n);
 // Rebuilds the graph with barriers between every launch (process-wide, permanent). The previous
 // secondary must not be pending. Same cost as nf_native_build.
 uint32_t nf_native_fall_back_to_barriers(NfNative* n, char* err, size_t err_len);
+
+// 1 once a bounded wait on the network's queue timed out: its work may still be running, so the network
+// takes no more work (every later build fails) and destroys nothing (close leaks what it made). The
+// caller treats the network as dead for this device.
+uint32_t nf_native_stalled(const NfNative* n);
 
 // Destroys everything this side made. Nothing of it may be pending.
 void nf_native_close(NfNative* n);
