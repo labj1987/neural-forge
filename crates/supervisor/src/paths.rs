@@ -70,22 +70,24 @@ pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<(
     let parent = path.parent().ok_or_else(|| std::io::Error::other(format!("{} has no parent directory", path.display())))?;
     std::fs::create_dir_all(parent)?;
     let mut attempt = 0u32;
-    let staged = loop {
+    let (staged, mut file) = loop {
         let candidate = parent.join(format!(".neural-forge-{}-{attempt}.tmp", std::process::id()));
         match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&candidate) {
-            Ok(mut file) => {
-                file.write_all(content)?;
-                file.sync_all()?;
-                break candidate;
-            }
+            Ok(file) => break (candidate, file),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1000 => attempt += 1,
             Err(e) => return Err(e),
         }
     };
-    std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)).inspect_err(|_| {
+    // Every step after the staged file exists removes it again on failure.
+    let result = file
+        .write_all(content)
+        .and_then(|()| file.sync_all())
+        .and_then(|()| std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(mode)))
+        .and_then(|()| std::fs::rename(&staged, path));
+    if result.is_err() {
         let _ = std::fs::remove_file(&staged);
-    })?;
-    std::fs::rename(&staged, path)
+    }
+    result
 }
 
 #[cfg(test)]
@@ -104,4 +106,20 @@ pub(crate) mod tests {
     // crate that touches this env var must acquire this lock for its entire
     // duration, restoring the prior value (or removing it) before releasing.
     pub(crate) static XDG_DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn write_atomic_leaves_no_staging_file_when_the_rename_fails() {
+        let dir = std::env::temp_dir().join(format!("neural-forge-write-atomic-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        // A non-empty directory where the file goes: staging succeeds, the rename fails.
+        std::fs::create_dir_all(dir.join("target/inside")).unwrap();
+        assert!(super::write_atomic(&dir.join("target"), b"content", 0o644).is_err());
+        let mut names: Vec<_> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name()).collect();
+        names.sort();
+        assert_eq!(names, ["target"], "the staging file must be removed");
+
+        super::write_atomic(&dir.join("file"), b"content", 0o644).unwrap();
+        assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"content");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 }
