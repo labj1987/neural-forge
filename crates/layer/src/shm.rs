@@ -270,6 +270,11 @@ impl ShmClient {
     /// CPU-visible result, vs. a path that leaves the result somewhere
     /// [`Self::take_capture_request`]'s caller can dump) before committing to either,
     /// without losing/duplicating the actual one-shot request in the process.
+    /// Whether any capture is asked for: the one-shot dump (1) or a frame series (more).
+    pub fn capture_requested(&self) -> bool {
+        self.header().is_some_and(|hdr| hdr.capture_request.load(Ordering::Relaxed) != 0)
+    }
+
     pub fn capture_request_pending(&self) -> bool {
         let Some(hdr) = self.header() else { return false };
         hdr.capture_request.load(Ordering::Relaxed) == 1

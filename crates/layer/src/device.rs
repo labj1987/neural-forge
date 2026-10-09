@@ -872,6 +872,30 @@ unsafe fn preupscale_slice<'a, T>(ptr: *const T, len: u32) -> &'a [T] {
     }
 }
 
+/// Whether the post path has nothing to do on this present: the effect is off (the model not applied, or the
+/// Enabled toggle off), the one-shot bootstrap request is done, and no capture or series is asked for or
+/// running. Unknown settings (the mapping not open yet) are not idle: `capture::run` opens it.
+fn post_path_idle(effect_off: Option<bool>, bootstrap_complete: bool, capture_requested: bool, series_running: bool) -> bool {
+    effect_off == Some(true) && bootstrap_complete && !capture_requested && !series_running
+}
+
+#[cfg(test)]
+mod post_path_idle_tests {
+    use super::post_path_idle;
+
+    /// Off, bootstrapped and nothing asked for: the present submits nothing of the layer's. Anything
+    /// else still runs the post path (and its relay).
+    #[test]
+    fn a_disabled_effect_skips_the_post_path_only_when_nothing_else_needs_it() {
+        assert!(post_path_idle(Some(true), true, false, false));
+        assert!(!post_path_idle(Some(false), true, false, false), "the effect is on");
+        assert!(!post_path_idle(None, true, false, false), "the mapping is not open yet");
+        assert!(!post_path_idle(Some(true), false, false, false), "the one-shot bootstrap request is still due");
+        assert!(!post_path_idle(Some(true), true, true, false), "a capture or series is asked for");
+        assert!(!post_path_idle(Some(true), true, false, true), "a series is running");
+    }
+}
+
 unsafe fn relay_app_waits(
     device: &ash::Device,
     queue: vk::Queue,
@@ -2637,6 +2661,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // `memcpy`, every single present call) is pure waste. Skip
                     // straight to a real no-op present, matching what "fail-open"
                     // should actually cost: nothing.
+                    break;
+                }
+                // The effect switched off costs nothing: once the one-shot bootstrap is done and no
+                // capture or series is asked for, `capture::run` would do nothing, so the relay below
+                // (a submit of the layer's own) is skipped too and the frame presents with the
+                // application's own waits.
+                let effect_off = shm.composition_settings().map(|s| !s.apply_model || !s.neural_enabled);
+                if post_path_idle(effect_off, *bootstrap_complete, shm.capture_requested(), series.running()) {
                     break;
                 }
                 // The application's present waits (its "rendering finished" semaphores)
