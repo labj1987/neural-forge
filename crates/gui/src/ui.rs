@@ -661,10 +661,20 @@ fn launch_option(target_exe: &str) -> String {
     let mut parts = vec!["NEURAL_FORGE_ENABLE=1".to_string()];
     let target_exe = target_exe.trim();
     if !target_exe.is_empty() {
-        parts.push(format!("NEURAL_FORGE_TARGET_EXE={target_exe}"));
+        parts.push(format!("NEURAL_FORGE_TARGET_EXE={}", shell_quote(target_exe)));
     }
     parts.push("%command%".to_string());
     parts.join(" ")
+}
+
+/// Steam runs the launch option through a shell, so a value with a space or any other
+/// shell character is single-quoted (a `'` inside becomes `'\''`).
+fn shell_quote(value: &str) -> String {
+    if value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
 }
 
 fn build_launch_option_group() -> adw::PreferencesGroup {
@@ -1254,5 +1264,11 @@ mod launch_option_tests {
     #[test]
     fn whitespace_only_target_exe_is_treated_as_empty() {
         assert_eq!(launch_option("   "), "NEURAL_FORGE_ENABLE=1 %command%");
+    }
+
+    #[test]
+    fn quotes_a_target_exe_with_a_space_or_a_quote() {
+        assert_eq!(launch_option("My Game.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' %command%");
+        assert_eq!(launch_option("it's.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='it'\\''s.exe' %command%");
     }
 }
