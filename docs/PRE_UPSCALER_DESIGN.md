@@ -301,8 +301,8 @@ which are not transfer sources, are never it). Logged once per change:
 `[preupscale] no DLSS input among N registered views ...; waiting`. Without an exposure input,
 model and roundtrip modes held nothing until the auto-exposure ("Auto-exposure when the game gives
 DLSS none (RE Requiem)", end of this document); since then the exposure is measured from the
-frame. "DLSS Ray Reconstruction" (end of this document) describes a precondition on kernel names for
-both rules; it is switched off (`GATE_BY_KERNEL_NAME = false`), so neither rule depends on names.
+frame. Neither rule identifies anything while DLSS Ray Reconstruction runs ("DLSS Ray
+Reconstruction", end of this document); otherwise neither depends on kernel names.
 
 ### The hold
 
@@ -1600,9 +1600,9 @@ What changed (`Tracker::switch_by_evidence`, `Tracker::retarget`):
 - **Scope.** Only among the size rule's candidates (render-size RGBA16F storage images smaller than
   the output, with depth and motion vectors at their extent). GTA V (one candidate) and DLAA (no
   size-rule candidate) never switch or retarget. A buffer naming another candidate without an input
-  launch (no depth and motion vectors beside it) is still forwarded and counted. Kernel names do not
-  gate it (`GATE_BY_KERNEL_NAME = false`); if the gate is turned back on, only SR input kernel
-  launches count.
+  launch (no depth and motion vectors beside it) is still forwarded and counted. A Ray
+  Reconstruction launch never counts, and nothing switches while Ray Reconstruction runs ("DLSS Ray
+  Reconstruction").
 
 Tests: `the_input_kernel_overrides_the_size_rules_pick_among_several_candidates` (three 1516x852
 candidates, size rule on 0x100, one stale input launch naming a third so the settled pick chooses
@@ -1796,99 +1796,77 @@ Revert checks, each run with one change reverted:
   parameters, same image), holds/s and fps as before, and no `different colour inputs` or
   `output-size colour image` line.
 
-## DLSS Ray Reconstruction (RE Requiem with ray tracing)
+## DLSS Ray Reconstruction
 
-> **What the code does now.** The name rule below is implemented but **switched off**:
-> `GATE_BY_KERNEL_NAME` is `false` (`crates/layer/src/preupscale.rs`), so `Tracker::names_known`
-> stays false, none of the three gates applies, and kernel names only feed the log lines. It was
-> turned off (2026-10-03) because Crimson Desert's newer DLSS Super Resolution launches
-> `custom_block*`/`k_initial_merge` kernels and no `hiluma_engine_input*`/`cuda_engine_input_kernel*`
-> one, so the gate switched a working game off. Names cannot tell that Super Resolution from Ray
-> Reconstruction, and nothing else tells them apart yet. Consequently Ray Reconstruction **is not
-> kept out**: if its colour input has Super Resolution's shape (RGBA16F, with depth and motion
-> vectors) it can be identified and held (Crimson Desert with Ray Reconstruction on is held at RR's
-> input, `rr2_enc0_kernel`'s colour image: DLSS_KERNEL_CATALOGUE.md). What still refuses it is the format check: a colour
-> input that is not `R16G16B16A16_SFLOAT` (RE Requiem's `B10G11R11` one at Balanced) is not held,
-> and frames go to DLSS untouched. The text below is the design and the evidence as measured;
-> read its "is never identified or held" statements, the `DLSS Ray Reconstruction detected` log
-> line and the gate numbering as describing the rule when it is on. The two tests that pinned
-> the gates are `#[ignore]`d with this reason.
+DLSS Ray Reconstruction is the denoiser and upscaler in one: its colour input is the **noisy**
+ray-traced frame, read with guide buffers. Running the model on it would show the model an
+un-denoised frame and write its answer into what Ray Reconstruction denoises: wrong whatever the
+format. So the model never runs before Ray Reconstruction. While it runs, nothing is identified or
+held, and the model runs after the upscaler, on the finished frame.
 
-Two probe runs on the rig (coordinator, the maintainer playing; `NEURAL_FORGE_PROBE_NGX=1`), Resident Evil
-Requiem with `RayTracingSetting=High`, HDR10, FG 3x/4x:
+### What tells Ray Reconstruction apart (Crimson Desert, 2026-10-09)
 
-- At DLAA (`MaxQuality`) and at Balanced, the kernels **created** include DLSS Super Resolution's
-  set (`hiluma_engine_input_*`, `cuda_engine_input_*`, `dltss_*`), but the only kernels
-  **launched** (probe sequence lines over ~100 command buffers) are `main_kernel`,
-  `k_conv_fp16_nhwc`, `k_pooling`, `k_upscale`, `k_element_wise` (frame generation's kind) and
-  `custom_block0/1_conv*_kernel`, `custom_block*_hf_kernel`, `custom_upsample_hf_kernel`,
-  `k_initial_merge`, `k_central_block`: **DLSS Ray Reconstruction**, the denoiser and upscaler in
-  one, whose colour input is the noisy ray-traced frame with guide buffers. SR never runs.
-- At Balanced the size rule identified `colour input: image ... (1486x836 B10G11R11_UFLOAT_PACK32
-  ...)`, RR's noisy input. It was not held only because the hold refuses a colour input that is
-  not RGBA16F (01716fc).
+Crimson Desert (DLSS 310.9.1, "NVIDIA DLSS 4.5", frame generation 3x) run twice from the same save
+with only its `_enableRayReconstruction` option changed (`~/nf-spike/runs/rr-probe-on`,
+`rr-probe-off`, `NEURAL_FORGE_PROBE_NGX=1`; `rr-dump-on`, `rr-dump-off` with
+`NEURAL_FORGE_PREUPSCALE=dump`):
 
-Running the model before Ray Reconstruction would feed it a noisy, un-denoised frame, and write
-its answer into RR's input: wrong whatever the format. So the identification needs a positive sign
-that DLSS Super Resolution runs. The handle rules cannot give one: RR's (and FG's) first launch can
-have SR's shape (a colour image with depth and motion vectors at one extent).
+| | Ray Reconstruction on | Ray Reconstruction off |
+|---|---|---|
+| Kernels launched (besides Frame Generation's) | `rr2_enc0..4_kernel`, `rr2_dec*`, `rr2_post_kernel`, `rr2_downsample_kernel_static_hdr_no_transparency`, `rr2_pooled_history*`, `rr2_histogram_auto_exposure_basic_kernel` | `rrlite_enc*`, `rrlite_dec*`, `rrlite_post_*_mvlo_hdr_folded`, `rrlite_downsample_kernel_static_hdr`, `cuda_dldn_engine_{luma_convert,reduce_sum,auto_exposure_copy}_kernel` |
+| What the first encoder's parameters name besides the colour input | two render-size `R8G8B8A8_UNORM` images (diffuse and specular albedo), an `R8G8B8A8_SNORM` one (normals), `R32_SFLOAT` and two `R16_SFLOAT` ones (hit distance, roughness), more RGBA16F, the 4K output | motion vectors, exposure, the 4K output; no guide buffers |
+| The held colour input (same frame of the start-up scene) | `abs(L - median3(L)) / median3(L)` mean 0.169; black dropouts and grain along edges | mean 0.043; clean |
 
-### The rule: SR's input kernel by name
+Neither run launches `hiluma_engine_input*`: with Ray Reconstruction off, this DLSS's Super
+Resolution is the `rrlite_*` family. That is what broke the first version of this rule, which waited
+for a Super Resolution input kernel by name and took `custom_block*`, `k_initial_merge`,
+`k_central_block` and `custom_upsample*` for Ray Reconstruction: those are **Frame Generation's**
+network (GTA V and Cyberpunk 2077 launch them with frame generation on and no ray tracing;
+docs/DLSS_KERNEL_CATALOGUE.md). It switched Crimson Desert off (2026-10-03) and was turned off; until
+3.1.4, Crimson Desert with Ray Reconstruction on was held at `rr2_enc0_kernel`'s colour input.
 
-An identification precondition, nothing more: the colour input is still found by the registered
-handles a launch names (the parameters rule) or by the registered set (the size rule).
+Resident Evil Requiem's probe (2026-10-02, with ray tracing, not installed since) launched only
+Frame Generation's kernels and created Super Resolution's without launching them; its input was
+taken as Ray Reconstruction's then, by the old names. With the names above it is unknown what ran
+there; its `B10G11R11` input is refused by the format check either way.
 
-- **Names.** With any mode but `off`, `vkCreateCuFunctionNVX` and `vkDestroyCuFunctionNVX` are now
-  hooked too (`preupscale::COMMANDS`; with `off` the hooked list is unchanged, and the probe's own
-  hooks are as before). Each kernel is classified by its name (`preupscale::Kernel`):
-  `hiluma_engine_input*` / `cuda_engine_input_kernel*` is **SR's input kernel**; `custom_block*`,
-  `k_central_block`, `k_initial_merge`, `custom_upsample*` is **Ray Reconstruction's network**
-  (frame generation shares some of these names: GTA V's FG launches `custom_block0_convPre_kernel`
-  and `k_initial_merge`); anything else is other. `vkCmdCuLaunchKernelNVX` notes per command buffer
-  which kernels it launched (`LaunchRefs::sr_input`, `rr`), and whether the input launch's kernel is
-  SR's (`LaunchRefs::input_sr`).
-- **Gates**, once any kernel name is known on the device (`Tracker::names_known`):
-  1. Nothing is identified, by either rule, unless an SR input kernel launched within the last
-     `SR_RECENT` = 64 launch-bearing submits (`Tracker::sr_running`; about 10 real frames at FG
-     6x). A change re-runs the identification, so switching RR off (or on) in a game's settings
-     takes effect within that window.
-  2. Only an input launch whose kernel is SR's input kernel is parameter evidence (RR's and FG's
-     SR-shaped launches are not).
-  3. A launch-bearing buffer that launches no SR input kernel is never the hold point: it is
-     forwarded like FG's (`Foreign`).
-- **Without names** (no `vkCreateCuFunctionNVX` seen on the device) the rules work exactly as
-  before.
-- **Logs.** Once, when RR's family launches in a submit while SR's input kernel does not:
-  `[preupscale] DLSS Ray Reconstruction detected (custom_block0_conv0_kernel, k_central_block, ...
-  launched, no DLSS Super Resolution input kernel); the model can't run before it (its input is the
-  noisy ray-traced frame): nothing is identified or held, the model runs after the upscaler`. The
-  identification line is then `no DLSS input: no DLSS Super Resolution input kernel
-  (hiluma_engine_input*, cuda_engine_input_kernel*) launched in the last 64 launch-bearing submits
-  (DLSS Ray Reconstruction's kernels launch: ...); waiting [device 0x...]`. With nothing held, the
-  post path runs as before (model on the final frame).
-- **The cost of a name rule.** A future DLSS whose SR input kernel has another name would identify
-  nothing; the `no DLSS Super Resolution input kernel` line says so, and the name list in
-  `Kernel::of` is the one place to extend. Frame generation alone (no SR, no RR) gets the same
-  refusal; its line may say "Ray Reconstruction detected" because the two share kernel names.
+### The rule
 
-Not done: holding a `B10G11R11_UFLOAT_PACK32` colour input. RE's was RR's input, and no SR game is
-known to use that format; the hold still refuses it (`device.rs`).
+- **Names** (`preupscale::Kernel::of`, from `vkCreateCuFunctionNVX`): `rr2_*` is Ray
+  Reconstruction; `hiluma_engine_input*` and `cuda_engine_input_kernel*` are Super Resolution's
+  input kernels (the logs and the probe only); everything else, `rrlite_*` and Frame Generation's
+  included, is other. Only Ray Reconstruction's names change a decision: Super Resolution needs no
+  name, so a DLSS whose Super Resolution kernels are called something new keeps being held.
+- **Running**: a launch-bearing submit with an `rr2_*` launch in one of its buffers marks Ray
+  Reconstruction running for the next `SR_RECENT` = 64 launch-bearing submits (about 10 real
+  frames at frame generation 6x; `Tracker::rr_running`). While it runs:
+  1. neither rule identifies anything (the size rule's, the input kernel's parameters' and a
+     switched choice are all dropped), so nothing is held;
+  2. a buffer launching an `rr2_*` kernel is never the hold point (`Foreign`), and its input launch
+     is never evidence for the identification or a retarget, whatever its shape (`rr2_enc0_kernel`
+     names the colour input with depth and motion vectors, Super Resolution's whole shape);
+  3. the post path runs at once (`preupscale::ray_reconstruction_running`, for one second after the
+     last Ray Reconstruction submit), not `HAND_BACK` (30 s) after the last hold: switching Ray
+     Reconstruction on in a game's settings moves the model after the upscaler within a frame.
+- **Switching back**: 64 launch-bearing submits without an `rr2_*` launch re-run the
+  identification, and Super Resolution is held again.
+- **Logs**, on each change: `[preupscale] DLSS Ray Reconstruction runs (rr2_enc0_kernel, ...
+  launched): its input is the noisy ray-traced frame with its guide buffers, so the model can't run
+  before it; nothing is held, the model runs after the upscaler`, and `DLSS Ray Reconstruction
+  stopped (no launch in 64 launch-bearing submits): DLSS's input is identified again`. The
+  identification line meanwhile is `no DLSS input: DLSS Ray Reconstruction runs (...); its input is
+  not held, the model runs after the upscaler`.
+- **The cost of a name rule**: a future Ray Reconstruction with other kernel names would be held as
+  before 3.1.4. `Kernel::of` is the one place to extend; a probe run with the game's Ray
+  Reconstruction on and off (as above) shows the names and whether the input carries guide buffers.
 
-Tests (`preupscale::tests`):
-
-- `kernels_are_told_apart_by_name`: GTA V's and NGX's SR input kernel names, RR's names, and SR's
-  other kernels, FG's and NGX's helpers as other.
-- `ray_reconstruction_is_never_identified_or_held`: RE's registered set without SR's input, plus a
-  render-size group (RGBA16F and B10G11R11 at 1486x836 with depth and motion vectors) the size rule
-  alone identifies; SR's kernels created, RR's launched, RR's first launch with SR's whole shape.
-  Nothing identified, no buffer held, the RR line once, the identification line names the missing
-  SR kernel. The same launches without names would be identified (the names are what keep RR out).
-- `with_kernel_names_sr_games_keep_their_identification_and_hold_target`: GTA V with names (FG
-  launching `main_kernel`, `custom_block0_convPre_kernel`, `k_initial_merge`): identified at the
-  first submit, held every frame, FG forwarded, no RR line. RE-like DLAA without exposure with SR
-  running and FG's launch having SR's whole shape with no second reader: SR identified (FG's launch
-  is no evidence with names).
-- GTA V, Crimson Desert and the DLAA tests without names pass unchanged.
+Tests (`preupscale::tests`): `kernels_are_told_apart_by_name` (the names of every probe, Frame
+Generation's and `rrlite_*` as other); `ray_reconstruction_is_never_identified_or_held` (GTA V's set
+with an `rr2_enc0_kernel` launch of Super Resolution's whole shape: nothing identified or held, the
+line once, the post path handed the model; the game switching to `rrlite_*`: held within 64 submits;
+the same launches without names: held); `super_resolution_is_held_whatever_its_kernels_are_called`
+(`hiluma_*`, `cuda_engine_*`, `rrlite_*` and an unknown name beside Frame Generation's kernels: held
+from the frame after the identification, no Ray Reconstruction line).
 
 ## Auto-exposure when the game gives DLSS none (RE Requiem)
 
@@ -1976,9 +1954,8 @@ entry:
   FG's frame is read by both FG buffers in the tests' FG data, modelled on GTA V's (not confirmed
   for every game).
 - **Single**: with two or more such entries none is used (logged once).
-- With kernel names known (on the rig the probe saw every kernel's name), the input launch would also have to be SR's
-  input kernel ("DLSS Ray Reconstruction" above), which would keep FG's and RR's launches out whatever
-  their shape. That gate is off (`GATE_BY_KERNEL_NAME = false`), so shape and readers are what identify.
+- A Ray Reconstruction launch (`rr2_*`) is never such an entry ("DLSS Ray Reconstruction" above);
+  otherwise shape and readers are what identify, not kernel names.
 - Such an entry's `exposure_input` is `None` even if some other 1x1 R16F is registered (one SR's
   buffer does not name is not DLSS's): the exposure is measured.
 
@@ -2066,11 +2043,11 @@ Revert checks (each change reverted alone, the named tests fail; all tests pass 
 
 ### What to look for on the rig
 
-- **RE Requiem with ray tracing (DLAA or Balanced):** written for the name rule, which is off
-  now (see the note under "DLSS Ray Reconstruction"): there is no `DLSS Ray Reconstruction
-  detected` line and no `no DLSS Super Resolution input kernel` refusal. Expect a `colour input:`
-  line as for any game; a B10G11R11 input is refused by the format check ("not R16G16B16A16_SFLOAT;
-  not holding"), and an RGBA16F one would be held.
+- **RE Requiem with ray tracing (DLAA or Balanced):** if it launches `rr2_*` kernels, the `DLSS Ray
+  Reconstruction runs` line and nothing held. Otherwise a `colour input:` line as for any game; a
+  B10G11R11 input is refused by the format check ("not R16G16B16A16_SFLOAT; not holding"), and an
+  RGBA16F one would be held: then probe it with ray tracing on and off as "DLSS Ray Reconstruction"
+  describes.
 - **RE Requiem with ray tracing off** (if SR runs there): `a CUDA launch names an output-size colour
   image ... taken as DLSS Super Resolution's input at DLAA` (DLAA) or a `colour input:` line by
   size/parameters (SR), then `[preupscale] exposure: measured from the frame (auto) ...`, holds at

@@ -187,7 +187,7 @@ CUDA kernels: `vkCmdCuLaunchKernelNVX`, on image views registered with
 - The NVX registration calls: the layer records every registered view and the handle or address
   it got back.
 - `vkCreateCuFunctionNVX` / `vkDestroyCuFunctionNVX`: the layer records each kernel's name and
-  what it is (`preupscale::Kernel`: DLSS SR's input kernel, Ray Reconstruction's network, other).
+  what it is (`preupscale::Kernel`: DLSS SR's input kernel, Ray Reconstruction's `rr2_*`, other).
 - `vkCmdCuLaunchKernelNVX`: marks the command buffer as launch-bearing (also through
   `vkCmdExecuteCommands`), with which kernels it launches. When the launch's parameters use CUDA's
   "extra" buffer form (what vkd3d-proton uses), the layer reads that parameter buffer (never writes
@@ -204,14 +204,13 @@ At a launch-bearing submit (`Tracker::observe`, then `Tracker::refresh`), two ru
 winning (PRE_UPSCALER_DESIGN.md, "Identification by the input kernel's parameters (DLAA)"), behind
 one precondition:
 
-- **DLSS Super Resolution must be running** (PRE_UPSCALER_DESIGN.md, "DLSS Ray Reconstruction").
-  Once any kernel name is known, nothing is identified unless SR's input kernel
-  (`hiluma_engine_input*`, `cuda_engine_input_kernel*`) launched within the last 64 launch-bearing
-  submits; only a launch of that kernel is parameter evidence; and a buffer that launches no SR
-  input kernel is never the hold point. This keeps DLSS Ray Reconstruction (Resident Evil Requiem
-  with ray tracing: its input is the noisy ray-traced frame) and frame generation alone out of
-  both rules. It is logged once: `DLSS Ray Reconstruction detected (... launched, no DLSS Super
-  Resolution input kernel)`. Without kernel names the rules work as before.
+- **DLSS Ray Reconstruction must not be running** (PRE_UPSCALER_DESIGN.md, "DLSS Ray
+  Reconstruction"). Its input is the noisy ray-traced frame. While one of its `rr2_*` kernels
+  launched within the last 64 launch-bearing submits, nothing is identified; a buffer launching
+  one is never the hold point or evidence, whatever its shape; and the post path runs the model
+  after the upscaler at once. Logged on each change: `DLSS Ray Reconstruction runs (...)` and
+  `DLSS Ray Reconstruction stopped`. Super Resolution needs no kernel name (Crimson Desert's is
+  `rrlite_*`, GTA V's `hiluma_engine_input*`).
 
 - **By the input kernel's parameters** (`Rule::Params`). A command buffer's first launch that names a
   registered depth image and a 2-channel float image is read as DLSS SR's input kernel. If it names
@@ -266,7 +265,7 @@ another queue. Each launch-bearing buffer is classified (`LaunchRefs::kind`):
 | Kind | Rule | Action |
 |---|---|---|
 | Colour | a launch's parameters name the identified colour input | held (the split point) |
-| Foreign | every launch readable, naming registered views, never the colour input; or, once kernel names are known, no launch of SR's input kernel | forwarded untouched (DLSS FG's, Ray Reconstruction's, other NGX features') |
+| Foreign | every launch readable, naming registered views, never the colour input; or a launch of DLSS Ray Reconstruction (`rr2_*`) | forwarded untouched (DLSS FG's, Ray Reconstruction's, other NGX features') |
 | Unknown | an unreadable launch, parameters naming no registered view, or a launch before identification | held, as before the fix (only with inputs identified) |
 
 Before this rule, the layer held FG's submits too and ran the model three times per real frame,

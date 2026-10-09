@@ -624,8 +624,9 @@ One run (`cdn-7`, title screen, E, 60 s in game, Ray Reconstruction on, settings
 - Motion vectors copied (RG16F, in `GENERAL` there).
 - **No jitter**: the game runs DLSS Ray Reconstruction (`rr2_*` kernels); the jitter word is only known
   for the 310.x Super Resolution input kernel (`hiluma_engine_input*`, word 3). The history is
-  reprojected with the motion vectors alone, so off by the jitter difference (under a pixel). Open:
-  find the word in RR's encoder parameters (`NEURAL_FORGE_PROBE_PARAMS`).
+  reprojected with the motion vectors alone, so off by the jitter difference (under a pixel). Found
+  later (below). Since 3.1.4 Ray Reconstruction's input is not held at all (PRE_UPSCALER_DESIGN.md,
+  "DLSS Ray Reconstruction"): with it on, Crimson Desert gets the model after the upscaler.
 
 ### Against the helper (2026-10-07, released 2.0.10 against this branch)
 
@@ -649,7 +650,11 @@ is out of scope).
 - **Jitter.** Found with `NEURAL_FORGE_PROBE_KERNEL` (a dump of a named kernel's parameters): Wukong's
   `cuda_engine_input_kernel*` keeps it in bytes 80-87, Crimson Desert's Ray Reconstruction encoder
   `rr2_enc0_kernel` in bytes 400-407 (the previous frame's in 392-399); both a Halton(2,3) sequence minus 0.5 in
-  render pixels. Both holds now run with it ("held", not "held without the jitter").
+  render pixels. Both holds then ran with it. Since 3.1.4 Ray Reconstruction is never held, so the
+  `rr2_enc0_kernel` word is no longer read.
+  With Ray Reconstruction off, Crimson Desert's Super Resolution (`rrlite_*`) keeps it in
+  `rrlite_enc0_*`'s bytes 168-175 (the previous frame's in 176-183), the same encoding (3000
+  launches probed, 2026-10-09).
 - **Fixed on the way:**
   - The after-the-upscaler path kept its claim on the network when the network was not built at its size,
     so the paths fought over the build. The claim is now always released.
