@@ -23,7 +23,7 @@ libc = "0.2"
 # For real ShmHeader::capture_request support (see src/dump.rs) -- a pure-Rust,
 # encode-only PNG writer is the minimal real dependency for "write these RGBA8 bytes
 # out as a file a human can actually look at", not something worth hand-rolling.
-png = "0.17"
+png = "0.18"
 
 # The native backend (vendored OpenDLSS-NR, C++ and embedded kernels) is x86_64-only.
 [target.'cfg(target_arch = "x86_64")'.dependencies]
