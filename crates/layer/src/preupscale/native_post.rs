@@ -13,7 +13,7 @@
 //! seed that changed every frame, with nothing blending frames, would shimmer). It never runs the network
 //! while the pre-upscaler path uses it, nor the other way round ([`super::native::Loader::claim_post`]).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -48,43 +48,113 @@ struct CompositePush {
     control: [f32; 4],
 }
 
+/// Which server answers the after-the-upscaler requests in this process: the channel is the process's, so
+/// two answerers (two devices' servers) would race for every request. Holds the owning device's handle, 0 for
+/// none; the owner's worker clears it when it ends.
+pub(crate) struct Owner(AtomicU64);
+
+static OWNER: Owner = Owner::new();
+
+impl Owner {
+    pub(crate) const fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    /// Takes the channel for `token` (non-zero), unless another server holds it.
+    pub(crate) fn claim(&self, token: u64) -> Option<Claim<'_>> {
+        self.0.compare_exchange(0, token, Ordering::AcqRel, Ordering::Acquire).ok().map(|_| Claim(self))
+    }
+}
+
+/// The channel held by one server, until dropped.
+pub(crate) struct Claim<'a>(&'a Owner);
+
+impl Drop for Claim<'_> {
+    fn drop(&mut self) {
+        self.0 .0.store(0, Ordering::Release);
+    }
+}
+
+/// How a server's worker is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Status {
+    /// Setting up.
+    Starting = 0,
+    /// Answering requests.
+    Serving = 1,
+    /// Ended for a reason that may pass (its pipelines could not be built, or another server holds the
+    /// channel): another start is worth making later.
+    Retry = 2,
+    /// Ended because a frame did not finish in time: the device's work may still be running, so nothing
+    /// starts on it again.
+    Stalled = 3,
+}
+
+impl Status {
+    fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Serving,
+            2 => Self::Retry,
+            3 => Self::Stalled,
+            _ => Self::Starting,
+        }
+    }
+}
+
 /// The after-the-upscaler requests' server on one device.
 pub(crate) struct PostServer {
     quit: Arc<AtomicBool>,
+    status: Arc<AtomicU8>,
     worker: Option<std::thread::JoinHandle<()>>,
 }
 
 impl PostServer {
-    /// Starts serving, unless another server (another device's, in this process) is answering already (its
-    /// heartbeat moves): two answerers would race for every request.
+    /// Starts the server's worker, which takes the channel ([`Owner`]), checks that nothing outside the
+    /// process answers it (its heartbeat stands still), builds its pipelines and serves. Nothing here waits:
+    /// this is called from the present. `None` only when the thread could not be spawned.
     pub(crate) fn start(device: ash::Device, instance: ash::Instance, physical: vk::PhysicalDevice, setup: Setup, import: bool, loader: Arc<Loader>, view: ShmView) -> Option<Self> {
-        let hdr = view.header();
-        let before = hdr.server_heartbeat.load(Ordering::Relaxed);
-        std::thread::sleep(Duration::from_millis(300));
-        if hdr.server_heartbeat.load(Ordering::Relaxed) != before {
-            crate::log!("[native] another device's server is answering the after-the-upscaler requests: it keeps them");
-            return None;
-        }
         let quit = Arc::new(AtomicBool::new(false));
-        let q = quit.clone();
+        let status = Arc::new(AtomicU8::new(Status::Starting as u8));
+        let (q, st) = (quit.clone(), status.clone());
         let worker = std::thread::Builder::new()
             .name("nf-native-post".into())
             .spawn(move || {
+                let end = |s: Status| st.store(s as u8, Ordering::Release);
+                let Some(claim) = OWNER.claim(ash::vk::Handle::as_raw(device.handle()).max(1)) else {
+                    crate::log!("[native] another device's server is answering the after-the-upscaler requests: it keeps them");
+                    return end(Status::Retry);
+                };
+                let hdr = view.header();
+                let before = hdr.server_heartbeat.load(Ordering::Relaxed);
+                std::thread::sleep(Duration::from_millis(300));
+                if hdr.server_heartbeat.load(Ordering::Relaxed) != before {
+                    crate::log!("[native] something else is answering the after-the-upscaler requests: it keeps them");
+                    drop(claim);
+                    return end(Status::Retry);
+                }
                 // SAFETY: the device and the queue the setup names are live for this thread's life (joined in Drop,
                 // before the device's teardown frees anything).
-                match unsafe { Gpu::new(&device, &instance, physical, setup) } {
-                    Some(mut gpu) => {
-                        crate::log!("[native] answering the after-the-upscaler path's requests on queue {} of family {}", setup.post_index, setup.family);
-                        crate::logging::flush();
-                        serve(&device, &instance, physical, import, &loader, view, &q, &mut gpu);
-                        // SAFETY: `serve` returns with nothing of `gpu` pending.
-                        unsafe { gpu.destroy(&device) };
-                    }
-                    None => crate::log!("[native] the after-the-upscaler path's pipelines could not be built; it stays untouched"),
-                }
+                let Some(mut gpu) = (unsafe { Gpu::new(&device, setup) }) else {
+                    crate::log!("[native] the after-the-upscaler path's pipelines could not be built; it stays untouched for now");
+                    drop(claim);
+                    return end(Status::Retry);
+                };
+                crate::log!("[native] answering the after-the-upscaler path's requests on queue {} of family {}", setup.post_index, setup.family);
+                crate::logging::flush();
+                end(Status::Serving);
+                serve(&device, &instance, physical, import, &loader, view, &q, &mut gpu);
+                let stalled = gpu.stalled;
+                // SAFETY: `serve` returns with nothing of `gpu` pending (or stalled, and then nothing is freed).
+                unsafe { gpu.destroy(&device) };
+                drop(claim);
+                end(if stalled { Status::Stalled } else { Status::Retry });
             })
             .ok()?;
-        Some(Self { quit, worker: Some(worker) })
+        Some(Self { quit, status, worker: Some(worker) })
+    }
+
+    pub(crate) fn status(&self) -> Status {
+        Status::from_u8(self.status.load(Ordering::Acquire))
     }
 }
 
@@ -126,34 +196,82 @@ struct SlotBuffers {
 impl Gpu {
     /// # Safety
     /// `device` is live and has the queue `setup` names.
-    unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, setup: Setup) -> Option<Self> {
-        let _ = (instance, physical);
-        // SAFETY: valid create infos throughout; partial failures leak a few small objects once.
+    unsafe fn new(device: &ash::Device, setup: Setup) -> Option<Self> {
+        // Built piece by piece into `g`; on an early return its drop destroys whatever exists (the server is
+        // started again after a failure, so a failed attempt must not leave anything behind).
+        let mut g = Partial { device, gpu: Self::empty() };
+        let step = |n: u32| -> Option<()> {
+            #[cfg(test)]
+            if tests::FAIL_AT.get() == Some(n) {
+                return None;
+            }
+            let _ = n;
+            Some(())
+        };
+        // SAFETY: valid create infos throughout; every handle goes into `g` as soon as it exists.
         unsafe {
-            let queue = device.get_device_queue(setup.family, setup.post_index);
-            crate::loader_data::initialize_queue(device.handle(), queue).ok()?;
+            step(0)?;
+            g.gpu.queue = device.get_device_queue(setup.family, setup.post_index);
+            crate::loader_data::initialize_queue(device.handle(), g.gpu.queue).ok()?;
             let binding = |n: u32| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build();
             let bindings = [binding(0), binding(1), binding(2)];
-            let set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
+            step(1)?;
+            g.gpu.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
+            let set_layout = g.gpu.set_layout;
             let layout = |bytes: usize| {
                 let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(bytes as u32).build();
                 device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None).ok()
             };
-            let layouts = [layout(std::mem::size_of::<PreprocessPush>())?, layout(std::mem::size_of::<CompositePush>())?];
-            let pipelines = [
-                super::hdr::compute_pipeline(device, layouts[0], PREPROCESS_SPV)?,
-                super::hdr::compute_pipeline(device, layouts[1], COMPOSITE_SPV)?,
-            ];
+            step(2)?;
+            g.gpu.layouts[0] = layout(std::mem::size_of::<PreprocessPush>())?;
+            step(3)?;
+            g.gpu.layouts[1] = layout(std::mem::size_of::<CompositePush>())?;
+            step(4)?;
+            g.gpu.pipelines[0] = super::hdr::compute_pipeline(device, g.gpu.layouts[0], PREPROCESS_SPV)?;
+            step(5)?;
+            g.gpu.pipelines[1] = super::hdr::compute_pipeline(device, g.gpu.layouts[1], COMPOSITE_SPV)?;
             let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 6 }];
-            let pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(2).pool_sizes(&sizes), None).ok()?;
+            step(6)?;
+            g.gpu.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(2).pool_sizes(&sizes), None).ok()?;
             let set_layouts = [set_layout, set_layout];
-            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(&set_layouts)).ok()?;
-            let command_pool = device
+            step(7)?;
+            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(g.gpu.pool).set_layouts(&set_layouts)).ok()?;
+            g.gpu.sets = [sets[0], sets[1]];
+            step(8)?;
+            g.gpu.command_pool = device
                 .create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(setup.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
                 .ok()?;
-            let cmd = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::builder().command_pool(command_pool).command_buffer_count(1)).ok()?[0];
-            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).ok()?;
-            Some(Self { queue, set_layout, layouts, pipelines, pool, sets: [sets[0], sets[1]], command_pool, cmd, fence, slots: [None, None], bound: None, stalled: false })
+            step(9)?;
+            g.gpu.cmd = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::builder().command_pool(g.gpu.command_pool).command_buffer_count(1)).ok()?[0];
+            step(10)?;
+            g.gpu.fence = device.create_fence(&vk::FenceCreateInfo::default(), None).ok()?;
+        }
+        Some(std::mem::replace(&mut g.gpu, Self::empty()))
+    }
+
+    /// The objects it owns that are destroyed one by one (the sets and the command buffer go with their pools).
+    #[cfg(test)]
+    fn live(&self) -> usize {
+        use ash::vk::Handle;
+        let handles = [self.set_layout.as_raw(), self.layouts[0].as_raw(), self.layouts[1].as_raw(), self.pipelines[0].as_raw(), self.pipelines[1].as_raw(), self.pool.as_raw(), self.command_pool.as_raw(), self.fence.as_raw()];
+        handles.iter().filter(|&&h| h != 0).count()
+    }
+
+    /// No objects (every handle null).
+    fn empty() -> Self {
+        Self {
+            queue: vk::Queue::null(),
+            set_layout: vk::DescriptorSetLayout::null(),
+            layouts: [vk::PipelineLayout::null(); 2],
+            pipelines: [vk::Pipeline::null(); 2],
+            pool: vk::DescriptorPool::null(),
+            sets: [vk::DescriptorSet::null(); 2],
+            command_pool: vk::CommandPool::null(),
+            cmd: vk::CommandBuffer::null(),
+            fence: vk::Fence::null(),
+            slots: [None, None],
+            bound: None,
+            stalled: false,
         }
     }
 
@@ -180,6 +298,21 @@ impl Gpu {
             }
             device.destroy_descriptor_set_layout(self.set_layout, None);
         }
+    }
+}
+
+/// [`Gpu::new`]'s objects so far; destroys them unless taken out.
+struct Partial<'a> {
+    device: &'a ash::Device,
+    gpu: Gpu,
+}
+
+impl Drop for Partial<'_> {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        tests::DESTROYED.set(self.gpu.live());
+        // SAFETY: nothing of a `Gpu` being built was ever submitted; null handles are ignored.
+        unsafe { self.gpu.destroy(self.device) };
     }
 }
 
@@ -376,4 +509,56 @@ unsafe fn evaluate(
         unsafe { std::ptr::copy_nonoverlapping(b.answer.ptr, answer_region, bytes as usize) };
     }
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Makes [`Gpu::new`] fail at this step.
+        pub(super) static FAIL_AT: Cell<Option<u32>> = const { Cell::new(None) };
+        /// How many objects the last failed [`Gpu::new`]'s guard held, all destroyed.
+        pub(super) static DESTROYED: Cell<usize> = const { Cell::new(usize::MAX) };
+    }
+
+    /// A failed setup destroys everything it created before the failure, at every step, so starting the
+    /// server again after one leaks nothing.
+    #[test]
+    fn a_failed_setup_destroys_what_it_created() {
+        let Some((_entry, _instance, physical, device, _queue, family)) = crate::composition::gpu::test_device() else { return };
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0 };
+        // Objects that exist when each step fails (the sets and the command buffer go with their pools).
+        let before = [0, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7];
+        for (step, &created) in before.iter().enumerate() {
+            FAIL_AT.set(Some(step as u32));
+            DESTROYED.set(usize::MAX);
+            // SAFETY: a live test device whose queue 0 of `family` exists.
+            assert!(unsafe { Gpu::new(&device, setup) }.is_none(), "step {step} did not fail");
+            assert_eq!(DESTROYED.get(), created, "failing at step {step}");
+        }
+        FAIL_AT.set(None);
+        // SAFETY: as above.
+        let mut gpu = unsafe { Gpu::new(&device, setup) }.expect("builds without the injected failure");
+        assert_eq!(gpu.live(), 8);
+        // SAFETY: nothing of it was submitted.
+        unsafe { gpu.destroy(&device) };
+        unsafe { device.destroy_device(None) };
+    }
+
+    /// One server answers at a time; once it ends, another can take over.
+    #[test]
+    fn one_server_owns_the_channel_until_it_ends() {
+        let owner = Owner::new();
+        let first = owner.claim(1).expect("free");
+        assert!(owner.claim(2).is_none(), "a second server must not answer too");
+        drop(first);
+        let second = owner.claim(2).expect("free again after the first ended");
+        assert!(owner.claim(1).is_none());
+        drop(second);
+    }
 }

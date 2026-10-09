@@ -4425,8 +4425,13 @@ pub(crate) struct Session {
     /// The native backend's after-the-upscaler server (`native_post`), once the mapping is open.
     #[cfg(target_arch = "x86_64")]
     pub(crate) post_server: Option<native_post::PostServer>,
+    /// When to start the server again after it ended for a reason that may pass (its pipelines could not be
+    /// built, another server held the channel): the native loader's schedule.
     #[cfg(target_arch = "x86_64")]
-    post_server_tried: bool,
+    post_retry: neural_forge_protocol::rebuild::BuildRetry,
+    /// The server stalled on a frame: nothing starts on this device again.
+    #[cfg(target_arch = "x86_64")]
+    post_stalled: bool,
     /// `NEURAL_FORGE_CAPTURE_AT`: how many times DLSS frames resumed after a gap, when the last resume was,
     /// and whether the capture was taken ([`Self::capture_at_due`]).
     resumes: u32,
@@ -4771,9 +4776,34 @@ impl Session {
     /// device), on a device with the native network.
     pub(crate) fn ensure_post_server(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, import: bool, shm: &ShmClient) {
         #[cfg(target_arch = "x86_64")]
-        if !self.post_server_tried && native_on(self.native.as_ref()) {
+        if !self.post_stalled && native_on(self.native.as_ref()) {
+            use native_post::Status;
+            let now = Instant::now();
+            match self.post_server.as_ref().map(native_post::PostServer::status) {
+                Some(Status::Starting) => return,
+                Some(Status::Serving) => {
+                    if self.post_retry.failing() {
+                        self.post_retry.succeeded();
+                    }
+                    return;
+                }
+                Some(Status::Stalled) => {
+                    self.post_stalled = true;
+                    drop(self.post_server.take());
+                    return;
+                }
+                Some(Status::Retry) => {
+                    // The worker has ended: joining it does not wait.
+                    drop(self.post_server.take());
+                    self.post_retry.failed(now);
+                    return;
+                }
+                None => {}
+            }
+            if matches!(self.post_retry.step(now), neural_forge_protocol::rebuild::Step::Wait(_)) {
+                return;
+            }
             let (Some(loader), Some(view)) = (self.native.clone(), shm.view()) else { return };
-            self.post_server_tried = true;
             self.post_server = native_post::PostServer::start(device.clone(), instance.clone(), physical_device, loader.setup(), import, loader, view);
         }
         #[cfg(not(target_arch = "x86_64"))]
