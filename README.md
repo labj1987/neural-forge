@@ -50,13 +50,16 @@ not loaded at run time: the layer reads the model's weights from the folder `ext
 
 The model runs in one of two places. The layer picks the place for each game by itself:
 
-- **Before the upscaler**, when the game uses DLSS (Super Resolution at Quality, Balanced,
-  Performance or DLAA, and Ray Reconstruction). The layer recognises the frame the game hands to
+- **Before the upscaler**, when the game uses DLSS Super Resolution (at Quality, Balanced,
+  Performance or DLAA). The layer recognises the frame the game hands to
   DLSS: the scene at render resolution, in HDR (16-bit float), without the HUD. It holds that DLSS
   submission, runs the network on the frame every frame, with DLSS's motion vectors and camera
   jitter for its history, and writes the answer back before DLSS upscales it. DLSS then upscales the
   enhanced frame. The model works on fewer pixels and gets the input it was made for. Games that
   record their frame in DLSS's own command buffer (Crimson Desert) are held inside that buffer.
+  With DLSS Ray Reconstruction on, the model runs after the upscaler instead: Ray Reconstruction's
+  input is the noisy ray-traced frame before its denoising, which is not a frame the model can
+  improve. Switching Ray Reconstruction on or off in a game moves the model within a few frames.
 - **After the upscaler**, for everything else: native resolution, games without DLSS, and
   devices without NVIDIA's `VK_NVX_image_view_handle`. This is the 1.x path: the finished 8-bit
   frame is captured at present, answered by the network and composited back onto the same frame
@@ -91,6 +94,10 @@ generation on wherever the game has it). 3.1.0 was measured on 2026-10-08. Sourc
 | Shadow Warrior 3 (menu) | 115.4 fps shown | 115.7 fps shown | 99.3 fps shown |
 | God of War (2018), in game | 37.6 fps | 27-30 fps | 27.5 fps |
 
+Crimson Desert since 3.1.4 (2026-10-09, one run each, same save): with Ray Reconstruction on, as in
+the table, the model runs after the upscaler: 67.7 fps shown. With Ray Reconstruction off, the model
+runs before the upscaler on every real frame: 29.0 real frames held per second, 173.8 fps shown.
+
 3.1.0 did not change the frame path, and its numbers are within run-to-run spread of 3.0's (about
 3 fps in GTA V), except God of War: one run, in a different spot from 3.0's, so it is not yet a
 demonstrated gain. At 4K (not a configuration the test machine plays) the network is probably slower
@@ -108,7 +115,7 @@ the full record of earlier versions is in [docs/HARDWARE_VALIDATION.md](docs/HAR
 | Game | Engine, API | DLSS used | Where measured | 3.1.0 |
 |---|---|---|---|---|
 | GTA V Enhanced (built-in benchmark) | RAGE, DX12 | Super Resolution, Frame Generation 4x | Benchmark pass 4 | 50.2 real / 201.4 fps shown |
-| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | In game, held inside DLSS's buffer | 150.9 fps shown |
+| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | In game, held inside DLSS's buffer (since 3.1.4 after the upscaler with Ray Reconstruction on, see above) | 150.9 fps shown |
 | GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | In game | 87.0 frames/s held |
 | God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | In game | 37.6 fps |
 | Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Menu | 119.7 fps shown |

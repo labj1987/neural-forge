@@ -97,8 +97,9 @@ are held inside it (`preupscale/inline.rs`, on the layer's side compute queue). 
 what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's
 output-size input), with the older size rule as the fallback (docs/PRE_UPSCALER_DESIGN.md,
 "Identification by the input kernel's parameters (DLAA)"). DLSS Ray
-Reconstruction is never held: its input is the noisy ray-traced frame, so while its `rr2_*` kernels
-(`vkCreateCuFunctionNVX`) launch nothing is identified and the model runs after the upscaler ("DLSS
+Reconstruction is never held: its input is the noisy ray-traced frame, so while its kernels
+(`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`; names from `vkCreateCuFunctionNVX`)
+launch nothing is identified and the model runs after the upscaler ("DLSS
 Ray Reconstruction"). Only that positive sign gates: Super Resolution needs no kernel name (Crimson
 Desert's is `rrlite_*`, and `custom_block*`/`k_initial_merge` are Frame Generation's); without a readable exposure image the
 exposure is measured from the frame ("Auto-exposure when the game gives DLSS none"). Everything else (no NVX, no DLSS, native)

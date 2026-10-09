@@ -446,6 +446,15 @@ state. Outside `GENERAL` it is moved to `TRANSFER_SRC_OPTIMAL` for the capture, 
 formats. Such inputs are held here even with nothing in the buffer before the launch
 (`Hazard::NotSplittable`): the split reads and writes the colour input as an RGBA16F storage image.
 
+**One hold per identification (3.1.4).** Once a hold inside DLSS's buffer has been recorded for an
+identification (`Tracker::inline_recorded`), a buffer the split could take is held inside too
+(`Hazard::HeldInside`). Hogwarts Legacy refuses the split for some of its DLSS buffers (a memory or
+same-layout barrier before the launch) and not others; holding the rest at the split alternated the
+two holds frame by frame, and each switch drained and rebuilt the hold's resources (the split's on
+DLSS's queue family, the hold inside's on the side queue's), and with them the native network's
+pipelines and history: 114 rebuilds in a minute at the title screen, 2 with the rule (2026-10-09).
+A new identification starts over, so GTA V's buffers, which the split always takes, never get one.
+
 `NEURAL_FORGE_INLINE=off` turns it off (no queue is added either). A `dump` taken here has the colour
 input and the exposure only.
 
@@ -1825,6 +1834,17 @@ network (GTA V and Cyberpunk 2077 launch them with frame generation on and no ra
 docs/DLSS_KERNEL_CATALOGUE.md). It switched Crimson Desert off (2026-10-03) and was turned off; until
 3.1.4, Crimson Desert with Ray Reconstruction on was held at `rr2_enc0_kernel`'s colour input.
 
+Hogwarts Legacy (DLSS 310.0, Unreal Engine 4, 2026-10-09; `~/nf-spike/runs/hl-rr-on`, `hl-dxr`)
+has another Ray Reconstruction: no `rr2_*` kernel at all. With its Ray Reconstruction option on it
+launches `cuda_dldn_engine_swin_enc0..5_kernel`, `cuda_dldn_engine_swin_dec0..4_kernel` and
+`cuda_dldn_engine_hkpn_output_kernel_transformer` (beside the engine's helpers
+`cuda_dldn_engine_{luma_convert,reduce_sum,auto_exposure_copy,multiscale_downsample}_kernel`), and
+`cuda_dldn_engine_swin_enc0_kernel` names the colour input with two `B10G11R11_UFLOAT` albedo
+images, an `R8G8B8A8_SNORM` normals image and an `R32_SFLOAT` one: the guide buffers. With it off
+the same game launches Super Resolution's `hiluma_engine_input*` and nothing of `swin` or `hkpn`.
+The helpers are not Ray Reconstruction's alone: Crimson Desert's `rrlite_*` Super Resolution
+launches `luma_convert`, `reduce_sum` and `auto_exposure_copy` too.
+
 Resident Evil Requiem's probe (2026-10-02, with ray tracing, not installed since) launched only
 Frame Generation's kernels and created Super Resolution's without launching them; its input was
 taken as Ray Reconstruction's then, by the old names. With the names above it is unknown what ran
@@ -1832,23 +1852,24 @@ there; its `B10G11R11` input is refused by the format check either way.
 
 ### The rule
 
-- **Names** (`preupscale::Kernel::of`, from `vkCreateCuFunctionNVX`): `rr2_*` is Ray
-  Reconstruction; `hiluma_engine_input*` and `cuda_engine_input_kernel*` are Super Resolution's
-  input kernels (the logs and the probe only); everything else, `rrlite_*` and Frame Generation's
-  included, is other. Only Ray Reconstruction's names change a decision: Super Resolution needs no
+- **Names** (`preupscale::Kernel::of`, from `vkCreateCuFunctionNVX`): `rr2_*`,
+  `cuda_dldn_engine_swin_*` and `cuda_dldn_engine_hkpn_*` are Ray Reconstruction;
+  `hiluma_engine_input*` and `cuda_engine_input_kernel*` are Super Resolution's input kernels (the
+  logs and the probe only); everything else, `rrlite_*`, the `cuda_dldn_engine_*` helpers and Frame
+  Generation's included, is other. Only Ray Reconstruction's names change a decision: Super Resolution needs no
   name, so a DLSS whose Super Resolution kernels are called something new keeps being held.
-- **Running**: a launch-bearing submit with an `rr2_*` launch in one of its buffers marks Ray
+- **Running**: a launch-bearing submit with a Ray Reconstruction launch in one of its buffers marks Ray
   Reconstruction running for the next `SR_RECENT` = 64 launch-bearing submits (about 10 real
   frames at frame generation 6x; `Tracker::rr_running`). While it runs:
   1. neither rule identifies anything (the size rule's, the input kernel's parameters' and a
      switched choice are all dropped), so nothing is held;
-  2. a buffer launching an `rr2_*` kernel is never the hold point (`Foreign`), and its input launch
+  2. a buffer launching a Ray Reconstruction kernel is never the hold point (`Foreign`), and its input launch
      is never evidence for the identification or a retarget, whatever its shape (`rr2_enc0_kernel`
      names the colour input with depth and motion vectors, Super Resolution's whole shape);
   3. the post path runs at once (`preupscale::ray_reconstruction_running`, for one second after the
      last Ray Reconstruction submit), not `HAND_BACK` (30 s) after the last hold: switching Ray
      Reconstruction on in a game's settings moves the model after the upscaler within a frame.
-- **Switching back**: 64 launch-bearing submits without an `rr2_*` launch re-run the
+- **Switching back**: 64 launch-bearing submits without a Ray Reconstruction launch re-run the
   identification, and Super Resolution is held again.
 - **Logs**, on each change: `[preupscale] DLSS Ray Reconstruction runs (rr2_enc0_kernel, ...
   launched): its input is the noisy ray-traced frame with its guide buffers, so the model can't run
@@ -1860,9 +1881,13 @@ there; its `B10G11R11` input is refused by the format check either way.
   before 3.1.4. `Kernel::of` is the one place to extend; a probe run with the game's Ray
   Reconstruction on and off (as above) shows the names and whether the input carries guide buffers.
 
+Measured with Ray Reconstruction on (2026-10-09): Crimson Desert 67.7 presents a second, Hogwarts
+Legacy 64.0 (`hl-new-rr-on`), every one composited by the post path; nothing held, no fault.
+
 Tests (`preupscale::tests`): `kernels_are_told_apart_by_name` (the names of every probe, Frame
-Generation's and `rrlite_*` as other); `ray_reconstruction_is_never_identified_or_held` (GTA V's set
-with an `rr2_enc0_kernel` launch of Super Resolution's whole shape: nothing identified or held, the
+Generation's, `rrlite_*` and the `cuda_dldn_engine_*` helpers as other);
+`ray_reconstruction_is_never_identified_or_held` (GTA V's set with an `rr2_enc0_kernel` launch, and
+again with a `cuda_dldn_engine_swin_enc0_kernel` one, of Super Resolution's whole shape: nothing identified or held, the
 line once, the post path handed the model; the game switching to `rrlite_*`: held within 64 submits;
 the same launches without names: held); `super_resolution_is_held_whatever_its_kernels_are_called`
 (`hiluma_*`, `cuda_engine_*`, `rrlite_*` and an unknown name beside Frame Generation's kernels: held
@@ -1936,6 +1961,28 @@ log-normal: a heavy dark tail beyond the 1% trim (shadows, letterboxing) pulls `
 and makes the picture brighter than GTA's choice would; a large bright sky the other way. The dumps
 themselves are not on this machine, so this was not checked on GTA's pixels.
 
+### A game exposure the encode does not trust (Wukong, Hogwarts Legacy)
+
+The game's 1x1 is used only while it behaves like an exposure (`Session::check_exposure`, after
+every hold that read it; the native hold reads its value back at the next hold, once its capture
+has finished). Two signs that it is not, each switching that identification to the measurement
+above for the rest of its life, logged once
+(`[preupscale] the game's exposure image ...; measuring it from the frame for this identification`):
+
+- **Over 1,000** (`EXPOSURE_TRUST_MAX`): Black Myth: Wukong's benchmark names DLSS's own
+  auto-exposure output, which read 0.22 to 59,456.
+- **Three jumps of more than 32x between holds within 120 holds** (`EXPOSURE_JUMP_MAX`,
+  `EXPOSURE_JUMPS`, `EXPOSURE_JUMP_WINDOW`): a game's eye adaptation moves a few stops a second; a
+  cut that resets it is one jump, or one there and back (Crimson Desert's menus: 0.0069 to 0.91
+  once). Hogwarts Legacy's 1x1 read 0.0027-0.0034 with the frames untouched
+  (roundtrip mode), and with the model on jumped between about 0.0023 and 0.000013 from hold to
+  hold: the game's adaptation reacts to the frames the model changed, the encode then darkened the
+  frame to nothing, the network answered noise, and within seconds the picture was green noise
+  (2026-10-09; 3.1.3 does the same). Measured from the frame, the same scenes stay clean; the rule
+  fires on the first held frames of each identification there.
+
+Before 3.1.4 the native hold never read the value back, so neither sign was ever checked with it.
+
 ### Identification of DLAA without an exposure image
 
 The DLAA rule ("Identification by the input kernel's parameters") counted an output-size entry only
@@ -1954,7 +2001,7 @@ entry:
   FG's frame is read by both FG buffers in the tests' FG data, modelled on GTA V's (not confirmed
   for every game).
 - **Single**: with two or more such entries none is used (logged once).
-- A Ray Reconstruction launch (`rr2_*`) is never such an entry ("DLSS Ray Reconstruction" above);
+- A Ray Reconstruction launch (`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`) is never such an entry ("DLSS Ray Reconstruction" above);
   otherwise shape and readers are what identify, not kernel names.
 - Such an entry's `exposure_input` is `None` even if some other 1x1 R16F is registered (one SR's
   buffer does not name is not DLSS's): the exposure is measured.
