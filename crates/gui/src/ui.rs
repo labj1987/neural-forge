@@ -36,14 +36,17 @@ fn refresh_all_rows() {
     REFRESHING.with(|f| f.set(false));
 }
 
-fn spin_row(title: &str, subtitle: &str, value: f32, lower: f64, upper: f64, step: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
-    spin_row_scaled(title, subtitle, value, lower, upper, step, 1.0, setter)
+/// A spin row for the persisted setting `setting`, bounded by its range in
+/// `neural_forge_protocol::SETTING_BOUNDS`.
+fn spin_row(title: &str, subtitle: &str, value: f32, setting: &str, step: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
+    spin_row_scaled(title, subtitle, value, setting, step, 1.0, setter)
 }
 
 /// A spin row that shows the field multiplied by `scale` (100.0 shows a fraction as a percent).
-/// `lower`/`upper`/`step` are in displayed units; the setter still receives the stored value.
-#[allow(clippy::too_many_arguments)]
-fn spin_row_scaled(title: &str, subtitle: &str, value: f32, lower: f64, upper: f64, step: f64, scale: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
+/// `step` is in displayed units; the setter still receives the stored value.
+fn spin_row_scaled(title: &str, subtitle: &str, value: f32, setting: &str, step: f64, scale: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
+    let (lower, upper) = neural_forge_protocol::setting_bounds(setting).unwrap_or_else(|| panic!("{setting} has no bounds"));
+    let (lower, upper) = (f64::from(lower) * scale, f64::from(upper) * scale);
     let adjustment = gtk4::Adjustment::new(f64::from(value) * scale, lower, upper, step, step * 10.0, 0.0);
     let digits = if step >= 1.0 { 0 } else if step >= 0.1 { 1 } else { 2 };
     let row = adw::SpinRow::new(Some(&adjustment), step, digits);
@@ -250,16 +253,16 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_group.add(&combo_row("Style", &["Default", "Natural", "Cinematic"], style, set_style));
 
     let (intensity, set_intensity) = bind_float(&shm, Some("intensity"), |h| &h.intensity_bits);
-    model_group.add(&spin_row("Intensity", "How strongly the model's answer replaces the frame", intensity, 0.0, 4.0, 0.05, set_intensity));
+    model_group.add(&spin_row("Intensity", "How strongly the model's answer replaces the frame", intensity, "intensity", 0.05, set_intensity));
 
     let (local_tone, set_local_tone) = bind_float(&shm, Some("local_tone"), |h| &h.local_tone_bits);
-    model_group.add(&spin_row("Local tone", "", local_tone, 0.0, 4.0, 0.05, set_local_tone));
+    model_group.add(&spin_row("Local tone", "", local_tone, "local_tone", 0.05, set_local_tone));
 
     let (local_structure, set_local_structure) = bind_float(&shm, Some("local_structure"), |h| &h.local_structure_bits);
-    model_group.add(&spin_row("Local structure", "", local_structure, 0.0, 4.0, 0.05, set_local_structure));
+    model_group.add(&spin_row("Local structure", "", local_structure, "local_structure", 0.05, set_local_structure));
 
     let (skin_structure, set_skin_structure) = bind_float(&shm, Some("skin_structure"), |h| &h.skin_structure_bits);
-    model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, -1.0, 4.0, 0.05, set_skin_structure));
+    model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, "skin_structure", 0.05, set_skin_structure));
 
     let (auto_mask, set_auto_mask) = bind_bool(&shm, Some("auto_mask"), |h| &h.auto_mask);
     model_group.add(&switch_row("Auto mask", "Automatic skin/detail masking", auto_mask, set_auto_mask));
@@ -269,8 +272,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Model every Nth frame",
         "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own",
         interval as f32,
-        1.0,
-        4.0,
+        "model_interval",
         1.0,
         move |v| set_interval(v as u32),
     );
@@ -284,16 +286,16 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     comp_group.set_title("Composition");
 
     let (transfer_strength, set_transfer_strength) = bind_float(&shm, Some("transfer_strength"), |h| &h.transfer_strength_bits);
-    comp_group.add(&spin_row("Detail strength", "How much of the model's edit reaches the frame; above 1 amplifies it", transfer_strength, 0.0, 4.0, 0.05, set_transfer_strength));
+    comp_group.add(&spin_row("Detail strength", "How much of the model's edit reaches the frame; above 1 amplifies it", transfer_strength, "transfer_strength", 0.05, set_transfer_strength));
 
     let (colour_strength, set_colour_strength) = bind_float(&shm, Some("colour_strength"), |h| &h.colour_strength_bits);
-    comp_group.add(&spin_row("Colour strength", "How much of the transfer is allowed to be colour, not just luminance", colour_strength, 0.0, 1.0, 0.05, set_colour_strength));
+    comp_group.add(&spin_row("Colour strength", "How much of the transfer is allowed to be colour, not just luminance", colour_strength, "colour_strength", 0.05, set_colour_strength));
 
     let (max_ratio, set_max_ratio) = bind_float(&shm, Some("max_ratio"), |h| &h.max_ratio_bits);
-    comp_group.add(&spin_row("Highlight guard", "The most the pass may brighten or darken a pixel by (x)", max_ratio, 1.0, 30.0, 0.1, set_max_ratio));
+    comp_group.add(&spin_row("Highlight guard", "The most the pass may brighten or darken a pixel by (x)", max_ratio, "max_ratio", 0.1, set_max_ratio));
 
     let (working_scale, set_working_scale) = bind_float(&shm, Some("working_scale"), |h| &h.working_scale_bits);
-    let scale_row = spin_row_scaled("Model resolution", "Percent of the frame the model works at; lower is faster and softer", working_scale, 25.0, 100.0, 5.0, 100.0, set_working_scale);
+    let scale_row = spin_row_scaled("Model resolution", "Percent of the frame the model works at; lower is faster and softer", working_scale, "working_scale", 5.0, 100.0, set_working_scale);
     comp_group.add(&scale_row);
 
 
@@ -330,11 +332,11 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (source, set_source) = bind_u32(&shm, Some("white_point_source"), |h| &h.white_point_source);
     hdr_group.add(&combo_row("White point source", &["Manual", "Measured"], source, set_source));
     let (white, set_white) = bind_float(&shm, Some("white_point"), |h| &h.white_point_bits);
-    hdr_group.add(&spin_row("Manual white point", "Linear-light reference", white, 0.01, 10000.0, 0.1, set_white));
+    hdr_group.add(&spin_row("Manual white point", "Linear-light reference", white, "white_point", 0.1, set_white));
     let (scale, set_scale) = bind_float(&shm, Some("white_point_scale"), |h| &h.white_point_scale_bits);
-    hdr_group.add(&spin_row("White point scale", "Multiplier", scale, 0.01, 100.0, 0.05, set_scale));
+    hdr_group.add(&spin_row("White point scale", "Multiplier", scale, "white_point_scale", 0.05, set_scale));
     let (trim, set_trim) = bind_float(&shm, Some("white_point_trim"), |h| &h.white_point_trim_bits);
-    hdr_group.add(&spin_row("White point trim", "Calibration multiplier", trim, 0.01, 100.0, 0.05, set_trim));
+    hdr_group.add(&spin_row("White point trim", "Calibration multiplier", trim, "white_point_trim", 0.05, set_trim));
 
     let (transfer, set_transfer) = bind_u32(&shm, Some("transfer"), |h| &h.transfer);
     let transfer_row = combo_row("Transfer mode", &["Classic", "Matched residual", "Native + edit"], transfer, set_transfer);
@@ -346,8 +348,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Colour trust",
         "How far the model may change a pixel's colour; larger changes (edge fringing) are shortened. 0 = no model colour",
         colour_trust,
-        0.0,
-        4.0,
+        "colour_trust",
         0.1,
         set_colour_trust,
     ));
@@ -357,8 +358,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Ratio smoothing",
         "Percent of the relighting taken from the neighbourhood rather than each pixel; removes speckle",
         ratio_smooth,
-        0.0,
-        100.0,
+        "ratio_smooth",
         5.0,
         100.0,
         set_ratio_smooth,
@@ -369,8 +369,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Ghost guard",
         "Only matters in pipelined mode (NEURAL_FORGE_PIPELINED=1): hides a late answer's detail where the frame has moved",
         ghost_guard,
-        0.0,
-        1.0,
+        "ghost_guard",
         0.05,
         set_ghost_guard,
     ));
@@ -392,10 +391,10 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     debug_group.add(&combo_row("Compare mode", &["Off", "Side by side", "Wipe"], compare_mode, set_compare_mode));
 
     let (compare_split, set_compare_split) = bind_float(&shm, Some("compare_split"), |h| &h.compare_split_bits);
-    debug_group.add(&spin_row("Compare split", "Wipe position, 0=left edge, 1=right edge", compare_split, 0.0, 1.0, 0.05, set_compare_split));
+    debug_group.add(&spin_row("Compare split", "Wipe position, 0=left edge, 1=right edge", compare_split, "compare_split", 0.05, set_compare_split));
 
     let (compare_zoom, set_compare_zoom) = bind_float(&shm, Some("compare_zoom"), |h| &h.compare_zoom_bits);
-    debug_group.add(&spin_row("Compare zoom", "", compare_zoom, 1.0, 2.0, 0.1, set_compare_zoom));
+    debug_group.add(&spin_row("Compare zoom", "", compare_zoom, "compare_zoom", 0.1, set_compare_zoom));
 
     let (compare_swap, set_compare_swap) = bind_bool(&shm, Some("compare_swap"), |h| &h.compare_swap);
     debug_group.add(&switch_row("Swap compare sides", "", compare_swap, set_compare_swap));
@@ -422,8 +421,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "Debug view 5 amplification",
         "Multiplies the pre-colour-trust colour view 5 shows, to make a subtle difference easier to see",
         debug_scale,
-        0.1,
-        10.0,
+        "debug_scale",
         0.1,
         set_debug_scale,
     ));

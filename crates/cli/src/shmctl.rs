@@ -6,7 +6,7 @@
 //! package, and document for what is fundamentally the same "attach to the mapping and
 //! poke it" job `cmd_config`/the GUI's settings binding already do.
 //!
-//! `status`/`set`/`toggle` operate on the same 21-setting surface
+//! `status`/`set`/`toggle` operate on the same setting surface
 //! `neural_forge_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` already
 //! define (so a value changed here also gets written to `config.ini` on the GUI's next
 //! save, the same as changing it from the GUI would), plus a handful of real,
@@ -93,7 +93,7 @@ fn cmd_status(header: &ShmHeader) {
     }
 }
 
-/// Shared by `set`/`toggle`: resolves `name` against the 21 persisted settings first,
+/// Shared by `set`/`toggle`: resolves `name` against the persisted settings first,
 /// then the extra live-status fields, returning whether it's float-valued and its
 /// current raw bits -- `None` if `name` isn't recognized by either.
 fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
@@ -108,7 +108,9 @@ fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
 /// applied `config.ini` to yet), the next `start()` would overwrite this value from it.
 fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
     if header.persisted_settings().iter().any(|(n, ..)| *n == name) {
-        header.apply_persisted_setting(name, bits);
+        if !header.apply_persisted_setting(name, bits) {
+            return false;
+        }
         header.tuning_seq.fetch_add(1, Ordering::Relaxed);
         header.control_seq.fetch_add(1, Ordering::Relaxed);
         return true;
@@ -143,7 +145,17 @@ fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
             }
         }
     };
-    store(header, name, bits);
+    if let Some((min, max)) = neural_forge_protocol::setting_bounds(name) {
+        let v = if is_float { f32::from_bits(bits) } else { bits as f32 };
+        if !(min..=max).contains(&v) {
+            eprintln!("shmctl set: {name} takes a value from {min} to {max}, got {value:?}");
+            return false;
+        }
+    }
+    if !store(header, name, bits) {
+        eprintln!("shmctl set: {name} was not stored");
+        return false;
+    }
     println!("{name}={value}");
     true
 }
@@ -344,6 +356,22 @@ mod tests {
     fn cmd_set_rejects_a_non_numeric_value_for_a_float_field() {
         let header = ShmHeader::default();
         assert!(!cmd_set(&header, "colour_strength", "not-a-number"));
+    }
+
+    #[test]
+    fn cmd_set_rejects_non_finite_negative_and_out_of_range_values() {
+        let header = ShmHeader::default();
+        header.init_defaults();
+        for bad in ["nan", "inf", "-inf", "-0.5", "4.5"] {
+            assert!(!cmd_set(&header, "intensity", bad), "{bad}");
+        }
+        assert_eq!(f32::from_bits(header.intensity_bits.load(Ordering::Relaxed)), 1.0);
+        assert!(!cmd_set(&header, "model_interval", "0"));
+        assert!(!cmd_set(&header, "style", "-1"));
+        assert!(!cmd_set(&header, "debug_view", "6"));
+        assert_eq!(header.tuning_seq.load(Ordering::Relaxed), 0, "a refused value changes nothing");
+        assert!(cmd_set(&header, "intensity", "4"));
+        assert_eq!(f32::from_bits(header.intensity_bits.load(Ordering::Relaxed)), 4.0);
     }
 
     #[test]

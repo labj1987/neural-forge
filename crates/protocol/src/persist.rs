@@ -74,18 +74,28 @@ mod tests {
         // Every persisted field gets its own value, distinct from its default and from
         // every other field's, so a name that `apply_persisted_setting` silently drops (or
         // maps onto the wrong field) shows up as a mismatch below.
+        // The value is inside the setting's range, so it is stored unclamped.
         let defaults = h.persisted_settings();
+        let value = |i: usize, is_float: bool, default_bits: u32, name: &str| {
+            let (min, max) = crate::setting_bounds(name).expect(name);
+            if is_float {
+                let v = min + (max - min) * (0.1 + 0.8 * i as f32 / defaults.len() as f32);
+                if v.to_bits() == default_bits { ((v + max) / 2.0).to_bits() } else { v.to_bits() }
+            } else if default_bits == max as u32 {
+                min as u32
+            } else {
+                default_bits + 1
+            }
+        };
         for (i, (name, is_float, default_bits)) in defaults.iter().enumerate() {
-            let bits = if *is_float { (10.0 + i as f32 * 0.25).to_bits() } else { 100 + i as u32 };
+            let bits = value(i, *is_float, *default_bits, name);
             assert_ne!(bits, *default_bits, "{name}");
-            h.apply_persisted_setting(name, bits);
+            assert!(h.apply_persisted_setting(name, bits), "{name}");
         }
-        for (i, (name, is_float, bits)) in h.persisted_settings().iter().enumerate() {
-            let expected = if *is_float { (10.0 + i as f32 * 0.25).to_bits() } else { 100 + i as u32 };
-            assert_eq!(*bits, expected, "{name} was not stored by apply_persisted_setting");
+        for (i, ((name, is_float, bits), (_, _, default_bits))) in h.persisted_settings().iter().zip(defaults.iter()).enumerate() {
+            assert_eq!(*bits, value(i, *is_float, *default_bits, name), "{name} was not stored by apply_persisted_setting");
         }
         let snap = snapshot(h);
-        assert_eq!(snap.get("set_white_point").map(String::as_str), Some("10"));
 
         h.init_defaults();
         assert_eq!(h.persisted_settings(), defaults);
@@ -98,6 +108,46 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn every_persisted_setting_has_bounds_holding_its_default() {
+        let h = crate::ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(crate::SETTING_BOUNDS.len(), h.persisted_settings().len());
+        for (name, is_float, bits) in h.persisted_settings() {
+            let (min, max) = crate::setting_bounds(name).unwrap_or_else(|| panic!("{name} has no bounds"));
+            let v = if is_float { f32::from_bits(bits) } else { bits as f32 };
+            assert!(min <= v && v <= max, "{name}'s default {v} is outside {min}..={max}");
+        }
+    }
+
+    #[test]
+    fn apply_rejects_non_finite_and_clamps_out_of_range_values() {
+        let h = crate::ShmHeader::default();
+        h.init_defaults();
+        let intensity = || f32::from_bits(h.intensity_bits.load(std::sync::atomic::Ordering::Relaxed));
+        let raw = |k: &str, v: &str| BTreeMap::from([(k.to_string(), v.to_string())]);
+
+        for bad in ["nan", "NaN", "inf", "-inf", "infinity"] {
+            apply(&h, &raw("set_intensity", bad));
+            assert_eq!(intensity(), 1.0, "{bad} must be rejected");
+        }
+        apply(&h, &raw("set_intensity", "-2.5"));
+        assert_eq!(intensity(), 0.0, "a negative intensity clamps to 0");
+        apply(&h, &raw("set_intensity", "1e30"));
+        assert_eq!(intensity(), 4.0, "an out-of-range intensity clamps to the maximum");
+        apply(&h, &raw("set_working_scale", "0.01"));
+        assert_eq!(f32::from_bits(h.working_scale_bits.load(std::sync::atomic::Ordering::Relaxed)), 0.25);
+        apply(&h, &raw("set_model_interval", "0"));
+        assert_eq!(h.model_interval.load(std::sync::atomic::Ordering::Relaxed), 1);
+        apply(&h, &raw("set_reversible_mode", "4000000000"));
+        assert_eq!(h.reversible_mode.load(std::sync::atomic::Ordering::Relaxed), 4);
+        // A negative value for a whole-number setting does not parse and leaves it alone.
+        apply(&h, &raw("set_style", "-1"));
+        assert_eq!(h.style.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert!(!h.apply_persisted_setting("intensity", f32::NAN.to_bits()));
+        assert!(!h.apply_persisted_setting("not_a_setting", 0));
     }
 
     #[test]

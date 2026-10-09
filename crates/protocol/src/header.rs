@@ -302,6 +302,53 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, server_busy_us) == 652, "l
 // arrays (every field before them is a word, so none gained padding).
 const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_of(4));
 
+/// The allowed range of every persisted setting ([`ShmHeader::persisted_settings`]), in the
+/// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
+/// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
+/// outside it and the GUI's rows take their bounds from it.
+pub const SETTING_BOUNDS: [(&str, f32, f32); 33] = [
+    ("white_point", 0.01, 10000.0),
+    ("white_point_scale", 0.01, 100.0),
+    ("white_point_trim", 0.01, 100.0),
+    ("white_point_source", 0.0, 1.0),
+    // evdev key codes (KEY_MAX); 0 is unbound.
+    ("toggle_key", 0.0, 767.0),
+    ("enabled", 0.0, 1.0),
+    ("style", 0.0, 2.0),
+    ("intensity", 0.0, 4.0),
+    ("local_tone", 0.0, 4.0),
+    ("local_structure", 0.0, 4.0),
+    // -1 follows local structure.
+    ("skin_structure", -1.0, 4.0),
+    ("auto_mask", 0.0, 1.0),
+    ("composition_bypass", 0.0, 1.0),
+    ("transfer_strength", 0.0, 4.0),
+    ("colour_strength", 0.0, 1.0),
+    ("max_ratio", 1.0, 30.0),
+    ("working_scale", 0.25, 1.0),
+    ("reversible_mode", 0.0, (crate::enums::reversible_mode::COUNT - 1) as f32),
+    ("hdr_mode", 0.0, 2.0),
+    ("transfer", 0.0, 2.0),
+    ("compare_mode", 0.0, 2.0),
+    ("compare_split", 0.0, 1.0),
+    ("compare_zoom", 1.0, 2.0),
+    ("compare_swap", 0.0, 1.0),
+    ("colour_mode", 0.0, 2.0),
+    ("hold_frame", 0.0, 1.0),
+    ("ghost_guard", 0.0, 1.0),
+    ("colour_trust", 0.0, 4.0),
+    ("ratio_smooth", 0.0, 1.0),
+    ("model_interval", 1.0, 4.0),
+    ("apply_model", 0.0, 1.0),
+    ("debug_view", 0.0, 5.0),
+    ("debug_scale", 0.1, 10.0),
+];
+
+/// `(min, max)` for a persisted setting, from [`SETTING_BOUNDS`].
+pub fn setting_bounds(name: &str) -> Option<(f32, f32)> {
+    SETTING_BOUNDS.iter().find(|(n, ..)| *n == name).map(|&(_, min, max)| (min, max))
+}
+
 impl ShmHeader {
     /// Resets every field to the defaults a freshly created mapping should hold. Takes
     /// `&self` rather than `&mut self`: this is called on a live mapping another
@@ -520,8 +567,22 @@ impl ShmHeader {
     /// Stores one persisted setting back by name (as looked up in a `config.ini`
     /// `set_<name>=<value>` line) -- `bits` is already the right representation
     /// (`f32::to_bits()` for the float-valued ones, per [`Self::persisted_settings`]'s
-    /// second field).
-    pub fn apply_persisted_setting(&self, name: &str, bits: u32) {
+    /// second field). A non-finite float is rejected and anything else is clamped to the
+    /// setting's range in [`SETTING_BOUNDS`]. Returns whether a value was stored.
+    pub fn apply_persisted_setting(&self, name: &str, bits: u32) -> bool {
+        let Some((min, max)) = setting_bounds(name) else { return false };
+        let Some(is_float) = self.persisted_settings().iter().find(|(n, ..)| *n == name).map(|&(_, f, _)| f) else {
+            return false;
+        };
+        let bits = if is_float {
+            let v = f32::from_bits(bits);
+            if !v.is_finite() {
+                return false;
+            }
+            v.clamp(min, max).to_bits()
+        } else {
+            bits.clamp(min as u32, max as u32)
+        };
         let field = match name {
             "white_point" => &self.white_point_bits,
             "white_point_scale" => &self.white_point_scale_bits,
@@ -556,9 +617,10 @@ impl ShmHeader {
             "apply_model" => &self.apply_model,
             "debug_view" => &self.debug_view,
             "debug_scale" => &self.debug_scale_bits,
-            _ => return,
+            _ => return false,
         };
         field.store(bits, Ordering::Relaxed);
+        true
     }
 
     pub fn neural_enabled(&self) -> bool {

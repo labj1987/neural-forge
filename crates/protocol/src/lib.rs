@@ -41,7 +41,7 @@ pub mod persist;
 pub mod private_dir;
 mod slot;
 
-pub use header::{load64, store64, ShmHeader, Tuning};
+pub use header::{load64, setting_bounds, store64, ShmHeader, Tuning, SETTING_BOUNDS};
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
 
