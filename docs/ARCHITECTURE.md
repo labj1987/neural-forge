@@ -87,8 +87,8 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   skin structure, `model_interval` (v6).
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
   transfer mode, white point fields, `working_scale`, compare and debug views, `reversible_mode`,
-  `apply_model`, `hold_frame`, `ghost_guard` (v4), colour trust and ratio smoothing (v5),
-  `composition_bypass`.
+  `apply_model`, `hold_frame`, `ghost_guard` (v4), colour trust and ratio smoothing (v5).
+  `composition_bypass` stays in the header (append-only) but nothing reads it.
 - **Model server status:** `server_state`, `model_up`, frame counter, upload/eval/readback ms,
   `server_busy_us` (v10).
 - **Layer status:** attached, frame counter, size, format, `layer_ms`, measured white, GPU

@@ -283,9 +283,6 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let comp_group = adw::PreferencesGroup::new();
     comp_group.set_title("Composition");
 
-    let (bypass, set_bypass) = bind_bool(&shm, Some("composition_bypass"), |h| &h.composition_bypass);
-    comp_group.add(&switch_row("Bypass composition", "On: the model's raw answer is the presented frame", bypass, set_bypass));
-
     let (transfer_strength, set_transfer_strength) = bind_float(&shm, Some("transfer_strength"), |h| &h.transfer_strength_bits);
     comp_group.add(&spin_row("Detail strength", "How much of the model's edit reaches the frame; above 1 amplifies it", transfer_strength, 0.0, 4.0, 0.05, set_transfer_strength));
 
