@@ -6,7 +6,7 @@
     "library_path": "./libneural_forge_layer.so",
     "api_version": "1.3.277",
     "implementation_version": "1",
-    "description": "NeuralForge neural rendering injection layer (Linux side)",
+    "description": "Neural Forge neural rendering injection layer (Linux side)",
     "enable_environment": { "NEURAL_FORGE_ENABLE": "1" },
     "disable_environment": { "NEURAL_FORGE_DISABLE": "1" }
   }

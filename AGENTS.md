@@ -62,10 +62,10 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 
 ## Runtime constraints
 
-Use only NeuralForge-owned paths, `NEURAL_FORGE_*` variables, and the
+Use only Neural Forge-owned paths, `NEURAL_FORGE_*` variables, and the
 `VK_LAYER_neuralforge_neural` identity. Keep NVIDIA DLL names, NGX exports and
 `DLSSNR.*` parameters unchanged. Do not copy or move ambiguous upstream config,
-shared memory, or Wine prefixes. Import DLLs explicitly into NeuralForge's data dir.
+shared memory, or Wine prefixes. Import DLLs explicitly into Neural Forge's data dir.
 
 Target-process filtering and the kernel ownership lease must remain effective before
 any process can resize or write a channel. Preserve the GTA baseline: the model before the

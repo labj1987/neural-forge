@@ -1,4 +1,4 @@
-# NeuralForge Phase 1
+# Neural Forge Phase 1
 
 > **Note (2026-10-07, 3.0.0):** the namespace, installation and target-ownership sections are
 > current for 3.0, which has no Windows helper, Wine prefix or runner. The "Preserved baseline and
@@ -7,7 +7,7 @@
 > Phase 3), and benchmarks run unattended with `scripts/gta-bench.sh`
 > ([RUNNING_AND_MEASURING.md](RUNNING_AND_MEASURING.md)).
 
-NeuralForge is the Rust application in `labj1987/neural-forge`. The GitHub repository
+Neural Forge is the Rust application in `labj1987/neural-forge`. The GitHub repository
 has been renamed from `labj1987/dlssnr`. Historical handoffs are evidence, not deployment instructions.
 No installed upstream package or game setting is changed by this work.
 See [HARDWARE_VALIDATION.md](HARDWARE_VALIDATION.md) for the current RTX 5070
@@ -15,7 +15,7 @@ validation evidence before GTA benchmarking.
 
 ## Namespace contract
 
-| Surface | NeuralForge |
+| Surface | Neural Forge |
 |---|---|
 | GUI / CLI | `neural-forge`, `neural-forge-cli` |
 | Vulkan identity / library (frozen) | `VK_LAYER_neuralforge_neural`, `libneural_forge_layer.so` |
@@ -30,7 +30,7 @@ validation evidence before GTA benchmarking.
 
 XDG variables fall back to the usual directories under HOME. Shared memory stays
 under /tmp for Steam pressure-vessel visibility. Old runtime/config paths are not
-imported. Explicit upstream (`dlssnr`) SHM/log paths are refused or reset to NeuralForge defaults.
+imported. Explicit upstream (`dlssnr`) SHM/log paths are refused or reset to Neural Forge defaults.
 External `nvngx_dlssnr.dll`, other NVIDIA DLL names, exported NGX functions,
 `DLSSNR.*` parameters and driver environment variables keep their original spelling.
 
@@ -86,13 +86,13 @@ Upstream remains installed at 0.3.0-1. Its known-good GTA Enhanced launch option
 VKLayer_DLSS5=1 DLSSNR_DMABUF=0 %command%
 ```
 
-Do not change this saved baseline. A separate NeuralForge test launch uses:
+Do not change this saved baseline. A separate Neural Forge test launch uses:
 
 ```text
 NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%
 ```
 
-NeuralForge currently uses host SHM transport; `NEURAL_FORGE_DMABUF` is reserved and
+Neural Forge currently uses host SHM transport; `NEURAL_FORGE_DMABUF` is reserved and
 has no zero-copy implementation -- and, per `DMABUF_TRANSPORT_DESIGN.md`, real
 hardware evidence this session says the underlying mechanism the current Wine-hosted
 helper would need is blocked at the driver/Wine level, not just unbuilt. DMA-BUF
@@ -115,7 +115,7 @@ Steam AppID 3240220, the exact Proton build, game build, and DLL hashes.
    Rockstar and Social Club while GTA runs; dimensions and owner must stay stable.
 2. Validate Vulkan operations using validation layers in a separate smoke run, then
    test the same saved GTA scene/route. Do not mix validation overhead into timing.
-3. Measure native baseline, upstream host transport, and NeuralForge host transport
+3. Measure native baseline, upstream host transport, and Neural Forge host transport
    with identical settings and visual mode. Warm up, alternate order, repeat at least
    three 60-second captures. Record average/1% low FPS, frame-time percentiles,
    GPU utilization, VRAM, helper frames and matched screenshots. Stop on corruption,

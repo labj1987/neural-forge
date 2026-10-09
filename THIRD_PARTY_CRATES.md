@@ -85,8 +85,8 @@ Each crate's own license text is in its published source (crates.io / the reposi
 | toml_parser | 1.1.3+spec-1.1.0 | MIT OR Apache-2.0 | https://github.com/toml-rs/toml |
 | typenum | 1.20.1 | MIT OR Apache-2.0 | https://github.com/paholg/typenum |
 | unicode-ident | 1.0.24 | (MIT OR Apache-2.0) AND Unicode-3.0 | https://github.com/dtolnay/unicode-ident |
-| vulkan-layer | 0.1.0 | see crate |  |
-| vulkan-layer-macros | 0.1.0 | see crate |  |
+| vulkan-layer | 0.1.0 | Apache-2.0 | https://github.com/google/vk-layer-for-rust |
+| vulkan-layer-macros | 0.1.0 | Apache-2.0 | https://github.com/google/vk-layer-for-rust |
 | winnow | 1.0.4 | MIT | https://github.com/winnow-rs/winnow |
 | zlib-rs | 0.6.7 | Zlib | https://github.com/trifectatechfoundation/zlib-rs |
 | zmij | 1.0.23 | MIT | https://github.com/dtolnay/zmij |

@@ -15,6 +15,24 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "THIRD_PARTY_CRATES.md"
 
+# Crates whose manifest declares no `license` (git dependencies). Checked against the licence files in their
+# source: google/vk-layer-for-rust ships the Apache-2.0 text in its LICENSE and an Apache header in each manifest.
+LICENSE_OVERRIDES = {
+    "vulkan-layer": "Apache-2.0",
+    "vulkan-layer-macros": "Apache-2.0",
+}
+
+
+def source_url(pkg):
+    """The crate's repository or homepage; for a git dependency without either, the git URL from its source."""
+    url = pkg.get("repository") or pkg.get("homepage")
+    if url:
+        return url
+    src = pkg.get("source") or ""
+    if src.startswith("git+"):
+        return src[len("git+"):].split("?")[0].split("#")[0].removesuffix(".git")
+    return ""
+
 
 def metadata(*extra):
     out = subprocess.run(
@@ -48,7 +66,7 @@ def main():
             if p["source"] is None:
                 continue  # this workspace's own crates: AGPL-3.0-or-later, see LICENSE
             rows[(p["name"], p["version"])] = (
-                p.get("license") or "see crate", p.get("repository") or p.get("homepage") or "")
+                p.get("license") or LICENSE_OVERRIDES.get(p["name"], "see crate"), source_url(p))
     lines = [
         "# Third-party Rust crates",
         "",
