@@ -4,6 +4,54 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.1.3 — 2026-10-09
+
+Fixes from two code reviews of 3.1.2.
+
+- Games no longer crash at start-up when another Vulkan layer sits below Neural Forge. When the
+  driver refused the first way Neural Forge asked for the game's device, the next attempt handed the
+  layers below a broken link.
+- Launchers, excluded programs and games Neural Forge is switched off for now get their GPU device
+  exactly as they asked for it, with no extra queues and no worker thread.
+- The target filter judges a wrapper such as gamescope, or a launcher script that carries the game's
+  `.exe` on its command line, as itself, so it no longer gets the effect meant for the game.
+  gamescope is never treated as the game.
+- Switching a game to a larger resolution (for example 720p, then 4K) no longer leaves the model
+  off at the new size.
+- A GPU stall in the model is handled without freeing memory the GPU may still be using, and the
+  model is no longer retried on a device where it stalled. A model that fails to build is retried on
+  a backoff instead of on every frame.
+- Model after the upscaler: starting it no longer stalls the game for a third of a second, and a start
+  that fails is retried instead of leaving the effect off until the game is restarted.
+- Model after the upscaler: with ratio smoothing or the ghost guard on, highlights (and the whole
+  picture at a white point other than 1) were shifted in brightness even when the model changed
+  nothing. They now stay as they are. With both off, the picture is unchanged.
+- Detail strength below 1 now works: 0 leaves the frame as it is, and values between 0 and 1 apply
+  the model's change partly. At the default (1) the picture is unchanged.
+- With the effect switched off, Neural Forge no longer adds any GPU work to the game's presents.
+- The toggle hotkey also works when the game presents to an HDR or 10-bit window.
+- The "Bypass composition" switch is gone from the Model tab. It never did anything.
+- The launch option the Setup tab shows quotes the game's executable name when it contains spaces
+  or other special characters, so it can be pasted into Steam as it is.
+- Settings are checked against their ranges everywhere: an out-of-range or invalid value in
+  `config.ini` or from `neural-forge-cli shmctl set` is clamped or refused instead of being used.
+- Installer: an install that was interrupted no longer blocks the next one. If the installation
+  record is damaged, install and uninstall stop and say how to recover instead of treating the
+  install as empty.
+- Command line: an unknown or misspelt argument prints the command's usage and exits with status 2
+  instead of being ignored (`uninstall --purg` no longer uninstalls), and every command has `--help`.
+  `uninstall --help` shows help and removes nothing.
+- Command line: after a restart, `shmctl` and the profile commands start from your saved settings
+  instead of the defaults, and changes made with `shmctl set`, `toggle` and `reset` are saved.
+  `import-binaries` fails when the folder has no `nvngx_dlssnr.dll`, and `doctor` checks that the
+  channel to the game can actually be opened.
+- Extracting the model builds the new copy beside the old one and swaps it in whole, so an
+  interrupted extraction leaves the previous model working. **A model extracted by 3.0.0 now shows as
+  not verified: extract it again once** (Setup tab, Extract from DLL).
+- Setup tab: the "model is missing" banner and the Status tab's model row update right after an
+  extraction. Loading or deleting a profile acts on the profile selected, by name. Settings are saved
+  a moment after the last change, and a failed save is shown.
+
 ## 3.1.2 — 2026-10-08
 
 - Remnant II: the model runs before the upscaler, inside DLSS's buffer, instead of after it. Its DLSS
