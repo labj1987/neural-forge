@@ -447,6 +447,69 @@ fn side_queue_request(instance: &ash::Instance, physical_device: vk::PhysicalDev
     Some(SideQueueRequest { infos: extended, _priorities: priorities, queue: SideQueue { family, index, app_family } })
 }
 
+/// The loader's `VkLayerDeviceCreateInfo` (`vk_layer.h`), which `vulkan_layer` does not export:
+/// the `VK_LAYER_LINK_INFO` node of a `VkDeviceCreateInfo`'s chain.
+#[repr(C)]
+struct LoaderDeviceCreateInfo {
+    s_type: vk::StructureType,
+    p_next: *const std::ffi::c_void,
+    function: i32,
+    layer_info: *mut VkLayerDeviceLink,
+}
+
+/// `VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO` and `VK_LAYER_LINK_INFO`.
+const LOADER_DEVICE_CREATE_INFO: vk::StructureType = vk::StructureType::from_raw(48);
+const LAYER_LINK_INFO: i32 = 0;
+
+/// The link node of a `vkCreateDevice` request and the `pLayerInfo` the framework left in it for
+/// the layer below. Every layer below advances `pLayerInfo` in place on each `vkCreateDevice` it
+/// receives, so when one application call is tried more than once (with the layer's additions,
+/// then without), each attempt must start from this value again, or the layer below reads its own
+/// successor's link (a crash, or a layer skipped).
+struct DeviceLink {
+    node: *mut LoaderDeviceCreateInfo,
+    info: *mut VkLayerDeviceLink,
+}
+
+impl DeviceLink {
+    /// # Safety
+    /// `create_info`'s chain is valid and its link node writable (the loader's own).
+    unsafe fn find(create_info: &vk::DeviceCreateInfo) -> Option<Self> {
+        let mut next = create_info.p_next.cast::<LoaderDeviceCreateInfo>();
+        while !next.is_null() {
+            // SAFETY: every node of a valid chain starts with `sType` and `pNext`; the fields past
+            // them are read only on the loader's own node.
+            let node = unsafe { &*next };
+            if node.s_type == LOADER_DEVICE_CREATE_INFO && node.function == LAYER_LINK_INFO {
+                return Some(Self { node: next.cast_mut(), info: node.layer_info });
+            }
+            next = node.p_next.cast();
+        }
+        None
+    }
+
+    fn restore(&self) {
+        // SAFETY: the node `find` found, alive for the `vkCreateDevice` call this is made in.
+        unsafe { (*self.node).layer_info = self.info };
+    }
+}
+
+/// Calls the next layer's `vkCreateDevice` with `link` (if the request has one) put back first: the
+/// one way this layer's device creation reaches the layer below, however many attempts it makes.
+///
+/// # Safety
+/// As `vkCreateDevice`; `link` was found in `info`'s chain.
+unsafe fn call_next_create_device(
+    next: vk::PFN_vkCreateDevice, link: Option<&DeviceLink>, physical_device: vk::PhysicalDevice, info: &vk::DeviceCreateInfo,
+    allocator: *const vk::AllocationCallbacks, p_device: &mut std::mem::MaybeUninit<vk::Device>,
+) -> vk::Result {
+    if let Some(link) = link {
+        link.restore();
+    }
+    // SAFETY: forwarded from this function's contract.
+    unsafe { next(physical_device, info, allocator, p_device.as_mut_ptr()) }
+}
+
 /// Per-instance hooks, carrying that instance's own context. Dropped by the framework when
 /// the application destroys the instance.
 #[derive(Default)]
@@ -473,16 +536,14 @@ impl Drop for NeuralForgeInstanceHooks {
 }
 
 impl InstanceHooks for NeuralForgeInstanceHooks {
-    /// Adds [`EXTERNAL_MEMORY_HOST_EXTENSION`] to the game's own `vkCreateDevice` call
-    /// when (and only when) it's safe to: the physical device actually advertises it
-    /// and the app hasn't already requested it either way. Every other case returns
-    /// [`LayerResult::Unhandled`], which hands the *unmodified* call straight to the
-    /// framework's own default `create_device` path -- identical to this hook not
-    /// existing at all. This function never changes device creation in any other way,
-    /// and never makes a request that would otherwise have succeeded start failing:
-    /// if creating the device with the extra extension is refused for any reason
-    /// `vkEnumerateDeviceExtensionProperties` didn't predict, it retries with the
-    /// exact, byte-identical original request before giving up.
+    /// Adds [`EXTERNAL_MEMORY_HOST_EXTENSION`], the side queue for the hold inside DLSS's command
+    /// buffer and the native backend's extensions, features and queues to the game's own
+    /// `vkCreateDevice` call where it's safe to. Every other case returns
+    /// [`LayerResult::Unhandled`], which hands the *unmodified* call straight to the framework's
+    /// own default `create_device` path -- identical to this hook not existing at all. It never
+    /// makes a request that would otherwise have succeeded start failing: an addition the driver
+    /// refuses is dropped and the request made again, down to the application's own, every attempt
+    /// through [`call_next_create_device`].
     fn create_device(
         &self,
         physical_device: vk::PhysicalDevice,
@@ -524,6 +585,13 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             None => return LayerResult::Unhandled,
         };
         let allocator_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
+        // SAFETY: the framework's copy of the request, whose chain is the loader's.
+        let link = unsafe { DeviceLink::find(create_info) };
+        // SAFETY: `vkCreateDevice` for this call's physical device, with the request each attempt
+        // passes and the framework's out-parameter.
+        let next_create_device = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| unsafe {
+            call_next_create_device(next_create_device, link.as_ref(), physical_device, info, allocator_ptr, p_device)
+        };
         // The hold inside DLSS's command buffer needs a queue of the layer's own beside the game's
         // (`preupscale::inline`): one more in the game's graphics family, on an NVIDIA device with
         // the pre-upscaler path on. A request with it that the driver refuses is made again without.
@@ -566,8 +634,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                         match unsafe { neural_forge_native::device_extend(gipa, instance.instance.handle(), physical_device, &with) } {
                             Err(why) => log!("[native] the device cannot run the network: {why}; native backend off on this device"),
                             Ok(extension) => {
-                                // SAFETY: the extended request; `p_device` is the framework's out-parameter.
-                                let result = unsafe { next_create_device(physical_device, &extension.info, allocator_ptr, p_device.as_mut_ptr()) };
+                                let result = next_create_device(&extension.info, p_device);
                                 drop(extension);
                                 if result == vk::Result::SUCCESS {
                                     // SAFETY: written by the successful call.
@@ -590,9 +657,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 let mut with = *info;
                 with.queue_create_info_count = sq.infos.len() as u32;
                 with.p_queue_create_infos = sq.infos.as_ptr();
-                // SAFETY: `with` is the request with `sq`'s queue infos, which outlive the call;
-                // `p_device` is the framework's out-parameter.
-                let result = unsafe { next_create_device(physical_device, &with, allocator_ptr, p_device.as_mut_ptr()) };
+                // `with` is the request with `sq`'s queue infos, which outlive the call.
+                let result = next_create_device(&with, p_device);
                 if result == vk::Result::SUCCESS {
                     // SAFETY: written by the successful call.
                     let device = unsafe { p_device.assume_init() };
@@ -601,8 +667,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                 }
                 log!("[preupscale] adding a queue for the hold inside DLSS's command buffer was refused ({result:?}); creating the device without it");
             }
-            // SAFETY: the request as given; `p_device` as above.
-            unsafe { next_create_device(physical_device, info, allocator_ptr, p_device.as_mut_ptr()) }
+            next_create_device(info, p_device)
         };
         // The application already enables it (vkd3d-proton does): nothing to add, but the
         // device is created here, unmodified, so it can be recorded like one this hook
@@ -925,5 +990,84 @@ mod device_lost_tests {
         assert_eq!(note_vk::<u32>(Err(vk::Result::ERROR_DEVICE_LOST)), Err(vk::Result::ERROR_DEVICE_LOST));
         assert!(device_lost());
         DEVICE_LOST.store(false, std::sync::atomic::Ordering::Relaxed); // other tests share the process
+    }
+}
+
+#[cfg(test)]
+mod device_link_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+    use std::ffi::c_char;
+
+    thread_local! {
+        static SEEN: RefCell<Vec<*mut VkLayerDeviceLink>> = const { RefCell::new(Vec::new()) };
+        static REFUSE: Cell<u32> = const { Cell::new(0) };
+        static CALLED: Cell<u32> = const { Cell::new(0) };
+    }
+
+    unsafe extern "system" fn gipa(_: vk::Instance, _: *const c_char) -> vk::PFN_vkVoidFunction {
+        None
+    }
+
+    unsafe extern "system" fn gdpa(_: vk::Device, _: *const c_char) -> vk::PFN_vkVoidFunction {
+        None
+    }
+
+    /// The layer below, as a real one behaves: it takes its link and advances `pLayerInfo` in place
+    /// for the layer under it, then refuses the first `REFUSE` requests.
+    unsafe extern "system" fn next_layer(
+        _: vk::PhysicalDevice, info: *const vk::DeviceCreateInfo, _: *const vk::AllocationCallbacks, _: *mut vk::Device,
+    ) -> vk::Result {
+        CALLED.set(CALLED.get() + 1);
+        // SAFETY: the test's own request. Without a link node (a request the hook made itself, in
+        // the ineligible-process test) it is refused; unwinding out of here would abort.
+        let Some(link) = (unsafe { DeviceLink::find(&*info) }) else {
+            return vk::Result::ERROR_INITIALIZATION_FAILED;
+        };
+        // SAFETY: the test's node and links, alive for the call.
+        unsafe {
+            let node = &mut *link.node;
+            SEEN.with_borrow_mut(|seen| seen.push(node.layer_info));
+            if !node.layer_info.is_null() {
+                node.layer_info = (*node.layer_info).pNext;
+            }
+        }
+        let refuse = REFUSE.get();
+        if refuse > 0 {
+            REFUSE.set(refuse - 1);
+            return vk::Result::ERROR_FEATURE_NOT_PRESENT;
+        }
+        vk::Result::SUCCESS
+    }
+
+    /// Every attempt of one application call reaches the layer below with the link the framework
+    /// left for it, however many attempts were refused before it.
+    #[test]
+    fn every_attempt_sees_the_original_link() {
+        let mut lower = VkLayerDeviceLink { pNext: std::ptr::null_mut(), pfnNextGetInstanceProcAddr: gipa, pfnNextGetDeviceProcAddr: gdpa };
+        let mut below = VkLayerDeviceLink { pNext: &mut lower, pfnNextGetInstanceProcAddr: gipa, pfnNextGetDeviceProcAddr: gdpa };
+        let original: *mut VkLayerDeviceLink = &mut below;
+        let mut node = LoaderDeviceCreateInfo { s_type: LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::null(), function: LAYER_LINK_INFO, layer_info: original };
+        // Another structure ahead of the link node, as applications chain features.
+        let mut features = vk::PhysicalDeviceFeatures2 { p_next: std::ptr::from_mut(&mut node).cast(), ..Default::default() };
+        let info = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut features).cast(), ..Default::default() };
+        // SAFETY: the chain above.
+        let link = unsafe { DeviceLink::find(&info) }.expect("found past the features");
+        assert_eq!(link.info, original);
+        REFUSE.set(5);
+        let mut p_device = std::mem::MaybeUninit::uninit();
+        // Six attempts, as `create_device` can make: the first five refused, each with its own copy
+        // of the request (the additions differ, the chain is the application's).
+        let mut results = Vec::new();
+        for _ in 0..6 {
+            let with = info;
+            // SAFETY: the fake layer below; the request and link above.
+            results.push(unsafe { call_next_create_device(next_layer, Some(&link), vk::PhysicalDevice::null(), &with, std::ptr::null(), &mut p_device) });
+        }
+        assert_eq!(results.last(), Some(&vk::Result::SUCCESS));
+        SEEN.with_borrow(|seen| {
+            assert_eq!(seen.len(), 6);
+            assert!(seen.iter().all(|&l| l == original), "an attempt saw an advanced link: {seen:?} (original {original:?})");
+        });
     }
 }
