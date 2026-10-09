@@ -18,7 +18,7 @@
 use neural_forge_protocol::ShmHeader;
 use std::sync::atomic::Ordering;
 
-fn usage() {
+pub fn usage() {
     eprintln!(
         "usage: neural-forge-cli shmctl <status|set|toggle|capture|reset>\n\n\
          \x20 status              print every setting and live status field\n\
@@ -209,6 +209,21 @@ fn cmd_capture(header: &ShmHeader, args: &[String]) -> bool {
         println!("capture_request={frames} -- the next {frames} presents go to a new $XDG_DATA_HOME/neural-forge/captures/series-<ms>/");
     }
     true
+}
+
+/// Checks the argument count of a `shmctl` command line before anything is opened, so an extra
+/// or missing argument is a usage error. `capture`'s own options are checked by `cmd_capture`.
+pub fn check_args(args: &[String]) -> Result<(), String> {
+    let n = args.len();
+    match args.first().map(String::as_str) {
+        None => Err("shmctl takes a subcommand".into()),
+        Some("status" | "reset") if n == 1 => Ok(()),
+        Some("set") if n == 3 => Ok(()),
+        Some("toggle") if n == 2 => Ok(()),
+        Some("capture") => Ok(()),
+        Some(sub @ ("status" | "reset" | "set" | "toggle")) => Err(format!("wrong number of arguments for shmctl {sub}")),
+        Some(other) => Err(format!("unknown shmctl subcommand {other:?}")),
+    }
 }
 
 pub fn run(args: &[String]) -> std::process::ExitCode {

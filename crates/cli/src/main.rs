@@ -248,11 +248,7 @@ fn cmd_doctor() -> ExitCode {
     if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
 }
 
-fn cmd_install(appdir: Option<&String>) -> ExitCode {
-    let Some(appdir) = appdir else {
-        eprintln!("usage: neural-forge-cli install --appdir DIR");
-        return ExitCode::FAILURE;
-    };
+fn cmd_install(appdir: &str) -> ExitCode {
     match neural_forge_supervisor::install::install(std::path::Path::new(appdir)) {
         Ok(report) => {
             println!("Installed Neural Forge. CLI: {}", report.cli_path.display());
@@ -294,11 +290,7 @@ fn cmd_uninstall(purge: bool) -> ExitCode {
     }
 }
 
-fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
-    let Some(dir) = dir else {
-        eprintln!("usage: neural-forge-cli import-binaries DIR");
-        return ExitCode::FAILURE;
-    };
+fn cmd_import_binaries(dir: &str) -> ExitCode {
     let src = std::path::Path::new(dir);
     if !src.is_dir() {
         eprintln!("not a directory: {dir}");
@@ -325,11 +317,7 @@ fn cmd_import_binaries(dir: Option<&String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_extract_model(source: Option<&String>) -> ExitCode {
-    let Some(source) = source else {
-        eprintln!("usage: neural-forge-cli extract-model DIR");
-        return ExitCode::FAILURE;
-    };
+fn cmd_extract_model(source: &str) -> ExitCode {
     let out = neural_forge_supervisor::model::model_dir();
     match neural_forge_supervisor::model::extract(std::path::Path::new(source), std::path::Path::new(&out)) {
         Ok(done) => {
@@ -360,36 +348,207 @@ fn cmd_extract_model(source: Option<&String>) -> ExitCode {
     }
 }
 
+/// A command line, parsed and checked before anything runs.
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Init,
+    Status,
+    Doctor,
+    Config,
+    ImportBinaries(String),
+    ExtractModel(String),
+    Install(String),
+    Uninstall { purge: bool },
+    Shmctl(Vec<String>),
+    Profile(Vec<String>),
+    /// `--help`/`-h`: the whole usage (`None`) or one command's.
+    Help(Option<String>),
+}
+
+/// Why a command line was refused: printed with the matching usage, exit code 2.
+#[derive(Debug, PartialEq, Eq)]
+struct UsageError {
+    command: Option<String>,
+    message: String,
+}
+
+fn is_help(arg: &str) -> bool {
+    matches!(arg, "--help" | "-h" | "help")
+}
+
+/// Parses `args` (without the program name). Every argument must be recognised: a typo such as
+/// `uninstall --purg` is refused rather than ignored, and `<command> --help` only prints help.
+fn parse(args: &[String]) -> Result<Command, UsageError> {
+    let Some(command) = args.first() else {
+        return Err(UsageError { command: None, message: "no command given".into() });
+    };
+    let rest: Vec<&str> = args[1..].iter().map(String::as_str).collect();
+    let err = |message: String| UsageError { command: Some(command.clone()), message };
+    if is_help(command) {
+        return match rest.as_slice() {
+            [] => Ok(Command::Help(None)),
+            [topic] if command_usage(topic).is_some() => Ok(Command::Help(Some((*topic).to_string()))),
+            _ => Err(UsageError { command: None, message: format!("no help for {:?}", rest.join(" ")) }),
+        };
+    }
+    if command_usage(command).is_none() {
+        return Err(UsageError { command: None, message: format!("unknown command: {command}") });
+    }
+    if rest.first().is_some_and(|a| matches!(*a, "--help" | "-h")) || (rest.first() == Some(&"help") && matches!(command.as_str(), "shmctl" | "profile")) {
+        return if rest.len() == 1 { Ok(Command::Help(Some(command.clone()))) } else { Err(err(format!("unexpected argument {:?}", rest[1]))) };
+    }
+    let unexpected = |extra: &[&str]| err(format!("unexpected argument {:?}", extra[0]));
+    let one = |what: &str| match rest.as_slice() {
+        [value] if !value.starts_with('-') => Ok((*value).to_string()),
+        [] => Err(err(format!("{command} takes {what}"))),
+        [value] => Err(err(format!("unknown option {value:?}"))),
+        [_, extra @ ..] => Err(unexpected(extra)),
+    };
+    let none = |cmd: Command| if rest.is_empty() { Ok(cmd) } else { Err(err(format!("unexpected argument {:?}", rest[0]))) };
+    match command.as_str() {
+        "init" => none(Command::Init),
+        "status" => none(Command::Status),
+        "doctor" => none(Command::Doctor),
+        "config" => none(Command::Config),
+        "import-binaries" => one("a directory").map(Command::ImportBinaries),
+        "extract-model" => one("a directory or the DLL").map(Command::ExtractModel),
+        "install" => match rest.as_slice() {
+            ["--appdir", dir] => Ok(Command::Install((*dir).to_string())),
+            ["--appdir"] | [] => Err(err("install takes --appdir DIR".into())),
+            [first, ..] if *first != "--appdir" => Err(err(format!("unknown option {first:?}"))),
+            [_, _, extra @ ..] => Err(unexpected(extra)),
+            _ => Err(err("install takes --appdir DIR".into())),
+        },
+        "uninstall" => match rest.as_slice() {
+            [] => Ok(Command::Uninstall { purge: false }),
+            ["--purge"] => Ok(Command::Uninstall { purge: true }),
+            ["--purge", extra @ ..] => Err(unexpected(extra)),
+            [other, ..] => Err(err(format!("unknown option {other:?}"))),
+        },
+        "shmctl" => shmctl::check_args(&args[1..]).map(|()| Command::Shmctl(args[1..].to_vec())).map_err(err),
+        "profile" => {
+            let ok = match rest.as_slice() {
+                [] | ["list"] => true,
+                ["save" | "load" | "delete", name] => !name.starts_with('-'),
+                _ => false,
+            };
+            if ok { Ok(Command::Profile(args[1..].to_vec())) } else { Err(err(format!("unexpected arguments: {}", rest.join(" ")))) }
+        }
+        _ => unreachable!("command_usage knows every command"),
+    }
+}
+
+/// One command's usage line, `None` for a command that does not exist.
+fn command_usage(command: &str) -> Option<&'static str> {
+    Some(match command {
+        "init" => "usage: neural-forge-cli init\n  create the default config",
+        "status" => "usage: neural-forge-cli status\n  show the config, channel and model",
+        "doctor" => "usage: neural-forge-cli doctor\n  check the config, NVIDIA DLL, model and paths",
+        "config" => "usage: neural-forge-cli config\n  print the effective config",
+        "import-binaries" => "usage: neural-forge-cli import-binaries DIR\n  copy NVIDIA's nvngx_dlssnr.dll from DIR into the user data dir",
+        "extract-model" => "usage: neural-forge-cli extract-model DIR\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL)",
+        "install" => "usage: neural-forge-cli install --appdir DIR\n  install an extracted AppImage AppDir into persistent user storage",
+        "uninstall" => {
+            "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also removes config, data\n  (the DLL, the model), state and /tmp/neural-forge-$UID"
+        }
+        "shmctl" => "",
+        "profile" => "",
+        _ => return None,
+    })
+}
+
+fn print_help(command: Option<&str>) {
+    match command {
+        None => usage(),
+        Some("shmctl") => shmctl::usage(),
+        Some("profile") => profile_usage(),
+        Some(command) => eprintln!("{}", command_usage(command).unwrap_or_default()),
+    }
+}
+
 fn main() -> ExitCode {
     // `args_os`: `args()` panics on an argument that is not valid UTF-8 (a path, say).
-    let args: Vec<String> = std::env::args_os().map(|a| a.to_string_lossy().into_owned()).collect();
-    let Some(command) = args.get(1) else {
-        usage();
-        return ExitCode::FAILURE;
-    };
-
-    match command.as_str() {
-        "init" => cmd_init(),
-        "status" => cmd_status(),
-        "doctor" => cmd_doctor(),
-        "config" => cmd_config(),
-        "import-binaries" => cmd_import_binaries(args.get(2)),
-        "extract-model" => cmd_extract_model(args.get(2)),
-        "install" => {
-            let appdir = args.iter().position(|a| a == "--appdir").and_then(|i| args.get(i + 1));
-            cmd_install(appdir)
+    let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    let command = match parse(&args) {
+        Ok(command) => command,
+        Err(e) => {
+            eprintln!("neural-forge-cli: {}\n", e.message);
+            print_help(e.command.as_deref());
+            return ExitCode::from(2);
         }
-        "uninstall" => cmd_uninstall(args.get(2).map(String::as_str) == Some("--purge")),
-        "shmctl" => shmctl::run(&args[2..]),
-        "profile" => cmd_profile(&args[2..]),
-        "help" | "--help" | "-h" => {
-            usage();
+    };
+    match command {
+        Command::Init => cmd_init(),
+        Command::Status => cmd_status(),
+        Command::Doctor => cmd_doctor(),
+        Command::Config => cmd_config(),
+        Command::ImportBinaries(dir) => cmd_import_binaries(&dir),
+        Command::ExtractModel(source) => cmd_extract_model(&source),
+        Command::Install(appdir) => cmd_install(&appdir),
+        Command::Uninstall { purge } => cmd_uninstall(purge),
+        Command::Shmctl(args) => shmctl::run(&args),
+        Command::Profile(args) => cmd_profile(&args),
+        Command::Help(command) => {
+            print_help(command.as_deref());
             ExitCode::SUCCESS
         }
-        other => {
-            eprintln!("unknown command: {other}");
-            usage();
-            ExitCode::FAILURE
-        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse_str(line: &str) -> Result<Command, UsageError> {
+        parse(&line.split_whitespace().map(String::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn uninstall_help_only_prints_help() {
+        assert_eq!(parse_str("uninstall --help"), Ok(Command::Help(Some("uninstall".into()))));
+        assert_eq!(parse_str("uninstall -h"), Ok(Command::Help(Some("uninstall".into()))));
+        assert_eq!(parse_str("uninstall"), Ok(Command::Uninstall { purge: false }));
+        assert_eq!(parse_str("uninstall --purge"), Ok(Command::Uninstall { purge: true }));
+    }
+
+    #[test]
+    fn a_misspelt_or_extra_argument_is_refused() {
+        let e = parse_str("uninstall --purg").unwrap_err();
+        assert_eq!(e.command.as_deref(), Some("uninstall"));
+        assert!(e.message.contains("--purg"), "{}", e.message);
+        assert!(parse_str("uninstall --purge now").is_err());
+        assert!(parse_str("init now").is_err());
+        assert!(parse_str("status --verbose").is_err());
+        assert!(parse_str("import-binaries a b").is_err());
+        assert!(parse_str("import-binaries").is_err());
+        assert!(parse_str("install --appdir a b").is_err());
+        assert!(parse_str("install --app a").is_err());
+        assert!(parse_str("profile save").is_err());
+        assert!(parse_str("profile save a b").is_err());
+        assert!(parse_str("shmctl set intensity").is_err());
+        assert!(parse_str("shmctl status now").is_err());
+        assert!(parse_str("bogus").is_err());
+        assert!(parse_str("").is_err());
+    }
+
+    #[test]
+    fn init_help_and_the_other_help_forms() {
+        assert_eq!(parse_str("init --help"), Ok(Command::Help(Some("init".into()))));
+        assert_eq!(parse_str("--help"), Ok(Command::Help(None)));
+        assert_eq!(parse_str("help install"), Ok(Command::Help(Some("install".into()))));
+        assert_eq!(parse_str("shmctl help"), Ok(Command::Help(Some("shmctl".into()))));
+        assert_eq!(parse_str("profile --help"), Ok(Command::Help(Some("profile".into()))));
+        assert!(parse_str("init --help extra").is_err());
+    }
+
+    #[test]
+    fn well_formed_commands_parse() {
+        assert_eq!(parse_str("init"), Ok(Command::Init));
+        assert_eq!(parse_str("install --appdir /x"), Ok(Command::Install("/x".into())));
+        assert_eq!(parse_str("extract-model /d"), Ok(Command::ExtractModel("/d".into())));
+        assert_eq!(parse_str("profile load gta"), Ok(Command::Profile(vec!["load".into(), "gta".into()])));
+        assert_eq!(parse_str("profile"), Ok(Command::Profile(vec![])));
+        assert_eq!(parse_str("shmctl set intensity 0.5"), Ok(Command::Shmctl(vec!["set".into(), "intensity".into(), "0.5".into()])));
+        assert_eq!(parse_str("shmctl capture --frames 3"), Ok(Command::Shmctl(vec!["capture".into(), "--frames".into(), "3".into()])));
     }
 }
