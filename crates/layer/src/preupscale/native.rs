@@ -888,6 +888,13 @@ pub(crate) fn format_of(target: &Target) -> (u32, u32) {
 }
 
 
+/// The motion vectors the capture copies into the native pass this frame, by the capture's own rule
+/// (`super::capture_reads`): readable, in a layout a copy can read from. The history is only enabled
+/// with them; one in `UNDEFINED` is not copied, and the history would reproject with stale vectors.
+fn copied_mvec(mvec: Option<super::Aux>) -> Option<super::Aux> {
+    mvec.filter(|a| a.readable && super::aux_copy_layout(a.layout).is_some())
+}
+
 /// One native hold (module docs): the capture with the motion-vector copy, the network, the write-back,
 /// submitted on the game's queue through `submit` with no wait in between. The previous hold's work
 /// is waited for (bounded) first, as every hold does. Frames the network is not ready for go to DLSS
@@ -1005,7 +1012,7 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     }
     // The history needs DLSS's motion vectors copied this frame.
-    let mvec = target.mvec.filter(|a| a.readable && a.layout.is_some());
+    let mvec = copied_mvec(target.mvec);
     let hdr_pass = res.hdr.as_ref();
     // SAFETY: the capture buffer is idle; the colour view was bound above.
     if unsafe { super::record_capture(device, res, target, None, hdr_pass, mvec.map(|_| native.mvec.buffer)) }.is_err() {
@@ -1076,6 +1083,18 @@ mod tests {
         assert_eq!(model_source(&source(",\n    \"verified\": true")), "build 310.9.1.0, verified");
         assert_eq!(model_source(&source("")), "build 310.9.1.0, verified");
         assert_eq!(model_source(""), "build unknown, verified");
+    }
+
+    #[test]
+    fn the_history_needs_motion_vectors_the_capture_copies() {
+        let aux = |layout, readable| Some(super::super::Aux { image: vk::Image::null(), format: vk::Format::R16G16_SFLOAT, layout, readable });
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::UNDEFINED), true)).is_none(), "UNDEFINED is not copied");
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::PREINITIALIZED), true)).is_none(), "PREINITIALIZED is not copied");
+        assert!(copied_mvec(aux(None, true)).is_none(), "no barrier seen");
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::GENERAL), false)).is_none(), "not readable");
+        assert!(copied_mvec(None).is_none());
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::GENERAL), true)).is_some());
+        assert!(copied_mvec(aux(Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), true)).is_some(), "transitioned for the copy");
     }
 
     const W: u32 = 20;
