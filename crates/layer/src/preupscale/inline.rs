@@ -322,10 +322,12 @@ impl Inline {
             .exposure_input
             .filter(|a| a.readable && a.format == vk::Format::R16_SFLOAT && matches!(a.layout, Some(vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL)))
             .map(|a| (a.image, a.layout.unwrap_or(vk::ImageLayout::GENERAL)));
-        // DLSS's motion vectors, copied beside it for the native backend's history.
+        // DLSS's motion vectors, copied beside it for the native backend's history: at the colour
+        // input's extent, or larger (high-resolution ones) and blitted down to it.
         let mvec = point
             .mvec_input
             .filter(|a| a.readable && slot.mvec != vk::Image::null())
+            .filter(|_| point.mvec_extent.0 >= extent.0 && point.mvec_extent.1 >= extent.1)
             .and_then(|a| a.layout.map(|layout| (a.image, layout)));
         // SAFETY: recording into the application's buffer, which it is recording on this thread
         // right now (the hook is inside its `vkCmdCuLaunchKernelNVX`); every handle is live.
@@ -337,13 +339,15 @@ impl Inline {
                 slot.image,
                 extent,
                 exposure.map(|(image, layout)| (image, layout, slot.exposure)),
-                mvec.map(|(image, layout)| (image, layout, slot.mvec)),
+                mvec.map(|(image, layout)| (image, layout, slot.mvec, point.mvec_extent)),
                 slot.captured,
                 slot.release,
             )
         };
         slot.point = Some(InlinePoint {
             exposure_input: exposure.map(|_| Aux { image: slot.exposure, format: vk::Format::R16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
+            // The copy is at the colour input's extent; the source's extent stays (the vectors' unit,
+            // `InlinePoint::mvec_scale`).
             mvec_input: mvec.map(|_| Aux { image: slot.mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
             ..point
         });
@@ -360,7 +364,8 @@ impl Inline {
             if convert { ", blitted to and from RGBA16F" } else { "" },
             point.hazard,
             match (mvec, point.mvec_input) {
-                (Some((_, layout)), _) => format!("copied from {layout:?}"),
+                (Some((_, layout)), _) if point.mvec_extent == extent => format!("copied from {layout:?}"),
+                (Some((_, layout)), _) => format!("resampled from {}x{} in {layout:?}", point.mvec_extent.0, point.mvec_extent.1),
                 (None, Some(a)) => format!("not copied ({:?} in {:?}, readable {})", a.format, a.layout, a.readable),
                 (None, None) => "not known".to_string(),
             }
@@ -607,8 +612,8 @@ fn wait_set(device: &ash::Device, event: vk::Event, deadline: Duration, stopping
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_hold(
     d: &ash::Device, cb: vk::CommandBuffer, (colour, layout, convert): (vk::Image, vk::ImageLayout, bool), staging: vk::Image, extent: (u32, u32),
-    exposure: Option<(vk::Image, vk::ImageLayout, vk::Image)>, mvec: Option<(vk::Image, vk::ImageLayout, vk::Image)>, captured: vk::Event,
-    release: vk::Event,
+    exposure: Option<(vk::Image, vk::ImageLayout, vk::Image)>, mvec: Option<(vk::Image, vk::ImageLayout, vk::Image, (u32, u32))>,
+    captured: vk::Event, release: vk::Event,
 ) {
     let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
     let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
@@ -650,13 +655,15 @@ unsafe fn record_hold(
     if !general {
         to_read.push(image_barrier(colour, layout, read_layout, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ));
     }
-    // DLSS's motion vectors into the slot's own (`mvec`: source, its layout, the slot's image), read
-    // in place when readable there, else moved to TRANSFER_SRC_OPTIMAL and back after the copy.
-    let mvec_moved = mvec.filter(|(_, l, _)| !matches!(*l, vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
-    to_read.extend(mvec.map(|(_, _, own)| image_barrier(own, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)));
-    to_read.extend(mvec_moved.map(|(source, l, _)| image_barrier(source, l, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ)));
+    // DLSS's motion vectors into the slot's own (`mvec`: source, its layout, the slot's image, the
+    // source's extent), read in place when readable there, else moved to TRANSFER_SRC_OPTIMAL and back
+    // after the copy. High-resolution ones (larger than the colour input) are blitted down to it,
+    // NEAREST: each render pixel takes one of the vectors it covers, never an average across an edge.
+    let mvec_moved = mvec.filter(|(_, l, _, _)| !matches!(*l, vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
+    to_read.extend(mvec.map(|(_, _, own, _)| image_barrier(own, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE)));
+    to_read.extend(mvec_moved.map(|(source, l, _, _)| image_barrier(source, l, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ)));
     let mvec_back: Vec<vk::ImageMemoryBarrier> = mvec_moved
-        .map(|(source, l, _)| image_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, l, vk::AccessFlags::empty(), vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE))
+        .map(|(source, l, _, _)| image_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, l, vk::AccessFlags::empty(), vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE))
         .into_iter()
         .collect();
     let exposure_region = vk::ImageCopy { extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..region };
@@ -688,9 +695,19 @@ unsafe fn record_hold(
         if let Some((source, source_layout, own)) = exposure {
             d.cmd_copy_image(cb, source, source_layout, own, vk::ImageLayout::GENERAL, &[exposure_region]);
         }
-        if let Some((source, source_layout, own)) = mvec {
+        if let Some((source, source_layout, own, (sw, sh))) = mvec {
             let from = if mvec_moved.is_some() { vk::ImageLayout::TRANSFER_SRC_OPTIMAL } else { source_layout };
-            d.cmd_copy_image(cb, source, from, own, vk::ImageLayout::GENERAL, &[region]);
+            if (sw, sh) == extent {
+                d.cmd_copy_image(cb, source, from, own, vk::ImageLayout::GENERAL, &[region]);
+            } else {
+                let down = vk::ImageBlit {
+                    src_subresource: layers,
+                    src_offsets: [vk::Offset3D::default(), vk::Offset3D { x: sw as i32, y: sh as i32, z: 1 }],
+                    dst_subresource: layers,
+                    dst_offsets: [vk::Offset3D::default(), far],
+                };
+                d.cmd_blit_image(cb, source, from, own, vk::ImageLayout::GENERAL, &[down], vk::Filter::NEAREST);
+            }
         }
         d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[published], &[], &mvec_back);
         d.cmd_set_event(cb, captured, vk::PipelineStageFlags::TRANSFER);
@@ -786,6 +803,7 @@ mod tests {
             layout: vk::ImageLayout::GENERAL,
             exposure_input: None,
             mvec_input: None,
+            mvec_extent: (w, h),
             identification: 0,
             hazard: Hazard::MemoryBarrier,
         };
@@ -902,6 +920,7 @@ mod tests {
                 layout: vk::ImageLayout::GENERAL,
                 exposure_input: None,
                 mvec_input: None,
+                mvec_extent: (w, h),
                 identification: 0,
                 hazard: Hazard::MemoryBarrier,
             };
@@ -966,13 +985,58 @@ mod mvec_tests {
     /// input, the job carries that copy, and the source is left as it was.
     #[test]
     fn the_motion_vectors_are_copied_beside_the_colour_input() {
-        let Some((_entry, instance, physical_device, device, queue, family)) = crate::composition::gpu::test_device() else { return };
+        let Some((copy, source)) = copy_case(1) else { return };
+        for (x, y, t) in texels(&copy, 32) {
+            assert_eq!(t, [x, y], "the copy at ({x}, {y})");
+        }
+        for (x, y, t) in texels(&source, 32) {
+            assert_eq!(t, [x, y], "DLSS's image at ({x}, {y}), after the hold");
+        }
+    }
+
+    /// High-resolution motion vectors (the output's extent, the `mvhi` input kernels; Hogwarts Legacy):
+    /// resampled to the colour input's extent, each render pixel taking the vector nearest its centre,
+    /// and the source is left as it was.
+    #[test]
+    fn high_resolution_motion_vectors_are_resampled_to_the_colour_input() {
+        let Some((copy, source)) = copy_case(2) else { return };
+        for (x, y, t) in texels(&copy, 32) {
+            assert_eq!(t, [2.0 * x + 1.0, 2.0 * y + 1.0], "the copy at ({x}, {y})");
+        }
+        for (x, y, t) in texels(&source, 64) {
+            assert_eq!(t, [x, y], "DLSS's image at ({x}, {y}), after the hold");
+        }
+    }
+
+    /// A whole number below 2048 as half-float bits (exact).
+    fn half(v: u32) -> u16 {
+        if v == 0 {
+            return 0;
+        }
+        let e = 31 - v.leading_zeros();
+        (((e + 15) << 10) | ((v << (10 - e)) & 0x3ff)) as u16
+    }
+
+    /// Each texel of an RG16F readback `width` wide, with its position.
+    fn texels(bits: &[u16], width: usize) -> Vec<(f32, f32, [f32; 2])> {
+        bits.chunks_exact(2)
+            .enumerate()
+            .map(|(i, t)| ((i % width) as f32, (i / width) as f32, [crate::preupscale::f16_to_f32(t[0]), crate::preupscale::f16_to_f32(t[1])]))
+            .collect()
+    }
+
+    /// One hold over a 32x16 colour input whose motion vectors are `scale` times its extent, each
+    /// texel holding its own position: the slot's copy and DLSS's image as read back afterwards (RG16F
+    /// bits). `None` without a test device.
+    fn copy_case(scale: u32) -> Option<(Vec<u16>, Vec<u16>)> {
+        let (_entry, instance, physical_device, device, queue, family) = crate::composition::gpu::test_device()?;
         let device = Arc::new(device);
         let (w, h) = (32u32, 16u32);
+        let (mw, mh) = (w * scale, h * scale);
         // SAFETY: test-only setup on a live device; every handle is destroyed at the end.
         unsafe {
             let props = instance.get_physical_device_memory_properties(physical_device);
-            let image = |format, usage| {
+            let image = |format, usage, (w, h): (u32, u32)| {
                 let info = vk::ImageCreateInfo::builder()
                     .image_type(vk::ImageType::TYPE_2D)
                     .format(format)
@@ -991,11 +1055,13 @@ mod mvec_tests {
                 (image, memory)
             };
             let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE;
-            let (colour, colour_memory) = image(vk::Format::R16G16B16A16_SFLOAT, usage);
+            let (colour, colour_memory) = image(vk::Format::R16G16B16A16_SFLOAT, usage, (w, h));
             let mvec_usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::SAMPLED;
-            let (mvec, mvec_memory) = image(vk::Format::R16G16_SFLOAT, mvec_usage);
-            let bytes = u64::from(w * h * 4);
-            let readback = device.create_buffer(&vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_DST), None).unwrap();
+            let (mvec, mvec_memory) = image(vk::Format::R16G16_SFLOAT, mvec_usage, (mw, mh));
+            let bytes = u64::from(mw * mh * 4);
+            let readback = device
+                .create_buffer(&vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC), None)
+                .unwrap();
             let breqs = device.get_buffer_memory_requirements(readback);
             let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
             let bindex = (0..props.memory_type_count)
@@ -1032,7 +1098,21 @@ mod mvec_tests {
                 barrier(mvec, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL),
             ]);
             device.cmd_clear_color_image(cb, colour, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [1.0, 0.5, 0.25, 1.0] }, &[range]);
-            device.cmd_clear_color_image(cb, mvec, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: [3.5, -0.25, 0.0, 0.0] }, &[range]);
+            // Each motion-vector texel holds its own position, uploaded through the readback buffer.
+            let ptr = device.map_memory(bmemory, 0, bytes, vk::MemoryMapFlags::empty()).unwrap().cast::<u16>();
+            for y in 0..mh {
+                for x in 0..mw {
+                    let i = ((y * mw + x) * 2) as usize;
+                    *ptr.add(i) = half(x);
+                    *ptr.add(i + 1) = half(y);
+                }
+            }
+            let whole = |w, h| vk::BufferImageCopy {
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                image_extent: vk::Extent3D { width: w, height: h, depth: 1 },
+                ..Default::default()
+            };
+            device.cmd_copy_buffer_to_image(cb, readback, mvec, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[whole(mw, mh)]);
             device.cmd_pipeline_barrier(cb, all, all, vk::DependencyFlags::empty(), &[], &[], &[barrier(mvec, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)]);
             let point = InlinePoint {
                 colour,
@@ -1040,6 +1120,7 @@ mod mvec_tests {
                 layout: vk::ImageLayout::GENERAL,
                 exposure_input: None,
                 mvec_input: Some(Aux { image: mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), readable: true }),
+                mvec_extent: (mw, mh),
                 identification: 0,
                 hazard: Hazard::MemoryBarrier,
             };
@@ -1055,23 +1136,17 @@ mod mvec_tests {
             inline.dispatch(jobs);
             device.queue_wait_idle(queue).unwrap();
 
-            // The copy, and DLSS's own image (back in SHADER_READ_ONLY_OPTIMAL), both hold the vectors.
-            let ptr = device.map_memory(bmemory, 0, bytes, vk::MemoryMapFlags::empty()).unwrap().cast::<u16>();
-            let region = vk::BufferImageCopy {
-                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
-                image_extent: vk::Extent3D { width: w, height: h, depth: 1 },
-                ..Default::default()
-            };
-            for (source, layout, what) in [(copy.image, vk::ImageLayout::GENERAL, "the copy"), (mvec, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, "DLSS's image")] {
+            // The copy, and DLSS's own image (back in SHADER_READ_ONLY_OPTIMAL), read back.
+            let mut out = Vec::new();
+            for (source, layout, (rw, rh)) in [(copy.image, vk::ImageLayout::GENERAL, (w, h)), (mvec, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, (mw, mh))] {
                 std::ptr::write_bytes(ptr, 0, (bytes / 2) as usize);
                 device.begin_command_buffer(read, &begin).unwrap();
                 device.cmd_pipeline_barrier(read, all, all, vk::DependencyFlags::empty(), &[], &[], &[barrier(source, layout, vk::ImageLayout::TRANSFER_SRC_OPTIMAL)]);
-                device.cmd_copy_image_to_buffer(read, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, readback, &[region]);
+                device.cmd_copy_image_to_buffer(read, source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, readback, &[whole(rw, rh)]);
                 device.end_command_buffer(read).unwrap();
                 device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[read]).build()], vk::Fence::null()).unwrap();
                 device.queue_wait_idle(queue).unwrap();
-                let texels = std::slice::from_raw_parts(ptr, (w * h * 2) as usize);
-                assert!(texels.chunks_exact(2).all(|t| t == [0x4300, 0xb400]), "{what} does not hold the motion vectors (3.5, -0.25)");
+                out.push(std::slice::from_raw_parts(ptr, (rw * rh * 2) as usize).to_vec());
             }
 
             destroy(device.handle());
@@ -1083,6 +1158,8 @@ mod mvec_tests {
                 device.destroy_image(i, None);
                 device.free_memory(m, None);
             }
+            let source = out.pop()?;
+            Some((out.pop()?, source))
         }
     }
 }
@@ -1170,6 +1247,7 @@ mod convert_tests {
                         layout: vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL,
                         exposure_input: None,
                         mvec_input: None,
+                        mvec_extent: (w, h),
                         identification: 0,
                         hazard: Hazard::NotSplittable,
                     };

@@ -765,8 +765,9 @@ fn inline_hold(
         width: extent.0,
         height: extent.1,
         depth: None,
-        // The copy the buffer made beside the colour input (the native backend's history).
-        mvec: job.point.mvec_input.filter(|_| native),
+        // The copy the buffer made beside the colour input (the native backend's history, and a dump's).
+        mvec: job.point.mvec_input.filter(|_| native || dump),
+        mvec_scale: job.point.mvec_scale(),
         exposure: [None; crate::preupscale::MAX_EXPOSURE],
         exposure_input: job.exposure.filter(|_| session.game_exposure_trusted(job.point.identification)),
         paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
@@ -1324,6 +1325,8 @@ impl NeuralForgeDeviceInfo {
             depth: Some(aux(inputs.depth, scan.depth_layout)),
             // The dump's buffer and file are RG16F (4 bytes a texel): RG32F motion vectors are not read.
             mvec: Some(aux(inputs.mvec, scan.mvec_layout)).map(|a| crate::preupscale::Aux { readable: a.readable && a.format == vk::Format::R16G16_SFLOAT, ..a }),
+            // Read only at the colour input's extent (`aux`): in its pixels.
+            mvec_scale: [1.0, 1.0],
             // The 1x1 candidates: read in their committed layout, or as GENERAL (assumed, flagged in
             // exposure.json) when no barrier on a storage image was seen.
             exposure: std::array::from_fn(|k| {

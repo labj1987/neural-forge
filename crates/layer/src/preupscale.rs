@@ -1061,6 +1061,13 @@ pub(crate) struct Tracker {
     /// buffer that reads one of them carries. A launch counts as someone else's only when it names
     /// a registered view and none of them is the colour input.
     keys: Vec<(u64, vk::ImageView, vk::Image)>,
+    /// The motion vectors DLSS's most recently recorded input launch named. The hold copies the
+    /// identified ones only while they are these: when a game switches DLSS to new images (Hogwarts
+    /// Legacy loading a save), launches name the new ones before the identification follows, and the
+    /// old ones, which DLSS no longer reads, may already be on their way out; reading them then made
+    /// the GPU hang (Xid 109) on about half of all loads (docs/PRE_UPSCALER_DESIGN.md,
+    /// "High-resolution motion vectors").
+    current_mvec: Option<vk::Image>,
     /// Launch-bearing submits whose buffers all had readable parameters none of which named the
     /// colour input (DLSS Frame Generation's, in GTA V), forwarded untouched.
     pub(crate) foreign_submits: u64,
@@ -1335,8 +1342,26 @@ pub(crate) struct InlinePoint {
     pub exposure_input: Option<Aux>,
     /// DLSS's motion vectors at the hold (the native backend's history), where they can be copied.
     pub mvec_input: Option<Aux>,
+    /// Their extent: the colour input's, or the output's where DLSS is given high-resolution motion
+    /// vectors (the `mvhi` input kernels; Hogwarts Legacy), which the copy resamples to the colour
+    /// input's ([`Self::mvec_scale`]).
+    pub mvec_extent: (u32, u32),
     pub identification: u64,
     pub hazard: Hazard,
+}
+
+impl InlinePoint {
+    /// What turns DLSS's motion vectors into the colour input's pixels, per axis: they are in the
+    /// pixels of their own image (measured on Hogwarts Legacy's 2560x1440 ones: consecutive frames
+    /// line up at 0.667 of their value, 1708 over 2560), so 1 at the colour input's extent and the
+    /// colour input's over theirs for high-resolution ones.
+    pub(crate) fn mvec_scale(&self) -> [f32; 2] {
+        let (w, h) = self.mvec_extent;
+        if w == 0 || h == 0 {
+            return [1.0, 1.0];
+        }
+        [self.desc.width as f32 / w as f32, self.desc.height as f32 / h as f32]
+    }
 }
 
 /// How a launch-bearing command buffer is treated at the submit.
@@ -1597,6 +1622,9 @@ impl Tracker {
         } else if refs.input.is_none() {
             fresh_input = true;
             refs.input = input_launch(&self.images, &named);
+            if let Some(InputLaunch::Inputs { mvec, .. }) = refs.input {
+                self.current_mvec = Some(mvec);
+            }
             if refs.input.is_some() {
                 refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
                 refs.input_rr = kernel == Some(Kernel::RayReconstruction);
@@ -1812,7 +1840,7 @@ impl Tracker {
         };
         // The inputs are refreshed on the next submit, not when an image is destroyed: an exposure
         // input or motion vectors destroyed since are not copied from.
-        let exposure_input = inputs.exposure_input.filter(|(image, _)| self.images.contains_key(image)).map(|(image, d)| {
+        let exposure_input = inputs.exposure_input.and_then(|(image, _)| self.images.get(&image).map(|d| (image, *d))).map(|(image, d)| {
             let layout = self
                 .pending
                 .get(&cb)
@@ -1822,9 +1850,11 @@ impl Tracker {
             Aux { image, format: d.format, layout, readable: d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (d.width, d.height) == (1, 1) }
         });
         // DLSS's motion vectors, copied beside the colour input for the native backend's history: RG16F
-        // at the colour input's extent, in a layout known here (or GENERAL for a storage image).
-        let mvec_input = self.images.contains_key(&inputs.mvec.0).then(|| {
-            let (image, d) = inputs.mvec;
+        // at the colour input's extent or larger (high-resolution motion vectors, resampled to it), in
+        // a layout known here (or GENERAL for a storage image).
+        let live_mvec = self.images.get(&inputs.mvec.0).copied().filter(|_| self.current_mvec == Some(inputs.mvec.0));
+        let mvec_input = live_mvec.map(|d| {
+            let image = inputs.mvec.0;
             let layout = self
                 .pending
                 .get(&cb)
@@ -1834,11 +1864,13 @@ impl Tracker {
                 .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL));
             let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
                 && d.format == vk::Format::R16G16_SFLOAT
-                && (d.width, d.height) == (desc.width, desc.height)
+                && d.width >= desc.width
+                && d.height >= desc.height
                 && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
             Aux { image, format: d.format, layout, readable }
         });
-        Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, identification: self.generation, hazard })
+        let mvec_extent = live_mvec.map_or((0, 0), |d| (d.width, d.height));
+        Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, mvec_extent, identification: self.generation, hazard })
     }
 
     /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
@@ -3657,6 +3689,9 @@ pub(crate) struct Target {
     pub height: u32,
     pub depth: Option<Aux>,
     pub mvec: Option<Aux>,
+    /// What turns `mvec`'s values into this colour input's pixels, per axis ([`InlinePoint::mvec_scale`]):
+    /// the native backend's reprojection multiplies by it, a dump records it.
+    pub mvec_scale: [f32; 2],
     /// The 1x1 exposure candidates, read in dump mode, each with whether its layout is assumed
     /// (no barrier on it was seen: a storage image is then read as `GENERAL`, the layout
     /// vkd3d-proton keeps those in).
@@ -3779,6 +3814,8 @@ pub(crate) struct DumpFrame {
     pub colour: Vec<u8>,
     pub depth: Option<(Vec<u8>, vk::Format)>,
     pub mvec: Option<Vec<u8>>,
+    /// `mvec`'s values times this are the colour input's pixels ([`Target::mvec_scale`]).
+    pub mvec_scale: [f32; 2],
     pub frame: u64,
     /// The 1x1 exposure candidates, read or not.
     pub exposure: Vec<ExposureValue>,
@@ -4185,6 +4222,7 @@ pub(crate) unsafe fn run_hold(
                         (read(&b.depth, 0, target.width as usize * target.height as usize * depth_texel_bytes(format) as usize), format)
                     }),
                     mvec: res.dump.as_ref().filter(|_| was_read(DumpPart::Mvec)).map(|b| read(&b.mvec, 0, n)),
+                    mvec_scale: target.mvec_scale,
                     frame,
                     exposure: target
                         .exposure
@@ -4305,12 +4343,14 @@ impl DumpFrame {
         let meta = format!(
             "{{\n  \"width\": {},\n  \"height\": {},\n  \"format\": \"R16G16B16A16_SFLOAT\",\n  \"padded_width\": {pw},\n  \"padded_height\": {ph},\n  \
              \"colour\": \"colour.rgba16f (padded_width x padded_height, little-endian half floats, scene-linear)\",\n  \
-             \"depth\": {},\n  \"depth_format\": \"{}\",\n  \"mvec\": {},\n  \"mvec_format\": \"R16G16_SFLOAT\",\n  \"frame\": {}\n}}\n",
+             \"depth\": {},\n  \"depth_format\": \"{}\",\n  \"mvec\": {},\n  \"mvec_format\": \"R16G16_SFLOAT\",\n  \"mvec_scale\": [{}, {}],\n  \"frame\": {}\n}}\n",
             self.width,
             self.height,
             depth_name.as_ref().map_or_else(|| "null".to_string(), |(n, ..)| format!("\"{n}\"")),
             depth_name.as_ref().map_or_else(|| "none".to_string(), |(.., f)| format!("{f:?}")),
             if self.mvec.is_some() { "\"mvec.rg16f\"" } else { "null" },
+            self.mvec_scale[0],
+            self.mvec_scale[1],
             self.frame
         );
         std::fs::write(dir.join("meta.json"), meta)?;
@@ -5995,6 +6035,59 @@ mod tests {
         assert!(t.inline_point(b, c).is_none());
     }
 
+    /// Motion vectors are in their own image's pixels: at the colour input's extent they are its pixels,
+    /// high-resolution ones (Hogwarts Legacy's 2560x1440 for a 1708x964 colour input) scale down by the
+    /// ratio of the extents, per axis; none known is a scale of 1.
+    #[test]
+    fn motion_vectors_scale_by_the_colour_input_over_their_extent() {
+        let point = |mvec_extent| InlinePoint {
+            colour: vk::Image::null(),
+            desc: ImageDesc { width: 1708, height: 964, format: vk::Format::R16G16B16A16_SFLOAT, usage: vk::ImageUsageFlags::STORAGE, plain: true },
+            layout: vk::ImageLayout::GENERAL,
+            exposure_input: None,
+            mvec_input: None,
+            mvec_extent,
+            identification: 1,
+            hazard: Hazard::MemoryBarrier,
+        };
+        assert_eq!(point((1708, 964)).mvec_scale(), [1.0, 1.0]);
+        assert_eq!(point((2560, 1440)).mvec_scale(), [1708.0 / 2560.0, 964.0 / 1440.0]);
+        assert_eq!(point((0, 0)).mvec_scale(), [1.0, 1.0]);
+    }
+
+    /// The hold copies the identified motion vectors only while DLSS's latest input launch names them:
+    /// a game switching DLSS to new images (Hogwarts Legacy loading a save) names the new ones in its
+    /// launches before the identification follows, and the old ones, which DLSS no longer reads, are
+    /// not touched again (reading them hung the GPU on about half of all loads).
+    #[test]
+    fn motion_vectors_dlss_no_longer_reads_are_not_copied() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        let mvec = |t: &mut Tracker, b: vk::CommandBuffer, params: &[u8]| {
+            t.global(b, Hazard::MemoryBarrier);
+            t.launch(b, Some(params));
+            let (b, c) = t.take_inline_at().expect("first colour launch");
+            t.inline_point(b, c).expect("held inside the buffer").mvec_input.map(|a| a.image)
+        };
+        assert_eq!(mvec(&mut t, cb(2), &params), Some(vk::Image::from_raw(0x300)));
+        // New motion vectors of the same kind, named by the next input launch.
+        let info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
+            format: vk::Format::R16G16_SFLOAT,
+            usage: copyable,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        t.record_image(vk::Image::from_raw(0x400), &info);
+        t.record_view(vk::ImageView::from_raw(0x401), vk::Image::from_raw(0x400));
+        t.register(vk::ImageView::from_raw(0x401), Some(0x1400));
+        let switched = param_block(&[0x1100, 0x1200, 0x1400]);
+        assert_eq!(mvec(&mut t, cb(3), &switched), None, "the old ones, while the identification has not followed");
+        // Back on the identified ones: copied again.
+        assert_eq!(mvec(&mut t, cb(4), &params), Some(vk::Image::from_raw(0x300)));
+    }
+
     /// An implausible game exposure (Wukong's DLSS-internal 1x1 read 59,456) stops that
     /// identification from using the game's exposure image; plausible ones (GTA V's 0.22, Cyberpunk's
     /// 3.3) never do, and a measured exposure is not judged.
@@ -7380,13 +7473,14 @@ mod tests {
             colour,
             depth: Some((vec![0u8; 12], vk::Format::D32_SFLOAT_S8_UINT)),
             mvec: Some(vec![0u8; 12]),
+            mvec_scale: [0.5, 0.75],
             frame: 42,
             exposure: Vec::new(),
         };
         let files = frame.write(&dir).unwrap();
         assert_eq!(files, vec!["colour.rgba16f", "depth.r32f", "mvec.rg16f", "colour-preview.png", "meta.json"], "no exposure.json without candidates");
         let meta = std::fs::read_to_string(dir.join("meta.json")).unwrap();
-        for needle in ["\"width\": 3", "\"height\": 1", "\"padded_width\": 4", "\"padded_height\": 2", "\"frame\": 42", "D32_SFLOAT_S8_UINT"] {
+        for needle in ["\"width\": 3", "\"height\": 1", "\"padded_width\": 4", "\"padded_height\": 2", "\"frame\": 42", "D32_SFLOAT_S8_UINT", "\"mvec_scale\": [0.5, 0.75]"] {
             assert!(meta.contains(needle), "{needle} in {meta}");
         }
         let rgba32: Vec<u8> = [0.5f32, 2.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
@@ -7820,7 +7914,7 @@ mod tests {
             let shm = scratch_shm(if import { "rt-import" } else { "rt-staged" });
             let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
             let white = 2.5;
-            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
+            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
             let (device, queue) = (&gpu.device, gpu.queue);
             let mut submits = Vec::new();
             let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
@@ -7928,6 +8022,7 @@ mod tests {
                 height: h,
                 depth: None,
                 mvec: None,
+                mvec_scale: [1.0, 1.0],
                 exposure: [None; MAX_EXPOSURE],
                 exposure_input: job.exposure,
                 paper_white: 2.5,
@@ -7956,6 +8051,7 @@ mod tests {
                 layout: vk::ImageLayout::GENERAL,
                 exposure_input: exposure_aux(exposure),
                 mvec_input: None,
+                mvec_extent: (w, h),
                 identification: 1,
                 hazard: Hazard::MemoryBarrier,
             };
@@ -8014,7 +8110,7 @@ mod tests {
             submits.push(which);
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
         };
-        let base = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification: 1 };
+        let base = Target { colour: image, width: w, height: h, depth: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification: 1 };
         {
             let target = Target { exposure_input: exposure_aux(zero), ..base };
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
@@ -8187,7 +8283,7 @@ mod tests {
 
     /// Runs one auto-exposure hold (roundtrip mode, no exposure image) on `texels` and returns it.
     fn auto_hold(gpu: &Gpu, res: &mut Resources, image: vk::Image, w: u32, h: u32, identification: u64) -> HoldResult {
-        let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification };
+        let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification };
         let (device, queue) = (&gpu.device, gpu.queue);
         let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
@@ -8402,6 +8498,7 @@ mod tests {
             height: h,
             depth: Some(Aux { image: depth, format: depth_format, layout: Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL), readable: true }),
             mvec: Some(Aux { image: mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
+            mvec_scale: [1.0, 1.0],
             exposure: [
                 Some((Aux { image: exp32, format: vk::Format::R32G32B32A32_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }, true)),
                 Some((Aux { image: exp16, format: vk::Format::R16_SFLOAT, layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), readable: true }, false)),

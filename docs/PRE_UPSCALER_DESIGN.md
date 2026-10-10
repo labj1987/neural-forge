@@ -2108,3 +2108,88 @@ Revert checks (each change reverted alone, the named tests fail; all tests pass 
 - **Cyberpunk 2077 with RR on** should get the RR line, if its RR kernels have the names above
   (not checked); with RR off and no exposure image it may now hold with the auto-exposure where it
   ran the post path before.
+
+## High-resolution motion vectors (Hogwarts Legacy, 2026-10-10)
+
+Hogwarts Legacy gives DLSS its motion vectors at the output's extent: a 2560x1440 RG16F image for a
+1708x964 colour input (the `mvhi` input kernels, `cuda_engine_input_kernel_rel_hdr_mvdiff_mvhi`).
+The hold copied motion vectors only at the colour input's extent, so the native backend ran there
+with no history at all.
+
+### The copy and the unit
+
+- **Blitted down, NEAREST.** Motion vectors larger than the colour input (both axes) are blitted
+  into the slot's image at the colour input's extent: each render pixel takes the vector under its
+  centre, never an average across an object's edge. At the colour input's extent they are copied as
+  before.
+- **In their own image's pixels.** Measured with `mvfit.py` on consecutive dumps while the camera
+  panned (median motion 15 px; a still scene, 0.04-0.28 px, could not tell any scale apart): the
+  previous frame lines up best at 0.667 times the vectors' value, the colour input's 1708 over 2560.
+  Warp error (mean absolute log2 luminance, best offset) over three pairs:
+
+  | scale | 0 | 0.5 | 0.667 | 0.75 | 1 | 1.25 | 1.5 |
+  |---|---|---|---|---|---|---|---|
+  | error | 0.41 | 0.24-0.29 | **0.120-0.129** | 0.17-0.19 | 0.33-0.34 | 0.41 | 0.46 |
+
+  So the blit keeps DLSS's values and the scale travels with them: `InlinePoint::mvec_scale` (the
+  colour input's extent over theirs, per axis; 1 at the same extent), `Target::mvec_scale`, the
+  native frame's `Params.more.yz`, by which `native_preprocess.comp` and `native_composite.comp`
+  multiply the vectors before reprojecting. A dump keeps the vectors as DLSS gave them and records
+  the scale (`mvec_scale` in `meta.json`).
+
+### The hang, and what caused it
+
+The first build (blit, `a7a5167`) made the GPU hang (Xid 109) a few seconds after a save loaded, on
+about half of all loads; 3.1.4, which did not read them, loaded cleanly. Every way of reading the
+image hung alike: `vkCmdCopyImage`, `vkCmdBlitImage`, a CUDA kernel of the layer's own launched with
+`VK_NVX_binary_import` through a storage view, and the same kernel fetching with `tex.base` through
+DLSS's own sampled handle. Clearing the slot's image instead of reading, or reading only at the
+title screen, never hung; nor did destroy waits, keeping the old image alive, history off, or other
+layouts and barriers help.
+
+The cause: when a save loads, the game hands DLSS new motion-vector images, and DLSS's input
+launches name the new image before the layer's identification is refreshed. The hold kept reading
+the identified, old image, which DLSS no longer reads and the game is retiring. Now the tracker
+remembers the motion vectors DLSS's most recently recorded input launch named
+(`Tracker::current_mvec`), and the hold copies the identified ones only while they are these; for
+the frames until the identification follows, the hold runs without them (no history, as for any
+frame without motion vectors).
+
+| Build (save loads, `hl-loop.sh`) | Loads with Xid 109 |
+|---|---|
+| 3.1.4 (motion vectors not read) | 0 of 5 |
+| any read method, before the rule | 5 of 5 (the first blit build), about half in later batches |
+| CUDA kernel + the rule (`hl-CM`) | 0 of 6 (189 fps in game) |
+| blit + the rule (`hl-BL`) | 0 of 6 (189-190 fps in game) |
+| this build: blit, the rule, the scale (`hl-FIN`) | 0 of 3 (189-190 fps) |
+
+The kernel needed `VK_NVX_binary_import` (PTX for `sm_80`, which Turing cannot run) and DLSS's own
+view handles; with the real cause fixed the plain blit does the same in core Vulkan, and is tested
+on lavapipe, so the blit stays and the kernel went.
+
+### Tests
+
+- `high_resolution_motion_vectors_are_resampled_to_the_colour_input` (lavapipe): 64x32 vectors, each
+  holding its own position, over a 32x16 colour input: the slot holds the vector under each render
+  pixel's centre (`2x + 1, 2y + 1`), DLSS's image is left as it was.
+- `motion_vectors_dlss_no_longer_reads_are_not_copied`: an input launch naming new motion vectors
+  before the identification follows: the old ones are not copied; back on the identified ones, they
+  are again.
+- `motion_vectors_scale_by_the_colour_input_over_their_extent`: 1 at the same extent, 1708/2560 and
+  964/1440 for Hogwarts Legacy's, 1 when none is known.
+- `the_native_frame_builds_the_lanes_and_composites_the_head_with_its_history` (lavapipe), frame 4:
+  vectors of (2, 4) at a scale of (0.5, 0.25) take the history from one pixel right and one down.
+- The dump's `meta.json` carries `mvec_scale` (`a_dump_writes_raw_files_a_sidecar_and_a_preview`).
+
+### What to look for on the rig
+
+- **Hogwarts Legacy:** `motion vectors resampled from 2560x1440` in the hold line; loading saves
+  repeatedly without a hang; in motion, no ghosting or smearing behind moving things, and a steadier
+  picture than 3.1.4 when standing still.
+- **Crimson Desert, GTA V:** `motion vectors copied from ...` as before (scale 1): unchanged.
+
+Checked 2026-10-10 on this build: Hogwarts Legacy's cutscene after the save, in motion, shows no
+trails behind the characters, and the grain on the rock during the heal effect is the same on 3.1.4
+(the history resets only across the loading pauses, 500 ms or more without a frame). Crimson Desert
+with Ray Reconstruction off: `motion vectors copied from GENERAL`, 174.2 fps in game (3.1.4:
+174.6), no Xid.

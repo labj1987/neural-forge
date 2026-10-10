@@ -6,7 +6,8 @@
 // history filter are theirs and must stay bit-for-bit as they are. What differs is where the inputs
 // come from: the proxy is preupscale_encode.comp's output (already on the half grid), and the
 // previous position of a pixel is DLSS's motion vector plus the change of the camera jitter
-// (prev = x + mv + jitter[t-1] - jitter[t], render pixels; NATIVE_BACKEND.md, "Motion vectors").
+// (prev = x + mv * scale + jitter[t-1] - jitter[t], render pixels; NATIVE_BACKEND.md, "Motion vectors";
+// the scale is 1, or render over output for high-resolution motion vectors, which arrive in output pixels).
 //
 // The descriptor set layout and Params are shared with native_composite.comp and
 // `preupscale::native::Params` (field for field, append only). The common functions are duplicated
@@ -26,7 +27,7 @@ layout(set = 0, binding = 4, std140) uniform Params {
   uvec4 frame;       // padded width, seed, history valid (CPU), parity
   vec4 motion;       // jitter[t-1] - jitter[t] (x, y), blend scale, intensity
   vec4 control;      // style, local tone, local structure, skin structure (< 0: follow structure)
-  vec4 more;         // auto mask (> 0 on), unused x3
+  vec4 more;         // auto mask (> 0 on), motion-vector scale (x, y), unused
 } p;
 // [0], [1]: whether the frame of that parity was encoded with a usable exposure (written by the composite).
 layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; } u_state;
@@ -71,7 +72,7 @@ vec3 gaussian3(uint x, uint y, uint seed) {
 
 // Where pixel `xy` was in the previous frame, in pixels (centre convention).
 vec2 previousPosition(uvec2 xy) {
-  vec2 mv = unpackHalf2x16(u_motion.mv[xy.y * p.dims.z + xy.x]);
+  vec2 mv = unpackHalf2x16(u_motion.mv[xy.y * p.dims.z + xy.x]) * p.more.yz;
   return vec2(xy) + 0.5 + mv + p.motion.xy;
 }
 

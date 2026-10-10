@@ -861,7 +861,8 @@ impl NativePass {
 
     /// The command buffers for this frame, in submission order: the initialisation the first time,
     /// then `N[parity]`. Writes the frame's parameters.
-    pub(crate) fn frame(&mut self, built: &Built, history: bool, jitter: Option<[f32; 2]>, c: Conditioning) -> Vec<vk::CommandBuffer> {
+    /// `mvec_scale` turns the copied motion vectors into render pixels ([`super::Target::mvec_scale`]).
+    pub(crate) fn frame(&mut self, built: &Built, history: bool, jitter: Option<[f32; 2]>, mvec_scale: [f32; 2], c: Conditioning) -> Vec<vk::CommandBuffer> {
         let p = (self.frames & 1) as usize;
         self.seed = if history { self.seed.wrapping_add(1) } else { 0 };
         let delta = match (self.last_jitter, jitter) {
@@ -875,7 +876,7 @@ impl NativePass {
             frame: [self.padded_width, self.seed, u32::from(history), p as u32],
             motion: [delta[0], delta[1], f.blend_scale, c.intensity],
             control: [c.style as f32, c.local_tone, c.local_structure, c.skin_structure],
-            more: [if c.auto_mask { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+            more: [if c.auto_mask { 1.0 } else { 0.0 }, mvec_scale[0], mvec_scale[1], 0.0],
         };
         // SAFETY: host-coherent and mapped for PARAMS_BYTES; parity `p`'s previous use (two frames
         // ago) completed: the hold waits for the previous hold's work before it records anything.
@@ -1255,7 +1256,7 @@ pub(crate) unsafe fn run_native_hold(
         note_reset(stale);
     }
     let history = native.frames > 0 && stale.is_none() && mvec.is_some();
-    let frame_cmds = native.frame(&built, history, jitter, conditioning);
+    let frame_cmds = native.frame(&built, history, jitter, target.mvec_scale, conditioning);
     res.native = Some(native);
     result.timing.prep = Some(t_hold.elapsed());
     if crate::note_vk(submit(super::Which::Capture, res.capture_cmd, vk::Fence::null())).is_err() {
@@ -1450,7 +1451,7 @@ mod tests {
     /// The native frame around the network (preprocess, the recorded graph, composite), with an empty
     /// secondary in the graph's place and a head written by the test: the input lanes, a first frame's
     /// answer, the blend toward the previous answer on a frame with history, and the intensity blend, each
-    /// against the CPU (bit for bit where the arithmetic is exact).
+    /// against the CPU (bit for bit where the arithmetic is exact), and the history through scaled motion vectors.
     #[test]
     fn the_native_frame_builds_the_lanes_and_composites_the_head_with_its_history() {
         let Some(gpu) = crate::composition::gpu::test_device() else {
@@ -1519,7 +1520,7 @@ mod tests {
 
             // Frame 1: no history. Lanes 4-6 and 7-9 are the centred proxy; the answer is the residual on it.
             write_head(0, 10.0);
-            let cmds = pass.frame(&built, false, None, Conditioning::default());
+            let cmds = pass.frame(&built, false, None, [1.0, 1.0], Conditioning::default());
             assert_eq!(cmds.len(), 2, "the initialisation, then the frame");
             fx.submit(&cmds);
             let l = lanes(5, 3);
@@ -1542,7 +1543,7 @@ mod tests {
             // Frame 2: history (no motion, no jitter): lanes 7-9 are the previous answer, and the answer blends
             // toward it by sigmoid(logit) * blendScale.
             write_head(1, 10.0);
-            let cmds = pass.frame(&built, true, None, Conditioning::default());
+            let cmds = pass.frame(&built, true, None, [1.0, 1.0], Conditioning::default());
             fx.submit(&cmds);
             let l = lanes(5, 3);
             assert_eq!(l[7], centre(neural(5, 3, 0, 0)), "history lane from the previous answer");
@@ -1561,13 +1562,23 @@ mod tests {
 
             // Frame 3: intensity 0.5, no history: the answer halfway from the proxy to the network's.
             write_head(2, 10.0);
-            let cmds = pass.frame(&built, false, None, Conditioning { intensity: 0.5, ..Conditioning::default() });
+            let cmds = pass.frame(&built, false, None, [1.0, 1.0], Conditioning { intensity: 0.5, ..Conditioning::default() });
             fx.submit(&cmds);
             let a3 = read_answer();
             for c in 0..3 {
                 let (p, n) = (proxy(7, 4, c), neural(7, 4, c, 2));
                 assert_eq!(a3[((4 * pw + 7) * 4 + c) as usize], trunc_half(0.5f32.mul_add(n - p, p).clamp(0.0, 1.0)), "intensity channel {c}");
             }
+
+            // Frame 4: history through motion vectors of (2, 4) (in output pixels) at a scale of
+            // (0.5, 0.25) (high-resolution motion vectors): pixel (5, 3) was at (6, 4) in the previous frame.
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.mvec.buffer, 0, vk::WHOLE_SIZE, u32::from(half(4.0)) << 16 | u32::from(half(2.0))));
+            write_head(3, 10.0);
+            let cmds = pass.frame(&built, true, None, [0.5, 0.25], Conditioning::default());
+            fx.submit(&cmds);
+            // The history is frame 3's network answer (before its intensity blend).
+            assert_ne!(neural(6, 4, 0, 2), neural(7, 7, 0, 2), "the test tells the scaled position from the unscaled one");
+            assert_eq!(lanes(5, 3)[7], centre(neural(6, 4, 0, 2)), "history lane from the previous answer where the scaled vector points");
 
             pass.destroy(device);
             encoded.destroy(device);

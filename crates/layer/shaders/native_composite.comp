@@ -111,7 +111,7 @@ bool exposure_ok(float e) {
 }
 
 vec2 previousPosition(uvec2 xy) {
-  vec2 mv = unpackHalf2x16(u_motion.mv[xy.y * p.dims.z + xy.x]);
+  vec2 mv = unpackHalf2x16(u_motion.mv[xy.y * p.dims.z + xy.x]) * p.more.yz;
   return vec2(xy) + 0.5 + mv + p.motion.xy;
 }
 

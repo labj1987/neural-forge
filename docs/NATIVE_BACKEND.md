@@ -366,6 +366,9 @@ and composite bit for bit; ATTRIBUTION.md).
   jitter[t])`, measured (-0.25, 0.31), (0.44, -0.50), (-0.94, 0.38) against (-0.25, 0.33), (0.50,
   -0.56), (-0.91, 0.33). Other DLSS versions' input kernels have no known jitter word: they get
   `jitter = 0` (history off by up to a pixel, which the network's blend weight then has to absorb).
+  Motion vectors at the output's extent (Hogwarts Legacy's `mvhi` ones) are in output pixels: the
+  hold blits them down to the colour input's extent and both shaders multiply them by render over
+  output per axis (`Params.more.yz`; PRE_UPSCALER_DESIGN.md, "High-resolution motion vectors").
 - **Seed**: 0 on a frame without history, then counting, so the first frame after a reset is NGX's
   exactly (0.6).
 - **Settings**: Phase 1 runs the defaults (style 0, tone 1, structure 1, skin -1, auto-mask, intensity
