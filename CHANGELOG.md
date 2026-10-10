@@ -4,6 +4,15 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.1.5 — 2026-10-10
+
+Hogwarts Legacy gets the model's history.
+
+- Hogwarts Legacy: the model now builds on the previous frame, as it does in other games, instead
+  of starting fresh on every frame. The game gives DLSS its motion vectors at the full screen size,
+  which Neural Forge couldn't use before; it now shrinks them to the size the game renders at and
+  scales their values to match.
+
 ## 3.1.4 — 2026-10-09
 
 DLSS Ray Reconstruction, and Hogwarts Legacy.
