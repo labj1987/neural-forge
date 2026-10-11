@@ -489,12 +489,22 @@ every hold refreshes and the picture is bit for bit what it was (the test
   about to write (its own rules: clamped-keep pixels give 0), with this hold's depth and fingerprint
   (log luma, log r/g, log b/g). An unusable exposure stores nothing and
   the next hold refreshes.
-- **Cached write-back** (W, in place of the decode): `history` (the refresh's edit read at the chained
+- **The walk** (refresh crossfade and soft refresh): a refresh right after a hold of the chain does
+  not show the answer at once. The shown edit walks from what was on screen to it across the interval,
+  1/N of the way on the refresh and (n + 1)/N on its n-th cached hold, so it arrives when the model
+  runs next. The start is the last shown edit (each hold keeps its own with its depth) read at this
+  hold's one step back, four taps admitted by depth; where those are not this surface, read plainly if
+  something came in front of a still view (under a pixel of motion, nearer than what was there);
+  else (the background a move revealed) the answer at once. The capture stores the start beside the
+  answer's edit and leaves this hold's picture, which `refresh` writes over the decode's right after it.
+  Measured in LESSONS.md, "3.3 edit cache: what was tried".
+- **Cached write-back** (W, in place of the decode): `history` (the refresh's edit, walked, read at the chained
   position, four depth-admitted bilinear taps, the colour check and the fingerprint against this
   hold's 3x3), `reduce` x3 (the coverage-weighted pyramid, 1/4, 1/16, 1/64), `apply`
   (the low band with the same-surface fill plus the high band by its confidence, clamped; `v_out =
   (v + eps) * 2^edit - eps` back to scene with the decode's rules: original kept where the encode
-  clamped, alpha kept, nothing written with an unusable exposure). Debug view 6 writes the rejection
+  clamped, alpha kept, nothing written with an unusable exposure; the shown edit kept for the next
+  refresh's walk). Debug view 6 writes the rejection
   mask instead (red rejected, green the high band's confidence, blue off the chain).
 - **When a hold is cached** (`cache::State::plan`): within the interval after a refresh that stored
   an edit, the very next DLSS submit after the previous hold (any frame that went to DLSS untouched
@@ -505,7 +515,7 @@ every hold refreshes and the picture is bit for bit what it was (the test
   `HistoryGap::touch` so the 500 ms rule counts from the last hold, not the last network frame.
   Frame generation is unaffected: the same submits are held.
 - **Resources**: the accumulated field lives with the native pass; the rest (`cache::Store`, about
-  90 bytes a render pixel) exists only while the interval is above 1. Reversed-Z is decided once per
+  140 bytes a render pixel) exists only while the interval is above 1. Reversed-Z is decided once per
   extent from the first hold's depth counts (texels at 0 and 1, else the top and bottom quarters).
 - **Status**: `[preupscale]` gains `cached=N refresh=N cache_gpu_ms median=X rejected=Y%`; SHM v17
   `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected` (1/10000), `cache_gpu_ms_bits`;

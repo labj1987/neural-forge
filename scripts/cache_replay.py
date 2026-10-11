@@ -31,6 +31,9 @@ that ceiling).
 
 Usage:
   cache_replay.py DUMP [--lags 1 2 3 4 8] [--json OUT] [--oracle] [parameters]
+  cache_replay.py DUMP --cadence 2 3 4 [--phase K] [--no-crossfade] [--no-soft-refresh] [--xf-frames N]
+                 [--aging] [--guided] [--json OUT]
+  cache_replay.py DUMP --cadence N --export-cadence DIR
   cache_replay.py DUMP --self-check
   cache_replay.py --make-synthetic DIR --kind still|pan|depth-edge
   cache_replay.py DUMP --export-carry DIR [--reverse-z yes|no]
@@ -46,10 +49,12 @@ Needs Python 3 and numpy.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import sys
 import time
+from dataclasses import dataclass
 
 import numpy as np
 
@@ -200,6 +205,287 @@ def print_table(results: dict, out=None) -> None:
 
 
 # --------------------------------------------------------------------------------------------------
+# Cadence: the cache as it runs, one refresh every N holds, and what it does over time
+# --------------------------------------------------------------------------------------------------
+
+@dataclass
+class Cadence:
+    """How a run at a fixed interval shows its edits. The defaults are the layer's (the capture, refresh,
+    history and apply shaders mirror run_cadence with them): crossfade and soft refresh on, the walk
+    over the whole interval. xf_frames, aging and guided are experiments, measured and not in the
+    shaders (docs/LESSONS.md, "3.3 edit cache: what was tried"); so is crossfade without soft.
+
+    crossfade   the shown edit does not jump to the model's answer on a refresh hold: it walks there
+                from what was on screen (the last shown edit at this hold's one step back) across the
+                interval, 1/span of the way on the refresh hold, (s + 1)/span on the s-th cached hold
+                after it (upstream's keyframe crossfade). Without soft, only where the history carried
+                to the refresh hold passes (depth and fingerprint); off: the answer at once;
+    xf_frames   caps the walk at this many holds (0: the whole interval);
+    soft        soft refresh: pixels with nothing carried walk too, from the last shown edit read at
+                this hold's one-step position (same surface, or something that came in front of a
+                still view); the background a move revealed takes the answer at once;
+    aging       the high band's confidence times 2^(-staleness / half_life), staleness = one per
+                stale_px of motion since the refresh;
+    guided      a fast guided filter (He et al.) of the cached edit on this hold's log luma, blended in
+                by guided_strength x sat(staleness / 2)."""
+
+    interval: int
+    phase: int = 0
+    crossfade: bool = True
+    xf_frames: int = 0
+    soft: bool = True
+    aging: bool = False
+    half_life: float = 8.0
+    guided: bool = False
+    guided_strength: float = 1.0
+    guided_eps: float = 0.005
+    stale_px: float = 4.0
+
+    def label(self) -> str:
+        parts = [f"i{self.interval}"]
+        if self.crossfade:
+            parts.append("xf" + (str(self.xf_frames) if self.xf_frames else ""))
+            if self.soft:
+                parts.append("soft")
+        if self.aging:
+            parts.append("aging")
+        if self.guided:
+            parts.append("guided")
+        return "-".join(parts) if len(parts) > 1 else parts[0] + "-base"
+
+
+def step_position(prev: cc.Frame, cur: cc.Frame, p: cc.Params) -> np.ndarray:
+    """Where each pixel of `cur` was on the hold before it (pixel units): its vector plus the change of
+    jitter."""
+    h, w = cur.lin.shape
+    pos = cc.pixel_centres(h, w) + cur.mv
+    if p.jitter:
+        pos = pos + (prev.jitter - cur.jitter)
+    return pos.astype(np.float32)
+
+
+def read_admitted(img: np.ndarray, src_lin: np.ndarray, pos: np.ndarray, lin_c: np.ndarray, tol: float) -> tuple:
+    """ReadHistory's four depth-admitted bilinear taps of any image: (value renormalised, sat(wsum))."""
+    h, w = lin_c.shape
+    acc = np.zeros(img.shape[:2] if img.ndim == 2 else (h, w) + img.shape[2:], np.float32)
+    wsum = np.zeros((h, w), np.float32)
+    for idx, _, _, wb in cc.bilinear_taps(pos, w, h):
+        g = cc.gather(src_lin, idx)
+        rel = np.abs(g - lin_c) / np.maximum(np.minimum(g, lin_c), 1e-7)
+        wt = (wb * np.clip((2.0 * tol - rel) / max(tol, 1e-6), 0, 1)).astype(np.float32)
+        v = cc.gather(img, idx)
+        acc += v * (wt[..., None] if v.ndim == 3 else wt)
+        wsum += wt
+    d = np.where(wsum > 1e-4, wsum, 1.0)
+    return (acc / (d[..., None] if acc.ndim == 3 else d)).astype(np.float32), np.clip(wsum, 0, 1)
+
+
+def box3(x: np.ndarray) -> np.ndarray:
+    """3x3 mean, edge-clamped (scipy's uniform_filter(size 3, mode nearest))."""
+    return cc.neighbourhood(x).mean(axis=0)
+
+
+def guided_fast(I: np.ndarray, P: np.ndarray, eps: float) -> np.ndarray:
+    """Upstream's modes 13-15 (measure_ghosting.guided_fast): 2x2 means at half size, a 3x3 window
+    there, a and b tent-blurred and read back bilinearly, rebuilt = a I + b, per channel."""
+    h, w = I.shape
+    H, W = (h + 1) // 2, (w + 1) // 2
+
+    def half(x):
+        x = np.pad(x, [(0, H * 2 - h), (0, W * 2 - w)], mode="edge")
+        return x.reshape(H, 2, W, 2).mean(axis=(1, 3))
+
+    def tent(x):
+        p = np.pad(x, 1, mode="edge")
+        x = 0.25 * p[:-2, 1:-1] + 0.5 * p[1:-1, 1:-1] + 0.25 * p[2:, 1:-1]
+        p = np.pad(x, 1, mode="edge")
+        return 0.25 * p[1:-1, :-2] + 0.5 * p[1:-1, 1:-1] + 0.25 * p[1:-1, 2:]
+
+    mI = box3(half(I))
+    var = np.maximum(box3(half(I * I)) - mI * mI, 0)
+    centres = (cc.pixel_centres(h, w) * np.array([W / w, H / h], np.float32)).astype(np.float32)
+    out = np.empty_like(P)
+    for ch in range(3):
+        mp = box3(half(P[..., ch]))
+        a = (box3(half(I * P[..., ch])) - mI * mp) / (var + eps)
+        b = mp - a * mI
+        out[..., ch] = cc.sample_bilinear(tent(a).astype(np.float32), centres) * I + \
+            cc.sample_bilinear(tent(b).astype(np.float32), centres)
+    return out
+
+
+def run_cadence(dump: cc.Dump, frames: Frames, cad: Cadence, p: cc.Params):
+    """Holds phase.. with the model on every interval-th: yields (hold, since, shown edit, frame).
+    A hold without a usable exposure restarts the run (the next hold refreshes)."""
+    n = cad.interval
+    span = min(n, cad.xf_frames) if cad.xf_frames > 0 else n
+    src = target = start = acc = prev = prev_shown = stale = None
+    since = 0
+    for t in range(cad.phase, len(dump)):
+        dst = frames[t]
+        if not dst.usable:
+            src = prev = prev_shown = None
+            continue
+        consecutive = prev is not None and prev.index == dst.index - 1
+        refresh = src is None or not consecutive or since + 1 >= n
+        step = step_position(prev, dst, p) if consecutive else None
+        if refresh:
+            target = dst.edit
+            start = target
+            if cad.crossfade and consecutive:
+                # What was on screen, at this hold's one-step position.
+                shown_then, on_surface = read_admitted(prev_shown, prev.lin, step, dst.lin, p.depth_tol)
+                walk = np.zeros(dst.lin.shape, bool)
+                if src is not None and not cad.soft:
+                    acc_now = cc.acc_step(acc, dst, prev.jitter, p)
+                    pos, on = cc.chained_position(acc_now, dst, src, p)
+                    r = cc.carry(src, dst, pos, on, p)
+                    walk = (r["valid"] > 0.5) & (r["validity"] > 0.5) & (on_surface > 0.5)
+                if cad.soft:
+                    moved = np.linalg.norm(step - cc.pixel_centres(*dst.lin.shape), axis=-1)
+                    lin_then = cc.sample_bilinear(prev.lin, step)
+                    front = (moved < 1.0) & (dst.lin <= lin_then * (1 + p.depth_tol))
+                    plain = cc.sample_bilinear(prev_shown, step)
+                    shown_then = np.where((on_surface > 0.5)[..., None], shown_then, plain)
+                    walk = walk | (on_surface > 0.5) | front
+                start = np.where(walk[..., None], shown_then, target).astype(np.float32)
+            src, acc, since = dst, None, 0
+            stale = np.zeros(dst.lin.shape, np.float32)
+            shown = start + (target - start) * (1.0 / span) if cad.crossfade else target
+        else:
+            since += 1
+            acc = cc.acc_step(acc, dst, prev.jitter, p)
+            pos, on = cc.chained_position(acc, dst, src, p)
+            f = min((since + 1) / span, 1.0)
+            source = (start + (target - start) * f).astype(np.float32) if cad.crossfade else target
+            r = cc.carry(dataclasses.replace(src, edit=source), dst, pos, on, p)
+            moved = np.linalg.norm(step - cc.pixel_centres(*dst.lin.shape), axis=-1)
+            stale = cc.sample_bilinear(stale, step) + np.clip(moved / cad.stale_px, 0, 1)
+            shown = r["cache"]
+            if cad.aging or cad.guided:
+                low, conf = r["low_band"], r["conf"]
+                if cad.aging:
+                    conf = conf * np.exp2(-stale / cad.half_life)
+                shown = cc.clamp_edit(low + conf[..., None] * (r["history"] - low), p)
+                if cad.guided:
+                    q = guided_fast(dst.log_luma, shown, cad.guided_eps)
+                    wgt = cad.guided_strength * np.clip(stale / 2.0, 0, 1)
+                    shown = cc.clamp_edit(shown + (q - shown) * wgt[..., None], p)
+        yield t, since, refresh, shown.astype(np.float32), dst, step
+        prev, prev_shown = dst, shown.astype(np.float32)
+
+
+def export_cadence(dump: cc.Dump, cad: Cadence, p: cc.Params, reverse_z: bool, out: str) -> int:
+    """For the layer's shader test: every hold's shown edit of a cadence run, `shown-TT.f32` (H x W x 3
+    f32 little-endian), and `holds.txt` (per hold: jitter x, jitter y). Returns the holds written."""
+    os.makedirs(out, exist_ok=True)
+    frames = Frames(dump, reverse_z, p, 3)
+    k = 0
+    with open(os.path.join(out, "holds.txt"), "w", encoding="utf-8") as fh:
+        for t, _, _, shown, dst, _ in run_cadence(dump, frames, cad, p):
+            fh.write(f"{float(dst.jitter[0])!r} {float(dst.jitter[1])!r}\n")
+            shown.astype("<f4").tofile(os.path.join(out, f"shown-{t:02d}.f32"))
+            k += 1
+    return k
+
+
+def half_res(x: np.ndarray) -> np.ndarray:
+    h, w = x.shape[0] // 2 * 2, x.shape[1] // 2 * 2
+    x = x[:h, :w]
+    return 0.25 * (x[0::2, 0::2] + x[1::2, 0::2] + x[0::2, 1::2] + x[1::2, 1::2])
+
+
+def gaussian(x: np.ndarray, sigma: float) -> np.ndarray:
+    r = int(3 * sigma)
+    k = np.exp(-0.5 * (np.arange(-r, r + 1) / sigma) ** 2).astype(np.float32)
+    k /= k.sum()
+    p = np.pad(x, ((0, 0), (r, r)), mode="edge")
+    x = sum(k[i] * p[:, i:i + x.shape[1]] for i in range(2 * r + 1))
+    p = np.pad(x, ((r, r), (0, 0)), mode="edge")
+    return sum(k[i] * p[i:i + x.shape[0], :] for i in range(2 * r + 1)).astype(np.float32)
+
+
+def regional_light(dst: cc.Frame, edit: np.ndarray, p: cc.Params) -> np.ndarray:
+    """measure_pulse.py's regional light: at half size, the shown picture's log2 luma ratio to the
+    untouched frame, Gaussian sigma 6 (12 px at full size)."""
+    y_orig = half_res(cc.luma(dst.v_colour))
+    y_shown = half_res(cc.luma(cc.apply_edit(dst.v_colour, edit, p)))
+    return gaussian(np.log2((y_shown + p.eps_v) / (y_orig + p.eps_v)).astype(np.float32), 6.0)
+
+
+def regional_step(now: np.ndarray, before: np.ndarray, step: np.ndarray) -> np.ndarray:
+    """The regional light's change from the hold before, moved here along the motion (half size)."""
+    pos = np.stack([half_res(step[..., 0]), half_res(step[..., 1])], -1) * 0.5
+    return now - cc.sample_bilinear(before, pos.astype(np.float32))
+
+
+def cadence_metrics(dump: cc.Dump, cad: Cadence, p: cc.Params, reverse_z: bool) -> dict:
+    """One cadence run's numbers.
+
+    err/p99.5/worse/kept: as the lag replay, against the model's answer on every hold after the first
+    refresh (the refresh holds included: a crossfade pays there); *_cached on the cached holds only.
+    pulse: measure_pulse.py's mean |regional light step| (stops) by holds since the refresh (0 = the
+    refresh hold), the model's own (its answer on every hold) beside it; pulse_excess = the refresh
+    holds' mean minus the cached holds'.
+    flicker: flicker_lab.py's motion-compensated |picture_t - picture_t-1| (display values) on pixels
+    that stayed on their surface, minus the model's own, x1000."""
+    frames = Frames(dump, reverse_z, p, 3)
+    acc = {k: [] for k in ("err", "p995", "worse", "pic", "base")}
+    cached = {k: [] for k in ("err", "p995", "worse", "pic", "base")}
+    pulse, model_pulse, flick = {}, [], []
+    prev = None
+    for t, since, refresh, shown, dst, step in run_cadence(dump, frames, cad, p):
+        reg = regional_light(dst, shown, p)
+        reg_true = regional_light(dst, dst.edit, p)
+        pic = cc.display(cc.apply_edit(dst.v_colour, shown, p))
+        if prev is not None and step is not None and prev[0] == t - 1:
+            r = cc.pair_metrics(shown, dst, p)
+            for k in ("err", "p995", "worse", "pic"):
+                acc[k].append(r[k])
+                if not refresh:
+                    cached[k].append(r[k])
+            acc["base"].append(dst.base)
+            if not refresh:
+                cached["base"].append(dst.base)
+            s = float(np.abs(regional_step(reg, prev[1], step)).mean())
+            pulse.setdefault(0 if refresh else since, []).append(s)
+            model_pulse.append(float(np.abs(regional_step(reg_true, prev[2], step)).mean()))
+            lin_then = cc.sample_bilinear(prev[5], step)
+            same = np.abs(np.log2(np.maximum(lin_then, 1e-6)) - np.log2(np.maximum(dst.lin, 1e-6))) < 0.1
+            dc = np.abs(pic - cc.sample_bilinear(prev[3], step)).mean(axis=-1)
+            dv = np.abs(dst.disp_answer - cc.sample_bilinear(prev[4], step)).mean(axis=-1)
+            flick.append(float((dc - dv)[same].mean()) if same.any() else 0.0)
+        prev = (t, reg, reg_true, pic, dst.disp_answer, dst.lin)
+
+    def summary(a):
+        if not a["err"]:
+            return {}
+        return {"err": float(np.mean(a["err"])), "p995": float(np.mean(a["p995"])),
+                "worse": 100 * float(np.mean(a["worse"])),
+                "kept": 100 * (1 - float(np.mean(a["pic"])) / float(np.mean(a["base"]))), "samples": len(a["err"])}
+
+    by_since = {str(k): float(np.mean(v)) for k, v in sorted(pulse.items())}
+    others = [x for k, v in pulse.items() if k != 0 for x in v]
+    return {"label": cad.label(), "cadence": dataclasses.asdict(cad), "all": summary(acc), "cached": summary(cached),
+            "pulse": by_since, "pulse_model": float(np.mean(model_pulse)) if model_pulse else float("nan"),
+            "pulse_excess": float(np.mean(pulse.get(0, [np.nan])) - np.mean(others)) if others else float("nan"),
+            "flicker": 1000 * float(np.mean(flick)) if flick else float("nan")}
+
+
+def print_cadence(rows: list, out=None) -> None:
+    out = out or sys.stdout
+    print(f"  {'run':<20} {'err':>7} {'p99.5':>6} {'worse%':>6} {'kept%':>6} | {'cached err':>10} {'p99.5':>6} | "
+          f"{'pulse run/others (model)':>26} {'excess':>8} | {'flicker':>7}", file=out)
+    for r in rows:
+        a, c = r["all"], r["cached"] or {"err": float("nan"), "p995": float("nan")}
+        pz = r["pulse"]
+        others = [v for k, v in pz.items() if k != "0"]
+        print(f"  {r['label']:<20} {a['err']:7.4f} {a['p995']:6.3f} {a['worse']:6.2f} {a['kept']:6.1f} | {c['err']:10.4f} "
+              f"{c['p995']:6.3f} | {pz.get('0', float('nan')):8.4f} / {np.mean(others) if others else float('nan'):6.4f} "
+              f"({r['pulse_model']:.4f}) {r['pulse_excess']:+8.4f} | {r['flicker']:7.3f}", file=out)
+
+
+# --------------------------------------------------------------------------------------------------
 # Self-check
 # --------------------------------------------------------------------------------------------------
 
@@ -261,7 +547,9 @@ def synthetic_holds(kind: str, w: int = 96, h: int = 64, n: int = 6) -> tuple:
     pan         the camera pans 2.5 px right and 1 px down per hold, jitter +-0.25 px: with the jitter
                 change the motion is a whole number of pixels, so a correct carry is exact.
     depth-edge  a near box moves 5 px right per hold over a still far background (sky on top); where
-                it uncovers the background the carried high band must be rejected."""
+                it uncovers the background the carried high band must be rejected.
+    regrade     the pan, with the model re-grading the whole picture 0.15 stop brighter each hold:
+                a refresh's walk starts away from its answer."""
     paper_white, exposure = 3.0, 1.5
     ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
     xs, ys = xs + 0.5, ys + 0.5
@@ -282,10 +570,10 @@ def synthetic_holds(kind: str, w: int = 96, h: int = 64, n: int = 6) -> tuple:
 
     holds, info = [], {"kind": kind}
     for t in range(n):
-        if kind == "still":
-            cam, jit = np.zeros(2), np.zeros(2)
-        elif kind == "pan":
+        if kind in ("pan", "regrade"):
             cam, jit = np.array([2.5 * t, 1.0 * t]), np.array([0.25 if t % 2 == 0 else -0.25, 0.0])
+        elif kind == "still":
+            cam, jit = np.zeros(2), np.zeros(2)
         elif kind == "depth-edge":
             cam, jit = np.zeros(2), np.zeros(2)
         else:
@@ -294,8 +582,10 @@ def synthetic_holds(kind: str, w: int = 96, h: int = 64, n: int = 6) -> tuple:
         v, edit = scene(X, Y, False)
         depth = 0.002 + 0.03 * np.clip(Y, 0, None) / h  # reversed-Z: the bottom is nearer
         mv = np.zeros((h, w, 2))
-        if kind == "pan" and t > 0:
+        if kind in ("pan", "regrade") and t > 0:
             mv[...] = [2.5, 1.0]
+        if kind == "regrade":
+            edit = edit + 0.15 * t
         if kind == "depth-edge":
             sky = ys < 8
             v[sky] = [0.3, 0.45, 0.8]
@@ -348,9 +638,21 @@ def main(argv=None) -> int:
     ap.add_argument("--self-check", action="store_true", help="lag-0 identity and the lag-1 oracle; non-zero exit on failure")
     ap.add_argument("--reverse-z", choices=("auto", "yes", "no"), default="auto")
     ap.add_argument("--make-synthetic", metavar="DIR", help="write a synthetic dump to DIR and exit")
-    ap.add_argument("--kind", choices=("still", "pan", "depth-edge"), default="pan")
+    ap.add_argument("--kind", choices=("still", "pan", "depth-edge", "regrade"), default="pan")
     ap.add_argument("--export-carry", metavar="DIR", help="write the refresh at hold 0 carried to every later hold (the layer's shader test) and exit")
     ap.add_argument("--quiet", action="store_true")
+    c = ap.add_argument_group("cadence: the cache run at a fixed interval (pulse, flicker; experiments not in the shaders)")
+    c.add_argument("--cadence", type=int, nargs="+", metavar="N", help="run with the model every N holds instead of the lag replay")
+    c.add_argument("--phase", type=int, default=0, help="the first refresh hold")
+    c.add_argument("--no-crossfade", action="store_true", help="the refresh shows the model's answer at once")
+    c.add_argument("--no-soft-refresh", action="store_true", help="only pixels whose history passes walk")
+    c.add_argument("--xf-frames", type=int, default=0, help="cap the walk at this many holds (0: the whole interval)")
+    c.add_argument("--aging", action="store_true")
+    c.add_argument("--half-life", type=float, default=8.0)
+    c.add_argument("--guided", action="store_true")
+    c.add_argument("--guided-strength", type=float, default=1.0)
+    c.add_argument("--guided-eps", type=float, default=0.005)
+    c.add_argument("--export-cadence", metavar="DIR", help="with one --cadence N: write every hold's shown edit (the layer's shader test) and exit")
     g = ap.add_argument_group("cache parameters (defaults are the shader's)")
     d = cc.Params()
     g.add_argument("--eps-v", type=float, default=d.eps_v)
@@ -401,6 +703,30 @@ def main(argv=None) -> int:
         ok = self_check(dump, p, rev)
         print("self-check " + ("passed" if ok else "FAILED"))
         return 0 if ok else 1
+
+    if args.cadence:
+        if min(args.cadence) < 2:
+            ap.error("--cadence intervals are 2 or more")
+        def cadence(n):
+            return Cadence(interval=n, phase=args.phase, crossfade=not args.no_crossfade, xf_frames=args.xf_frames,
+                           soft=not args.no_soft_refresh, aging=args.aging, half_life=args.half_life, guided=args.guided,
+                           guided_strength=args.guided_strength, guided_eps=args.guided_eps)
+
+        if args.export_cadence:
+            if len(args.cadence) != 1:
+                ap.error("--export-cadence takes one --cadence interval")
+            k = export_cadence(dump, cadence(args.cadence[0]), p, rev, args.export_cadence)
+            print(f"wrote {k} hold(s) to {args.export_cadence}")
+            return 0
+        t0 = time.time()
+        rows = [cadence_metrics(dump, cadence(n), p, rev) for n in args.cadence]
+        print(f"cadence, {time.time() - t0:.0f} s")
+        print_cadence(rows)
+        if args.json:
+            with open(args.json, "w", encoding="utf-8") as fh:
+                json.dump({"dump": os.path.abspath(args.dump), "params": p.as_dict(), "runs": rows}, fh, indent=1, allow_nan=True)
+            print(f"wrote {args.json}")
+        return 0
 
     t0 = time.time()
     log = None if args.quiet else (lambda s: print(s, file=sys.stderr, flush=True))

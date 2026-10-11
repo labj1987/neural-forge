@@ -46,6 +46,13 @@ layout(set = 0, binding = 13, std430) buffer Levels { vec4 v[]; } u_levels;
 layout(set = 0, binding = 14, std430) buffer Stats { uint v[]; } u_stats;
 // The network's answer image (padded extent, proxy domain): the refresh capture's decode.
 layout(set = 0, binding = 15, rgba16f) uniform readonly image2D u_answer;
+// The refresh hold's walk start (rgb): what was on screen, where the shown edit walks from to the
+// answer across the interval (the answer itself where nothing walks).
+layout(set = 0, binding = 16, std430) buffer SrcFrom { vec4 v[]; } u_src_from;
+// The edit each hold showed (rgb) with that hold's pseudo-linear depth (a): the next refresh's walk start.
+layout(set = 0, binding = 17, std430) buffer Shown { vec4 v[]; } u_shown;
+// This hold's own motion vector (nearest surface, render pixels): the one step back to the hold before.
+layout(set = 0, binding = 18, std430) buffer Step { vec2 v[]; } u_step;
 
 layout(push_constant) uniform Params {
   uvec2 size;            // render extent
@@ -65,13 +72,14 @@ layout(push_constant) uniform Params {
   float print_tol;
   float sigma_depth;
   float sigma_luma;
+  float walk;            // how far the shown edit has walked from u_src_from to the answer
 } p;
 
 const uint F_REVERSE_Z = 1u;     // depth: near is larger (reversed-Z)
 const uint F_NEAREST = 2u;       // motion from the nearest surface of the 3x3 (only with depth)
 const uint F_FRESH = 4u;         // the previous hold refreshed: its accumulated field is zero
 const uint F_CHAINED = 8u;       // accumulate (else the motion pass copies the vectors as they are)
-const uint F_STORE_EDIT = 16u;   // the apply stores the shown edit into u_hist (tests)
+const uint F_WALK = 16u;         // a refresh walks from the last shown edit (it was the hold before)
 const uint F_DEBUG_MASK = 32u;   // the apply writes the rejection mask instead of the frame
 const uint F_KEEP_CLAMPED = 64u; // the decode's rule: keep the original where the encode clamped
 const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds the decoded answer
@@ -163,6 +171,14 @@ float stored(float v) {
 // edit_of's log2 ratio in v, clamped; stored with this hold's depth and fingerprint for the cached
 // holds that follow. An unusable exposure stores nothing (the decode writes nothing either) and
 // says so: the next hold refreshes.
+//
+// With F_WALK (run_cadence's crossfade and soft refresh) the shown edit does not jump to the answer:
+// it walks there across the interval from what was on screen, the last shown edit read at this
+// hold's one step back (four taps admitted by depth against the hold it was shown on), or, where
+// that is no surface of this one, read plainly when something came in front of a still view. Where
+// neither (the background a move revealed) the answer is taken at once. The walk's start is stored
+// for the cached holds; this hold's own picture (p.walk of the way) is left in u_hist for the
+// refresh pass to write over the decode's.
 void main() {
   uvec2 xy = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(xy, p.size))) return;
@@ -185,6 +201,52 @@ void main() {
   vec3 vc = to_v(original, scale);
   vec3 va = to_v(result, scale);
   vec3 edit = clamp_edit(log2((max(va, vec3(0.0)) + p.eps_v) / (max(vc, vec3(0.0)) + p.eps_v)));
-  u_src_edit.v[i] = vec4(edit, u_lin.v[i]);
+  float lin_c = u_lin.v[i];
+  u_src_edit.v[i] = vec4(edit, lin_c);
   u_src_print.v[i] = u_print.v[i];
+  vec3 start = edit;
+  bool walk = false;
+  if ((p.flags & F_WALK) != 0u) {
+    // step_position, read_admitted: the last shown edit one step back, admitted by depth.
+    vec2 mv = u_step.v[i];
+    vec2 pos = vec2(xy) + 0.5 + mv + p.step_jitter;
+    vec2 px = pos - 0.5;
+    vec2 f0 = floor(px);
+    vec2 f = px - f0;
+    ivec2 i0 = ivec2(f0);
+    vec3 then = vec3(0.0);
+    vec3 plain = vec3(0.0);
+    float lin_then = 0.0;
+    float wsum = 0.0;
+    float tol = p.depth_tol;
+    for (int k = 0; k < 4; k++) {
+      int ox = k & 1;
+      int oy = k >> 1;
+      ivec2 t = clamp(i0 + ivec2(ox, oy), ivec2(0), ivec2(p.size) - 1);
+      vec4 s = u_shown.v[uint(t.y) * p.size.x + uint(t.x)];
+      float wb = (ox == 1 ? f.x : 1.0 - f.x) * (oy == 1 ? f.y : 1.0 - f.y);
+      float rel = abs(s.w - lin_c) / max(min(s.w, lin_c), 1e-7);
+      float wt = wb * clamp((2.0 * tol - rel) / max(tol, 1e-6), 0.0, 1.0);
+      then += s.rgb * wt;
+      wsum += wt;
+      plain += s.rgb * wb;
+      lin_then += s.w * wb;
+    }
+    then /= wsum > 1e-4 ? wsum : 1.0;
+    bool on_surface = clamp(wsum, 0.0, 1.0) > 0.5;
+    bool front = length(mv + p.step_jitter) < 1.0 && lin_c <= lin_then * (1.0 + tol);
+    walk = on_surface || front;
+    if (walk) start = on_surface ? then : plain;
+  }
+  u_src_from.v[i] = vec4(start, 0.0);
+  vec4 stash = vec4(0.0);
+  if (walk) {
+    vec3 shown = start + (edit - start) * p.walk;
+    vec3 v_out = max((max(vc, vec3(0.0)) + p.eps_v) * exp2(shown) - p.eps_v, vec3(0.0));
+    for (int c = 0; c < 3; c++) {
+      stash[c] = keep && encoded[c] >= CLAMPED ? original[c] : v_out[c] * inv_scale;
+    }
+    stash.a = 1.0;
+  }
+  u_hist.v[i] = stash;
 }

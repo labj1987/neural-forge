@@ -142,15 +142,68 @@ class CacheReplayTests(unittest.TestCase):
             self.assertLess(r[m]["err"], 1e-6, m)
             self.assertGreater(r[m]["kept"], 99.999, m)
 
+    def test_cadence_base_is_the_lag_replay(self):
+        """At interval 2 every cached hold is a lag-1 carry from the refresh before it, so the cadence
+        run's cached holds give the lag replay's lag-1 numbers on the same holds."""
+        dump = cc.load_dump(self.dirs["depth-edge"])
+        p = cc.Params()
+        frames = cr.Frames(dump, True, p, 3)
+        h, w = dump.height, dump.width
+        for t, since, refresh, shown, dst, _ in cr.run_cadence(dump, frames, cr.Cadence(interval=2, crossfade=False), p):
+            self.assertEqual(refresh, t % 2 == 0)
+            self.assertEqual(since, t % 2)
+            if refresh:
+                np.testing.assert_array_equal(shown, dst.edit)
+                continue
+            acc = cc.acc_step(None, dst, frames[t - 1].jitter, p)
+            pos, on = cc.chained_position(acc, dst, frames[t - 1], p)
+            want = cc.carry(frames[t - 1], dst, pos, on, p)["cache"]
+            np.testing.assert_allclose(shown, want, atol=1e-6)
+        self.assertEqual((h, w), shown.shape[:2])
+
+    def test_crossfade_walks_from_what_was_shown_to_the_answer(self):
+        """On a still scene whose edit changes from hold to hold the crossfade starts at what was on
+        screen and reaches the refresh's answer on the interval's last hold; soft refresh changes
+        nothing where everything is carried."""
+        holds, white, _ = cr.synthetic_holds("still", w=32, h=24, n=7)
+        for k, hd in enumerate(holds):
+            hd.answer = hd.answer * (1.0 + 0.1 * k)  # the model re-grades by a little each hold
+        with tempfile.TemporaryDirectory() as d:
+            cc.write_dump(d, holds, paper_white=white)
+            dump = cc.load_dump(d)
+            p = cc.Params(max_luma_edit=0.0)
+            runs = {}
+            for name, cad in (("base", cr.Cadence(interval=3, crossfade=False)), ("xf", cr.Cadence(interval=3, soft=False)),
+                              ("soft", cr.Cadence(interval=3))):
+                runs[name] = [(t, s.copy()) for t, _, _, s, _, _ in cr.run_cadence(dump, cr.Frames(dump, True, p, 3), cad, p)]
+            base, xf = dict(runs["base"]), dict(runs["xf"])
+            # Hold 3 refreshes: one third of the way from hold 2's shown edit (hold 0's) to hold 3's.
+            np.testing.assert_allclose(xf[3], base[2] + (base[3] - base[2]) / 3, atol=2e-3)
+            np.testing.assert_allclose(xf[5], base[3], atol=2e-3)
+            for (_, a), (_, b) in zip(runs["xf"], runs["soft"]):
+                np.testing.assert_allclose(a, b, atol=1e-6)
+            r = cr.cadence_metrics(dump, cr.Cadence(interval=3), p, True)
+            self.assertEqual(set(r["pulse"]), {"0", "1", "2"})
+
+    def test_guided_filter_keeps_a_linear_edit(self):
+        rng = np.random.default_rng(1)
+        guide = rng.normal(size=(20, 30)).astype(np.float32)
+        edit = np.stack([0.5 * guide + 0.1, -0.2 * guide, 0 * guide + 0.3], -1).astype(np.float32)
+        out = cr.guided_fast(guide, edit, 1e-6)
+        self.assertLess(float(np.abs(out - edit)[2:-2, 2:-2].max()), 1e-2)
+
     def test_command_line(self):
         out = os.path.join(self.tmp.name, "r.json")
         with contextlib.redirect_stdout(io.StringIO()):
             self.assertEqual(cr.main([self.dirs["pan"], "--lags", "1", "2", "--json", out, "--quiet"]), 0)
             self.assertEqual(cr.main([self.dirs["still"], "--self-check"]), 0)
+            self.assertEqual(cr.main([self.dirs["pan"], "--cadence", "2", "--json", out + ".cad"]), 0)
         with open(out, encoding="utf-8") as fh:
             doc = json.load(fh)
         self.assertEqual(set(doc["results"]), {"1", "2"})
         self.assertEqual(set(doc["results"]["1"]), set(cr.MODES))
+        with open(out + ".cad", encoding="utf-8") as fh:
+            self.assertEqual([r["label"] for r in json.load(fh)["runs"]], ["i2-xf-soft"])
 
 
 if __name__ == "__main__":

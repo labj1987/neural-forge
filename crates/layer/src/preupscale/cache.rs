@@ -2,7 +2,7 @@
 //! network runs on one hold in N (a refresh) and the holds between (cached holds) reuse its
 //! correction, carried along the game's motion and multiplied onto their own fresh frame.
 //!
-//! The GPU side is six compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
+//! The GPU side is seven compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
 //! of `scripts/cache_common.py` (the numpy reference the offline replay measures with):
 //!
 //! - in the capture (`C`) of every hold: `prep` (this hold's fingerprint, pseudo-linear depth, the
@@ -11,7 +11,9 @@
 //!   `motion` runs, copying DLSS's vectors as they are, so the network's input is bit for bit what it
 //!   was;
 //! - in a refresh hold's write-back (`W`), right before the decode: `capture` (the edit the decode is
-//!   about to write, against the frame, with this hold's depth and fingerprint);
+//!   about to write, against the frame, with this hold's depth and fingerprint, and where the shown
+//!   edit walks from: what was on screen on the hold before); right after it: `refresh` (this hold's
+//!   step of the walk over the decode's picture, and the edit shown kept for the next refresh);
 //! - as a cached hold's whole write-back, in place of the network and the decode: `history` (the
 //!   refresh's edit read at the chained position, depth-admitted, checked against this hold),
 //!   `reduce` three times (the coverage-weighted pyramid), `apply` (band split, written back with the
@@ -33,6 +35,7 @@ const CAPTURE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_captur
 const HISTORY_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_history.spv");
 const REDUCE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_reduce.spv");
 const APPLY_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_apply.spv");
+const REFRESH_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_refresh.spv");
 
 const PREP: usize = 0;
 const MOTION: usize = 1;
@@ -40,15 +43,16 @@ const CAPTURE: usize = 2;
 const HISTORY: usize = 3;
 const REDUCE: usize = 4;
 const APPLY: usize = 5;
-const SPV: [&[u8]; 6] = [PREP_SPV, MOTION_SPV, CAPTURE_SPV, HISTORY_SPV, REDUCE_SPV, APPLY_SPV];
+const REFRESH: usize = 6;
+const SPV: [&[u8]; 7] = [PREP_SPV, MOTION_SPV, CAPTURE_SPV, HISTORY_SPV, REDUCE_SPV, APPLY_SPV, REFRESH_SPV];
 
 /// The shaders' `F_*` flags.
 pub(crate) const F_REVERSE_Z: u32 = 1;
 pub(crate) const F_NEAREST: u32 = 2;
 pub(crate) const F_FRESH: u32 = 4;
 pub(crate) const F_CHAINED: u32 = 8;
-#[cfg_attr(not(test), allow(dead_code))]
-pub(crate) const F_STORE_EDIT: u32 = 16;
+/// A refresh walks from the last shown edit (the hold before showed one).
+pub(crate) const F_WALK: u32 = 16;
 pub(crate) const F_DEBUG_MASK: u32 = 32;
 pub(crate) const F_KEEP_CLAMPED: u32 = 64;
 pub(crate) const F_COUNT_DEPTH: u32 = 256;
@@ -74,7 +78,7 @@ const STAT_BYTES: u64 = STAT_WORDS as u64 * 4;
 pub(crate) const MAX_INTERVAL: u32 = 4;
 
 /// The push constants of every `preupscale_cache_*.comp`: their `Params` blocks match this field for
-/// field (append only, in all seven places).
+/// field (append only, in all eight places).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct CachePush {
@@ -104,6 +108,9 @@ pub(crate) struct CachePush {
     pub print_tol: f32,
     pub sigma_depth: f32,
     pub sigma_luma: f32,
+    /// `float walk`: how far the shown edit has walked from the refresh's start to its answer
+    /// ([`Plan::walk`]).
+    pub walk: f32,
 }
 
 /// The carry's parameters: `scripts/cache_common.py`'s `Params` defaults (the replay's numbers are
@@ -168,6 +175,9 @@ pub(crate) struct Store {
     pub(crate) hist: OwnBuffer,
     conf: OwnBuffer,
     levels: OwnBuffer,
+    src_from: OwnBuffer,
+    pub(crate) shown: OwnBuffer,
+    step: OwnBuffer,
 }
 
 impl Store {
@@ -176,7 +186,7 @@ impl Store {
     unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32) -> Option<Self> {
         let n = u64::from(width) * u64::from(height);
         let levels: u64 = (0..3).map(|l| level_size(width, height, l)).map(|(w, h)| u64::from(w) * u64::from(h)).sum();
-        let sizes = [n * 8, n * 4, n * 16, n * 16, n * 16, n * 16, n * 4, levels * 32];
+        let sizes = [n * 8, n * 4, n * 16, n * 16, n * 16, n * 16, n * 4, levels * 32, n * 16, n * 16, n * 8];
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
         let mut made: Vec<OwnBuffer> = Vec::with_capacity(sizes.len());
         for bytes in sizes {
@@ -194,11 +204,11 @@ impl Store {
         }
         let mut it = made.into_iter();
         let mut next = || it.next().expect("one buffer per size");
-        Some(Self { acc_prev: next(), lin: next(), print: next(), src_edit: next(), src_print: next(), hist: next(), conf: next(), levels: next() })
+        Some(Self { acc_prev: next(), lin: next(), print: next(), src_edit: next(), src_print: next(), hist: next(), conf: next(), levels: next(), src_from: next(), shown: next(), step: next() })
     }
 
-    fn all(&self) -> [&OwnBuffer; 8] {
-        [&self.acc_prev, &self.lin, &self.print, &self.src_edit, &self.src_print, &self.hist, &self.conf, &self.levels]
+    fn all(&self) -> [&OwnBuffer; 11] {
+        [&self.acc_prev, &self.lin, &self.print, &self.src_edit, &self.src_print, &self.hist, &self.conf, &self.levels, &self.src_from, &self.shown, &self.step]
     }
 
     /// # Safety
@@ -295,6 +305,10 @@ pub(crate) struct Plan {
     pub flags: u32,
     pub step_jitter: [f32; 2],
     pub refresh_jitter: [f32; 2],
+    /// How far the shown edit has walked from the refresh's start (what was on screen) to its
+    /// answer: 1/interval on the refresh, (n + 1)/interval on its n-th cached hold, so it arrives on
+    /// the interval's last hold (`run_cadence`'s crossfade over the whole interval).
+    pub walk: f32,
 }
 
 impl State {
@@ -311,15 +325,9 @@ impl State {
         let chain_live = std::mem::take(&mut self.chain_live) && consecutive;
         let jitter = h.jitter.unwrap_or_default();
         let chained = h.interval > 1;
-        let cached = chained
-            && had
-            && consecutive
-            && self.since_refresh + 1 < h.interval
-            && h.jitter.is_some()
-            && h.mvec
-            && h.depth == self.refresh_depth
-            && h.history_ok
-            && !h.armed;
+        // The hold before showed an edit of this chain, and this one can read it (or the refresh's).
+        let continues = chained && had && consecutive && h.jitter.is_some() && h.mvec && h.depth == self.refresh_depth && h.history_ok && !h.armed;
+        let cached = continues && self.since_refresh + 1 < h.interval;
         let mut flags = F_KEEP_CLAMPED;
         if chained {
             flags |= F_CHAINED;
@@ -338,13 +346,19 @@ impl State {
             if cached && h.debug_mask {
                 flags |= F_DEBUG_MASK;
             }
+            if continues && !cached {
+                flags |= F_WALK;
+            }
         }
+        let n = h.interval.max(1) as f32;
+        let walk = if cached { ((self.since_refresh + 2) as f32 / n).min(1.0) } else { 1.0 / n };
         let delta = |a: [f32; 2]| [a[0] - jitter[0], a[1] - jitter[1]];
         Plan {
             kind: if cached { Kind::Cached } else { Kind::Refresh },
             flags,
             step_jitter: if consecutive { delta(self.prev_jitter) } else { [0.0; 2] },
             refresh_jitter: delta(self.refresh_jitter),
+            walk,
         }
     }
 
@@ -393,21 +407,22 @@ pub(crate) fn infer_reverse_z(counts: &[u32; STAT_WORDS]) -> Option<bool> {
     (top != bottom).then_some(bottom > top)
 }
 
-/// The pass for one extent: six pipelines over one descriptor set, the counters, the timers.
+/// The pass for one extent: seven pipelines over one descriptor set, the counters, the timers.
 pub(crate) struct CachePass {
     width: u32,
     height: u32,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
-    pipelines: [vk::Pipeline; 6],
+    pipelines: [vk::Pipeline; 7],
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     stats: HostBuffer,
     /// Bound where a buffer of [`Store`] or the depth is not there (the shaders do not read it then).
     dummy: OwnBuffer,
     pub(crate) store: Option<Store>,
-    /// GPU timestamps around the passes in the capture and in the write-back.
-    timers: [Option<crate::gpu_timer::GpuTimer>; 2],
+    /// GPU timestamps around the passes in the capture, in the write-back before (or in place of)
+    /// the decode, and after the decode.
+    timers: [Option<crate::gpu_timer::GpuTimer>; 3],
     pub(crate) state: State,
     pub(crate) tuning: Tuning,
 }
@@ -415,14 +430,14 @@ pub(crate) struct CachePass {
 // SAFETY: plain handles and the layer's own mapping, only used behind the device's `State` mutex.
 unsafe impl Send for CachePass {}
 
-/// Descriptor types of bindings 0..=15 (the shaders' layout).
+/// Descriptor types of bindings 0..=18 (the shaders' layout).
 fn binding_type(n: u32) -> vk::DescriptorType {
     match n {
         0 | 1 | 15 => vk::DescriptorType::STORAGE_IMAGE,
         _ => vk::DescriptorType::STORAGE_BUFFER,
     }
 }
-const BINDINGS: u32 = 16;
+const BINDINGS: u32 = 19;
 
 impl CachePass {
     /// # Safety
@@ -454,7 +469,7 @@ impl CachePass {
             let stats = p.stats.take()?;
             let dummy = p.dummy.take()?;
             std::ptr::write_bytes(stats.ptr, 0, STAT_BYTES as usize);
-            let pipelines: [vk::Pipeline; 6] = std::mem::take(&mut p.pipelines).try_into().ok()?;
+            let pipelines: [vk::Pipeline; 7] = std::mem::take(&mut p.pipelines).try_into().ok()?;
             Some(Self {
                 width,
                 height,
@@ -467,6 +482,7 @@ impl CachePass {
                 dummy,
                 store: None,
                 timers: [
+                    crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
                     crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
                     crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
                 ],
@@ -512,7 +528,7 @@ impl CachePass {
         let dummy = self.dummy.buffer;
         let s = self.store.as_ref();
         let pick = |f: fn(&Store) -> vk::Buffer| s.map_or(dummy, f);
-        let buffers: [(u32, vk::Buffer); 13] = [
+        let buffers: [(u32, vk::Buffer); 16] = [
             (2, b.exposure),
             (3, b.depth.unwrap_or(dummy)),
             (4, b.mvec),
@@ -526,6 +542,9 @@ impl CachePass {
             (12, pick(|s| s.conf.buffer)),
             (13, pick(|s| s.levels.buffer)),
             (14, self.stats.buffer),
+            (16, pick(|s| s.src_from.buffer)),
+            (17, pick(|s| s.shown.buffer)),
+            (18, pick(|s| s.step.buffer)),
         ];
         let images = [(0u32, b.colour), (1, b.encoded), (15, b.answer)];
         let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers.iter().map(|&(_, buffer)| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }]).collect();
@@ -563,6 +582,7 @@ impl CachePass {
             print_tol: t.print_tol,
             sigma_depth: t.sigma_depth,
             sigma_luma: t.sigma_luma,
+            walk: 1.0,
         }
     }
 
@@ -650,6 +670,25 @@ impl CachePass {
         }
     }
 
+    /// Records the refresh hold's step of the walk, in the write-back right after the decode.
+    ///
+    /// # Safety
+    /// `cmd` is recording, after the decode; [`Self::record_capture`] was recorded for this hold.
+    pub(crate) unsafe fn record_refresh(&self, device: &ash::Device, cmd: vk::CommandBuffer, push: &CachePush) {
+        // SAFETY: forwarded.
+        unsafe {
+            // The decode wrote the colour input this pass reads and writes.
+            Self::compute_barrier(device, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE);
+            if let Some(t) = &self.timers[2] {
+                t.record_start(device, cmd);
+            }
+            self.dispatch(device, cmd, REFRESH, push, self.width, self.height);
+            if let Some(t) = &self.timers[2] {
+                t.record_end(device, cmd);
+            }
+        }
+    }
+
     /// Records a cached hold's write-back: the history read, the pyramid, the apply over the colour
     /// input.
     ///
@@ -678,9 +717,9 @@ impl CachePass {
     }
 
     /// Marks the timers whose passes were submitted (`capture`: the capture's part; `writeback`: the
-    /// write-back's).
-    pub(crate) fn submitted(&mut self, capture: bool, writeback: bool) {
-        for (t, on) in self.timers.iter_mut().zip([capture, writeback]) {
+    /// write-back's; `refresh`: the refresh pass after the decode).
+    pub(crate) fn submitted(&mut self, capture: bool, writeback: bool, refresh: bool) {
+        for (t, on) in self.timers.iter_mut().zip([capture, writeback, refresh]) {
             if let Some(t) = t.as_mut().filter(|_| on) {
                 t.mark_submitted();
             }
@@ -810,8 +849,8 @@ mod tests {
 
     #[test]
     fn the_push_constants_match_the_shaders_params_block() {
-        // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, nine floats: 84 bytes, std430.
-        assert_eq!(std::mem::size_of::<CachePush>(), 84);
+        // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, ten floats: 88 bytes, std430.
+        assert_eq!(std::mem::size_of::<CachePush>(), 88);
         assert_eq!(std::mem::offset_of!(CachePush, flags), 8);
         assert_eq!(std::mem::offset_of!(CachePush, depth_kind), 12);
         assert_eq!(std::mem::offset_of!(CachePush, mvec_scale), 16);
@@ -822,6 +861,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CachePush, eps_v), 48);
         assert_eq!(std::mem::offset_of!(CachePush, print_tol), 72);
         assert_eq!(std::mem::offset_of!(CachePush, sigma_luma), 80);
+        assert_eq!(std::mem::offset_of!(CachePush, walk), 84);
         for spv in SPV {
             assert!(spv.len() > 20 && spv.len().is_multiple_of(4), "embedded SPIR-V");
         }
@@ -913,6 +953,39 @@ mod tests {
         assert_ne!(p3.flags & (F_CHAINED | F_NEAREST | F_REVERSE_Z | F_KEEP_CLAMPED), 0);
         let one = s.plan(&Hold { interval: 1, ..j(4, 0.0) });
         assert_eq!(one.flags, F_KEEP_CLAMPED, "interval 1: the vectors as they are");
+    }
+
+    /// The walk: a refresh right after a hold of the chain walks from it (1/interval of the way), its
+    /// cached holds go on to the answer on the interval's last hold; the first refresh, one after a
+    /// reset, and interval 1 do not walk.
+    #[test]
+    fn a_refresh_walks_from_the_hold_before_across_the_interval() {
+        let four = |h| Hold { interval: 4, ..hold(h) };
+        let mut s = State::default();
+        let mut seen = Vec::new();
+        for h in 1..=6 {
+            let plan = s.plan(&four(h));
+            s.went_through(&four(h), &plan);
+            seen.push((plan.kind, plan.flags & F_WALK != 0, plan.walk));
+        }
+        use Kind::{Cached as C, Refresh as R};
+        assert_eq!(seen, [(R, false, 0.25), (C, false, 0.5), (C, false, 0.75), (C, false, 1.0), (R, true, 0.25), (C, false, 0.5)]);
+        // A reset: the refresh after it takes the answer at once.
+        let p = s.plan(&Hold { history_ok: false, ..four(7) });
+        assert_eq!((p.kind, p.flags & F_WALK), (R, 0));
+        // At interval 2 the cached hold arrives.
+        let two = |h| Hold { interval: 2, ..hold(h) };
+        let mut s = State::default();
+        let walks: Vec<(bool, f32)> = (1..=4)
+            .map(|h| {
+                let plan = s.plan(&two(h));
+                s.went_through(&two(h), &plan);
+                (plan.flags & F_WALK != 0, plan.walk)
+            })
+            .collect();
+        assert_eq!(walks, [(false, 0.5), (false, 1.0), (true, 0.5), (false, 1.0)]);
+        let one = State::default().plan(&Hold { interval: 1, ..hold(1) });
+        assert_eq!((one.flags & F_WALK, one.walk), (0, 1.0));
     }
 
     #[test]
@@ -1182,12 +1255,12 @@ mod tests {
                 src_edit = rig.read_f32(rig.store_buffer(|s| s.src_edit.buffer), n * 4);
                 continue;
             }
-            let apply = CachePush { flags: push.flags | F_STORE_EDIT, ..push };
             // SAFETY: as above.
-            rig.one_shot(|cmd| unsafe { rig.pass.record_apply(d, cmd, &apply) });
+            rig.one_shot(|cmd| unsafe { rig.pass.record_apply(d, cmd, &push) });
             let hist = rig.read_f32(rig.store_buffer(|s| s.hist.buffer), n * 4);
+            let shown = rig.read_f32(rig.store_buffer(|s| s.shown.buffer), n * 4);
             let acc = rig.read_f32(rig.acc.buffer, n * 2);
-            let edit: Vec<f32> = hist.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
+            let edit: Vec<f32> = shown.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
             let weight: Vec<f32> = hist.chunks_exact(4).map(|c| c[3]).collect();
             let tool = |name: &str| f32s(&std::fs::read(out.join(format!("{name}-{t:02}.f32"))).unwrap());
             results.push((t, edit, weight, acc, tool("cache"), tool("weight"), tool("acc")));
@@ -1276,6 +1349,83 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    /// The shaders run the replay tool's cadence (`--export-cadence`: the model one hold in 3, the
+    /// shown edit walking from what was on screen to each refresh's answer, soft refresh): every
+    /// hold's shown edit, refresh holds included, within 1e-3 stop of the tool's. `regrade` is where
+    /// the walk shows: its model brightens the picture 0.15 stop a hold.
+    #[test]
+    fn the_shaders_walk_as_the_replay_tool_does() {
+        const INTERVAL: usize = 3;
+        for kind in ["still", "pan", "depth-edge", "regrade"] {
+            let dir = scratch(&format!("cadence-{kind}"));
+            let dump = dir.join("dump");
+            let out = dir.join("cadence");
+            if !replay_tool(&["--make-synthetic", dump.to_str().unwrap(), "--kind", kind])
+                || !replay_tool(&[dump.to_str().unwrap(), "--cadence", "3", "--export-cadence", out.to_str().unwrap(), "--reverse-z", "yes"])
+            {
+                eprintln!("python3 with numpy is not available: the shader-against-tool test is skipped");
+                return;
+            }
+            let holds: Vec<[f32; 2]> = std::fs::read_to_string(out.join("holds.txt"))
+                .unwrap()
+                .lines()
+                .map(|l| {
+                    let v: Vec<f32> = l.split_whitespace().map(|x| x.parse().unwrap()).collect();
+                    [v[0], v[1]]
+                })
+                .collect();
+            let read = |name: String| std::fs::read(dump.join(name)).unwrap();
+            let (w, h) = (96u32, 64u32);
+            let n = (w * h) as usize;
+            let Some(rig) = Rig::new(w, h) else {
+                eprintln!("no Vulkan device: skipped");
+                return;
+            };
+            Rig::write(&rig.exposure, &0x3e00u32.to_le_bytes());
+            let d = &rig.gpu.3;
+            for (t, hj) in holds.iter().enumerate() {
+                rig.upload_image(rig.colour.image, &read(format!("hold-{t:02}/colour.rgba16f")));
+                Rig::write(&rig.mvec, &read(format!("hold-{t:02}/mvec.rg16f")));
+                Rig::write(&rig.depth, &read(format!("hold-{t:02}/depth.r32f")));
+                let since = t % INTERVAL;
+                let refresh = since == 0;
+                let mut flags = F_CHAINED | F_NEAREST | F_REVERSE_Z | F_KEEP_CLAMPED;
+                if t == 0 || since == 1 {
+                    flags |= F_FRESH;
+                }
+                if refresh && t > 0 {
+                    flags |= F_WALK;
+                }
+                let mut push = rig.pass.push(flags, 1, [1.0, 1.0], 3.0);
+                push.walk = if refresh { 1.0 / INTERVAL as f32 } else { ((since + 1) as f32 / INTERVAL as f32).min(1.0) };
+                if t > 0 {
+                    let r = holds[t - since];
+                    push.step_jitter = [holds[t - 1][0] - hj[0], holds[t - 1][1] - hj[1]];
+                    push.refresh_jitter = [r[0] - hj[0], r[1] - hj[1]];
+                }
+                // SAFETY (all): recording into the test's buffer; bound in `Rig::new`.
+                rig.one_shot(|cmd| unsafe { rig.pass.record_motion(d, cmd, &push, rig.acc.buffer) });
+                if refresh {
+                    rig.upload_image(rig.answer.image, &read(format!("hold-{t:02}/answer.rgba16f")));
+                    let capture = CachePush { flags: push.flags | F_SCENE_ANSWER, ..push };
+                    rig.one_shot(|cmd| unsafe {
+                        rig.pass.record_capture(d, cmd, &capture);
+                        rig.pass.record_refresh(d, cmd, &capture);
+                    });
+                } else {
+                    rig.one_shot(|cmd| unsafe { rig.pass.record_apply(d, cmd, &push) });
+                }
+                let shown = rig.read_f32(rig.store_buffer(|s| s.shown.buffer), n * 4);
+                let edit: Vec<f32> = shown.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
+                let tool = f32s(&std::fs::read(out.join(format!("shown-{t:02}.f32"))).unwrap());
+                let de = max_diff(&edit, &tool);
+                eprintln!("{kind} hold {t}: shown edit max diff {de:.2e} stop");
+                assert!(de <= 1e-3, "{kind} hold {t} ({}): the shown edit differs from the tool's by {de} stop", if refresh { "refresh" } else { "cached" });
+            }
+            let _ = std::fs::remove_dir_all(&dir);
         }
     }
 

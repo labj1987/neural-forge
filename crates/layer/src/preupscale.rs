@@ -4304,6 +4304,7 @@ unsafe fn record_capture(
 /// colour input in place ([`hdr::HdrPass::record_decode`]). Closed by a barrier that makes it
 /// visible to everything later on the queue. For a cache dump (`cache`), the colour input with the
 /// answer written back, the motion vectors and the depth are then copied into its readbacks.
+/// `edit_refresh` is the edit cache's refresh, recorded around the decode.
 ///
 /// # Safety
 /// `res`'s write-back command buffer must not be pending; with `hdr`, the pass holds this hold's
@@ -4311,7 +4312,7 @@ unsafe fn record_capture(
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_writeback(
     device: &ash::Device, res: &Resources, target: &Target, source: vk::Buffer, hdr: Option<&hdr::HdrPass>, cache: Option<&CacheCopies>,
-    edit_capture: Option<&dyn Fn(vk::CommandBuffer)>,
+    edit_refresh: Option<hdr::Around<'_>>,
 ) -> ash::prelude::VkResult<()> {
     let cmd = res.writeback_cmd;
     let (dst_stage, dst_access, mut src_stage, mut src_access) = if hdr.is_some() {
@@ -4354,7 +4355,7 @@ unsafe fn record_writeback(
             timer.record_start(device, cmd);
         }
         match hdr {
-            Some(pass) => pass.record_decode(device, cmd, source, target.paper_white, edit_capture),
+            Some(pass) => pass.record_decode(device, cmd, source, target.paper_white, edit_refresh),
             None => device.cmd_copy_buffer_to_image(cmd, source, target.colour, vk::ImageLayout::GENERAL, &[writeback_region(target.width, target.height)]),
         }
         if let Some(c) = cache {

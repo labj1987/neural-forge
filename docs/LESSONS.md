@@ -473,6 +473,74 @@ how much of the model's effect is kept (100% = the model on every hold).
 - With both removed the shader still matches the tool (the shader-against-tool test, within 1e-3
   stop) and interval 1 is unchanged bit for bit.
 
+**Refresh crossfade and soft refresh: kept.** `cache_replay.py --cadence` runs the cache as the layer
+does, the model on one hold in N and the cached holds between, and measures over time: the numbers
+above for every hold after the first refresh (refresh holds included), p99.5 on the cached holds alone,
+upstream's pulse probe (`measure_pulse.py`: the regional light, a 12-pixel Gaussian of the shown
+picture's log luma ratio to the untouched frame, and its mean step from the hold before along the
+motion, on refresh holds / on cached holds, the model's own step when it runs on every hold in
+brackets), and flicker (upstream's `flicker_lab.py`: the motion-compensated change of the displayed
+picture on pixels that stayed on their surface, minus the model's own on every hold, x1000; negative
+is steadier than the model). Phase 0, each dump's 16 holds.
+
+Without the walk the refresh holds pulse: the regional light steps 7x as far on them as on the cached
+holds on the pan (0.044 against 0.006 stop) and 1.6x on the drive, because the cached holds hold one
+answer still and the refresh jumps to the next. Upstream's keyframe crossfade (the shown edit walks
+from what was on screen to the new answer across the interval, so it arrives when the model runs next)
+with its soft refresh (pixels whose history failed the fingerprint walk too, from the last shown edit
+one step back, or plainly where something came in front of a still view; only the background a move
+reveals takes the answer at once) evens the pulse out (pan 0.023 / 0.021, drive 0.017 / 0.018, still
+0.0085 / 0.0100, all at or below the model's own) and lowers flicker on every dump and interval (pan i2
++0.239 -> +0.010, drive -1.96 -> -2.93, still -1.25 -> -1.87). The price is lag: on the refresh
+hold the picture is still half the previous answer at interval 2, so the error against each hold's own
+answer goes up (p99.5 over all holds pan 0.139 -> 0.206, drive 0.357 -> 0.522, still 0.268 -> 0.386;
+kept 7-9 points lower); on the cached holds alone it is the same at interval 2 and up to 0.03 higher at
+3 and 4. Upstream turns its crossfade off before the upscaler (OptiScaler's `DlssNr_EditCache_Dx12.cpp`
+around line 689, no reason given); the live run below checks it after DLSS. Without soft refresh the
+walk is weaker (pan i2 pulse 0.028 / 0.019, flicker +0.078). A walk capped at 2 holds is in between at
+intervals 3 and 4 (the same at 2): less lag, more pulse, as upstream found when it chose the whole
+interval. Shipped: the walk over the whole interval with soft refresh (the capture, history, apply and
+a new refresh pass; `run_cadence` is the mirror).
+
+| dump | run | err/p99.5/worse%/kept% | p99.5 cached | pulse refresh / cached (model) | flicker |
+|---|---|---|---|---|---|
+| pan | i2-base | 0.0220/0.139/0.10/88.9 | 0.261 | 0.0444 / 0.0062 (0.0265) | +0.239 |
+| pan | i3-base | 0.0324/0.196/0.18/82.6 | 0.294 | 0.0594 / 0.0066 (0.0265) | +0.380 |
+| pan | i4-base | 0.0479/0.275/0.43/75.2 | 0.344 | 0.0668 / 0.0073 (0.0265) | +0.634 |
+| pan | i2-xf | 0.0327/0.203/0.11/83.7 | 0.261 | 0.0276 / 0.0189 (0.0265) | +0.078 |
+| pan | i3-xf | 0.0453/0.277/0.24/76.4 | 0.304 | 0.0326 / 0.0153 (0.0265) | +0.202 |
+| pan | i4-xf | 0.0586/0.347/0.64/70.3 | 0.367 | 0.0366 / 0.0140 (0.0265) | +0.501 |
+| pan | i2-xf-soft | 0.0347/0.206/0.11/81.7 | 0.261 | 0.0230 / 0.0214 (0.0265) | +0.010 |
+| pan | i3-xf-soft | 0.0502/0.285/0.27/72.8 | 0.306 | 0.0210 / 0.0178 (0.0265) | +0.167 |
+| pan | i4-xf-soft | 0.0638/0.365/0.68/66.3 | 0.373 | 0.0182 / 0.0165 (0.0265) | +0.377 |
+| pan | i2-xf2-soft | 0.0347/0.206/0.11/81.7 | 0.261 | 0.0230 / 0.0214 (0.0265) | +0.010 |
+| pan | i3-xf2-soft | 0.0437/0.257/0.19/76.4 | 0.294 | 0.0306 / 0.0158 (0.0265) | +0.200 |
+| pan | i4-xf2-soft | 0.0555/0.319/0.44/71.0 | 0.344 | 0.0345 / 0.0143 (0.0265) | +0.450 |
+| drive | i2-base | 0.0531/0.357/1.59/85.0 | 0.669 | 0.0345 / 0.0214 (0.0190) | -1.962 |
+| drive | i3-base | 0.0696/0.469/2.16/80.6 | 0.704 | 0.0408 / 0.0144 (0.0190) | -2.249 |
+| drive | i4-base | 0.0864/0.576/2.70/76.1 | 0.720 | 0.0503 / 0.0112 (0.0190) | -2.677 |
+| drive | i2-xf | 0.0761/0.510/1.73/78.7 | 0.669 | 0.0188 / 0.0181 (0.0190) | -2.910 |
+| drive | i3-xf | 0.0922/0.618/2.35/74.4 | 0.699 | 0.0168 / 0.0146 (0.0190) | -3.236 |
+| drive | i4-xf | 0.1027/0.680/2.84/71.6 | 0.717 | 0.0188 / 0.0123 (0.0190) | -3.381 |
+| drive | i2-xf-soft | 0.0777/0.522/1.75/78.3 | 0.669 | 0.0174 / 0.0184 (0.0190) | -2.931 |
+| drive | i3-xf-soft | 0.0944/0.633/2.38/73.9 | 0.699 | 0.0140 / 0.0153 (0.0190) | -3.282 |
+| drive | i4-xf-soft | 0.1051/0.696/2.88/71.0 | 0.721 | 0.0137 / 0.0130 (0.0190) | -3.428 |
+| drive | i2-xf2-soft | 0.0777/0.522/1.75/78.3 | 0.669 | 0.0174 / 0.0184 (0.0190) | -2.931 |
+| drive | i3-xf2-soft | 0.0883/0.594/2.29/75.5 | 0.704 | 0.0204 / 0.0145 (0.0190) | -3.016 |
+| drive | i4-xf2-soft | 0.0983/0.655/2.79/72.8 | 0.720 | 0.0254 / 0.0122 (0.0190) | -3.146 |
+| still | i2-base | 0.0446/0.268/1.22/78.8 | 0.502 | 0.0185 / 0.0166 (0.0087) | -1.249 |
+| still | i3-base | 0.0562/0.338/1.60/73.5 | 0.506 | 0.0193 / 0.0097 (0.0087) | -1.483 |
+| still | i4-base | 0.0663/0.400/1.81/68.8 | 0.500 | 0.0184 / 0.0078 (0.0087) | -1.734 |
+| still | i2-xf | 0.0634/0.385/1.29/69.9 | 0.502 | 0.0089 / 0.0103 (0.0087) | -1.867 |
+| still | i3-xf | 0.0726/0.443/1.62/65.7 | 0.503 | 0.0068 / 0.0068 (0.0087) | -2.070 |
+| still | i4-xf | 0.0772/0.471/1.76/63.7 | 0.494 | 0.0050 / 0.0058 (0.0087) | -2.142 |
+| still | i2-xf-soft | 0.0641/0.386/1.29/69.6 | 0.502 | 0.0085 / 0.0100 (0.0087) | -1.872 |
+| still | i3-xf-soft | 0.0732/0.445/1.62/65.5 | 0.502 | 0.0061 / 0.0066 (0.0087) | -2.080 |
+| still | i4-xf-soft | 0.0776/0.472/1.75/63.5 | 0.493 | 0.0044 / 0.0058 (0.0087) | -2.150 |
+| still | i2-xf2-soft | 0.0641/0.386/1.29/69.6 | 0.502 | 0.0085 / 0.0100 (0.0087) | -1.872 |
+| still | i3-xf2-soft | 0.0695/0.420/1.64/67.2 | 0.506 | 0.0091 / 0.0071 (0.0087) | -1.934 |
+| still | i4-xf2-soft | 0.0748/0.451/1.84/64.8 | 0.500 | 0.0084 / 0.0064 (0.0087) | -1.991 |
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

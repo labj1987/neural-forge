@@ -26,6 +26,10 @@ never reprojected. One carry here, as the shader does it on a cached hold:
      jointly-bilaterally on depth and luma, coarse to fine, fading to no edit where nothing of this
      surface is near (surface fill); final edit = low + confidence * (history - low).
 
+Over time (cache_replay.py's run_cadence, which the shaders mirror too): a refresh hold's shown edit
+walks from what was on screen to the model's answer across the interval (the crossfade and soft
+refresh), so step 3 reads the refresh's edit as far as the walk has got.
+
 Ported from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5), commit
 6bfc4389c25054ef6747df6e6b1b470e9541c4da: OptiScaler/shaders/dlssnr/precompile/dlssnr_cache.hlsl
 (LinDepth, PrintOf, PrintMatch, ClampEdit, NearestSurfaceMotion, ReadHistory, FetchLevel,
@@ -625,7 +629,8 @@ def carry(src: Frame, dst: Frame, pos: np.ndarray, on: np.ndarray, p: Params) ->
     cache = clamp_edit(p.low_gain * low + p.high_gain * conf[..., None] * (hist["edit"] - low), p, scale)
     naive = sample_bilinear(src.edit, pos) * onf[..., None]
     return dict(naive=naive, low=clamp_edit(p.low_gain * low, p, scale), cache=cache,
-                valid=hist["valid"], validity=validity, v_colour=v_colour, conf=conf, history=hist["edit"])
+                valid=hist["valid"], validity=validity, v_colour=v_colour, conf=conf, history=hist["edit"],
+                low_band=low)
 
 
 # --------------------------------------------------------------------------------------------------

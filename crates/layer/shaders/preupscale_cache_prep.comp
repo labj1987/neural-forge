@@ -48,6 +48,13 @@ layout(set = 0, binding = 13, std430) buffer Levels { vec4 v[]; } u_levels;
 layout(set = 0, binding = 14, std430) buffer Stats { uint v[]; } u_stats;
 // The network's answer image (padded extent, proxy domain): the refresh capture's decode.
 layout(set = 0, binding = 15, rgba16f) uniform readonly image2D u_answer;
+// The refresh hold's walk start (rgb): what was on screen, where the shown edit walks from to the
+// answer across the interval (the answer itself where nothing walks).
+layout(set = 0, binding = 16, std430) buffer SrcFrom { vec4 v[]; } u_src_from;
+// The edit each hold showed (rgb) with that hold's pseudo-linear depth (a): the next refresh's walk start.
+layout(set = 0, binding = 17, std430) buffer Shown { vec4 v[]; } u_shown;
+// This hold's own motion vector (nearest surface, render pixels): the one step back to the hold before.
+layout(set = 0, binding = 18, std430) buffer Step { vec2 v[]; } u_step;
 
 layout(push_constant) uniform Params {
   uvec2 size;            // render extent
@@ -67,13 +74,14 @@ layout(push_constant) uniform Params {
   float print_tol;
   float sigma_depth;
   float sigma_luma;
+  float walk;            // how far the shown edit has walked from u_src_from to the answer
 } p;
 
 const uint F_REVERSE_Z = 1u;     // depth: near is larger (reversed-Z)
 const uint F_NEAREST = 2u;       // motion from the nearest surface of the 3x3 (only with depth)
 const uint F_FRESH = 4u;         // the previous hold refreshed: its accumulated field is zero
 const uint F_CHAINED = 8u;       // accumulate (else the motion pass copies the vectors as they are)
-const uint F_STORE_EDIT = 16u;   // the apply stores the shown edit into u_hist (tests)
+const uint F_WALK = 16u;         // a refresh walks from the last shown edit (it was the hold before)
 const uint F_DEBUG_MASK = 32u;   // the apply writes the rejection mask instead of the frame
 const uint F_KEEP_CLAMPED = 64u; // the decode's rule: keep the original where the encode clamped
 const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds the decoded answer
