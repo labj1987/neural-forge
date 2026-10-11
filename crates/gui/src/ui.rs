@@ -51,10 +51,6 @@ fn refresh_all_rows() {
 
 /// A spin row for the persisted setting `setting`, bounded by its range in
 /// `neural_forge_protocol::SETTING_BOUNDS`.
-/// The model-every-Nth-frame row's subtitle after the upscaler, and before it (the edit cache).
-const INTERVAL_AFTER: &str = "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own";
-const INTERVAL_BEFORE: &str = "Network every Nth frame while the camera moves, every frame while it is still; frames between reuse its last result, moved with the game's motion. 1 = every frame";
-
 fn spin_row(title: &str, subtitle: &str, value: f32, setting: &str, step: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
     spin_row_scaled(title, subtitle, value, setting, step, 1.0, setter)
 }
@@ -357,7 +353,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (interval, set_interval) = bind_u32(&shm, Some("model_interval"), |h| &h.model_interval);
     let interval_row = spin_row(
         "Model every Nth frame",
-        INTERVAL_AFTER,
+        "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own",
         interval as f32,
         "model_interval",
         1.0,
@@ -506,7 +502,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     );
     debug_group.add(&debug_view_row);
 
-    // The edit cache's counters (model every Nth frame before the upscaler).
+    // The edit cache's counters (before the upscaler: the network on every frame while the camera is
+    // still, every second frame while it moves).
     let cache_row = adw::ActionRow::builder().title("Edit cache").subtitle("Not running").build();
     debug_group.add(&cache_row);
     {
@@ -558,9 +555,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_page.add(&model_group);
     view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
 
-    // Model resolution applies after the upscaler only: shown while a game runs and the model is not
-    // running before the upscaler. Model-every-Nth-frame is shown while a game runs, and says what it
-    // does on the path the model is on (before the upscaler: the edit cache).
+    // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
+    // and the model is not running before the upscaler.
     {
         let shm = std::sync::Arc::clone(&shm);
         let beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
@@ -575,17 +571,10 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                 } else {
                     at.elapsed() < std::time::Duration::from_secs(2)
                 };
-                (active, active && hdr.native_running.load(Ordering::Relaxed) == 0)
+                active && hdr.native_running.load(Ordering::Relaxed) == 0
             };
-            let (active, after_upscaler) = after_upscaler;
-            scale_row.set_visible(after_upscaler);
-            interval_row.set_visible(active);
-            if after_upscaler {
-                interval_row.set_title("Model every Nth frame");
-                interval_row.set_subtitle(INTERVAL_AFTER);
-            } else {
-                interval_row.set_title("Network every Nth frame");
-                interval_row.set_subtitle(INTERVAL_BEFORE);
+            for row in [interval_row.upcast_ref::<gtk4::Widget>(), scale_row.upcast_ref()] {
+                row.set_visible(after_upscaler);
             }
         };
         update();

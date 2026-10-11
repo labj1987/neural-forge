@@ -496,13 +496,6 @@ impl ShmClient {
         hdr.preupscale_misses.store(misses, Ordering::Relaxed);
     }
 
-    /// `model_interval` (1..=4): on the pre-upscaler path, the edit cache's interval while the camera
-    /// moves (`preupscale::cache::Regime`).
-    /// 1 before the mapping is open.
-    pub fn model_interval(&self) -> u32 {
-        self.header().map_or(1, |h| h.model_interval.load(Ordering::Relaxed).clamp(1, 4))
-    }
-
     /// `debug_view` (0 before the mapping is open).
     pub fn debug_view(&self) -> u32 {
         self.header().map_or(0, |h| h.debug_view.load(Ordering::Relaxed))

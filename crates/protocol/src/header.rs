@@ -214,8 +214,8 @@ pub struct ShmHeader {
     /// Run the model on every Nth presented frame (1 = every frame). With frame generation on,
     /// 2 skips the model on roughly the generated half and carries the last answer onto them
     /// (ghost guard applied), instead of making every generated frame wait for its own answer.
-    /// Before the upscaler it is the edit cache's interval while the camera moves; a still camera
-    /// runs the network on every hold (docs/ARCHITECTURE.md 4.10).
+    /// After the upscaler only: before it the edit cache sets its own cadence (docs/ARCHITECTURE.md
+    /// 4.10).
     pub model_interval: AtomicU32,
 
     // --- v8 ------------------------------------------------------------------------------
@@ -276,8 +276,9 @@ pub struct ShmHeader {
     /// 4.9), or 0 for none. Set by `shmctl dump-cache`; the layer zeroes it
     /// when it takes the request (the dump then runs to its end or to the first missed hold).
     pub preupscale_dump_request: AtomicU32,
-    /// The pre-upscaler edit cache (`model_interval` above 1 before the upscaler; docs/ARCHITECTURE.md
-    /// 4.10): holds that ran the network (refresh holds; every hold at interval 1) and holds that
+    /// The pre-upscaler edit cache (docs/ARCHITECTURE.md 4.10: the network on every hold while the
+    /// camera is still, on every second one while it moves; every hold with
+    /// `NEURAL_FORGE_EDIT_CACHE=off`): holds that ran the network (refresh holds) and holds that
     /// reused its last correction instead (cached holds), counted since the layer opened the channel.
     pub cache_refresh_holds: AtomicU32,
     pub cache_cached_holds: AtomicU32,

@@ -1,7 +1,8 @@
-//! The pre-upscaler edit cache (docs/ARCHITECTURE.md 4.10): with `model_interval` N above 1 the
-//! network runs on one hold in N (a refresh; every hold while the camera is still, [`Regime`]) and
-//! the holds between (cached holds) reuse its correction, carried along the game's motion and
-//! multiplied onto their own fresh frame.
+//! The pre-upscaler edit cache (docs/ARCHITECTURE.md 4.10): the network runs on every hold while the
+//! camera is still and on one hold in [`MOVING_INTERVAL`] while it moves (a refresh, [`Regime`]),
+//! and the holds between (cached holds) reuse its correction, carried along the game's motion and
+//! multiplied onto their own fresh frame. `model_interval` is the after-the-upscaler path's setting
+//! and is not read here; `NEURAL_FORGE_EDIT_CACHE=off` ([`interval`]) makes every hold a refresh.
 //!
 //! The GPU side is seven compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
 //! of `scripts/cache_common.py` (the numpy reference the offline replay measures with):
@@ -77,8 +78,43 @@ const STAT_MOTION_N: usize = 11;
 const STAT_WORDS: usize = 16;
 const STAT_BYTES: u64 = STAT_WORDS as u64 * 4;
 
-/// The highest interval the cache serves (`ShmHeader::model_interval`'s bound).
-pub(crate) const MAX_INTERVAL: u32 = 4;
+/// The interval while the camera moves: the network on every second hold. 3 trails further (p99.5
+/// at 3 over 2: pan 0.131 -> 0.185 stop, drive 0.339 -> 0.437; docs/LESSONS.md, "3.3 edit cache: what
+/// was tried").
+pub(crate) const MOVING_INTERVAL: u32 = 2;
+
+/// The variable that switches the cache off: `off` (or `0`) runs the network on every hold, as 3.2.0
+/// did (the A/B and rollback switch). Read once, like `NEURAL_FORGE_PREUPSCALE`.
+pub(crate) const ENV: &str = "NEURAL_FORGE_EDIT_CACHE";
+
+/// Whether `raw` (the [`ENV`] value) leaves the cache on: unset, empty, `on` or `1`; `off` or `0`
+/// switch it off; anything else is an error (and on, the default).
+pub(crate) fn parse_env(raw: Option<&str>) -> Result<bool, String> {
+    match raw.map(str::trim) {
+        None | Some("" | "on" | "1") => Ok(true),
+        Some("off" | "0") => Ok(false),
+        Some(other) => Err(other.to_string()),
+    }
+}
+
+/// The cache's interval while the camera moves for this process: [`MOVING_INTERVAL`], or 1 (every
+/// hold a refresh, bit for bit 3.2.0's hold) with `NEURAL_FORGE_EDIT_CACHE=off`. Cached; logged once.
+pub(crate) fn interval() -> u32 {
+    static INTERVAL: std::sync::LazyLock<u32> = std::sync::LazyLock::new(|| {
+        let on = match parse_env(neural_forge_protocol::env::var(ENV).as_deref()) {
+            Ok(on) => on,
+            Err(other) => {
+                crate::log!("[preupscale] {ENV}={other:?} is not one of on, off; the edit cache stays on");
+                true
+            }
+        };
+        if !on {
+            crate::log!("[preupscale] edit cache off ({ENV}=off): the network runs on every hold");
+        }
+        if on { MOVING_INTERVAL } else { 1 }
+    });
+    *INTERVAL
+}
 
 /// The push constants of every `preupscale_cache_*.comp`: their `Params` blocks match this field for
 /// field (append only, in all nine places).
@@ -283,7 +319,7 @@ pub(crate) struct Outcome {
 /// The adaptive cadence (`scripts/cache_replay.py`'s `Regime`, which this mirrors): while the camera
 /// is still the network runs on every hold, so the view a player looks at closest keeps all of the
 /// model's detail (a cached hold cannot carry the part of the answer that follows each hold's
-/// jitter); while it moves, on one hold in `model_interval`. A hold reads as still when its median
+/// jitter); while it moves, on one hold in [`MOVING_INTERVAL`]. A hold reads as still when its median
 /// texel moves less than a quarter of the pace, max(0.1% of the render width, 0.5 px) / 3 a hold;
 /// the motion pass counts the texels (`STAT_STILL`, `STAT_MOTION_N`). A change waits for consecutive
 /// holds that want it, 3 into the still regime and 20 out of it, so the cadence never hops
@@ -300,7 +336,7 @@ impl Regime {
     const INTO_STILL: u32 = 3;
     const OUT_OF_STILL: u32 = 20;
 
-    /// The interval for the next hold, `model_interval` being `max`.
+    /// The interval for the next hold, `max` being the moving one ([`interval`]).
     pub(crate) fn interval(self, max: u32) -> u32 {
         if self.still { 1 } else { max }
     }
@@ -358,7 +394,7 @@ pub(crate) struct State {
 /// What a hold brings to [`State::plan`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Hold {
-    /// `model_interval`, 1..=[`MAX_INTERVAL`]: the interval while the camera moves ([`Regime`]).
+    /// The interval while the camera moves ([`Regime`]): [`interval`] (the tests take others).
     pub interval: u32,
     /// `Session::seen`: the DLSS submit this hold is.
     pub hold: u64,
@@ -1040,8 +1076,22 @@ mod tests {
         assert_eq!(kinds(&mut s, &[Hold { jitter: None, ..hold(1) }, hold(2)]), [R, R]);
     }
 
+    /// `NEURAL_FORGE_EDIT_CACHE`: the cache is on unless the variable says `off` (or `0`); a value it
+    /// does not know is an error, which [`interval`] logs and keeps the cache on for.
+    #[test]
+    fn the_edit_cache_is_on_unless_switched_off() {
+        for on in [None, Some(""), Some("on"), Some("1"), Some(" on ")] {
+            assert_eq!(parse_env(on), Ok(true), "{on:?}");
+        }
+        for off in [Some("off"), Some("0"), Some("off\n")] {
+            assert_eq!(parse_env(off), Ok(false), "{off:?}");
+        }
+        assert_eq!(parse_env(Some("2")), Err("2".into()));
+        assert_eq!(MOVING_INTERVAL, 2);
+    }
+
     /// The adaptive cadence: 3 still holds in a row (the median texel under a quarter of the pace)
-    /// make every hold a refresh, 20 moving ones give `model_interval` back; a reading against the
+    /// make every hold a refresh, 20 moving ones give the moving interval back; a reading against the
     /// regime restarts the count.
     #[test]
     fn a_still_camera_runs_the_network_on_every_hold() {

@@ -143,8 +143,9 @@ pub(crate) unsafe fn run_native(
     {
         // The Model tab's settings.
         let conditioning = shm.global_tuning().map_or_else(native::Conditioning::default, native::Conditioning::from);
-        // The edit cache's interval, and the debug view of its rejection mask.
-        let ask = native::CacheAsk { hold, interval: shm.model_interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
+        // The edit cache's interval (its own, not `model_interval`: that is the after-the-upscaler
+        // path's), and the debug view of its rejection mask.
+        let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
         // SAFETY: forwarded.
         return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, arm, ask, submit) };
     }
@@ -300,6 +301,10 @@ pub(crate) fn mode() -> Mode {
                 if raw.as_deref().is_none_or(|v| v.trim().is_empty()) { " (default)" } else { "" },
                 std::process::id()
             );
+            if mode == Mode::Model {
+                // `NEURAL_FORGE_EDIT_CACHE`, read (and logged when off) with the mode.
+                let _ = cache::interval();
+            }
             crate::logging::flush();
         }
         mode

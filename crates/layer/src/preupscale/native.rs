@@ -12,7 +12,7 @@
 //!   residual, the blend toward the history, the next history and the answer buffer);
 //! - `W`, the write-back (`super::record_writeback`): the answer decoded over DLSS's colour input.
 //!
-//! With `model_interval` above 1 the holds between two network frames are the edit cache's cached
+//! With the edit cache on (the default) the holds between two network frames are its cached
 //! holds (`super::cache`, docs/ARCHITECTURE.md 4.10): `C` as always, no `N`, and a `W` that carries the
 //! last network frame's correction to this frame instead of decoding an answer. The capture's motion
 //! pass writes [`NativePass::acc`], the motion back to the last network frame that the frame shaders
@@ -1264,7 +1264,8 @@ fn copied_mvec(mvec: Option<super::Aux>) -> Option<super::Aux> {
 pub(crate) struct CacheAsk {
     /// `Session::seen`: which DLSS submit this hold is (consecutive holds differ by 1).
     pub hold: u64,
-    /// `model_interval`.
+    /// The cache's interval while the camera moves (`super::cache::interval`: 2, or 1 with
+    /// `NEURAL_FORGE_EDIT_CACHE=off`).
     pub interval: u32,
     /// `debug_view` asks for the cache's rejection mask.
     pub debug_mask: bool,
@@ -1449,7 +1450,7 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("the edit cache's passes could not be built");
         return result;
     };
-    let wanted = ask.interval.clamp(1, super::cache::MAX_INTERVAL);
+    let wanted = ask.interval.max(1);
     // Above interval 1 the cache's buffers are in the network's input features (`cache::ScratchLayout`).
     let chained = wanted > 1 && edit.chain(built.frame.features_bytes);
     if !chained {

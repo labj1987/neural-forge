@@ -268,6 +268,19 @@ scripts/gta-bench.sh --host <host> pu-identity-1 VK_LAYER_neuralforge_neural NEU
 `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=2.5` (or 4) tries another paper white in `model` or
 `roundtrip` mode.
 
+### The edit cache
+
+In `model` mode the edit cache (ARCHITECTURE.md 4.10) runs the network on every hold while the
+camera is still and on every second hold while it moves; `model_interval` does not change it (it is
+the after-the-upscaler path's setting). `NEURAL_FORGE_EDIT_CACHE=off`, read once at start-up, runs
+the network on every hold, bit for bit as 3.2.0 did: the A/B switch for benchmarks and the rollback.
+The layer logs `edit cache off` when it is set, and the `[preupscale]` summaries count the holds
+(`cached=0` with it off).
+
+```bash
+scripts/gta-bench.sh --host <host> cache-off-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_EDIT_CACHE=off 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+```
+
 ### Offline tools
 
 `scripts/hdr_encode.py` (numpy, Pillow) encodes a `dump` for the model and judges an answer
