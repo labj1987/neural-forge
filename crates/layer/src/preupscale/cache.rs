@@ -20,8 +20,11 @@
 //!   times at half size (a guided filter of that edit on this hold's log luma), `apply` again (the
 //!   filter blended in by how far each pixel moved, written back with the decode's rules).
 //!
-//! One [`CachePass`] per [`super::Resources`] (one extent), built on the first native hold. Its
-//! buffers beyond the accumulated field ([`Store`]) exist only while the interval is above 1.
+//! One [`CachePass`] per [`super::Resources`] (one extent), built on the first native hold. Of its
+//! buffers only the walk's start ([`Store`], 8 bytes a render pixel, while the interval is above 1)
+//! is its own: everything else lives in the network's input features ([`ScratchLayout`]), which only
+//! the network's frame uses, and the refresh's edit is written after that frame and read before the
+//! next one's.
 
 use ash::vk;
 use ash::vk::Handle;
@@ -171,25 +174,91 @@ pub(crate) fn level_size(width: u32, height: u32, level: u32) -> (u32, u32) {
     (w, h)
 }
 
-/// The cache's buffers beyond the accumulated field, at the render extent: built when the interval
-/// first goes above 1, freed when it is back at 1.
+/// The bytes a [`ScratchLayout`] region starts on (`minStorageBufferOffsetAlignment` is at most 256).
+const SCRATCH_ALIGN: u64 = 256;
+
+/// A buffer of the cache inside the network's input features: its offset and size in bytes.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Region {
+    pub offset: u64,
+    pub bytes: u64,
+}
+
+/// Where the cache's buffers live in the network's input features (`nn::Frame::features`, 64 bytes a
+/// texel of the network's padded field, so at least 64 a render pixel), which the network's frame
+/// alone writes and reads: `native_preprocess.comp` rewrites every texel of it before the graph reads
+/// any. So it is free outside that frame, and the cache uses it for everything that does not cross
+/// one: the refresh's edit (written in the refresh's write-back, after its network frame; read by the
+/// cached holds until the next refresh's frame), the shown edit and the staleness (from one hold to
+/// the next; a refresh's are never read again), and each hold's own buffers (its depth, the previous
+/// field's copy in the capture; the history read and the pyramid in a cached write-back, where the
+/// guided filter's grids then take their place). Bytes a render pixel: edits 8 (three 16-bit stops),
+/// depths and the rest 4, the refresh's fingerprint 12; 60 in all with the grids, about 167 MB at a
+/// 4K output's Balanced render size (2228x1253).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ScratchLayout {
+    pub src_edit: Region,
+    pub src_lin: Region,
+    pub src_print: Region,
+    pub shown: Region,
+    pub shown_lin: Region,
+    pub stale: Region,
+    pub lin: Region,
+    /// In the capture, over the write-back's buffers below.
+    pub acc_prev: Region,
+    pub stale_prev: Region,
+    /// In a cached write-back; the guided filter's grids over the three once the apply's first
+    /// dispatch has read them.
+    pub hist: Region,
+    pub conf: Region,
+    pub levels: Region,
+    pub guide_a: Region,
+    pub guide_b: Region,
+    pub total: u64,
+}
+
+impl ScratchLayout {
+    pub(crate) fn new(width: u32, height: u32) -> Self {
+        let n = u64::from(width) * u64::from(height);
+        let half = u64::from(width.div_ceil(2)) * u64::from(height.div_ceil(2));
+        let levels: u64 = (0..3).map(|l| level_size(width, height, l)).map(|(w, h)| u64::from(w) * u64::from(h)).sum();
+        fn take(at: &mut u64, bytes: u64) -> Region {
+            let r = Region { offset: *at, bytes };
+            *at = (*at + bytes).next_multiple_of(SCRATCH_ALIGN);
+            r
+        }
+        let mut at = 0u64;
+        let mut l = Self::default();
+        for (r, bytes) in [(&mut l.src_edit, n * 8), (&mut l.src_lin, n * 4), (&mut l.src_print, n * 12), (&mut l.shown, n * 8), (&mut l.shown_lin, n * 4), (&mut l.stale, n * 4), (&mut l.lin, n * 4)] {
+            *r = take(&mut at, bytes);
+        }
+        let shared = at;
+        let mut ends = [shared; 3];
+        for (end, set) in ends.iter_mut().zip([
+            vec![(&mut l.acc_prev, n * 8), (&mut l.stale_prev, n * 4)],
+            vec![(&mut l.hist, n * 8), (&mut l.conf, n * 4), (&mut l.levels, levels * 32)],
+            vec![(&mut l.guide_a, half * 32), (&mut l.guide_b, half * 32)],
+        ]) {
+            for (r, bytes) in set {
+                *r = take(end, bytes);
+            }
+        }
+        l.total = ends.into_iter().max().unwrap_or(shared);
+        l
+    }
+
+    #[cfg(test)]
+    fn regions(&self) -> [Region; 14] {
+        [self.src_edit, self.src_lin, self.src_print, self.shown, self.shown_lin, self.stale, self.lin, self.acc_prev, self.stale_prev, self.hist, self.conf, self.levels, self.guide_a, self.guide_b]
+    }
+}
+
+/// The cache's own buffer, at the render extent: where a walking refresh's edit starts (EDIT16, 8
+/// bytes a texel), the one thing that crosses the network's frame. Built when the interval first goes
+/// above 1, freed when it is back at 1.
 pub(crate) struct Store {
-    acc_prev: OwnBuffer,
-    lin: OwnBuffer,
-    print: OwnBuffer,
-    src_edit: OwnBuffer,
-    src_print: OwnBuffer,
-    pub(crate) hist: OwnBuffer,
-    conf: OwnBuffer,
-    levels: OwnBuffer,
-    src_from: OwnBuffer,
-    pub(crate) shown: OwnBuffer,
-    step: OwnBuffer,
-    guide_a: OwnBuffer,
-    guide_b: OwnBuffer,
-    stale: OwnBuffer,
-    stale_prev: OwnBuffer,
-    /// What the buffers asked for, in bytes (the log's account).
+    start: OwnBuffer,
+    /// What it asked for, in bytes (the log's account).
     bytes: u64,
 }
 
@@ -197,74 +266,18 @@ impl Store {
     /// # Safety
     /// `device` is live.
     unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32) -> Option<Self> {
-        let n = u64::from(width) * u64::from(height);
-        let half = u64::from(width.div_ceil(2)) * u64::from(height.div_ceil(2));
-        let levels: u64 = (0..3).map(|l| level_size(width, height, l)).map(|(w, h)| u64::from(w) * u64::from(h)).sum();
-        let sizes = [n * 8, n * 4, n * 16, n * 16, n * 16, n * 16, n * 4, levels * 32, n * 16, n * 16, n * 8, half * 32, half * 32, n * 4, n * 4];
+        let bytes = u64::from(width) * u64::from(height) * 8;
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
-        let mut made: Vec<OwnBuffer> = Vec::with_capacity(sizes.len());
-        for bytes in sizes {
-            // SAFETY: forwarded.
-            match unsafe { OwnBuffer::new(device, instance, physical_device, bytes, usage) } {
-                Some(b) => made.push(b),
-                None => {
-                    for b in &made {
-                        // SAFETY: nothing was submitted with them.
-                        unsafe { b.destroy(device) };
-                    }
-                    return None;
-                }
-            }
-        }
-        let mut it = made.into_iter();
-        let mut next = || it.next().expect("one buffer per size");
-        Some(Self {
-            acc_prev: next(),
-            lin: next(),
-            print: next(),
-            src_edit: next(),
-            src_print: next(),
-            hist: next(),
-            conf: next(),
-            levels: next(),
-            src_from: next(),
-            shown: next(),
-            step: next(),
-            guide_a: next(),
-            guide_b: next(),
-            stale: next(),
-            stale_prev: next(),
-            bytes: sizes.iter().sum(),
-        })
-    }
-
-    fn all(&self) -> [&OwnBuffer; 15] {
-        [
-            &self.acc_prev,
-            &self.lin,
-            &self.print,
-            &self.src_edit,
-            &self.src_print,
-            &self.hist,
-            &self.conf,
-            &self.levels,
-            &self.src_from,
-            &self.shown,
-            &self.step,
-            &self.guide_a,
-            &self.guide_b,
-            &self.stale,
-            &self.stale_prev,
-        ]
+        // SAFETY: forwarded.
+        let start = unsafe { OwnBuffer::new(device, instance, physical_device, bytes, usage) }?;
+        Some(Self { start, bytes })
     }
 
     /// # Safety
-    /// Nothing submitted may still use them.
+    /// Nothing submitted may still use it.
     unsafe fn destroy(&self, device: &ash::Device) {
-        for b in self.all() {
-            // SAFETY: forwarded.
-            unsafe { b.destroy(device) };
-        }
+        // SAFETY: forwarded.
+        unsafe { self.start.destroy(device) };
     }
 }
 
@@ -282,6 +295,8 @@ pub(crate) struct Bindings {
     pub mvec: vk::Buffer,
     /// The accumulated field the network reads (`native::NativePass::acc`).
     pub acc: vk::Buffer,
+    /// The network's input features and their size in bytes ([`ScratchLayout`]).
+    pub scratch: (vk::Buffer, u64),
 }
 
 /// A hold of the cache: what the network does on it.
@@ -317,8 +332,10 @@ pub(crate) struct State {
     /// DLSS frame was a cached hold of this pass: the network did not run since).
     prev_jitter: [f32; 2],
     chain_live: bool,
-    /// `Session::seen` of the last hold that went through (consecutive holds: the next is this + 1).
+    /// `Session::seen` of the last hold that went through (consecutive holds: the next is this + 1),
+    /// and the network's build it used.
     last_seen: Option<u64>,
+    generation: u64,
     /// The depth's convention, decided from the first counts (`infer_reverse_z`).
     reverse_z: Option<bool>,
     /// The kind of the last submitted hold whose counters are still to be read.
@@ -342,6 +359,9 @@ pub(crate) struct Hold {
     pub armed: bool,
     /// `debug_view` asks for the rejection mask.
     pub debug_mask: bool,
+    /// `native::Built::generation`: a rebuilt network has new input features, which held the
+    /// refresh's edit and the shown one.
+    pub generation: u64,
 }
 
 /// What [`State::plan`] decided for a hold.
@@ -367,7 +387,7 @@ impl State {
 
     /// Whether this hold is cached or refreshes, and its passes' flags. Takes the stored edit out.
     pub(crate) fn plan(&mut self, h: &Hold) -> Plan {
-        let consecutive = self.last_seen.is_some_and(|s| s.wrapping_add(1) == h.hold);
+        let consecutive = self.last_seen.is_some_and(|s| s.wrapping_add(1) == h.hold) && self.generation == h.generation;
         let had = std::mem::take(&mut self.valid);
         let chain_live = std::mem::take(&mut self.chain_live) && consecutive;
         let jitter = h.jitter.unwrap_or_default();
@@ -412,6 +432,7 @@ impl State {
     /// The hold `h` planned as `plan` went through (everything submitted).
     pub(crate) fn went_through(&mut self, h: &Hold, plan: &Plan) {
         self.last_seen = Some(h.hold);
+        self.generation = h.generation;
         self.prev_jitter = h.jitter.unwrap_or_default();
         let chained = h.interval > 1;
         self.pending = chained.then_some(plan.kind);
@@ -464,9 +485,16 @@ pub(crate) struct CachePass {
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     stats: HostBuffer,
-    /// Bound where a buffer of [`Store`] or the depth is not there (the shaders do not read it then).
+    /// Bound where a buffer of [`Store`], the scratch or the depth is not there (the shaders do not
+    /// read it then).
     dummy: OwnBuffer,
     pub(crate) store: Option<Store>,
+    /// Where the scratch buffers are ([`ScratchLayout::new`] for this extent), and the buffer they are
+    /// in for this hold ([`Self::bind`]).
+    layout: ScratchLayout,
+    scratch: vk::Buffer,
+    /// The network's input features were too small for the layout (logged once).
+    said_small: bool,
     /// GPU timestamps around the passes in the capture, in the write-back before (or in place of)
     /// the decode, and after the decode.
     timers: [Option<crate::gpu_timer::GpuTimer>; 3],
@@ -528,6 +556,9 @@ impl CachePass {
                 stats,
                 dummy,
                 store: None,
+                layout: ScratchLayout::new(width, height),
+                scratch: vk::Buffer::null(),
+                said_small: false,
                 timers: [
                     crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
                     crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
@@ -543,16 +574,30 @@ impl CachePass {
         (self.width, self.height) == (width, height)
     }
 
-    /// Builds the [`Store`] if it is not built. `false` when it cannot be.
+    /// Builds the [`Store`] if it is not built. `false` when it cannot be, or when the network's input
+    /// features (`scratch_bytes`) cannot hold the [`ScratchLayout`].
     ///
     /// # Safety
     /// `device` is live; nothing of the pass is pending.
-    pub(crate) unsafe fn ensure_store(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+    pub(crate) unsafe fn ensure_store(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, scratch_bytes: u64) -> bool {
+        if scratch_bytes < self.layout.total {
+            if !std::mem::replace(&mut self.said_small, true) {
+                crate::log!("[preupscale] edit cache: the network's input features ({scratch_bytes} bytes) cannot hold its buffers ({} bytes); interval 1", self.layout.total);
+            }
+            return false;
+        }
         if self.store.is_none() {
             // SAFETY: forwarded.
             self.store = unsafe { Store::build(device, instance, physical_device, self.width, self.height) };
             if let Some(store) = &self.store {
-                crate::log!("[preupscale] edit cache: buffers for {}x{} built, {:.1} MiB{}", self.width, self.height, store.bytes as f64 / 1048576.0, crate::vram::note());
+                crate::log!(
+                    "[preupscale] edit cache: its buffer for {}x{} built, {:.1} MiB (and {:.1} MiB of the network's input features){}",
+                    self.width,
+                    self.height,
+                    store.bytes as f64 / 1048576.0,
+                    self.layout.total as f64 / 1048576.0,
+                    crate::vram::note()
+                );
             }
         }
         self.store.is_some()
@@ -574,34 +619,38 @@ impl CachePass {
     ///
     /// # Safety
     /// Nothing of the pass is pending; every handle is live.
-    pub(crate) unsafe fn bind(&self, device: &ash::Device, b: &Bindings) {
+    pub(crate) unsafe fn bind(&mut self, device: &ash::Device, b: &Bindings) {
         let dummy = self.dummy.buffer;
-        let s = self.store.as_ref();
-        let pick = |f: fn(&Store) -> vk::Buffer| s.map_or(dummy, f);
-        let buffers: [(u32, vk::Buffer); 20] = [
-            (2, b.exposure),
-            (3, b.depth.unwrap_or(dummy)),
-            (4, b.mvec),
-            (5, b.acc),
-            (6, pick(|s| s.acc_prev.buffer)),
-            (7, pick(|s| s.lin.buffer)),
-            (8, pick(|s| s.print.buffer)),
-            (9, pick(|s| s.src_edit.buffer)),
-            (10, pick(|s| s.src_print.buffer)),
-            (11, pick(|s| s.hist.buffer)),
-            (12, pick(|s| s.conf.buffer)),
-            (13, pick(|s| s.levels.buffer)),
-            (14, self.stats.buffer),
-            (16, pick(|s| s.src_from.buffer)),
-            (17, pick(|s| s.shown.buffer)),
-            (18, pick(|s| s.step.buffer)),
-            (19, pick(|s| s.guide_a.buffer)),
-            (20, pick(|s| s.guide_b.buffer)),
-            (21, pick(|s| s.stale.buffer)),
-            (22, pick(|s| s.stale_prev.buffer)),
+        // The scratch only with the store (the interval above 1) and room for the layout.
+        let scratch = (self.store.is_some() && b.scratch.1 >= self.layout.total).then_some(b.scratch.0);
+        self.scratch = scratch.unwrap_or(vk::Buffer::null());
+        let l = self.layout;
+        let region = |r: Region| scratch.map_or((dummy, 0, vk::WHOLE_SIZE), |buffer| (buffer, r.offset, r.bytes));
+        let whole = |buffer: vk::Buffer| (buffer, 0, vk::WHOLE_SIZE);
+        let buffers: [(u32, (vk::Buffer, u64, u64)); 20] = [
+            (2, whole(b.exposure)),
+            (3, whole(b.depth.unwrap_or(dummy))),
+            (4, whole(b.mvec)),
+            (5, whole(b.acc)),
+            (6, region(l.acc_prev)),
+            (7, region(l.lin)),
+            (8, region(l.shown_lin)),
+            (9, region(l.src_edit)),
+            (10, region(l.src_print)),
+            (11, region(l.hist)),
+            (12, region(l.conf)),
+            (13, region(l.levels)),
+            (14, whole(self.stats.buffer)),
+            (16, whole(self.store.as_ref().map_or(dummy, |s| s.start.buffer))),
+            (17, region(l.shown)),
+            (18, region(l.src_lin)),
+            (19, region(l.guide_a)),
+            (20, region(l.guide_b)),
+            (21, region(l.stale)),
+            (22, region(l.stale_prev)),
         ];
         let images = [(0u32, b.colour), (1, b.encoded), (15, b.answer)];
-        let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers.iter().map(|&(_, buffer)| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }]).collect();
+        let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers.iter().map(|&(_, (buffer, offset, range))| [vk::DescriptorBufferInfo { buffer, offset, range }]).collect();
         let image_infos: Vec<[vk::DescriptorImageInfo; 1]> =
             images.iter().map(|&(_, view)| [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }]).collect();
         let mut writes: Vec<vk::WriteDescriptorSet> = Vec::with_capacity(BINDINGS as usize);
@@ -677,7 +726,7 @@ impl CachePass {
     ///
     /// # Safety
     /// `cmd` is recording; [`Self::bind`] was called for this hold with `acc`; with [`F_CHAINED`] the
-    /// store is built.
+    /// store is built and the scratch bound.
     pub(crate) unsafe fn record_motion(&self, device: &ash::Device, cmd: vk::CommandBuffer, push: &CachePush, acc: vk::Buffer) {
         let chained = push.flags & F_CHAINED != 0;
         // SAFETY: forwarded.
@@ -687,15 +736,14 @@ impl CachePass {
                 t.record_start(device, cmd);
             }
             if chained {
-                let store = self.store.as_ref().expect("the store is built for a chained hold");
-                let bytes = u64::from(self.width) * u64::from(self.height) * 8;
+                let l = self.layout;
                 self.dispatch(device, cmd, PREP, push, self.width, self.height);
                 // The previous field and staleness kept for the motion pass to read (the network's binding is
                 // the field itself).
                 let kept = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).build();
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[kept], &[], &[]);
-                device.cmd_copy_buffer(cmd, acc, store.acc_prev.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
-                device.cmd_copy_buffer(cmd, store.stale.buffer, store.stale_prev.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes / 2 }]);
+                device.cmd_copy_buffer(cmd, acc, self.scratch, &[vk::BufferCopy { src_offset: 0, dst_offset: l.acc_prev.offset, size: l.acc_prev.bytes }]);
+                device.cmd_copy_buffer(cmd, self.scratch, self.scratch, &[vk::BufferCopy { src_offset: l.stale.offset, dst_offset: l.stale_prev.offset, size: l.stale.bytes }]);
                 Self::compute_barrier(device, cmd, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE);
             }
             self.dispatch(device, cmd, MOTION, push, self.width, self.height);
@@ -778,6 +826,17 @@ impl CachePass {
             }
             Self::to_host(device, cmd);
         }
+    }
+
+    /// Records only a cached hold's history read (tests: the guided filter's grids overwrite it later
+    /// in [`Self::record_apply`]).
+    ///
+    /// # Safety
+    /// As [`Self::record_apply`].
+    #[cfg(test)]
+    unsafe fn record_history(&self, device: &ash::Device, cmd: vk::CommandBuffer, push: &CachePush) {
+        // SAFETY: forwarded.
+        unsafe { self.dispatch(device, cmd, HISTORY, push, self.width, self.height) };
     }
 
     /// Marks the timers whose passes were submitted (`capture`: the capture's part; `writeback`: the
@@ -937,8 +996,38 @@ mod tests {
         assert_eq!(level_size(1485, 836, 2), (24, 14));
     }
 
+    /// The cache's buffers fit in the network's input features at every size: 64 bytes a texel of
+    /// its field, at least the render extent (the hold checks the real size too: `ensure_store`).
+    #[test]
+    fn the_scratch_layout_fits_in_the_networks_input_features() {
+        // From the replay tool's synthetic dumps up (smaller frames are not held: the region
+        // alignment would not fit, and `ensure_store` says so).
+        for (w, h) in [(96, 64), (97, 65), (641, 359), (1485, 836), (2228, 1253), (2560, 1440), (3840, 2160)] {
+            let l = ScratchLayout::new(w, h);
+            let features = u64::from(w) * u64::from(h) * 64;
+            assert!(l.total <= features, "{w}x{h}: {} bytes in {features}", l.total);
+            for r in l.regions() {
+                assert!(r.offset.is_multiple_of(SCRATCH_ALIGN) && r.offset + r.bytes <= l.total, "{w}x{h}: {r:?}");
+            }
+            // What is live at once does not overlap: the long-lived buffers, then the capture's or the
+            // write-back's (the grids replace the history read and the pyramid).
+            let long = [l.src_edit, l.src_lin, l.src_print, l.shown, l.shown_lin, l.stale, l.lin];
+            for set in [&[l.acc_prev, l.stale_prev][..], &[l.hist, l.conf, l.levels], &[l.guide_a, l.guide_b]] {
+                let live: Vec<Region> = long.iter().chain(set).copied().collect();
+                for (i, a) in live.iter().enumerate() {
+                    for b in &live[i + 1..] {
+                        assert!(a.offset + a.bytes <= b.offset || b.offset + b.bytes <= a.offset, "{w}x{h}: {a:?} overlaps {b:?}");
+                    }
+                }
+            }
+        }
+        // At a 4K output's Balanced render size: 60 bytes a pixel, the store 8.
+        let l = ScratchLayout::new(2228, 1253);
+        assert!(l.total < 61 * 2228 * 1253, "{}", l.total);
+    }
+
     fn hold(h: u64) -> Hold {
-        Hold { interval: 2, hold: h, jitter: Some([0.25, -0.25]), mvec: true, depth: true, history_ok: true, armed: false, debug_mask: false }
+        Hold { interval: 2, hold: h, jitter: Some([0.25, -0.25]), mvec: true, depth: true, history_ok: true, armed: false, debug_mask: false, generation: 1 }
     }
 
     /// Runs `holds` through the state, each going through; returns the kinds.
@@ -984,8 +1073,9 @@ mod tests {
         let missed = s.plan(&hold(2));
         assert_eq!(missed.kind, C);
         assert_eq!(kinds(&mut s, &[hold(3), hold(4)]), [R, C]);
-        // No jitter, no vectors, depth gone, an armed dump.
-        for odd in [Hold { jitter: None, ..hold(2) }, Hold { mvec: false, ..hold(2) }, Hold { depth: false, ..hold(2) }, Hold { armed: true, ..hold(2) }] {
+        // No jitter, no vectors, depth gone, an armed dump, a rebuilt network (its input features
+        // held the edit).
+        for odd in [Hold { jitter: None, ..hold(2) }, Hold { mvec: false, ..hold(2) }, Hold { depth: false, ..hold(2) }, Hold { armed: true, ..hold(2) }, Hold { generation: 2, ..hold(2) }] {
             let mut s = State::default();
             assert_eq!(kinds(&mut s, &[hold(1), odd]), [R, R], "{odd:?}");
         }
@@ -1083,6 +1173,8 @@ mod tests {
         pub depth: HostBuffer,
         pub mvec: HostBuffer,
         pub acc: OwnBuffer,
+        /// Stands for the network's input features.
+        pub scratch: OwnBuffer,
         pub staging: HostBuffer,
         pub pass: CachePass,
     }
@@ -1100,8 +1192,9 @@ mod tests {
                 let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
                 let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
                 let mut pass = CachePass::build(device, instance, physical, family, w, h).expect("the cache pass builds");
-                assert!(pass.ensure_store(device, instance, physical));
-                let rig = Self {
+                let scratch_bytes = ScratchLayout::new(w, h).total;
+                assert!(pass.ensure_store(device, instance, physical, scratch_bytes));
+                let mut rig = Self {
                     colour: OwnImage::new(device, instance, physical, w, h, usage).unwrap(),
                     encoded: OwnImage::new(device, instance, physical, w, h, usage).unwrap(),
                     answer: OwnImage::new(device, instance, physical, w, h, usage).unwrap(),
@@ -1109,6 +1202,7 @@ mod tests {
                     depth: host(n * 4),
                     mvec: host(n * 4),
                     acc: OwnBuffer::new(device, instance, physical, n * 8, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap(),
+                    scratch: OwnBuffer::new(device, instance, physical, scratch_bytes, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap(),
                     staging: host(n * 16),
                     pass,
                     pool,
@@ -1145,6 +1239,7 @@ mod tests {
                         depth: Some(rig.depth.buffer),
                         mvec: rig.mvec.buffer,
                         acc: rig.acc.buffer,
+                        scratch: (rig.scratch.buffer, scratch_bytes),
                     },
                 );
                 Some(rig)
@@ -1188,13 +1283,30 @@ mod tests {
             unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), buffer.ptr, bytes.len()) };
         }
 
-        /// The first `count` f32 of a device buffer.
-        pub fn read_f32(&self, buffer: vk::Buffer, count: usize) -> Vec<f32> {
+        /// `count` words of a device buffer from byte `offset`.
+        pub fn read_words(&self, buffer: vk::Buffer, offset: u64, count: usize) -> Vec<u32> {
             let size = count as u64 * 4;
             // SAFETY: recording into the test's buffer.
-            self.one_shot(|cmd| unsafe { self.gpu.3.cmd_copy_buffer(cmd, buffer, self.staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size }]) });
+            self.one_shot(|cmd| unsafe { self.gpu.3.cmd_copy_buffer(cmd, buffer, self.staging.buffer, &[vk::BufferCopy { src_offset: offset, dst_offset: 0, size }]) });
             // SAFETY: mapped and idle (waited for).
-            unsafe { std::slice::from_raw_parts(self.staging.ptr.cast::<f32>(), count).to_vec() }
+            unsafe { std::slice::from_raw_parts(self.staging.ptr.cast::<u32>(), count).to_vec() }
+        }
+
+        /// The first `count` f32 of a device buffer.
+        pub fn read_f32(&self, buffer: vk::Buffer, count: usize) -> Vec<f32> {
+            self.read_words(buffer, 0, count).into_iter().map(f32::from_bits).collect()
+        }
+
+        /// A scratch region of EDIT16 texels as (edit rgb, the spare half) per texel.
+        pub fn read_edits(&self, region: fn(&ScratchLayout) -> Region) -> (Vec<f32>, Vec<u32>) {
+            let r = region(&self.pass.layout);
+            let n = (self.w * self.h) as usize;
+            let words = self.read_words(self.scratch.buffer, r.offset, n * 2);
+            let t = self.pass.tuning;
+            let range = t.max_luma_edit + t.chroma_stops;
+            let un = |q: u32| q as f32 / 65535.0 * (2.0 * range) - range;
+            let edits = words.chunks_exact(2).flat_map(|w| [un(w[0] & 0xffff), un(w[0] >> 16), un(w[1] & 0xffff)]).collect();
+            (edits, words.chunks_exact(2).map(|w| w[1] >> 16).collect())
         }
 
         /// The colour image as f32 RGBA.
@@ -1211,9 +1323,6 @@ mod tests {
             halves.iter().map(|&h| super::super::f16_to_f32(h)).collect()
         }
 
-        pub fn store_buffer(&self, pick: fn(&Store) -> vk::Buffer) -> vk::Buffer {
-            pick(self.pass.store.as_ref().expect("built"))
-        }
     }
 
     impl Drop for Rig {
@@ -1229,6 +1338,7 @@ mod tests {
                     b.destroy(d);
                 }
                 self.acc.destroy(d);
+                self.scratch.destroy(d);
                 d.destroy_command_pool(self.pool, None);
             }
         }
@@ -1317,18 +1427,19 @@ mod tests {
                 rig.upload_image(rig.answer.image, &read("hold-00/answer.rgba16f".to_string()));
                 let capture = CachePush { flags: push.flags | F_SCENE_ANSWER, ..push };
                 rig.one_shot(|cmd| unsafe { rig.pass.record_capture(d, cmd, &capture) });
-                src_edit = rig.read_f32(rig.store_buffer(|s| s.src_edit.buffer), n * 4);
+                src_edit = rig.read_edits(|l| l.src_edit).0;
                 continue;
             }
+            // SAFETY: as above. The history read first on its own: the guided filter's grids take its
+            // place in the whole write-back (which reads it again, the same).
+            rig.one_shot(|cmd| unsafe { rig.pass.record_history(d, cmd, &push) });
+            let (history, weight) = rig.read_edits(|l| l.hist);
+            let weight: Vec<f32> = weight.into_iter().map(|q| q as f32 / 65535.0).collect();
             // SAFETY: as above.
             rig.one_shot(|cmd| unsafe { rig.pass.record_apply(d, cmd, &push) });
-            let hist = rig.read_f32(rig.store_buffer(|s| s.hist.buffer), n * 4);
-            let shown = rig.read_f32(rig.store_buffer(|s| s.shown.buffer), n * 4);
+            let edit = rig.read_edits(|l| l.shown).0;
             let acc = rig.read_f32(rig.acc.buffer, n * 2);
-            let edit: Vec<f32> = shown.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
-            let weight: Vec<f32> = hist.chunks_exact(4).map(|c| c[3]).collect();
             let tool = |name: &str| f32s(&std::fs::read(out.join(format!("{name}-{t:02}.f32"))).unwrap());
-            let history: Vec<f32> = hist.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
             results.push((t, edit, weight, acc, tool("cache"), tool("weight"), tool("acc"), history));
             // The picture written back, in the edit's place for the comparison between the paths.
             let colour = rig.read_colour();
@@ -1367,11 +1478,11 @@ mod tests {
                 assert!(da <= 1e-4, "{kind} hold {t}: the accumulated motion differs by {da} px");
                 assert!(dw <= 1e-3, "{kind} hold {t}: the weight differs by {dw}");
             }
-            let src: Vec<f32> = src_edit.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
+            let src = &src_edit;
             match kind {
                 "still" => {
                     for (t, edit, ..) in &results {
-                        let d = max_diff(edit, &src);
+                        let d = max_diff(edit, src);
                         assert!(d < 1e-4, "still hold {t}: the cached edit is the refresh's within {d}");
                     }
                 }
@@ -1446,7 +1557,6 @@ mod tests {
                 .collect();
             let read = |name: String| std::fs::read(dump.join(name)).unwrap();
             let (w, h) = (96u32, 64u32);
-            let n = (w * h) as usize;
             let Some(rig) = Rig::new(w, h) else {
                 eprintln!("no Vulkan device: skipped");
                 return;
@@ -1485,8 +1595,7 @@ mod tests {
                 } else {
                     rig.one_shot(|cmd| unsafe { rig.pass.record_apply(d, cmd, &push) });
                 }
-                let shown = rig.read_f32(rig.store_buffer(|s| s.shown.buffer), n * 4);
-                let edit: Vec<f32> = shown.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
+                let edit = rig.read_edits(|l| l.shown).0;
                 let tool = f32s(&std::fs::read(out.join(format!("shown-{t:02}.f32"))).unwrap());
                 let de = max_diff(&edit, &tool);
                 eprintln!("{kind} hold {t}: shown edit max diff {de:.2e} stop");

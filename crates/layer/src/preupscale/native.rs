@@ -1449,7 +1449,7 @@ pub(crate) unsafe fn run_native_hold(
     };
     let wanted = ask.interval.clamp(1, super::cache::MAX_INTERVAL);
     // SAFETY: nothing of the pass is pending (waited above).
-    let chained = wanted > 1 && unsafe { edit.ensure_store(device, instance, physical_device) };
+    let chained = wanted > 1 && unsafe { edit.ensure_store(device, instance, physical_device, built.frame.features_bytes) };
     if !chained {
         // SAFETY: as above.
         unsafe { edit.free_store(device) };
@@ -1464,6 +1464,7 @@ pub(crate) unsafe fn run_native_hold(
         history_ok: native.frames > 0 && native.gap.pending(Instant::now()).is_none(),
         armed: arm.is_some(),
         debug_mask: ask.debug_mask,
+        generation: built.generation,
     };
     let plan = edit.state.plan(&cache_hold);
     let cached = plan.kind == super::cache::Kind::Cached;
@@ -1476,6 +1477,7 @@ pub(crate) unsafe fn run_native_hold(
         depth: depth.and(res.depth.as_ref()).map(DepthCopy::buffer),
         mvec: native.mvec.buffer,
         acc: native.acc.buffer,
+        scratch: (built.frame.features, built.frame.features_bytes),
     };
     // SAFETY: nothing of the pass is pending; every handle is live.
     unsafe { edit.bind(device, &bindings) };
@@ -1749,10 +1751,10 @@ mod tests {
             let mut new = NativePass::build(device, instance, physical, family, W, H).unwrap();
             assert!(old.record(device, &built, graph, encoded.view, exposure.buffer));
             assert!(new.record(device, &built, graph, encoded.view, exposure.buffer));
-            let cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H).unwrap();
+            let mut cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H).unwrap();
             cache.bind(
                 device,
-                &super::super::cache::Bindings { colour: encoded.view, encoded: encoded.view, answer: encoded.view, exposure: exposure.buffer, depth: None, mvec: new.mvec.buffer, acc: new.acc.buffer },
+                &super::super::cache::Bindings { colour: encoded.view, encoded: encoded.view, answer: encoded.view, exposure: exposure.buffer, depth: None, mvec: new.mvec.buffer, acc: new.acc.buffer, scratch: (vk::Buffer::null(), 0) },
             );
             let answer_of = |pass: &NativePass| -> Vec<u16> {
                 fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, pass.answer(), staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }]));

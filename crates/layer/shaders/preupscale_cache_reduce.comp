@@ -16,6 +16,13 @@
 // in `preupscale::cache::CachePush` (field for field, append only).
 layout(local_size_x = 8, local_size_y = 8) in;
 
+// Where the buffers live (`preupscale::cache::ScratchLayout`): u_start in the cache's own store (it
+// crosses the network's frame on a refresh hold); everything else from binding 6 on in the network's
+// input features, which only the network's frame writes and reads (`preprocess` rewrites all of them
+// before the graph reads any): the refresh's edit is written after that frame and read until the next
+// refresh's, the per-hold buffers live within a hold's capture or write-back. Edits are EDIT16: three
+// 16-bit fixed-point stops (+-edit_range()) in a uvec2 whose last half is spare.
+
 // DLSS's colour input, GENERAL (the apply writes it in place; the capture reads it before the decode).
 layout(set = 0, binding = 0, rgba16f) uniform image2D u_colour;
 // The encoded proxy (padded extent): the decode's clamped-highlight rule.
@@ -30,14 +37,19 @@ layout(set = 0, binding = 4, std430) readonly buffer Motion { uint mv[]; } u_mot
 // p.mvec_scale = render pixels), and its copy from the previous hold.
 layout(set = 0, binding = 5, std430) buffer Acc { vec2 v[]; } u_acc;
 layout(set = 0, binding = 6, std430) buffer AccPrev { vec2 v[]; } u_acc_prev;
-// This hold: pseudo-linear depth, and the fingerprint (log luma, log r/g, log b/g, 0).
+// This hold's pseudo-linear depth (the prep pass; a refresh's write-back reads the depth again, the
+// network's frame having overwritten this).
 layout(set = 0, binding = 7, std430) buffer Lin { float v[]; } u_lin;
-layout(set = 0, binding = 8, std430) buffer Print { vec4 v[]; } u_print;
-// The refresh hold: its clamped edit (rgb) and depth (a), and its fingerprint.
-layout(set = 0, binding = 9, std430) buffer SrcEdit { vec4 v[]; } u_src_edit;
-layout(set = 0, binding = 10, std430) buffer SrcPrint { vec4 v[]; } u_src_print;
-// A cached hold: the history read (edit rgb, weight = valid x validity) and its confidence.
-layout(set = 0, binding = 11, std430) buffer Hist { vec4 v[]; } u_hist;
+// The pseudo-linear depth of the hold u_shown's edit was shown on.
+layout(set = 0, binding = 8, std430) buffer ShownLin { float v[]; } u_shown_lin;
+// The refresh hold: its clamped edit (EDIT16), its fingerprint (three floats a texel: log luma, log
+// r/g, log b/g) and its depth (binding 18).
+layout(set = 0, binding = 9, std430) buffer SrcEdit { uvec2 v[]; } u_src_edit;
+layout(set = 0, binding = 10, std430) buffer SrcPrint { float v[]; } u_src_print;
+// A cached hold: the history read (EDIT16, the weight valid x validity as UNORM16 in the spare
+// half) and its confidence. A refresh hold: the capture's walked picture for the refresh pass
+// (packed half4, alpha 1 where it walks).
+layout(set = 0, binding = 11, std430) buffer Hist { uvec2 v[]; } u_hist;
 layout(set = 0, binding = 12, std430) buffer Conf { float v[]; } u_conf;
 // The pyramid, levels 0..2 one after the other, two vec4 a texel: (edit rgb, coverage), (log2
 // depth, log luma, 0, 0).
@@ -46,15 +58,16 @@ layout(set = 0, binding = 13, std430) buffer Levels { vec4 v[]; } u_levels;
 layout(set = 0, binding = 14, std430) buffer Stats { uint v[]; } u_stats;
 // The network's answer image (padded extent, proxy domain): the refresh capture's decode.
 layout(set = 0, binding = 15, rgba16f) uniform readonly image2D u_answer;
-// The refresh hold's walk start (rgb): what was on screen, where the shown edit walks from to the
-// answer across the interval (the answer itself where nothing walks).
-layout(set = 0, binding = 16, std430) buffer SrcFrom { vec4 v[]; } u_src_from;
-// The edit each hold showed (rgb) with that hold's pseudo-linear depth (a): the next refresh's walk start.
-layout(set = 0, binding = 17, std430) buffer Shown { vec4 v[]; } u_shown;
-// This hold's own motion vector (nearest surface, render pixels): the one step back to the hold before.
-layout(set = 0, binding = 18, std430) buffer Step { vec2 v[]; } u_step;
+// The refresh hold's walk start (EDIT16): what was on screen, where the shown edit walks from to the
+// answer across the interval (the answer itself where nothing walks). A walking refresh's motion pass
+// leaves the start it found there for the capture, the spare half 1 where it walks.
+layout(set = 0, binding = 16, std430) buffer Start { uvec2 v[]; } u_start;
+// The edit each hold showed (EDIT16; with the debug mask, the apply's spare half carries the weight
+// and the confidence, 8 bits each): the next refresh's walk start.
+layout(set = 0, binding = 17, std430) buffer Shown { uvec2 v[]; } u_shown;
+layout(set = 0, binding = 18, std430) buffer SrcLin { float v[]; } u_src_lin;
 // The guided filter's half-size grids, two vec4 a texel each: the 2x2 means, then the tent-blurred
-// coefficients (a); its coefficients (b).
+// coefficients (a); its coefficients (b). Over the history read and the pyramid, done with by then.
 layout(set = 0, binding = 19, std430) buffer GuideA { vec4 v[]; } u_guide_a;
 layout(set = 0, binding = 20, std430) buffer GuideB { vec4 v[]; } u_guide_b;
 // How far each pixel has moved since the refresh (one per 4 px of each hold's motion, at most one a
@@ -80,7 +93,7 @@ layout(push_constant) uniform Params {
   float print_tol;
   float sigma_depth;
   float sigma_luma;
-  float walk;            // how far the shown edit has walked from u_src_from to the answer
+  float walk;            // how far the shown edit has walked from u_start to the answer
   float guided_eps;      // the guided filter's regularisation
 } p;
 
@@ -137,6 +150,28 @@ vec3 clamp_edit(vec3 e) {
   return clamp(e, vec3(lc - p.chroma_stops), vec3(lc + p.chroma_stops));
 }
 
+// EDIT16: every stored edit is a clamped one (or a mix of clamped ones), within +-edit_range(), in
+// steps of 2 edit_range() / 65535 (7.6e-5 stop: within 3.9e-5 of the f32 the tool keeps).
+float edit_range() { return p.max_luma_edit > 0.0 ? p.max_luma_edit + p.chroma_stops : 16.0; }
+
+uint fixed16(float e, float r) { return uint(round((clamp(e, -r, r) + r) / (2.0 * r) * 65535.0)); }
+
+float unfixed16(uint q, float r) { return float(q) / 65535.0 * (2.0 * r) - r; }
+
+uvec2 pack_edit(vec3 e, uint spare) {
+  float r = edit_range();
+  return uvec2(fixed16(e.r, r) | (fixed16(e.g, r) << 16u), fixed16(e.b, r) | (spare << 16u));
+}
+
+vec3 unpack_edit(uvec2 w) {
+  float r = edit_range();
+  return vec3(unfixed16(w.x & 0xffffu, r), unfixed16(w.x >> 16u, r), unfixed16(w.y & 0xffffu, r));
+}
+
+uint spare_of(uvec2 w) { return w.y >> 16u; }
+
+uint unorm16(float v) { return uint(round(clamp(v, 0.0, 1.0) * 65535.0)); }
+
 float soft(float d, float tol) { return clamp((2.0 * tol - d) / max(tol, 1e-4), 0.0, 1.0); }
 
 float outside(float v, float lo, float hi) { return max(max(lo - v, v - hi), 0.0); }
@@ -156,6 +191,34 @@ uint level_base(uint level) {
     base += 2u * s.x * s.y;
   }
   return base;
+}
+
+// One texel of DLSS's depth as f32 device depth (cache_dump::depth_to_f32's rule).
+float device_depth(uint i) {
+  if (p.depth_kind == 3u) {
+    uint word = u_depth.raw[i >> 1u];
+    return float((i & 1u) == 0u ? word & 0xffffu : word >> 16u) / 65535.0;
+  }
+  uint raw = u_depth.raw[i];
+  return p.depth_kind == 2u ? float(raw & 0x00ffffffu) / 16777215.0 : uintBitsToFloat(raw);
+}
+
+// lin_depth (LinDepth): proportional to view depth; 1 everywhere without depth.
+float lin_depth(uint i) {
+  if (p.depth_kind == 0u) return 1.0;
+  float d = device_depth(i);
+  d = isnan(d) ? 0.0 : (isinf(d) ? (d > 0.0 ? 1.0 : 0.0) : d);
+  return 1.0 / max((p.flags & F_REVERSE_Z) != 0u ? d : 1.0 - d, 1e-7);
+}
+
+// print_of (PrintOf): this hold's fingerprint at a texel, log luma and the two log chroma ratios, all
+// with eps_v, of the colour input as the game left it (read before the decode or the apply writes it;
+// recomputed where needed rather than kept).
+vec3 print_at(ivec2 at) {
+  float e = exposure();
+  vec3 v = to_v(imageLoad(u_colour, at).rgb, exposure_ok(e) ? e / p.paper_white : 0.0);
+  vec3 q = max(v, vec3(0.0)) + p.eps_v;
+  return vec3(log2(dot(max(v, vec3(0.0)), LUMA) + p.eps_v), log2(q.r / q.g), log2(q.b / q.g));
 }
 
 // One level of the pyramid (reduce4 / ReduceToFirstLevel, build_levels): the coverage-weighted mean
@@ -179,10 +242,10 @@ void main() {
       vec2 g;
       float w;
       if (p.level == 0u) {
-        vec4 h = u_hist.v[j];
-        e = h.rgb;
-        w = h.a;
-        g = vec2(log2(max(u_lin.v[j], 1e-7)), u_print.v[j].x);
+        uvec2 h = u_hist.v[j];
+        e = unpack_edit(h);
+        w = float(spare_of(h)) / 65535.0;
+        g = vec2(log2(max(u_lin.v[j], 1e-7)), print_at(ivec2(s)).x);
       } else {
         vec4 a = u_levels.v[in_base + 2u * j];
         e = a.rgb;
