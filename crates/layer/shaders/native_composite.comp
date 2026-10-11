@@ -14,6 +14,12 @@ layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_encoded;
 layout(set = 0, binding = 1) uniform sampler2D u_history;
+// The motion back to the previous network frame (preupscale_cache_motion.comp's accumulated field), valid
+// extent, f32 x and y per texel in the motion vectors' own units (times p.more.yz = render pixels; NaN where
+// the cache's chain left the frame). At interval 1 it holds DLSS's vectors of this frame converted exactly, so
+// the reprojection is the same as reading the packed halves. MOTION_HALF (a test's switch, never set by the
+// layer) reads DLSS's packed half2 vectors directly, as this shader did before the field existed.
+layout(constant_id = 0) const bool MOTION_HALF = false;
 layout(set = 0, binding = 2, std430) readonly buffer Motion { uint mv[]; } u_motion;
 // f32 [field][4]: RGB residual, blend logit. (Binding 3 is the preprocess's features.)
 layout(set = 0, binding = 9, std430) readonly buffer Head { float head[]; } u_head;
@@ -111,7 +117,9 @@ bool exposure_ok(float e) {
 }
 
 vec2 previousPosition(uvec2 xy) {
-  vec2 mv = unpackHalf2x16(u_motion.mv[xy.y * p.dims.z + xy.x]) * p.more.yz;
+  uint at = xy.y * p.dims.z + xy.x;
+  vec2 motion = MOTION_HALF ? unpackHalf2x16(u_motion.mv[at]) : vec2(uintBitsToFloat(u_motion.mv[2u * at]), uintBitsToFloat(u_motion.mv[2u * at + 1u]));
+  vec2 mv = motion * p.more.yz;
   return vec2(xy) + 0.5 + mv + p.motion.xy;
 }
 

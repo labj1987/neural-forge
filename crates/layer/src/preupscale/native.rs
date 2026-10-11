@@ -458,14 +458,14 @@ impl Default for Conditioning {
 
 /// A device-local buffer of the layer's own.
 pub(crate) struct OwnBuffer {
-    buffer: vk::Buffer,
+    pub(super) buffer: vk::Buffer,
     memory: vk::DeviceMemory,
 }
 
 impl OwnBuffer {
     /// # Safety
     /// `device` is live.
-    unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64, usage: vk::BufferUsageFlags) -> Option<Self> {
+    pub(super) unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64, usage: vk::BufferUsageFlags) -> Option<Self> {
         let info = vk::BufferCreateInfo::builder().size(bytes).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: valid create info.
         let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
@@ -497,7 +497,7 @@ impl OwnBuffer {
 
     /// # Safety
     /// Nothing submitted may still use it.
-    unsafe fn destroy(&self, device: &ash::Device) {
+    pub(super) unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded.
         unsafe {
             device.destroy_buffer(self.buffer, None);
@@ -592,7 +592,14 @@ pub(crate) struct NativePass {
     sets: [vk::DescriptorSet; 2],
     /// `history[p]` is read by parity `p`'s frame and `history[1 - p]` written.
     history: [OwnImage; 2],
+    /// DLSS's motion vectors as the capture copies them (packed half2).
     pub(crate) mvec: OwnBuffer,
+    /// The motion back to the previous network frame the frame shaders read (binding 2), f32 x and y
+    /// per texel: `preupscale_cache_motion.comp`'s accumulated field (`super::cache`).
+    pub(crate) acc: OwnBuffer,
+    /// A test's switch: binding 2 is `mvec` and the frame shaders read it as packed halves
+    /// (`MOTION_HALF`), as they did before the accumulated field.
+    motion_half: bool,
     answer: OwnBuffer,
     state: OwnBuffer,
     params: [HostBuffer; 2],
@@ -622,16 +629,19 @@ impl NativePass {
     /// `device` is live; `family` is the queue family the frames are submitted on.
     pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32) -> Option<Self> {
         // SAFETY: forwarded.
-        unsafe { Self::build_failing_at(device, instance, physical_device, family, width, height, None) }
+        unsafe { Self::build_failing_at(device, instance, physical_device, family, width, height, None, false) }
     }
 
-    /// [`Self::build`], failing on purpose at creation step `fail_at` (`0..BUILD_STEPS`) when given.
+    /// [`Self::build`], failing on purpose at creation step `fail_at` (`0..BUILD_STEPS`) when given,
+    /// and with `motion_half` the frame shaders reading DLSS's packed vectors (a test's reference).
     /// Built piece by piece; [`PassPartial`] destroys whatever exists on an early return.
     ///
     /// # Safety
     /// As [`Self::build`].
+    #[allow(clippy::too_many_arguments)]
     unsafe fn build_failing_at(
         device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32, fail_at: Option<usize>,
+        motion_half: bool,
     ) -> Option<Self> {
         let (padded_width, padded_height) = super::padded(width, height);
         let binding = |n: u32, ty: vk::DescriptorType| {
@@ -665,9 +675,13 @@ impl NativePass {
             step()?;
             p.pipeline_layout = made(device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&p.set_layout)), None).ok()?);
             step()?;
-            p.preprocess = made(hdr::compute_pipeline(device, p.pipeline_layout, PREPROCESS_SPV)?);
+            // MOTION_HALF (constant_id 0), a VkBool32.
+            let half = u32::from(motion_half).to_le_bytes();
+            let entry = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
+            let spec = vk::SpecializationInfo::builder().map_entries(&entry).data(&half).build();
+            p.preprocess = made(hdr::compute_pipeline_with(device, p.pipeline_layout, PREPROCESS_SPV, Some(&spec))?);
             step()?;
-            p.composite = made(hdr::compute_pipeline(device, p.pipeline_layout, COMPOSITE_SPV)?);
+            p.composite = made(hdr::compute_pipeline_with(device, p.pipeline_layout, COMPOSITE_SPV, Some(&spec))?);
             step()?;
             p.sampler = made(
                 device
@@ -709,6 +723,14 @@ impl NativePass {
                 texels * 4,
                 vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
             )?));
+            step()?;
+            p.acc = Some(made(OwnBuffer::new(
+                device,
+                instance,
+                physical_device,
+                texels * 8,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+            )?));
             let answer_bytes = u64::from(padded_width) * u64::from(padded_height) * 8;
             step()?;
             p.answer = Some(made(OwnBuffer::new(device, instance, physical_device, answer_bytes, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER)?));
@@ -735,7 +757,7 @@ impl NativePass {
                 crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).map(made),
             ];
             let take_buffer = |b: &mut Option<OwnBuffer>| b.take().expect("built above");
-            let (mvec, answer, state) = (take_buffer(&mut p.mvec), take_buffer(&mut p.answer), take_buffer(&mut p.state));
+            let (mvec, acc, answer, state) = (take_buffer(&mut p.mvec), take_buffer(&mut p.acc), take_buffer(&mut p.answer), take_buffer(&mut p.state));
             let mut history = std::mem::take(&mut p.history).into_iter();
             let history = [history.next().expect("built above"), history.next().expect("built above")];
             let mut params = std::mem::take(&mut p.params).into_iter();
@@ -753,6 +775,8 @@ impl NativePass {
                 sets: [sets[0], sets[1]],
                 history,
                 mvec,
+                acc,
+                motion_half,
                 answer,
                 state,
                 params,
@@ -797,7 +821,7 @@ impl NativePass {
             let prev = [vk::DescriptorImageInfo { sampler: self.sampler, image_view: self.history[p].view, image_layout: vk::ImageLayout::GENERAL }];
             let buf = |buffer, range| [vk::DescriptorBufferInfo { buffer, offset: 0, range }];
             let (mv, feat, head, params, state, expo, ans) = (
-                buf(self.mvec.buffer, vk::WHOLE_SIZE),
+                buf(if self.motion_half { self.mvec.buffer } else { self.acc.buffer }, vk::WHOLE_SIZE),
                 buf(f.features, vk::WHOLE_SIZE),
                 buf(f.head, vk::WHOLE_SIZE),
                 buf(self.params[p].buffer, PARAMS_BYTES),
@@ -995,6 +1019,7 @@ impl NativePass {
                 h.destroy(device);
             }
             self.mvec.destroy(device);
+            self.acc.destroy(device);
             self.answer.destroy(device);
             self.state.destroy(device);
             for b in &self.params {
@@ -1011,9 +1036,9 @@ impl NativePass {
 }
 
 /// The creation steps of [`NativePass::build`] that can fail, in order.
-const BUILD_STEPS: usize = 16;
+const BUILD_STEPS: usize = 17;
 /// The objects [`NativePass::destroy`] destroys besides its timers.
-const PASS_OBJECTS: isize = 14;
+const PASS_OBJECTS: isize = 15;
 
 #[cfg(test)]
 thread_local! {
@@ -1047,6 +1072,7 @@ struct PassPartial<'a> {
     pool: vk::DescriptorPool,
     history: Vec<OwnImage>,
     mvec: Option<OwnBuffer>,
+    acc: Option<OwnBuffer>,
     answer: Option<OwnBuffer>,
     state: Option<OwnBuffer>,
     params: Vec<HostBuffer>,
@@ -1065,6 +1091,7 @@ impl<'a> PassPartial<'a> {
             pool: vk::DescriptorPool::null(),
             history: Vec::new(),
             mvec: None,
+            acc: None,
             answer: None,
             state: None,
             params: Vec::new(),
@@ -1086,7 +1113,7 @@ impl Drop for PassPartial<'_> {
             self.set_layout.as_raw(),
         ];
         let objects = handles.iter().filter(|&&h| h != 0).count() + self.history.len() + self.params.len();
-        let buffers = [self.mvec.take(), self.answer.take(), self.state.take()];
+        let buffers = [self.mvec.take(), self.acc.take(), self.answer.take(), self.state.take()];
         destroyed((objects + buffers.iter().flatten().count()) as isize);
         // SAFETY: nothing here was ever submitted; null handles are ignored by the destroy calls;
         // freeing the pools frees the sets and command buffers allocated from them.
@@ -1145,6 +1172,7 @@ pub(crate) struct Retries {
     pub(crate) auto: PassRetry,
     pub(crate) pass: PassRetry,
     pub(crate) depth: PassRetry,
+    pub(crate) edit: PassRetry,
 }
 
 /// `NEURAL_FORGE_NATIVE_FAIL=chain`: reports one counter-chain timeout at the 300th network frame, to
@@ -1218,6 +1246,17 @@ fn copied_mvec(mvec: Option<super::Aux>) -> Option<super::Aux> {
     mvec.filter(|a| a.readable && super::aux_copy_layout(a.layout).is_some())
 }
 
+/// What the edit cache needs from the hold's caller (`super::run_native`).
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheAsk {
+    /// `Session::seen`: which DLSS submit this hold is (consecutive holds differ by 1).
+    pub hold: u64,
+    /// `model_interval`.
+    pub interval: u32,
+    /// `debug_view` asks for the cache's rejection mask.
+    pub debug_mask: bool,
+}
+
 /// One native hold (module docs): the capture with the motion-vector copy, the network, the write-back,
 /// submitted on the game's queue through `submit` with no wait in between. The previous hold's work
 /// is waited for (bounded) first, as every hold does. Frames the network is not ready for go to DLSS
@@ -1229,7 +1268,7 @@ fn copied_mvec(mvec: Option<super::Aux>) -> Option<super::Aux> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_native_hold(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut super::Resources, target: &Target,
-    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, conditioning: Conditioning, arm: Option<super::cache_dump::Arm>,
+    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, conditioning: Conditioning, arm: Option<super::cache_dump::Arm>, ask: CacheAsk,
     submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> super::HoldResult {
     let mut result = super::HoldResult { native: true, ..Default::default() };
@@ -1242,6 +1281,11 @@ pub(crate) unsafe fn run_native_hold(
     result.writeback_gpu_ms = writeback_gpu;
     result.network_gpu_ms = res.native.as_mut().and_then(|n| n.take_gpu_ms(device));
     result.depth_gpu_ms = res.depth.as_mut().and_then(|d| d.take_gpu_ms(device));
+    // The previous hold's edit-cache counters (finished: waited above).
+    if let Some(c) = res.edit.as_mut() {
+        result.cache_gpu_ms = c.take_gpu_ms(device);
+        result.cache_rejected = c.after_fence().rejected;
+    }
     // An armed hold's readbacks (finished: waited above), before anything clears the exposure.
     result.cache_frame = res.take_cache_frame();
     if arm.is_none() {
@@ -1367,6 +1411,69 @@ pub(crate) unsafe fn run_native_hold(
         });
     }
     let depth = depth.filter(|_| res.depth.is_some());
+    // The edit cache (`super::cache`): its passes for this extent, and its store while the interval
+    // is above 1 (at 1 only the motion pass runs, copying the vectors for the network as they are).
+    if res.edit.as_ref().is_some_and(|c| !c.matches(target.width, target.height)) {
+        if let Some(c) = res.edit.take() {
+            // SAFETY: idle (waited above).
+            unsafe { c.destroy(device) };
+        }
+    }
+    if res.edit.is_none() {
+        let family = res.queue_family;
+        // SAFETY: `device` is live; `family` is the holds' family.
+        res.edit = res.native_retry.edit.build((target.width, target.height), now, || unsafe {
+            super::cache::CachePass::build(device, instance, physical_device, family, target.width, target.height)
+        });
+    }
+    let Some(colour_view) = res.hdr.as_ref().and_then(hdr::HdrPass::colour_view) else {
+        res.native = Some(native);
+        result.miss = Some("a storage view of the colour input could not be created");
+        return result;
+    };
+    let Some(edit) = res.edit.as_mut() else {
+        res.native = Some(native);
+        result.miss = Some("the edit cache's passes could not be built");
+        return result;
+    };
+    let wanted = ask.interval.clamp(1, super::cache::MAX_INTERVAL);
+    // SAFETY: nothing of the pass is pending (waited above).
+    let chained = wanted > 1 && unsafe { edit.ensure_store(device, instance, physical_device) };
+    if !chained {
+        // SAFETY: as above.
+        unsafe { edit.free_store(device) };
+    }
+    native.gap.note_format(format_of(target));
+    let cache_hold = super::cache::Hold {
+        interval: if chained { wanted } else { 1 },
+        hold: ask.hold,
+        jitter,
+        mvec: mvec.is_some(),
+        depth: depth.is_some(),
+        history_ok: native.frames > 0 && native.gap.pending(Instant::now()).is_none(),
+        armed: arm.is_some(),
+        debug_mask: ask.debug_mask,
+    };
+    let plan = edit.state.plan(&cache_hold);
+    let cached = plan.kind == super::cache::Kind::Cached;
+    let hdr_ref = res.hdr.as_ref().expect("built above");
+    let bindings = super::cache::Bindings {
+        colour: colour_view,
+        encoded: hdr_ref.encoded_view(),
+        answer: hdr_ref.answer_view(),
+        exposure: hdr_ref.exposure_buffer(),
+        depth: depth.and(res.depth.as_ref()).map(DepthCopy::buffer),
+        mvec: native.mvec.buffer,
+        acc: native.acc.buffer,
+    };
+    // SAFETY: nothing of the pass is pending; every handle is live.
+    unsafe { edit.bind(device, &bindings) };
+    edit.clear_counters();
+    let mut push = edit.push(plan.flags, depth.map_or(0, super::cache::depth_kind), target.mvec_scale, target.paper_white);
+    push.step_jitter = plan.step_jitter;
+    push.refresh_jitter = plan.refresh_jitter;
+    // The motion pass whenever there are vectors to copy, and always while the cache runs (its prep).
+    let run_motion = chained || mvec.is_some();
     // A cache dump's readbacks for an armed hold, built on its first one.
     if arm.is_some() && res.cache.is_none() {
         // SAFETY: `device` is live.
@@ -1380,25 +1487,58 @@ pub(crate) unsafe fn run_native_hold(
     });
     let hdr_pass = res.hdr.as_ref();
     let depth_copy = depth.and(res.depth.as_ref()).map(|d| (d.buffer(), d.timer.as_ref()));
+    let edit = res.edit.as_ref().expect("built above");
+    let acc = native.acc.buffer;
+    // SAFETY (the three closures): recording into the hold's own buffers; the set was bound above.
+    let motion = |cmd: vk::CommandBuffer| unsafe { edit.record_motion(device, cmd, &push, acc) };
+    let capture_edit = |cmd: vk::CommandBuffer| unsafe { edit.record_capture(device, cmd, &push) };
+    let apply = |cmd: vk::CommandBuffer| unsafe { edit.record_apply(device, cmd, &push) };
     // SAFETY: the capture buffer is idle; the colour view was bound above.
-    if unsafe { super::record_capture(device, res, target, None, hdr_pass, mvec.map(|_| native.mvec.buffer), depth_copy, cache.map(|c| c.colour)) }.is_err() {
+    let recorded = unsafe {
+        super::record_capture(
+            device,
+            res,
+            target,
+            None,
+            hdr_pass,
+            mvec.map(|_| native.mvec.buffer),
+            depth_copy,
+            cache.map(|c| c.colour),
+            run_motion.then_some(&motion as &dyn Fn(vk::CommandBuffer)),
+        )
+    };
+    if recorded.is_err() {
         res.native = Some(native);
         result.miss = Some("recording the capture failed");
         return result;
     }
-    // SAFETY: as above, with the native pass's answer as the decode's source.
-    if unsafe { super::record_writeback(device, res, target, native.answer(), hdr_pass, cache.as_ref()) }.is_err() {
+    // SAFETY: as above: on a cached hold the cache's passes write the colour input; else the decode,
+    // with the native pass's answer as its source (and the edit captured first while the cache runs).
+    let recorded = unsafe {
+        if cached {
+            super::record_cached_writeback(device, res, &apply)
+        } else {
+            super::record_writeback(device, res, target, native.answer(), hdr_pass, cache.as_ref(), chained.then_some(&capture_edit as &dyn Fn(vk::CommandBuffer)))
+        }
+    };
+    if recorded.is_err() {
         res.native = Some(native);
         result.miss = Some("recording the write-back failed");
         return result;
     }
-    native.gap.note_format(format_of(target));
-    let stale = native.gap.begin(Instant::now());
-    if native.frames > 0 {
-        note_reset(stale);
-    }
-    let history = native.frames > 0 && stale.is_none() && mvec.is_some();
-    let frame_cmds = native.frame(&built, history, jitter, target.mvec_scale, conditioning);
+    // A cached hold keeps the network's history as it is (no frame of the network): its parity,
+    // seed and jitter stay the last refresh's, and the 500 ms rule counts from this hold.
+    let (history, frame_cmds) = if cached {
+        native.gap.touch(Instant::now());
+        (false, Vec::new())
+    } else {
+        let stale = native.gap.begin(Instant::now());
+        if native.frames > 0 {
+            note_reset(stale);
+        }
+        let history = native.frames > 0 && stale.is_none() && mvec.is_some();
+        (history, native.frame(&built, history, jitter, target.mvec_scale, conditioning))
+    };
     res.native = Some(native);
     result.timing.prep = Some(t_hold.elapsed());
     if let Some(d) = res.depth.as_mut() {
@@ -1444,6 +1584,10 @@ pub(crate) unsafe fn run_native_hold(
     if let Some(timer) = res.writeback_timer.as_mut() {
         timer.mark_submitted();
     }
+    if let Some(edit) = res.edit.as_mut() {
+        edit.state.went_through(&cache_hold, &plan);
+        edit.submitted(run_motion, cached || chained);
+    }
     if let (Some(arm), Some(c)) = (arm.filter(|_| cache.is_some()), res.cache.as_mut()) {
         c.pending = Some(super::cache_dump::Pending {
             arm,
@@ -1460,6 +1604,7 @@ pub(crate) unsafe fn run_native_hold(
     }
     result.evaluated = true;
     result.wrote_back = true;
+    result.cached = cached;
     result.timing.writeback = Some(t_hold.elapsed());
     result
 }
@@ -1511,12 +1656,12 @@ mod tests {
         let live = || LIVE.with(std::cell::Cell::get);
         for at in 0..BUILD_STEPS {
             // SAFETY: a fresh device; nothing is submitted.
-            let pass = unsafe { NativePass::build_failing_at(device, instance, physical, family, W, H, Some(at)) };
+            let pass = unsafe { NativePass::build_failing_at(device, instance, physical, family, W, H, Some(at), false) };
             assert!(pass.is_none(), "step {at} fails");
             assert_eq!(live(), 0, "every object made before step {at} is destroyed");
         }
         // SAFETY: as above.
-        let pass = unsafe { NativePass::build_failing_at(device, instance, physical, family, W, H, Some(BUILD_STEPS)) }.expect("no step fails");
+        let pass = unsafe { NativePass::build_failing_at(device, instance, physical, family, W, H, Some(BUILD_STEPS), false) }.expect("no step fails");
         assert!(live() > 0);
         // SAFETY: nothing of it was submitted.
         unsafe { pass.destroy(device) };
@@ -1530,7 +1675,7 @@ mod tests {
             retry.build(extent, at, || {
                 calls.set(calls.get() + 1);
                 // SAFETY: as above.
-                unsafe { NativePass::build_failing_at(device, instance, physical, family, extent.0, extent.1, fail.then_some(3)) }
+                unsafe { NativePass::build_failing_at(device, instance, physical, family, extent.0, extent.1, fail.then_some(3), false) }
             })
         };
         assert!(hold(&mut retry, (W, H), t0, true).is_none());
@@ -1546,6 +1691,109 @@ mod tests {
         // SAFETY: nothing of it was submitted.
         unsafe { pass.destroy(device) };
         assert_eq!(live(), 0);
+    }
+
+    /// At interval 1 the frame shaders read the accumulated field the cache's motion pass made from
+    /// DLSS's vectors, where they read the packed vectors before (`MOTION_HALF`, the old path): the
+    /// network's 16 input lanes and its answer are bit for bit the same over frames with history,
+    /// with fractional vectors and a high-resolution scale.
+    #[test]
+    fn at_interval_1_the_network_sees_exactly_what_it_saw_before_the_accumulated_field() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let frame = nn::Frame { field_width: FW, field_height: FH, features: features.buffer, features_bytes: u64::from(FW * FH) * 64, head: head.buffer, head_bytes: u64::from(FW * FH) * 16, blend_scale: 0.5, chained: 0 };
+            let built = Built { width: W, height: H, frame, graph, graph_own: graph, generation: 1 };
+            let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            fx.one_shot(|cmd| {
+                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
+                let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
+                device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+            // The old path (packed halves) and the new (the field), side by side.
+            let mut old = NativePass::build_failing_at(device, instance, physical, family, W, H, None, true).unwrap();
+            let mut new = NativePass::build(device, instance, physical, family, W, H).unwrap();
+            assert!(old.record(device, &built, graph, encoded.view, exposure.buffer));
+            assert!(new.record(device, &built, graph, encoded.view, exposure.buffer));
+            let cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H).unwrap();
+            cache.bind(
+                device,
+                &super::super::cache::Bindings { colour: encoded.view, encoded: encoded.view, answer: encoded.view, exposure: exposure.buffer, depth: None, mvec: new.mvec.buffer, acc: new.acc.buffer },
+            );
+            let answer_of = |pass: &NativePass| -> Vec<u16> {
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, pass.answer(), staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }]));
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).to_vec()
+            };
+            let lanes = || -> Vec<u32> { std::slice::from_raw_parts(features.ptr.cast::<u32>(), (FW * FH * 16) as usize).to_vec() };
+            // Fractional vectors of both signs, some pointing out of the frame, a NaN and an infinity.
+            let vectors = |frame: u32| -> Vec<u32> {
+                (0..W * H)
+                    .map(|i| {
+                        let (x, y) = (i % W, i / W);
+                        let vx = ((x * 7 + y * 3 + frame * 5) % 23) as f32 * 0.37 - 4.1;
+                        let vy = ((x * 5 + y * 11 + frame) % 19) as f32 * -0.29 + 2.3;
+                        let bits = |v: f32| u32::from(super::super::tests::f32_to_f16(v));
+                        match i {
+                            17 => u32::from(0x7e00u16) | bits(vy) << 16,
+                            41 => u32::from(0x7c00u16) | bits(vy) << 16,
+                            _ => bits(vx) | bits(vy) << 16,
+                        }
+                    })
+                    .collect()
+            };
+            for (frame, (history, scale, jitter)) in [(false, [1.0, 1.0], Some([0.1, -0.2])), (true, [1.0, 1.0], Some([-0.3, 0.25])), (true, [0.6667, 0.6667], Some([0.4, 0.1])), (true, [0.5, 0.25], None)].into_iter().enumerate() {
+                let frame = frame as u32;
+                let v = vectors(frame);
+                let fill = |pass: &NativePass| {
+                    std::ptr::copy_nonoverlapping(v.as_ptr().cast::<u8>(), staging.ptr, v.len() * 4);
+                    fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, staging.buffer, pass.mvec.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(W * H) * 4 }]));
+                };
+                fill(&old);
+                fill(&new);
+                // The capture's motion pass at interval 1.
+                let push = cache.push(super::super::cache::F_KEEP_CLAMPED, 0, scale, 3.0);
+                fx.one_shot(|cmd| cache.record_motion(device, cmd, &push, new.acc.buffer));
+                let h: Vec<f32> = (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, frame), residual(x, y, 1, frame), residual(x, y, 2, frame), 1.5])).collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+                fx.submit(&old.frame(&built, history, jitter, scale, Conditioning::default()));
+                let (old_lanes, old_answer) = (lanes(), answer_of(&old));
+                fx.submit(&new.frame(&built, history, jitter, scale, Conditioning::default()));
+                let (new_lanes, new_answer) = (lanes(), answer_of(&new));
+                assert!(old_lanes == new_lanes, "frame {frame}: the network's input lanes differ");
+                assert!(old_answer == new_answer, "frame {frame}: the answer differs");
+            }
+            for pass in [&old, &new] {
+                pass.destroy(device);
+            }
+            cache.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
     }
 
     const W: u32 = 20;
@@ -1683,7 +1931,9 @@ mod tests {
             });
             let mut pass = NativePass::build(device, instance, physical, family, W, H).expect("the native pass builds");
             assert!(pass.record(device, &built, graph, encoded.view, exposure.buffer));
-            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.mvec.buffer, 0, vk::WHOLE_SIZE, 0));
+            // The frame shaders read the accumulated field (the cache's motion pass makes it from
+            // DLSS's vectors): no motion.
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
             let write_head = |frame: u32, logit: f32| {
                 let h: Vec<f32> = (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, frame), residual(x, y, 1, frame), residual(x, y, 2, frame), logit])).collect();
                 std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
@@ -1749,7 +1999,9 @@ mod tests {
 
             // Frame 4: history through motion vectors of (2, 4) (in output pixels) at a scale of
             // (0.5, 0.25) (high-resolution motion vectors): pixel (5, 3) was at (6, 4) in the previous frame.
-            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.mvec.buffer, 0, vk::WHOLE_SIZE, u32::from(half(4.0)) << 16 | u32::from(half(2.0))));
+            let field: Vec<f32> = (0..W * H).flat_map(|_| [2.0f32, 4.0]).collect();
+            std::ptr::copy_nonoverlapping(field.as_ptr().cast::<u8>(), staging.ptr, field.len() * 4);
+            fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, staging.buffer, pass.acc.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(W * H) * 8 }]));
             write_head(3, 10.0);
             let cmds = pass.frame(&built, true, None, [0.5, 0.25], Conditioning::default());
             fx.submit(&cmds);

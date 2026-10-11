@@ -92,6 +92,8 @@ use vulkan_layer::LayerVulkanCommand as VulkanCommand;
 use crate::shm::ShmClient;
 use neural_forge_protocol::Slot;
 
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod cache;
 pub(crate) mod cache_dump;
 pub(crate) mod hdr;
 pub(crate) mod inline;
@@ -134,21 +136,26 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
 #[allow(clippy::too_many_arguments, clippy::needless_return)]
 pub(crate) unsafe fn run_native(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target,
-    loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient, arm: Option<cache_dump::Arm>,
+    loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient, arm: Option<cache_dump::Arm>, hold: u64,
     submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
     {
         // The Model tab's settings.
         let conditioning = shm.global_tuning().map_or_else(native::Conditioning::default, native::Conditioning::from);
+        // The edit cache's interval, and the debug view of its rejection mask.
+        let ask = native::CacheAsk { hold, interval: shm.model_interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
         // SAFETY: forwarded.
-        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, arm, submit) };
+        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, arm, ask, submit) };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, submit);
+    let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, hold, submit);
     #[cfg(not(target_arch = "x86_64"))]
     match *loader {}
 }
+
+/// `debug_view`'s value for the edit cache's rejection mask (`ShmHeader::debug_view`).
+pub(crate) const CACHE_DEBUG_VIEW: u32 = 6;
 
 /// The variable that selects the mode. Read through `neural_forge_protocol::env`.
 pub(crate) const ENV: &str = "NEURAL_FORGE_PREUPSCALE";
@@ -3652,6 +3659,9 @@ pub(crate) struct Resources {
     /// DLSS's depth as the native hold copied it, built on the first hold with a readable one.
     #[cfg(target_arch = "x86_64")]
     pub(crate) depth: Option<native::DepthCopy>,
+    /// The edit cache's passes (`cache`), built on the first native hold.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) edit: Option<cache::CachePass>,
     /// A running cache dump's readbacks (`cache_dump`), built on its first armed hold and freed
     /// after it.
     pub(crate) cache: Option<cache_dump::Buffers>,
@@ -3738,6 +3748,8 @@ impl Resources {
             game_exposure_read: None,
             #[cfg(target_arch = "x86_64")]
             depth: None,
+            #[cfg(target_arch = "x86_64")]
+            edit: None,
             cache: None,
             capture_pending: false,
             writeback_pending: false,
@@ -3820,6 +3832,10 @@ impl Resources {
             #[cfg(target_arch = "x86_64")]
             if let Some(depth) = &self.depth {
                 depth.destroy(device);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(edit) = &self.edit {
+                edit.destroy(device);
             }
             if let Some(cache) = &self.cache {
                 cache.destroy(device);
@@ -3989,6 +4005,13 @@ pub(crate) struct HoldResult {
     pub depth_gpu_ms: Option<f32>,
     /// A cache dump's armed hold read back here (the previous one on the split path).
     pub cache_frame: Option<cache_dump::Frame>,
+    /// The native backend: this hold reused the last refresh's correction (the edit cache) instead of
+    /// running the network. `evaluated` is set either way.
+    pub cached: bool,
+    /// The native backend: the GPU time of the previous hold's cache passes, read likewise.
+    pub cache_gpu_ms: Option<f32>,
+    /// The previous cached hold's share of rejected pixels (0..1), read likewise.
+    pub cache_rejected: Option<f32>,
 }
 
 impl HoldResult {
@@ -4128,8 +4151,8 @@ fn capture_reads(
 /// layout (transitioned to TRANSFER_SRC_OPTIMAL and back when that layout cannot be copied from).
 /// The native backend's hold also copies DLSS's depth into its buffer (`native_depth`, with the
 /// timer around that copy alone; from [`Target::depth_buffer`] inside DLSS's buffer, else the depth
-/// aspect of [`Target::depth`]), and for a cache dump the colour input as it is (`colour_before`,
-/// tightly packed at the real extent).
+/// aspect of [`Target::depth`]), for a cache dump the colour input as it is (`colour_before`,
+/// tightly packed at the real extent), and last `extra` (the edit cache's passes, `cache`).
 ///
 /// # Safety
 /// `res`'s capture command buffer must not be pending; with `hdr`, its colour view is bound to
@@ -4137,7 +4160,7 @@ fn capture_reads(
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_capture(
     device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>, native_mvec: Option<vk::Buffer>,
-    native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>, colour_before: Option<vk::Buffer>,
+    native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>, colour_before: Option<vk::Buffer>, extra: Option<&dyn Fn(vk::CommandBuffer)>,
 ) -> ash::prelude::VkResult<()> {
     let auto = hdr.is_some() && ExposureSource::of(target) == ExposureSource::Auto;
     let cmd = res.capture_cmd;
@@ -4229,6 +4252,10 @@ unsafe fn record_capture(
             }
             None => device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, res.proxy.buffer, &capture_regions(target.width, target.height)),
         }
+        // The edit cache's passes (the native hold's), after every copy and the encode.
+        if let Some(extra) = extra {
+            extra(cmd);
+        }
     }
     let back: Vec<vk::ImageMemoryBarrier> = aux
         .iter()
@@ -4281,8 +4308,10 @@ unsafe fn record_capture(
 /// # Safety
 /// `res`'s write-back command buffer must not be pending; with `hdr`, the pass holds this hold's
 /// capture and its colour view is bound to `target.colour`.
+#[allow(clippy::too_many_arguments)]
 unsafe fn record_writeback(
     device: &ash::Device, res: &Resources, target: &Target, source: vk::Buffer, hdr: Option<&hdr::HdrPass>, cache: Option<&CacheCopies>,
+    edit_capture: Option<&dyn Fn(vk::CommandBuffer)>,
 ) -> ash::prelude::VkResult<()> {
     let cmd = res.writeback_cmd;
     let (dst_stage, dst_access, mut src_stage, mut src_access) = if hdr.is_some() {
@@ -4325,7 +4354,7 @@ unsafe fn record_writeback(
             timer.record_start(device, cmd);
         }
         match hdr {
-            Some(pass) => pass.record_decode(device, cmd, source, target.paper_white),
+            Some(pass) => pass.record_decode(device, cmd, source, target.paper_white, edit_capture),
             None => device.cmd_copy_buffer_to_image(cmd, source, target.colour, vk::ImageLayout::GENERAL, &[writeback_region(target.width, target.height)]),
         }
         if let Some(c) = cache {
@@ -4337,6 +4366,37 @@ unsafe fn record_writeback(
             }
         }
         device.cmd_pipeline_barrier(cmd, src_stage, close_stage, vk::DependencyFlags::empty(), &[close], &[], &[]);
+        if let Some(timer) = &res.writeback_timer {
+            timer.record_end(device, cmd);
+        }
+        device.end_command_buffer(cmd)
+    }
+}
+
+/// Records a cached hold's write-back (the edit cache, `cache`): the write-back's opening barrier,
+/// `apply` (the cache's passes, which write the colour input in place), and its closing barrier, with
+/// the write-back's timer around them.
+///
+/// # Safety
+/// `res`'s write-back command buffer must not be pending.
+#[cfg(target_arch = "x86_64")]
+unsafe fn record_cached_writeback(device: &ash::Device, res: &Resources, apply: &dyn Fn(vk::CommandBuffer)) -> ash::prelude::VkResult<()> {
+    let cmd = res.writeback_cmd;
+    let open = vk::MemoryBarrier::builder()
+        .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+        .build();
+    let close = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+    // SAFETY: the layer's own buffer, not pending; every handle is live.
+    unsafe {
+        device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
+        device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+        device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[open], &[], &[]);
+        if let Some(timer) = &res.writeback_timer {
+            timer.record_start(device, cmd);
+        }
+        apply(cmd);
+        device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &[]);
         if let Some(timer) = &res.writeback_timer {
             timer.record_end(device, cmd);
         }
@@ -4420,7 +4480,7 @@ pub(crate) unsafe fn run_hold(
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     let dump_bufs = if dump { res.dump.as_ref() } else { None };
     // SAFETY: the capture buffer is idle (`wait_idle` above); the colour view was bound above.
-    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, None, None, None) }.is_err() {
+    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, None, None, None, None) }.is_err() {
         result.miss = Some("recording the capture failed");
         return result;
     }
@@ -4525,7 +4585,7 @@ pub(crate) unsafe fn run_hold(
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     // SAFETY: the write-back buffer is idle (`wait_idle` above); in the HDR modes the pass holds this
     // hold's capture and its colour view.
-    if unsafe { record_writeback(device, res, target, source, hdr_pass, None) }.is_err() {
+    if unsafe { record_writeback(device, res, target, source, hdr_pass, None, None) }.is_err() {
         result.miss = Some("recording the write-back failed");
         return result;
     }
@@ -4681,6 +4741,15 @@ struct Stats {
     network_gpu_ms: Vec<f32>,
     /// The native hold's depth copy (`native::DepthCopy`).
     depth_gpu_ms: Vec<f32>,
+    /// The edit cache (`cache`): its passes' GPU time, the window's refresh and cached holds, the
+    /// session's, the last cached hold's rejected share, and the median published at the last summary.
+    cache_gpu_ms: Vec<f32>,
+    window_refresh: u32,
+    window_cached: u32,
+    refresh_holds: u32,
+    cached_holds: u32,
+    last_rejected: Option<f32>,
+    cache_gpu_published: Option<f32>,
     /// [`HoldTiming`]'s phases in milliseconds, per hold that reached them.
     prep_ms: Vec<f32>,
     capture_wait_ms: Vec<f32>,
@@ -4876,6 +4945,12 @@ impl Session {
     pub(crate) fn suppresses_post(&self) -> bool {
         let now = Instant::now();
         mode() == Mode::Model && post_off(self.engaged, self.last_dlss, now) && !ray_reconstruction_running(now)
+    }
+
+    /// How many launch-bearing submits with DLSS's inputs identified reached the hold point
+    /// ([`Self::saw_dlss`]): the number of the one being held (the edit cache tells consecutive holds by it).
+    pub(crate) fn seen(&self) -> u64 {
+        self.seen
     }
 
     /// A launch-bearing submit with DLSS's inputs identified reached the hold point.
@@ -5118,6 +5193,21 @@ impl Session {
         if let Some(g) = result.depth_gpu_ms {
             s.depth_gpu_ms.push(g);
         }
+        if let Some(g) = result.cache_gpu_ms {
+            s.cache_gpu_ms.push(g);
+        }
+        if result.cache_rejected.is_some() {
+            s.last_rejected = result.cache_rejected;
+        }
+        if result.native && result.evaluated {
+            if result.cached {
+                s.window_cached += 1;
+                s.cached_holds = s.cached_holds.wrapping_add(1);
+            } else {
+                s.window_refresh += 1;
+                s.refresh_holds = s.refresh_holds.wrapping_add(1);
+            }
+        }
         s.book(&result.timing);
         if let Some(e) = result.exposure.filter(|&e| hdr::exposure_ok(e)) {
             s.exposure.push(e);
@@ -5138,6 +5228,10 @@ impl Session {
             }
         }
         shm.publish_preupscale_hold(s.last_hold_ms, s.misses);
+        if result.native {
+            let gpu = s.cache_gpu_published.or_else(|| s.cache_gpu_ms.last().copied());
+            shm.publish_cache(s.refresh_holds, s.cached_holds, s.last_rejected, gpu);
+        }
         shm.publish_preupscale_state(if holding { 2 } else { 1 }, self.last_hold_native, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
@@ -5147,7 +5241,7 @@ impl Session {
             let rate = per_second(SUMMARY_EVERY, s.window_start.map_or(Duration::ZERO, |t| now.duration_since(t)));
             s.window_start = Some(now);
             crate::log!(
-                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2}{}{} misses={} (total {}) holds_per_s={:.1}{}",
+                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2}{}{}{} misses={} (total {}) holds_per_s={:.1}{}",
                 mode().name(),
                 extent.0,
                 extent.1,
@@ -5160,6 +5254,17 @@ impl Session {
                     String::new()
                 } else {
                     format!(" depth_copy_gpu_ms median={:.4} max={:.4}", median(&s.depth_gpu_ms), s.depth_gpu_ms.iter().copied().fold(0.0, f32::max))
+                },
+                if s.window_cached + s.window_refresh == 0 {
+                    String::new()
+                } else {
+                    format!(
+                        " cached={} refresh={} cache_gpu_ms median={:.3} rejected={}",
+                        s.window_cached,
+                        s.window_refresh,
+                        median(&s.cache_gpu_ms),
+                        s.last_rejected.map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0))
+                    )
                 },
                 s.window_misses,
                 s.misses,
@@ -5181,6 +5286,12 @@ impl Session {
             s.writeback_gpu_ms.clear();
             s.network_gpu_ms.clear();
             s.depth_gpu_ms.clear();
+            if !s.cache_gpu_ms.is_empty() {
+                s.cache_gpu_published = Some(median(&s.cache_gpu_ms));
+            }
+            s.cache_gpu_ms.clear();
+            s.window_cached = 0;
+            s.window_refresh = 0;
             s.clear_phases();
             s.window_misses = 0;
         }
@@ -8090,7 +8201,7 @@ mod tests {
     // ---- The HDR encode: a CPU reference and the GPU checks against it. ----
 
     /// Single to half precision, round to nearest even.
-    fn f32_to_f16(v: f32) -> u16 {
+    pub(crate) fn f32_to_f16(v: f32) -> u16 {
         if v.is_nan() {
             return 0x7e00;
         }
@@ -8950,8 +9061,8 @@ mod tests {
             identification: 1,
         };
         let run = |res: &Resources, target: &Target, cache: Option<&CacheCopies>| unsafe {
-            record_capture(d, res, target, None, None, None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour)).unwrap();
-            record_writeback(d, res, target, res.proxy.buffer, None, cache).unwrap();
+            record_capture(d, res, target, None, None, None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour), None).unwrap();
+            record_writeback(d, res, target, res.proxy.buffer, None, cache, None).unwrap();
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             d.queue_submit(gpu.queue, &[vk::SubmitInfo::builder().command_buffers(&[res.capture_cmd, res.writeback_cmd]).build()], fence).unwrap();
             d.wait_for_fences(&[fence], true, u64::MAX).unwrap();

@@ -777,6 +777,7 @@ fn inline_hold(
         paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
         identification: job.point.identification,
     };
+    let seen = session.seen();
     let Some(res) = session.res.as_mut() else { return };
     let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| {
         let info = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build();
@@ -790,7 +791,7 @@ fn inline_hold(
         // SAFETY: as below; the loader belongs to this device, and the side queue's family is the
         // network's own (its graph is recorded for it too).
         Some(loader) => unsafe {
-            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, arm, &mut submit)
+            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, arm, seen, &mut submit)
         },
         None => unsafe {
             crate::preupscale::run_hold(device, instance, physical_device, res, &target, mode, dump, 0, &mut submit)
@@ -1366,6 +1367,7 @@ impl NeuralForgeDeviceInfo {
         };
         let loader = session.native.as_ref().filter(|_| native);
         let jitter = scan.jitter_px();
+        let seen = session.seen();
         let res = session.res.as_mut()?;
         let mut held: Option<(crate::preupscale::HoldResult, std::time::Duration)> = None;
         let mut accepted: Vec<vk::CommandBuffer> = Vec::new();
@@ -1381,7 +1383,7 @@ impl NeuralForgeDeviceInfo {
             let hold = match loader {
                 // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
                 Some(loader) => unsafe {
-                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, arm, &mut layer_submit)
+                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, arm, seen, &mut layer_submit)
                 },
                 None => unsafe {
                     crate::preupscale::run_hold(&self.device, instance, self.physical_device, res, &target, mode, dump, scan.evaluation, &mut layer_submit)

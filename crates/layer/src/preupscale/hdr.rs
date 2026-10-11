@@ -617,6 +617,18 @@ impl HdrPass {
         self.encoded.view
     }
 
+    /// The colour input's view bound at the last [`Self::bind_colour`].
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn colour_view(&self) -> Option<vk::ImageView> {
+        self.colour_view
+    }
+
+    /// The answer image's view (padded extent, `GENERAL` after the write-back's opening barrier).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn answer_view(&self) -> vk::ImageView {
+        self.answer.view
+    }
+
     /// The exposure buffer (the capture copies the texel to offset 0).
     pub(crate) fn exposure_buffer(&self) -> vk::Buffer {
         self.exposure.buffer
@@ -764,12 +776,15 @@ impl HdrPass {
     /// Records, after the write-back's opening barrier: the copy of `source` (the padded answer,
     /// tightly packed) into the answer image, made visible to the shader, and the decode dispatch
     /// over the real extent, which writes the colour input in place. The caller closes with a
-    /// `COMPUTE_SHADER/SHADER_WRITE -> ALL_COMMANDS` barrier.
+    /// `COMPUTE_SHADER/SHADER_WRITE -> ALL_COMMANDS` barrier. `before` is recorded between the
+    /// answer's copy (made visible to compute shaders) and the decode: the edit cache's capture, which
+    /// reads the colour input before the decode overwrites it (`before` ends with the barrier that
+    /// orders the two).
     ///
     /// # Safety
     /// `cmd` is recording, the answer image is in `GENERAL` (the caller's opening barrier), the
     /// encoded image still holds this hold's capture, [`Self::bind_colour`] was called for it.
-    pub(crate) unsafe fn record_decode(&self, device: &ash::Device, cmd: vk::CommandBuffer, source: vk::Buffer, paper_white: f32) {
+    pub(crate) unsafe fn record_decode(&self, device: &ash::Device, cmd: vk::CommandBuffer, source: vk::Buffer, paper_white: f32, before: Option<&dyn Fn(vk::CommandBuffer)>) {
         let region = vk::BufferImageCopy {
             buffer_offset: 0,
             buffer_row_length: self.padded_width,
@@ -783,6 +798,9 @@ impl HdrPass {
         unsafe {
             device.cmd_copy_buffer_to_image(cmd, source, self.answer.image, vk::ImageLayout::GENERAL, &[region]);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[answer_in], &[], &[]);
+            if let Some(before) = before {
+                before(cmd);
+            }
             self.dispatch(device, cmd, self.decode, paper_white, self.width, self.height);
         }
     }
@@ -855,11 +873,23 @@ fn to_general(image: vk::Image, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier 
 /// # Safety
 /// `device` is live; `layout` matches the shader's interface.
 pub(super) unsafe fn compute_pipeline(device: &ash::Device, layout: vk::PipelineLayout, spv: &[u8]) -> Option<vk::Pipeline> {
+    // SAFETY: forwarded.
+    unsafe { compute_pipeline_with(device, layout, spv, None) }
+}
+
+/// [`compute_pipeline`] with specialization constants.
+///
+/// # Safety
+/// As [`compute_pipeline`]; `spec` matches the shader's constants.
+pub(super) unsafe fn compute_pipeline_with(device: &ash::Device, layout: vk::PipelineLayout, spv: &[u8], spec: Option<&vk::SpecializationInfo>) -> Option<vk::Pipeline> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).ok()?;
     // SAFETY: valid SPIR-V, compiled by `glslangValidator -V` and checked by spirv-val.
     let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&code), None) }.ok()?;
     let entry = c"main";
-    let stage = vk::PipelineShaderStageCreateInfo::builder().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(entry).build();
+    let mut stage = vk::PipelineShaderStageCreateInfo::builder().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(entry).build();
+    if let Some(spec) = spec {
+        stage.p_specialization_info = std::ptr::from_ref(spec);
+    }
     let info = vk::ComputePipelineCreateInfo::builder().stage(stage).layout(layout).build();
     // SAFETY: `module` and `layout` outlive the call.
     let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&info), None) };

@@ -496,6 +496,31 @@ impl ShmClient {
         hdr.preupscale_misses.store(misses, Ordering::Relaxed);
     }
 
+    /// `model_interval` (1..=4): on the pre-upscaler path, the edit cache's interval (`preupscale::cache`).
+    /// 1 before the mapping is open.
+    pub fn model_interval(&self) -> u32 {
+        self.header().map_or(1, |h| h.model_interval.load(Ordering::Relaxed).clamp(1, 4))
+    }
+
+    /// `debug_view` (0 before the mapping is open).
+    pub fn debug_view(&self) -> u32 {
+        self.header().map_or(0, |h| h.debug_view.load(Ordering::Relaxed))
+    }
+
+    /// The edit cache's status (`ShmHeader::cache_*`): the hold counts, the last cached hold's
+    /// rejected share (0..1, when one was read) and the cache passes' GPU milliseconds (when known).
+    pub fn publish_cache(&self, refresh_holds: u32, cached_holds: u32, rejected: Option<f32>, gpu_ms: Option<f32>) {
+        let Some(hdr) = self.header() else { return };
+        hdr.cache_refresh_holds.store(refresh_holds, Ordering::Relaxed);
+        hdr.cache_cached_holds.store(cached_holds, Ordering::Relaxed);
+        if let Some(r) = rejected {
+            hdr.cache_rejected.store((r.clamp(0.0, 1.0) * 10_000.0).round() as u32, Ordering::Relaxed);
+        }
+        if let Some(ms) = gpu_ms {
+            hdr.cache_gpu_ms_bits.store(ms.to_bits(), Ordering::Relaxed);
+        }
+    }
+
     /// A pending K-hold cache dump request (`ShmHeader::preupscale_dump_request`), taken: the field is
     /// zeroed so the CLI and the status see it was. One atomic load when there is none.
     pub fn take_preupscale_dump_request(&self) -> Option<u32> {
