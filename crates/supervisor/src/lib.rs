@@ -1,8 +1,9 @@
 //! Shared front-end support for `neural-forge-cli` and `neural-forge`: config, XDG paths, the
-//! settings channel, installation and the model extraction, so both front ends do each of these the
-//! same way. Linux-only: reads XDG env vars.
+//! settings channel, installation, the model extraction and the diagnosis (`doctor`), so both
+//! front ends do each of these the same way. Linux-only: reads XDG env vars.
 
 pub mod config;
+pub mod doctor;
 pub mod install;
 pub mod model;
 pub mod model_shape;

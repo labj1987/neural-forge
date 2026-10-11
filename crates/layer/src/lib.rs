@@ -124,6 +124,7 @@ fn duplicate_copy() -> bool {
     let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
     if let Some(live) = other_copies(&maps, &own).into_iter().find(|path| copy_is_live(path)) {
         crate::log!("[layer] another copy is already loaded from {live}; this copy ({own}) stays inert. Remove one of the implicit-layer manifests.");
+        crate::event!(neural_forge_protocol::state_log::DUPLICATE, "another copy is already loaded from {live}; this copy ({own}) stays inert");
         return true;
     }
     NEURAL_FORGE_LAYER_LIVE.store(true, std::sync::atomic::Ordering::Relaxed);
@@ -185,6 +186,9 @@ pub(crate) fn note_vk<T>(result: ash::prelude::VkResult<T>) -> ash::prelude::VkR
     if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) && !DEVICE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
         crate::log!("[layer] VK_ERROR_DEVICE_LOST; layer inert from here on");
         crate::logging::flush();
+        // Once, with the latch: the channel's `device_lost_at` and the state log say it without a log.
+        crate::shm::note_device_lost();
+        crate::event!(neural_forge_protocol::state_log::DEVICE_LOST, "VK_ERROR_DEVICE_LOST; the layer is inert from here on");
     }
     result
 }
@@ -221,9 +225,41 @@ pub(crate) fn note_fence_wait(result: ash::prelude::VkResult<()>, site: &'static
                  driver stall without device loss; failing open and continuing rather than hanging"
             );
             crate::breadcrumbs::dump("fence wait timeout");
+            crate::event!(
+                neural_forge_protocol::state_log::FENCE_TIMEOUT,
+                "fence wait timed out after {FENCE_WAIT_TIMEOUT:?} at {site}; stages, newest first: {}",
+                crate::breadcrumbs::trail()
+            );
         }
     }
     note_vk(result)
+}
+
+/// Why this process's device cannot run the network (`neural_forge_native::device_extend`'s refusal),
+/// once one was refused: the Status tab's line (`layer_reason`, published when the channel opens,
+/// `shm::ShmClient::open`) and the state log's. Set at device creation, never per frame.
+static NATIVE_UNAVAILABLE: Mutex<Option<String>> = Mutex::new(None);
+
+/// `device cannot run the network: <first missing>` from `device_extend`'s message ("the device lacks
+/// X", or an exception's text).
+fn cannot_run_line(why: &str) -> String {
+    let first = why.strip_prefix("the device lacks ").unwrap_or(why);
+    format!("{}{first}", neural_forge_protocol::state_log::CANNOT_RUN_PREFIX)
+}
+
+fn note_native_unavailable(why: &str) {
+    let line = cannot_run_line(why);
+    let mut said = NATIVE_UNAVAILABLE.lock().unwrap();
+    // A launcher can create several devices on the same GPU: one line per different reason.
+    if said.as_deref() != Some(line.as_str()) {
+        crate::event!(neural_forge_protocol::state_log::NATIVE_UNAVAILABLE, "{line}");
+        *said = Some(line);
+    }
+}
+
+/// The status line for a device that cannot run the network, if this process created one.
+pub(crate) fn native_unavailable() -> Option<String> {
+    NATIVE_UNAVAILABLE.lock().unwrap().clone()
 }
 
 fn env_flag(name: &str) -> bool {
@@ -607,7 +643,10 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                         // SAFETY: the next layer's gipa for this instance; `with` and everything it
                         // points to outlive the extension, which outlives the call.
                         match unsafe { neural_forge_native::device_extend(gipa, instance.instance.handle(), physical_device, &with) } {
-                            Err(why) => log!("[native] the device cannot run the network: {why}; native backend off on this device"),
+                            Err(why) => {
+                                log!("[native] the device cannot run the network: {why}; native backend off on this device");
+                                note_native_unavailable(&why);
+                            }
                             Ok(extension) => {
                                 let result = next_create_device(&extension.info, p_device);
                                 drop(extension);
@@ -965,6 +1004,15 @@ mod device_lost_tests {
         assert_eq!(note_vk::<u32>(Err(vk::Result::ERROR_DEVICE_LOST)), Err(vk::Result::ERROR_DEVICE_LOST));
         assert!(device_lost());
         DEVICE_LOST.store(false, std::sync::atomic::Ordering::Relaxed); // other tests share the process
+    }
+
+    #[test]
+    fn the_cannot_run_line_names_the_first_missing_requirement() {
+        assert_eq!(cannot_run_line("the device lacks VK_EXT_shader_float8"), "device cannot run the network: VK_EXT_shader_float8");
+        assert_eq!(cannot_run_line("Vulkan 1.3 (the device reports 1.2)"), "device cannot run the network: Vulkan 1.3 (the device reports 1.2)");
+        note_native_unavailable("the device lacks shaderInt64");
+        assert_eq!(native_unavailable().as_deref(), Some("device cannot run the network: shaderInt64"));
+        *NATIVE_UNAVAILABLE.lock().unwrap() = None;
     }
 }
 

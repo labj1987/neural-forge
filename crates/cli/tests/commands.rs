@@ -10,6 +10,8 @@ fn cli(scratch: &Path, shm: &Path, args: &[&str]) -> (bool, String) {
         .env("XDG_DATA_HOME", scratch.join("data"))
         .env("XDG_STATE_HOME", scratch.join("state"))
         .env("NEURAL_FORGE_SHM", shm)
+        // No `nvidia-smi` or `journalctl` to find: `doctor` must not read the real GPU or kernel log here.
+        .env("PATH", scratch.join("no-bin"))
         .output()
         .expect("run neural-forge-cli");
     (out.status.success(), format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr)))
@@ -42,14 +44,13 @@ fn import_binaries_fails_when_the_dll_is_not_there() {
 fn doctor_opens_the_channel() {
     let dir = scratch("doctor");
     let (_, out) = cli(&dir, &dir.join("shm.bin"), &["doctor"]);
-    let line = out.lines().skip_while(|l| !l.starts_with("channel:")).nth(1).unwrap_or_default().trim().to_string();
-    assert_eq!(line, "ok", "{out}");
+    assert!(out.lines().any(|l| l == "[ok] channel: the settings channel opens"), "{out}");
+    assert!(out.contains("[info] xid: journalctl is not installed"), "the kernel log is not read: {out}");
 
     // A runtime directory that cannot hold the channel (a file where the directory goes).
     std::fs::write(dir.join("not-a-dir"), "").unwrap();
     let (ok, out) = cli(&dir, &dir.join("not-a-dir/shm.bin"), &["doctor"]);
     assert!(!ok);
-    let line = out.lines().skip_while(|l| !l.starts_with("channel:")).nth(1).unwrap_or_default().trim().to_string();
-    assert!(line.starts_with("cannot open"), "{out}");
+    assert!(out.lines().any(|l| l.starts_with("[FAILURE] channel: the settings channel cannot be opened")), "{out}");
     std::fs::remove_dir_all(&dir).ok();
 }

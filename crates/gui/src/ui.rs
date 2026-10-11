@@ -501,6 +501,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     status_page.add(&build_telemetry_group(&shm));
     let status_group = build_status_group(&shm, &toasts);
     status_page.add(&status_group);
+    status_page.add(&build_diagnosis_group());
     view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", "network-transmit-receive-symbolic");
 
     view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", "preferences-system-symbolic");
@@ -1210,6 +1211,80 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     }
 
     group
+}
+
+/// The Diagnosis group: the Diagnose button runs `neural-forge-cli doctor`'s checks
+/// (`neural_forge_supervisor::doctor`) and lists the findings, worst first. They run on a worker thread:
+/// `nvidia-smi` and `journalctl` can take seconds.
+fn build_diagnosis_group() -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Diagnosis");
+    group.set_description(Some("Why neural rendering is or is not running: the install, the GPU and driver, the kernel log and the last game session"));
+    // The group's actions, side by side in its header.
+    let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let diagnose = gtk4::Button::with_label("Diagnose");
+    diagnose.add_css_class("suggested-action");
+    diagnose.set_valign(gtk4::Align::Center);
+    actions.append(&diagnose);
+    group.set_header_suffix(Some(&actions));
+
+    let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = std::rc::Rc::default();
+    let weak_group = group.downgrade();
+    diagnose.connect_clicked(move |button| {
+        let Some(group) = weak_group.upgrade() else { return };
+        button.set_sensitive(false);
+        button.set_label("Diagnosing…");
+        let (button, rows) = (button.clone(), rows.clone());
+        glib::spawn_future_local(async move {
+            let findings = gio::spawn_blocking(|| neural_forge_supervisor::doctor::run(&neural_forge_supervisor::doctor::Roots::system())).await;
+            for row in rows.borrow_mut().drain(..) {
+                group.remove(&row);
+            }
+            let findings = findings.unwrap_or_else(|_| {
+                vec![neural_forge_supervisor::doctor::Finding {
+                    check: "diagnose",
+                    severity: neural_forge_supervisor::doctor::Severity::Failure,
+                    summary: "the checks stopped with an internal error".into(),
+                    evidence: "run `neural-forge-cli doctor` in a terminal to see it".into(),
+                    fix: None,
+                }]
+            });
+            for finding in &findings {
+                let row = finding_row(finding);
+                group.add(&row);
+                rows.borrow_mut().push(row);
+            }
+            button.set_label("Diagnose");
+            button.set_sensitive(true);
+        });
+    });
+    group
+}
+
+/// One finding as a row: the severity's icon, the summary as the title, the evidence and the fix below.
+fn finding_row(finding: &neural_forge_supervisor::doctor::Finding) -> adw::ActionRow {
+    use neural_forge_supervisor::doctor::Severity;
+    let row = adw::ActionRow::new();
+    // Plain text: evidence quotes log lines and paths, which may hold `<` or `&`.
+    row.set_use_markup(false);
+    row.set_title(&finding.summary);
+    let subtitle = match &finding.fix {
+        Some(fix) => format!("{}\nFix: {fix}", finding.evidence),
+        None => finding.evidence.clone(),
+    };
+    row.set_subtitle(&subtitle);
+    row.set_subtitle_selectable(true);
+    row.set_tooltip_text(Some(finding.check));
+    let (icon, class) = match finding.severity {
+        Severity::Failure => ("dialog-error-symbolic", "error"),
+        Severity::Warning => ("dialog-warning-symbolic", "warning"),
+        Severity::Info => ("dialog-information-symbolic", "dim-label"),
+        Severity::Ok => ("emblem-ok-symbolic", "success"),
+    };
+    let image = gtk4::Image::from_icon_name(icon);
+    image.add_css_class(class);
+    row.add_prefix(&image);
+    row
 }
 
 /// The Status page's one line on the pre-upscaler path, from the header's `preupscale_*` fields

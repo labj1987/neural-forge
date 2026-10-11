@@ -210,6 +210,7 @@ impl Loader {
         let worker = std::thread::Builder::new().name("nf-native-load".into()).spawn(move || Self::work(&shared, device, setup)).ok();
         if worker.is_none() {
             crate::log!("[native] could not start the loader thread; frames go to DLSS untouched");
+            note_failure("the loader thread could not be started");
             self.shared.0.lock().unwrap().failed = Some("the loader thread could not be started".into());
         }
         *self.worker.lock().unwrap() = worker;
@@ -306,6 +307,15 @@ impl Loader {
                     }
                 }
             });
+            // The state log, written before the loader's lock is taken again: holds take it on the game's thread.
+            match &result {
+                Ok((_, Some(_))) => note_recovered(),
+                Ok(_) => {}
+                Err(why) if open_stalled || network.as_ref().is_some_and(nn::Network::stalled) => {
+                    note_failure(&format!("{why} (the network's queue stopped responding; off until the game restarts)"));
+                }
+                Err(why) => note_failure(why),
+            }
             state = lock.lock().unwrap();
             state.opened = true;
             match result {
@@ -1080,6 +1090,32 @@ pub(crate) fn status(result: &super::HoldResult, loader: &Loader) -> String {
     }
 }
 
+/// The last network failure written to the state log, so a retry schedule that keeps failing the same
+/// way writes it once; `None` once the network was built again.
+static LAST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+
+/// A load or build failure for the state log: each different reason once.
+fn note_failure(why: &str) {
+    if failure_is_new(&mut LAST_FAILURE.lock().unwrap(), why) {
+        crate::event!(neural_forge_protocol::state_log::NATIVE_FAILED, "{why}");
+    }
+}
+
+/// A successful build: written to the state log only when it ends a failure.
+fn note_recovered() {
+    if LAST_FAILURE.lock().unwrap().take().is_some() {
+        crate::event!(neural_forge_protocol::state_log::NATIVE_RECOVERED, "the network is built again");
+    }
+}
+
+fn failure_is_new(last: &mut Option<String>, why: &str) -> bool {
+    if last.as_deref() == Some(why) {
+        return false;
+    }
+    *last = Some(why.to_string());
+    true
+}
+
 /// Logs a history reset's reason (the model server logs the same reasons for NGX's).
 pub(crate) fn note_reset(stale: Option<Stale>) {
     match stale {
@@ -1300,6 +1336,16 @@ pub(crate) unsafe fn run_native_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_failure_is_new_once_per_reason_until_it_clears() {
+        let mut last = None;
+        assert!(failure_is_new(&mut last, "no model at /x"));
+        assert!(!failure_is_new(&mut last, "no model at /x"), "a retry failing the same way is not written again");
+        assert!(failure_is_new(&mut last, "building the network for 1280x720 failed: out of memory"));
+        last = None;
+        assert!(failure_is_new(&mut last, "no model at /x"), "after a recovery the same failure is new again");
+    }
 
     #[test]
     fn model_source_reads_build_and_verified() {
