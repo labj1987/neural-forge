@@ -98,8 +98,14 @@ jobs:
       - name: Build the CLI for the installation tests
         run: cargo build --locked -p neural-forge-cli
 
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
       - name: Installation coexistence tests
         run: python3 scripts/test_install.py
+
+      - name: Third-party crate listing is current
+        run: python3 scripts/gen_third_party_crates.py --check
 
       - name: Namespace contract
         run: python3 scripts/check_namespace.py
