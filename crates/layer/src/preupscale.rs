@@ -4794,10 +4794,10 @@ pub(crate) struct Session {
     #[cfg(target_arch = "x86_64")]
     post_stalled: bool,
     /// `NEURAL_FORGE_CAPTURE_AT`: how many times DLSS frames resumed after a gap, when the last resume was,
-    /// and whether the capture was taken ([`Self::capture_at_due`]).
+    /// and which of its entries were taken, one bit each ([`Self::capture_at_due`]).
     resumes: u32,
     resumed_at: Option<Instant>,
-    captured_at: bool,
+    captured_at: u64,
     /// The native backend's status line last published (`layer_reason`), so it is written on change only.
     #[cfg(target_arch = "x86_64")]
     native_status: String,
@@ -4856,6 +4856,30 @@ fn probe_kernel(name: &str, bytes: &[u8]) {
 pub(crate) fn dump_ignores_hazard() -> bool {
     static IGNORE: LazyLock<bool> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD").is_ok_and(|v| v == "ignore"));
     *IGNORE
+}
+
+/// One `NEURAL_FORGE_CAPTURE_AT` entry, `<resume>:<ms>[:<frames>]`, parsed ([`Session::capture_at_due`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CaptureAt {
+    resume: u32,
+    after: Duration,
+    frames: u32,
+}
+
+impl CaptureAt {
+    /// `None` for anything malformed, and for a series of 0 frames.
+    fn parse(v: &str) -> Option<Self> {
+        let mut parts = v.split(':').map(str::trim);
+        let resume = parts.next()?.parse().ok()?;
+        let after = Duration::from_millis(parts.next()?.parse().ok()?);
+        let frames = parts.next().map_or(Some(1), |f| f.parse().ok().filter(|&n| n >= 1))?;
+        parts.next().is_none().then_some(Self { resume, after, frames })
+    }
+
+    /// Entries separated by commas (at most 64); `None` when any is malformed.
+    fn parse_list(v: &str) -> Option<Vec<Self>> {
+        v.split(',').map(Self::parse).collect::<Option<Vec<_>>>().filter(|l| !l.is_empty() && l.len() <= 64)
+    }
 }
 
 /// A pause in DLSS frames that counts as a resume for `NEURAL_FORGE_CAPTURE_AT` ([`Session::capture_at_due`]).
@@ -5238,23 +5262,26 @@ impl Session {
         drop(self.native.take());
     }
 
-    /// `NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>`: whether to capture the presented frame now, once, `<ms>` after
-    /// the `<resume>`-th time DLSS frames resumed after a gap of [`CAPTURE_GAP`] or more (1 is the first
-    /// frames). A scripted benchmark restarts its camera with every pass, so the same values capture the same
-    /// moment in every run, whatever the loading took (the A/B captures of docs/NATIVE_BACKEND.md, Phase 3).
-    pub(crate) fn capture_at_due(&mut self) -> bool {
-        static AT: LazyLock<Option<(u32, Duration)>> = LazyLock::new(|| {
-            let v = std::env::var("NEURAL_FORGE_CAPTURE_AT").ok()?;
-            let (n, ms) = v.split_once(':')?;
-            Some((n.trim().parse().ok()?, Duration::from_millis(ms.trim().parse().ok()?)))
-        });
-        let Some((n, after)) = *AT else { return false };
-        let due = !self.captured_at && self.resumes == n && self.resumed_at.is_some_and(|t| t.elapsed() >= after);
-        if due {
-            self.captured_at = true;
-            crate::log!("[preupscale] NEURAL_FORGE_CAPTURE_AT: capturing the frame {} ms after resume {n}", after.as_millis());
-        }
-        due
+    /// `NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>[:<frames>][,...]`: how many consecutive presented frames to
+    /// capture as a series now (`crate::series`; 1 without `<frames>`), once per entry, `<ms>` after the
+    /// `<resume>`-th time DLSS frames resumed after a gap of [`CAPTURE_GAP`] or more (1 is the first
+    /// frames). A scripted benchmark restarts its camera with every pass, so the same values capture the
+    /// same moment in every run, whatever the loading took (the A/B captures of docs/NATIVE_BACKEND.md,
+    /// Phase 3; the flicker and added-detail series of `scripts/bench-iq.py`). Several entries cover a
+    /// pass whose resume number moves: GTA sometimes pauses once more while it starts.
+    pub(crate) fn capture_at_due(&mut self) -> Option<u32> {
+        static AT: LazyLock<Vec<CaptureAt>> =
+            LazyLock::new(|| std::env::var("NEURAL_FORGE_CAPTURE_AT").ok().and_then(|v| CaptureAt::parse_list(&v)).unwrap_or_default());
+        self.capture_at_due_for(&AT)
+    }
+
+    fn capture_at_due_for(&mut self, entries: &[CaptureAt]) -> Option<u32> {
+        let (i, at) = entries.iter().enumerate().find(|&(i, at)| {
+            self.captured_at & (1 << i) == 0 && self.resumes == at.resume && self.resumed_at.is_some_and(|t| t.elapsed() >= at.after)
+        })?;
+        self.captured_at |= 1 << i;
+        crate::log!("[preupscale] NEURAL_FORGE_CAPTURE_AT: capturing {} frames {} ms after resume {}", at.frames, at.after.as_millis(), at.resume);
+        Some(at.frames)
     }
 
     /// Publishes the native backend's status line after a native hold, when it changed.
@@ -5430,6 +5457,38 @@ mod tests {
         assert!(s.phases().ends_with("capture_wait max=5.00 (session max 40.00, bound 5000 ms)"), "{}", s.phases());
         // The classes are the layer-wide bound until the target machine's numbers say otherwise.
         assert_eq!((FRAME_CAPTURE_WAIT, CLEANUP_WAIT), (crate::FENCE_WAIT_TIMEOUT, crate::FENCE_WAIT_TIMEOUT));
+    }
+
+    #[test]
+    fn capture_at_takes_an_optional_series_length() {
+        let at = |resume, ms, frames| Some(CaptureAt { resume, after: Duration::from_millis(ms), frames });
+        assert_eq!(CaptureAt::parse("5:70000"), at(5, 70000, 1), "without a length: the one frame as before");
+        assert_eq!(CaptureAt::parse(" 5 : 70000 : 6 "), at(5, 70000, 6));
+        for bad in ["", "5", "5:", "x:1", "5:70000:0", "5:70000:x", "5:70000:6:1", "-1:10"] {
+            assert_eq!(CaptureAt::parse(bad), None, "{bad:?}");
+        }
+        let list = CaptureAt::parse_list("5:70100:100,6:70100:100").unwrap();
+        assert_eq!(list.iter().map(|a| a.resume).collect::<Vec<_>>(), [5, 6]);
+        assert_eq!(CaptureAt::parse_list("5:1,x"), None, "one bad entry refuses the list");
+        assert_eq!(CaptureAt::parse_list(""), None);
+    }
+
+    /// Each entry is due once, at its resume and not before its delay, with the series length asked for.
+    #[test]
+    fn capture_at_is_due_once_per_entry_with_its_series_length() {
+        let mut session = Session::default();
+        let entries = CaptureAt::parse_list("2:0:6,3:0:4,2:60000:9").unwrap();
+        assert_eq!(session.capture_at_due_for(&[]), None, "unset: never");
+        session.saw_dlss();
+        assert_eq!(session.capture_at_due_for(&entries), None, "resume 1 is not one asked for");
+        session.last_dlss = Some(Instant::now() - CAPTURE_GAP);
+        session.saw_dlss();
+        assert_eq!(session.capture_at_due_for(&entries), Some(6));
+        assert_eq!(session.capture_at_due_for(&entries), None, "once; the third entry is too early");
+        session.last_dlss = Some(Instant::now() - CAPTURE_GAP);
+        session.saw_dlss();
+        assert_eq!(session.capture_at_due_for(&entries), Some(4), "the next resume's entry");
+        assert_eq!(session.capture_at_due_for(&entries), None);
     }
 
     #[test]

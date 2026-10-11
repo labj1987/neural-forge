@@ -2636,8 +2636,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         // carries the model's edit made before DLSS, is read back as both halves of
                         // each pair. The one-shot request is served as a series of one frame.
                         if let Some(instance) = &self.instance {
-                            if readable && preupscale.capture_at_due() {
-                                series.start(1, &crate::dump::captures_dir());
+                            if let Some(frames) = readable.then(|| preupscale.capture_at_due()).flatten() {
+                                series.start(frames, &crate::dump::captures_dir());
                             }
                             if let Some(frames) = crate::series::take_request(shm, true) {
                                 if readable {
@@ -2703,6 +2703,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // capture or series is asked for, `capture::run` would do nothing, so the relay below
                 // (a submit of the layer's own) is skipped too and the frame presents with the
                 // application's own waits.
+                // `NEURAL_FORGE_CAPTURE_AT` starts its series before the idle check, so the model-off
+                // runs of a flicker or added-detail comparison (`scripts/bench-iq.py`) capture too.
+                if let Some(frames) = readable.then(|| preupscale.capture_at_due()).flatten() {
+                    series.start(frames, &crate::dump::captures_dir());
+                }
                 let effect_off = shm.composition_settings().map(|s| !s.apply_model || !s.neural_enabled);
                 if post_path_idle(effect_off, *bootstrap_complete, shm.capture_requested(), series.running()) {
                     break;
@@ -2751,9 +2756,6 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // one-shot dump's, and each path only ever consumes its own values. Before
                     // `capture::run` has opened the mapping this finds nothing, and the series
                     // starts one present later.
-                    if readable && preupscale.capture_at_due() {
-                        series.start(1, &crate::dump::captures_dir());
-                    }
                     if let Some(frames) = crate::series::take_request(shm, false) {
                         if readable {
                             series.start(frames, &crate::dump::captures_dir());
