@@ -831,6 +831,77 @@ by 0.69 on every cached hold in motion. Not added until a live Crimson Desert ca
 whether the foliage looks better with it (the rejected count is already in the history pass, so
 the apply could read it within the hold).
 
+**The light pop-in limiter (Phase 5.1, upstream's anti pop-in, 2026-10-11): built, measured, removed.** The model sees only
+the frame: a light entering it can make the model re-grade regions far from the light whose own
+picture did not change, and the whole picture shifts in one hold. Upstream eases that: where the
+frame's own regional light (a 3x3 tent of bilinear reads 12 px apart of its log luma) changed by
+under 0.15 stop since the hold before, the shown edit's regional light (the same tent of the edit's
+luma) may move at most a set rate (its default 0.75 stop a second) from what was shown there on the
+hold before; where the frame changed (a light switched on right there, a cut, a revealed area) the
+change passes. Ours ran it on a quarter-size grid on every chained hold, refresh or cached: the frame's tent and
+each texel's position (its nearest-surface vector and the change of jitter) in the capture, the
+edit's tent against the last shown one after the write-back, and the shift read bilinearly and
+multiplied onto what the decode or the cached write-back wrote; the grid (28 bytes a quarter-size
+texel) kept what was shown. The step was the rate times the smoothed hold time (0.9 / 0.1, each
+clamped to 1/500..1/10 s). The shaders matched the replay tool's shift within 1.2e-5 stop.
+
+Offline, `cache_replay.py --cadence 2 --adaptive` (the shipped cadence) and `--cadence 1` (the model
+on every hold), the hold times the dumps' own (22-59 ms: dumping slows the game, and the game's
+clock runs on). Jump: the regional light's step from the hold before along the motion (the pulse
+probe's 12-pixel Gaussian of the shown picture's log luma ratio to the untouched frame), mean / p99
+over the frame, averaged over the holds. Lag: the mean distance of the limited picture's regional
+light from the unlimited one's (stops). Then err / p99.5 / kept% against the model's answer, as
+above.
+
+| dump | no limiter: jump, err/p99.5/kept% | 0.75 stop/s: jump, lag, err/p99.5/kept% | 1.5 stop/s: jump, lag, err/p99.5/kept% |
+|---|---|---|---|
+| drive | 0.0283 / 0.134, 0.0510/0.339/85.6 | 0.0263 / 0.122, 0.0038, 0.0550/0.382/84.5 | 0.0269 / 0.123, 0.0021, 0.0533/0.374/85.0 |
+| `gta-drive-64` | 0.0212 / 0.086, 0.0443/0.276/84.2 | 0.0203 / 0.080, 0.0025, 0.0469/0.308/83.4 | 0.0207 / 0.081, 0.0011, 0.0454/0.298/83.9 |
+| pan | 0.0241 / 0.148, 0.0215/0.131/89.1 | 0.0229 / 0.142, 0.0060, 0.0274/0.181/87.0 | 0.0234 / 0.143, 0.0032, 0.0247/0.172/88.0 |
+| `gta-pan-64` | 0.0303 / 0.148, 0.0421/0.335/88.3 | 0.0271 / 0.132, 0.0068, 0.0483/0.387/86.4 | 0.0279 / 0.133, 0.0044, 0.0461/0.380/87.1 |
+| still | 0.0132 / 0.050, 0.0302/0.186/85.7 | 0.0124 / 0.046, 0.0016, 0.0323/0.210/84.8 | 0.0129 / 0.048, 0.0007, 0.0310/0.202/85.4 |
+| `gta-still-64` | 0.0144 / 0.074, 0.0116/0.101/96.0 | 0.0126 / 0.064, 0.0025, 0.0154/0.150/95.2 | 0.0134 / 0.067, 0.0013, 0.0134/0.138/95.6 |
+| Crimson Desert | 0.0458 / 0.381, 0.0653/0.505/72.8 | 0.0405 / 0.328, 0.0038, 0.0677/0.541/71.9 | 0.0417 / 0.334, 0.0024, 0.0665/0.537/72.4 |
+| still, model every hold | 0.0087 / 0.040 | 0.0072 / 0.032, 0.0016 | 0.0080 / 0.035, 0.0007 |
+| `gta-still-64`, model every hold | 0.0125 / 0.063 | 0.0106 / 0.053, 0.0025 | 0.0115 / 0.056, 0.0013 |
+| drive, model every hold | 0.0190 / 0.117 | 0.0169 / 0.109, 0.0042 | 0.0177 / 0.110, 0.0023 |
+
+- **The gate: lower regional jumps on the drive, under 0.002 stop of lag on the still shots.**
+  Upstream's 0.75 stop a second fails it: 0.0025 stop of lag on `gta-still-64` (its creep and
+  acceleration). 1.5 passes: lag 0.0007 and 0.0013 on the still dumps (the same with the model on
+  every hold), the drive's jumps 5% / 8% lower (mean / p99; the 64-hold drive 2% / 6%, the model on
+  every hold 7% / 6%). Upstream's own offline result was in this range (Control's debris scene p99
+  0.050 -> 0.033 stop for 0.0014 stop of lag).
+- **Its cost offline is the model's own answer.** The limiter holds the regional light back from what the
+  model gives on that hold, so every number measured against the model's answer is a little worse
+  (drive p99.5 0.339 -> 0.374, kept -0.6 point; the pan's flicker, motion-compensated against the
+  model's own, goes down: +0.254 -> +0.187).
+
+Live (GTA V Enhanced, 1440p, frame generation off, the adaptive cadence, release builds with the
+limiter at 1.5 stop/s and without it, three runs each in turns; the still moment from the new
+shot's 31st frame against one model-off run of the same layer, 89.7 real fps, flicker 1.03%):
+
+| run | real fps (pass 4) | still: flicker | still: added detail | cache_gpu_ms (median of the windows) |
+|---|---|---|---|---|
+| limiter | 72.6* / 74.3 / 75.1 | 1.134 / 1.001 / 1.066% (1.067%) | x1.230 / x1.300 / x1.285 (x1.272) | 1.03 / 1.14 / 1.14 |
+| without | 60.6* / 74.4 / 75.2 | 1.155 / 1.046 / 1.048% (1.083%) | x1.283 / x1.382 / x1.382 (x1.349) | 0.93 / 0.96 / 0.98 |
+
+(*: the first pair ran while another agent's image measurement held a core and pushed the rig into
+swap.) No Xid.
+
+- **Detail at the still moment: worse in every pair.** The limiter kept 78% of the added detail
+  without it (x1.272 against x1.349), each of its runs below each run without it; the five earlier
+  runs of the cadence without it read x1.31-1.39. Flicker the same (1.07 against 1.08%, under the
+  10% the metric resolves), fps the same (74.3 / 75.1 against 74.4 / 75.2), the cache's GPU time
+  +0.1 to 0.18 ms a hold.
+- **Not kept: removed from the shaders, the layer and the replay tool.** The gate asked for detail
+  and flicker at the still moment no worse; detail was. The shift is smooth (a quarter-size grid,
+  36-pixel tents), so it should not touch pixel-scale detail by itself; what it holds back on the
+  still shot is the model's regional re-grade while DLSS's history converges after the cut, and the
+  measure reads less detail there. Upstream ships it on after DLSS, where the trade is different;
+  before the upscaler, with the network on every hold while the camera is still, the jumps it would
+  have cut were 5-8% of the drive's.
+
 **The background model (upstream's CacheAsync, Phase 5.2): not attempted.** Upstream launches the
 network on one frame on a compute queue of its own and lands its answer two frames later, carried to
 then along the motion; the frames between show the cached edit. Its minimum interval is 3 (the launch
