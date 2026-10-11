@@ -22,10 +22,6 @@ use ash::vk;
 
 use super::HostBuffer;
 
-/// Passes recorded around the decode: the first before it, the second after it
-/// ([`HdrPass::record_decode`]).
-pub(crate) type Around<'a> = (&'a dyn Fn(vk::CommandBuffer), &'a dyn Fn(vk::CommandBuffer));
-
 const ENCODE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_encode.spv");
 const DECODE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_decode.spv");
 const EXPOSURE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_exposure.spv");
@@ -780,16 +776,15 @@ impl HdrPass {
     /// Records, after the write-back's opening barrier: the copy of `source` (the padded answer,
     /// tightly packed) into the answer image, made visible to the shader, and the decode dispatch
     /// over the real extent, which writes the colour input in place. The caller closes with a
-    /// `COMPUTE_SHADER/SHADER_WRITE -> ALL_COMMANDS` barrier. `around` is the edit cache's refresh:
-    /// its first part is recorded between the answer's copy (made visible to compute shaders) and the
-    /// decode (the capture, which reads the colour input before the decode overwrites it, ending with
-    /// the barrier that orders the two), its second right after the decode (the refresh pass, which
-    /// opens with its own barrier).
+    /// `COMPUTE_SHADER/SHADER_WRITE -> ALL_COMMANDS` barrier. `before` is recorded between the
+    /// answer's copy (made visible to compute shaders) and the decode: the edit cache's capture, which
+    /// reads the colour input before the decode overwrites it (`before` ends with the barrier that
+    /// orders the two).
     ///
     /// # Safety
     /// `cmd` is recording, the answer image is in `GENERAL` (the caller's opening barrier), the
     /// encoded image still holds this hold's capture, [`Self::bind_colour`] was called for it.
-    pub(crate) unsafe fn record_decode(&self, device: &ash::Device, cmd: vk::CommandBuffer, source: vk::Buffer, paper_white: f32, around: Option<Around<'_>>) {
+    pub(crate) unsafe fn record_decode(&self, device: &ash::Device, cmd: vk::CommandBuffer, source: vk::Buffer, paper_white: f32, before: Option<&dyn Fn(vk::CommandBuffer)>) {
         let region = vk::BufferImageCopy {
             buffer_offset: 0,
             buffer_row_length: self.padded_width,
@@ -803,13 +798,10 @@ impl HdrPass {
         unsafe {
             device.cmd_copy_buffer_to_image(cmd, source, self.answer.image, vk::ImageLayout::GENERAL, &[region]);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[answer_in], &[], &[]);
-            if let Some((before, _)) = around {
+            if let Some(before) = before {
                 before(cmd);
             }
             self.dispatch(device, cmd, self.decode, paper_white, self.width, self.height);
-            if let Some((_, after)) = around {
-                after(cmd);
-            }
         }
     }
 

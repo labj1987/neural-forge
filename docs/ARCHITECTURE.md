@@ -489,18 +489,11 @@ every hold refreshes and the picture is bit for bit what it was (the test
   about to write (its own rules: clamped-keep pixels give 0), with this hold's depth and fingerprint
   (log luma, log r/g, log b/g). An unusable exposure stores nothing and
   the next hold refreshes.
-- **The walk** (refresh crossfade and soft refresh): a refresh right after a hold of the chain does
-  not show the answer at once. The shown edit walks from what was on screen to it across the interval,
-  1/N of the way on the refresh and (n + 1)/N on its n-th cached hold, so it arrives when the model
-  runs next. The start is the last shown edit (each hold keeps its own with its depth) read at this
-  hold's one step back, four taps admitted by depth; where those are not this surface, read plainly if
-  something came in front of a still view (under a pixel of motion, nearer than what was there);
-  else (the background a move revealed) the answer at once. The start is found by the motion pass in
-  the capture (the shown edit is in the network's input features, gone once it has run); the capture
-  stores it beside the answer's edit and leaves this hold's picture, which `refresh` writes over the
-  decode's right after it.
-  Measured in LESSONS.md, "3.3 edit cache: what was tried".
-- **Cached write-back** (W, in place of the decode): `history` (the refresh's edit, walked, read at the chained
+- **No walk**: a refresh shows its answer at once. Upstream's keyframe crossfade with soft refresh
+  (the shown edit walking from what was on screen to each refresh's answer across the interval) was
+  tried and removed: offline it evened the refresh pulse at the cost of lag; live after DLSS it changed
+  neither flicker nor trailing measurably (LESSONS.md, "3.3 edit cache: what was tried").
+- **Cached write-back** (W, in place of the decode): `history` (the refresh's edit read at the chained
   position, four depth-admitted bilinear taps, the colour check and the fingerprint against this
   hold's 3x3), `reduce` x3 (the coverage-weighted pyramid, 1/4, 1/16, 1/64), `apply`
   (the low band with the same-surface fill plus the high band by its confidence, clamped), `guided` x3
@@ -508,8 +501,7 @@ every hold refreshes and the picture is bit for bit what it was (the test
   3x3 window, eps 0.005, blended in by sat(staleness / 2), staleness one per 4 px of each hold's motion
   since the refresh, accumulated by the motion pass; clamped; `v_out =
   (v + eps) * 2^edit - eps` back to scene with the decode's rules: original kept where the encode
-  clamped, alpha kept, nothing written with an unusable exposure; the shown edit kept for the next
-  refresh's walk). Debug view 6 writes the rejection
+  clamped, alpha kept, nothing written with an unusable exposure). Debug view 6 writes the rejection
   mask instead (red rejected, green the high band's confidence, blue off the chain).
 - **When a hold is cached** (`cache::State::plan`): within the interval after a refresh that stored
   an edit, the very next DLSS submit after the previous hold (any frame that went to DLSS untouched
@@ -519,21 +511,20 @@ every hold refreshes and the picture is bit for bit what it was (the test
   is (parity, seed, `last_jitter`), call `claim_pre` and set `evaluated` like a refresh, and
   `HistoryGap::touch` so the 500 ms rule counts from the last hold, not the last network frame.
   Frame generation is unaffected: the same submits are held.
-- **Resources**: the accumulated field lives with the native pass (8 bytes a render pixel). While the
-  interval is above 1 the cache has one buffer of its own (`cache::Store`, 8 bytes a render pixel, 22
-  MB at a 4K output's Balanced render size 2228x1253): where a walking refresh starts, the only thing
-  that has to survive the network's frame (the motion pass finds it in the capture, before the
-  network runs). Everything else lives in the network's input features (`cache::ScratchLayout`, 60
-  bytes a render pixel of the features' 64 a field texel), which only the network's frame uses
-  (`native_preprocess.comp` rewrites them all before the graph reads them): the refresh's edit is
-  written after its frame and read until the next refresh's, the shown edit and the staleness go from
-  one hold to the next, and each hold's own buffers (its depth; the previous field's copy in the capture;
-  the history read and the pyramid in a cached write-back, the guided filter's grids then in their
-  place) live within it. The fingerprint is read from the frame where it is needed, the refresh's
-  depth from the depth again. Edits are kept as three 16-bit fixed-point stops (+-2.5, steps of 7.6e-5
-  stop: the shaders stay within 9e-5 stop of the replay tool). A rebuilt network (new features)
-  drops the edit. It had 146 bytes a render pixel of its own before (408 MB at 2228x1253; LESSONS.md,
-  "3.3 edit cache: what was tried"). Reversed-Z is decided once per
+- **Resources**: the accumulated field lives with the native pass (8 bytes a render pixel). Above
+  interval 1 the cache allocates nothing of its own: its buffers live in the network's input features
+  (`cache::ScratchLayout`, 56 bytes a render pixel of the features' 64 a field texel, 156 MB at a 4K
+  output's Balanced render size 2228x1253), which only the network's frame uses
+  (`native_preprocess.comp` rewrites them all before the graph reads them). The refresh's edit is
+  written after its frame and read until the next refresh's, the staleness goes from one hold to the
+  next, and each hold's own buffers (its depth; the previous field's copy in the capture; the history
+  read, the pyramid and the shown edit in a cached write-back, the guided filter's grids over the
+  first two once the apply has read them) live within it. The fingerprint is read from the frame
+  where it is needed, the refresh's depth from the depth again. Edits are kept as three 16-bit
+  fixed-point stops (+-2.5, steps of 7.6e-5 stop: the shaders stay within 8e-5 stop of the replay
+  tool). A hold checks the features' size, and a rebuilt network (new features) drops the edit. The
+  cache had 146 bytes a render pixel of its own before (408 MB at 2228x1253; LESSONS.md, "3.3 edit
+  cache: what was tried"). Reversed-Z is decided once per
   extent from the first hold's depth counts (texels at 0 and 1, else the top and bottom quarters).
 - **Status**: `[preupscale]` gains `cached=N refresh=N cache_gpu_ms median=X rejected=Y%`; SHM v17
   `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected` (1/10000), `cache_gpu_ms_bits`;

@@ -2,29 +2,26 @@
 //! network runs on one hold in N (a refresh) and the holds between (cached holds) reuse its
 //! correction, carried along the game's motion and multiplied onto their own fresh frame.
 //!
-//! The GPU side is eight compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
+//! The GPU side is seven compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
 //! of `scripts/cache_common.py` (the numpy reference the offline replay measures with):
 //!
-//! - in the capture (`C`) of every hold: `prep` (this hold's fingerprint, pseudo-linear depth, the
-//!   depth's reversed-Z counts) and `motion` (the accumulated motion
+//! - in the capture (`C`) of every hold: `prep` (this hold's pseudo-linear depth, the depth's
+//!   reversed-Z counts) and `motion` (the accumulated motion
 //!   back to the previous network frame, which the network's history reads too). At interval 1 only
 //!   `motion` runs, copying DLSS's vectors as they are, so the network's input is bit for bit what it
 //!   was;
 //! - in a refresh hold's write-back (`W`), right before the decode: `capture` (the edit the decode is
-//!   about to write, against the frame, with this hold's depth and fingerprint, and where the shown
-//!   edit walks from: what was on screen on the hold before); right after it: `refresh` (this hold's
-//!   step of the walk over the decode's picture, and the edit shown kept for the next refresh);
+//!   about to write, against the frame, with this hold's depth and fingerprint);
 //! - as a cached hold's whole write-back, in place of the network and the decode: `history` (the
 //!   refresh's edit read at the chained position, depth-admitted, checked against this hold),
 //!   `reduce` three times (the coverage-weighted pyramid), `apply` (band split), `guided` three
 //!   times at half size (a guided filter of that edit on this hold's log luma), `apply` again (the
 //!   filter blended in by how far each pixel moved, written back with the decode's rules).
 //!
-//! One [`CachePass`] per [`super::Resources`] (one extent), built on the first native hold. Of its
-//! buffers only the walk's start ([`Store`], 8 bytes a render pixel, while the interval is above 1)
-//! is its own: everything else lives in the network's input features ([`ScratchLayout`]), which only
-//! the network's frame uses, and the refresh's edit is written after that frame and read before the
-//! next one's.
+//! One [`CachePass`] per [`super::Resources`] (one extent), built on the first native hold. Above
+//! interval 1 its buffers live in the network's input features ([`ScratchLayout`]), which only the
+//! network's frame uses: the refresh's edit is written after that frame and read before the next
+//! one's. It has none of its own beyond the counters.
 
 use ash::vk;
 use ash::vk::Handle;
@@ -39,7 +36,6 @@ const CAPTURE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_captur
 const HISTORY_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_history.spv");
 const REDUCE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_reduce.spv");
 const APPLY_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_apply.spv");
-const REFRESH_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_refresh.spv");
 const GUIDED_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_guided.spv");
 
 const PREP: usize = 0;
@@ -48,17 +44,14 @@ const CAPTURE: usize = 2;
 const HISTORY: usize = 3;
 const REDUCE: usize = 4;
 const APPLY: usize = 5;
-const REFRESH: usize = 6;
-const GUIDED: usize = 7;
-const SPV: [&[u8]; 8] = [PREP_SPV, MOTION_SPV, CAPTURE_SPV, HISTORY_SPV, REDUCE_SPV, APPLY_SPV, REFRESH_SPV, GUIDED_SPV];
+const GUIDED: usize = 6;
+const SPV: [&[u8]; 7] = [PREP_SPV, MOTION_SPV, CAPTURE_SPV, HISTORY_SPV, REDUCE_SPV, APPLY_SPV, GUIDED_SPV];
 
 /// The shaders' `F_*` flags.
 pub(crate) const F_REVERSE_Z: u32 = 1;
 pub(crate) const F_NEAREST: u32 = 2;
 pub(crate) const F_FRESH: u32 = 4;
 pub(crate) const F_CHAINED: u32 = 8;
-/// A refresh walks from the last shown edit (the hold before showed one).
-pub(crate) const F_WALK: u32 = 16;
 pub(crate) const F_DEBUG_MASK: u32 = 32;
 pub(crate) const F_KEEP_CLAMPED: u32 = 64;
 pub(crate) const F_COUNT_DEPTH: u32 = 256;
@@ -114,9 +107,6 @@ pub(crate) struct CachePush {
     pub print_tol: f32,
     pub sigma_depth: f32,
     pub sigma_luma: f32,
-    /// `float walk`: how far the shown edit has walked from the refresh's start to its answer
-    /// ([`Plan::walk`]).
-    pub walk: f32,
     /// `float guided_eps`: the guided filter's regularisation ([`Tuning`]).
     pub guided_eps: f32,
 }
@@ -189,19 +179,18 @@ pub(crate) struct Region {
 /// alone writes and reads: `native_preprocess.comp` rewrites every texel of it before the graph reads
 /// any. So it is free outside that frame, and the cache uses it for everything that does not cross
 /// one: the refresh's edit (written in the refresh's write-back, after its network frame; read by the
-/// cached holds until the next refresh's frame), the shown edit and the staleness (from one hold to
-/// the next; a refresh's are never read again), and each hold's own buffers (its depth, the previous
-/// field's copy in the capture; the history read and the pyramid in a cached write-back, where the
-/// guided filter's grids then take their place). Bytes a render pixel: edits 8 (three 16-bit stops),
-/// depths and the rest 4, the refresh's fingerprint 12; 60 in all with the grids, about 167 MB at a
-/// 4K output's Balanced render size (2228x1253).
+/// cached holds until the next refresh's frame), the staleness (from one hold to the next; a
+/// refresh's is never read again), and each hold's own buffers (its depth, the previous field's copy
+/// in the capture; the history read, the pyramid and the shown edit in a cached write-back, the
+/// guided filter's grids over the first two once the apply has read them). Bytes a render pixel:
+/// edits 8 (three 16-bit stops), depths and the rest 4, the refresh's fingerprint 12; 56 in all with
+/// the grids, about 156 MB at a 4K output's Balanced render size (2228x1253).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct ScratchLayout {
     pub src_edit: Region,
     pub src_lin: Region,
     pub src_print: Region,
     pub shown: Region,
-    pub shown_lin: Region,
     pub stale: Region,
     pub lin: Region,
     /// In the capture, over the write-back's buffers below.
@@ -229,7 +218,7 @@ impl ScratchLayout {
         }
         let mut at = 0u64;
         let mut l = Self::default();
-        for (r, bytes) in [(&mut l.src_edit, n * 8), (&mut l.src_lin, n * 4), (&mut l.src_print, n * 12), (&mut l.shown, n * 8), (&mut l.shown_lin, n * 4), (&mut l.stale, n * 4), (&mut l.lin, n * 4)] {
+        for (r, bytes) in [(&mut l.src_edit, n * 8), (&mut l.src_lin, n * 4), (&mut l.src_print, n * 12), (&mut l.shown, n * 8), (&mut l.stale, n * 4), (&mut l.lin, n * 4)] {
             *r = take(&mut at, bytes);
         }
         let shared = at;
@@ -248,36 +237,8 @@ impl ScratchLayout {
     }
 
     #[cfg(test)]
-    fn regions(&self) -> [Region; 14] {
-        [self.src_edit, self.src_lin, self.src_print, self.shown, self.shown_lin, self.stale, self.lin, self.acc_prev, self.stale_prev, self.hist, self.conf, self.levels, self.guide_a, self.guide_b]
-    }
-}
-
-/// The cache's own buffer, at the render extent: where a walking refresh's edit starts (EDIT16, 8
-/// bytes a texel), the one thing that crosses the network's frame. Built when the interval first goes
-/// above 1, freed when it is back at 1.
-pub(crate) struct Store {
-    start: OwnBuffer,
-    /// What it asked for, in bytes (the log's account).
-    bytes: u64,
-}
-
-impl Store {
-    /// # Safety
-    /// `device` is live.
-    unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32) -> Option<Self> {
-        let bytes = u64::from(width) * u64::from(height) * 8;
-        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
-        // SAFETY: forwarded.
-        let start = unsafe { OwnBuffer::new(device, instance, physical_device, bytes, usage) }?;
-        Some(Self { start, bytes })
-    }
-
-    /// # Safety
-    /// Nothing submitted may still use it.
-    unsafe fn destroy(&self, device: &ash::Device) {
-        // SAFETY: forwarded.
-        unsafe { self.start.destroy(device) };
+    fn regions(&self) -> [Region; 13] {
+        [self.src_edit, self.src_lin, self.src_print, self.shown, self.stale, self.lin, self.acc_prev, self.stale_prev, self.hist, self.conf, self.levels, self.guide_a, self.guide_b]
     }
 }
 
@@ -372,10 +333,6 @@ pub(crate) struct Plan {
     pub flags: u32,
     pub step_jitter: [f32; 2],
     pub refresh_jitter: [f32; 2],
-    /// How far the shown edit has walked from the refresh's start (what was on screen) to its
-    /// answer: 1/interval on the refresh, (n + 1)/interval on its n-th cached hold, so it arrives on
-    /// the interval's last hold (`run_cadence`'s crossfade over the whole interval).
-    pub walk: f32,
 }
 
 impl State {
@@ -392,7 +349,7 @@ impl State {
         let chain_live = std::mem::take(&mut self.chain_live) && consecutive;
         let jitter = h.jitter.unwrap_or_default();
         let chained = h.interval > 1;
-        // The hold before showed an edit of this chain, and this one can read it (or the refresh's).
+        // The hold before went through on this chain, and this one can read the refresh's edit.
         let continues = chained && had && consecutive && h.jitter.is_some() && h.mvec && h.depth == self.refresh_depth && h.history_ok && !h.armed;
         let cached = continues && self.since_refresh + 1 < h.interval;
         let mut flags = F_KEEP_CLAMPED;
@@ -413,19 +370,13 @@ impl State {
             if cached && h.debug_mask {
                 flags |= F_DEBUG_MASK;
             }
-            if continues && !cached {
-                flags |= F_WALK;
-            }
         }
-        let n = h.interval.max(1) as f32;
-        let walk = if cached { ((self.since_refresh + 2) as f32 / n).min(1.0) } else { 1.0 / n };
         let delta = |a: [f32; 2]| [a[0] - jitter[0], a[1] - jitter[1]];
         Plan {
             kind: if cached { Kind::Cached } else { Kind::Refresh },
             flags,
             step_jitter: if consecutive { delta(self.prev_jitter) } else { [0.0; 2] },
             refresh_jitter: delta(self.refresh_jitter),
-            walk,
         }
     }
 
@@ -475,29 +426,29 @@ pub(crate) fn infer_reverse_z(counts: &[u32; STAT_WORDS]) -> Option<bool> {
     (top != bottom).then_some(bottom > top)
 }
 
-/// The pass for one extent: eight pipelines over one descriptor set, the counters, the timers.
+/// The pass for one extent: seven pipelines over one descriptor set, the counters, the timers.
 pub(crate) struct CachePass {
     width: u32,
     height: u32,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
-    pipelines: [vk::Pipeline; 8],
+    pipelines: [vk::Pipeline; 7],
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     stats: HostBuffer,
-    /// Bound where a buffer of [`Store`], the scratch or the depth is not there (the shaders do not
-    /// read it then).
+    /// Bound where the scratch or the depth is not there (the shaders do not read it then).
     dummy: OwnBuffer,
-    pub(crate) store: Option<Store>,
+    /// The interval is above 1 and the network's input features hold the [`ScratchLayout`].
+    chained: bool,
     /// Where the scratch buffers are ([`ScratchLayout::new`] for this extent), and the buffer they are
     /// in for this hold ([`Self::bind`]).
     layout: ScratchLayout,
     scratch: vk::Buffer,
     /// The network's input features were too small for the layout (logged once).
     said_small: bool,
-    /// GPU timestamps around the passes in the capture, in the write-back before (or in place of)
-    /// the decode, and after the decode.
-    timers: [Option<crate::gpu_timer::GpuTimer>; 3],
+    /// GPU timestamps around the passes in the capture and in the write-back (before, or in place
+    /// of, the decode).
+    timers: [Option<crate::gpu_timer::GpuTimer>; 2],
     pub(crate) state: State,
     pub(crate) tuning: Tuning,
 }
@@ -505,14 +456,14 @@ pub(crate) struct CachePass {
 // SAFETY: plain handles and the layer's own mapping, only used behind the device's `State` mutex.
 unsafe impl Send for CachePass {}
 
-/// Descriptor types of bindings 0..=22 (the shaders' layout).
+/// Descriptor types of bindings 0..=20 (the shaders' layout).
 fn binding_type(n: u32) -> vk::DescriptorType {
     match n {
-        0 | 1 | 15 => vk::DescriptorType::STORAGE_IMAGE,
+        0 | 1 | 14 => vk::DescriptorType::STORAGE_IMAGE,
         _ => vk::DescriptorType::STORAGE_BUFFER,
     }
 }
-const BINDINGS: u32 = 23;
+const BINDINGS: u32 = 21;
 
 impl CachePass {
     /// # Safety
@@ -544,7 +495,7 @@ impl CachePass {
             let stats = p.stats.take()?;
             let dummy = p.dummy.take()?;
             std::ptr::write_bytes(stats.ptr, 0, STAT_BYTES as usize);
-            let pipelines: [vk::Pipeline; 8] = std::mem::take(&mut p.pipelines).try_into().ok()?;
+            let pipelines: [vk::Pipeline; 7] = std::mem::take(&mut p.pipelines).try_into().ok()?;
             Some(Self {
                 width,
                 height,
@@ -555,15 +506,11 @@ impl CachePass {
                 set,
                 stats,
                 dummy,
-                store: None,
+                chained: false,
                 layout: ScratchLayout::new(width, height),
                 scratch: vk::Buffer::null(),
                 said_small: false,
-                timers: [
-                    crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
-                    crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
-                    crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family),
-                ],
+                timers: [crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family), crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family)],
                 state: State::default(),
                 tuning: Tuning::default(),
             })
@@ -574,42 +521,24 @@ impl CachePass {
         (self.width, self.height) == (width, height)
     }
 
-    /// Builds the [`Store`] if it is not built. `false` when it cannot be, or when the network's input
-    /// features (`scratch_bytes`) cannot hold the [`ScratchLayout`].
-    ///
-    /// # Safety
-    /// `device` is live; nothing of the pass is pending.
-    pub(crate) unsafe fn ensure_store(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, scratch_bytes: u64) -> bool {
+    /// Chains holds above interval 1: `false` when the network's input features (`scratch_bytes`)
+    /// cannot hold the [`ScratchLayout`] (the hold then runs at interval 1).
+    pub(crate) fn chain(&mut self, scratch_bytes: u64) -> bool {
         if scratch_bytes < self.layout.total {
             if !std::mem::replace(&mut self.said_small, true) {
                 crate::log!("[preupscale] edit cache: the network's input features ({scratch_bytes} bytes) cannot hold its buffers ({} bytes); interval 1", self.layout.total);
             }
             return false;
         }
-        if self.store.is_none() {
-            // SAFETY: forwarded.
-            self.store = unsafe { Store::build(device, instance, physical_device, self.width, self.height) };
-            if let Some(store) = &self.store {
-                crate::log!(
-                    "[preupscale] edit cache: its buffer for {}x{} built, {:.1} MiB (and {:.1} MiB of the network's input features)",
-                    self.width,
-                    self.height,
-                    store.bytes as f64 / 1048576.0,
-                    self.layout.total as f64 / 1048576.0
-                );
-            }
+        if !std::mem::replace(&mut self.chained, true) {
+            crate::log!("[preupscale] edit cache: chaining {}x{}, {:.1} MiB of the network's input features", self.width, self.height, self.layout.total as f64 / 1048576.0);
         }
-        self.store.is_some()
+        true
     }
 
-    /// Frees the [`Store`] (the interval is back at 1) and drops the edit.
-    ///
-    /// # Safety
-    /// Nothing of the pass is pending.
-    pub(crate) unsafe fn free_store(&mut self, device: &ash::Device) {
-        if let Some(store) = self.store.take() {
-            // SAFETY: forwarded.
-            unsafe { store.destroy(device) };
+    /// Back at interval 1: drops the edit.
+    pub(crate) fn unchain(&mut self) {
+        if std::mem::replace(&mut self.chained, false) {
             self.state.drop_edit();
         }
     }
@@ -620,35 +549,33 @@ impl CachePass {
     /// Nothing of the pass is pending; every handle is live.
     pub(crate) unsafe fn bind(&mut self, device: &ash::Device, b: &Bindings) {
         let dummy = self.dummy.buffer;
-        // The scratch only with the store (the interval above 1) and room for the layout.
-        let scratch = (self.store.is_some() && b.scratch.1 >= self.layout.total).then_some(b.scratch.0);
+        // The scratch only above interval 1 and with room for the layout.
+        let scratch = (self.chained && b.scratch.1 >= self.layout.total).then_some(b.scratch.0);
         self.scratch = scratch.unwrap_or(vk::Buffer::null());
         let l = self.layout;
         let region = |r: Region| scratch.map_or((dummy, 0, vk::WHOLE_SIZE), |buffer| (buffer, r.offset, r.bytes));
         let whole = |buffer: vk::Buffer| (buffer, 0, vk::WHOLE_SIZE);
-        let buffers: [(u32, (vk::Buffer, u64, u64)); 20] = [
+        let buffers: [(u32, (vk::Buffer, u64, u64)); 18] = [
             (2, whole(b.exposure)),
             (3, whole(b.depth.unwrap_or(dummy))),
             (4, whole(b.mvec)),
             (5, whole(b.acc)),
             (6, region(l.acc_prev)),
             (7, region(l.lin)),
-            (8, region(l.shown_lin)),
-            (9, region(l.src_edit)),
-            (10, region(l.src_print)),
-            (11, region(l.hist)),
-            (12, region(l.conf)),
-            (13, region(l.levels)),
-            (14, whole(self.stats.buffer)),
-            (16, whole(self.store.as_ref().map_or(dummy, |s| s.start.buffer))),
-            (17, region(l.shown)),
-            (18, region(l.src_lin)),
-            (19, region(l.guide_a)),
-            (20, region(l.guide_b)),
-            (21, region(l.stale)),
-            (22, region(l.stale_prev)),
+            (8, region(l.src_edit)),
+            (9, region(l.src_print)),
+            (10, region(l.hist)),
+            (11, region(l.conf)),
+            (12, region(l.levels)),
+            (13, whole(self.stats.buffer)),
+            (15, region(l.shown)),
+            (16, region(l.src_lin)),
+            (17, region(l.guide_a)),
+            (18, region(l.guide_b)),
+            (19, region(l.stale)),
+            (20, region(l.stale_prev)),
         ];
-        let images = [(0u32, b.colour), (1, b.encoded), (15, b.answer)];
+        let images = [(0u32, b.colour), (1, b.encoded), (14, b.answer)];
         let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers.iter().map(|&(_, (buffer, offset, range))| [vk::DescriptorBufferInfo { buffer, offset, range }]).collect();
         let image_infos: Vec<[vk::DescriptorImageInfo; 1]> =
             images.iter().map(|&(_, view)| [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }]).collect();
@@ -684,7 +611,6 @@ impl CachePass {
             print_tol: t.print_tol,
             sigma_depth: t.sigma_depth,
             sigma_luma: t.sigma_luma,
-            walk: 1.0,
             guided_eps: t.guided_eps,
         }
     }
@@ -725,7 +651,7 @@ impl CachePass {
     ///
     /// # Safety
     /// `cmd` is recording; [`Self::bind`] was called for this hold with `acc`; with [`F_CHAINED`] the
-    /// store is built and the scratch bound.
+    /// scratch is bound.
     pub(crate) unsafe fn record_motion(&self, device: &ash::Device, cmd: vk::CommandBuffer, push: &CachePush, acc: vk::Buffer) {
         let chained = push.flags & F_CHAINED != 0;
         // SAFETY: forwarded.
@@ -757,7 +683,7 @@ impl CachePass {
     /// into its image and before the decode runs.
     ///
     /// # Safety
-    /// `cmd` is recording; [`Self::bind`] was called for this hold; the store is built.
+    /// `cmd` is recording; [`Self::bind`] was called for this hold, chained.
     pub(crate) unsafe fn record_capture(&self, device: &ash::Device, cmd: vk::CommandBuffer, push: &CachePush) {
         // SAFETY: forwarded.
         unsafe {
@@ -774,31 +700,12 @@ impl CachePass {
         }
     }
 
-    /// Records the refresh hold's step of the walk, in the write-back right after the decode.
-    ///
-    /// # Safety
-    /// `cmd` is recording, after the decode; [`Self::record_capture`] was recorded for this hold.
-    pub(crate) unsafe fn record_refresh(&self, device: &ash::Device, cmd: vk::CommandBuffer, push: &CachePush) {
-        // SAFETY: forwarded.
-        unsafe {
-            // The decode wrote the colour input this pass reads and writes.
-            Self::compute_barrier(device, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE);
-            if let Some(t) = &self.timers[2] {
-                t.record_start(device, cmd);
-            }
-            self.dispatch(device, cmd, REFRESH, push, self.width, self.height);
-            if let Some(t) = &self.timers[2] {
-                t.record_end(device, cmd);
-            }
-        }
-    }
-
     /// Records a cached hold's write-back: the history read, the pyramid, the band split, the guided
     /// filter at half size, and its blend written over the colour input.
     ///
     /// # Safety
     /// `cmd` is recording, after the write-back's opening barrier; [`Self::bind`] was called for this
-    /// hold; the store is built.
+    /// hold, chained.
     pub(crate) unsafe fn record_apply(&self, device: &ash::Device, cmd: vk::CommandBuffer, push: &CachePush) {
         // SAFETY: forwarded.
         unsafe {
@@ -839,9 +746,9 @@ impl CachePass {
     }
 
     /// Marks the timers whose passes were submitted (`capture`: the capture's part; `writeback`: the
-    /// write-back's; `refresh`: the refresh pass after the decode).
-    pub(crate) fn submitted(&mut self, capture: bool, writeback: bool, refresh: bool) {
-        for (t, on) in self.timers.iter_mut().zip([capture, writeback, refresh]) {
+    /// write-back's).
+    pub(crate) fn submitted(&mut self, capture: bool, writeback: bool) {
+        for (t, on) in self.timers.iter_mut().zip([capture, writeback]) {
             if let Some(t) = t.as_mut().filter(|_| on) {
                 t.mark_submitted();
             }
@@ -912,9 +819,6 @@ impl CachePass {
     pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
         // SAFETY: forwarded; destroying the pool frees the set.
         unsafe {
-            if let Some(store) = &self.store {
-                store.destroy(device);
-            }
             for t in self.timers.iter().flatten() {
                 t.destroy(device);
             }
@@ -971,8 +875,8 @@ mod tests {
 
     #[test]
     fn the_push_constants_match_the_shaders_params_block() {
-        // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, eleven floats: 92 bytes, std430.
-        assert_eq!(std::mem::size_of::<CachePush>(), 92);
+        // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, ten floats: 88 bytes, std430.
+        assert_eq!(std::mem::size_of::<CachePush>(), 88);
         assert_eq!(std::mem::offset_of!(CachePush, flags), 8);
         assert_eq!(std::mem::offset_of!(CachePush, depth_kind), 12);
         assert_eq!(std::mem::offset_of!(CachePush, mvec_scale), 16);
@@ -983,8 +887,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CachePush, eps_v), 48);
         assert_eq!(std::mem::offset_of!(CachePush, print_tol), 72);
         assert_eq!(std::mem::offset_of!(CachePush, sigma_luma), 80);
-        assert_eq!(std::mem::offset_of!(CachePush, walk), 84);
-        assert_eq!(std::mem::offset_of!(CachePush, guided_eps), 88);
+        assert_eq!(std::mem::offset_of!(CachePush, guided_eps), 84);
         for spv in SPV {
             assert!(spv.len() > 20 && spv.len().is_multiple_of(4), "embedded SPIR-V");
         }
@@ -996,11 +899,11 @@ mod tests {
     }
 
     /// The cache's buffers fit in the network's input features at every size: 64 bytes a texel of
-    /// its field, at least the render extent (the hold checks the real size too: `ensure_store`).
+    /// its field, at least the render extent (the hold checks the real size too: `chain`).
     #[test]
     fn the_scratch_layout_fits_in_the_networks_input_features() {
         // From the replay tool's synthetic dumps up (smaller frames are not held: the region
-        // alignment would not fit, and `ensure_store` says so).
+        // alignment would not fit, and `chain` says so).
         for (w, h) in [(96, 64), (97, 65), (641, 359), (1485, 836), (2228, 1253), (2560, 1440), (3840, 2160)] {
             let l = ScratchLayout::new(w, h);
             let features = u64::from(w) * u64::from(h) * 64;
@@ -1010,7 +913,7 @@ mod tests {
             }
             // What is live at once does not overlap: the long-lived buffers, then the capture's or the
             // write-back's (the grids replace the history read and the pyramid).
-            let long = [l.src_edit, l.src_lin, l.src_print, l.shown, l.shown_lin, l.stale, l.lin];
+            let long = [l.src_edit, l.src_lin, l.src_print, l.shown, l.stale, l.lin];
             for set in [&[l.acc_prev, l.stale_prev][..], &[l.hist, l.conf, l.levels], &[l.guide_a, l.guide_b]] {
                 let live: Vec<Region> = long.iter().chain(set).copied().collect();
                 for (i, a) in live.iter().enumerate() {
@@ -1020,9 +923,9 @@ mod tests {
                 }
             }
         }
-        // At a 4K output's Balanced render size: 60 bytes a pixel, the store 8.
+        // At a 4K output's Balanced render size: 56 bytes a pixel.
         let l = ScratchLayout::new(2228, 1253);
-        assert!(l.total < 61 * 2228 * 1253, "{}", l.total);
+        assert!(l.total < 57 * 2228 * 1253, "{}", l.total);
     }
 
     fn hold(h: u64) -> Hold {
@@ -1109,39 +1012,6 @@ mod tests {
         assert_eq!(one.flags, F_KEEP_CLAMPED, "interval 1: the vectors as they are");
     }
 
-    /// The walk: a refresh right after a hold of the chain walks from it (1/interval of the way), its
-    /// cached holds go on to the answer on the interval's last hold; the first refresh, one after a
-    /// reset, and interval 1 do not walk.
-    #[test]
-    fn a_refresh_walks_from_the_hold_before_across_the_interval() {
-        let four = |h| Hold { interval: 4, ..hold(h) };
-        let mut s = State::default();
-        let mut seen = Vec::new();
-        for h in 1..=6 {
-            let plan = s.plan(&four(h));
-            s.went_through(&four(h), &plan);
-            seen.push((plan.kind, plan.flags & F_WALK != 0, plan.walk));
-        }
-        use Kind::{Cached as C, Refresh as R};
-        assert_eq!(seen, [(R, false, 0.25), (C, false, 0.5), (C, false, 0.75), (C, false, 1.0), (R, true, 0.25), (C, false, 0.5)]);
-        // A reset: the refresh after it takes the answer at once.
-        let p = s.plan(&Hold { history_ok: false, ..four(7) });
-        assert_eq!((p.kind, p.flags & F_WALK), (R, 0));
-        // At interval 2 the cached hold arrives.
-        let two = |h| Hold { interval: 2, ..hold(h) };
-        let mut s = State::default();
-        let walks: Vec<(bool, f32)> = (1..=4)
-            .map(|h| {
-                let plan = s.plan(&two(h));
-                s.went_through(&two(h), &plan);
-                (plan.flags & F_WALK != 0, plan.walk)
-            })
-            .collect();
-        assert_eq!(walks, [(false, 0.5), (false, 1.0), (true, 0.5), (false, 1.0)]);
-        let one = State::default().plan(&Hold { interval: 1, ..hold(1) });
-        assert_eq!((one.flags & F_WALK, one.walk), (0, 1.0));
-    }
-
     #[test]
     fn reversed_z_is_told_by_the_cleared_value_then_by_the_ground() {
         let mut c = [0u32; STAT_WORDS];
@@ -1192,7 +1062,7 @@ mod tests {
                 let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
                 let mut pass = CachePass::build(device, instance, physical, family, w, h).expect("the cache pass builds");
                 let scratch_bytes = ScratchLayout::new(w, h).total;
-                assert!(pass.ensure_store(device, instance, physical, scratch_bytes));
+                assert!(pass.chain(scratch_bytes));
                 let mut rig = Self {
                     colour: OwnImage::new(device, instance, physical, w, h, usage).unwrap(),
                     encoded: OwnImage::new(device, instance, physical, w, h, usage).unwrap(),
@@ -1530,11 +1400,10 @@ mod tests {
     }
 
     /// The shaders run the replay tool's cadence (`--export-cadence`: the model one hold in 3, the
-    /// shown edit walking from what was on screen to each refresh's answer, soft refresh): every
-    /// hold's shown edit, refresh holds included, within 1e-3 stop of the tool's. `regrade` is where
-    /// the walk shows: its model brightens the picture 0.15 stop a hold.
+    /// guided filter by staleness): every hold's edit (a refresh's own, a cached hold's shown one)
+    /// within 1e-3 stop of the tool's. `regrade`'s model brightens the picture 0.15 stop a hold.
     #[test]
-    fn the_shaders_walk_as_the_replay_tool_does() {
+    fn the_shaders_run_the_cadence_as_the_replay_tool_does() {
         const INTERVAL: usize = 3;
         for kind in ["still", "pan", "depth-edge", "regrade"] {
             let dir = scratch(&format!("cadence-{kind}"));
@@ -1572,11 +1441,7 @@ mod tests {
                 if t == 0 || since == 1 {
                     flags |= F_FRESH;
                 }
-                if refresh && t > 0 {
-                    flags |= F_WALK;
-                }
                 let mut push = rig.pass.push(flags, 1, [1.0, 1.0], 3.0);
-                push.walk = if refresh { 1.0 / INTERVAL as f32 } else { ((since + 1) as f32 / INTERVAL as f32).min(1.0) };
                 if t > 0 {
                     let r = holds[t - since];
                     push.step_jitter = [holds[t - 1][0] - hj[0], holds[t - 1][1] - hj[1]];
@@ -1587,14 +1452,11 @@ mod tests {
                 if refresh {
                     rig.upload_image(rig.answer.image, &read(format!("hold-{t:02}/answer.rgba16f")));
                     let capture = CachePush { flags: push.flags | F_SCENE_ANSWER, ..push };
-                    rig.one_shot(|cmd| unsafe {
-                        rig.pass.record_capture(d, cmd, &capture);
-                        rig.pass.record_refresh(d, cmd, &capture);
-                    });
+                    rig.one_shot(|cmd| unsafe { rig.pass.record_capture(d, cmd, &capture) });
                 } else {
                     rig.one_shot(|cmd| unsafe { rig.pass.record_apply(d, cmd, &push) });
                 }
-                let edit = rig.read_edits(|l| l.shown).0;
+                let edit = rig.read_edits(if refresh { |l: &ScratchLayout| l.src_edit } else { |l: &ScratchLayout| l.shown }).0;
                 let tool = f32s(&std::fs::read(out.join(format!("shown-{t:02}.f32"))).unwrap());
                 let de = max_diff(&edit, &tool);
                 eprintln!("{kind} hold {t}: shown edit max diff {de:.2e} stop");

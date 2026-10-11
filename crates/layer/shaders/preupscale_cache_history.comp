@@ -16,8 +16,7 @@
 // in `preupscale::cache::CachePush` (field for field, append only).
 layout(local_size_x = 8, local_size_y = 8) in;
 
-// Where the buffers live (`preupscale::cache::ScratchLayout`): u_start in the cache's own store (it
-// crosses the network's frame on a refresh hold); everything else from binding 6 on in the network's
+// Where the buffers live (`preupscale::cache::ScratchLayout`): from binding 6 on, in the network's
 // input features, which only the network's frame writes and reads (`preprocess` rewrites all of them
 // before the graph reads any): the refresh's edit is written after that frame and read until the next
 // refresh's, the per-hold buffers live within a hold's capture or write-back. Edits are EDIT16: three
@@ -40,40 +39,33 @@ layout(set = 0, binding = 6, std430) buffer AccPrev { vec2 v[]; } u_acc_prev;
 // This hold's pseudo-linear depth (the prep pass; a refresh's write-back reads the depth again, the
 // network's frame having overwritten this).
 layout(set = 0, binding = 7, std430) buffer Lin { float v[]; } u_lin;
-// The pseudo-linear depth of the hold u_shown's edit was shown on.
-layout(set = 0, binding = 8, std430) buffer ShownLin { float v[]; } u_shown_lin;
 // The refresh hold: its clamped edit (EDIT16), its fingerprint (three floats a texel: log luma, log
-// r/g, log b/g) and its depth (binding 18).
-layout(set = 0, binding = 9, std430) buffer SrcEdit { uvec2 v[]; } u_src_edit;
-layout(set = 0, binding = 10, std430) buffer SrcPrint { float v[]; } u_src_print;
+// r/g, log b/g) and its depth (binding 16).
+layout(set = 0, binding = 8, std430) buffer SrcEdit { uvec2 v[]; } u_src_edit;
+layout(set = 0, binding = 9, std430) buffer SrcPrint { float v[]; } u_src_print;
 // A cached hold: the history read (EDIT16, the weight valid x validity as UNORM16 in the spare
-// half) and its confidence. A refresh hold: the capture's walked picture for the refresh pass
-// (packed half4, alpha 1 where it walks).
-layout(set = 0, binding = 11, std430) buffer Hist { uvec2 v[]; } u_hist;
-layout(set = 0, binding = 12, std430) buffer Conf { float v[]; } u_conf;
+// half) and its confidence.
+layout(set = 0, binding = 10, std430) buffer Hist { uvec2 v[]; } u_hist;
+layout(set = 0, binding = 11, std430) buffer Conf { float v[]; } u_conf;
 // The pyramid, levels 0..2 one after the other, two vec4 a texel: (edit rgb, coverage), (log2
 // depth, log luma, 0, 0).
-layout(set = 0, binding = 13, std430) buffer Levels { vec4 v[]; } u_levels;
+layout(set = 0, binding = 12, std430) buffer Levels { vec4 v[]; } u_levels;
 // Host-visible counters (STAT_*), cleared by the CPU before the hold.
-layout(set = 0, binding = 14, std430) buffer Stats { uint v[]; } u_stats;
+layout(set = 0, binding = 13, std430) buffer Stats { uint v[]; } u_stats;
 // The network's answer image (padded extent, proxy domain): the refresh capture's decode.
-layout(set = 0, binding = 15, rgba16f) uniform readonly image2D u_answer;
-// The refresh hold's walk start (EDIT16): what was on screen, where the shown edit walks from to the
-// answer across the interval (the answer itself where nothing walks). A walking refresh's motion pass
-// leaves the start it found there for the capture, the spare half 1 where it walks.
-layout(set = 0, binding = 16, std430) buffer Start { uvec2 v[]; } u_start;
-// The edit each hold showed (EDIT16; with the debug mask, the apply's spare half carries the weight
-// and the confidence, 8 bits each): the next refresh's walk start.
-layout(set = 0, binding = 17, std430) buffer Shown { uvec2 v[]; } u_shown;
-layout(set = 0, binding = 18, std430) buffer SrcLin { float v[]; } u_src_lin;
+layout(set = 0, binding = 14, rgba16f) uniform readonly image2D u_answer;
+// A cached hold's edit between the apply's two dispatches and the guided filter (EDIT16; with the
+// debug mask, the spare half carries the weight and the confidence, 8 bits each).
+layout(set = 0, binding = 15, std430) buffer Shown { uvec2 v[]; } u_shown;
+layout(set = 0, binding = 16, std430) buffer SrcLin { float v[]; } u_src_lin;
 // The guided filter's half-size grids, two vec4 a texel each: the 2x2 means, then the tent-blurred
 // coefficients (a); its coefficients (b). Over the history read and the pyramid, done with by then.
-layout(set = 0, binding = 19, std430) buffer GuideA { vec4 v[]; } u_guide_a;
-layout(set = 0, binding = 20, std430) buffer GuideB { vec4 v[]; } u_guide_b;
+layout(set = 0, binding = 17, std430) buffer GuideA { vec4 v[]; } u_guide_a;
+layout(set = 0, binding = 18, std430) buffer GuideB { vec4 v[]; } u_guide_b;
 // How far each pixel has moved since the refresh (one per 4 px of each hold's motion, at most one a
 // hold), and its copy from the previous hold.
-layout(set = 0, binding = 21, std430) buffer Stale { float v[]; } u_stale;
-layout(set = 0, binding = 22, std430) buffer StalePrev { float v[]; } u_stale_prev;
+layout(set = 0, binding = 19, std430) buffer Stale { float v[]; } u_stale;
+layout(set = 0, binding = 20, std430) buffer StalePrev { float v[]; } u_stale_prev;
 
 layout(push_constant) uniform Params {
   uvec2 size;            // render extent
@@ -93,7 +85,6 @@ layout(push_constant) uniform Params {
   float print_tol;
   float sigma_depth;
   float sigma_luma;
-  float walk;            // how far the shown edit has walked from u_start to the answer
   float guided_eps;      // the guided filter's regularisation
 } p;
 
@@ -101,7 +92,6 @@ const uint F_REVERSE_Z = 1u;     // depth: near is larger (reversed-Z)
 const uint F_NEAREST = 2u;       // motion from the nearest surface of the 3x3 (only with depth)
 const uint F_FRESH = 4u;         // the previous hold refreshed: its accumulated field is zero
 const uint F_CHAINED = 8u;       // accumulate (else the motion pass copies the vectors as they are)
-const uint F_WALK = 16u;         // a refresh walks from the last shown edit (it was the hold before)
 const uint F_DEBUG_MASK = 32u;   // the apply writes the rejection mask instead of the frame
 const uint F_KEEP_CLAMPED = 64u; // the decode's rule: keep the original where the encode clamped
 const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds the decoded answer
@@ -224,9 +214,8 @@ vec3 print_at(ivec2 at) {
 shared uint s_rejected;
 
 // A cached hold's history read and validation (read_history, validate and carry's weight and
-// confidence): the refresh hold's edit (walked p.walk of the way from its start to the answer,
-// run_cadence) at the chained position, admitted by depth, checked against this hold's colour and
-// fingerprint. Writes (edit, weight) and the confidence; counts the texels
+// confidence): the refresh hold's edit at the chained position, admitted by depth, checked against
+// this hold's colour and fingerprint. Writes (edit, weight) and the confidence; counts the texels
 // whose history was rejected.
 void main() {
   uvec2 xy = gl_GlobalInvocationID.xy;
@@ -261,11 +250,8 @@ void main() {
         ivec2 t = clamp(i0 + ivec2(ox, oy), ivec2(0), ivec2(p.size) - 1);
         uint j = uint(t.y) * p.size.x + uint(t.x);
         float wb = (ox == 1 ? f.x : 1.0 - f.x) * (oy == 1 ? f.y : 1.0 - f.y);
-        vec3 s = unpack_edit(u_src_edit.v[j]);
+        vec3 e = unpack_edit(u_src_edit.v[j]);
         float s_lin = u_src_lin.v[j];
-        // The refresh's edit where the walk has got to: from its start to the answer.
-        vec3 from = unpack_edit(u_start.v[j]);
-        vec3 e = from + (s - from) * p.walk;
         float rel = abs(s_lin - lin_c) / max(min(s_lin, lin_c), 1e-7);
         float wd = clamp((2.0 * tol - rel) / max(tol, 1e-6), 0.0, 1.0);
         float wt = wb * wd;

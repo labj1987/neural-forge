@@ -26,9 +26,8 @@ never reprojected. One carry here, as the shader does it on a cached hold:
      jointly-bilaterally on depth and luma, coarse to fine, fading to no edit where nothing of this
      surface is near (surface fill); final edit = low + confidence * (history - low).
 
-Over time (cache_replay.py's run_cadence, which the shaders mirror too): a refresh hold's shown edit
-walks from what was on screen to the model's answer across the interval (the crossfade and soft
-refresh), so step 3 reads the refresh's edit as far as the walk has got.
+Over time (cache_replay.py's run_cadence, which the shaders mirror too): a refresh hold shows the
+model's answer, its cached holds carry it (steps 3-5), with a guided filter by staleness.
 
 Ported from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5), commit
 6bfc4389c25054ef6747df6e6b1b470e9541c4da: OptiScaler/shaders/dlssnr/precompile/dlssnr_cache.hlsl

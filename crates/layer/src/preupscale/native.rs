@@ -1450,11 +1450,10 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     };
     let wanted = ask.interval.clamp(1, super::cache::MAX_INTERVAL);
-    // SAFETY: nothing of the pass is pending (waited above).
-    let chained = wanted > 1 && unsafe { edit.ensure_store(device, instance, physical_device, built.frame.features_bytes) };
+    // Above interval 1 the cache's buffers are in the network's input features (`cache::ScratchLayout`).
+    let chained = wanted > 1 && edit.chain(built.frame.features_bytes);
     if !chained {
-        // SAFETY: as above.
-        unsafe { edit.free_store(device) };
+        edit.unchain();
     }
     native.gap.note_format(format_of(target));
     let cache_hold = super::cache::Hold {
@@ -1487,7 +1486,6 @@ pub(crate) unsafe fn run_native_hold(
     let mut push = edit.push(plan.flags, depth.map_or(0, super::cache::depth_kind), target.mvec_scale, target.paper_white);
     push.step_jitter = plan.step_jitter;
     push.refresh_jitter = plan.refresh_jitter;
-    push.walk = plan.walk;
     // The motion pass whenever there are vectors to copy, and always while the cache runs (its prep).
     let run_motion = chained || mvec.is_some();
     // A cache dump's readbacks for an armed hold, built on its first one.
@@ -1508,7 +1506,6 @@ pub(crate) unsafe fn run_native_hold(
     // SAFETY (the four closures): recording into the hold's own buffers; the set was bound above.
     let motion = |cmd: vk::CommandBuffer| unsafe { edit.record_motion(device, cmd, &push, acc) };
     let capture_edit = |cmd: vk::CommandBuffer| unsafe { edit.record_capture(device, cmd, &push) };
-    let refresh_edit = |cmd: vk::CommandBuffer| unsafe { edit.record_refresh(device, cmd, &push) };
     let apply = |cmd: vk::CommandBuffer| unsafe { edit.record_apply(device, cmd, &push) };
     // SAFETY: the capture buffer is idle; the colour view was bound above.
     let recorded = unsafe {
@@ -1535,7 +1532,7 @@ pub(crate) unsafe fn run_native_hold(
         if cached {
             super::record_cached_writeback(device, res, &apply)
         } else {
-            super::record_writeback(device, res, target, native.answer(), hdr_pass, cache.as_ref(), chained.then_some((&capture_edit as &dyn Fn(vk::CommandBuffer), &refresh_edit as &dyn Fn(vk::CommandBuffer))))
+            super::record_writeback(device, res, target, native.answer(), hdr_pass, cache.as_ref(), chained.then_some(&capture_edit as &dyn Fn(vk::CommandBuffer)))
         }
     };
     if recorded.is_err() {
@@ -1603,7 +1600,7 @@ pub(crate) unsafe fn run_native_hold(
     }
     if let Some(edit) = res.edit.as_mut() {
         edit.state.went_through(&cache_hold, &plan);
-        edit.submitted(run_motion, cached || chained, chained && !cached);
+        edit.submitted(run_motion, cached || chained);
     }
     if let (Some(arm), Some(c)) = (arm.filter(|_| cache.is_some()), res.cache.as_mut()) {
         c.pending = Some(super::cache_dump::Pending {

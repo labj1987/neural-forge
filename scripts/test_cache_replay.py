@@ -149,7 +149,7 @@ class CacheReplayTests(unittest.TestCase):
         p = cc.Params()
         frames = cr.Frames(dump, True, p, 3)
         h, w = dump.height, dump.width
-        for t, since, refresh, shown, dst, _ in cr.run_cadence(dump, frames, cr.Cadence(interval=2, crossfade=False, guided=False), p):
+        for t, since, refresh, shown, dst, _ in cr.run_cadence(dump, frames, cr.Cadence(interval=2, guided=False), p):
             self.assertEqual(refresh, t % 2 == 0)
             self.assertEqual(since, t % 2)
             if refresh:
@@ -161,29 +161,10 @@ class CacheReplayTests(unittest.TestCase):
             np.testing.assert_allclose(shown, want, atol=1e-6)
         self.assertEqual((h, w), shown.shape[:2])
 
-    def test_crossfade_walks_from_what_was_shown_to_the_answer(self):
-        """On a still scene whose edit changes from hold to hold the crossfade starts at what was on
-        screen and reaches the refresh's answer on the interval's last hold; soft refresh changes
-        nothing where everything is carried."""
-        holds, white, _ = cr.synthetic_holds("still", w=32, h=24, n=7)
-        for k, hd in enumerate(holds):
-            hd.answer = hd.answer * (1.0 + 0.1 * k)  # the model re-grades by a little each hold
-        with tempfile.TemporaryDirectory() as d:
-            cc.write_dump(d, holds, paper_white=white)
-            dump = cc.load_dump(d)
-            p = cc.Params(max_luma_edit=0.0)
-            runs = {}
-            for name, cad in (("base", cr.Cadence(interval=3, crossfade=False, guided=False)),
-                              ("xf", cr.Cadence(interval=3, soft=False, guided=False)), ("soft", cr.Cadence(interval=3, guided=False))):
-                runs[name] = [(t, s.copy()) for t, _, _, s, _, _ in cr.run_cadence(dump, cr.Frames(dump, True, p, 3), cad, p)]
-            base, xf = dict(runs["base"]), dict(runs["xf"])
-            # Hold 3 refreshes: one third of the way from hold 2's shown edit (hold 0's) to hold 3's.
-            np.testing.assert_allclose(xf[3], base[2] + (base[3] - base[2]) / 3, atol=2e-3)
-            np.testing.assert_allclose(xf[5], base[3], atol=2e-3)
-            for (_, a), (_, b) in zip(runs["xf"], runs["soft"]):
-                np.testing.assert_allclose(a, b, atol=1e-6)
-            r = cr.cadence_metrics(dump, cr.Cadence(interval=3), p, True)
-            self.assertEqual(set(r["pulse"]), {"0", "1", "2"})
+    def test_cadence_metrics_has_a_pulse_per_hold_since_the_refresh(self):
+        dump = cc.load_dump(self.dirs["pan"])
+        r = cr.cadence_metrics(dump, cr.Cadence(interval=3), cc.Params(), True)
+        self.assertEqual(set(r["pulse"]), {"0", "1", "2"})
 
     def test_guided_filter_keeps_a_linear_edit(self):
         rng = np.random.default_rng(1)
@@ -203,7 +184,7 @@ class CacheReplayTests(unittest.TestCase):
         self.assertEqual(set(doc["results"]), {"1", "2"})
         self.assertEqual(set(doc["results"]["1"]), set(cr.MODES))
         with open(out + ".cad", encoding="utf-8") as fh:
-            self.assertEqual([r["label"] for r in json.load(fh)["runs"]], ["i2-xf-soft"])
+            self.assertEqual([r["label"] for r in json.load(fh)["runs"]], ["i2-base"])
 
 
 if __name__ == "__main__":
