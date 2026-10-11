@@ -584,7 +584,12 @@ fn check_device_lost(hdr: Option<&neural_forge_protocol::ShmHeader>, session: Op
         evidence.push(format!("state log: {}", event_line(e)));
     }
     if evidence.is_empty() {
-        return vec![Finding::new("device-lost", Severity::Ok, "the GPU device was not lost in the last game session", "channel: device_lost_at=0; no device-lost line in the last session", None)];
+        // Only what was actually read is evidence: with neither the channel nor a session, nothing is known.
+        let read: Vec<&str> = [hdr.map(|_| "channel: device_lost_at=0"), session.map(|_| "state log: no device-lost line in the last session")].into_iter().flatten().collect();
+        if read.is_empty() {
+            return Vec::new();
+        }
+        return vec![Finding::new("device-lost", Severity::Ok, "the GPU device was not lost in the last game session", read.join("\n"), None)];
     }
     vec![Finding::new(
         "device-lost",
@@ -1070,6 +1075,8 @@ mod tests {
         let mapping = channel(&f);
         let hdr = mapping.header();
         assert_eq!(check_device_lost(Some(hdr), None)[0].severity, Severity::Ok);
+        assert_eq!(check_device_lost(Some(hdr), None)[0].evidence, "channel: device_lost_at=0");
+        assert!(check_device_lost(None, None).is_empty(), "nothing read, nothing claimed");
         hdr.device_lost_at.store(1_760_119_200, Ordering::Relaxed);
         let v = check_device_lost(Some(hdr), None);
         assert_eq!(v[0].severity, Severity::Failure);
