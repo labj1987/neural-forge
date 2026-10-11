@@ -29,6 +29,7 @@ adapted, or taken from DLSS5VKLayer's real source, not just its documented behav
 | [DLSS5oneclick-forlinux](https://github.com/Mhsbrian/DLSS5oneclick-forlinux) (Copyright (c) 2026 Faisal Bahashwan), MIT, commit `b0f16ff`: `src/diagnose.rs` read, **technique only, no code** | **How `doctor` reads logs** (`crates/supervisor/src/doctor.rs`, `crates/protocol/src/state_log.rs`): every finding is driven by the component's own log grammar matched exactly, the newest matching line is the verdict, and the tests feed lines that only contain a match as substring traps. The checks, the state log and its grammar are this project's own. Its MIT license permits this use; the notice: "Permission is hereby granted, free of charge, to any person obtaining a copy of this software and associated documentation files (the "Software"), to deal in the Software without restriction ... The above copyright notice and this permission notice shall be included in all copies or substantial portions of the Software." |
 | [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), GPL-3.0: **design only, no code** | **The idea of reading the game's exposure texture** to scale the HDR scene before the encode. Neural Forge reads DLSS's own 1x1 exposure input on the GPU at each hold (the image is found from DLSS's registered views, not from OptiScaler's code). |
 | [OptiScaler](https://github.com/cdozdil/OptiScaler), GPL-3.0: its pre-SR mod, **design only, no code** | **The inspiration for running the model before the upscaler** (on DLSS Super Resolution's render-resolution input rather than the upscaled frame). The mechanism here is different and this project's own: a Vulkan layer that recognises DLSS's input through `VK_NVX_image_view_handle` and holds the game's DLSS submit (`crates/layer/src/preupscale.rs`). |
+| [DLSS5oneclick-forlinux](https://github.com/Mhsbrian/DLSS5oneclick-forlinux) (Faisal Bahashwan), MIT, commit `b0f16ff`: `src/platform/vdf.rs`, `src/platform/launch_options.rs` and `src/platform/steam.rs` read, **adapted** | **Steam discovery and the guarded launch-option edit** in `crates/supervisor/src/vdf.rs`, `launch_options.rs` and `steam.rs`: the VDF reader with byte spans and the one-value splice that never re-serialises the file (`set_string_preserving`: replace the value, insert a missing key, or a missing parent block holding it, before the closing brace), the merge/strip pair for launch options (split respecting quotes, game arguments without `%command%` moved behind one, strip removing exactly what merge adds), the Steam root list with Flatpak and Snap, the library and app-manifest reading with Steam's own tools filtered out, and `apply_with`'s sequence (refuse while Steam runs, splice, re-parse and compare, `.orig` once and `.bak` per edit, replace; the app block created only in the most recently modified account). Rewritten for this project: byte-based parsing with `[$CONDITION]`s, the verification as "the original tree plus exactly this change", layout and CRLF copied from the file, the atomic write keeping the file's mode, `steamwebhelper` in the running check, only the accounts that have the game edited, and a typed outcome carrying the string to paste instead of an error. The MIT notice is below. |
 
 ## Ported functions (upstream parity work, from 0.3.1-1 / commit 117c953)
 
@@ -110,6 +111,32 @@ DLSS5VKLayer's own attribution of it, and no code from it appears in this reposi
 OpenDLSS-NR's source is vendored in `third_party/opendlss-nr` (the native backend, see above) under its
 MIT notice: `third_party/opendlss-nr/LICENSE` and upstream's `NOTICE` ship with every build, and the same
 license covers the documented design the history reset follows.
+
+The Steam code adapted from DLSS5oneclick-forlinux (see above) is used under its MIT license:
+
+```
+MIT License
+
+Copyright (c) 2026 Faisal Bahashwan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ## C/C++ linked into the layer
 

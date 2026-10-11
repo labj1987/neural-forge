@@ -5,10 +5,13 @@
 pub mod config;
 pub mod doctor;
 pub mod install;
+pub mod launch_options;
 pub mod model;
 pub mod model_shape;
 pub mod paths;
 pub mod profiles;
+pub mod steam;
+pub mod vdf;
 
 pub use config::Config;
 
