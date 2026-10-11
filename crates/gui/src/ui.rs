@@ -687,36 +687,10 @@ fn refresh_profile_combo(combo: &adw::ComboRow) {
     }
 }
 
-/// The exact Steam launch-option string for these settings -- pulled out of the
-/// closure below so it's a plain, unit-testable function instead of only ever being
-/// exercised live through GTK signal handlers.
-///
-/// There is no DMA-BUF switch: nothing reads `NEURAL_FORGE_DMABUF` (the transport is not wired),
-/// and a switch that does nothing was worse than none.
-fn launch_option(target_exe: &str) -> String {
-    let mut parts = vec!["NEURAL_FORGE_ENABLE=1".to_string()];
-    let target_exe = target_exe.trim();
-    if !target_exe.is_empty() {
-        parts.push(format!("NEURAL_FORGE_TARGET_EXE={}", shell_quote(target_exe)));
-    }
-    parts.push("%command%".to_string());
-    parts.join(" ")
-}
-
-/// Steam runs the launch option through a shell, so a value with a space or any other
-/// shell character is single-quoted (a `'` inside becomes `'\''`).
-fn shell_quote(value: &str) -> String {
-    if value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
-        value.to_string()
-    } else {
-        format!("'{}'", value.replace('\'', "'\\''"))
-    }
-}
-
 fn build_launch_option_group() -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Steam launch option");
-    group.set_description(Some("Paste this into the game's Properties -> Launch Options in Steam"));
+    group.set_description(Some("To set it by hand: paste this into the game's Properties -> Launch Options in Steam"));
 
     let exe_row = adw::EntryRow::new();
     exe_row.set_title("Target executable (optional, for a multi-process game)");
@@ -731,7 +705,7 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
     group.add(&preview_row);
 
     let exe_row_for_build = exe_row.clone();
-    let build_option = std::rc::Rc::new(move || launch_option(&exe_row_for_build.text()));
+    let build_option = std::rc::Rc::new(move || neural_forge_supervisor::launch_options::launch_option(&exe_row_for_build.text()));
 
     preview_row.set_subtitle(&build_option());
 
@@ -825,9 +799,117 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     group
 }
 
+/// The games group's description: what the switches do, or why they can't be used right now.
+fn games_note(roots: &[neural_forge_supervisor::steam::Root], games: usize, steam_running: bool) -> String {
+    if roots.is_empty() {
+        return "Steam was not found. Set the launch option below by hand".to_string();
+    }
+    let mut note = String::new();
+    if neural_forge_supervisor::steam::only_flatpak(roots) {
+        note.push_str("Steam is the Flatpak build: the games it runs cannot see Neural Forge's Vulkan layer. ");
+    }
+    note.push_str(if games == 0 {
+        "No installed games found"
+    } else if steam_running {
+        "Close Steam to switch games here: Steam rewrites its settings when it exits, so a change made while it runs is lost. Or copy the launch option below into the game's Properties"
+    } else {
+        "Turns Neural Forge on in the game's Steam launch options, keeping the options already there"
+    });
+    note
+}
+
+/// A toast with a Copy button for `manual`, the launch options to set by hand.
+fn manual_toast(message: &str, manual: String) -> adw::Toast {
+    let toast = adw::Toast::new(message);
+    toast.set_timeout(0);
+    toast.set_button_label(Some("Copy launch options"));
+    toast.connect_button_clicked(move |_| {
+        if let Some(display) = gtk4::gdk::Display::default() {
+            display.clipboard().set_text(&manual);
+        }
+    });
+    toast
+}
+
+/// The installed Steam games, each with a switch that turns Neural Forge on or off in its launch
+/// options (`neural_forge_supervisor::steam::apply`). While Steam runs the switches are insensitive:
+/// it would overwrite the edit on exit. The refresh button scans again.
+fn build_games_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    use neural_forge_supervisor::steam;
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Steam games");
+    let refresh = gtk4::Button::from_icon_name("view-refresh-symbolic");
+    refresh.set_tooltip_text(Some("Look for games again"));
+    refresh.add_css_class("flat");
+    refresh.set_valign(gtk4::Align::Center);
+    group.set_header_suffix(Some(&refresh));
+
+    let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::SwitchRow>>> = std::rc::Rc::default();
+    let fill = {
+        let (group, rows, toasts) = (group.clone(), rows.clone(), toasts.clone());
+        move || {
+            for row in rows.borrow_mut().drain(..) {
+                group.remove(&row);
+            }
+            let roots = steam::roots();
+            let games = steam::games(&roots);
+            let running = steam::steam_running(std::path::Path::new("/proc"));
+            group.set_description(Some(&games_note(&roots, games.len(), running)));
+            for game in games {
+                let row = adw::SwitchRow::new();
+                row.set_use_markup(false);
+                row.set_title(&game.name);
+                row.set_subtitle(&format!("{} · {}", game.appid, game.library.display()));
+                row.set_active(steam::enabled(&game.root.path, &game.appid));
+                row.set_sensitive(!running);
+                let reverting = std::rc::Rc::new(std::cell::Cell::new(false));
+                // Weak: the list holds the rows, and each row's handler would otherwise hold the list.
+                let (group_for_row, rows_for_row, toasts) = (group.clone(), std::rc::Rc::downgrade(&rows), toasts.clone());
+                row.connect_active_notify(move |row| {
+                    if reverting.get() {
+                        return;
+                    }
+                    let action = if row.is_active() { steam::Action::Enable { target_exe: String::new() } } else { steam::Action::Disable };
+                    let revert = || {
+                        reverting.set(true);
+                        row.set_active(!row.is_active());
+                        reverting.set(false);
+                    };
+                    match steam::apply_now(&game.root.path, &game.appid, &action) {
+                        steam::Outcome::Changed(_) | steam::Outcome::Unchanged => {
+                            let state = if row.is_active() { "on" } else { "off" };
+                            toasts.add_toast(adw::Toast::new(&format!("Neural Forge is {state} for {}", game.name)));
+                        }
+                        steam::Outcome::SteamRunning { manual } => {
+                            revert();
+                            if let Some(rows) = rows_for_row.upgrade() {
+                                for other in rows.borrow().iter() {
+                                    other.set_sensitive(false);
+                                }
+                                group_for_row.set_description(Some(&games_note(&steam::roots(), rows.borrow().len(), true)));
+                            }
+                            toasts.add_toast(manual_toast("Steam is running: close it first, or set the launch options by hand", manual));
+                        }
+                        steam::Outcome::Failed { reason, manual } => {
+                            revert();
+                            toasts.add_toast(manual_toast(&format!("Could not change the launch options safely: {reason}"), manual));
+                        }
+                    }
+                });
+                group.add(&row);
+                rows.borrow_mut().push(row);
+            }
+        }
+    };
+    fill();
+    refresh.connect_clicked(move |_| fill());
+    group
+}
+
 fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.add(&build_model_group(toasts));
+    page.add(&build_games_group(toasts));
     page.add(&build_launch_option_group());
     page
 }
@@ -1286,32 +1368,18 @@ mod preupscale_label_tests {
 }
 
 #[cfg(test)]
-mod launch_option_tests {
+mod games_note_tests {
     use super::*;
+    use neural_forge_supervisor::steam::Root;
 
     #[test]
-    fn matches_the_documented_baseline_with_no_target_exe() {
-        assert_eq!(launch_option(""), "NEURAL_FORGE_ENABLE=1 %command%");
-    }
-
-    #[test]
-    fn includes_target_exe_when_given() {
-        assert_eq!(launch_option("GTA5_Enhanced.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
-    }
-
-    #[test]
-    fn trims_whitespace_around_target_exe() {
-        assert_eq!(launch_option("  GTA5_Enhanced.exe  "), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
-    }
-
-    #[test]
-    fn whitespace_only_target_exe_is_treated_as_empty() {
-        assert_eq!(launch_option("   "), "NEURAL_FORGE_ENABLE=1 %command%");
-    }
-
-    #[test]
-    fn quotes_a_target_exe_with_a_space_or_a_quote() {
-        assert_eq!(launch_option("My Game.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' %command%");
-        assert_eq!(launch_option("it's.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='it'\\''s.exe' %command%");
+    fn says_why_the_switches_are_off() {
+        let native = Root { path: "/s".into(), flatpak: false };
+        let flatpak = Root { path: "/f".into(), flatpak: true };
+        assert!(games_note(&[], 0, false).starts_with("Steam was not found"));
+        assert!(games_note(std::slice::from_ref(&native), 3, true).starts_with("Close Steam"));
+        assert!(games_note(std::slice::from_ref(&native), 3, false).starts_with("Turns Neural Forge on"));
+        assert!(games_note(std::slice::from_ref(&flatpak), 1, false).starts_with("Steam is the Flatpak build"));
+        assert!(!games_note(&[native, flatpak], 1, false).contains("Flatpak"), "a native Steam is there too");
     }
 }

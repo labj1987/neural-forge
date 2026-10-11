@@ -601,7 +601,7 @@ mod tests {
         set_mtime(&newer, 2_000);
         // Only the older account has GTA: only its file changes.
         let Outcome::Changed(edits) = apply(&home.0, "3240220", &enable(), false) else { panic!() };
-        assert_eq!(edits.iter().map(|e| e.file.clone()).collect::<Vec<_>>(), [older.clone()]);
+        assert_eq!(edits.iter().map(|e| &e.file).collect::<Vec<_>>(), [&older]);
         assert_eq!(options_in(&newer, "3240220"), None);
         // Neither has this game: the block is created in the most recently modified file only
         // (the edit above made the older one newest; put the times back).

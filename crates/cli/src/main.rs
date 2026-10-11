@@ -1,5 +1,6 @@
 //! `neural-forge-cli` -- the command-line front end: config, the NVIDIA DLL import and the model
-//! extraction, install/uninstall, the live settings channel (`shmctl`) and settings profiles. Shares
+//! extraction, install/uninstall, the live settings channel (`shmctl`), settings profiles and the
+//! Steam games' launch options (`games`, `enable`, `disable`). Shares
 //! its logic with the GUI through `neural_forge_supervisor` and `neural_forge_protocol`.
 
 mod shmctl;
@@ -28,7 +29,14 @@ fn usage() {
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
-         \x20                     (see `profile help`)"
+         \x20                     (see `profile help`)\n\
+         \x20 games                list installed Steam games and whether Neural Forge\n\
+         \x20                     is on in their launch options\n\
+         \x20 enable GAME [--target-exe EXE]\n\
+         \x20                     turn Neural Forge on in GAME's Steam launch options\n\
+         \x20                     (GAME: appid, exact name, or a unique part of a name;\n\
+         \x20                     Steam must be closed, else the string to paste is shown)\n\
+         \x20 disable GAME         take Neural Forge back out of GAME's launch options"
     );
 }
 
@@ -358,6 +366,87 @@ fn cmd_extract_model(source: &str) -> ExitCode {
     }
 }
 
+/// Notes about the Steam install that apply to every game: missing, Flatpak-only, or running.
+fn steam_notes(roots: &[neural_forge_supervisor::steam::Root]) {
+    use neural_forge_supervisor::steam;
+    if roots.is_empty() {
+        println!("Steam was not found (looked in ~/.local/share/Steam, ~/.steam/steam, the Flatpak and the Snap)");
+    } else if steam::only_flatpak(roots) {
+        println!("Steam is the Flatpak build: the games it runs cannot see Neural Forge's Vulkan layer");
+    }
+    if steam::steam_running(std::path::Path::new("/proc")) {
+        println!("Steam is running: close it before `enable`/`disable` (it rewrites its settings on exit)");
+    }
+}
+
+fn cmd_games() -> ExitCode {
+    use neural_forge_supervisor::steam;
+    let roots = steam::roots();
+    steam_notes(&roots);
+    let games = steam::games(&roots);
+    if games.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    println!("{:>8}  {:<3}  name  (library)", "appid", "on");
+    for game in &games {
+        let on = if steam::enabled(&game.root.path, &game.appid) { "yes" } else { "no" };
+        println!("{:>8}  {:<3}  {}  ({})", game.appid, on, game.name, game.library.display());
+    }
+    ExitCode::SUCCESS
+}
+
+fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action) -> ExitCode {
+    use neural_forge_supervisor::steam::{self, Action, FindError, Outcome};
+    let roots = steam::roots();
+    let games = steam::games(&roots);
+    let game = match steam::find(&games, query) {
+        Ok(game) => game,
+        Err(FindError::NotFound) => {
+            steam_notes(&roots);
+            eprintln!("no installed Steam game matches {query:?} (see `neural-forge-cli games`)");
+            return ExitCode::FAILURE;
+        }
+        Err(FindError::Ambiguous(candidates)) => {
+            eprintln!("{query:?} matches more than one game; use the appid or more of the name:");
+            for (name, appid) in candidates {
+                eprintln!("  {appid:>8}  {name}");
+            }
+            return ExitCode::FAILURE;
+        }
+    };
+    let verb = if matches!(action, Action::Disable) { "off" } else { "on" };
+    let manual_hint = |manual: &str| {
+        if manual.is_empty() {
+            eprintln!("Clear the game's launch options in Steam (Properties -> Launch Options).");
+        } else {
+            eprintln!("Set the game's launch options in Steam (Properties -> Launch Options) to:\n{manual}");
+        }
+    };
+    match steam::apply_now(&game.root.path, &game.appid, &action) {
+        Outcome::Changed(edits) => {
+            for edit in edits {
+                println!("{}: {:?} -> {:?}\n  in {} (previous copy: {})", game.name, edit.before, edit.after, edit.file.display(), edit.backup.display());
+            }
+            println!("Neural Forge is {verb} for {} ({})", game.name, game.appid);
+            ExitCode::SUCCESS
+        }
+        Outcome::Unchanged => {
+            println!("Neural Forge was already {verb} for {} ({})", game.name, game.appid);
+            ExitCode::SUCCESS
+        }
+        Outcome::SteamRunning { manual } => {
+            eprintln!("Steam is running, and would overwrite the change when it exits. Close Steam and run this again, or:");
+            manual_hint(&manual);
+            ExitCode::FAILURE
+        }
+        Outcome::Failed { reason, manual } => {
+            eprintln!("could not change the launch options safely: {reason}");
+            manual_hint(&manual);
+            ExitCode::FAILURE
+        }
+    }
+}
+
 /// A command line, parsed and checked before anything runs.
 #[derive(Debug, PartialEq, Eq)]
 enum Command {
@@ -371,6 +460,9 @@ enum Command {
     Uninstall { purge: bool },
     Shmctl(Vec<String>),
     Profile(Vec<String>),
+    Games,
+    Enable { game: String, target_exe: String },
+    Disable(String),
     /// `--help`/`-h`: the whole usage (`None`) or one command's.
     Help(Option<String>),
 }
@@ -444,6 +536,31 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
             };
             if ok { Ok(Command::Profile(args[1..].to_vec())) } else { Err(err(format!("unexpected arguments: {}", rest.join(" ")))) }
         }
+        "games" => none(Command::Games),
+        "enable" | "disable" => {
+            let mut words = Vec::new();
+            let mut target_exe = String::new();
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--target-exe" if command == "enable" => match rest.get(i + 1) {
+                        Some(exe) => {
+                            target_exe = (*exe).to_string();
+                            i += 1;
+                        }
+                        None => return Err(err("--target-exe takes an executable name".into())),
+                    },
+                    option if option.starts_with('-') => return Err(err(format!("unknown option {option:?}"))),
+                    word => words.push(word),
+                }
+                i += 1;
+            }
+            if words.is_empty() {
+                return Err(err(format!("{command} takes a game: its appid or name")));
+            }
+            let game = words.join(" ");
+            Ok(if command == "enable" { Command::Enable { game, target_exe } } else { Command::Disable(game) })
+        }
         _ => unreachable!("command_usage knows every command"),
     }
 }
@@ -461,6 +578,11 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "uninstall" => {
             "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also removes config, data\n  (the DLL, the model), state and /tmp/neural-forge-$UID"
         }
+        "games" => "usage: neural-forge-cli games\n  list installed Steam games (appid, Neural Forge on/off, name, library)",
+        "enable" => {
+            "usage: neural-forge-cli enable GAME [--target-exe EXE]\n  turn Neural Forge on in GAME's Steam launch options, keeping the options already there.\n  GAME is an appid, an exact name or a unique part of a name. Steam must be closed (it\n  rewrites its settings on exit); otherwise the launch options to paste are printed."
+        }
+        "disable" => "usage: neural-forge-cli disable GAME\n  take Neural Forge back out of GAME's Steam launch options (see `enable --help`)",
         "shmctl" => "",
         "profile" => "",
         _ => return None,
@@ -498,6 +620,9 @@ fn main() -> ExitCode {
         Command::Uninstall { purge } => cmd_uninstall(purge),
         Command::Shmctl(args) => shmctl::run(&args),
         Command::Profile(args) => cmd_profile(&args),
+        Command::Games => cmd_games(),
+        Command::Enable { game, target_exe } => cmd_set_game(&game, neural_forge_supervisor::steam::Action::Enable { target_exe }),
+        Command::Disable(game) => cmd_set_game(&game, neural_forge_supervisor::steam::Action::Disable),
         Command::Help(command) => {
             print_help(command.as_deref());
             ExitCode::SUCCESS
@@ -560,5 +685,20 @@ mod tests {
         assert_eq!(parse_str("profile"), Ok(Command::Profile(vec![])));
         assert_eq!(parse_str("shmctl set intensity 0.5"), Ok(Command::Shmctl(vec!["set".into(), "intensity".into(), "0.5".into()])));
         assert_eq!(parse_str("shmctl capture --frames 3"), Ok(Command::Shmctl(vec!["capture".into(), "--frames".into(), "3".into()])));
+    }
+
+    #[test]
+    fn game_commands_parse() {
+        assert_eq!(parse_str("games"), Ok(Command::Games));
+        assert!(parse_str("games now").is_err());
+        assert_eq!(parse_str("enable 3240220"), Ok(Command::Enable { game: "3240220".into(), target_exe: String::new() }));
+        assert_eq!(parse_str("enable grand theft auto --target-exe GTA5_Enhanced.exe"), Ok(Command::Enable { game: "grand theft auto".into(), target_exe: "GTA5_Enhanced.exe".into() }));
+        assert_eq!(parse_str("disable Hogwarts Legacy"), Ok(Command::Disable("Hogwarts Legacy".into())));
+        assert!(parse_str("enable").is_err());
+        assert!(parse_str("enable gta --target-exe").is_err());
+        assert!(parse_str("disable gta --target-exe x.exe").is_err(), "disable takes no target");
+        assert!(parse_str("disable --force gta").is_err());
+        assert_eq!(parse_str("enable --help"), Ok(Command::Help(Some("enable".into()))));
+        assert_eq!(parse_str("help games"), Ok(Command::Help(Some("games".into()))));
     }
 }

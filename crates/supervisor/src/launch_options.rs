@@ -173,8 +173,8 @@ mod tests {
             ("", "NEURAL_FORGE_ENABLE=1 %command%"),
         ] {
             assert_eq!(merge(existing, ""), merged, "{existing:?}");
-            assert_eq!(strip(&merged), existing, "{existing:?}");
-            assert!(is_enabled(&merged) && !is_enabled(existing));
+            assert_eq!(strip(merged), existing, "{existing:?}");
+            assert!(is_enabled(merged) && !is_enabled(existing));
         }
     }
 
