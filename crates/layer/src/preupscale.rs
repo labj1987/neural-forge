@@ -5266,7 +5266,7 @@ impl Session {
             let rate = per_second(SUMMARY_EVERY, s.window_start.map_or(Duration::ZERO, |t| now.duration_since(t)));
             s.window_start = Some(now);
             crate::log!(
-                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2}{}{}{} misses={} (total {}) holds_per_s={:.1}{}",
+                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2}{}{}{} misses={} (total {}) holds_per_s={:.1}{}{}",
                 mode().name(),
                 extent.0,
                 extent.1,
@@ -5301,7 +5301,8 @@ impl Session {
                         if source == ExposureSource::Auto { "auto" } else { "game" }
                     ),
                     None => String::new(),
-                }
+                },
+                crate::vram::note()
             );
             crate::log!("[preupscale] {}", s.phases());
             crate::logging::flush();

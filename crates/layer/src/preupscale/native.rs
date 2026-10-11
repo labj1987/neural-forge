@@ -283,6 +283,7 @@ impl Loader {
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
             }
             let t = Instant::now();
+            let vram_before = crate::vram::reading();
             let mut open_stalled = false;
             let result = match network.take() {
                 Some(n) => Ok(n),
@@ -330,12 +331,16 @@ impl Loader {
                         state.generation += 1;
                         state.built = Some(Built { width: w, height: h, frame, graph: n.graph_commands(), graph_own: n.graph_commands_own(), generation: state.generation });
                         crate::log!(
-                            "[native] network {}built for {w}x{h} (field {}x{}, chained {}) in {} ms",
+                            "[native] network {}built for {w}x{h} (field {}x{}, chained {}) in {} ms{}",
                             if fall_back { "re" } else { "" },
                             frame.field_width,
                             frame.field_height,
                             frame.chained != 0,
-                            t.elapsed().as_millis()
+                            t.elapsed().as_millis(),
+                            match (vram_before, crate::vram::reading()) {
+                                (Some((before, _)), Some((after, budget))) => format!(" (vram {before} -> {after} of {budget} MiB)"),
+                                _ => String::new(),
+                            }
                         );
                         retry.succeeded();
                         if let Some(streak) = retry.take_recovered() {

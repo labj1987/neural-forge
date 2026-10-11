@@ -35,6 +35,7 @@ mod present_sync;
 mod probe_ngx;
 mod probe_seq;
 mod preupscale;
+mod vram;
 
 // The native backend (crates/native), linked into the 64-bit layer (`preupscale::native`).
 #[cfg(target_arch = "x86_64")]

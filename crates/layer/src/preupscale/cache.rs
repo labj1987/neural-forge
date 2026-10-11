@@ -189,6 +189,8 @@ pub(crate) struct Store {
     guide_b: OwnBuffer,
     stale: OwnBuffer,
     stale_prev: OwnBuffer,
+    /// What the buffers asked for, in bytes (the log's account).
+    bytes: u64,
 }
 
 impl Store {
@@ -216,7 +218,24 @@ impl Store {
         }
         let mut it = made.into_iter();
         let mut next = || it.next().expect("one buffer per size");
-        Some(Self { acc_prev: next(), lin: next(), print: next(), src_edit: next(), src_print: next(), hist: next(), conf: next(), levels: next(), src_from: next(), shown: next(), step: next(), guide_a: next(), guide_b: next(), stale: next(), stale_prev: next() })
+        Some(Self {
+            acc_prev: next(),
+            lin: next(),
+            print: next(),
+            src_edit: next(),
+            src_print: next(),
+            hist: next(),
+            conf: next(),
+            levels: next(),
+            src_from: next(),
+            shown: next(),
+            step: next(),
+            guide_a: next(),
+            guide_b: next(),
+            stale: next(),
+            stale_prev: next(),
+            bytes: sizes.iter().sum(),
+        })
     }
 
     fn all(&self) -> [&OwnBuffer; 15] {
@@ -532,6 +551,9 @@ impl CachePass {
         if self.store.is_none() {
             // SAFETY: forwarded.
             self.store = unsafe { Store::build(device, instance, physical_device, self.width, self.height) };
+            if let Some(store) = &self.store {
+                crate::log!("[preupscale] edit cache: buffers for {}x{} built, {:.1} MiB{}", self.width, self.height, store.bytes as f64 / 1048576.0, crate::vram::note());
+            }
         }
         self.store.is_some()
     }

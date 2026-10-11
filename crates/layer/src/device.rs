@@ -1059,6 +1059,9 @@ impl NeuralForgeDeviceInfo {
             // Also without DLSS's tracking (no VK_NVX_image_view_handle): the after-the-upscaler path
             // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
             if nvidia && active {
+                if let Some(instance) = &instance {
+                    crate::vram::init(instance, physical_device);
+                }
                 state.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup)));
             }
         }
