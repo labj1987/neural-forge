@@ -463,6 +463,54 @@ excluded: `prev = x + mv * mvec_scale + jitter[t-1] - jitter[t]`; zeros where `m
 and `depth.r32f` (device depth as f32: D16/D24 divided by their maximum; only for holds with
 `depth_valid`).
 
+### 4.10 The edit cache (model every Nth frame before the upscaler)
+
+`crates/layer/src/preupscale/cache.rs`, `shaders/preupscale_cache_*.comp`; the numpy reference they
+mirror step for step is `scripts/cache_common.py` (`scripts/cache_replay.py` measures it offline on a
+4.9 dump). Ported from optiscaler-dlss5's `dlssnr_cache.hlsl` (ATTRIBUTION.md).
+
+`model_interval` (1..4) is the cache's interval on this path: the network runs on one hold in N (a
+**refresh**: C, N, W as in 4.5) and the holds between are **cached**: C as always (exposure, vectors,
+depth, the encode), no N, and a write-back that carries the refresh's correction to this hold. At 1
+every hold refreshes and the picture is bit for bit what it was (the test
+`at_interval_1_the_network_sees_exactly_what_it_saw_before_the_accumulated_field`).
+
+- **Accumulated motion.** The network's history reads `NativePass::acc` (f32 x, y per texel, in the
+  vectors' own units) instead of DLSS's packed vectors. The capture's `motion` pass writes it: at
+  interval 1 DLSS's vectors as they are (an exact conversion); above 1, `acc_t(x) = mv_t(x) +
+  acc_{t-1}(x + mv_t(x) + jitter[t-1] - jitter[t])` (the previous field read bilinearly, zero right
+  after a network frame; `mv` from the nearest surface of the 3x3 depth neighbourhood; NaN where the
+  chain leaves the frame, which the network's `hasHistory` and the cache both read as no history).
+  The jitter telescopes: the network adds `last_jitter - jitter` (the last refresh's) as before, the
+  cache `jitter[refresh] - jitter[t]`.
+- **Refresh capture** (in W, between the answer's copy and the decode): the edit `log2((v_answer +
+  eps) / (v_frame + eps))` per channel in the exposure-normalised `v = max(scene, 0) * e / W`, eps
+  2^-9, clamped (luma within 1.5 stops, each channel within 1 stop of it), from what the decode is
+  about to write (its own rules: clamped-keep pixels give 0), with this hold's depth and fingerprint
+  (log luma, log r/g, log b/g, the quarter-size surroundings). An unusable exposure stores nothing and
+  the next hold refreshes.
+- **Cached write-back** (W, in place of the decode): `history` (the refresh's edit read at the chained
+  position, four depth-admitted bilinear taps and Catmull-Rom, the colour check and the fingerprint
+  against this hold's 3x3), `reduce` x3 (the coverage-weighted pyramid, 1/4, 1/16, 1/64), `apply`
+  (the low band with the same-surface fill plus the high band by its confidence, clamped; `v_out =
+  (v + eps) * 2^edit - eps` back to scene with the decode's rules: original kept where the encode
+  clamped, alpha kept, nothing written with an unusable exposure). Debug view 6 writes the rejection
+  mask instead (red rejected, green the high band's confidence, blue off the chain).
+- **When a hold is cached** (`cache::State::plan`): within the interval after a refresh that stored
+  an edit, the very next DLSS submit after the previous hold (any frame that went to DLSS untouched
+  breaks it), the network's history still good (`HistoryGap::pending`: no skip, no other extent, under
+  500 ms), jitter, vectors, the same depth presence as the refresh, no cache dump armed. A hold that
+  misses for any reason takes the stored edit with it. Cached holds keep the network's history as it
+  is (parity, seed, `last_jitter`), call `claim_pre` and set `evaluated` like a refresh, and
+  `HistoryGap::touch` so the 500 ms rule counts from the last hold, not the last network frame.
+  Frame generation is unaffected: the same submits are held.
+- **Resources**: the accumulated field lives with the native pass; the rest (`cache::Store`, about
+  90 bytes a render pixel) exists only while the interval is above 1. Reversed-Z is decided once per
+  extent from the first hold's depth counts (texels at 0 and 1, else the top and bottom quarters).
+- **Status**: `[preupscale]` gains `cached=N refresh=N cache_gpu_ms median=X rejected=Y%`; SHM v17
+  `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected` (1/10000), `cache_gpu_ms_bits`;
+  `shmctl status` and the Debug tab show them.
+
 ## 5. After the upscaler (1.x path)
 
 `crates/layer/src/capture.rs` (`run`), `crates/layer/src/composition/`,

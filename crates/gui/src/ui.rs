@@ -51,6 +51,10 @@ fn refresh_all_rows() {
 
 /// A spin row for the persisted setting `setting`, bounded by its range in
 /// `neural_forge_protocol::SETTING_BOUNDS`.
+/// The model-every-Nth-frame row's subtitle after the upscaler, and before it (the edit cache).
+const INTERVAL_AFTER: &str = "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own";
+const INTERVAL_BEFORE: &str = "Network every Nth frame; frames between reuse its last result, moved with the game's motion. 1 = every frame";
+
 fn spin_row(title: &str, subtitle: &str, value: f32, setting: &str, step: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
     spin_row_scaled(title, subtitle, value, setting, step, 1.0, setter)
 }
@@ -353,7 +357,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (interval, set_interval) = bind_u32(&shm, Some("model_interval"), |h| &h.model_interval);
     let interval_row = spin_row(
         "Model every Nth frame",
-        "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own",
+        INTERVAL_AFTER,
         interval as f32,
         "model_interval",
         1.0,
@@ -492,12 +496,42 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
             "Amplified diff",
             "Colour trust (green passes, red held back)",
             "Pre-colour-trust composite",
+            "Edit cache: rejected (before the upscaler)",
         ],
         debug_view,
         set_debug_view,
     );
-    debug_view_row.set_subtitle("The last two only differ from the composited picture where colour trust is actually engaged");
+    debug_view_row.set_subtitle(
+        "Colour trust's two only differ from the composited picture where colour trust is actually engaged. The edit cache's view replaces the frames that reuse the network's last result before the upscaler: red where it was rejected, green by how much of its detail was kept, blue where the motion left the frame",
+    );
     debug_group.add(&debug_view_row);
+
+    // The edit cache's counters (model every Nth frame before the upscaler).
+    let cache_row = adw::ActionRow::builder().title("Edit cache").subtitle("Not running").build();
+    debug_group.add(&cache_row);
+    {
+        let shm = std::sync::Arc::clone(&shm);
+        let update = move || {
+            let hdr = shm.header();
+            let refresh = hdr.cache_refresh_holds.load(Ordering::Relaxed);
+            let cached = hdr.cache_cached_holds.load(Ordering::Relaxed);
+            let text = if refresh == 0 && cached == 0 {
+                "Not running".to_string()
+            } else {
+                format!(
+                    "{refresh} network frames, {cached} reused; {:.1}% rejected on the last reused frame; cache passes {:.3} ms",
+                    f64::from(hdr.cache_rejected.load(Ordering::Relaxed)) / 100.0,
+                    f32::from_bits(hdr.cache_gpu_ms_bits.load(Ordering::Relaxed))
+                )
+            };
+            cache_row.set_subtitle(&text);
+        };
+        update();
+        glib::timeout_add_seconds_local(1, move || {
+            update();
+            glib::ControlFlow::Continue
+        });
+    }
 
     let (debug_scale, set_debug_scale) = bind_float(&shm, Some("debug_scale"), |h| &h.debug_scale_bits);
     debug_group.add(&spin_row(
@@ -524,8 +558,9 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_page.add(&model_group);
     view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
 
-    // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
-    // and the model is not running before the upscaler.
+    // Model resolution applies after the upscaler only: shown while a game runs and the model is not
+    // running before the upscaler. Model-every-Nth-frame is shown while a game runs, and says what it
+    // does on the path the model is on (before the upscaler: the edit cache).
     {
         let shm = std::sync::Arc::clone(&shm);
         let beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
@@ -540,10 +575,17 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                 } else {
                     at.elapsed() < std::time::Duration::from_secs(2)
                 };
-                active && hdr.native_running.load(Ordering::Relaxed) == 0
+                (active, active && hdr.native_running.load(Ordering::Relaxed) == 0)
             };
-            for row in [interval_row.upcast_ref::<gtk4::Widget>(), scale_row.upcast_ref()] {
-                row.set_visible(after_upscaler);
+            let (active, after_upscaler) = after_upscaler;
+            scale_row.set_visible(after_upscaler);
+            interval_row.set_visible(active);
+            if after_upscaler {
+                interval_row.set_title("Model every Nth frame");
+                interval_row.set_subtitle(INTERVAL_AFTER);
+            } else {
+                interval_row.set_title("Network every Nth frame");
+                interval_row.set_subtitle(INTERVAL_BEFORE);
             }
         };
         update();
