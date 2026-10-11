@@ -137,6 +137,69 @@ fn combo_row(title: &str, options: &[&str], selected: u32, setter: impl Fn(u32) 
     row
 }
 
+/// The strength preset menu: choosing a preset sets the four rows (`rows`, in
+/// `neural_forge_supervisor::presets::KNOBS`' order) through their own handlers, so the values are
+/// written and saved exactly as if typed in. It shows the preset the rows match, else "Custom".
+fn preset_row(rows: &[adw::SpinRow; 4]) -> adw::ComboRow {
+    use neural_forge_supervisor::presets::{matching, PRESETS};
+    let mut names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+    names.push("Custom");
+    let custom = PRESETS.len() as u32;
+    let row = adw::ComboRow::new();
+    row.set_title("Strength preset");
+    row.set_subtitle("Sets the four values below. Reference is Neural Forge's defaults");
+    row.set_model(Some(&gtk4::StringList::new(&names)));
+    let rows = std::rc::Rc::new(rows.clone());
+    // Set while this code changes the menu or the rows, so neither reacts to the other.
+    let syncing = std::rc::Rc::new(std::cell::Cell::new(false));
+    let sync = {
+        let row = row.downgrade();
+        let rows = std::rc::Rc::clone(&rows);
+        let syncing = std::rc::Rc::clone(&syncing);
+        std::rc::Rc::new(move || {
+            let Some(row) = row.upgrade() else { return };
+            let values = [0, 1, 2, 3].map(|i| rows[i].value() as f32);
+            let shown = matching(values).map_or(custom, |i| i as u32);
+            if row.selected() != shown {
+                syncing.set(true);
+                row.set_selected(shown);
+                syncing.set(false);
+            }
+        })
+    };
+    sync();
+    {
+        let rows = std::rc::Rc::clone(&rows);
+        let syncing = std::rc::Rc::clone(&syncing);
+        let sync = std::rc::Rc::clone(&sync);
+        row.connect_selected_notify(move |row| {
+            if syncing.get() || refreshing() {
+                return;
+            }
+            // "Custom" sets nothing; the menu goes back to what the rows match.
+            if let Some(preset) = PRESETS.get(row.selected() as usize) {
+                syncing.set(true);
+                for (spin, value) in rows.iter().zip(preset.values) {
+                    spin.set_value(f64::from(value));
+                }
+                syncing.set(false);
+            }
+            sync();
+        });
+    }
+    // A value changed by hand, by a profile, Reset or `shmctl` (the rows follow the header).
+    for spin in rows.iter() {
+        let syncing = std::rc::Rc::clone(&syncing);
+        let sync = std::rc::Rc::clone(&sync);
+        spin.connect_value_notify(move |_| {
+            if !syncing.get() {
+                sync();
+            }
+        });
+    }
+    row
+}
+
 /// GDK on Linux X11/Wayland uses XKB hardware codes (evdev + 8).
 fn evdev_keycode(hardware: u32) -> Option<u32> {
     hardware.checked_sub(8).filter(|&code| code > 0 && code <= 767)
@@ -266,16 +329,23 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_group.add(&combo_row("Style", &["Default", "Natural", "Cinematic"], style, set_style));
 
     let (intensity, set_intensity) = bind_float(&shm, Some("intensity"), |h| &h.intensity_bits);
-    model_group.add(&spin_row("Intensity", "How strongly the model's answer replaces the frame", intensity, "intensity", 0.05, set_intensity));
+    let intensity_row = spin_row("Intensity", "How strongly the model's answer replaces the frame", intensity, "intensity", 0.05, set_intensity);
 
     let (local_tone, set_local_tone) = bind_float(&shm, Some("local_tone"), |h| &h.local_tone_bits);
-    model_group.add(&spin_row("Local tone", "", local_tone, "local_tone", 0.05, set_local_tone));
+    let local_tone_row = spin_row("Local tone", "", local_tone, "local_tone", 0.05, set_local_tone);
 
     let (local_structure, set_local_structure) = bind_float(&shm, Some("local_structure"), |h| &h.local_structure_bits);
-    model_group.add(&spin_row("Local structure", "", local_structure, "local_structure", 0.05, set_local_structure));
+    let local_structure_row = spin_row("Local structure", "", local_structure, "local_structure", 0.05, set_local_structure);
 
     let (skin_structure, set_skin_structure) = bind_float(&shm, Some("skin_structure"), |h| &h.skin_structure_bits);
-    model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, "skin_structure", 0.05, set_skin_structure));
+    let skin_structure_row = spin_row("Skin structure", "-1 follows local structure", skin_structure, "skin_structure", 0.05, set_skin_structure);
+
+    // In `neural_forge_supervisor::presets::KNOBS`' order.
+    let strength_rows = [intensity_row, local_tone_row, local_structure_row, skin_structure_row];
+    model_group.add(&preset_row(&strength_rows));
+    for row in &strength_rows {
+        model_group.add(row);
+    }
 
     let (auto_mask, set_auto_mask) = bind_bool(&shm, Some("auto_mask"), |h| &h.auto_mask);
     model_group.add(&switch_row("Auto mask", "Automatic skin/detail masking", auto_mask, set_auto_mask));
