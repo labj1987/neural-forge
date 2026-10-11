@@ -22,8 +22,9 @@ otherwise. "History" means [history/development-before-neuralforge.md](history/d
 4. [September 21-25: motion vectors, zero copy, frame generation](#september-21-25-motion-vectors-zero-copy-frame-generation)
 5. [October 1-2: measurement groundwork (1.0.1, 1.1.0)](#october-1-2-measurement-groundwork-101-110)
 6. [October 2: the model before the upscaler (2.0)](#october-2-the-model-before-the-upscaler-20)
-7. [Deliberately not done, or left open](#deliberately-not-done-or-left-open)
-8. [Working practices that came out of all this](#working-practices-that-came-out-of-all-this)
+7. [October 11: the edit cache (3.3)](#october-11-the-edit-cache-33)
+8. [Deliberately not done, or left open](#deliberately-not-done-or-left-open)
+9. [Working practices that came out of all this](#working-practices-that-came-out-of-all-this)
 
 ## September 9-12: getting a model answer at all
 
@@ -418,6 +419,59 @@ Every early exit during the 2.0 runs was an access violation at `GTA5_Enhanced.e
 "Game Init": 32 dumps on the rig, 11 of them on 2026-10-01 with 1.0.1, and other Game Init crashes
 going back to January, before Neural Forge. It is the game's own; relaunching after a few minutes
 works (HARDWARE_VALIDATION.md, "2.0.0").
+
+## October 11: the edit cache (3.3)
+
+### 3.3 edit cache: what was tried
+
+The edit cache (ARCHITECTURE.md 4.10) was ported from optiscaler-dlss5 with all of its anti-ghosting
+parts. Each part was then measured offline with `scripts/cache_replay.py` on three GTA V dumps (16
+holds each at 1485x836, the model on every hold: `gta-pan`, `gta-drive`, `gta-still`), the cache
+mode carried 2, 3 and 4 holds, each part switched off in turn. Cells are err / p99.5 / worse% /
+kept%: mean error and the per-hold 99.5th percentile (the strongest trails) in stops against the
+model's own answer for that hold, the share of the frame worse than no edit by over 0.15 stop, and
+how much of the model's effect is kept (100% = the model on every hold).
+
+| dump | variant | lag 2 | lag 3 | lag 4 |
+|---|---|---|---|---|
+| pan | as ported | 0.0583/0.337/0.41/68.7 | 0.0746/0.433/0.86/58.7 | 0.0912/0.531/1.51/47.8 |
+| pan | no fingerprint | 0.0592/0.316/0.83/66.1 | 0.0764/0.385/2.38/55.1 | 0.0926/0.448/4.42/44.9 |
+| pan | no surroundings (context) | 0.0577/0.328/0.45/69.0 | 0.0735/0.421/0.95/60.0 | 0.0878/0.486/1.67/51.8 |
+| pan | no surface fill | 0.0585/0.326/0.64/66.7 | 0.0770/0.454/1.84/55.7 | 0.0956/0.581/3.99/45.9 |
+| pan | no Catmull-Rom | 0.0575/0.334/0.38/68.9 | 0.0741/0.431/0.82/58.9 | 0.0909/0.530/1.46/47.9 |
+| pan | **without both (shipped)** | 0.0569/0.324/0.41/69.3 | 0.0729/0.419/0.90/60.2 | 0.0874/0.485/1.61/51.9 |
+| drive | as ported | 0.1127/0.772/3.67/68.9 | 0.1200/0.820/3.96/66.9 | 0.1269/0.863/4.20/64.9 |
+| drive | no fingerprint | 0.1126/0.755/4.12/68.9 | 0.1200/0.809/4.55/66.9 | 0.1269/0.853/4.92/65.0 |
+| drive | no surroundings (context) | 0.1113/0.736/3.84/69.3 | 0.1182/0.775/4.17/67.4 | 0.1247/0.807/4.46/65.5 |
+| drive | no surface fill | 0.1129/0.772/4.07/68.8 | 0.1206/0.835/4.54/66.6 | 0.1276/0.881/4.96/64.7 |
+| drive | no Catmull-Rom | 0.1089/0.756/3.21/69.9 | 0.1163/0.807/3.49/67.9 | 0.1232/0.852/3.73/65.9 |
+| drive | **without both (shipped)** | 0.1074/0.716/3.35/70.3 | 0.1143/0.756/3.68/68.4 | 0.1207/0.789/3.96/66.6 |
+| still | as ported | 0.0838/0.504/2.64/60.4 | 0.0811/0.495/2.41/61.8 | 0.0859/0.516/2.80/59.4 |
+| still | no fingerprint | 0.0846/0.505/2.89/59.9 | 0.0817/0.497/2.63/61.5 | 0.0868/0.520/3.07/58.9 |
+| still | no surroundings (context) | 0.0838/0.504/2.66/60.4 | 0.0812/0.496/2.44/61.8 | 0.0859/0.517/2.83/59.4 |
+| still | no surface fill | 0.0839/0.505/2.65/60.4 | 0.0812/0.496/2.43/61.8 | 0.0860/0.517/2.81/59.4 |
+| still | no Catmull-Rom | 0.0808/0.490/2.14/61.8 | 0.0786/0.482/2.00/62.9 | 0.0830/0.502/2.32/60.7 |
+| still | **without both (shipped)** | 0.0807/0.488/2.16/61.8 | 0.0786/0.481/2.02/62.9 | 0.0830/0.501/2.35/60.7 |
+
+- **The fingerprint: kept.** Without it the area worse than no edit grows 2-3x at lag 4 on the pan
+  (1.51 -> 4.42%) and by a sixth on the drive. Its p99.5 is lower without it on the pan (it rejects
+  a carried edit and the frame goes without one), but that is the trade the fingerprint is for.
+- **The same-surface fill: kept.** Without it the worse-than-no-edit area more than doubles on the
+  pan at lag 4 (1.51 -> 3.99%) and kept drops 2 points.
+- **The surroundings term of the fingerprint (upstream's context, a quarter-size mean log luma
+  compared with the refresh's): removed.** Upstream added it for "the light an object left on the
+  ground". Here it rejected more than it saved: without it trails (p99.5) and error are lower on the
+  pan and the drive (pan lag 4 p99.5 0.531 -> 0.486, kept 47.8 -> 51.8%), for 0.1-0.2 point more
+  worse-than-no-edit area; the still view does not change. Removing it also drops the quarter-size grid and
+  its tent read from every hold.
+- **The Catmull-Rom re-read of the history: removed.** Upstream re-reads the carried edit with a
+  five-tap Catmull-Rom where all four bilinear taps are the same surface, against the blur that
+  bilinear reads accumulate when the edit is re-carried hold after hold. Our cache never re-carries:
+  every cached hold reads the refresh's own edit once, through the accumulated motion, so there is no
+  blur to undo, and the sharpened read only adds error. Without it every number is better on all
+  three dumps (still lag 2 worse% 2.64 -> 2.14), and the history pass does five fewer bilinear reads.
+- With both removed the shader still matches the tool (the shader-against-tool test, within 1e-3
+  stop) and interval 1 is unchanged bit for bit.
 
 ## Deliberately not done, or left open
 

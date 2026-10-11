@@ -487,11 +487,11 @@ every hold refreshes and the picture is bit for bit what it was (the test
   eps) / (v_frame + eps))` per channel in the exposure-normalised `v = max(scene, 0) * e / W`, eps
   2^-9, clamped (luma within 1.5 stops, each channel within 1 stop of it), from what the decode is
   about to write (its own rules: clamped-keep pixels give 0), with this hold's depth and fingerprint
-  (log luma, log r/g, log b/g, the quarter-size surroundings). An unusable exposure stores nothing and
+  (log luma, log r/g, log b/g). An unusable exposure stores nothing and
   the next hold refreshes.
 - **Cached write-back** (W, in place of the decode): `history` (the refresh's edit read at the chained
-  position, four depth-admitted bilinear taps and Catmull-Rom, the colour check and the fingerprint
-  against this hold's 3x3), `reduce` x3 (the coverage-weighted pyramid, 1/4, 1/16, 1/64), `apply`
+  position, four depth-admitted bilinear taps, the colour check and the fingerprint against this
+  hold's 3x3), `reduce` x3 (the coverage-weighted pyramid, 1/4, 1/16, 1/64), `apply`
   (the low band with the same-surface fill plus the high band by its confidence, clamped; `v_out =
   (v + eps) * 2^edit - eps` back to scene with the decode's rules: original kept where the encode
   clamped, alpha kept, nothing written with an unusable exposure). Debug view 6 writes the rejection

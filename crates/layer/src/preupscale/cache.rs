@@ -5,8 +5,8 @@
 //! The GPU side is six compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
 //! of `scripts/cache_common.py` (the numpy reference the offline replay measures with):
 //!
-//! - in the capture (`C`) of every hold: `prep` (this hold's fingerprint, pseudo-linear depth,
-//!   quarter-size luma grid, the depth's reversed-Z counts) and `motion` (the accumulated motion
+//! - in the capture (`C`) of every hold: `prep` (this hold's fingerprint, pseudo-linear depth, the
+//!   depth's reversed-Z counts) and `motion` (the accumulated motion
 //!   back to the previous network frame, which the network's history reads too). At interval 1 only
 //!   `motion` runs, copying DLSS's vectors as they are, so the network's input is bit for bit what it
 //!   was;
@@ -102,7 +102,6 @@ pub(crate) struct CachePush {
     pub colour_tol: f32,
     pub colour_floor: f32,
     pub print_tol: f32,
-    pub context_tol: f32,
     pub sigma_depth: f32,
     pub sigma_luma: f32,
 }
@@ -118,7 +117,6 @@ pub(crate) struct Tuning {
     pub colour_tol: f32,
     pub colour_floor: f32,
     pub print_tol: f32,
-    pub context_tol: f32,
     pub sigma_depth: f32,
     pub sigma_luma: f32,
 }
@@ -133,7 +131,6 @@ impl Default for Tuning {
             colour_tol: 0.50,
             colour_floor: 0.6,
             print_tol: 0.25,
-            context_tol: 0.25,
             sigma_depth: 0.15,
             sigma_luma: 1.0,
         }
@@ -166,7 +163,6 @@ pub(crate) struct Store {
     acc_prev: OwnBuffer,
     lin: OwnBuffer,
     print: OwnBuffer,
-    grid: OwnBuffer,
     src_edit: OwnBuffer,
     src_print: OwnBuffer,
     pub(crate) hist: OwnBuffer,
@@ -179,9 +175,8 @@ impl Store {
     /// `device` is live.
     unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32) -> Option<Self> {
         let n = u64::from(width) * u64::from(height);
-        let (g0w, g0h) = level_size(width, height, 0);
         let levels: u64 = (0..3).map(|l| level_size(width, height, l)).map(|(w, h)| u64::from(w) * u64::from(h)).sum();
-        let sizes = [n * 8, n * 4, n * 16, u64::from(g0w) * u64::from(g0h) * 4, n * 16, n * 16, n * 16, n * 4, levels * 32];
+        let sizes = [n * 8, n * 4, n * 16, n * 16, n * 16, n * 16, n * 4, levels * 32];
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
         let mut made: Vec<OwnBuffer> = Vec::with_capacity(sizes.len());
         for bytes in sizes {
@@ -199,11 +194,11 @@ impl Store {
         }
         let mut it = made.into_iter();
         let mut next = || it.next().expect("one buffer per size");
-        Some(Self { acc_prev: next(), lin: next(), print: next(), grid: next(), src_edit: next(), src_print: next(), hist: next(), conf: next(), levels: next() })
+        Some(Self { acc_prev: next(), lin: next(), print: next(), src_edit: next(), src_print: next(), hist: next(), conf: next(), levels: next() })
     }
 
-    fn all(&self) -> [&OwnBuffer; 9] {
-        [&self.acc_prev, &self.lin, &self.print, &self.grid, &self.src_edit, &self.src_print, &self.hist, &self.conf, &self.levels]
+    fn all(&self) -> [&OwnBuffer; 8] {
+        [&self.acc_prev, &self.lin, &self.print, &self.src_edit, &self.src_print, &self.hist, &self.conf, &self.levels]
     }
 
     /// # Safety
@@ -420,14 +415,14 @@ pub(crate) struct CachePass {
 // SAFETY: plain handles and the layer's own mapping, only used behind the device's `State` mutex.
 unsafe impl Send for CachePass {}
 
-/// Descriptor types of bindings 0..=16 (the shaders' layout).
+/// Descriptor types of bindings 0..=15 (the shaders' layout).
 fn binding_type(n: u32) -> vk::DescriptorType {
     match n {
-        0 | 1 | 16 => vk::DescriptorType::STORAGE_IMAGE,
+        0 | 1 | 15 => vk::DescriptorType::STORAGE_IMAGE,
         _ => vk::DescriptorType::STORAGE_BUFFER,
     }
 }
-const BINDINGS: u32 = 17;
+const BINDINGS: u32 = 16;
 
 impl CachePass {
     /// # Safety
@@ -517,7 +512,7 @@ impl CachePass {
         let dummy = self.dummy.buffer;
         let s = self.store.as_ref();
         let pick = |f: fn(&Store) -> vk::Buffer| s.map_or(dummy, f);
-        let buffers: [(u32, vk::Buffer); 14] = [
+        let buffers: [(u32, vk::Buffer); 13] = [
             (2, b.exposure),
             (3, b.depth.unwrap_or(dummy)),
             (4, b.mvec),
@@ -525,15 +520,14 @@ impl CachePass {
             (6, pick(|s| s.acc_prev.buffer)),
             (7, pick(|s| s.lin.buffer)),
             (8, pick(|s| s.print.buffer)),
-            (9, pick(|s| s.grid.buffer)),
-            (10, pick(|s| s.src_edit.buffer)),
-            (11, pick(|s| s.src_print.buffer)),
-            (12, pick(|s| s.hist.buffer)),
-            (13, pick(|s| s.conf.buffer)),
-            (14, pick(|s| s.levels.buffer)),
-            (15, self.stats.buffer),
+            (9, pick(|s| s.src_edit.buffer)),
+            (10, pick(|s| s.src_print.buffer)),
+            (11, pick(|s| s.hist.buffer)),
+            (12, pick(|s| s.conf.buffer)),
+            (13, pick(|s| s.levels.buffer)),
+            (14, self.stats.buffer),
         ];
-        let images = [(0u32, b.colour), (1, b.encoded), (16, b.answer)];
+        let images = [(0u32, b.colour), (1, b.encoded), (15, b.answer)];
         let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers.iter().map(|&(_, buffer)| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }]).collect();
         let image_infos: Vec<[vk::DescriptorImageInfo; 1]> =
             images.iter().map(|&(_, view)| [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }]).collect();
@@ -567,7 +561,6 @@ impl CachePass {
             colour_tol: t.colour_tol,
             colour_floor: t.colour_floor,
             print_tol: t.print_tol,
-            context_tol: t.context_tol,
             sigma_depth: t.sigma_depth,
             sigma_luma: t.sigma_luma,
         }
@@ -817,8 +810,8 @@ mod tests {
 
     #[test]
     fn the_push_constants_match_the_shaders_params_block() {
-        // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, ten floats: 88 bytes, std430.
-        assert_eq!(std::mem::size_of::<CachePush>(), 88);
+        // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, nine floats: 84 bytes, std430.
+        assert_eq!(std::mem::size_of::<CachePush>(), 84);
         assert_eq!(std::mem::offset_of!(CachePush, flags), 8);
         assert_eq!(std::mem::offset_of!(CachePush, depth_kind), 12);
         assert_eq!(std::mem::offset_of!(CachePush, mvec_scale), 16);
@@ -827,8 +820,8 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CachePush, paper_white), 40);
         assert_eq!(std::mem::offset_of!(CachePush, level), 44);
         assert_eq!(std::mem::offset_of!(CachePush, eps_v), 48);
-        assert_eq!(std::mem::offset_of!(CachePush, context_tol), 76);
-        assert_eq!(std::mem::offset_of!(CachePush, sigma_luma), 84);
+        assert_eq!(std::mem::offset_of!(CachePush, print_tol), 72);
+        assert_eq!(std::mem::offset_of!(CachePush, sigma_luma), 80);
         for spv in SPV {
             assert!(spv.len() > 20 && spv.len().is_multiple_of(4), "embedded SPIR-V");
         }

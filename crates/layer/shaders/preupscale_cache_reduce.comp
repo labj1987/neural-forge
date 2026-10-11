@@ -30,24 +30,22 @@ layout(set = 0, binding = 4, std430) readonly buffer Motion { uint mv[]; } u_mot
 // p.mvec_scale = render pixels), and its copy from the previous hold.
 layout(set = 0, binding = 5, std430) buffer Acc { vec2 v[]; } u_acc;
 layout(set = 0, binding = 6, std430) buffer AccPrev { vec2 v[]; } u_acc_prev;
-// This hold: pseudo-linear depth, and the fingerprint (log luma, log r/g, log b/g, context).
+// This hold: pseudo-linear depth, and the fingerprint (log luma, log r/g, log b/g, 0).
 layout(set = 0, binding = 7, std430) buffer Lin { float v[]; } u_lin;
 layout(set = 0, binding = 8, std430) buffer Print { vec4 v[]; } u_print;
-// This hold's quarter-size mean log luma (the context's grid).
-layout(set = 0, binding = 9, std430) buffer Grid { float v[]; } u_grid;
 // The refresh hold: its clamped edit (rgb) and depth (a), and its fingerprint.
-layout(set = 0, binding = 10, std430) buffer SrcEdit { vec4 v[]; } u_src_edit;
-layout(set = 0, binding = 11, std430) buffer SrcPrint { vec4 v[]; } u_src_print;
+layout(set = 0, binding = 9, std430) buffer SrcEdit { vec4 v[]; } u_src_edit;
+layout(set = 0, binding = 10, std430) buffer SrcPrint { vec4 v[]; } u_src_print;
 // A cached hold: the history read (edit rgb, weight = valid x validity) and its confidence.
-layout(set = 0, binding = 12, std430) buffer Hist { vec4 v[]; } u_hist;
-layout(set = 0, binding = 13, std430) buffer Conf { float v[]; } u_conf;
+layout(set = 0, binding = 11, std430) buffer Hist { vec4 v[]; } u_hist;
+layout(set = 0, binding = 12, std430) buffer Conf { float v[]; } u_conf;
 // The pyramid, levels 0..2 one after the other, two vec4 a texel: (edit rgb, coverage), (log2
 // depth, log luma, 0, 0).
-layout(set = 0, binding = 14, std430) buffer Levels { vec4 v[]; } u_levels;
+layout(set = 0, binding = 13, std430) buffer Levels { vec4 v[]; } u_levels;
 // Host-visible counters (STAT_*), cleared by the CPU before the hold.
-layout(set = 0, binding = 15, std430) buffer Stats { uint v[]; } u_stats;
+layout(set = 0, binding = 14, std430) buffer Stats { uint v[]; } u_stats;
 // The network's answer image (padded extent, proxy domain): the refresh capture's decode.
-layout(set = 0, binding = 16, rgba16f) uniform readonly image2D u_answer;
+layout(set = 0, binding = 15, rgba16f) uniform readonly image2D u_answer;
 
 layout(push_constant) uniform Params {
   uvec2 size;            // render extent
@@ -65,7 +63,6 @@ layout(push_constant) uniform Params {
   float colour_tol;
   float colour_floor;
   float print_tol;
-  float context_tol;
   float sigma_depth;
   float sigma_luma;
 } p;

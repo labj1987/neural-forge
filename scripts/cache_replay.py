@@ -332,10 +332,8 @@ def params_from(args) -> cc.Params:
     return cc.Params(eps_v=args.eps_v, max_luma_edit=args.max_luma_edit, chroma_stops=args.chroma_stops,
                      depth_tol=args.depth_tol, colour_tol=args.colour_tol, noise_aware=not args.no_noise_aware,
                      colour_floor=args.colour_floor, high_decay=args.high_decay, fingerprint=not args.no_fingerprint,
-                     context=not args.no_context, print_tol=args.print_tol,
-                     context_tol=args.print_tol if args.context_tol is None else args.context_tol,
-                     surface_fill=not args.no_surface_fill, bilateral=not args.no_bilateral,
-                     sigma_depth=args.sigma_depth, sigma_luma=args.sigma_luma, catmull_rom=not args.no_catmull_rom,
+                     print_tol=args.print_tol, surface_fill=not args.no_surface_fill, bilateral=not args.no_bilateral,
+                     sigma_depth=args.sigma_depth, sigma_luma=args.sigma_luma,
                      nearest_surface=not args.no_nearest_surface, jitter=not args.no_jitter,
                      chain_sample=args.chain_sample, chain=args.chain, low_gain=args.low_gain, high_gain=args.high_gain)
 
@@ -364,14 +362,11 @@ def main(argv=None) -> int:
     g.add_argument("--colour-floor", type=float, default=d.colour_floor)
     g.add_argument("--high-decay", type=float, default=d.high_decay)
     g.add_argument("--no-fingerprint", action="store_true")
-    g.add_argument("--no-context", action="store_true")
     g.add_argument("--print-tol", type=float, default=d.print_tol)
-    g.add_argument("--context-tol", type=float, default=None, help="default: --print-tol")
     g.add_argument("--no-surface-fill", action="store_true")
     g.add_argument("--no-bilateral", action="store_true")
     g.add_argument("--sigma-depth", type=float, default=d.sigma_depth)
     g.add_argument("--sigma-luma", type=float, default=d.sigma_luma)
-    g.add_argument("--no-catmull-rom", action="store_true")
     g.add_argument("--no-nearest-surface", action="store_true")
     g.add_argument("--no-jitter", action="store_true")
     g.add_argument("--chain", choices=("recurrence", "walk"), default=d.chain,

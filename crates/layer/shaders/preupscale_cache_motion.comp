@@ -4,12 +4,11 @@
 // motion vector from the nearest surface of the 3x3 (NearestSurfaceMotion), plus the previous hold's
 // accumulated field read where it leads, NaN where the chain leaves the frame. The network reads the
 // field for its history (native_preprocess.comp, binding 2) and the cache for where each pixel was on
-// the refresh hold. At interval 1 (flags without F_CHAINED) the vectors are copied as they are. Also
-// the context (ContextAt) into the fingerprint's fourth lane.
+// the refresh hold. At interval 1 (flags without F_CHAINED) the vectors are copied as they are.
 //
 // Ported from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5), commit
 // 6bfc4389c25054ef6747df6e6b1b470e9541c4da: OptiScaler/shaders/dlssnr/precompile/dlssnr_cache.hlsl
-// (NearestSurfaceMotion, ContextAt, mode 5). Upstream is GPL-3.0; this port is distributed under this project's
+// (NearestSurfaceMotion, mode 5). Upstream is GPL-3.0; this port is distributed under this project's
 // AGPL-3.0-or-later (see ATTRIBUTION.md).
 //
 // The numbers are those of scripts/cache_common.py, the numpy reference this shader mirrors step
@@ -35,24 +34,22 @@ layout(set = 0, binding = 4, std430) readonly buffer Motion { uint mv[]; } u_mot
 // p.mvec_scale = render pixels), and its copy from the previous hold.
 layout(set = 0, binding = 5, std430) buffer Acc { vec2 v[]; } u_acc;
 layout(set = 0, binding = 6, std430) buffer AccPrev { vec2 v[]; } u_acc_prev;
-// This hold: pseudo-linear depth, and the fingerprint (log luma, log r/g, log b/g, context).
+// This hold: pseudo-linear depth, and the fingerprint (log luma, log r/g, log b/g, 0).
 layout(set = 0, binding = 7, std430) buffer Lin { float v[]; } u_lin;
 layout(set = 0, binding = 8, std430) buffer Print { vec4 v[]; } u_print;
-// This hold's quarter-size mean log luma (the context's grid).
-layout(set = 0, binding = 9, std430) buffer Grid { float v[]; } u_grid;
 // The refresh hold: its clamped edit (rgb) and depth (a), and its fingerprint.
-layout(set = 0, binding = 10, std430) buffer SrcEdit { vec4 v[]; } u_src_edit;
-layout(set = 0, binding = 11, std430) buffer SrcPrint { vec4 v[]; } u_src_print;
+layout(set = 0, binding = 9, std430) buffer SrcEdit { vec4 v[]; } u_src_edit;
+layout(set = 0, binding = 10, std430) buffer SrcPrint { vec4 v[]; } u_src_print;
 // A cached hold: the history read (edit rgb, weight = valid x validity) and its confidence.
-layout(set = 0, binding = 12, std430) buffer Hist { vec4 v[]; } u_hist;
-layout(set = 0, binding = 13, std430) buffer Conf { float v[]; } u_conf;
+layout(set = 0, binding = 11, std430) buffer Hist { vec4 v[]; } u_hist;
+layout(set = 0, binding = 12, std430) buffer Conf { float v[]; } u_conf;
 // The pyramid, levels 0..2 one after the other, two vec4 a texel: (edit rgb, coverage), (log2
 // depth, log luma, 0, 0).
-layout(set = 0, binding = 14, std430) buffer Levels { vec4 v[]; } u_levels;
+layout(set = 0, binding = 13, std430) buffer Levels { vec4 v[]; } u_levels;
 // Host-visible counters (STAT_*), cleared by the CPU before the hold.
-layout(set = 0, binding = 15, std430) buffer Stats { uint v[]; } u_stats;
+layout(set = 0, binding = 14, std430) buffer Stats { uint v[]; } u_stats;
 // The network's answer image (padded extent, proxy domain): the refresh capture's decode.
-layout(set = 0, binding = 16, rgba16f) uniform readonly image2D u_answer;
+layout(set = 0, binding = 15, rgba16f) uniform readonly image2D u_answer;
 
 layout(push_constant) uniform Params {
   uvec2 size;            // render extent
@@ -70,7 +67,6 @@ layout(push_constant) uniform Params {
   float colour_tol;
   float colour_floor;
   float print_tol;
-  float context_tol;
   float sigma_depth;
   float sigma_luma;
 } p;
@@ -146,36 +142,6 @@ uint level_base(uint level) {
   return base;
 }
 
-// sample_grid with ContextAt's tent: four bilinear reads of the quarter grid at the pixel centre,
-// offset half a grid texel each way (context_at_centres).
-float grid_at(vec2 at) {
-  uvec2 g = level_size(0u);
-  vec2 f0 = floor(at);
-  vec2 f = at - f0;
-  ivec2 i0 = ivec2(f0);
-  float r = 0.0;
-  for (int oy = 0; oy < 2; oy++) {
-    for (int ox = 0; ox < 2; ox++) {
-      ivec2 t = clamp(i0 + ivec2(ox, oy), ivec2(0), ivec2(g) - 1);
-      float w = (oy == 1 ? f.y : 1.0 - f.y) * (ox == 1 ? f.x : 1.0 - f.x);
-      r += u_grid.v[uint(t.y) * g.x + uint(t.x)] * w;
-    }
-  }
-  return r;
-}
-
-float context_at(uvec2 xy) {
-  vec2 g = vec2(level_size(0u));
-  vec2 base = (vec2(xy) + 0.5) / vec2(p.size) * g - 0.5;
-  float sum = 0.0;
-  for (int sx = 0; sx < 2; sx++) {
-    for (int sy = 0; sy < 2; sy++) {
-      sum += grid_at(base + vec2(sx == 0 ? -0.5 : 0.5, sy == 0 ? -0.5 : 0.5));
-    }
-  }
-  return 0.25 * sum;
-}
-
 vec2 finite_or_zero(vec2 v) {
   return vec2(isnan(v.x) || isinf(v.x) ? 0.0 : v.x, isnan(v.y) || isinf(v.y) ? 0.0 : v.y);
 }
@@ -210,7 +176,6 @@ void main() {
     u_acc.v[i] = unpackHalf2x16(u_motion.mv[i]);
     return;
   }
-  u_print.v[i].w = context_at(xy);
   // nearest_surface_motion: the vector of the nearest depth in the 3x3 (first in scan order on a tie).
   uint pick = i;
   if ((p.flags & F_NEAREST) != 0u) {

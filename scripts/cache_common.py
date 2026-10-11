@@ -18,22 +18,24 @@ never reprojected. One carry here, as the shader does it on a cached hold:
      where that vector and the change of jitter lead), plus the change of jitter since the refresh.
      (chain_step, "walk", re-reads each older hold's vectors at the running position instead.)
   3. The history read there: four bilinear taps, each admitted by relative depth against this
-     pixel (full weight to depth_tol, none at twice it), renormalised; Catmull-Rom where all four
-     taps are this surface, clamped to the taps' range.
+     pixel (full weight to depth_tol, none at twice it), renormalised.
   4. Validation: the colour check on log luma against this hold's 3x3 range (noise-aware), which
      only dims the high band (lerp(0.6, 1, v)); the fingerprint (normalised log luma and two log
-     chroma ratios against the 3x3 range, the quarter-size surroundings), which rejects the edit.
+     chroma ratios against the 3x3 range), which rejects the edit.
   5. The band split: a coverage-weighted pyramid (1/4, 1/16, 1/64) of the validated edit, read
      jointly-bilaterally on depth and luma, coarse to fine, fading to no edit where nothing of this
      surface is near (surface fill); final edit = low + confidence * (history - low).
 
 Ported from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5), commit
 6bfc4389c25054ef6747df6e6b1b470e9541c4da: OptiScaler/shaders/dlssnr/precompile/dlssnr_cache.hlsl
-(LinDepth, PrintOf, ContextAt, PrintMatch, ClampEdit, NearestSurfaceMotion, ReadHistory,
-CatmullRom, FetchLevel, SurfaceLow, modes 1, 3, 4, 5, 12) and tools/dlssnr_cache/nrcache_common.py,
+(LinDepth, PrintOf, PrintMatch, ClampEdit, NearestSurfaceMotion, ReadHistory, FetchLevel,
+SurfaceLow, modes 1, 3, 4, 5) and tools/dlssnr_cache/nrcache_common.py,
 measure_ghosting.py, measure_reprojection.py (the numpy mirror and the metrics). Upstream is
 GPL-3.0; this port is distributed under this project's AGPL-3.0-or-later (see ATTRIBUTION.md).
-Where upstream's Python tools and its shader disagree, this follows the shader.
+Where upstream's Python tools and its shader disagree, this follows the shader. Upstream's
+surroundings term of the fingerprint (ContextAt, mode 12) and its Catmull-Rom re-read of the
+history are left out: both measured worse on our dumps (docs/LESSONS.md, "3.3 edit cache: what was
+tried").
 
 numpy only.
 """
@@ -69,14 +71,11 @@ class Params:
     colour_floor: float = 0.6       # a colour failure dims the high band to this, not to zero
     high_decay: float = 1.0         # per-carry confidence factor (shader 1.0)
     fingerprint: bool = True        # reject where the frame no longer looks like the refresh hold
-    context: bool = True            # ... including its quarter-size surroundings
     print_tol: float = 0.25         # fingerprint tolerance, stops; soft to twice it
-    context_tol: float = 0.25       # surroundings tolerance, stops (the shader sets it to print_tol)
     surface_fill: bool = True       # low band from this surface only, fading to no edit
     bilateral: bool = True          # push-pull path: first level read jointly-bilaterally
     sigma_depth: float = 0.15       # bilateral sigma, log2 depth (x(1+level) in the surface fill)
     sigma_luma: float = 1.0         # bilateral sigma, stops of luma (likewise)
-    catmull_rom: bool = True        # re-read the edit with Catmull-Rom where all four taps pass
     nearest_surface: bool = True    # motion from the nearest depth in the 3x3 neighbourhood
     jitter: bool = True             # add the change of jitter to the motion
     chain_sample: str = "bilinear"  # how a chained step reads the next hold's vectors (walk only)
@@ -316,31 +315,6 @@ def sample_nearest(img: np.ndarray, pos: np.ndarray) -> np.ndarray:
     return gather(img, yi * w + xi)
 
 
-def catmull_rom(img: np.ndarray, pos: np.ndarray) -> np.ndarray:
-    """CatmullRom: the five-bilinear-tap Catmull-Rom read (the usual TAA arrangement)."""
-    t1 = np.floor(pos - 0.5) + 0.5
-    f = (pos - t1).astype(F32)
-    w0 = f * (-0.5 + f * (1.0 - 0.5 * f))
-    w1 = 1.0 + f * f * (-2.5 + 1.5 * f)
-    w2 = f * (0.5 + f * (2.0 - 1.5 * f))
-    w3 = f * f * (-0.5 + 0.5 * f)
-    w12 = w1 + w2
-    o12 = w2 / np.maximum(w12, 1e-6)
-    tc0, tc3, tc12 = t1 - 1.0, t1 + 2.0, t1 + o12
-
-    def at(xs, ys):
-        return sample_bilinear(img, np.stack([xs, ys], -1))
-
-    parts = [(at(tc12[..., 0], tc0[..., 1]), w12[..., 0] * w0[..., 1]),
-             (at(tc0[..., 0], tc12[..., 1]), w0[..., 0] * w12[..., 1]),
-             (at(tc12[..., 0], tc12[..., 1]), w12[..., 0] * w12[..., 1]),
-             (at(tc3[..., 0], tc12[..., 1]), w3[..., 0] * w12[..., 1]),
-             (at(tc12[..., 0], tc3[..., 1]), w12[..., 0] * w3[..., 1])]
-    r = sum(v * wt[..., None] for v, wt in parts)
-    ws = sum(wt for _, wt in parts)
-    return (r / np.maximum(ws, 1e-6)[..., None]).astype(F32)
-
-
 def neighbourhood(img: np.ndarray) -> np.ndarray:
     """The 3x3 neighbourhood, edge-clamped, stacked on a new first axis in the shader's scan order
     (dy outer, dx inner)."""
@@ -348,13 +322,6 @@ def neighbourhood(img: np.ndarray) -> np.ndarray:
     pad = [(1, 1), (1, 1)] + [(0, 0)] * (img.ndim - 2)
     p = np.pad(img, pad, mode="edge")
     return np.stack([p[1 + dy:1 + dy + h, 1 + dx:1 + dx + w] for dy in (-1, 0, 1) for dx in (-1, 0, 1)])
-
-
-def level_size(h: int, w: int, level: int) -> tuple:
-    """LevelSize: a quarter each side, rounded up, level + 1 times."""
-    for _ in range(level + 1):
-        h, w = (h + 3) // 4, (w + 3) // 4
-    return h, w
 
 
 def level_taps(h: int, w: int, lh: int, lw: int):
@@ -374,25 +341,8 @@ def level_taps(h: int, w: int, lh: int, lw: int):
         yield yi[:, None] * lw + xi[None, :], (wy[:, None] * wx[None, :]).astype(F32)
 
 
-def sample_grid(grid: np.ndarray, h: int, w: int, offset=(0.0, 0.0)) -> np.ndarray:
-    """A linear-clamp read of a coarse grid at the frame's pixel centres, offset in grid texels."""
-    lh, lw = grid.shape[:2]
-    px = (np.arange(w, dtype=F32) + 0.5) / w * lw - 0.5 + offset[0]
-    py = (np.arange(h, dtype=F32) + 0.5) / h * lh - 0.5 + offset[1]
-    x0, y0 = np.floor(px), np.floor(py)
-    fx, fy = (px - x0).astype(F32), (py - y0).astype(F32)
-    x0, y0 = x0.astype(np.intp), y0.astype(np.intp)
-    out = np.zeros((h, w), F32)
-    for oy in (0, 1):
-        for ox in (0, 1):
-            xi = np.clip(x0 + ox, 0, lw - 1)
-            yi = np.clip(y0 + oy, 0, lh - 1)
-            out += grid[yi[:, None], xi[None, :]] * ((fy if oy else 1 - fy)[:, None] * (fx if ox else 1 - fx)[None, :])
-    return out
-
-
 # --------------------------------------------------------------------------------------------------
-# Per-hold inputs, computed once (what modes 12 and 16 and the capture produce)
+# Per-hold inputs, computed once (what mode 16 and the capture produce)
 # --------------------------------------------------------------------------------------------------
 
 @dataclass
@@ -404,7 +354,7 @@ class Frame:
     edit: np.ndarray          # H x W x 3, the model's (clamped) edit: "true" for this hold
     lin: np.ndarray           # H x W pseudo-linear depth
     log_luma: np.ndarray      # H x W, log2(luma(v) + eps): normalised (paper white is 1 in v)
-    prt: np.ndarray           # H x W x 4 fingerprint at capture: log luma, log r/g, log b/g, context
+    prt: np.ndarray           # H x W x 3 fingerprint at capture: log luma, log r/g, log b/g
     prt_lo: np.ndarray        # H x W x 3, 3x3 range of this hold's print
     prt_hi: np.ndarray
     mv: np.ndarray            # H x W x 2, render pixels to the previous hold (nearest-surface if on)
@@ -417,19 +367,6 @@ def print_of(v: np.ndarray, p: Params) -> np.ndarray:
     q = np.maximum(v, 0) + p.eps_v
     return np.stack([np.log2(luma(np.maximum(v, 0)) + p.eps_v), np.log2(q[..., 0] / q[..., 1]),
                      np.log2(q[..., 2] / q[..., 1])], -1).astype(F32)
-
-
-def context_at_centres(log_luma: np.ndarray) -> np.ndarray:
-    """Mode 12 + ContextAt: the quarter-size mean of normalised log luma (blocks clipped at the frame
-    edge), read at each pixel centre with a tent of four bilinear reads half a quarter-texel apart."""
-    h, w = log_luma.shape
-    ch, cw = level_size(h, w, 0)
-    pad = np.zeros((ch * 4, cw * 4), F32)
-    cnt = np.zeros((ch * 4, cw * 4), F32)
-    pad[:h, :w] = log_luma
-    cnt[:h, :w] = 1
-    grid = pad.reshape(ch, 4, cw, 4).sum(axis=(1, 3)) / np.maximum(cnt.reshape(ch, 4, cw, 4).sum(axis=(1, 3)), 1)
-    return 0.25 * sum(sample_grid(grid.astype(F32), h, w, (sx, sy)) for sx in (-0.5, 0.5) for sy in (-0.5, 0.5))
 
 
 def nearest_surface_motion(mv: np.ndarray, lin: np.ndarray) -> np.ndarray:
@@ -461,13 +398,12 @@ def prepare(hold: Hold, dump_white: float, reverse_z: bool, p: Params) -> Frame:
     lin = lin_depth(hold.depth, reverse_z, (h, w))
     prt3 = print_of(vc, p)
     nb = neighbourhood(prt3)
-    ctx = context_at_centres(prt3[..., 0])
     mv = np.nan_to_num(hold.mvec, nan=0.0, posinf=0.0, neginf=0.0)
     if p.nearest_surface and hold.depth is not None:
         mv = nearest_surface_motion(mv, lin)
     da = display(va)
     return Frame(index=hold.index, usable=usable, jitter=hold.jitter, v_colour=vc, edit=edit_of(vc, va, p),
-                 lin=lin, log_luma=prt3[..., 0].copy(), prt=np.concatenate([prt3, ctx[..., None]], -1),
+                 lin=lin, log_luma=prt3[..., 0].copy(), prt=prt3,
                  prt_lo=nb.min(axis=0), prt_hi=nb.max(axis=0), mv=mv.astype(F32), disp_answer=da,
                  base=float(np.abs(display(vc) - da).mean()))
 
@@ -542,15 +478,12 @@ def outside(v, lo, hi):
 
 def read_history(src: Frame, pos: np.ndarray, lin_c: np.ndarray, p: Params) -> dict:
     """ReadHistory: four bilinear taps of the refresh hold's history at pos, each admitted by relative
-    depth; the fingerprint from the strongest tap; Catmull-Rom blended in by how surely all four pass."""
+    depth; the fingerprint from the strongest tap."""
     h, w = lin_c.shape
     edit = np.zeros((h, w, 3), F32)
     conf = np.zeros((h, w), F32)
     ll = np.zeros((h, w), F32)
     wsum = np.zeros((h, w), F32)
-    all_valid = np.ones((h, w), F32)
-    lo = np.full((h, w, 3), 1e9, F32)
-    hi = np.full((h, w, 3), -1e9, F32)
     best_w = np.zeros((h, w), F32)
     best_i = np.zeros((h, w), np.intp)
     tol = p.depth_tol
@@ -559,14 +492,11 @@ def read_history(src: Frame, pos: np.ndarray, lin_c: np.ndarray, p: Params) -> d
         rel = np.abs(g - lin_c) / np.maximum(np.minimum(g, lin_c), 1e-7)
         wd = np.clip((2.0 * tol - rel) / max(tol, 1e-6), 0, 1)
         wt = (wb * wd).astype(F32)
-        all_valid = np.minimum(all_valid, wd)
         e = gather(src.edit, idx)
         edit += e * wt[..., None]
         conf += wt  # the refresh stored confidence 1 everywhere
         ll += gather(src.log_luma, idx) * wt
         wsum += wt
-        lo = np.minimum(lo, e)
-        hi = np.maximum(hi, e)
         better = wt > best_w
         best_w = np.where(better, wt, best_w)
         best_i = np.where(better, idx, best_i)
@@ -575,10 +505,6 @@ def read_history(src: Frame, pos: np.ndarray, lin_c: np.ndarray, p: Params) -> d
     edit /= d[..., None]
     conf /= d
     ll /= d
-    if p.catmull_rom:
-        cr = np.clip(catmull_rom(src.edit, pos), lo, hi)
-        av = all_valid[..., None]
-        edit = np.where(av > 0, edit + (cr - edit) * av, edit)
     has = best_w > 0
     prt = np.where(has[..., None], gather(src.prt, best_i), 0)
     meta_y = has.astype(F32)  # validity stored at refresh: 1
@@ -598,8 +524,6 @@ def validate(hist: dict, dst: Frame, on: np.ndarray, p: Params) -> tuple:
     m = soft(outside(src[..., 0], dst.prt_lo[..., 0], dst.prt_hi[..., 0]), p.print_tol)
     m = m * soft(np.maximum(outside(src[..., 1], dst.prt_lo[..., 1], dst.prt_hi[..., 1]),
                             outside(src[..., 2], dst.prt_lo[..., 2], dst.prt_hi[..., 2])), p.print_tol)
-    if p.context:
-        m = m * soft(np.abs(dst.prt[..., 3] - src[..., 3]), p.context_tol)
     validity = np.where(on, np.clip(hist["meta_y"], 0, 1) * m, 0)
     return v_colour, validity.astype(F32)
 
