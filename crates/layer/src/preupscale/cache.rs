@@ -1330,10 +1330,11 @@ mod tests {
     /// synthetic dumps, within 1e-3 stop: the shown edit, the accumulated motion and the weight. And
     /// on each kind what it is for: a still scene reproduces the refresh's edit; a pan keeps it
     /// aligned, its field the composed motion; a moving box's uncovered background rejects the
-    /// carried high band.
+    /// carried high band; a still view under sub-pixel jitter reads each texel's edit whole from the
+    /// refresh's nearest texel (no bilinear blend of a near-pixel-scale edit).
     #[test]
     fn the_shaders_carry_the_edit_as_the_replay_tool_does() {
-        for kind in ["still", "pan", "depth-edge"] {
+        for kind in ["still", "pan", "depth-edge", "jitter"] {
             let Some((rig, results, src_edit)) = carry_on_gpu(kind, false) else { return };
             let (w, h) = (rig.w as usize, rig.h as usize);
             let n = w * h;
@@ -1380,6 +1381,26 @@ mod tests {
                     }
                     assert!(worst < 1e-3, "pan: the carried edit is off its source by up to {worst} stop");
                 }
+                "jitter" => {
+                    // Nothing moves: the refresh's texel nearest to where this hold's pixel samples
+                    // (the jitters of cache_replay.py's synthetic_holds).
+                    const JITTER: [[f32; 2]; 6] = [[0.0, 0.0], [0.3, -0.2], [-0.35, 0.15], [0.1, 0.4], [-0.2, -0.3], [0.45, 0.05]];
+                    let refresh = JITTER[0];
+                    for (t, _, _, .., history) in &results {
+                        let j = JITTER[*t];
+                        let mut worst = 0.0f32;
+                        for y in 2..h - 2 {
+                            for x in 2..w - 2 {
+                                let sx = (x as f32 + 0.5 + refresh[0] - j[0]).floor() as usize;
+                                let sy = (y as f32 + 0.5 + refresh[1] - j[1]).floor() as usize;
+                                let i = y * w + x;
+                                let s = (sy * w + sx) * 3;
+                                worst = worst.max(max_diff(&history[i * 3..i * 3 + 3], &src[s..s + 3]));
+                            }
+                        }
+                        assert!(worst < 1e-4, "jitter hold {t}: the history read is off the nearest texel's edit by {worst} stop");
+                    }
+                }
                 "depth-edge" => {
                     // Hold 1: the box (rows 20..44) moved from x 10 to 15; columns 10..15 show the
                     // background it covered on the refresh hold.
@@ -1405,7 +1426,7 @@ mod tests {
     #[test]
     fn the_shaders_run_the_cadence_as_the_replay_tool_does() {
         const INTERVAL: usize = 3;
-        for kind in ["still", "pan", "depth-edge", "regrade"] {
+        for kind in ["still", "pan", "depth-edge", "regrade", "jitter"] {
             let dir = scratch(&format!("cadence-{kind}"));
             let dump = dir.join("dump");
             let out = dir.join("cadence");

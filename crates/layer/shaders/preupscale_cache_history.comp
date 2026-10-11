@@ -214,9 +214,9 @@ vec3 print_at(ivec2 at) {
 shared uint s_rejected;
 
 // A cached hold's history read and validation (read_history, validate and carry's weight and
-// confidence): the refresh hold's edit at the chained position, admitted by depth, checked against
-// this hold's colour and fingerprint. Writes (edit, weight) and the confidence; counts the texels
-// whose history was rejected.
+// confidence): the refresh hold's edit at the chained position (its strongest depth-admitted tap),
+// checked against this hold's colour and fingerprint. Writes (edit, weight) and the confidence;
+// counts the texels whose history was rejected.
 void main() {
   uvec2 xy = gl_GlobalInvocationID.xy;
   bool inside = all(lessThan(xy, p.size));
@@ -232,12 +232,13 @@ void main() {
     if (on) {
       vec2 pos = vec2(xy) + 0.5 + acc + p.refresh_jitter;
       float lin_c = u_lin.v[i];
-      // read_history: four bilinear taps, each admitted by relative depth.
+      // read_history: four bilinear taps, each admitted by relative depth, for the weight, the colour
+      // check's luma and the strongest tap; the edit is the strongest tap's own (a bilinear blend of a
+      // sub-pixel-scale edit at the jitter's offset keeps a fifth to a third of its detail).
       vec2 px = pos - 0.5;
       vec2 f0 = floor(px);
       vec2 f = px - f0;
       ivec2 i0 = ivec2(f0);
-      vec3 edit = vec3(0.0);
       float conf = 0.0;
       float ll = 0.0;
       float wsum = 0.0;
@@ -250,12 +251,10 @@ void main() {
         ivec2 t = clamp(i0 + ivec2(ox, oy), ivec2(0), ivec2(p.size) - 1);
         uint j = uint(t.y) * p.size.x + uint(t.x);
         float wb = (ox == 1 ? f.x : 1.0 - f.x) * (oy == 1 ? f.y : 1.0 - f.y);
-        vec3 e = unpack_edit(u_src_edit.v[j]);
         float s_lin = u_src_lin.v[j];
         float rel = abs(s_lin - lin_c) / max(min(s_lin, lin_c), 1e-7);
         float wd = clamp((2.0 * tol - rel) / max(tol, 1e-6), 0.0, 1.0);
         float wt = wb * wd;
-        edit += e * wt;
         conf += wt;
         ll += u_src_print.v[3u * j] * wt;
         wsum += wt;
@@ -265,10 +264,10 @@ void main() {
         }
       }
       float dn = wsum > 1e-4 ? wsum : 1.0;
-      edit /= dn;
       conf /= dn;
       ll /= dn;
       bool has = best_w > 0.0;
+      vec3 edit = has ? unpack_edit(u_src_edit.v[best]) : vec3(0.0);
       vec3 src = has ? vec3(u_src_print.v[3u * best], u_src_print.v[3u * best + 1u], u_src_print.v[3u * best + 2u]) : vec3(0.0);
       float meta_y = has ? 1.0 : 0.0;
       float valid = clamp(wsum, 0.0, 1.0);

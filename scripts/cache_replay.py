@@ -34,7 +34,7 @@ Usage:
   cache_replay.py DUMP --cadence 2 3 4 [--phase K] [--aging] [--no-guided] [--json OUT]
   cache_replay.py DUMP --cadence N --export-cadence DIR
   cache_replay.py DUMP --self-check
-  cache_replay.py --make-synthetic DIR --kind still|pan|depth-edge
+  cache_replay.py --make-synthetic DIR --kind still|pan|depth-edge|regrade|jitter
   cache_replay.py DUMP --export-carry DIR [--reverse-z yes|no]
 
 Ported in part from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5),
@@ -497,7 +497,9 @@ def synthetic_holds(kind: str, w: int = 96, h: int = 64, n: int = 6) -> tuple:
     depth-edge  a near box moves 5 px right per hold over a still far background (sky on top); where
                 it uncovers the background the carried high band must be rejected.
     regrade     the pan, with the model re-grading the whole picture 0.15 stop brighter each hold:
-                every refresh's answer differs from the last."""
+                every refresh's answer differs from the last.
+    jitter      nothing moves but the jitter (sub-pixel, a different offset each hold), and the edit
+                has a near-pixel-scale term: the history read must carry it whole."""
     paper_white, exposure = 3.0, 1.5
     ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
     xs, ys = xs + 0.5, ys + 0.5
@@ -524,6 +526,9 @@ def synthetic_holds(kind: str, w: int = 96, h: int = 64, n: int = 6) -> tuple:
             cam, jit = np.zeros(2), np.zeros(2)
         elif kind == "depth-edge":
             cam, jit = np.zeros(2), np.zeros(2)
+        elif kind == "jitter":
+            cam = np.zeros(2)
+            jit = np.array([[0.0, 0.0], [0.3, -0.2], [-0.35, 0.15], [0.1, 0.4], [-0.2, -0.3], [0.45, 0.05]][t % 6])
         else:
             raise ValueError(f"unknown synthetic kind {kind!r}")
         X, Y = xs - jit[0] + cam[0], ys - jit[1] + cam[1]
@@ -534,6 +539,8 @@ def synthetic_holds(kind: str, w: int = 96, h: int = 64, n: int = 6) -> tuple:
             mv[...] = [2.5, 1.0]
         if kind == "regrade":
             edit = edit + 0.15 * t
+        if kind == "jitter":
+            edit = edit + 0.3 * (np.cos(2.9 * X) * np.cos(2.7 * Y))[..., None]
         if kind == "depth-edge":
             sky = ys < 8
             v[sky] = [0.3, 0.45, 0.8]
@@ -586,7 +593,7 @@ def main(argv=None) -> int:
     ap.add_argument("--self-check", action="store_true", help="lag-0 identity and the lag-1 oracle; non-zero exit on failure")
     ap.add_argument("--reverse-z", choices=("auto", "yes", "no"), default="auto")
     ap.add_argument("--make-synthetic", metavar="DIR", help="write a synthetic dump to DIR and exit")
-    ap.add_argument("--kind", choices=("still", "pan", "depth-edge", "regrade"), default="pan")
+    ap.add_argument("--kind", choices=("still", "pan", "depth-edge", "regrade", "jitter"), default="pan")
     ap.add_argument("--export-carry", metavar="DIR", help="write the refresh at hold 0 carried to every later hold (the layer's shader test) and exit")
     ap.add_argument("--quiet", action="store_true")
     c = ap.add_argument_group("cadence: the cache run at a fixed interval (pulse, flicker; experiments not in the shaders)")

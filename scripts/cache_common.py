@@ -18,7 +18,10 @@ never reprojected. One carry here, as the shader does it on a cached hold:
      where that vector and the change of jitter lead), plus the change of jitter since the refresh.
      (chain_step, "walk", re-reads each older hold's vectors at the running position instead.)
   3. The history read there: four bilinear taps, each admitted by relative depth against this
-     pixel (full weight to depth_tol, none at twice it), renormalised.
+     pixel (full weight to depth_tol, none at twice it), renormalised, for the weight and the luma
+     the colour check reads; the edit is the strongest tap's own, not their blend (a bilinear blend
+     at the jitter's sub-pixel offset keeps a fifth to a third of the edit's detail; docs/LESSONS.md,
+     "3.3 edit cache: what was tried").
   4. Validation: the colour check on log luma against this hold's 3x3 range (noise-aware), which
      only dims the high band (lerp(0.6, 1, v)); the fingerprint (normalised log luma and two log
      chroma ratios against the 3x3 range), which rejects the edit.
@@ -481,9 +484,8 @@ def outside(v, lo, hi):
 
 def read_history(src: Frame, pos: np.ndarray, lin_c: np.ndarray, p: Params) -> dict:
     """ReadHistory: four bilinear taps of the refresh hold's history at pos, each admitted by relative
-    depth; the fingerprint from the strongest tap."""
+    depth; the edit and the fingerprint from the strongest tap."""
     h, w = lin_c.shape
-    edit = np.zeros((h, w, 3), F32)
     conf = np.zeros((h, w), F32)
     ll = np.zeros((h, w), F32)
     wsum = np.zeros((h, w), F32)
@@ -495,8 +497,6 @@ def read_history(src: Frame, pos: np.ndarray, lin_c: np.ndarray, p: Params) -> d
         rel = np.abs(g - lin_c) / np.maximum(np.minimum(g, lin_c), 1e-7)
         wd = np.clip((2.0 * tol - rel) / max(tol, 1e-6), 0, 1)
         wt = (wb * wd).astype(F32)
-        e = gather(src.edit, idx)
-        edit += e * wt[..., None]
         conf += wt  # the refresh stored confidence 1 everywhere
         ll += gather(src.log_luma, idx) * wt
         wsum += wt
@@ -505,10 +505,10 @@ def read_history(src: Frame, pos: np.ndarray, lin_c: np.ndarray, p: Params) -> d
         best_i = np.where(better, idx, best_i)
     ok = wsum > 1e-4
     d = np.where(ok, wsum, 1.0)
-    edit /= d[..., None]
     conf /= d
     ll /= d
     has = best_w > 0
+    edit = np.where(has[..., None], gather(src.edit, best_i), 0)
     prt = np.where(has[..., None], gather(src.prt, best_i), 0)
     meta_y = has.astype(F32)  # validity stored at refresh: 1
     return dict(edit=edit.astype(F32), conf=conf, log_luma=ll, valid=np.clip(wsum, 0, 1), prt=prt, meta_y=meta_y)

@@ -4,6 +4,7 @@
 Run with `python3 scripts/test_cache_replay.py`. Needs numpy; skips with a message without it."""
 
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -92,6 +93,23 @@ class CacheReplayTests(unittest.TestCase):
         self.assertGreater(r["cache"]["kept"], 99.9)
         self.assertLess(r["cache"]["err"], 1e-3)
         self.assertLess(r["none"]["kept"], 1e-6)
+
+    def test_history_read_keeps_a_pixel_scale_edit(self):
+        # A checkerboard edit read at a sub-pixel offset: the strongest tap's own edit comes through
+        # whole, where a bilinear blend of the four taps keeps a fraction of it.
+        dump = cc.load_dump(self.dirs["still"])
+        p = cc.Params()
+        f = cc.prepare(dump.hold(0), dump.paper_white, True, p)
+        h, w = f.lin.shape
+        ys, xs = np.mgrid[0:h, 0:w]
+        chk = (((xs + ys) % 2) * 0.6 - 0.3).astype(np.float32)
+        src = dataclasses.replace(f, edit=np.repeat(chk[..., None], 3, -1))
+        pos = (cc.pixel_centres(h, w) + np.array([0.4, -0.3], np.float32)).astype(np.float32)
+        read = cc.read_history(src, pos, f.lin, p)["edit"]
+        inner = (slice(2, h - 2), slice(2, w - 2))
+        np.testing.assert_array_equal(read[inner], src.edit[inner])
+        blend = cc.sample_bilinear(src.edit, pos)
+        self.assertLess(float(np.abs(blend[inner]).mean()), 0.3 * float(np.abs(src.edit[inner]).mean()))
 
     def test_pan_stays_aligned(self):
         dump = cc.load_dump(self.dirs["pan"])

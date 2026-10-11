@@ -494,8 +494,8 @@ every hold refreshes and the picture is bit for bit what it was (the test
   tried and removed: offline it evened the refresh pulse at the cost of lag; live after DLSS it changed
   neither flicker nor trailing measurably (LESSONS.md, "3.3 edit cache: what was tried").
 - **Cached write-back** (W, in place of the decode): `history` (the refresh's edit read at the chained
-  position, four depth-admitted bilinear taps, the colour check and the fingerprint against this
-  hold's 3x3), `reduce` x3 (the coverage-weighted pyramid, 1/4, 1/16, 1/64), `apply`
+  position: four depth-admitted bilinear taps, the edit their strongest tap's own, not their blend;
+  the colour check and the fingerprint against this hold's 3x3), `reduce` x3 (the coverage-weighted pyramid, 1/4, 1/16, 1/64), `apply`
   (the low band with the same-surface fill plus the high band by its confidence, clamped), `guided` x3
   at half size and `apply` again (a fast guided filter of that edit on this hold's log luma, 2x2 means,
   3x3 window, eps 0.005, blended in by sat(staleness / 2), staleness one per 4 px of each hold's motion
@@ -521,7 +521,7 @@ every hold refreshes and the picture is bit for bit what it was (the test
   read, the pyramid and the shown edit in a cached write-back, the guided filter's grids over the
   first two once the apply has read them) live within it. The fingerprint is read from the frame
   where it is needed, the refresh's depth from the depth again. Edits are kept as three 16-bit
-  fixed-point stops (+-2.5, steps of 7.6e-5 stop: the shaders stay within 8e-5 stop of the replay
+  fixed-point stops (+-2.5, steps of 7.6e-5 stop: the shaders stay within 1e-4 stop of the replay
   tool). A hold checks the features' size, and a rebuilt network (new features) drops the edit. The
   cache had 146 bytes a render pixel of its own before (408 MB at 2228x1253; LESSONS.md, "3.3 edit
   cache: what was tried"). Reversed-Z is decided once per
