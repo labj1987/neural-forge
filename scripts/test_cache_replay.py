@@ -149,7 +149,7 @@ class CacheReplayTests(unittest.TestCase):
         p = cc.Params()
         frames = cr.Frames(dump, True, p, 3)
         h, w = dump.height, dump.width
-        for t, since, refresh, shown, dst, _ in cr.run_cadence(dump, frames, cr.Cadence(interval=2, crossfade=False), p):
+        for t, since, refresh, shown, dst, _ in cr.run_cadence(dump, frames, cr.Cadence(interval=2, crossfade=False, guided=False), p):
             self.assertEqual(refresh, t % 2 == 0)
             self.assertEqual(since, t % 2)
             if refresh:
@@ -173,8 +173,8 @@ class CacheReplayTests(unittest.TestCase):
             dump = cc.load_dump(d)
             p = cc.Params(max_luma_edit=0.0)
             runs = {}
-            for name, cad in (("base", cr.Cadence(interval=3, crossfade=False)), ("xf", cr.Cadence(interval=3, soft=False)),
-                              ("soft", cr.Cadence(interval=3))):
+            for name, cad in (("base", cr.Cadence(interval=3, crossfade=False, guided=False)),
+                              ("xf", cr.Cadence(interval=3, soft=False, guided=False)), ("soft", cr.Cadence(interval=3, guided=False))):
                 runs[name] = [(t, s.copy()) for t, _, _, s, _, _ in cr.run_cadence(dump, cr.Frames(dump, True, p, 3), cad, p)]
             base, xf = dict(runs["base"]), dict(runs["xf"])
             # Hold 3 refreshes: one third of the way from hold 2's shown edit (hold 0's) to hold 3's.

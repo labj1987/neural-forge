@@ -55,6 +55,14 @@ layout(set = 0, binding = 16, std430) buffer SrcFrom { vec4 v[]; } u_src_from;
 layout(set = 0, binding = 17, std430) buffer Shown { vec4 v[]; } u_shown;
 // This hold's own motion vector (nearest surface, render pixels): the one step back to the hold before.
 layout(set = 0, binding = 18, std430) buffer Step { vec2 v[]; } u_step;
+// The guided filter's half-size grids, two vec4 a texel each: the 2x2 means, then the tent-blurred
+// coefficients (a); its coefficients (b).
+layout(set = 0, binding = 19, std430) buffer GuideA { vec4 v[]; } u_guide_a;
+layout(set = 0, binding = 20, std430) buffer GuideB { vec4 v[]; } u_guide_b;
+// How far each pixel has moved since the refresh (one per 4 px of each hold's motion, at most one a
+// hold), and its copy from the previous hold.
+layout(set = 0, binding = 21, std430) buffer Stale { float v[]; } u_stale;
+layout(set = 0, binding = 22, std430) buffer StalePrev { float v[]; } u_stale_prev;
 
 layout(push_constant) uniform Params {
   uvec2 size;            // render extent
@@ -75,6 +83,7 @@ layout(push_constant) uniform Params {
   float sigma_depth;
   float sigma_luma;
   float walk;            // how far the shown edit has walked from u_src_from to the answer
+  float guided_eps;      // the guided filter's regularisation
 } p;
 
 const uint F_REVERSE_Z = 1u;     // depth: near is larger (reversed-Z)
@@ -104,6 +113,9 @@ const float K = 5.770780;
 const float CLAMPED = 0.999;
 
 uint index_of(uvec2 xy) { return xy.y * p.size.x + xy.x; }
+
+// The guided filter's half-size grid (guided_fast's half: rounded up).
+uvec2 half_size() { return (p.size + 1u) / 2u; }
 
 bool exposure_ok(float e) { return e > 1e-6 && e < 65504.0; }
 

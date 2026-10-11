@@ -5,7 +5,8 @@
 // accumulated field read where it leads, NaN where the chain leaves the frame. The network reads the
 // field for its history (native_preprocess.comp, binding 2) and the cache for where each pixel was on
 // the refresh hold. At interval 1 (flags without F_CHAINED) the vectors are copied as they are. Also
-// this hold's own vector (u_step), for a refresh's one step back to what was on screen.
+// this hold's own vector (u_step), for a refresh's one step back to what was on screen, and how far
+// each pixel has travelled since the refresh (u_stale, the guided filter's weight).
 //
 // Ported from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5), commit
 // 6bfc4389c25054ef6747df6e6b1b470e9541c4da: OptiScaler/shaders/dlssnr/precompile/dlssnr_cache.hlsl
@@ -58,6 +59,14 @@ layout(set = 0, binding = 16, std430) buffer SrcFrom { vec4 v[]; } u_src_from;
 layout(set = 0, binding = 17, std430) buffer Shown { vec4 v[]; } u_shown;
 // This hold's own motion vector (nearest surface, render pixels): the one step back to the hold before.
 layout(set = 0, binding = 18, std430) buffer Step { vec2 v[]; } u_step;
+// The guided filter's half-size grids, two vec4 a texel each: the 2x2 means, then the tent-blurred
+// coefficients (a); its coefficients (b).
+layout(set = 0, binding = 19, std430) buffer GuideA { vec4 v[]; } u_guide_a;
+layout(set = 0, binding = 20, std430) buffer GuideB { vec4 v[]; } u_guide_b;
+// How far each pixel has moved since the refresh (one per 4 px of each hold's motion, at most one a
+// hold), and its copy from the previous hold.
+layout(set = 0, binding = 21, std430) buffer Stale { float v[]; } u_stale;
+layout(set = 0, binding = 22, std430) buffer StalePrev { float v[]; } u_stale_prev;
 
 layout(push_constant) uniform Params {
   uvec2 size;            // render extent
@@ -78,6 +87,7 @@ layout(push_constant) uniform Params {
   float sigma_depth;
   float sigma_luma;
   float walk;            // how far the shown edit has walked from u_src_from to the answer
+  float guided_eps;      // the guided filter's regularisation
 } p;
 
 const uint F_REVERSE_Z = 1u;     // depth: near is larger (reversed-Z)
@@ -107,6 +117,9 @@ const float K = 5.770780;
 const float CLAMPED = 0.999;
 
 uint index_of(uvec2 xy) { return xy.y * p.size.x + xy.x; }
+
+// The guided filter's half-size grid (guided_fast's half: rounded up).
+uvec2 half_size() { return (p.size + 1u) / 2u; }
 
 bool exposure_ok(float e) { return e > 1e-6 && e < 65504.0; }
 
@@ -175,6 +188,22 @@ vec2 previous_acc(vec2 pos) {
   return r;
 }
 
+// sample_bilinear of the previous hold's staleness at pos (edge-clamped).
+float previous_stale(vec2 pos) {
+  vec2 px = pos - 0.5;
+  vec2 f0 = floor(px);
+  vec2 f = px - f0;
+  ivec2 i0 = ivec2(f0);
+  float r = 0.0;
+  for (int k = 0; k < 4; k++) {
+    int ox = k & 1;
+    int oy = k >> 1;
+    ivec2 t = clamp(i0 + ivec2(ox, oy), ivec2(0), ivec2(p.size) - 1);
+    r += u_stale_prev.v[uint(t.y) * p.size.x + uint(t.x)] * (ox == 1 ? f.x : 1.0 - f.x) * (oy == 1 ? f.y : 1.0 - f.y);
+  }
+  return r;
+}
+
 void main() {
   uvec2 xy = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(xy, p.size))) return;
@@ -208,7 +237,14 @@ void main() {
   // acc_step: acc_t(x) = mv_t(x) + acc_{t-1}(x + mv_t(x) + jitter[t-1] - jitter[t]).
   vec2 at = vec2(xy) + 0.5 + mv + p.step_jitter;
   vec2 acc = mv;
-  if ((p.flags & F_FRESH) == 0u) acc += previous_acc(at);
+  // run_cadence's staleness: one per 4 px of this hold's motion (at most one), plus the previous
+  // hold's read bilinearly where the motion leads (none right after a refresh).
+  float stale = clamp(length(mv + p.step_jitter) / 4.0, 0.0, 1.0);
+  if ((p.flags & F_FRESH) == 0u) {
+    acc += previous_acc(at);
+    stale += previous_stale(at);
+  }
+  u_stale.v[i] = stale;
   bool on = at.x >= 0.0 && at.x <= float(p.size.x) && at.y >= 0.0 && at.y <= float(p.size.y);
   u_acc.v[i] = on ? acc / p.mvec_scale : vec2(nan_value());
 }

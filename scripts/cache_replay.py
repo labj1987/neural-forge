@@ -32,7 +32,7 @@ that ceiling).
 Usage:
   cache_replay.py DUMP [--lags 1 2 3 4 8] [--json OUT] [--oracle] [parameters]
   cache_replay.py DUMP --cadence 2 3 4 [--phase K] [--no-crossfade] [--no-soft-refresh] [--xf-frames N]
-                 [--aging] [--guided] [--json OUT]
+                 [--aging] [--no-guided] [--json OUT]
   cache_replay.py DUMP --cadence N --export-cadence DIR
   cache_replay.py DUMP --self-check
   cache_replay.py --make-synthetic DIR --kind still|pan|depth-edge
@@ -173,10 +173,10 @@ def carried_position(frames, t: int, lag: int, p: cc.Params) -> tuple:
 
 def export_carry(dump: cc.Dump, p: cc.Params, reverse_z: bool, out: str) -> int:
     """For the layer's shader test: the refresh at hold 0 carried to every later hold by the
-    recurrence. Writes per hold t >= 1 `cache-TT.f32` (H x W x 3, the shown edit of mode "cache"),
-    `acc-TT.f32` (H x W x 2, the accumulated motion, NaN off the chain) and `weight-TT.f32` (H x W,
-    valid x validity), and `holds.txt` (per hold: jitter x, jitter y, exposure), all f32
-    little-endian. Returns the number of holds carried to."""
+    recurrence. Writes per hold t >= 1 `cache-TT.f32` (H x W x 3, the shown edit: mode "cache" with the
+    guided filter, as run_cadence shows it), `acc-TT.f32` (H x W x 2, the accumulated motion, NaN off
+    the chain) and `weight-TT.f32` (H x W, valid x validity), and `holds.txt` (per hold: jitter x,
+    jitter y, exposure), all f32 little-endian. Returns the number of holds carried to."""
     os.makedirs(out, exist_ok=True)
     frames = Frames(dump, reverse_z, p, len(dump))
     with open(os.path.join(out, "holds.txt"), "w", encoding="utf-8") as fh:
@@ -185,11 +185,12 @@ def export_carry(dump: cc.Dump, p: cc.Params, reverse_z: bool, out: str) -> int:
             fh.write(f"{float(f.jitter[0])!r} {float(f.jitter[1])!r} {float(dump.hold(k).exposure)!r}\n")
     src = frames[0]
     acc = None
+    shown = {t: e for t, _, _, e, _, _ in run_cadence(dump, frames, Cadence(interval=len(dump) + 1), p)}
     for t in range(1, len(dump)):
         acc = cc.acc_step(acc, frames[t], frames[t - 1].jitter, p)
         pos, on = cc.chained_position(acc, frames[t], src, p)
         r = cc.carry(src, frames[t], pos, on, p)
-        r["cache"].astype("<f4").tofile(os.path.join(out, f"cache-{t:02d}.f32"))
+        shown[t].astype("<f4").tofile(os.path.join(out, f"cache-{t:02d}.f32"))
         acc.astype("<f4").tofile(os.path.join(out, f"acc-{t:02d}.f32"))
         (r["valid"] * r["validity"]).astype("<f4").tofile(os.path.join(out, f"weight-{t:02d}.f32"))
     return len(dump) - 1
@@ -210,10 +211,10 @@ def print_table(results: dict, out=None) -> None:
 
 @dataclass
 class Cadence:
-    """How a run at a fixed interval shows its edits. The defaults are the layer's (the capture, refresh,
-    history and apply shaders mirror run_cadence with them): crossfade and soft refresh on, the walk
-    over the whole interval. xf_frames, aging and guided are experiments, measured and not in the
-    shaders (docs/LESSONS.md, "3.3 edit cache: what was tried"); so is crossfade without soft.
+    """How a run at a fixed interval shows its edits. The defaults are the layer's (the shaders mirror
+    run_cadence with them): crossfade and soft refresh on, the walk over the whole interval, the guided
+    filter on. xf_frames and aging are experiments, measured and not in the shaders (docs/LESSONS.md,
+    "3.3 edit cache: what was tried"); so is crossfade without soft.
 
     crossfade   the shown edit does not jump to the model's answer on a refresh hold: it walks there
                 from what was on screen (the last shown edit at this hold's one step back) across the
@@ -227,7 +228,8 @@ class Cadence:
     aging       the high band's confidence times 2^(-staleness / half_life), staleness = one per
                 stale_px of motion since the refresh;
     guided      a fast guided filter (He et al.) of the cached edit on this hold's log luma, blended in
-                by guided_strength x sat(staleness / 2)."""
+                by guided_strength x sat(staleness / 2) (staleness: as for aging; the motion pass
+                accumulates it on the GPU)."""
 
     interval: int
     phase: int = 0
@@ -236,7 +238,7 @@ class Cadence:
     soft: bool = True
     aging: bool = False
     half_life: float = 8.0
-    guided: bool = False
+    guided: bool = True
     guided_strength: float = 1.0
     guided_eps: float = 0.005
     stale_px: float = 4.0
@@ -249,8 +251,8 @@ class Cadence:
                 parts.append("soft")
         if self.aging:
             parts.append("aging")
-        if self.guided:
-            parts.append("guided")
+        if not self.guided:
+            parts.append("noguided")
         return "-".join(parts) if len(parts) > 1 else parts[0] + "-base"
 
 
@@ -649,8 +651,8 @@ def main(argv=None) -> int:
     c.add_argument("--xf-frames", type=int, default=0, help="cap the walk at this many holds (0: the whole interval)")
     c.add_argument("--aging", action="store_true")
     c.add_argument("--half-life", type=float, default=8.0)
-    c.add_argument("--guided", action="store_true")
-    c.add_argument("--guided-strength", type=float, default=1.0)
+    c.add_argument("--no-guided", action="store_true", help="no guided filter of the cached edits")
+    c.add_argument("--guided-strength", type=float, default=1.0, help="(experiment) the shaders use 1")
     c.add_argument("--guided-eps", type=float, default=0.005)
     c.add_argument("--export-cadence", metavar="DIR", help="with one --cadence N: write every hold's shown edit (the layer's shader test) and exit")
     g = ap.add_argument_group("cache parameters (defaults are the shader's)")
@@ -709,7 +711,7 @@ def main(argv=None) -> int:
             ap.error("--cadence intervals are 2 or more")
         def cadence(n):
             return Cadence(interval=n, phase=args.phase, crossfade=not args.no_crossfade, xf_frames=args.xf_frames,
-                           soft=not args.no_soft_refresh, aging=args.aging, half_life=args.half_life, guided=args.guided,
+                           soft=not args.no_soft_refresh, aging=args.aging, half_life=args.half_life, guided=not args.no_guided,
                            guided_strength=args.guided_strength, guided_eps=args.guided_eps)
 
         if args.export_cadence:

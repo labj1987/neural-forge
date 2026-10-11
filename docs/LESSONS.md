@@ -541,6 +541,63 @@ a new refresh pass; `run_cadence` is the mirror).
 | still | i3-xf2-soft | 0.0695/0.420/1.64/67.2 | 0.506 | 0.0091 / 0.0071 (0.0087) | -1.934 |
 | still | i4-xf2-soft | 0.0748/0.451/1.84/64.8 | 0.500 | 0.0084 / 0.0064 (0.0087) | -1.991 |
 
+**Guided filter: kept. Aging: not added.** Upstream measured both slightly worse and ships them off
+(edit-cache.md, "they also soften detail that was right"). Ours, the same definitions (aging: the high
+band's confidence times 2^(-staleness / 8), staleness one per 4 px of each hold's motion since the
+refresh; guided: He et al.'s fast guided filter of the cached edit on the hold's log luma, 2x2 means at
+half size, a 3x3 window, eps 0.005, blended in by sat(staleness / 2)), run once through the cadence
+replay with and without the walk:
+
+- Aging changes almost nothing: p99.5 within 1% on every dump and interval, the worse-than-no-edit
+  area 6-10% smaller on the drive only (i2 1.75 -> 1.65% with the walk), pulse and flicker the same.
+  Not worth a carried staleness field and its reads; not in the shader (`--aging` in the tool).
+- The guided filter is better on every dump, interval and metric that moves: with the walk at
+  interval 2, p99.5 pan 0.206 -> 0.193, drive 0.522 -> 0.489, still 0.386 -> 0.381; on the cached
+  holds alone 0.261 -> 0.239, 0.669 -> 0.615, 0.502 -> 0.493; the worse-than-no-edit area drive
+  1.75 -> 1.29%, still 1.29 -> 1.17%; kept +0.4 to +1.0 point; flicker a little lower (pan +0.010 ->
+  +0.004, drive -2.93 -> -2.99, still -1.87 -> -1.91); pulse unchanged. So ours disagree with
+  upstream's and it went into the shaders: the motion pass accumulates the staleness, three
+  half-size passes build the coefficients, the apply blends them in (`--no-guided` in the tool).
+
+| dump | run | err/p99.5/worse%/kept% | p99.5 cached | pulse refresh / cached (model) | flicker |
+|---|---|---|---|---|---|
+| pan | i2-base | 0.0220/0.139/0.10/88.9 | 0.261 | 0.0444 / 0.0062 (0.0265) | +0.239 |
+| pan | i4-base | 0.0479/0.275/0.43/75.2 | 0.344 | 0.0668 / 0.0073 (0.0265) | +0.634 |
+| pan | i2-xf-soft | 0.0347/0.206/0.11/81.7 | 0.261 | 0.0230 / 0.0214 (0.0265) | +0.010 |
+| pan | i4-xf-soft | 0.0638/0.365/0.68/66.3 | 0.373 | 0.0182 / 0.0165 (0.0265) | +0.377 |
+| pan | i2-aging | 0.0219/0.138/0.10/88.9 | 0.260 | 0.0444 / 0.0063 (0.0265) | +0.238 |
+| pan | i4-aging | 0.0477/0.275/0.41/75.3 | 0.343 | 0.0666 / 0.0074 (0.0265) | +0.630 |
+| pan | i2-guided | 0.0209/0.127/0.07/89.3 | 0.239 | 0.0444 / 0.0062 (0.0265) | +0.244 |
+| pan | i4-guided | 0.0461/0.260/0.34/75.9 | 0.325 | 0.0668 / 0.0073 (0.0265) | +0.646 |
+| pan | i2-xf-soft-aging | 0.0345/0.205/0.10/81.7 | 0.260 | 0.0230 / 0.0214 (0.0265) | +0.006 |
+| pan | i4-xf-soft-aging | 0.0636/0.364/0.65/66.4 | 0.373 | 0.0182 / 0.0165 (0.0265) | +0.372 |
+| pan | i2-xf-soft-guided | 0.0334/0.193/0.08/82.2 | 0.239 | 0.0230 / 0.0214 (0.0265) | +0.004 |
+| pan | i4-xf-soft-guided | 0.0623/0.352/0.58/67.0 | 0.358 | 0.0183 / 0.0164 (0.0265) | +0.385 |
+| drive | i2-base | 0.0531/0.357/1.59/85.0 | 0.669 | 0.0345 / 0.0214 (0.0190) | -1.962 |
+| drive | i4-base | 0.0864/0.576/2.70/76.1 | 0.720 | 0.0503 / 0.0112 (0.0190) | -2.677 |
+| drive | i2-xf-soft | 0.0777/0.522/1.75/78.3 | 0.669 | 0.0174 / 0.0184 (0.0190) | -2.931 |
+| drive | i4-xf-soft | 0.1051/0.696/2.88/71.0 | 0.721 | 0.0137 / 0.0130 (0.0190) | -3.428 |
+| drive | i2-aging | 0.0525/0.353/1.50/85.1 | 0.662 | 0.0349 / 0.0221 (0.0190) | -1.976 |
+| drive | i4-aging | 0.0847/0.566/2.44/76.4 | 0.708 | 0.0511 / 0.0113 (0.0190) | -2.782 |
+| drive | i2-guided | 0.0498/0.328/1.16/85.9 | 0.615 | 0.0357 / 0.0238 (0.0190) | -1.811 |
+| drive | i4-guided | 0.0816/0.526/1.96/77.2 | 0.658 | 0.0517 / 0.0119 (0.0190) | -2.702 |
+| drive | i2-xf-soft-aging | 0.0770/0.517/1.65/78.5 | 0.662 | 0.0176 / 0.0187 (0.0190) | -2.977 |
+| drive | i4-xf-soft-aging | 0.1038/0.689/2.61/71.3 | 0.713 | 0.0139 / 0.0130 (0.0190) | -3.546 |
+| drive | i2-xf-soft-guided | 0.0737/0.489/1.29/79.3 | 0.615 | 0.0181 / 0.0197 (0.0190) | -2.991 |
+| drive | i4-xf-soft-guided | 0.1026/0.657/2.27/71.5 | 0.675 | 0.0141 / 0.0132 (0.0190) | -3.617 |
+| still | i2-base | 0.0446/0.268/1.22/78.8 | 0.502 | 0.0185 / 0.0166 (0.0087) | -1.249 |
+| still | i4-base | 0.0663/0.400/1.81/68.8 | 0.500 | 0.0184 / 0.0078 (0.0087) | -1.734 |
+| still | i2-xf-soft | 0.0641/0.386/1.29/69.6 | 0.502 | 0.0085 / 0.0100 (0.0087) | -1.872 |
+| still | i4-xf-soft | 0.0776/0.472/1.75/63.5 | 0.493 | 0.0044 / 0.0058 (0.0087) | -2.150 |
+| still | i2-aging | 0.0445/0.268/1.20/78.9 | 0.502 | 0.0186 / 0.0167 (0.0087) | -1.253 |
+| still | i4-aging | 0.0661/0.399/1.75/68.9 | 0.499 | 0.0186 / 0.0077 (0.0087) | -1.760 |
+| still | i2-guided | 0.0438/0.263/1.11/79.2 | 0.493 | 0.0186 / 0.0169 (0.0087) | -1.267 |
+| still | i4-guided | 0.0641/0.385/1.51/69.7 | 0.482 | 0.0188 / 0.0078 (0.0087) | -1.852 |
+| still | i2-xf-soft-aging | 0.0640/0.386/1.27/69.6 | 0.502 | 0.0085 / 0.0100 (0.0087) | -1.880 |
+| still | i4-xf-soft-aging | 0.0774/0.472/1.69/63.6 | 0.493 | 0.0043 / 0.0057 (0.0087) | -2.178 |
+| still | i2-xf-soft-guided | 0.0632/0.381/1.17/70.0 | 0.493 | 0.0085 / 0.0101 (0.0087) | -1.911 |
+| still | i4-xf-soft-guided | 0.0759/0.460/1.48/64.2 | 0.479 | 0.0046 / 0.0057 (0.0087) | -2.283 |
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

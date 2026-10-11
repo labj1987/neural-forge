@@ -53,6 +53,14 @@ layout(set = 0, binding = 16, std430) buffer SrcFrom { vec4 v[]; } u_src_from;
 layout(set = 0, binding = 17, std430) buffer Shown { vec4 v[]; } u_shown;
 // This hold's own motion vector (nearest surface, render pixels): the one step back to the hold before.
 layout(set = 0, binding = 18, std430) buffer Step { vec2 v[]; } u_step;
+// The guided filter's half-size grids, two vec4 a texel each: the 2x2 means, then the tent-blurred
+// coefficients (a); its coefficients (b).
+layout(set = 0, binding = 19, std430) buffer GuideA { vec4 v[]; } u_guide_a;
+layout(set = 0, binding = 20, std430) buffer GuideB { vec4 v[]; } u_guide_b;
+// How far each pixel has moved since the refresh (one per 4 px of each hold's motion, at most one a
+// hold), and its copy from the previous hold.
+layout(set = 0, binding = 21, std430) buffer Stale { float v[]; } u_stale;
+layout(set = 0, binding = 22, std430) buffer StalePrev { float v[]; } u_stale_prev;
 
 layout(push_constant) uniform Params {
   uvec2 size;            // render extent
@@ -73,6 +81,7 @@ layout(push_constant) uniform Params {
   float sigma_depth;
   float sigma_luma;
   float walk;            // how far the shown edit has walked from u_src_from to the answer
+  float guided_eps;      // the guided filter's regularisation
 } p;
 
 const uint F_REVERSE_Z = 1u;     // depth: near is larger (reversed-Z)
@@ -102,6 +111,9 @@ const float K = 5.770780;
 const float CLAMPED = 0.999;
 
 uint index_of(uvec2 xy) { return xy.y * p.size.x + xy.x; }
+
+// The guided filter's half-size grid (guided_fast's half: rounded up).
+uvec2 half_size() { return (p.size + 1u) / 2u; }
 
 bool exposure_ok(float e) { return e > 1e-6 && e < 65504.0; }
 
@@ -173,11 +185,35 @@ void bilateral(uint level, uvec2 xy, vec2 guide, float sd, float sl, out vec3 ac
   }
 }
 
-// A cached hold's write-back (carry's "cache" mode, then apply_edit): the low band from the pyramid
-// with the same-surface fill, the history's high band by its confidence, clamped; multiplied onto
-// this hold's frame in v and written over DLSS's colour input with the decode's rules (the padding
-// is never reached, the original kept where the encode clamped, alpha kept, nothing written with an
-// unusable exposure). The shown edit is kept for the next refresh's walk.
+// The guided filter's tent-blurred coefficients (a in u_guide_a's first vec4, b in its second) read
+// bilinearly at the frame's pixel centre (guided_fast's last step).
+void guided_coefficients(uvec2 xy, out vec3 a, out vec3 b) {
+  uvec2 hs = half_size();
+  vec2 px = (vec2(xy) + 0.5) * vec2(hs) / vec2(p.size) - 0.5;
+  vec2 f0 = floor(px);
+  vec2 f = px - f0;
+  ivec2 i0 = ivec2(f0);
+  a = vec3(0.0);
+  b = vec3(0.0);
+  for (int k = 0; k < 4; k++) {
+    int ox = k & 1;
+    int oy = k >> 1;
+    ivec2 t = clamp(i0 + ivec2(ox, oy), ivec2(0), ivec2(hs) - 1);
+    uint j = 2u * (uint(t.y) * hs.x + uint(t.x));
+    float w = (ox == 1 ? f.x : 1.0 - f.x) * (oy == 1 ? f.y : 1.0 - f.y);
+    a += u_guide_a.v[j].rgb * w;
+    b += u_guide_a.v[j + 1u].rgb * w;
+  }
+}
+
+// A cached hold's write-back (carry's "cache" mode, run_cadence's guided filter, then apply_edit),
+// in two dispatches. p.level 0: the low band from the pyramid with the same-surface fill plus the
+// history's high band by its confidence, clamped, into u_shown. p.level 1, after the guided filter's
+// passes over that: the filter's rebuild of the edit from this hold's log luma blended in by how far
+// the pixel has moved since the refresh (sat(staleness / 2)), clamped and kept in u_shown for the
+// next refresh's walk; multiplied onto this hold's frame in v and written over DLSS's colour input
+// with the decode's rules (the padding is never reached, the original kept where the encode clamped,
+// alpha kept, nothing written with an unusable exposure).
 void main() {
   uvec2 xy = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(xy, p.size))) return;
@@ -187,24 +223,33 @@ void main() {
     return;
   }
   uint i = index_of(xy);
-  vec2 guide = vec2(log2(max(u_lin.v[i], 1e-7)), u_print.v[i].x);
-  vec3 low = vec3(0.0);
-  float have = 0.0;
-  for (int lvl = 2; lvl >= 0; lvl--) {
-    float grow = 1.0 + float(lvl);
-    vec3 acc;
-    float ws;
-    bilateral(uint(lvl), xy, guide, p.sigma_depth * grow, p.sigma_luma * grow, acc, ws);
-    float a = clamp(ws * 4.0, 0.0, 1.0);
-    vec3 est = ws > 1e-6 ? acc / max(ws, 1e-6) : low;
-    low = low + (est - low) * a;
-    have = have + (1.0 - have) * a;
+  if (p.level == 0u) {
+    vec2 guide = vec2(log2(max(u_lin.v[i], 1e-7)), u_print.v[i].x);
+    vec3 low = vec3(0.0);
+    float have = 0.0;
+    for (int lvl = 2; lvl >= 0; lvl--) {
+      float grow = 1.0 + float(lvl);
+      vec3 acc;
+      float ws;
+      bilateral(uint(lvl), xy, guide, p.sigma_depth * grow, p.sigma_luma * grow, acc, ws);
+      float a = clamp(ws * 4.0, 0.0, 1.0);
+      vec3 est = ws > 1e-6 ? acc / max(ws, 1e-6) : low;
+      low = low + (est - low) * a;
+      have = have + (1.0 - have) * a;
+    }
+    low *= have;
+    vec3 hist = u_hist.v[i].rgb;
+    u_shown.v[i] = vec4(clamp_edit(low + u_conf.v[i] * (hist - low)), u_lin.v[i]);
+    return;
   }
-  low *= have;
-  vec4 hist = u_hist.v[i];
-  float conf = u_conf.v[i];
-  vec3 edit = clamp_edit(low + conf * (hist.rgb - low));
-  u_shown.v[i] = vec4(edit, u_lin.v[i]);
+  vec4 shown = u_shown.v[i];
+  vec3 ga;
+  vec3 gb;
+  guided_coefficients(xy, ga, gb);
+  vec3 q = ga * u_print.v[i].x + gb;
+  float wgt = clamp(u_stale.v[i] / 2.0, 0.0, 1.0);
+  vec3 edit = clamp_edit(shown.rgb + (q - shown.rgb) * wgt);
+  u_shown.v[i] = vec4(edit, shown.a);
   ivec2 at = ivec2(xy);
   vec4 original = imageLoad(u_colour, at);
   float scale = e / p.paper_white;
@@ -215,7 +260,7 @@ void main() {
     // high band's confidence, blue where the chain left the frame; at paper white / 2.
     vec2 acc = u_acc.v[i];
     bool lost = isnan(acc.x) || isnan(acc.y);
-    result = vec3(1.0 - clamp(hist.a, 0.0, 1.0), conf, lost ? 1.0 : 0.0) * 0.5 * inv_scale;
+    result = vec3(1.0 - clamp(u_hist.v[i].a, 0.0, 1.0), u_conf.v[i], lost ? 1.0 : 0.0) * 0.5 * inv_scale;
   } else {
     vec3 v = to_v(original.rgb, scale);
     vec3 v_out = max((max(v, vec3(0.0)) + p.eps_v) * exp2(edit) - p.eps_v, vec3(0.0));

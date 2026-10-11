@@ -2,7 +2,7 @@
 //! network runs on one hold in N (a refresh) and the holds between (cached holds) reuse its
 //! correction, carried along the game's motion and multiplied onto their own fresh frame.
 //!
-//! The GPU side is seven compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
+//! The GPU side is eight compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
 //! of `scripts/cache_common.py` (the numpy reference the offline replay measures with):
 //!
 //! - in the capture (`C`) of every hold: `prep` (this hold's fingerprint, pseudo-linear depth, the
@@ -16,8 +16,9 @@
 //!   step of the walk over the decode's picture, and the edit shown kept for the next refresh);
 //! - as a cached hold's whole write-back, in place of the network and the decode: `history` (the
 //!   refresh's edit read at the chained position, depth-admitted, checked against this hold),
-//!   `reduce` three times (the coverage-weighted pyramid), `apply` (band split, written back with the
-//!   decode's rules).
+//!   `reduce` three times (the coverage-weighted pyramid), `apply` (band split), `guided` three
+//!   times at half size (a guided filter of that edit on this hold's log luma), `apply` again (the
+//!   filter blended in by how far each pixel moved, written back with the decode's rules).
 //!
 //! One [`CachePass`] per [`super::Resources`] (one extent), built on the first native hold. Its
 //! buffers beyond the accumulated field ([`Store`]) exist only while the interval is above 1.
@@ -36,6 +37,7 @@ const HISTORY_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_histor
 const REDUCE_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_reduce.spv");
 const APPLY_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_apply.spv");
 const REFRESH_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_refresh.spv");
+const GUIDED_SPV: &[u8] = include_bytes!("../../shaders/preupscale_cache_guided.spv");
 
 const PREP: usize = 0;
 const MOTION: usize = 1;
@@ -44,7 +46,8 @@ const HISTORY: usize = 3;
 const REDUCE: usize = 4;
 const APPLY: usize = 5;
 const REFRESH: usize = 6;
-const SPV: [&[u8]; 7] = [PREP_SPV, MOTION_SPV, CAPTURE_SPV, HISTORY_SPV, REDUCE_SPV, APPLY_SPV, REFRESH_SPV];
+const GUIDED: usize = 7;
+const SPV: [&[u8]; 8] = [PREP_SPV, MOTION_SPV, CAPTURE_SPV, HISTORY_SPV, REDUCE_SPV, APPLY_SPV, REFRESH_SPV, GUIDED_SPV];
 
 /// The shaders' `F_*` flags.
 pub(crate) const F_REVERSE_Z: u32 = 1;
@@ -78,7 +81,7 @@ const STAT_BYTES: u64 = STAT_WORDS as u64 * 4;
 pub(crate) const MAX_INTERVAL: u32 = 4;
 
 /// The push constants of every `preupscale_cache_*.comp`: their `Params` blocks match this field for
-/// field (append only, in all eight places).
+/// field (append only, in all nine places).
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct CachePush {
@@ -111,6 +114,8 @@ pub(crate) struct CachePush {
     /// `float walk`: how far the shown edit has walked from the refresh's start to its answer
     /// ([`Plan::walk`]).
     pub walk: f32,
+    /// `float guided_eps`: the guided filter's regularisation ([`Tuning`]).
+    pub guided_eps: f32,
 }
 
 /// The carry's parameters: `scripts/cache_common.py`'s `Params` defaults (the replay's numbers are
@@ -126,6 +131,7 @@ pub(crate) struct Tuning {
     pub print_tol: f32,
     pub sigma_depth: f32,
     pub sigma_luma: f32,
+    pub guided_eps: f32,
 }
 
 impl Default for Tuning {
@@ -140,6 +146,7 @@ impl Default for Tuning {
             print_tol: 0.25,
             sigma_depth: 0.15,
             sigma_luma: 1.0,
+            guided_eps: 0.005,
         }
     }
 }
@@ -178,6 +185,10 @@ pub(crate) struct Store {
     src_from: OwnBuffer,
     pub(crate) shown: OwnBuffer,
     step: OwnBuffer,
+    guide_a: OwnBuffer,
+    guide_b: OwnBuffer,
+    stale: OwnBuffer,
+    stale_prev: OwnBuffer,
 }
 
 impl Store {
@@ -185,8 +196,9 @@ impl Store {
     /// `device` is live.
     unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32) -> Option<Self> {
         let n = u64::from(width) * u64::from(height);
+        let half = u64::from(width.div_ceil(2)) * u64::from(height.div_ceil(2));
         let levels: u64 = (0..3).map(|l| level_size(width, height, l)).map(|(w, h)| u64::from(w) * u64::from(h)).sum();
-        let sizes = [n * 8, n * 4, n * 16, n * 16, n * 16, n * 16, n * 4, levels * 32, n * 16, n * 16, n * 8];
+        let sizes = [n * 8, n * 4, n * 16, n * 16, n * 16, n * 16, n * 4, levels * 32, n * 16, n * 16, n * 8, half * 32, half * 32, n * 4, n * 4];
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
         let mut made: Vec<OwnBuffer> = Vec::with_capacity(sizes.len());
         for bytes in sizes {
@@ -204,11 +216,27 @@ impl Store {
         }
         let mut it = made.into_iter();
         let mut next = || it.next().expect("one buffer per size");
-        Some(Self { acc_prev: next(), lin: next(), print: next(), src_edit: next(), src_print: next(), hist: next(), conf: next(), levels: next(), src_from: next(), shown: next(), step: next() })
+        Some(Self { acc_prev: next(), lin: next(), print: next(), src_edit: next(), src_print: next(), hist: next(), conf: next(), levels: next(), src_from: next(), shown: next(), step: next(), guide_a: next(), guide_b: next(), stale: next(), stale_prev: next() })
     }
 
-    fn all(&self) -> [&OwnBuffer; 11] {
-        [&self.acc_prev, &self.lin, &self.print, &self.src_edit, &self.src_print, &self.hist, &self.conf, &self.levels, &self.src_from, &self.shown, &self.step]
+    fn all(&self) -> [&OwnBuffer; 15] {
+        [
+            &self.acc_prev,
+            &self.lin,
+            &self.print,
+            &self.src_edit,
+            &self.src_print,
+            &self.hist,
+            &self.conf,
+            &self.levels,
+            &self.src_from,
+            &self.shown,
+            &self.step,
+            &self.guide_a,
+            &self.guide_b,
+            &self.stale,
+            &self.stale_prev,
+        ]
     }
 
     /// # Safety
@@ -407,13 +435,13 @@ pub(crate) fn infer_reverse_z(counts: &[u32; STAT_WORDS]) -> Option<bool> {
     (top != bottom).then_some(bottom > top)
 }
 
-/// The pass for one extent: seven pipelines over one descriptor set, the counters, the timers.
+/// The pass for one extent: eight pipelines over one descriptor set, the counters, the timers.
 pub(crate) struct CachePass {
     width: u32,
     height: u32,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
-    pipelines: [vk::Pipeline; 7],
+    pipelines: [vk::Pipeline; 8],
     pool: vk::DescriptorPool,
     set: vk::DescriptorSet,
     stats: HostBuffer,
@@ -430,14 +458,14 @@ pub(crate) struct CachePass {
 // SAFETY: plain handles and the layer's own mapping, only used behind the device's `State` mutex.
 unsafe impl Send for CachePass {}
 
-/// Descriptor types of bindings 0..=18 (the shaders' layout).
+/// Descriptor types of bindings 0..=22 (the shaders' layout).
 fn binding_type(n: u32) -> vk::DescriptorType {
     match n {
         0 | 1 | 15 => vk::DescriptorType::STORAGE_IMAGE,
         _ => vk::DescriptorType::STORAGE_BUFFER,
     }
 }
-const BINDINGS: u32 = 19;
+const BINDINGS: u32 = 23;
 
 impl CachePass {
     /// # Safety
@@ -469,7 +497,7 @@ impl CachePass {
             let stats = p.stats.take()?;
             let dummy = p.dummy.take()?;
             std::ptr::write_bytes(stats.ptr, 0, STAT_BYTES as usize);
-            let pipelines: [vk::Pipeline; 7] = std::mem::take(&mut p.pipelines).try_into().ok()?;
+            let pipelines: [vk::Pipeline; 8] = std::mem::take(&mut p.pipelines).try_into().ok()?;
             Some(Self {
                 width,
                 height,
@@ -528,7 +556,7 @@ impl CachePass {
         let dummy = self.dummy.buffer;
         let s = self.store.as_ref();
         let pick = |f: fn(&Store) -> vk::Buffer| s.map_or(dummy, f);
-        let buffers: [(u32, vk::Buffer); 16] = [
+        let buffers: [(u32, vk::Buffer); 20] = [
             (2, b.exposure),
             (3, b.depth.unwrap_or(dummy)),
             (4, b.mvec),
@@ -545,6 +573,10 @@ impl CachePass {
             (16, pick(|s| s.src_from.buffer)),
             (17, pick(|s| s.shown.buffer)),
             (18, pick(|s| s.step.buffer)),
+            (19, pick(|s| s.guide_a.buffer)),
+            (20, pick(|s| s.guide_b.buffer)),
+            (21, pick(|s| s.stale.buffer)),
+            (22, pick(|s| s.stale_prev.buffer)),
         ];
         let images = [(0u32, b.colour), (1, b.encoded), (15, b.answer)];
         let buffer_infos: Vec<[vk::DescriptorBufferInfo; 1]> = buffers.iter().map(|&(_, buffer)| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }]).collect();
@@ -583,6 +615,7 @@ impl CachePass {
             sigma_depth: t.sigma_depth,
             sigma_luma: t.sigma_luma,
             walk: 1.0,
+            guided_eps: t.guided_eps,
         }
     }
 
@@ -635,10 +668,12 @@ impl CachePass {
                 let store = self.store.as_ref().expect("the store is built for a chained hold");
                 let bytes = u64::from(self.width) * u64::from(self.height) * 8;
                 self.dispatch(device, cmd, PREP, push, self.width, self.height);
-                // The previous field kept for the motion pass to read (the network's binding is the field itself).
+                // The previous field and staleness kept for the motion pass to read (the network's binding is
+                // the field itself).
                 let kept = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).build();
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[kept], &[], &[]);
                 device.cmd_copy_buffer(cmd, acc, store.acc_prev.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
+                device.cmd_copy_buffer(cmd, store.stale.buffer, store.stale_prev.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes / 2 }]);
                 Self::compute_barrier(device, cmd, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE);
             }
             self.dispatch(device, cmd, MOTION, push, self.width, self.height);
@@ -689,8 +724,8 @@ impl CachePass {
         }
     }
 
-    /// Records a cached hold's write-back: the history read, the pyramid, the apply over the colour
-    /// input.
+    /// Records a cached hold's write-back: the history read, the pyramid, the band split, the guided
+    /// filter at half size, and its blend written over the colour input.
     ///
     /// # Safety
     /// `cmd` is recording, after the write-back's opening barrier; [`Self::bind`] was called for this
@@ -708,7 +743,14 @@ impl CachePass {
                 self.dispatch(device, cmd, REDUCE, &CachePush { level, ..*push }, lw, lh);
             }
             Self::compute_barrier(device, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE);
-            self.dispatch(device, cmd, APPLY, push, self.width, self.height);
+            self.dispatch(device, cmd, APPLY, &CachePush { level: 0, ..*push }, self.width, self.height);
+            let (hw, hh) = (self.width.div_ceil(2), self.height.div_ceil(2));
+            for level in 0..3 {
+                Self::compute_barrier(device, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE);
+                self.dispatch(device, cmd, GUIDED, &CachePush { level, ..*push }, hw, hh);
+            }
+            Self::compute_barrier(device, cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::SHADER_WRITE);
+            self.dispatch(device, cmd, APPLY, &CachePush { level: 1, ..*push }, self.width, self.height);
             if let Some(t) = &self.timers[1] {
                 t.record_end(device, cmd);
             }
@@ -849,8 +891,8 @@ mod tests {
 
     #[test]
     fn the_push_constants_match_the_shaders_params_block() {
-        // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, ten floats: 88 bytes, std430.
-        assert_eq!(std::mem::size_of::<CachePush>(), 88);
+        // uvec2 size, uint flags, uint depth_kind, vec2 x3, float, uint, eleven floats: 92 bytes, std430.
+        assert_eq!(std::mem::size_of::<CachePush>(), 92);
         assert_eq!(std::mem::offset_of!(CachePush, flags), 8);
         assert_eq!(std::mem::offset_of!(CachePush, depth_kind), 12);
         assert_eq!(std::mem::offset_of!(CachePush, mvec_scale), 16);
@@ -862,6 +904,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(CachePush, print_tol), 72);
         assert_eq!(std::mem::offset_of!(CachePush, sigma_luma), 80);
         assert_eq!(std::mem::offset_of!(CachePush, walk), 84);
+        assert_eq!(std::mem::offset_of!(CachePush, guided_eps), 88);
         for spv in SPV {
             assert!(spv.len() > 20 && spv.len().is_multiple_of(4), "embedded SPIR-V");
         }
@@ -1197,7 +1240,7 @@ mod tests {
     /// answer), every later hold is cached; returns per cached hold (t, the shown edit RGB, the
     /// weight, the accumulated field) from the GPU and the tool's own.
     #[allow(clippy::type_complexity)]
-    fn carry_on_gpu(kind: &str, depth_image: bool) -> Option<(Rig, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>, Vec<f32>)> {
+    fn carry_on_gpu(kind: &str, depth_image: bool) -> Option<(Rig, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>, Vec<f32>)> {
         let dir = scratch(&format!("{kind}-{depth_image}"));
         let dump = dir.join("dump");
         let out = dir.join("carry");
@@ -1263,7 +1306,8 @@ mod tests {
             let edit: Vec<f32> = shown.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
             let weight: Vec<f32> = hist.chunks_exact(4).map(|c| c[3]).collect();
             let tool = |name: &str| f32s(&std::fs::read(out.join(format!("{name}-{t:02}.f32"))).unwrap());
-            results.push((t, edit, weight, acc, tool("cache"), tool("weight"), tool("acc")));
+            let history: Vec<f32> = hist.chunks_exact(4).flat_map(|c| [c[0], c[1], c[2]]).collect();
+            results.push((t, edit, weight, acc, tool("cache"), tool("weight"), tool("acc"), history));
             // The picture written back, in the edit's place for the comparison between the paths.
             let colour = rig.read_colour();
             results.last_mut().unwrap().4.extend(colour);
@@ -1291,7 +1335,7 @@ mod tests {
             let Some((rig, results, src_edit)) = carry_on_gpu(kind, false) else { return };
             let (w, h) = (rig.w as usize, rig.h as usize);
             let n = w * h;
-            for (t, edit, weight, acc, t_edit, t_weight, t_acc) in &results {
+            for (t, edit, weight, acc, t_edit, t_weight, t_acc, _) in &results {
                 let t_edit = &t_edit[..n * 3];
                 let de = max_diff(edit, t_edit);
                 let dw = max_diff(weight, t_weight);
@@ -1320,8 +1364,9 @@ mod tests {
                         }
                     }
                     // Aligned: hold 1 moved 2.5 px right and 1 down, with a jitter change of 0.5: each
-                    // interior texel shows the refresh's edit from 3 px right and 1 down, unchanged.
-                    let (_, edit, weight, ..) = &results[0];
+                    // interior texel reads the refresh's edit from 3 px right and 1 down, unchanged
+                    // (the history read, before the band split and the guided filter).
+                    let (_, _, weight, .., edit) = &results[0];
                     let mut worst = 0.0f32;
                     for y in 4..h - 4 {
                         for x in 4..w - 8 {

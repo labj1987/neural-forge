@@ -501,7 +501,10 @@ every hold refreshes and the picture is bit for bit what it was (the test
 - **Cached write-back** (W, in place of the decode): `history` (the refresh's edit, walked, read at the chained
   position, four depth-admitted bilinear taps, the colour check and the fingerprint against this
   hold's 3x3), `reduce` x3 (the coverage-weighted pyramid, 1/4, 1/16, 1/64), `apply`
-  (the low band with the same-surface fill plus the high band by its confidence, clamped; `v_out =
+  (the low band with the same-surface fill plus the high band by its confidence, clamped), `guided` x3
+  at half size and `apply` again (a fast guided filter of that edit on this hold's log luma, 2x2 means,
+  3x3 window, eps 0.005, blended in by sat(staleness / 2), staleness one per 4 px of each hold's motion
+  since the refresh, accumulated by the motion pass; clamped; `v_out =
   (v + eps) * 2^edit - eps` back to scene with the decode's rules: original kept where the encode
   clamped, alpha kept, nothing written with an unusable exposure; the shown edit kept for the next
   refresh's walk). Debug view 6 writes the rejection
@@ -515,7 +518,7 @@ every hold refreshes and the picture is bit for bit what it was (the test
   `HistoryGap::touch` so the 500 ms rule counts from the last hold, not the last network frame.
   Frame generation is unaffected: the same submits are held.
 - **Resources**: the accumulated field lives with the native pass; the rest (`cache::Store`, about
-  140 bytes a render pixel) exists only while the interval is above 1. Reversed-Z is decided once per
+  165 bytes a render pixel) exists only while the interval is above 1. Reversed-Z is decided once per
   extent from the first hold's depth counts (texels at 0 and 1, else the top and bottom quarters).
 - **Status**: `[preupscale]` gains `cached=N refresh=N cache_gpu_ms median=X rejected=Y%`; SHM v17
   `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected` (1/10000), `cache_gpu_ms_bits`;
