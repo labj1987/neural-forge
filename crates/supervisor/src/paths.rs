@@ -50,6 +50,11 @@ pub fn state_dir() -> String {
     format!("{}/neural-forge", xdg("XDG_STATE_HOME", ".local/state"))
 }
 
+/// Where the layer writes its captures (`neural_forge_layer::dump::captures_dir`, the same path).
+pub fn captures_dir() -> String {
+    format!("{}/captures", data_dir())
+}
+
 pub fn binaries_dir() -> String {
     format!("{}/binaries", data_dir())
 }

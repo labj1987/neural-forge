@@ -28,7 +28,10 @@ fn usage() {
          \x20 shmctl <sub>         raw status/set/toggle/capture against a running\n\
          \x20                     instance's live SHM header (see `shmctl help`)\n\
          \x20 profile <sub>        save/load/list/delete named settings profiles\n\
-         \x20                     (see `profile help`)"
+         \x20                     (see `profile help`)\n\
+         \x20 report [--appid ID]  write a diagnostic report zip (home and user name\n\
+         \x20                     redacted) to the desktop; ID: the game's Steam app id,\n\
+         \x20                     for its Proton version"
     );
 }
 
@@ -139,6 +142,29 @@ fn cmd_profile(args: &[String]) -> ExitCode {
         }
         _ => {
             profile_usage();
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Writes the diagnostic report (`neural_forge_supervisor::report`) and prints where it went.
+fn cmd_report(appid: Option<&str>) -> ExitCode {
+    let cfg = Config::load();
+    // The channel opened the way `shmctl status` opens it, for the same text.
+    let (status, game) = match neural_forge_supervisor::open_channel(&cfg) {
+        Ok(mapping) => {
+            neural_forge_supervisor::apply_saved_settings(&cfg, &mapping);
+            (neural_forge_supervisor::shm_status::status_text(mapping.header()), mapping.header().game_name())
+        }
+        Err(e) => (format!("channel not open: {e}: {}\n", neural_forge_supervisor::channel_path(&cfg)), String::new()),
+    };
+    match neural_forge_supervisor::report::save(&status, &game, appid, None, None) {
+        Ok(path) => {
+            println!("wrote {}", path.display());
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("report: writing the report failed: {e}");
             ExitCode::FAILURE
         }
     }
@@ -371,6 +397,8 @@ enum Command {
     Uninstall { purge: bool },
     Shmctl(Vec<String>),
     Profile(Vec<String>),
+    /// The Steam app id, when given.
+    Report(Option<String>),
     /// `--help`/`-h`: the whole usage (`None`) or one command's.
     Help(Option<String>),
 }
@@ -444,6 +472,14 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
             };
             if ok { Ok(Command::Profile(args[1..].to_vec())) } else { Err(err(format!("unexpected arguments: {}", rest.join(" ")))) }
         }
+        "report" => match rest.as_slice() {
+            [] => Ok(Command::Report(None)),
+            ["--appid", id] if !id.is_empty() && id.bytes().all(|b| b.is_ascii_digit()) => Ok(Command::Report(Some((*id).to_string()))),
+            ["--appid", id] => Err(err(format!("--appid takes a Steam app id (digits), got {id:?}"))),
+            ["--appid"] => Err(err("--appid takes a Steam app id".into())),
+            ["--appid", _, extra @ ..] => Err(unexpected(extra)),
+            [other, ..] => Err(err(format!("unknown option {other:?}"))),
+        },
         _ => unreachable!("command_usage knows every command"),
     }
 }
@@ -460,6 +496,9 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "install" => "usage: neural-forge-cli install --appdir DIR\n  install an extracted AppImage AppDir into persistent user storage",
         "uninstall" => {
             "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also removes config, data\n  (the DLL, the model), state and /tmp/neural-forge-$UID"
+        }
+        "report" => {
+            "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game's Proton when ID, its Steam app id, is given), config.ini, the\n  model's manifest, the layer's logs, the channel's status and the newest capture pair.\n  The home directory and user name are replaced with ~ and <user>; nothing is uploaded"
         }
         "shmctl" => "",
         "profile" => "",
@@ -498,6 +537,7 @@ fn main() -> ExitCode {
         Command::Uninstall { purge } => cmd_uninstall(purge),
         Command::Shmctl(args) => shmctl::run(&args),
         Command::Profile(args) => cmd_profile(&args),
+        Command::Report(appid) => cmd_report(appid.as_deref()),
         Command::Help(command) => {
             print_help(command.as_deref());
             ExitCode::SUCCESS
@@ -538,6 +578,11 @@ mod tests {
         assert!(parse_str("shmctl set intensity").is_err());
         assert!(parse_str("shmctl status now").is_err());
         assert!(parse_str("bogus").is_err());
+        assert!(parse_str("report --appid").is_err());
+        assert!(parse_str("report --appid gta").is_err());
+        assert!(parse_str("report --appid 1 2").is_err());
+        assert!(parse_str("report --app 1").is_err());
+        assert!(parse_str("report now").is_err());
         assert!(parse_str("").is_err());
     }
 
@@ -559,6 +604,9 @@ mod tests {
         assert_eq!(parse_str("profile load gta"), Ok(Command::Profile(vec!["load".into(), "gta".into()])));
         assert_eq!(parse_str("profile"), Ok(Command::Profile(vec![])));
         assert_eq!(parse_str("shmctl set intensity 0.5"), Ok(Command::Shmctl(vec!["set".into(), "intensity".into(), "0.5".into()])));
+        assert_eq!(parse_str("report"), Ok(Command::Report(None)));
+        assert_eq!(parse_str("report --appid 3240220"), Ok(Command::Report(Some("3240220".into()))));
+        assert_eq!(parse_str("report --help"), Ok(Command::Help(Some("report".into()))));
         assert_eq!(parse_str("shmctl capture --frames 3"), Ok(Command::Shmctl(vec!["capture".into(), "--frames".into(), "3".into()])));
     }
 }

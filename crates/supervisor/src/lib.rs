@@ -8,6 +8,8 @@ pub mod model;
 pub mod model_shape;
 pub mod paths;
 pub mod profiles;
+pub mod report;
+pub mod shm_status;
 
 pub use config::Config;
 
