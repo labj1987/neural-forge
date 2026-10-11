@@ -81,6 +81,7 @@ const uint F_STORE_EDIT = 16u;   // the apply stores the shown edit into u_hist 
 const uint F_DEBUG_MASK = 32u;   // the apply writes the rejection mask instead of the frame
 const uint F_KEEP_CLAMPED = 64u; // the decode's rule: keep the original where the encode clamped
 const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds the decoded answer
+const uint F_COUNT_DEPTH = 256u; // the prep pass counts the depth for telling reversed-Z (until decided)
 
 const uint STAT_Z0 = 0u;         // depth texels at exactly 0 / 1
 const uint STAT_Z1 = 1u;
@@ -182,7 +183,7 @@ void main() {
     u_print.v[i] = vec4(ll, log2(q.r / q.g), log2(q.b / q.g), 0.0);
     u_lin.v[i] = lin_depth(i);
     // infer_reverse_z's counts (the CPU decides once, from the first hold with depth).
-    if (p.depth_kind != 0u) {
+    if (p.depth_kind != 0u && (p.flags & F_COUNT_DEPTH) != 0u) {
       float d = device_depth(i);
       if (d == 0.0) atomicAdd(s_stats[STAT_Z0], 1u);
       if (d == 1.0) atomicAdd(s_stats[STAT_Z1], 1u);

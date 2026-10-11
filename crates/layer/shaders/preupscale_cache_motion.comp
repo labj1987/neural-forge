@@ -83,6 +83,7 @@ const uint F_STORE_EDIT = 16u;   // the apply stores the shown edit into u_hist 
 const uint F_DEBUG_MASK = 32u;   // the apply writes the rejection mask instead of the frame
 const uint F_KEEP_CLAMPED = 64u; // the decode's rule: keep the original where the encode clamped
 const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds the decoded answer
+const uint F_COUNT_DEPTH = 256u; // the prep pass counts the depth for telling reversed-Z (until decided)
 
 const uint STAT_Z0 = 0u;         // depth texels at exactly 0 / 1
 const uint STAT_Z1 = 1u;

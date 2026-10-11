@@ -51,6 +51,7 @@ pub(crate) const F_CHAINED: u32 = 8;
 pub(crate) const F_STORE_EDIT: u32 = 16;
 pub(crate) const F_DEBUG_MASK: u32 = 32;
 pub(crate) const F_KEEP_CLAMPED: u32 = 64;
+pub(crate) const F_COUNT_DEPTH: u32 = 256;
 /// Tests: the capture's answer image holds the decoded answer (the replay tool's dumps store it so).
 #[cfg(test)]
 const F_SCENE_ANSWER: u32 = 128;
@@ -333,8 +334,11 @@ impl State {
             if h.depth {
                 flags |= F_NEAREST;
             }
-            if self.reverse_z.unwrap_or(true) {
-                flags |= F_REVERSE_Z;
+            match self.reverse_z {
+                Some(false) => {}
+                Some(true) => flags |= F_REVERSE_Z,
+                // Assumed until the prep pass's counts tell.
+                None => flags |= F_REVERSE_Z | F_COUNT_DEPTH,
             }
             if cached && h.debug_mask {
                 flags |= F_DEBUG_MASK;
