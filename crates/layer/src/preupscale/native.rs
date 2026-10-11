@@ -252,6 +252,8 @@ impl Loader {
 
     fn work(shared: &(Mutex<LoaderState>, Condvar), device: vk::Device, setup: Setup) {
         let (lock, wake) = shared;
+        // This device's VRAM readings for the build lines (it outlives this thread: `Drop` joins it).
+        let vram = crate::vram::probe(setup.gipa, setup.instance, setup.physical);
         let mut retry = BuildRetry::default();
         let mut inject = neural_forge_protocol::env::var(FailInject::ENV).and_then(|v| FailInject::parse(&v));
         if let Some(f) = inject {
@@ -283,7 +285,7 @@ impl Loader {
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
             }
             let t = Instant::now();
-            let vram_before = crate::vram::reading();
+            let vram_before = vram.as_ref().map(crate::vram::reading);
             let mut open_stalled = false;
             let result = match network.take() {
                 Some(n) => Ok(n),
@@ -337,7 +339,7 @@ impl Loader {
                             frame.field_height,
                             frame.chained != 0,
                             t.elapsed().as_millis(),
-                            match (vram_before, crate::vram::reading()) {
+                            match (vram_before, vram.as_ref().map(crate::vram::reading)) {
                                 (Some((before, _)), Some((after, budget))) => format!(" (vram {before} -> {after} of {budget} MiB)"),
                                 _ => String::new(),
                             }

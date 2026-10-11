@@ -591,12 +591,11 @@ impl CachePass {
             self.store = unsafe { Store::build(device, instance, physical_device, self.width, self.height) };
             if let Some(store) = &self.store {
                 crate::log!(
-                    "[preupscale] edit cache: its buffer for {}x{} built, {:.1} MiB (and {:.1} MiB of the network's input features){}",
+                    "[preupscale] edit cache: its buffer for {}x{} built, {:.1} MiB (and {:.1} MiB of the network's input features)",
                     self.width,
                     self.height,
                     store.bytes as f64 / 1048576.0,
-                    self.layout.total as f64 / 1048576.0,
-                    crate::vram::note()
+                    self.layout.total as f64 / 1048576.0
                 );
             }
         }
