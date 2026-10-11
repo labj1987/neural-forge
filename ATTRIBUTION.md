@@ -28,6 +28,7 @@ adapted, or taken from DLSS5VKLayer's real source, not just its documented behav
 | [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (maan), MIT: its documentation of the proxy transform read, **design only, no code** | **The pre-upscaler path's HDR encode** (2.0; `crates/layer/src/preupscale/hdr.rs`, `shaders/preupscale_encode.comp` and `preupscale_decode.comp`): the scene divided by a paper white, the per-channel shoulder above 0.75 (`0.75 + 0.25 (1 - exp(-5.770780 (v - 0.75)))`) and sRGB before the model, as OpenDLSS-NR documents its proxy; the inverse on write-back, the exposure multiply and the paper white of 3 are this project's own, chosen by measurement on GTA V Enhanced (`docs/PRE_UPSCALER_DESIGN.md`, "E1b"). |
 | [Dagherbou/OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR), GPL-3.0: **design only, no code** | **The idea of reading the game's exposure texture** to scale the HDR scene before the encode. Neural Forge reads DLSS's own 1x1 exposure input on the GPU at each hold (the image is found from DLSS's registered views, not from OptiScaler's code). |
 | [OptiScaler](https://github.com/cdozdil/OptiScaler), GPL-3.0: its pre-SR mod, **design only, no code** | **The inspiration for running the model before the upscaler** (on DLSS Super Resolution's render-resolution input rather than the upscaled frame). The mechanism here is different and this project's own: a Vulkan layer that recognises DLSS's input through `VK_NVX_image_view_handle` and holds the game's DLSS submit (`crates/layer/src/preupscale.rs`). |
+| [DLSS5oneclick-forlinux](https://github.com/Mhsbrian/DLSS5oneclick-forlinux) (Faisal Bahashwan), MIT, commit `b0f16ff`: `src/report.rs` and `src/platform/steam.rs` read, **adapted** | **The diagnostic report's shape** (`crates/supervisor/src/report.rs`): one zip of the logs and settings plus a summary of the machine, written to the XDG desktop directory, else `~/Desktop`, else the home directory (never `/tmp`, which a reboot clears before the file is attached); each log kept as its last 4 MiB behind a line saying how much was left out; the game's Proton tool read from Steam's `config/config.vdf` `CompatToolMapping`, the app's own entry first and the global default (`"0"`) after. Written fresh here: the desktop directory is read from `user-dirs.dirs` rather than an environment variable, the log tail starts at a whole line, the zip writer and the `config.vdf` reader are this project's own (no zip or VDF crate), and every member is redacted (home directory and user name), which the original does not do. MIT notice below. |
 
 ## Ported functions (upstream parity work, from 0.3.1-1 / commit 117c953)
 
@@ -109,6 +110,32 @@ DLSS5VKLayer's own attribution of it, and no code from it appears in this reposi
 OpenDLSS-NR's source is vendored in `third_party/opendlss-nr` (the native backend, see above) under its
 MIT notice: `third_party/opendlss-nr/LICENSE` and upstream's `NOTICE` ship with every build, and the same
 license covers the documented design the history reset follows.
+
+DLSS5oneclick-forlinux's MIT notice, for the adapted report code (`crates/supervisor/src/report.rs`):
+
+```
+MIT License
+
+Copyright (c) 2026 Faisal Bahashwan
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
 
 ## C/C++ linked into the layer
 
