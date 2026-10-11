@@ -397,6 +397,65 @@ game (likely VRAM-bound). For comparison, 2.0's hold through the helper held the
 10.2 ms of CPU time (3.6-4.4 ms of it draining the game's queue, 5.9-6.1 ms the helper's round
 trip; PRE_UPSCALER_DESIGN.md, "Hand-off latency").
 
+### 4.9 Depth, and the pre-upscaler cache dump
+
+**Depth.** Every native hold copies DLSS's depth into a device-local buffer of the layer's at the
+render extent (`native::DepthCopy`), as the first command of `C`, timed alone (`depth_copy_gpu_ms`
+in the `[preupscale]` summary line). The split hold copies the depth aspect of the identified depth
+image; the hold inside DLSS's buffer copies it into a slot buffer there (in a layout
+`depth_copy_layout` takes) and `C` on the side queue copies that over. The texels stay raw, tagged
+with the game's format: 4 bytes (D32, D24 with its top byte, depth handed over as R32), or 2 for D16.
+A barrier on the depth image in front of the launch (`Scan::depth_hazard`; GTA V Enhanced with DLSS
+Frame Generation on writes its depth there) leaves that hold without depth instead of stopping it.
+While the pre-upscaler path is on, depth images get `TRANSFER_SRC` added at creation, as RG16F images
+do (`wants_copyable`; `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked).
+
+**The cache dump** (`preupscale::cache_dump`) writes K consecutive model-mode holds for the offline
+replay of the edit cache (`scripts/cache_replay.py`). Requests: `neural-forge-cli shmctl dump-cache
+[--holds K]` (the header's `preupscale_dump_request`, v17; the layer zeroes it when it takes it), a
+file `dump-cache` next to the channel (`/tmp/neural-forge-$UID/dump-cache`, holding K or nothing for
+16; looked for at most once a second, removed when taken), or
+`NEURAL_FORGE_CACHE_DUMP_AT=<resume>:<ms>[:K][,...]` (resumes counted as for
+`NEURAL_FORGE_CAPTURE_AT`). K is 1 to 64, 16 by default. The model runs on every hold as always; an
+armed hold only adds copies: the colour input before the model in `C`, and in `W` after the decode
+the colour input (the answer written back), the motion vectors and the depth copy, into host
+readbacks built for the dump and freed after it. They are read once the hold's `W` fence was waited
+on (the next hold on the split path, right after the worker's wait inside DLSS's buffer). A hold
+that misses, or a DLSS frame between two armed holds that went unheld, ends the dump there.
+
+Directory `$XDG_DATA_HOME/neural-forge/captures/preupscale-cache-<unix ms>/`, `manifest.json`
+rewritten after every hold:
+
+```json
+{
+  "format": "neural-forge-cache-dump", "version": 1,
+  "holds": K,                            // frames written
+  "width": W, "height": H,               // the render extent; every file is cropped to it
+  "path": "split" | "inline",
+  "paper_white": 3.0,
+  "mvec_scale": [sx, sy],                // stored vectors times this are render pixels
+  "depth_format": "D32_SFLOAT_S8_UINT", // the game's depth format; "none" when no hold had depth
+  "reverse_z": null,                     // unknown in the layer; the replay tool infers it
+  "game": "GTA5_Enhanced.exe",
+  "frames": [
+    {"index": 0, "hold": 12345, "time_ms": 1791680000123,
+     "jitter": [jx, jy],                 // render pixels as the hold received them (null: unknown)
+     "exposure": e,                      // what the encode and decode used (0: unusable)
+     "history": true,                    // the network used its history
+     "mvec_valid": true, "depth_valid": true,
+     "files": {"colour": "hold-00/colour.rgba16f", "answer": "hold-00/answer.rgba16f",
+               "mvec": "hold-00/mvec.rg16f", "depth": "hold-00/depth.r32f"}}
+  ]
+}
+```
+
+Per-hold files, little-endian, row-major, top row first, W x H with no padding: `colour.rgba16f`
+(DLSS's colour input before the model, scene-linear), `answer.rgba16f` (the same image after `W`;
+clamped-keep pixels equal `colour`), `mvec.rg16f` (DLSS's vectors, current to previous, jitter
+excluded: `prev = x + mv * mvec_scale + jitter[t-1] - jitter[t]`; zeros where `mvec_valid` is false)
+and `depth.r32f` (device depth as f32: D16/D24 divided by their maximum; only for holds with
+`depth_valid`).
+
 ## 5. After the upscaler (1.x path)
 
 `crates/layer/src/capture.rs` (`run`), `crates/layer/src/composition/`,

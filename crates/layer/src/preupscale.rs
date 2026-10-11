@@ -4791,7 +4791,7 @@ impl Session {
         if self.last_dlss.is_none_or(|t| t.elapsed() >= CAPTURE_GAP) {
             self.resumes += 1;
             self.resumed_at = Some(Instant::now());
-            if std::env::var_os("NEURAL_FORGE_CAPTURE_AT").is_some() {
+            if std::env::var_os("NEURAL_FORGE_CAPTURE_AT").is_some() || cache_dump::scheduled_any() {
                 crate::log!("[preupscale] DLSS frames resumed (#{}) after {} ms", self.resumes, self.last_dlss.map_or(0, |t| t.elapsed().as_millis()));
             }
         }

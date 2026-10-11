@@ -1,6 +1,6 @@
 //! The K-hold pre-upscaler cache dump: K consecutive model-mode holds written out for the edit
 //! cache's offline replay (`scripts/cache_replay.py`; the format is docs/ARCHITECTURE.md,
-//! "Pre-upscaler cache dump"). The model runs on every hold as always; an armed hold only adds
+//! 4.9). The model runs on every hold as always; an armed hold only adds
 //! copies: the colour input before the model (in `C`), and after the write-back the colour input
 //! with the answer in it, the motion vectors and the depth the hold copied (in `W`). They land in
 //! host buffers built for the dump and freed after it, and are read once the hold's work finished:
@@ -174,7 +174,8 @@ struct Run {
 #[derive(Default)]
 pub(crate) struct CacheDump {
     next_poll: Option<Instant>,
-    at_taken: bool,
+    /// `NEURAL_FORGE_CACHE_DUMP_AT`'s entries already taken.
+    at_taken: usize,
     runs: u64,
     run: Option<Run>,
 }
@@ -195,14 +196,19 @@ impl CacheDump {
                 want = want.or_else(|| take_trigger_file(&trigger::trigger_path(shm.channel_path())));
             }
         }
-        if !self.at_taken {
-            if let Some((n, after, k)) = scheduled() {
-                if resumes == n && resumed_at.is_some_and(|t| t.elapsed() >= after) {
-                    self.at_taken = true;
-                    crate::log!("[preupscale] NEURAL_FORGE_CACHE_DUMP_AT: dumping {k} holds {} ms after resume {n}", after.as_millis());
-                    want = want.or(Some(k));
-                }
+        // The scheduled entries in order; one whose moment passed (its resume is over) is skipped.
+        while let Some(&(n, after, k)) = scheduled().get(self.at_taken) {
+            if resumes > n {
+                crate::log!("[preupscale] NEURAL_FORGE_CACHE_DUMP_AT: resume {n} ended before its dump; skipped");
+                self.at_taken += 1;
+                continue;
             }
+            if resumes == n && resumed_at.is_some_and(|t| t.elapsed() >= after) && self.run.is_none() {
+                self.at_taken += 1;
+                crate::log!("[preupscale] NEURAL_FORGE_CACHE_DUMP_AT: dumping {k} holds {} ms after resume {n}", after.as_millis());
+                want = want.or(Some(k));
+            }
+            break;
         }
         let Some(k) = want else { return };
         if self.run.is_some() {
@@ -288,11 +294,21 @@ impl CacheDump {
     }
 }
 
-/// `NEURAL_FORGE_CACHE_DUMP_AT`, parsed once.
-fn scheduled() -> Option<(u32, Duration, u32)> {
-    static AT: std::sync::LazyLock<Option<(u32, Duration, u32)>> =
-        std::sync::LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_CACHE_DUMP_AT").and_then(|v| trigger::parse_at(&v)));
-    *AT
+/// `NEURAL_FORGE_CACHE_DUMP_AT`, parsed once (empty when unset or malformed, which is logged).
+fn scheduled() -> &'static [(u32, Duration, u32)] {
+    static AT: std::sync::LazyLock<Vec<(u32, Duration, u32)>> = std::sync::LazyLock::new(|| {
+        let Some(v) = neural_forge_protocol::env::var("NEURAL_FORGE_CACHE_DUMP_AT") else { return Vec::new() };
+        trigger::parse_at_list(&v).unwrap_or_else(|| {
+            crate::log!("[preupscale] NEURAL_FORGE_CACHE_DUMP_AT={v:?} is not <resume>:<ms>[:K][,...]; ignored");
+            Vec::new()
+        })
+    });
+    &AT
+}
+
+/// Whether `NEURAL_FORGE_CACHE_DUMP_AT` is set (the resumes are then logged).
+pub(crate) fn scheduled_any() -> bool {
+    !scheduled().is_empty()
 }
 
 /// Reads and removes the trigger file, if there is one. A file that is not a request is removed

@@ -269,7 +269,7 @@ pub struct ShmHeader {
     // --- v17 -----------------------------------------------------------------------------
     /// How many consecutive model-mode holds the layer should dump before the upscaler (colour
     /// before and after the model, motion vectors, depth, jitter, exposure; docs/ARCHITECTURE.md
-    /// "Pre-upscaler cache dump"), or 0 for none. Set by `shmctl dump-cache`; the layer zeroes it
+    /// 4.9), or 0 for none. Set by `shmctl dump-cache`; the layer zeroes it
     /// when it takes the request (the dump then runs to its end or to the first missed hold).
     pub preupscale_dump_request: AtomicU32,
 }

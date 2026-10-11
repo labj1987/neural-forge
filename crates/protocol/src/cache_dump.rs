@@ -1,7 +1,7 @@
 //! The K-hold pre-upscaler cache dump's triggers, shared by the layer (which takes them) and the CLI
 //! (which sets them): the channel's `preupscale_dump_request` (v17), a trigger file next to the
 //! channel, and `NEURAL_FORGE_CACHE_DUMP_AT`. The dump itself is the layer's
-//! (`preupscale::cache_dump`); its format is docs/ARCHITECTURE.md's "Pre-upscaler cache dump".
+//! (`preupscale::cache_dump`); its format is docs/ARCHITECTURE.md, 4.9.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -35,9 +35,9 @@ pub fn parse_trigger(text: &str) -> Option<u32> {
     }
 }
 
-/// `NEURAL_FORGE_CACHE_DUMP_AT=<resume>:<ms>[:K]`: dump K holds (default [`DEFAULT_HOLDS`]) starting
-/// `<ms>` after the `<resume>`-th time DLSS frames resumed after a gap, as `NEURAL_FORGE_CAPTURE_AT`
-/// counts them (a scripted benchmark's passes).
+/// One `NEURAL_FORGE_CACHE_DUMP_AT` entry, `<resume>:<ms>[:K]`: dump K holds (default
+/// [`DEFAULT_HOLDS`]) starting `<ms>` after the `<resume>`-th time DLSS frames resumed after a gap, as
+/// `NEURAL_FORGE_CAPTURE_AT` counts them (a scripted benchmark's passes).
 pub fn parse_at(text: &str) -> Option<(u32, Duration, u32)> {
     let mut parts = text.trim().split(':');
     let resume = parts.next()?.trim().parse().ok()?;
@@ -50,6 +50,12 @@ pub fn parse_at(text: &str) -> Option<(u32, Duration, u32)> {
         return None;
     }
     Some((resume, Duration::from_millis(ms), holds))
+}
+
+/// `NEURAL_FORGE_CACHE_DUMP_AT`: one or more [`parse_at`] entries separated by commas (one dump each,
+/// several in one benchmark run). `None` when any entry is malformed.
+pub fn parse_at_list(text: &str) -> Option<Vec<(u32, Duration, u32)>> {
+    text.split(',').map(parse_at).collect::<Option<Vec<_>>>().filter(|v| !v.is_empty())
 }
 
 #[cfg(test)]
@@ -81,5 +87,7 @@ mod tests {
         assert_eq!(parse_at("1"), None);
         assert_eq!(parse_at("1:2:3:4"), None);
         assert_eq!(parse_at("x:2"), None);
+        assert_eq!(parse_at_list("2:1000:8,5:20000"), Some(vec![(2, Duration::from_millis(1000), 8), (5, Duration::from_millis(20000), DEFAULT_HOLDS)]));
+        assert_eq!(parse_at_list("2:1000,oops"), None);
     }
 }
