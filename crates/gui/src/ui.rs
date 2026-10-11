@@ -137,6 +137,69 @@ fn combo_row(title: &str, options: &[&str], selected: u32, setter: impl Fn(u32) 
     row
 }
 
+/// The strength preset menu: choosing a preset sets the four rows (`rows`, in
+/// `neural_forge_supervisor::presets::KNOBS`' order) through their own handlers, so the values are
+/// written and saved exactly as if typed in. It shows the preset the rows match, else "Custom".
+fn preset_row(rows: &[adw::SpinRow; 4]) -> adw::ComboRow {
+    use neural_forge_supervisor::presets::{matching, PRESETS};
+    let mut names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
+    names.push("Custom");
+    let custom = PRESETS.len() as u32;
+    let row = adw::ComboRow::new();
+    row.set_title("Strength preset");
+    row.set_subtitle("Sets the four values below. Reference is Neural Forge's defaults");
+    row.set_model(Some(&gtk4::StringList::new(&names)));
+    let rows = std::rc::Rc::new(rows.clone());
+    // Set while this code changes the menu or the rows, so neither reacts to the other.
+    let syncing = std::rc::Rc::new(std::cell::Cell::new(false));
+    let sync = {
+        let row = row.downgrade();
+        let rows = std::rc::Rc::clone(&rows);
+        let syncing = std::rc::Rc::clone(&syncing);
+        std::rc::Rc::new(move || {
+            let Some(row) = row.upgrade() else { return };
+            let values = [0, 1, 2, 3].map(|i| rows[i].value() as f32);
+            let shown = matching(values).map_or(custom, |i| i as u32);
+            if row.selected() != shown {
+                syncing.set(true);
+                row.set_selected(shown);
+                syncing.set(false);
+            }
+        })
+    };
+    sync();
+    {
+        let rows = std::rc::Rc::clone(&rows);
+        let syncing = std::rc::Rc::clone(&syncing);
+        let sync = std::rc::Rc::clone(&sync);
+        row.connect_selected_notify(move |row| {
+            if syncing.get() || refreshing() {
+                return;
+            }
+            // "Custom" sets nothing; the menu goes back to what the rows match.
+            if let Some(preset) = PRESETS.get(row.selected() as usize) {
+                syncing.set(true);
+                for (spin, value) in rows.iter().zip(preset.values) {
+                    spin.set_value(f64::from(value));
+                }
+                syncing.set(false);
+            }
+            sync();
+        });
+    }
+    // A value changed by hand, by a profile, Reset or `shmctl` (the rows follow the header).
+    for spin in rows.iter() {
+        let syncing = std::rc::Rc::clone(&syncing);
+        let sync = std::rc::Rc::clone(&sync);
+        spin.connect_value_notify(move |_| {
+            if !syncing.get() {
+                sync();
+            }
+        });
+    }
+    row
+}
+
 /// GDK on Linux X11/Wayland uses XKB hardware codes (evdev + 8).
 fn evdev_keycode(hardware: u32) -> Option<u32> {
     hardware.checked_sub(8).filter(|&code| code > 0 && code <= 767)
@@ -266,16 +329,23 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     model_group.add(&combo_row("Style", &["Default", "Natural", "Cinematic"], style, set_style));
 
     let (intensity, set_intensity) = bind_float(&shm, Some("intensity"), |h| &h.intensity_bits);
-    model_group.add(&spin_row("Intensity", "How strongly the model's answer replaces the frame", intensity, "intensity", 0.05, set_intensity));
+    let intensity_row = spin_row("Intensity", "How strongly the model's answer replaces the frame", intensity, "intensity", 0.05, set_intensity);
 
     let (local_tone, set_local_tone) = bind_float(&shm, Some("local_tone"), |h| &h.local_tone_bits);
-    model_group.add(&spin_row("Local tone", "", local_tone, "local_tone", 0.05, set_local_tone));
+    let local_tone_row = spin_row("Local tone", "", local_tone, "local_tone", 0.05, set_local_tone);
 
     let (local_structure, set_local_structure) = bind_float(&shm, Some("local_structure"), |h| &h.local_structure_bits);
-    model_group.add(&spin_row("Local structure", "", local_structure, "local_structure", 0.05, set_local_structure));
+    let local_structure_row = spin_row("Local structure", "", local_structure, "local_structure", 0.05, set_local_structure);
 
     let (skin_structure, set_skin_structure) = bind_float(&shm, Some("skin_structure"), |h| &h.skin_structure_bits);
-    model_group.add(&spin_row("Skin structure", "-1 follows local structure", skin_structure, "skin_structure", 0.05, set_skin_structure));
+    let skin_structure_row = spin_row("Skin structure", "-1 follows local structure", skin_structure, "skin_structure", 0.05, set_skin_structure);
+
+    // In `neural_forge_supervisor::presets::KNOBS`' order.
+    let strength_rows = [intensity_row, local_tone_row, local_structure_row, skin_structure_row];
+    model_group.add(&preset_row(&strength_rows));
+    for row in &strength_rows {
+        model_group.add(row);
+    }
 
     let (auto_mask, set_auto_mask) = bind_bool(&shm, Some("auto_mask"), |h| &h.auto_mask);
     model_group.add(&switch_row("Auto mask", "Automatic skin/detail masking", auto_mask, set_auto_mask));
@@ -490,6 +560,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     let debug_page = adw::PreferencesPage::new();
     debug_page.add(&debug_group);
+    debug_page.add(&build_capture_group(&shm, &toasts));
     // Short tab label -- the group's own title inside the page ("Compare and debug")
     // carries the full wording; ViewSwitcher button labels are cramped for five tabs
     // and (like AdwPreferencesGroup::title) are Pango markup, so no bare "&" either.
@@ -501,7 +572,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     status_page.add(&build_telemetry_group(&shm));
     let status_group = build_status_group(&shm, &toasts);
     status_page.add(&status_group);
-    status_page.add(&build_diagnosis_group());
+    status_page.add(&build_diagnosis_group(&shm, &toasts));
     view_stack.add_titled_with_icon(&status_page, Some("status"), "Status", "network-transmit-receive-symbolic");
 
     view_stack.add_titled_with_icon(&setup_page, Some("setup"), "Setup", "preferences-system-symbolic");
@@ -1298,7 +1369,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
 /// The Diagnosis group: the Diagnose button runs `neural-forge-cli doctor`'s checks
 /// (`neural_forge_supervisor::doctor`) and lists the findings, worst first. They run on a worker thread:
 /// `nvidia-smi` and `journalctl` can take seconds.
-fn build_diagnosis_group() -> adw::PreferencesGroup {
+fn build_diagnosis_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Diagnosis");
     group.set_description(Some("Why neural rendering is or is not running: the install, the GPU and driver, the kernel log and the last game session"));
@@ -1308,6 +1379,14 @@ fn build_diagnosis_group() -> adw::PreferencesGroup {
     diagnose.add_css_class("suggested-action");
     diagnose.set_valign(gtk4::Align::Center);
     actions.append(&diagnose);
+    let save = gtk4::Button::with_label("Save report");
+    save.set_valign(gtk4::Align::Center);
+    save.set_tooltip_text(Some(
+        "Saves a zip to the desktop to attach to a problem report: these findings, system details, settings, the \
+         layer's logs and the newest capture. Your home folder and user name are replaced; nothing is uploaded",
+    ));
+    connect_save_report(&save, shm, toasts);
+    actions.append(&save);
     group.set_header_suffix(Some(&actions));
 
     let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::ActionRow>>> = std::rc::Rc::default();
@@ -1341,6 +1420,151 @@ fn build_diagnosis_group() -> adw::PreferencesGroup {
         });
     });
     group
+}
+
+/// Opens `dir` in the file manager, creating it first if it is missing.
+fn open_folder(dir: &std::path::Path, parent: Option<gtk4::Window>, toasts: &adw::ToastOverlay) {
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't create {}: {e}", dir.display()))));
+        return;
+    }
+    let toasts = toasts.clone();
+    gtk4::FileLauncher::new(Some(&gio::File::for_path(dir))).launch(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+        if let Err(e) = result {
+            toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't open the folder: {e}"))));
+        }
+    });
+}
+
+/// What the capture button's row says, from the channel: whether frames are held before the upscaler
+/// now, where a capture has no frame without the model's edit (see the button's tooltip).
+fn capture_subtitle(holding: bool) -> &'static str {
+    if holding {
+        "The model runs before the upscaler now: both images will be the presented frame, which already has its edit"
+    } else {
+        "Saves the next frame as two PNGs: the game's frame and Neural Forge's result"
+    }
+}
+
+/// The Debug page's captures: the same one-frame request as `neural-forge-cli shmctl capture`, and the
+/// folder the layer writes them to.
+fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Captures");
+
+    let capture_row = adw::ActionRow::new();
+    capture_row.set_title("Capture before/after");
+    capture_row.set_subtitle(capture_subtitle(false));
+    let capture_button = gtk4::Button::with_label("Capture");
+    capture_button.set_valign(gtk4::Align::Center);
+    // `neural_forge_layer::capture::run` serves the request after the upscaler; while frames are held
+    // before it, `neural_forge_layer::series::take_request` serves it as a one-frame series instead.
+    capture_button.set_tooltip_text(Some(
+        "After the upscaler, the next frame is saved as <time>-original.png (the game's frame) and \
+         <time>-composited.png (Neural Forge's result). While the model runs before the upscaler (a DLSS game), \
+         the layer has no frame without the model's edit when the game presents, so both images are the \
+         presented frame, in a series-<time> folder. A game that draws into its swapchain with a copy cannot \
+         be captured after the upscaler; the layer's log says so.",
+    ));
+    capture_row.add_suffix(&capture_button);
+    group.add(&capture_row);
+
+    let folder_row = adw::ActionRow::new();
+    folder_row.set_title("Captures folder");
+    let captures_dir = std::path::PathBuf::from(neural_forge_supervisor::paths::captures_dir());
+    folder_row.set_subtitle(&glib::markup_escape_text(&captures_dir.display().to_string()));
+    let folder_button = gtk4::Button::with_label("Open");
+    folder_button.set_valign(gtk4::Align::Center);
+    folder_row.add_suffix(&folder_button);
+    group.add(&folder_row);
+
+    {
+        let toasts = toasts.clone();
+        let captures_dir = captures_dir.clone();
+        folder_button.connect_clicked(move |button| open_folder(&captures_dir, button.root().and_downcast::<gtk4::Window>(), &toasts));
+    }
+
+    {
+        let shm = std::sync::Arc::clone(shm);
+        let toasts = toasts.clone();
+        capture_button.connect_clicked(move |button| {
+            let header = shm.header();
+            if header.capture_request.load(Ordering::Relaxed) != 0 {
+                toasts.add_toast(adw::Toast::new("A capture is already waiting for the game's next frame"));
+                return;
+            }
+            header.capture_request.store(1, Ordering::Relaxed);
+            // The layer clears the request when it has taken the frame.
+            let shm = std::sync::Arc::clone(&shm);
+            let toasts = toasts.clone();
+            let captures_dir = captures_dir.clone();
+            let parent = button.root().and_downcast::<gtk4::Window>();
+            glib::timeout_add_seconds_local_once(2, move || {
+                if shm.header().capture_request.load(Ordering::Relaxed) != 0 {
+                    toasts.add_toast(adw::Toast::new("The capture is waiting for a game to present a frame"));
+                    return;
+                }
+                let toast = adw::Toast::builder().title("Captured").button_label("Open folder").build();
+                let toasts_for_button = toasts.clone();
+                toast.connect_button_clicked(move |_| open_folder(&captures_dir, parent.clone(), &toasts_for_button));
+                toasts.add_toast(toast);
+            });
+        });
+    }
+
+    // Holding before the upscaler: from the channel, while the layer's heartbeat is fresh.
+    let shm = std::sync::Arc::clone(shm);
+    let beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
+    glib::timeout_add_seconds_local(1, move || {
+        let hdr = shm.header();
+        let now = hdr.layer_heartbeat.load(Ordering::Relaxed);
+        let (seen, at) = beat.get();
+        let active = if now != seen {
+            beat.set((now, std::time::Instant::now()));
+            seen != 0
+        } else {
+            at.elapsed() < std::time::Duration::from_secs(2)
+        };
+        capture_row.set_subtitle(capture_subtitle(active && hdr.preupscale_state.load(Ordering::Relaxed) == 2));
+        glib::ControlFlow::Continue
+    });
+    group
+}
+
+/// "Save report": the diagnostic report (`neural_forge_supervisor::report`) on the desktop.
+fn connect_save_report(button: &gtk4::Button, shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) {
+    let shm = std::sync::Arc::clone(shm);
+    let toasts = toasts.clone();
+    button.connect_clicked(move |button| {
+        // The channel is read here, on the main thread; the files and probes on a worker.
+        let status = neural_forge_supervisor::shm_status::status_text(shm.header());
+        let game = shm.header().game_name();
+        let toasts = toasts.clone();
+        let button = button.clone();
+        button.set_sensitive(false);
+        glib::spawn_future_local(async move {
+            let saved = gio::spawn_blocking(move || neural_forge_supervisor::report::save(&status, &game, None)).await;
+            button.set_sensitive(true);
+            match saved {
+                Ok(Ok(path)) => {
+                    let name = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                    let dir = path.parent().map(|d| d.display().to_string()).unwrap_or_default();
+                    let toast = adw::Toast::builder()
+                        .title(glib::markup_escape_text(&format!("Saved {name} to {dir}")))
+                        .button_label("Show")
+                        .timeout(10)
+                        .build();
+                    let parent = button.root().and_downcast::<gtk4::Window>();
+                    toast.connect_button_clicked(move |_| {
+                        gtk4::FileLauncher::new(Some(&gio::File::for_path(&path))).open_containing_folder(parent.as_ref(), None::<&gio::Cancellable>, |_| {});
+                    });
+                    toasts.add_toast(toast);
+                }
+                Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Saving the report failed: {e}")))),
+                Err(_) => toasts.add_toast(adw::Toast::new("Saving the report failed: the worker panicked")),
+            }
+        });
+    });
 }
 
 /// One finding as a row: the severity's icon, the summary as the title, the evidence and the fix below.
@@ -1421,6 +1645,17 @@ mod preupscale_label_tests {
         assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input every frame");
         assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input every frame, 1 frame missed");
         assert_eq!(preupscale_label(true, 1, 1485, 836, 85), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
+    }
+}
+
+#[cfg(test)]
+mod capture_tests {
+    use super::capture_subtitle;
+
+    #[test]
+    fn the_capture_row_says_when_there_is_no_before_image() {
+        assert!(capture_subtitle(true).contains("before the upscaler"));
+        assert!(capture_subtitle(false).contains("two PNGs"));
     }
 }
 

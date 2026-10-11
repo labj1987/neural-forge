@@ -173,6 +173,32 @@ pub fn find<'a>(games: &'a [Game], query: &str) -> Result<&'a Game, FindError> {
         .unwrap_or(Err(FindError::NotFound))
 }
 
+/// The game whose install folder holds an executable named `exe` (ignoring case), searched a few
+/// folders deep (`Game/Binaries/Win64/Game-Win64-Shipping.exe` is four). The channel names a running
+/// game by its executable; this is how the report finds its app id, and from it its Proton.
+pub fn game_for_exe<'a>(games: &'a [Game], exe: &str) -> Option<&'a Game> {
+    const DEPTH: usize = 4;
+    fn holds(dir: &Path, exe: &str, depth: usize) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+        let mut subdirs = Vec::new();
+        for e in entries.flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            if kind.is_file() && e.file_name().to_str().is_some_and(|n| n.eq_ignore_ascii_case(exe)) {
+                return true;
+            }
+            if kind.is_dir() && depth > 1 {
+                subdirs.push(e.path());
+            }
+        }
+        subdirs.iter().any(|d| holds(d, exe, depth - 1))
+    }
+    let exe = exe.trim();
+    if exe.is_empty() || exe.contains('/') {
+        return None;
+    }
+    games.iter().find(|g| holds(&g.library.join("steamapps/common").join(&g.installdir), exe, DEPTH))
+}
+
 /// Whether the Steam client is running: a process under `proc_root` (normally `/proc`) whose
 /// `comm` is `steam` or `steamwebhelper` (`comm` is cut at 15 characters; both names are shorter).
 pub fn steam_running(proc_root: &Path) -> bool {
@@ -398,6 +424,22 @@ mod tests {
     fn write(path: &Path, text: &str) {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(path, text).unwrap();
+    }
+
+    #[test]
+    fn a_running_exe_names_its_game() {
+        let s = Scratch::new("exe");
+        let game = |appid: &str, name: &str| Game { appid: appid.into(), name: name.into(), installdir: name.into(), library: s.0.clone(), root: Root { path: s.0.clone(), flatpak: false } };
+        let games = vec![game("1", "Alpha"), game("2", "Remnant2"), game("3", "Deep")];
+        write(&s.0.join("steamapps/common/Alpha/alpha.exe"), "");
+        write(&s.0.join("steamapps/common/Remnant2/Remnant2/Binaries/Win64/Remnant2-Win64-Shipping.exe"), "");
+        write(&s.0.join("steamapps/common/Deep/a/b/c/d/e/deep.exe"), "");
+        assert_eq!(game_for_exe(&games, "ALPHA.EXE").map(|g| g.appid.as_str()), Some("1"), "case is ignored");
+        assert_eq!(game_for_exe(&games, "Remnant2-Win64-Shipping.exe").map(|g| g.appid.as_str()), Some("2"));
+        assert!(game_for_exe(&games, "deep.exe").is_none(), "deeper than four folders is not searched");
+        assert!(game_for_exe(&games, "missing.exe").is_none());
+        assert!(game_for_exe(&games, "").is_none());
+        assert!(game_for_exe(&games, "Alpha/alpha.exe").is_none(), "a name, not a path");
     }
 
     fn manifest(appid: &str, name: &str) -> String {

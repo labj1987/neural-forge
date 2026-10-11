@@ -437,6 +437,14 @@ works (HARDWARE_VALIDATION.md, "2.0.0").
 - **DMA-BUF and a native Linux helper:** closed (above).
 - **Queue priority:** refused by the driver without privileges.
 - **Building a frame generator into Neural Forge:** out of scope; the game's own works.
+- **A before/after capture while the model runs before the upscaler.** The capture request (`shmctl
+  capture`, the Debug tab's Capture button) is served after the upscaler as a matched pair: the game's
+  frame and the composited result (`capture::run`, `dump::write_pair`). While frames are held before
+  DLSS (the default for DLSS games), the post path does not run, and the present takes the request as a
+  one-frame series (`series::take_request`): both PNGs are the presented frame, which already carries the
+  model's edit, so there is no "before" image. A real pair needs the colour input read back before the
+  network writes its answer, at render resolution, and the same frame's upscaled output; the
+  `NEURAL_FORGE_PREUPSCALE=dump` mode reads the input but never writes back, so it is not that either.
 
 ## Working practices that came out of all this
 

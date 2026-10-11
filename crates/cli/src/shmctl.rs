@@ -41,50 +41,8 @@ fn extra_field<'a>(header: &'a ShmHeader, name: &str) -> Option<(&'a std::sync::
     })
 }
 
-fn server_state_name(v: u32) -> &'static str {
-    use neural_forge_protocol::enums::server_state::*;
-    match v {
-        MODEL_FAILED => "model_failed",
-        RUNNING => "running",
-        STOPPED => "stopped",
-        _ => "unknown",
-    }
-}
-
 fn cmd_status(header: &ShmHeader) {
-    println!("# live status");
-    println!("server_state={} ({})", header.server_state.load(Ordering::Relaxed), server_state_name(header.server_state.load(Ordering::Relaxed)));
-    println!("model_up={}", header.model_up.load(Ordering::Relaxed));
-    let frames = (u64::from(header.server_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.server_frames_lo.load(Ordering::Relaxed));
-    println!("server_frames={frames}");
-    println!("server_upload_ms={}", f32::from_bits(header.server_upload_ms_bits.load(Ordering::Relaxed)));
-    println!("server_eval_ms={}", f32::from_bits(header.server_eval_ms_bits.load(Ordering::Relaxed)));
-    println!("server_readback_ms={}", f32::from_bits(header.server_readback_ms_bits.load(Ordering::Relaxed)));
-    println!("server_busy_ms={}", f64::from(header.server_busy_us.load(Ordering::Relaxed)) / 1000.0);
-    let layer_frames = (u64::from(header.layer_frames_hi.load(Ordering::Relaxed)) << 32) | u64::from(header.layer_frames_lo.load(Ordering::Relaxed));
-    println!("layer_frames={layer_frames}");
-    println!("layer_ms={}", f32::from_bits(header.layer_ms_bits.load(Ordering::Relaxed)));
-    println!("layer_capture_gpu_ms={}", f32::from_bits(header.layer_capture_gpu_ms_bits.load(Ordering::Relaxed)));
-    println!("layer_compose_gpu_ms={}", f32::from_bits(header.layer_compose_gpu_ms_bits.load(Ordering::Relaxed)));
-    let preupscale = header.preupscale_state.load(Ordering::Relaxed);
-    println!("preupscale_state={preupscale} ({})", match preupscale { 0 => "off", 1 => "waiting for DLSS input", 2 => "holding", _ => "unknown" });
-    println!("layer_reason={}", header.layer_reason());
-    println!("native_running={}", header.native_running.load(Ordering::Relaxed));
-    println!("device_lost_at={}", header.device_lost_at.load(Ordering::Relaxed));
-    println!("preupscale_extent={}x{}", header.preupscale_width.load(Ordering::Relaxed), header.preupscale_height.load(Ordering::Relaxed));
-    println!("preupscale_hold_ms={}", f32::from_bits(header.preupscale_hold_ms_bits.load(Ordering::Relaxed)));
-    println!("preupscale_misses={}", header.preupscale_misses.load(Ordering::Relaxed));
-    println!("layer_measured_white={}", f32::from_bits(header.layer_measured_white_bits.load(Ordering::Relaxed)));
-    println!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed));
-    println!("capture_request={}", header.capture_request.load(Ordering::Relaxed));
-    println!("# settings (neural_forge_protocol::ShmHeader::persisted_settings)");
-    for (name, is_float, bits) in header.persisted_settings() {
-        if is_float {
-            println!("{name}={}", f32::from_bits(bits));
-        } else {
-            println!("{name}={bits}");
-        }
-    }
+    print!("{}", neural_forge_supervisor::shm_status::status_text(header));
 }
 
 /// Shared by `set`/`toggle`: resolves `name` against the persisted settings first,
@@ -391,14 +349,5 @@ mod tests {
         assert_eq!(header.tuning_seq.load(Ordering::Relaxed), 0, "a refused value changes nothing");
         assert!(cmd_set(&header, "intensity", "4"));
         assert_eq!(f32::from_bits(header.intensity_bits.load(Ordering::Relaxed)), 4.0);
-    }
-
-    #[test]
-    fn server_state_name_covers_every_real_state() {
-        use neural_forge_protocol::enums::server_state::*;
-        for state in [MODEL_FAILED, RUNNING, STOPPED] {
-            assert_ne!(server_state_name(state), "unknown");
-        }
-        assert_eq!(server_state_name(9999), "unknown");
     }
 }

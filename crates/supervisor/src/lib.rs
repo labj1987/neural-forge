@@ -9,7 +9,10 @@ pub mod launch_options;
 pub mod model;
 pub mod model_shape;
 pub mod paths;
+pub mod presets;
 pub mod profiles;
+pub mod report;
+pub mod shm_status;
 pub mod steam;
 pub mod vdf;
 

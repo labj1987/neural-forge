@@ -722,6 +722,20 @@ fn parse_xid(line: &str) -> Option<Xid> {
     Some(Xid { time, number, process, line: line.trim().to_string() })
 }
 
+/// This boot's `NVRM: Xid` lines from the kernel log, oldest first, or why they could not be read:
+/// the diagnostic report's `xid.txt`.
+pub fn xid_lines(roots: &Roots) -> String {
+    let command = format!("journalctl {}", JOURNAL_ARGS.join(" "));
+    match (roots.journalctl)(&JOURNAL_ARGS) {
+        CommandOutput::Ran(text) => {
+            let lines: Vec<&str> = text.lines().filter(|l| parse_xid(l).is_some()).map(str::trim).collect();
+            if lines.is_empty() { format!("{command}: no NVRM: Xid line this boot\n") } else { format!("{command}:\n{}\n", lines.join("\n")) }
+        }
+        CommandOutput::Failed(why) => format!("{command}: could not be read: {why}\n"),
+        CommandOutput::Missing => format!("{command}: journalctl is not installed\n"),
+    }
+}
+
 /// What the README's Known issues say about an Xid number.
 fn xid_meaning(number: u32) -> Option<&'static str> {
     match number {
@@ -1197,6 +1211,20 @@ mod tests {
         let v = check_steam(&f.roots);
         assert_eq!((v.len(), v[0].severity), (1, Severity::Info));
         assert_eq!(v[0].summary, "no Steam installation found");
+    }
+
+    #[test]
+    fn the_reports_xid_lines_are_only_the_drivers_own() {
+        let journal = "2026-10-10T14:15:00-04:00 rig kernel: NVRM: Xid (PCI:0000:01:00): 109, pid=1, name=Game.exe, channel 0x15\n\
+                       2026-10-10T14:16:00-04:00 rig kernel: usb 1-1: not an NVRM: Xid line\n";
+        let f = fixture(CommandOutput::Missing, CommandOutput::Ran(journal.into()));
+        let text = xid_lines(&f.roots);
+        assert!(text.contains("): 109, pid=1"), "{text}");
+        assert!(!text.contains("usb 1-1"), "{text}");
+        let f = fixture(CommandOutput::Missing, CommandOutput::Ran("nothing\n".into()));
+        assert!(xid_lines(&f.roots).ends_with("no NVRM: Xid line this boot\n"));
+        let f = fixture(CommandOutput::Missing, CommandOutput::Failed("exit status: 1 (No journal files were opened)".into()));
+        assert!(xid_lines(&f.roots).contains("could not be read: exit status: 1"));
     }
 
     fn event(time: u64, pid: u32, kind: &str, message: &str) -> String {
