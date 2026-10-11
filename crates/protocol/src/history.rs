@@ -69,11 +69,10 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
         self.format = Some(class);
     }
 
-    /// Called once per evaluate, just before it runs. Returns why the model's history must be
-    /// reset for it, or `None` when the previous evaluate on this slot was the frame before.
-    /// The first evaluate of a session returns `None`: a new feature already resets itself.
-    pub fn begin(&mut self, now: Instant) -> Option<Stale> {
-        let stale = match self.last {
+    /// What [`Self::begin`] would return at `now`, without starting an evaluate: whether the history
+    /// is still good for one.
+    pub fn pending(&self, now: Instant) -> Option<Stale> {
+        match self.last {
             None => None,
             Some(_) if self.format_changed => Some(Stale::FormatChanged),
             Some(_) if self.broken => Some(Stale::Skipped),
@@ -81,7 +80,23 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
                 let gap = now.saturating_duration_since(t);
                 (gap > Self::MAX_GAP).then_some(Stale::Idle(gap))
             }
-        };
+        }
+    }
+
+    /// A frame that kept the history in use without evaluating (the layer's edit cache: the frame got
+    /// the last evaluate's correction carried to it). [`Self::MAX_GAP`] counts from it; a reset already
+    /// asked for stays asked for.
+    pub fn touch(&mut self, now: Instant) {
+        if self.last.is_some() {
+            self.last = Some(now);
+        }
+    }
+
+    /// Called once per evaluate, just before it runs. Returns why the model's history must be
+    /// reset for it, or `None` when the previous evaluate on this slot was the frame before.
+    /// The first evaluate of a session returns `None`: a new feature already resets itself.
+    pub fn begin(&mut self, now: Instant) -> Option<Stale> {
+        let stale = self.pending(now);
         self.broken = false;
         self.format_changed = false;
         self.last = Some(now);
@@ -97,6 +112,32 @@ mod tests {
     enum FormatClass {
         Sdr8,
         Hdr16,
+    }
+
+    #[test]
+    fn touched_frames_keep_the_history_and_pending_does_not_consume_a_reset() {
+        let mut g: HistoryGap = HistoryGap::default();
+        let t0 = Instant::now();
+        g.touch(t0);
+        assert_eq!(g.begin(t0), None, "a touch before the first evaluate does not start the clock");
+        // Evaluates 400 ms apart with touched frames between: never idle.
+        for i in 1..6u64 {
+            g.touch(t0 + Duration::from_millis(400 * i - 200));
+            assert_eq!(g.pending(t0 + Duration::from_millis(400 * i)), None);
+            assert_eq!(g.begin(t0 + Duration::from_millis(400 * i)), None);
+        }
+        // Without the touches the same evaluates would reset.
+        let mut h: HistoryGap = HistoryGap::default();
+        h.begin(t0);
+        assert!(matches!(h.pending(t0 + Duration::from_millis(600)), Some(Stale::Idle(_))));
+        // A skip stays pending through touches and `pending`, and is consumed by the next begin.
+        g.skipped();
+        let t = t0 + Duration::from_millis(2100);
+        g.touch(t);
+        assert_eq!(g.pending(t), Some(Stale::Skipped));
+        assert_eq!(g.pending(t), Some(Stale::Skipped));
+        assert_eq!(g.begin(t), Some(Stale::Skipped));
+        assert_eq!(g.pending(t), None);
     }
 
     #[test]

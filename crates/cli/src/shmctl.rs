@@ -391,7 +391,7 @@ mod tests {
         assert_eq!(f32::from_bits(header.intensity_bits.load(Ordering::Relaxed)), 1.0);
         assert!(!cmd_set(&header, "model_interval", "0"));
         assert!(!cmd_set(&header, "style", "-1"));
-        assert!(!cmd_set(&header, "debug_view", "6"));
+        assert!(!cmd_set(&header, "debug_view", "7"));
         assert_eq!(header.tuning_seq.load(Ordering::Relaxed), 0, "a refused value changes nothing");
         assert!(cmd_set(&header, "intensity", "4"));
         assert_eq!(f32::from_bits(header.intensity_bits.load(Ordering::Relaxed)), 4.0);

@@ -65,7 +65,8 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// feature counts, its reason string, the DMA-BUF exchange) and renames what the in-process model
 /// server still writes from `helper_*` to `server_*`; v16 appends `device_lost_at`, so the GUI and
 /// `doctor` can say the GPU device was lost without a log; v17 appends `preupscale_dump_request`, the
-/// K-hold pre-upscaler cache dump's trigger).
+/// K-hold pre-upscaler cache dump's trigger, and the edit cache's status: its refresh and cached hold
+/// counts, the last cached hold's rejected share and the cache passes' GPU time).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.

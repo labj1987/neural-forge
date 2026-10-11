@@ -92,6 +92,8 @@ pub struct ShmHeader {
     /// engagement, 5 pre-colour-trust composite -- see `compose.comp`'s own `debug_view` push
     /// constant doc comment for the exact meaning of each (0-3 match
     /// `composition::apply::compose_pixel`'s CPU reference; 4/5 are GPU-only, from upstream).
+    /// 6 is the pre-upscaler edit cache's rejection mask, written into DLSS's colour input on cached
+    /// holds (`preupscale_cache_apply.comp`); the post path draws 6 as 0.
     pub debug_view: AtomicU32,
     /// View 5 only: multiplies the pre-colour-trust colour before display, so a subtle
     /// difference from the normal (view 0) result is easier to see. 1.0 = no amplification.
@@ -272,6 +274,17 @@ pub struct ShmHeader {
     /// 4.9), or 0 for none. Set by `shmctl dump-cache`; the layer zeroes it
     /// when it takes the request (the dump then runs to its end or to the first missed hold).
     pub preupscale_dump_request: AtomicU32,
+    /// The pre-upscaler edit cache (`model_interval` above 1 before the upscaler; docs/ARCHITECTURE.md
+    /// 4.10): holds that ran the network (refresh holds; every hold at interval 1) and holds that
+    /// reused its last correction instead (cached holds), counted since the layer opened the channel.
+    pub cache_refresh_holds: AtomicU32,
+    pub cache_cached_holds: AtomicU32,
+    /// The last cached hold's share of pixels whose carried correction was rejected (the frame no
+    /// longer looked like the refresh hold there, or the motion left the frame), in units of 1/10000.
+    pub cache_rejected: AtomicU32,
+    /// f32 bits: the cache passes' GPU time per hold in milliseconds, the median of the layer's last
+    /// summary window (the latest reading before the first).
+    pub cache_gpu_ms_bits: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -296,7 +309,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 672, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 688, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 72, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 568, "layout changed -- bump SHM_VERSION");
@@ -312,6 +325,8 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 656, "layout 
 const _: () = assert!(std::mem::offset_of!(ShmHeader, native_running) == 660, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, device_lost_at) == 664, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_dump_request) == 668, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, cache_refresh_holds) == 672, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, cache_gpu_ms_bits) == 684, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 228, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 424, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, server_state) == 156, "layout changed -- bump SHM_VERSION");
@@ -358,7 +373,7 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 33] = [
     ("ratio_smooth", 0.0, 1.0),
     ("model_interval", 1.0, 4.0),
     ("apply_model", 0.0, 1.0),
-    ("debug_view", 0.0, 5.0),
+    ("debug_view", 0.0, 6.0),
     ("debug_scale", 0.1, 10.0),
 ];
 
@@ -447,6 +462,9 @@ impl ShmHeader {
         self.seq_eval.store(0, Ordering::Relaxed);
         self.native_running.store(0, Ordering::Relaxed);
         self.device_lost_at.store(0, Ordering::Relaxed);
+        for f in [&self.cache_refresh_holds, &self.cache_cached_holds, &self.cache_rejected, &self.cache_gpu_ms_bits] {
+            f.store(0, Ordering::Relaxed);
+        }
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
@@ -848,9 +866,13 @@ mod tests {
 
     #[test]
     fn preupscale_dump_request_is_appended_after_device_lost_at() {
-        // v17 appends one word: every earlier field keeps its offset, and the new one sits last.
+        // v17 appends words: every earlier field keeps its offset, the cache's status fields sit last.
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_dump_request), std::mem::offset_of!(ShmHeader, device_lost_at) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_dump_request) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, cache_refresh_holds), std::mem::offset_of!(ShmHeader, preupscale_dump_request) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, cache_cached_holds), std::mem::offset_of!(ShmHeader, cache_refresh_holds) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, cache_rejected), std::mem::offset_of!(ShmHeader, cache_cached_holds) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, cache_gpu_ms_bits), std::mem::offset_of!(ShmHeader, cache_rejected) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, cache_gpu_ms_bits) + 4, std::mem::size_of::<ShmHeader>());
         assert_eq!(crate::SHM_VERSION, 17);
         let h = ShmHeader::default();
         h.init_defaults();
