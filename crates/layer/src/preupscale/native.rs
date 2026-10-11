@@ -12,6 +12,12 @@
 //!   residual, the blend toward the history, the next history and the answer buffer);
 //! - `W`, the write-back (`super::record_writeback`): the answer decoded over DLSS's colour input.
 //!
+//! With `model_interval` above 1 the holds between two network frames are the edit cache's cached
+//! holds (`super::cache`, docs/ARCHITECTURE.md 4.10): `C` as always, no `N`, and a `W` that carries the
+//! last network frame's correction to this frame instead of decoding an answer. The capture's motion
+//! pass writes [`NativePass::acc`], the motion back to the last network frame that the frame shaders
+//! read (at interval 1, DLSS's vectors as they are).
+//!
 //! The ordering is submission order on the game's queue plus each buffer's opening barrier
 //! (`ALL_COMMANDS/MEMORY_WRITE` to what it reads), the same chain as the model server hold's
 //! (`super`, "The dependency chain of a hold"), minus the host round trip.

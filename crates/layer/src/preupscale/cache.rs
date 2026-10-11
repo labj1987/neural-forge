@@ -1063,7 +1063,6 @@ mod tests {
         }
 
         /// The colour image as f32 RGBA.
-        #[allow(dead_code)]
         pub fn read_colour(&self) -> Vec<f32> {
             let region = vk::BufferImageCopy {
                 image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
@@ -1128,8 +1127,8 @@ mod tests {
     /// answer), every later hold is cached; returns per cached hold (t, the shown edit RGB, the
     /// weight, the accumulated field) from the GPU and the tool's own.
     #[allow(clippy::type_complexity)]
-    fn carry_on_gpu(kind: &str) -> Option<(Rig, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>, Vec<f32>)> {
-        let dir = scratch(kind);
+    fn carry_on_gpu(kind: &str, depth_image: bool) -> Option<(Rig, Vec<(usize, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>)>, Vec<f32>)> {
+        let dir = scratch(&format!("{kind}-{depth_image}"));
         let dump = dir.join("dump");
         let out = dir.join("carry");
         if !replay_tool(&["--make-synthetic", dump.to_str()?, "--kind", kind]) || !replay_tool(&[dump.to_str()?, "--export-carry", out.to_str()?, "--reverse-z", "yes"]) {
@@ -1157,10 +1156,17 @@ mod tests {
         let d = &rig.gpu.3;
         let mut results = Vec::new();
         let mut src_edit = Vec::new();
+        // The split hold copies the depth aspect of DLSS's depth image into the layer's buffer; the
+        // hold inside DLSS's buffer copies it into a slot buffer there, which the capture copies over.
+        let depth = depth_image.then(|| DepthImage::new(&rig));
         for (t, hj) in holds.iter().enumerate() {
             rig.upload_image(rig.colour.image, &read(format!("hold-{t:02}/colour.rgba16f")));
             Rig::write(&rig.mvec, &read(format!("hold-{t:02}/mvec.rg16f")));
-            Rig::write(&rig.depth, &read(format!("hold-{t:02}/depth.r32f")));
+            let depth_bytes = read(format!("hold-{t:02}/depth.r32f"));
+            match &depth {
+                Some(image) => image.route_through(&rig, &depth_bytes),
+                None => Rig::write(&rig.depth, &depth_bytes),
+            }
             let mut flags = F_CHAINED | F_NEAREST | F_REVERSE_Z | F_KEEP_CLAMPED;
             if t <= 1 {
                 flags |= F_FRESH;
@@ -1188,6 +1194,12 @@ mod tests {
             let weight: Vec<f32> = hist.chunks_exact(4).map(|c| c[3]).collect();
             let tool = |name: &str| f32s(&std::fs::read(out.join(format!("{name}-{t:02}.f32"))).unwrap());
             results.push((t, edit, weight, acc, tool("cache"), tool("weight"), tool("acc")));
+            // The picture written back, in the edit's place for the comparison between the paths.
+            let colour = rig.read_colour();
+            results.last_mut().unwrap().4.extend(colour);
+        }
+        if let Some(image) = depth {
+            image.destroy(&rig);
         }
         let _ = std::fs::remove_dir_all(&dir);
         Some((rig, results, src_edit))
@@ -1206,9 +1218,11 @@ mod tests {
     #[test]
     fn the_shaders_carry_the_edit_as_the_replay_tool_does() {
         for kind in ["still", "pan", "depth-edge"] {
-            let Some((rig, results, src_edit)) = carry_on_gpu(kind) else { return };
+            let Some((rig, results, src_edit)) = carry_on_gpu(kind, false) else { return };
             let (w, h) = (rig.w as usize, rig.h as usize);
+            let n = w * h;
             for (t, edit, weight, acc, t_edit, t_weight, t_acc) in &results {
+                let t_edit = &t_edit[..n * 3];
                 let de = max_diff(edit, t_edit);
                 let dw = max_diff(weight, t_weight);
                 let da = max_diff(acc, t_acc);
@@ -1265,6 +1279,93 @@ mod tests {
                 }
                 _ => unreachable!(),
             }
+        }
+    }
+
+    /// A D32_SFLOAT_S8_UINT image standing for DLSS's depth, and a slot buffer as the hold inside
+    /// DLSS's buffer has.
+    struct DepthImage {
+        image: vk::Image,
+        memory: vk::DeviceMemory,
+        slot: HostBuffer,
+    }
+
+    impl DepthImage {
+        fn new(rig: &Rig) -> Self {
+            let (instance, physical, d) = (&rig.gpu.1, rig.gpu.2, &rig.gpu.3);
+            let info = vk::ImageCreateInfo::builder()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::D32_SFLOAT_S8_UINT)
+                .extent(vk::Extent3D { width: rig.w, height: rig.h, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            // SAFETY: the test's device; nothing submitted yet.
+            unsafe {
+                let image = d.create_image(&info, None).unwrap();
+                let reqs = d.get_image_memory_requirements(image);
+                let props = instance.get_physical_device_memory_properties(physical);
+                let index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
+                let memory = d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None).unwrap();
+                d.bind_image_memory(image, memory, 0).unwrap();
+                let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+                let general = vk::ImageMemoryBarrier::builder()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(image)
+                    .subresource_range(range)
+                    .build();
+                rig.one_shot(|cmd| d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[general]));
+                let slot = super::super::own_host_buffer_with(d, instance, physical, u64::from(rig.w * rig.h) * 4, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+                Self { image, memory, slot }
+            }
+        }
+
+        /// `bytes` (f32 device depth) into the image's depth aspect, then into the layer's depth
+        /// buffer the way the hold inside DLSS's buffer does (image -> slot buffer -> layer's buffer).
+        fn route_through(&self, rig: &Rig, bytes: &[u8]) {
+            let d = &rig.gpu.3;
+            Rig::write(&rig.staging, bytes);
+            let region = vk::BufferImageCopy {
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::DEPTH, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+                image_extent: vk::Extent3D { width: rig.w, height: rig.h, depth: 1 },
+                ..Default::default()
+            };
+            let size = bytes.len() as u64;
+            // SAFETY: recording into the test's buffers; the image is in GENERAL.
+            rig.one_shot(|cmd| unsafe { d.cmd_copy_buffer_to_image(cmd, rig.staging.buffer, self.image, vk::ImageLayout::GENERAL, &[region]) });
+            rig.one_shot(|cmd| unsafe { d.cmd_copy_image_to_buffer(cmd, self.image, vk::ImageLayout::GENERAL, self.slot.buffer, &[region]) });
+            rig.one_shot(|cmd| unsafe { d.cmd_copy_buffer(cmd, self.slot.buffer, rig.depth.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size }]) });
+        }
+
+        fn destroy(&self, rig: &Rig) {
+            let d = &rig.gpu.3;
+            // SAFETY: every submission was waited for.
+            unsafe {
+                self.slot.destroy(d);
+                d.destroy_image(self.image, None);
+                d.free_memory(self.memory, None);
+            }
+        }
+    }
+
+    /// The hold inside DLSS's buffer gets its depth through the game's image and a slot buffer, the
+    /// split hold as given: the same inputs give the same picture, bit for bit, through the same passes.
+    #[test]
+    fn the_hold_inside_dlss_buffer_writes_the_same_picture_as_the_split_hold() {
+        let Some((_, split, _)) = carry_on_gpu("depth-edge", false) else { return };
+        let Some((_, inline, _)) = carry_on_gpu("depth-edge", true) else { return };
+        assert_eq!(split.len(), inline.len());
+        for (a, b) in split.iter().zip(&inline) {
+            assert!(a.1 == b.1 && a.2 == b.2, "hold {}: the shown edit or its weight differ", a.0);
+            let bits = |v: &[f32]| v.iter().map(|x| x.to_bits()).collect::<Vec<u32>>();
+            assert_eq!(bits(&a.4), bits(&b.4), "hold {}: the picture written back differs", a.0);
         }
     }
 }
