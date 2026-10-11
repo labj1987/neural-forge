@@ -17,7 +17,7 @@ neural-forge-protocol = { path = "../protocol" }
 # expressed in terms of `ash::vk` types, and Cargo treats different 0.x versions of the
 # same crate as separate, incompatible types -- a mismatched ash version here would
 # fail to compile against vulkan-layer's trait signatures, not just risk skew.
-ash = "=0.37.3"
+ash = "=0.38.0"
 vulkan-layer = { git = "https://github.com/google/vk-layer-for-rust", rev = "102d87cd9781c045b232e77eef198eed75ce8a8c" }
 libc = "0.2"
 # For real ShmHeader::capture_request support (see src/dump.rs) -- a pure-Rust,
