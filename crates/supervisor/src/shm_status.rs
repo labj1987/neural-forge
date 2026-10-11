@@ -56,6 +56,7 @@ pub fn status_text(header: &ShmHeader) -> String {
     line(format_args!("layer_measured_white={}", f32::from_bits(header.layer_measured_white_bits.load(Ordering::Relaxed))));
     line(format_args!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed)));
     line(format_args!("capture_request={}", header.capture_request.load(Ordering::Relaxed)));
+    line(format_args!("preupscale_dump_request={}", header.preupscale_dump_request.load(Ordering::Relaxed)));
     line(format_args!("# settings (neural_forge_protocol::ShmHeader::persisted_settings)"));
     for (name, is_float, bits) in header.persisted_settings() {
         if is_float {
@@ -85,10 +86,12 @@ mod tests {
         let header = ShmHeader::default();
         header.init_defaults();
         header.capture_request.store(1, Ordering::Relaxed);
+        header.preupscale_dump_request.store(16, Ordering::Relaxed);
         let text = status_text(&header);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "# live status");
         assert!(lines.contains(&"capture_request=1"), "{text}");
+        assert!(lines.contains(&"preupscale_dump_request=16"), "{text}");
         assert!(lines.contains(&"intensity=1"), "{text}");
         assert!(lines.contains(&"skin_structure=-1"), "{text}");
         let settings_at = lines.iter().position(|l| l.starts_with("# settings")).expect("a settings section");

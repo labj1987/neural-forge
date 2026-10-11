@@ -13,7 +13,7 @@ use std::sync::atomic::Ordering;
 
 pub fn usage() {
     eprintln!(
-        "usage: neural-forge-cli shmctl <status|set|toggle|capture|reset>\n\n\
+        "usage: neural-forge-cli shmctl <status|set|toggle|capture|dump-cache|reset>\n\n\
          \x20 status              print every setting and live status field\n\
          \x20 set <name> <value>  set one setting (float fields take a decimal value)\n\
          \x20 toggle <name>       flip a 0/1-valued setting\n\
@@ -22,6 +22,9 @@ pub fn usage() {
          \x20 capture --frames N  dump the next N presented frames (N > 1) as a series of\n\
          \x20                     original+composited pairs, whichever present path runs\n\
          \x20                     (see neural_forge_layer::series)\n\
+         \x20 dump-cache [--holds K]  dump the next K model-mode holds before the upscaler\n\
+         \x20                     (default 16, at most 64) to $XDG_DATA_HOME/neural-forge/\n\
+         \x20                     captures/preupscale-cache-<ms>/ (docs/ARCHITECTURE.md)\n\
          \x20 reset               reset every setting to its default; preserves the\n\
          \x20                     live layer session (see ShmHeader::reset_persisted_settings)\n\n\
          Opens config.ini's shm= channel, else $NEURAL_FORGE_SHM, else the default under\n\
@@ -163,6 +166,30 @@ fn cmd_capture(header: &ShmHeader, args: &[String]) -> bool {
     true
 }
 
+/// `dump-cache [--holds K]`: the hold count it asks for, or why the arguments are wrong.
+fn dump_cache_holds(args: &[String]) -> Result<u32, String> {
+    use neural_forge_protocol::cache_dump::{parse_holds, DEFAULT_HOLDS, MAX_HOLDS};
+    match args {
+        [] => Ok(DEFAULT_HOLDS),
+        [flag, k] if flag == "--holds" => parse_holds(k).ok_or_else(|| format!("shmctl dump-cache: --holds takes a count from 1 to {MAX_HOLDS}, got {k:?}")),
+        _ => Err("usage: neural-forge-cli shmctl dump-cache [--holds K]".into()),
+    }
+}
+
+fn cmd_dump_cache(header: &ShmHeader, args: &[String]) -> bool {
+    match dump_cache_holds(args) {
+        Ok(k) => {
+            header.preupscale_dump_request.store(k, Ordering::Relaxed);
+            println!("preupscale_dump_request={k} -- the game's next {k} model-mode holds go to a new $XDG_DATA_HOME/neural-forge/captures/preupscale-cache-<ms>/");
+            true
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            false
+        }
+    }
+}
+
 /// Checks the argument count of a `shmctl` command line before anything is opened, so an extra
 /// or missing argument is a usage error. `capture`'s own options are checked by `cmd_capture`.
 pub fn check_args(args: &[String]) -> Result<(), String> {
@@ -173,6 +200,7 @@ pub fn check_args(args: &[String]) -> Result<(), String> {
         Some("set") if n == 3 => Ok(()),
         Some("toggle") if n == 2 => Ok(()),
         Some("capture") => Ok(()),
+        Some("dump-cache") => dump_cache_holds(&args[1..]).map(|_| ()),
         Some(sub @ ("status" | "reset" | "set" | "toggle")) => Err(format!("wrong number of arguments for shmctl {sub}")),
         Some(other) => Err(format!("unknown shmctl subcommand {other:?}")),
     }
@@ -210,6 +238,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
             }
         },
         Some("capture") => cmd_capture(header, &args[1..]),
+        Some("dump-cache") => cmd_dump_cache(header, &args[1..]),
         Some("reset") => {
             header.reset_persisted_settings();
             println!("settings reset to defaults; layer session preserved");
@@ -247,6 +276,23 @@ mod tests {
         let (is_float, bits) = resolve(&header, "colour_strength").expect("colour_strength should resolve");
         assert!(is_float);
         assert_eq!(f32::from_bits(bits), 1.0);
+    }
+
+    #[test]
+    fn dump_cache_takes_an_optional_hold_count() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        assert_eq!(dump_cache_holds(&a("")), Ok(16));
+        assert_eq!(dump_cache_holds(&a("--holds 8")), Ok(8));
+        assert_eq!(dump_cache_holds(&a("--holds 64")), Ok(64));
+        assert!(dump_cache_holds(&a("--holds 65")).is_err());
+        assert!(dump_cache_holds(&a("--holds 0")).is_err());
+        assert!(dump_cache_holds(&a("--holds")).is_err());
+        assert!(dump_cache_holds(&a("8")).is_err());
+        assert!(check_args(&a("dump-cache --holds 4")).is_ok());
+        assert!(check_args(&a("dump-cache --holds 100")).is_err());
+        let header = ShmHeader::default();
+        assert!(cmd_dump_cache(&header, &a("--holds 4")));
+        assert_eq!(header.preupscale_dump_request.load(Ordering::Relaxed), 4);
     }
 
     #[test]

@@ -265,6 +265,13 @@ pub struct ShmHeader {
     /// backend's status line and is rewritten whenever the status changes, and `doctor` and the
     /// Status tab need the loss to survive whatever is written after it.
     pub device_lost_at: AtomicU32,
+
+    // --- v17 -----------------------------------------------------------------------------
+    /// How many consecutive model-mode holds the layer should dump before the upscaler (colour
+    /// before and after the model, motion vectors, depth, jitter, exposure; docs/ARCHITECTURE.md
+    /// "Pre-upscaler cache dump"), or 0 for none. Set by `shmctl dump-cache`; the layer zeroes it
+    /// when it takes the request (the dump then runs to its end or to the first missed hold).
+    pub preupscale_dump_request: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -289,7 +296,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 668, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 672, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 72, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 568, "layout changed -- bump SHM_VERSION");
@@ -304,6 +311,7 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 648,
 const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 656, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, native_running) == 660, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, device_lost_at) == 664, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_dump_request) == 668, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 228, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 424, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, server_state) == 156, "layout changed -- bump SHM_VERSION");
@@ -836,8 +844,17 @@ mod tests {
     fn device_lost_at_is_appended_after_native_running() {
         // v16 appends one word: every earlier field keeps its offset, and the new one sits last.
         assert_eq!(std::mem::offset_of!(ShmHeader, device_lost_at), std::mem::offset_of!(ShmHeader, native_running) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, device_lost_at) + 4, std::mem::size_of::<ShmHeader>());
-        assert_eq!(crate::SHM_VERSION, 16);
+    }
+
+    #[test]
+    fn preupscale_dump_request_is_appended_after_device_lost_at() {
+        // v17 appends one word: every earlier field keeps its offset, and the new one sits last.
+        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_dump_request), std::mem::offset_of!(ShmHeader, device_lost_at) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_dump_request) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 17);
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.preupscale_dump_request.load(Ordering::Relaxed), 0, "a fresh session dumps nothing");
     }
 
     #[test]

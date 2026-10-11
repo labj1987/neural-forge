@@ -496,6 +496,21 @@ impl ShmClient {
         hdr.preupscale_misses.store(misses, Ordering::Relaxed);
     }
 
+    /// A pending K-hold cache dump request (`ShmHeader::preupscale_dump_request`), taken: the field is
+    /// zeroed so the CLI and the status see it was. One atomic load when there is none.
+    pub fn take_preupscale_dump_request(&self) -> Option<u32> {
+        let hdr = self.header()?;
+        if hdr.preupscale_dump_request.load(Ordering::Relaxed) == 0 {
+            return None;
+        }
+        Some(hdr.preupscale_dump_request.swap(0, Ordering::Relaxed)).filter(|&k| k > 0)
+    }
+
+    /// The channel's path once it is open (empty before).
+    pub fn channel_path(&self) -> &str {
+        &self.path
+    }
+
     /// Whether the model is switched on: the live `enabled` toggle (F11 / the GUI / `shmctl set
     /// enabled`) and `apply_model`. What the native backend checks: it has no model server to report the
     /// model unavailable. `false` before the mapping is open.
