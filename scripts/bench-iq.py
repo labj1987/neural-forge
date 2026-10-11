@@ -12,7 +12,7 @@ taken on the frames as presented (8-bit sRGB PNGs, linearised), with Y the Rec.7
 
 Flicker: per pixel d = |log2(Y_t + f) - log2(Y_t-1 + f)| between consecutive frames, f = 0.05 x the
 geometric mean of the first frame's Y; the mean of the smallest 95% of d (the 5% that change most
-are moving objects), averaged over the pairs of the window (6 frames: 5 pairs), shown as
+are moving objects), averaged over the pairs of the window (9 frames: 8 pairs, two whole frame-generation cycles at 4x), shown as
 100 x (2^mean - 1) %. The same measure as the reference's live benchmark.
 
 Added detail (with --baseline, a run with the layer loaded and the model off, captured at the same
@@ -22,7 +22,7 @@ and its four neighbours' largest frame-to-frame change within the window is unde
 both runs. f is the
 baseline's for both, so the two logs are on one scale.
 
-The window is the 6 frames from SETTLE frames after the series' first cut (`anchor`; the first
+The window is the 9 frames from SETTLE frames after the series' first cut (`anchor`; the first
 frames when there is no cut): GTA's camera starts a pass up to about a second earlier or later from
 run to run, so the series is captured across the cut and the cut fixes the moment. --start K / --frames N choose the window by hand.
 --scan prints the mean frame-to-frame change of every pair and the stillest N-frame window, for
@@ -34,7 +34,7 @@ import os
 import re
 import sys
 
-WINDOW = 6
+WINDOW = 9
 EXCLUDE = 0.05  # the share of pixels with the largest change left out of the flicker mean
 FLOOR = 0.05  # x geometric mean luma
 STATIC_STOPS = 0.05
