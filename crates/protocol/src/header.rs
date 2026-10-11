@@ -214,6 +214,8 @@ pub struct ShmHeader {
     /// Run the model on every Nth presented frame (1 = every frame). With frame generation on,
     /// 2 skips the model on roughly the generated half and carries the last answer onto them
     /// (ghost guard applied), instead of making every generated frame wait for its own answer.
+    /// Before the upscaler it is the edit cache's interval while the camera moves; a still camera
+    /// runs the network on every hold (docs/ARCHITECTURE.md 4.10).
     pub model_interval: AtomicU32,
 
     // --- v8 ------------------------------------------------------------------------------

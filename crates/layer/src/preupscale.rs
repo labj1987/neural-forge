@@ -4008,6 +4008,9 @@ pub(crate) struct HoldResult {
     /// The native backend: this hold reused the last refresh's correction (the edit cache) instead of
     /// running the network. `evaluated` is set either way.
     pub cached: bool,
+    /// The native backend: the edit cache's adaptive cadence had the camera still on this hold
+    /// (`cache::Regime`: the network on every hold).
+    pub cache_still: bool,
     /// The native backend: the GPU time of the previous hold's cache passes, read likewise.
     pub cache_gpu_ms: Option<f32>,
     /// The previous cached hold's share of rejected pixels (0..1), read likewise.
@@ -4742,11 +4745,13 @@ struct Stats {
     network_gpu_ms: Vec<f32>,
     /// The native hold's depth copy (`native::DepthCopy`).
     depth_gpu_ms: Vec<f32>,
-    /// The edit cache (`cache`): its passes' GPU time, the window's refresh and cached holds, the
-    /// session's, the last cached hold's rejected share, and the median published at the last summary.
+    /// The edit cache (`cache`): its passes' GPU time, the window's refresh and cached holds (and
+    /// those in the still regime), the session's, the last cached hold's rejected share, and the
+    /// median published at the last summary.
     cache_gpu_ms: Vec<f32>,
     window_refresh: u32,
     window_cached: u32,
+    window_still: u32,
     refresh_holds: u32,
     cached_holds: u32,
     last_rejected: Option<f32>,
@@ -5225,6 +5230,9 @@ impl Session {
             s.last_rejected = result.cache_rejected;
         }
         if result.native && result.evaluated {
+            if result.cache_still {
+                s.window_still += 1;
+            }
             if result.cached {
                 s.window_cached += 1;
                 s.cached_holds = s.cached_holds.wrapping_add(1);
@@ -5284,9 +5292,10 @@ impl Session {
                     String::new()
                 } else {
                     format!(
-                        " cached={} refresh={} cache_gpu_ms median={:.3} rejected={}",
+                        " cached={} refresh={} still={} cache_gpu_ms median={:.3} rejected={}",
                         s.window_cached,
                         s.window_refresh,
+                        s.window_still,
                         median(&s.cache_gpu_ms),
                         s.last_rejected.map_or_else(|| "-".to_string(), |r| format!("{:.1}%", r * 100.0))
                     )
@@ -5317,6 +5326,7 @@ impl Session {
             s.cache_gpu_ms.clear();
             s.window_cached = 0;
             s.window_refresh = 0;
+            s.window_still = 0;
             s.clear_phases();
             s.window_misses = 0;
         }

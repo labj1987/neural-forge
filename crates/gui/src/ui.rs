@@ -53,7 +53,7 @@ fn refresh_all_rows() {
 /// `neural_forge_protocol::SETTING_BOUNDS`.
 /// The model-every-Nth-frame row's subtitle after the upscaler, and before it (the edit cache).
 const INTERVAL_AFTER: &str = "1 = every frame. With frame generation on, 2 lets generated frames reuse the last answer instead of waiting for their own";
-const INTERVAL_BEFORE: &str = "Network every Nth frame; frames between reuse its last result, moved with the game's motion. 1 = every frame";
+const INTERVAL_BEFORE: &str = "Network every Nth frame while the camera moves, every frame while it is still; frames between reuse its last result, moved with the game's motion. 1 = every frame";
 
 fn spin_row(title: &str, subtitle: &str, value: f32, setting: &str, step: f64, setter: impl Fn(f32) + 'static) -> adw::SpinRow {
     spin_row_scaled(title, subtitle, value, setting, step, 1.0, setter)

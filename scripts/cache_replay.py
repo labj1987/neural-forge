@@ -247,12 +247,12 @@ class Cadence:
 
 
 class Regime:
-    """The layer's adaptive cadence (`cache::Regime`, which mirrors this): the camera is still while
-    the median pixel of a hold moves less than a quarter of the pace (enter) or three quarters of it
-    (stay), the pace being max(0.1% of the render width, 0.5 px) / 3 a hold (upstream's speed
-    reference at motion priority 0.5). A regime change waits for consecutive holds that want it: 3
-    toward the shorter interval, 20 toward the longer, so the cadence never hops. The motion pass counts
-    the pixels (`still_counts`) and a hold's counts decide the holds after it."""
+    """The layer's adaptive cadence (`cache::Regime`, which mirrors this): a hold reads as still when
+    its median pixel moves less than a quarter of the pace, max(0.1% of the render width, 0.5 px) / 3
+    a hold (upstream's speed reference at motion priority 0.5). A regime change waits for consecutive
+    holds that want it: 3 toward the shorter interval, 20 toward the longer, so the cadence never
+    hops. The motion pass counts the pixels (`still_counts`) and a hold's counts decide the holds
+    after it."""
 
     TO_SHORTER = 3
     TO_LONGER = 20
@@ -264,10 +264,10 @@ class Regime:
         return self.cad.still_interval if self.still else self.cad.interval
 
     def observe(self, counts: tuple) -> None:
-        enter, stay, n = counts
+        still, n = counts
         if n == 0:
             return
-        wants = 2 * (stay if self.still else enter) > n
+        wants = 2 * still > n
         if wants == self.still:
             self.against = 0
             return
@@ -278,12 +278,12 @@ class Regime:
 
 
 def still_counts(mv: np.ndarray) -> tuple:
-    """The motion pass's STAT_STILL_ENTER, STAT_STILL_STAY and STAT_MOTION_N: pixels whose vector (the
-    nearest surface's, render pixels) is shorter than a quarter / three quarters of the pace, and all."""
+    """The motion pass's STAT_STILL and STAT_MOTION_N: pixels whose vector (the nearest surface's,
+    render pixels) is shorter than a quarter of the pace, and all of them."""
     h, w = mv.shape[:2]
     pace = np.float32(max(0.001 * w, 0.5) / 3.0)
     s = np.sqrt((mv.astype(np.float32) ** 2).sum(axis=-1))
-    return int((s < np.float32(0.25) * pace).sum()), int((s < np.float32(0.75) * pace).sum()), h * w
+    return int((s < np.float32(0.25) * pace).sum()), h * w
 
 
 def step_position(prev: cc.Frame, cur: cc.Frame, p: cc.Params) -> np.ndarray:
@@ -382,8 +382,8 @@ def export_cadence(dump: cc.Dump, cad: Cadence, p: cc.Params, reverse_z: bool, o
     k = 0
     with open(os.path.join(out, "holds.txt"), "w", encoding="utf-8") as fh:
         for t, _, _, shown, dst, _ in run_cadence(dump, frames, cad, p):
-            enter, stay, n = still_counts(dst.mv)
-            fh.write(f"{float(dst.jitter[0])!r} {float(dst.jitter[1])!r} {enter} {stay} {n}\n")
+            still, n = still_counts(dst.mv)
+            fh.write(f"{float(dst.jitter[0])!r} {float(dst.jitter[1])!r} {still} {n}\n")
             shown.astype("<f4").tofile(os.path.join(out, f"shown-{t:02d}.f32"))
             k += 1
     return k

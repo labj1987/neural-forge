@@ -469,10 +469,11 @@ and `depth.r32f` (device depth as f32: D16/D24 divided by their maximum; only fo
 mirror step for step is `scripts/cache_common.py` (`scripts/cache_replay.py` measures it offline on a
 4.9 dump). Ported from optiscaler-dlss5's `dlssnr_cache.hlsl` (ATTRIBUTION.md).
 
-`model_interval` (1..4) is the cache's interval on this path: the network runs on one hold in N (a
-**refresh**: C, N, W as in 4.5) and the holds between are **cached**: C as always (exposure, vectors,
-depth, the encode), no N, and a write-back that carries the refresh's correction to this hold. At 1
-every hold refreshes and the picture is bit for bit what it was (the test
+`model_interval` (1..4) is the cache's interval on this path while the camera moves: the network
+runs on one hold in N (a **refresh**: C, N, W as in 4.5) and the holds between are **cached**: C as
+always (exposure, vectors, depth, the encode), no N, and a write-back that carries the refresh's
+correction to this hold. While the camera is still every hold refreshes (the adaptive cadence,
+below). At 1 every hold refreshes and the picture is bit for bit what it was (the test
 `at_interval_1_the_network_sees_exactly_what_it_saw_before_the_accumulated_field`).
 
 - **Accumulated motion.** The network's history reads `NativePass::acc` (f32 x, y per texel, in the
@@ -503,7 +504,16 @@ every hold refreshes and the picture is bit for bit what it was (the test
   (v + eps) * 2^edit - eps` back to scene with the decode's rules: original kept where the encode
   clamped, alpha kept, nothing written with an unusable exposure). Debug view 6 writes the rejection
   mask instead (red rejected, green the high band's confidence, blue off the chain).
-- **When a hold is cached** (`cache::State::plan`): within the interval after a refresh that stored
+- **Adaptive cadence** (`cache::Regime`, mirrored by `cache_replay.py --adaptive`): the motion pass
+  counts the texels whose vector (the nearest surface's) is shorter than a quarter of the pace,
+  max(0.1% of the render width, 0.5 px) / 3 a hold (0.124 px at 1440p Balanced), and how many it
+  counted (`STAT_STILL`, `STAT_MOTION_N`, read when the hold's fence was waited on). A hold reads
+  as still when that is most of them; the regime changes after 3 holds in a row that want the still
+  regime, or 20 that want out of it. Still: the network runs on every hold, since what a cached hold cannot carry (the part of the
+  answer that follows each hold's jitter) is what a player sees on a still view; moving:
+  `model_interval`. Upstream's direction (still: a long interval) and its GPU budget and early
+  refresh were measured and not taken (LESSONS.md, "3.3 edit cache: what was tried").
+- **When a hold is cached** (`cache::State::plan`): within the regime's interval after a refresh that stored
   an edit, the very next DLSS submit after the previous hold (any frame that went to DLSS untouched
   breaks it), the network's history still good (`HistoryGap::pending`: no skip, no other extent, under
   500 ms), jitter, vectors, the same depth presence as the refresh, no cache dump armed. A hold that
@@ -526,7 +536,8 @@ every hold refreshes and the picture is bit for bit what it was (the test
   cache had 146 bytes a render pixel of its own before (408 MB at 2228x1253; LESSONS.md, "3.3 edit
   cache: what was tried"). Reversed-Z is decided once per
   extent from the first hold's depth counts (texels at 0 and 1, else the top and bottom quarters).
-- **Status**: `[preupscale]` gains `cached=N refresh=N cache_gpu_ms median=X rejected=Y%`; SHM v17
+- **Status**: `[preupscale]` gains `cached=N refresh=N still=N cache_gpu_ms median=X rejected=Y%`
+  (still: the window's holds in the still regime); SHM v17
   `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected` (1/10000), `cache_gpu_ms_bits`;
   `shmctl status` and the Debug tab show them.
 

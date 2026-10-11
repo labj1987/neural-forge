@@ -109,6 +109,8 @@ const uint STAT_BOTTOM_N = 6u;
 const uint STAT_REJECTED = 7u;   // cached hold: texels whose history was rejected (weight < 0.5)
 const uint STAT_EDIT_OK = 8u;    // refresh capture: 1 = an edit was stored (usable exposure)
 const uint STAT_APPLY_BAD = 9u;  // cached hold: 1 = unusable exposure, nothing was written
+const uint STAT_STILL = 10u;      // motion pass: texels moving under a quarter of the pace (the
+const uint STAT_MOTION_N = 11u;   // adaptive cadence's regime), and all it counted
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float KNEE = 0.75;

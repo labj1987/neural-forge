@@ -1619,6 +1619,7 @@ pub(crate) unsafe fn run_native_hold(
     result.evaluated = true;
     result.wrote_back = true;
     result.cached = cached;
+    result.cache_still = cache_hold.interval > 1 && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
     result.timing.writeback = Some(t_hold.elapsed());
     result
 }

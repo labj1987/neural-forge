@@ -5,7 +5,8 @@
 // accumulated field read where it leads, NaN where the chain leaves the frame. The network reads the
 // field for its history (native_preprocess.comp, binding 2) and the cache for where each pixel was on
 // the refresh hold. At interval 1 (flags without F_CHAINED) the vectors are copied as they are. Also
-// how far each pixel has travelled since the refresh (u_stale, the guided filter's weight).
+// how far each pixel has travelled since the refresh (u_stale, the guided filter's weight), and how
+// many texels move less than a quarter of the pace (the adaptive cadence: cache::Regime).
 //
 // Ported from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5), commit
 // 6bfc4389c25054ef6747df6e6b1b470e9541c4da: OptiScaler/shaders/dlssnr/precompile/dlssnr_cache.hlsl
@@ -112,6 +113,8 @@ const uint STAT_BOTTOM_N = 6u;
 const uint STAT_REJECTED = 7u;   // cached hold: texels whose history was rejected (weight < 0.5)
 const uint STAT_EDIT_OK = 8u;    // refresh capture: 1 = an edit was stored (usable exposure)
 const uint STAT_APPLY_BAD = 9u;  // cached hold: 1 = unusable exposure, nothing was written
+const uint STAT_STILL = 10u;      // motion pass: texels moving under a quarter of the pace (the
+const uint STAT_MOTION_N = 11u;   // adaptive cadence's regime), and all it counted
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float KNEE = 0.75;
@@ -256,16 +259,18 @@ float previous_stale(vec2 pos) {
   return r;
 }
 
-void main() {
-  uvec2 xy = gl_GlobalInvocationID.xy;
-  if (any(greaterThanEqual(xy, p.size))) return;
+shared uint s_still[2];
+
+// still_counts: whether this texel's vector (render pixels) is under a quarter of the pace, max(0.1%
+// of the width, 0.5 px) / 3 a hold.
+void count_still(vec2 mv) {
+  float pace = max(0.001 * float(p.size.x), 0.5) / 3.0;
+  if (length(mv) < 0.25 * pace) atomicAdd(s_still[0], 1u);
+  atomicAdd(s_still[1], 1u);
+}
+
+void accumulate(uvec2 xy) {
   uint i = index_of(xy);
-  // At interval 1 the network reads the vectors as they are, as f32: unpackHalf2x16 is exact, and
-  // native_preprocess.comp multiplies by the same scale it always did.
-  if ((p.flags & F_CHAINED) == 0u) {
-    u_acc.v[i] = unpackHalf2x16(u_motion.mv[i]);
-    return;
-  }
   // nearest_surface_motion: the vector of the nearest depth in the 3x3 (first in scan order on a tie).
   uint pick = i;
   if ((p.flags & F_NEAREST) != 0u) {
@@ -285,6 +290,7 @@ void main() {
     }
   }
   vec2 mv = finite_or_zero(unpackHalf2x16(u_motion.mv[pick]) * p.mvec_scale);
+  count_still(mv);
   // acc_step: acc_t(x) = mv_t(x) + acc_{t-1}(x + mv_t(x) + jitter[t-1] - jitter[t]).
   vec2 at = vec2(xy) + 0.5 + mv + p.step_jitter;
   vec2 acc = mv;
@@ -298,4 +304,21 @@ void main() {
   u_stale.v[i] = stale;
   bool on = at.x >= 0.0 && at.x <= float(p.size.x) && at.y >= 0.0 && at.y <= float(p.size.y);
   u_acc.v[i] = on ? acc / p.mvec_scale : vec2(nan_value());
+}
+
+void main() {
+  uvec2 xy = gl_GlobalInvocationID.xy;
+  uint local = gl_LocalInvocationIndex;
+  bool inside = all(lessThan(xy, p.size));
+  // At interval 1 the network reads the vectors as they are, as f32: unpackHalf2x16 is exact, and
+  // native_preprocess.comp multiplies by the same scale it always did.
+  if ((p.flags & F_CHAINED) == 0u) {
+    if (inside) u_acc.v[index_of(xy)] = unpackHalf2x16(u_motion.mv[index_of(xy)]);
+    return;
+  }
+  if (local < 2u) s_still[local] = 0u;
+  barrier();
+  if (inside) accumulate(xy);
+  barrier();
+  if (local < 2u && s_still[local] != 0u) atomicAdd(u_stats.v[STAT_STILL + local], s_still[local]);
 }

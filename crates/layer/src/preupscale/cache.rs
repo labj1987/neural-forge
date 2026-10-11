@@ -1,13 +1,15 @@
 //! The pre-upscaler edit cache (docs/ARCHITECTURE.md 4.10): with `model_interval` N above 1 the
-//! network runs on one hold in N (a refresh) and the holds between (cached holds) reuse its
-//! correction, carried along the game's motion and multiplied onto their own fresh frame.
+//! network runs on one hold in N (a refresh; every hold while the camera is still, [`Regime`]) and
+//! the holds between (cached holds) reuse its correction, carried along the game's motion and
+//! multiplied onto their own fresh frame.
 //!
 //! The GPU side is seven compute passes (`shaders/preupscale_cache_*.comp`), the step-for-step mirror
 //! of `scripts/cache_common.py` (the numpy reference the offline replay measures with):
 //!
 //! - in the capture (`C`) of every hold: `prep` (this hold's pseudo-linear depth, the depth's
 //!   reversed-Z counts) and `motion` (the accumulated motion
-//!   back to the previous network frame, which the network's history reads too). At interval 1 only
+//!   back to the previous network frame, which the network's history reads too, and the
+//!   [`Regime`]'s counts). At interval 1 only
 //!   `motion` runs, copying DLSS's vectors as they are, so the network's input is bit for bit what it
 //!   was;
 //! - in a refresh hold's write-back (`W`), right before the decode: `capture` (the edit the decode is
@@ -70,6 +72,8 @@ const STAT_BOTTOM_N: usize = 6;
 const STAT_REJECTED: usize = 7;
 const STAT_EDIT_OK: usize = 8;
 const STAT_APPLY_BAD: usize = 9;
+const STAT_STILL: usize = 10;
+const STAT_MOTION_N: usize = 11;
 const STAT_WORDS: usize = 16;
 const STAT_BYTES: u64 = STAT_WORDS as u64 * 4;
 
@@ -276,6 +280,52 @@ pub(crate) struct Outcome {
     pub rejected: Option<f32>,
 }
 
+/// The adaptive cadence (`scripts/cache_replay.py`'s `Regime`, which this mirrors): while the camera
+/// is still the network runs on every hold, so the view a player looks at closest keeps all of the
+/// model's detail (a cached hold cannot carry the part of the answer that follows each hold's
+/// jitter); while it moves, on one hold in `model_interval`. A hold reads as still when its median
+/// texel moves less than a quarter of the pace, max(0.1% of the render width, 0.5 px) / 3 a hold;
+/// the motion pass counts the texels (`STAT_STILL`, `STAT_MOTION_N`). A change waits for consecutive
+/// holds that want it, 3 into the still regime and 20 out of it, so the cadence never hops
+/// (docs/LESSONS.md, "3.3 edit cache: what was tried").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Regime {
+    still: bool,
+    /// Consecutive holds that wanted the other regime.
+    against: u32,
+}
+
+impl Regime {
+    /// Holds in a row that move it into the still regime (the shorter interval), and out of it.
+    const INTO_STILL: u32 = 3;
+    const OUT_OF_STILL: u32 = 20;
+
+    /// The interval for the next hold, `model_interval` being `max`.
+    pub(crate) fn interval(self, max: u32) -> u32 {
+        if self.still { 1 } else { max }
+    }
+
+    pub(crate) fn still(self) -> bool {
+        self.still
+    }
+
+    /// One hold's counts: texels under a quarter of the pace, and all of them.
+    pub(crate) fn observe(&mut self, still: u32, n: u32) {
+        if n == 0 {
+            return;
+        }
+        let wants = 2 * u64::from(still) > u64::from(n);
+        if wants == self.still {
+            self.against = 0;
+            return;
+        }
+        self.against += 1;
+        if self.against >= if wants { Self::INTO_STILL } else { Self::OUT_OF_STILL } {
+            *self = Self { still: wants, against: 0 };
+        }
+    }
+}
+
 /// The cache's bookkeeping on the CPU. A hold takes the stored edit out at its start
 /// ([`Self::plan`]) and only a hold that went through ([`Self::went_through`]) puts it back, so a hold
 /// that misses for any reason leaves the next one to refresh; so does every reset of the network's
@@ -301,12 +351,14 @@ pub(crate) struct State {
     reverse_z: Option<bool>,
     /// The kind of the last submitted hold whose counters are still to be read.
     pending: Option<Kind>,
+    /// The adaptive cadence, from the counts of the holds before.
+    pub(crate) regime: Regime,
 }
 
 /// What a hold brings to [`State::plan`].
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Hold {
-    /// `model_interval`, 1..=[`MAX_INTERVAL`].
+    /// `model_interval`, 1..=[`MAX_INTERVAL`]: the interval while the camera moves ([`Regime`]).
     pub interval: u32,
     /// `Session::seen`: the DLSS submit this hold is.
     pub hold: u64,
@@ -351,7 +403,7 @@ impl State {
         let chained = h.interval > 1;
         // The hold before went through on this chain, and this one can read the refresh's edit.
         let continues = chained && had && consecutive && h.jitter.is_some() && h.mvec && h.depth == self.refresh_depth && h.history_ok && !h.armed;
-        let cached = continues && self.since_refresh + 1 < h.interval;
+        let cached = continues && self.since_refresh + 1 < self.regime.interval(h.interval);
         let mut flags = F_KEEP_CLAMPED;
         if chained {
             flags |= F_CHAINED;
@@ -540,6 +592,7 @@ impl CachePass {
     pub(crate) fn unchain(&mut self) {
         if std::mem::replace(&mut self.chained, false) {
             self.state.drop_edit();
+            self.state.regime = Regime::default();
         }
     }
 
@@ -783,12 +836,13 @@ impl CachePass {
 
     /// Reads what the last submitted hold's passes counted (its fence was waited on): the stored
     /// edit is dropped when the refresh's exposure was unusable or a cached hold could not apply,
-    /// and the depth's convention is decided once.
+    /// the motion's counts go to the [`Regime`], and the depth's convention is decided once.
     pub(crate) fn after_fence(&mut self) -> Outcome {
         let Some(kind) = self.state.pending.take() else { return Outcome::default() };
         let decided = self.state.reverse_z.is_some();
         let c = self.counters();
         let mut out = Outcome::default();
+        self.state.regime.observe(c[STAT_STILL], c[STAT_MOTION_N]);
         if !decided {
             if let Some(rev) = infer_reverse_z(&c) {
                 crate::log!("[preupscale] edit cache: depth is {} ({} of {} texels at 0, {} at 1)", if rev { "reversed-Z" } else { "forward" }, c[STAT_Z0], c[STAT_DEPTH_N], c[STAT_Z1]);
@@ -984,6 +1038,43 @@ mod tests {
         // A refresh without jitter stores nothing to carry.
         let mut s = State::default();
         assert_eq!(kinds(&mut s, &[Hold { jitter: None, ..hold(1) }, hold(2)]), [R, R]);
+    }
+
+    /// The adaptive cadence: 3 still holds in a row (the median texel under a quarter of the pace)
+    /// make every hold a refresh, 20 moving ones give `model_interval` back; a reading against the
+    /// regime restarts the count.
+    #[test]
+    fn a_still_camera_runs_the_network_on_every_hold() {
+        use Kind::{Cached as C, Refresh as R};
+        let (still, moving) = ((60, 100), (10, 100));
+        let mut r = Regime::default();
+        for c in [still, still, moving, still, still] {
+            r.observe(c.0, c.1);
+        }
+        assert!(!r.still(), "the moving reading restarted the count");
+        r.observe(still.0, still.1);
+        assert!(r.still());
+        assert_eq!(r.interval(3), 1);
+        for _ in 0..30 {
+            r.observe(moving.0, moving.1);
+            r.observe(still.0, still.1);
+        }
+        r.observe(0, 0);
+        assert!(r.still(), "a still reading (and nothing counted) keeps the regime");
+        for _ in 0..19 {
+            r.observe(moving.0, moving.1);
+        }
+        assert!(r.still());
+        r.observe(moving.0, moving.1);
+        assert!(!r.still());
+        assert_eq!(r.interval(3), 3);
+
+        let mut s = State::default();
+        assert_eq!(kinds(&mut s, &[hold(1), hold(2)]), [R, C]);
+        s.regime = Regime { still: true, against: 0 };
+        assert_eq!(kinds(&mut s, &[hold(3), hold(4), hold(5)]), [R, R, R]);
+        s.regime = Regime::default();
+        assert_eq!(kinds(&mut s, &[hold(6), hold(7), hold(8)]), [C, R, C], "moving again: the hold after a refresh is cached");
     }
 
     /// The flags and jitters: the hold after a refresh starts the accumulated field afresh, the
@@ -1436,14 +1527,12 @@ mod tests {
                 eprintln!("python3 with numpy is not available: the shader-against-tool test is skipped");
                 return;
             }
-            let holds: Vec<[f32; 2]> = std::fs::read_to_string(out.join("holds.txt"))
+            let lines: Vec<Vec<f64>> = std::fs::read_to_string(out.join("holds.txt"))
                 .unwrap()
                 .lines()
-                .map(|l| {
-                    let v: Vec<f32> = l.split_whitespace().map(|x| x.parse().unwrap()).collect();
-                    [v[0], v[1]]
-                })
+                .map(|l| l.split_whitespace().map(|x| x.parse().unwrap()).collect())
                 .collect();
+            let holds: Vec<[f32; 2]> = lines.iter().map(|v| [v[0] as f32, v[1] as f32]).collect();
             let read = |name: String| std::fs::read(dump.join(name)).unwrap();
             let (w, h) = (96u32, 64u32);
             let Some(rig) = Rig::new(w, h) else {
@@ -1468,8 +1557,15 @@ mod tests {
                     push.step_jitter = [holds[t - 1][0] - hj[0], holds[t - 1][1] - hj[1]];
                     push.refresh_jitter = [r[0] - hj[0], r[1] - hj[1]];
                 }
+                rig.pass.clear_counters();
                 // SAFETY (all): recording into the test's buffer; bound in `Rig::new`.
                 rig.one_shot(|cmd| unsafe { rig.pass.record_motion(d, cmd, &push, rig.acc.buffer) });
+                // The adaptive cadence's counts (still_counts), within a texel or two of the tool's.
+                let c = rig.pass.counters();
+                let counts = [c[STAT_STILL], c[STAT_MOTION_N]];
+                for (k, (&gpu, &tool)) in counts.iter().zip(&lines[t][2..4]).enumerate() {
+                    assert!((f64::from(gpu) - tool).abs() <= 2.0, "{kind} hold {t}: still count {k} is {gpu}, the tool's {tool}");
+                }
                 if refresh {
                     rig.upload_image(rig.answer.image, &read(format!("hold-{t:02}/answer.rgba16f")));
                     let capture = CachePush { flags: push.flags | F_SCENE_ANSWER, ..push };
