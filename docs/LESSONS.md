@@ -831,6 +831,35 @@ by 0.69 on every cached hold in motion. Not added until a live Crimson Desert ca
 whether the foliage looks better with it (the rejected count is already in the history pass, so
 the apply could read it within the hold).
 
+**The background model (upstream's CacheAsync, Phase 5.2): not attempted.** Upstream launches the
+network on one frame on a compute queue of its own and lands its answer two frames later, carried to
+then along the motion; the frames between show the cached edit. Its minimum interval is 3 (the launch
+frame, the frame it runs beside, the landing), and it only paid at long intervals: Control at 1440p,
+x8 in the background 25.3 fps against 24.8 in step (1% low 22.3 against 19.5), x3 in the background
+21.7 against 23.8 in step, slower, because the network then shares the GPU with every frame (28 ms
+wall on its queue against 16 at x8). The handoff made it conditional on our cadence leaving the cache
+at interval 3 or more for a meaningful share of frames. It never does: the shipped cadence is 1 while
+the camera is still and 2 while it moves (3 trails further, above), so 0% of holds are at 3 or more;
+the network runs on 51-53% of GTA's benchmark holds (the still regime 2-7%). A second network
+instance would also cost VRAM where there is none: upstream's pushed Control at 1440p to 11.6 of 12
+GB and slowed every frame (24.2 to 19.8 fps), and at 4K with frame generation ours is already at the
+card's edge without one ("3.3 edit cache: VRAM at 4K with frame generation").
+
+**Low- and high-band gains (Phase 5.4): tried, not kept.** Upstream's `LowGain`/`HighGain` scale the
+carried edit's two bands, a cheap stand-in for a stronger model. On top of the nearest-tap read, live
+at GTA's still moment at interval 2 (the table above): a high-band gain of 1.1 read x1.146 / x1.168
+added detail (mean x1.157) and 1.2 read x1.192 / x1.185 (x1.189), against x1.210 without a gain
+(three runs, x1.186-1.229): no more detail than without, inside the runs' spread, and one 1.1 run's
+flicker (1.242%) was above interval 1's (1.18-1.21%). The detail a cached hold lacks is the part of
+the model's answer that follows each hold's jitter (the refresh's high band correlates 0.00-0.14 with
+the next hold's), which scaling an older answer cannot bring back; and with the adaptive cadence a
+still view runs the network on every hold, so there is no carried band left to scale where a player
+looks closest. The Overdrive preset (intensity 1.30, local tone 1.25, local structure 1.45, skin
+structure 1.20) would not gain from it for the same reason: it already raises the model's own
+answer on every refresh, and a gain on the carried bands would only exaggerate the older answer on
+the cached holds in motion, where the trail, not the strength, is what limits them. Not in the
+shaders; `--low-gain` and `--high-gain` stay in the replay tool.
+
 ### 3.3 edit cache: VRAM at 4K with frame generation
 
 At 4K with frame generation 4x the cache's gate failed: interval 2 ran at 19.1-22.5 real fps against
