@@ -272,7 +272,7 @@ fail there).
 
 ## 6. Reading the logs
 
-**Where they are.** The layer logs to `NEURAL_FORGE_LOG` if set, otherwise to the game's stderr
+**Where they are.** Transitions and errors only (never per-frame lines) also go to the state log, `$XDG_STATE_HOME/neural-forge/layer.log`, which `neural-forge-cli doctor` reads. The full log goes to `NEURAL_FORGE_LOG` if set, otherwise to the game's stderr
 (the Proton log; in `gta-bench.sh` runs, `launch.log`). `NEURAL_FORGE_LOG_TIME=1` puts a Unix
 timestamp on every line (to match them with `journalctl -k`).
 `scripts/check-stalls.sh [LOG]` checks a layer log for fence-wait timeouts and breadcrumb dumps

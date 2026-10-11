@@ -130,9 +130,10 @@ versions disagree. The layer applies the saved settings (`config.ini`) when it c
 | 13 | `native_running` (the layer runs the model itself) | 3.0.0 |
 | 14 | `scaling_downscaler` removed (nothing read it) | 3.0.0 |
 | 15 | The helper's fields removed (passes, motion, rebuild spacing, VRAM and feature counts, its reason string, the DMA-BUF exchange); `helper_*` renamed `server_*` | 3.0.0 |
+| 16 | `device_lost_at` (Unix seconds of the session's `VK_ERROR_DEVICE_LOST`, 0 when none) | 3.2.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
-the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15.
+the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16.
 
 ## 3. Which path a frame takes
 
@@ -504,7 +505,52 @@ for model settings). The layer reads them live; the native hold applies a change
 Saved settings live in `~/.config/neural-forge/config.ini` as `set_<name>=` and are applied by the
 layer when it creates the header. Status comes from heartbeats and counters, refreshed once a
 second; the Status tab's "Model placement" line is `preupscale_state` with the extent, misses and
-the layer's status line.
+the layer's status line (`layer_reason`; a device that cannot run the network is published there as
+"device cannot run the network: <first missing>" when the layer opens the channel).
+
+### 7.1 Diagnosis and the report
+
+`crates/supervisor/src/doctor.rs` is the one set of checks behind `neural-forge-cli doctor` and the
+Status tab's Diagnose button. Every check reads through `doctor::Roots` (proc/sys roots, the XDG
+dirs, the channel path, and `nvidia-smi`/`journalctl` as injected commands), so the tests drive each
+one from a fixture tree. A finding has a severity (ok, info, warning, failure), the evidence it read
+and one fix; only a failure makes `doctor` exit non-zero. Log-driven findings match the producer's
+exact grammar and take the newest matching line as the verdict: the kernel's `NVRM: Xid (` lines,
+and the layer's state log.
+
+The state log (`$XDG_STATE_HOME/neural-forge/layer.log`, rotated to `.1` at 256 KiB; grammar in
+`crates/protocol/src/state_log.rs`) is written by the layer only on transitions: the first
+engagement in a process, a duplicate layer copy, the device-lost latch, a device that cannot run
+the network, each different network failure and the recovery after one, and the first fence-wait
+timeout with its breadcrumb trail. It is written only for games launched with
+`NEURAL_FORGE_ENABLE=1`, never on the present path in steady state (the stderr sink and
+`crates/layer/src/logging.rs` are unchanged). Inside Steam's runtime container the game keeps the
+user's home and `XDG_*` variables, so the layer and `doctor` name the same file; a Flatpak Steam
+points `XDG_STATE_HOME` into its sandbox, and doctor reports a Flatpak-only Steam as unsupported.
+
+`crates/supervisor/src/report.rs` writes `neural-forge-report-<unix>.zip` (its own zip writer, text
+deflated with `miniz_oxide`, already linked through `png`) to the XDG desktop dir, else `~/Desktop`,
+else `$HOME`: a summary (version, GPU, driver, compute capability, kernel, session type, the game's
+Proton tool from Steam's `CompatToolMapping`, all findings), `config.ini`, the model manifest, the
+state logs (last 4 MiB each), this boot's Xid lines, the channel status (`shm_status.rs`, the text
+`shmctl status` prints) and the newest capture pair. Every text member and member name is redacted:
+the home directory becomes `~` and the user name `<user>` (whole tokens only).
+
+### 7.2 Steam launch options
+
+`crates/supervisor/src/steam.rs` finds the Steam roots (native, `~/.steam/steam`, Flatpak, Snap;
+canonicalised and deduplicated), their libraries (`libraryfolders.vdf`) and games
+(`appmanifest_*.acf`, Steam's own tools filtered out). `launch_options.rs` holds the launch option
+the Setup tab shows and a symmetric, idempotent merge/strip pair over existing options (quotes
+respected, our variables in front so wrappers keep working, game arguments without `%command%` moved
+behind one). The edit of `userdata/<id>/config/localconfig.vdf` (`vdf.rs`) never re-serialises the
+file: it splices the one quoted value (or inserts the missing key or app block with the file's own
+layout and line endings), re-parses the result and requires the tree to equal the original plus
+exactly that change. It refuses while a `steam` or `steamwebhelper` process runs (Steam rewrites the
+file on exit), backs up to `.neural-forge.orig` once ever and `.neural-forge.bak` before each edit,
+and replaces the file atomically with its mode kept. Every account that has the game is edited; a
+game no account has gets its block only in the most recently modified account. Refused or failed
+edits return the string to paste instead.
 
 ## 8. Failure behaviour
 
@@ -512,4 +558,5 @@ Everything fails open: a missing model, a network that will not build, a late an
 unsupported swapchain, a submit the layer cannot split, or a Vulkan error means the frame goes on
 untouched. Every fence wait the layer can hit is bounded (5 s, `FENCE_WAIT_TIMEOUT`); a timeout is
 logged once with a breadcrumb trail (`crates/layer/src/breadcrumbs.rs`). `VK_ERROR_DEVICE_LOST`
-latches the layer off.
+latches the layer off and stamps the header's `device_lost_at`, so the Status tab and `doctor`
+can say so without a log; the state log records it too.

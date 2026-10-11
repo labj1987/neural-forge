@@ -210,14 +210,20 @@ stay; Neural Forge does not touch its files.
 ## Usage
 
 1. Open Neural Forge. On the Setup tab, check the model says "present" (or extract it there).
-2. Put this in the game's Steam launch options (the Setup tab builds and copies it):
+2. Close Steam, then switch the game on in the Setup tab's Steam games list (or run
+   `neural-forge-cli enable GAME`). That adds this to the game's Steam launch options, keeping any
+   options already there:
 
    ```text
    NEURAL_FORGE_ENABLE=1 %command%
    ```
 
-   For a game that starts several processes, add `NEURAL_FORGE_TARGET_EXE=<game>.exe` (the
-   Setup tab's "Target executable" field).
+   With Steam running, the list is read-only: copy the launch option from below it and paste it into
+   the game's Properties > General > Launch options instead. For a game that starts several
+   processes, add `NEURAL_FORGE_TARGET_EXE=<game>.exe` (the Setup tab's "Target executable" field
+   builds that string). Steam's file is backed up next to it before every change
+   (`localconfig.vdf.neural-forge.bak`, and the first state found as
+   `localconfig.vdf.neural-forge.orig`).
 3. In the game, use DLSS Super Resolution (Quality, Balanced or Performance) to get the model
    before the upscaler. Turn on the game's own DLSS Frame Generation if you want it.
 4. Start the game. The layer waits until the game has rendered steadily for 5 seconds, and stays
@@ -256,11 +262,11 @@ this version re-creates the shared memory.
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the model's style, intensity, local tone, local structure, skin structure, auto mask, model resolution and model every Nth frame (after the upscaler only), and the toggle key. |
+| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, model resolution and model every Nth frame (after the upscaler only), and the toggle key. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
-| Debug | Compare views (side by side or wipe, split, zoom, swap) and debug views (original/proxy, raw answer, amplified diff, colour trust). |
-| Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`) and the Steam launch option. |
+| Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust), and captures: take one (the next frame as before/after PNGs) and open the captures folder. |
+| Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), your installed Steam games with a Neural Forge switch each, and the launch option to copy by hand. |
 
 The model before the upscaler runs every frame and writes the model's answer straight back
 (there is no composition step), so "Model every Nth frame" and the Composition tab only change the
@@ -337,6 +343,12 @@ the code (`crates/`, `scripts/`).
 
 ## Troubleshooting
 
+Start with **Diagnose** on the Status tab (or `neural-forge-cli doctor`): it checks the install, the
+GPU and driver, free video memory, GPU faults in the kernel log, the last game session's log and
+your Steam games' launch options, and says what to do about each problem it finds. To report a
+bug, attach the zip **Save report** (or `neural-forge-cli report`) writes to your desktop; your home
+folder and user name are replaced in it.
+
 - **No effect in game.** Check the launch option has `NEURAL_FORGE_ENABLE=1`, that the model is
   extracted (Setup tab), and give the game 5 s of normal play. The Status tab's Model placement
   line says which path is active.
@@ -349,9 +361,11 @@ the code (`crates/`, `scripts/`).
   with the 1.x path, and remove it again afterwards. F11 switches the model off and on in either.
 - **F11 does nothing.** Add yourself to the `input` group (see [Usage](#usage)). The layer log
   (`NEURAL_FORGE_LOG`) has a `[hotkey]` line saying which backend it uses.
-- **The model does not run.** The layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has
-  `[native]` lines saying why: no model extracted, a missing device feature, or a failed build
-  (retried on its own).
+- **The model does not run.** The Status tab's Model placement line, or Diagnose, gives the reason:
+  no model extracted, a missing device feature, or a failed build (retried on its own). The full
+  layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has the `[native]` lines.
+- **Steam installed as a Flatpak.** Its games run in a sandbox that does not see the layer installed
+  in your home folder; use your distribution's Steam package.
 - **Steam Linux Runtime (pressure-vessel).** The game must see `/tmp/neural-forge-$UID`. If it
   does not, add `PRESSURE_VESSEL_FILESYSTEMS_RW=/tmp/neural-forge-$UID` to the launch options.
 - **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone. If a game
@@ -360,7 +374,8 @@ the code (`crates/`, `scripts/`).
 
 ### CLI
 
-`neural-forge-cli <command>`: `init`, `status`, `doctor`, `config`, `import-binaries DIR`,
+`neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
+`enable GAME [--target-exe EXE]`, `disable GAME`, `config`, `import-binaries DIR`,
 `extract-model DIR`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N]|reset` for the live settings.
 `neural-forge-cli help` has the details.
@@ -372,6 +387,7 @@ the code (`crates/`, `scripts/`).
 | `~/.config/neural-forge/config.ini` | Paths (`binaries=`, `shm=`) and every setting as `set_<name>=`. The layer applies the saved settings when it opens the channel. |
 | `~/.config/neural-forge/profiles.ini` | Named profiles. |
 | `~/.local/share/neural-forge/` | The installed layer and GUI, the extracted model (`model/`), an imported DLL (`binaries/`), captures (`captures/`). |
+| `~/.local/state/neural-forge/layer.log` | The layer's session log: state changes and errors only, never per frame (kept to 256 KiB, the previous one as `layer.log.1`). Diagnose and the report read it. |
 | `/tmp/neural-forge-$UID/shm.bin` | The shared memory the layer and the GUI talk through. |
 
 ### Uninstall

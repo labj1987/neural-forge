@@ -4,6 +4,47 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.2.0 — 2026-10-10
+
+Finding out why nothing happens, switching games on from the app, and a report to attach to a bug.
+
+- `neural-forge-cli doctor` and the new Diagnose button on the Status tab now say why neural rendering
+  is or isn't running, worst problem first, each with what was checked and what to do about it. They
+  check the install and the Vulkan layer's registration, the GPU, driver and whether the card can run
+  the network at all, free video memory, GPU faults (Xid) in this boot's kernel log, a GPU device lost
+  during the last game, a GPU missing a feature the network needs, a game whose layer never attached,
+  the `input` group for the toggle key, the errors of the last game session, and which of your Steam
+  games launch with Neural Forge. `doctor` exits with an error only on a real failure.
+- The layer now keeps a short log of what happened in each game session (attached, switched off and
+  why, the network failing or recovering, a lost GPU device, a stall) in
+  `~/.local/state/neural-forge/layer.log`. It never writes on every frame. The diagnosis reads it, so
+  you don't have to capture a log yourself first.
+- The Status tab now says "device cannot run the network" with the first missing feature when the
+  GPU lacks one, instead of showing nothing.
+- The Setup tab lists your installed Steam games with a switch each: turning one on adds
+  `NEURAL_FORGE_ENABLE=1` to that game's Steam launch options and keeps whatever options you already
+  had there; turning it off removes only what Neural Forge added. Steam must be closed while you
+  switch, because it rewrites its settings when it exits; while it runs the switches are greyed out,
+  and the launch option to paste by hand is still below. The same from a terminal:
+  `neural-forge-cli games`, `neural-forge-cli enable GAME` and `neural-forge-cli disable GAME` (GAME is
+  an app id or a name). Steam's file is backed up next to it before every change
+  (`localconfig.vdf.neural-forge.bak`), and the first state found is kept for good
+  (`localconfig.vdf.neural-forge.orig`).
+- Steam installed only as a Flatpak is now reported: games it runs can't see Neural Forge's layer.
+- New "Save report" button next to Diagnose, and `neural-forge-cli report`: saves a zip to your
+  desktop with the diagnosis, your system (GPU, driver, kernel, the game's Proton version), settings,
+  the layer's logs, GPU faults from the kernel log, the live status and the newest capture. Your home
+  folder and user name are replaced with `~` and `<user>` in everything in it. Nothing is uploaded:
+  attach the file to an issue yourself.
+- The Debug tab can take a capture (the next frame as before/after pictures) and open the captures
+  folder. While the model runs before the upscaler (DLSS games), both pictures show the frame as
+  presented, with the model's change already in it; the button says so.
+- The Model tab has strength presets: Light, Moderate, Reference (the defaults) and Overdrive set
+  intensity, local tone, local structure and skin structure together.
+- Requirements: the network needs an RTX 40-series or newer card. RTX 20 and 30-series cards can't
+  run it, and the diagnosis now says so.
+- After updating, restart any game that was running: the app and the layer need the same version.
+
 ## 3.1.5 — 2026-10-10
 
 Hogwarts Legacy gets the model's history.
