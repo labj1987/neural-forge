@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Summarise gta-bench.sh runs.
 
-usage: bench-report.py [--host HOST] [--mean] [--fg] <label>...
+usage: bench-report.py [--host HOST] [--mean] [--fg] [--baseline LABEL] <label>...
        bench-report.py --self-test
 
 Per run: the real fps of each benchmark pass (GTA's own Benchmark file), pass 4 in detail
@@ -15,6 +15,10 @@ over the same window), and the median of every field of the layer's [sync] lines
 300 composed frames, first line dropped as warm-up). --mean adds the mean of the pass-4
 numbers over all labels given, which is how three runs of one configuration are reported.
 
+A run with a presented-frame series (NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames>) also gets its
+flicker beside the fps, and its added detail against --baseline, a model-off run of the same moment
+(scripts/bench-iq.py, which this loads from beside itself; --host sends it along).
+
 Each run also gets its pass-4 frame-generation multiplier (displayed / real). GTA decides at each
 loading screen whether to run DLSS Frame Generation, and in benchmark launches it often does not,
 with or without Neural Forge (docs/RUNNING_AND_MEASURING.md). --fg is for runs with frame
@@ -26,6 +30,7 @@ the rig over ssh.
 """
 import datetime as dt
 import glob
+import importlib.util
 import os
 import re
 import statistics
@@ -88,7 +93,27 @@ def rate_text(composited, held):
     return f"held before upscaler/s {fmt(held)} (composited/s {fmt(composited)}: frames not held, e.g. loading screens)"
 
 
-def report(label, base):
+def bench_iq():
+    """scripts/bench-iq.py as a module: the copy --host sent along, else the file beside this one."""
+    if "bench_iq" in sys.modules:
+        return sys.modules["bench_iq"]
+    spec = importlib.util.spec_from_file_location("bench_iq", os.path.join(os.path.dirname(os.path.abspath(__file__)), "bench-iq.py"))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    sys.modules["bench_iq"] = module
+    return module
+
+
+def iq_text(d, baseline):
+    """` | flicker X% detail xY` when the run has a frame series, else nothing."""
+    try:
+        text = bench_iq().summary(d, baseline)
+    except (ImportError, OSError) as e:
+        return f" | flicker: {e}"
+    return f" | {text}" if text else ""
+
+
+def report(label, base, baseline=None):
     d = os.path.join(base, label)
     if not os.path.exists(f"{d}/benchmark.txt"):
         print(f"{label}: no benchmark.txt (early exit?)")
@@ -139,6 +164,7 @@ def report(label, base):
         f"{label}: passes {' / '.join(f'{a:.1f}' for a in avgs)} | pass4 ({dur:.0f}s) real {real4:.1f}, "
         f"displayed {fmt(disp, '{:.1f}')} (frame generation {fmt(fg, '{:.1f}x')}), {rate_text(nf, held)}, "
         f"GPU {fmt(gpu, '{:.0f}%')} {fmt(power, '{:.0f}W')}"
+        + iq_text(d, baseline and os.path.join(base, baseline))
         + (f" | {' '.join(s for s in settings if '=' in s)}" if settings else "")
     )
     print(f"    [sync] {sync_medians(log)}")
@@ -147,8 +173,17 @@ def report(label, base):
 
 def main(argv):
     if len(argv) > 1 and argv[0] == "--host":
-        with open(__file__, "rb") as f:
-            sys.exit(subprocess.run(["ssh", argv[1], "python3", "-", *argv[2:]], stdin=f).returncode)
+        here = os.path.dirname(os.path.abspath(__file__))
+        iq = open(os.path.join(here, "bench-iq.py")).read()
+        # bench-iq.py goes along as a module, defined before this script runs.
+        prelude = f"import sys, types\n_m = types.ModuleType('bench_iq')\nexec({iq!r}, _m.__dict__)\nsys.modules['bench_iq'] = _m\n"
+        program = (prelude + open(__file__).read()).encode()
+        sys.exit(subprocess.run(["ssh", argv[1], "python3", "-", *argv[2:]], input=program).returncode)
+    baseline = None
+    if "--baseline" in argv:
+        i = argv.index("--baseline")
+        baseline = argv[i + 1] if i + 1 < len(argv) else None
+        argv = argv[:i] + argv[i + 2 :]
     mean = "--mean" in argv
     want_fg = "--fg" in argv
     labels = [a for a in argv if a not in ("--mean", "--fg")]
@@ -156,7 +191,7 @@ def main(argv):
         print(__doc__, file=sys.stderr)
         sys.exit(2)
     base = os.path.expanduser(os.environ.get("NF_BENCH_DIR", "~/nf-spike/gta"))
-    results = [(label, r) for label, r in ((label, report(label, base)) for label in labels) if r]
+    results = [(label, r) for label, r in ((label, report(label, base, baseline)) for label in labels) if r]
     missed = [label for label, r in results if want_fg and not engaged(r[3])]
     for label in missed:
         print(f"{label}: frame generation did not engage (displayed / real under {FG_ENGAGED}x); run it again")
@@ -196,6 +231,17 @@ def _self_test():
     assert rate_text(61.0, None) == "composited/s 61.0"
     assert engaged(3.99) and engaged(1.97) and not engaged(1.01) and not engaged(None)
     assert rate_text(29.0, 65.8).startswith("held before upscaler/s 65.8 (composited/s 29.0")
+    # A run with a series of identical frames: no flicker, and no detail added over itself.
+    import tempfile
+    from PIL import Image
+
+    with tempfile.TemporaryDirectory() as run:
+        os.mkdir(f"{run}/series-1")
+        pixels = bytes((i * 37) % 256 for i in range(64 * 48 * 3))
+        for i in range(6):
+            Image.frombytes("RGB", (64, 48), pixels).save(f"{run}/series-1/{i:06}-composited.png")
+        assert iq_text(run, run) == " | flicker 0.00% detail x1.00", iq_text(run, run)
+        assert iq_text(f"{run}/series-1/none", None) == ""
     print("bench-report self-test ok")
 
 

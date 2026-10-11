@@ -148,6 +148,38 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
 and check: `gdctl show` for the desktop, and `sha256sum` of `settings.xml` against the value taken
 before the change. Remove any backup made for the test.
 
+**Flicker and added detail.** `NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames>` makes the layer
+capture `<frames>` consecutive presented frames as a series, `<ms>` after the `<resume>`-th time
+DLSS's frames resumed after a pause (a loading screen, the start of a benchmark pass), so every run
+captures the same moment; gta-bench.sh moves the series into the run's directory.
+`scripts/bench-iq.py RUN_DIR [--baseline MODEL_OFF_RUN_DIR]` measures it, and `bench-report.py`
+prints the same beside the fps (`--baseline LABEL`):
+
+- *Flicker*: the mean frame-to-frame change of log luma (`log2(Y + 0.05 x geomean)`) over the 6
+  frames, ignoring the 5% of pixels that change most (people walking, particles), as a percentage.
+- *Added detail*: the energy of the log-luma Laplacian on the pixels static in both runs, with the
+  model over without it (x1.15 = 15% more local contrast).
+
+The moment is GTA's still shot in pass 5 (the long free-roam pass) at about 70.5 s: a cut from a
+crane shot over the pavement to people standing beside a parked car, the camera still for about a
+second (median motion 0.001 px a frame; at least 0.16 px at every other moment sampled every 2 to
+3 s). The camera starts a pass up to about a second earlier or later from run to run, so the series
+is captured across the cut and bench-iq.py takes the 6 frames from 40 frames after it (the first
+frames after a cut are DLSS's history converging); `--start K` picks a window by hand. GTA
+sometimes pauses once more while it starts, which moves the pass to resume 6, so both are given:
+`NEURAL_FORGE_CAPTURE_AT=5:69500:200,6:69500:200` (entries separated by commas, each taken once).
+200 frames are about 3 GB of PNGs. The baseline is the same layer with the model off
+(`--set apply_model=0`; with a development layer whose shared memory is newer than the installed
+CLI's, point `NF_BENCH_CLI` at the development `neural-forge-cli`).
+Frame generation multiplies the presented frames, so compare runs with the same frame generation
+multiplier (gta-bench runs where it did not engage are repeated). Its in-between frames change less
+than the real ones, in a cycle of 4 at 4x, so a 6-frame window (5 pairs) counts one phase of the
+cycle twice: three model-off runs (2026-10-11, 4x) gave 0.294 / 0.279 / 0.345% over 6 frames (24%
+apart), 0.325 / 0.310 / 0.320% over 5 frames (5%) and 0.318 / 0.306 / 0.329% over 9 (8%). With
+frame generation on, use `--frames 5` or `--frames 9` (whole cycles); a flicker difference under
+10% is noise. Added detail between two model-off runs: x0.97 and x0.98. `bench-iq.py --scan RUN_DIR` lists the change of every pair of a longer
+series and its stillest window, for choosing another moment.
+
 Results land in `$NF_BENCH_DIR/<label>` on the host (default `~/nf-spike/gta`): GTA's Benchmark
 and FrameTimes files, MangoHud's CSV, `nvidia-smi` samples, and `launch.log` with the layer's lines.
 

@@ -24,7 +24,11 @@
 #       NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 #
 # Rig paths can be overridden with NF_BENCH_STEAM_LIBRARY (the library holding GTA),
-# NF_BENCH_STEAM_ROOT (the Steam client), NF_BENCH_PROTON and NF_BENCH_DIR.
+# NF_BENCH_STEAM_ROOT (the Steam client), NF_BENCH_PROTON, NF_BENCH_DIR, and NF_BENCH_CLI (the
+# neural-forge-cli --set uses; the installed one by default, a development build's when the
+# layer under test has a newer shared-memory version than the installed CLI can open).
+# A frame series the layer captured during the run (NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<frames>,
+# for scripts/bench-iq.py) is moved into the run's directory.
 # GTA sometimes exits early at Game Init, with or without Neural Forge; the script says
 # "launch exited early" and leaves no benchmark.txt. Run it again straight away.
 set -u
@@ -53,7 +57,7 @@ PROTON=${NF_BENCH_PROTON:-$C/compatibilitytools.d/Proton-CachyOS Latest}
 GAME="$S/steamapps/common/Grand Theft Auto V Enhanced"
 SLR=$S/steamapps/common/SteamLinuxRuntime_4
 DOCS="$S/steamapps/compatdata/3240220/pfx/drive_c/users/steamuser/Documents/Rockstar Games/GTAV Enhanced/Benchmarks"
-CLI=$HOME/.local/share/neural-forge/bin/neural-forge-cli
+CLI=${NF_BENCH_CLI:-$HOME/.local/share/neural-forge/bin/neural-forge-cli}
 shmctl() { NEURAL_FORGE_SHM=/tmp/neural-forge-$(id -u)/shm.bin NEURAL_FORGE_UID=$(id -u) "$CLI" shmctl "$@"; }
 status_of() { shmctl status | sed -n "s/^$1=//p"; }
 
@@ -115,4 +119,7 @@ if [ -n "$new" ] && [ "$new" != "$before" ]; then
   ts=${new##*/Benchmark-}; ts=${ts%.txt}; cp "$new" "$out/benchmark.txt"
   for f in "$DOCS"/FrameTimes-Pass*-$ts.txt; do cp "$f" "$out/${f##*/FrameTimes-}"; done
 fi
+sed -n 's/.*\[series\] capturing the next [0-9]* presents into //p' "$out/launch.log" | while read -r d; do
+  [ -d "$d" ] && mv "$d" "$out/"
+done
 ls "$out"
