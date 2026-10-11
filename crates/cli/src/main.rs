@@ -14,7 +14,8 @@ fn usage() {
          commands:\n\
          \x20 init                 create the default config\n\
          \x20 status               show the config, channel and model\n\
-         \x20 doctor               check the config, NVIDIA DLL, model and paths\n\
+         \x20 doctor               say why neural rendering is or is not running: the\n\
+         \x20                     install, GPU, driver, kernel log and the last session\n\
          \x20 config               print the effective config\n\
          \x20 import-binaries DIR  copy NVIDIA's nvngx_dlssnr.dll into the user data dir\n\
          \x20 extract-model DIR    write the model directory from nvngx_dlssnr.dll\n\
@@ -206,57 +207,11 @@ fn cmd_status() -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// Every check of `neural_forge_supervisor::doctor`, worst first; non-zero only on a real failure.
 fn cmd_doctor() -> ExitCode {
-    let mut ok = true;
-    let cfg = Config::load();
-
-    print!("config: {}\n  ", paths::config_file());
-    if std::path::Path::new(&paths::config_file()).exists() {
-        println!("ok");
-    } else {
-        println!("missing (run `neural-forge-cli init`)");
-        ok = false;
-    }
-
-    let binaries = if cfg.binaries.is_empty() { paths::binaries_dir() } else { cfg.binaries.clone() };
-    let ngx_dll = std::path::Path::new(&binaries).join("nvngx_dlssnr.dll");
-    print!("binaries: {binaries}\n  nvngx_dlssnr.dll: ");
-    if ngx_dll.exists() {
-        println!("ok");
-    } else {
-        println!("missing (only needed to extract the model; see `neural-forge-cli import-binaries DIR`)");
-    }
-
-    print!("model: {}\n  ", neural_forge_supervisor::model::model_dir());
-    match model_build() {
-        Some(build) => println!("ok (build {build}{})", unverified_note()),
-        None => {
-            println!("missing (run `neural-forge-cli extract-model DIR`)");
-            ok = false;
-        }
-    }
-
-    print!("user dirs: {}, {}\n  ", paths::data_dir(), paths::state_dir());
-    match paths::ensure_dirs() {
-        Ok(()) => println!("ok"),
-        Err(e) => {
-            println!("not writable: {e}");
-            ok = false;
-        }
-    }
-
-    // The channel itself, opened the way the GUI and the layer open it: a runtime dir that exists
-    // but is not ours or not private, or a header from another build, fails here.
-    print!("channel: {}\n  ", neural_forge_supervisor::channel_path(&cfg));
-    match neural_forge_supervisor::open_channel(&cfg) {
-        Ok(_) => println!("ok"),
-        Err(e) => {
-            println!("cannot open: {e}");
-            ok = false;
-        }
-    }
-
-    if ok { ExitCode::SUCCESS } else { ExitCode::FAILURE }
+    let findings = neural_forge_supervisor::doctor::run(&neural_forge_supervisor::doctor::Roots::system());
+    print!("{}", neural_forge_supervisor::doctor::render_text(&findings));
+    if neural_forge_supervisor::doctor::any_failure(&findings) { ExitCode::FAILURE } else { ExitCode::SUCCESS }
 }
 
 fn cmd_install(appdir: &str) -> ExitCode {
@@ -453,7 +408,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
     Some(match command {
         "init" => "usage: neural-forge-cli init\n  create the default config",
         "status" => "usage: neural-forge-cli status\n  show the config, channel and model",
-        "doctor" => "usage: neural-forge-cli doctor\n  check the config, NVIDIA DLL, model and paths",
+        "doctor" => "usage: neural-forge-cli doctor\n  say why neural rendering is or is not running (the install, GPU, driver, kernel log and the\n  last game session), worst first; exits 1 only on a failure",
         "config" => "usage: neural-forge-cli config\n  print the effective config",
         "import-binaries" => "usage: neural-forge-cli import-binaries DIR\n  copy NVIDIA's nvngx_dlssnr.dll from DIR into the user data dir",
         "extract-model" => "usage: neural-forge-cli extract-model DIR\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL)",
