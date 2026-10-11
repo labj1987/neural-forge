@@ -153,7 +153,7 @@ Setup notes for these games:
 
 ## Requirements
 
-- x86_64 Linux with glibc 2.38 or newer, the Vulkan loader, and an NVIDIA RTX 40-series or newer
+- x86_64 Linux with glibc 2.39 or newer (Ubuntu 24.04, Fedora 40 or later), the Vulkan loader, and an NVIDIA RTX 40-series or newer
   GPU (compute capability 8.9 or higher: the network's kernels use FP8 tensor-core instructions that
   RTX 20 and 30-series cards do not have) whose driver offers `VK_NV_cuda_kernel_launch`, `VK_KHR_cooperative_matrix`, `VK_NV_cooperative_matrix2` and
   `VK_EXT_shader_float8` (tested on an RTX 5070 with drivers 615.71.09 and 615.78.08). On non-NVIDIA

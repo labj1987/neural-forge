@@ -42,7 +42,8 @@ Finding out why nothing happens, switching games on from the app, and a report t
 - The Model tab has strength presets: Light, Moderate, Reference (the defaults) and Overdrive set
   intensity, local tone, local structure and skin structure together.
 - Requirements: the network needs an RTX 40-series or newer card. RTX 20 and 30-series cards can't
-  run it, and the diagnosis now says so.
+  run it, and the diagnosis now says so. The app and `neural-forge-cli` now need glibc 2.39 or newer
+  (Ubuntu 24.04, Fedora 40 or later; 2.38 before).
 - After updating, restart any game that was running: the app and the layer need the same version.
 
 ## 3.1.5 — 2026-10-10
