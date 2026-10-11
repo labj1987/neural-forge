@@ -63,6 +63,12 @@ struct Slot {
     /// RG16F at `extent`: DLSS's motion vectors, for the native backend (null if it could not be built).
     mvec: vk::Image,
     mvec_memory: vk::DeviceMemory,
+    /// DLSS's depth aspect at `extent`, 4 bytes a texel at most: the native backend's depth copy (null
+    /// if it could not be built).
+    depth: vk::Buffer,
+    depth_memory: vk::DeviceMemory,
+    /// The format of the depth the owner's recorded hold copies into `depth`, if it copies one.
+    depth_copied: Option<vk::Format>,
     extent: (u32, u32),
     captured: vk::Event,
     release: vk::Event,
@@ -90,6 +96,8 @@ pub(crate) struct Job {
     pub cb: vk::CommandBuffer,
     /// The camera jitter DLSS was given (filled in at the submit, from the launch's parameters).
     pub jitter: Option<[f32; 2]>,
+    /// The slot buffer the buffer copied DLSS's depth aspect into, and the depth's format.
+    pub depth: Option<(vk::Buffer, vk::Format)>,
     captured: vk::Event,
     release: vk::Event,
 }
@@ -329,6 +337,12 @@ impl Inline {
             .filter(|a| a.readable && slot.mvec != vk::Image::null())
             .filter(|_| point.mvec_extent.0 >= extent.0 && point.mvec_extent.1 >= extent.1)
             .and_then(|a| a.layout.map(|layout| (a.image, layout)));
+        // DLSS's depth aspect, copied into the slot's buffer for the native backend's depth copy.
+        let depth = point
+            .depth_input
+            .filter(|a| a.readable && slot.depth != vk::Buffer::null())
+            .and_then(|a| a.layout.map(|layout| (a.image, layout, a.format, slot.depth)));
+        slot.depth_copied = depth.map(|(_, _, format, _)| format);
         // SAFETY: recording into the application's buffer, which it is recording on this thread
         // right now (the hook is inside its `vkCmdCuLaunchKernelNVX`); every handle is live.
         unsafe {
@@ -340,6 +354,7 @@ impl Inline {
                 extent,
                 exposure.map(|(image, layout)| (image, layout, slot.exposure)),
                 mvec.map(|(image, layout)| (image, layout, slot.mvec, point.mvec_extent)),
+                depth,
                 slot.captured,
                 slot.release,
             )
@@ -395,6 +410,7 @@ impl Inline {
                     side_family: self.side_family,
                     cb,
                     jitter: None,
+                    depth: slot.depth_copied.map(|f| (slot.depth, f)),
                     captured: slot.captured,
                     release: slot.release,
                 });
@@ -444,6 +460,9 @@ impl Inline {
                 exposure_memory: vk::DeviceMemory::null(),
                 mvec: vk::Image::null(),
                 mvec_memory: vk::DeviceMemory::null(),
+                depth: vk::Buffer::null(),
+                depth_memory: vk::DeviceMemory::null(),
+                depth_copied: None,
                 extent: (0, 0),
                 captured,
                 release,
@@ -464,6 +483,7 @@ impl Inline {
                         d.destroy_image(image, None);
                         d.free_memory(memory, None);
                     }
+                    free_mvec(d, &slot);
                     if slot.image != vk::Image::null() {
                         d.destroy_image(slot.image, None);
                         d.free_memory(slot.memory, None);
@@ -486,6 +506,7 @@ impl Inline {
         // SAFETY: not in use (contract).
         unsafe { free_mvec(&self.device, slot) };
         (slot.mvec, slot.mvec_memory) = Default::default();
+        (slot.depth, slot.depth_memory, slot.depth_copied) = Default::default();
         if slot.image != vk::Image::null() {
             // SAFETY: not in use (contract).
             unsafe {
@@ -503,6 +524,51 @@ impl Inline {
         // Without it the hold still runs, with no history for the native backend.
         // SAFETY: the device is live.
         (slot.mvec, slot.mvec_memory) = unsafe { self.image(vk::Format::R16G16_SFLOAT, extent) }.unwrap_or_default();
+        // Without it the hold runs with no depth.
+        // SAFETY: the device is live.
+        (slot.depth, slot.depth_memory) = unsafe { self.buffer(u64::from(extent.0) * u64::from(extent.1) * 4) }.unwrap_or_default();
+    }
+
+    /// A device-local `TRANSFER_SRC | TRANSFER_DST` buffer of the layer's, shared by DLSS's family and
+    /// the layer's queue's family when they differ.
+    ///
+    /// # Safety
+    /// The device is live.
+    unsafe fn buffer(&self, bytes: u64) -> Option<(vk::Buffer, vk::DeviceMemory)> {
+        #[cfg(test)]
+        if tests::FAIL_IMAGES.get() {
+            return None;
+        }
+        let d = &self.device;
+        let families = [self.app_family, self.side_family];
+        let mut info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
+        info = if self.app_family == self.side_family {
+            info.sharing_mode(vk::SharingMode::EXCLUSIVE)
+        } else {
+            info.sharing_mode(vk::SharingMode::CONCURRENT).queue_family_indices(&families)
+        };
+        // SAFETY: valid create info on a live device.
+        let buffer = unsafe { d.create_buffer(&info, None) }.ok()?;
+        // SAFETY: just created.
+        let reqs = unsafe { d.get_buffer_memory_requirements(buffer) };
+        let index = (0..self.memory.memory_type_count)
+            .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL));
+        // SAFETY: valid allocate info.
+        let memory = index.and_then(|index| unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.ok());
+        // SAFETY: a fresh buffer and an allocation of its required size and type.
+        match memory.filter(|&m| unsafe { d.bind_buffer_memory(buffer, m, 0) }.is_ok()) {
+            Some(memory) => Some((buffer, memory)),
+            None => {
+                // SAFETY: never used.
+                unsafe {
+                    d.destroy_buffer(buffer, None);
+                    if let Some(m) = memory {
+                        d.free_memory(m, None);
+                    }
+                }
+                None
+            }
+        }
     }
 
     /// A device-local image of the layer's: `TRANSFER_SRC | TRANSFER_DST | STORAGE` (the encode and
@@ -613,7 +679,7 @@ fn wait_set(device: &ash::Device, event: vk::Event, deadline: Duration, stopping
 unsafe fn record_hold(
     d: &ash::Device, cb: vk::CommandBuffer, (colour, layout, convert): (vk::Image, vk::ImageLayout, bool), staging: vk::Image, extent: (u32, u32),
     exposure: Option<(vk::Image, vk::ImageLayout, vk::Image)>, mvec: Option<(vk::Image, vk::ImageLayout, vk::Image, (u32, u32))>,
-    captured: vk::Event, release: vk::Event,
+    depth: Option<(vk::Image, vk::ImageLayout, vk::Format, vk::Buffer)>, captured: vk::Event, release: vk::Event,
 ) {
     let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
     let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
@@ -666,6 +732,18 @@ unsafe fn record_hold(
         .map(|(source, l, _, _)| image_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, l, vk::AccessFlags::empty(), vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE))
         .into_iter()
         .collect();
+    // DLSS's depth aspect into the slot's buffer (`depth`: source, its layout, its format, the
+    // buffer), read in place in GENERAL or TRANSFER_SRC_OPTIMAL, else moved there and back.
+    let depth_moved = depth.filter(|(_, l, _, _)| !matches!(*l, vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL));
+    let depth_barrier = |image, old, new, src: vk::AccessFlags, dst: vk::AccessFlags, format| vk::ImageMemoryBarrier {
+        subresource_range: super::aux_range(format),
+        ..image_barrier(image, old, new, src, dst)
+    };
+    to_read.extend(depth_moved.map(|(source, l, f, _)| depth_barrier(source, l, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::TRANSFER_READ, f)));
+    let mut mvec_back = mvec_back;
+    mvec_back.extend(depth_moved.map(|(source, l, f, _)| {
+        depth_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, l, vk::AccessFlags::empty(), vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, f)
+    }));
     let exposure_region = vk::ImageCopy { extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..region };
     // The copy made available before the host sees `captured` and the side queue reads it.
     let published = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
@@ -709,6 +787,19 @@ unsafe fn record_hold(
                 d.cmd_blit_image(cb, source, from, own, vk::ImageLayout::GENERAL, &[down], vk::Filter::NEAREST);
             }
         }
+        if let Some((source, source_layout, format, own)) = depth {
+            let from = if depth_moved.is_some() { vk::ImageLayout::TRANSFER_SRC_OPTIMAL } else { source_layout };
+            let aspect = if super::DEPTH_FORMATS.contains(&format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
+            let copy = vk::BufferImageCopy {
+                buffer_offset: 0,
+                buffer_row_length: 0,
+                buffer_image_height: 0,
+                image_subresource: vk::ImageSubresourceLayers { aspect_mask: aspect, ..layers },
+                image_offset: vk::Offset3D::default(),
+                image_extent: vk::Extent3D { width: extent.0, height: extent.1, depth: 1 },
+            };
+            d.cmd_copy_image_to_buffer(cb, source, from, own, &[copy]);
+        }
         d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[published], &[], &mvec_back);
         d.cmd_set_event(cb, captured, vk::PipelineStageFlags::TRANSFER);
         d.cmd_wait_events(cb, &[release], vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::TRANSFER, &[acquire], &[], &to_write);
@@ -724,7 +815,7 @@ unsafe fn record_hold(
     }
 }
 
-/// Frees a slot's motion-vector image, if it has one.
+/// Frees a slot's motion-vector image and depth buffer, if it has them.
 ///
 /// # Safety
 /// Nothing uses it.
@@ -734,6 +825,13 @@ unsafe fn free_mvec(d: &ash::Device, slot: &Slot) {
         unsafe {
             d.destroy_image(slot.mvec, None);
             d.free_memory(slot.mvec_memory, None);
+        }
+    }
+    if slot.depth != vk::Buffer::null() {
+        // SAFETY: the contract.
+        unsafe {
+            d.destroy_buffer(slot.depth, None);
+            d.free_memory(slot.depth_memory, None);
         }
     }
 }
@@ -804,6 +902,7 @@ mod tests {
             exposure_input: None,
             mvec_input: None,
             mvec_extent: (w, h),
+            depth_input: None,
             identification: 0,
             hazard: Hazard::MemoryBarrier,
         };
@@ -921,6 +1020,7 @@ mod tests {
                 exposure_input: None,
                 mvec_input: None,
                 mvec_extent: (w, h),
+                depth_input: None,
                 identification: 0,
                 hazard: Hazard::MemoryBarrier,
             };
@@ -1121,6 +1221,7 @@ mod mvec_tests {
                 exposure_input: None,
                 mvec_input: Some(Aux { image: mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL), readable: true }),
                 mvec_extent: (mw, mh),
+                depth_input: None,
                 identification: 0,
                 hazard: Hazard::MemoryBarrier,
             };
@@ -1248,6 +1349,7 @@ mod convert_tests {
                         exposure_input: None,
                         mvec_input: None,
                         mvec_extent: (w, h),
+                        depth_input: None,
                         identification: 0,
                         hazard: Hazard::NotSplittable,
                     };

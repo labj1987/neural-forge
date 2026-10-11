@@ -732,6 +732,8 @@ fn inline_hold(
         inline_tally("skipped (the model is switched off)");
         return;
     }
+    // The staging image can always be copied from.
+    let arm = if native { session.cache_dump_arm(shm, true, true) } else { None };
     // A dump here has the colour input only (no depth or motion-vector layouts to wait for).
     let dump = if native {
         false
@@ -765,6 +767,8 @@ fn inline_hold(
         width: extent.0,
         height: extent.1,
         depth: None,
+        // The depth the buffer copied beside the colour input (the native backend's depth copy).
+        depth_buffer: job.depth.filter(|_| native),
         // The copy the buffer made beside the colour input (the native backend's history, and a dump's).
         mvec: job.point.mvec_input.filter(|_| native || dump),
         mvec_scale: job.point.mvec_scale(),
@@ -786,7 +790,7 @@ fn inline_hold(
         // SAFETY: as below; the loader belongs to this device, and the side queue's family is the
         // network's own (its graph is recorded for it too).
         Some(loader) => unsafe {
-            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, &mut submit)
+            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, arm, &mut submit)
         },
         None => unsafe {
             crate::preupscale::run_hold(device, instance, physical_device, res, &target, mode, dump, 0, &mut submit)
@@ -796,6 +800,10 @@ fn inline_hold(
         let mut writeback_gpu = None;
         if res.wait_idle(device, &mut writeback_gpu) {
             hold.writeback_gpu_ms = writeback_gpu.or(hold.writeback_gpu_ms);
+            // A cache dump's armed hold: read back now (the GPU is parked at the hold until release).
+            if let Some(frame) = res.take_cache_frame() {
+                hold.cache_frame = Some(frame);
+            }
         } else {
             // The GPU copies the staging image back as it is; the write-back may not have reached it.
             hold.wrote_back = false;
@@ -804,6 +812,7 @@ fn inline_hold(
     }
     if hold.native {
         session.note_native(shm, &hold);
+        session.cache_dump_after(arm, &mut hold);
     }
     inline_tally(match (hold.wrote_back, job.jitter.is_some()) {
         (true, true) => "held",
@@ -1318,11 +1327,18 @@ impl NeuralForgeDeviceInfo {
             layout,
             readable: desc.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && (desc.width, desc.height) == (colour.width, colour.height),
         };
+        // A cache dump's armed hold also copies the colour input as it is (TRANSFER_SRC).
+        let arm = if native { session.cache_dump_arm(shm, false, colour.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)) } else { None };
         let target = crate::preupscale::Target {
             colour: inputs.colour.0,
             width: colour.width,
             height: colour.height,
-            depth: Some(aux(inputs.depth, scan.depth_layout)),
+            // Model mode copies the depth on every hold (`native::DepthCopy`), but not when a barrier on
+            // it comes before the launch (the launch buffer may write it first: GTA V Enhanced with DLSS
+            // Frame Generation on); that hold has no depth. A dump refuses such a hold instead.
+            depth: Some(aux(inputs.depth, scan.depth_layout))
+                .filter(|_| mode != Mode::Model || scan.depth_hazard.is_none() || crate::preupscale::dump_ignores_hazard()),
+            depth_buffer: None,
             // The dump's buffer and file are RG16F (4 bytes a texel): RG32F motion vectors are not read.
             mvec: Some(aux(inputs.mvec, scan.mvec_layout)).map(|a| crate::preupscale::Aux { readable: a.readable && a.format == vk::Format::R16G16_SFLOAT, ..a }),
             // Read only at the colour input's extent (`aux`): in its pixels.
@@ -1365,7 +1381,7 @@ impl NeuralForgeDeviceInfo {
             let hold = match loader {
                 // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
                 Some(loader) => unsafe {
-                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, &mut layer_submit)
+                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, arm, &mut layer_submit)
                 },
                 None => unsafe {
                     crate::preupscale::run_hold(&self.device, instance, self.physical_device, res, &target, mode, dump, scan.evaluation, &mut layer_submit)
@@ -1378,6 +1394,7 @@ impl NeuralForgeDeviceInfo {
         if let Some((mut hold, cpu)) = held {
             if hold.native {
                 session.note_native(shm, &hold);
+                session.cache_dump_after(arm, &mut hold);
             }
             session.check_exposure(scan.identification, &hold);
             session.note_exposure_source(scan.identification, &inputs, &hold);

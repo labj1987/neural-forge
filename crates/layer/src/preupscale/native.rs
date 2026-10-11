@@ -508,6 +508,65 @@ impl OwnBuffer {
 
 const PARAMS_BYTES: u64 = std::mem::size_of::<Params>() as u64;
 
+/// DLSS's depth, copied by every native hold's capture (`C`) into a device-local buffer of the
+/// layer's at the render extent, wherever it can be read: on the split path from the identified
+/// depth image (its depth aspect), inside DLSS's buffer from the slot buffer the hold recorded there
+/// (`inline`). Kept raw, tagged with the game's format: 4 bytes a texel (D32, D24 with its top byte,
+/// depth handed over as R32), or 2 for D16 (the buffer's first half). No conversion pass: what reads
+/// it converts (the cache dump writes f32, `cache_dump::depth_to_f32`).
+pub(crate) struct DepthCopy {
+    buffer: OwnBuffer,
+    /// What the last hold copied: the game's depth format, or `None` when that hold copied none (not
+    /// readable, a barrier on it in front of the launch, no depth inside DLSS's buffer).
+    pub(crate) valid: Option<vk::Format>,
+    /// GPU timestamps around the copy alone (the first command of `C`).
+    pub(crate) timer: Option<crate::gpu_timer::GpuTimer>,
+}
+
+impl DepthCopy {
+    /// # Safety
+    /// `device` is live; `family` is the queue family the holds are submitted on.
+    pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32) -> Option<Self> {
+        let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
+        // SAFETY: forwarded.
+        let buffer = unsafe { OwnBuffer::new(device, instance, physical_device, u64::from(width) * u64::from(height) * 4, usage) }?;
+        Some(Self { buffer, valid: None, timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family) })
+    }
+
+    pub(crate) fn buffer(&self) -> vk::Buffer {
+        self.buffer.buffer
+    }
+
+    /// The copy's GPU time on the last hold that copied, once its fence was waited on.
+    pub(crate) fn take_gpu_ms(&mut self, device: &ash::Device) -> Option<f32> {
+        let timer = self.timer.as_mut()?;
+        timer.read_if_pending(device);
+        timer.take_reading()
+    }
+
+    /// # Safety
+    /// Nothing submitted may still use it.
+    pub(crate) unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded.
+        unsafe {
+            self.buffer.destroy(device);
+            if let Some(t) = &self.timer {
+                t.destroy(device);
+            }
+        }
+    }
+}
+
+/// What the capture copies into [`DepthCopy`] this hold: the slot buffer's copy inside DLSS's
+/// buffer, else the depth image where it is readable in a layout a copy can read from (the device
+/// leaves it out when a barrier on it comes before the launch).
+pub(crate) fn depth_source(target: &Target) -> Option<vk::Format> {
+    if let Some((_, format)) = target.depth_buffer {
+        return Some(format);
+    }
+    target.depth.filter(|a| a.readable && super::aux_copy_layout(a.layout).is_some()).map(|a| a.format)
+}
+
 /// The layer's side of the native frame for one extent: the two frame shaders, the history images,
 /// DLSS's motion vectors' copy, the answer buffer, and the two recorded `N` buffers.
 pub(crate) struct NativePass {
@@ -632,7 +691,14 @@ impl NativePass {
             }
             let texels = u64::from(width) * u64::from(height);
             step()?;
-            p.mvec = Some(made(OwnBuffer::new(device, instance, physical_device, texels * 4, vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER)?));
+            // TRANSFER_SRC: a cache dump reads it back (`cache_dump`).
+            p.mvec = Some(made(OwnBuffer::new(
+                device,
+                instance,
+                physical_device,
+                texels * 4,
+                vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+            )?));
             let answer_bytes = u64::from(padded_width) * u64::from(padded_height) * 8;
             step()?;
             p.answer = Some(made(OwnBuffer::new(device, instance, physical_device, answer_bytes, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER)?));
@@ -1068,6 +1134,7 @@ pub(crate) struct Retries {
     pub(crate) hdr: PassRetry,
     pub(crate) auto: PassRetry,
     pub(crate) pass: PassRetry,
+    pub(crate) depth: PassRetry,
 }
 
 /// `NEURAL_FORGE_NATIVE_FAIL=chain`: reports one counter-chain timeout at the 300th network frame, to
@@ -1152,7 +1219,7 @@ fn copied_mvec(mvec: Option<super::Aux>) -> Option<super::Aux> {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_native_hold(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut super::Resources, target: &Target,
-    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, conditioning: Conditioning,
+    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, conditioning: Conditioning, arm: Option<super::cache_dump::Arm>,
     submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> super::HoldResult {
     let mut result = super::HoldResult { native: true, ..Default::default() };
@@ -1164,6 +1231,13 @@ pub(crate) unsafe fn run_native_hold(
     }
     result.writeback_gpu_ms = writeback_gpu;
     result.network_gpu_ms = res.native.as_mut().and_then(|n| n.take_gpu_ms(device));
+    result.depth_gpu_ms = res.depth.as_mut().and_then(|d| d.take_gpu_ms(device));
+    // An armed hold's readbacks (finished: waited above), before anything clears the exposure.
+    result.cache_frame = res.take_cache_frame();
+    if arm.is_none() {
+        // SAFETY: idle (waited above).
+        unsafe { res.free_cache(device) };
+    }
     // The game's exposure the previous hold's capture read (finished: waited above), for the
     // caller's check (`Session::check_exposure`). Only for this identification.
     let previous_read = res.game_exposure_read.take() == Some(target.identification);
@@ -1273,15 +1347,37 @@ pub(crate) unsafe fn run_native_hold(
     }
     // The history needs DLSS's motion vectors copied this frame.
     let mvec = copied_mvec(target.mvec);
+    // DLSS's depth, wherever it can be read, into the layer's own buffer.
+    let depth = depth_source(target);
+    if depth.is_some() && res.depth.is_none() {
+        let family = res.queue_family;
+        // SAFETY: `device` is live; `family` is the holds' family.
+        res.depth = res.native_retry.depth.build((target.width, target.height), now, || unsafe {
+            DepthCopy::build(device, instance, physical_device, family, target.width, target.height)
+        });
+    }
+    let depth = depth.filter(|_| res.depth.is_some());
+    // A cache dump's readbacks for an armed hold, built on its first one.
+    if arm.is_some() && res.cache.is_none() {
+        // SAFETY: `device` is live.
+        res.cache = unsafe { super::cache_dump::Buffers::build(device, instance, physical_device, target.width, target.height) };
+    }
+    let cache = arm.and(res.cache.as_ref()).map(|c| super::CacheCopies {
+        colour: c.colour.buffer,
+        answer: c.answer.buffer,
+        mvec: mvec.map(|_| (native.mvec.buffer, c.mvec.buffer)),
+        depth: depth.and(res.depth.as_ref()).map(|d| (d.buffer(), c.depth.buffer)),
+    });
     let hdr_pass = res.hdr.as_ref();
+    let depth_copy = depth.and(res.depth.as_ref()).map(|d| (d.buffer(), d.timer.as_ref()));
     // SAFETY: the capture buffer is idle; the colour view was bound above.
-    if unsafe { super::record_capture(device, res, target, None, hdr_pass, mvec.map(|_| native.mvec.buffer)) }.is_err() {
+    if unsafe { super::record_capture(device, res, target, None, hdr_pass, mvec.map(|_| native.mvec.buffer), depth_copy, cache.map(|c| c.colour)) }.is_err() {
         res.native = Some(native);
         result.miss = Some("recording the capture failed");
         return result;
     }
     // SAFETY: as above, with the native pass's answer as the decode's source.
-    if unsafe { super::record_writeback(device, res, target, native.answer(), hdr_pass) }.is_err() {
+    if unsafe { super::record_writeback(device, res, target, native.answer(), hdr_pass, cache.as_ref()) }.is_err() {
         res.native = Some(native);
         result.miss = Some("recording the write-back failed");
         return result;
@@ -1295,9 +1391,20 @@ pub(crate) unsafe fn run_native_hold(
     let frame_cmds = native.frame(&built, history, jitter, target.mvec_scale, conditioning);
     res.native = Some(native);
     result.timing.prep = Some(t_hold.elapsed());
+    if let Some(d) = res.depth.as_mut() {
+        d.valid = None;
+    }
     if crate::note_vk(submit(super::Which::Capture, res.capture_cmd, vk::Fence::null())).is_err() {
         result.miss = Some("the capture submit failed");
         return result;
+    }
+    if let Some(d) = res.depth.as_mut() {
+        d.valid = depth;
+        if depth.is_some() {
+            if let Some(t) = d.timer.as_mut() {
+                t.mark_submitted();
+            }
+        }
     }
     result.waits_consumed = true;
     res.game_exposure_read = (source == super::ExposureSource::Game).then_some(target.identification);
@@ -1326,6 +1433,18 @@ pub(crate) unsafe fn run_native_hold(
     res.writeback_pending = true;
     if let Some(timer) = res.writeback_timer.as_mut() {
         timer.mark_submitted();
+    }
+    if let (Some(arm), Some(c)) = (arm.filter(|_| cache.is_some()), res.cache.as_mut()) {
+        c.pending = Some(super::cache_dump::Pending {
+            arm,
+            time_ms: std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64),
+            jitter,
+            history,
+            mvec: mvec.is_some(),
+            depth,
+            mvec_scale: target.mvec_scale,
+            paper_white: target.paper_white,
+        });
     }
     result.evaluated = true;
     result.wrote_back = true;

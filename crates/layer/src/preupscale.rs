@@ -92,6 +92,7 @@ use vulkan_layer::LayerVulkanCommand as VulkanCommand;
 use crate::shm::ShmClient;
 use neural_forge_protocol::Slot;
 
+pub(crate) mod cache_dump;
 pub(crate) mod hdr;
 pub(crate) mod inline;
 #[cfg(target_arch = "x86_64")]
@@ -107,10 +108,13 @@ pub(crate) type NativeLoader = Arc<native::Loader>;
 pub(crate) enum NativeLoader {}
 
 /// Whether an image the application creates gets `TRANSFER_SRC` added: a 2D, single-sample RG16F image
-/// without it (DLSS's motion vectors; the hold copies only RG16F, for the native backend's history).
+/// without it (DLSS's motion vectors; the hold copies only RG16F, for the native backend's history),
+/// or a depth image without it (the hold copies DLSS's depth every frame, [`native::DepthCopy`]).
+/// Only asked while the pre-upscaler path is on (`NEURAL_FORGE_PREUPSCALE=off` creates every image
+/// as the application asked).
 pub(crate) fn wants_copyable(info: &vk::ImageCreateInfo) -> bool {
     cfg!(target_arch = "x86_64")
-        && info.format == vk::Format::R16G16_SFLOAT
+        && (info.format == vk::Format::R16G16_SFLOAT || DEPTH_FORMATS.contains(&info.format))
         && info.image_type == vk::ImageType::TYPE_2D
         && info.samples == vk::SampleCountFlags::TYPE_1
         && info.tiling == vk::ImageTiling::OPTIMAL
@@ -130,7 +134,7 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
 #[allow(clippy::too_many_arguments, clippy::needless_return)]
 pub(crate) unsafe fn run_native(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target,
-    loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient,
+    loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient, arm: Option<cache_dump::Arm>,
     submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
@@ -138,10 +142,10 @@ pub(crate) unsafe fn run_native(
         // The Model tab's settings.
         let conditioning = shm.global_tuning().map_or_else(native::Conditioning::default, native::Conditioning::from);
         // SAFETY: forwarded.
-        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, submit) };
+        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, arm, submit) };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, submit);
+    let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, submit);
     #[cfg(not(target_arch = "x86_64"))]
     match *loader {}
 }
@@ -425,7 +429,7 @@ impl ImageDesc {
 /// [`DEPTH_FORMATS`].
 const DEPTH_AS_COLOUR: [vk::Format; 2] = [vk::Format::R32_SFLOAT, vk::Format::R32_UINT];
 
-const DEPTH_FORMATS: [vk::Format; 6] = [
+pub(crate) const DEPTH_FORMATS: [vk::Format; 6] = [
     vk::Format::D16_UNORM,
     vk::Format::X8_D24_UNORM_PACK32,
     vk::Format::D32_SFLOAT,
@@ -434,12 +438,12 @@ const DEPTH_FORMATS: [vk::Format; 6] = [
     vk::Format::D32_SFLOAT_S8_UINT,
 ];
 
-fn has_stencil(format: vk::Format) -> bool {
+pub(crate) fn has_stencil(format: vk::Format) -> bool {
     matches!(format, vk::Format::D16_UNORM_S8_UINT | vk::Format::D24_UNORM_S8_UINT | vk::Format::D32_SFLOAT_S8_UINT)
 }
 
 /// Bytes per texel of the depth aspect copied out of a depth format.
-fn depth_texel_bytes(format: vk::Format) -> u64 {
+pub(crate) fn depth_texel_bytes(format: vk::Format) -> u64 {
     match format {
         vk::Format::D16_UNORM | vk::Format::D16_UNORM_S8_UINT => 2,
         _ => 4,
@@ -1226,6 +1230,10 @@ pub(crate) struct Scan {
     /// Why a dump (which also reads depth, the motion vectors and the 1x1 exposure candidates)
     /// must not be taken in front of the launch buffer: a barrier on one of those images only.
     pub dump_hazard: Option<Hazard>,
+    /// A barrier on the depth image itself in front of the launch: the model-mode hold then does not
+    /// copy the depth (it would read it before the launch buffer finished it), and marks it invalid
+    /// for that hold. GTA V Enhanced with DLSS Frame Generation on writes depth there.
+    pub depth_hazard: Option<Hazard>,
     /// The queue family that owns the colour input, when a submitted ownership transfer said so.
     pub colour_owner: Option<u32>,
     /// The camera jitter DLSS was given for this frame, when its input kernel's parameters say
@@ -1314,6 +1322,20 @@ fn jitter_plausible(v: u64) -> bool {
 
 /// The layouts the hold inside DLSS's buffer copies the motion vectors from (moved to
 /// `TRANSFER_SRC_OPTIMAL` and back when not already readable there).
+/// Whether the hold inside DLSS's buffer copies the depth aspect of a `format` image found in `layout`
+/// (moved to TRANSFER_SRC_OPTIMAL and back unless it is there or in GENERAL). The separate depth
+/// layouts only for formats without stencil: with one, the stencil aspect's layout is not known.
+pub(crate) fn depth_copy_layout(format: vk::Format, layout: vk::ImageLayout) -> bool {
+    use vk::ImageLayout as L;
+    match layout {
+        L::GENERAL | L::TRANSFER_SRC_OPTIMAL | L::SHADER_READ_ONLY_OPTIMAL => true,
+        L::DEPTH_STENCIL_ATTACHMENT_OPTIMAL | L::DEPTH_STENCIL_READ_ONLY_OPTIMAL => DEPTH_FORMATS.contains(&format),
+        L::DEPTH_ATTACHMENT_OPTIMAL | L::DEPTH_READ_ONLY_OPTIMAL => DEPTH_FORMATS.contains(&format) && !has_stencil(format),
+        L::COLOR_ATTACHMENT_OPTIMAL => DEPTH_AS_COLOUR.contains(&format),
+        _ => false,
+    }
+}
+
 pub(crate) const MVEC_COPY_LAYOUTS: [vk::ImageLayout; 4] = [
     vk::ImageLayout::GENERAL,
     vk::ImageLayout::TRANSFER_SRC_OPTIMAL,
@@ -1346,6 +1368,9 @@ pub(crate) struct InlinePoint {
     /// vectors (the `mvhi` input kernels; Hogwarts Legacy), which the copy resamples to the colour
     /// input's ([`Self::mvec_scale`]).
     pub mvec_extent: (u32, u32),
+    /// DLSS's depth at the hold, where its depth aspect can be copied (the native backend's depth
+    /// copy): at the colour input's extent, in a layout [`depth_copy_layout`] takes.
+    pub depth_input: Option<Aux>,
     pub identification: u64,
     pub hazard: Hazard,
 }
@@ -1870,7 +1895,23 @@ impl Tracker {
             Aux { image, format: d.format, layout, readable }
         });
         let mvec_extent = live_mvec.map_or((0, 0), |d| (d.width, d.height));
-        Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, mvec_extent, identification: self.generation, hazard })
+        // DLSS's depth, copied beside it into a slot buffer for the native backend: at the colour
+        // input's extent, in a layout known here. Not when it was destroyed since (Black Myth: Wukong
+        // hands DLSS a new one every frame with frame generation on).
+        let depth_input = self.images.get(&inputs.depth.0).copied().map(|d| {
+            let image = inputs.depth.0;
+            let layout = self
+                .pending
+                .get(&cb)
+                .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
+                .or_else(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
+                .or_else(|| self.committed.get(&image).copied());
+            let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+                && (d.width, d.height) == (desc.width, desc.height)
+                && layout.is_some_and(|l| depth_copy_layout(d.format, l));
+            Aux { image, format: d.format, layout, readable }
+        });
+        Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, mvec_extent, depth_input, identification: self.generation, hazard })
     }
 
     /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
@@ -2041,34 +2082,36 @@ impl Tracker {
     /// recorded into it before the launch that first names the colour input (before its first
     /// launch when none names it): a barrier on an image the hold reads, or global synchronization.
     ///
-    /// Returns `(hazard, dump_hazard)`. Every hold reads and writes the colour input and reads the
+    /// Returns `(hazard, dump_hazard, depth_hazard)`, the last one a barrier on the depth image
+    /// alone ([`Scan::depth_hazard`]). Every hold reads and writes the colour input and reads the
     /// exposure input; only a dump also reads depth, the motion vectors and every 1x1 exposure
     /// candidate, so a barrier on one of those alone stops only a dump. With DLSS Frame Generation
     /// on, GTA V Enhanced copies depth and motion vectors for it inside the launch buffer, between
     /// `GENERAL -> GENERAL` barriers, right before SR's input launch (docs/PRE_UPSCALER_DESIGN.md,
     /// "When a submit is not split").
-    fn launch_hazard(&self, cb: vk::CommandBuffer, inputs: Option<&Inputs>) -> (Option<Hazard>, Option<Hazard>) {
+    fn launch_hazard(&self, cb: vk::CommandBuffer, inputs: Option<&Inputs>) -> (Option<Hazard>, Option<Hazard>, Option<Hazard>) {
         if self.rendering.get(&cb).is_some_and(|r| r.open_resume) {
-            return (Some(Hazard::SuspendedRendering), None);
+            return (Some(Hazard::SuspendedRendering), None, None);
         }
-        let Some(refs) = self.launch.get(&cb) else { return (None, None) };
+        let Some(refs) = self.launch.get(&cb) else { return (None, None, None) };
         let colour = inputs.map(|i| i.colour.0);
         let Some(before) = colour.and_then(|c| refs.before_named.iter().find(|(i, _)| *i == c)).map(|(_, b)| *b).or(refs.before_first) else {
-            return (None, None);
+            return (None, None, None);
         };
         if before.global.is_some() {
-            return (before.global, None);
+            return (before.global, None, before.global);
         }
         // Unknown inputs: every watched image counts as read by every hold.
         let held = |image: vk::Image| inputs.is_none_or(|i| i.colour.0 == image || i.exposure_input.is_some_and(|e| e.0 == image));
         let dumped = |image: vk::Image| {
             inputs.is_some_and(|i| i.depth.0 == image || i.mvec.0 == image || i.exposure.iter().flatten().any(|e| e.0 == image))
         };
-        let Some(recorded) = self.pending.get(&cb) else { return (None, None) };
+        let Some(recorded) = self.pending.get(&cb) else { return (None, None, None) };
         let before = &recorded[..before.barriers.min(recorded.len())];
         (
             before.iter().find(|s| held(s.image)).map(ImageSync::hazard),
             before.iter().find(|s| dumped(s.image)).map(ImageSync::hazard),
+            before.iter().find(|s| inputs.is_some_and(|i| i.depth.0 == s.image)).map(ImageSync::hazard),
         )
     }
 
@@ -2577,7 +2620,7 @@ impl Tracker {
                     let layout = |image: Option<vk::Image>| image.and_then(|i| proposed.get(&i).map(|p| p.0).or(self.committed.get(&i).copied()));
                     let inputs = self.inputs.map(|i| Inputs { colour: retarget.unwrap_or(i.colour), ..i });
                     let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
-                    let (hazard, dump_hazard) = self.launch_hazard(cb, inputs.as_ref());
+                    let (hazard, dump_hazard, depth_hazard) = self.launch_hazard(cb, inputs.as_ref());
                     found = Some(Scan {
                         batch: bi,
                         index: ci,
@@ -2592,6 +2635,7 @@ impl Tracker {
                         identification: self.generation,
                         hazard,
                         dump_hazard,
+                        depth_hazard,
                         colour_owner,
                         jitter: self.launch.get(&cb).and_then(|r| r.jitter),
                     });
@@ -3364,6 +3408,18 @@ pub(crate) fn capture_regions(width: u32, height: u32) -> Vec<vk::BufferImageCop
 }
 
 /// The write-back region: the padded buffer's top-left `width` x `height`, cropping the padding.
+/// The colour input at its real extent, tightly packed (a cache dump's readbacks).
+fn colour_region(width: u32, height: u32) -> vk::BufferImageCopy {
+    vk::BufferImageCopy {
+        buffer_offset: 0,
+        buffer_row_length: 0,
+        buffer_image_height: 0,
+        image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+        image_offset: vk::Offset3D::default(),
+        image_extent: vk::Extent3D { width, height, depth: 1 },
+    }
+}
+
 pub(crate) fn writeback_region(width: u32, height: u32) -> vk::BufferImageCopy {
     let (pw, _) = padded(width, height);
     vk::BufferImageCopy {
@@ -3500,6 +3556,12 @@ pub(crate) struct Resources {
     /// the HDR pass's exposure buffer ([`HoldResult::previous_exposure`]).
     #[cfg(target_arch = "x86_64")]
     pub(crate) game_exposure_read: Option<u64>,
+    /// DLSS's depth as the native hold copied it, built on the first hold with a readable one.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) depth: Option<native::DepthCopy>,
+    /// A running cache dump's readbacks (`cache_dump`), built on its first armed hold and freed
+    /// after it.
+    pub(crate) cache: Option<cache_dump::Buffers>,
     capture_pending: bool,
     writeback_pending: bool,
 }
@@ -3581,6 +3643,9 @@ impl Resources {
             native_retry: native::Retries::default(),
             #[cfg(target_arch = "x86_64")]
             game_exposure_read: None,
+            #[cfg(target_arch = "x86_64")]
+            depth: None,
+            cache: None,
             capture_pending: false,
             writeback_pending: false,
         })
@@ -3659,8 +3724,49 @@ impl Resources {
             if let Some(native) = &self.native {
                 native.destroy(device);
             }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(depth) = &self.depth {
+                depth.destroy(device);
+            }
+            if let Some(cache) = &self.cache {
+                cache.destroy(device);
+            }
         }
     }
+
+    /// An armed hold's readbacks, once its work finished ([`Self::wait_idle`] returned true since),
+    /// with the exposure its encode and decode used. Call before the next hold clears that.
+    pub(crate) fn take_cache_frame(&mut self) -> Option<cache_dump::Frame> {
+        let exposure = self.hdr.as_ref().map_or(0.0, hdr::HdrPass::exposure_value);
+        self.cache.as_mut()?.take(exposure)
+    }
+
+    /// Whether an armed hold's readbacks wait to be read.
+    pub(crate) fn cache_pending(&self) -> bool {
+        self.cache.as_ref().is_some_and(|c| c.pending.is_some())
+    }
+
+    /// Frees a finished cache dump's readbacks.
+    ///
+    /// # Safety
+    /// Nothing submitted may still use them ([`Self::wait_idle`] returned true since the last hold).
+    pub(crate) unsafe fn free_cache(&mut self, device: &ash::Device) {
+        if let Some(cache) = self.cache.take() {
+            // SAFETY: forwarded.
+            unsafe { cache.destroy(device) };
+        }
+    }
+}
+
+/// The extra copies of a hold armed for a cache dump ([`cache_dump`]): the colour input before the
+/// model (in the capture), and after the write-back the colour input again (the answer written
+/// back), the native pass's motion vectors and the depth copy, each `(source, readback)`.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CacheCopies {
+    pub colour: vk::Buffer,
+    pub answer: vk::Buffer,
+    pub mvec: Option<(vk::Buffer, vk::Buffer)>,
+    pub depth: Option<(vk::Buffer, vk::Buffer)>,
 }
 
 /// Dump mode's readbacks: depth and motion vectors (render extent, 4 bytes per texel), and the
@@ -3688,6 +3794,9 @@ pub(crate) struct Target {
     pub width: u32,
     pub height: u32,
     pub depth: Option<Aux>,
+    /// Inside DLSS's buffer: the slot buffer the hold copied DLSS's depth aspect into there, and the
+    /// depth's format (`inline`). Copied from instead of [`Self::depth`].
+    pub depth_buffer: Option<(vk::Buffer, vk::Format)>,
     pub mvec: Option<Aux>,
     /// What turns `mvec`'s values into this colour input's pixels, per axis ([`InlinePoint::mvec_scale`]):
     /// the native backend's reprojection multiplies by it, a dump records it.
@@ -3783,6 +3892,10 @@ pub(crate) struct HoldResult {
     /// The native backend: the GPU time of the previous hold's network frame (`N`: preprocess, the
     /// network, composite), read when its fence was found signalled here.
     pub network_gpu_ms: Option<f32>,
+    /// The native backend: the GPU time of the last depth copy (`native::DepthCopy`), read likewise.
+    pub depth_gpu_ms: Option<f32>,
+    /// A cache dump's armed hold read back here (the previous one on the split path).
+    pub cache_frame: Option<cache_dump::Frame>,
 }
 
 impl HoldResult {
@@ -3841,7 +3954,7 @@ fn aux_copy_layout(layout: Option<vk::ImageLayout>) -> Option<(vk::ImageLayout, 
     }
 }
 
-fn aux_range(format: vk::Format) -> vk::ImageSubresourceRange {
+pub(crate) fn aux_range(format: vk::Format) -> vk::ImageSubresourceRange {
     let aspect = if DEPTH_FORMATS.contains(&format) {
         if has_stencil(format) { vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL } else { vk::ImageAspectFlags::DEPTH }
     } else {
@@ -3861,6 +3974,8 @@ enum DumpPart {
     ExposureInput,
     /// [`Target::mvec`], into the native backend's motion buffer.
     NativeMvec,
+    /// [`Target::depth`]'s depth aspect, into the native backend's depth copy.
+    NativeDepth,
 }
 
 /// One image a dump copies into a readback buffer.
@@ -3879,9 +3994,15 @@ struct DumpRead {
 /// render extent and each 1x1 exposure candidate at its [`EXPOSURE_STRIDE`] slot; for the HDR
 /// encode (`exposure_buffer`), the exposure input. Each readable one in a layout it can be copied
 /// from (see [`aux_copy_layout`]).
-fn capture_reads(target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: Option<vk::Buffer>, native_mvec: Option<vk::Buffer>) -> Vec<DumpRead> {
+fn capture_reads(
+    target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: Option<vk::Buffer>, native_mvec: Option<vk::Buffer>, native_depth: Option<vk::Buffer>,
+) -> Vec<DumpRead> {
     let full = (target.width, target.height);
     let mut parts = Vec::new();
+    // First: the capture times it alone.
+    if let Some(buffer) = native_depth.filter(|_| target.depth_buffer.is_none()) {
+        parts.push((DumpPart::NativeDepth, target.depth, buffer, 0, full));
+    }
     if let Some(bufs) = bufs {
         parts.push((DumpPart::Depth, target.depth, bufs.depth.buffer, 0, full));
         parts.push((DumpPart::Mvec, target.mvec, bufs.mvec.buffer, 0, full));
@@ -3912,12 +4033,18 @@ fn capture_reads(target: &Target, bufs: Option<&DumpBuffers>, exposure_buffer: O
 /// ([`hdr::HdrPass::record_encode`]); in dump mode also the depth aspect, the
 /// motion vectors and the 1x1 exposure candidates. Each auxiliary image is read in its committed
 /// layout (transitioned to TRANSFER_SRC_OPTIMAL and back when that layout cannot be copied from).
+/// The native backend's hold also copies DLSS's depth into its buffer (`native_depth`, with the
+/// timer around that copy alone; from [`Target::depth_buffer`] inside DLSS's buffer, else the depth
+/// aspect of [`Target::depth`]), and for a cache dump the colour input as it is (`colour_before`,
+/// tightly packed at the real extent).
 ///
 /// # Safety
 /// `res`'s capture command buffer must not be pending; with `hdr`, its colour view is bound to
 /// `target.colour` and, for [`ExposureSource::Auto`], its auto-exposure is built.
+#[allow(clippy::too_many_arguments)]
 unsafe fn record_capture(
     device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>, native_mvec: Option<vk::Buffer>,
+    native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>, colour_before: Option<vk::Buffer>,
 ) -> ash::prelude::VkResult<()> {
     let auto = hdr.is_some() && ExposureSource::of(target) == ExposureSource::Auto;
     let cmd = res.capture_cmd;
@@ -3926,7 +4053,8 @@ unsafe fn record_capture(
         device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
         device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
     }
-    let aux: Vec<DumpRead> = capture_reads(target, dump, hdr.filter(|_| !auto).map(hdr::HdrPass::exposure_buffer), native_mvec);
+    let aux: Vec<DumpRead> = capture_reads(target, dump, hdr.filter(|_| !auto).map(hdr::HdrPass::exposure_buffer), native_mvec, native_depth.map(|(b, _)| b));
+    let depth_timer = native_depth.and_then(|(_, t)| t);
     let mut to_read: Vec<vk::ImageMemoryBarrier> = aux
         .iter()
         .filter(|r| r.transition)
@@ -3960,7 +4088,24 @@ unsafe fn record_capture(
         if let Some(timer) = &res.capture_timer {
             timer.record_start(device, cmd);
         }
+        // Inside DLSS's buffer the hold already copied the depth into its slot buffer.
+        if let (Some((dst, _)), Some((src, format))) = (native_depth, target.depth_buffer) {
+            if let Some(t) = depth_timer {
+                t.record_start(device, cmd);
+            }
+            let size = u64::from(target.width) * u64::from(target.height) * depth_texel_bytes(format);
+            device.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size }]);
+            if let Some(t) = depth_timer {
+                t.record_end(device, cmd);
+            }
+        }
         for r in &aux {
+            let timed = r.part == DumpPart::NativeDepth;
+            if timed {
+                if let Some(t) = depth_timer {
+                    t.record_start(device, cmd);
+                }
+            }
             let aspect = if DEPTH_FORMATS.contains(&r.aux.format) { vk::ImageAspectFlags::DEPTH } else { vk::ImageAspectFlags::COLOR };
             let region = vk::BufferImageCopy {
                 buffer_offset: r.offset,
@@ -3971,6 +4116,14 @@ unsafe fn record_capture(
                 image_extent: vk::Extent3D { width: r.extent.0, height: r.extent.1, depth: 1 },
             };
             device.cmd_copy_image_to_buffer(cmd, r.aux.image, r.read, r.buffer, &[region]);
+            if timed {
+                if let Some(t) = depth_timer {
+                    t.record_end(device, cmd);
+                }
+            }
+        }
+        if let Some(buffer) = colour_before {
+            device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, buffer, &[colour_region(target.width, target.height)]);
         }
         match hdr {
             Some(pass) => {
@@ -4029,14 +4182,17 @@ unsafe fn record_capture(
 /// Records the write-back into the colour input (GENERAL), cropping the padding: `source` (padded
 /// RGBA16F) copied raw, or with `hdr`, copied into the HDR pass's answer image and decoded over the
 /// colour input in place ([`hdr::HdrPass::record_decode`]). Closed by a barrier that makes it
-/// visible to everything later on the queue.
+/// visible to everything later on the queue. For a cache dump (`cache`), the colour input with the
+/// answer written back, the motion vectors and the depth are then copied into its readbacks.
 ///
 /// # Safety
 /// `res`'s write-back command buffer must not be pending; with `hdr`, the pass holds this hold's
 /// capture and its colour view is bound to `target.colour`.
-unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Target, source: vk::Buffer, hdr: Option<&hdr::HdrPass>) -> ash::prelude::VkResult<()> {
+unsafe fn record_writeback(
+    device: &ash::Device, res: &Resources, target: &Target, source: vk::Buffer, hdr: Option<&hdr::HdrPass>, cache: Option<&CacheCopies>,
+) -> ash::prelude::VkResult<()> {
     let cmd = res.writeback_cmd;
-    let (dst_stage, dst_access, src_stage, src_access) = if hdr.is_some() {
+    let (dst_stage, dst_access, mut src_stage, mut src_access) = if hdr.is_some() {
         (
             vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER,
             vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE,
@@ -4047,7 +4203,17 @@ unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Targe
         (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
     };
     let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE).dst_access_mask(dst_access).build();
-    let close = vk::MemoryBarrier::builder().src_access_mask(src_access).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+    // The dump's copies read what the decode wrote, and the host reads them after the fence.
+    let (mut close_stage, mut close_access) = (vk::PipelineStageFlags::ALL_COMMANDS, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
+    let decoded = vk::MemoryBarrier::builder().src_access_mask(src_access).dst_access_mask(vk::AccessFlags::TRANSFER_READ).build();
+    let decoded_stage = src_stage;
+    if cache.is_some() {
+        src_stage |= vk::PipelineStageFlags::TRANSFER;
+        src_access |= vk::AccessFlags::TRANSFER_WRITE;
+        close_stage |= vk::PipelineStageFlags::HOST;
+        close_access |= vk::AccessFlags::HOST_READ;
+    }
+    let close = vk::MemoryBarrier::builder().src_access_mask(src_access).dst_access_mask(close_access).build();
     let answer_image: Vec<vk::ImageMemoryBarrier> = hdr.map(hdr::HdrPass::answer_to_general).into_iter().collect();
     // SAFETY: the layer's own buffer, not pending; every handle is live.
     unsafe {
@@ -4069,7 +4235,15 @@ unsafe fn record_writeback(device: &ash::Device, res: &Resources, target: &Targe
             Some(pass) => pass.record_decode(device, cmd, source, target.paper_white),
             None => device.cmd_copy_buffer_to_image(cmd, source, target.colour, vk::ImageLayout::GENERAL, &[writeback_region(target.width, target.height)]),
         }
-        device.cmd_pipeline_barrier(cmd, src_stage, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &[]);
+        if let Some(c) = cache {
+            device.cmd_pipeline_barrier(cmd, decoded_stage, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[decoded], &[], &[]);
+            device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, c.answer, &[colour_region(target.width, target.height)]);
+            let texels = u64::from(target.width) * u64::from(target.height);
+            for (src, dst) in [c.mvec, c.depth].into_iter().flatten() {
+                device.cmd_copy_buffer(cmd, src, dst, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: texels * 4 }]);
+            }
+        }
+        device.cmd_pipeline_barrier(cmd, src_stage, close_stage, vk::DependencyFlags::empty(), &[close], &[], &[]);
         if let Some(timer) = &res.writeback_timer {
             timer.record_end(device, cmd);
         }
@@ -4153,7 +4327,7 @@ pub(crate) unsafe fn run_hold(
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     let dump_bufs = if dump { res.dump.as_ref() } else { None };
     // SAFETY: the capture buffer is idle (`wait_idle` above); the colour view was bound above.
-    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, None) }.is_err() {
+    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, None, None, None) }.is_err() {
         result.miss = Some("recording the capture failed");
         return result;
     }
@@ -4211,7 +4385,7 @@ pub(crate) unsafe fn run_hold(
                 // SAFETY: the capture finished; each buffer holds at least `at + len` bytes (`n`,
                 // `bytes`, `MAX_EXPOSURE * EXPOSURE_STRIDE`).
                 let read = |buf: &HostBuffer, at: usize, len: usize| unsafe { std::slice::from_raw_parts(buf.ptr.add(at), len) }.to_vec();
-                let reads = res.dump.as_ref().map(|bufs| capture_reads(target, Some(bufs), None, None)).unwrap_or_default();
+                let reads = res.dump.as_ref().map(|bufs| capture_reads(target, Some(bufs), None, None, None)).unwrap_or_default();
                 let was_read = |part: DumpPart| reads.iter().any(|r| r.part == part);
                 result.dump = Some(DumpFrame {
                     width: target.width,
@@ -4258,7 +4432,7 @@ pub(crate) unsafe fn run_hold(
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     // SAFETY: the write-back buffer is idle (`wait_idle` above); in the HDR modes the pass holds this
     // hold's capture and its colour view.
-    if unsafe { record_writeback(device, res, target, source, hdr_pass) }.is_err() {
+    if unsafe { record_writeback(device, res, target, source, hdr_pass, None) }.is_err() {
         result.miss = Some("recording the write-back failed");
         return result;
     }
@@ -4412,6 +4586,8 @@ struct Stats {
     capture_gpu_ms: Vec<f32>,
     writeback_gpu_ms: Vec<f32>,
     network_gpu_ms: Vec<f32>,
+    /// The native hold's depth copy (`native::DepthCopy`).
+    depth_gpu_ms: Vec<f32>,
     /// [`HoldTiming`]'s phases in milliseconds, per hold that reached them.
     prep_ms: Vec<f32>,
     capture_wait_ms: Vec<f32>,
@@ -4534,6 +4710,11 @@ pub(crate) struct Session {
     native_status: String,
     /// Consecutive frames still to dump after the one just taken ([`dump_frames`]).
     burst: u32,
+    /// Launch-bearing submits with DLSS's inputs identified so far ([`Self::saw_dlss`]): a cache
+    /// dump's holds must be consecutive ones.
+    seen: u64,
+    /// The K-hold cache dump ([`cache_dump`]).
+    cache_dump: cache_dump::CacheDump,
 }
 
 /// `NEURAL_FORGE_PROBE_PARAMS=1`: logs every word of DLSS Super Resolution's input-kernel parameters
@@ -4615,7 +4796,26 @@ impl Session {
             }
         }
         self.last_dlss = Some(Instant::now());
+        self.seen += 1;
         self.share_post_off();
+    }
+
+    /// Starts a requested cache dump ([`cache_dump::CacheDump::poll`]), then whether this model-mode
+    /// hold (the DLSS submit [`Self::saw_dlss`] just counted) is armed for one. `copyable`: the colour
+    /// input can be copied from (TRANSFER_SRC); a dump cannot run on one that cannot.
+    pub(crate) fn cache_dump_arm(&mut self, shm: &ShmClient, inline: bool, copyable: bool) -> Option<cache_dump::Arm> {
+        self.cache_dump.poll(shm, self.resumes, self.resumed_at);
+        if !copyable && self.cache_dump.running() {
+            self.cache_dump.end("the colour input lacks TRANSFER_SRC");
+            return None;
+        }
+        self.cache_dump.arm(self.seen, inline)
+    }
+
+    /// Books a model-mode hold's part in a cache dump: the readback it brought, and whether the hold
+    /// it was armed for (`arm`) wrote back.
+    pub(crate) fn cache_dump_after(&mut self, arm: Option<cache_dump::Arm>, result: &mut HoldResult) {
+        self.cache_dump.after_hold(arm, result.wrote_back, result.cache_frame.take());
     }
 
     /// Publishes, process-wide, until when this device keeps the post path off
@@ -4693,6 +4893,9 @@ impl Session {
             if !old.wait_idle(device, &mut gpu) {
                 self.res = Some(old);
                 return false;
+            }
+            if old.cache_pending() {
+                self.cache_dump.lost();
             }
             // SAFETY: drained just above.
             unsafe { old.destroy(device) };
@@ -4819,6 +5022,9 @@ impl Session {
         if let Some(g) = result.network_gpu_ms {
             s.network_gpu_ms.push(g);
         }
+        if let Some(g) = result.depth_gpu_ms {
+            s.depth_gpu_ms.push(g);
+        }
         s.book(&result.timing);
         if let Some(e) = result.exposure.filter(|&e| hdr::exposure_ok(e)) {
             s.exposure.push(e);
@@ -4848,7 +5054,7 @@ impl Session {
             let rate = per_second(SUMMARY_EVERY, s.window_start.map_or(Duration::ZERO, |t| now.duration_since(t)));
             s.window_start = Some(now);
             crate::log!(
-                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2}{} misses={} (total {}) holds_per_s={:.1}{}",
+                "[preupscale] mode={} extent={}x{} (padded {pw}x{ph}) holds={} hold_ms median={:.2} capture_gpu_ms median={:.2} writeback_gpu_ms median={:.2}{}{} misses={} (total {}) holds_per_s={:.1}{}",
                 mode().name(),
                 extent.0,
                 extent.1,
@@ -4857,6 +5063,11 @@ impl Session {
                 median(&s.capture_gpu_ms),
                 median(&s.writeback_gpu_ms),
                 if s.network_gpu_ms.is_empty() { String::new() } else { format!(" network_gpu_ms median={:.2}", median(&s.network_gpu_ms)) },
+                if s.depth_gpu_ms.is_empty() {
+                    String::new()
+                } else {
+                    format!(" depth_copy_gpu_ms median={:.4} max={:.4}", median(&s.depth_gpu_ms), s.depth_gpu_ms.iter().copied().fold(0.0, f32::max))
+                },
                 s.window_misses,
                 s.misses,
                 rate,
@@ -4876,6 +5087,7 @@ impl Session {
             s.capture_gpu_ms.clear();
             s.writeback_gpu_ms.clear();
             s.network_gpu_ms.clear();
+            s.depth_gpu_ms.clear();
             s.clear_phases();
             s.window_misses = 0;
         }
@@ -6047,6 +6259,7 @@ mod tests {
             exposure_input: None,
             mvec_input: None,
             mvec_extent,
+            depth_input: None,
             identification: 1,
             hazard: Hazard::MemoryBarrier,
         };
@@ -6239,7 +6452,15 @@ mod tests {
         t.launch(cb(2), Some(&params));
         let scan = t.submit_ok(&[vec![cb(1), cb(2)]]).expect("launch-bearing");
         assert_eq!((scan.hazard, scan.dump_hazard), (None, Some(Hazard::SameLayoutBarrier)));
+        // The model-mode hold still runs; it only leaves the depth out.
+        assert_eq!(scan.depth_hazard, Some(Hazard::SameLayoutBarrier));
         assert!(scan.colour_in_general());
+        // Barriers on the motion vectors alone: the depth is copied.
+        t.begin(cb(2));
+        t.barrier(cb(2), sync(mvec, vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ));
+        t.launch(cb(2), Some(&params));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!((scan.hazard, scan.dump_hazard, scan.depth_hazard), (None, Some(Hazard::SameLayoutBarrier), None));
         // A barrier on the colour input as well: no hold either.
         t.begin(cb(2));
         t.barrier(cb(2), sync(depth, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ));
@@ -7914,7 +8135,7 @@ mod tests {
             let shm = scratch_shm(if import { "rt-import" } else { "rt-staged" });
             let mut res = unsafe { Resources::build(&gpu.device, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, import) }.expect("resources");
             let white = 2.5;
-            let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
+            let target = Target { colour: image, width: w, height: h, depth: None, depth_buffer: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: exposure_aux(exposure), paper_white: white, identification: 1 };
             let (device, queue) = (&gpu.device, gpu.queue);
             let mut submits = Vec::new();
             let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
@@ -8021,6 +8242,7 @@ mod tests {
                 width: w,
                 height: h,
                 depth: None,
+                depth_buffer: None,
                 mvec: None,
                 mvec_scale: [1.0, 1.0],
                 exposure: [None; MAX_EXPOSURE],
@@ -8052,6 +8274,7 @@ mod tests {
                 exposure_input: exposure_aux(exposure),
                 mvec_input: None,
                 mvec_extent: (w, h),
+                depth_input: None,
                 identification: 1,
                 hazard: Hazard::MemoryBarrier,
             };
@@ -8110,7 +8333,7 @@ mod tests {
             submits.push(which);
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
         };
-        let base = Target { colour: image, width: w, height: h, depth: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification: 1 };
+        let base = Target { colour: image, width: w, height: h, depth: None, depth_buffer: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification: 1 };
         {
             let target = Target { exposure_input: exposure_aux(zero), ..base };
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
@@ -8283,7 +8506,7 @@ mod tests {
 
     /// Runs one auto-exposure hold (roundtrip mode, no exposure image) on `texels` and returns it.
     fn auto_hold(gpu: &Gpu, res: &mut Resources, image: vk::Image, w: u32, h: u32, identification: u64) -> HoldResult {
-        let target = Target { colour: image, width: w, height: h, depth: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification };
+        let target = Target { colour: image, width: w, height: h, depth: None, depth_buffer: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification };
         let (device, queue) = (&gpu.device, gpu.queue);
         let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
@@ -8416,6 +8639,175 @@ mod tests {
         finish(&gpu, res, &[(image, memory)]);
     }
 
+    /// What the native hold copies DLSS's depth from: the slot buffer inside DLSS's buffer, else a
+    /// readable depth image in a layout a copy can read from; nothing otherwise.
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn the_depth_is_copied_only_where_it_can_be_read() {
+        let depth = |readable, layout| Aux { image: vk::Image::null(), format: vk::Format::D32_SFLOAT_S8_UINT, layout, readable };
+        let base = Target {
+            colour: vk::Image::null(),
+            width: 4,
+            height: 4,
+            depth: None,
+            depth_buffer: None,
+            mvec: None,
+            mvec_scale: [1.0, 1.0],
+            exposure: [None; MAX_EXPOSURE],
+            exposure_input: None,
+            paper_white: hdr::DEFAULT_PAPER_WHITE,
+            identification: 1,
+        };
+        assert_eq!(native::depth_source(&base), None);
+        let readable = Target { depth: Some(depth(true, Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL))), ..base };
+        assert_eq!(native::depth_source(&readable), Some(vk::Format::D32_SFLOAT_S8_UINT));
+        assert_eq!(native::depth_source(&Target { depth: Some(depth(false, Some(vk::ImageLayout::GENERAL))), ..base }), None, "no TRANSFER_SRC");
+        assert_eq!(native::depth_source(&Target { depth: Some(depth(true, None)), ..base }), None, "no layout known");
+        assert_eq!(native::depth_source(&Target { depth: Some(depth(true, Some(vk::ImageLayout::UNDEFINED))), ..base }), None);
+        let inside = Target { depth_buffer: Some((vk::Buffer::null(), vk::Format::D16_UNORM)), ..base };
+        assert_eq!(native::depth_source(&inside), Some(vk::Format::D16_UNORM));
+        // Inside DLSS's buffer: the separate depth layouts only without stencil.
+        assert!(depth_copy_layout(vk::Format::D32_SFLOAT, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL));
+        assert!(!depth_copy_layout(vk::Format::D32_SFLOAT_S8_UINT, vk::ImageLayout::DEPTH_ATTACHMENT_OPTIMAL));
+        assert!(depth_copy_layout(vk::Format::D32_SFLOAT_S8_UINT, vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL));
+        assert!(!depth_copy_layout(vk::Format::D32_SFLOAT_S8_UINT, vk::ImageLayout::UNDEFINED));
+        assert!(depth_copy_layout(vk::Format::R32_SFLOAT, vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL));
+    }
+
+    /// The pre-upscaler path makes the game's depth images copyable, as it does RG16F images.
+    #[test]
+    fn depth_images_are_made_copyable() {
+        let info = |format| {
+            vk::ImageCreateInfo::builder()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(format)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
+                .build()
+        };
+        let x86 = cfg!(target_arch = "x86_64");
+        assert_eq!(wants_copyable(&info(vk::Format::D32_SFLOAT_S8_UINT)), x86);
+        assert_eq!(wants_copyable(&info(vk::Format::D16_UNORM)), x86);
+        assert!(!wants_copyable(&info(vk::Format::R16G16B16A16_SFLOAT)));
+        let already = vk::ImageCreateInfo { usage: vk::ImageUsageFlags::TRANSFER_SRC, ..info(vk::Format::D32_SFLOAT) };
+        assert!(!wants_copyable(&already));
+    }
+
+    /// A native capture on a real device: the depth aspect of a D32S8 image in
+    /// DEPTH_STENCIL_ATTACHMENT_OPTIMAL into the depth copy (through a transition and back), and a
+    /// cache dump's copy of the colour input before; then the write-back's dump copies (the colour
+    /// input after, the motion vectors and the depth). Without a readable depth, nothing is copied.
+    #[test]
+    fn the_capture_copies_the_depth_and_a_dumps_colour_and_the_write_back_reads_them_back() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("preupscale depth copy test: no Vulkan device, skipping");
+            return;
+        };
+        let d = &gpu.device;
+        let (w, h) = (5u32, 3u32);
+        let (image, memory) = gpu.image(w, h);
+        let original = pattern(w, h);
+        gpu.upload(image, w, h, &original);
+        let depth_format = vk::Format::D32_SFLOAT_S8_UINT;
+        let info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(depth_format)
+            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        let Ok(depth) = (unsafe { d.create_image(&info, None) }) else {
+            eprintln!("preupscale depth copy test: no D32_SFLOAT_S8_UINT image here, skipping");
+            return;
+        };
+        let reqs = unsafe { d.get_image_memory_requirements(depth) };
+        let props = unsafe { gpu.instance.get_physical_device_memory_properties(gpu.physical) };
+        let index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
+        let depth_mem = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
+        unsafe { d.bind_image_memory(depth, depth_mem, 0) }.unwrap();
+        let ds_range = aux_range(depth_format);
+        let to = |old, new| {
+            vk::ImageMemoryBarrier::builder()
+                .old_layout(old)
+                .new_layout(new)
+                .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+                .dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                .image(depth)
+                .subresource_range(ds_range)
+                .build()
+        };
+        let all = vk::PipelineStageFlags::ALL_COMMANDS;
+        gpu.one_shot(|cmd| unsafe {
+            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL)]);
+            d.cmd_clear_depth_stencil_image(cmd, depth, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearDepthStencilValue { depth: 0.75, stencil: 3 }, &[ds_range]);
+            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL)]);
+        });
+        let shm = scratch_shm("depth-copy");
+        let mut res = unsafe { Resources::build(d, &gpu.instance, gpu.physical, gpu.family, w, h, &shm, false) }.expect("resources");
+        let texels = (w * h) as usize;
+        let host = |bytes: usize| own_host_buffer(d, &gpu.instance, gpu.physical, bytes as u64).expect("host buffer");
+        let (depth_copy, before, after, mvec_src, mvec_back, depth_back) = (host(texels * 4), host(texels * 8), host(texels * 8), host(texels * 4), host(texels * 4), host(texels * 4));
+        let fill = |b: &HostBuffer, bytes: usize, v: u8| unsafe { std::ptr::write_bytes(b.ptr, v, bytes) };
+        let read = |b: &HostBuffer, bytes: usize| unsafe { std::slice::from_raw_parts(b.ptr, bytes) }.to_vec();
+        fill(&depth_copy, texels * 4, 0xaa);
+        fill(&mvec_src, texels * 4, 0x3c);
+        let readable = Target {
+            colour: image,
+            width: w,
+            height: h,
+            depth: Some(Aux { image: depth, format: depth_format, layout: Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL), readable: true }),
+            depth_buffer: None,
+            mvec: None,
+            mvec_scale: [1.0, 1.0],
+            exposure: [None; MAX_EXPOSURE],
+            exposure_input: None,
+            paper_white: hdr::DEFAULT_PAPER_WHITE,
+            identification: 1,
+        };
+        let run = |res: &Resources, target: &Target, cache: Option<&CacheCopies>| unsafe {
+            record_capture(d, res, target, None, None, None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour)).unwrap();
+            record_writeback(d, res, target, res.proxy.buffer, None, cache).unwrap();
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            d.queue_submit(gpu.queue, &[vk::SubmitInfo::builder().command_buffers(&[res.capture_cmd, res.writeback_cmd]).build()], fence).unwrap();
+            d.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            d.destroy_fence(fence, None);
+        };
+        // Not readable: the depth copy is left alone.
+        run(&res, &Target { depth: Some(Aux { readable: false, ..readable.depth.unwrap() }), ..readable }, None);
+        assert!(read(&depth_copy, texels * 4).iter().all(|&b| b == 0xaa), "an unreadable depth is copied");
+        let cache = CacheCopies { colour: before.buffer, answer: after.buffer, mvec: Some((mvec_src.buffer, mvec_back.buffer)), depth: Some((depth_copy.buffer, depth_back.buffer)) };
+        run(&res, &readable, Some(&cache));
+        let quarter: Vec<u8> = (0..texels).flat_map(|_| 0.75f32.to_le_bytes()).collect();
+        assert_eq!(read(&depth_copy, texels * 4), quarter, "the depth aspect as float32");
+        assert_eq!(read(&before, texels * 8), original, "the colour input before, tightly packed");
+        // The raw write-back put the proxy (the colour as captured) back: the answer equals it.
+        assert_eq!(read(&after, texels * 8), original, "the colour input after the write-back");
+        assert_eq!(read(&mvec_back, texels * 4), vec![0x3c; texels * 4]);
+        assert_eq!(read(&depth_back, texels * 4), quarter);
+        // The depth is back in its layout (validation checks this use).
+        gpu.one_shot(|cmd| unsafe {
+            d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[], &[], &[to(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, vk::ImageLayout::GENERAL)]);
+        });
+        let mut gpu_ms = None;
+        assert!(res.wait_idle(d, &mut gpu_ms));
+        unsafe {
+            res.destroy(d);
+            for b in [&depth_copy, &before, &after, &mvec_src, &mvec_back, &depth_back] {
+                b.destroy(d);
+            }
+            d.destroy_image(image, None);
+            d.free_memory(memory, None);
+            d.destroy_image(depth, None);
+            d.free_memory(depth_mem, None);
+        }
+    }
+
     /// Dump mode on a real device: colour (padded), the depth aspect of a D32S8 image that sits in
     /// DEPTH_STENCIL_ATTACHMENT_OPTIMAL (read through a transition and put back), RG16F motion
     /// vectors in GENERAL, and two 1x1 exposure images (RGBA32F in GENERAL, R16F in
@@ -8497,6 +8889,7 @@ mod tests {
             width: w,
             height: h,
             depth: Some(Aux { image: depth, format: depth_format, layout: Some(vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL), readable: true }),
+            depth_buffer: None,
             mvec: Some(Aux { image: mvec, format: vk::Format::R16G16_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), readable: true }),
             mvec_scale: [1.0, 1.0],
             exposure: [
