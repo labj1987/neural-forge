@@ -101,6 +101,8 @@ pub(crate) mod inline;
 pub(crate) mod native;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native_post;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod reduced;
 
 /// The native backend's per-device network ([`native::Loader`]); the native crate builds for x86_64 only.
 #[cfg(target_arch = "x86_64")]
@@ -146,7 +148,9 @@ pub(crate) unsafe fn run_native(
         // The edit cache's interval, and the debug view of its rejection mask.
         let ask = native::CacheAsk { hold, interval: shm.model_interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
         // SAFETY: forwarded.
-        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, arm, ask, submit) };
+        return unsafe {
+            native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, arm, ask, shm.working_scale(), submit)
+        };
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, hold, submit);

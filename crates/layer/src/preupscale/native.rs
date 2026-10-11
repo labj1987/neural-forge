@@ -593,9 +593,14 @@ pub(crate) fn depth_source(target: &Target) -> Option<vk::Format> {
 /// The layer's side of the native frame for one extent: the two frame shaders, the history images,
 /// DLSS's motion vectors' copy, the answer buffer, and the two recorded `N` buffers.
 pub(crate) struct NativePass {
+    /// The network's extent: the render extent, or at a reduced model resolution its scaled size.
     width: u32,
     height: u32,
     padded_width: u32,
+    /// The render extent (DLSS's motion vectors' copy and the accumulated field are at it).
+    render: (u32, u32),
+    /// A reduced model resolution's passes and buffers (`super::reduced`); `None` at 100%.
+    pub(crate) reduced: Option<super::reduced::Reduced>,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     preprocess: vk::Pipeline,
@@ -640,9 +645,44 @@ unsafe impl Send for NativePass {}
 impl NativePass {
     /// # Safety
     /// `device` is live; `family` is the queue family the frames are submitted on.
+    #[cfg(test)]
     pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32) -> Option<Self> {
         // SAFETY: forwarded.
         unsafe { Self::build_failing_at(device, instance, physical_device, family, width, height, None, false) }
+    }
+
+    /// [`Self::build`] for the network at `model` of the render extent `render`: below the render
+    /// extent with a reduced model resolution's passes (`super::reduced`), else exactly as `build`.
+    ///
+    /// # Safety
+    /// As [`Self::build`].
+    pub(crate) unsafe fn build_at(
+        device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, render: (u32, u32), model: (u32, u32),
+    ) -> Option<Self> {
+        // SAFETY: forwarded.
+        let mut pass = unsafe { Self::build_sized(device, instance, physical_device, family, model.0, model.1, None, false, render) }?;
+        if model != render {
+            // SAFETY: forwarded.
+            match unsafe { super::reduced::Reduced::build(device, instance, physical_device, family, render, model) } {
+                Some(r) => {
+                    crate::log!(
+                        "[native] model resolution {:.0}%: the network runs at {}x{} of the render extent {}x{}",
+                        100.0 * f64::from(model.0) / f64::from(render.0),
+                        model.0,
+                        model.1,
+                        render.0,
+                        render.1
+                    );
+                    pass.reduced = Some(r);
+                }
+                None => {
+                    // SAFETY: never submitted.
+                    unsafe { pass.destroy(device) };
+                    return None;
+                }
+            }
+        }
+        Some(pass)
     }
 
     /// [`Self::build`], failing on purpose at creation step `fail_at` (`0..BUILD_STEPS`) when given,
@@ -651,10 +691,25 @@ impl NativePass {
     ///
     /// # Safety
     /// As [`Self::build`].
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn build_failing_at(
         device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32, fail_at: Option<usize>,
         motion_half: bool,
+    ) -> Option<Self> {
+        // SAFETY: forwarded.
+        unsafe { Self::build_sized(device, instance, physical_device, family, width, height, fail_at, motion_half, (width, height)) }
+    }
+
+    /// [`Self::build_failing_at`] with the network at `width` x `height` and the motion buffers at the
+    /// render extent `render`.
+    ///
+    /// # Safety
+    /// As [`Self::build`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_sized(
+        device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32, fail_at: Option<usize>,
+        motion_half: bool, render: (u32, u32),
     ) -> Option<Self> {
         let (padded_width, padded_height) = super::padded(width, height);
         let binding = |n: u32, ty: vk::DescriptorType| {
@@ -726,7 +781,7 @@ impl NativePass {
                 step()?;
                 p.history.push(made(OwnImage::new(device, instance, physical_device, width, height, vk::ImageUsageFlags::SAMPLED)?));
             }
-            let texels = u64::from(width) * u64::from(height);
+            let texels = u64::from(render.0) * u64::from(render.1);
             step()?;
             // TRANSFER_SRC: a cache dump reads it back (`cache_dump`).
             p.mvec = Some(made(OwnBuffer::new(
@@ -779,6 +834,8 @@ impl NativePass {
                 width,
                 height,
                 padded_width,
+                render,
+                reduced: None,
                 set_layout: std::mem::take(&mut p.set_layout),
                 pipeline_layout: std::mem::take(&mut p.pipeline_layout),
                 preprocess: std::mem::take(&mut p.preprocess),
@@ -807,11 +864,19 @@ impl NativePass {
         }
     }
 
-    pub(crate) fn matches(&self, width: u32, height: u32) -> bool {
-        (self.width, self.height) == (width, height)
+    /// Built for the render extent `render` with the network at `model`.
+    pub(crate) fn matches(&self, render: (u32, u32), model: (u32, u32)) -> bool {
+        self.render == render && (self.width, self.height) == model
     }
 
+    /// What the write-back decodes: the network's answer, or at a reduced model resolution the
+    /// enlarged one (render padded extent either way).
     pub(crate) fn answer(&self) -> vk::Buffer {
+        self.reduced.as_ref().map_or(self.answer.buffer, |r| r.answer.buffer)
+    }
+
+    /// The network's own answer (its padded extent), which a reduced model resolution enlarges.
+    pub(crate) fn network_answer(&self) -> vk::Buffer {
         self.answer.buffer
     }
 
@@ -829,12 +894,20 @@ impl NativePass {
         for p in 0..2 {
             let set = self.sets[p];
             let general = |view| [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }];
-            let enc = general(encoded);
+            // At a reduced model resolution the network reads its own input and motion.
+            let enc = general(self.reduced.as_ref().map_or(encoded, |r| r.encoded.view));
             let next = general(self.history[1 - p].view);
             let prev = [vk::DescriptorImageInfo { sampler: self.sampler, image_view: self.history[p].view, image_layout: vk::ImageLayout::GENERAL }];
             let buf = |buffer, range| [vk::DescriptorBufferInfo { buffer, offset: 0, range }];
             let (mv, feat, head, params, state, expo, ans) = (
-                buf(if self.motion_half { self.mvec.buffer } else { self.acc.buffer }, vk::WHOLE_SIZE),
+                buf(
+                    match &self.reduced {
+                        _ if self.motion_half => self.mvec.buffer,
+                        Some(r) => r.acc.buffer,
+                        None => self.acc.buffer,
+                    },
+                    vk::WHOLE_SIZE,
+                ),
                 buf(f.features, vk::WHOLE_SIZE),
                 buf(f.head, vk::WHOLE_SIZE),
                 buf(self.params[p].buffer, PARAMS_BYTES),
@@ -983,9 +1056,18 @@ impl NativePass {
     }
 
     /// The command buffers for this frame, in submission order: the initialisation the first time,
-    /// then `N[parity]`. Writes the frame's parameters.
-    /// `mvec_scale` turns the copied motion vectors into render pixels ([`super::Target::mvec_scale`]).
+    /// then `N[parity]`, then at a reduced model resolution the enlarge (recorded by the caller for
+    /// this hold, `super::reduced::Reduced::record_enlarge`). Writes the frame's parameters.
+    /// `mvec_scale` turns the copied motion vectors into render pixels ([`super::Target::mvec_scale`]);
+    /// `jitter` is in render pixels. At a reduced model resolution both are scaled to the network's.
     pub(crate) fn frame(&mut self, built: &Built, history: bool, jitter: Option<[f32; 2]>, mvec_scale: [f32; 2], c: Conditioning) -> Vec<vk::CommandBuffer> {
+        let (jitter, mvec_scale) = match &self.reduced {
+            Some(r) => {
+                let k = r.ratio();
+                (jitter.map(|j| [j[0] * k[0], j[1] * k[1]]), [mvec_scale[0] * k[0], mvec_scale[1] * k[1]])
+            }
+            None => (jitter, mvec_scale),
+        };
         let p = (self.frames & 1) as usize;
         self.seed = if history { self.seed.wrapping_add(1) } else { 0 };
         let delta = match (self.last_jitter, jitter) {
@@ -1009,11 +1091,12 @@ impl NativePass {
         if let Some(timer) = self.timers[p].as_mut() {
             timer.mark_submitted();
         }
-        let mut out = Vec::with_capacity(2);
+        let mut out = Vec::with_capacity(3);
         if !std::mem::replace(&mut self.initialised, true) {
             out.push(self.commands[2]);
         }
         out.push(self.commands[p]);
+        out.extend(self.reduced.as_ref().map(super::reduced::Reduced::command));
         out
     }
 
@@ -1027,6 +1110,9 @@ impl NativePass {
                 destroyed(1);
             }
             destroyed(PASS_OBJECTS);
+            if let Some(r) = &self.reduced {
+                r.destroy(device);
+            }
             device.destroy_command_pool(self.command_pool, None);
             for h in &self.history {
                 h.destroy(device);
@@ -1273,7 +1359,8 @@ pub(crate) struct CacheAsk {
 /// One native hold (module docs): the capture with the motion-vector copy, the network, the write-back,
 /// submitted on the game's queue through `submit` with no wait in between. The previous hold's work
 /// is waited for (bounded) first, as every hold does. Frames the network is not ready for go to DLSS
-/// untouched, with `miss` saying why.
+/// untouched, with `miss` saying why. `model_scale` is the model resolution setting (`working_scale`):
+/// below 1, or by default from 4K up, the network runs at a scale of the render extent (`super::reduced`).
 ///
 /// # Safety
 /// As `super::run_hold`; `loader` belongs to `device`, and `res` was built for the queue family the
@@ -1282,7 +1369,7 @@ pub(crate) struct CacheAsk {
 pub(crate) unsafe fn run_native_hold(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut super::Resources, target: &Target,
     loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, conditioning: Conditioning, arm: Option<super::cache_dump::Arm>, ask: CacheAsk,
-    submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
+    model_scale: f32, submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> super::HoldResult {
     let mut result = super::HoldResult { native: true, ..Default::default() };
     let t_hold = Instant::now();
@@ -1325,7 +1412,11 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("the network's counter chain timed out; it is being rebuilt with barriers");
         return result;
     }
-    let Some(built) = loader.ready(target.width, target.height) else {
+    // The network's extent: the render extent, or its scaled size at a reduced model resolution (the
+    // setting, or the default's automatic one, `super::reduced::effective_scale`).
+    let scale = super::reduced::effective_scale(target.width, target.height, model_scale);
+    let model = super::reduced::model_extent(target.width, target.height, scale);
+    let Some(built) = loader.ready(model.0, model.1) else {
         if let Some(n) = res.native.as_mut() {
             n.gap.skipped();
         }
@@ -1389,13 +1480,20 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     };
     // The native pass for this extent, its buffers recorded for this build.
-    let mut native = match res.native.take().filter(|n| n.matches(target.width, target.height)) {
+    // Another extent or model resolution: the old pass is destroyed (idle: waited above), not dropped.
+    if res.native.as_ref().is_some_and(|n| !n.matches((target.width, target.height), model)) {
+        if let Some(old) = res.native.take() {
+            // SAFETY: idle (waited above).
+            unsafe { old.destroy(device) };
+        }
+    }
+    let mut native = match res.native.take() {
         Some(n) => n,
         None => {
             let family = res.queue_family;
             // SAFETY: `device` is live; `family` is the frames' family.
-            let built = res.native_retry.pass.build((target.width, target.height), now, || unsafe {
-                NativePass::build(device, instance, physical_device, family, target.width, target.height)
+            let built = res.native_retry.pass.build(model, now, || unsafe {
+                NativePass::build_at(device, instance, physical_device, family, (target.width, target.height), model)
             });
             match built {
                 Some(n) => n,
@@ -1450,8 +1548,18 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     };
     let wanted = ask.interval.clamp(1, super::cache::MAX_INTERVAL);
-    // Above interval 1 the cache's buffers are in the network's input features (`cache::ScratchLayout`).
-    let chained = wanted > 1 && edit.chain(built.frame.features_bytes);
+    // Above interval 1 the cache's buffers are in the network's input features (`cache::ScratchLayout`);
+    // at a reduced model resolution those are too small, and the cache gets a buffer of its own.
+    let scratch = match native.reduced.as_mut() {
+        None => (built.frame.features, built.frame.features_bytes),
+        Some(r) if wanted > 1 => {
+            let bytes = super::cache::ScratchLayout::new(target.width, target.height).total;
+            // SAFETY: `device` is live; idle (waited above).
+            unsafe { r.scratch(device, instance, physical_device, bytes) }.unwrap_or((vk::Buffer::null(), 0))
+        }
+        Some(_) => (vk::Buffer::null(), 0),
+    };
+    let chained = wanted > 1 && edit.chain(scratch.1);
     if !chained {
         edit.unchain();
     }
@@ -1478,7 +1586,7 @@ pub(crate) unsafe fn run_native_hold(
         depth: depth.and(res.depth.as_ref()).map(DepthCopy::buffer),
         mvec: native.mvec.buffer,
         acc: native.acc.buffer,
-        scratch: (built.frame.features, built.frame.features_bytes),
+        scratch,
     };
     // SAFETY: nothing of the pass is pending; every handle is live.
     unsafe { edit.bind(device, &bindings) };
@@ -1503,8 +1611,34 @@ pub(crate) unsafe fn run_native_hold(
     let depth_copy = depth.and(res.depth.as_ref()).map(|d| (d.buffer(), d.timer.as_ref()));
     let edit = res.edit.as_ref().expect("built above");
     let acc = native.acc.buffer;
-    // SAFETY (the four closures): recording into the hold's own buffers; the set was bound above.
-    let motion = |cmd: vk::CommandBuffer| unsafe { edit.record_motion(device, cmd, &push, acc) };
+    // A reduced model resolution (`super::reduced`): on a hold that runs the network, the network's
+    // input and motion at its extent in the capture, and its answer enlarged after its frame.
+    let reduced = native.reduced.as_ref().filter(|_| !cached).map(|r| {
+        let reverse = if push.flags & super::cache::F_REVERSE_Z != 0 { super::reduced::F_REVERSE_Z } else { 0 };
+        let motion = if run_motion { super::reduced::F_MOTION } else { 0 };
+        (r, r.push(target.paper_white, depth.map_or(0, super::cache::depth_kind), reverse | motion))
+    });
+    if let Some((r, _)) = &reduced {
+        let bindings = super::reduced::Bindings {
+            colour: colour_view,
+            encoded: hdr_ref.encoded_view(),
+            exposure: hdr_ref.exposure_buffer(),
+            acc,
+            answer: native.network_answer(),
+            depth: depth.and(res.depth.as_ref()).map(DepthCopy::buffer),
+        };
+        // SAFETY: nothing of the pass is pending (waited above); every handle is live.
+        unsafe { r.bind(device, &bindings) };
+    }
+    // SAFETY (the four closures): recording into the hold's own buffers; the sets were bound above.
+    let motion = |cmd: vk::CommandBuffer| unsafe {
+        if run_motion {
+            edit.record_motion(device, cmd, &push, acc);
+        }
+        if let Some((r, push)) = &reduced {
+            r.record_reduce(device, cmd, push);
+        }
+    };
     let capture_edit = |cmd: vk::CommandBuffer| unsafe { edit.record_capture(device, cmd, &push) };
     let apply = |cmd: vk::CommandBuffer| unsafe { edit.record_apply(device, cmd, &push) };
     // SAFETY: the capture buffer is idle; the colour view was bound above.
@@ -1518,9 +1652,11 @@ pub(crate) unsafe fn run_native_hold(
             mvec.map(|_| native.mvec.buffer),
             depth_copy,
             cache.map(|c| c.colour),
-            run_motion.then_some(&motion as &dyn Fn(vk::CommandBuffer)),
+            (run_motion || reduced.is_some()).then_some(&motion as &dyn Fn(vk::CommandBuffer)),
         )
     };
+    // SAFETY: the pass's command buffer is idle (waited above); its set was bound above.
+    let recorded = recorded.and_then(|()| reduced.map_or(Ok(()), |(r, push)| unsafe { r.record_enlarge(device, &push) }.map(|_| ())));
     if recorded.is_err() {
         res.native = Some(native);
         result.miss = Some("recording the capture failed");
@@ -1749,8 +1885,13 @@ mod tests {
             // The old path (packed halves) and the new (the field), side by side.
             let mut old = NativePass::build_failing_at(device, instance, physical, family, W, H, None, true).unwrap();
             let mut new = NativePass::build(device, instance, physical, family, W, H).unwrap();
+            // At 100% model resolution: no reduced passes, the network's own answer decoded, every frame
+            // the same as `new`'s, byte for byte.
+            let mut full = NativePass::build_at(device, instance, physical, family, (W, H), (W, H)).unwrap();
+            assert!(full.reduced.is_none() && full.answer() == full.network_answer());
             assert!(old.record(device, &built, graph, encoded.view, exposure.buffer));
             assert!(new.record(device, &built, graph, encoded.view, exposure.buffer));
+            assert!(full.record(device, &built, graph, encoded.view, exposure.buffer));
             let mut cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H).unwrap();
             cache.bind(
                 device,
@@ -1786,6 +1927,7 @@ mod tests {
                 };
                 fill(&old);
                 fill(&new);
+                fill(&full);
                 // The capture's motion pass at interval 1.
                 let push = cache.push(super::super::cache::F_KEEP_CLAMPED, 0, scale, 3.0);
                 fx.one_shot(|cmd| cache.record_motion(device, cmd, &push, new.acc.buffer));
@@ -1797,8 +1939,14 @@ mod tests {
                 let (new_lanes, new_answer) = (lanes(), answer_of(&new));
                 assert!(old_lanes == new_lanes, "frame {frame}: the network's input lanes differ");
                 assert!(old_answer == new_answer, "frame {frame}: the answer differs");
+                // `full`'s field: a copy of the one the motion pass wrote (the cache is bound to `new`'s).
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, new.acc.buffer, full.acc.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(W * H) * 8 }]));
+                let cmds = full.frame(&built, history, jitter, scale, Conditioning::default());
+                assert_eq!(cmds.len(), if frame == 0 { 2 } else { 1 }, "no enlarge at 100%");
+                fx.submit(&cmds);
+                assert!(lanes() == new_lanes && answer_of(&full) == new_answer, "frame {frame}: 100% model resolution differs");
             }
-            for pass in [&old, &new] {
+            for pass in [&old, &new, &full] {
                 pass.destroy(device);
             }
             cache.destroy(device);

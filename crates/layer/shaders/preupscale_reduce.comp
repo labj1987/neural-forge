@@ -1,0 +1,89 @@
+#version 450
+// Reduced model resolution before the upscaler (`model_resolution` below 100%; docs/ARCHITECTURE.md
+// 4.11): the network's input at its own, smaller extent, recorded in the capture after the encode and
+// the motion pass. Each model texel is the area (box) average of the render pixels it covers, taken in
+// the encode's exposure-normalised v = max(scene, 0) * e / paper_white before the shoulder, then put
+// through preupscale_encode.comp's shoulder and sRGB OETF; the padding duplicates the last column and
+// row, as the encode's does. With motion (flags bit 1) the accumulated field
+// (preupscale_cache_motion.comp's, render extent) is sampled at each model texel's centre (the
+// nearest render pixel) into the network's own field; the vectors keep their units (the network's
+// parameters carry the scale to model pixels, `native::NativePass::frame`).
+//
+// The descriptor set layout and the push constants are shared with preupscale_enlarge.comp and
+// `preupscale::reduced::ReducedPush` (field for field, append only). The curve functions are
+// preupscale_encode.comp's (duplicated: scripts/check_shaders.py hashes .comp files only).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The game's colour input (render extent), GENERAL. Only read.
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_colour;
+// binding 1 (the full-size encoded picture) is the enlarge's only.
+layout(set = 0, binding = 2, std430) readonly buffer Exposure { uint bits; } u_exposure;
+// The network's encoded input (model padded extent), GENERAL.
+layout(set = 0, binding = 3, rgba16f) uniform writeonly image2D u_small;
+// The accumulated motion (render extent) and the network's copy of it (model extent): f32 x, y.
+layout(set = 0, binding = 4, std430) readonly buffer AccFull { float v[]; } u_acc_full;
+layout(set = 0, binding = 5, std430) writeonly buffer AccSmall { float v[]; } u_acc_small;
+// bindings 6, 7, 8 (the answers, the depth) are the enlarge's only.
+
+layout(push_constant) uniform Params {
+  uvec2 size;          // the render extent
+  uvec2 padded;        // the render extent's padded size (the answer's rows)
+  uvec2 model;         // the network's extent
+  uvec2 model_padded;  // the network's padded extent (its encoded image and answer rows)
+  float paper_white;
+  uint depth_kind;     // 0 none, 1 f32 bits, 2 D24 UNORM, 3 D16 UNORM (cache::depth_kind)
+  uint flags;          // bit 0: reversed-Z; bit 1: copy the motion
+  float sigma_luma;    // the enlarge's guide weights
+  float sigma_depth;
+} p;
+
+const float KNEE = 0.75;
+const float K = 5.770780;
+const uint F_MOTION = 2u;
+
+bool exposure_ok(float e) {
+  return e > 1e-6 && e < 65504.0;
+}
+
+float shoulder(float v) {
+  return v <= KNEE ? v : KNEE + 0.25 * (1.0 - exp(-K * (v - KNEE)));
+}
+
+float srgb_oetf(float c) {
+  c = clamp(c, 0.0, 1.0);
+  return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (any(greaterThanEqual(id, p.model_padded))) return;
+  uvec2 m = min(id, p.model - 1u);
+  vec2 ratio = vec2(p.size) / vec2(p.model);
+  vec2 lo = vec2(m) * ratio;
+  vec2 hi = lo + ratio;
+  float e = unpackHalf2x16(u_exposure.bits).x;
+  float scale = exposure_ok(e) ? e / p.paper_white : 0.0;
+  vec3 sum = vec3(0.0);
+  float wsum = 0.0;
+  for (int y = int(floor(lo.y)); float(y) < hi.y; y++) {
+    float wy = min(hi.y, float(y + 1)) - max(lo.y, float(y));
+    for (int x = int(floor(lo.x)); float(x) < hi.x; x++) {
+      float w = wy * (min(hi.x, float(x + 1)) - max(lo.x, float(x)));
+      if (w <= 0.0) continue;
+      vec3 s = imageLoad(u_colour, min(ivec2(x, y), ivec2(p.size) - 1)).rgb;
+      // As the encode: NaN and negatives are 0, +Inf ends on the shoulder's top (64 is past it).
+      s = clamp(mix(s, vec3(0.0), isnan(s)), 0.0, 65504.0);
+      sum += min(s * scale, vec3(64.0)) * w;
+      wsum += w;
+    }
+  }
+  vec3 v = sum / max(wsum, 1e-6);
+  imageStore(u_small, ivec2(id), vec4(srgb_oetf(shoulder(v.r)), srgb_oetf(shoulder(v.g)), srgb_oetf(shoulder(v.b)), 1.0));
+  if ((p.flags & F_MOTION) != 0u && all(lessThan(id, p.model))) {
+    uvec2 src = min(uvec2((vec2(m) + 0.5) * ratio), p.size - 1u);
+    uint from = 2u * (src.y * p.size.x + src.x);
+    uint to = 2u * (m.y * p.model.x + m.x);
+    u_acc_small.v[to] = u_acc_full.v[from];
+    u_acc_small.v[to + 1u] = u_acc_full.v[from + 1u];
+  }
+}

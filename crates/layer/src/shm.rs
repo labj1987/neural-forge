@@ -503,6 +503,15 @@ impl ShmClient {
         self.header().map_or(1, |h| h.model_interval.load(Ordering::Relaxed).clamp(1, 4))
     }
 
+    /// `working_scale` (0.25..=1), the model resolution: on the pre-upscaler path the network's scale
+    /// of the render extent (`preupscale::reduced`). 1 before the mapping is open or when unusable.
+    pub fn working_scale(&self) -> f32 {
+        self.header().map_or(1.0, |h| {
+            let s = f32::from_bits(h.working_scale_bits.load(Ordering::Relaxed));
+            if s.is_finite() { s.clamp(0.25, 1.0) } else { 1.0 }
+        })
+    }
+
     /// `debug_view` (0 before the mapping is open).
     pub fn debug_view(&self) -> u32 {
         self.header().map_or(0, |h| h.debug_view.load(Ordering::Relaxed))
