@@ -710,6 +710,127 @@ through gta-bench with `model_interval` set; the kernel and the gain by temporar
   from run to run. The PNGs at frames 60 and 130 (the W and O of the sign, their legs) show the
   camera in a different place in each run and clean edges in all of them: no doubled edge, no trail.
 
+**The adaptive cadence (Phase 4, 2026-10-11).** Upstream's cadence (`SpeedInterval`) picks the
+interval from the camera's speed: long while still (2x the interval, up to 8), the interval while
+moving, shorter in fast motion down to a floor of 2, with an early refresh when 10% of the carried
+edit is rejected and a GPU budget as an alternative driver. Measured on our numbers, the
+direction is the other way round, and of the rest only the regime itself stayed.
+
+- **Speed.** Per hold, the median length of the motion vectors (the nearest surface's, render
+  pixels): GTA's pan dump 4-7 px, the drive 5-10, the pass-2 creep (`gta-pan-64`) 1.1-1.6, Crimson
+  Desert's foliage pan 1.0-1.6 (the same vector on two holds in a row: one game frame held twice
+  at frame generation 6x), GTA's still shot 0.001 px. The pace is upstream's reference at motion
+  priority 0.5, max(0.1% of the render width, 0.5 px) / 3 a hold: 0.495 px at 1485 wide, so a hold
+  is still under 0.124 px. Every moving dump is far above it; the still shot is far below.
+- **Direction: the network on every hold while still (taken), not a long interval (upstream's).**
+  At the still moment a cached hold keeps 71% of the model's added detail (above: the per-jitter
+  part of the answer no cache carries), and a still view is where a player looks closest; in
+  motion the carried edit's error grows with the lag (trails p99.5 at interval 3 over 2: pan 0.131
+  -> 0.185, drive 0.339 -> 0.437, `gta-pan-64` 0.335 -> 0.436), so the moving interval is 2. The
+  still moments are a few percent of a benchmark's holds (1-7% here), so neither direction
+  moves its fps: upstream's direction ran at the fixed interval's speed and loses the detail
+  (below).
+- **Hysteresis: 3 holds into the still regime, 20 out of it** (upstream's shorten-in-3,
+  lengthen-in-20; still is the shorter interval here). On `gta-still-64` (still for 24 holds,
+  creeping 0.01-0.4 px for 16, then accelerating to 4.5 px) the model runs on 56 of 64 holds:
+  every hold until 20 holds after the creep passes the threshold, then every other one.
+- **Still hold (a second threshold, three quarters of the pace, to leave): removed.** It keeps the
+  still regime 4 holds longer on `gta-still-64` (model 92.2% of holds against 87.5%, kept 97.0
+  against 96.0%), during the creep, and nothing else on any dump. The 20-hold exit already keeps a
+  still view from flapping: a reading above the threshold has to repeat 20 times in a row. The
+  live runs below had it; the bench-iq window is in the still regime either way.
+- **Fast motion to interval 1: not added.** The carry is mostly accepted in fast motion (rejected
+  3.4% of the drive's pixels at interval 2, 4.2% on the pan, 9.3% on Crimson Desert's foliage), so
+  a refresh on every hold would buy little and cost the most fps exactly where the frame rate is
+  felt.
+- **Early refresh on the rejected share (upstream: 10%): not added.** At interval 2 the hold after
+  a cached hold refreshes anyway, so the rule could only act at 3 or 4, which the trails above rule
+  out.
+- **GPU budget: not added.** Upstream's `ceil((refresh - cached) / (budget - cached))` sets the
+  interval from cost alone: with a refresh at about 6.3 ms (the network 5.9, the write-back 0.4)
+  and a cached hold's cache passes at 0.8-0.9 ms (1440p), a budget under about 3.6 ms gives 3 or
+  more (the trails above), 3.6-6.3 ms gives 2 on every hold, a still view included, and more gives
+  1 everywhere. It cannot meet the trail gate and the still gate at once; the regime does both.
+
+Offline, `cache_replay.py --cadence N --adaptive` (`--still-interval` for upstream's direction),
+err / p99.5 / worse% / kept% and the share of holds the model ran on:
+
+| dump | fixed 2 | fixed 3 | adaptive, 2 in motion (shipped) | upstream's direction (8 still, 2 moving) |
+|---|---|---|---|---|
+| pan | 0.0215/0.131/0.09/89.1, 50% | 0.0314/0.185/0.14/83.0, 38% | = fixed 2 | = fixed 2 |
+| drive | 0.0510/0.339/1.35/85.6, 50% | 0.0663/0.437/1.70/81.5, 38% | = fixed 2 | = fixed 2 |
+| still | 0.0498/0.309/1.91/76.4, 50% | 0.0607/0.372/2.19/71.4, 38% | 0.0302/0.186/1.10/85.7, 69% | = fixed 2 (16 holds: never 20 still in a row) |
+| Crimson Desert | 0.0653/0.505/2.28/72.8, 50% | 0.0831/0.628/2.82/65.4, 38% | = fixed 2 | = fixed 2 |
+| `gta-pan-64` | 0.0421/0.335/1.44/88.3, 50% | 0.0581/0.436/1.93/83.3, 34% | = fixed 2 | = fixed 2 |
+| `gta-drive-64` | 0.0443/0.276/1.18/84.2, 50% | 0.0590/0.363/1.45/79.1, 34% | = fixed 2 | = fixed 2 |
+| `gta-still-64` | 0.0503/0.446/1.66/87.0, 50% | 0.0629/0.555/1.88/84.0, 34% | 0.0116/0.101/0.32/96.0, 88% | 0.0598/0.530/1.79/84.8, 38% |
+
+The 64-hold dumps (`~/nf-spike/cache-dumps/gta-*-64` on the rig) are the bench's pass 2 at 4 s
+and pass 5 at 67.5 s and 70 s. Upstream's direction on `gta-still-64` ran with the still hold
+(below); the shipped column without it.
+
+Live, GTA V Enhanced (`gta-bench.sh`, `model_interval` 2, the other two builds by temporary
+patches never committed). Real fps: GTA's pass 4 (the long free-roam pass, where the still shot
+is) and passes 1-3; p99 frame time over passes 1-3; the share of holds the network ran on and of
+holds in the still regime from the layer's summaries. Still moment: bench-iq's flicker and added
+detail over 9 frames from 31 frames after the cut, against a model-off run of the same layer
+(each run's window and the baseline's at their own cut). Not the default 41: in the slower runs
+the camera starts moving again 47-56 frames after the cut, and the default window caught it in
+three runs (interval 1 x1.133 and x1.172, adaptive x1.104, flicker 1.36-1.93%).
+
+| 1440p, frame generation off | pass 4 / passes 1-3 fps, p99 ms | network / still regime | still: added detail, flicker |
+|---|---|---|---|
+| interval 1 | 69.5 / 72.3, 15.9; 69.0 / 72.3, 16.5 | 100% | x1.327, 1.108%; x1.351, 1.120% |
+| **adaptive (shipped)** | 74.5 / 79.6, 17.4; 73.4 / 80.2, 16.8 | 51.7 / 3.3%; 53.4 / 6.7% | x1.389, 1.044%; x1.309, 1.130% |
+| fixed 2 | 75.0 / 79.3, 17.6 | 50.0% | x1.221, 1.016% |
+| upstream's direction (8 still) | 75.2 / 79.7, 18.3 | 48.9 / 2.9% | x1.143, 1.099% |
+| model off | 90.0 / 109.2, 14.1 | - | x1.000, 0.980% |
+
+| configuration | adaptive: pass 4 / passes 1-3 fps, p99 ms | fixed 2 |
+|---|---|---|
+| 1440p, frame generation 4x | 52.4 / 54.4, 23.2 | 52.6 / 56.4, 23.8 |
+| 4K, frame generation off | 43.5 / 44.3, 29.2; 42.5 / 46.2, 29.5 | 43.0 / 45.2, 29.1; 45.2 / 42.8, 29.1 |
+
+- **Detail: adaptive keeps 103% of interval 1's added detail** (x1.349 against x1.339, means of
+  two runs each; flicker 1.04-1.13% against 1.11-1.12%), fixed 2 keeps 65% (x1.221) and
+  upstream's direction 42% (x1.143): it is at its long interval (8) through the window, which is
+  mostly cached holds.
+- **Speed: the fixed interval's.** The still regime is 1-7% of a benchmark's holds, so the
+  network runs on 51-53% of them against 50%; every difference above is inside the run-to-run
+  spread (about 3 fps). Upstream's direction runs on 49% and is no faster either.
+- **Trails in motion: fixed 2's**, by construction (no moving dump reads as still) and offline.
+- Runs left out: the first model-off, interval-1 and adaptive runs ran beside the offline replays,
+  which pushed the rig into swap (48.7, 42.8 and 70.4 real fps); and two runs meant for frame
+  generation 4x where it did not engage (1.0x: adaptive 76.0 and 74.8, fixed 76.9). No Xid in
+  any run.
+
+The shipped build (one threshold) once more, 1440p, frame generation off: 75.6 / 81.0 fps, p99
+16.0 ms, the network on 51.0% of holds (2.1% in the still regime), added detail x1.343 at 0.978%
+flicker. No Xid.
+
+**The high band's confidence on foliage (Crimson Desert): measured, not added.** On Crimson
+Desert's dump the low band alone is about as good as the whole cache from interval 2 up, and 9.3%
+of its pixels are rejected against GTA's 3.4-4.2%. Two ways to lower the high band's confidence
+with what predicts that, in the replay at interval 2 (err / p99.5 / worse% / kept%):
+
+| variant | Crimson Desert | pan | drive | still |
+|---|---|---|---|---|
+| as is | 0.0653/0.505/2.28/72.8 | 0.0215/0.131/0.09/89.1 | 0.0510/0.339/1.35/85.6 | 0.0498/0.309/1.91/76.4 |
+| low band only | 0.0650/0.530/1.19/72.4 | 0.0226/0.157/0.10/88.6 | 0.0598/0.412/1.54/83.1 | 0.0511/0.345/1.08/76.0 |
+| x the 7x7 share accepted | 0.0656/0.508/2.12/72.6 | 0.0215/0.132/0.08/89.1 | 0.0510/0.340/1.32/85.6 | 0.0492/0.306/1.79/76.7 |
+| x its square | 0.0658/0.513/2.03/72.5 | 0.0215/0.133/0.08/89.1 | 0.0510/0.341/1.29/85.6 | 0.0487/0.304/1.69/77.0 |
+| x (1 - rejected share / 0.3), per hold | 0.0621/0.500/1.62/73.9 | 0.0213/0.131/0.08/89.1 | 0.0509/0.337/1.28/85.6 | 0.0481/0.299/1.62/77.2 |
+| x (1 - rejected share / 0.6) | 0.0634/0.501/1.92/73.5 | 0.0214/0.131/0.08/89.1 | 0.0509/0.338/1.31/85.6 | 0.0489/0.303/1.76/76.9 |
+
+The local share does nothing. The per-hold factor helps Crimson Desert (kept +1.1 points, the
+worse-than-no-edit area 2.28 -> 1.62%) and leaves GTA's dumps as they were, but every number in
+this replay improves when the high band shrinks (it is the per-jitter part that correlates 0-0.14
+with the next hold's), and live the same kind of shrink (the bilinear read) cost the detail the
+replay could not see. The factor scales GTA's carried high band by 0.86-0.89 and Crimson Desert's
+by 0.69 on every cached hold in motion. Not added until a live Crimson Desert capture can show
+whether the foliage looks better with it (the rejected count is already in the history pass, so
+the apply could read it within the hold).
+
 ### 3.3 edit cache: VRAM at 4K with frame generation
 
 At 4K with frame generation 4x the cache's gate failed: interval 2 ran at 19.1-22.5 real fps against
