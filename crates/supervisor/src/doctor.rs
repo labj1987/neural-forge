@@ -76,6 +76,8 @@ pub enum LaunchOptionState {
     Present,
     /// Missing for the named game.
     Missing(String),
+    /// No installed Steam game has it.
+    NoneEnabled,
 }
 
 /// Every root path and every command the checks read, so tests can drive them from fixtures.
@@ -101,8 +103,11 @@ pub struct Roots {
     pub nvidia_smi: Command,
     /// `journalctl`.
     pub journalctl: Command,
-    /// Whether the launch option is set, when something knows; `None` is unknown.
+    /// Whether the launch option is set, when something knows; `None` derives it from
+    /// [`Roots::steam_roots`].
     pub launch_option_state: Option<LaunchOptionState>,
+    /// The Steam installations ([`crate::steam::roots`]): their games and launch options.
+    pub steam_roots: Vec<crate::steam::Root>,
 }
 
 /// Runs `program` with `args`, its standard output on success.
@@ -140,6 +145,7 @@ impl Roots {
             nvidia_smi: Box::new(|args| run_command("nvidia-smi", args)),
             journalctl: Box::new(|args| run_command("journalctl", args)),
             launch_option_state: None,
+            steam_roots: crate::steam::roots(),
         }
     }
 
@@ -182,6 +188,7 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
             out.extend(check_cannot_run(None, session.as_deref()));
         }
     }
+    out.extend(check_steam(roots));
     out.extend(check_xid(roots));
     out.extend(check_input_group(roots));
     out.extend(check_session_log(roots, events.as_deref().map_err(|e| e.kind()), session.as_deref()));
@@ -518,9 +525,11 @@ fn check_attached(roots: &Roots, hdr: &neural_forge_protocol::ShmHeader, manifes
     }
     // The likely causes, most likely first.
     let mut causes = Vec::new();
-    match &roots.launch_option_state {
+    let launch = roots.launch_option_state.clone().or_else(|| steam_launch_state(&crate::steam::games(&roots.steam_roots)));
+    match &launch {
         Some(LaunchOptionState::Present) => {}
         Some(LaunchOptionState::Missing(game)) => causes.push(format!("{game}'s Steam launch options lack `NEURAL_FORGE_ENABLE=1 %command%`")),
+        Some(LaunchOptionState::NoneEnabled) => causes.push("no installed Steam game has `NEURAL_FORGE_ENABLE=1 %command%` in its launch options".to_string()),
         None => causes.push("the game's Steam launch options may lack `NEURAL_FORGE_ENABLE=1 %command%`".to_string()),
     }
     causes.push("the game was already running when Neural Forge was installed or updated: restart it".to_string());
@@ -528,11 +537,63 @@ fn check_attached(roots: &Roots, hdr: &neural_forge_protocol::ShmHeader, manifes
         causes.push("the layer manifest is missing or broken (see the manifest finding)".to_string());
     }
     let numbered = causes.iter().enumerate().map(|(i, c)| format!("{}. {c}", i + 1)).collect::<Vec<_>>().join("\n");
-    let fix = match &roots.launch_option_state {
+    let fix = match &launch {
         Some(LaunchOptionState::Missing(game)) => format!("Set {game}'s launch options to `NEURAL_FORGE_ENABLE=1 %command%` (Steam: the game's Properties > General), then start it."),
+        Some(LaunchOptionState::NoneEnabled) => "Switch the game on in the Setup tab's Steam games list (or `neural-forge-cli enable GAME`) with Steam closed, then start it.".to_string(),
         _ => "Check the game's launch options for `NEURAL_FORGE_ENABLE=1 %command%`, then start the game again (a running game keeps the layer it started with).".to_string(),
     };
     Finding::new(CHECK, Severity::Warning, "no game's layer has attached since the channel was created (this boot)", format!("{evidence}\nlikely causes:\n{numbered}"), Some(fix))
+}
+
+// ---- Steam: which games launch with Neural Forge ---------------------------------------------------
+
+/// [`LaunchOptionState::Present`] when any installed game launches with Neural Forge on,
+/// [`LaunchOptionState::NoneEnabled`] when none does; `None` without any Steam game.
+fn steam_launch_state(games: &[crate::steam::Game]) -> Option<LaunchOptionState> {
+    if games.is_empty() {
+        return None;
+    }
+    Some(if games.iter().any(|g| crate::steam::enabled(&g.root.path, &g.appid)) { LaunchOptionState::Present } else { LaunchOptionState::NoneEnabled })
+}
+
+/// The Steam installations and every installed game's Neural Forge state. A Flatpak-only Steam is
+/// a failure: its games run in a sandbox that does not see the layer installed on the host.
+fn check_steam(roots: &Roots) -> Vec<Finding> {
+    const CHECK: &str = "steam";
+    let steam = &roots.steam_roots;
+    if steam.is_empty() {
+        return vec![Finding::new(CHECK, Severity::Info, "no Steam installation found", "no steamapps/ under ~/.local/share/Steam, ~/.steam/steam, the Flatpak or the Snap root", None)];
+    }
+    let mut out = Vec::new();
+    let root_list = steam.iter().map(|r| format!("{}{}", r.path.display(), if r.flatpak { " (Flatpak)" } else { "" })).collect::<Vec<_>>().join("\n");
+    if crate::steam::only_flatpak(steam) {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Failure,
+            "Steam is the Flatpak build, the layer is not visible to it",
+            root_list.clone(),
+            Some("Install your distribution's Steam package (not the Flatpak) and run the games from it.".into()),
+        ));
+    }
+    let games = crate::steam::games(steam);
+    let enabled: Vec<bool> = games.iter().map(|g| crate::steam::enabled(&g.root.path, &g.appid)).collect();
+    let on = enabled.iter().filter(|e| **e).count();
+    let list = games.iter().zip(&enabled).map(|(g, e)| format!("{} {} ({}): {}", if *e { "on " } else { "off" }, g.name, g.appid, g.library.display())).collect::<Vec<_>>().join("\n");
+    let evidence = format!("Steam: {root_list}\n{list}");
+    if games.is_empty() {
+        out.push(Finding::new(CHECK, Severity::Info, "no installed Steam games found", evidence, None));
+    } else if on == 0 {
+        out.push(Finding::new(
+            CHECK,
+            Severity::Info,
+            format!("none of {} installed Steam games launches with Neural Forge", games.len()),
+            evidence,
+            Some("Switch a game on in the Setup tab's Steam games list (or `neural-forge-cli enable GAME`) with Steam closed.".into()),
+        ));
+    } else {
+        out.push(Finding::new(CHECK, Severity::Ok, format!("{on} of {} installed Steam games launch with Neural Forge", games.len()), evidence, None));
+    }
+    out
 }
 
 /// The newest session in the state log: the events of the process that last engaged (or, with no
@@ -864,6 +925,7 @@ mod tests {
             nvidia_smi: Box::new(move |_| smi.clone()),
             journalctl: Box::new(move |_| journal.clone()),
             launch_option_state: None,
+            steam_roots: Vec::new(),
         };
         Fixture { dir, roots }
     }
@@ -1063,6 +1125,78 @@ mod tests {
         let v = check_attached(&f.roots, mapping.header(), true);
         assert_eq!(v.severity, Severity::Ok);
         assert!(v.summary.starts_with("GTA5_Enhanced.exe's layer attached"));
+    }
+
+    /// A Steam root under the fixture with one library holding `games` (appid, name, launch options).
+    fn steam(f: &mut Fixture, sub: &str, flatpak: bool, games: &[(&str, &str, Option<&str>)]) {
+        let root = f.dir.join(sub);
+        let lib = root.display().to_string();
+        write(&root.join("steamapps/libraryfolders.vdf"), &format!("\"libraryfolders\"\n{{\n\t\"0\"\n\t{{\n\t\t\"path\"\t\t\"{lib}\"\n\t}}\n}}\n"));
+        let mut apps = String::new();
+        for (appid, name, options) in games {
+            write(&root.join(format!("steamapps/appmanifest_{appid}.acf")), &format!("\"AppState\"\n{{\n\t\"appid\"\t\t\"{appid}\"\n\t\"name\"\t\t\"{name}\"\n\t\"installdir\"\t\t\"{name}\"\n}}\n"));
+            if let Some(options) = options {
+                apps.push_str(&format!("\t\t\t\t\t\"{appid}\"\n\t\t\t\t\t{{\n\t\t\t\t\t\t\"LaunchOptions\"\t\t\"{options}\"\n\t\t\t\t\t}}\n"));
+            }
+        }
+        write(&root.join("userdata/1/config/localconfig.vdf"), &format!("\"UserLocalConfigStore\"\n{{\n\t\"Software\"\n\t{{\n\t\t\"Valve\"\n\t\t{{\n\t\t\t\"Steam\"\n\t\t\t{{\n\t\t\t\t\"apps\"\n\t\t\t\t{{\n{apps}\t\t\t\t}}\n\t\t\t}}\n\t\t}}\n\t}}\n}}\n"));
+        f.roots.steam_roots.push(crate::steam::Root { path: root, flatpak });
+    }
+
+    #[test]
+    fn steam_games_are_listed_with_their_state() {
+        let mut f = quiet();
+        steam(&mut f, "steam", false, &[("3240220", "Grand Theft Auto V Enhanced", Some("MANGOHUD=1 NEURAL_FORGE_ENABLE=1 %command%")), ("990080", "Hogwarts Legacy", None), ("1493710", "Proton Experimental", None)]);
+        let v = check_steam(&f.roots);
+        assert_eq!(v.len(), 1);
+        assert_eq!(v[0].severity, Severity::Ok);
+        assert_eq!(v[0].summary, "1 of 2 installed Steam games launch with Neural Forge", "Proton is not a game");
+        assert!(v[0].evidence.contains("on  Grand Theft Auto V Enhanced (3240220)"), "{}", v[0].evidence);
+        assert!(v[0].evidence.contains("off Hogwarts Legacy (990080)"), "{}", v[0].evidence);
+    }
+
+    #[test]
+    fn no_enabled_game_is_a_cause_of_a_layer_that_never_attached() {
+        let mut f = quiet();
+        steam(&mut f, "steam", false, &[("990080", "Hogwarts Legacy", Some("gamemoderun %command%"))]);
+        let v = check_steam(&f.roots);
+        assert_eq!(v[0].severity, Severity::Info);
+        assert!(v[0].fix.as_deref().unwrap().contains("neural-forge-cli enable"));
+        let mapping = channel(&f);
+        let v = check_attached(&f.roots, mapping.header(), true);
+        assert!(v.evidence.contains("1. no installed Steam game has `NEURAL_FORGE_ENABLE=1 %command%`"), "{}", v.evidence);
+        assert!(v.fix.unwrap().starts_with("Switch the game on in the Setup tab"));
+        // An explicit state from the caller wins over the derived one.
+        f.roots.launch_option_state = Some(LaunchOptionState::Present);
+        assert!(check_attached(&f.roots, mapping.header(), true).evidence.contains("1. the game was already running"));
+    }
+
+    #[test]
+    fn an_enabled_game_drops_the_launch_option_cause() {
+        let mut f = quiet();
+        steam(&mut f, "steam", false, &[("3240220", "GTA", Some("NEURAL_FORGE_ENABLE=1 %command%"))]);
+        let mapping = channel(&f);
+        assert!(check_attached(&f.roots, mapping.header(), true).evidence.contains("1. the game was already running"));
+    }
+
+    #[test]
+    fn a_flatpak_only_steam_is_a_failure_and_a_native_one_is_not() {
+        let mut f = quiet();
+        steam(&mut f, "flatpak", true, &[("3240220", "GTA", Some("NEURAL_FORGE_ENABLE=1 %command%"))]);
+        let v = check_steam(&f.roots);
+        let flat = v.iter().find(|x| x.severity == Severity::Failure).expect("flatpak failure");
+        assert_eq!(flat.summary, "Steam is the Flatpak build, the layer is not visible to it");
+        assert!(flat.evidence.contains("(Flatpak)"));
+        steam(&mut f, "native", false, &[]);
+        assert!(check_steam(&f.roots).iter().all(|x| x.severity != Severity::Failure), "a native Steam next to the Flatpak one sees the layer");
+    }
+
+    #[test]
+    fn no_steam_is_only_a_note() {
+        let f = quiet();
+        let v = check_steam(&f.roots);
+        assert_eq!((v.len(), v[0].severity), (1, Severity::Info));
+        assert_eq!(v[0].summary, "no Steam installation found");
     }
 
     fn event(time: u64, pid: u32, kind: &str, message: &str) -> String {
