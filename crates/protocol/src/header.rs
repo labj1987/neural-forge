@@ -256,6 +256,15 @@ pub struct ShmHeader {
     /// 1 while the layer runs the model before the upscaler, 0 otherwise (the GUI shows the
     /// after-the-upscaler settings only then).
     pub native_running: AtomicU32,
+
+    // --- v16 -----------------------------------------------------------------------------
+    /// The wall-clock time (Unix seconds) the layer of the game that holds this channel saw
+    /// `VK_ERROR_DEVICE_LOST`, or 0 when it has not. Written once, when the layer's latch fires
+    /// (`note_vk`), and reset when a game's layer opens the channel, so it describes the latest game
+    /// session only. A field of its own rather than `layer_reason`: that string is the native
+    /// backend's status line and is rewritten whenever the status changes, and `doctor` and the
+    /// Status tab need the loss to survive whatever is written after it.
+    pub device_lost_at: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -280,7 +289,7 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 664, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 668, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 72, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 568, "layout changed -- bump SHM_VERSION");
@@ -294,6 +303,7 @@ const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_state) == 632, 
 const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_misses) == 648, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, seq_eval) == 656, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, native_running) == 660, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, device_lost_at) == 664, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, layer_reason) == 228, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, game_name) == 424, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, server_state) == 156, "layout changed -- bump SHM_VERSION");
@@ -428,6 +438,7 @@ impl ShmHeader {
         self.server_busy_us.store(0, Ordering::Relaxed);
         self.seq_eval.store(0, Ordering::Relaxed);
         self.native_running.store(0, Ordering::Relaxed);
+        self.device_lost_at.store(0, Ordering::Relaxed);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
@@ -818,6 +829,27 @@ mod tests {
         assert_eq!(h.seq_req_b.load(Ordering::Relaxed), 0);
         assert_eq!(h.seq_resp_b.load(Ordering::Relaxed), 0);
         assert_eq!(h.proxy_format_b.load(Ordering::Relaxed), crate::enums::proxy_format::RGBA8);
+        assert_eq!(h.device_lost_at.load(Ordering::Relaxed), 0, "a fresh session has not lost its device");
+    }
+
+    #[test]
+    fn device_lost_at_is_appended_after_native_running() {
+        // v16 appends one word: every earlier field keeps its offset, and the new one sits last.
+        assert_eq!(std::mem::offset_of!(ShmHeader, device_lost_at), std::mem::offset_of!(ShmHeader, native_running) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, device_lost_at) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 16);
+    }
+
+    #[test]
+    fn init_defaults_clears_a_device_loss_and_a_settings_reset_keeps_it() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        h.device_lost_at.store(1_760_000_000, Ordering::Relaxed);
+        // A settings reset is not a new session: the loss is still the latest game's.
+        h.reset_persisted_settings();
+        assert_eq!(h.device_lost_at.load(Ordering::Relaxed), 1_760_000_000);
+        h.init_defaults();
+        assert_eq!(h.device_lost_at.load(Ordering::Relaxed), 0);
     }
 
     #[test]

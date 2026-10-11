@@ -40,6 +40,8 @@ pub mod persist;
 #[cfg(unix)]
 pub mod private_dir;
 mod slot;
+#[cfg(unix)]
+pub mod state_log;
 
 pub use header::{load64, setting_bounds, store64, ShmHeader, Tuning, SETTING_BOUNDS};
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
@@ -60,11 +62,12 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// drops `scaling_downscaler`, which nothing read: the model never runs above the frame's size; v15
 /// removes the Windows helper's fields (the per-pass settings, motion settings, rebuild spacing, its VRAM and
 /// feature counts, its reason string, the DMA-BUF exchange) and renames what the in-process model
-/// server still writes from `helper_*` to `server_*`).
+/// server still writes from `helper_*` to `server_*`; v16 appends `device_lost_at`, so the GUI and
+/// `doctor` can say the GPU device was lost without a log).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 15;
+pub const SHM_VERSION: u32 = 16;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;
