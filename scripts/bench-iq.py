@@ -37,11 +37,13 @@ import sys
 WINDOW = 9
 EXCLUDE = 0.05  # the share of pixels with the largest change left out of the flicker mean
 FLOOR = 0.05  # x geometric mean luma
-STATIC_STOPS = 0.05
+STATIC_STOPS = 0.05  # largest frame-to-frame change (stops) of a pixel counted as static for detail
 # A pair whose trimmed change is over this (stops) can be a cut, and the window starts SETTLE frames
 # after the first one (see `anchor`).
 CUT_STOPS = 0.05
-SETTLE = 40  # largest frame-to-frame change (stops) of a pixel counted as static for detail
+# The window starts on the new shot's 31st frame: GTA's camera starts moving again 47-56 frames after
+# the still shot's cut in the slower runs, inside a window from the 41st (40 until 2026-10-11).
+SETTLE = 30
 REC709 = (0.2126, 0.7152, 0.0722)
 # The darkest non-black 8-bit sRGB code, linear: black pixels count as this in the geometric mean.
 DARKEST = 1 / 255 / 12.92
@@ -157,7 +159,8 @@ def anchor(t, frames=WINDOW):
     that starts or stops moving changes gradually). Counting from the cut fixes the moment: GTA's
     benchmark camera starts a pass up to about a second earlier or later from run to run, so the
     series is captured across the cut. SETTLE leaves out the frames right after it, where DLSS's
-    history is still converging (their change decays over about 30 frames). None when the series
+    history is still converging (their change decays over about 30 frames; the window starts on the
+    new shot's 31st frame). None when the series
     ends too soon after the cut."""
     for i in range(1, len(t)):
         if t[i] > CUT_STOPS and t[i] > 3 * t[i - 1]:

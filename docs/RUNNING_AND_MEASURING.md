@@ -164,8 +164,12 @@ The moment is GTA's still shot in pass 5 (the long free-roam pass) at about 70.5
 crane shot over the pavement to people standing beside a parked car, the camera still for about a
 second (median motion 0.001 px a frame; at least 0.16 px at every other moment sampled every 2 to
 3 s). The camera starts a pass up to about a second earlier or later from run to run, so the series
-is captured across the cut and bench-iq.py takes the 9 frames from 40 frames after it (the first
-frames after a cut are DLSS's history converging); `--start K` picks a window by hand. GTA
+is captured across the cut and bench-iq.py takes the 9 frames from the new shot's 31st frame (the
+first frames after a cut are DLSS's history converging; their change decays over about 30 frames).
+Until 2026-10-11 the window started on the 41st frame: in the slower runs GTA's camera starts
+moving again 47-56 frames after the cut, inside that window (interval 1 read x1.133 and x1.172
+added detail there against x1.33-1.35 from the 31st), so numbers taken before then with the
+default window are from the 41st frame. `--start K` picks a window by hand. GTA
 sometimes pauses once more while it starts, which moves the pass to resume 6, so both are given:
 `NEURAL_FORGE_CAPTURE_AT=5:69500:200,6:69500:200` (entries separated by commas, each taken once).
 200 frames are about 3 GB of PNGs. The baseline is the same layer with the model off
