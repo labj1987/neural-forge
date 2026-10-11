@@ -473,7 +473,7 @@ how much of the model's effect is kept (100% = the model on every hold).
 - With both removed the shader still matches the tool (the shader-against-tool test, within 1e-3
   stop) and interval 1 is unchanged bit for bit.
 
-**Refresh crossfade and soft refresh: kept.** `cache_replay.py --cadence` runs the cache as the layer
+**Refresh crossfade and soft refresh: tried offline, removed after the live A/B below.** `cache_replay.py --cadence` runs the cache as the layer
 does, the model on one hold in N and the cached holds between, and measures over time: the numbers
 above for every hold after the first refresh (refresh holds included), p99.5 on the cached holds alone,
 upstream's pulse probe (`measure_pulse.py`: the regional light, a 12-pixel Gaussian of the shown
@@ -499,8 +499,10 @@ kept 7-9 points lower); on the cached holds alone it is the same at interval 2 a
 around line 689, no reason given); the live runs below are after DLSS. Without soft refresh the
 walk is weaker (pan i2 pulse 0.028 / 0.019, flicker +0.078). A walk capped at 2 holds is in between at
 intervals 3 and 4 (the same at 2): less lag, more pulse, as upstream found when it chose the whole
-interval. Shipped: the walk over the whole interval with soft refresh (the capture, history, apply and
-a new refresh pass; `run_cadence` is the mirror).
+interval. The walk over the whole interval with soft refresh shipped for a few hours (the capture,
+history, apply and a refresh pass; `--no-crossfade`, `--no-soft-refresh` and `--xf-frames` in the
+tool), until the live A/B after DLSS found nothing it improved there (below); it is gone from the
+shaders, the layer and the tool.
 
 | dump | run | err/p99.5/worse%/kept% | p99.5 cached | pulse refresh / cached (model) | flicker |
 |---|---|---|---|---|---|
@@ -624,6 +626,73 @@ flicker 1.197% against 1.030% with the model off on the same layer, added detail
 frame-generation-off capture of the cache as first ported, so the walk's effect on flicker after DLSS
 is not separated live; the model's own flicker every hold at this moment is the comparison still to
 take.
+
+**The walk, live after DLSS (GTA V Enhanced, 1440p, frame generation off, interval 2, 2026-10-11).**
+A temporary `NEURAL_FORGE_CACHE_WALK=0` against the walk, with interval 1 and the model off as
+references, the same layer (all edits 16-bit, below), at the still moment (bench-iq's 9 frames from
+the cut, baseline the model-off run) and over pass 2's opening shot (Vinewood, the camera creeping
+while the light goes from day to night; 160 presented frames from 3 s after the pass starts):
+
+| run | real fps (pass 4) | still: flicker | still: added detail | pass 2: MAD vs interval 1 (all / edges) |
+|---|---|---|---|---|
+| walk on | 77.7 | 1.082% | x1.057 | 0.242 / 0.628 (again: 0.290 / 0.691) |
+| walk off | 77.6 / 77.7 | 1.130% | x1.070 | 0.257 / 0.656 |
+| interval 1 | 69.9 | 1.187% | x1.221 | 0 |
+| model off | 90.4 | 0.976% | x1.000 | 0.394 / 0.844 |
+
+MAD is the mean absolute log2-luma difference (stops, half resolution) to the interval-1 series after
+aligning the frames by the offset of least difference; edges are the reference's top 10% gradient.
+Two walk-on runs differ from each other by 0.190 / 0.533, more than walk on and off differ from
+interval 1: the runs' timing differs more than the walk does. The walk's flicker is 4% lower, under
+the 10% the metric resolves, and the PNGs at the sign's edges (frames 60 and 130 of the shot) show no
+trail either way. Nothing it improves live, so it went (and with it the buffer the cache had of its
+own). What does show at the still moment: interval 2 keeps a quarter of the model's added detail
+(x1.06-1.07 against x1.22 every hold), the gap the refresh's carried edit loses to the current one.
+
+### 3.3 edit cache: VRAM at 4K with frame generation
+
+At 4K with frame generation 4x the cache's gate failed: interval 2 ran at 19.1-22.5 real fps against
+interval 1's 29-35 (earlier runs), the network at 15.8-17 ms instead of 12; VRAM was pinned at 11.86
+of 12.2 GB in every 4K run (GTA fills what is free). The cache's buffers were 146 bytes a render pixel
+(408 MB at 2228x1253), so they were the suspect.
+
+- **Account and cut.** Of those 146 bytes, 68 lived across holds and the rest within one. All of it
+  now lives in the network's input features (64 bytes a texel of its padded field), which only the
+  network's frame uses: `native_preprocess.comp` rewrites every texel before the graph reads any.
+  What crosses a network frame (the refresh's edit, read until the next refresh) is written after
+  one and dead before the next; the walk's start was the one thing that crossed one, and it went with
+  the walk. Edits are three 16-bit fixed-point stops in 8 bytes (the shaders stay within 8e-5 stop of
+  the replay tool, was 4.5e-6; the test's tolerance is 1e-3); the fingerprint is read from the frame
+  where it is needed and the step vector is gone; the guided filter's grids reuse the history read's
+  and the pyramid's bytes. 56 bytes a render pixel of the features, 0 of the cache's own (8 for the
+  few hours the walk still needed its start: 22 MB).
+- **It was not the VRAM.** With the cache's own VRAM cut from 408 to 21 MB, the first runs at 4K FG
+  4x still gave interval 2 20.0 real fps (network 16-19.8 ms, GPU 99% at 151 W) and interval 3 20.7
+  against interval 1's 26.6 (network 12.5 ms, 214 W). VRAM in use was the same in all of them (median
+  11.26 GB, peak 11.86 of 12.2: `nvidia-smi` each second). Later runs of the same layer at interval 2
+  gave 28.0 real fps with the network at 12.1-13.0 ms (193 W): the same build is fast in some runs and
+  slow in others. With the walk gone (the cache allocating nothing of its own) the 4K FG 4x runs
+  spread wider still: interval 2 at 28.0 real fps with the network at 12.1-13.0 ms against interval
+  1's 25.4 and 26.6 (12.0-12.5 ms) when the run is healthy, so the gate passes there; but three of the
+  last six runs (two at interval 2, one at interval 1; with counter chaining and without) collapsed
+  to 3.3-3.4 real fps, the network at 28-65 ms, the GPU at 21-22% and 60-67 W, while the kernel log said
+  `NVRM: ctxBufPoolReserve: Failed to reserve memory ... Out of memory` about 2,000 times a minute for
+  the whole run (none in the healthy runs). And interval 2's slower runs earlier (network 16-20 ms,
+  ~150 W) had the same VRAM readings as the healthy ones. So at 4K with frame generation the process
+  (GTA, DLSS frame generation, the network's 1.37 GB at the render size: about 294 MiB of weights and
+  364 bytes a field texel) is at the edge of the card whatever the cache does, and which side of it a
+  run lands on decides the result, not the interval. Frame generation also did not engage in three
+  of the later runs (1.0x), which the gate has to repeat. Left open: the network's own VRAM (its
+  activations, or a memory priority so the driver does not starve it), not the cache's.
+- **The network's rebuild returns its memory.** Every run first builds the network at the output
+  size for the after-the-upscaler path (the menus, before any DLSS frame), then at the render size
+  for the hold. `VK_EXT_memory_budget`, now on the `[native] network built` lines: at 1440p the
+  2560x1440 build adds 1666 MiB and the switch to 1485x836 frees 858-865 MiB, what the field sizes
+  predict (about 294 MiB of weights and 364 bytes a field texel: 871 MiB) - nothing is held. At 4K
+  the 3840x2160 build adds 3338 MiB (3.3 GB) and the switch frees 574-1235 MiB of a predicted 1970,
+  read while GTA was at its budget (9.9 GB) and allocating; the 1440p match says it is GTA filling
+  what was freed, not memory kept. The post path's build is not skippable: DLSS appears only once
+  the benchmark starts, after the menus the after-the-upscaler path serves.
 
 ## Deliberately not done, or left open
 
