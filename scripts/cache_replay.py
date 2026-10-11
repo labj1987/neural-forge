@@ -31,7 +31,7 @@ that ceiling).
 
 Usage:
   cache_replay.py DUMP [--lags 1 2 3 4 8] [--json OUT] [--oracle] [parameters]
-  cache_replay.py DUMP --cadence 2 3 4 [--phase K] [--aging] [--no-guided] [--json OUT]
+  cache_replay.py DUMP --cadence 2 3 4 [--adaptive] [--phase K] [--aging] [--no-guided] [--json OUT]
   cache_replay.py DUMP --cadence N --export-cadence DIR
   cache_replay.py DUMP --self-check
   cache_replay.py --make-synthetic DIR --kind still|pan|depth-edge|regrade|jitter
@@ -216,6 +216,8 @@ class Cadence:
     (upstream's keyframe crossfade with soft refresh), removed after the live runs (docs/LESSONS.md,
     "3.3 edit cache: what was tried").
 
+    adaptive    the layer's cadence: `interval` while the camera moves, `still_interval` while it is
+                still (Regime);
     aging       the high band's confidence times 2^(-staleness / half_life), staleness = one per
                 stale_px of motion since the refresh;
     guided      a fast guided filter (He et al.) of the cached edit on this hold's log luma, blended in
@@ -224,6 +226,8 @@ class Cadence:
 
     interval: int
     phase: int = 0
+    adaptive: bool = False
+    still_interval: int = 1
     aging: bool = False
     half_life: float = 8.0
     guided: bool = True
@@ -233,11 +237,53 @@ class Cadence:
 
     def label(self) -> str:
         parts = [f"i{self.interval}"]
+        if self.adaptive:
+            parts.append(f"adaptive{self.still_interval}" if self.still_interval != 1 else "adaptive")
         if self.aging:
             parts.append("aging")
         if not self.guided:
             parts.append("noguided")
         return "-".join(parts) if len(parts) > 1 else parts[0] + "-base"
+
+
+class Regime:
+    """The layer's adaptive cadence (`cache::Regime`, which mirrors this): the camera is still while
+    the median pixel of a hold moves less than a quarter of the pace (enter) or three quarters of it
+    (stay), the pace being max(0.1% of the render width, 0.5 px) / 3 a hold (upstream's speed
+    reference at motion priority 0.5). A regime change waits for consecutive holds that want it: 3
+    toward the shorter interval, 20 toward the longer, so the cadence never hops. The motion pass counts
+    the pixels (`still_counts`) and a hold's counts decide the holds after it."""
+
+    TO_SHORTER = 3
+    TO_LONGER = 20
+
+    def __init__(self, cad: "Cadence"):
+        self.cad, self.still, self.against = cad, False, 0
+
+    def interval(self) -> int:
+        return self.cad.still_interval if self.still else self.cad.interval
+
+    def observe(self, counts: tuple) -> None:
+        enter, stay, n = counts
+        if n == 0:
+            return
+        wants = 2 * (stay if self.still else enter) > n
+        if wants == self.still:
+            self.against = 0
+            return
+        self.against += 1
+        shorter = (self.cad.still_interval < self.cad.interval) == wants
+        if self.against >= (self.TO_SHORTER if shorter else self.TO_LONGER):
+            self.still, self.against = wants, 0
+
+
+def still_counts(mv: np.ndarray) -> tuple:
+    """The motion pass's STAT_STILL_ENTER, STAT_STILL_STAY and STAT_MOTION_N: pixels whose vector (the
+    nearest surface's, render pixels) is shorter than a quarter / three quarters of the pace, and all."""
+    h, w = mv.shape[:2]
+    pace = np.float32(max(0.001 * w, 0.5) / 3.0)
+    s = np.sqrt((mv.astype(np.float32) ** 2).sum(axis=-1))
+    return int((s < np.float32(0.25) * pace).sum()), int((s < np.float32(0.75) * pace).sum()), h * w
 
 
 def step_position(prev: cc.Frame, cur: cc.Frame, p: cc.Params) -> np.ndarray:
@@ -285,13 +331,17 @@ def guided_fast(I: np.ndarray, P: np.ndarray, eps: float) -> np.ndarray:
 
 
 def run_cadence(dump: cc.Dump, frames: Frames, cad: Cadence, p: cc.Params):
-    """Holds phase.. with the model on every interval-th: yields (hold, since, shown edit, frame).
-    A hold without a usable exposure restarts the run (the next hold refreshes)."""
-    n = cad.interval
+    """Holds phase.. with the model on every interval-th (adaptive: the regime's interval, decided by
+    the holds before): yields (hold, since, shown edit, frame). A hold without a usable exposure
+    restarts the run (the next hold refreshes)."""
+    regime = Regime(cad) if cad.adaptive else None
     src = acc = prev = stale = None
     since = 0
     for t in range(cad.phase, len(dump)):
         dst = frames[t]
+        n = regime.interval() if regime else cad.interval
+        if regime:
+            regime.observe(still_counts(dst.mv))
         if not dst.usable:
             src = prev = None
             continue
@@ -325,13 +375,15 @@ def run_cadence(dump: cc.Dump, frames: Frames, cad: Cadence, p: cc.Params):
 
 def export_cadence(dump: cc.Dump, cad: Cadence, p: cc.Params, reverse_z: bool, out: str) -> int:
     """For the layer's shader test: every hold's shown edit of a cadence run, `shown-TT.f32` (H x W x 3
-    f32 little-endian), and `holds.txt` (per hold: jitter x, jitter y). Returns the holds written."""
+    f32 little-endian), and `holds.txt` (per hold: jitter x, jitter y, and the motion pass's
+    still_counts). Returns the holds written."""
     os.makedirs(out, exist_ok=True)
     frames = Frames(dump, reverse_z, p, 3)
     k = 0
     with open(os.path.join(out, "holds.txt"), "w", encoding="utf-8") as fh:
         for t, _, _, shown, dst, _ in run_cadence(dump, frames, cad, p):
-            fh.write(f"{float(dst.jitter[0])!r} {float(dst.jitter[1])!r}\n")
+            enter, stay, n = still_counts(dst.mv)
+            fh.write(f"{float(dst.jitter[0])!r} {float(dst.jitter[1])!r} {enter} {stay} {n}\n")
             shown.astype("<f4").tofile(os.path.join(out, f"shown-{t:02d}.f32"))
             k += 1
     return k
@@ -376,13 +428,17 @@ def cadence_metrics(dump: cc.Dump, cad: Cadence, p: cc.Params, reverse_z: bool) 
     refresh hold), the model's own (its answer on every hold) beside it; pulse_excess = the refresh
     holds' mean minus the cached holds'.
     flicker: flicker_lab.py's motion-compensated |picture_t - picture_t-1| (display values) on pixels
-    that stayed on their surface, minus the model's own, x1000."""
+    that stayed on their surface, minus the model's own, x1000.
+    refresh_share: the holds the model ran on, % of all."""
     frames = Frames(dump, reverse_z, p, 3)
     acc = {k: [] for k in ("err", "p995", "worse", "pic", "base")}
     cached = {k: [] for k in ("err", "p995", "worse", "pic", "base")}
     pulse, model_pulse, flick = {}, [], []
     prev = None
+    holds = refreshes = 0
     for t, since, refresh, shown, dst, step in run_cadence(dump, frames, cad, p):
+        holds += 1
+        refreshes += int(refresh)
         reg = regional_light(dst, shown, p)
         reg_true = regional_light(dst, dst.edit, p)
         pic = cc.display(cc.apply_edit(dst.v_colour, shown, p))
@@ -417,20 +473,21 @@ def cadence_metrics(dump: cc.Dump, cad: Cadence, p: cc.Params, reverse_z: bool) 
     return {"label": cad.label(), "cadence": dataclasses.asdict(cad), "all": summary(acc), "cached": summary(cached),
             "pulse": by_since, "pulse_model": float(np.mean(model_pulse)) if model_pulse else float("nan"),
             "pulse_excess": float(np.mean(pulse.get(0, [np.nan])) - np.mean(others)) if others else float("nan"),
-            "flicker": 1000 * float(np.mean(flick)) if flick else float("nan")}
+            "flicker": 1000 * float(np.mean(flick)) if flick else float("nan"),
+            "refresh_share": 100 * refreshes / max(holds, 1)}
 
 
 def print_cadence(rows: list, out=None) -> None:
     out = out or sys.stdout
     print(f"  {'run':<20} {'err':>7} {'p99.5':>6} {'worse%':>6} {'kept%':>6} | {'cached err':>10} {'p99.5':>6} | "
-          f"{'pulse run/others (model)':>26} {'excess':>8} | {'flicker':>7}", file=out)
+          f"{'pulse run/others (model)':>26} {'excess':>8} | {'flicker':>7} | {'model%':>6}", file=out)
     for r in rows:
         a, c = r["all"], r["cached"] or {"err": float("nan"), "p995": float("nan")}
         pz = r["pulse"]
         others = [v for k, v in pz.items() if k != "0"]
         print(f"  {r['label']:<20} {a['err']:7.4f} {a['p995']:6.3f} {a['worse']:6.2f} {a['kept']:6.1f} | {c['err']:10.4f} "
               f"{c['p995']:6.3f} | {pz.get('0', float('nan')):8.4f} / {np.mean(others) if others else float('nan'):6.4f} "
-              f"({r['pulse_model']:.4f}) {r['pulse_excess']:+8.4f} | {r['flicker']:7.3f}", file=out)
+              f"({r['pulse_model']:.4f}) {r['pulse_excess']:+8.4f} | {r['flicker']:7.3f} | {r['refresh_share']:6.1f}", file=out)
 
 
 # --------------------------------------------------------------------------------------------------
@@ -599,6 +656,8 @@ def main(argv=None) -> int:
     c = ap.add_argument_group("cadence: the cache run at a fixed interval (pulse, flicker; experiments not in the shaders)")
     c.add_argument("--cadence", type=int, nargs="+", metavar="N", help="run with the model every N holds instead of the lag replay")
     c.add_argument("--phase", type=int, default=0, help="the first refresh hold")
+    c.add_argument("--adaptive", action="store_true", help="the layer's adaptive cadence: N while the camera moves")
+    c.add_argument("--still-interval", type=int, default=1, help="(experiment) with --adaptive: the interval while still; the layer uses 1")
     c.add_argument("--aging", action="store_true")
     c.add_argument("--half-life", type=float, default=8.0)
     c.add_argument("--no-guided", action="store_true", help="no guided filter of the cached edits")
@@ -660,7 +719,7 @@ def main(argv=None) -> int:
         if min(args.cadence) < 2:
             ap.error("--cadence intervals are 2 or more")
         def cadence(n):
-            return Cadence(interval=n, phase=args.phase, aging=args.aging, half_life=args.half_life, guided=not args.no_guided,
+            return Cadence(interval=n, phase=args.phase, adaptive=args.adaptive, still_interval=args.still_interval, aging=args.aging, half_life=args.half_life, guided=not args.no_guided,
                            guided_strength=args.guided_strength, guided_eps=args.guided_eps)
 
         if args.export_cadence:

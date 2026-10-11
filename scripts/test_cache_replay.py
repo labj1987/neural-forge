@@ -179,6 +179,30 @@ class CacheReplayTests(unittest.TestCase):
             np.testing.assert_allclose(shown, want, atol=1e-6)
         self.assertEqual((h, w), shown.shape[:2])
 
+    def test_adaptive_cadence_refreshes_every_hold_once_still(self):
+        """The regime: 3 still holds and every hold after them refreshes; a moving camera keeps the
+        interval. The layer's cache::Regime mirrors this."""
+        p = cc.Params()
+        for kind, want in (("still", [True, False, True, True, True, True]), ("pan", [True, False] * 3)):
+            dump = cc.load_dump(self.dirs[kind])
+            frames = cr.Frames(dump, True, p, 3)
+            got = [refresh for _, _, refresh, _, _, _ in cr.run_cadence(dump, frames, cr.Cadence(interval=2, adaptive=True), p)]
+            self.assertEqual(got, want, kind)
+        r = cr.Regime(cr.Cadence(interval=2, adaptive=True))
+        for counts in [(60, 90, 100)] * 2 + [(10, 20, 100)] + [(60, 90, 100)] * 2:
+            r.observe(counts)
+        self.assertFalse(r.still, "a moving hold restarts the count")
+        r.observe((60, 90, 100))
+        self.assertEqual(r.interval(), 1)
+        for _ in range(30):
+            r.observe((10, 60, 100))
+        self.assertTrue(r.still, "between the thresholds the regime stays")
+        for _ in range(19):
+            r.observe((10, 20, 100))
+        self.assertTrue(r.still)
+        r.observe((10, 20, 100))
+        self.assertEqual(r.interval(), 2)
+
     def test_cadence_metrics_has_a_pulse_per_hold_since_the_refresh(self):
         dump = cc.load_dump(self.dirs["pan"])
         r = cr.cadence_metrics(dump, cr.Cadence(interval=3), cc.Params(), True)
