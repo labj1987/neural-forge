@@ -969,6 +969,13 @@ impl ImageSync {
         self.src_queue_family != self.dst_queue_family
     }
 
+    /// Whether what came before this barrier may have written the image: a layout transition, an
+    /// ownership transfer, or a write in its source access. A same-layout barrier after reads only
+    /// (GTA V Enhanced's on its depth, around the copy into DLSS's own) orders reads.
+    pub(crate) fn may_follow_a_write(&self) -> bool {
+        self.old_layout != self.new_layout || self.transfers_ownership() || self.src_access & WRITE_ACCESS != 0
+    }
+
     /// Why a hold must not run before this barrier.
     fn hazard(&self) -> Hazard {
         if self.transfers_ownership() {
@@ -980,6 +987,11 @@ impl ImageSync {
         }
     }
 }
+
+/// The write bits of `VkAccessFlags2` (the legacy ones keep their values): shader, colour and depth
+/// attachment, transfer, host and memory writes, shader storage writes, acceleration structure and
+/// command preprocess writes, transform feedback writes.
+const WRITE_ACCESS: u64 = 0x40 | 0x100 | 0x400 | 0x1000 | 0x4000 | 0x1_0000 | 0x4_0000 | 0x40_0000 | 0x200_0000 | 0x400_0000 | 0x800_0000 | 0x20_0000_0000;
 
 /// Why a launch-bearing submit cannot be split in front of its launch buffer: the hold would read
 /// (and write) DLSS's inputs before synchronization the application recorded for them, or between
@@ -1898,8 +1910,9 @@ impl Tracker {
         // DLSS's depth, copied beside it into a slot buffer for the native backend: at the colour
         // input's extent, in a layout known here. Not when it was destroyed since (Black Myth: Wukong
         // hands DLSS a new one every frame with frame generation on).
-        let depth_input = self.images.get(&inputs.depth.0).copied().map(|d| {
-            let image = inputs.depth.0;
+        let (named, _) = self.hold_depth(cb, inputs.depth, None);
+        let depth_input = self.images.get(&named).copied().map(|d| {
+            let image = named;
             let layout = self
                 .pending
                 .get(&cb)
@@ -2035,6 +2048,9 @@ impl Tracker {
                 || i.mvec.0 == image
                 || i.exposure.iter().flatten().any(|e| e.0 == image)
                 || i.exposure_input.is_some_and(|e| e.0 == image)
+                // Every depth image at the identified depth's extent: the input launch may name
+                // another one than the identified (`Self::hold_depth`; GTA V Enhanced alternates two).
+                || self.images.get(&image).is_some_and(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == (i.depth.1.width, i.depth.1.height))
         })
     }
 
@@ -2111,7 +2127,7 @@ impl Tracker {
         (
             before.iter().find(|s| held(s.image)).map(ImageSync::hazard),
             before.iter().find(|s| dumped(s.image)).map(ImageSync::hazard),
-            before.iter().find(|s| inputs.is_some_and(|i| i.depth.0 == s.image)).map(ImageSync::hazard),
+            before.iter().find(|s| inputs.is_some_and(|i| i.depth.0 == s.image) && s.may_follow_a_write()).map(ImageSync::hazard),
         )
     }
 
@@ -2618,15 +2634,22 @@ impl Tracker {
                     held_kind = kind;
                     held_target = retarget.or(self.inputs.map(|i| i.colour)).map(|c| (c.0, retarget.is_some()));
                     let layout = |image: Option<vk::Image>| image.and_then(|i| proposed.get(&i).map(|p| p.0).or(self.committed.get(&i).copied()));
-                    let inputs = self.inputs.map(|i| Inputs { colour: retarget.unwrap_or(i.colour), ..i });
+                    // The depth this frame's hold reads ([`Self::hold_depth`]): GTA V Enhanced
+                    // alternates two depth images frame by frame, so the identified one is the previous
+                    // frame's on every other frame.
+                    let inputs = self.inputs.map(|i| {
+                        let colour = retarget.unwrap_or(i.colour);
+                        Inputs { colour, depth: self.hold_depth(cb, i.depth, self.before_launch(cb, colour.0)), ..i }
+                    });
                     let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
                     let (hazard, dump_hazard, depth_hazard) = self.launch_hazard(cb, inputs.as_ref());
+                    self.probe_depth(cb, inputs.as_ref(), depth_hazard);
                     found = Some(Scan {
                         batch: bi,
                         index: ci,
                         colour_layout: layout(inputs.map(|i| i.colour.0)),
                         inputs,
-                        depth_layout: layout(self.inputs.map(|i| i.depth.0)),
+                        depth_layout: layout(inputs.map(|i| i.depth.0)),
                         mvec_layout: layout(self.inputs.map(|i| i.mvec.0)),
                         exposure_layouts: std::array::from_fn(|k| layout(self.inputs.and_then(|i| i.exposure[k]).map(|e| e.0))),
                         exposure_input_layout: layout(self.inputs.and_then(|i| i.exposure_input).map(|e| e.0)),
@@ -2669,6 +2692,76 @@ impl Tracker {
 
     /// The size rule's other candidate `cb`'s input launch names, with the colour input's depth and
     /// motion vectors (so their layouts are watched), if any. Never DLSS Ray Reconstruction's launch.
+    /// `NEURAL_FORGE_PROBE_DEPTH=1`: for the first 120 launch-bearing submits held, logs the
+    /// identified and the named depth, their layouts, and the launch buffer's barriers on depth
+    /// images (before the launch or not). Diagnostic only.
+    fn probe_depth(&self, cb: vk::CommandBuffer, inputs: Option<&Inputs>, hazard: Option<Hazard>) {
+        static ON: LazyLock<bool> = LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_DEPTH").as_deref() == Some("1"));
+        static COUNT: AtomicU64 = AtomicU64::new(0);
+        if !*ON || COUNT.fetch_add(1, Ordering::Relaxed) >= 120 {
+            return;
+        }
+        let Some(i) = inputs else { return };
+        let identified = self.inputs.map(|x| x.depth.0);
+        let before = self.launch.get(&cb).and_then(|r| r.before_named.iter().find(|(im, _)| *im == i.colour.0).map(|(_, b)| *b).or(r.before_first));
+        let barriers: Vec<String> = self
+            .pending
+            .get(&cb)
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(|(_, s)| self.images.get(&s.image).is_some_and(|d| DEPTH_FORMATS.contains(&d.format)))
+            .map(|(k, s)| {
+                format!(
+                    "#{k}{} {} {:?}->{:?} access {:#x}->{:#x}",
+                    if before.is_some_and(|b| k < b.barriers) { "(before)" } else { "" },
+                    hex(s.image),
+                    s.old_layout,
+                    s.new_layout,
+                    s.src_access,
+                    s.dst_access
+                )
+            })
+            .collect();
+        crate::log!(
+            "[probe-depth] identified {} ({:?}) named {} ({:?}) hazard {hazard:?}; depth barriers in the launch buffer: [{}]",
+            identified.map_or_else(|| "-".into(), hex),
+            identified.and_then(|d| self.committed.get(&d)),
+            hex(i.depth.0),
+            self.committed.get(&i.depth.0),
+            barriers.join("; ")
+        );
+    }
+
+    /// How many of `cb`'s recorded barriers come before the launch that first names `colour` (before
+    /// its first launch when none names it), as [`Self::launch_hazard`] counts them.
+    fn before_launch(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Option<usize> {
+        let refs = self.launch.get(&cb)?;
+        refs.before_named.iter().find(|(i, _)| *i == colour).map(|(_, b)| *b).or(refs.before_first).map(|b| b.barriers)
+    }
+
+    /// The depth a hold reads for DLSS this frame, at `identified`'s extent:
+    /// 1. a depth image the buffer synchronizes reads of before the launch (a same-layout barrier
+    ///    after reads only, within the first `before` barriers, or all of them): the frame's depth
+    ///    that the buffer copies into DLSS's own. GTA V Enhanced copies its depth, one of two it
+    ///    alternates between, into a ring of three DLSS reads, inside the launch buffer: the ring's
+    ///    image is written after the hold, the source is final before it;
+    /// 2. else the depth image the input launch names, where its layout is known;
+    /// 3. else the identified one.
+    fn hold_depth(&self, cb: vk::CommandBuffer, identified: (vk::Image, ImageDesc), before: Option<usize>) -> (vk::Image, ImageDesc) {
+        let extent = (identified.1.width, identified.1.height);
+        let depth = |image: vk::Image| self.images.get(&image).filter(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == extent).map(|d| (image, *d));
+        let recorded = self.pending.get(&cb).map_or(&[][..], Vec::as_slice);
+        let recorded = &recorded[..before.unwrap_or(recorded.len()).min(recorded.len())];
+        let read = recorded.iter().rev().filter(|s| s.old_layout == s.new_layout && !s.may_follow_a_write()).find_map(|s| depth(s.image));
+        let named = match self.launch.get(&cb).and_then(|r| r.input.as_ref()) {
+            Some(InputLaunch::Inputs { depth: d, .. }) => depth(*d),
+            _ => None,
+        };
+        let known = |image: vk::Image| self.committed.contains_key(&image) || recorded.iter().any(|s| s.image == image);
+        read.or(named.filter(|(d, _)| known(*d))).unwrap_or(identified)
+    }
+
     fn retarget(&self, cb: vk::CommandBuffer) -> Option<(vk::Image, ImageDesc)> {
         let i = self.inputs?;
         let refs = self.launch.get(&cb)?;
@@ -6430,6 +6523,92 @@ mod tests {
         t.forget_image(vk::Image::from_raw(0x300));
         let point = t.inline_point(b, c).expect("still held inside the buffer");
         assert!(point.mvec_input.is_none(), "a destroyed motion-vector image is copied from");
+    }
+
+    /// The depth a hold reads is the one this buffer's input launch names, with that image's own
+    /// layout: GTA V Enhanced alternates two depth images, and the identified one holds the previous
+    /// frame's depth on every other frame.
+    #[test]
+    fn the_hold_reads_the_depth_its_input_launch_names() {
+        let (mut t, params) = held_tracker();
+        let other = vk::Image::from_raw(0x400);
+        let info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
+            format: vk::Format::D32_SFLOAT_S8_UINT,
+            usage: vk::ImageUsageFlags::STORAGE,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        t.record_image(other, &info);
+        t.record_view(vk::ImageView::from_raw(0x401), other);
+        t.register(vk::ImageView::from_raw(0x401), Some(0x1400));
+        let _ = t.refresh();
+        // The identified inputs stay; a depth-only change is taken silently.
+        assert_eq!(t.inputs.map(|i| i.colour.0), Some(colour()));
+        let read_only = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        t.barrier(cb(1), ImageSync { old_layout: vk::ImageLayout::DEPTH_STENCIL_ATTACHMENT_OPTIMAL, ..ImageSync::to(other, read_only) });
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        let named_other = param_block(&[0x1100, 0x1400, 0x1300]);
+        t.begin(cb(2));
+        t.launch(cb(2), Some(&named_other));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!(scan.inputs.map(|i| i.depth.0), Some(other));
+        assert_eq!(scan.depth_layout, Some(read_only), "the named depth's own layout");
+        // The next frame names the identified one again.
+        t.begin(cb(2));
+        t.launch(cb(2), Some(&params));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!(scan.inputs.map(|i| i.depth.0), Some(vk::Image::from_raw(0x200)));
+    }
+
+    /// GTA V Enhanced's launch buffer with frame generation on (`NEURAL_FORGE_PROBE_DEPTH`,
+    /// 2026-10-10): before the input launch, read-only `GENERAL -> GENERAL` barriers on the frame's
+    /// depth (one of two the game alternates between) around a copy into DLSS's own depth, which the
+    /// launch names and which has no layout known. The hold reads the frame's depth, and the barriers
+    /// do not stop it; a barrier after a write does.
+    #[test]
+    fn the_hold_reads_the_depth_the_launch_buffer_copies_from() {
+        let (mut t, _) = held_tracker();
+        let info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
+            format: vk::Format::D32_SFLOAT_S8_UINT,
+            usage: vk::ImageUsageFlags::STORAGE,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        let (frame_depth, ring) = (vk::Image::from_raw(0x400), vk::Image::from_raw(0x500));
+        for (image, raw) in [(frame_depth, 0x400), (ring, 0x500)] {
+            t.record_image(image, &info);
+            t.record_view(vk::ImageView::from_raw(raw + 1), image);
+            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
+        }
+        let _ = t.refresh();
+        assert_eq!(t.inputs.map(|i| i.colour.0), Some(colour()));
+        let sync = |src: vk::AccessFlags, dst: vk::AccessFlags| ImageSync {
+            src_access: u64::from(src.as_raw()),
+            dst_access: u64::from(dst.as_raw()),
+            ..general_to_general(frame_depth)
+        };
+        // An earlier frame left it in GENERAL.
+        t.barrier(cb(1), ImageSync::to(frame_depth, GENERAL));
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        let names_ring = param_block(&[0x1100, 0x1500, 0x1300]);
+        t.begin(cb(2));
+        t.barrier(cb(2), sync(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ));
+        t.barrier(cb(2), sync(vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ));
+        t.launch(cb(2), Some(&names_ring));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!(scan.inputs.map(|i| i.depth.0), Some(frame_depth), "the copy's source, not DLSS's ring");
+        assert_eq!((scan.depth_layout, scan.depth_hazard, scan.hazard), (Some(GENERAL), None, None));
+        // Written in the buffer before the launch: not the frame's final depth, and no depth this hold.
+        t.begin(cb(2));
+        t.barrier(cb(2), sync(vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ));
+        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1400, 0x1300])));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!(scan.inputs.map(|i| i.depth.0), Some(frame_depth));
+        assert_eq!(scan.depth_hazard, Some(Hazard::SameLayoutBarrier));
     }
 
     /// Depth and motion vectors are read only by a dump: a barrier on them before the launch stops

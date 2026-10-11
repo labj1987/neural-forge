@@ -557,6 +557,16 @@ impl DepthCopy {
     }
 }
 
+/// Why a hold copies no depth ([`depth_source`] is `None`), for a cache dump's manifest.
+pub(crate) fn depth_missing(target: &Target) -> &'static str {
+    match target.depth {
+        None => "no depth for this hold (a barrier on it before the launch, or none copied inside DLSS's buffer)",
+        Some(a) if !a.readable => "the depth image cannot be copied (no TRANSFER_SRC, or another extent)",
+        Some(a) if a.layout.is_none() => "the depth image's layout is not known",
+        Some(_) => "the depth image is in a layout a copy cannot read (UNDEFINED)",
+    }
+}
+
 /// What the capture copies into [`DepthCopy`] this hold: the slot buffer's copy inside DLSS's
 /// buffer, else the depth image where it is readable in a layout a copy can read from (the device
 /// leaves it out when a barrier on it comes before the launch).
@@ -1442,6 +1452,8 @@ pub(crate) unsafe fn run_native_hold(
             history,
             mvec: mvec.is_some(),
             depth,
+            depth_missing: depth.is_none().then(|| depth_missing(target)),
+            depth_layout: target.depth.and_then(|a| a.layout),
             mvec_scale: target.mvec_scale,
             paper_white: target.paper_white,
         });

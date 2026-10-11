@@ -401,12 +401,19 @@ trip; PRE_UPSCALER_DESIGN.md, "Hand-off latency").
 
 **Depth.** Every native hold copies DLSS's depth into a device-local buffer of the layer's at the
 render extent (`native::DepthCopy`), as the first command of `C`, timed alone (`depth_copy_gpu_ms`
-in the `[preupscale]` summary line). The split hold copies the depth aspect of the identified depth
-image; the hold inside DLSS's buffer copies it into a slot buffer there (in a layout
+in the `[preupscale]` summary line). Which depth (`Tracker::hold_depth`): a depth image the launch
+buffer synchronizes reads of before the launch (the frame's depth it copies into DLSS's own), else
+the one the input launch names where its layout is known, else the identified one. GTA V Enhanced
+alternates two depth images frame by frame and copies the frame's one into a ring of three that
+DLSS reads, inside the launch buffer: the identified image held the previous frame's depth on every
+other hold, and the ring's image is written after the hold. The split hold copies the chosen
+image's depth aspect; the hold inside DLSS's buffer copies it into a slot buffer there (in a layout
 `depth_copy_layout` takes) and `C` on the side queue copies that over. The texels stay raw, tagged
 with the game's format: 4 bytes (D32, D24 with its top byte, depth handed over as R32), or 2 for D16.
-A barrier on the depth image in front of the launch (`Scan::depth_hazard`; GTA V Enhanced with DLSS
-Frame Generation on writes its depth there) leaves that hold without depth instead of stopping it.
+A barrier on that image in front of the launch that may follow a write (a layout transition, an
+ownership transfer, a write in its source access; `Scan::depth_hazard`) leaves that hold without
+depth instead of stopping it. Every depth image at the identified depth's extent has its barriers
+tracked. `NEURAL_FORGE_PROBE_DEPTH=1` logs the first 120 held buffers' depth choice and barriers.
 While the pre-upscaler path is on, depth images get `TRANSFER_SRC` added at creation, as RG16F images
 do (`wants_copyable`; `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked).
 

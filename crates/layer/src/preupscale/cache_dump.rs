@@ -49,6 +49,10 @@ pub(crate) struct Pending {
     pub mvec: bool,
     /// The depth the hold copied, and its format (raw: 2 bytes a texel for D16, 4 otherwise).
     pub depth: Option<vk::Format>,
+    /// Why it copied none ([`super::native::depth_missing`]).
+    pub depth_missing: Option<&'static str>,
+    /// The depth image's layout at the hold as the tracking knew it (the split hold).
+    pub depth_layout: Option<vk::ImageLayout>,
     pub mvec_scale: [f32; 2],
     pub paper_white: f32,
 }
@@ -336,8 +340,10 @@ fn number(v: f32) -> String {
 fn entry(index: u32, frame: &Frame, files: &[(&str, String)]) -> String {
     let jitter = frame.meta.jitter.map_or_else(|| "null".to_string(), |[x, y]| format!("[{}, {}]", number(x), number(y)));
     let files: Vec<String> = files.iter().map(|(k, v)| format!("\"{k}\": \"{v}\"")).collect();
+    let missing = frame.meta.depth_missing.map_or_else(String::new, |why| format!(", \"depth_missing\": \"{why}\""));
+    let layout = frame.meta.depth_layout.map_or_else(String::new, |l| format!(", \"depth_layout\": \"{l:?}\""));
     format!(
-        "    {{\"index\": {index}, \"hold\": {}, \"time_ms\": {}, \"jitter\": {jitter}, \"exposure\": {}, \"history\": {}, \"mvec_valid\": {}, \"depth_valid\": {}, \"files\": {{{}}}}}",
+        "    {{\"index\": {index}, \"hold\": {}, \"time_ms\": {}, \"jitter\": {jitter}, \"exposure\": {}, \"history\": {}, \"mvec_valid\": {}, \"depth_valid\": {}{missing}{layout}, \"files\": {{{}}}}}",
         frame.meta.arm.hold,
         frame.meta.time_ms,
         number(frame.exposure),
@@ -424,6 +430,8 @@ mod tests {
             history: hold > 10,
             mvec: true,
             depth,
+            depth_missing: depth.is_none().then_some("not readable"),
+            depth_layout: Some(vk::ImageLayout::GENERAL),
             mvec_scale: [1.0, 1.0],
             paper_white: 3.0,
         }
@@ -519,6 +527,7 @@ mod tests {
         write_frames(&dir, &rx);
         let text = std::fs::read_to_string(dir.join("manifest.json")).unwrap();
         assert!(text.contains("\"depth_format\": \"none\""), "{text}");
+        assert!(text.contains("\"depth_missing\": \"not readable\", \"depth_layout\": \"GENERAL\""), "{text}");
         assert!(!dir.join("hold-00/depth.r32f").exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
