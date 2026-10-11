@@ -496,7 +496,7 @@ hold the picture is still half the previous answer at interval 2, so the error a
 answer goes up (p99.5 over all holds pan 0.139 -> 0.206, drive 0.357 -> 0.522, still 0.268 -> 0.386;
 kept 7-9 points lower); on the cached holds alone it is the same at interval 2 and up to 0.03 higher at
 3 and 4. Upstream turns its crossfade off before the upscaler (OptiScaler's `DlssNr_EditCache_Dx12.cpp`
-around line 689, no reason given); the live run below checks it after DLSS. Without soft refresh the
+around line 689, no reason given); the live runs below are after DLSS. Without soft refresh the
 walk is weaker (pan i2 pulse 0.028 / 0.019, flicker +0.078). A walk capped at 2 holds is in between at
 intervals 3 and 4 (the same at 2): less lag, more pulse, as upstream found when it chose the whole
 interval. Shipped: the walk over the whole interval with soft refresh (the capture, history, apply and
@@ -550,12 +550,14 @@ replay with and without the walk:
 
 - Aging changes almost nothing: p99.5 within 1% on every dump and interval, the worse-than-no-edit
   area 6-10% smaller on the drive only (i2 1.75 -> 1.65% with the walk), pulse and flicker the same.
-  Not worth a carried staleness field and its reads; not in the shader (`--aging` in the tool).
-- The guided filter is better on every dump, interval and metric that moves: with the walk at
-  interval 2, p99.5 pan 0.206 -> 0.193, drive 0.522 -> 0.489, still 0.386 -> 0.381; on the cached
-  holds alone 0.261 -> 0.239, 0.669 -> 0.615, 0.502 -> 0.493; the worse-than-no-edit area drive
-  1.75 -> 1.29%, still 1.29 -> 1.17%; kept +0.4 to +1.0 point; flicker a little lower (pan +0.010 ->
-  +0.004, drive -2.93 -> -2.99, still -1.87 -> -1.91); pulse unchanged. So ours disagree with
+  Too small to tell from these 16-hold dumps; not in the shader (`--aging` in the tool).
+- The guided filter lowers error, trails and the worse-than-no-edit area and raises kept on every
+  dump and interval: with the walk at interval 2, p99.5 pan 0.206 -> 0.193, drive 0.522 -> 0.489,
+  still 0.386 -> 0.381; on the cached holds alone 0.261 -> 0.239, 0.669 -> 0.615, 0.502 -> 0.493;
+  the worse-than-no-edit area drive 1.75 -> 1.29%, still 1.29 -> 1.17%; kept +0.4 to +1.0 point.
+  With the walk its flicker is within 0.01 of the walk's alone (lower at interval 2: pan +0.010 ->
+  +0.004, drive -2.93 -> -2.99, still -1.87 -> -1.91; pan +0.004 and +0.008 at 3 and 4); without the
+  walk the drive's flicker rose by 0.15. Pulse unchanged. So ours disagree with
   upstream's and it went into the shaders: the motion pass accumulates the staleness, three
   half-size passes build the coefficients, the apply blends them in (`--no-guided` in the tool).
 
@@ -597,6 +599,31 @@ replay with and without the walk:
 | still | i4-xf-soft-aging | 0.0774/0.472/1.69/63.6 | 0.493 | 0.0043 / 0.0057 (0.0087) | -2.178 |
 | still | i2-xf-soft-guided | 0.0632/0.381/1.17/70.0 | 0.493 | 0.0085 / 0.0101 (0.0087) | -1.911 |
 | still | i4-xf-soft-guided | 0.0759/0.460/1.48/64.2 | 0.479 | 0.0046 / 0.0057 (0.0087) | -2.283 |
+
+**Live (GTA V Enhanced, 1440p, frame generation off, 2026-10-11).** The release build with all of the
+above, `gta-bench.sh`, against the gate's runs of the cache as first ported (context and Catmull-Rom
+in, no walk, no guided filter):
+
+| run | real fps (pass 4) | passes 1-5 | cache_gpu_ms median | rejected |
+|---|---|---|---|---|
+| as ported, interval 2 | 77.7 | 81.8 / 81.1 / 90.2 / 94.1 / 81.3 | 0.509 | 3.2% |
+| now, interval 2 | 75.4 | 82.4 / 80.0 / 88.3 / 93.2 / 79.4 | 0.758 | 2.6% |
+| as ported, interval 3 | 64.6 | 64.9 / 71.7 / 80.0 / 87.0 / 68.5 | 0.543 | 3.6% |
+| now, interval 3 | 79.7 | 85.6 / 85.7 / 97.0 / 101.3 / 85.1 | 0.789 | 2.9% |
+| now without the guided passes, interval 3 | 80.0 | 87.4 / 85.8 / 99.4 / 105.5 / 85.2 | 0.689 | |
+
+The cost per cached hold is read at interval 3, where two holds in three are cached and the median is
+a cached hold's (at interval 2 it falls between the two kinds): +0.25 ms in all, of which the guided
+filter's three half-size passes are 0.10 ms and the walk with the two removals the other 0.15; each
+under the 0.2 ms a cached hold may cost. The fps differences are inside the run-to-run spread (about
+3 fps; the as-ported interval-3 run ran at 69% GPU and is low for its own reasons). Fewer holds are
+rejected without the surroundings test. No Xid.
+
+At GTA's still moment (`NEURAL_FORGE_CAPTURE_AT`, bench-iq's 9 frames from the cut), interval 2:
+flicker 1.197% against 1.030% with the model off on the same layer, added detail x1.130. There is no
+frame-generation-off capture of the cache as first ported, so the walk's effect on flicker after DLSS
+is not separated live; the model's own flicker every hold at this moment is the comparison still to
+take.
 
 ## Deliberately not done, or left open
 
