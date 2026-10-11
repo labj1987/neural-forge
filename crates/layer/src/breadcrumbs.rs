@@ -53,6 +53,13 @@ pub fn dump(reason: &str) {
     crate::logging::flush();
 }
 
+/// The ring's stage names, newest first, on one line (`a < b < c`): what the state log keeps of a dump.
+pub fn trail() -> String {
+    let Ok(guard) = RING.lock() else { return String::new() };
+    let (next, entries) = &*guard;
+    (0..CAPACITY).filter_map(|i| entries[(*next + CAPACITY - 1 - i) % CAPACITY].map(|(stage, _)| stage)).collect::<Vec<_>>().join(" < ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -69,6 +76,16 @@ mod tests {
         let second = entries[(*next + CAPACITY - 2) % CAPACITY];
         assert_eq!(newest.map(|(s, _)| s), Some("test:two:9f3a"));
         assert_eq!(second.map(|(s, _)| s), Some("test:one:9f3a"));
+    }
+
+    #[test]
+    fn the_trail_lists_the_newest_mark_first() {
+        mark("test:trail:a:51c2");
+        mark("test:trail:b:51c2");
+        let trail = trail();
+        // Other tests mark the shared ring concurrently, so only the order of these two is certain.
+        let (a, b) = (trail.find("test:trail:a:51c2").unwrap(), trail.find("test:trail:b:51c2").unwrap());
+        assert!(b < a, "{trail}");
     }
 
     #[test]

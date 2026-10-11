@@ -83,6 +83,44 @@ pub fn flush() {
     let _ = sink.flush();
 }
 
+/// The state log's file (`neural_forge_protocol::state_log`), decided once: only in a process that
+/// opted in (`NEURAL_FORGE_ENABLE=1`, read directly rather than through `layer_enabled`, whose own
+/// first evaluation can write the duplicate-copy event), and never in this crate's tests, which must
+/// not touch the real XDG state dir.
+static STATE_LOG: std::sync::LazyLock<Option<std::path::PathBuf>> = std::sync::LazyLock::new(|| {
+    if cfg!(test) || !neural_forge_protocol::env::flag("NEURAL_FORGE_ENABLE") {
+        return None;
+    }
+    neural_forge_protocol::state_log::path(std::env::var("XDG_STATE_HOME").ok().as_deref(), std::env::var("HOME").ok().as_deref())
+});
+
+/// Appends one transition to the state log (see `neural_forge_protocol::state_log` for the grammar
+/// and the file). Synchronous: an open, a `write` and a close. Never call it per frame: only where
+/// the layer's state changes, and only once per change (every caller is latched or deduplicated).
+/// Use the [`crate::event!`] macro.
+pub fn event(kind: &'static str, message: &str) {
+    let Some(path) = STATE_LOG.as_deref() else { return };
+    // Serialises this process's writers, so a rotation and an append never race inside it.
+    static LOCK: Mutex<()> = Mutex::new(());
+    let _guard = LOCK.lock();
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let line = neural_forge_protocol::state_log::format_line(now, std::process::id(), crate::ownership::process_name(), kind, message);
+    if let Err(e) = neural_forge_protocol::state_log::append(path, &line, neural_forge_protocol::state_log::ROTATE_BYTES) {
+        static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            log(format_args!("[layer] cannot write the state log {}: {e}", path.display()));
+        }
+    }
+}
+
+/// `event!(KIND, "format", args...)`: one state-log line (see [`crate::logging::event`]).
+#[macro_export]
+macro_rules! event {
+    ($kind:expr, $($arg:tt)*) => {
+        $crate::logging::event($kind, &format!($($arg)*))
+    };
+}
+
 #[macro_export]
 macro_rules! log {
     ($($arg:tt)*) => {

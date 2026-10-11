@@ -130,6 +130,43 @@ impl ShmView {
     }
 }
 
+/// The header of the channel this process opened (the lease lets one game hold it), for the one
+/// write that has no `ShmClient` at hand: `note_vk`'s device-lost latch ([`note_device_lost`]).
+static CHANNEL: std::sync::atomic::AtomicPtr<neural_forge_protocol::ShmHeader> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+fn unix_now() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(1, |d| d.as_secs() as u32).max(1)
+}
+
+/// What a game's layer states on the channel when it opens it, once: `device_lost_at` describes this
+/// session (cleared, or set when the device was already lost before the channel opened), and a device
+/// that cannot run the network says so in `layer_reason`, which the Status tab shows (nothing else
+/// writes that line on such a device: the native backend's status comes only from holds).
+fn note_channel_open(hdr: &neural_forge_protocol::ShmHeader, lost: bool, cannot_run: Option<&str>) {
+    CHANNEL.store(std::ptr::from_ref(hdr).cast_mut(), Ordering::Release);
+    state_session(hdr, lost, cannot_run);
+}
+
+fn state_session(hdr: &neural_forge_protocol::ShmHeader, lost: bool, cannot_run: Option<&str>) {
+    hdr.device_lost_at.store(if lost { unix_now() } else { 0 }, Ordering::Relaxed);
+    if let Some(line) = cannot_run {
+        hdr.set_layer_reason(line);
+    }
+}
+
+/// Stamps `device_lost_at` on the channel, if this process has it open. Called once, by the latch.
+pub(crate) fn note_device_lost() {
+    let hdr = CHANNEL.load(Ordering::Acquire);
+    if !hdr.is_null() {
+        // SAFETY: set from a mapping that stays mapped for the life of the process (`ShmClient::open`).
+        stamp_device_lost(unsafe { &*hdr });
+    }
+}
+
+fn stamp_device_lost(hdr: &neural_forge_protocol::ShmHeader) {
+    let _ = hdr.device_lost_at.compare_exchange(0, unix_now(), Ordering::Relaxed, Ordering::Relaxed);
+}
+
 /// One process's connection to the mapping. Not `Clone` — there is exactly one of these
 /// per device, guarded by a `Mutex` in [`crate::device::NeuralForgeDeviceInfo`].
 pub struct ShmClient {
@@ -576,6 +613,7 @@ impl ShmClient {
             if neural_forge_protocol::persist::apply_saved(hdr) {
                 crate::log!("[shm] applied the saved settings from {}", neural_forge_protocol::persist::config_file());
             }
+            note_channel_open(hdr, crate::device_lost(), crate::native_unavailable().as_deref());
         }
         true
     }
@@ -1295,5 +1333,29 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
         assert!(!ensure_private_parent_dir(&format!("{dir}/shm.bin")));
+    }
+
+    #[test]
+    fn opening_the_channel_states_this_sessions_device_loss_and_a_device_that_cannot_run_the_network() {
+        // `state_session`/`stamp_device_lost` are what `note_channel_open`/`note_device_lost` do to the
+        // registered header; the registration itself is process-wide, so the test stays off it.
+        let h = &neural_forge_protocol::ShmHeader::default();
+        h.init_defaults();
+        // A previous game's loss is cleared by the next game's open.
+        h.device_lost_at.store(7, Ordering::Relaxed);
+        state_session(h, false, None);
+        assert_eq!(h.device_lost_at.load(Ordering::Relaxed), 0);
+        assert_eq!(h.layer_reason(), "");
+        // The latch fires after the open: stamped once, not moved by a second call.
+        stamp_device_lost(h);
+        let at = h.device_lost_at.load(Ordering::Relaxed);
+        assert!(at > 1_700_000_000, "{at}");
+        h.device_lost_at.store(5, Ordering::Relaxed);
+        stamp_device_lost(h);
+        assert_eq!(h.device_lost_at.load(Ordering::Relaxed), 5);
+        // Lost before the open, on a device that cannot run the network.
+        state_session(h, true, Some("device cannot run the network: VK_EXT_shader_float8"));
+        assert!(h.device_lost_at.load(Ordering::Relaxed) > 1_700_000_000);
+        assert_eq!(h.layer_reason(), "device cannot run the network: VK_EXT_shader_float8");
     }
 }

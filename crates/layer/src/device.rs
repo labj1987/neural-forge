@@ -2435,6 +2435,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             if engaged { "game is rendering steadily; engaging" } else { "game not rendering steadily (loading?); passing frames through untouched" }
                         );
                         crate::logging::flush();
+                        // The state log's session marker: the first engagement only (this flips at
+                        // every loading screen).
+                        static ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+                        if engaged && !ATTACHED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                            crate::event!(neural_forge_protocol::state_log::ATTACH, "the game is rendering steadily; the layer engaged");
+                        }
                     }
                 }
                 if !engaged {
