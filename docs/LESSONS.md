@@ -647,7 +647,68 @@ interval 1: the runs' timing differs more than the walk does. The walk's flicker
 the 10% the metric resolves, and the PNGs at the sign's edges (frames 60 and 130 of the shot) show no
 trail either way. Nothing it improves live, so it went (and with it the buffer the cache had of its
 own). What does show at the still moment: interval 2 keeps a quarter of the model's added detail
-(x1.06-1.07 against x1.22 every hold), the gap the refresh's carried edit loses to the current one.
+(x1.06-1.07 against x1.22 every hold), the gap the refresh's carried edit loses to the current one: the history read, below.
+
+**Where the cached holds lost the model's detail: the history read (2026-10-11).** At the still moment
+interval 2 kept a quarter to a half of interval 1's added detail. The offline dumps put the loss in
+one place. Per stage, the Laplacian energy of the carried luma edit over the model's own edit for
+that hold (still dump: pixels whose accumulated motion is under 0.05 px; pan and drive: every pixel
+on the chain), and the picture's detail before DLSS (log-luma Laplacian energy over the frame's):
+
+| dump, lag | refresh's edit | nearest | bilinear | Catmull-Rom | depth-admitted bilinear (shipped) | low band | after confidence | picture: model / nearest / bilinear |
+|---|---|---|---|---|---|---|---|---|
+| still, 1 | 1.004 | 1.001 | 0.178 | 0.359 | 0.179 | 0.050 | 0.194 | x1.037 / x1.021 / x1.003 |
+| still, 2 | 0.999 | 0.998 | 0.268 | 0.520 | 0.269 | 0.049 | 0.259 | x1.029 / x1.019 / x1.004 |
+| pan, 1 | 1.005 | 1.051 | 0.355 | 0.585 | 0.465 | 0.201 | 0.435 | x1.036 / x1.058 / x1.036 |
+| pan, 2 | 1.002 | 1.070 | 0.356 | 0.583 | 0.479 | 0.200 | 0.427 | x1.032 / x1.059 / x1.036 |
+| drive, 1 | 1.025 | 1.019 | 0.328 | 0.552 | 0.348 | 0.127 | 0.321 | x1.232 / x1.120 / x1.059 |
+| drive, 2 | 1.049 | 1.027 | 0.331 | 0.551 | 0.350 | 0.122 | 0.314 | x1.233 / x1.121 / x1.060 |
+
+- **The bilinear read keeps a fifth to a third of the high band.** The model's edit is near pixel
+  scale, and a cached hold reads it at the jitter's sub-pixel offset: four taps blended at up to half
+  a pixel average it away. The nearest texel keeps all of it, Catmull-Rom about half.
+- **Nothing after it costs much.** The confidence takes at most 7% more (on still pixels it is
+  0.94-0.95: colour check 0.999, 2 x valid - 1 1.00, fingerprint 0.94), so loosening the colour floor,
+  the fingerprint or that term has nothing to win. The guided filter is off on a still view
+  (staleness 0). The 16-bit edits: 3.9e-5 stop at most from the f32, 0 to 0.0006% of pixels at the
+  +-2.5 stop range.
+- **The rest is the model's own.** The refresh's high band correlates 0.14 (still), 0.00 (pan,
+  drive) with the next hold's: the answer moves with the jitter, which is why kept stays near 60%
+  whatever the read, and why a carried edit cannot be the next hold's.
+- Catmull-Rom was removed earlier on per-hold error before DLSS, which a blur improves; detail after
+  DLSS is the measure that shows the blur.
+
+Live, GTA V Enhanced, 1440p, frame generation off, the still moment (bench-iq's 9 frames from the
+cut, against one model-off run of the same layer) and pass 2's opening shot (160 frames from 4 s:
+MAD to the first interval-1 run, all / edges, and the frame offset the alignment chose). Every run
+through gta-bench with `model_interval` set; the kernel and the gain by temporary switches:
+
+| run | real fps (pass 4) | still: added detail | still: flicker | pass 2: MAD (offset) |
+|---|---|---|---|---|
+| model off | 91.8 | x1.000 | 0.970% | 1.235 / 1.753 (+6) |
+| interval 1 | 69.7 / 70.0 | x1.265 / x1.323 (mean x1.294) | 1.179 / 1.206% (1.193%) | reference / 0.171 / 0.335 (0) |
+| interval 2, bilinear (as was) | 76.7 | x1.139 | 1.061% | 0.214 / 0.419 (0) |
+| interval 2, Catmull-Rom | 75.8 | x1.167 | 1.276% | 0.296 / 0.546 (-6) |
+| **interval 2, nearest (shipped)** | 77.0 / 76.5 / 77.8 | x1.229 / x1.186 / x1.216 (x1.210) | 1.119 / 1.104 / 1.064% (1.096%) | 0.328 / 0.556 (-6), 0.267 / 0.482 (-6), 0.292 / 0.538 (-4) |
+| nearest, high band x1.1 | 76.6 / 75.9 | x1.146 / x1.168 (x1.157) | 1.119 / 1.242% (1.181%) | 0.161 / 0.326 (0), 0.333 / 0.579 (-8) |
+| nearest, high band x1.2 | 77.4 / 77.4 | x1.192 / x1.185 (x1.189) | 1.042 / 1.125% (1.084%) | 0.284 / 0.523 (-1), 0.326 / 0.594 (-6) |
+
+- **Nearest: kept.** The read takes the strongest depth-admitted tap's edit (the tap the fingerprint
+  already came from); the four taps still give the weight and the colour check's luma. Added detail
+  x1.210 over three runs against bilinear's x1.139 and interval 1's x1.294: 71% of interval 1's
+  added detail, from 47%. Flicker lower than interval 1's in every run (1.06-1.12% against
+  1.18-1.21%). The same fps.
+- **Not the 95% asked for.** The metric's own spread is wide: two interval-1 runs differ by 0.058,
+  three nearest runs by 0.043. What stays missing is the part of the model's answer that belongs to
+  each hold's own jitter (the correlation above), which no read of an older answer can carry.
+- **Catmull-Rom: no.** Less detail than nearest and flicker above interval 1's.
+- **High-band gain: no.** 1.1 and 1.2 on top of nearest read x1.157 and x1.189, no more than without
+  (inside the spread), and one 1.1 run's flicker was over interval 1's. Not added.
+- **No trailing.** The pass-2 MAD follows the frame offset the alignment needs, not the variant:
+  the runs that align at 0 read 0.16-0.21 (interval 1 again 0.171, a gain-1.1 run 0.161), those at
+  -4 to -8 read 0.27-0.33, whatever they ran; GTA's camera is not at the same place in the same frame
+  from run to run. The PNGs at frames 60 and 130 (the W and O of the sign, their legs) show the
+  camera in a different place in each run and clean edges in all of them: no doubled edge, no trail.
 
 ### 3.3 edit cache: VRAM at 4K with frame generation
 

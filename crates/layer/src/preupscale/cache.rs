@@ -1386,7 +1386,7 @@ mod tests {
                     // (the jitters of cache_replay.py's synthetic_holds).
                     const JITTER: [[f32; 2]; 6] = [[0.0, 0.0], [0.3, -0.2], [-0.35, 0.15], [0.1, 0.4], [-0.2, -0.3], [0.45, 0.05]];
                     let refresh = JITTER[0];
-                    for (t, _, _, .., history) in &results {
+                    for (t, .., history) in &results {
                         let j = JITTER[*t];
                         let mut worst = 0.0f32;
                         for y in 2..h - 2 {
