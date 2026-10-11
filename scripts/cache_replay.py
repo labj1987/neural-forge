@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Replays the pre-upscaler edit cache offline on a K-hold dump, and measures what it keeps.
+
+A cache dump (lead format v1: manifest.json plus raw colour/answer/mvec/depth per hold, written by
+the layer with the model running on every hold) has the model's real answer for every hold. For
+each lag L (1, 2, 3, 4, 8 by default) and every hold t >= L, the cache is refreshed at t-L (the edit
+from that hold's colour and answer), carried to t along the motion chained through the holds
+between, validated against hold t's colour and depth, and compared with the model's real answer
+for t. The algorithm is scripts/cache_common.py, the reference the layer's
+preupscale_cache*.comp shaders mirror.
+
+Modes (all on the same holds):
+
+  none    no edit at all: the frame without the model. The floor.
+  naive   the whole edit reprojected (bilinear), no validation: what a simple cache would do.
+  low     the cache's low band only (validated pyramid, same-surface fill), no high band.
+  cache   the full algorithm: validated history, band split, high band by confidence.
+
+Metrics (as upstream's measure_ghosting.py / measure_reprojection.py define them):
+
+  err     mean |luma(shown edit) - luma(true edit)| in stops, per hold, averaged. Lower is better.
+  p99.5   the per-hold 99.5th percentile of that, averaged: the strongest trails.
+  worse   share of the area where the shown edit is worse than no edit by over 0.15 stop.
+  kept    1 - mean|display(shown) - display(model)| / mean|display(original) - display(model)|,
+          display = Reinhard on luma, then gamma 1/2.2. 100% = the model on every hold.
+
+"true" is the model's edit for that hold, clamped as the cache clamps every edit; "display(model)"
+is the model's real answer, so kept is below 100% where the clamp binds (the self-check reports
+that ceiling).
+
+Usage:
+  cache_replay.py DUMP [--lags 1 2 3 4 8] [--json OUT] [--oracle] [parameters]
+  cache_replay.py DUMP --self-check
+  cache_replay.py --make-synthetic DIR --kind still|pan|depth-edge
+
+Ported in part from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5),
+commit 6bfc4389c25054ef6747df6e6b1b470e9541c4da: tools/dlssnr_cache/measure_reprojection.py and
+measure_ghosting.py (the strategies and the metrics). Upstream is GPL-3.0; this port is
+distributed under this project's AGPL-3.0-or-later (see ATTRIBUTION.md).
+
+Needs Python 3 and numpy.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import cache_common as cc  # noqa: E402
+
+MODES = ("none", "naive", "low", "cache")
+METRICS = ("err", "p995", "worse", "harm", "kept")
+
+
+# --------------------------------------------------------------------------------------------------
+# Replay
+# --------------------------------------------------------------------------------------------------
+
+class Frames:
+    """The dump's holds, prepared on demand, keeping only the few a chain still needs."""
+
+    def __init__(self, dump: cc.Dump, reverse_z: bool, p: cc.Params, keep: int):
+        self.dump, self.reverse_z, self.p, self.keep = dump, reverse_z, p, keep
+        self.cache = {}
+
+    def __getitem__(self, k: int) -> cc.Frame:
+        if k not in self.cache:
+            self.cache[k] = cc.prepare(self.dump.hold(k), self.dump.paper_white, self.reverse_z, self.p)
+            for old in [j for j in self.cache if j < k - self.keep]:
+                del self.cache[old]
+        return self.cache[k]
+
+
+def resolve_reverse_z(dump: cc.Dump, choice: str) -> tuple:
+    """The depth convention: forced, from the manifest, or inferred from the first holds' depth."""
+    if choice in ("yes", "no"):
+        return choice == "yes", "forced on the command line"
+    if dump.manifest.get("reverse_z") is not None:
+        return bool(dump.manifest["reverse_z"]), "from the manifest"
+    if not dump.has_depth:
+        return True, "no depth in the dump (depth tests pass everywhere)"
+    depths = [dump.hold(k).depth for k in range(min(3, len(dump)))]
+    rev, why = cc.infer_reverse_z(depths)
+    if rev is None:
+        return True, f"inferred: unknown ({why}); assuming reversed-Z"
+    return rev, f"inferred: {why}"
+
+
+def shown_edits(src: cc.Frame, dst: cc.Frame, pos, on, p: cc.Params) -> tuple:
+    out = cc.carry(src, dst, pos, on, p)
+    shown = {"none": np.zeros_like(dst.edit), "naive": out["naive"], "low": out["low"], "cache": out["cache"]}
+    return shown, out
+
+
+def replay(dump: cc.Dump, lags, p: cc.Params, reverse_z: bool, oracle: bool = False, modes=MODES,
+           log=None) -> dict:
+    """Every lag x mode x metric. With oracle, each hold is refreshed from itself (no carry)."""
+    lags = sorted(set(int(x) for x in lags))
+    max_lag = max(lags)
+    frames = Frames(dump, reverse_z, p, max_lag + 1)
+    h, w = dump.height, dump.width
+    centres = cc.pixel_centres(h, w)
+    acc = {L: {m: {k: [] for k in ("err", "p995", "worse", "harm", "pic")} for m in modes} for L in lags}
+    base = {L: [] for L in lags}
+    skipped = 0
+
+    for t in range(len(dump)):
+        dst = frames[t]
+        if not dst.usable:
+            skipped += 1
+            continue
+        pos, on = centres, np.ones((h, w), bool)
+        for L in range(0, min(max_lag, t) + 1):
+            if L > 0 and not oracle:
+                pos = cc.chain_step(pos, frames[t - L + 1], frames[t - L], p)
+                on = on & cc.on_screen(pos, h, w)
+            if L not in lags:
+                continue
+            src = dst if oracle or L == 0 else frames[t - L]
+            if not src.usable:
+                continue
+            if oracle or L == 0:
+                shown, _ = shown_edits(src, dst, centres, np.ones((h, w), bool), p)
+            else:
+                shown, _ = shown_edits(src, dst, pos, on, p)
+            base[L].append(dst.base)
+            for m in modes:
+                r = cc.pair_metrics(shown[m], dst, p)
+                for k, v in r.items():
+                    acc[L][m][k].append(v)
+        if log:
+            log(f"  hold {t + 1}/{len(dump)}")
+
+    results = {}
+    for L in lags:
+        n = len(base[L])
+        results[L] = {}
+        for m in modes:
+            a = acc[L][m]
+            if n == 0:
+                results[L][m] = {k: float("nan") for k in METRICS} | {"samples": 0}
+                continue
+            b = float(np.mean(base[L]))
+            results[L][m] = {"err": float(np.mean(a["err"])), "p995": float(np.mean(a["p995"])),
+                             "worse": 100 * float(np.mean(a["worse"])), "harm": 1000 * float(np.mean(a["harm"])),
+                             "kept": 100 * (1 - float(np.mean(a["pic"])) / b) if b > 0 else float("nan"),
+                             "samples": n}
+    return {"results": results, "unusable_holds": skipped}
+
+
+def print_table(results: dict, out=None) -> None:
+    out = out or sys.stdout
+    print(f"  {'lag':>3}  {'mode':<6} {'err':>8} {'p99.5':>7} {'worse%':>7} {'harm':>7} {'kept%':>7} {'n':>4}", file=out)
+    for L, per in results.items():
+        for m, r in per.items():
+            print(f"  {L:>3}  {m:<6} {r['err']:8.4f} {r['p995']:7.3f} {r['worse']:7.2f} {r['harm']:7.2f} "
+                  f"{r['kept']:7.2f} {r['samples']:>4}", file=out)
+
+
+# --------------------------------------------------------------------------------------------------
+# Self-check
+# --------------------------------------------------------------------------------------------------
+
+def self_check(dump: cc.Dump, p: cc.Params, reverse_z: bool, out=None) -> bool:
+    """Lag 0 is the identity for every mode's carry, and a lag-1 replay refreshed at the hold itself
+    (--oracle, clamp off) keeps 100% of the effect with zero error."""
+    out = out or sys.stdout
+    ok = True
+
+    def check(name, cond, detail):
+        nonlocal ok
+        ok &= bool(cond)
+        print(f"  {'PASS' if cond else 'FAIL'}  {name}: {detail}", file=out)
+
+    frames = Frames(dump, reverse_z, p, 2)
+    usable = [k for k in range(len(dump)) if frames[k].usable]
+    check("usable holds", len(usable) >= 2, f"{len(usable)} of {len(dump)} have a usable exposure")
+    if len(usable) < 2:
+        return False
+
+    h, w = dump.height, dump.width
+    centres = cc.pixel_centres(h, w)
+    for k in usable[:3]:
+        f = frames[k]
+        shown, d = shown_edits(f, f, centres, np.ones((h, w), bool), p)
+        dev = max(float(np.abs(d[x] - 1).max()) for x in ("valid", "validity", "v_colour", "conf"))
+        check(f"lag 0 hold {k}: carry admits everything", dev < 1e-5, f"max |weight - 1| {dev:.2e}")
+        dh = float(np.abs(d["history"] - f.edit).max())
+        check(f"lag 0 hold {k}: history read is the edit", dh < 1e-5, f"max diff {dh:.2e} stop")
+        dn = float(np.abs(shown["naive"] - f.edit).max())
+        check(f"lag 0 hold {k}: naive is the edit", dn < 1e-5, f"max diff {dn:.2e} stop")
+        dc = float(np.abs(shown["cache"] - cc.clamp_edit(f.edit, p)).max())
+        check(f"lag 0 hold {k}: cache is the edit", dc < 1e-4, f"max diff {dc:.2e} stop")
+        guide = np.stack([np.log2(np.maximum(f.lin, 1e-7)), f.log_luma], -1).astype(np.float32)
+        lo = cc.low_band(cc.build_levels(f.edit, np.ones((h, w), np.float32), guide), guide, p)
+        dl = float(np.abs(shown["low"] - cc.clamp_edit(lo, p)).max())
+        check(f"lag 0 hold {k}: low is the edit's low band", dl < 1e-5, f"max diff {dl:.2e} stop")
+        check(f"lag 0 hold {k}: none is no edit", not shown["none"].any(), "all zero")
+
+    raw = cc.Params(**{**p.as_dict(), "max_luma_edit": 0.0})
+    r = replay(dump, [1], raw, reverse_z, oracle=True, modes=("none", "naive", "cache"))["results"][1]
+    for m in ("naive", "cache"):
+        check(f"lag 1 oracle {m}", r[m]["err"] < 1e-4 and r[m]["kept"] > 99.99,
+              f"err {r[m]['err']:.2e} stop, kept {r[m]['kept']:.4f}% over {r[m]['samples']} holds")
+    ceiling = replay(dump, [1], p, reverse_z, oracle=True, modes=("none", "cache"))["results"][1]["cache"]["kept"]
+    print(f"  info  with the edit clamp at {p.max_luma_edit} stop, the oracle keeps {ceiling:.2f}% "
+          "(the clamp's own ceiling)", file=out)
+    return ok
+
+
+# --------------------------------------------------------------------------------------------------
+# Synthetic dumps
+# --------------------------------------------------------------------------------------------------
+
+def synthetic_holds(kind: str, w: int = 96, h: int = 64, n: int = 6) -> tuple:
+    """Holds with known motion and a known "model" edit. Returns (holds, paper_white, info).
+
+    still       nothing moves.
+    pan         the camera pans 2.5 px right and 1 px down per hold, jitter +-0.25 px: with the jitter
+                change the motion is a whole number of pixels, so a correct carry is exact.
+    depth-edge  a near box moves 5 px right per hold over a still far background (sky on top); where
+                it uncovers the background the carried high band must be rejected."""
+    paper_white, exposure = 3.0, 1.5
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float64)
+    xs, ys = xs + 0.5, ys + 0.5
+
+    def scene(X, Y, obj):
+        """v of the colour and the model's edit at world (X, Y); obj picks the box's look."""
+        detail = 0.25 * np.sin(1.3 * X) * np.sin(1.1 * Y)
+        if obj:
+            base = np.stack([0.45 + 0.1 * np.sin(X / 5), 0.25 + 0.05 * np.cos(Y / 4), 0.12 + 0 * X], -1)
+            el = 0.7 + 0.2 * np.sin(0.9 * X + 1) * np.cos(0.8 * Y)
+            chroma = np.stack([0.1 + 0 * X, 0 * X, -0.1 + 0 * X], -1)
+        else:
+            base = np.stack([0.20 + 0.08 * np.sin(X / 13), 0.28 + 0.08 * np.sin(Y / 11), 0.30 + 0.05 * np.cos((X + Y) / 17)], -1)
+            el = -0.4 + 0.4 * np.sin(X / 17 + Y / 23) + 0.25 * np.sin(0.9 * X + 1) * np.cos(0.7 * Y)
+            chroma = np.stack([-0.05 + 0 * X, 0.05 * np.sin(X / 9), 0.15 + 0 * X], -1)
+        v = base * np.exp2(detail)[..., None]
+        return v, el[..., None] + chroma - (chroma @ cc.LUMA.astype(np.float64))[..., None]
+
+    holds, info = [], {"kind": kind}
+    for t in range(n):
+        if kind == "still":
+            cam, jit = np.zeros(2), np.zeros(2)
+        elif kind == "pan":
+            cam, jit = np.array([2.5 * t, 1.0 * t]), np.array([0.25 if t % 2 == 0 else -0.25, 0.0])
+        elif kind == "depth-edge":
+            cam, jit = np.zeros(2), np.zeros(2)
+        else:
+            raise ValueError(f"unknown synthetic kind {kind!r}")
+        X, Y = xs - jit[0] + cam[0], ys - jit[1] + cam[1]
+        v, edit = scene(X, Y, False)
+        depth = 0.002 + 0.03 * np.clip(Y, 0, None) / h  # reversed-Z: the bottom is nearer
+        mv = np.zeros((h, w, 2))
+        if kind == "pan" and t > 0:
+            mv[...] = [2.5, 1.0]
+        if kind == "depth-edge":
+            sky = ys < 8
+            v[sky] = [0.3, 0.45, 0.8]
+            edit[sky] = [0.0, 0.1, 0.3]
+            depth = np.where(sky, 0.0, 0.01 + 0.01 * ys / h)
+            x0 = 10 + 5 * t
+            box = (xs >= x0) & (xs < x0 + 20) & (ys >= 20) & (ys < 44)
+            vb, eb = scene(xs - x0, ys - 20, True)
+            v[box], edit[box], depth = vb[box], eb[box], np.where(box, 0.4, depth)
+            if t > 0:
+                mv[box] = [-5.0, 0.0]
+            info.setdefault("box_x", []).append(x0)
+            info["box_rows"] = [20, 44]
+            info["box_width"] = 20
+        answer = np.maximum((v + cc.EPS_V) * np.exp2(edit) - cc.EPS_V, 0)
+        to_scene = paper_white / exposure
+        holds.append(cc.Hold(index=t, jitter=jit.astype(np.float32), exposure=exposure,
+                             colour=(v * to_scene).astype(np.float32), answer=(answer * to_scene).astype(np.float32),
+                             mvec=mv.astype(np.float32), depth=depth.astype(np.float32)))
+    return holds, paper_white, info
+
+
+def make_synthetic(path: str, kind: str) -> dict:
+    holds, white, info = synthetic_holds(kind)
+    cc.write_dump(path, holds, paper_white=white, game=f"synthetic-{kind}", extra={"synthetic": info})
+    return info
+
+
+# --------------------------------------------------------------------------------------------------
+# Command line
+# --------------------------------------------------------------------------------------------------
+
+def params_from(args) -> cc.Params:
+    return cc.Params(eps_v=args.eps_v, max_luma_edit=args.max_luma_edit, chroma_stops=args.chroma_stops,
+                     depth_tol=args.depth_tol, colour_tol=args.colour_tol, noise_aware=not args.no_noise_aware,
+                     colour_floor=args.colour_floor, high_decay=args.high_decay, fingerprint=not args.no_fingerprint,
+                     context=not args.no_context, print_tol=args.print_tol,
+                     context_tol=args.print_tol if args.context_tol is None else args.context_tol,
+                     surface_fill=not args.no_surface_fill, bilateral=not args.no_bilateral,
+                     sigma_depth=args.sigma_depth, sigma_luma=args.sigma_luma, catmull_rom=not args.no_catmull_rom,
+                     nearest_surface=not args.no_nearest_surface, jitter=not args.no_jitter,
+                     chain_sample=args.chain_sample, low_gain=args.low_gain, high_gain=args.high_gain)
+
+
+def main(argv=None) -> int:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("dump", nargs="?", help="the dump directory (manifest.json)")
+    ap.add_argument("--lags", type=int, nargs="+", default=[1, 2, 3, 4, 8])
+    ap.add_argument("--modes", nargs="+", default=list(MODES), choices=MODES)
+    ap.add_argument("--oracle", action="store_true", help="refresh every hold from itself (no carry)")
+    ap.add_argument("--json", metavar="OUT", help="also write the results as JSON")
+    ap.add_argument("--self-check", action="store_true", help="lag-0 identity and the lag-1 oracle; non-zero exit on failure")
+    ap.add_argument("--reverse-z", choices=("auto", "yes", "no"), default="auto")
+    ap.add_argument("--make-synthetic", metavar="DIR", help="write a synthetic dump to DIR and exit")
+    ap.add_argument("--kind", choices=("still", "pan", "depth-edge"), default="pan")
+    ap.add_argument("--quiet", action="store_true")
+    g = ap.add_argument_group("cache parameters (defaults are the shader's)")
+    d = cc.Params()
+    g.add_argument("--eps-v", type=float, default=d.eps_v)
+    g.add_argument("--max-luma-edit", type=float, default=d.max_luma_edit, help="0 = no edit clamp")
+    g.add_argument("--chroma-stops", type=float, default=d.chroma_stops)
+    g.add_argument("--depth-tol", type=float, default=d.depth_tol)
+    g.add_argument("--colour-tol", type=float, default=d.colour_tol)
+    g.add_argument("--no-noise-aware", action="store_true")
+    g.add_argument("--colour-floor", type=float, default=d.colour_floor)
+    g.add_argument("--high-decay", type=float, default=d.high_decay)
+    g.add_argument("--no-fingerprint", action="store_true")
+    g.add_argument("--no-context", action="store_true")
+    g.add_argument("--print-tol", type=float, default=d.print_tol)
+    g.add_argument("--context-tol", type=float, default=None, help="default: --print-tol")
+    g.add_argument("--no-surface-fill", action="store_true")
+    g.add_argument("--no-bilateral", action="store_true")
+    g.add_argument("--sigma-depth", type=float, default=d.sigma_depth)
+    g.add_argument("--sigma-luma", type=float, default=d.sigma_luma)
+    g.add_argument("--no-catmull-rom", action="store_true")
+    g.add_argument("--no-nearest-surface", action="store_true")
+    g.add_argument("--no-jitter", action="store_true")
+    g.add_argument("--chain-sample", choices=("bilinear", "nearest"), default=d.chain_sample)
+    g.add_argument("--low-gain", type=float, default=d.low_gain)
+    g.add_argument("--high-gain", type=float, default=d.high_gain)
+    args = ap.parse_args(argv)
+
+    if args.make_synthetic:
+        info = make_synthetic(args.make_synthetic, args.kind)
+        print(f"wrote a synthetic {args.kind} dump to {args.make_synthetic} ({json.dumps(info)})")
+        return 0
+    if not args.dump:
+        ap.error("a dump directory is needed (or --make-synthetic)")
+    if min(args.lags) < 0:
+        ap.error("lags are 0 or more")
+
+    p = params_from(args)
+    dump = cc.load_dump(args.dump)
+    rev, why = resolve_reverse_z(dump, args.reverse_z)
+    print(f"{args.dump}: {len(dump)} holds, {dump.width}x{dump.height}, game {dump.manifest.get('game')}, "
+          f"depth {dump.manifest.get('depth_format')}")
+    print(f"reverse_z: {'yes' if rev else 'no'} ({why})")
+
+    if args.self_check:
+        ok = self_check(dump, p, rev)
+        print("self-check " + ("passed" if ok else "FAILED"))
+        return 0 if ok else 1
+
+    t0 = time.time()
+    log = None if args.quiet else (lambda s: print(s, file=sys.stderr, flush=True))
+    out = replay(dump, args.lags, p, rev, oracle=args.oracle, modes=args.modes, log=log)
+    if out["unusable_holds"]:
+        print(f"{out['unusable_holds']} hold(s) had no usable exposure and were left out")
+    print(f"{'oracle (no carry)' if args.oracle else 'carried'}, {time.time() - t0:.0f} s")
+    print_table(out["results"])
+
+    if args.json:
+        doc = {"dump": os.path.abspath(args.dump), "holds": len(dump), "width": dump.width, "height": dump.height,
+               "reverse_z": rev, "reverse_z_reason": why, "oracle": args.oracle, "params": p.as_dict(),
+               "unusable_holds": out["unusable_holds"],
+               "results": {str(L): per for L, per in out["results"].items()}}
+        with open(args.json, "w", encoding="utf-8") as fh:
+            json.dump(doc, fh, indent=1, allow_nan=True)
+        print(f"wrote {args.json}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
