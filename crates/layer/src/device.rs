@@ -1536,6 +1536,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // diagnostics identify a legal render-to-swapchain transfer without touching
         // the application's creation or recording path.
         let images = self.fetch_swapchain_images(swapchain);
+        if swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height) {
+            // The presented size decides the pre-upscaler path's default model resolution.
+            #[cfg(target_arch = "x86_64")]
+            crate::preupscale::reduced::note_output(create_info.image_extent.width, create_info.image_extent.height);
+        }
         let state = SwapchainState {
             format: create_info.image_format,
             width: create_info.image_extent.width,

@@ -543,6 +543,48 @@ refreshes at interval 1, and the picture is bit for bit 3.2.0's (the test
   `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected` (1/10000), `cache_gpu_ms_bits`;
   `shmctl status` and the Debug tab show them.
 
+### 4.11 Model resolution (the network below the render extent)
+
+`crates/layer/src/preupscale/reduced.rs`, `shaders/preupscale_{reduce,enlarge}.comp`. The Model
+resolution setting (`working_scale`, 25-100%) sets the network's extent as a scale of the render
+extent; each side rounded, at least 8 texels. At its default (100%) this path picks it
+(`reduced::effective_scale`): **50% at a 4K-class output (7 Mpx presented or more) with 2.5 Mpx of
+render size or more** (4K Balanced, Quality and DLAA; 4K Balanced's 2228x1253 runs the network at 1114x627)
+and 100% everywhere else (1440p in every mode, 4K Performance). The presented size is the largest game
+swapchain the layer saw created (`reduced::note_output`): 1440p DLAA renders at the same 2560x1440 as 4K
+Quality, so the render size alone cannot decide. A setting below 100% is used as set;
+`NEURAL_FORGE_PREUPSCALE_FULL_RES=1` keeps the default at 100% at every size (the A/B switch). The
+numbers behind the rule are in LESSONS.md, "Reduced model resolution"; lowering it by default was
+authorized by Alex on 2026-10-11. Unlike the 1.x path, nothing leaves the GPU below 100%: the network
+builds its graph for any extent and the passes around it are the layer's own.
+
+- **Capture** (`C`, after the encode and the motion pass): `preupscale_reduce.comp` writes the
+  network's input at its padded extent, each texel the area (box) average of the render pixels it
+  covers in the encode's `v = max(scene, 0) * e / W`, put through the encode's shoulder and sRGB
+  curve; and samples the accumulated motion (`NativePass::acc`, render extent) at each texel's centre
+  into the network's own field. The vectors keep their units; the network's parameters scale them and
+  the jitter by the model/render ratio, so its history reprojects at its extent.
+- **Network** (`N`): as at 100%, at the model extent (history, answer and features all at it).
+- **Enlarge** (its own command buffer, right after `N`): `preupscale_enlarge.comp` turns the answer
+  into one at the render extent. The network's edit in the edit cache's representation (log2 of
+  `(v_answer + eps) / (v_input + eps)` per channel, eps 2^-9, clamped as the cache clamps: luma
+  within 1.5 stops, each channel within 1 stop of it) is enlarged by a joint bilateral upsample: the
+  four bilinear taps around each render pixel, each weighted by `exp(-(dluma / 0.08)^2)` (the encoded
+  pictures' luma, upstream's JBU sigma) and, with depth, `exp(-(log2(z / z_tap) / 0.15)^2)` (the
+  cache's pseudo-linear depth, the tap's from the render pixel at its centre); plain bilinear where the
+  weights vanish. The pixel's own `v * 2^edit` is encoded into the answer the write-back decodes, so
+  the decode (its clamped-highlight rule included) and the edit cache's refresh capture run unchanged.
+- **The edit cache** stays at the render extent and reads the enlarged answer like a full-resolution
+  one. Its buffers cannot live in the network's smaller input features, so below 100% (above
+  interval 1) it gets a buffer of its own (`ScratchLayout`, 156 MB at 2228x1253).
+- **VRAM**: the network's 364 bytes a field texel go with the field (4K Balanced: 2304x1280 field,
+  1.07 GB, at 50% 1152x640, 0.27 GB); the reduced path adds the enlarged answer (8 bytes a padded
+  render pixel), the network's input and motion at its extent, and the cache's buffer.
+- At 100% none of it is built; the frame is byte for byte what it was (the test
+  `at_interval_1_the_network_sees_exactly_what_it_saw_before_the_accumulated_field` runs a pass built
+  through `NativePass::build_at` at 100% beside the old one). `[native] model resolution N%: the
+  network runs at WxH of the render extent WxH` is logged when a reduced pass is built.
+
 ## 5. After the upscaler (1.x path)
 
 `crates/layer/src/capture.rs` (`run`), `crates/layer/src/composition/`,

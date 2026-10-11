@@ -71,7 +71,11 @@ shared memory, or Wine prefixes. Import DLLs explicitly into Neural Forge's data
 
 Target-process filtering and the kernel ownership lease must remain effective before
 any process can resize or write a channel. Preserve the GTA baseline: the model before the
-upscaler on the native backend, every frame, model_resolution=1. Since 3.0 the network runs in
+upscaler on the native backend, the network on every frame while the camera is still and on every
+second frame in motion with the edit cache carrying it between (docs/ARCHITECTURE.md 4.10;
+`NEURAL_FORGE_EDIT_CACHE=off` runs it every frame), at the default model resolution (50% at a 4K-class
+output from 4K Balanced's render size up, 100% everywhere else, authorized 2026-10-11;
+docs/ARCHITECTURE.md 4.11). Since 3.0 the network runs in
 the layer (`crates/native`, `crates/layer/src/preupscale/native.rs`; docs/NATIVE_BACKEND.md); the
 2.x Windows helper and everything around it (runners, Wine prefix, DMA-BUF, NGX) are removed and
 not to be brought back. Do not lower model resolution or turn the model off by default without

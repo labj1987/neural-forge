@@ -931,6 +931,77 @@ answer on every refresh, and a gain on the carried bands would only exaggerate t
 the cached holds in motion, where the trail, not the strength, is what limits them. Not in the
 shaders; `--low-gain` and `--high-gain` stay in the replay tool.
 
+**Reduced model resolution (P5-B, 2026-10-11).** The network's cost goes with its field (1440p
+Balanced render 1485x836: 5.95 ms; 4K Balanced 2228x1253: 11.9 ms), and at 4K the cache alone gained
+8-20%. Upstream runs the model at 50% before the upscaler for its x8 preset (detail x1.04 against
+x1.18 at full resolution).
+
+- **Does the 1.x lesson still apply? No.** In 1.x anything below 100% left the zero-copy path: the
+  answer went through host memory to the model server, and the scaled proxy cost about 4 ms of CPU
+  copies a model frame (58.1 fps at 0.75 against 61.6 at 1.0, "Model resolution: CPU resample
+  (rejected) and GPU blit"). Since 3.0 the network runs on the game's device and builds its graph for
+  any extent (`Loader::ready(w, h)`); the encode, the decode and everything between are the layer's
+  own compute passes on device-local memory. Below 100% the layer adds a reduce in the capture and an
+  enlarge after the network, nothing that leaves the GPU (ARCHITECTURE.md 4.11).
+- **Built:** the area average into the network's field, the history and vectors at its extent (vectors
+  and jitter scaled), the answer's edit (the cache's log2 ratio) enlarged by a joint bilateral upsample
+  guided by the full-resolution frame's luma (sigma 0.08, upstream's) and depth (0.15 stop), then
+  applied and decoded by the decode's rules; the cache at the render extent reads the enlarged answer.
+  At 100% nothing of it is built (byte for byte, tested).
+- **Live, GTA V Enhanced, `model_interval` 2 (the adaptive cache), frame generation off.** Real fps of
+  pass 4 (passes 1-3 in brackets), the network's median GPU ms from the `[preupscale]` lines. Still
+  moment: flicker and added detail against a model-off run of the same layer, 9 frames from 8 / 14
+  frames after each series' own cut at 4K (from 31 / 20 at 1440p; at 4K's frame rates the camera
+  moves again about 30 frames after the cut, and bench-iq's default 40 lands in the motion; `--start`
+  puts one index on both runs, so the windows were taken per series). 1440p's baseline is P5-A's
+  model-off run of the same day (`p5a-moff`, same build of everything before the model).
+
+| 4K (render 2228x1253) | network ms | real fps, two runs | added detail | flicker (off: 1.29 / 1.14%) |
+|---|---|---|---|---|
+| 100% (field 2304x1280) | 11.9 | 39.6 (39.2/42.8/45.0); 43.2 (48.0/45.6/48.5) | x0.75 / x0.89; x0.89 / x0.88 | 1.29 / 3.36%; 1.38 / 1.45% |
+| 75% (1671x940) | 7.2 | 49.4 (51.0/51.2/53.6); 47.3 (49.7/50.3/52.7) | x1.04 / x1.04; x1.05 / x1.03 | 1.25 / 1.12%; 1.31 / 1.20% |
+| 50% (1114x627) | 3.8 | 53.7 (55.4/55.5/58.4); 54.0 (55.0/54.6/57.4) | x1.07 / x1.08; x1.03 / x1.06 | 1.26 / 1.12%; 1.27 / 1.11% |
+| model off | - | 68.5 | x1.00 | |
+
+| 1440p (render 1485x836) | network ms | real fps | added detail | flicker (off: 1.03 / 1.07%) |
+|---|---|---|---|---|
+| 100% | 5.9 | 72.2 (77.4/77.1/84.5) | x1.27 / x1.44 | 1.10 / 1.04% |
+| 75% (1114x627) | 3.7 | 80.6 (86.7/85.9/95.0) | x1.12 / x1.13 | 0.94 / 0.97% |
+| 50% (743x418) | 2.9 | 78.1 (89.1/88.7/99.9) | x0.93 / x0.95 | 1.07 / 0.99% |
+
+- **4K: 50% is faster (+11-14 real fps, the network 11.9 -> 3.8 ms) and shows more of the model's
+  detail, not less.** At 100% the 4K still moment has less local contrast than with the model off
+  (x0.75-0.89 in both runs: the network at a 2304x1280 field softens it; the crops show a hazier
+  facade), at 75% and 50% x1.03-1.08, flicker no higher than model off. The pictures at the edges
+  (street lamps against the sky, the car's roof, the facade's ornament at 2x) show no halo or
+  blockiness from the enlargement against model off; the fringe on the lamps is DLSS's and is there
+  without the model too.
+- **1440p: 75% keeps 88% of 100%'s added detail (x1.12 against x1.27-1.44) and 50% none**, so 1440p
+  stays at 100% (75% is +8 fps). One run each; the gap is beyond the metric's run-to-run spread.
+- **VRAM at 4K:** the field's 364 bytes a texel are 1.07 GB at 100%, 0.63 at 75%, 0.27 at 50%; the
+  reduced path adds about 190 MB (the cache's own buffers, which no longer fit in the smaller
+  features, 156 MB; the enlarged answer, 22 MB). Sampled each 2 s through a run (GTA fills what is
+  free): median / peak 10.37 / 11.84 GB at 100%, 10.12 / 11.73 at 75%, 10.01 / 11.15 at 50%.
+- **4K with frame generation 4x (3 runs a scale; 2 at 100%).** Frame generation engaged in 2 of 3
+  runs at 50% (37.3 and 37.1 real, 149 shown), 2 of 3 at 75% (31.2 and 30.1, 125 and 120 shown), 1 of
+  2 at 100% (27.9 real, 111 shown). No `ctxBufPoolReserve` line in the kernel log in any of the eight
+  runs, including 100%, so this session did not reproduce the out-of-memory storm and cannot say
+  whether a lower scale prevents it; 50% leaves about 0.6 GB more free at the peak. No Xid in any run.
+- **Default (authorized by Alex on 2026-10-11, relayed by the lead: "do whatever gives the best FPS
+  and the best visuals, even if it does involve reducing the resolution, as long as it doesn't hurt
+  the actual picture"):** at the setting's default (100%) the pre-upscaler path runs the network at
+  50% from 2 Mpx of render size up (4K output) and at 100% below; a lowered setting is used as set,
+  and `NEURAL_FORGE_PREUPSCALE_FULL_RES=1` keeps 100% for an A/B. The after-the-upscaler path is
+  unchanged (its builds stay at the output size). A run with the default at 4K: 54.1 real fps (passes
+  55.3/55.5/58.7), the network at 1114x627 and 3.77 ms (its capture caught a moving moment, so no
+  detail number). Only 4K Balanced and 1440p Balanced were measured. The first rule (50% from 2 Mpx of
+  render size up) also took 4K Performance (1920x1080 render) and 1440p DLAA (2560x1440, the same render
+  size as 4K Quality) to 50% unmeasured, so the rule shipped is narrower: 50% only at a 4K-class output
+  (7 Mpx presented or more) with 2.5 Mpx of render size or more, where the network gets at least the
+  measured 4K Balanced case's pixels; 100% everywhere else.
+- **Not measured:** trailing in motion against 100% (the enlargement only changes refresh holds'
+  answers and the cache's reprojection is unchanged; no pan capture was taken), and other games.
+
 ### 3.3 edit cache: VRAM at 4K with frame generation
 
 At 4K with frame generation 4x the cache's gate failed: interval 2 ran at 19.1-22.5 real fps against
