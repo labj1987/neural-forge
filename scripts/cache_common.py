@@ -12,9 +12,11 @@ never reprojected. One carry here, as the shader does it on a cached hold:
   1. The edit of the refresh hold: per channel log2((v_answer + eps_v) / (v_colour + eps_v)) in the
      exposure-normalised value v = max(scene, 0) * exposure / paper_white, clamped (luma within
      +-max_luma_edit stops, each channel within +-chroma_stops of the clamped luma).
-  2. Where each pixel of this hold was on the refresh hold: the motion chained back one hold at a
-     time, each hold's vectors taken from the nearest surface of the 3x3 depth neighbourhood and
-     sampled at the running position, plus the change of jitter.
+  2. Where each pixel of this hold was on the refresh hold: the accumulated motion, updated on every
+     hold since the refresh (acc_step, the GPU's rule: this hold's vector, taken from the nearest
+     surface of the 3x3 depth neighbourhood, plus the previous accumulated field read bilinearly
+     where that vector and the change of jitter lead), plus the change of jitter since the refresh.
+     (chain_step, "walk", re-reads each older hold's vectors at the running position instead.)
   3. The history read there: four bilinear taps, each admitted by relative depth against this
      pixel (full weight to depth_tol, none at twice it), renormalised; Catmull-Rom where all four
      taps are this surface, clamped to the taps' range.
@@ -77,7 +79,8 @@ class Params:
     catmull_rom: bool = True        # re-read the edit with Catmull-Rom where all four taps pass
     nearest_surface: bool = True    # motion from the nearest depth in the 3x3 neighbourhood
     jitter: bool = True             # add the change of jitter to the motion
-    chain_sample: str = "bilinear"  # how a chained step reads the next hold's vectors
+    chain_sample: str = "bilinear"  # how a chained step reads the next hold's vectors (walk only)
+    chain: str = "recurrence"       # "recurrence": the GPU's accumulated field; "walk": chain_step
     low_gain: float = 1.0
     high_gain: float = 1.0
 
@@ -485,6 +488,44 @@ def chain_step(pos: np.ndarray, cur: Frame, prev: Frame, p: Params) -> np.ndarra
 
 def on_screen(pos: np.ndarray, h: int, w: int) -> np.ndarray:
     return (pos[..., 0] >= 0) & (pos[..., 0] <= w) & (pos[..., 1] >= 0) & (pos[..., 1] <= h)
+
+
+def sample_bilinear_taken(img: np.ndarray, pos: np.ndarray) -> np.ndarray:
+    """A bilinear read that skips taps of weight 0, so that a NaN there does not spread (a NaN in a
+    tap that counts does). The shader's own loop over the four taps."""
+    h, w = img.shape[:2]
+    out = np.zeros(pos.shape[:-1] + img.shape[2:], F32)
+    for idx, _, _, wt in bilinear_taps(pos, w, h):
+        v = gather(img, idx)
+        wt_b = wt[..., None] if v.ndim == 3 else wt
+        out = out + np.where(wt_b > 0, v * wt_b, 0)
+    return out.astype(F32)
+
+
+def acc_step(acc_prev: np.ndarray | None, cur: Frame, prev_jitter: np.ndarray, p: Params) -> np.ndarray:
+    """preupscale_cache_motion.comp: the accumulated motion of hold `cur` back to the last refresh,
+    acc_t(x) = mv_t(x) + acc_{t-1}(x + mv_t(x) + jitter[t-1] - jitter[t]), the previous field read
+    bilinearly (`acc_prev` None: the hold right after a refresh, whose field is zero). Jitter is left
+    out of the field; it telescopes to jitter[refresh] - jitter[t] (chained_position). NaN where the
+    step's position leaves the frame or reads a NaN: the chain is lost there."""
+    h, w = cur.mv.shape[:2]
+    p1 = pixel_centres(h, w) + cur.mv
+    if p.jitter:
+        p1 = p1 + (prev_jitter - cur.jitter)
+    acc = cur.mv.copy() if acc_prev is None else cur.mv + sample_bilinear_taken(acc_prev, p1)
+    acc[~on_screen(p1, h, w)] = np.nan
+    return acc.astype(F32)
+
+
+def chained_position(acc: np.ndarray, cur: Frame, src: Frame, p: Params) -> tuple:
+    """Where each pixel of `cur` was on the refresh hold `src`, from the accumulated field: (pos, on).
+    Off the chain (NaN) the position is the pixel itself, and `on` is false."""
+    h, w = acc.shape[:2]
+    on = np.isfinite(acc).all(axis=-1)
+    pos = pixel_centres(h, w) + np.where(on[..., None], acc, 0)
+    if p.jitter:
+        pos = pos + (src.jitter - cur.jitter)
+    return pos.astype(F32), on
 
 
 # --------------------------------------------------------------------------------------------------

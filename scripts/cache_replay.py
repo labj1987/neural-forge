@@ -5,7 +5,8 @@ A cache dump (lead format v1: manifest.json plus raw colour/answer/mvec/depth pe
 the layer with the model running on every hold) has the model's real answer for every hold. For
 each lag L (1, 2, 3, 4, 8 by default) and every hold t >= L, the cache is refreshed at t-L (the edit
 from that hold's colour and answer), carried to t along the motion chained through the holds
-between, validated against hold t's colour and depth, and compared with the model's real answer
+between (--chain recurrence, the default: the layer's accumulated motion field; --chain walk: each
+older hold's vectors re-read at the running position), validated against hold t's colour and depth, and compared with the model's real answer
 for t. The algorithm is scripts/cache_common.py, the reference the layer's
 preupscale_cache*.comp shaders mirror.
 
@@ -32,6 +33,7 @@ Usage:
   cache_replay.py DUMP [--lags 1 2 3 4 8] [--json OUT] [--oracle] [parameters]
   cache_replay.py DUMP --self-check
   cache_replay.py --make-synthetic DIR --kind still|pan|depth-edge
+  cache_replay.py DUMP --export-carry DIR [--reverse-z yes|no]
 
 Ported in part from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5),
 commit 6bfc4389c25054ef6747df6e6b1b470e9541c4da: tools/dlssnr_cache/measure_reprojection.py and
@@ -117,7 +119,7 @@ def replay(dump: cc.Dump, lags, p: cc.Params, reverse_z: bool, oracle: bool = Fa
             continue
         pos, on = centres, np.ones((h, w), bool)
         for L in range(0, min(max_lag, t) + 1):
-            if L > 0 and not oracle:
+            if L > 0 and not oracle and p.chain == "walk":
                 pos = cc.chain_step(pos, frames[t - L + 1], frames[t - L], p)
                 on = on & cc.on_screen(pos, h, w)
             if L not in lags:
@@ -125,6 +127,8 @@ def replay(dump: cc.Dump, lags, p: cc.Params, reverse_z: bool, oracle: bool = Fa
             src = dst if oracle or L == 0 else frames[t - L]
             if not src.usable:
                 continue
+            if L > 0 and not oracle and p.chain == "recurrence":
+                pos, on = carried_position(frames, t, L, p)
             if oracle or L == 0:
                 shown, _ = shown_edits(src, dst, centres, np.ones((h, w), bool), p)
             else:
@@ -152,6 +156,38 @@ def replay(dump: cc.Dump, lags, p: cc.Params, reverse_z: bool, oracle: bool = Fa
                              "kept": 100 * (1 - float(np.mean(a["pic"])) / b) if b > 0 else float("nan"),
                              "samples": n}
     return {"results": results, "unusable_holds": skipped}
+
+
+def carried_position(frames, t: int, lag: int, p: cc.Params) -> tuple:
+    """The recurrence (cc.acc_step) from a refresh at t - lag up to hold t: (pos, on)."""
+    acc = None
+    for k in range(t - lag + 1, t + 1):
+        acc = cc.acc_step(acc, frames[k], frames[k - 1].jitter, p)
+    return cc.chained_position(acc, frames[t], frames[t - lag], p)
+
+
+def export_carry(dump: cc.Dump, p: cc.Params, reverse_z: bool, out: str) -> int:
+    """For the layer's shader test: the refresh at hold 0 carried to every later hold by the
+    recurrence. Writes per hold t >= 1 `cache-TT.f32` (H x W x 3, the shown edit of mode "cache"),
+    `acc-TT.f32` (H x W x 2, the accumulated motion, NaN off the chain) and `weight-TT.f32` (H x W,
+    valid x validity), and `holds.txt` (per hold: jitter x, jitter y, exposure), all f32
+    little-endian. Returns the number of holds carried to."""
+    os.makedirs(out, exist_ok=True)
+    frames = Frames(dump, reverse_z, p, len(dump))
+    with open(os.path.join(out, "holds.txt"), "w", encoding="utf-8") as fh:
+        for k in range(len(dump)):
+            f = frames[k]
+            fh.write(f"{float(f.jitter[0])!r} {float(f.jitter[1])!r} {float(dump.hold(k).exposure)!r}\n")
+    src = frames[0]
+    acc = None
+    for t in range(1, len(dump)):
+        acc = cc.acc_step(acc, frames[t], frames[t - 1].jitter, p)
+        pos, on = cc.chained_position(acc, frames[t], src, p)
+        r = cc.carry(src, frames[t], pos, on, p)
+        r["cache"].astype("<f4").tofile(os.path.join(out, f"cache-{t:02d}.f32"))
+        acc.astype("<f4").tofile(os.path.join(out, f"acc-{t:02d}.f32"))
+        (r["valid"] * r["validity"]).astype("<f4").tofile(os.path.join(out, f"weight-{t:02d}.f32"))
+    return len(dump) - 1
 
 
 def print_table(results: dict, out=None) -> None:
@@ -301,7 +337,7 @@ def params_from(args) -> cc.Params:
                      surface_fill=not args.no_surface_fill, bilateral=not args.no_bilateral,
                      sigma_depth=args.sigma_depth, sigma_luma=args.sigma_luma, catmull_rom=not args.no_catmull_rom,
                      nearest_surface=not args.no_nearest_surface, jitter=not args.no_jitter,
-                     chain_sample=args.chain_sample, low_gain=args.low_gain, high_gain=args.high_gain)
+                     chain_sample=args.chain_sample, chain=args.chain, low_gain=args.low_gain, high_gain=args.high_gain)
 
 
 def main(argv=None) -> int:
@@ -315,6 +351,7 @@ def main(argv=None) -> int:
     ap.add_argument("--reverse-z", choices=("auto", "yes", "no"), default="auto")
     ap.add_argument("--make-synthetic", metavar="DIR", help="write a synthetic dump to DIR and exit")
     ap.add_argument("--kind", choices=("still", "pan", "depth-edge"), default="pan")
+    ap.add_argument("--export-carry", metavar="DIR", help="write the refresh at hold 0 carried to every later hold (the layer's shader test) and exit")
     ap.add_argument("--quiet", action="store_true")
     g = ap.add_argument_group("cache parameters (defaults are the shader's)")
     d = cc.Params()
@@ -337,7 +374,9 @@ def main(argv=None) -> int:
     g.add_argument("--no-catmull-rom", action="store_true")
     g.add_argument("--no-nearest-surface", action="store_true")
     g.add_argument("--no-jitter", action="store_true")
-    g.add_argument("--chain-sample", choices=("bilinear", "nearest"), default=d.chain_sample)
+    g.add_argument("--chain", choices=("recurrence", "walk"), default=d.chain,
+                   help="recurrence: the layer's accumulated motion field (default); walk: each older hold's vectors re-read at the running position")
+    g.add_argument("--chain-sample", choices=("bilinear", "nearest"), default=d.chain_sample, help="walk only")
     g.add_argument("--low-gain", type=float, default=d.low_gain)
     g.add_argument("--high-gain", type=float, default=d.high_gain)
     args = ap.parse_args(argv)
@@ -357,6 +396,11 @@ def main(argv=None) -> int:
     print(f"{args.dump}: {len(dump)} holds, {dump.width}x{dump.height}, game {dump.manifest.get('game')}, "
           f"depth {dump.manifest.get('depth_format')}")
     print(f"reverse_z: {'yes' if rev else 'no'} ({why})")
+
+    if args.export_carry:
+        n = export_carry(dump, p, rev, args.export_carry)
+        print(f"wrote {n} carried hold(s) to {args.export_carry}")
+        return 0
 
     if args.self_check:
         ok = self_check(dump, p, rev)
