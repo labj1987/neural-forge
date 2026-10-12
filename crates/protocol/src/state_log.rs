@@ -46,7 +46,12 @@ pub const NATIVE_RECOVERED: &str = "native-recovered";
 /// and the breadcrumb trail.
 pub const FENCE_TIMEOUT: &str = "fence-timeout";
 
-pub const KINDS: [&str; 7] = [ATTACH, DUPLICATE, DEVICE_LOST, NATIVE_UNAVAILABLE, NATIVE_FAILED, NATIVE_RECOVERED, FENCE_TIMEOUT];
+/// A process `NEURAL_FORGE_TARGET_EXE` leaves out made a Vulkan device (at most once per process);
+/// the event's process is its executable, the message names the target. A game whose executable
+/// the target misses shows up here.
+pub const TARGET_EXCLUDED: &str = "target-excluded";
+
+pub const KINDS: [&str; 8] = [ATTACH, DUPLICATE, DEVICE_LOST, NATIVE_UNAVAILABLE, NATIVE_FAILED, NATIVE_RECOVERED, FENCE_TIMEOUT, TARGET_EXCLUDED];
 
 /// The prefix of a [`NATIVE_UNAVAILABLE`] message, and of the layer's status line for the same case.
 pub const CANNOT_RUN_PREFIX: &str = "device cannot run the network: ";

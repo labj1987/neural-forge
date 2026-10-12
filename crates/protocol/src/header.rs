@@ -551,8 +551,27 @@ impl ShmHeader {
     /// non-zero once anything has written: that is how "not yet configured" (0) is read. Returns
     /// whether every name was a setting.
     pub fn write_settings(&self, settings: &[(&str, u32)]) -> bool {
-        let odd = self.tuning_seq.load(Ordering::Relaxed) | 1;
-        self.tuning_seq.store(odd, Ordering::Relaxed);
+        // Entering is a compare-and-swap from an even value to the next odd one, so two writers
+        // (the GUI and the CLI) take turns. One left odd by a writer that died mid-write is taken
+        // over once it has stayed on that value for STUCK_FOR: the next odd value is ours.
+        let mut stuck: Option<(u32, std::time::Instant)> = None;
+        let odd = loop {
+            let seq = self.tuning_seq.load(Ordering::Relaxed);
+            let next = if seq & 1 == 0 {
+                seq.wrapping_add(1)
+            } else if stuck.is_some_and(|(v, at)| v == seq && at.elapsed() >= STUCK_FOR) {
+                seq.wrapping_add(2)
+            } else {
+                if stuck.is_none_or(|(v, _)| v != seq) {
+                    stuck = Some((seq, std::time::Instant::now()));
+                }
+                std::thread::yield_now();
+                continue;
+            };
+            if self.tuning_seq.compare_exchange_weak(seq, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+                break next;
+            }
+        };
         std::sync::atomic::fence(Ordering::Release);
         let mut all = true;
         for (name, bits) in settings {
@@ -724,24 +743,29 @@ impl ShmHeader {
             auto_mask: self.auto_mask.load(Ordering::Relaxed),
         };
         // A live writer moves the sequence on within microseconds; one that stays on the same odd
-        // value for this many looks has died mid-write.
-        const STUCK: u32 = 4096;
-        let (mut last, mut same) = (u32::MAX, 0u32);
+        // value for STUCK_FOR has died mid-write. That value is remembered (per process), so later
+        // reads do not wait for it again; the next write takes it over.
+        let mut stuck: Option<(u32, std::time::Instant)> = None;
         loop {
             let before = self.tuning_seq.load(Ordering::Acquire);
+            if before & 1 == 1 && DEAD_TUNING_SEQ.load(Ordering::Relaxed) == before {
+                return read();
+            }
             if before & 1 == 0 {
                 let tuning = read();
                 std::sync::atomic::fence(Ordering::Acquire);
                 if self.tuning_seq.load(Ordering::Relaxed) == before {
                     return tuning;
                 }
-            } else if before == last {
-                same += 1;
-                if same >= STUCK {
+            } else if let Some((value, at)) = stuck.filter(|(v, _)| *v == before) {
+                if at.elapsed() >= STUCK_FOR {
+                    DEAD_TUNING_SEQ.store(value, Ordering::Relaxed);
                     return read();
                 }
+                std::thread::yield_now();
+                continue;
             } else {
-                (last, same) = (before, 0);
+                stuck = Some((before, std::time::Instant::now()));
             }
             std::hint::spin_loop();
         }
@@ -769,6 +793,13 @@ impl ShmHeader {
         load_words_seq_guarded(&self.capture_result_seq, &self.capture_result)
     }
 }
+
+/// How long one odd `tuning_seq` must stay unchanged before its writer counts as dead (a live
+/// writer moves it on within microseconds, a preempted one within a scheduler slice or two).
+const STUCK_FOR: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The odd `tuning_seq` this process found left by a dead writer: reads skip the wait for it.
+static DEAD_TUNING_SEQ: AtomicU32 = AtomicU32::new(0);
 
 /// Reads a lo/hi `AtomicU32` pair as one `u64` frame counter.
 ///
@@ -997,9 +1028,39 @@ mod tests {
         writer.join().unwrap();
         assert_eq!(h.tuning_seq.load(Ordering::Relaxed) % 2, 0);
         assert!(!h.write_settings(&[("no_such_setting", 1)]));
-        // A writer that died mid-write: the sequence stays odd, and the values are still read.
-        h.tuning_seq.store(h.tuning_seq.load(Ordering::Relaxed) | 1, Ordering::Relaxed);
+        // A writer that died mid-write: the sequence stays odd, and the values are still read,
+        // the second time without waiting; the next write takes the section over.
+        let dead = h.tuning_seq.load(Ordering::Relaxed) | 1;
+        h.tuning_seq.store(dead, Ordering::Relaxed);
         let _ = h.global_tuning();
+        assert_eq!(DEAD_TUNING_SEQ.load(Ordering::Relaxed), dead);
+        let _ = h.global_tuning();
+        assert!(h.write_settings(&[("intensity", 0.75f32.to_bits())]));
+        assert_eq!(h.tuning_seq.load(Ordering::Relaxed), dead + 3);
+        assert_eq!(h.global_tuning().intensity, 0.75);
+    }
+
+    #[test]
+    fn two_writers_take_turns() {
+        let h = std::sync::Arc::new(ShmHeader::default());
+        h.init_defaults();
+        let start = h.tuning_seq.load(Ordering::Relaxed);
+        std::thread::scope(|s| {
+            for w in 0..2 {
+                let h = &h;
+                s.spawn(move || {
+                    for _ in 0..5000 {
+                        let v = if w == 0 { 0.5f32 } else { 2.0 };
+                        h.write_settings(&[("intensity", v.to_bits()), ("local_tone", v.to_bits())]);
+                    }
+                });
+            }
+            for _ in 0..20_000 {
+                let t = h.global_tuning();
+                assert_eq!(t.intensity, t.local_tone, "a torn read");
+            }
+        });
+        assert_eq!(h.tuning_seq.load(Ordering::Relaxed), start + 2 * 2 * 5000, "every write took its own turn");
     }
 
     #[test]
