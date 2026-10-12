@@ -17,7 +17,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab: the Neural rendering switch, style, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present from build 310.8.0.0, the Steam games with their switches and the executables they target, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe,PlayGTAV.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: telemetry, layer state, the Model placement line and the model](screenshots/status.png) |
+| ![Model tab: the Neural rendering switch, style, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present from build 310.8.0.0, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: telemetry, layer state, the Model placement line and the model](screenshots/status.png) |
 
 The screenshots show 3.0.0 with default settings and no game running.
 
@@ -236,9 +236,11 @@ stay; Neural Forge does not touch its files.
    ```
 
    The executable is found from Steam's own data for the game (the program Steam starts, the
-   executables beside it, and an Unreal Engine game's real binary), so only the game itself can use
+   executables beside it, an Unreal Engine game's real binary, and the large executables anywhere in
+   the game's folder), so only the game itself can use
    Neural Forge, never a store launcher or helper it starts first; the games list shows it. To name
-   it yourself: `neural-forge-cli enable GAME --target-exe Game.exe` (remembered for that game, also
+   it yourself: `neural-forge-cli enable GAME --target-exe Game.exe` or the edit button beside the game
+   (remembered for that game, also
    when the GUI switches it on again; `--target-exe auto` goes back to the found one). With Steam
    running, the list is read-only: pick the game in the "Steam launch option" group below it, copy
    the launch option and paste it into the game's Properties > General > Launch options instead. A

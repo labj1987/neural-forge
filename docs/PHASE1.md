@@ -70,9 +70,17 @@ target). The supervisor always sets it when it switches a game on (GUI, `neural-
 the program Steam's own launch entry for the game starts (`appcache/appinfo.vdf`, the entries for
 the installed branch), the other executables beside it (a store bootstrapper such as `PlayGTAV.exe`
 starts `GTA5_Enhanced.exe` from the same folder; anti-cheat's `start_protected_game.exe` its
-neighbour) and an Unreal Engine game's `<Project>/Binaries/Win64` binary, leaving out redistributable
-installers, anti-cheat services, crash reporters and store launchers. A target chosen by hand
-(`enable GAME --target-exe`) is kept in `config.ini` (`target_exe_<appid>`) and wins. The Steam AppID
+neighbour), an Unreal Engine game's `<Project>/Binaries/Win64` binary, and from the whole install
+folder (six folders deep) every executable at least a quarter the size of the largest, which finds a
+game whose launcher has a folder of its own (ESO's `game/client/eso64.exe`, FINAL FANTASY XIV's
+`game/ffxiv_dx11.exe`). Redistributable installers, anti-cheat services, crash reporters and
+launchers (bootstrappers, updaters, patchers) are left out; a launch entry that is a launcher stays
+only when nothing else qualifies. A target chosen by hand (`enable GAME --target-exe`, or the Setup
+tab's per-game editor, which offers the folder's executables best first) is kept in `config.ini`
+(`target_exe_<appid>`) and wins. When a process the target leaves out makes a Vulkan device, the
+layer writes a `target-excluded` line to the state log (once per process, not for known launchers
+and helpers), and `doctor` reports a game that ran as an executable its target missed, with the
+command that targets it. The Steam AppID
 alone is insufficient: launchers inherit it too.
 
 Without a target, Wine's own processes, Steam's, store launchers and their helpers (Rockstar, Social

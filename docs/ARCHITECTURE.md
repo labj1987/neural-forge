@@ -782,7 +782,11 @@ Switching on always writes `NEURAL_FORGE_TARGET_EXE`: `steam::target_for`, the e
 hand for the game (`config.ini`'s `target_exe_<appid>`), else `steam::target_exes`, derived from
 Steam's binary app cache (`appinfo.rs`: `appcache/appinfo.vdf` version 29, the launch entries for
 Windows or Linux and the installed branch) and the game's folder (PHASE1.md, "Target ownership").
-Without the app cache the folder's top-level executables and Unreal's binaries are used. Switching
+Without the app cache the folder's top-level executables and Unreal's binaries are used; either way
+the large executables anywhere in the folder are added (PHASE1.md). `steam::TargetFinder` reads each
+root's app cache once for all games; `candidates` ranks the folder's executables for the GUI's
+per-game target editor. A game's app manifest found twice is the copy whose folder exists, fully
+installed, written last. Switching
 off removes it with the rest; switching on again writes it again.
 
 ## 8. Failure behaviour

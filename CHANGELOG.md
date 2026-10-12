@@ -16,7 +16,12 @@ fixes across the model before the upscaler, the app and its diagnosis.
   A game switched on with an earlier version has none named yet: switch it off and on again, or run
   `neural-forge-cli enable GAME` (Diagnose lists these games). `--target-exe` names the executable by
   hand and is remembered for that game; a game whose executable happens to be called like a launcher
-  works when it is the one named.
+  works when it is the one named. Games whose launcher sits in a folder of its own (The Elder Scrolls
+  Online, FINAL FANTASY XIV) get the real game executable from anywhere in their folder.
+- Each game in the Setup tab has an edit button to choose the executable Neural Forge targets, from
+  those found in the game's folder (best first) or by typing a name.
+- Diagnose now says when a game ran but its target left out the executable it ran as, and gives the
+  exact command to fix it.
 - Without a named executable, store launchers and helpers can no longer take Neural Forge either, and
   a program that stops showing frames gives it up after 10 seconds.
 - Switching a game on also covers the Steam account you are signed in with when it has never run the
@@ -64,7 +69,8 @@ fixes across the model before the upscaler, the app and its diagnosis.
   `NEURAL_FORGE_LOG` is rotated at 64 MB.
 - Diagnose, `doctor`, the report and `shmctl status` only look now: they no longer create the settings
   channel or Neural Forge's folders. A hung `nvidia-smi` or `journalctl` can no longer freeze them, or
-  the app's Diagnose and Save report buttons: it is stopped after 10 seconds. Diagnose checks the
+  the app's Diagnose and Save report buttons: they return after 10 seconds, even when the driver keeps
+  the command from stopping. Diagnose checks the
   extracted model's files, not only its description, and warns about a game switched on in a Flatpak
   Steam next to a native one.
 - The report also hides your computer's name, finds the game's Proton in the Steam install the game is

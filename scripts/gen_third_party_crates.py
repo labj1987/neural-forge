@@ -35,7 +35,7 @@ LICENSE_OVERRIDES = {
 }
 
 # A crate's licence and notice files, by name.
-LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|notice|copyright|unlicense|authors)([-_.].*)?$", re.I)
+LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|notice|copyright|unlicense)([-_.].*)?$", re.I)
 
 # The native code compiled into the layer: (name, licence, files under tools/native).
 NATIVE = [
@@ -120,7 +120,6 @@ def licence_files(pkg):
     extra = [d / pkg["license_file"]] if pkg.get("license_file") else []
     while True:
         found = sorted(f for f in d.iterdir() if f.is_file() and LICENCE_FILE.match(f.name)) if d.is_dir() else []
-        found = [f for f in found if not f.name.lower().startswith("authors")] + [f for f in found if f.name.lower().startswith("authors")]
         if found or stop is None or d == stop or d == d.parent:
             break
         d = d.parent
@@ -184,7 +183,7 @@ def self_test():
     assert names == ["lib", "shared"], names
     for name in ["LICENSE", "LICENSE-MIT", "license.txt", "COPYING", "NOTICE", "UNLICENSE", "LICENCE-APACHE"]:
         assert LICENCE_FILE.match(name), name
-    for name in ["README.md", "Cargo.toml", "licensing.rs"]:
+    for name in ["README.md", "Cargo.toml", "licensing.rs", "AUTHORS", "AUTHORS.md"]:
         assert not LICENCE_FILE.match(name), name
     print("gen_third_party_crates self-test ok")
 
