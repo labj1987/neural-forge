@@ -152,7 +152,7 @@ pub fn request(hdr: &ShmHeader, frames: u32) -> Result<u32, RequestError> {
     }
     let previous = hdr
         .capture_next_id
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n % MAX_ID + 1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |n| Some(n % MAX_ID + 1))
         .unwrap_or_default();
     let id = previous % MAX_ID + 1;
     // Release: a cancel of an earlier id written before this request is seen before it.

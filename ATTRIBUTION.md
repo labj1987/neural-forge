@@ -150,8 +150,8 @@ from their sources at build time (`scripts/gen_third_party_crates.py --licences`
 
 | Component | Version | License | Use |
 |---|---|---|---|
-| [volk](https://github.com/zeux/volk) | vulkan-sdk-1.4.357.0 | MIT | Vulkan function loader, compiled into the native backend. Fetched at build time by `scripts/fetch-native-tools.sh` (SHA-256 pinned). |
-| [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | v1.4.363 | Apache-2.0 / MIT | The Vulkan declarations the C++ is compiled against. Fetched the same way. |
+| [volk](https://github.com/zeux/volk) | vulkan-sdk-1.4.363.0 | MIT | Vulkan function loader, compiled into the native backend. Fetched at build time by `scripts/fetch-native-tools.sh` (SHA-256 pinned). |
+| [Vulkan-Headers](https://github.com/KhronosGroup/Vulkan-Headers) | v1.4.365 | Apache-2.0 / MIT | The Vulkan declarations the C++ is compiled against. Fetched the same way. |
 | libstdc++ (GCC) | the build compiler's | GPL-3.0 with the GCC Runtime Library Exception | Linked statically into the layer so it does not depend on the host's C++ runtime. The exception permits distributing the result under this project's license. |
 
 glslang (BSD-3-Clause and others) compiles the shaders at build time and is not part of any shipped binary.

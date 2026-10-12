@@ -1636,7 +1636,7 @@ mod tests {
         let n = (width * height) as usize;
         let frame: Vec<u8> = (0..n).flat_map(|i| { let t = (i * 37 % 256) as u8; [t, t.wrapping_add(64), t.wrapping_add(128), 255] }).collect();
         let answer: Vec<u8> = (0..n).flat_map(|i| { let t = (i * 53 % 256) as u8; [t.wrapping_add(20), t, t.wrapping_add(200), 255] }).collect();
-        let swap = |v: &[u8]| v.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect::<Vec<u8>>();
+        let swap = |v: &[u8]| v.as_chunks::<4>().0.iter().flat_map(|p| [p[2], p[1], p[0], p[3]]).collect::<Vec<u8>>();
         let params = ComposeParams { colour_strength: 0.7, transfer_strength: 0.8, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 1.0, transfer: 1, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
         let Some(rgb) = compose_once_ordered(width, height, &frame, &frame, &answer, (width, height), None, None, params, false) else {
             eprintln!("bgr_order_composes_the_same_true_colours_as_rgb_order: no Vulkan device, skipping");
@@ -1865,14 +1865,14 @@ mod tests {
             .flat_map(|m| [1.0f32, 0.8].into_iter().flat_map(move |wp| [0.0f32, 1.0].map(|s| (m, wp, s))))
         {
             {
-                let answer: Vec<u8> = frame.chunks_exact(4).flat_map(|p| crate::composition::encode::reference_encode_pixel([p[0], p[1], p[2], p[3]], false, wp, mode)).collect();
+                let answer: Vec<u8> = frame.as_chunks::<4>().0.iter().flat_map(|p| crate::composition::encode::reference_encode_pixel([p[0], p[1], p[2], p[3]], false, wp, mode)).collect();
                 // Ratio smoothing and the ghost guard on as well (`smooth`): their taps are encoded too.
                 let params = ComposeParams { white_point: wp, reversible_mode: mode, ratio_smooth: smooth, ghost_guard: smooth, ..base };
                 let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else {
                     eprintln!("encode curve test: no Vulkan device, skipping");
                     return;
                 };
-                let worst = out.chunks_exact(4).zip(frame.chunks_exact(4))
+                let worst = out.as_chunks::<4>().0.iter().zip(frame.as_chunks::<4>().0.iter())
                     .flat_map(|(o, f)| (0..3).map(move |c| (i32::from(o[c]) - i32::from(f[c])).abs()))
                     .max()
                     .unwrap_or(0);
@@ -2216,7 +2216,7 @@ mod tests {
         // maximum everywhere -- the composited pixel should sit meaningfully above
         // `base` and not still be exactly `base`, proving the (upscaled) answer
         // really reached the shader, not a silently-empty/no-op composite.
-        let avg = out.chunks_exact(4).map(|p| p[0] as u32).sum::<u32>() / (out.len() as u32 / 4);
+        let avg = out.as_chunks::<4>().0.iter().map(|p| p[0] as u32).sum::<u32>() / (out.len() as u32 / 4);
         assert!(avg > 60, "composited output (avg r={avg}) should be visibly brighter than the 50-valued base if the upscaled answer reached the shader");
 
         // (2) An answer *larger* than the frame (working_scale > 1.0, out of scope

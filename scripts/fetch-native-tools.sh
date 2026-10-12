@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Downloads the pinned sources and tools the native backend (crates/native) builds with into tools/native/
 # (git-ignored):
-#   glslang 16.6.0 (Linux x86_64 release binary), Vulkan-Headers v1.4.363, volk vulkan-sdk-1.4.357.0, and
+#   glslang 16.6.0 (Linux x86_64 release binary), Vulkan-Headers v1.4.365, volk vulkan-sdk-1.4.363.0, and
 #   OpenDLSS-NR at commit 9d08f41 with this project's patches (third_party/opendlss-nr/patches/) applied.
 # Every archive is checked against the SHA-256 pinned below before it is unpacked; every patch must apply
 # cleanly. Re-running skips a tool whose unpacked copy carries the stamp of the same pinned archive (and, for
@@ -18,8 +18,8 @@ mkdir -p "$TOOLS"
 # name | url | sha256 | file that must exist after unpacking (relative to tools/native/<name>)
 PINS=(
   "glslang|https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.tar.gz|2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce|bin/glslang"
-  "Vulkan-Headers|https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.363.tar.gz|cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68|include/vulkan/vulkan_core.h"
-  "volk|https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz|6400c7b23e24d17e4f04bac49b55b06c4e87677d33398e90344743ec73560ca6|volk.c"
+  "Vulkan-Headers|https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.365.tar.gz|ed832b3292cce324ebba6522fd2d3004bf1b797fa49bfbcad0b302ff23d56abc|include/vulkan/vulkan_core.h"
+  "volk|https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.363.0.tar.gz|1547d8d74395d4048fb3f4a6313da56db626e89b55db238d0d7e8944c8a645f3|volk.c"
   "OpenDLSS-NR|https://github.com/maanHimself/OpenDLSS-NR/archive/9d08f4184bbcb9d858e2fb7a7834ec0837a9d2f1.tar.gz|1301bfc9ee8e3868e9df579d7c9bfeb537a82b4be97c164e0c7925661d787125|src/vk_context.cpp"
 )
 

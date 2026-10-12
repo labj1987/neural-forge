@@ -1691,12 +1691,12 @@ impl Tracker {
         // The camera jitter, from the first launch of the buffer whose kernel is known to carry it
         // (SR's input kernels).
         let at = self.functions.get(&function).and_then(|(_, name)| jitter_word(name));
-        if let Some(value) = at.and_then(|at| bytes.chunks_exact(8).nth(at)).map(|w| u64::from_le_bytes(w.try_into().unwrap_or_default())).filter(|&v| jitter_plausible(v)) {
+        if let Some(value) = at.and_then(|at| bytes.as_chunks::<8>().0.get(at)).map(|w| u64::from_le_bytes(*w)).filter(|&v| jitter_plausible(v)) {
             self.launch.entry(command_buffer).or_default().jitter.get_or_insert(value);
         }
         let mut named: Vec<vk::Image> = Vec::new();
-        for word in bytes.chunks_exact(8) {
-            let value = u64::from_le_bytes(word.try_into().unwrap_or_default());
+        for word in bytes.as_chunks::<8>().0.iter() {
+            let value = u64::from_le_bytes(*word);
             if value == 0 {
                 continue;
             }
@@ -1747,8 +1747,8 @@ impl Tracker {
                     })
                     .collect();
                 let words: Vec<String> = bytes
-                    .chunks_exact(8)
-                    .map(|w| u64::from_le_bytes(w.try_into().unwrap_or_default()))
+                    .as_chunks::<8>().0.iter()
+                    .map(|w| u64::from_le_bytes(*w))
                     .filter(|&v| v != 0)
                     .take(64)
                     .map(|v| format!("{v:#x}"))
@@ -1842,8 +1842,8 @@ impl Tracker {
             return;
         }
         let words: Vec<String> = bytes
-            .chunks_exact(8)
-            .map(|w| u64::from_le_bytes(w.try_into().unwrap_or_default()))
+            .as_chunks::<8>().0.iter()
+            .map(|w| u64::from_le_bytes(*w))
             .enumerate()
             .map(|(i, value)| format!("{i}={}", self.describe_word(value, colour)))
             .collect();
@@ -5095,10 +5095,10 @@ fn probe_params(bytes: &[u8]) {
         return;
     }
     let words: Vec<String> = bytes
-        .chunks_exact(8)
+        .as_chunks::<8>().0.iter()
         .enumerate()
         .map(|(i, w)| {
-            let v = u64::from_le_bytes(w.try_into().unwrap_or_default());
+            let v = u64::from_le_bytes(*w);
             format!("w{i}={v:016x}({},{})", f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32))
         })
         .collect();
@@ -5116,9 +5116,9 @@ fn probe_kernel(name: &str, bytes: &[u8]) {
         return;
     }
     let words: Vec<String> = bytes
-        .chunks_exact(4)
+        .as_chunks::<4>().0.iter()
         .map(|w| {
-            let v = u32::from_le_bytes(w.try_into().unwrap_or_default());
+            let v = u32::from_le_bytes(*w);
             format!("{v:08x}:{}", f32::from_bits(v))
         })
         .collect();
@@ -7368,7 +7368,7 @@ mod tests {
         t.record_view(vk::ImageView::from_raw(0x702), vk::Image::from_raw(0x500));
         t.register(vk::ImageView::from_raw(0x702), Some(0x0320_1c23));
         assert_eq!(t.describe_word(0x0320_1c23_0140_1c00, c), "[view:depth(1485x836,D32_SFLOAT_S8_UINT)|view:mvec(1485x836,R16G16_SFLOAT)]");
-        let words: Vec<String> = param_block(&[]).chunks_exact(8).map(|w| t.describe_word(u64::from_le_bytes(w.try_into().unwrap()), c)).collect();
+        let words: Vec<String> = param_block(&[]).as_chunks::<8>().0.iter().map(|w| t.describe_word(u64::from_le_bytes(*w), c)).collect();
         assert_eq!(words, ["i(1485,836)", "f(0.5,0)"]);
         assert_eq!(t.describe_word(0, c), "0");
         assert_eq!(t.describe_word(0x7f12_3456_789a_bcde, c), "0x7f123456789abcde");
@@ -9316,7 +9316,7 @@ mod tests {
         for scale in [1.0f32, 8.0] {
             let original: Vec<u8> = {
                 let base = hdr_pattern(w, h);
-                base.chunks_exact(2).enumerate().flat_map(|(i, b)| {
+                base.as_chunks::<2>().0.iter().enumerate().flat_map(|(i, b)| {
                     let v = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
                     let v = if i % 4 == 3 { v } else { v * scale };
                     f32_to_f16(v).to_le_bytes()
@@ -9639,9 +9639,9 @@ mod tests {
         assert_eq!(&frame.colour[..TEXEL as usize], &original[..TEXEL as usize]);
         let (depth_bytes, format) = frame.depth.expect("depth read");
         assert_eq!(format, depth_format);
-        assert!(depth_bytes.chunks_exact(4).all(|v| f32::from_le_bytes(v.try_into().unwrap()) == 0.25), "the depth aspect as float32");
+        assert!(depth_bytes.as_chunks::<4>().0.iter().all(|v| f32::from_le_bytes(*v) == 0.25), "the depth aspect as float32");
         let mv = frame.mvec.expect("motion vectors read");
-        assert!(mv.chunks_exact(4).all(|v| v == [0x00, 0x3c, 0x00, 0xc0]), "RG16F (1, -2)");
+        assert!(mv.as_chunks::<4>().0.iter().all(|v| *v == [0x00, 0x3c, 0x00, 0xc0]), "RG16F (1, -2)");
         assert_eq!(frame.exposure.len(), 3, "one entry per candidate");
         let rgba32: Vec<u8> = [0.5f32, 2.0, 0.0, 1.0].iter().flat_map(|v| v.to_le_bytes()).collect();
         assert_eq!(frame.exposure[0], ExposureValue { image: exp32.as_raw(), format: vk::Format::R32G32B32A32_SFLOAT, layout: Some(vk::ImageLayout::GENERAL), assumed: true, bytes: Some(rgba32) });

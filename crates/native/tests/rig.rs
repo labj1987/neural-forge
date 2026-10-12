@@ -230,7 +230,7 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
             d.get_query_pool_results(queries, 0, 2, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT).unwrap();
             eprintln!("run {run}: graph {:.3} ms GPU", (stamps[1] - stamps[0]) as f64 * period / 1e6);
             let got = std::slice::from_raw_parts(down_ptr, head_bytes as usize);
-            let differing = got.chunks_exact(4).zip(expected.chunks_exact(4)).filter(|(a, b)| a != b).count();
+            let differing = got.as_chunks::<4>().0.iter().zip(expected.as_chunks::<4>().0.iter()).filter(|(a, b)| a != b).count();
             eprintln!("run {run}: {:?} incl. copies, {differing} of {} head values differ, chain timeouts {:?}", t.elapsed(), expected.len() / 4, net.chain_timeouts());
             assert_eq!(differing, 0, "the head differs from dlss5vk's");
             assert_eq!(net.chain_timeouts().0, 0);

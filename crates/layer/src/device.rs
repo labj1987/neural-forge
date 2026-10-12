@@ -1565,8 +1565,8 @@ impl NeuralForgeDeviceInfo {
             // Model mode copies the depth on every hold (`native::DepthCopy`), but not when a barrier on
             // it comes before the launch (the launch buffer may write it first: GTA V Enhanced with DLSS
             // Frame Generation on); that hold has no depth. A dump refuses such a hold instead.
-            depth: Some(aux(inputs.depth, scan.depth_layout))
-                .filter(|_| mode != Mode::Model || scan.depth_hazard.is_none() || crate::preupscale::dump_ignores_hazard())
+            depth: (mode != Mode::Model || scan.depth_hazard.is_none() || crate::preupscale::dump_ignores_hazard())
+                .then(|| aux(inputs.depth, scan.depth_layout))
                 // Only from a layout the copy can take for both aspects at once (`depth_copy_layout`:
                 // the separate depth layouts only without stencil), as the hold inside DLSS's buffer.
                 .map(|a| crate::preupscale::Aux { readable: a.readable && a.layout.is_some_and(|l| crate::preupscale::depth_copy_layout(a.format, l)), ..a }),
@@ -3618,7 +3618,7 @@ mod submit_order_tests {
         let bytes = crate::capture::test_capture_once(&device, &instance, physical, queue, family, good, vk::ImageLayout::GENERAL, w, h).expect("capture");
         // B8G8R8A8 memory order.
         let expected: Vec<u8> = [fill[2], fill[1], fill[0], fill[3]].iter().map(|c| (c * 255.0f32).round() as u8).collect();
-        assert!(bytes.chunks_exact(4).all(|px| px == expected.as_slice()), "the capture reads the source's own pixels");
+        assert!(bytes.as_chunks::<4>().0.iter().all(|px| px == expected.as_slice()), "the capture reads the source's own pixels");
         // And the same source written into the swapchain at an offset is refused again.
         t.note_write_shape(swap, TapWrite { unscaled_extent: None, copy: true });
         assert!(t.tap_matches(swap, w, h, swapchain_format).is_err());

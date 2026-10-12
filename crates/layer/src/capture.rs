@@ -2933,8 +2933,8 @@ mod tests {
         // live: 0.25 * 255 = 63.75, which truncation would wrongly expect as 63
         // against the real, correct 64).
         let expected: [u8; 4] = [(color[0] * 255.0).round() as u8, (color[1] * 255.0).round() as u8, (color[2] * 255.0).round() as u8, (color[3] * 255.0).round() as u8];
-        for pixel in captured.chunks_exact(4) {
-            assert_eq!(pixel, expected, "every captured pixel must match the source image's own fill color, read straight out of the imported host pointer");
+        for pixel in captured.as_chunks::<4>().0.iter() {
+            assert_eq!(*pixel, expected, "every captured pixel must match the source image's own fill color, read straight out of the imported host pointer");
         }
 
         unsafe {
@@ -3333,7 +3333,7 @@ mod tests {
                     // reads the answer nor writes the proxy while a request is outstanding.
                     let proxy = unsafe { std::slice::from_raw_parts(proxy_region as *const u8, frame_bytes) };
                     let answer = unsafe { std::slice::from_raw_parts_mut(answer_region as *mut u8, frame_bytes) };
-                    for (a, p) in answer.chunks_exact_mut(4).zip(proxy.chunks_exact(4)) {
+                    for (a, p) in answer.as_chunks_mut::<4>().0.iter_mut().zip(proxy.as_chunks::<4>().0.iter()) {
                         a.copy_from_slice(&[255 - p[0], 255 - p[1], 255 - p[2], p[3]]);
                     }
                     hdr.server_eval_ms_bits.store(1.5f32.to_bits(), AtomicOrdering::Relaxed);

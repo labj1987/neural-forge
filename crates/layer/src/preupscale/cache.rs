@@ -1449,8 +1449,8 @@ mod tests {
             let t = self.pass.tuning;
             let range = t.max_luma_edit + t.chroma_stops;
             let un = |q: u32| q as f32 / 65535.0 * (2.0 * range) - range;
-            let edits = words.chunks_exact(2).flat_map(|w| [un(w[0] & 0xffff), un(w[0] >> 16), un(w[1] & 0xffff)]).collect();
-            (edits, words.chunks_exact(2).map(|w| w[1] >> 16).collect())
+            let edits = words.as_chunks::<2>().0.iter().flat_map(|w| [un(w[0] & 0xffff), un(w[0] >> 16), un(w[1] & 0xffff)]).collect();
+            (edits, words.as_chunks::<2>().0.iter().map(|w| w[1] >> 16).collect())
         }
 
         /// The colour image as f32 RGBA.
@@ -1489,7 +1489,7 @@ mod tests {
     }
 
     fn f32s(bytes: &[u8]) -> Vec<f32> {
-        bytes.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        bytes.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
     }
 
     fn scratch(name: &str) -> std::path::PathBuf {

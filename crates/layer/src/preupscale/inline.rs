@@ -1179,7 +1179,7 @@ mod tests {
                 assert_eq!(holds.load(Ordering::SeqCst), round, "the worker ran the hold once per execution");
                 let texels = std::slice::from_raw_parts(ptr, (w * h * 4) as usize);
                 let expected = [0x3c00u16, 0x3800, 0x3400, 0x3c00]; // 1.0, 0.5, 0.25, 1.0 as f16
-                assert!(texels.chunks_exact(4).all(|t| t == expected), "the colour input changed across a hold that wrote nothing");
+                assert!(texels.as_chunks::<4>().0.iter().all(|t| *t == expected), "the colour input changed across a hold that wrote nothing");
                 let slots = inline.slots.lock().unwrap();
                 let slot = &slots.slots[slots.by_cb[&cb]];
                 assert_eq!(device.get_event_status(slot.captured), Ok(false), "captured reset by the buffer");
@@ -1249,7 +1249,7 @@ mod mvec_tests {
 
     /// Each texel of an RG16F readback `width` wide, with its position.
     fn texels(bits: &[u16], width: usize) -> Vec<(f32, f32, [f32; 2])> {
-        bits.chunks_exact(2)
+        bits.as_chunks::<2>().0.iter()
             .enumerate()
             .map(|(i, t)| ((i % width) as f32, (i / width) as f32, [crate::preupscale::f16_to_f32(t[0]), crate::preupscale::f16_to_f32(t[1])]))
             .collect()

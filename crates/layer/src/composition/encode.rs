@@ -309,7 +309,7 @@ mod tests {
         // not be distinguished from the check's own noise.
         let frame: Vec<u8> = (0..64u32).flat_map(|i| [(i * 3) as u8, (i * 5) as u8, (i * 7) as u8, 255]).collect();
         let encoded: Vec<u8> = frame
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .flat_map(|p| reference_encode_pixel([p[0], p[1], p[2], p[3]], false, 1.0, reversible_mode::KNEE))
             .collect();
         let (max, mean, pixels) = compare_to_reference(&frame, &encoded, false, 1.0, reversible_mode::KNEE).expect("same raster");
@@ -348,7 +348,7 @@ mod tests {
         // the check; a small delta here is not proof the order is right.
         let frame: Vec<u8> = (0..32u32).flat_map(|i| [255u8, 250, (i * 2) as u8, 255]).collect();
         let wrong_order: Vec<u8> = frame
-            .chunks_exact(4)
+            .as_chunks::<4>().0.iter()
             .flat_map(|p| reference_encode_pixel([p[0], p[1], p[2], p[3]], true, 1.0, reversible_mode::KNEE))
             .collect();
         let (max, _, _) = compare_to_reference(&frame, &wrong_order, false, 1.0, reversible_mode::KNEE).expect("same raster");
