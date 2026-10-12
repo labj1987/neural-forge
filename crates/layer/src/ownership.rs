@@ -53,7 +53,16 @@ static ELIGIBLE: LazyLock<bool> = LazyLock::new(|| {
     let (args, exe) = this_process();
     let target = neural_forge_protocol::env::var("NEURAL_FORGE_TARGET_EXE");
     let ok = allowed(&args, &exe, target.as_deref());
-    if !ok { crate::log!("[ownership] process excluded from NeuralForge session"); }
+    if !ok {
+        crate::log!("[ownership] process excluded from NeuralForge session");
+        // Asked when the process makes its Vulkan device, so once per process. A name the target
+        // leaves out that is not a known launcher or helper may be the game itself: the state log
+        // says so, and `doctor` turns it into the fix (the executable to target).
+        let name = judged_name(&args, &exe);
+        if let Some(target) = target.filter(|_| !neural_forge_protocol::processes::never_the_game(&name)) {
+            crate::event!(neural_forge_protocol::state_log::TARGET_EXCLUDED, "NEURAL_FORGE_TARGET_EXE={target} leaves out {name}");
+        }
+    }
     ok
 });
 
