@@ -68,7 +68,7 @@ F32 = np.float32
 class Params:
     """Every knob of the carry, with the shader's defaults."""
 
-    eps_v: float = EPS_V            # ratio floor in exposure-normalised v (dump-format.md)
+    eps_v: float = EPS_V            # ratio floor in exposure-normalised v (docs/ARCHITECTURE.md 4.9)
     max_luma_edit: float = 1.5      # ClampEdit luma limit, stops; 0 turns the whole clamp off
     chroma_stops: float = 1.0       # ClampEdit: each channel within this of the clamped luma
     depth_tol: float = 0.10         # relative depth: full weight inside, none at twice it
@@ -94,7 +94,7 @@ class Params:
 
 
 # --------------------------------------------------------------------------------------------------
-# The dump (lead/dump-format.md, v1)
+# The dump (docs/ARCHITECTURE.md 4.9, v1)
 # --------------------------------------------------------------------------------------------------
 
 DUMP_FORMAT = "neural-forge-cache-dump"
@@ -250,7 +250,7 @@ def infer_reverse_z(depths: list) -> tuple:
 
 
 # --------------------------------------------------------------------------------------------------
-# The edit (dump-format.md "Edit representation"; shader FreshEdit / ClampEdit / apply)
+# The edit (docs/ARCHITECTURE.md 4.9-4.10; shader FreshEdit / ClampEdit / apply)
 # --------------------------------------------------------------------------------------------------
 
 def luma(x: np.ndarray) -> np.ndarray:

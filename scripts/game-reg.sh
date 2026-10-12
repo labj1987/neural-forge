@@ -13,32 +13,43 @@ uid=$(id -u)
 out=$HOME/nf-spike/runs/$label; mkdir -p "$out"; C=$HOME/.local/share/neural-forge/bin/neural-forge-cli
 pad(){ timeout 5 sh -c 'echo "$1" > /tmp/nf-pad.fifo' sh "$1" || echo "warning: controller step $1 failed" >&2; sleep 1; }
 start=$(date "+%F %T"); echo "$start" > "$out/start"
+
+# Ends the game however this script ends (a failed step under set -e included): `pgrep -f` also
+# matches this script (and the shell running it), whose own command line holds the pattern, so this
+# process, everything above it and anything it forked itself are skipped.
+quit_game() {
+    local mine=" " p=$$
+    while [ "$p" -gt 1 ]; do
+        mine="$mine$p "
+        p=$(ps -o ppid= -p "$p" | tr -d ' ')
+        [ -n "$p" ] || break
+    done
+    for p in $(pgrep -f -- "$pat" || true); do
+        case $mine in *" $p "*) continue;; esac
+        [ -e "/proc/$p" ] || continue
+        [ "$(ps -o ppid= -p "$p" | tr -d ' ')" = "$$" ] && continue
+        kill -TERM "$p" 2>/dev/null || true
+    done
+}
+trap quit_game EXIT
 "$C" shmctl set enabled 1 >/dev/null
 XA=$(ls -t "/run/user/$uid"/.mutter-Xwaylandauth.* | head -1)
 DISPLAY=:0 XAUTHORITY=$XA timeout 10 steam -applaunch "$appid" >/dev/null 2>&1 || true
 sleep "$boot"
 for s in "$@"; do case $s in W*) sleep "${s#W}";; *) pad "$s";; esac; done
 m=$(date "+%F %T"); sleep 60
-timeout 10 "$C" shmctl capture >/dev/null 2>&1 || true; sleep 3
-d=$(ls -td "$HOME"/.local/share/neural-forge/captures/series-* "$HOME"/.local/share/neural-forge/captures/*-original.png 2>/dev/null | head -1 || true)
-if [ -d "$d" ]; then cp "$d/000000-original.png" "$out/end.png"; elif [ -f "$d" ]; then cp "$d" "$out/end.png"; fi
+# This run's capture only: a file older than the marker is an earlier run's, never copied as this one's.
+marker=$out/.capture-marker; touch "$marker"
+if timeout 40 "$C" shmctl capture >"$out/capture.txt" 2>&1; then
+    shot=$(find "$HOME/.local/share/neural-forge/captures" -newer "$marker" -name '*-original.png' 2>/dev/null | sort | head -1)
+    if [ -n "$shot" ]; then cp "$shot" "$out/end.png"; else echo "warning: the capture wrote no original frame" >&2; fi
+else
+    echo "warning: capture failed: $(tail -1 "$out/capture.txt")" >&2
+fi
+rm -f "$marker"
 journalctl --user -u steam-relaunch --since "$start" -o cat > "$out/launch.log" || true
 
-# `pgrep -f` also matches this script (and the shell running it): its own command line holds the pattern.
-# Skip this process, everything above it and anything it forked itself (the $(...) running pgrep).
-mine=" "
-p=$$
-while [ "$p" -gt 1 ]; do
-    mine="$mine$p "
-    p=$(ps -o ppid= -p "$p" | tr -d ' ')
-    [ -n "$p" ] || break
-done
-for p in $(pgrep -f -- "$pat" || true); do
-    case $mine in *" $p "*) continue;; esac
-    [ -e "/proc/$p" ] || continue
-    [ "$(ps -o ppid= -p "$p" | tr -d ' ')" = "$$" ] && continue
-    kill -TERM "$p" 2>/dev/null || true
-done
+quit_game
 sleep 8
 L=$out/launch.log; W=$(journalctl --user -u steam-relaunch --since "$m" --until "$(date "+%F %T")" -o cat || true)
 echo "== $label"

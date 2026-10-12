@@ -39,7 +39,13 @@ def find_cli(args):
         return args.cli
     repo = Path(__file__).resolve().parent.parent
     data = Path(os.environ.get('XDG_DATA_HOME', str(Path.home() / '.local/share')))
-    candidates = [args.cli, os.environ.get('NEURAL_FORGE_CLI') and Path(os.environ['NEURAL_FORGE_CLI'])]
+    # $NEURAL_FORGE_CLI names one just as explicitly: set but not runnable is an error, not a fallthrough.
+    named = os.environ.get('NEURAL_FORGE_CLI', '').strip()
+    if named:
+        if not (Path(named).is_file() and os.access(named, os.X_OK)):
+            raise SystemExit(f'NEURAL_FORGE_CLI={named} is not an executable file')
+        return Path(named)
+    candidates = []
     if args.appdir is not None:
         candidates.append(args.appdir / 'usr/bin/neural-forge-cli')
     candidates += [data / 'neural-forge/bin/neural-forge-cli', repo / 'target/release/neural-forge-cli', repo / 'target/debug/neural-forge-cli']

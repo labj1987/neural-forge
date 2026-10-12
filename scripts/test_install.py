@@ -94,11 +94,19 @@ class InstallTests(unittest.TestCase):
             (root / 'state/neural-forge/state.txt').write_text('state')
             runtime.mkdir(mode=0o700, exist_ok=True)
             (runtime / 'shm.bin').write_text('shm')
+            # What the install really put in place (and nothing for menu integration: that is the
+            # AppImage integrator's job).
+            installed = [data / 'neural-forge/bin/neural-forge', data / 'neural-forge/bin/neural-forge-cli',
+                         data / 'neural-forge/lib/neural-forge/libneural_forge_layer.so',
+                         data / 'vulkan/implicit_layer.d/neural_forge_layer.json', data / 'neural-forge/installation.json']
+            for path in installed:
+                self.assertTrue(path.is_file(), path)
+            self.assertFalse((data / 'applications').exists(), 'the installer writes no menu entry')
+            # A lost record: purge still takes the manifest that would load the deleted library.
+            (data / 'neural-forge/installation.json').unlink()
             cli('uninstall', '--purge')
-            for gone in [data / 'neural-forge', root / 'config/neural-forge', root / 'state/neural-forge', runtime,
-                         data / f'applications/{identity}.desktop', data / 'vulkan/implicit_layer.d/neural_forge_layer.json']:
+            for gone in installed + [data / 'neural-forge', root / 'config/neural-forge', root / 'state/neural-forge', runtime]:
                 self.assertFalse(gone.exists(), gone)
             self.assertEqual(upstream.read_text(), 'upstream sentinel')
-            self.assertFalse((data / 'applications').exists(), 'an emptied directory we created should go too')
 
 if __name__ == '__main__': unittest.main()

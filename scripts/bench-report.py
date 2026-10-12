@@ -104,10 +104,11 @@ def bench_iq():
     return module
 
 
-def iq_text(d, baseline):
-    """` | flicker X% detail xY` when the run has a frame series, else nothing."""
+def iq_text(d, baseline, fg=None):
+    """` | flicker X% detail xY` when the run has a frame series, else nothing. `fg`: the run's
+    measured frame-generation ratio (displayed / rendered), rounded for the window."""
     try:
-        text = bench_iq().summary(d, baseline)
+        text = bench_iq().summary(d, baseline, fg=max(1, round(fg)) if fg else 1)
     except (ImportError, OSError) as e:
         return f" | flicker: {e}"
     return f" | {text}" if text else ""
@@ -164,7 +165,7 @@ def report(label, base, baseline=None):
         f"{label}: passes {' / '.join(f'{a:.1f}' for a in avgs)} | pass4 ({dur:.0f}s) real {real4:.1f}, "
         f"displayed {fmt(disp, '{:.1f}')} (frame generation {fmt(fg, '{:.1f}x')}), {rate_text(nf, held)}, "
         f"GPU {fmt(gpu, '{:.0f}%')} {fmt(power, '{:.0f}W')}"
-        + iq_text(d, baseline and os.path.join(base, baseline))
+        + iq_text(d, baseline and os.path.join(base, baseline), fg)
         + (f" | {' '.join(s for s in settings if '=' in s)}" if settings else "")
     )
     print(f"    [sync] {sync_medians(log)}")
@@ -238,9 +239,9 @@ def _self_test():
     with tempfile.TemporaryDirectory() as run:
         os.mkdir(f"{run}/series-1")
         pixels = bytes((i * 37) % 256 for i in range(64 * 48 * 3))
-        for i in range(6):
+        for i in range(bench_iq().WINDOW):
             Image.frombytes("RGB", (64, 48), pixels).save(f"{run}/series-1/{i:06}-composited.png")
-        assert iq_text(run, run) == " | flicker 0.00% detail x1.00", iq_text(run, run)
+        assert iq_text(run, run) == " | flicker 0.00% (no cut) detail x1.00", iq_text(run, run)
         assert iq_text(f"{run}/series-1/none", None) == ""
     print("bench-report self-test ok")
 

@@ -38,8 +38,9 @@ Usage:
   cache_replay.py DUMP --export-carry DIR [--reverse-z yes|no]
 
 Ported in part from optiscaler-dlss5 by Skynizz (https://github.com/Skynizz/optiscaler-dlss5),
-commit 6bfc4389c25054ef6747df6e6b1b470e9541c4da: tools/dlssnr_cache/measure_reprojection.py and
-measure_ghosting.py (the strategies and the metrics). Upstream is GPL-3.0; this port is
+commit 6bfc4389c25054ef6747df6e6b1b470e9541c4da: tools/dlssnr_cache/measure_reprojection.py,
+measure_ghosting.py (the strategies and the metrics), measure_pulse.py (the regional light step)
+and flicker_lab.py (the motion-compensated flicker). Upstream is GPL-3.0; this port is
 distributed under this project's AGPL-3.0-or-later (see ATTRIBUTION.md).
 
 Needs Python 3 and numpy.

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Flicker and added detail of gta-bench.sh runs, from their presented-frame series.
 
-usage: bench-iq.py [--baseline MODEL_OFF_RUN_DIR] [--frames N] [--start K] [--scan] RUN_DIR...
+usage: bench-iq.py [--baseline MODEL_OFF_RUN_DIR] [--fg N] [--frames N] [--start K] [--scan] RUN_DIR...
        bench-iq.py --self-test
 
 A run's series is the `series-<ms>/` directory gta-bench.sh moves into the run directory: N
@@ -12,8 +12,10 @@ taken on the frames as presented (8-bit sRGB PNGs, linearised), with Y the Rec.7
 
 Flicker: per pixel d = |log2(Y_t + f) - log2(Y_t-1 + f)| between consecutive frames, f = 0.05 x the
 geometric mean of the first frame's Y; the mean of the smallest 95% of d (the 5% that change most
-are moving objects), averaged over the pairs of the window (9 frames: 8 pairs, two whole frame-generation cycles at 4x), shown as
-100 x (2^mean - 1) %. The same measure as the reference's live benchmark.
+are moving objects), averaged over the pairs of the window, shown as 100 x (2^mean - 1) %. The same
+measure as the reference's live benchmark. The window covers whole frame-generation cycles: its
+pair count is the smallest multiple of the multiplier (--fg N, the presented frames per rendered
+frame; 1 without frame generation) that is at least 8, so 9 frames at 1x, 2x and 4x and 10 at 3x.
 
 Added detail (with --baseline, a run with the layer loaded and the model off, captured at the same
 moment): the mean energy of the 4-neighbour Laplacian of log2(Y + f) over the static pixels of the
@@ -22,9 +24,11 @@ and its four neighbours' largest frame-to-frame change within the window is unde
 both runs. f is the
 baseline's for both, so the two logs are on one scale.
 
-The window is the 9 frames from SETTLE frames after the series' first cut (`anchor`; the first
-frames when there is no cut): GTA's camera starts a pass up to about a second earlier or later from
-run to run, so the series is captured across the cut and the cut fixes the moment. --start K / --frames N choose the window by hand.
+The window starts SETTLE rendered frames (SETTLE x the multiplier presented frames: the series
+holds presented frames) after the series' first cut (`anchor`); a series without a cut is measured
+from its first frame, and the output says so. GTA's camera starts a pass up to about a second
+earlier or later from run to run, so the series is captured across the cut and the cut fixes the
+moment. --start K / --frames N choose the window by hand.
 --scan prints the mean frame-to-frame change of every pair and the stillest N-frame window, for
 choosing the capture moment. With several RUN_DIRs the spread of their flicker (max / min - 1) is
 printed too: the stability gate for repeated model-off runs is a spread of 10% or less.
@@ -41,8 +45,10 @@ STATIC_STOPS = 0.05  # largest frame-to-frame change (stops) of a pixel counted 
 # A pair whose trimmed change is over this (stops) can be a cut, and the window starts SETTLE frames
 # after the first one (see `anchor`).
 CUT_STOPS = 0.05
-# The window starts on the new shot's 31st frame: GTA's camera starts moving again 47-56 frames after
-# the still shot's cut in the slower runs, inside a window from the 41st (40 until 2026-10-11).
+# The window starts on the new shot's 31st rendered frame: DLSS's history converges over about 30
+# rendered frames, and GTA's camera starts moving again 47-56 frames after the still shot's cut in
+# the slower runs, inside a window from the 41st (40 until 2026-10-11). Counted in rendered frames:
+# the series holds presented frames, `settle` converts.
 SETTLE = 30
 REC709 = (0.2126, 0.7152, 0.0722)
 # The darkest non-black 8-bit sRGB code, linear: black pixels count as this in the geometric mean.
@@ -153,8 +159,21 @@ def detail(lumas, base_lumas):
     return energy(logs) / energy(base)
 
 
-def anchor(t, frames=WINDOW):
-    """The window's first frame, from `t`, the trimmed change of each pair of the series: SETTLE frames after the series' first cut, or 0 without a cut. A cut
+def window_frames(fg=1):
+    """The window's frames for frame-generation multiplier `fg`: whole cycles, at least 8 pairs."""
+    fg = max(1, int(fg))
+    return -(-8 // fg) * fg + 1
+
+
+def settle(fg=1):
+    """SETTLE rendered frames, in presented frames at multiplier `fg`."""
+    return SETTLE * max(1, int(fg))
+
+
+def anchor(t, frames=WINDOW, fg=1):
+    """`(start, cut)`: the window's first frame, from `t`, the trimmed change of each pair of the
+    series, `settle(fg)` presented frames after the series' first cut (`cut` True), or `(0, False)`
+    without a cut. A cut
     is a pair whose trimmed change is over CUT_STOPS and over 3 times the pair before it (a camera
     that starts or stops moving changes gradually). Counting from the cut fixes the moment: GTA's
     benchmark camera starts a pass up to about a second earlier or later from run to run, so the
@@ -164,9 +183,9 @@ def anchor(t, frames=WINDOW):
     ends too soon after the cut."""
     for i in range(1, len(t)):
         if t[i] > CUT_STOPS and t[i] > 3 * t[i - 1]:
-            start = i + 1 + SETTLE
-            return start if start + frames <= len(t) + 1 else None
-    return 0
+            start = i + 1 + settle(fg)
+            return (start, True) if start + frames <= len(t) + 1 else None
+    return (0, False)
 
 
 def pair_stats(files):
@@ -185,22 +204,28 @@ def pair_stats(files):
     return out
 
 
-def window(run, start=None, frames=WINDOW):
-    """The run's `frames` lumas from `start` (None: from the cut, `anchor`), or an error string."""
+def window(run, start=None, frames=WINDOW, fg=1):
+    """`(lumas, where)`: the run's `frames` lumas from `start` (None: from the cut, `anchor`) and
+    where the window is ("from the cut", "from the series' start (no cut)", "from frame K"), or an
+    error string."""
     d = series_dir(run)
     if d is None:
         return f"no series in {run}"
     files = frame_files(d)
     if start is None:
-        start = anchor([t for _, t in pair_stats(files)], frames) if len(files) > frames else 0
-        if start is None:
-            return f"{d}: {len(files)} frames, the series ends before {SETTLE} + {frames} frames after its cut"
+        found = anchor([t for _, t in pair_stats(files)], frames, fg) if len(files) > frames else (0, False)
+        if found is None:
+            return f"{d}: {len(files)} frames, the series ends before {settle(fg)} + {frames} frames after its cut"
+        start, cut = found
+        where = "from the cut" if cut else "from the series' start (no cut)"
+    else:
+        where = f"from frame {start}"
     if len(files) < start + frames:
         return f"{d}: {len(files)} frames, the window needs {start + frames}"
-    return [load_luma(f) for f in files[start : start + frames]]
+    return [load_luma(f) for f in files[start : start + frames]], where
 
 
-def scan(run, frames=WINDOW):
+def scan(run, frames=WINDOW, fg=1):
     """Mean change (stops) of every consecutive pair of the whole series, and the stillest window."""
     d = series_dir(run)
     stats = pair_stats(frame_files(d)) if d else []
@@ -213,23 +238,34 @@ def scan(run, frames=WINDOW):
     if len(trimmed) >= k:
         best = min(range(len(trimmed) - k + 1), key=lambda s: sum(trimmed[s : s + k]))
         out.append(f"  stillest {frames}-frame window: frames {best}..{best + k}, flicker {percent(sum(trimmed[best:best + k]) / k):.3f}%")
-    cut = anchor(trimmed, frames)
-    out.append(f"  window after the cut: {'none (the series ends too soon)' if cut is None else f'frames {cut}..{cut + k}'}")
+    found = anchor(trimmed, frames, fg)
+    if found is None:
+        out.append("  window after the cut: none (the series ends too soon)")
+    elif not found[1]:
+        out.append(f"  no cut: the window is frames 0..{k}")
+    else:
+        out.append(f"  window after the cut: frames {found[0]}..{found[0] + k}")
     return "\n".join(out)
 
 
-def summary(run, baseline=None, start=None, frames=WINDOW):
-    """`flicker X% detail xY` for bench-report.py, or None when the run has no series."""
+def summary(run, baseline=None, start=None, frames=None, fg=1):
+    """`flicker X% detail xY` for bench-report.py, or None when the run has no series. `fg`: the
+    run's frame-generation multiplier (presented per rendered frame)."""
     if series_dir(run) is None:
         return None
-    lumas = window(run, start, frames)
-    if isinstance(lumas, str):
-        return lumas
+    frames = frames or window_frames(fg)
+    got = window(run, start, frames, fg)
+    if isinstance(got, str):
+        return got
+    lumas, where = got
     text = f"flicker {percent(flicker(lumas)):.2f}%"
+    if where.startswith("from the series' start"):
+        text += " (no cut)"
     if baseline:
-        base = window(baseline, start, frames)
+        base = window(baseline, start, frames, fg)
         if isinstance(base, str):
             return f"{text} (detail: {base})"
+        base = base[0]
         if base[0].shape != lumas[0].shape:
             return f"{text} (detail: the baseline is {base[0].shape[1]}x{base[0].shape[0]})"
         x = detail(lumas, base)
@@ -238,7 +274,7 @@ def summary(run, baseline=None, start=None, frames=WINDOW):
 
 
 def main(argv):
-    opts = {"--baseline": None, "--frames": WINDOW, "--start": None}
+    opts = {"--baseline": None, "--frames": None, "--start": None, "--fg": "1"}
     runs, want_scan = [], False
     it = iter(argv)
     for a in it:
@@ -251,23 +287,26 @@ def main(argv):
     if not runs:
         print(__doc__, file=sys.stderr)
         return 2
-    frames, baseline = int(opts["--frames"]), opts["--baseline"]
+    fg = int(opts["--fg"])
+    frames, baseline = int(opts["--frames"] or window_frames(fg)), opts["--baseline"]
     start = None if opts["--start"] is None else int(opts["--start"])
     if want_scan:
         for run in runs:
-            print(scan(run, frames))
+            print(scan(run, frames, fg))
         return 0
     values = []
     for run in runs:
-        lumas = window(run, start, frames)
-        if isinstance(lumas, str):
-            print(f"{run}: {lumas}")
+        got = window(run, start, frames, fg)
+        if isinstance(got, str):
+            print(f"{run}: {got}")
             continue
+        lumas, where = got
         f = flicker(lumas)
         values.append(f)
-        line = f"{run}: flicker {percent(f):.3f}% ({frames} frames from {'the cut' if start is None else start})"
+        line = f"{run}: flicker {percent(f):.3f}% ({frames} frames {where})"
         if baseline:
-            base = window(baseline, start, frames)
+            base = window(baseline, start, frames, fg)
+            base = base if isinstance(base, str) else base[0]
             x = detail(lumas, base) if not isinstance(base, str) else None
             line += f", detail x{x:.3f}" if x is not None else f", detail - ({base if isinstance(base, str) else 'no static pixels'})"
         print(line)
@@ -315,11 +354,16 @@ def _self_test():
     other = 0.05 + 0.55 * rng.random((h, w))
     black = n.full((h, w), 1e-4)
     shot = [other * (1 + 0.001 * (i % 2)) for i in range(SETTLE + WINDOW)]
-    assert anchor(changes(still + [black, black] + shot)) == WINDOW + SETTLE
+    assert anchor(changes(still + [black, black] + shot)) == (WINDOW + SETTLE, True)
     assert anchor(changes(still + [black] + shot[:SETTLE])) is None, "the series ends too soon"
-    assert anchor(changes(still)) == 0, "no cut: from the start"
+    assert anchor(changes(still)) == (0, False), "no cut: from the start, and said so"
+    # Frame generation: settle counts rendered frames, the window whole cycles.
+    assert settle(4) == 4 * SETTLE and settle(1) == SETTLE
+    assert [window_frames(f) for f in (1, 2, 3, 4)] == [9, 9, 10, 9]
+    long_shot = [other * (1 + 0.001 * (i % 2)) for i in range(settle(2) + WINDOW)]
+    assert anchor(changes(still + [black, black] + long_shot), WINDOW, 2) == (WINDOW + settle(2), True)
     pan = [n.roll(base, 3 * i, 1) for i in range(4)]
-    assert anchor(changes(pan + still)) == 0, "a camera that stops is not a cut"
+    assert anchor(changes(pan + still)) == (0, False), "a camera that stops is not a cut"
     print("bench-iq self-test ok")
 
 

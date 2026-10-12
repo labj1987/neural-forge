@@ -10,7 +10,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 SO_PATH="${NEURAL_FORGE_SMOKE_SO:-}"
 if [[ -z "$SO_PATH" ]]; then
     cargo build --locked -p neural-forge-layer
-    SO_PATH="$(pwd)/target/debug/libneural_forge_layer.so"
+    SO_PATH="${CARGO_TARGET_DIR:-$(pwd)/target}/debug/libneural_forge_layer.so"
 fi
 test -f "$SO_PATH"
 
@@ -25,7 +25,7 @@ sed "s#\./libneural_forge_layer\.so#$SO_PATH#" data/neural_forge_layer.json \
 # found this way still needs to be named explicitly to actually get inserted into the
 # call chain. That's a test-harness-only difference: a real install drops this manifest
 # into an actual implicit_layer.d directory instead, where enable_environment alone is
-# enough (see data/neural_forge_layer.json and build-appimage.sh once that exists).
+# enough (see data/neural_forge_layer.json and build-appimage.sh).
 export VK_LAYER_PATH="$SCRATCH"
 # An installed copy's implicit manifest (~/.local/share/vulkan/implicit_layer.d) has the same
 # layer name and wins over VK_LAYER_PATH, so on a machine with Neural Forge installed the

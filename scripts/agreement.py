@@ -21,7 +21,7 @@ Per matched frame, ``edit = composited - original`` (per channel, signed). Repor
 
 The 16-pixel band holding the frame stamp and a 1-pixel border are excluded.
 
-Dependencies: Python 3 and Pillow (``python3-pil``); no numpy.
+Dependencies: Python 3 and Pillow 10.2 or newer (``python3-pil``); no numpy.
 
     scripts/agreement.py REF_DIR TEST_DIR
     scripts/agreement.py --runs REF1:TEST1 REF2:TEST2 REF3:TEST3
@@ -59,7 +59,13 @@ PAIR = re.compile(r"^(?P<key>.+)-original\.png$")
 
 
 def lam(fn, **images):
-    return ImageMath.lambda_eval(lambda e: fn(e), **images)
+    if hasattr(ImageMath, "lambda_eval"):
+        return ImageMath.lambda_eval(lambda e: fn(e), **images)
+    # Pillow before 10.3 (Ubuntu 24.04's python3-pil is 10.2) has no lambda_eval: the same steps.
+    args = dict(ImageMath.ops)
+    args.update({k: ImageMath._Operand(v) if isinstance(v, Image.Image) else v for k, v in images.items()})
+    out = fn(args)
+    return getattr(out, "im", out)
 
 
 def decode_stamp(img: Image.Image) -> int | None:
