@@ -17,7 +17,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab: the Neural rendering switch, style, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present from build 310.8.0.0, Extract from DLL, and the Steam launch option NEURAL_FORGE_ENABLE=1 %command%](screenshots/setup.png) | ![Status tab: telemetry, layer state, the Model placement line and the model](screenshots/status.png) |
+| ![Model tab: the Neural rendering switch, style, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present from build 310.8.0.0, the Steam games with their switches and the executables they target, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe,PlayGTAV.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: telemetry, layer state, the Model placement line and the model](screenshots/status.png) |
 
 The screenshots show 3.0.0 with default settings and no game running.
 
@@ -270,7 +270,9 @@ sudo usermod -aG input "$USER"
 ```
 
 Log out and in again afterwards. `NEURAL_FORGE_TOGGLE_KEY=F10` (a key name or a Linux key code)
-changes the key, and `NEURAL_FORGE_HOTKEY_BACKEND=evdev` or `x11` forces one backend.
+changes the key, and `NEURAL_FORGE_HOTKEY_BACKEND=evdev` or `x11` forces one backend. The key acts
+only while the game's window has the focus; inside gamescope, where that cannot be known, it is off
+unless `NEURAL_FORGE_HOTKEY_GLOBAL=1` is set.
 
 **Nothing to start.** The network runs in the game; the GUI is only for settings and status and can
 be opened or closed at any time.
@@ -351,6 +353,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: the old pipelined present. Higher frame rate, but answers land on later frames and ghost. |
 | `NEURAL_FORGE_TOGGLE_KEY=F10` | layer | Toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
 | `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | layer | Forces one keyboard backend (default: evdev, then XInput2). |
+| `NEURAL_FORGE_HOTKEY_GLOBAL=1` | layer | The toggle key acts whatever window has the focus. By default it acts only while the game's window has it, and inside gamescope (where the focus cannot be known) not at all unless this is set. |
 | `NEURAL_FORGE_MAX_MODEL_PIXELS=N` | layer | Largest raster the after-the-upscaler path gives the model (default 3840x2160 = 8294400). |
 | `NEURAL_FORGE_LOG=/path` | layer | Log file (default: stderr), written by its own thread and rotated to `/path.1` at 64 MiB. |
 | `NEURAL_FORGE_LOG_TIME=1` | layer | Testing aid: timestamp every log line. |
