@@ -370,13 +370,15 @@ fn cmd_games() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     let cfg = Config::load();
+    let finder = steam::TargetFinder::new(&games);
     println!("{:>8}  {:<3}  name  (library)  target executable", "appid", "on");
     for game in &games {
         let on = if steam::enabled(&game.root.path, &game.appid) { "yes" } else { "no" };
         let target = match game.unsupported() {
             Some(why) => format!("cannot be switched on: {why}"),
-            None => match steam::target_for(&cfg, game) {
+            None => match steam::target_for_in(&cfg, game, &finder) {
                 t if t.is_empty() => "not found".to_string(),
+                t if steam::chosen_target(&cfg, &game.appid).is_some() => format!("{t} (chosen by hand)"),
                 t => t,
             },
         };

@@ -138,14 +138,15 @@ pub fn is_tool(appid: &str, name: &str) -> bool {
 }
 
 /// The games in every library of every root (tools filtered out), sorted by name, each appid once:
-/// a library two roots share is read once, and an appid with app manifests in two places (a stale
-/// copy in another library, or both a native and a Flatpak Steam) is the copy found first, the
-/// native roots coming before the Flatpak one.
+/// a library two roots share is read once, and of an appid with app manifests in two places (a
+/// stale copy in another library, or both a native and a Flatpak Steam) the copy kept is the native
+/// root's, else the one whose folder exists, else the one Steam marks fully installed, else the
+/// manifest written last.
 pub fn games(roots: &[Root]) -> Vec<Game> {
-    let mut out: Vec<Game> = Vec::new();
-    let mut ordered: Vec<&Root> = roots.iter().filter(|r| !r.flatpak).collect();
-    ordered.extend(roots.iter().filter(|r| r.flatpak));
-    for root in ordered {
+    // Each copy with what makes it the right one: a native root, its folder there, Steam's
+    // "fully installed" state flag, the manifest written last.
+    let mut copies: Vec<(Game, (bool, bool, bool, std::time::SystemTime))> = Vec::new();
+    for root in roots {
         for library in libraries(&root.path) {
             let Ok(dir) = std::fs::read_dir(library.join("steamapps")) else { continue };
             let mut manifests: Vec<PathBuf> = dir
@@ -158,12 +159,23 @@ pub fn games(roots: &[Root]) -> Vec<Game> {
                 let Some(tree) = std::fs::read(&manifest).ok().and_then(|t| vdf::parse(&t).ok()) else { continue };
                 let field = |key: &str| tree.string_at(&["AppState", key]).map(str::to_string);
                 let (Some(appid), Some(name), Some(installdir)) = (field("appid"), field("name"), field("installdir")) else { continue };
-                if is_tool(&appid, &name) || out.iter().any(|g| g.appid == appid) {
+                if is_tool(&appid, &name) || copies.iter().any(|(g, _)| g.appid == appid && g.library == library) {
                     continue;
                 }
                 let branch = tree.string_at(&["AppState", "MountedConfig", "BetaKey"]).unwrap_or_default().trim().to_string();
-                out.push(Game { appid, name, installdir, library: library.clone(), root: root.clone(), branch });
+                let installed = tree.string_at(&["AppState", "StateFlags"]).and_then(|f| f.trim().parse::<u32>().ok()).is_some_and(|f| f & 4 != 0);
+                let written = std::fs::metadata(&manifest).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+                let game = Game { appid, name, installdir, library: library.clone(), root: root.clone(), branch };
+                let rank = (!root.flatpak, game.dir().is_dir(), installed, written);
+                copies.push((game, rank));
             }
+        }
+    }
+    let mut out: Vec<Game> = Vec::new();
+    for (game, rank) in &copies {
+        let best = copies.iter().filter(|(g, _)| g.appid == game.appid).map(|(_, r)| *r).max();
+        if best == Some(*rank) && !out.iter().any(|g| g.appid == game.appid) {
+            out.push(game.clone());
         }
     }
     out.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then_with(|| a.appid.cmp(&b.appid)));
@@ -199,14 +211,14 @@ pub fn find<'a>(games: &'a [Game], query: &str) -> Result<&'a Game, FindError> {
 fn helper_exe(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
     neural_forge_protocol::processes::never_the_game(&n)
-        || ["setup", "redist", "prereq", "unins", "installer", "dotnet", "crashreport", "crashhandler", "crashpad", "crs-", "beservice", "easyanticheat", "start_protected_game", "bugsplat", "vcredist"]
+        || ["setup", "redist", "prereq", "unins", "installer", "dotnet", "crashreport", "crashhandler", "crashpad", "crs-", "beservice", "easyanticheat", "start_protected_game", "bugsplat", "vcredist", "cefsubprocess", "webhelper"]
             .iter()
             .any(|part| n.contains(part))
 }
 
 fn helper_dir(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
-    ["redist", "_commonredist", "redistributables", "installers", "directx", "vcredist", "battleye", "easyanticheat", "engine", "support"].contains(&n.as_str())
+    ["redist", "_commonredist", "redistributables", "installers", "__installer", "directx", "vcredist", "battleye", "easyanticheat", "engine", "support", "crashreporter", "crashpad"].contains(&n.as_str())
 }
 
 /// The `.exe` files directly in `dir` (case kept), sorted.
@@ -249,59 +261,186 @@ fn elf_executable(path: &Path) -> bool {
     meta.is_file() && meta.permissions().mode() & 0o111 != 0 && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && magic == *b"\x7fELF"
 }
 
-/// The executables of `game` that can be the process the player sees, for `NEURAL_FORGE_TARGET_EXE`
-/// (the layer lets only these claim the channel). Names only, case kept, deduplicated ignoring case.
-///
-/// From Steam's own launch entries for the game (`appinfo.vdf`, those for Windows or Linux and the
-/// installed branch): each entry's executable, the other executables beside it (a store
-/// bootstrapper such as `PlayGTAV.exe` starts the game from its own folder, and anti-cheat's
-/// `start_protected_game.exe` starts its neighbour), and Unreal Engine's real binary under
-/// `<Project>/Binaries/Win64` (the stub in the install folder starts it). Without launch entries,
-/// the executables at the top of the install folder and Unreal's binaries. Redistributable
-/// installers, anti-cheat services, crash reporters and store launchers are left out unless Steam
-/// launches them directly. A Linux launch script stands for the ELF executables beside it.
-pub fn target_exes(game: &Game) -> Vec<String> {
-    let dir = game.dir();
-    let mut out: Vec<String> = Vec::new();
-    let add = |name: &str, out: &mut Vec<String>| {
-        if !name.is_empty() && !name.contains(',') && !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-            out.push(name.to_string());
-        }
-    };
-    let launches = crate::appinfo::launches(&game.root.path, &game.appid).ok().flatten().unwrap_or_default();
-    let mut launched = false;
-    for launch in launches.iter().filter(|l| (l.for_os("windows") || l.for_os("linux")) && l.for_branch(&game.branch)) {
-        let rel = launch.executable.replace('\\', "/");
-        let rel = rel.trim_start_matches("./");
-        let path = dir.join(rel);
-        let name = rel.rsplit('/').next().unwrap_or(rel);
-        let beside = path.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.clone());
-        launched = true;
-        if name.to_ascii_lowercase().ends_with(".sh") {
-            let Ok(entries) = std::fs::read_dir(&beside) else { continue };
-            let mut elves: Vec<String> = entries.flatten().filter(|e| elf_executable(&e.path())).filter_map(|e| e.file_name().to_str().map(str::to_string)).collect();
-            elves.sort();
-            for elf in elves {
-                add(&elf, &mut out);
+/// Names of programs that start the game rather than being it: store and publisher launchers,
+/// bootstrappers, updaters and patchers (`Bethesda.net_Launcher.exe`, `ffxivboot64.exe`).
+fn launcher_like(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    neural_forge_protocol::processes::never_the_game(&n)
+        || ["launcher", "updater", "patcher"].iter().any(|p| n.contains(p))
+        || n.ends_with("boot.exe")
+        || n.ends_with("boot64.exe")
+}
+
+/// How deep [`TargetFinder`] searches a game's folder for executables.
+const SEARCH_DEPTH: usize = 6;
+
+/// One executable in a game's folder that its process could be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Candidate {
+    pub name: String,
+    /// Its path in the install folder, `/`-separated.
+    pub path: String,
+    pub bytes: u64,
+    /// Part of the target found for the game ([`TargetFinder::target_exes`]).
+    pub chosen: bool,
+}
+
+/// Finds the executables the game's process can be, for `NEURAL_FORGE_TARGET_EXE` (the layer lets
+/// only these claim the channel). Steam's app cache is read once for all the games it is made for.
+pub struct TargetFinder {
+    launches: std::collections::HashMap<(PathBuf, String), Vec<crate::appinfo::Launch>>,
+}
+
+impl TargetFinder {
+    /// Reads each root's `appcache/appinfo.vdf` once, for every game of `games` in that root.
+    pub fn new(games: &[Game]) -> TargetFinder {
+        let mut launches = std::collections::HashMap::new();
+        let mut roots: Vec<&Path> = games.iter().map(|g| g.root.path.as_path()).collect();
+        roots.sort();
+        roots.dedup();
+        for root in roots {
+            let appids: Vec<&str> = games.iter().filter(|g| g.root.path == root).map(|g| g.appid.as_str()).collect();
+            for (appid, l) in crate::appinfo::launches_for(root, &appids) {
+                launches.insert((root.to_path_buf(), appid), l);
             }
-            continue;
         }
-        add(name, &mut out);
-        if name.to_ascii_lowercase().ends_with(".exe") {
-            for exe in exes_in(&beside).iter().filter(|e| !helper_exe(e)) {
+        TargetFinder { launches }
+    }
+
+    /// Every executable in the game's folder (up to [`SEARCH_DEPTH`] folders deep, leaving out
+    /// redistributable installers, anti-cheat services and crash reporters and the folders that
+    /// hold them), best first: the found target in its order ([`Self::target_exes`]), then the
+    /// rest by size, launchers last. What the Setup tab offers to choose from.
+    pub fn candidates(&self, game: &Game) -> Vec<Candidate> {
+        let found = all_exes(&game.dir());
+        let chosen = self.target_exes(game);
+        let mut out: Vec<Candidate> = chosen
+            .iter()
+            .map(|name| {
+                let (path, bytes) = found.iter().find(|(p, _)| file_name(p).eq_ignore_ascii_case(name)).cloned().unwrap_or((name.clone(), 0));
+                Candidate { name: name.clone(), path, bytes, chosen: true }
+            })
+            .collect();
+        let mut rest: Vec<&(String, u64)> = found.iter().filter(|(p, _)| !chosen.iter().any(|c| c.eq_ignore_ascii_case(file_name(p)))).collect();
+        rest.sort_by_key(|(p, bytes)| (launcher_like(file_name(p)), std::cmp::Reverse(*bytes), p.to_ascii_lowercase()));
+        for (path, bytes) in rest {
+            if !out.iter().any(|c| c.name.eq_ignore_ascii_case(file_name(path))) {
+                out.push(Candidate { name: file_name(path).to_string(), path: path.clone(), bytes: *bytes, chosen: false });
+            }
+        }
+        out
+    }
+
+    /// The executables of `game` that can be the process the player sees. Names only, case kept,
+    /// deduplicated ignoring case.
+    ///
+    /// From Steam's own launch entries for the game (`appinfo.vdf`, those for Windows or Linux and the
+    /// installed branch): each entry's executable, unless it is a launcher (`launcher_like`) and
+    /// anything else qualifies; the other executables beside it (a store bootstrapper such as
+    /// `PlayGTAV.exe` starts the game from its own folder; anti-cheat's `start_protected_game.exe`
+    /// its neighbour); and Unreal Engine's real binary under `<Project>/Binaries/Win64`. Without launch
+    /// entries, the executables at the top of the install folder and Unreal's. Then, from the whole
+    /// folder, every other executable at least a quarter the size of the largest one: a launcher in
+    /// a folder of its own starts the game from another (ESO's `Launcher/Bethesda.net_Launcher.exe`
+    /// starts `game/client/eso64.exe`, FINAL FANTASY XIV's `boot/ffxivboot.exe` `game/ffxiv_dx11.exe`).
+    /// Redistributable installers, anti-cheat services, crash reporters and launchers are never
+    /// added from the folder. A Linux launch script stands for the ELF executables beside it.
+    pub fn target_exes(&self, game: &Game) -> Vec<String> {
+        let dir = game.dir();
+        let mut out: Vec<String> = Vec::new();
+        let add = |name: &str, out: &mut Vec<String>| {
+            if !name.is_empty() && !name.contains(',') && !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+                out.push(name.to_string());
+            }
+        };
+        let launches = self.launches.get(&(game.root.path.clone(), game.appid.clone())).map(Vec::as_slice).unwrap_or_default();
+        let mut launched = false;
+        let mut launchers: Vec<String> = Vec::new();
+        for launch in launches.iter().filter(|l| (l.for_os("windows") || l.for_os("linux")) && l.for_branch(&game.branch)) {
+            let rel = launch.executable.replace('\\', "/");
+            let rel = rel.trim_start_matches("./");
+            let path = dir.join(rel);
+            let name = rel.rsplit('/').next().unwrap_or(rel);
+            let beside = path.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.clone());
+            launched = true;
+            if name.to_ascii_lowercase().ends_with(".sh") {
+                let Ok(entries) = std::fs::read_dir(&beside) else { continue };
+                let mut elves: Vec<String> = entries.flatten().filter(|e| elf_executable(&e.path())).filter_map(|e| e.file_name().to_str().map(str::to_string)).collect();
+                elves.sort();
+                for elf in elves {
+                    add(&elf, &mut out);
+                }
+                continue;
+            }
+            if launcher_like(name) {
+                launchers.push(name.to_string());
+            } else {
+                add(name, &mut out);
+            }
+            if name.to_ascii_lowercase().ends_with(".exe") {
+                for exe in exes_in(&beside).iter().filter(|e| !helper_exe(e) && !launcher_like(e)) {
+                    add(exe, &mut out);
+                }
+            }
+        }
+        if !launched {
+            for exe in exes_in(&dir).iter().filter(|e| !helper_exe(e)) {
                 add(exe, &mut out);
             }
         }
-    }
-    if !launched {
-        for exe in exes_in(&dir).iter().filter(|e| !helper_exe(e)) {
+        for exe in unreal_binaries(&dir).iter().filter(|e| !helper_exe(e)) {
             add(exe, &mut out);
         }
+        // The rest of the folder: the large executables, largest first.
+        let mut found: Vec<(String, u64)> = all_exes(&dir).into_iter().filter(|(p, _)| !launcher_like(file_name(p))).collect();
+        found.sort_by_key(|(p, bytes)| (std::cmp::Reverse(*bytes), p.to_ascii_lowercase()));
+        if let Some(&(_, largest)) = found.first().filter(|(_, b)| *b > 0) {
+            for (path, bytes) in &found {
+                if bytes.saturating_mul(4) >= largest {
+                    add(file_name(path), &mut out);
+                }
+            }
+        }
+        // A launcher Steam starts directly stays only when nothing else qualifies (a game whose
+        // executable is literally called a launcher).
+        if out.is_empty() {
+            for name in &launchers {
+                add(name, &mut out);
+            }
+        }
+        out
     }
-    for exe in unreal_binaries(&dir).iter().filter(|e| !helper_exe(e)) {
-        add(exe, &mut out);
+}
+
+fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Every `.exe` under `dir` (relative path, size), up to [`SEARCH_DEPTH`] folders deep, without the
+/// helper folders and helper executables ([`helper_dir`], [`helper_exe`]); symlinks not followed.
+fn all_exes(dir: &Path) -> Vec<(String, u64)> {
+    fn walk(dir: &Path, rel: &str, depth: usize, out: &mut Vec<(String, u64)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for e in entries.flatten() {
+            let Ok(kind) = e.file_type() else { continue };
+            let Some(name) = e.file_name().to_str().map(str::to_string) else { continue };
+            let path = if rel.is_empty() { name.clone() } else { format!("{rel}/{name}") };
+            if kind.is_dir() && depth > 1 && !helper_dir(&name) {
+                walk(&e.path(), &path, depth - 1, out);
+            } else if kind.is_file() && name.to_ascii_lowercase().ends_with(".exe") && !helper_exe(&name) {
+                out.push((path, e.metadata().map(|m| m.len()).unwrap_or(0)));
+            }
+        }
     }
+    let mut out = Vec::new();
+    walk(dir, "", SEARCH_DEPTH, &mut out);
+    out.sort();
     out
+}
+
+/// [`TargetFinder::target_exes`] for one game.
+pub fn target_exes(game: &Game) -> Vec<String> {
+    TargetFinder::new(std::slice::from_ref(game)).target_exes(game)
 }
 
 /// The games whose install folder holds an executable named `exe` (ignoring case), best first: a
@@ -331,13 +470,10 @@ pub fn games_for_exe<'a>(games: &'a [Game], exe: &str) -> Vec<&'a Game> {
         return Vec::new();
     }
     // Rank: 0 when the game's own targets name it, else 1 + the depth it was found at.
-    let ranked: Vec<(usize, &Game)> = games
-        .iter()
-        .filter_map(|g| {
-            let depth = depth_of(&g.dir(), exe, DEPTH)?;
-            Some((if target_exes(g).iter().any(|t| t.eq_ignore_ascii_case(exe)) { 0 } else { depth }, g))
-        })
-        .collect();
+    let holding: Vec<(usize, &Game)> = games.iter().filter_map(|g| Some((depth_of(&g.dir(), exe, DEPTH)?, g))).collect();
+    let finder = TargetFinder::new(&holding.iter().map(|(_, g)| (*g).clone()).collect::<Vec<_>>());
+    let ranked: Vec<(usize, &Game)> =
+        holding.into_iter().map(|(depth, g)| (if finder.target_exes(g).iter().any(|t| t.eq_ignore_ascii_case(exe)) { 0 } else { depth }, g)).collect();
     let Some(best) = ranked.iter().map(|(r, _)| *r).min() else { return Vec::new() };
     ranked.into_iter().filter(|(r, _)| *r == best).map(|(_, g)| g).collect()
 }
@@ -411,11 +547,17 @@ pub fn chosen_target_key(appid: &str) -> String {
 /// The `NEURAL_FORGE_TARGET_EXE` value for `game`: the executable chosen by hand for it in `cfg`,
 /// else every name [`target_exes`] finds, comma-separated. Empty only when neither has one.
 pub fn target_for(cfg: &crate::Config, game: &Game) -> String {
-    cfg.settings
-        .get(&chosen_target_key(&game.appid))
-        .map(|t| t.trim().to_string())
-        .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| target_exes(game).join(","))
+    target_for_in(cfg, game, &TargetFinder::new(std::slice::from_ref(game)))
+}
+
+/// [`target_for`] with a [`TargetFinder`] made once for many games.
+pub fn target_for_in(cfg: &crate::Config, game: &Game, finder: &TargetFinder) -> String {
+    chosen_target(cfg, &game.appid).unwrap_or_else(|| finder.target_exes(game).join(","))
+}
+
+/// The target chosen by hand for `appid`, if any.
+pub fn chosen_target(cfg: &crate::Config, appid: &str) -> Option<String> {
+    cfg.settings.get(&chosen_target_key(appid)).map(|t| t.trim().to_string()).filter(|t| !t.is_empty())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -668,6 +810,40 @@ mod tests {
         assert_eq!(target_exes(&game("99", "Uncached", "")), ["Game.exe"]);
         assert_eq!(target_exes(&game("88", "Native", "")), ["game.x86_64"]);
         assert!(target_exes(&game("98", "Missing", "")).is_empty());
+        // A launcher in a folder of its own starting the game from another: the whole folder is
+        // searched, and the large executables there are the target, the launcher never.
+        let sized = |dir: &str, name: &str, mb: u64| {
+            let path = s.0.join("steamapps/common").join(dir).join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::File::create(&path).unwrap().set_len(mb << 20).unwrap();
+        };
+        sized("Zenimax Online", "Launcher/Bethesda.net_Launcher.exe", 60);
+        sized("Zenimax Online", "Launcher/BethesdaNetUpdater.exe", 2);
+        sized("Zenimax Online", "Launcher/CrashReporter.exe", 3);
+        sized("Zenimax Online", "The Elder Scrolls Online/game/client/eso64.exe", 90);
+        sized("Zenimax Online", "The Elder Scrolls Online/game/client/eso.exe", 70);
+        sized("Zenimax Online", "The Elder Scrolls Online/game/client/tools.exe", 1);
+        sized("FFXIV", "boot/ffxivboot.exe", 1);
+        sized("FFXIV", "boot/ffxivboot64.exe", 1);
+        sized("FFXIV", "boot/ffxivlauncher64.exe", 20);
+        sized("FFXIV", "game/ffxiv_dx11.exe", 50);
+        sized("FFXIV", "_CommonRedist/vcredist_x64.exe", 100);
+        let more = crate::appinfo::tests::image(&[
+            (3240220, &[("PlayGTAV.exe", "windows", "")]),
+            (306130, &[("Launcher\\Bethesda.net_Launcher.exe", "windows", "")]),
+            (39210, &[("boot/ffxivboot.exe", "windows", "")]),
+        ]);
+        std::fs::write(s.0.join("appcache/appinfo.vdf"), more).unwrap();
+        let eso = game("306130", "Zenimax Online", "");
+        assert_eq!(target_exes(&eso), ["eso64.exe", "eso.exe"]);
+        assert_eq!(target_exes(&game("39210", "FFXIV", "")), ["ffxiv_dx11.exe"]);
+        let finder = TargetFinder::new(std::slice::from_ref(&eso));
+        let names: Vec<(String, bool)> = finder.candidates(&eso).into_iter().map(|c| (c.name, c.chosen)).collect();
+        assert_eq!(
+            names,
+            [("eso64.exe".into(), true), ("eso.exe".into(), true), ("tools.exe".into(), false), ("Bethesda.net_Launcher.exe".into(), false), ("BethesdaNetUpdater.exe".into(), false)],
+            "the found target first, the rest by size, launchers last"
+        );
         // A target chosen by hand wins, and survives switching off and on (it lives in config.ini).
         let gta = game("3240220", "Grand Theft Auto V Enhanced", "");
         let mut cfg = crate::Config::default();
@@ -751,6 +927,25 @@ mod tests {
         assert_eq!(games[0].installdir, "Grand Theft Auto V Enhanced");
         // The same root listed twice still gives each game once.
         assert_eq!(super::games(&[roots[0].clone(), roots[0].clone()]).len(), 3);
+    }
+
+    #[test]
+    fn of_two_manifests_for_one_appid_the_installed_copy_is_kept() {
+        let home = Scratch::new("stale");
+        let root = home.0.join("Steam");
+        let other = home.0.join("Other");
+        std::fs::create_dir_all(other.join("steamapps")).unwrap();
+        write(
+            &root.join("steamapps/libraryfolders.vdf"),
+            &format!("\"libraryfolders\"\n{{\n\t\"1\"\n\t{{\n\t\t\"path\"\t\t\"{}\"\n\t}}\n}}\n", other.display()),
+        );
+        // A stale manifest in the root library (no folder), the real one in the other library.
+        write(&root.join("steamapps/appmanifest_990080.acf"), &manifest("990080", "Hogwarts Legacy"));
+        write(&other.join("steamapps/appmanifest_990080.acf"), &manifest("990080", "Hogwarts Legacy"));
+        std::fs::create_dir_all(other.join("steamapps/common/Hogwarts Legacy")).unwrap();
+        let games = games(&[Root { path: root.clone(), flatpak: false }]);
+        assert_eq!(games.len(), 1);
+        assert_eq!(games[0].library, other.canonicalize().unwrap());
     }
 
     #[test]

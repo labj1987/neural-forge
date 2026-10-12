@@ -144,8 +144,15 @@ fn run_command(program: &str, args: &[&str], timeout: std::time::Duration) -> Co
             Ok(Some(status)) => break Ok(status),
             Ok(None) if std::time::Instant::now() >= deadline => {
                 let _ = child.kill();
-                let _ = child.wait();
-                break Err(format!("did not finish within {} s and was stopped", timeout.as_secs()));
+                // A process in an uninterruptible driver sleep (a wedged GPU) does not die at once,
+                // and a child it forked can keep the pipes open: it is reaped, and its pipes drained,
+                // on a thread of its own, so the caller returns now.
+                std::thread::spawn(move || {
+                    let _ = child.wait();
+                    let _ = stdout.join();
+                    let _ = stderr.join();
+                });
+                return CommandOutput::Failed(format!("did not finish within {} s and was stopped", timeout.as_secs()));
             }
             Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
             Err(e) => break Err(e.to_string()),
@@ -164,13 +171,18 @@ fn run_command(program: &str, args: &[&str], timeout: std::time::Duration) -> Co
     }
 }
 
-/// [`run_command`] for `program`, each set of arguments run once: the doctor and the report ask
-/// `nvidia-smi` and `journalctl` the same questions.
+/// [`run_command`] for `program`, each set of arguments run once (the doctor and the report ask
+/// `nvidia-smi` and `journalctl` the same questions), and none again once one has timed out.
 fn cached_command(program: &'static str) -> Command {
     let cache: std::cell::RefCell<Vec<(Vec<String>, CommandOutput)>> = std::cell::RefCell::default();
     Box::new(move |args| {
         let key: Vec<String> = args.iter().map(|a| a.to_string()).collect();
         if let Some((_, out)) = cache.borrow().iter().find(|(k, _)| *k == key) {
+            return out.clone();
+        }
+        // A program that already hung (a wedged GPU hangs every nvidia-smi query) is not waited
+        // for again: the doctor and the report each ask it more than one question.
+        if let Some((_, out)) = cache.borrow().iter().find(|(_, out)| matches!(out, CommandOutput::Failed(why) if why.contains("was stopped"))) {
             return out.clone();
         }
         let out = run_command(program, args, COMMAND_TIMEOUT);
@@ -260,6 +272,9 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
     out.extend(check_xid(roots));
     out.extend(check_input_group(roots));
     out.extend(check_session_log(roots, events.as_deref().map_err(|e| e.kind()), session.as_deref()));
+    if let Ok(events) = events.as_deref() {
+        out.extend(check_target_excluded(roots, events));
+    }
     sort_worst_first(&mut out);
     out
 }
@@ -711,11 +726,13 @@ fn check_steam(roots: &Roots) -> Vec<Finding> {
         ));
     }
     // On without a target: a store launcher or helper that presents first can take the effect.
+    let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
+    let finder = crate::steam::TargetFinder::new(&games);
     let untargeted: Vec<(&crate::steam::Game, String)> = games
         .iter()
         .zip(&options)
         .filter(|(g, o)| usable(g) && o.as_deref().is_some_and(|o| !crate::launch_options::has_target(o)))
-        .map(|(g, o)| (g, crate::launch_options::merge(o.as_deref().unwrap_or_default(), &crate::steam::target_for(&crate::Config::load_from(&roots.config_file.to_string_lossy()), g))))
+        .map(|(g, o)| (g, crate::launch_options::merge(o.as_deref().unwrap_or_default(), &crate::steam::target_for_in(&cfg, g, &finder))))
         .collect();
     if !untargeted.is_empty() {
         let names = untargeted.iter().map(|(g, _)| g.name.as_str()).collect::<Vec<_>>().join(", ");
@@ -984,6 +1001,48 @@ fn check_input_group(roots: &Roots) -> Vec<Finding> {
 }
 
 // ---- the state log -------------------------------------------------------------------------------
+
+/// The layer's `target-excluded` events: a process the game's `NEURAL_FORGE_TARGET_EXE` left out
+/// made a Vulkan device. When no process of that name engaged afterwards, the game most likely ran
+/// as that executable and the target missed it: the finding names it and the exact fix.
+fn check_target_excluded(roots: &Roots, events: &[state_log::Event]) -> Vec<Finding> {
+    const CHECK: &str = "target-excluded";
+    let mut missed: Vec<&state_log::Event> = Vec::new();
+    for (i, e) in events.iter().enumerate() {
+        if e.kind != state_log::TARGET_EXCLUDED {
+            continue;
+        }
+        let engaged_later = events[i + 1..].iter().any(|later| later.kind == state_log::ATTACH && later.process.eq_ignore_ascii_case(&e.process));
+        if !engaged_later {
+            missed.retain(|m| !m.process.eq_ignore_ascii_case(&e.process));
+            missed.push(e);
+        }
+    }
+    if missed.is_empty() {
+        return Vec::new();
+    }
+    let games = crate::steam::games(&roots.steam_roots);
+    missed
+        .iter()
+        .map(|e| {
+            let exe = &e.process;
+            let fix = match crate::steam::games_for_exe(&games, exe).as_slice() {
+                [game] => format!(
+                    "With Steam closed, run `neural-forge-cli enable {} --target-exe {exe}` (or choose {exe} in the Setup tab's target editor for {}), then start the game.",
+                    game.appid, game.name
+                ),
+                _ => format!("Add {exe} to `NEURAL_FORGE_TARGET_EXE` in the game's launch options (`neural-forge-cli enable GAME --target-exe {exe}`), then start the game."),
+            };
+            Finding::new(
+                CHECK,
+                Severity::Warning,
+                format!("the game ran but its target excluded {exe}, so Neural Forge stayed off in it"),
+                format!("{} {}", utc(e.time), event_line(e)),
+                Some(fix),
+            )
+        })
+        .collect()
+}
 
 fn check_session_log(roots: &Roots, events: Result<&[state_log::Event], std::io::ErrorKind>, session: Option<&[state_log::Event]>) -> Vec<Finding> {
     const CHECK: &str = "last-session";
@@ -1389,6 +1448,9 @@ mod tests {
     fn a_hung_command_is_stopped() {
         let start = std::time::Instant::now();
         let out = run_command("sleep", &["30"], std::time::Duration::from_millis(300));
+        // A command whose child keeps the pipes open after the command itself is killed.
+        let held = run_command("sh", &["-c", "sleep 30 & sleep 30"], std::time::Duration::from_millis(300));
+        assert!(matches!(&held, CommandOutput::Failed(why) if why.contains("stopped")), "{held:?}");
         assert!(matches!(&out, CommandOutput::Failed(why) if why.contains("stopped")), "{out:?}");
         assert!(start.elapsed() < std::time::Duration::from_secs(5));
         assert_eq!(run_command("printf", &["x"], COMMAND_TIMEOUT), CommandOutput::Ran("x".into()));
@@ -1402,6 +1464,24 @@ mod tests {
         assert_eq!(one(&findings, "channel").severity, Severity::Info);
         assert!(!f.roots.shm_path.exists(), "the doctor created the channel");
         assert!(!f.roots.state_dir.exists() && !f.roots.binaries_dir.exists(), "the doctor created user dirs");
+    }
+
+    #[test]
+    fn a_process_the_target_left_out_is_reported_with_the_fix() {
+        let mut f = quiet();
+        steam(&mut f, "steam", false, &[("306130", "ESO", Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=eso.exe %command%"))]);
+        write(&f.dir.join("steam/steamapps/common/ESO/game/client/eso64.exe"), "");
+        let excluded = event(100, 7, "target-excluded", "NEURAL_FORGE_TARGET_EXE=eso.exe leaves out eso64.exe").replace("\tGame.exe\t", "\teso64.exe\t");
+        let events: Vec<state_log::Event> = excluded.lines().filter_map(state_log::parse_line).collect();
+        assert_eq!(events.len(), 1, "{excluded}");
+        let v = check_target_excluded(&f.roots, &events);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].summary.contains("excluded eso64.exe"), "{}", v[0].summary);
+        assert!(v[0].fix.as_deref().unwrap().contains("neural-forge-cli enable 306130 --target-exe eso64.exe"), "{:?}", v[0].fix);
+        // Engaged later under that name: fixed, nothing to say.
+        let attach = event(200, 8, "attach", "engaged").replace("\tGame.exe\t", "\teso64.exe\t");
+        let events: Vec<state_log::Event> = format!("{excluded}{attach}").lines().filter_map(state_log::parse_line).collect();
+        assert!(check_target_excluded(&f.roots, &events).is_empty());
     }
 
     #[test]

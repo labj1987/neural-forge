@@ -129,6 +129,13 @@ impl Reader<'_> {
 
 /// The launch entries of `appid` in an `appinfo.vdf` image; `Ok(None)` when the app is not in it.
 pub fn launches_in(data: &[u8], appid: u32) -> Result<Option<Vec<Launch>>, String> {
+    Ok(launches_many(data, &[appid])?.remove(&appid))
+}
+
+/// The launch entries of every app of `appids` found in an `appinfo.vdf` image, read in one pass
+/// (the string table once): the Setup tab and the doctor ask for every installed game at once.
+pub fn launches_many(data: &[u8], appids: &[u32]) -> Result<std::collections::HashMap<u32, Vec<Launch>>, String> {
+    let mut found = std::collections::HashMap::new();
     let mut r = Reader { data, at: 0 };
     let magic = r.u32()?;
     if magic != MAGIC_V29 {
@@ -137,24 +144,30 @@ pub fn launches_in(data: &[u8], appid: u32) -> Result<Option<Vec<Launch>>, Strin
     r.u32()?; // universe
     let table = u64::from_le_bytes(r.take(8)?.try_into().unwrap());
     let table = usize::try_from(table).ok().filter(|&t| t >= 16 && t < data.len()).ok_or("appinfo.vdf: bad string table offset")?;
-    loop {
+    let mut strings: Option<Vec<String>> = None;
+    while found.len() < appids.len() {
         let id = r.u32()?;
         if id == 0 {
-            return Ok(None);
+            break;
         }
         let size = r.u32()? as usize;
         let start = r.at;
-        if id != appid {
-            r.take(size)?;
+        r.take(size)?;
+        if !appids.contains(&id) {
             continue;
         }
         if size < RECORD_PREFIX || start + size > table {
             return Err("appinfo.vdf: bad record size".into());
         }
-        let strings = string_table(data, table)?;
+        if strings.is_none() {
+            strings = Some(string_table(data, table)?);
+        }
         let mut tree = Reader { data: &data[..start + size], at: start + RECORD_PREFIX };
-        let root = tree.block(&strings, 0)?;
-        let Some(Value::Block(entries)) = root.path(&["appinfo", "config", "launch"]) else { return Ok(Some(Vec::new())) };
+        let root = tree.block(strings.as_deref().unwrap_or_default(), 0)?;
+        let Some(Value::Block(entries)) = root.path(&["appinfo", "config", "launch"]) else {
+            found.insert(id, Vec::new());
+            continue;
+        };
         let launches = entries
             .iter()
             .filter_map(|(_, entry)| {
@@ -172,8 +185,9 @@ pub fn launches_in(data: &[u8], appid: u32) -> Result<Option<Vec<Launch>>, Strin
                 })
             })
             .collect();
-        return Ok(Some(launches));
+        found.insert(id, launches);
     }
+    Ok(found)
 }
 
 fn string_table(data: &[u8], at: usize) -> Result<Vec<String>, String> {
@@ -186,12 +200,12 @@ fn string_table(data: &[u8], at: usize) -> Result<Vec<String>, String> {
     (0..count).map(|_| r.cstr()).collect()
 }
 
-/// The launch entries of `appid` from `root`'s `appcache/appinfo.vdf`.
-pub fn launches(root: &Path, appid: &str) -> Result<Option<Vec<Launch>>, String> {
-    let appid: u32 = appid.parse().map_err(|_| format!("{appid:?} is not an appid"))?;
-    let path = root.join("appcache/appinfo.vdf");
-    let data = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    launches_in(&data, appid)
+/// The launch entries of each of `appids` from `root`'s `appcache/appinfo.vdf`, read once. Apps
+/// the cache does not have, and every app when it cannot be read, are absent.
+pub fn launches_for(root: &Path, appids: &[&str]) -> std::collections::HashMap<String, Vec<Launch>> {
+    let ids: Vec<u32> = appids.iter().filter_map(|a| a.parse().ok()).collect();
+    let Ok(data) = std::fs::read(root.join("appcache/appinfo.vdf")) else { return Default::default() };
+    launches_many(&data, &ids).map(|m| m.into_iter().map(|(k, v)| (k.to_string(), v)).collect()).unwrap_or_default()
 }
 
 #[cfg(test)]
