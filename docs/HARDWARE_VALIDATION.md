@@ -1282,3 +1282,48 @@ Generation, DLSS Super Resolution Quality. In play (F.E.A.S.T. centre, Continue)
 1712x960, 49.0 holds/s, 98.0 presents/s (frame generation 2x), 0 misses in the window, nothing
 composited after the upscaler; the game's 1x1 exposure reads over 1000, so it is measured from the
 frame. No fence timeout, no Xid.
+
+## 2026-10-10 -- 3.3 edit cache: baseline (3.2.0)
+
+GTA V Enhanced built-in benchmark (`scripts/gta-bench.sh`), installed 3.2.0, RTX 5070 12 GB, driver 615.78.08,
+DLSS Balanced, ray tracing on, mods off. One run per configuration; real fps and 1% low over GTA's passes 1-3 (its own
+frame times, rendered frames); shown fps = real x the frame-generation factor MangoHud measured over pass 4; N and W
+are the layer's median network and write-back GPU ms. Model off = no Neural Forge layer.
+
+| Configuration | Model off: real / shown / 1% low | Model on: real / shown / 1% low | N ms | W ms |
+|---|---|---|---|---|
+| 1440p, frame generation off | 112.6 / 112.6 / 68.8 | 71.5 / 71.5 / 24.3 | 5.94 | 0.12 |
+| 1440p, frame generation 4x | 77.7 / 310.8 / 47.4 | 49.5 / 197.9 / 24.2 | 6.52 | 0.12 |
+| 4K, frame generation off | 88.1 / 88.1 / 59.7 | 39.9 / 39.9 / 34.1 | 11.96 | 0.26 |
+| 4K, frame generation 4x | 51.8 / 207.1 / 20.6 (rerun 51.0 / 204.1 / 17.6) | 3.8 / - / 2.7 (rerun 35.2 / 140.7 / 7.2) | 37.25 (12.52) | 0.26 |
+
+4K with frame generation 4x and the model on is at the card's memory limit: the rerun sampled 11 863 of 12 227 MiB
+in use (about 10.4 GB with the model off). The first run went over it (the network at 37 ms with the GPU mostly
+idle: paging) and ran at 3-4 fps; the rerun stayed under and ran at 35 fps. Every run also builds the network at the
+output size first, for the after-the-upscaler path during the first seconds, before the pre-upscaler path builds it
+at the render size.
+
+## 2026-10-11 -- 3.3 edit cache: the final build
+
+The 3.3.0 build (the edit cache with the adaptive cadence; the network at full render size) against the baseline
+above, same benchmark, method and machine, Alex's settings as found. 1440p numbers are two runs (the first build of
+the day differed only in a reduced-resolution path that is off at 1440p), 4K one run.
+
+| Configuration | 3.2.0 model on: real / shown | 3.3.0 model on: real / shown | N ms | W ms |
+|---|---|---|---|---|
+| 1440p, frame generation off | 71.5 / 71.5 | 81.3, 79.6 | 5.94 | 0.38-0.41 |
+| 1440p, frame generation 4x | 49.5 / 197.9 | 55.7 / 222.7 | 6.71 | 0.38 |
+| 4K, frame generation off | 39.9 / 39.9 | 44.4 / 44.4 | 11.92 | 0.94 |
+| 4K, frame generation 4x | 3.8 / - (rerun 35.2 / 140.7) | 22.2 / 88.6 | 17.94 | 0.97 |
+
+At 4K with frame generation 4x the model on sits at the card's video-memory limit in both versions (11.86 of 12.2
+GB sampled; the network slows from 12 ms to 16-65 ms when it is evicted, and the driver sometimes logs
+`ctxBufPoolReserve ... Out of memory`), so that row changes from run to run and is not a comparison. In motion the
+network ran on half the holds (cached=150 refresh=150 per 300); the cache's own passes took 1.08 ms per hold at
+1440p and 2.46 ms at 4K, and rejected 2-3% of pixels. 1% lows in single runs are dominated by GTA's own streaming
+hitches (frames over 40 ms appear in every run, model on or off), so they are not compared. No Xid in any run.
+Image quality (GTA's still shot, 1440p, frame generation off): added detail on a fixed facade box x2.16 / x2.12
+against x2.08 / x2.18 with the network on every frame; flicker 1.18 / 1.10% against 1.13 / 1.03%. Play checks
+(GTA San Andreas DE, Crimson Desert, Hogwarts Legacy): attached, the effect shown, the toggle key off and on, no
+miss, fence timeout or Xid. Every phase's numbers, and what was tried and dropped, are in LESSONS.md, "3.3 edit
+cache: what was tried".

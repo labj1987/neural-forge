@@ -76,6 +76,22 @@ How it works, step by step: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Measured results
 
+### 3.3.0 against 3.2.0
+
+GTA V Enhanced's built-in benchmark, RTX 5070 (12 GB), driver 615.78.08, DLSS Balanced, ray tracing on, script mods
+off, one run each (real fps over the benchmark's passes 1-3; shown fps with frame generation). 3.3.0 runs the network
+before the upscaler on every second frame in motion and on every frame while the camera is still (the edit cache).
+Details: [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-10-11). 4K with frame generation 4x sits
+at the 12 GB card's video-memory limit with the model on, in 3.2.0 as in 3.3.0: how much the network slows down
+there changes from run to run, so its numbers are not a comparison.
+
+| Configuration | Model off | 3.2.0 | 3.3.0 |
+|---|---|---|---|
+| 1440p, frame generation off | 112.6 fps | 71.5 fps | **81.3 fps** |
+| 1440p, frame generation 4x | 77.7 real / 310.8 shown | 49.5 real / 197.9 shown | **55.7 real / 222.7 shown** |
+| 4K, frame generation off | 88.1 fps | 39.9 fps | **44.4 fps** |
+| 4K, frame generation 4x | 51.8 real / 207.1 shown | 3.8 to 35.2 real, run to run | 22.2 real / 88.6 shown (one run) |
+
 ### 3.1.0, 3.0 and 2.0.10 (NVIDIA's runtime through the helper)
 
 Same machine for all three. Machine: RTX 5070 (12 GB), NVIDIA driver 615.78.08, desktop 2560x1440 at
@@ -268,9 +284,11 @@ this version re-creates the shared memory.
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
 | Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), your installed Steam games with a Neural Forge switch each, and the launch option to copy by hand. |
 
-The model before the upscaler runs every frame and writes the model's answer straight back
-(there is no composition step), so "Model every Nth frame" and the Composition tab only change the
-after-the-upscaler path. The Model tab's tuning and the switch apply to both.
+Before the upscaler the network runs on every frame while the camera is still and on every second
+frame while it moves; the frame in between reuses its last result, moved with the game's motion and
+checked against depth and colour (the edit cache). The model's answer is written straight back (there is no
+composition step), so "Model every Nth frame" and the Composition tab only change the after-the-upscaler
+path. The Model tab's tuning and the switch apply to both.
 
 Settings are live: the GUI and the running layer share them through shared memory.
 `neural-forge-cli shmctl status|set|toggle|capture` does the same from a terminal.
@@ -331,7 +349,8 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_PROBE_NGX=1` | layer | Testing aid: log the game's DLSS work as it reaches Vulkan ([docs/PRE_UPSCALER_PROBE.md](docs/PRE_UPSCALER_PROBE.md)). |
 | `NEURAL_FORGE_PROBE_PARAMS=1`, `NEURAL_FORGE_PROBE_KERNEL=<name>` | layer | Testing aids: log every word of DLSS's input-kernel parameters, or of a named kernel's. |
 | `NEURAL_FORGE_LOG_LAUNCH_QUEUES=1` | layer | Testing aid: log which queue each DLSS launch is submitted on. |
-| `NEURAL_FORGE_CAPTURE_AT=N:MS` | layer | Testing aid: capture the presented frame once, MS milliseconds after DLSS's frames resumed (after a gap) for the Nth time; 1 is the first frames. |
+| `NEURAL_FORGE_CAPTURE_AT=N:MS[:FRAMES][,...]` | layer | Testing aid: capture the presented frame (or FRAMES consecutive frames) MS milliseconds after DLSS's frames resumed (after a gap) for the Nth time; 1 is the first frames. Several entries, separated by commas, are each taken once. |
+| `NEURAL_FORGE_CACHE_DUMP_AT=N:MS[:K][,...]` | layer | Testing aid: dump K (default 16) consecutive holds before the upscaler for `scripts/cache_replay.py`, at the same moments `NEURAL_FORGE_CAPTURE_AT` names. `neural-forge-cli shmctl dump-cache [--holds K]` asks for one now. |
 | `NEURAL_FORGE_WARMUP_SECS=N` | layer | Testing aid: seconds of steady rendering before the layer engages (default 5). |
 | `NEURAL_FORGE_INLINE=off` | layer | Testing aid: never hold inside DLSS's command buffer. |
 | `NEURAL_FORGE_NATIVE_CHAIN=0`, `NEURAL_FORGE_NATIVE_INLINE_CHAIN=1` | layer | Testing aids: barriers between the network's launches instead of counter chaining (before the upscaler), or counter chaining inside DLSS's buffer (where barriers are the default). |

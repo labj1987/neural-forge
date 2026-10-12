@@ -4,6 +4,22 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.3.0 — 2026-10-11
+
+More frames per second with the model on, without giving up its detail.
+
+- Before the upscaler, the network no longer runs on every frame. While the camera moves it runs on
+  every second frame, and the frame in between reuses its result, moved with the game's own motion
+  vectors and checked against depth and colour so it is not carried onto things that moved or were
+  uncovered. While the camera is still it runs on every frame, so a still view keeps all of the model's
+  detail. GTA V Enhanced's benchmark at 1440p: 81 fps instead of 72 with frame generation off, and 223
+  fps shown instead of 198 with frame generation 4x; at 4K: 44 fps instead of 40 with frame generation
+  off.
+- The Debug tab shows the edit cache at work (frames with and without the network, the share it
+  rejected, its cost) and has a view of what it rejected.
+- For comparisons, `NEURAL_FORGE_EDIT_CACHE=off` runs the network on every frame again.
+- After updating, restart any game that was running: the app and the layer share a new layout.
+
 ## 3.2.0 — 2026-10-10
 
 Finding out why nothing happens, switching games on from the app, and a report to attach to a bug.
