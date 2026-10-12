@@ -77,10 +77,11 @@ game whose launcher has a folder of its own (ESO's `game/client/eso64.exe`, FINA
 launchers (bootstrappers, updaters, patchers) are left out; a launch entry that is a launcher stays
 only when nothing else qualifies. A target chosen by hand (`enable GAME --target-exe`, or the Setup
 tab's per-game editor, which offers the folder's executables best first) is kept in `config.ini`
-(`target_exe_<appid>`) and wins. When a process the target leaves out makes a Vulkan device, the
-layer writes a `target-excluded` line to the state log (once per process, not for known launchers
-and helpers), and `doctor` reports a game that ran as an executable its target missed, with the
-command that targets it. The Steam AppID
+(`target_exe_<appid>`) and wins. When a process the target leaves out creates a game-sized swapchain, the layer
+writes a `target-excluded` line to the state log (once per process; never for launchers, bootstrappers,
+updaters or helpers), and `doctor` reports the newest one, unless a process engaged in that session or
+a later one, as a game that ran as an executable its target missed, with the command that targets
+it. The Steam AppID
 alone is insufficient: launchers inherit it too.
 
 Without a target, Wine's own processes, Steam's, store launchers and their helpers (Rockstar, Social

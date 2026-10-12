@@ -206,15 +206,7 @@ pub fn find<'a>(games: &'a [Game], query: &str) -> Result<&'a Game, FindError> {
         .unwrap_or(Err(FindError::NotFound))
 }
 
-/// Executables a game folder ships that are not the game: redistributable installers, anti-cheat
-/// services and crash reporters (matched on the lowercase name), and folders that hold only those.
-fn helper_exe(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    neural_forge_protocol::processes::never_the_game(&n)
-        || ["setup", "redist", "prereq", "unins", "installer", "dotnet", "crashreport", "crashhandler", "crashpad", "crs-", "beservice", "easyanticheat", "start_protected_game", "bugsplat", "vcredist", "cefsubprocess", "webhelper"]
-            .iter()
-            .any(|part| n.contains(part))
-}
+use neural_forge_protocol::processes::{game_helper as helper_exe, launcher_like};
 
 fn helper_dir(name: &str) -> bool {
     let n = name.to_ascii_lowercase();
@@ -259,16 +251,6 @@ fn elf_executable(path: &Path) -> bool {
     let Ok(meta) = std::fs::metadata(path) else { return false };
     let mut magic = [0u8; 4];
     meta.is_file() && meta.permissions().mode() & 0o111 != 0 && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && magic == *b"\x7fELF"
-}
-
-/// Names of programs that start the game rather than being it: store and publisher launchers,
-/// bootstrappers, updaters and patchers (`Bethesda.net_Launcher.exe`, `ffxivboot64.exe`).
-fn launcher_like(name: &str) -> bool {
-    let n = name.to_ascii_lowercase();
-    neural_forge_protocol::processes::never_the_game(&n)
-        || ["launcher", "updater", "patcher"].iter().any(|p| n.contains(p))
-        || n.ends_with("boot.exe")
-        || n.ends_with("boot64.exe")
 }
 
 /// How deep [`TargetFinder`] searches a game's folder for executables.

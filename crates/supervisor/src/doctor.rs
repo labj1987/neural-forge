@@ -1003,24 +1003,22 @@ fn check_input_group(roots: &Roots) -> Vec<Finding> {
 // ---- the state log -------------------------------------------------------------------------------
 
 /// The layer's `target-excluded` events: a process the game's `NEURAL_FORGE_TARGET_EXE` left out
-/// made a Vulkan device. When no process of that name engaged afterwards, the game most likely ran
-/// as that executable and the target missed it: the finding names it and the exact fix.
+/// made a game-sized swapchain. Only the newest one counts (an older one is an older session), and
+/// only when no process engaged from ten minutes before it on (the target's own process in that
+/// session, or a later session that worked), and it is no launcher or helper: then the game most
+/// likely ran as that executable and the target missed it. The finding names it and the exact fix.
 fn check_target_excluded(roots: &Roots, events: &[state_log::Event]) -> Vec<Finding> {
     const CHECK: &str = "target-excluded";
-    let mut missed: Vec<&state_log::Event> = Vec::new();
-    for (i, e) in events.iter().enumerate() {
-        if e.kind != state_log::TARGET_EXCLUDED {
-            continue;
-        }
-        let engaged_later = events[i + 1..].iter().any(|later| later.kind == state_log::ATTACH && later.process.eq_ignore_ascii_case(&e.process));
-        if !engaged_later {
-            missed.retain(|m| !m.process.eq_ignore_ascii_case(&e.process));
-            missed.push(e);
-        }
-    }
-    if missed.is_empty() {
+    const SESSION_SECS: u64 = 600;
+    let Some(newest) = events.iter().rev().find(|e| e.kind == state_log::TARGET_EXCLUDED) else { return Vec::new() };
+    let name = newest.process.as_str();
+    if neural_forge_protocol::processes::launcher_like(name) || neural_forge_protocol::processes::game_helper(name) {
         return Vec::new();
     }
+    if events.iter().any(|e| e.kind == state_log::ATTACH && e.time + SESSION_SECS >= newest.time) {
+        return Vec::new();
+    }
+    let missed = [newest];
     let games = crate::steam::games(&roots.steam_roots);
     missed
         .iter()
@@ -1478,9 +1476,20 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].summary.contains("excluded eso64.exe"), "{}", v[0].summary);
         assert!(v[0].fix.as_deref().unwrap().contains("neural-forge-cli enable 306130 --target-exe eso64.exe"), "{:?}", v[0].fix);
-        // Engaged later under that name: fixed, nothing to say.
-        let attach = event(200, 8, "attach", "engaged").replace("\tGame.exe\t", "\teso64.exe\t");
+        // A process engaged in the same session (the target's own) or later: nothing to say.
+        let attach = event(200, 8, "attach", "engaged");
         let events: Vec<state_log::Event> = format!("{excluded}{attach}").lines().filter_map(state_log::parse_line).collect();
+        assert!(check_target_excluded(&f.roots, &events).is_empty());
+        let before = event(1, 8, "attach", "engaged");
+        let events: Vec<state_log::Event> = format!("{before}{excluded}").lines().filter_map(state_log::parse_line).collect();
+        assert!(check_target_excluded(&f.roots, &events).is_empty(), "the target attached in the same session");
+        // An older session's exclusion is aged out by a newer one that worked.
+        let much_later = event(5000, 9, "attach", "engaged");
+        let events: Vec<state_log::Event> = format!("{excluded}{much_later}").lines().filter_map(state_log::parse_line).collect();
+        assert!(check_target_excluded(&f.roots, &events).is_empty());
+        // A launcher that made a swapchain is never the advice.
+        let launcher = event(100, 7, "target-excluded", "x").replace("\tGame.exe\t", "\tBethesda.net_Launcher.exe\t");
+        let events: Vec<state_log::Event> = launcher.lines().filter_map(state_log::parse_line).collect();
         assert!(check_target_excluded(&f.roots, &events).is_empty());
     }
 

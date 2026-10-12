@@ -1009,13 +1009,16 @@ fn game_subtitle(game: &neural_forge_supervisor::steam::Game, target: &str, chos
 /// first) or type names (comma-separated). Saving remembers it for the game (`config.ini`, as
 /// `neural-forge-cli enable --target-exe` does); "Use the found ones" forgets it. A game that is on
 /// gets its launch options rewritten with the new target at once (Steam closed).
+#[allow(clippy::too_many_arguments)]
 fn target_editor(
     button: &gtk4::Button,
-    row: &adw::SwitchRow,
+    row: &adw::ActionRow,
+    switch: &gtk4::Switch,
     game: &neural_forge_supervisor::steam::Game,
     target: &std::rc::Rc<std::cell::RefCell<String>>,
     candidates: &[neural_forge_supervisor::steam::Candidate],
     toasts: &adw::ToastOverlay,
+    running: &std::rc::Rc<std::cell::Cell<bool>>,
 ) {
     use neural_forge_supervisor::steam;
     let body = gtk4::Box::new(gtk4::Orientation::Vertical, 6);
@@ -1050,7 +1053,7 @@ fn target_editor(
     dialog.add_response("auto", "Use the found ones");
     dialog.add_response("save", "Save");
     dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
-    let (row, game, target, toasts) = (row.clone(), game.clone(), target.clone(), toasts.clone());
+    let (row, switch, game, target, toasts, running) = (row.clone(), switch.clone(), game.clone(), target.clone(), toasts.clone(), running.clone());
     dialog.choose(button.root().as_ref(), None::<&gio::Cancellable>, move |response| {
         let typed = entry.text().split(',').map(str::trim).filter(|n| !n.is_empty()).collect::<Vec<_>>().join(",");
         let mut cfg = neural_forge_supervisor::Config::load();
@@ -1072,7 +1075,7 @@ fn target_editor(
             toasts.add_toast(toast(&format!("Saving config.ini failed: {e}")));
             return;
         }
-        let (row, game, target, toasts) = (row.clone(), game.clone(), target.clone(), toasts.clone());
+        let (row, switch, game, target, toasts, running) = (row.clone(), switch.clone(), game.clone(), target.clone(), toasts.clone(), running.clone());
         glib::spawn_future_local(async move {
             let worker_game = game.clone();
             let found = gio::spawn_blocking(move || {
@@ -1085,7 +1088,9 @@ fn target_editor(
             let Ok((new, chosen)) = found else { return };
             *target.borrow_mut() = new.clone();
             row.set_subtitle(&game_subtitle(&game, &new, chosen));
-            if !row.is_active() || new.is_empty() {
+            // A game whose executable was just named can be switched on now, without a refresh.
+            switch.set_sensitive(switch_usable(&game, &new, switch.is_active(), running.get()));
+            if !switch.is_active() || new.is_empty() {
                 toasts.add_toast(toast(&format!("{}'s target is {}; it is used when the game is switched on", game.name, if new.is_empty() { "not found" } else { &new })));
                 return;
             }
@@ -1142,42 +1147,50 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
     group.set_description(Some("Looking for games…"));
     group.set_header_suffix(Some(refresh));
 
-    let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::SwitchRow>>> = std::rc::Rc::default();
+    // Each game: its row and the switch in it. Only the switch is ever insensitive, so the target
+    // editor opens for a game whose executable was not found, the one it is there for.
+    let rows: std::rc::Rc<std::cell::RefCell<Vec<(adw::ActionRow, gtk4::Switch)>>> = std::rc::Rc::default();
     let fill = {
         let (group, rows, toasts) = (group.clone(), rows.clone(), toasts.clone());
         move |scan: &SteamScan| {
-            for row in rows.borrow_mut().drain(..) {
+            for (row, _) in rows.borrow_mut().drain(..) {
                 group.remove(&row);
             }
             group.set_description(Some(&games_note(&scan.roots, scan.games.len(), scan.running)));
+            // Shared by the rows: a refused edit finds Steam running for all of them.
+            let running = std::rc::Rc::new(std::cell::Cell::new(scan.running));
             for scanned in &scan.games {
                 let game = scanned.game.clone();
                 // Shared with the target editor, which changes it.
                 let target = std::rc::Rc::new(std::cell::RefCell::new(scanned.target.clone()));
-                let row = adw::SwitchRow::new();
+                let row = adw::ActionRow::new();
                 row.set_use_markup(false);
                 row.set_title(&game.name);
                 row.set_subtitle(&game_subtitle(&game, &target.borrow(), scanned.chosen));
-                row.set_active(scanned.enabled);
+                let switch = gtk4::Switch::new();
+                switch.set_valign(gtk4::Align::Center);
+                switch.set_active(scanned.enabled);
+                row.add_suffix(&switch);
+                row.set_activatable_widget(Some(&switch));
                 if game.unsupported().is_none() {
                     let edit = gtk4::Button::from_icon_name("document-edit-symbolic");
                     edit.set_tooltip_text(Some("Choose the executable Neural Forge targets for this game"));
                     edit.add_css_class("flat");
                     edit.set_valign(gtk4::Align::Center);
                     row.add_suffix(&edit);
-                    let (row_weak, game, target, toasts, candidates) = (row.downgrade(), game.clone(), target.clone(), toasts.clone(), scanned.candidates.clone());
+                    let (row_weak, switch_weak, game, target, toasts, candidates, running) =
+                        (row.downgrade(), switch.downgrade(), game.clone(), target.clone(), toasts.clone(), scanned.candidates.clone(), running.clone());
                     edit.connect_clicked(move |button| {
-                        let Some(row) = row_weak.upgrade() else { return };
-                        target_editor(button, &row, &game, &target, &candidates, &toasts);
+                        let (Some(row), Some(switch)) = (row_weak.upgrade(), switch_weak.upgrade()) else { return };
+                        target_editor(button, &row, &switch, &game, &target, &candidates, &toasts, &running);
                     });
                 }
                 // Switching off always works; switching on needs a usable game with a known executable.
-                let can_switch = scanned.enabled || (game.unsupported().is_none() && !target.borrow().is_empty());
-                row.set_sensitive(!scan.running && can_switch);
+                switch.set_sensitive(switch_usable(&game, &target.borrow(), scanned.enabled, scan.running));
                 let reverting = std::rc::Rc::new(std::cell::Cell::new(false));
                 // Weak: the list holds the rows, and each row's handler would otherwise hold the list.
-                let (group_for_row, rows_for_row, toasts) = (group.downgrade(), std::rc::Rc::downgrade(&rows), toasts.clone());
-                row.connect_active_notify(move |row| {
+                let (group_for_row, rows_for_row, toasts, running) = (group.downgrade(), std::rc::Rc::downgrade(&rows), toasts.clone(), running.clone());
+                switch.connect_active_notify(move |row| {
                     if reverting.get() {
                         return;
                     }
@@ -1185,7 +1198,7 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                     let action = if on { steam::Action::Enable { target_exe: target.borrow().clone() } } else { steam::Action::Disable };
                     row.set_sensitive(false);
                     let (row, game, reverting, toasts) = (row.downgrade(), game.clone(), reverting.clone(), toasts.clone());
-                    let (group_for_row, rows_for_row) = (group_for_row.clone(), rows_for_row.clone());
+                    let (group_for_row, rows_for_row, running) = (group_for_row.clone(), rows_for_row.clone(), running.clone());
                     glib::spawn_future_local(async move {
                         let (root, appid) = (game.root.path.clone(), game.appid.clone());
                         let outcome = gio::spawn_blocking(move || steam::apply_now(&root, &appid, &action)).await;
@@ -1203,8 +1216,9 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                             }
                             Ok(steam::Outcome::SteamRunning { manual }) => {
                                 revert();
+                                running.set(true);
                                 if let (Some(rows), Some(group)) = (rows_for_row.upgrade(), group_for_row.upgrade()) {
-                                    for other in rows.borrow().iter() {
+                                    for (_, other) in rows.borrow().iter() {
                                         other.set_sensitive(false);
                                     }
                                     group.set_description(Some(&games_note(&steam::roots(), rows.borrow().len(), true)));
@@ -1223,11 +1237,17 @@ fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw
                     });
                 });
                 group.add(&row);
-                rows.borrow_mut().push(row);
+                rows.borrow_mut().push((row, switch));
             }
         }
     };
     (group, fill)
+}
+
+/// Whether a game's switch can be used: not while Steam runs; off always, on only for a game that
+/// can load the layer and has a target.
+fn switch_usable(game: &neural_forge_supervisor::steam::Game, target: &str, on: bool, steam_running: bool) -> bool {
+    !steam_running && (on || (game.unsupported().is_none() && !target.is_empty()))
 }
 
 fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
