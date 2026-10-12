@@ -4,6 +4,85 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.4.0 — 2026-10-12
+
+Neural Forge now always knows which program is your game, captures show exactly what you saw, and
+fixes across the model before the upscaler, the app and its diagnosis.
+
+- Switching a game on, on the Setup tab or with `neural-forge-cli enable`, now also names the game's
+  own executable in its launch options, found from Steam's data for that game. No store launcher or
+  helper the game starts first (Rockstar, Ubisoft Connect, EA app, Battle.net, Epic, GOG Galaxy, Riot
+  and others) can take Neural Forge any more. The games list shows which executable each game uses.
+  A game switched on with an earlier version has none named yet: switch it off and on again, or run
+  `neural-forge-cli enable GAME` (Diagnose lists these games). `--target-exe` names the executable by
+  hand and is remembered for that game; a game whose executable happens to be called like a launcher
+  works when it is the one named.
+- Without a named executable, store launchers and helpers can no longer take Neural Forge either, and
+  a program that stops showing frames gives it up after 10 seconds.
+- Switching a game on also covers the Steam account you are signed in with when it has never run the
+  game. Games of the Flatpak Steam, which cannot load Neural Forge, can no longer be switched on, and
+  the list says why.
+- Captures now show exactly what the game presented: the capture button and `shmctl capture` read the
+  frame before and after Neural Forge's own composition, instead of composing a separate, different
+  version of it. Taking a capture no longer flashes a differently composed frame or stalls the game
+  while the PNGs are written.
+- The capture button and `shmctl capture` say what really happened: where the files are and whether
+  the effect changed the frame (or why not: effect off, no answer from the model in time, model
+  running before the upscaler), or why nothing was written (HDR or 10-bit game, unreadable picture,
+  disk error). "Captured" is no longer shown when nothing was saved.
+- A capture requested while no game was running no longer fires on the next game you start: it is
+  withdrawn after 5 seconds with a message. Clicking the button again while it waits cancels it;
+  `shmctl capture --cancel` stops a running series. A cache dump asked for with no game running no
+  longer fires on the next game either.
+- `shmctl capture --frames` takes at most 1000 frames and `--view` only valid debug views. Capture
+  files are written completely or not at all, and two captures in the same millisecond no longer
+  overwrite each other.
+- `NEURAL_FORGE_EDIT_CACHE=off` is now a full return to 3.2.0's model before the upscaler: the game's
+  depth is no longer touched, and none of the edit cache is built.
+- Highlights the model cannot bring back are kept as whole pixels: a pixel with one clipped channel no
+  longer mixes the original's and the model's colours, which could tint the edges of bright lights.
+- The edit cache picks the depth DLSS itself reads when it can, decides whether depth is reversed only
+  after several frames agree (a loading screen no longer settles it wrongly), works at 8K and 5K DLAA,
+  and no longer carries motion from an older frame when a frame comes without motion vectors.
+- Very bright scenes in games without their own exposure value no longer drop the model for a frame
+  now and then.
+- More robust holds before the upscaler: a failed GPU submission can no longer let the next frame reuse
+  work still running, and the hold inside DLSS's command buffer is no longer recorded where it cannot
+  run or while the model is switched off (F11).
+- A game that turns on the older form of a Vulkan feature the network needs keeps working, without the
+  network, instead of having its device created wrongly; the game's own device settings are no longer
+  modified.
+- Less stutter in DLSS games with the effect after the upscaler.
+- The toggle key now acts only while the game's window has the focus, so typing the key in another
+  window no longer switches the model. Inside gamescope, where the focus cannot be known, it is off
+  unless you set `NEURAL_FORGE_HOTKEY_GLOBAL=1` in the game's launch options.
+- The toggle key can no longer close the game when the X server connection drops, and setting it to
+  none really disables it. A full `/tmp` no longer crashes the game: frames simply go through untouched.
+- Debug view 2 shows the model's own answer again when the model runs below the frame's size, and the
+  composed frame keeps the game's alpha.
+- The layer's log no longer slows the game when its output is slow; a log file set with
+  `NEURAL_FORGE_LOG` is rotated at 64 MB.
+- Diagnose, `doctor`, the report and `shmctl status` only look now: they no longer create the settings
+  channel or Neural Forge's folders. A hung `nvidia-smi` or `journalctl` can no longer freeze them, or
+  the app's Diagnose and Save report buttons: it is stopped after 10 seconds. Diagnose checks the
+  extracted model's files, not only its description, and warns about a game switched on in a Flatpak
+  Steam next to a native one.
+- The report also hides your computer's name, finds the game's Proton in the Steam install the game is
+  in, uses your local time, and a second report in the same second no longer replaces the first. Its
+  help now says it lists your installed Steam games and their library folders.
+- The Setup tab no longer freezes the app while it reads Steam, and switching a game happens in the
+  background. Game, profile and file names with `&` or `<` show correctly in the app's messages.
+- A strength preset is applied to the game as one change, never half of one. `shmctl toggle` only
+  flips on/off settings (it used to change others to wrong values). Profile names that would break the
+  profiles file are refused.
+- Uninstalling without the install record, or with a damaged one, still removes Neural Forge's layer,
+  and `uninstall --purge` never leaves the layer registered with its files gone.
+- Launch-option values with a stray space (`NEURAL_FORGE_PREUPSCALE="off "`) now work.
+- The Status tab's frame rate is measured over the time that really passed, and the edit cache's line
+  says "Not running" once the game has closed.
+- The AppImage now carries the full licence texts of everything built into it.
+- After updating, restart any game that was running: the app and the layer share a new layout.
+
 ## 3.3.0 — 2026-10-11
 
 More frames per second with the model on, without giving up its detail.
