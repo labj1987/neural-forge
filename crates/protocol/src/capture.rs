@@ -283,9 +283,11 @@ pub fn result(hdr: &ShmHeader) -> Option<Outcome> {
 
 /// A new game's layer opening the channel: a request left waiting from before belongs to no game that
 /// is running now (it would fire, unasked, at this game's first frame), and an outcome left running
-/// is a game that went away mid-capture.
+/// is a game that went away mid-capture. The same holds for a cache-dump request
+/// (`shmctl dump-cache`) that no pre-upscaler hold has taken yet.
 pub fn reset_session(hdr: &ShmHeader) {
     hdr.capture_request.store(0, Ordering::Release);
+    hdr.preupscale_dump_request.store(0, Ordering::Relaxed);
     hdr.capture_cancel.store(0, Ordering::Relaxed);
     if let Some(mut stale) = result(hdr).filter(|o| o.state == state::RUNNING) {
         stale.state = state::FAILED;
@@ -297,6 +299,17 @@ pub fn reset_session(hdr: &ShmHeader) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_session_drops_requests_left_for_an_earlier_game() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        h.preupscale_dump_request.store(32, Ordering::Relaxed);
+        h.capture_request.store(5, Ordering::Relaxed);
+        reset_session(&h);
+        assert_eq!(h.preupscale_dump_request.load(Ordering::Relaxed), 0);
+        assert_eq!(h.capture_request.load(Ordering::Relaxed), 0);
+    }
 
     #[test]
     fn a_request_carries_its_id_and_count_in_one_word() {

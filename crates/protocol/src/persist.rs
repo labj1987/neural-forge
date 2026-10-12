@@ -50,14 +50,16 @@ pub fn apply_saved(header: &ShmHeader) -> bool {
 /// key it doesn't recognize (an older/newer build's config.ini) or a value that
 /// doesn't parse, rather than failing the whole load over one bad line.
 pub fn apply(header: &ShmHeader, raw: &BTreeMap<String, String>) {
+    let mut settings = Vec::new();
     for (name, is_float, _) in header.persisted_settings() {
         let Some(value) = raw.get(&format!("set_{name}")) else { continue };
-        let bits = if is_float { value.parse::<f32>().ok().map(f32::to_bits) } else { value.parse::<u32>().ok() };
+        let bits = if is_float { value.trim().parse::<f32>().ok().map(f32::to_bits) } else { value.trim().parse::<u32>().ok() };
         if let Some(bits) = bits {
-            header.apply_persisted_setting(name, bits);
+            settings.push((name, bits));
         }
     }
-    header.tuning_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // One unit: a profile is never seen half applied, and `tuning_seq` marks the header configured.
+    header.write_settings(&settings);
 }
 
 #[cfg(all(test, unix))]

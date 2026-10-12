@@ -5465,7 +5465,7 @@ impl Session {
             let gpu = s.cache_gpu_published.or_else(|| s.cache_gpu_ms.last().copied());
             shm.publish_cache(s.refresh_holds, s.cached_holds, s.last_rejected, gpu);
         }
-        shm.publish_preupscale_state(if holding { 2 } else { 1 }, self.last_hold_native, extent.0, extent.1);
+        shm.publish_preupscale_state(if holding { neural_forge_protocol::enums::preupscale_state::HOLDING } else { neural_forge_protocol::enums::preupscale_state::WAITING }, self.last_hold_native, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
             // The window's rate: frames the model ran on before the upscaler (the post path's
@@ -5629,7 +5629,7 @@ impl Session {
     /// The header state for a present: holding when a hold happened within [`RECENT`].
     pub(crate) fn publish_status(&self, shm: &ShmClient, extent: Option<(u32, u32)>) {
         let (w, h) = extent.unwrap_or((0, 0));
-        shm.publish_preupscale_state(if self.holding() { 2 } else { 1 }, self.last_hold_native, w, h);
+        shm.publish_preupscale_state(if self.holding() { neural_forge_protocol::enums::preupscale_state::HOLDING } else { neural_forge_protocol::enums::preupscale_state::WAITING }, self.last_hold_native, w, h);
     }
 }
 

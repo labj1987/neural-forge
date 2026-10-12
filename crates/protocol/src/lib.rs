@@ -41,6 +41,7 @@ mod path;
 pub mod persist;
 #[cfg(unix)]
 pub mod private_dir;
+pub mod processes;
 mod slot;
 #[cfg(unix)]
 pub mod state_log;

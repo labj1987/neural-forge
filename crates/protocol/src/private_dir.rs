@@ -83,24 +83,25 @@ pub fn ensure_private_parent_dir(path: &str) -> bool {
     open_dir_checked(dir).is_some()
 }
 
-/// Whether `dir` is one of this project's own runtime directories by name
-/// (`.../neural-forge-<uid>`): the only kind [`heal_private_parent_dir`] may change the mode of.
-fn runtime_dir_by_name(dir: &str) -> bool {
-    dir.trim_end_matches('/').rsplit('/').next().is_some_and(|name| name.starts_with("neural-forge-"))
+/// Like [`ensure_private_parent_dir`], but first takes this project's runtime directory
+/// ([`crate::shm_runtime_dir`], `/tmp/neural-forge-<uid>`), when this uid already owns it, back to
+/// mode 0700 (through a descriptor, so a symlink is never followed). An earlier build created the
+/// runtime directory with the umask's mode, and the layer refuses such a directory for good; a
+/// directory someone else owns is left alone and refused.
+///
+/// Only that one directory is healed. A custom channel path can name any directory of the user's
+/// (even one called `neural-forge-notes`), and tightening it would change the permissions of a
+/// directory this project does not own: it is checked as it is, and refused unless already private.
+pub fn heal_private_parent_dir(path: &str) -> bool {
+    heal_parent_dir_of(path, &crate::shm_runtime_dir())
 }
 
-/// Like [`ensure_private_parent_dir`], but first takes this project's runtime directory, when
-/// this uid already owns it, back to mode 0700 (through a descriptor, so a symlink is never
-/// followed). An earlier build created the runtime directory with the umask's mode, and the
-/// layer refuses such a directory for good; a directory someone else owns is left alone and
-/// refused.
-///
-/// Only a directory named `neural-forge-<something>` is healed. A custom channel path can name
-/// any directory of the user's, and tightening that one would change the permissions of a
-/// directory this project does not own: it is checked as it is, and refused unless already
-/// private.
-pub fn heal_private_parent_dir(path: &str) -> bool {
-    if let Some((dir, _)) = split(path).filter(|(dir, _)| runtime_dir_by_name(dir)) {
+fn same_dir(a: &str, b: &str) -> bool {
+    a.trim_end_matches('/') == b.trim_end_matches('/')
+}
+
+fn heal_parent_dir_of(path: &str, runtime_dir: &str) -> bool {
+    if let Some((dir, _)) = split(path).filter(|(dir, _)| same_dir(dir, runtime_dir)) {
         mkdir_all(dir);
         if let Ok(c_dir) = CString::new(dir) {
             // SAFETY: `c_dir` is a valid NUL-terminated C string for the call's duration.
@@ -222,8 +223,20 @@ mod tests {
         // Already private: accepted, and still untouched.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(heal_private_parent_dir(&format!("{dir}/shm.bin")));
-        assert!(runtime_dir_by_name("/tmp/neural-forge-1000") && runtime_dir_by_name("/tmp/neural-forge-1000/"));
-        assert!(!runtime_dir_by_name("/tmp/neural-forge-1000/custom") && !runtime_dir_by_name("/home/a/Documents"));
+        assert!(same_dir("/tmp/neural-forge-1000", "/tmp/neural-forge-1000/"));
+        assert!(!same_dir("/tmp/neural-forge-1000/custom", "/tmp/neural-forge-1000"));
+        std::fs::remove_dir_all(std::path::Path::new(&dir).parent().unwrap()).ok();
+    }
+
+    /// A directory merely named like the runtime directory is not healed: only the one
+    /// `shm_runtime_dir` names is this project's.
+    #[test]
+    fn heal_touches_only_the_runtime_directory_itself() {
+        let dir = format!("{}/neural-forge-notes", scratch_dir());
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(!heal_private_parent_dir(&format!("{dir}/shm.bin")));
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
         std::fs::remove_dir_all(std::path::Path::new(&dir).parent().unwrap()).ok();
     }
 
@@ -235,7 +248,7 @@ mod tests {
         let path = format!("{dir}/shm.bin");
         assert!(!ensure_private_parent_dir(&path));
         assert!(open_private_file(&path, libc::O_RDWR | libc::O_CREAT, 0o600).is_none());
-        assert!(heal_private_parent_dir(&path));
+        assert!(heal_parent_dir_of(&path, &dir));
         assert!(open_private_file(&path, libc::O_RDWR | libc::O_CREAT, 0o600).is_some());
         std::fs::remove_dir_all(&dir).ok();
     }

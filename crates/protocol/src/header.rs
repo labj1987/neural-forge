@@ -409,8 +409,10 @@ impl ShmHeader {
     /// process may be reading, same as everything else here, so it goes through the
     /// atomics rather than a bulk memory write.
     pub fn init_defaults(&self) {
-        self.magic.store(SHM_MAGIC, Ordering::Relaxed);
-        self.version.store(SHM_VERSION, Ordering::Relaxed);
+        // The magic goes last (and is withdrawn first): a process opening the channel while this
+        // runs sees no magic, not a valid-looking header still full of another layout's values.
+        // Openers also serialise on the file's lock (`mapping::with_init_lock`).
+        self.magic.store(0, Ordering::Release);
         self.seq_req.store(0, Ordering::Relaxed);
         self.seq_resp.store(0, Ordering::Relaxed);
         self.width.store(0, Ordering::Relaxed);
@@ -513,6 +515,10 @@ impl ShmHeader {
         self.width_b.store(0, Ordering::Relaxed);
         self.height_b.store(0, Ordering::Relaxed);
         self.proxy_format_b.store(crate::enums::proxy_format::RGBA8, Ordering::Relaxed);
+        self.preupscale_dump_request.store(0, Ordering::Relaxed);
+
+        self.version.store(SHM_VERSION, Ordering::Relaxed);
+        self.magic.store(SHM_MAGIC, Ordering::Release);
     }
 
     /// Resets every user-tunable setting -- [`Self::persisted_settings`]'s own list -- to its
@@ -534,11 +540,27 @@ impl ShmHeader {
     pub fn reset_persisted_settings(&self) {
         let defaults = ShmHeader::default();
         defaults.init_defaults();
-        for (name, _, bits) in defaults.persisted_settings() {
-            self.apply_persisted_setting(name, bits);
+        let settings: Vec<(&str, u32)> = defaults.persisted_settings().into_iter().map(|(name, _, bits)| (name, bits)).collect();
+        self.write_settings(&settings);
+    }
+
+    /// Writes several settings as one unit (`persisted_settings` names, raw bits, each clamped as
+    /// [`Self::apply_persisted_setting`] does) and bumps `control_seq` once. `tuning_seq` is their
+    /// sequence lock: odd while the values change, even again after, so [`Self::global_tuning`]
+    /// never reads half of a preset or a profile. It only grows (by two per write), and stays
+    /// non-zero once anything has written: that is how "not yet configured" (0) is read. Returns
+    /// whether every name was a setting.
+    pub fn write_settings(&self, settings: &[(&str, u32)]) -> bool {
+        let odd = self.tuning_seq.load(Ordering::Relaxed) | 1;
+        self.tuning_seq.store(odd, Ordering::Relaxed);
+        std::sync::atomic::fence(Ordering::Release);
+        let mut all = true;
+        for (name, bits) in settings {
+            all &= self.apply_persisted_setting(name, *bits);
         }
-        self.tuning_seq.fetch_add(1, Ordering::Relaxed);
+        self.tuning_seq.store(odd.wrapping_add(1).max(2), Ordering::Release);
         self.control_seq.fetch_add(1, Ordering::Relaxed);
+        all
     }
 
     /// Whether this mapping is one of ours and laid out the way this build expects.
@@ -689,14 +711,39 @@ impl ShmHeader {
     }
 
     /// The Model tab's settings, as the network uses them.
+    /// Read under `tuning_seq` ([`Self::write_settings`]): a preset or profile being written is seen
+    /// whole, before or after. A writer that died mid-write (the sequence left on one odd value) is
+    /// recognised after a few thousand looks and the values are read as they stand.
     pub fn global_tuning(&self) -> Tuning {
-        Tuning {
+        let read = || Tuning {
             intensity: f32::from_bits(self.intensity_bits.load(Ordering::Relaxed)),
             local_tone: f32::from_bits(self.local_tone_bits.load(Ordering::Relaxed)),
             local_structure: f32::from_bits(self.local_structure_bits.load(Ordering::Relaxed)),
             skin_structure: f32::from_bits(self.skin_structure_bits.load(Ordering::Relaxed)),
             style: self.style.load(Ordering::Relaxed),
             auto_mask: self.auto_mask.load(Ordering::Relaxed),
+        };
+        // A live writer moves the sequence on within microseconds; one that stays on the same odd
+        // value for this many looks has died mid-write.
+        const STUCK: u32 = 4096;
+        let (mut last, mut same) = (u32::MAX, 0u32);
+        loop {
+            let before = self.tuning_seq.load(Ordering::Acquire);
+            if before & 1 == 0 {
+                let tuning = read();
+                std::sync::atomic::fence(Ordering::Acquire);
+                if self.tuning_seq.load(Ordering::Relaxed) == before {
+                    return tuning;
+                }
+            } else if before == last {
+                same += 1;
+                if same >= STUCK {
+                    return read();
+                }
+            } else {
+                (last, same) = (before, 0);
+            }
+            std::hint::spin_loop();
         }
     }
 
@@ -761,7 +808,11 @@ pub fn store64(lo: &AtomicU32, hi: &AtomicU32, v: u64) {
 /// the sequence odd, it is simply carried through to the next even value.
 fn store_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], s: &str) {
     let bytes = s.as_bytes();
-    let n = bytes.len().min(W * 4 - 1);
+    // Cut at a character boundary: half a UTF-8 sequence would read back as U+FFFD.
+    let mut n = bytes.len().min(W * 4 - 1);
+    while !s.is_char_boundary(n) {
+        n -= 1;
+    }
     let odd = seq.load(Ordering::Relaxed) | 1;
     seq.store(odd, Ordering::Relaxed);
     // Keeps the odd store ordered before the data writes below, as far as a reader
@@ -906,7 +957,10 @@ mod tests {
     #[test]
     fn init_defaults_sets_real_values() {
         let h = ShmHeader::default();
+        h.preupscale_dump_request.store(16, Ordering::Relaxed);
         h.init_defaults();
+        assert_eq!(h.preupscale_dump_request.load(Ordering::Relaxed), 0, "a stale cache-dump request does not survive");
+        assert_eq!(h.magic.load(Ordering::Relaxed), SHM_MAGIC);
         assert!(h.is_valid());
         assert!(h.neural_enabled());
         assert_eq!(f32::from_bits(h.intensity_bits.load(Ordering::Relaxed)), 1.0);
@@ -917,6 +971,45 @@ mod tests {
         assert_eq!(h.seq_resp_b.load(Ordering::Relaxed), 0);
         assert_eq!(h.proxy_format_b.load(Ordering::Relaxed), crate::enums::proxy_format::RGBA8);
         assert_eq!(h.device_lost_at.load(Ordering::Relaxed), 0, "a fresh session has not lost its device");
+    }
+
+    #[test]
+    fn settings_written_together_are_read_together() {
+        let h = std::sync::Arc::new(ShmHeader::default());
+        h.init_defaults();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (h, stop) = (h.clone(), stop.clone());
+            std::thread::spawn(move || {
+                let mut i = 0u32;
+                while !stop.load(Ordering::Relaxed) {
+                    let v = if i.is_multiple_of(2) { 0.5f32 } else { 2.0 };
+                    h.write_settings(&[("intensity", v.to_bits()), ("local_tone", v.to_bits()), ("local_structure", v.to_bits())]);
+                    i += 1;
+                }
+            })
+        };
+        for _ in 0..20_000 {
+            let t = h.global_tuning();
+            assert!(t.intensity == t.local_tone && t.local_tone == t.local_structure, "a torn read: {t:?}");
+        }
+        stop.store(true, Ordering::Relaxed);
+        writer.join().unwrap();
+        assert_eq!(h.tuning_seq.load(Ordering::Relaxed) % 2, 0);
+        assert!(!h.write_settings(&[("no_such_setting", 1)]));
+        // A writer that died mid-write: the sequence stays odd, and the values are still read.
+        h.tuning_seq.store(h.tuning_seq.load(Ordering::Relaxed) | 1, Ordering::Relaxed);
+        let _ = h.global_tuning();
+    }
+
+    #[test]
+    fn long_text_is_cut_at_a_character_boundary() {
+        let h = ShmHeader::default();
+        let name = "é".repeat(200);
+        h.set_game_name(&name);
+        let back = h.game_name();
+        assert!(!back.is_empty() && !back.contains('\u{FFFD}'), "{back:?}");
+        assert!(back.chars().all(|c| c == 'é'));
     }
 
     #[test]

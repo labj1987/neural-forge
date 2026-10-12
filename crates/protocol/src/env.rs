@@ -1,8 +1,12 @@
 //! Environment variables. Every variable this project reads is named `NEURAL_FORGE_*`.
 
-/// `std::env::var(name)`, as an `Option`.
+/// `std::env::var(name)` with surrounding whitespace trimmed, as an `Option`: `None` when the
+/// variable is unset, not UTF-8, or blank. A launch option written by hand often carries a stray
+/// space (`NEURAL_FORGE_PREUPSCALE="off "`), which must not turn a valid value into an unknown one.
 pub fn var(name: &str) -> Option<String> {
-    std::env::var(name).ok()
+    let value = std::env::var(name).ok()?;
+    let trimmed = value.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
 }
 
 /// Whether `name` is set at all, to anything.
@@ -27,5 +31,12 @@ mod tests {
         assert_eq!(var("NEURAL_FORGE_ENVTEST_A").as_deref(), Some("new"));
         std::env::set_var("NEURAL_FORGE_ENVTEST_B", "1");
         assert!(is_set("NEURAL_FORGE_ENVTEST_B") && flag("NEURAL_FORGE_ENVTEST_B"));
+        std::env::set_var("NEURAL_FORGE_ENVTEST_C", " off\t");
+        assert_eq!(var("NEURAL_FORGE_ENVTEST_C").as_deref(), Some("off"), "values are trimmed");
+        std::env::set_var("NEURAL_FORGE_ENVTEST_D", "  ");
+        assert_eq!(var("NEURAL_FORGE_ENVTEST_D"), None, "blank is unset");
+        assert!(is_set("NEURAL_FORGE_ENVTEST_D"));
+        std::env::set_var("NEURAL_FORGE_ENVTEST_E", " 1 ");
+        assert!(flag("NEURAL_FORGE_ENVTEST_E"));
     }
 }

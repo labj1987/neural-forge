@@ -5,6 +5,17 @@
 //! undefined behavior the moment the bytes don't match a declared variant. Read the
 //! raw `u32` and clamp/validate it at the call site instead.
 
+/// Where the model runs relative to DLSS's upscaler (`ShmHeader::preupscale_state`), as the layer
+/// publishes it.
+pub mod preupscale_state {
+    /// After the upscaler (no DLSS, no NVX, or switched off).
+    pub const OFF: u32 = 0;
+    /// Before-the-upscaler tracking is on, but no DLSS input has been held lately.
+    pub const WAITING: u32 = 1;
+    /// Holding DLSS's input: the model runs before the upscaler.
+    pub const HOLDING: u32 = 2;
+}
+
 /// Where the white point comes from: the slider, or the calibration grid measured off
 /// the untouched copy of the frame.
 pub mod white_point_source {

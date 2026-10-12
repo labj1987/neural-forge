@@ -25,50 +25,19 @@ fn judged_name(args: &[String], exe: &str) -> String {
     }
 }
 
-/// Processes that are never the game, by their executable name with spaces, `-` and `_` removed:
-/// Wine's own services and helpers, store launchers and their web helpers (each presents a window of
-/// its own, often game-sized, for as long as it is open), crash reporters and gamescope. Without the
-/// supervisor's `NEURAL_FORGE_TARGET_EXE` the first process to present steadily claims the channel,
-/// so one of these could otherwise hold it while the game itself runs.
-const NEVER_THE_GAME: &[&str] = &[
-    // Wine and Proton.
-    "explorer.exe", "services.exe", "winedevice.exe", "plugplay.exe", "rpcss.exe", "svchost.exe", "conhost.exe",
-    "start.exe", "wineboot.exe", "winemenubuilder.exe", "tabtip.exe", "xalia.exe",
-    // Steam.
-    "steam.exe", "steamwebhelper.exe", "steamservice.exe", "steamerrorreporter.exe", "steamerrorreporter64.exe", "gameoverlayui.exe",
-    // Rockstar Games Launcher and Social Club (also matched by prefix below).
-    "launcher.exe", "launcherpatcher.exe", "rockstarservice.exe", "rockstarlauncher.exe", "socialclubhelper.exe", "socialclub.exe",
-    // Ubisoft Connect.
-    "upc.exe", "uplay.exe", "uplaywebcore.exe", "uplayservice.exe", "ubisoftconnect.exe", "ubisoftgamelauncher.exe", "ubisoftgamelauncher64.exe",
-    // EA app and Origin.
-    "eadesktop.exe", "ealauncher.exe", "eabackgroundservice.exe", "ealocalhostsvc.exe", "eacefsubprocess.exe", "origin.exe",
-    "originwebhelperservice.exe", "originthinsetupinternal.exe", "qtwebengineprocess.exe",
-    // Battle.net.
-    "battle.net.exe", "battle.netlauncher.exe", "agent.exe", "blizzarderror.exe", "blizzardbrowser.exe",
-    // Epic Games Launcher and Epic Online Services.
-    "epicgameslauncher.exe", "epicwebhelper.exe", "epiconlineserviceshost.exe", "epiconlineservicesuserhelper.exe",
-    "eosoverlayrenderer.exe", "eosoverlayrendererwin64shipping.exe", "eosoverlayrendererwin32shipping.exe",
-    // GOG Galaxy.
-    "galaxyclient.exe", "galaxyclienthelper.exe", "galaxycommunication.exe", "goggalaxynotificationsrenderer.exe",
-    // Amazon Games, Riot, Wargaming, Paradox.
-    "amazongamesui.exe", "riotclientservices.exe", "riotclientux.exe", "riotclientuxrender.exe", "wgc.exe", "paradoxlauncher.exe",
-    // Crash reporters.
-    "crashreportclient.exe", "unitycrashhandler64.exe", "unitycrashhandler32.exe",
-    "gamescope",
-];
-
-/// Name prefixes (spaces, `-` and `_` removed) of whole launcher families, whatever the helper.
-const NEVER_THE_GAME_PREFIXES: &[&str] =
-    &["rockstar", "socialclub", "xalia", "ubisoftconnect", "uplay", "battle.net", "epicgameslauncher", "epiconlineservices", "galaxyclient", "riotclient"];
-
+/// Whether this process may claim the channel. An explicit `NEURAL_FORGE_TARGET_EXE` (the supervisor
+/// writes the game's executable into every launch option it sets) is the final word: the process it
+/// names is eligible even when its name is on the denylist (a game whose executable is literally
+/// `Launcher.exe`), and no other process is. Only without a target does the denylist decide.
 fn allowed(args: &[String], exe_path: &str, target: Option<&str>) -> bool {
     let exe = judged_name(args, exe_path);
-    let compact = exe.replace([' ', '-', '_'], "");
-    if exe.is_empty() || NEVER_THE_GAME.contains(&compact.as_str()) || NEVER_THE_GAME_PREFIXES.iter().any(|prefix| compact.starts_with(prefix)) {
+    if exe.is_empty() {
         return false;
     }
-    target.map(|names| names.split(',').any(|name| basename(name.trim()) == exe))
-        .unwrap_or(true)
+    if let Some(names) = target.filter(|t| t.split(',').any(|name| !name.trim().is_empty())) {
+        return names.split(',').map(str::trim).filter(|name| !name.is_empty()).any(|name| basename(name) == exe);
+    }
+    !neural_forge_protocol::processes::never_the_game(&exe)
 }
 
 /// This process's arguments and executable path.
@@ -233,12 +202,19 @@ mod tests {
     /// test holds a lease briefly shares that lease's open file description (and its lock).
     static LEASE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     #[test]
-    fn launchers_cannot_claim_even_when_explicitly_targeted() {
+    fn launchers_cannot_claim_unless_explicitly_targeted() {
         for exe in ["explorer.exe", "Xalia.exe", "Launcher.exe", "SocialClubHelper.exe", "RockstarService.exe", "Rockstar Games Launcher.exe", "Social Club Helper.exe"] {
             let args = vec!["wine64-preloader".into(), format!("C:\\Rockstar Games\\{exe}")];
             assert!(!allowed(&args, "/usr/bin/wine64-preloader", None));
-            assert!(!allowed(&args, "/usr/bin/wine64-preloader", Some(exe)));
+            assert!(!allowed(&args, "/usr/bin/wine64-preloader", Some("GTA5_Enhanced.exe")), "{exe}: another game is the target");
+            // A game whose executable is literally one of these names works when it is the target.
+            assert!(allowed(&args, "/usr/bin/wine64-preloader", Some(exe)), "{exe}, targeted");
         }
+        // An empty or blank target is no target: the denylist decides.
+        let launcher = vec!["wine64-preloader".to_string(), "C:\\x\\Launcher.exe".into()];
+        assert!(!allowed(&launcher, "/usr/bin/wine64-preloader", Some(" , ")));
+        assert!(allowed(&["Z:\\g\\Game.exe".into()], "/usr/bin/wine64-preloader", Some("")));
+        assert!(allowed(&launcher, "/usr/bin/wine64-preloader", Some("Other.exe, Launcher.exe")));
         let wine = "/home/u/.steam/proton/files/bin/wine64-preloader";
         assert!(allowed(&["Z:\\games\\GTA5_Enhanced.exe".into()], wine, Some("GTA5_Enhanced.exe")));
         assert!(!allowed(&["another-game.exe".into()], wine, Some("GTA5_Enhanced.exe")));
@@ -264,7 +240,7 @@ mod tests {
         assert!(allowed(&native, "/opt/mygame/mygame", Some("mygame")));
         assert!(!allowed(&native, "/opt/mygame/mygame", Some("out.exe")));
     }
-    /// The real launcher names (as Wine's `.exe` argument) never claim, targeted or not; a game still does.
+    /// The real launcher names (as Wine's `.exe` argument) never claim unless they are the target; a game still does.
     #[test]
     fn store_launchers_and_their_helpers_never_claim() {
         let wine = "/usr/bin/wine64-preloader";
@@ -276,7 +252,7 @@ mod tests {
         ] {
             let args = vec![wine.to_string(), format!("C:\\Program Files\\{exe}")];
             assert!(!allowed(&args, wine, None), "{exe}");
-            assert!(!allowed(&args, wine, Some(exe)), "{exe}, targeted");
+            assert!(!allowed(&args, wine, Some("Cyberpunk2077.exe")), "{exe}, another game targeted");
         }
         for game in ["GTA5_Enhanced.exe", "ACValhalla.exe", "Cyberpunk2077.exe", "eldenring.exe"] {
             assert!(allowed(&[wine.to_string(), format!("Z:\\g\\{game}")], wine, None), "{game}");

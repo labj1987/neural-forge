@@ -782,13 +782,14 @@ impl ShmClient {
             return false;
         }
         let mut mappings = MAPPINGS.lock().unwrap_or_else(|e| e.into_inner());
-        let base = match mappings.iter().find(|m| m.path == path) {
+        let (base, raw_fd) = match mappings.iter().find(|m| m.path == path) {
             // Another device of this process mapped it already: the same mapping.
-            Some(mapped) => mapped.base as *mut u8,
+            Some(mapped) => (mapped.base as *mut u8, mapped.fd.as_raw_fd()),
             None => match map_channel(path) {
                 Ok((base, fd)) => {
+                    let raw_fd = fd.as_raw_fd();
                     mappings.push(Mapped { path: path.to_owned(), base: base as usize, fd, reserved: [0; Slot::COUNT] });
-                    base
+                    (base, raw_fd)
                 }
                 Err(refused) => {
                     self.map_refused = refused;
@@ -803,12 +804,17 @@ impl ShmClient {
         // SAFETY: mapped for the life of the process; `HEADER_BYTES` is large enough for `ShmHeader`
         // (enforced at compile time in `neural_forge_protocol`).
         let hdr = unsafe { &*header };
-        if hdr.magic.load(Ordering::Relaxed) != SHM_MAGIC || !hdr.is_valid() {
-            // No magic is a new file (a foreign one was refused); a version mismatch is
-            // a stale build of ours. Both get the same answer: (re)initialize rather than
-            // half-read a layout we don't agree on.
-            hdr.init_defaults();
-        }
+        // SAFETY: the descriptor stays open in `MAPPINGS` for the life of the process.
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw_fd) };
+        neural_forge_protocol::mapping::with_init_lock(fd, || {
+            if hdr.magic.load(Ordering::Acquire) != SHM_MAGIC || !hdr.is_valid() {
+                // No magic is a new file (a foreign one was refused); a version mismatch is
+                // a stale build of ours. Both get the same answer: (re)initialize rather than
+                // half-read a layout we don't agree on. Under the file's lock, so a front end
+                // opening it at the same moment neither initialises it too nor reads it half done.
+                hdr.init_defaults();
+            }
+        });
         self.last_heartbeat = hdr.server_heartbeat.load(Ordering::Relaxed);
         self.last_control_seq = hdr.control_seq.load(Ordering::Relaxed);
         self.header = header;
@@ -988,6 +994,22 @@ fn map_channel(path: &str) -> Result<(*mut u8, OwnedFd), bool> {
     // SAFETY: `raw_fd` was just returned by a successful `open()` and is owned nowhere else.
     let fd = unsafe { OwnedFd::from_raw_fd(raw_fd) };
 
+    neural_forge_protocol::mapping::with_init_lock(fd.as_fd(), || size_channel(path, &fd))?;
+    // SAFETY: `fd` is open and sized to at least `total` bytes; mapping the whole file (header plus
+    // both slots' regions) is in bounds. It is never unmapped, so everything derived from it stays
+    // valid for the life of the process. A `MAP_SHARED` file mapping is sparse and page-cache backed:
+    // it costs only the pages a session touches.
+    let total = neural_forge_protocol::shm_total_bytes();
+    let p = unsafe { libc::mmap(std::ptr::null_mut(), total, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
+    if p == libc::MAP_FAILED {
+        crate::log!("[shm] mmap {path} failed; not retrying");
+        return Err(true);
+    }
+    Ok((p.cast::<u8>(), fd))
+}
+
+/// Classifies and sizes the channel file under its init lock (`mapping::with_init_lock`).
+fn size_channel(path: &str, fd: &OwnedFd) -> Result<(), bool> {
     // Sizing the file and writing a header over its start is only for a file that is new or
     // already a mapping; a path naming anything else is left exactly as it is.
     match neural_forge_protocol::mapping::channel_file(fd.as_fd()) {
@@ -1019,16 +1041,7 @@ fn map_channel(path: &str) -> Result<(*mut u8, OwnedFd), bool> {
         crate::log!("[shm] cannot back the header of {path} (error {err}, is /tmp full?)");
         return Err(false);
     }
-    // SAFETY: `fd` is open and sized to at least `total` bytes; mapping the whole file (header plus
-    // both slots' regions) is in bounds. It is never unmapped, so everything derived from it stays
-    // valid for the life of the process. A `MAP_SHARED` file mapping is sparse and page-cache backed:
-    // it costs only the pages a session touches.
-    let p = unsafe { libc::mmap(std::ptr::null_mut(), total, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd.as_raw_fd(), 0) };
-    if p == libc::MAP_FAILED {
-        crate::log!("[shm] mmap {path} failed; not retrying");
-        return Err(true);
-    }
-    Ok((p.cast::<u8>(), fd))
+    Ok(())
 }
 
 /// Refuses to create or use the mapping's directory unless it is private: a directory,

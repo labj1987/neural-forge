@@ -119,6 +119,68 @@ pub fn channel_file(fd: BorrowedFd<'_>) -> Option<ChannelFile> {
     }
 }
 
+/// Runs `f` holding an exclusive `flock` on the channel file `fd`: classifying, sizing and
+/// initialising a channel happen under it in every process that opens one (this module and the
+/// layer), so two processes finding the same new file cannot both initialise it (the header has a
+/// single writer per field), nor can one read a header another is still writing. The lock is the
+/// file's own, separate from the ownership lease (`<channel>.owner`), and held only for those steps.
+pub fn with_init_lock<R>(fd: BorrowedFd<'_>, f: impl FnOnce() -> R) -> R {
+    struct Unlock(i32);
+    impl Drop for Unlock {
+        fn drop(&mut self) {
+            // SAFETY: plain call on a descriptor that is open for the guard's lifetime.
+            unsafe { libc::flock(self.0, libc::LOCK_UN) };
+        }
+    }
+    // SAFETY: plain call on an open descriptor. Interrupted waits are retried; any other failure
+    // (no flock support) proceeds unlocked, as before.
+    while unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX) } != 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {}
+    let _unlock = Unlock(fd.as_raw_fd());
+    f()
+}
+
+/// A read-only look at an existing channel, for diagnostics (`doctor`, the report, `shmctl
+/// status`): nothing is created, sized, initialised or healed, and nothing written through it
+/// reaches the file (the mapping is private). `Ok(None)` when there is no channel file yet (no
+/// game and no front end has opened one this boot).
+pub fn open_existing(path: &str) -> Result<Option<Mapping>, OpenError> {
+    if !crate::isolated_path(path) {
+        return Err(OpenError::Unavailable);
+    }
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(None);
+    }
+    let fd = crate::private_dir::open_private_file(path, libc::O_RDONLY, 0).ok_or(OpenError::Unavailable)?;
+    match channel_file(fd.as_fd()) {
+        Some(ChannelFile::Ours) => {}
+        Some(ChannelFile::New | ChannelFile::Blank) => return Ok(None),
+        Some(ChannelFile::Foreign) => return Err(OpenError::Foreign),
+        None => return Err(OpenError::Unavailable),
+    }
+    // SAFETY: plain out-parameter.
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: `fd` is open.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut st) } != 0 || (st.st_size as usize) < HEADER_BYTES {
+        return Err(OpenError::Unavailable);
+    }
+    // SAFETY: the file is at least `HEADER_BYTES` long. A private writable mapping of a read-only
+    // descriptor: loads see the file, any store stays in this process. Never unmapped (see
+    // `Mapping::header`).
+    let map = unsafe { libc::mmap(std::ptr::null_mut(), HEADER_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_PRIVATE, fd.as_raw_fd(), 0) };
+    if map == libc::MAP_FAILED {
+        return Err(OpenError::Unavailable);
+    }
+    let header = map.cast::<ShmHeader>();
+    // SAFETY: just mapped, large enough for `ShmHeader`.
+    let found = unsafe { &*header }.version.load(Ordering::Acquire);
+    if found != SHM_VERSION {
+        // SAFETY: mapped above with exactly this length; nothing derived from it escapes.
+        unsafe { libc::munmap(map, HEADER_BYTES) };
+        return Err(OpenError::WrongVersion { found });
+    }
+    Ok(Some(Mapping { _fd: fd, header, freshly_created: false }))
+}
+
 /// Opens the mapping at `$NEURAL_FORGE_SHM` (or the default runtime path), creating it if
 /// necessary. A caller that has a `config.ini` resolves the path once through the
 /// supervisor (`neural_forge_supervisor::channel_path`) and uses [`open_path`] instead,
@@ -146,9 +208,14 @@ pub fn open_path(path: &str) -> Result<Mapping, OpenError> {
         return Err(OpenError::Unavailable);
     }
     let fd = crate::private_dir::open_private_file(path, libc::O_RDWR | libc::O_CREAT, 0o600).ok_or(OpenError::Unavailable)?;
+    let opened = with_init_lock(fd.as_fd(), || open_locked(fd.as_fd()))?;
+    Ok(Mapping { _fd: fd, header: opened.0, freshly_created: opened.1 })
+}
 
+/// [`open_path`]'s steps under the file's init lock: classify, size, map, initialise or check.
+fn open_locked(fd: BorrowedFd<'_>) -> Result<(*mut ShmHeader, bool), OpenError> {
     // Before the file is sized or written: is it one of ours, or new?
-    match channel_file(fd.as_fd()) {
+    match channel_file(fd) {
         Some(ChannelFile::New | ChannelFile::Ours | ChannelFile::Blank) => {}
         Some(ChannelFile::Foreign) => return Err(OpenError::Foreign),
         None => return Err(OpenError::Unavailable),
@@ -187,8 +254,7 @@ pub fn open_path(path: &str) -> Result<Mapping, OpenError> {
         }
         return Err(OpenError::WrongVersion { found });
     }
-
-    Ok(Mapping { _fd: fd, header, freshly_created })
+    Ok((header, freshly_created))
 }
 
 #[cfg(test)]
@@ -214,6 +280,35 @@ mod tests {
         assert!(mapping.header().is_valid());
         assert!(mapping.header().neural_enabled());
         assert_eq!(f32::from_bits(mapping.header().intensity_bits.load(Ordering::Relaxed)), 1.0);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn open_existing_creates_nothing_and_writes_nothing() {
+        let path = scratch_path();
+        assert!(open_existing(&path).unwrap().is_none(), "no file: no channel");
+        assert!(!std::path::Path::new(&path).exists(), "and none was created");
+        let live = open_path(&path).unwrap();
+        live.header().intensity_bits.store(0.25f32.to_bits(), Ordering::Relaxed);
+        let look = open_existing(&path).unwrap().unwrap();
+        assert_eq!(f32::from_bits(look.header().intensity_bits.load(Ordering::Relaxed)), 0.25);
+        look.header().intensity_bits.store(3.0f32.to_bits(), Ordering::Relaxed);
+        assert_eq!(f32::from_bits(live.header().intensity_bits.load(Ordering::Relaxed)), 0.25, "a store through the look stays private");
+        live.header().version.store(SHM_VERSION + 1, Ordering::Relaxed);
+        assert_eq!(open_existing(&path).err(), Some(OpenError::WrongVersion { found: SHM_VERSION + 1 }));
+        cleanup(&path);
+    }
+
+    /// Many openers racing on one new file: exactly one initialises it, and none sees a header
+    /// that is not either absent or complete.
+    #[test]
+    fn concurrent_openers_initialise_a_new_file_once() {
+        let path = scratch_path();
+        let fresh: usize = std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8).map(|_| s.spawn(|| open_path(&path).map(|m| usize::from(m.freshly_created)))).collect();
+            handles.into_iter().map(|h| h.join().unwrap().expect("every opener succeeds")).sum()
+        });
+        assert_eq!(fresh, 1);
         cleanup(&path);
     }
 
@@ -303,15 +398,17 @@ mod tests {
     #[test]
     fn a_directory_shared_with_other_users_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        // A runtime directory by name (`neural-forge-<uid>`), as the default path's is.
+        // Named like a runtime directory, but not the one `shm_runtime_dir` names: refused as it
+        // is, its mode untouched (only the real runtime directory is healed, `private_dir`).
         let scratch = scratch_path();
         let path = format!("{}/neural-forge-heal/shm.bin", scratch.trim_end_matches("/shm.bin"));
         let dir = std::path::Path::new(&path).parent().unwrap().to_path_buf();
         std::fs::create_dir_all(&dir).unwrap();
-        // Our own directory with a loose mode is tightened, not refused.
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(open_path(&path).err(), Some(OpenError::Unavailable));
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o755);
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(open_path(&path).is_ok());
-        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
         // A symlink in place of the directory is refused.
         let link = format!("{}-link", dir.display());
         std::os::unix::fs::symlink(&dir, &link).unwrap();

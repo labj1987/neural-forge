@@ -90,10 +90,12 @@ pub fn parse_line(line: &str) -> Option<Event> {
     KINDS.contains(&kind).then(|| Event { time, pid, process, kind: kind.to_string(), message })
 }
 
-/// Every parseable event in `dir`'s rotated file and then its current one, oldest first.
+/// Every parseable event in `dir`'s rotated file and then its current one, oldest first. Bytes
+/// that are not UTF-8 (a line torn by a crash mid-character) spoil only their own line.
 pub fn read_dir_events(dir: &Path) -> std::io::Result<Vec<Event>> {
-    let mut text = std::fs::read_to_string(dir.join(ROTATED_NAME)).unwrap_or_default();
-    match std::fs::read_to_string(dir.join(FILE_NAME)) {
+    let read = |name: &str| std::fs::read(dir.join(name)).map(|b| String::from_utf8_lossy(&b).into_owned());
+    let mut text = read(ROTATED_NAME).unwrap_or_default();
+    match read(FILE_NAME) {
         Ok(current) => text.push_str(&current),
         Err(e) if text.is_empty() => return Err(e),
         Err(_) => {}
@@ -104,20 +106,74 @@ pub fn read_dir_events(dir: &Path) -> std::io::Result<Vec<Event>> {
 /// Appends `line` to the file at `path`, rotating it to [`ROTATED_NAME`] first when it has reached
 /// `rotate_at` bytes. Creates the directory (0700) and the file (0600). One `write` per line with
 /// `O_APPEND`, so two processes appending at once never interleave inside a line.
+///
+/// Every process appending takes the file's `flock` and checks that what it opened is still the
+/// file at `path`: a rotation (a rename, under that lock) by another process sends it to the new
+/// file instead of writing into, or rotating again, the one just rotated away.
 pub fn append(path: &Path, line: &str, rotate_at: u64) -> std::io::Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
     let dir = path.parent().ok_or_else(|| std::io::Error::other("the state log has no directory"))?;
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-    if std::fs::metadata(path).is_ok_and(|m| m.len() >= rotate_at) {
-        std::fs::rename(path, dir.join(ROTATED_NAME))?;
+    for _ in 0..8 {
+        let mut file = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
+        // SAFETY: plain call on the descriptor just opened; the lock goes with it on drop.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let meta = file.metadata()?;
+        let current = std::fs::symlink_metadata(path).ok().map(|m| (m.dev(), m.ino()));
+        if current != Some((meta.dev(), meta.ino())) {
+            continue; // rotated away between the open and the lock
+        }
+        if meta.len() >= rotate_at {
+            std::fs::rename(path, dir.join(ROTATED_NAME))?;
+            continue;
+        }
+        return file.write_all(line.as_bytes());
     }
-    let mut file = std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)?;
-    file.write_all(line.as_bytes())
+    Err(std::io::Error::other("the state log kept being rotated"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_appends_across_a_rotation_lose_no_line() {
+        let dir = scratch("concurrent");
+        let path = dir.join(FILE_NAME);
+        std::thread::scope(|s| {
+            for t in 0..4 {
+                let path = &path;
+                s.spawn(move || {
+                    for i in 0..200 {
+                        append(path, &format!("{i}\t{t}\tg.exe\tattach\tx\n"), 4096).unwrap();
+                    }
+                });
+            }
+        });
+        // Rotation keeps one older file: every line is either in it, in the current file, or was in
+        // a file rotated away twice. What must not happen is a line lost inside the two files, or a
+        // rotated file clobbered by a small one: the rotated file holds at least `rotate_at` bytes.
+        let rotated = std::fs::metadata(dir.join(ROTATED_NAME)).unwrap().len();
+        assert!(rotated >= 4096, "{rotated}");
+        let events = read_dir_events(&dir).unwrap();
+        assert!(events.len() as u64 * 20 >= 4096);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_line_with_bad_bytes_spoils_only_itself() {
+        let dir = scratch("lossy");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ROTATED_NAME), b"1\t2\tg.exe\tattach\tok\n9\t9\tg\xff.exe\tattach\tbad\n").unwrap();
+        std::fs::write(dir.join(FILE_NAME), b"3\t2\tg.exe\tattach\tlater\n").unwrap();
+        let events = read_dir_events(&dir).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].message, "ok");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 
     fn scratch(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("neural-forge-state-log-{name}-{}", std::process::id()));
