@@ -118,6 +118,9 @@ mod tests {
         assert!(write_png(&dir.join("bad.png"), &[0; 7], 2, 1, false, true).is_err());
         // A missing directory fails at the temporary file.
         assert!(write_png(&dir.join("missing/x.png"), &[0; 8], 2, 1, false, true).is_err());
+        // A failure after the file was created (the encoder refuses a 0x0 image): nothing is left
+        // under the final name, and no temporary file either.
+        assert!(write_png(&dir.join("empty.png"), &[], 0, 0, false, true).is_err());
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }

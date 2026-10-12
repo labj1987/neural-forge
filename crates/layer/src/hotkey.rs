@@ -14,9 +14,11 @@
 //!   XWayland, so it is not an option. The connection is the layer's own: an I/O error on it (the
 //!   X server going away) marks the backend dead instead of letting Xlib end the game's process.
 //!
-//! The key is global, not the game window's: evdev sees every press on the machine, so the toggle
-//! fires whichever window has focus. Pick a key nothing else uses while a game runs. Only presses of
-//! the watched key are kept; every other key code read is dropped at once.
+//! Both backends see presses whatever has the focus, so a press acts only while the game has it:
+//! the window the X server (XWayland) names active (`_NET_ACTIVE_WINDOW`) belongs to this process
+//! ([`Focus`]). Where that cannot be told (no X server, or one without EWMH, as inside gamescope) a
+//! press is ignored unless `NEURAL_FORGE_HOTKEY_GLOBAL=1` asks for the key to act whatever has the
+//! focus. Only presses of the watched key are kept; every other key code read is dropped at once.
 //!
 //! Neither links X11: libX11/libXi are `dlopen`ed only when the evdev backend is unavailable, so
 //! a Vulkan process on a machine with no X at all is unaffected.
@@ -26,7 +28,7 @@
 //! header names, and `NEURAL_FORGE_HOTKEY_BACKEND` (`evdev` or `x11`) forces one backend.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CString};
+use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr, CString};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -475,6 +477,149 @@ unsafe extern "C" fn io_error_exit(_display: *mut c_void, _data: *mut c_void) {
     X11_DEAD.store(true, Ordering::Release);
 }
 
+// ---- whether the game has the keyboard focus ----------------------------------------------------
+
+/// The game's keyboard focus as the X server (or XWayland) sees it: the window EWMH names active
+/// (`_NET_ACTIVE_WINDOW` on the root) belongs to this process (`_NET_WM_PID`, which Wine sets on its
+/// windows). Through libxcb, `dlopen`ed: its requests return errors as values, so a query racing a
+/// window's destruction, or the server going away, can never reach an Xlib error handler (which in
+/// a game process may end it). Asked only when the toggle key was pressed.
+struct Focus {
+    lib: *mut c_void,
+    conn: *mut c_void,
+    root: u32,
+    active: u32,
+    pid: u32,
+    has_error: unsafe extern "C" fn(*mut c_void) -> c_int,
+    get_property: unsafe extern "C" fn(*mut c_void, u8, u32, u32, u32, u32, u32) -> u32,
+    get_property_reply: unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> *mut c_void,
+    value: unsafe extern "C" fn(*const c_void) -> *mut c_void,
+    value_length: unsafe extern "C" fn(*const c_void) -> c_int,
+    disconnect: unsafe extern "C" fn(*mut c_void),
+}
+
+/// `xcb_screen_iterator_t`, of which only `data` (whose first field is the root window) is read.
+#[repr(C)]
+struct XcbScreenIterator {
+    data: *const u32,
+    rem: c_int,
+    index: c_int,
+}
+
+const XCB_ATOM_WINDOW: u32 = 33;
+const XCB_ATOM_CARDINAL: u32 = 6;
+
+impl Focus {
+    fn open() -> Option<Self> {
+        std::env::var_os("DISPLAY")?;
+        // SAFETY: a plain dlopen of a NUL-terminated name.
+        let lib = unsafe { libc::dlopen(c"libxcb.so.1".as_ptr(), libc::RTLD_LAZY | libc::RTLD_LOCAL) };
+        if lib.is_null() {
+            return None;
+        }
+        // SAFETY: every type below matches the named libxcb function's C signature.
+        let focus = unsafe {
+            (|| {
+                let connect: unsafe extern "C" fn(*const c_char, *mut c_int) -> *mut c_void = sym(lib, "xcb_connect")?;
+                let has_error: unsafe extern "C" fn(*mut c_void) -> c_int = sym(lib, "xcb_connection_has_error")?;
+                let disconnect: unsafe extern "C" fn(*mut c_void) = sym(lib, "xcb_disconnect")?;
+                let get_setup: unsafe extern "C" fn(*mut c_void) -> *const c_void = sym(lib, "xcb_get_setup")?;
+                let roots: unsafe extern "C" fn(*const c_void) -> XcbScreenIterator = sym(lib, "xcb_setup_roots_iterator")?;
+                let intern: unsafe extern "C" fn(*mut c_void, u8, u16, *const c_char) -> u32 = sym(lib, "xcb_intern_atom")?;
+                let intern_reply: unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> *mut c_void = sym(lib, "xcb_intern_atom_reply")?;
+                let get_property = sym(lib, "xcb_get_property")?;
+                let get_property_reply = sym(lib, "xcb_get_property_reply")?;
+                let value = sym(lib, "xcb_get_property_value")?;
+                let value_length = sym(lib, "xcb_get_property_value_length")?;
+                let mut screen = 0;
+                let conn = connect(std::ptr::null(), &mut screen);
+                if conn.is_null() || has_error(conn) != 0 {
+                    if !conn.is_null() {
+                        disconnect(conn);
+                    }
+                    return None;
+                }
+                // The first screen's root: the game's (a Wine process uses the default display).
+                let _ = screen;
+                let it = roots(get_setup(conn));
+                let root = if it.data.is_null() { 0 } else { *it.data };
+                let atom = |name: &CStr| {
+                    let cookie = intern(conn, 1, name.to_bytes().len() as u16, name.as_ptr());
+                    let reply = intern_reply(conn, cookie, std::ptr::null_mut());
+                    if reply.is_null() {
+                        return 0;
+                    }
+                    // `xcb_intern_atom_reply_t`: response type, pad, sequence, length, then the atom.
+                    let atom = *reply.cast::<u8>().add(8).cast::<u32>();
+                    libc::free(reply);
+                    atom
+                };
+                let (active, pid) = (atom(c"_NET_ACTIVE_WINDOW"), atom(c"_NET_WM_PID"));
+                if root == 0 || active == 0 || pid == 0 {
+                    disconnect(conn);
+                    return None;
+                }
+                Some(Focus { lib, conn, root, active, pid, has_error, get_property, get_property_reply, value, value_length, disconnect })
+            })()
+        };
+        if focus.is_none() {
+            // SAFETY: the handle from the dlopen above, nothing of it in use.
+            unsafe { libc::dlclose(lib) };
+        }
+        focus
+    }
+
+    /// One 32-bit value of `property` on `window`, `None` without it (or on any error).
+    fn property(&self, window: u32, property: u32, kind: u32) -> Option<u32> {
+        // SAFETY: a live connection; the reply is freed once read, and its value is read only when
+        // it holds at least one 32-bit item.
+        unsafe {
+            let cookie = (self.get_property)(self.conn, 0, window, property, kind, 0, 1);
+            let reply = (self.get_property_reply)(self.conn, cookie, std::ptr::null_mut());
+            if reply.is_null() {
+                return None;
+            }
+            let value = ((self.value_length)(reply) >= 1).then(|| *(self.value)(reply).cast::<u32>());
+            libc::free(reply);
+            value
+        }
+    }
+
+    /// Whether the active window is this process's: `None` when the server does not say (no active
+    /// window property, a window without a PID, a broken connection).
+    fn game_focused(&self) -> Option<bool> {
+        // SAFETY: a live connection.
+        if unsafe { (self.has_error)(self.conn) } != 0 {
+            return None;
+        }
+        let window = self.property(self.root, self.active, XCB_ATOM_WINDOW)?;
+        if window == 0 {
+            // No X window is active: a native Wayland window (or nothing) has the focus.
+            return Some(false);
+        }
+        Some(self.property(window, self.pid, XCB_ATOM_CARDINAL)? == std::process::id())
+    }
+}
+
+impl Drop for Focus {
+    fn drop(&mut self) {
+        // SAFETY: the connection is closed once, before its library is unloaded.
+        unsafe {
+            (self.disconnect)(self.conn);
+            libc::dlclose(self.lib);
+        }
+    }
+}
+
+/// What a press of the toggle key does, given whether the game has the focus (`None`: unknown) and
+/// whether the user asked for a global key (`NEURAL_FORGE_HOTKEY_GLOBAL=1`).
+fn press_acts(focused: Option<bool>, global: bool) -> bool {
+    match focused {
+        Some(focused) => focused || global,
+        None => global,
+    }
+}
+
 // ---- the poller -----------------------------------------------------------------------------
 
 enum Backend {
@@ -490,6 +635,8 @@ pub struct Poller {
     pending: u32,
     pending_key: u32,
     last_poll: Option<Instant>,
+    /// The focus check, opened with the first press (`None` inside: there is no X server to ask).
+    focus: Option<Option<Focus>>,
 }
 
 // The backends hold raw descriptors/pointers used only from the layer's serialized present hook.
@@ -497,7 +644,7 @@ unsafe impl Send for Poller {}
 
 impl Default for Poller {
     fn default() -> Self {
-        Self { backend: Backend::Unopened, pending: 0, pending_key: 0, last_poll: None }
+        Self { backend: Backend::Unopened, pending: 0, pending_key: 0, last_poll: None, focus: None }
     }
 }
 
@@ -555,12 +702,26 @@ impl Poller {
                 Backend::Unopened | Backend::None => 0,
             };
         }
-        if self.pending > 0 && key == self.pending_key {
-            self.pending -= 1;
-            true
-        } else {
-            false
+        if self.pending == 0 || key != self.pending_key {
+            return false;
         }
+        self.pending -= 1;
+        // Both backends see every press on the machine: the key acts only while the game has the
+        // focus, or anywhere when the user asked for that.
+        static GLOBAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::flag("NEURAL_FORGE_HOTKEY_GLOBAL"));
+        let focus = self.focus.get_or_insert_with(Focus::open);
+        let focused = focus.as_ref().and_then(Focus::game_focused);
+        let acts = press_acts(focused, *GLOBAL);
+        if focused.is_none() && !*GLOBAL {
+            static SAID: AtomicBool = AtomicBool::new(false);
+            if !SAID.swap(true, Ordering::Relaxed) {
+                crate::log!(
+                    "[hotkey] the toggle key was pressed, but whether the game has the focus cannot be told here (no X server, \
+                     or no _NET_ACTIVE_WINDOW): ignored; NEURAL_FORGE_HOTKEY_GLOBAL=1 makes it act whatever has the focus"
+                );
+            }
+        }
+        acts
     }
 }
 
@@ -598,8 +759,12 @@ mod tests {
         p.pending = 1;
         p.pending_key = 87;
         p.last_poll = Some(Instant::now());
+        // No X server to ask about the focus here: the press is consumed, and acts only when global.
+        p.focus = Some(None);
         assert!(!p.pressed(88), "another key's press is never one of these");
-        assert!(p.pressed(87));
+        assert_eq!(p.pending, 1);
+        assert_eq!(p.pressed(87), press_acts(None, neural_forge_protocol::env::flag("NEURAL_FORGE_HOTKEY_GLOBAL")));
+        assert_eq!(p.pending, 0, "delivered once");
         assert!(!p.pressed(87));
     }
 
@@ -624,5 +789,16 @@ mod tests {
         X11_DEAD.store(false, Ordering::SeqCst);
         X11_DISPLAY.store(std::ptr::null_mut(), Ordering::SeqCst);
         PREVIOUS_IO_ERROR.store(0, Ordering::SeqCst);
+    }
+
+    /// A press acts with the game focused; never with another window focused unless global was asked
+    /// for; and where focus cannot be told only when global was asked for.
+    #[test]
+    fn a_press_acts_only_with_the_game_focused_unless_global() {
+        assert!(press_acts(Some(true), false));
+        assert!(!press_acts(Some(false), false));
+        assert!(press_acts(Some(false), true));
+        assert!(!press_acts(None, false));
+        assert!(press_acts(None, true));
     }
 }
