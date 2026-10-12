@@ -41,11 +41,18 @@ fn import_binaries_fails_when_the_dll_is_not_there() {
 }
 
 #[test]
-fn doctor_opens_the_channel() {
+fn doctor_reads_the_channel_without_creating_it() {
     let dir = scratch("doctor");
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let (_, out) = cli(&dir, &dir.join("shm.bin"), &["doctor"]);
+    assert!(out.lines().any(|l| l.starts_with("[info] channel: no settings channel yet")), "{out}");
+    assert!(!dir.join("shm.bin").exists() && !dir.join("data").exists(), "the doctor only looks");
+    assert!(out.contains("[info] xid: journalctl is not installed"), "the kernel log is not read: {out}");
+    let (ok, out) = cli(&dir, &dir.join("shm.bin"), &["shmctl", "set", "debug_view", "0"]);
+    assert!(ok, "{out}");
     let (_, out) = cli(&dir, &dir.join("shm.bin"), &["doctor"]);
     assert!(out.lines().any(|l| l == "[ok] channel: the settings channel opens"), "{out}");
-    assert!(out.contains("[info] xid: journalctl is not installed"), "the kernel log is not read: {out}");
 
     // A runtime directory that cannot hold the channel (a file where the directory goes).
     std::fs::write(dir.join("not-a-dir"), "").unwrap();

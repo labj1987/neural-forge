@@ -20,7 +20,12 @@ pub struct Config {
 
 impl Config {
     pub fn load() -> Self {
-        let mut map = neural_forge_protocol::persist::read_config(&paths::config_file());
+        Self::load_from(&paths::config_file())
+    }
+
+    /// [`Config::load`] from `file` instead of the user's `config.ini`.
+    pub fn load_from(file: &str) -> Self {
+        let mut map = neural_forge_protocol::persist::read_config(file);
         let mut cfg = Self { binaries: map.remove("binaries").unwrap_or_default(), shm: map.remove("shm").unwrap_or_default(), settings: map };
         if !neural_forge_protocol::isolated_path(&cfg.shm) {
             cfg.shm.clear();

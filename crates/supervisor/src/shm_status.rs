@@ -17,6 +17,19 @@ pub fn server_state_name(v: u32) -> &'static str {
     }
 }
 
+/// The channel's status text and the game it names, looked at read-only
+/// (`neural_forge_protocol::mapping::open_existing`): `shmctl status`, the report and the GUI's
+/// "Save report" never create the channel, apply settings to it or write to it. Without a
+/// channel, or with one that cannot be read, the text says so and the game is empty.
+pub fn look(cfg: &crate::Config) -> (String, String) {
+    let path = crate::channel_path(cfg);
+    match neural_forge_protocol::mapping::open_existing(&path) {
+        Ok(Some(mapping)) => (status_text(mapping.header()), mapping.header().game_name()),
+        Ok(None) => (format!("no channel at {path}: no game and no Neural Forge window has opened it since the computer started\n"), String::new()),
+        Err(e) => (format!("channel not readable: {e}: {path}\n"), String::new()),
+    }
+}
+
 /// `header`'s live status fields, then its settings (`ShmHeader::persisted_settings`).
 pub fn status_text(header: &ShmHeader) -> String {
     let mut s = String::new();
@@ -41,11 +54,14 @@ pub fn status_text(header: &ShmHeader) -> String {
     line(format_args!("layer_capture_gpu_ms={}", f32::from_bits(header.layer_capture_gpu_ms_bits.load(Ordering::Relaxed))));
     line(format_args!("layer_compose_gpu_ms={}", f32::from_bits(header.layer_compose_gpu_ms_bits.load(Ordering::Relaxed))));
     let preupscale = header.preupscale_state.load(Ordering::Relaxed);
-    line(format_args!("preupscale_state={preupscale} ({})", match preupscale {
-        0 => "off",
-        1 => "waiting for DLSS input",
-        2 => "holding",
-        _ => "unknown",
+    line(format_args!("preupscale_state={preupscale} ({})", {
+        use neural_forge_protocol::enums::preupscale_state::*;
+        match preupscale {
+            OFF => "off",
+            WAITING => "waiting for DLSS input",
+            HOLDING => "holding",
+            _ => "unknown",
+        }
     }));
     line(format_args!("layer_reason={}", header.layer_reason()));
     line(format_args!("native_running={}", header.native_running.load(Ordering::Relaxed)));

@@ -24,6 +24,54 @@ fn refreshing() -> bool {
     REFRESHING.with(std::cell::Cell::get)
 }
 
+/// A toast showing `text` as written. libadwaita reads a toast's title as Pango markup, so a game,
+/// profile or file name holding `&` or `<` would otherwise be shown wrong or not at all: every
+/// toast goes through here.
+fn toast(text: &str) -> adw::Toast {
+    adw::Toast::new(&glib::markup_escape_text(text))
+}
+
+/// Whether a game's layer is alive: its heartbeat (`layer_heartbeat`) changed within the last two
+/// seconds. A closed game leaves its last values in the channel; only a moving heartbeat says they
+/// are current. Each timer that asks keeps its own.
+#[derive(Default)]
+struct Liveness(std::cell::Cell<(Option<u32>, Option<std::time::Instant>)>);
+
+impl Liveness {
+    fn alive(&self, hdr: &neural_forge_protocol::ShmHeader) -> bool {
+        let now = hdr.layer_heartbeat.load(Ordering::Relaxed);
+        let (seen, changed) = self.0.get();
+        let changed = match seen {
+            Some(seen) if seen != now => Some(std::time::Instant::now()),
+            _ => changed,
+        };
+        self.0.set((Some(now), changed));
+        changed.is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(2))
+    }
+}
+
+thread_local! {
+    /// Set when the window closes: every periodic update ([`every`]) stops then.
+    static STOPPED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Runs `update` now and then every `period` for as long as `owner` exists and the window is open.
+/// The timer holds `owner` weakly, so it neither keeps a closed page's widgets alive nor runs on
+/// after them.
+fn every<W: IsA<glib::Object>>(owner: &W, period: std::time::Duration, update: impl Fn(&W) + 'static) {
+    update(owner);
+    let owner = owner.downgrade();
+    glib::timeout_add_local(period, move || match owner.upgrade() {
+        Some(owner) if !STOPPED.with(std::cell::Cell::get) => {
+            update(&owner);
+            glib::ControlFlow::Continue
+        }
+        _ => glib::ControlFlow::Break,
+    });
+}
+
+const SECOND: std::time::Duration = std::time::Duration::from_secs(1);
+
 fn register_refresher(f: impl Fn() + 'static) {
     REFRESHERS.with(|r| r.borrow_mut().push(Box::new(f)));
 }
@@ -137,11 +185,11 @@ fn combo_row(title: &str, options: &[&str], selected: u32, setter: impl Fn(u32) 
     row
 }
 
-/// The strength preset menu: choosing a preset sets the four rows (`rows`, in
-/// `neural_forge_supervisor::presets::KNOBS`' order) through their own handlers, so the values are
-/// written and saved exactly as if typed in. It shows the preset the rows match, else "Custom".
-fn preset_row(rows: &[adw::SpinRow; 4]) -> adw::ComboRow {
-    use neural_forge_supervisor::presets::{matching, PRESETS};
+/// The strength preset menu: choosing a preset writes its four values to the header as one unit
+/// (`Knobs::write`, so the layer never sees half of a preset) and saves them; the four rows follow
+/// the header. It shows the preset the header matches, else "Custom".
+fn preset_row(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, rows: &[adw::SpinRow]) -> adw::ComboRow {
+    use neural_forge_supervisor::presets::{matching, Knobs, KNOBS, PRESETS};
     let mut names: Vec<&str> = PRESETS.iter().map(|p| p.name).collect();
     names.push("Custom");
     let custom = PRESETS.len() as u32;
@@ -149,17 +197,15 @@ fn preset_row(rows: &[adw::SpinRow; 4]) -> adw::ComboRow {
     row.set_title("Strength preset");
     row.set_subtitle("Sets the four values below. Reference is Neural Forge's defaults");
     row.set_model(Some(&gtk4::StringList::new(&names)));
-    let rows = std::rc::Rc::new(rows.clone());
-    // Set while this code changes the menu or the rows, so neither reacts to the other.
+    // Set while this code changes the menu, so it does not react to itself.
     let syncing = std::rc::Rc::new(std::cell::Cell::new(false));
     let sync = {
         let row = row.downgrade();
-        let rows = std::rc::Rc::clone(&rows);
+        let shm = std::sync::Arc::clone(shm);
         let syncing = std::rc::Rc::clone(&syncing);
         std::rc::Rc::new(move || {
             let Some(row) = row.upgrade() else { return };
-            let values = [0, 1, 2, 3].map(|i| rows[i].value() as f32);
-            let shown = matching(values).map_or(custom, |i| i as u32);
+            let shown = matching(&Knobs::from_header(shm.header())).map_or(custom, |i| i as u32);
             if row.selected() != shown {
                 syncing.set(true);
                 row.set_selected(shown);
@@ -169,33 +215,26 @@ fn preset_row(rows: &[adw::SpinRow; 4]) -> adw::ComboRow {
     };
     sync();
     {
-        let rows = std::rc::Rc::clone(&rows);
+        let shm = std::sync::Arc::clone(shm);
         let syncing = std::rc::Rc::clone(&syncing);
         let sync = std::rc::Rc::clone(&sync);
         row.connect_selected_notify(move |row| {
             if syncing.get() || refreshing() {
                 return;
             }
-            // "Custom" sets nothing; the menu goes back to what the rows match.
+            // "Custom" sets nothing; the menu goes back to what the header matches.
             if let Some(preset) = PRESETS.get(row.selected() as usize) {
-                syncing.set(true);
-                for (spin, value) in rows.iter().zip(preset.values) {
-                    spin.set_value(f64::from(value));
-                }
-                syncing.set(false);
+                preset.knobs.write(shm.header());
+                crate::shm::persist_settings_later(&shm, &KNOBS);
+                refresh_all_rows();
             }
             sync();
         });
     }
     // A value changed by hand, by a profile, Reset or `shmctl` (the rows follow the header).
-    for spin in rows.iter() {
-        let syncing = std::rc::Rc::clone(&syncing);
+    for spin in rows {
         let sync = std::rc::Rc::clone(&sync);
-        spin.connect_value_notify(move |_| {
-            if !syncing.get() {
-                sync();
-            }
-        });
+        spin.connect_value_notify(move |_| sync());
     }
     row
 }
@@ -340,9 +379,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (skin_structure, set_skin_structure) = bind_float(&shm, Some("skin_structure"), |h| &h.skin_structure_bits);
     let skin_structure_row = spin_row("Skin structure", "-1 follows local structure", skin_structure, "skin_structure", 0.05, set_skin_structure);
 
-    // In `neural_forge_supervisor::presets::KNOBS`' order.
     let strength_rows = [intensity_row, local_tone_row, local_structure_row, skin_structure_row];
-    model_group.add(&preset_row(&strength_rows));
+    model_group.add(&preset_row(&shm, &strength_rows));
     for row in &strength_rows {
         model_group.add(row);
     }
@@ -508,11 +546,13 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     debug_group.add(&cache_row);
     {
         let shm = std::sync::Arc::clone(&shm);
-        let update = move || {
+        let live = Liveness::default();
+        every(&cache_row, SECOND, move |cache_row| {
             let hdr = shm.header();
             let refresh = hdr.cache_refresh_holds.load(Ordering::Relaxed);
             let cached = hdr.cache_cached_holds.load(Ordering::Relaxed);
-            let text = if refresh == 0 && cached == 0 {
+            // A closed game's counters stay in the channel: only a live layer's are current.
+            let text = if !live.alive(hdr) || (refresh == 0 && cached == 0) {
                 "Not running".to_string()
             } else {
                 format!(
@@ -522,11 +562,6 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
                 )
             };
             cache_row.set_subtitle(&text);
-        };
-        update();
-        glib::timeout_add_seconds_local(1, move || {
-            update();
-            glib::ControlFlow::Continue
         });
     }
 
@@ -542,7 +577,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     let toasts = adw::ToastOverlay::new();
     if let Some(message) = install_error {
-        toasts.add_toast(adw::Toast::builder().title(message).timeout(0).build());
+        toasts.add_toast(adw::Toast::builder().title(glib::markup_escape_text(&message)).timeout(0).build());
     }
 
     // Tabbed like upstream's Qt GUI, rather than one long scrolling page -- each tab
@@ -559,28 +594,13 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // and the model is not running before the upscaler.
     {
         let shm = std::sync::Arc::clone(&shm);
-        let beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
-        let update = move || {
-            let after_upscaler = {
-                let hdr = shm.header();
-                let now = hdr.layer_heartbeat.load(Ordering::Relaxed);
-                let (seen, at) = beat.get();
-                let active = if now != seen {
-                    beat.set((now, std::time::Instant::now()));
-                    seen != 0
-                } else {
-                    at.elapsed() < std::time::Duration::from_secs(2)
-                };
-                active && hdr.native_running.load(Ordering::Relaxed) == 0
-            };
-            for row in [interval_row.upcast_ref::<gtk4::Widget>(), scale_row.upcast_ref()] {
-                row.set_visible(after_upscaler);
-            }
-        };
-        update();
-        glib::timeout_add_seconds_local(1, move || {
-            update();
-            glib::ControlFlow::Continue
+        let live = Liveness::default();
+        let scale_row = scale_row.clone();
+        every(&interval_row, SECOND, move |interval_row| {
+            let hdr = shm.header();
+            let after_upscaler = live.alive(hdr) && hdr.native_running.load(Ordering::Relaxed) == 0;
+            interval_row.set_visible(after_upscaler);
+            scale_row.set_visible(after_upscaler);
         });
     }
 
@@ -677,10 +697,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     // Follow the header: a change made with `shmctl`, a loaded profile, Reset or another
     // instance appears here within a second instead of needing an app restart.
-    glib::timeout_add_seconds_local(1, || {
-        refresh_all_rows();
-        glib::ControlFlow::Continue
-    });
+    every(&toasts, SECOND, |_| refresh_all_rows());
 
     let window = adw::ApplicationWindow::builder()
         .application(app)
@@ -692,10 +709,11 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     {
         let toasts = toasts.clone();
-        crate::shm::on_save_error(move |message| toasts.add_toast(adw::Toast::new(&message)));
+        crate::shm::on_save_error(move |message| toasts.add_toast(toast(&message)));
     }
-    // A change made in the last moment before closing is still saved.
+    // A change made in the last moment before closing is still saved; the periodic updates stop.
     window.connect_close_request(|_| {
+        STOPPED.with(|s| s.set(true));
         if let Err(e) = crate::shm::flush_settings() {
             eprintln!("neural-forge: saving config.ini failed: {e}");
         }
@@ -790,18 +808,27 @@ fn refresh_profile_combo(combo: &adw::ComboRow) {
     }
 }
 
-fn build_launch_option_group() -> adw::PreferencesGroup {
+/// The Setup tab's hand-set launch option: pick a game and its executable is filled in (the one
+/// the games list would write), or type one for a game Steam does not list. Filled from the Steam
+/// scan by the returned function.
+fn build_launch_option_group() -> (adw::PreferencesGroup, impl Fn(&SteamScan)) {
     let group = adw::PreferencesGroup::new();
     group.set_title("Steam launch option");
     group.set_description(Some("To set it by hand: paste this into the game's Properties -> Launch Options in Steam"));
 
+    let game_row = adw::ComboRow::new();
+    game_row.set_title("Game");
+    game_row.set_model(Some(&gtk4::StringList::new(&["Another game"])));
+    group.add(&game_row);
+
     let exe_row = adw::EntryRow::new();
-    exe_row.set_title("Target executable (optional, for a multi-process game)");
+    exe_row.set_title("Target executable (the game's .exe; several separated by commas)");
     group.add(&exe_row);
 
     let preview_row = adw::ActionRow::new();
     preview_row.set_title("Launch option");
     preview_row.add_css_class("property");
+    preview_row.set_use_markup(false);
     let copy_button = gtk4::Button::with_label("Copy");
     copy_button.set_valign(gtk4::Align::Center);
     preview_row.add_suffix(&copy_button);
@@ -809,9 +836,7 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
 
     let exe_row_for_build = exe_row.clone();
     let build_option = std::rc::Rc::new(move || neural_forge_supervisor::launch_options::launch_option(&exe_row_for_build.text()));
-
     preview_row.set_subtitle(&build_option());
-
     {
         let preview_row = preview_row.clone();
         let build_option = std::rc::Rc::clone(&build_option);
@@ -821,7 +846,30 @@ fn build_launch_option_group() -> adw::PreferencesGroup {
         button.display().clipboard().set_text(&build_option());
     });
 
-    group
+    // The games the combo lists (after "Another game"), with their targets.
+    let targets: std::rc::Rc<std::cell::RefCell<Vec<String>>> = std::rc::Rc::default();
+    {
+        let (targets, exe_row) = (targets.clone(), exe_row.clone());
+        game_row.connect_selected_notify(move |row| {
+            if let Some(target) = (row.selected() as usize).checked_sub(1).and_then(|i| targets.borrow().get(i).cloned()) {
+                exe_row.set_text(&target);
+            }
+        });
+    }
+    let fill = move |scan: &SteamScan| {
+        let listed: Vec<&ScannedGame> = scan.games.iter().filter(|g| g.game.unsupported().is_none() && !g.target.is_empty()).collect();
+        *targets.borrow_mut() = listed.iter().map(|g| g.target.clone()).collect();
+        let mut names = vec!["Another game"];
+        names.extend(listed.iter().map(|g| g.game.name.as_str()));
+        game_row.set_model(Some(&gtk4::StringList::new(&names)));
+        // A game already switched on first, else the first game: the string is complete by default.
+        let pick = listed.iter().position(|g| g.enabled).or((!listed.is_empty()).then_some(0));
+        game_row.set_selected(pick.map_or(0, |i| i as u32 + 1));
+        if let Some(i) = pick {
+            exe_row.set_text(&listed[i].target);
+        }
+    };
+    (group, fill)
 }
 
 /// The model's row text: present with the build it came from (and whether that build is verified),
@@ -870,7 +918,7 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
         dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
             let Ok(file) = result else { return };
             let Some(path) = file.path() else {
-                toasts.add_toast(adw::Toast::new("That file has no local path -- choose a file on this computer"));
+                toasts.add_toast(toast("That file has no local path -- choose a file on this computer"));
                 return;
             };
             glib::spawn_future_local(async move {
@@ -878,7 +926,7 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 match gio::spawn_blocking(move || neural_forge_supervisor::model::extract(&path, &out)).await {
                     Ok(Ok(done)) => {
                         let unverified = if done.verified { "" } else { " (not verified against NVIDIA's runtime)" };
-                        toasts.add_toast(adw::Toast::new(&format!(
+                        toasts.add_toast(toast(&format!(
                             "Model extracted from build {}{unverified} -- restart the game to use it",
                             done.build
                         )))
@@ -887,10 +935,10 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                     Ok(Err(neural_forge_supervisor::model::ModelError::Shape(report))) => {
                         eprintln!("neural-forge: extraction refused:\n{report}");
                         let summary = report.lines().next().unwrap_or_default();
-                        toasts.add_toast(adw::Toast::new(&format!("Extraction refused, a different network: {summary}")));
+                        toasts.add_toast(toast(&format!("Extraction refused, a different network: {summary}")));
                     }
-                    Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&format!("Extraction failed: {e}"))),
-                    Err(_) => toasts.add_toast(adw::Toast::new("Extraction failed: the worker panicked")),
+                    Ok(Err(e)) => toasts.add_toast(toast(&format!("Extraction failed: {e}"))),
+                    Err(_) => toasts.add_toast(toast("Extraction failed: the worker panicked")),
                 }
                 let (text, present) = model_status();
                 status_row.set_subtitle(&text);
@@ -923,7 +971,7 @@ fn games_note(roots: &[neural_forge_supervisor::steam::Root], games: usize, stea
 
 /// A toast with a Copy button for `manual`, the launch options to set by hand.
 fn manual_toast(message: &str, manual: String) -> adw::Toast {
-    let toast = adw::Toast::new(message);
+    let toast = toast(message);
     toast.set_timeout(0);
     toast.set_button_label(Some("Copy launch options"));
     toast.connect_button_clicked(move |_| {
@@ -934,86 +982,161 @@ fn manual_toast(message: &str, manual: String) -> adw::Toast {
     toast
 }
 
+/// One installed game as the Setup tab shows it.
+struct ScannedGame {
+    game: neural_forge_supervisor::steam::Game,
+    enabled: bool,
+    /// What switching it on writes as `NEURAL_FORGE_TARGET_EXE` (`steam::target_for`); empty when
+    /// its executable was not found.
+    target: String,
+}
+
+/// Steam as the Setup tab shows it, read on a worker thread ([`scan_steam`]): every account's
+/// `localconfig.vdf`, Steam's app cache and the games' folders are too slow to read on the main loop.
+struct SteamScan {
+    roots: Vec<neural_forge_supervisor::steam::Root>,
+    running: bool,
+    games: Vec<ScannedGame>,
+}
+
+fn scan_steam() -> SteamScan {
+    use neural_forge_supervisor::steam;
+    let cfg = neural_forge_supervisor::Config::load();
+    let roots = steam::roots();
+    let games = steam::games(&roots)
+        .into_iter()
+        .map(|game| {
+            let enabled = steam::enabled(&game.root.path, &game.appid);
+            let target = if game.unsupported().is_some() { String::new() } else { steam::target_for(&cfg, &game) };
+            ScannedGame { game, enabled, target }
+        })
+        .collect();
+    SteamScan { running: steam::steam_running(std::path::Path::new("/proc")), roots, games }
+}
+
 /// The installed Steam games, each with a switch that turns Neural Forge on or off in its launch
-/// options (`neural_forge_supervisor::steam::apply`). While Steam runs the switches are insensitive:
-/// it would overwrite the edit on exit. The refresh button scans again.
-fn build_games_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+/// options (`neural_forge_supervisor::steam::apply`) for the game's own executable. While Steam runs
+/// the switches are insensitive: it would overwrite the edit on exit. A game of the Flatpak Steam
+/// cannot be switched on (its sandbox does not see the layer) and says so. Filled from the Steam
+/// scan by the returned function; the edit itself also runs on a worker thread.
+fn build_games_group(toasts: &adw::ToastOverlay, refresh: &gtk4::Button) -> (adw::PreferencesGroup, impl Fn(&SteamScan)) {
     use neural_forge_supervisor::steam;
     let group = adw::PreferencesGroup::new();
     group.set_title("Steam games");
-    let refresh = gtk4::Button::from_icon_name("view-refresh-symbolic");
-    refresh.set_tooltip_text(Some("Look for games again"));
-    refresh.add_css_class("flat");
-    refresh.set_valign(gtk4::Align::Center);
-    group.set_header_suffix(Some(&refresh));
+    group.set_description(Some("Looking for games…"));
+    group.set_header_suffix(Some(refresh));
 
     let rows: std::rc::Rc<std::cell::RefCell<Vec<adw::SwitchRow>>> = std::rc::Rc::default();
     let fill = {
         let (group, rows, toasts) = (group.clone(), rows.clone(), toasts.clone());
-        move || {
+        move |scan: &SteamScan| {
             for row in rows.borrow_mut().drain(..) {
                 group.remove(&row);
             }
-            let roots = steam::roots();
-            let games = steam::games(&roots);
-            let running = steam::steam_running(std::path::Path::new("/proc"));
-            group.set_description(Some(&games_note(&roots, games.len(), running)));
-            for game in games {
+            group.set_description(Some(&games_note(&scan.roots, scan.games.len(), scan.running)));
+            for scanned in &scan.games {
+                let game = scanned.game.clone();
+                let target = scanned.target.clone();
                 let row = adw::SwitchRow::new();
                 row.set_use_markup(false);
                 row.set_title(&game.name);
-                row.set_subtitle(&format!("{} · {}", game.appid, game.library.display()));
-                row.set_active(steam::enabled(&game.root.path, &game.appid));
-                row.set_sensitive(!running);
+                let detail = match (game.unsupported(), target.is_empty()) {
+                    (Some(why), _) => format!("cannot be switched on: {why}"),
+                    (None, true) => "its executable was not found: set the launch option below by hand".to_string(),
+                    (None, false) => format!("runs {}", target.replace(',', ", ")),
+                };
+                row.set_subtitle(&format!("{} · {} · {detail}", game.appid, game.library.display()));
+                row.set_active(scanned.enabled);
+                // Switching off always works; switching on needs a usable game with a known executable.
+                let can_switch = scanned.enabled || (game.unsupported().is_none() && !target.is_empty());
+                row.set_sensitive(!scan.running && can_switch);
                 let reverting = std::rc::Rc::new(std::cell::Cell::new(false));
                 // Weak: the list holds the rows, and each row's handler would otherwise hold the list.
-                let (group_for_row, rows_for_row, toasts) = (group.clone(), std::rc::Rc::downgrade(&rows), toasts.clone());
+                let (group_for_row, rows_for_row, toasts) = (group.downgrade(), std::rc::Rc::downgrade(&rows), toasts.clone());
                 row.connect_active_notify(move |row| {
                     if reverting.get() {
                         return;
                     }
-                    let action = if row.is_active() { steam::Action::Enable { target_exe: String::new() } } else { steam::Action::Disable };
-                    let revert = || {
-                        reverting.set(true);
-                        row.set_active(!row.is_active());
-                        reverting.set(false);
-                    };
-                    match steam::apply_now(&game.root.path, &game.appid, &action) {
-                        steam::Outcome::Changed(_) | steam::Outcome::Unchanged => {
-                            let state = if row.is_active() { "on" } else { "off" };
-                            toasts.add_toast(adw::Toast::new(&format!("Neural Forge is {state} for {}", game.name)));
-                        }
-                        steam::Outcome::SteamRunning { manual } => {
-                            revert();
-                            if let Some(rows) = rows_for_row.upgrade() {
-                                for other in rows.borrow().iter() {
-                                    other.set_sensitive(false);
-                                }
-                                group_for_row.set_description(Some(&games_note(&steam::roots(), rows.borrow().len(), true)));
+                    let on = row.is_active();
+                    let action = if on { steam::Action::Enable { target_exe: target.clone() } } else { steam::Action::Disable };
+                    row.set_sensitive(false);
+                    let (row, game, reverting, toasts) = (row.downgrade(), game.clone(), reverting.clone(), toasts.clone());
+                    let (group_for_row, rows_for_row) = (group_for_row.clone(), rows_for_row.clone());
+                    glib::spawn_future_local(async move {
+                        let (root, appid) = (game.root.path.clone(), game.appid.clone());
+                        let outcome = gio::spawn_blocking(move || steam::apply_now(&root, &appid, &action)).await;
+                        let Some(row) = row.upgrade() else { return };
+                        row.set_sensitive(true);
+                        let revert = || {
+                            reverting.set(true);
+                            row.set_active(!on);
+                            reverting.set(false);
+                        };
+                        match outcome {
+                            Ok(steam::Outcome::Changed(_) | steam::Outcome::Unchanged) => {
+                                let state = if on { "on" } else { "off" };
+                                toasts.add_toast(toast(&format!("Neural Forge is {state} for {}", game.name)));
                             }
-                            toasts.add_toast(manual_toast("Steam is running: close it first, or set the launch options by hand", manual));
+                            Ok(steam::Outcome::SteamRunning { manual }) => {
+                                revert();
+                                if let (Some(rows), Some(group)) = (rows_for_row.upgrade(), group_for_row.upgrade()) {
+                                    for other in rows.borrow().iter() {
+                                        other.set_sensitive(false);
+                                    }
+                                    group.set_description(Some(&games_note(&steam::roots(), rows.borrow().len(), true)));
+                                }
+                                toasts.add_toast(manual_toast("Steam is running: close it first, or set the launch options by hand", manual));
+                            }
+                            Ok(steam::Outcome::Failed { reason, manual }) => {
+                                revert();
+                                toasts.add_toast(manual_toast(&format!("Could not change the launch options safely: {reason}"), manual));
+                            }
+                            Err(_) => {
+                                revert();
+                                toasts.add_toast(toast("Could not change the launch options: the worker stopped"));
+                            }
                         }
-                        steam::Outcome::Failed { reason, manual } => {
-                            revert();
-                            toasts.add_toast(manual_toast(&format!("Could not change the launch options safely: {reason}"), manual));
-                        }
-                    }
+                    });
                 });
                 group.add(&row);
                 rows.borrow_mut().push(row);
             }
         }
     };
-    fill();
-    refresh.connect_clicked(move |_| fill());
-    group
+    (group, fill)
 }
 
 fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
     page.add(&build_model_group(toasts));
-    page.add(&build_games_group(toasts));
-    page.add(&build_launch_option_group());
+    let refresh = gtk4::Button::from_icon_name("view-refresh-symbolic");
+    refresh.set_tooltip_text(Some("Look for games again"));
+    refresh.add_css_class("flat");
+    refresh.set_valign(gtk4::Align::Center);
+    let (games_group, fill_games) = build_games_group(toasts, &refresh);
+    let (launch_group, fill_launch) = build_launch_option_group();
+    page.add(&games_group);
+    page.add(&launch_group);
+    let fill = std::rc::Rc::new(move |scan: &SteamScan| {
+        fill_games(scan);
+        fill_launch(scan);
+    });
+    let scan = move |button: Option<gtk4::Button>| {
+        let fill = std::rc::Rc::clone(&fill);
+        if let Some(button) = &button {
+            button.set_sensitive(false);
+        }
+        glib::spawn_future_local(async move {
+            if let Ok(scan) = gio::spawn_blocking(scan_steam).await {
+                fill(&scan);
+            }
+            if let Some(button) = button {
+                button.set_sensitive(true);
+            }
+        });
+    };
+    scan(None);
+    refresh.connect_clicked(move |button| scan(Some(button.clone())));
     page
 }
 
@@ -1147,20 +1270,17 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     }
 
     let shm_for_timer = std::sync::Arc::clone(shm);
-    let sparkline_for_timer = sparkline.clone();
-    let mut last_layer_frames: Option<u64> = None;
-    let mut layer_beat_seen = (0u32, std::time::Instant::now());
-    glib::timeout_add_local(std::time::Duration::from_millis(u64::from(TELEMETRY_INTERVAL_MS)), move || {
+    // The last frame count and when it was read: the rate is over the time that really passed (a
+    // busy main loop runs the timer late).
+    let last_layer_frames: std::cell::Cell<Option<(u64, std::time::Instant)>> = std::cell::Cell::new(None);
+    let live = Liveness::default();
+    every(&sparkline, std::time::Duration::from_millis(u64::from(TELEMETRY_INTERVAL_MS)), move |sparkline| {
         let hdr = shm_for_timer.header();
 
         model_row.set_subtitle(if hdr.native_running.load(Ordering::Relaxed) != 0 { "running before the upscaler" } else { "not running before the upscaler" });
         // The name is only as current as the frames: a closed game leaves its name behind.
-        let beat = hdr.layer_heartbeat.load(Ordering::Relaxed);
-        if beat != layer_beat_seen.0 {
-            layer_beat_seen = (beat, std::time::Instant::now());
-        }
         let game = hdr.game_name();
-        let active = layer_beat_seen.1.elapsed() < std::time::Duration::from_secs(2) && layer_beat_seen.0 != 0;
+        let active = live.alive(hdr);
         game_row.set_subtitle(&match (game.is_empty(), active) {
             (_, false) => "none attached".to_string(),
             (true, true) => "attached".to_string(),
@@ -1168,12 +1288,15 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
         });
 
         let layer_frames = neural_forge_protocol::load64(&hdr.layer_frames_lo, &hdr.layer_frames_hi);
-        let per_second = 1000.0 / f64::from(TELEMETRY_INTERVAL_MS);
-        let layer_fps = last_layer_frames.map(|prev| (layer_frames.saturating_sub(prev)) as f64 * per_second);
-        last_layer_frames = Some(layer_frames);
+        let now = std::time::Instant::now();
+        let layer_fps = last_layer_frames.get().and_then(|(prev, at)| {
+            let secs = now.duration_since(at).as_secs_f64();
+            (secs > 0.0).then(|| layer_frames.saturating_sub(prev) as f64 / secs)
+        });
+        last_layer_frames.set(Some((layer_frames, now)));
         match layer_fps {
-            Some(l) => fps_row.set_subtitle(&format!("{l:.1} presents/s")),
-            None => fps_row.set_subtitle("—"),
+            Some(l) if active => fps_row.set_subtitle(&format!("{l:.1} presents/s")),
+            _ => fps_row.set_subtitle("—"),
         }
 
         let sample = TelemetrySample {
@@ -1187,9 +1310,7 @@ fn build_telemetry_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
             }
             history.push_back(sample);
         }
-        sparkline_for_timer.queue_draw();
-
-        glib::ControlFlow::Continue
+        sparkline.queue_draw();
     });
 
     group
@@ -1212,21 +1333,14 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
 
     let shm_for_timer = std::sync::Arc::clone(shm);
     // Liveness is read from the heartbeat, not `layer_attached`: a closed game never clears it.
-    let layer_beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
-    let fresh = |cell: &std::cell::Cell<(u32, std::time::Instant)>, now_value: u32| {
-        let (seen, at) = cell.get();
-        if now_value != seen {
-            cell.set((now_value, std::time::Instant::now()));
-            true
-        } else {
-            at.elapsed() < std::time::Duration::from_secs(2)
-        }
-    };
-    glib::timeout_add_seconds_local(1, move || {
+    let live = Liveness::default();
+    let preupscale_for_timer = preupscale_row.clone();
+    every(&layer_row, SECOND, move |layer_row| {
+        let preupscale_row = &preupscale_for_timer;
         let hdr = shm_for_timer.header();
         // A header laid out by another build is refused at open (see `Shm::open`), so the
         // version needs no check here.
-        let layer_active = fresh(&layer_beat, hdr.layer_heartbeat.load(Ordering::Relaxed));
+        let layer_active = live.alive(hdr);
         let attached = hdr.layer_attached.load(Ordering::Relaxed) != 0;
         layer_row.set_subtitle(if layer_active {
             "active: processing the game's frames"
@@ -1245,7 +1359,6 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         // The layer's own status line: the model running, or why it is not.
         let layer_reason = if layer_active { hdr.layer_reason() } else { String::new() };
         preupscale_row.set_subtitle(&if layer_reason.is_empty() { label } else { format!("{label} -- {layer_reason}") });
-        glib::ControlFlow::Continue
     });
 
     let model_row = adw::ActionRow::new();
@@ -1296,8 +1409,8 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
                     cfg.settings.insert(name, value);
                 }
                 match cfg.save() {
-                    Ok(()) => toasts.add_toast(adw::Toast::new("Settings reset")),
-                    Err(e) => toasts.add_toast(adw::Toast::new(&format!("Reset the live session, but saving config.ini failed: {e}"))),
+                    Ok(()) => toasts.add_toast(toast("Settings reset")),
+                    Err(e) => toasts.add_toast(toast(&format!("Reset the live session, but saving config.ini failed: {e}"))),
                 }
             });
         });
@@ -1330,18 +1443,18 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         let save_profile_row = save_profile_row.clone();
         save_profile_button.connect_clicked(move |_| {
             let name = save_profile_row.text().trim().to_string();
-            if name.is_empty() {
-                toasts.add_toast(adw::Toast::new("Enter a name before saving"));
+            if let Some(why) = neural_forge_supervisor::profiles::invalid_name(&name) {
+                toasts.add_toast(toast(&format!("Not saved: {why}")));
                 return;
             }
             let settings = neural_forge_protocol::persist::snapshot(shm.header());
             match neural_forge_supervisor::profiles::save_profile(&name, settings) {
                 Ok(()) => {
-                    toasts.add_toast(adw::Toast::new(&format!("Saved profile \"{name}\"")));
+                    toasts.add_toast(toast(&format!("Saved profile \"{name}\"")));
                     save_profile_row.set_text("");
                     refresh_profile_combo(&profile_combo);
                 }
-                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Save failed: {e}"))),
+                Err(e) => toasts.add_toast(toast(&format!("Save failed: {e}"))),
             }
         });
     }
@@ -1352,12 +1465,12 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         let profile_combo = profile_combo.clone();
         load_profile_button.connect_clicked(move |_| {
             let Some(name) = selected_profile(&profile_combo) else {
-                toasts.add_toast(adw::Toast::new("No profile selected"));
+                toasts.add_toast(toast("No profile selected"));
                 return;
             };
             let profiles = neural_forge_supervisor::profiles::load_all();
             let Some(settings) = profiles.get(&name) else {
-                toasts.add_toast(adw::Toast::new(&format!("Profile \"{name}\" is gone")));
+                toasts.add_toast(toast(&format!("Profile \"{name}\" is gone")));
                 refresh_profile_combo(&profile_combo);
                 return;
             };
@@ -1371,7 +1484,7 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
                 Ok(()) => format!("Loaded profile \"{name}\""),
                 Err(e) => format!("Applied to the running session, but saving config.ini failed: {e}"),
             };
-            toasts.add_toast(adw::Toast::new(&message));
+            toasts.add_toast(toast(&message));
         });
     }
 
@@ -1380,16 +1493,16 @@ fn build_status_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
         let profile_combo = profile_combo.clone();
         delete_profile_button.connect_clicked(move |_| {
             let Some(name) = selected_profile(&profile_combo) else {
-                toasts.add_toast(adw::Toast::new("No profile selected"));
+                toasts.add_toast(toast("No profile selected"));
                 return;
             };
             match neural_forge_supervisor::profiles::delete_profile(&name) {
                 Ok(true) => {
-                    toasts.add_toast(adw::Toast::new(&format!("Deleted profile \"{name}\"")));
+                    toasts.add_toast(toast(&format!("Deleted profile \"{name}\"")));
                     refresh_profile_combo(&profile_combo);
                 }
-                Ok(false) => toasts.add_toast(adw::Toast::new("Profile already gone")),
-                Err(e) => toasts.add_toast(adw::Toast::new(&format!("Delete failed: {e}"))),
+                Ok(false) => toasts.add_toast(toast("Profile already gone")),
+                Err(e) => toasts.add_toast(toast(&format!("Delete failed: {e}"))),
             }
         });
     }
@@ -1413,8 +1526,9 @@ fn build_diagnosis_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
     let save = gtk4::Button::with_label("Save report");
     save.set_valign(gtk4::Align::Center);
     save.set_tooltip_text(Some(
-        "Saves a zip to the desktop to attach to a problem report: these findings, system details, settings, the \
-         layer's logs and the newest capture. Your home folder and user name are replaced; nothing is uploaded",
+        "Saves a zip to the desktop to attach to a problem report: these findings (which list your installed \
+         Steam games and their library folders), system details, settings, the layer's logs and the newest \
+         capture. Your home folder, user name and computer name are replaced; nothing is uploaded",
     ));
     connect_save_report(&save, shm, toasts);
     actions.append(&save);
@@ -1456,13 +1570,13 @@ fn build_diagnosis_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Ma
 /// Opens `dir` in the file manager, creating it first if it is missing.
 fn open_folder(dir: &std::path::Path, parent: Option<gtk4::Window>, toasts: &adw::ToastOverlay) {
     if let Err(e) = std::fs::create_dir_all(dir) {
-        toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't create {}: {e}", dir.display()))));
+        toasts.add_toast(toast(&format!("Couldn't create {}: {e}", dir.display())));
         return;
     }
     let toasts = toasts.clone();
     gtk4::FileLauncher::new(Some(&gio::File::for_path(dir))).launch(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
         if let Err(e) = result {
-            toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Couldn't open the folder: {e}"))));
+            toasts.add_toast(toast(&format!("Couldn't open the folder: {e}")));
         }
     });
 }
@@ -1531,14 +1645,14 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
             if let Some((id, _)) = waiting.take() {
                 button.set_label("Capture");
                 if capture::cancel(header, id) == capture::Cancelled::Withdrawn {
-                    toasts.add_toast(adw::Toast::new("Capture cancelled"));
+                    toasts.add_toast(toast("Capture cancelled"));
                 }
                 return;
             }
             let id = match capture::request(header, 1) {
                 Ok(id) => id,
                 Err(e) => {
-                    toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Not captured: {e}"))));
+                    toasts.add_toast(toast(&format!("Not captured: {e}")));
                     return;
                 }
             };
@@ -1548,9 +1662,10 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
             let toasts = toasts.clone();
             let captures_dir = captures_dir.clone();
             let waiting = waiting.clone();
-            let button = button.clone();
+            let button = button.downgrade();
             glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
                 let Some((id, since)) = waiting.get() else { return glib::ControlFlow::Break };
+                let Some(button) = button.upgrade() else { return glib::ControlFlow::Break };
                 let header = shm.header();
                 let done = |message: String, folder: bool| {
                     waiting.set(None);
@@ -1591,19 +1706,11 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
 
     // Holding before the upscaler: from the channel, while the layer's heartbeat is fresh.
     let shm = std::sync::Arc::clone(shm);
-    let beat = std::cell::Cell::new((0u32, std::time::Instant::now()));
-    glib::timeout_add_seconds_local(1, move || {
+    let live = Liveness::default();
+    every(&capture_row, SECOND, move |capture_row| {
         let hdr = shm.header();
-        let now = hdr.layer_heartbeat.load(Ordering::Relaxed);
-        let (seen, at) = beat.get();
-        let active = if now != seen {
-            beat.set((now, std::time::Instant::now()));
-            seen != 0
-        } else {
-            at.elapsed() < std::time::Duration::from_secs(2)
-        };
-        capture_row.set_subtitle(capture_subtitle(active && hdr.preupscale_state.load(Ordering::Relaxed) == 2));
-        glib::ControlFlow::Continue
+        let holding = hdr.preupscale_state.load(Ordering::Relaxed) == neural_forge_protocol::enums::preupscale_state::HOLDING;
+        capture_row.set_subtitle(capture_subtitle(live.alive(hdr) && holding));
     });
     group
 }
@@ -1637,8 +1744,8 @@ fn connect_save_report(button: &gtk4::Button, shm: &std::sync::Arc<neural_forge_
                     });
                     toasts.add_toast(toast);
                 }
-                Ok(Err(e)) => toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Saving the report failed: {e}")))),
-                Err(_) => toasts.add_toast(adw::Toast::new("Saving the report failed: the worker panicked")),
+                Ok(Err(e)) => toasts.add_toast(toast(&format!("Saving the report failed: {e}"))),
+                Err(_) => toasts.add_toast(toast("Saving the report failed: the worker panicked")),
             }
         });
     });
@@ -1671,14 +1778,15 @@ fn finding_row(finding: &neural_forge_supervisor::doctor::Finding) -> adw::Actio
 }
 
 /// The Status page's one line on the pre-upscaler path, from the header's `preupscale_*` fields
-/// (0 off, 1 waiting for DLSS's input, 2 holding). `layer_active`: the layer's heartbeat is fresh;
-/// otherwise the fields are a closed game's leftovers.
+/// (`neural_forge_protocol::enums::preupscale_state`). `layer_active`: the layer's heartbeat is
+/// fresh; otherwise the fields are a closed game's leftovers.
 fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, misses: u32) -> String {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, WAITING};
     let missed = if misses == 0 { String::new() } else { format!(", {misses} frame{} missed", if misses == 1 { "" } else { "s" }) };
     match state {
         _ if !layer_active => "no game running".to_string(),
-        2 => format!("before the upscaler: holding DLSS's {width}x{height} input every frame{missed}"),
-        1 => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
+        HOLDING => format!("before the upscaler: holding DLSS's {width}x{height} input{missed}"),
+        WAITING => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
         _ => "after the upscaler".to_string(),
     }
 }
@@ -1719,8 +1827,8 @@ mod preupscale_label_tests {
         assert_eq!(preupscale_label(false, 2, 1485, 836, 3), "no game running");
         assert_eq!(preupscale_label(true, 0, 0, 0, 0), "after the upscaler");
         assert_eq!(preupscale_label(true, 1, 0, 0, 0), "after the upscaler: waiting for DLSS Super Resolution");
-        assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input every frame");
-        assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input every frame, 1 frame missed");
+        assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input");
+        assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input, 1 frame missed");
         assert_eq!(preupscale_label(true, 1, 1485, 836, 85), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
     }
 }

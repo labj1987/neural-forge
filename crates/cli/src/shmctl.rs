@@ -14,9 +14,10 @@ use std::sync::atomic::Ordering;
 pub fn usage() {
     eprintln!(
         "usage: neural-forge-cli shmctl <status|set|toggle|capture|dump-cache|reset>\n\n\
-         \x20 status              print every setting and live status field\n\
+         \x20 status              print every setting and live status field (only looks:\n\
+         \x20                     it creates and changes nothing)\n\
          \x20 set <name> <value>  set one setting (float fields take a decimal value)\n\
-         \x20 toggle <name>       flip a 0/1-valued setting\n\
+         \x20 toggle <name>       flip an on/off (0/1) setting\n\
          \x20 capture [--frames N] [--view V]\n\
          \x20                     save the next presented frame (or the next N, at most\n\
          \x20                     {max_frames}, as a series-<ms>/ folder) as original+composited\n\
@@ -37,10 +38,6 @@ pub fn usage() {
     );
 }
 
-fn cmd_status(header: &ShmHeader) {
-    print!("{}", neural_forge_supervisor::shm_status::status_text(header));
-}
-
 /// Shared by `set`/`toggle`: resolves `name` against the persisted settings, returning whether it's
 /// float-valued and its current raw bits -- `None` if `name` isn't one.
 fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
@@ -51,15 +48,7 @@ fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
 /// `tuning_seq` bump also marks the header as configured: left at 0 (a header nothing had
 /// applied `config.ini` to yet), the next `start()` would overwrite this value from it.
 fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
-    if header.persisted_settings().iter().any(|(n, ..)| *n == name) {
-        if !header.apply_persisted_setting(name, bits) {
-            return false;
-        }
-        header.tuning_seq.fetch_add(1, Ordering::Relaxed);
-        header.control_seq.fetch_add(1, Ordering::Relaxed);
-        return true;
-    }
-    false
+    header.persisted_settings().iter().any(|(n, ..)| *n == name) && header.write_settings(&[(name, bits)])
 }
 
 fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
@@ -104,12 +93,15 @@ fn cmd_toggle(header: &ShmHeader, name: &str) -> bool {
         eprintln!("shmctl toggle: unknown setting {name:?}");
         return false;
     };
-    if is_float {
-        eprintln!("shmctl toggle: {name} is a float-valued setting, use `set` instead");
+    if is_float || neural_forge_protocol::setting_bounds(name) != Some((0.0, 1.0)) {
+        eprintln!("shmctl toggle: {name} is not an on/off setting, use `set` instead");
         return false;
     }
     let new = u32::from(bits == 0);
-    store(header, name, new);
+    if !store(header, name, new) {
+        eprintln!("shmctl toggle: {name} was not stored");
+        return false;
+    }
     println!("{name}={new}");
     true
 }
@@ -281,6 +273,12 @@ pub fn check_args(args: &[String]) -> Result<(), String> {
 
 pub fn run(args: &[String]) -> std::process::ExitCode {
     let cfg = neural_forge_supervisor::Config::load();
+    // `status` only looks: it neither creates the channel nor applies the saved settings to it.
+    if args.first().map(String::as_str) == Some("status") {
+        let (text, _) = neural_forge_supervisor::shm_status::look(&cfg);
+        print!("{text}");
+        return std::process::ExitCode::SUCCESS;
+    }
     let mapping = match neural_forge_supervisor::open_channel(&cfg) {
         Ok(mapping) => mapping,
         Err(e) => {
@@ -292,10 +290,6 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
     let header = mapping.header();
 
     let ok = match args.first().map(String::as_str) {
-        Some("status") => {
-            cmd_status(header);
-            true
-        }
         Some("set") => match (args.get(1), args.get(2)) {
             (Some(name), Some(value)) => cmd_set(header, name, value),
             _ => {
@@ -475,6 +469,17 @@ mod tests {
         assert_eq!(header.apply_model.load(Ordering::Relaxed), 1);
         assert!(cmd_toggle(&header, "apply_model"));
         assert_eq!(header.apply_model.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn cmd_toggle_refuses_a_setting_that_is_not_on_off() {
+        let header = ShmHeader::default();
+        header.init_defaults();
+        for name in ["model_interval", "style", "toggle_key"] {
+            let before = resolve(&header, name).unwrap().1;
+            assert!(!cmd_toggle(&header, name), "{name}");
+            assert_eq!(resolve(&header, name).unwrap().1, before, "{name} unchanged");
+        }
     }
 
     #[test]

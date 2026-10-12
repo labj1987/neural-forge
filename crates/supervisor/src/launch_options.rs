@@ -2,8 +2,9 @@
 //! taken back out of) whatever launch options the game already has.
 //!
 //! Neural Forge's part is environment variables in front of everything else: `NEURAL_FORGE_ENABLE=1`
-//! (the layer manifest's `enable_environment`) and, for a multi-process game, the
-//! `NEURAL_FORGE_TARGET_EXE=<exe>` the GUI's Setup tab asks for. In front, not just before
+//! (the layer manifest's `enable_environment`) and `NEURAL_FORGE_TARGET_EXE=<exe>[,<exe>...]`, the
+//! game's own executables (`steam::target_for`), which the GUI and the CLI always write so that no
+//! store launcher or helper process can take the effect. In front, not just before
 //! `%command%`: a wrapper such as `gamemoderun %command%` takes `NAME=value` after it as a program
 //! to run. [`launch_option`] (the string the Setup tab shows and copies) is [`merge`] applied to an
 //! empty string, so the copied string and the written one cannot diverge.
@@ -28,9 +29,10 @@ pub fn launch_option(target_exe: &str) -> String {
 }
 
 /// Steam runs the launch option through a shell, so a value with a space or any other shell
-/// character is single-quoted (a `'` inside becomes `'\''`).
+/// character is single-quoted (a `'` inside becomes `'\''`). A comma (between target executables)
+/// is not special to the shell.
 pub fn shell_quote(value: &str) -> String {
-    if !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')) {
+    if !value.is_empty() && value.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-' | ',')) {
         value.to_string()
     } else {
         format!("'{}'", value.replace('\'', "'\\''"))
@@ -99,6 +101,15 @@ pub fn is_enabled(options: &str) -> bool {
     around_command(&tokens).is_some_and(|(before, _)| before.iter().any(|t| t == ENABLE))
 }
 
+/// Whether `options` turns Neural Forge on with a target executable (`NEURAL_FORGE_TARGET_EXE=` with
+/// a value, before `%command%`).
+pub fn has_target(options: &str) -> bool {
+    let tokens = split_tokens(options);
+    around_command(&tokens).is_some_and(|(before, _)| {
+        before.iter().any(|t| t == ENABLE) && before.iter().any(|t| t.strip_prefix(TARGET_PREFIX).is_some_and(|v| !matches!(v.trim(), "" | "''" | "\"\"")))
+    })
+}
+
 /// `existing` with Neural Forge turned on. Returned unchanged (byte for byte) when it already is,
 /// with the same target executable if one is given. Otherwise Neural Forge's variables go first,
 /// replacing any earlier ones of its own; a target executable already there is kept when
@@ -153,6 +164,16 @@ mod tests {
         assert_eq!(launch_option("  GTA5_Enhanced.exe  "), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
         assert_eq!(launch_option("My Game.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' %command%");
         assert_eq!(launch_option("it's.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='it'\\''s.exe' %command%");
+    }
+
+    #[test]
+    fn a_target_is_seen_only_with_the_switch_and_a_value() {
+        assert!(has_target("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=a.exe,b.exe %command%"));
+        assert!(has_target("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE='My Game.exe' %command% -x"));
+        assert!(!has_target("NEURAL_FORGE_ENABLE=1 %command%"));
+        assert!(!has_target("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE= %command%"));
+        assert!(!has_target("NEURAL_FORGE_TARGET_EXE=a.exe %command%"), "not switched on");
+        assert_eq!(launch_option("a.exe,b.exe"), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=a.exe,b.exe %command%");
     }
 
     #[test]

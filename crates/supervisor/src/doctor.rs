@@ -74,11 +74,18 @@ pub type Command = Box<dyn Fn(&[&str]) -> CommandOutput>;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LaunchOptionState {
     Present,
-    /// Missing for the named game.
-    Missing(String),
+    /// Missing for the named game; `option` is the launch option to set for it.
+    Missing { game: String, option: String },
     /// No installed Steam game has it.
     NoneEnabled,
 }
+
+/// The launch option to set by hand when the game is not known.
+const GENERIC_OPTION: &str = "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=<the game's .exe> %command%";
+
+/// How long an external command (`nvidia-smi`, `journalctl`) may run: a wedged GPU can hang
+/// `nvidia-smi` for minutes, and the doctor, the report and the GUI's buttons wait on it.
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// Every root path and every command the checks read, so tests can drive them from fixtures.
 pub struct Roots {
@@ -110,18 +117,66 @@ pub struct Roots {
     pub steam_roots: Vec<crate::steam::Root>,
 }
 
-/// Runs `program` with `args`, its standard output on success.
-fn run_command(program: &str, args: &[&str]) -> CommandOutput {
-    match std::process::Command::new(program).args(args).stdin(std::process::Stdio::null()).output() {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => CommandOutput::Missing,
-        Err(e) => CommandOutput::Failed(e.to_string()),
-        Ok(out) if out.status.success() => CommandOutput::Ran(String::from_utf8_lossy(&out.stdout).into_owned()),
-        Ok(out) => {
-            let stderr = String::from_utf8_lossy(&out.stderr);
+/// Runs `program` with `args`, its standard output on success. Killed after `timeout`.
+fn run_command(program: &str, args: &[&str], timeout: std::time::Duration) -> CommandOutput {
+    use std::io::Read;
+    use std::process::Stdio;
+    let mut child = match std::process::Command::new(program).args(args).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn() {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return CommandOutput::Missing,
+        Err(e) => return CommandOutput::Failed(e.to_string()),
+        Ok(child) => child,
+    };
+    // The pipes are drained while waiting, so a long output cannot block the child.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut out = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut out);
+            }
+            out
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let stderr = drain(child.stderr.take().map(|p| Box::new(p) as Box<dyn Read + Send>));
+    let deadline = std::time::Instant::now() + timeout;
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) if std::time::Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                break Err(format!("did not finish within {} s and was stopped", timeout.as_secs()));
+            }
+            Ok(None) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            Err(e) => break Err(e.to_string()),
+        }
+    };
+    let stdout = stdout.join().unwrap_or_default();
+    let stderr = stderr.join().unwrap_or_default();
+    match status {
+        Err(why) => CommandOutput::Failed(why),
+        Ok(status) if status.success() => CommandOutput::Ran(String::from_utf8_lossy(&stdout).into_owned()),
+        Ok(status) => {
+            let stderr = String::from_utf8_lossy(&stderr);
             let first = stderr.lines().find(|l| !l.trim().is_empty()).unwrap_or("no message");
-            CommandOutput::Failed(format!("{} ({first})", out.status))
+            CommandOutput::Failed(format!("{status} ({first})"))
         }
     }
+}
+
+/// [`run_command`] for `program`, each set of arguments run once: the doctor and the report ask
+/// `nvidia-smi` and `journalctl` the same questions.
+fn cached_command(program: &'static str) -> Command {
+    let cache: std::cell::RefCell<Vec<(Vec<String>, CommandOutput)>> = std::cell::RefCell::default();
+    Box::new(move |args| {
+        let key: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+        if let Some((_, out)) = cache.borrow().iter().find(|(k, _)| *k == key) {
+            return out.clone();
+        }
+        let out = run_command(program, args, COMMAND_TIMEOUT);
+        cache.borrow_mut().push((key, out.clone()));
+        out
+    })
 }
 
 impl Roots {
@@ -142,8 +197,8 @@ impl Roots {
             binaries_dir: binaries.into(),
             model_dir: crate::model::model_dir().into(),
             shm_path: crate::channel_path(&cfg).into(),
-            nvidia_smi: Box::new(|args| run_command("nvidia-smi", args)),
-            journalctl: Box::new(|args| run_command("journalctl", args)),
+            nvidia_smi: cached_command("nvidia-smi"),
+            journalctl: cached_command("journalctl"),
             launch_option_state: None,
             steam_roots: crate::steam::roots(),
         }
@@ -165,8 +220,21 @@ pub fn run(roots: &Roots) -> Vec<Finding> {
     out.extend(check_compute_capability(&gpus));
     let events = state_log::read_dir_events(&roots.state_dir);
     let session = events.as_ref().ok().and_then(|e| last_session(e));
-    match neural_forge_protocol::mapping::open_path(&roots.shm_path.to_string_lossy()) {
-        Ok(mapping) => {
+    match neural_forge_protocol::mapping::open_existing(&roots.shm_path.to_string_lossy()) {
+        Ok(None) => {
+            out.push(Finding::new(
+                "channel",
+                Severity::Info,
+                "no settings channel yet: no game and no Neural Forge window has opened it since the computer started",
+                roots.shm_path.display().to_string(),
+                None,
+            ));
+            out.extend(check_vram(&gpus, None));
+            out.push(check_never_attached(roots, manifest_ok, "no channel file".to_string()));
+            out.extend(check_device_lost(None, session.as_deref()));
+            out.extend(check_cannot_run(None, session.as_deref()));
+        }
+        Ok(Some(mapping)) => {
             let hdr = mapping.header();
             out.push(Finding::new("channel", Severity::Ok, "the settings channel opens", roots.shm_path.display().to_string(), None));
             out.extend(check_vram(&gpus, Some(hdr)));
@@ -257,33 +325,49 @@ fn check_ngx_dll(roots: &Roots) -> Finding {
 
 fn check_model(roots: &Roots) -> Finding {
     let dir = roots.model_dir.display().to_string();
-    match crate::model::installed(&roots.model_dir) {
-        Some(build) => {
+    let extract = "Extract it in the Setup tab, or run `neural-forge-cli extract-model DIR` with the folder that holds nvngx_dlssnr.dll.";
+    match crate::model::check_installed(&roots.model_dir) {
+        Ok(build) => {
             let note = if crate::model::installed_verified(&roots.model_dir) == Some(false) { ", not verified against NVIDIA's runtime" } else { "" };
-            Finding::new("model", Severity::Ok, format!("the model is extracted (build {build}{note})"), dir, None)
+            Finding::new("model", Severity::Ok, format!("the model is extracted and intact (build {build}{note})"), dir, None)
         }
-        None => Finding::new(
+        Err(why) if crate::model::installed(&roots.model_dir).is_none() => {
+            Finding::new("model", Severity::Failure, "the model is not extracted: the network has nothing to load", why, Some(extract.into()))
+        }
+        Err(why) => Finding::new(
             "model",
             Severity::Failure,
-            "the model is not extracted: the network has nothing to load",
-            format!("no readable manifest.json in {dir}"),
-            Some("Extract it in the Setup tab, or run `neural-forge-cli extract-model DIR` with the folder that holds nvngx_dlssnr.dll.".into()),
+            "the extracted model is damaged: the network cannot load it",
+            format!("{dir}: {why}"),
+            Some(format!("Extract it again. {extract}")),
         ),
     }
 }
 
+/// Whether each user dir is writable, or could be created: the nearest existing ancestor is a
+/// writable directory. Only looks: the doctor creates nothing.
 fn check_user_dirs(roots: &Roots) -> Finding {
     let dirs = [&roots.config_dir, &roots.data_dir, &roots.state_dir, &roots.binaries_dir];
     let evidence = dirs.iter().map(|d| d.display().to_string()).collect::<Vec<_>>().join(", ");
-    match dirs.iter().try_for_each(std::fs::create_dir_all) {
-        Ok(()) => Finding::new("user-dirs", Severity::Ok, "the user dirs are writable", evidence, None),
-        Err(e) => Finding::new(
+    let writable = |dir: &Path| {
+        let existing = dir.ancestors().find(|a| a.exists());
+        existing.is_some_and(|a| {
+            let Ok(c) = std::ffi::CString::new(a.as_os_str().as_encoded_bytes()) else { return false };
+            // SAFETY: `c` is a valid NUL-terminated path for the call's duration.
+            a.is_dir() && unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0
+        })
+    };
+    let bad: Vec<String> = dirs.iter().filter(|d| !writable(d)).map(|d| d.display().to_string()).collect();
+    if bad.is_empty() {
+        Finding::new("user-dirs", Severity::Ok, "the user dirs are writable", evidence, None)
+    } else {
+        Finding::new(
             "user-dirs",
             Severity::Failure,
-            format!("the user dirs are not writable: {e}"),
+            format!("the user dirs are not writable: {}", bad.join(", ")),
             evidence,
             Some("Make them owned by and writable for your user (`ls -ld` each to see which).".into()),
-        ),
+        )
     }
 }
 
@@ -412,7 +496,7 @@ fn parse_gpu_line(line: &str) -> Gpu {
 }
 
 /// The lowest compute capability the network runs on: its kernels are PTX for `sm_89`
-/// (`third_party/opendlss-nr/scripts/ptx/ptxgen.py`, `target="sm_89"`) using FP8 (e4m3) tensor-core
+/// (OpenDLSS-NR's `scripts/ptx/ptxgen.py`, `target="sm_89"`) using FP8 (e4m3) tensor-core
 /// instructions (`mma.sync...e4m3`, e.g. `mlp_e4m3.py`), and the device needs `VK_EXT_shader_float8`
 /// (`crates/native/cpp/nf_native.cpp`). PTX for sm_89 is only compiled by the driver for 8.9 and newer,
 /// and FP8 tensor cores start with Ada (RTX 40): an RTX 20 (7.5) or 30 (8.6) cannot run it at all.
@@ -523,14 +607,19 @@ fn check_attached(roots: &Roots, hdr: &neural_forge_protocol::ShmHeader, manifes
         let game = if game.is_empty() { "a game".to_string() } else { game };
         return Finding::new(CHECK, Severity::Ok, format!("{game}'s layer attached to the channel since it was created ({frames} frames)"), evidence, None);
     }
-    // The likely causes, most likely first.
+    check_never_attached(roots, manifest_ok, evidence)
+}
+
+/// No game's layer has attached: the likely causes, most likely first, and the fix for the first.
+fn check_never_attached(roots: &Roots, manifest_ok: bool, evidence: String) -> Finding {
+    const CHECK: &str = "layer-attached";
     let mut causes = Vec::new();
     let launch = roots.launch_option_state.clone().or_else(|| steam_launch_state(&crate::steam::games(&roots.steam_roots)));
     match &launch {
         Some(LaunchOptionState::Present) => {}
-        Some(LaunchOptionState::Missing(game)) => causes.push(format!("{game}'s Steam launch options lack `NEURAL_FORGE_ENABLE=1 %command%`")),
-        Some(LaunchOptionState::NoneEnabled) => causes.push("no installed Steam game has `NEURAL_FORGE_ENABLE=1 %command%` in its launch options".to_string()),
-        None => causes.push("the game's Steam launch options may lack `NEURAL_FORGE_ENABLE=1 %command%`".to_string()),
+        Some(LaunchOptionState::Missing { game, .. }) => causes.push(format!("{game}'s Steam launch options lack `NEURAL_FORGE_ENABLE=1`")),
+        Some(LaunchOptionState::NoneEnabled) => causes.push("no installed Steam game has `NEURAL_FORGE_ENABLE=1` in its launch options".to_string()),
+        None => causes.push(format!("the game's Steam launch options may lack `{GENERIC_OPTION}`")),
     }
     causes.push("the game was already running when Neural Forge was installed or updated: restart it".to_string());
     if !manifest_ok {
@@ -538,22 +627,29 @@ fn check_attached(roots: &Roots, hdr: &neural_forge_protocol::ShmHeader, manifes
     }
     let numbered = causes.iter().enumerate().map(|(i, c)| format!("{}. {c}", i + 1)).collect::<Vec<_>>().join("\n");
     let fix = match &launch {
-        Some(LaunchOptionState::Missing(game)) => format!("Set {game}'s launch options to `NEURAL_FORGE_ENABLE=1 %command%` (Steam: the game's Properties > General), then start it."),
-        Some(LaunchOptionState::NoneEnabled) => "Switch the game on in the Setup tab's Steam games list (or `neural-forge-cli enable GAME`) with Steam closed, then start it.".to_string(),
-        _ => "Check the game's launch options for `NEURAL_FORGE_ENABLE=1 %command%`, then start the game again (a running game keeps the layer it started with).".to_string(),
+        Some(LaunchOptionState::Missing { game, option }) => format!("Set {game}'s launch options to `{option}` (Steam: the game's Properties > General), then start it."),
+        Some(LaunchOptionState::NoneEnabled) => format!("Switch the game on in the Setup tab's Steam games list (or `neural-forge-cli enable GAME`) with Steam closed, then start it. By hand: `{GENERIC_OPTION}`."),
+        _ => format!("Check the game's launch options for `{GENERIC_OPTION}`, then start the game again (a running game keeps the layer it started with)."),
     };
     Finding::new(CHECK, Severity::Warning, "no game's layer has attached since the channel was created (this boot)", format!("{evidence}\nlikely causes:\n{numbered}"), Some(fix))
 }
 
 // ---- Steam: which games launch with Neural Forge ---------------------------------------------------
 
-/// [`LaunchOptionState::Present`] when any installed game launches with Neural Forge on,
-/// [`LaunchOptionState::NoneEnabled`] when none does; `None` without any Steam game.
+/// [`LaunchOptionState::Present`] when any installed game that can load the layer (not the
+/// Flatpak Steam's) launches with Neural Forge on, [`LaunchOptionState::NoneEnabled`] when none
+/// does; `None` without any Steam game.
 fn steam_launch_state(games: &[crate::steam::Game]) -> Option<LaunchOptionState> {
     if games.is_empty() {
         return None;
     }
-    Some(if games.iter().any(|g| crate::steam::enabled(&g.root.path, &g.appid)) { LaunchOptionState::Present } else { LaunchOptionState::NoneEnabled })
+    let on = games.iter().any(|g| g.unsupported().is_none() && crate::steam::enabled(&g.root.path, &g.appid));
+    Some(if on { LaunchOptionState::Present } else { LaunchOptionState::NoneEnabled })
+}
+
+/// The first launch options of `game` that switch Neural Forge on, from any account.
+fn enabled_options(game: &crate::steam::Game) -> Option<String> {
+    crate::steam::launch_options(&game.root.path, &game.appid).into_iter().filter_map(|a| a.options).find(|o| crate::launch_options::is_enabled(o))
 }
 
 /// The Steam installations and every installed game's Neural Forge state. A Flatpak-only Steam is
@@ -576,22 +672,61 @@ fn check_steam(roots: &Roots) -> Vec<Finding> {
         ));
     }
     let games = crate::steam::games(steam);
-    let enabled: Vec<bool> = games.iter().map(|g| crate::steam::enabled(&g.root.path, &g.appid)).collect();
-    let on = enabled.iter().filter(|e| **e).count();
-    let list = games.iter().zip(&enabled).map(|(g, e)| format!("{} {} ({}): {}", if *e { "on " } else { "off" }, g.name, g.appid, g.library.display())).collect::<Vec<_>>().join("\n");
+    let options: Vec<Option<String>> = games.iter().map(enabled_options).collect();
+    let usable = |g: &crate::steam::Game| g.unsupported().is_none();
+    let on = games.iter().zip(&options).filter(|(g, o)| usable(g) && o.is_some()).count();
+    let list = games
+        .iter()
+        .zip(&options)
+        .map(|(g, o)| {
+            let flatpak = if usable(g) { "" } else { " [Flatpak Steam]" };
+            format!("{} {} ({}){flatpak}: {}", if o.is_some() { "on " } else { "off" }, g.name, g.appid, g.library.display())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     let evidence = format!("Steam: {root_list}\n{list}");
+    let usable_games = games.iter().filter(|g| usable(g)).count();
     if games.is_empty() {
-        out.push(Finding::new(CHECK, Severity::Info, "no installed Steam games found", evidence, None));
+        out.push(Finding::new(CHECK, Severity::Info, "no installed Steam games found", evidence.clone(), None));
     } else if on == 0 {
         out.push(Finding::new(
             CHECK,
             Severity::Info,
-            format!("none of {} installed Steam games launches with Neural Forge", games.len()),
-            evidence,
+            format!("none of {usable_games} installed Steam games that can load the layer launches with Neural Forge"),
+            evidence.clone(),
             Some("Switch a game on in the Setup tab's Steam games list (or `neural-forge-cli enable GAME`) with Steam closed.".into()),
         ));
     } else {
-        out.push(Finding::new(CHECK, Severity::Ok, format!("{on} of {} installed Steam games launch with Neural Forge", games.len()), evidence, None));
+        out.push(Finding::new(CHECK, Severity::Ok, format!("{on} of {usable_games} installed Steam games launch with Neural Forge"), evidence.clone(), None));
+    }
+    // Switched on in the Flatpak Steam: it cannot work there, whatever the native Steam does.
+    let flatpak_on: Vec<String> = games.iter().zip(&options).filter(|(g, o)| !usable(g) && o.is_some()).map(|(g, _)| format!("{} ({})", g.name, g.appid)).collect();
+    if !flatpak_on.is_empty() && !crate::steam::only_flatpak(steam) {
+        out.push(Finding::new(
+            "steam-flatpak-games",
+            Severity::Warning,
+            format!("switched on in the Flatpak Steam, whose games cannot load the layer: {}", flatpak_on.join(", ")),
+            evidence.clone(),
+            Some("Install those games in your distribution's Steam (not the Flatpak) and switch them on there.".into()),
+        ));
+    }
+    // On without a target: a store launcher or helper that presents first can take the effect.
+    let untargeted: Vec<(&crate::steam::Game, String)> = games
+        .iter()
+        .zip(&options)
+        .filter(|(g, o)| usable(g) && o.as_deref().is_some_and(|o| !crate::launch_options::has_target(o)))
+        .map(|(g, o)| (g, crate::launch_options::merge(o.as_deref().unwrap_or_default(), &crate::steam::target_for(&crate::Config::load_from(&roots.config_file.to_string_lossy()), g))))
+        .collect();
+    if !untargeted.is_empty() {
+        let names = untargeted.iter().map(|(g, _)| g.name.as_str()).collect::<Vec<_>>().join(", ");
+        let wanted = untargeted.iter().map(|(g, o)| format!("{}: {o}", g.name)).collect::<Vec<_>>().join("\n");
+        out.push(Finding::new(
+            "steam-target",
+            Severity::Warning,
+            format!("on without the game's executable as its target, so a launcher or helper can take the effect: {names}"),
+            format!("{evidence}\nlaunch options to set:\n{wanted}"),
+            Some("With Steam closed, switch each game off and on again in the Setup tab, or run `neural-forge-cli enable GAME`; or set the launch options listed above by hand.".into()),
+        ));
     }
     out
 }
@@ -719,7 +854,17 @@ fn parse_xid(line: &str) -> Option<Xid> {
     let number = after.split(',').next()?.trim().parse().ok()?;
     let process = after.split(", ").find_map(|f| f.strip_prefix("name=")).map(|n| n.trim_end_matches(',').to_string());
     let time = line.split_whitespace().next().unwrap_or_default().to_string();
-    Some(Xid { time, number, process, line: line.trim().to_string() })
+    Some(Xid { time, number, process, line: without_host(line.trim()) })
+}
+
+/// A `journalctl -o short-iso` line without its host name field (`<time> <host> kernel: ...` becomes
+/// `<time> kernel: ...`): the report must not carry the machine's name.
+fn without_host(line: &str) -> String {
+    let mut parts = line.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(time), Some(_host), Some(rest)) if rest.starts_with("kernel:") => format!("{time} {rest}"),
+        _ => line.to_string(),
+    }
 }
 
 /// This boot's `NVRM: Xid` lines from the kernel log, oldest first, or why they could not be read:
@@ -728,7 +873,7 @@ pub fn xid_lines(roots: &Roots) -> String {
     let command = format!("journalctl {}", JOURNAL_ARGS.join(" "));
     match (roots.journalctl)(&JOURNAL_ARGS) {
         CommandOutput::Ran(text) => {
-            let lines: Vec<&str> = text.lines().filter(|l| parse_xid(l).is_some()).map(str::trim).collect();
+            let lines: Vec<String> = text.lines().filter_map(parse_xid).map(|x| x.line).collect();
             if lines.is_empty() { format!("{command}: no NVRM: Xid line this boot\n") } else { format!("{command}:\n{}\n", lines.join("\n")) }
         }
         CommandOutput::Failed(why) => format!("{command}: could not be read: {why}\n"),
@@ -778,8 +923,12 @@ fn check_xid(roots: &Roots) -> Vec<Finding> {
         return vec![Finding::new(CHECK, Severity::Ok, "no NVIDIA Xid (GPU fault) in this boot's kernel log", command, None)];
     }
     let newest: Vec<&Xid> = xids.iter().rev().take(XID_SHOWN).collect();
-    let mut numbers: Vec<u32> = newest.iter().map(|x| x.number).collect();
-    numbers.dedup();
+    let mut numbers: Vec<u32> = Vec::new();
+    for x in &newest {
+        if !numbers.contains(&x.number) {
+            numbers.push(x.number);
+        }
+    }
     let latest = newest[0];
     let mut evidence = format!("{command}: {} Xid line(s) this boot, newest first:", xids.len());
     for x in &newest {
@@ -1005,9 +1154,8 @@ mod tests {
         assert_eq!(one(&v, "config").severity, Severity::Failure);
         assert_eq!(one(&v, "model").severity, Severity::Failure);
         assert_eq!(one(&v, "nvngx-dll").severity, Severity::Info, "the DLL is only needed to extract");
-        assert_eq!(one(&v, "user-dirs").severity, Severity::Ok);
-        assert_eq!(one(&v, "channel").severity, Severity::Ok);
-        assert!(f.roots.state_dir.is_dir(), "the user dirs are created");
+        assert_eq!(one(&v, "user-dirs").severity, Severity::Ok, "they can be created");
+        assert_eq!(one(&v, "channel").severity, Severity::Info, "no channel yet");
         // Worst first.
         assert!(v.windows(2).all(|w| w[0].severity >= w[1].severity));
     }
@@ -1016,11 +1164,20 @@ mod tests {
     fn a_present_config_and_model_are_ok() {
         let f = quiet();
         write(&f.roots.config_file, "");
-        write(&f.roots.model_dir.join("manifest.json"), r#"{"source": {"build": "310.8.0", "verified": true}}"#);
+        let bytes = [1u8; 16];
+        let tensors = [crate::model::Tensor { name: "block0.layer0.layer".into(), block: 0, layer: 0, parameter: "layer".into(), bytes: &bytes }];
+        for (rel, data) in crate::model::build_model(&tensors, [310, 8, 0, 0], "00").unwrap() {
+            std::fs::create_dir_all(f.roots.model_dir.join(&rel).parent().unwrap()).unwrap();
+            std::fs::write(f.roots.model_dir.join(&rel), data).unwrap();
+        }
         write(&f.roots.binaries_dir.join("nvngx_dlssnr.dll"), "");
         let v = run(&f.roots);
         assert_eq!(one(&v, "config").severity, Severity::Ok);
-        assert_eq!(one(&v, "model").summary, "the model is extracted (build 310.8.0)");
+        assert_eq!(one(&v, "model").summary, "the model is extracted and intact (build 310.8.0.0)");
+        // A stage file that no longer matches the manifest: damaged, not OK.
+        let first = std::fs::read_dir(f.roots.model_dir.join("model")).unwrap().flatten().map(|e| e.path()).find(|p| std::fs::metadata(p).unwrap().len() > 0).unwrap();
+        std::fs::write(&first, [9u8; 16]).unwrap();
+        assert!(one(&run(&f.roots), "model").summary.contains("damaged"));
         assert_eq!(one(&v, "nvngx-dll").severity, Severity::Ok);
     }
 
@@ -1123,14 +1280,16 @@ mod tests {
         let mapping = channel(&f);
         let v = check_attached(&f.roots, mapping.header(), false);
         assert_eq!(v.severity, Severity::Warning);
+        assert!(v.evidence.contains("NEURAL_FORGE_TARGET_EXE=<the game's .exe>"), "the advice names the target: {}", v.evidence);
         let (launch, restart, manifest) = (v.evidence.find("1. the game's Steam launch options may lack").unwrap(), v.evidence.find("2. the game was already running").unwrap(), v.evidence.find("3. the layer manifest").unwrap());
         assert!(launch < restart && restart < manifest);
         // Known missing for a game: named, first, and the fix says where.
-        f.roots.launch_option_state = Some(LaunchOptionState::Missing("Cyberpunk 2077".into()));
+        let option = "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe %command%".to_string();
+        f.roots.launch_option_state = Some(LaunchOptionState::Missing { game: "Cyberpunk 2077".into(), option });
         let v = check_attached(&f.roots, mapping.header(), true);
         assert!(v.evidence.contains("1. Cyberpunk 2077's Steam launch options lack"), "{}", v.evidence);
         assert!(!v.evidence.contains("3."), "an installed manifest is not a cause");
-        assert!(v.fix.unwrap().starts_with("Set Cyberpunk 2077's launch options"));
+        assert_eq!(v.fix.unwrap(), "Set Cyberpunk 2077's launch options to `NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=Cyberpunk2077.exe %command%` (Steam: the game's Properties > General), then start it.");
         f.roots.launch_option_state = Some(LaunchOptionState::Present);
         assert!(check_attached(&f.roots, mapping.header(), true).evidence.contains("1. the game was already running"));
         // A heartbeat: attached.
@@ -1160,7 +1319,7 @@ mod tests {
     #[test]
     fn steam_games_are_listed_with_their_state() {
         let mut f = quiet();
-        steam(&mut f, "steam", false, &[("3240220", "Grand Theft Auto V Enhanced", Some("MANGOHUD=1 NEURAL_FORGE_ENABLE=1 %command%")), ("990080", "Hogwarts Legacy", None), ("1493710", "Proton Experimental", None)]);
+        steam(&mut f, "steam", false, &[("3240220", "Grand Theft Auto V Enhanced", Some("MANGOHUD=1 NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%")), ("990080", "Hogwarts Legacy", None), ("1493710", "Proton Experimental", None)]);
         let v = check_steam(&f.roots);
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].severity, Severity::Ok);
@@ -1178,7 +1337,7 @@ mod tests {
         assert!(v[0].fix.as_deref().unwrap().contains("neural-forge-cli enable"));
         let mapping = channel(&f);
         let v = check_attached(&f.roots, mapping.header(), true);
-        assert!(v.evidence.contains("1. no installed Steam game has `NEURAL_FORGE_ENABLE=1 %command%`"), "{}", v.evidence);
+        assert!(v.evidence.contains("1. no installed Steam game has `NEURAL_FORGE_ENABLE=1`"), "{}", v.evidence);
         assert!(v.fix.unwrap().starts_with("Switch the game on in the Setup tab"));
         // An explicit state from the caller wins over the derived one.
         f.roots.launch_option_state = Some(LaunchOptionState::Present);
@@ -1203,6 +1362,46 @@ mod tests {
         assert!(flat.evidence.contains("(Flatpak)"));
         steam(&mut f, "native", false, &[]);
         assert!(check_steam(&f.roots).iter().all(|x| x.severity != Severity::Failure), "a native Steam next to the Flatpak one sees the layer");
+    }
+
+    #[test]
+    fn a_game_on_without_its_target_is_a_warning_with_the_options_to_set() {
+        let mut f = quiet();
+        steam(&mut f, "steam", false, &[("3240220", "Grand Theft Auto V Enhanced", Some("NEURAL_FORGE_ENABLE=1 %command% --launcher-skip"))]);
+        write(&f.dir.join("steam/steamapps/common/Grand Theft Auto V Enhanced/GTA5_Enhanced.exe"), "");
+        let v = check_steam(&f.roots);
+        let w = one(&v, "steam-target");
+        assert_eq!(w.severity, Severity::Warning);
+        assert!(w.evidence.contains("Grand Theft Auto V Enhanced: NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command% --launcher-skip"), "{}", w.evidence);
+    }
+
+    #[test]
+    fn a_game_switched_on_in_the_flatpak_steam_next_to_a_native_one_is_a_warning() {
+        let mut f = quiet();
+        steam(&mut f, "native", false, &[("990080", "Hogwarts Legacy", None)]);
+        steam(&mut f, "flatpak", true, &[("3240220", "GTA", Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=a.exe %command%"))]);
+        let v = check_steam(&f.roots);
+        assert_eq!(one(&v, "steam").severity, Severity::Info, "the Flatpak game does not count as on");
+        assert!(one(&v, "steam-flatpak-games").summary.contains("GTA (3240220)"));
+    }
+
+    #[test]
+    fn a_hung_command_is_stopped() {
+        let start = std::time::Instant::now();
+        let out = run_command("sleep", &["30"], std::time::Duration::from_millis(300));
+        assert!(matches!(&out, CommandOutput::Failed(why) if why.contains("stopped")), "{out:?}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(run_command("printf", &["x"], COMMAND_TIMEOUT), CommandOutput::Ran("x".into()));
+        assert_eq!(run_command("neural-forge-no-such-program", &[], COMMAND_TIMEOUT), CommandOutput::Missing);
+    }
+
+    #[test]
+    fn no_channel_file_is_reported_without_creating_one() {
+        let f = quiet();
+        let findings = run(&f.roots);
+        assert_eq!(one(&findings, "channel").severity, Severity::Info);
+        assert!(!f.roots.shm_path.exists(), "the doctor created the channel");
+        assert!(!f.roots.state_dir.exists() && !f.roots.binaries_dir.exists(), "the doctor created user dirs");
     }
 
     #[test]

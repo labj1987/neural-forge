@@ -55,7 +55,28 @@ pub fn save_all(profiles: &BTreeMap<String, ProfileSettings>) -> std::io::Result
     paths::write_atomic(std::path::Path::new(&profiles_file()), text.as_bytes(), 0o644)
 }
 
+/// Why `name` cannot name a profile, if it cannot: it must be non-empty, without surrounding
+/// spaces, at most 64 characters, and without a line break, `[`, `]`, `=` or `#` (each would
+/// read back as another section, a setting or a comment in `profiles.ini`).
+pub fn invalid_name(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        Some("a profile needs a name")
+    } else if name.trim() != name {
+        Some("a profile name cannot start or end with a space")
+    } else if name.chars().count() > 64 {
+        Some("a profile name is at most 64 characters")
+    } else if name.chars().any(|c| c.is_control() || matches!(c, '[' | ']' | '=' | '#')) {
+        Some("a profile name cannot hold a line break, [, ], = or #")
+    } else {
+        None
+    }
+}
+
+/// Saves `settings` as profile `name` ([`invalid_name`] refuses a name `profiles.ini` cannot hold).
 pub fn save_profile(name: &str, settings: ProfileSettings) -> std::io::Result<()> {
+    if let Some(why) = invalid_name(name) {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
+    }
     let mut all = load_all();
     all.insert(name.to_string(), settings);
     save_all(&all)
@@ -74,6 +95,17 @@ pub fn delete_profile(name: &str) -> std::io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn names_that_would_break_the_file_are_refused() {
+        for bad in ["", " a", "a ", "a\nb", "[x]", "a=b", "#c", "a\rb", &"x".repeat(65)] {
+            assert!(invalid_name(bad).is_some(), "{bad:?}");
+            assert_eq!(save_profile(bad, ProfileSettings::new()).unwrap_err().kind(), std::io::ErrorKind::InvalidInput);
+        }
+        for good in ["Night", "GTA V – sharp", "a b c"] {
+            assert_eq!(invalid_name(good), None, "{good:?}");
+        }
+    }
 
     // Guards every test here for the same reason `paths::tests` guards
     // `XDG_DATA_HOME`: `XDG_CONFIG_HOME` is a real process-wide env var, and Rust's

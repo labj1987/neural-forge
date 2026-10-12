@@ -684,6 +684,7 @@ dependencies = [
 name = "neural-forge-supervisor"
 version = "3.3.0"
 dependencies = [
+ "libc",
  "miniz_oxide 0.9.1",
  "neural-forge-protocol",
  "serde_json",

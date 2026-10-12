@@ -33,14 +33,17 @@ fn usage() {
          \x20                     (see `profile help`)\n\
          \x20 games                list installed Steam games and whether Neural Forge\n\
          \x20                     is on in their launch options\n\
-         \x20 enable GAME [--target-exe EXE]\n\
-         \x20                     turn Neural Forge on in GAME's Steam launch options\n\
-         \x20                     (GAME: appid, exact name, or a unique part of a name;\n\
-         \x20                     Steam must be closed, else the string to paste is shown)\n\
+         \x20 enable GAME [--target-exe EXE[,EXE...]|auto]\n\
+         \x20                     turn Neural Forge on in GAME's Steam launch options for\n\
+         \x20                     the game's own executable (found from Steam's data;\n\
+         \x20                     --target-exe names it, remembered for GAME; auto finds it\n\
+         \x20                     again). GAME: appid, exact name, or a unique part of a\n\
+         \x20                     name; Steam must be closed, else the string to paste is shown\n\
          \x20 disable GAME         take Neural Forge back out of GAME's launch options\n\
-         \x20 report [--appid ID]  write a diagnostic report zip (home and user name\n\
-         \x20                     redacted) to the desktop; ID: the game's Steam app id,\n\
-         \x20                     for its Proton version"
+         \x20 report [--appid ID]  write a diagnostic report zip to the desktop (home, user\n\
+         \x20                     and host names redacted; it lists your installed Steam\n\
+         \x20                     games and their library folders); ID: the game's Steam\n\
+         \x20                     app id, for its Proton version"
     );
 }
 
@@ -71,6 +74,10 @@ fn cmd_profile_list() -> ExitCode {
 }
 
 fn cmd_profile_save(name: &str) -> ExitCode {
+    if let Some(why) = neural_forge_supervisor::profiles::invalid_name(name) {
+        eprintln!("profile save: {why}");
+        return ExitCode::FAILURE;
+    }
     let channel_cfg = Config::load();
     let mapping = match neural_forge_supervisor::open_channel(&channel_cfg) {
         Ok(mapping) => mapping,
@@ -159,14 +166,8 @@ fn cmd_profile(args: &[String]) -> ExitCode {
 /// Writes the diagnostic report (`neural_forge_supervisor::report`) and prints where it went.
 fn cmd_report(appid: Option<&str>) -> ExitCode {
     let cfg = Config::load();
-    // The channel opened the way `shmctl status` opens it, for the same text.
-    let (status, game) = match neural_forge_supervisor::open_channel(&cfg) {
-        Ok(mapping) => {
-            neural_forge_supervisor::apply_saved_settings(&cfg, &mapping);
-            (neural_forge_supervisor::shm_status::status_text(mapping.header()), mapping.header().game_name())
-        }
-        Err(e) => (format!("channel not open: {e}: {}\n", neural_forge_supervisor::channel_path(&cfg)), String::new()),
-    };
+    // The channel looked at the way `shmctl status` looks at it (read-only), for the same text.
+    let (status, game) = neural_forge_supervisor::shm_status::look(&cfg);
     match neural_forge_supervisor::report::save(&status, &game, appid) {
         Ok(path) => {
             println!("wrote {}", path.display());
@@ -368,12 +369,44 @@ fn cmd_games() -> ExitCode {
     if games.is_empty() {
         return ExitCode::SUCCESS;
     }
-    println!("{:>8}  {:<3}  name  (library)", "appid", "on");
+    let cfg = Config::load();
+    println!("{:>8}  {:<3}  name  (library)  target executable", "appid", "on");
     for game in &games {
         let on = if steam::enabled(&game.root.path, &game.appid) { "yes" } else { "no" };
-        println!("{:>8}  {:<3}  {}  ({})", game.appid, on, game.name, game.library.display());
+        let target = match game.unsupported() {
+            Some(why) => format!("cannot be switched on: {why}"),
+            None => match steam::target_for(&cfg, game) {
+                t if t.is_empty() => "not found".to_string(),
+                t => t,
+            },
+        };
+        println!("{:>8}  {:<3}  {}  ({})  {target}", game.appid, on, game.name, game.library.display());
     }
     ExitCode::SUCCESS
+}
+
+/// The target to enable `game` with: `chosen` (remembered in config.ini for the game; `auto`
+/// forgets it), else the remembered one, else the one found from Steam's data.
+fn target_for_enable(game: &neural_forge_supervisor::steam::Game, chosen: &str) -> Result<String, String> {
+    use neural_forge_supervisor::steam;
+    let mut cfg = Config::load();
+    let key = steam::chosen_target_key(&game.appid);
+    let chosen = chosen.trim();
+    if chosen == "auto" {
+        if cfg.settings.remove(&key).is_some() {
+            cfg.save().map_err(|e| format!("saving config.ini failed: {e}"))?;
+        }
+    } else if !chosen.is_empty() {
+        if cfg.settings.get(&key).map(String::as_str) != Some(chosen) {
+            cfg.settings.insert(key, chosen.to_string());
+            cfg.save().map_err(|e| format!("saving config.ini failed: {e}"))?;
+        }
+        return Ok(chosen.to_string());
+    }
+    match steam::target_for(&cfg, game) {
+        t if t.is_empty() => Err(format!("{}'s executable was not found in {}; name it with --target-exe (the .exe the game runs)", game.name, game.dir().display())),
+        t => Ok(t),
+    }
 }
 
 fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action) -> ExitCode {
@@ -394,6 +427,20 @@ fn cmd_set_game(query: &str, action: neural_forge_supervisor::steam::Action) -> 
             }
             return ExitCode::FAILURE;
         }
+    };
+    if let (Action::Enable { .. }, Some(why)) = (&action, game.unsupported()) {
+        eprintln!("{} cannot be switched on: {why}. Install it in your distribution's Steam instead.", game.name);
+        return ExitCode::FAILURE;
+    }
+    let action = match action {
+        Action::Enable { target_exe } => match target_for_enable(game, &target_exe) {
+            Ok(target_exe) => Action::Enable { target_exe },
+            Err(why) => {
+                eprintln!("{why}");
+                return ExitCode::FAILURE;
+            }
+        },
+        Action::Disable => Action::Disable,
     };
     let verb = if matches!(action, Action::Disable) { "off" } else { "on" };
     let manual_hint = |manual: &str| {
@@ -569,13 +616,13 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "uninstall" => {
             "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also removes config, data\n  (the DLL, the model), state and /tmp/neural-forge-$UID"
         }
-        "games" => "usage: neural-forge-cli games\n  list installed Steam games (appid, Neural Forge on/off, name, library)",
+        "games" => "usage: neural-forge-cli games\n  list installed Steam games (appid, Neural Forge on/off, name, library, the executable\n  Neural Forge targets)",
         "enable" => {
-            "usage: neural-forge-cli enable GAME [--target-exe EXE]\n  turn Neural Forge on in GAME's Steam launch options, keeping the options already there.\n  GAME is an appid, an exact name or a unique part of a name. Steam must be closed (it\n  rewrites its settings on exit); otherwise the launch options to paste are printed."
+            "usage: neural-forge-cli enable GAME [--target-exe EXE[,EXE...]|auto]\n  turn Neural Forge on in GAME's Steam launch options, keeping the options already there,\n  with NEURAL_FORGE_TARGET_EXE set to the game's own executable, so no launcher or helper\n  can take the effect. The executable is found from Steam's data and the game's folder;\n  --target-exe names it instead and is remembered for GAME (also when the GUI switches it\n  on); --target-exe auto forgets it. GAME is an appid, an exact name or a unique part of a\n  name. Steam must be closed (it rewrites its settings on exit); otherwise the launch\n  options to paste are printed."
         }
         "disable" => "usage: neural-forge-cli disable GAME\n  take Neural Forge back out of GAME's Steam launch options (see `enable --help`)",
         "report" => {
-            "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game's Proton when ID, its Steam app id, is given), config.ini, the\n  model's manifest, the layer's logs, the channel's status and the newest capture pair.\n  The home directory and user name are replaced with ~ and <user>; nothing is uploaded"
+            "usage: neural-forge-cli report [--appid ID]\n  write neural-forge-report-<time>.zip to the desktop: a summary (version, GPU, driver,\n  kernel, session, the game and its Proton -- found from the game the channel names, or\n  from ID, its Steam app id -- and the doctor's findings, which list your installed Steam\n  games and their library folders), config.ini, the model's manifest, the layer's logs,\n  this boot's GPU fault (Xid) lines, the channel's status and the newest capture pair.\n  The home directory, user name and host name are replaced with ~, <user> and <host>;\n  nothing is uploaded"
         }
         "shmctl" => "",
         "profile" => "",

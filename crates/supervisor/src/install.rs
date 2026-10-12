@@ -212,10 +212,11 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     // left it there, and refusing it would block every later install.
     let mut adopted = BTreeMap::new();
     for (path, content) in &files {
-        // The destination and the directory it lands in, not every ancestor: a symlinked
-        // $HOME or ~/.local/share is an ordinary setup, and refusing it refused every launch.
-        if path.is_symlink() || path.parent().is_some_and(Path::is_symlink) {
-            return Err(InstallError::RefusedSymlink(path.clone()));
+        // The destination and every directory between it and the XDG data home: a symlinked
+        // $HOME or ~/.local/share is an ordinary setup (refusing it refused every launch), but a
+        // symlinked `neural-forge`, `lib` or `vulkan` below it would send the install elsewhere.
+        if let Some(link) = symlink_below_data_home(path) {
+            return Err(InstallError::RefusedSymlink(link));
         }
         if path.exists() {
             let current = digest_file(path)?;
@@ -279,6 +280,44 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     Ok(InstallReport { changed: true, root: root.clone(), gui_path: root.join("bin/neural-forge"), cli_path: root.join("bin/neural-forge-cli") })
 }
 
+/// The first symlink among `path` and its ancestors below the XDG data home, if any.
+fn symlink_below_data_home(path: &Path) -> Option<PathBuf> {
+    let data_home = PathBuf::from(paths::data_home());
+    path.ancestors().take_while(|a| *a != data_home && a.starts_with(&data_home)).find(|a| a.is_symlink()).map(Path::to_path_buf)
+}
+
+/// Whether the file at `path` is a layer manifest naming this project's layer.
+fn is_our_manifest(path: &Path) -> bool {
+    !path.is_symlink()
+        && std::fs::read_to_string(path)
+            .ok()
+            .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+            .is_some_and(|m| m.get("layer").and_then(|l| l.get("name")).and_then(|n| n.as_str()) == Some(LAYER))
+}
+
+/// What an install puts in place, by location alone: for an uninstall without a usable record
+/// (missing, or unreadable), so a lost record never leaves a layer every game still loads.
+fn remove_known_install() -> std::io::Result<()> {
+    let manifest = manifest_path();
+    if is_our_manifest(&manifest) {
+        std::fs::remove_file(&manifest)?;
+        remove_empty_parents(&manifest);
+    }
+    let root = PathBuf::from(paths::data_dir());
+    for file in [root.join("bin/neural-forge"), root.join("bin/neural-forge-cli")] {
+        if file.is_file() && !file.is_symlink() {
+            std::fs::remove_file(&file)?;
+            remove_empty_parents(&file);
+        }
+    }
+    let lib = root.join("lib/neural-forge");
+    if lib.is_dir() && !lib.is_symlink() {
+        std::fs::remove_dir_all(&lib)?;
+        remove_empty_parents(&lib.join("x"));
+    }
+    Ok(())
+}
+
 /// Removes now-empty directories from `dir` upward, stopping at (and keeping) `stop`.
 fn prune_empty_dirs(dir: &Path, stop: &Path) {
     let mut current = dir;
@@ -294,9 +333,23 @@ fn prune_empty_dirs(dir: &Path, stop: &Path) {
 /// own record (a file the user or another program has since changed is left alone,
 /// reported as preserved rather than silently deleted), then clears the record. The layer
 /// manifest goes first, so no game loads a layer whose files are half gone. A record entry
-/// outside the directories this installer owns is skipped: neither removed nor reported.
+/// outside the directories this installer owns is skipped: neither removed nor reported. Without
+/// a record, or with one that cannot be read, what an install puts in place is removed by its
+/// location ([`remove_known_install`]): the layer manifest (when it names this layer), the
+/// binaries and the layer's library directory.
 pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
-    let (old, _foreign) = owned_record(load_record()?);
+    let record = match load_record() {
+        Ok(record) if !record.is_empty() => record,
+        _ => {
+            remove_known_install()?;
+            let record = record_path();
+            if record.exists() {
+                std::fs::remove_file(record)?;
+            }
+            return Ok(Vec::new());
+        }
+    };
+    let (old, _foreign) = owned_record(record);
     let manifest = manifest_path().to_string_lossy().into_owned();
     let mut preserved = Vec::new();
     let ordered = old.get_key_value(&manifest).into_iter().chain(old.iter().filter(|(name, _)| **name != manifest));
@@ -344,6 +397,13 @@ pub fn purge() -> std::io::Result<Vec<PathBuf>> {
             let _ = std::fs::remove_file(path);
             remove_empty_parents(path);
         }
+    }
+    // Whatever the record said: a manifest naming this layer would point every game at a library
+    // that is about to be deleted.
+    let manifest = manifest_path();
+    if is_our_manifest(&manifest) {
+        std::fs::remove_file(&manifest)?;
+        remove_empty_parents(&manifest);
     }
     let mut removed = Vec::new();
     let runtime = neural_forge_protocol::shm_runtime_dir();
@@ -532,9 +592,10 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains(&record_path().display().to_string()) && message.contains("Move it aside"), "{message}");
 
-        let err = uninstall().expect_err("uninstall must not act on an unreadable record");
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-        assert!(PathBuf::from(paths::data_dir()).join("bin/neural-forge").exists(), "nothing may be removed");
+        // Uninstall cannot use it, but still removes what an install puts in place, by location.
+        uninstall().expect("uninstall works without a readable record");
+        assert!(!PathBuf::from(paths::data_dir()).join("bin/neural-forge").exists());
+        assert!(!manifest_path().exists());
     }
 
     #[test]
@@ -707,6 +768,49 @@ mod tests {
         let err = install(&appdir).expect_err("a symlinked destination directory must be refused");
         assert!(matches!(err, InstallError::RefusedSymlink(_)), "unexpected error: {err}");
         assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing may be written through the symlink");
+    }
+
+    #[test]
+    fn a_symlinked_neural_forge_or_lib_directory_is_refused() {
+        let scratch = ScratchDataHome::new("symlinked-root");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        let elsewhere = scratch.dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, paths::data_dir()).unwrap();
+        assert!(matches!(install(&appdir), Err(InstallError::RefusedSymlink(_))));
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0, "nothing may be written through the symlink");
+    }
+
+    #[test]
+    fn without_a_record_uninstall_still_removes_the_install_and_purge_the_manifest() {
+        let scratch = ScratchDataHome::new("no-record");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+        let manifest = manifest_path();
+        let lib = PathBuf::from(paths::data_dir()).join("lib/neural-forge/libneural_forge_layer.so");
+        assert!(manifest.is_file() && lib.is_file());
+        // A lost record: the layer and the manifest that loads it still go.
+        std::fs::remove_file(record_path()).unwrap();
+        assert!(uninstall().unwrap().is_empty());
+        assert!(!manifest.exists() && !lib.exists());
+        assert!(!PathBuf::from(paths::data_dir()).join("bin/neural-forge-cli").exists());
+        // A corrupt record: the same.
+        install(&appdir).unwrap();
+        std::fs::write(record_path(), "{ not json").unwrap();
+        uninstall().unwrap();
+        assert!(!manifest.exists() && !lib.exists() && !record_path().exists());
+        // purge never leaves a manifest pointing at the deleted library, record or not.
+        install(&appdir).unwrap();
+        std::fs::remove_file(record_path()).unwrap();
+        purge().unwrap();
+        assert!(!manifest.exists() && !PathBuf::from(paths::data_dir()).exists());
+        // A manifest of another layer at our name is not ours to remove.
+        std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+        std::fs::write(&manifest, r#"{"layer": {"name": "VK_LAYER_other"}}"#).unwrap();
+        uninstall().unwrap();
+        assert!(manifest.exists());
     }
 
     #[test]

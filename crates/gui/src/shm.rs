@@ -113,6 +113,14 @@ fn persist_later(shm: &Arc<Mapping>, name: &'static str) {
     });
 }
 
+/// Marks `names` changed for the next save: settings written to the header some other way than
+/// through a bound row (a preset, `Knobs::write`).
+pub fn persist_settings_later(shm: &Arc<Mapping>, names: &[&'static str]) {
+    for name in names {
+        persist_later(shm, name);
+    }
+}
+
 /// Writes every changed setting to `config.ini` now (the timer does this on its own; the window
 /// calls it on close). A full load-modify-save of the file, so no other key is written stale.
 pub fn flush_settings() -> std::io::Result<()> {
@@ -204,6 +212,9 @@ mod tests {
         let config_home = scratch.join("config");
         let shm_path = scratch.join("shm.bin");
         std::fs::create_dir_all(&config_home).unwrap();
+        // The channel's directory must be private, as the real runtime directory is.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&scratch, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         // Config, data and state all go to the scratch dir, so the test never creates the real
         // XDG dirs.

@@ -71,7 +71,18 @@ pub fn ensure_dirs() -> std::io::Result<()> {
 /// already-running process that has the old inode mapped (a GUI, a game) keeps reading the old content until it reopens the path, exactly like
 /// `install.py`'s own `os.replace` step. A crash part-way leaves the old file whole, never an
 /// empty one: `config.ini` and `profiles.ini` are written through this too.
+///
+/// A `path` that is a symlink is written through: its target is replaced (a symlinked
+/// `localconfig.vdf` stays a symlink to the edited file). The directory is fsynced after the
+/// rename, so the replacement itself survives a crash.
 pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<()> {
+    let resolved;
+    let path = if path.is_symlink() {
+        resolved = std::fs::canonicalize(path)?;
+        resolved.as_path()
+    } else {
+        path
+    };
     let parent = path.parent().ok_or_else(|| std::io::Error::other(format!("{} has no parent directory", path.display())))?;
     std::fs::create_dir_all(parent)?;
     let mut attempt = 0u32;
@@ -92,7 +103,8 @@ pub fn write_atomic(path: &Path, content: &[u8], mode: u32) -> std::io::Result<(
     if result.is_err() {
         let _ = std::fs::remove_file(&staged);
     }
-    result
+    result?;
+    std::fs::File::open(parent)?.sync_all()
 }
 
 #[cfg(test)]
@@ -125,6 +137,11 @@ pub(crate) mod tests {
 
         super::write_atomic(&dir.join("file"), b"content", 0o644).unwrap();
         assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"content");
+        // A symlink is written through: it stays a link, and its target changes.
+        std::os::unix::fs::symlink(dir.join("file"), dir.join("link")).unwrap();
+        super::write_atomic(&dir.join("link"), b"new", 0o644).unwrap();
+        assert!(dir.join("link").is_symlink());
+        assert_eq!(std::fs::read(dir.join("file")).unwrap(), b"new");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

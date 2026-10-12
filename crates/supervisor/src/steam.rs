@@ -88,6 +88,22 @@ pub struct Game {
     pub library: PathBuf,
     /// The Steam root it was found through (whose `userdata/` holds its launch options).
     pub root: Root,
+    /// The installed beta branch (`MountedConfig/BetaKey` in its app manifest); empty for the
+    /// default branch. Launch entries can be per branch.
+    pub branch: String,
+}
+
+impl Game {
+    /// Its install folder.
+    pub fn dir(&self) -> PathBuf {
+        self.library.join("steamapps/common").join(&self.installdir)
+    }
+
+    /// Why Neural Forge cannot be switched on for it, if it cannot: a game of the Flatpak Steam
+    /// runs in a sandbox that does not see the layer installed on the host.
+    pub fn unsupported(&self) -> Option<&'static str> {
+        self.root.flatpak.then_some("it belongs to the Flatpak Steam, whose games cannot load Neural Forge's layer")
+    }
 }
 
 /// Apps in `steamapps` that are Steam's own tools rather than games: Proton builds, the Steam Linux
@@ -121,11 +137,15 @@ pub fn is_tool(appid: &str, name: &str) -> bool {
         || name.starts_with("steamvr")
 }
 
-/// The games in every library of every root (tools filtered out), sorted by name. A library two
-/// roots share is read once.
+/// The games in every library of every root (tools filtered out), sorted by name, each appid once:
+/// a library two roots share is read once, and an appid with app manifests in two places (a stale
+/// copy in another library, or both a native and a Flatpak Steam) is the copy found first, the
+/// native roots coming before the Flatpak one.
 pub fn games(roots: &[Root]) -> Vec<Game> {
     let mut out: Vec<Game> = Vec::new();
-    for root in roots {
+    let mut ordered: Vec<&Root> = roots.iter().filter(|r| !r.flatpak).collect();
+    ordered.extend(roots.iter().filter(|r| r.flatpak));
+    for root in ordered {
         for library in libraries(&root.path) {
             let Ok(dir) = std::fs::read_dir(library.join("steamapps")) else { continue };
             let mut manifests: Vec<PathBuf> = dir
@@ -138,10 +158,11 @@ pub fn games(roots: &[Root]) -> Vec<Game> {
                 let Some(tree) = std::fs::read(&manifest).ok().and_then(|t| vdf::parse(&t).ok()) else { continue };
                 let field = |key: &str| tree.string_at(&["AppState", key]).map(str::to_string);
                 let (Some(appid), Some(name), Some(installdir)) = (field("appid"), field("name"), field("installdir")) else { continue };
-                if is_tool(&appid, &name) || out.iter().any(|g| g.appid == appid && g.library == library) {
+                if is_tool(&appid, &name) || out.iter().any(|g| g.appid == appid) {
                     continue;
                 }
-                out.push(Game { appid, name, installdir, library: library.clone(), root: root.clone() });
+                let branch = tree.string_at(&["AppState", "MountedConfig", "BetaKey"]).unwrap_or_default().trim().to_string();
+                out.push(Game { appid, name, installdir, library: library.clone(), root: root.clone(), branch });
             }
         }
     }
@@ -173,30 +194,152 @@ pub fn find<'a>(games: &'a [Game], query: &str) -> Result<&'a Game, FindError> {
         .unwrap_or(Err(FindError::NotFound))
 }
 
-/// The game whose install folder holds an executable named `exe` (ignoring case), searched a few
-/// folders deep (`Game/Binaries/Win64/Game-Win64-Shipping.exe` is four). The channel names a running
-/// game by its executable; this is how the report finds its app id, and from it its Proton.
-pub fn game_for_exe<'a>(games: &'a [Game], exe: &str) -> Option<&'a Game> {
+/// Executables a game folder ships that are not the game: redistributable installers, anti-cheat
+/// services and crash reporters (matched on the lowercase name), and folders that hold only those.
+fn helper_exe(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    neural_forge_protocol::processes::never_the_game(&n)
+        || ["setup", "redist", "prereq", "unins", "installer", "dotnet", "crashreport", "crashhandler", "crashpad", "crs-", "beservice", "easyanticheat", "start_protected_game", "bugsplat", "vcredist"]
+            .iter()
+            .any(|part| n.contains(part))
+}
+
+fn helper_dir(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    ["redist", "_commonredist", "redistributables", "installers", "directx", "vcredist", "battleye", "easyanticheat", "engine", "support"].contains(&n.as_str())
+}
+
+/// The `.exe` files directly in `dir` (case kept), sorted.
+fn exes_in(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
+        .filter_map(|e| e.file_name().to_str().map(str::to_string))
+        .filter(|n| n.to_ascii_lowercase().ends_with(".exe"))
+        .collect();
+    out.sort();
+    out
+}
+
+/// Unreal Engine's game binaries: `<Project>/Binaries/<Win64|WinGDK|Win32>/*.exe` under `dir`.
+/// Steam usually starts a small stub in the install folder that starts this one.
+fn unreal_binaries(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut projects: Vec<PathBuf> = entries.flatten().filter(|e| e.file_type().is_ok_and(|t| t.is_dir())).map(|e| e.path()).collect();
+    projects.sort();
+    let mut out = Vec::new();
+    for project in projects {
+        if project.file_name().and_then(|n| n.to_str()).is_some_and(helper_dir) {
+            continue;
+        }
+        for platform in ["Win64", "WinGDK", "Win32"] {
+            out.extend(exes_in(&project.join("Binaries").join(platform)));
+        }
+    }
+    out
+}
+
+/// Whether `path` is an ELF executable (a native Linux game's binary).
+fn elf_executable(path: &Path) -> bool {
+    use std::io::Read;
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(meta) = std::fs::metadata(path) else { return false };
+    let mut magic = [0u8; 4];
+    meta.is_file() && meta.permissions().mode() & 0o111 != 0 && std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).is_ok() && magic == *b"\x7fELF"
+}
+
+/// The executables of `game` that can be the process the player sees, for `NEURAL_FORGE_TARGET_EXE`
+/// (the layer lets only these claim the channel). Names only, case kept, deduplicated ignoring case.
+///
+/// From Steam's own launch entries for the game (`appinfo.vdf`, those for Windows or Linux and the
+/// installed branch): each entry's executable, the other executables beside it (a store
+/// bootstrapper such as `PlayGTAV.exe` starts the game from its own folder, and anti-cheat's
+/// `start_protected_game.exe` starts its neighbour), and Unreal Engine's real binary under
+/// `<Project>/Binaries/Win64` (the stub in the install folder starts it). Without launch entries,
+/// the executables at the top of the install folder and Unreal's binaries. Redistributable
+/// installers, anti-cheat services, crash reporters and store launchers are left out unless Steam
+/// launches them directly. A Linux launch script stands for the ELF executables beside it.
+pub fn target_exes(game: &Game) -> Vec<String> {
+    let dir = game.dir();
+    let mut out: Vec<String> = Vec::new();
+    let add = |name: &str, out: &mut Vec<String>| {
+        if !name.is_empty() && !name.contains(',') && !out.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            out.push(name.to_string());
+        }
+    };
+    let launches = crate::appinfo::launches(&game.root.path, &game.appid).ok().flatten().unwrap_or_default();
+    let mut launched = false;
+    for launch in launches.iter().filter(|l| (l.for_os("windows") || l.for_os("linux")) && l.for_branch(&game.branch)) {
+        let rel = launch.executable.replace('\\', "/");
+        let rel = rel.trim_start_matches("./");
+        let path = dir.join(rel);
+        let name = rel.rsplit('/').next().unwrap_or(rel);
+        let beside = path.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.clone());
+        launched = true;
+        if name.to_ascii_lowercase().ends_with(".sh") {
+            let Ok(entries) = std::fs::read_dir(&beside) else { continue };
+            let mut elves: Vec<String> = entries.flatten().filter(|e| elf_executable(&e.path())).filter_map(|e| e.file_name().to_str().map(str::to_string)).collect();
+            elves.sort();
+            for elf in elves {
+                add(&elf, &mut out);
+            }
+            continue;
+        }
+        add(name, &mut out);
+        if name.to_ascii_lowercase().ends_with(".exe") {
+            for exe in exes_in(&beside).iter().filter(|e| !helper_exe(e)) {
+                add(exe, &mut out);
+            }
+        }
+    }
+    if !launched {
+        for exe in exes_in(&dir).iter().filter(|e| !helper_exe(e)) {
+            add(exe, &mut out);
+        }
+    }
+    for exe in unreal_binaries(&dir).iter().filter(|e| !helper_exe(e)) {
+        add(exe, &mut out);
+    }
+    out
+}
+
+/// The games whose install folder holds an executable named `exe` (ignoring case), best first: a
+/// game whose [`target_exes`] name it, else the one holding it least deep, searched up to four
+/// folders deep (`Game/Binaries/Win64/Game-Win64-Shipping.exe` is four). Several games tied for
+/// the best place are all returned, so a caller can say the name is ambiguous. The channel names a
+/// running game by its executable; this is how the report finds its app id, and from it its Proton.
+pub fn games_for_exe<'a>(games: &'a [Game], exe: &str) -> Vec<&'a Game> {
     const DEPTH: usize = 4;
-    fn holds(dir: &Path, exe: &str, depth: usize) -> bool {
-        let Ok(entries) = std::fs::read_dir(dir) else { return false };
+    /// The depth (1: the folder itself) of the shallowest file named `exe` under `dir`.
+    fn depth_of(dir: &Path, exe: &str, depth: usize) -> Option<usize> {
+        let entries = std::fs::read_dir(dir).ok()?;
         let mut subdirs = Vec::new();
         for e in entries.flatten() {
             let Ok(kind) = e.file_type() else { continue };
             if kind.is_file() && e.file_name().to_str().is_some_and(|n| n.eq_ignore_ascii_case(exe)) {
-                return true;
+                return Some(DEPTH - depth + 1);
             }
             if kind.is_dir() && depth > 1 {
                 subdirs.push(e.path());
             }
         }
-        subdirs.iter().any(|d| holds(d, exe, depth - 1))
+        subdirs.iter().filter_map(|d| depth_of(d, exe, depth - 1)).min()
     }
     let exe = exe.trim();
     if exe.is_empty() || exe.contains('/') {
-        return None;
+        return Vec::new();
     }
-    games.iter().find(|g| holds(&g.library.join("steamapps/common").join(&g.installdir), exe, DEPTH))
+    // Rank: 0 when the game's own targets name it, else 1 + the depth it was found at.
+    let ranked: Vec<(usize, &Game)> = games
+        .iter()
+        .filter_map(|g| {
+            let depth = depth_of(&g.dir(), exe, DEPTH)?;
+            Some((if target_exes(g).iter().any(|t| t.eq_ignore_ascii_case(exe)) { 0 } else { depth }, g))
+        })
+        .collect();
+    let Some(best) = ranked.iter().map(|(r, _)| *r).min() else { return Vec::new() };
+    ranked.into_iter().filter(|(r, _)| *r == best).map(|(_, g)| g).collect()
 }
 
 /// Whether the Steam client is running: a process under `proc_root` (normally `/proc`) whose
@@ -258,9 +401,27 @@ pub fn enabled(root: &Path, appid: &str) -> bool {
     launch_options(root, appid).iter().any(|a| a.options.as_deref().is_some_and(launch_options::is_enabled))
 }
 
+/// The `config.ini` key of the target executable chosen by hand for `appid` (`neural-forge-cli
+/// enable GAME --target-exe EXE`). It wins over [`target_exes`] whenever the game is switched on,
+/// from the command line or the GUI, so it survives switching the game off and on again.
+pub fn chosen_target_key(appid: &str) -> String {
+    format!("target_exe_{appid}")
+}
+
+/// The `NEURAL_FORGE_TARGET_EXE` value for `game`: the executable chosen by hand for it in `cfg`,
+/// else every name [`target_exes`] finds, comma-separated. Empty only when neither has one.
+pub fn target_for(cfg: &crate::Config, game: &Game) -> String {
+    cfg.settings
+        .get(&chosen_target_key(&game.appid))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
+        .unwrap_or_else(|| target_exes(game).join(","))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
-    /// Turn Neural Forge on; the target executable may be empty.
+    /// Turn Neural Forge on for the target executable(s) (comma-separated; never empty: [`apply`]
+    /// refuses an empty one, since without it a store launcher could take the channel).
     Enable { target_exe: String },
     Disable,
 }
@@ -306,8 +467,9 @@ pub fn apply_now(root: &Path, appid: &str, action: &Action) -> Outcome {
 /// Sets the game's launch options in `root`'s `localconfig.vdf` files.
 ///
 /// Which accounts: every account whose file already has the game's block (the accounts that have
-/// run it); when none has, enabling creates the block only in the most recently modified file (the
-/// account last signed in), and disabling has nothing to do. Every edit is prepared and verified
+/// run it), and when enabling also the most recently modified file (the account last signed in),
+/// which gets the block if it lacks it; disabling with no account having the block has nothing to
+/// do. Every edit is prepared and verified
 /// before any file is written, so a refusal leaves all of them untouched. For each file written:
 /// `localconfig.vdf.neural-forge.orig` is a copy of it as first found (taken once, never
 /// replaced), `localconfig.vdf.neural-forge.bak` a copy from just before this edit, and the new
@@ -316,6 +478,9 @@ pub fn apply(root: &Path, appid: &str, action: &Action, steam_running: bool) -> 
     let accounts = launch_options(root, appid);
     let current = accounts.iter().find(|a| a.has_app).and_then(|a| a.options.clone()).unwrap_or_default();
     let manual = action.apply_to(&current);
+    if matches!(action, Action::Enable { target_exe } if target_exe.trim().is_empty()) {
+        return Outcome::Failed { reason: "the game's executable is not known: name it (the .exe the game runs) as the target".into(), manual };
+    }
     if steam_running {
         return Outcome::SteamRunning { manual };
     }
@@ -328,12 +493,15 @@ pub fn apply(root: &Path, appid: &str, action: &Action, steam_running: bool) -> 
         return Outcome::Failed { reason: format!("cannot read {}", unreadable.join(", ")), manual };
     }
     let mut targets: Vec<&AccountOptions> = accounts.iter().filter(|a| a.has_app).collect();
-    if targets.is_empty() {
-        if *action == Action::Disable {
-            return Outcome::Unchanged;
-        }
+    if *action != Action::Disable {
+        // The account last signed in (its file written last) gets the game's block too: it is the
+        // one that will start the game next, whether or not it has run it before.
         let newest = accounts.iter().max_by_key(|a| std::fs::metadata(&a.file).and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH));
-        targets.extend(newest);
+        if let Some(newest) = newest.filter(|n| !n.has_app) {
+            targets.push(newest);
+        }
+    } else if targets.is_empty() {
+        return Outcome::Unchanged;
     }
     let path = options_path(appid);
     let mut planned = Vec::new();
@@ -429,17 +597,84 @@ mod tests {
     #[test]
     fn a_running_exe_names_its_game() {
         let s = Scratch::new("exe");
-        let game = |appid: &str, name: &str| Game { appid: appid.into(), name: name.into(), installdir: name.into(), library: s.0.clone(), root: Root { path: s.0.clone(), flatpak: false } };
-        let games = vec![game("1", "Alpha"), game("2", "Remnant2"), game("3", "Deep")];
+        let game = |appid: &str, name: &str| Game { appid: appid.into(), name: name.into(), installdir: name.into(), library: s.0.clone(), root: Root { path: s.0.clone(), flatpak: false }, branch: String::new() };
+        let games = vec![game("1", "Alpha"), game("2", "Remnant2"), game("3", "Deep"), game("4", "Bundle"), game("5", "Twin")];
         write(&s.0.join("steamapps/common/Alpha/alpha.exe"), "");
         write(&s.0.join("steamapps/common/Remnant2/Remnant2/Binaries/Win64/Remnant2-Win64-Shipping.exe"), "");
         write(&s.0.join("steamapps/common/Deep/a/b/c/d/e/deep.exe"), "");
-        assert_eq!(game_for_exe(&games, "ALPHA.EXE").map(|g| g.appid.as_str()), Some("1"), "case is ignored");
-        assert_eq!(game_for_exe(&games, "Remnant2-Win64-Shipping.exe").map(|g| g.appid.as_str()), Some("2"));
-        assert!(game_for_exe(&games, "deep.exe").is_none(), "deeper than four folders is not searched");
-        assert!(game_for_exe(&games, "missing.exe").is_none());
-        assert!(game_for_exe(&games, "").is_none());
-        assert!(game_for_exe(&games, "Alpha/alpha.exe").is_none(), "a name, not a path");
+        // A bundle carrying another game's executable deep inside: the game whose own targets name it wins.
+        write(&s.0.join("steamapps/common/Bundle/extras/alpha/alpha.exe"), "");
+        write(&s.0.join("steamapps/common/Twin/twin.exe"), "");
+        write(&s.0.join("steamapps/common/Alpha/twin.exe"), "");
+        let appids = |exe: &str| games_for_exe(&games, exe).iter().map(|g| g.appid.as_str()).collect::<Vec<_>>();
+        assert_eq!(appids("ALPHA.EXE"), ["1"], "case is ignored; the game whose target it is wins");
+        assert_eq!(appids("Remnant2-Win64-Shipping.exe"), ["2"]);
+        assert_eq!(appids("twin.exe"), ["1", "5"], "both games' own targets: ambiguous");
+        assert!(appids("deep.exe").is_empty(), "deeper than four folders is not searched");
+        assert!(appids("missing.exe").is_empty());
+        assert!(appids("").is_empty());
+        assert!(appids("Alpha/alpha.exe").is_empty(), "a name, not a path");
+    }
+
+    /// The layouts of real games (their files and Steam's launch entries as on a real install): the
+    /// target is the executable the game's process really is.
+    #[test]
+    fn the_target_is_the_executable_the_game_really_runs() {
+        let s = Scratch::new("targets");
+        let root = Root { path: s.0.clone(), flatpak: false };
+        let game = |appid: &str, dir: &str, branch: &str| Game { appid: appid.into(), name: dir.into(), installdir: dir.into(), library: s.0.clone(), root: root.clone(), branch: branch.into() };
+        let files = |dir: &str, names: &[&str]| {
+            for name in names {
+                write(&s.0.join("steamapps/common").join(dir).join(name), "");
+            }
+        };
+        // A store bootstrapper starting the game beside it; the store's own launcher lives elsewhere.
+        files("Grand Theft Auto V Enhanced", &["PlayGTAV.exe", "GTA5_Enhanced.exe", "GTA5_Enhanced_BE.exe", "BattlEye/BEService_x64.exe", "Redistributables/Rockstar-Games-Launcher.exe", "Redistributables/Social-Club-Setup.exe"]);
+        // Unreal: a stub in the folder starts <Project>/Binaries/Win64/<Name>-Win64-Shipping.exe.
+        files("Remnant2", &["Remnant2.exe", "Remnant2/Binaries/Win64/Remnant2-Win64-Shipping.exe", "Engine/Binaries/Win64/CrashReportClient.exe"]);
+        // Launch entries per beta branch.
+        files("Hogwarts Legacy", &["HogwartsLegacy.exe", "Phoenix/Binaries/Win64/HogwartsLegacy.exe", "Engine/Binaries/Win64/CrashReportClient.exe"]);
+        // Anti-cheat's bootstrapper starts its neighbour.
+        files("ELDEN RING", &["Game/start_protected_game.exe", "Game/eldenring.exe", "Game/EasyAntiCheat/EasyAntiCheat_EOS_Setup.exe"]);
+        // A subfolder launch with a crash handler beside it.
+        files("Crimson Desert", &["bin64/CrimsonDesert.exe", "bin64/crashpad_handler.exe"]);
+        // A game whose executable is literally Launcher.exe.
+        files("Odd", &["Launcher.exe", "UnityCrashHandler64.exe"]);
+        // Not in Steam's cache: the folder's own executables.
+        files("Uncached", &["Game.exe", "vc_redist.x64.exe", "unins000.exe"]);
+        // Native Linux behind a launch script.
+        files("Native", &["start.sh", "data.pak"]);
+        let elf = s.0.join("steamapps/common/Native/game.x86_64");
+        std::fs::write(&elf, b"\x7fELF....").unwrap();
+        std::fs::set_permissions(&elf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let data = crate::appinfo::tests::image(&[
+            (3240220, &[("PlayGTAV.exe", "windows", "")]),
+            (1282100, &[("Remnant2.exe", "windows", "")]),
+            (990080, &[("Phoenix-Win64-Test.exe", "windows", "development"), ("HogwartsLegacy.exe", "windows", "")]),
+            (1245620, &[("Game\\start_protected_game.exe", "windows", "")]),
+            (3321460, &[("bin64/CrimsonDesert.exe", "windows", ""), ("CrimsonDesert_Steam.app", "macos", "")]),
+            (77, &[("Launcher.exe", "", "")]),
+            (88, &[("start.sh", "linux", "")]),
+        ]);
+        write(&s.0.join("appcache/appinfo.vdf"), "");
+        std::fs::write(s.0.join("appcache/appinfo.vdf"), data).unwrap();
+        assert_eq!(target_exes(&game("3240220", "Grand Theft Auto V Enhanced", "")), ["PlayGTAV.exe", "GTA5_Enhanced.exe", "GTA5_Enhanced_BE.exe"]);
+        assert_eq!(target_exes(&game("1282100", "Remnant2", "")), ["Remnant2.exe", "Remnant2-Win64-Shipping.exe"]);
+        assert_eq!(target_exes(&game("990080", "Hogwarts Legacy", "")), ["HogwartsLegacy.exe"]);
+        assert_eq!(target_exes(&game("990080", "Hogwarts Legacy", "development")), ["Phoenix-Win64-Test.exe", "HogwartsLegacy.exe"]);
+        assert_eq!(target_exes(&game("1245620", "ELDEN RING", "")), ["start_protected_game.exe", "eldenring.exe"]);
+        assert_eq!(target_exes(&game("3321460", "Crimson Desert", "")), ["CrimsonDesert.exe"]);
+        assert_eq!(target_exes(&game("77", "Odd", "")), ["Launcher.exe"]);
+        assert_eq!(target_exes(&game("99", "Uncached", "")), ["Game.exe"]);
+        assert_eq!(target_exes(&game("88", "Native", "")), ["game.x86_64"]);
+        assert!(target_exes(&game("98", "Missing", "")).is_empty());
+        // A target chosen by hand wins, and survives switching off and on (it lives in config.ini).
+        let gta = game("3240220", "Grand Theft Auto V Enhanced", "");
+        let mut cfg = crate::Config::default();
+        assert_eq!(target_for(&cfg, &gta), "PlayGTAV.exe,GTA5_Enhanced.exe,GTA5_Enhanced_BE.exe");
+        cfg.settings.insert(chosen_target_key("3240220"), " GTA5_Enhanced.exe ".into());
+        assert_eq!(target_for(&cfg, &gta), "GTA5_Enhanced.exe");
+        assert_eq!(launch_options::launch_option(&target_for(&cfg, &gta)), "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=GTA5_Enhanced.exe %command%");
     }
 
     fn manifest(appid: &str, name: &str) -> String {
@@ -465,7 +700,7 @@ mod tests {
     }
 
     fn enable() -> Action {
-        Action::Enable { target_exe: String::new() }
+        Action::Enable { target_exe: "G.exe".into() }
     }
 
     #[test]
@@ -531,7 +766,7 @@ mod tests {
     }
 
     fn game(appid: &str, name: &str) -> Game {
-        Game { appid: appid.into(), name: name.into(), installdir: name.into(), library: PathBuf::new(), root: Root { path: PathBuf::new(), flatpak: false } }
+        Game { appid: appid.into(), name: name.into(), installdir: name.into(), library: PathBuf::new(), root: Root { path: PathBuf::new(), flatpak: false }, branch: String::new() }
     }
 
     #[test]
@@ -572,9 +807,9 @@ mod tests {
         write(&lc, &original);
         let Outcome::Changed(edits) = apply(&home.0, "3240220", &enable(), false) else { panic!() };
         assert_eq!(edits.len(), 1);
-        assert_eq!(edits[0].after, "NEURAL_FORGE_ENABLE=1 MANGOHUD=1 PROTON_ENABLE_WAYLAND=1 %command% -dx12 -skipintro");
+        assert_eq!(edits[0].after, "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe MANGOHUD=1 PROTON_ENABLE_WAYLAND=1 %command% -dx12 -skipintro");
         let after = std::fs::read_to_string(&lc).unwrap();
-        assert_eq!(after, original.replace("\"MANGOHUD=1", "\"NEURAL_FORGE_ENABLE=1 MANGOHUD=1"), "byte-identical except the one value");
+        assert_eq!(after, original.replace("\"MANGOHUD=1", "\"NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe MANGOHUD=1"), "byte-identical except the one value");
         assert!(enabled(&home.0, "3240220") && !enabled(&home.0, "990080"));
         assert_eq!(apply(&home.0, "3240220", &enable(), false), Outcome::Unchanged);
         assert!(matches!(apply(&home.0, "3240220", &Action::Disable, false), Outcome::Changed(_)));
@@ -610,7 +845,7 @@ mod tests {
         let lc = home.0.join("userdata/1/config/localconfig.vdf");
         let original = localconfig(&[("3240220", Some("gamemoderun %command% -x"))]);
         write(&lc, &original);
-        assert_eq!(apply(&home.0, "3240220", &enable(), true), Outcome::SteamRunning { manual: "NEURAL_FORGE_ENABLE=1 gamemoderun %command% -x".into() });
+        assert_eq!(apply(&home.0, "3240220", &enable(), true), Outcome::SteamRunning { manual: "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe gamemoderun %command% -x".into() });
         assert_eq!(std::fs::read_to_string(&lc).unwrap(), original);
         assert!(!home.0.join("userdata/1/config/localconfig.vdf.neural-forge.bak").exists());
     }
@@ -641,17 +876,20 @@ mod tests {
         let set_mtime = |p: &Path, secs: u64| std::fs::File::options().write(true).open(p).unwrap().set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs)).unwrap();
         set_mtime(&older, 1_000);
         set_mtime(&newer, 2_000);
-        // Only the older account has GTA: only its file changes.
+        // Only the older account has GTA: its file changes, and the account signed in last (the
+        // newer file) gets the game's block too, since it is the one that starts the game next.
         let Outcome::Changed(edits) = apply(&home.0, "3240220", &enable(), false) else { panic!() };
-        assert_eq!(edits.iter().map(|e| &e.file).collect::<Vec<_>>(), [&older]);
-        assert_eq!(options_in(&newer, "3240220"), None);
+        assert_eq!(edits.iter().map(|e| &e.file).collect::<Vec<_>>(), [&older, &newer]);
+        assert_eq!(options_in(&newer, "3240220").as_deref(), Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe %command%"));
+        assert!(matches!(apply(&home.0, "3240220", &Action::Enable { target_exe: " ".into() }, false), Outcome::Failed { .. }), "no target, no edit");
         // Neither has this game: the block is created in the most recently modified file only
-        // (the edit above made the older one newest; put the times back).
+        // (the edit above made both newer; put the times back).
         set_mtime(&older, 1_000);
+        set_mtime(&newer, 2_000);
         let Outcome::Changed(edits) = apply(&home.0, "1593500", &enable(), false) else { panic!() };
         assert_eq!(edits.len(), 1);
         assert_eq!(edits[0].file, newer);
-        assert_eq!(options_in(&newer, "1593500").as_deref(), Some("NEURAL_FORGE_ENABLE=1 %command%"));
+        assert_eq!(options_in(&newer, "1593500").as_deref(), Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe %command%"));
         assert_eq!(options_in(&older, "1593500"), None);
         // Both have it now: both are edited, and disabling a game no account has is a no-op.
         write(&older, &localconfig(&[("1593500", Some("MANGOHUD=1 %command%"))]));
@@ -667,12 +905,12 @@ mod tests {
         let original = localconfig(&[("3240220", Some("PROTON_LOG=1 %command%")), ("990080", None)]).replace('\n', "\r\n");
         write(&lc, &original);
         apply(&home.0, "3240220", &enable(), false);
-        assert_eq!(std::fs::read_to_string(&lc).unwrap(), original.replace("\"PROTON_LOG=1", "\"NEURAL_FORGE_ENABLE=1 PROTON_LOG=1"));
+        assert_eq!(std::fs::read_to_string(&lc).unwrap(), original.replace("\"PROTON_LOG=1", "\"NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe PROTON_LOG=1"));
         apply(&home.0, "990080", &enable(), false);
         apply(&home.0, "1593500", &enable(), false);
         let text = std::fs::read_to_string(&lc).unwrap();
         assert!(!text.replace("\r\n", "").contains('\n'), "only CRLF line endings: {text:?}");
-        assert_eq!(options_in(&lc, "1593500").as_deref(), Some("NEURAL_FORGE_ENABLE=1 %command%"));
+        assert_eq!(options_in(&lc, "1593500").as_deref(), Some("NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe %command%"));
     }
 
     #[test]
@@ -697,7 +935,7 @@ mod tests {
         let text = "\"UserLocalConfigStore\"\n{\n\t\"friends\"\n\t{\n\t}\n}\n";
         write(&lc, text);
         match apply(&home.0, "3240220", &enable(), false) {
-            Outcome::Failed { manual, .. } => assert_eq!(manual, "NEURAL_FORGE_ENABLE=1 %command%"),
+            Outcome::Failed { manual, .. } => assert_eq!(manual, "NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=G.exe %command%"),
             other => panic!("{other:?}"),
         }
         assert_eq!(std::fs::read_to_string(&lc).unwrap(), text);

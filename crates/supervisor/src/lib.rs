@@ -2,6 +2,7 @@
 //! settings channel, installation, the model extraction and the diagnosis (`doctor`), so both
 //! front ends do each of these the same way. Linux-only: reads XDG env vars.
 
+pub mod appinfo;
 pub mod config;
 pub mod doctor;
 pub mod install;

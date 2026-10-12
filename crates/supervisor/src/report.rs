@@ -9,7 +9,9 @@
 //! Logs keep their last [`LOG_CAP`] bytes.
 //!
 //! Every text member, and every member's name, is redacted before it is written ([`Redactor`]): the
-//! home directory becomes `~` and the user name `<user>`. PNGs are stored as they are: the layer's
+//! home directory becomes `~`, the user name `<user>` and the host name `<host>`. The doctor's
+//! findings in `summary.txt` list every installed Steam game with its library folder (a library
+//! outside the home keeps its path): that is what the report is for, and the front ends say so. PNGs are stored as they are: the layer's
 //! encoder (`neural_forge_layer::dump::write_png`) writes no text chunks, so they carry no paths.
 //!
 //! Everything this module reads comes in through [`Sources`] (paths) and [`Inputs`] (text the
@@ -40,7 +42,7 @@ pub struct Sources {
     pub captures_dir: PathBuf,
     /// `/proc` (kernel release, NVIDIA driver and GPU names).
     pub proc_root: PathBuf,
-    /// Steam installations to look in for the game's Proton tool, in order.
+    /// Steam installations to look in for the game's Proton tool, the game's own first.
     pub steam_roots: Vec<PathBuf>,
 }
 
@@ -54,11 +56,7 @@ impl Sources {
             state_dir: PathBuf::from(crate::paths::state_dir()),
             captures_dir: PathBuf::from(crate::paths::captures_dir()),
             proc_root: PathBuf::from("/proc"),
-            steam_roots: vec![
-                PathBuf::from(crate::paths::data_home()).join("Steam"),
-                home.join(".steam/steam"),
-                home.join(".var/app/com.valvesoftware.Steam/.local/share/Steam"),
-            ],
+            steam_roots: crate::steam::roots().into_iter().map(|r| r.path).collect(),
             home,
         }
     }
@@ -122,33 +120,31 @@ fn driver_version(text: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// Runs `nvidia-smi` for [`probe_system`]'s compute capability.
-pub fn run_nvidia_smi() -> Option<String> {
-    let out = std::process::Command::new("nvidia-smi").args(["--query-gpu=compute_cap", "--format=csv,noheader"]).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())
-}
-
-/// Replaces the home directory with `~` and the user name with `<user>` (see [`Redactor::redact`]).
+/// Replaces the home directory with `~`, the user name with `<user>` and the host name with
+/// `<host>` (see [`Redactor::redact`]).
 #[derive(Debug, Clone)]
 pub struct Redactor {
     /// Home directory spellings, longest first, without a trailing `/`.
     homes: Vec<String>,
     user: Option<String>,
+    host: Option<String>,
 }
 
-/// User names shorter than this are not replaced on their own: a one- or two-letter name matches
-/// ordinary words everywhere. The home directory, which contains it, is still replaced.
-const MIN_USER_LEN: usize = 3;
+/// Names shorter than this are replaced only where they are a whole path component (`/al/`): a one-
+/// or two-letter name matches ordinary words everywhere else. The home directory, which contains
+/// the user name, is still replaced.
+const MIN_NAME_LEN: usize = 3;
 
 impl Redactor {
     /// `homes`: every spelling of the home directory (the `$HOME` value and its resolved path, which
-    /// differ where `/home` is a symlink). A home of `/` is ignored. `user`: the login name.
-    pub fn new(homes: &[&str], user: &str) -> Self {
+    /// differ where `/home` is a symlink). A home of `/` is ignored. `user`: the login name;
+    /// `host`: the machine's host name (empty for none).
+    pub fn new(homes: &[&str], user: &str, host: &str) -> Self {
         let mut homes: Vec<String> = homes.iter().map(|h| h.trim_end_matches('/').to_string()).filter(|h| !h.is_empty()).collect();
         homes.sort_by_key(|h| std::cmp::Reverse(h.len()));
         homes.dedup();
-        let user = Some(user.to_string()).filter(|u| u.chars().count() >= MIN_USER_LEN);
-        Redactor { homes, user }
+        let name = |s: &str| Some(s.trim().to_string()).filter(|s| !s.is_empty());
+        Redactor { homes, user: name(user), host: name(host) }
     }
 
     /// From `$HOME` (and its resolved path) and `$USER` (else `$LOGNAME`, else the home's last part).
@@ -163,22 +159,30 @@ impl Redactor {
             .find_map(|v| std::env::var(v).ok().filter(|u| !u.is_empty()))
             .or_else(|| home.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_default();
+        let host = std::fs::read_to_string("/proc/sys/kernel/hostname").unwrap_or_default();
         let refs: Vec<&str> = homes.iter().map(String::as_str).collect();
-        Redactor::new(&refs, &user)
+        Redactor::new(&refs, &user, &host)
     }
 
-    /// The home directory first (the longest spelling first), only where the path ends or goes on
-    /// with `/`: `/home/alexa` is another directory, not `~a`. Then the user name, only as a whole
-    /// token: the characters on either side must not be letters, digits or `_`. So `alex` in
-    /// `alex-fps.png`, `user=alex` or `/tmp/alex/` is replaced, and `alexa`, `alex2` or `xalex` are
-    /// not; a name inside a longer word is far more often a word than the name.
+    /// The home directory first (the longest spelling first), only where it is a whole path: it
+    /// ends or goes on with `/` (`/home/alexa` is another directory, not `~a`) and does not continue
+    /// another path (`/mnt/home/alex` is not the home). Then the user name and the host name, only
+    /// as whole tokens: the characters on either side must not be letters, digits or `_`. So `alex`
+    /// in `alex-fps.png`, `user=alex` or `/tmp/alex/` is replaced, and `alexa`, `alex2` or `xalex`
+    /// are not; a name inside a longer word is far more often a word than the name. A name shorter
+    /// than three characters is replaced only as a whole path component (`/tmp/al/`).
     pub fn redact(&self, text: &str) -> String {
         let mut out = text.to_string();
         for home in &self.homes {
-            out = replace_bounded(&out, home, "~", |c| c == '/' || !is_path_char(c), |_| true);
+            out = replace_bounded(&out, home, "~", |c| c == '/' || !is_path_char(c), |c| c != '/' && !is_path_char(c));
         }
-        if let Some(user) = &self.user {
-            out = replace_bounded(&out, user, "<user>", |c| !is_word_char(c), |c| !is_word_char(c));
+        for (name, with) in [(&self.user, "<user>"), (&self.host, "<host>")] {
+            let Some(name) = name else { continue };
+            out = if name.chars().count() >= MIN_NAME_LEN {
+                replace_bounded(&out, name, with, |c| !is_word_char(c), |c| !is_word_char(c))
+            } else {
+                replace_bounded(&out, name, with, |c| c == '/' || !is_path_char(c), |c| c == '/')
+            };
         }
         out
     }
@@ -273,15 +277,17 @@ pub fn log_tail(path: &Path, cap: u64) -> Option<Vec<u8>> {
 }
 
 /// The game's Proton tool from Steam's `config/config.vdf` (`CompatToolMapping`): the app's own
-/// entry, else the global default (`"0"`), with which one it was. The first Steam root with a
-/// readable `config.vdf` decides.
+/// entry in any root (the first root that has one), else the global default (`"0"`) of the first
+/// root that has one, with which one it was. The caller lists the game's own Steam root first.
 pub fn proton_tool(steam_roots: &[PathBuf], appid: &str) -> Option<String> {
-    let text = steam_roots.iter().find_map(|root| std::fs::read(root.join("config/config.vdf")).ok())?;
-    let tree = crate::vdf::parse(&text).ok()?;
-    let mapping = tree.block_at(&["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"])?;
+    let trees: Vec<crate::vdf::Block> =
+        steam_roots.iter().filter_map(|root| std::fs::read(root.join("config/config.vdf")).ok()).filter_map(|text| crate::vdf::parse(&text).ok()).collect();
     for (key, what) in [(appid, "this game's setting"), ("0", "Steam's default for every game")] {
-        if let Some(name) = mapping.string_at(&[key, "name"]).filter(|n| !n.is_empty()) {
-            return Some(format!("{name} ({what})"));
+        for tree in &trees {
+            let Some(mapping) = tree.block_at(&["InstallConfigStore", "Software", "Valve", "Steam", "CompatToolMapping"]) else { continue };
+            if let Some(name) = mapping.string_at(&[key, "name"]).filter(|n| !n.is_empty()) {
+                return Some(format!("{name} ({what})"));
+            }
         }
     }
     None
@@ -401,11 +407,15 @@ pub fn collect(sources: &Sources, inputs: &Inputs, redactor: &Redactor, created:
     members
 }
 
-/// Writes the report into `out_dir` as `neural-forge-report-<created>.zip` and returns its path.
+/// Writes the report into `out_dir` as `neural-forge-report-<created>.zip` (`-2`, `-3`, ... when a
+/// report of the same second is there already) and returns its path.
 pub fn write_report(out_dir: &Path, sources: &Sources, inputs: &Inputs, redactor: &Redactor, created: u64) -> std::io::Result<PathBuf> {
     let members = collect(sources, inputs, redactor, created);
-    let bytes = zip::write(&members, created)?;
-    let path = out_dir.join(format!("neural-forge-report-{created}.zip"));
+    let bytes = zip::write(&members, created.wrapping_add(zip::local_offset(created)))?;
+    let path = (1..)
+        .map(|n| out_dir.join(if n == 1 { format!("neural-forge-report-{created}.zip") } else { format!("neural-forge-report-{created}-{n}.zip") }))
+        .find(|p| std::fs::symlink_metadata(p).is_err())
+        .expect("an unused name");
     crate::paths::write_atomic(&path, &bytes, 0o600)?;
     Ok(path)
 }
@@ -414,24 +424,44 @@ pub fn write_report(out_dir: &Path, sources: &Sources, inputs: &Inputs, redactor
 /// [`probe_system`], `$XDG_SESSION_TYPE`), with `doctor`'s findings and this boot's Xid lines,
 /// redacted for this user, written to [`desktop_dir`]. `game` is the channel's game (its
 /// executable); without `steam_appid`, the app id for its Proton is looked up from it.
+///
+/// The external commands (`nvidia-smi`, `journalctl`) run once each, with the doctor's time limit.
 pub fn save(channel_status: &str, game: &str, steam_appid: Option<&str>) -> std::io::Result<PathBuf> {
-    let sources = Sources::from_env();
+    let mut sources = Sources::from_env();
     let session_type = std::env::var("XDG_SESSION_TYPE").unwrap_or_default();
     let doctor_roots = crate::doctor::Roots::system();
     let findings = crate::doctor::render_text(&crate::doctor::run(&doctor_roots));
     let xid_lines = crate::doctor::xid_lines(&doctor_roots);
-    let found_appid = match steam_appid {
-        Some(_) => None,
-        None => crate::steam::game_for_exe(&crate::steam::games(&doctor_roots.steam_roots), game).map(|g| g.appid.clone()),
+    let games = crate::steam::games(&doctor_roots.steam_roots);
+    let candidates: Vec<&crate::steam::Game> = match steam_appid {
+        Some(appid) => games.iter().filter(|g| g.appid == appid).collect(),
+        None => crate::steam::games_for_exe(&games, game),
+    };
+    let (found_appid, game_line) = match candidates.as_slice() {
+        [one] => {
+            // The game's own Steam root decides its Proton.
+            sources.steam_roots.retain(|r| *r != one.root.path);
+            sources.steam_roots.insert(0, one.root.path.clone());
+            (Some(one.appid.clone()), game.to_string())
+        }
+        [] => (None, game.to_string()),
+        many => {
+            let list = many.iter().map(|g| format!("{} ({})", g.name, g.appid)).collect::<Vec<_>>().join(", ");
+            (None, format!("{game} (its Steam app is ambiguous: {list})"))
+        }
+    };
+    let compute = match (doctor_roots.nvidia_smi)(&["--query-gpu=compute_cap", "--format=csv,noheader"]) {
+        crate::doctor::CommandOutput::Ran(out) => Some(out),
+        _ => None,
     };
     let inputs = Inputs {
         findings: Some(&findings),
         xid_lines: Some(&xid_lines),
         channel_status,
-        game,
+        game: &game_line,
         steam_appid: steam_appid.or(found_appid.as_deref()),
         session_type: &session_type,
-        system: probe_system(&sources.proc_root, run_nvidia_smi().as_deref()),
+        system: probe_system(&sources.proc_root, compute.as_deref()),
     };
     let created = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let out_dir = desktop_dir(&sources.config_home, &sources.home);
@@ -483,6 +513,19 @@ pub mod zip {
         let time = ((secs / 3600) << 11) | (((secs % 3600) / 60) << 5) | ((secs % 60) / 2);
         let date = (((year - 1980).min(127) as u64) << 9) | ((month as u64) << 5) | day as u64;
         (time as u16, date as u16)
+    }
+
+    /// Seconds to add to UTC `unix` for the local time then (zip times are local, as unzip shows
+    /// them); 0 when the zone cannot be read.
+    pub fn local_offset(unix: u64) -> u64 {
+        let Ok(t) = libc::time_t::try_from(unix) else { return 0 };
+        // SAFETY: plain out-parameter; `localtime_r` is the thread-safe form.
+        let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+        if unsafe { libc::localtime_r(&t, &mut tm) }.is_null() {
+            return 0;
+        }
+        // A zone west of UTC gives a negative offset: wrapping addition subtracts it.
+        tm.tm_gmtoff as u64
     }
 
     fn too_big() -> std::io::Error {
@@ -659,9 +702,11 @@ mod tests {
         let home = s.home.display().to_string();
         let status = format!("# live status\nlayer_reason=model at {home}/x\n");
         let findings = format!("[warn] the model in {home}/.local/share is old");
-        let redactor = Redactor::new(&[home.as_str()], "alex");
+        let redactor = Redactor::new(&[home.as_str()], "alex", "lordnikon");
         let path = write_report(&root, &s, &inputs(&status, Some(findings.as_str()), Some("NVRM: Xid 79 for alex")), &redactor, 1_791_635_696).unwrap();
         assert_eq!(path, root.join("neural-forge-report-1791635696.zip"));
+        let again = write_report(&root, &s, &inputs(&status, None, None), &redactor, 1_791_635_696).unwrap();
+        assert_eq!(again, root.join("neural-forge-report-1791635696-2.zip"), "a report of the same second does not replace the first");
         let members = read_zip(&std::fs::read(&path).unwrap());
         let names: Vec<&str> = members.iter().map(|(n, ..)| n.as_str()).collect();
         assert_eq!(
@@ -722,7 +767,7 @@ mod tests {
         i.system = SystemInfo::default();
         i.game = "";
         i.session_type = "";
-        let members = collect(&s, &i, &Redactor::new(&[], ""), 1);
+        let members = collect(&s, &i, &Redactor::new(&[], "", ""), 1);
         let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, ["summary.txt", "channel-status.txt"]);
         let summary = String::from_utf8(members[0].data.clone()).unwrap();
@@ -733,7 +778,7 @@ mod tests {
         assert!(summary.ends_with("Findings:\nnot gathered\n"), "{summary}");
         i.findings = Some("  \n");
         i.xid_lines = Some("");
-        let members = collect(&s, &i, &Redactor::new(&[], ""), 1);
+        let members = collect(&s, &i, &Redactor::new(&[], "", ""), 1);
         assert!(String::from_utf8_lossy(&members[0].data).ends_with("Findings:\nnone\n"));
         assert_eq!(members.iter().find(|m| m.name == "xid.txt").map(|m| m.data.as_slice()), Some(&b"no Xid lines\n"[..]));
         std::fs::remove_dir_all(&root).unwrap();
@@ -741,7 +786,9 @@ mod tests {
 
     #[test]
     fn redaction_replaces_the_home_first_and_the_user_only_as_a_token() {
-        let r = Redactor::new(&["/home/alex/", "/var/home/alex"], "alex");
+        let r = Redactor::new(&["/home/alex/", "/var/home/alex"], "alex", "lordnikon");
+        assert_eq!(r.redact("/mnt/home/alex/x"), "/mnt/home/<user>/x", "a home inside another path is not the home");
+        assert_eq!(r.redact("2026-10-12T10:00:00+0200 lordnikon kernel: NVRM"), "2026-10-12T10:00:00+0200 <host> kernel: NVRM");
         assert_eq!(r.redact("/home/alex"), "~");
         assert_eq!(r.redact("/home/alex/x and /var/home/alex/y"), "~/x and ~/y", "every spelling, the longest first");
         assert_eq!(r.redact("cwd=/home/alex, done"), "cwd=~, done");
@@ -755,10 +802,10 @@ mod tests {
     }
 
     #[test]
-    fn a_root_home_or_a_short_user_name_is_not_replaced() {
-        let r = Redactor::new(&["/"], "al");
-        assert_eq!(r.redact("/usr/lib al /al/"), "/usr/lib al /al/");
-        let r = Redactor::new(&["/home/al"], "al");
+    fn a_root_home_is_ignored_and_a_short_name_goes_only_as_a_path_component() {
+        let r = Redactor::new(&["/"], "al", "pc");
+        assert_eq!(r.redact("/usr/lib al /al/ /tmp/al pc /x/pc/y"), "/usr/lib al /<user>/ /tmp/<user> pc /x/<host>/y");
+        let r = Redactor::new(&["/home/al"], "al", "");
         assert_eq!(r.redact("/home/al/x al"), "~/x al", "the home still goes");
     }
 
@@ -768,7 +815,7 @@ mod tests {
         let s = sources(&root);
         write(&s.captures_dir.join("series-5/alex-original.png"), b"o");
         write(&s.captures_dir.join("series-5/alex-composited.png"), b"c");
-        let members = collect(&s, &inputs("", None, None), &Redactor::new(&[], "alex"), 1);
+        let members = collect(&s, &inputs("", None, None), &Redactor::new(&[], "alex", ""), 1);
         let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
         assert!(names.contains(&"captures/series-5-<user>-original.png"), "{names:?}");
         std::fs::remove_dir_all(&root).unwrap();

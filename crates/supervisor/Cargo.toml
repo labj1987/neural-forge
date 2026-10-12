@@ -17,3 +17,5 @@ serde_json = "1"
 # The diagnostic report's zip (`report::zip`) deflates its text members. Already linked through
 # `png`, so this adds no crate.
 miniz_oxide = "0.9"
+# The doctor's writability check (access) and the report's local time (localtime_r).
+libc = "0.2"

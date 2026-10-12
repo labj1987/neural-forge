@@ -331,8 +331,8 @@ pub fn check_shape(tensors: &[Tensor], expected: &[(&str, u64)]) -> Result<(), M
     Err(ModelError::Shape(report))
 }
 
-fn stage_of(block: u32) -> &'static str {
-    STAGES.iter().find(|(_, first, last)| (*first..=*last).contains(&block)).map(|s| s.0).expect("blocks are 0..=70")
+fn stage_of(block: u32) -> Option<&'static str> {
+    STAGES.iter().find(|(_, first, last)| (*first..=*last).contains(&block)).map(|s| s.0)
 }
 
 /// Upper case: `nr::Model` compares its own upper-case digest (`sha256.h`) as a string.
@@ -345,8 +345,12 @@ pub fn is_verified(build: [u16; 4]) -> bool {
     VERIFIED_BUILDS.iter().any(|v| v[..] == build[..3])
 }
 
-/// Lays the tensors into the stage files and the manifest. Returns (relative path, bytes) pairs.
-pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Vec<(String, Vec<u8>)> {
+/// Lays the tensors into the stage files and the manifest. Returns (relative path, bytes) pairs; a
+/// tensor of a block no stage holds is an error ([`check_shape`] refuses such a DLL first).
+pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Result<Vec<(String, Vec<u8>)>, ModelError> {
+    if let Some(t) = tensors.iter().find(|t| stage_of(t.block).is_none()) {
+        return Err(ModelError::Weights(format!("{}: block {} is in no stage of the graph", t.name, t.block)));
+    }
     let mut sorted: Vec<&Tensor> = tensors.iter().collect();
     sorted.sort_by(|a, b| (a.block, a.layer, &a.parameter).cmp(&(b.block, b.layer, &b.parameter)));
     let mut files = Vec::new();
@@ -354,7 +358,7 @@ pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Vec
     let mut records = Vec::new();
     for (id, _, _) in STAGES {
         let mut packed = Vec::new();
-        for t in sorted.iter().filter(|t| stage_of(t.block) == id) {
+        for t in sorted.iter().filter(|t| stage_of(t.block) == Some(id)) {
             // 16-byte alignment keeps every tensor's start aligned for the host's re-layout copies.
             packed.resize(packed.len().next_multiple_of(16), 0);
             records.push(serde_json::json!({
@@ -387,7 +391,7 @@ pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Vec
     });
     let text = serde_json::to_string_pretty(&manifest).expect("a JSON value always serializes") + "\n";
     files.push(("manifest.json".to_string(), text.into_bytes()));
-    files
+    Ok(files)
 }
 
 fn read_manifest(dir: &Path) -> Option<serde_json::Value> {
@@ -398,6 +402,31 @@ fn read_manifest(dir: &Path) -> Option<serde_json::Value> {
 /// or `None` when there is no readable manifest there.
 pub fn installed(dir: &Path) -> Option<String> {
     read_manifest(dir)?["source"]["build"].as_str().map(str::to_string)
+}
+
+/// Checks the installed model's stage files against its manifest: each stage's file is there with
+/// the manifest's length and SHA-256. `Ok(build)` when all are, else what is wrong.
+pub fn check_installed(dir: &Path) -> Result<String, String> {
+    let manifest = read_manifest(dir).ok_or_else(|| format!("no readable manifest.json in {}", dir.display()))?;
+    let build = manifest["source"]["build"].as_str().ok_or("the manifest names no source build")?.to_string();
+    let stages = manifest["stages"].as_array().filter(|s| !s.is_empty()).ok_or("the manifest lists no stages")?;
+    for stage in stages {
+        let (Some(file), Some(len), Some(sha)) = (stage["file"].as_str(), stage["packedByteLength"].as_u64(), stage["sha256"].as_str()) else {
+            return Err("a stage in the manifest lacks its file, length or digest".into());
+        };
+        if file.contains('/') || file.starts_with('.') {
+            return Err(format!("the manifest names an unexpected stage file {file:?}"));
+        }
+        let path = dir.join("model").join(file);
+        let bytes = std::fs::read(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+        if bytes.len() as u64 != len {
+            return Err(format!("{}: {} bytes, the manifest says {len}", path.display(), bytes.len()));
+        }
+        if !sha256_hex(&bytes).eq_ignore_ascii_case(sha) {
+            return Err(format!("{}: its SHA-256 differs from the manifest's", path.display()));
+        }
+    }
+    Ok(build)
 }
 
 /// Whether the installed model came from a build in [`VERIFIED_BUILDS`] (the manifest's
@@ -435,7 +464,7 @@ fn extract_shaped(source: &Path, out: &Path, expected: &[(&str, u64)]) -> Result
         .ok_or_else(|| w_err(format!("no RCDATA resource named {RESOURCE_NAME}")))?;
     let tensors = parse_weights(blob)?;
     check_shape(&tensors, expected)?;
-    let files = build_model(&tensors, version, &sha256_hex(&image));
+    let files = build_model(&tensors, version, &sha256_hex(&image))?;
     replace_tree(out, &files)?;
     Ok(Extracted {
         dir: out.to_path_buf(),
@@ -784,7 +813,7 @@ mod tests {
     fn manifest_slices_reproduce_every_tensor() {
         let blob = weights();
         let tensors = parse_weights(&blob).unwrap();
-        let files = build_model(&tensors, [310, 8, 0, 0], "00");
+        let files = build_model(&tensors, [310, 8, 0, 0], "00").unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&files.last().unwrap().1).unwrap();
         assert_eq!(manifest["totals"]["blockCount"], 71);
         assert_eq!(manifest["stages"].as_array().unwrap().len(), 11);
@@ -803,6 +832,35 @@ mod tests {
             assert_eq!(stage["packedByteLength"], packed.len());
             assert_eq!(stage["sha256"], sha256_hex(packed));
         }
+    }
+
+    #[test]
+    fn a_block_outside_the_graph_is_an_error_not_a_panic() {
+        let bytes = [0u8; 4];
+        let tensors = [Tensor { name: "block71.layer0.layer".into(), block: 71, layer: 0, parameter: "layer".into(), bytes: &bytes }];
+        assert!(matches!(build_model(&tensors, [310, 8, 0, 0], "00"), Err(ModelError::Weights(_))));
+    }
+
+    #[test]
+    fn the_installed_model_is_checked_against_its_manifest() {
+        let dir = std::env::temp_dir().join(format!("neural-forge-model-check-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let bytes = [7u8; 32];
+        let tensors = [Tensor { name: "block0.layer0.layer".into(), block: 0, layer: 0, parameter: "layer".into(), bytes: &bytes }];
+        let files = build_model(&tensors, [310, 8, 0, 0], "00").unwrap();
+        for (rel, data) in &files {
+            std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
+            std::fs::write(dir.join(rel), data).unwrap();
+        }
+        assert_eq!(check_installed(&dir), Ok("310.8.0.0".to_string()));
+        let (first, _) = files.iter().find(|(p, d)| p.starts_with("model/") && !d.is_empty()).unwrap();
+        std::fs::write(dir.join(first), [0u8; 32]).unwrap();
+        assert!(check_installed(&dir).unwrap_err().contains("SHA-256"));
+        std::fs::write(dir.join(first), [0u8; 3]).unwrap();
+        assert!(check_installed(&dir).unwrap_err().contains("bytes"));
+        std::fs::remove_file(dir.join(first)).unwrap();
+        assert!(check_installed(&dir).is_err());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
