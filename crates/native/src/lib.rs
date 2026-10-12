@@ -52,7 +52,7 @@ mod ffi {
         pub fn nf_native_record_graph(n: *mut c_void, primary: vk::CommandBuffer, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_chain_timeouts(n: *const c_void, at: *mut c_char, len: usize) -> u32;
         pub fn nf_native_reset_chain_timeouts(n: *mut c_void);
-        pub fn nf_native_fall_back_to_barriers(n: *mut c_void, err: *mut c_char, len: usize) -> u32;
+        pub fn nf_native_fall_back_to_barriers(n: *mut c_void);
         pub fn nf_native_stalled(n: *const c_void) -> u32;
         pub fn nf_native_close(n: *mut c_void);
     }
@@ -107,8 +107,9 @@ pub unsafe fn device_supported(gipa: vk::PFN_vkGetInstanceProcAddr, instance: vk
     }
 }
 
-/// The network's additions to a `VkDeviceCreateInfo`, alive until dropped (which puts back any flag it
-/// set in the application's own structures). Drop it only after `vkCreateDevice` returned.
+/// The network's additions to a `VkDeviceCreateInfo`: a copy of the application's chain with the
+/// network's flags set, and what it adds (the application's own structures are only read). Alive
+/// until dropped; drop it only after `vkCreateDevice` returned.
 pub struct DeviceExtension {
     state: *mut c_void,
     /// The create info to pass on; its pointers stay valid while `self` lives.
@@ -289,6 +290,12 @@ impl Network {
         unsafe { ffi::nf_native_stalled(self.raw) != 0 }
     }
 
+    /// Counter waits that gave up since the last reset (no allocation: for every frame's check).
+    pub fn chain_timeout_count(&self) -> u32 {
+        // SAFETY: `raw` is live; a null `where` of length 0 is written nothing.
+        unsafe { ffi::nf_native_chain_timeouts(self.raw, std::ptr::null_mut(), 0) }
+    }
+
     /// Counter waits that gave up since the last reset, and where the first one was.
     pub fn chain_timeouts(&self) -> (u32, String) {
         let mut at = [0 as c_char; MESSAGE];
@@ -302,18 +309,15 @@ impl Network {
         unsafe { ffi::nf_native_reset_chain_timeouts(self.raw) }
     }
 
-    /// Rebuilds the graph with barriers between launches (for the rest of the process), at the previous
-    /// build's size.
+    /// Switches to barriers between launches (for the rest of the process) and drops the graph recorded
+    /// with counter chaining: the next [`Self::build`] records it with barriers, once, at the size it is
+    /// asked for.
     ///
     /// # Safety
     /// As [`Self::build`]: nothing of a previous build may be pending.
-    pub unsafe fn fall_back_to_barriers(&mut self) -> Result<Frame, String> {
-        let mut err = [0 as c_char; MESSAGE];
+    pub unsafe fn fall_back_to_barriers(&mut self) {
         // SAFETY: `raw` is live; nothing of the previous build is pending (this function's contract).
-        if unsafe { ffi::nf_native_fall_back_to_barriers(self.raw, err.as_mut_ptr(), MESSAGE) } != 1 {
-            return Err(message(&err));
-        }
-        self.frame().ok_or_else(|| "rebuilt, but no frame".to_string())
+        unsafe { ffi::nf_native_fall_back_to_barriers(self.raw) }
     }
 }
 
@@ -329,8 +333,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_1() {
-        assert_eq!(abi_version(), 1);
+    fn abi_version_is_2() {
+        assert_eq!(abi_version(), 2);
     }
 
     #[test]

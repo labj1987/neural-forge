@@ -325,6 +325,8 @@ void Context::release() {
   else if (queue_) {
     try { waitIdle(); } catch (...) {}   // a destructor must not throw; the caller already drained it
   }
+  // The wait just made may have timed out and latched it: then nothing is destroyed either.
+  if (stalled_) return;
   if (waitFence_) vkDestroyFence(device_, waitFence_, nullptr);
   for (VkShaderModule module : modules_) vkDestroyShaderModule(device_, module, nullptr);
   destroyBuffer(dummy_);

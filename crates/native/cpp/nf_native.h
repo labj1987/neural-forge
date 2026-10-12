@@ -27,11 +27,13 @@ uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance i
                                     char* missing, size_t missing_len);
 
 // Extends `in` (the create info about to go to the next layer's vkCreateDevice) with the network's
-// extensions and features, writing the result to `out`. Feature flags the application's own chain
-// already carries a structure for are set in that structure in place and put back by
-// nf_native_device_restore; everything else is prepended in memory owned by `*state`. `out`, its
-// extension list and its chain stay valid until nf_native_device_restore(*state), which must be
-// called once vkCreateDevice has returned, whatever it returned.
+// extensions and features, writing the result to `out`. `in` and its chain are only read: `out`'s chain
+// is a copy of the application's (each structure's size from the Vulkan registry; a structure this
+// build does not know fails the call) with the flags set in the copies, and the structures the
+// application has none of prepended, all in memory owned by `*state`. Fails when the application
+// enables VK_EXT_buffer_device_address (it excludes the core feature the kernels need). `out`, its
+// extension list and its chain stay valid until nf_native_device_restore(*state), which frees them
+// and must be called once vkCreateDevice has returned, whatever it returned.
 uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
                                  const VkDeviceCreateInfo* in, VkDeviceCreateInfo* out, void** state, char* err,
                                  size_t err_len);
@@ -102,10 +104,10 @@ uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err,
 uint32_t nf_native_chain_timeouts(const NfNative* n, char* where, size_t where_len);
 void nf_native_reset_chain_timeouts(NfNative* n);
 
-// Rebuilds the graph with barriers between every launch (process-wide, permanent: a network opened
-// later in the process does not chain either, whatever its `chain`). The previous
-// secondary must not be pending. Same cost as nf_native_build.
-uint32_t nf_native_fall_back_to_barriers(NfNative* n, char* err, size_t err_len);
+// Switches to barriers between every launch (process-wide, permanent: a network opened later in the
+// process does not chain either, whatever its `chain`) and drops the graph recorded with chaining: the
+// next nf_native_build records it with barriers. The previous secondary must not be pending. Cheap.
+void nf_native_fall_back_to_barriers(NfNative* n);
 
 // 1 once a bounded wait on the network's queue timed out: its work may still be running, so the network
 // takes no more work (every later build fails) and destroys nothing (close leaks what it made). The

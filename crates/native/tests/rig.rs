@@ -6,7 +6,10 @@
 //! Runs only with `NEURAL_FORGE_NATIVE_RIG=<dump dir>` (holding `features.f32` and `head.f32` of a
 //! 1486x836 frame); `NEURAL_FORGE_NATIVE_MODEL` overrides the model directory (default: the user data
 //! dir's `neural-forge/model`). The same variable runs the rebuild test (a small build, then a large one
-//! on the same network).
+//! on the same network), the fallback to barriers and the device-creation test.
+//!
+//! One network per process at a time (`nf_native_open` refuses a second): the tests take [`ONE`] so
+//! the harness's threads run them one after another.
 
 use ash::vk;
 use neural_forge_native::{device_extend, device_supported, Network, OpenInfo};
@@ -14,6 +17,13 @@ use std::path::PathBuf;
 
 const WIDTH: u32 = 1486;
 const HEIGHT: u32 = 836;
+
+/// Held by every test for its whole run: one network (and one rig device) at a time.
+static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
+    ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 struct Gpu {
     _entry: ash::Entry,
@@ -97,6 +107,7 @@ fn a_larger_build_after_a_smaller_one_on_one_network() {
         eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
         return;
     }
+    let _one = one_at_a_time();
     let model = model_dir();
     let g = gpu();
     let open = OpenInfo {
@@ -147,6 +158,7 @@ fn a_larger_build_after_a_smaller_one_on_one_network() {
 
 #[test]
 fn the_network_through_the_c_api_matches_dlss5vk() {
+    let _one = one_at_a_time();
     let Some(dump) = std::env::var_os("NEURAL_FORGE_NATIVE_RIG").map(PathBuf::from) else {
         eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
         return;
@@ -257,6 +269,99 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
             d.free_memory(m, None);
         }
         d.destroy_device(None);
+        g.instance.destroy_instance(None);
+    }
+}
+
+/// The fallback to barriers is a switch: the next build records the graph once, without counter
+/// chaining, at the size it is asked for.
+#[test]
+fn the_fallback_to_barriers_builds_once_without_chaining() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let model = model_dir();
+    let g = gpu();
+    let open = OpenInfo {
+        gipa: g._entry.static_fn().get_instance_proc_addr,
+        instance: g.instance.handle(),
+        physical: g.physical,
+        device: g.device.handle(),
+        queue_family: g.compute,
+        queue_index: 0,
+        frame_family: g.family,
+        model_dir: &model,
+        chain: true,
+        fence_timeout_ms: 5000,
+        init_dispatchable: None,
+    };
+    // SAFETY: the device was made with device_extend; the compute queue is the network's alone.
+    let mut net = unsafe { Network::open(&open) }.expect("open");
+    // SAFETY: nothing of a previous build exists, and nothing of one is ever submitted here.
+    unsafe {
+        net.build(640, 360).expect("the first build");
+        net.fall_back_to_barriers();
+        assert!(net.frame().is_none(), "the chained graph is dropped by the switch");
+        let rebuilt = net.build(800, 448).expect("the build after the switch");
+        assert_eq!(rebuilt.chained, 0, "recorded with barriers");
+        assert!(rebuilt.field_width >= 800 && rebuilt.field_height >= 448, "at the size asked for, not the old one");
+        drop(net);
+        g.device.destroy_device(None);
+        g.instance.destroy_instance(None);
+    }
+}
+
+/// `device_extend` only reads the application's create info: its own feature structure keeps its flags,
+/// the copy the extended chain carries has the network's set, and the device is created with it. An
+/// application enabling VK_EXT_buffer_device_address gets no additions.
+#[test]
+fn device_extend_copies_the_applications_chain() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let g = gpu();
+    let gipa = g._entry.static_fn().get_instance_proc_addr;
+    let priorities = [1.0f32];
+    let queues = [vk::DeviceQueueCreateInfo::builder().queue_family_index(g.family).queue_priorities(&priorities).build()];
+    let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
+    let info = vk::DeviceCreateInfo::builder().queue_create_infos(&queues).push_next(&mut v12).push_next(&mut v11).build();
+    // SAFETY: valid create info, outliving the extension.
+    let extension = unsafe { device_extend(gipa, g.instance.handle(), g.physical, &info) }.expect("extend");
+    assert_eq!((v12.buffer_device_address, v12.shader_float16, v11.storage_buffer16_bit_access), (0, 0, 0), "the application's structures are untouched");
+    assert!(std::ptr::eq(v11.p_next.cast::<vk::PhysicalDeviceVulkan12Features>(), &v12), "and so is their chain");
+    // SAFETY: the extended chain is valid while `extension` lives; every node starts with sType and pNext.
+    let (mut copied12, mut copied11) = (None, None);
+    unsafe {
+        let mut node = extension.info.p_next.cast::<vk::BaseInStructure>();
+        while !node.is_null() {
+            assert_ne!(node.cast::<vk::PhysicalDeviceVulkan12Features>(), std::ptr::addr_of!(v12), "not the application's own");
+            match (*node).s_type {
+                vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => copied12 = Some(*node.cast::<vk::PhysicalDeviceVulkan12Features>()),
+                vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_1_FEATURES => copied11 = Some(*node.cast::<vk::PhysicalDeviceVulkan11Features>()),
+                _ => {}
+            }
+            node = (*node).p_next;
+        }
+    }
+    let (c12, c11) = (copied12.expect("the Vulkan 1.2 features' copy"), copied11.expect("the Vulkan 1.1 features' copy"));
+    assert_eq!((c12.buffer_device_address, c12.shader_float16, c11.storage_buffer16_bit_access), (1, 1, 1));
+    // SAFETY: the extended create info is valid while `extension` lives.
+    let device = unsafe { g.instance.create_device(g.physical, &extension.info, None) }.expect("vkCreateDevice with the copied chain");
+    drop(extension);
+    let ext = [c"VK_EXT_buffer_device_address".as_ptr()];
+    let with_ext = vk::DeviceCreateInfo::builder().queue_create_infos(&queues).enabled_extension_names(&ext).build();
+    // SAFETY: valid create info.
+    let refused = unsafe { device_extend(gipa, g.instance.handle(), g.physical, &with_ext) };
+    assert!(refused.is_err_and(|e| e.contains("VK_EXT_buffer_device_address")));
+    // SAFETY: nothing of either device is in use.
+    unsafe {
+        device.destroy_device(None);
+        g.device.destroy_device(None);
         g.instance.destroy_instance(None);
     }
 }

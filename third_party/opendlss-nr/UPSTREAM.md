@@ -69,6 +69,6 @@ Each one is also a patch in `patches/`, relative to this directory and applied i
    latches `stalled()`. The work it gave up on may still run on the GPU, so a stalled context takes no more work
    (`beginCommands`, `endAndSubmit` and `waitIdle` throw) and destroys nothing: `destroyBuffer`, `destroyPipeline`
    and `destroyCuda*` forget the handle, and the destructors of `Context`, `Model`, `Kernels` and `Graph` return at
-   once, leaking what they own. Before, a timeout threw and the owners' destructors then freed buffers the
+   once, leaking what they own; `Context`'s also when its own last wait for its queue is the one that timed out. Before, a timeout threw and the owners' destructors then freed buffers the
    timed-out submit could still be using. neural-forge-native reports the flag (`nf_native_stalled`) and the
    layer stops using the network on that device.
