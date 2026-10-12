@@ -204,10 +204,9 @@ struct State {
     /// Reused across frames the same way `original_scratch` is, for the answer bytes
     /// `capture::run` reads back once a round trip resolves.
     answer_scratch: Vec<u8>,
-    /// `working_scale`'s scaled proxy bytes -- reused across frames the same way
-    /// `original_scratch` is, but at the (usually much smaller) model resolution
-    /// rather than the swapchain's own. Empty and unused whenever `working_scale`
-    /// is left at its default `1.0`.
+    /// The after-the-upscaler path's `working_scale` proxy bytes -- reused across frames
+    /// the same way `original_scratch` is, but at that scale's smaller size rather than
+    /// the swapchain's own. Empty and unused at the default `1.0`.
     model_scratch: Vec<u8>,
     /// The original frame paired with whichever wire slot most recently produced the
     /// answer currently held in `last_answer` -- not per-slot, since only one answer
@@ -722,6 +721,11 @@ fn inline_hold(
         inline_tally("skipped (no shared memory)");
         return;
     }
+    // The model's switch for the recording side: nothing is recorded into DLSS's buffers while it is off.
+    #[cfg(target_arch = "x86_64")]
+    if let Some(view) = shm.view() {
+        crate::preupscale::inline::watch_switch(device.handle(), view.header());
+    }
     // The native backend runs the network itself, on this side queue (no slot 0).
     let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
     if mode == Mode::Model && !native {
@@ -797,15 +801,20 @@ fn inline_hold(
             crate::preupscale::run_hold(device, instance, physical_device, res, &target, mode, dump, 0, &mut submit)
         },
     };
-    if hold.wrote_back {
+    // Whatever of the hold went to the side queue (all of it, or the capture alone after a failed
+    // submit) is waited for before the worker releases DLSS's buffer, which copies the staging image
+    // back and goes on to overwrite it.
+    if res.pending() {
         let mut writeback_gpu = None;
         if res.wait_idle(device, &mut writeback_gpu) {
-            hold.writeback_gpu_ms = writeback_gpu.or(hold.writeback_gpu_ms);
-            // A cache dump's armed hold: read back now (the GPU is parked at the hold until release).
-            if let Some(frame) = res.take_cache_frame() {
-                hold.cache_frame = Some(frame);
+            if hold.wrote_back {
+                hold.writeback_gpu_ms = writeback_gpu.or(hold.writeback_gpu_ms);
+                // A cache dump's armed hold: read back now (the GPU is parked at the hold until release).
+                if let Some(frame) = res.take_cache_frame() {
+                    hold.cache_frame = Some(frame);
+                }
             }
-        } else {
+        } else if hold.wrote_back {
             // The GPU copies the staging image back as it is; the write-back may not have reached it.
             hold.wrote_back = false;
             hold.miss = Some("the write-back inside DLSS's buffer did not finish in time");
@@ -1338,7 +1347,10 @@ impl NeuralForgeDeviceInfo {
             // it comes before the launch (the launch buffer may write it first: GTA V Enhanced with DLSS
             // Frame Generation on); that hold has no depth. A dump refuses such a hold instead.
             depth: Some(aux(inputs.depth, scan.depth_layout))
-                .filter(|_| mode != Mode::Model || scan.depth_hazard.is_none() || crate::preupscale::dump_ignores_hazard()),
+                .filter(|_| mode != Mode::Model || scan.depth_hazard.is_none() || crate::preupscale::dump_ignores_hazard())
+                // Only from a layout the copy can take for both aspects at once (`depth_copy_layout`:
+                // the separate depth layouts only without stencil), as the hold inside DLSS's buffer.
+                .map(|a| crate::preupscale::Aux { readable: a.readable && a.layout.is_some_and(|l| crate::preupscale::depth_copy_layout(a.format, l)), ..a }),
             depth_buffer: None,
             // The dump's buffer and file are RG16F (4 bytes a texel): RG32F motion vectors are not read.
             mvec: Some(aux(inputs.mvec, scan.mvec_layout)).map(|a| crate::preupscale::Aux { readable: a.readable && a.format == vk::Format::R16G16_SFLOAT, ..a }),
@@ -1723,16 +1735,38 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Unhandled
     }
 
-    /// Allocated here (through the next layer) only to learn the buffers' pool, for the hold inside
-    /// DLSS's buffer ([`crate::preupscale::inline::Inline::reset_pool`]); without it, untouched.
+    /// Created here (through the next layer) only to learn the pool's queue family, for the hold inside
+    /// DLSS's buffer ([`crate::preupscale::inline::Inline::record`]); without it, untouched.
+    fn create_command_pool(
+        &self, create_info: &vk::CommandPoolCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<ash::prelude::VkResult<vk::CommandPool>> {
+        let Some(i) = &self.inline else { return LayerResult::Unhandled };
+        // SAFETY: the application's own create info and allocator, forwarded unchanged to the next layer.
+        let result = unsafe { self.device.create_command_pool(create_info, allocator) };
+        if let Ok(pool) = result {
+            i.pool_created(pool, create_info.queue_family_index);
+        }
+        LayerResult::Handled(result)
+    }
+
+    /// Allocated here (through the next layer) only to learn the buffers' pool and level, for the hold
+    /// inside DLSS's buffer ([`crate::preupscale::inline::Inline::reset_pool`]) and the pre-upscaler
+    /// tracking ([`crate::preupscale::Tracking::reset_pool`]); without either, untouched.
     fn allocate_command_buffers(
         &self, allocate_info: &vk::CommandBufferAllocateInfo,
     ) -> LayerResult<ash::prelude::VkResult<Vec<vk::CommandBuffer>>> {
-        let Some(i) = &self.inline else { return LayerResult::Unhandled };
+        if self.inline.is_none() && self.preupscale.is_none() {
+            return LayerResult::Unhandled;
+        }
         // SAFETY: the application's own allocate info, forwarded unchanged to the next layer.
         let result = unsafe { self.device.allocate_command_buffers(allocate_info) };
         if let Ok(cbs) = &result {
-            i.allocated(allocate_info.command_pool, cbs);
+            if let Some(i) = &self.inline {
+                i.allocated(allocate_info.command_pool, allocate_info.level, cbs);
+            }
+            if let Some(t) = &self.preupscale {
+                t.allocated(allocate_info.command_pool, cbs);
+            }
         }
         LayerResult::Handled(result)
     }
@@ -1743,6 +1777,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if let Some(i) = &self.inline {
             i.reset(command_buffer);
         }
+        if let Some(t) = &self.preupscale {
+            t.reset(command_buffer);
+        }
         LayerResult::Unhandled
     }
 
@@ -1752,6 +1789,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if let Some(i) = &self.inline {
             i.reset_pool(command_pool, false);
         }
+        if let Some(t) = &self.preupscale {
+            t.reset_pool(command_pool, false);
+        }
         LayerResult::Unhandled
     }
 
@@ -1760,6 +1800,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     ) -> LayerResult<()> {
         if let Some(i) = &self.inline {
             i.reset_pool(command_pool, true);
+        }
+        if let Some(t) = &self.preupscale {
+            t.reset_pool(command_pool, true);
         }
         LayerResult::Unhandled
     }

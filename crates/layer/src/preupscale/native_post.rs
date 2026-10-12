@@ -363,14 +363,20 @@ fn process(
         && hdr.neural_enabled()
         && hdr.apply_model.load(Ordering::Relaxed) != 0;
     let conditioning = Conditioning::from(hdr.global_tuning());
-    // The claim is released whatever happens after it: a claim held while the network is not
-    // built at this size would keep the pre-upscaler path off it for good.
+    // The claim is released whatever happens after it (a claim held while the network is not built at
+    // this size would keep the pre-upscaler path off it for good), except after a frame that did not
+    // finish in time: its work may still use the network, so the claim stays until its fence signals
+    // (`Loader::post_stalled`, checked by the pre-upscaler path's claim).
     let evaluated = wanted && loader.claim_post() && {
         let ok = loader.ready(width, height).is_some_and(|built| {
             // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
             unsafe { evaluate(device, instance, physical, import, loader, view, gpu, slot, &built, width, height, format == proxy_format::BGRA8, conditioning) }
         });
-        loader.release_post();
+        if gpu.stalled {
+            loader.post_stalled(device, gpu.fence);
+        } else {
+            loader.release_post();
+        }
         ok
     };
     if !evaluated && gpu.stalled && gpu.slots[slot.index()].as_ref().is_some_and(|b| !b.answer.staged) {
@@ -549,7 +555,7 @@ mod tests {
         unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
             None
         }
-        let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0 };
+        let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0, properties2: crate::vram::Properties2::None };
         // Objects that exist when each step fails (the sets and the command buffer go with their pools).
         let before = [0, 0, 1, 2, 3, 4, 5, 6, 6, 7, 7];
         for (step, &created) in before.iter().enumerate() {

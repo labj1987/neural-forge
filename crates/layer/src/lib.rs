@@ -63,6 +63,8 @@ use device::NeuralForgeDeviceInfo;
 struct InstanceContext {
     instance: Arc<ash::Instance>,
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
+    /// Which `vkGetPhysicalDeviceMemoryProperties2` the application's instance may call (the VRAM log).
+    properties2: vram::Properties2,
 }
 
 /// The owning instance of each physical device a device is being created on, so
@@ -657,7 +659,16 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                                     if let Some(sq) = &side {
                                         SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.side_queue());
                                     }
-                                    let setup = preupscale::native::Setup { gipa, instance: instance.instance.handle(), physical: physical_device, frame_family, family, index, post_index: index + 1 };
+                                    let setup = preupscale::native::Setup {
+                                        gipa,
+                                        instance: instance.instance.handle(),
+                                        physical: physical_device,
+                                        frame_family,
+                                        family,
+                                        index,
+                                        post_index: index + 1,
+                                        properties2: instance.properties2,
+                                    };
                                     NATIVE_DEVICES.lock().unwrap().get_or_insert_default().insert(device, setup);
                                     log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");
                                     return result;
@@ -811,7 +822,7 @@ impl Layer for NeuralForgeLayer {
 
     fn create_instance_info(
         &self,
-        _create_info: &vk::InstanceCreateInfo,
+        create_info: &vk::InstanceCreateInfo,
         _allocator: Option<&vk::AllocationCallbacks>,
         instance: Arc<ash::Instance>,
         next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
@@ -822,7 +833,7 @@ impl Layer for NeuralForgeLayer {
             next_get_instance_proc_addr(instance.handle(), c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR".as_ptr())
                 .map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(p))
         };
-        NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance, surface_caps }) }
+        NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance, surface_caps, properties2: vram::Properties2::of(create_info) }) }
     }
 
     fn create_device_info(
@@ -945,7 +956,7 @@ mod instance_table_tests {
             eprintln!("instance table test: no Vulkan ICD, skipping");
             return;
         };
-        let hooks = |instance: &Arc<ash::Instance>| NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None }) };
+        let hooks = |instance: &Arc<ash::Instance>| NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None }) };
         // Stand-in handles: the table is keyed by whatever the framework hands over.
         let (real_gpu, probe_gpu) = (vk::PhysicalDevice::from_raw(0x5100), vk::PhysicalDevice::from_raw(0x5200));
         let real_hooks = hooks(&real);
@@ -1123,7 +1134,7 @@ mod device_link_tests {
         let priorities = [1.0];
         let queue = vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities).build();
         let info = vk::DeviceCreateInfo::builder().queue_create_infos(std::slice::from_ref(&queue)).build();
-        let hooks = NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None }) };
+        let hooks = NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None }) };
         let mut p_device = std::mem::MaybeUninit::uninit();
         CALLED.set(0);
         let result = hooks.create_device(physical, &info, &link, None, &mut p_device);

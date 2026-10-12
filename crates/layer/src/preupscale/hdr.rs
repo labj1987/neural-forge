@@ -49,9 +49,10 @@ pub(crate) const AUTO_LOG2_HI: f32 = 16.0;
 /// The share of samples dropped at each end before the log-average (sun, speculars, near-black).
 #[cfg(test)]
 pub(crate) const AUTO_TRIM: f32 = 0.01;
-/// The adapted log2 e is kept in this range (a normal half, and [`exposure_ok`]).
+/// The adapted log2 e is kept in this range: a normal half (2^-14 is the smallest; a subnormal one
+/// may be flushed to 0, which [`exposure_ok`] refuses), and [`exposure_ok`].
 #[cfg(test)]
-pub(crate) const AUTO_MIN_LOG2_E: f32 = -16.0;
+pub(crate) const AUTO_MIN_LOG2_E: f32 = -14.0;
 #[cfg(test)]
 pub(crate) const AUTO_MAX_LOG2_E: f32 = 15.0;
 
@@ -735,14 +736,14 @@ impl HdrPass {
     }
 
     /// Records, after the capture's exposure copy (or the auto-exposure's resolve): the exposure
-    /// write made visible to the shader,
-    /// the encode dispatch over the padded extent, and the copy of the encoded image into `proxy`
-    /// (tightly packed at the padded size). The caller's closing barrier covers the transfer.
+    /// write made visible to the shader, the encode dispatch over the padded extent, and, given a
+    /// `proxy`, the copy of the encoded image into it (tightly packed at the padded size). The caller's
+    /// closing barrier covers the transfer, or without one the encode's writes.
     ///
     /// # Safety
     /// `cmd` is recording, the encoded image is in `GENERAL` (the caller's opening barrier),
     /// [`Self::bind_colour`] was called for this hold, and `proxy` holds the padded frame.
-    pub(crate) unsafe fn record_encode(&self, device: &ash::Device, cmd: vk::CommandBuffer, proxy: vk::Buffer, paper_white: f32) {
+    pub(crate) unsafe fn record_encode(&self, device: &ash::Device, cmd: vk::CommandBuffer, proxy: Option<vk::Buffer>, paper_white: f32) {
         let exposure_in = vk::MemoryBarrier::builder()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
             .dst_access_mask(vk::AccessFlags::SHADER_READ)
@@ -768,8 +769,10 @@ impl HdrPass {
                 &[],
             );
             self.dispatch(device, cmd, self.encode, paper_white, self.padded_width, self.padded_height);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[encoded_out], &[], &[]);
-            device.cmd_copy_image_to_buffer(cmd, self.encoded.image, vk::ImageLayout::GENERAL, proxy, &[region]);
+            if let Some(proxy) = proxy {
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[encoded_out], &[], &[]);
+                device.cmd_copy_image_to_buffer(cmd, self.encoded.image, vk::ImageLayout::GENERAL, proxy, &[region]);
+            }
         }
     }
 

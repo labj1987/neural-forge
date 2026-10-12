@@ -27,6 +27,11 @@ use super::{own_host_buffer, HostBuffer};
 const POLL_EVERY: Duration = Duration::from_secs(1);
 /// A running dump that saw no armed hold or readback for this long ends (the game stopped holding).
 const STALLED: Duration = Duration::from_secs(2);
+/// Frames read back and not written yet, at most (each is about 67 MB at 4K DLAA): the hold waits for
+/// the writer beyond that ([`WRITER_WAIT`]) instead of queueing gigabytes in the game's process.
+const QUEUED_FRAMES: usize = 8;
+/// How long a hold waits for the writer to take a frame before the dump ends (the disk is too slow).
+const WRITER_WAIT: Duration = Duration::from_secs(2);
 
 /// An armed hold: which dump it belongs to and which DLSS submit it is ([`super::Session`]'s count).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -171,7 +176,7 @@ struct Run {
     outstanding: u32,
     activity: Instant,
     dir: PathBuf,
-    tx: mpsc::Sender<Frame>,
+    tx: mpsc::SyncSender<Frame>,
 }
 
 /// The per-device dump state ([`super::Session`]).
@@ -223,7 +228,7 @@ impl CacheDump {
         self.runs += 1;
         let stamp = unix_ms();
         let dir = crate::dump::captures_dir().join(format!("preupscale-cache-{stamp}"));
-        let (tx, rx) = mpsc::channel::<Frame>();
+        let (tx, rx) = mpsc::sync_channel::<Frame>(QUEUED_FRAMES);
         let writer_dir = dir.clone();
         let spawned = std::thread::Builder::new().name("nf-cache-dump".into()).spawn(move || write_frames(&writer_dir, &rx));
         if spawned.is_err() {
@@ -280,9 +285,25 @@ impl CacheDump {
         run.outstanding = run.outstanding.saturating_sub(1);
         run.written += 1;
         run.activity = Instant::now();
-        if run.tx.send(frame).is_err() {
-            self.end("the writer thread ended");
-            return;
+        // Bounded: with QUEUED_FRAMES waiting the hold waits for the writer, up to WRITER_WAIT.
+        let deadline = Instant::now() + WRITER_WAIT;
+        let mut frame = frame;
+        loop {
+            match run.tx.try_send(frame) {
+                Ok(()) => break,
+                Err(mpsc::TrySendError::Full(f)) if Instant::now() < deadline => {
+                    frame = f;
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Err(mpsc::TrySendError::Full(_)) => {
+                    self.end("the writer fell behind (the disk is slower than the holds)");
+                    return;
+                }
+                Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.end("the writer thread ended");
+                    return;
+                }
+            }
         }
         if run.written >= run.want {
             self.end("complete");
@@ -336,11 +357,30 @@ fn number(v: f32) -> String {
     if v.is_finite() { format!("{v}") } else { "null".into() }
 }
 
+/// `s` as a JSON string literal: quotes, backslashes and every control character escaped.
+fn json_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if u32::from(c) < 0x20 || c == '\u{7f}' => out.push_str(&format!("\\u{:04x}", u32::from(c))),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
 /// One frame's manifest entry.
 fn entry(index: u32, frame: &Frame, files: &[(&str, String)]) -> String {
     let jitter = frame.meta.jitter.map_or_else(|| "null".to_string(), |[x, y]| format!("[{}, {}]", number(x), number(y)));
-    let files: Vec<String> = files.iter().map(|(k, v)| format!("\"{k}\": \"{v}\"")).collect();
-    let missing = frame.meta.depth_missing.map_or_else(String::new, |why| format!(", \"depth_missing\": \"{why}\""));
+    let files: Vec<String> = files.iter().map(|(k, v)| format!("\"{k}\": {}", json_string(v))).collect();
+    let missing = frame.meta.depth_missing.map_or_else(String::new, |why| format!(", \"depth_missing\": {}", json_string(why)));
     let layout = frame.meta.depth_layout.map_or_else(String::new, |l| format!(", \"depth_layout\": \"{l:?}\""));
     format!(
         "    {{\"index\": {index}, \"hold\": {}, \"time_ms\": {}, \"jitter\": {jitter}, \"exposure\": {}, \"history\": {}, \"mvec_valid\": {}, \"depth_valid\": {}{missing}{layout}, \"files\": {{{}}}}}",
@@ -358,7 +398,7 @@ fn entry(index: u32, frame: &Frame, files: &[(&str, String)]) -> String {
 fn manifest(first: &Frame, depth_format: Option<vk::Format>, entries: &[String]) -> String {
     format!(
         "{{\n  \"format\": \"neural-forge-cache-dump\", \"version\": 1,\n  \"holds\": {},\n  \"width\": {}, \"height\": {},\n  \"path\": \"{}\",\n  \
-         \"paper_white\": {},\n  \"mvec_scale\": [{}, {}],\n  \"depth_format\": \"{}\",\n  \"reverse_z\": null,\n  \"game\": \"{}\",\n  \"frames\": [\n{}\n  ]\n}}\n",
+         \"paper_white\": {},\n  \"mvec_scale\": [{}, {}],\n  \"depth_format\": \"{}\",\n  \"reverse_z\": null,\n  \"game\": {},\n  \"frames\": [\n{}\n  ]\n}}\n",
         entries.len(),
         first.width,
         first.height,
@@ -367,7 +407,7 @@ fn manifest(first: &Frame, depth_format: Option<vk::Format>, entries: &[String])
         number(first.meta.mvec_scale[0]),
         number(first.meta.mvec_scale[1]),
         depth_format.map_or_else(|| "none".to_string(), |f| format!("{f:?}")),
-        crate::ownership::process_name().replace(['"', '\\'], "_"),
+        json_string(crate::ownership::process_name()),
         entries.join(",\n")
     )
 }
@@ -552,7 +592,7 @@ mod tests {
     /// Consecutive armed holds are written; a gap between them, or a miss, ends the dump.
     #[test]
     fn a_gap_or_a_miss_ends_the_dump() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(QUEUED_FRAMES);
         let mut d = CacheDump { run: Some(Run { id: 1, want: 4, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }), runs: 1, ..Default::default() };
         let a = d.arm(10, false).unwrap();
         d.after_hold(Some(a), true, None);
@@ -564,7 +604,7 @@ mod tests {
         d.after_hold(Some(c), true, Some(frame(11, 1, 1, None)));
         assert!(!d.running());
         assert_eq!(rx.try_iter().map(|f| f.meta.arm.hold).collect::<Vec<_>>(), [10, 11]);
-        let (tx, _rx) = mpsc::channel();
+        let (tx, _rx) = mpsc::sync_channel(QUEUED_FRAMES);
         d.run = Some(Run { id: 2, want: 4, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx });
         let a = d.arm(20, false).unwrap();
         d.after_hold(Some(a), false, None);
@@ -573,7 +613,7 @@ mod tests {
 
     #[test]
     fn the_dump_ends_after_k_holds() {
-        let (tx, rx) = mpsc::channel();
+        let (tx, rx) = mpsc::sync_channel(QUEUED_FRAMES);
         let mut d = CacheDump { run: Some(Run { id: 1, want: 2, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }), runs: 1, ..Default::default() };
         let a = d.arm(1, false).unwrap();
         d.after_hold(Some(a), true, None);
@@ -583,5 +623,28 @@ mod tests {
         d.after_hold(None, true, Some(frame(2, 1, 1, None)));
         assert!(!d.running());
         assert_eq!(rx.try_iter().count(), 2);
+    }
+
+    /// The writer's queue is bounded: a writer that does not keep up ends the dump (after the hold
+    /// waited for it), instead of the readbacks piling up in the game's memory.
+    #[test]
+    fn a_writer_that_falls_behind_ends_the_dump() {
+        let (tx, rx) = mpsc::sync_channel(QUEUED_FRAMES);
+        let want = QUEUED_FRAMES as u32 + 4;
+        let mut d = CacheDump { run: Some(Run { id: 1, want, armed: 0, written: 0, last_hold: None, outstanding: 0, activity: Instant::now(), dir: PathBuf::new(), tx }), runs: 1, ..Default::default() };
+        for hold in 0..=QUEUED_FRAMES as u64 {
+            let a = d.arm(hold, false).unwrap();
+            d.after_hold(Some(a), true, Some(frame(hold, 1, 1, None)));
+        }
+        assert!(!d.running(), "the frame past the queue's bound waited and then ended the dump");
+        assert_eq!(rx.try_iter().count(), QUEUED_FRAMES, "no more than the bound was queued");
+    }
+
+    /// The manifest's strings are JSON whatever the game's process is called.
+    #[test]
+    fn manifest_strings_are_escaped() {
+        assert_eq!(json_string("GTA5_Enhanced.exe"), "\"GTA5_Enhanced.exe\"");
+        assert_eq!(json_string("a\"b\\c\nd\te\u{1}f\u{7f}"), "\"a\\\"b\\\\c\\nd\\te\\u0001f\\u007f\"");
+        assert_eq!(json_string("Résumé"), "\"Résumé\"", "anything else is kept as it is (UTF-8)");
     }
 }

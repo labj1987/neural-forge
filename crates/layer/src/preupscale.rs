@@ -111,16 +111,26 @@ pub(crate) enum NativeLoader {}
 
 /// Whether an image the application creates gets `TRANSFER_SRC` added: a 2D, single-sample RG16F image
 /// without it (DLSS's motion vectors; the hold copies only RG16F, for the native backend's history),
-/// or a depth image without it (the hold copies DLSS's depth every frame, [`native::DepthCopy`]).
+/// or, while the edit cache is on, a depth image without it (the hold copies DLSS's depth every frame
+/// for the cache, [`native::DepthCopy`]; `NEURAL_FORGE_EDIT_CACHE=off` copies none, as 3.2.0).
 /// Only asked while the pre-upscaler path is on (`NEURAL_FORGE_PREUPSCALE=off` creates every image
 /// as the application asked).
 pub(crate) fn wants_copyable(info: &vk::ImageCreateInfo) -> bool {
     cfg!(target_arch = "x86_64")
-        && (info.format == vk::Format::R16G16_SFLOAT || DEPTH_FORMATS.contains(&info.format))
+        && (info.format == vk::Format::R16G16_SFLOAT || (DEPTH_FORMATS.contains(&info.format) && edit_cache_on()))
         && info.image_type == vk::ImageType::TYPE_2D
         && info.samples == vk::SampleCountFlags::TYPE_1
         && info.tiling == vk::ImageTiling::OPTIMAL
         && !info.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+}
+
+/// Whether the edit cache runs (`cache::interval` above 1): only then are DLSS's depth images made
+/// copyable and copied.
+pub(crate) fn edit_cache_on() -> bool {
+    #[cfg(target_arch = "x86_64")]
+    return cache::interval() > 1;
+    #[cfg(not(target_arch = "x86_64"))]
+    false
 }
 
 /// Whether model-mode holds on a device with `loader` go to the native backend.
@@ -146,6 +156,9 @@ pub(crate) unsafe fn run_native(
         // The edit cache's interval (its own, not `model_interval`: that is the after-the-upscaler
         // path's), and the debug view of its rejection mask.
         let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
+        // Told when this hold's work is waited on (`Resources::wait_idle`): until then the
+        // after-the-upscaler path keeps off the network.
+        res.pre_loader = Some(loader.clone());
         // SAFETY: forwarded.
         return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, arm, ask, submit) };
     }
@@ -341,6 +354,9 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     VulkanCommand::CmdWaitEvents,
     VulkanCommand::CmdWaitEvents2,
     VulkanCommand::CmdBeginRendering,
+    // Each pool's queue family: the hold inside DLSS's buffer is only recorded into a buffer of
+    // DLSS's graphics family ([`inline::Inline::record`]).
+    VulkanCommand::CreateCommandPool,
 ];
 
 /// What a CUDA kernel is, by the name `vkCreateCuFunctionNVX` gave it (docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray
@@ -749,7 +765,7 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
 /// With `NEURAL_FORGE_PREUPSCALE=dump` it shows which candidate is the game's frame; an N past the
 /// candidates leaves the launch ambiguous (not used, logged once).
 fn pick() -> Option<usize> {
-    static PICK: LazyLock<Option<usize>> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PREUPSCALE_PICK").ok().and_then(|v| v.parse().ok()));
+    static PICK: LazyLock<Option<usize>> = LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PREUPSCALE_PICK").and_then(|v| v.parse().ok()));
     *PICK
 }
 
@@ -929,7 +945,15 @@ pub(crate) struct ImageSync {
     pub dst_access: u64,
     pub src_queue_family: u32,
     pub dst_queue_family: u32,
+    /// The barrier's aspect mask (`VkImageAspectFlags`); 0 where not known (the whole image).
+    pub aspect: u32,
 }
+
+/// The layout tracked for a depth/stencil image after a barrier on one of its two aspects only
+/// (`separateDepthStencilLayouts`): its depth and stencil may now be in different layouts, so no
+/// copy or transition of the image is recorded from it ([`aux_copy_layout`], [`depth_copy_layout`])
+/// until a barrier on both aspects says where they are.
+pub(crate) const ASPECTS_APART: vk::ImageLayout = vk::ImageLayout::from_raw(0x7fff_0001);
 
 impl ImageSync {
     pub(crate) fn from_barrier(b: &vk::ImageMemoryBarrier, src_stage: vk::PipelineStageFlags, dst_stage: vk::PipelineStageFlags) -> Self {
@@ -943,6 +967,7 @@ impl ImageSync {
             dst_access: u64::from(b.dst_access_mask.as_raw()),
             src_queue_family: b.src_queue_family_index,
             dst_queue_family: b.dst_queue_family_index,
+            aspect: b.subresource_range.aspect_mask.as_raw(),
         }
     }
 
@@ -957,6 +982,7 @@ impl ImageSync {
             dst_access: b.dst_access_mask.as_raw(),
             src_queue_family: b.src_queue_family_index,
             dst_queue_family: b.dst_queue_family_index,
+            aspect: b.subresource_range.aspect_mask.as_raw(),
         }
     }
 
@@ -973,7 +999,15 @@ impl ImageSync {
             dst_access: 0,
             src_queue_family: vk::QUEUE_FAMILY_IGNORED,
             dst_queue_family: vk::QUEUE_FAMILY_IGNORED,
+            aspect: 0,
         }
+    }
+
+    /// Whether this barrier covers only one of a depth/stencil image's two aspects.
+    fn one_aspect_of_two(&self) -> bool {
+        let both = vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL;
+        let a = vk::ImageAspectFlags::from_raw(self.aspect);
+        a.intersects(both) && !a.contains(both)
     }
 
     /// A queue-family ownership transfer (its release or its acquire: both name the same pair).
@@ -1000,10 +1034,28 @@ impl ImageSync {
     }
 }
 
-/// The write bits of `VkAccessFlags2` (the legacy ones keep their values): shader, colour and depth
-/// attachment, transfer, host and memory writes, shader storage writes, acceleration structure and
-/// command preprocess writes, transform feedback writes.
-const WRITE_ACCESS: u64 = 0x40 | 0x100 | 0x400 | 0x1000 | 0x4000 | 0x1_0000 | 0x4_0000 | 0x40_0000 | 0x200_0000 | 0x400_0000 | 0x800_0000 | 0x20_0000_0000;
+/// Every write bit of `VkAccessFlags2` (the legacy ones keep their values): shader, colour and depth
+/// attachment, transfer, host and memory writes, shader storage writes, video decode and encode,
+/// transform feedback and its counter, command preprocess, acceleration structure, optical flow and
+/// micromap writes. Read bits (`TRANSFORM_FEEDBACK_COUNTER_READ` among them) are not writes.
+const WRITE_ACCESS: u64 = {
+    use vk::AccessFlags2 as A;
+    A::SHADER_WRITE.as_raw()
+        | A::COLOR_ATTACHMENT_WRITE.as_raw()
+        | A::DEPTH_STENCIL_ATTACHMENT_WRITE.as_raw()
+        | A::TRANSFER_WRITE.as_raw()
+        | A::HOST_WRITE.as_raw()
+        | A::MEMORY_WRITE.as_raw()
+        | A::SHADER_STORAGE_WRITE.as_raw()
+        | A::VIDEO_DECODE_WRITE_KHR.as_raw()
+        | A::VIDEO_ENCODE_WRITE_KHR.as_raw()
+        | A::TRANSFORM_FEEDBACK_WRITE_EXT.as_raw()
+        | A::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT.as_raw()
+        | A::COMMAND_PREPROCESS_WRITE_NV.as_raw()
+        | A::ACCELERATION_STRUCTURE_WRITE_KHR.as_raw()
+        | A::OPTICAL_FLOW_WRITE_NV.as_raw()
+        | A::MICROMAP_WRITE_EXT.as_raw()
+};
 
 /// Why a launch-bearing submit cannot be split in front of its launch buffer: the hold would read
 /// (and write) DLSS's inputs before synchronization the application recorded for them, or between
@@ -1468,6 +1520,10 @@ pub(crate) unsafe fn launch_params<'a>(extras: *const *const c_void, extra_count
         // SAFETY: the list is END-terminated (caller); every read is at or before the terminator
         // or the value that follows a key.
         let key = unsafe { *extras.add(i) } as usize;
+        // A key's value is the next entry: past an explicit count it is not part of the list.
+        if key != 0 && extra_count > 1 && i + 1 >= extra_count {
+            return None;
+        }
         match key {
             0 => break,
             // SAFETY: as above.
@@ -1922,7 +1978,7 @@ impl Tracker {
         // DLSS's depth, copied beside it into a slot buffer for the native backend: at the colour
         // input's extent, in a layout known here. Not when it was destroyed since (Black Myth: Wukong
         // hands DLSS a new one every frame with frame generation on).
-        let (named, _) = self.hold_depth(cb, inputs.depth, None);
+        let (named, _) = self.hold_depth(cb, inputs.depth, None, true);
         let depth_input = self.images.get(&named).copied().map(|d| {
             let image = named;
             let layout = self
@@ -2067,6 +2123,9 @@ impl Tracker {
     }
 
     pub(crate) fn barrier(&mut self, command_buffer: vk::CommandBuffer, sync: ImageSync) {
+        // One aspect of a depth/stencil image: the two may be apart from here on.
+        let apart = sync.one_aspect_of_two() && self.images.get(&sync.image).is_some_and(|d| has_stencil(d.format));
+        let sync = if apart { ImageSync { new_layout: ASPECTS_APART, ..sync } } else { sync };
         if self.inputs.is_some_and(|i| i.colour.0 == sync.image) {
             self.colour_barriers += 1;
             self.last_colour_layout = Some(sync.new_layout);
@@ -2651,7 +2710,7 @@ impl Tracker {
                     // frame's on every other frame.
                     let inputs = self.inputs.map(|i| {
                         let colour = retarget.unwrap_or(i.colour);
-                        Inputs { colour, depth: self.hold_depth(cb, i.depth, self.before_launch(cb, colour.0)), ..i }
+                        Inputs { colour, depth: self.hold_depth(cb, i.depth, self.before_launch(cb, colour.0), false), ..i }
                     });
                     let colour_owner = inputs.and_then(|i| proposed.get(&i.colour.0).and_then(|p| p.1).or(self.owners.get(&i.colour.0).copied()));
                     let (hazard, dump_hazard, depth_hazard) = self.launch_hazard(cb, inputs.as_ref());
@@ -2753,25 +2812,35 @@ impl Tracker {
     }
 
     /// The depth a hold reads for DLSS this frame, at `identified`'s extent:
-    /// 1. a depth image the buffer synchronizes reads of before the launch (a same-layout barrier
+    /// 1. the depth image the input launch names, where its layout is known and the buffer does not
+    ///    write it before the launch (no barrier on it there that may follow a write): DLSS's own
+    ///    input, final at the hold. Inside DLSS's buffer (`inside`: the copy is recorded at the launch
+    ///    itself, after anything the buffer wrote) that is enough;
+    /// 2. else a depth image the buffer synchronizes reads of before the launch (a same-layout barrier
     ///    after reads only, within the first `before` barriers, or all of them): the frame's depth
-    ///    that the buffer copies into DLSS's own. GTA V Enhanced copies its depth, one of two it
+    ///    that the buffer copies into the one DLSS names. GTA V Enhanced copies its depth, one of two it
     ///    alternates between, into a ring of three DLSS reads, inside the launch buffer: the ring's
     ///    image is written after the hold, the source is final before it;
-    /// 2. else the depth image the input launch names, where its layout is known;
-    /// 3. else the identified one.
-    fn hold_depth(&self, cb: vk::CommandBuffer, identified: (vk::Image, ImageDesc), before: Option<usize>) -> (vk::Image, ImageDesc) {
+    /// 3. else the named one where its layout is known (its write before the launch then leaves the
+    ///    hold without depth, `Scan::depth_hazard`);
+    /// 4. else the identified one.
+    fn hold_depth(&self, cb: vk::CommandBuffer, identified: (vk::Image, ImageDesc), before: Option<usize>, inside: bool) -> (vk::Image, ImageDesc) {
         let extent = (identified.1.width, identified.1.height);
         let depth = |image: vk::Image| self.images.get(&image).filter(|d| DEPTH_FORMATS.contains(&d.format) && (d.width, d.height) == extent).map(|d| (image, *d));
         let recorded = self.pending.get(&cb).map_or(&[][..], Vec::as_slice);
         let recorded = &recorded[..before.unwrap_or(recorded.len()).min(recorded.len())];
-        let read = recorded.iter().rev().filter(|s| s.old_layout == s.new_layout && !s.may_follow_a_write()).find_map(|s| depth(s.image));
         let named = match self.launch.get(&cb).and_then(|r| r.input.as_ref()) {
             Some(InputLaunch::Inputs { depth: d, .. }) => depth(*d),
             _ => None,
         };
         let known = |image: vk::Image| self.committed.contains_key(&image) || recorded.iter().any(|s| s.image == image);
-        read.or(named.filter(|(d, _)| known(*d))).unwrap_or(identified)
+        let named = named.filter(|(d, _)| known(*d));
+        let written = |image: vk::Image| recorded.iter().any(|s| s.image == image && s.may_follow_a_write());
+        if let Some(n) = named.filter(|(d, _)| inside || !written(*d)) {
+            return n;
+        }
+        let read = recorded.iter().rev().filter(|s| s.old_layout == s.new_layout && !s.may_follow_a_write()).find_map(|s| depth(s.image));
+        read.or(named).unwrap_or(identified)
     }
 
     fn retarget(&self, cb: vk::CommandBuffer) -> Option<(vk::Image, ImageDesc)> {
@@ -2874,6 +2943,10 @@ pub(crate) struct Tracking {
     /// The device's handle, named on the identification lines (DLSS and the swapchain may be on
     /// different devices).
     device: u64,
+    /// The pool each of the device's command buffers came from: a pool reset or destroyed ends all of
+    /// its buffers ([`Self::reset_pool`]). Apart from the tracker's lock (allocations are not
+    /// launches).
+    pools: Mutex<HashMap<vk::CommandBuffer, vk::CommandPool>>,
 }
 
 static TRACKING: LazyLock<Mutex<HashMap<vk::Device, Arc<Tracking>>>> = LazyLock::new(Default::default);
@@ -2973,9 +3046,45 @@ impl Tracking {
 
     /// `vkFreeCommandBuffers`, as [`Self::begin`].
     pub(crate) fn free(&self, command_buffers: &[vk::CommandBuffer]) {
+        {
+            let mut pools = lock(&self.pools);
+            for cb in command_buffers {
+                pools.remove(cb);
+            }
+        }
         if self.armed() {
             let mut t = self.lock();
             t.free(command_buffers);
+            self.rearm(&t);
+        }
+    }
+
+    /// `vkAllocateCommandBuffers` returned `command_buffers` from `pool`.
+    pub(crate) fn allocated(&self, pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer]) {
+        lock(&self.pools).extend(command_buffers.iter().map(|&cb| (cb, pool)));
+    }
+
+    /// `vkResetCommandBuffer`: what was recorded is gone, as at [`Self::begin`].
+    pub(crate) fn reset(&self, command_buffer: vk::CommandBuffer) {
+        self.begin(command_buffer);
+    }
+
+    /// `vkResetCommandPool` (`destroyed`: `vkDestroyCommandPool`): every buffer of the pool is reset
+    /// (or gone), so what was tracked for them is dropped and the tracking disarms when nothing is
+    /// left; before, their launches and barriers stayed (and the tracking armed) until each buffer
+    /// was begun or freed again.
+    pub(crate) fn reset_pool(&self, pool: vk::CommandPool, destroyed: bool) {
+        let buffers: Vec<vk::CommandBuffer> = {
+            let mut pools = lock(&self.pools);
+            let of_pool = pools.iter().filter(|(_, p)| **p == pool).map(|(cb, _)| *cb).collect();
+            if destroyed {
+                pools.retain(|_, p| *p != pool);
+            }
+            of_pool
+        };
+        if self.armed() && !buffers.is_empty() {
+            let mut t = self.lock();
+            t.free(&buffers);
             self.rearm(&t);
         }
     }
@@ -3640,6 +3749,9 @@ pub(crate) struct Resources {
     pool: vk::CommandPool,
     capture_cmd: vk::CommandBuffer,
     writeback_cmd: vk::CommandBuffer,
+    /// An empty buffer, recorded once: submitted with the write-back fence after a hold's later submit
+    /// failed, so that fence covers what of the hold did go ([`Self::fence_submitted`]).
+    fence_cmd: vk::CommandBuffer,
     capture_fence: vk::Fence,
     writeback_fence: vk::Fence,
     capture_timer: Option<crate::gpu_timer::GpuTimer>,
@@ -3670,8 +3782,14 @@ pub(crate) struct Resources {
     /// A running cache dump's readbacks (`cache_dump`), built on its first armed hold and freed
     /// after it.
     pub(crate) cache: Option<cache_dump::Buffers>,
+    /// The network whose pre-upscaler work these resources' fences cover, told when it was waited on
+    /// (`native::Loader::pre_idle`).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) pre_loader: Option<NativeLoader>,
     capture_pending: bool,
-    writeback_pending: bool,
+    pub(crate) writeback_pending: bool,
+    /// A hold's work went to the queue and no fence could be put after it: nothing here is reused.
+    unfenced: bool,
 }
 
 // SAFETY: the raw pointers are the SHM mapping (process-lifetime) or the layer's own mapped
@@ -3713,12 +3831,18 @@ impl Resources {
             cleanup(None, &[]);
             return None;
         };
-        let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(2);
+        let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3);
         // SAFETY: `pool` was just created; the loader's dispatch pointer is set on each buffer.
         let Ok(cmds) = (unsafe { crate::loader_data::allocate_commands(device, &alloc) }) else {
             cleanup(Some(pool), &[]);
             return None;
         };
+        // SAFETY: a fresh buffer of the layer's own; recorded once, empty.
+        let empty = unsafe { device.begin_command_buffer(cmds[2], &vk::CommandBufferBeginInfo::default()).and_then(|()| device.end_command_buffer(cmds[2])) };
+        if empty.is_err() {
+            cleanup(Some(pool), &[]);
+            return None;
+        }
         let mut fences = Vec::new();
         for _ in 0..2 {
             // SAFETY: valid create info.
@@ -3737,6 +3861,7 @@ impl Resources {
             pool,
             capture_cmd: cmds[0],
             writeback_cmd: cmds[1],
+            fence_cmd: cmds[2],
             capture_fence: fences[0],
             writeback_fence: fences[1],
             capture_timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family),
@@ -3756,8 +3881,11 @@ impl Resources {
             #[cfg(target_arch = "x86_64")]
             edit: None,
             cache: None,
+            #[cfg(target_arch = "x86_64")]
+            pre_loader: None,
             capture_pending: false,
             writeback_pending: false,
+            unfenced: false,
         })
     }
 
@@ -3770,7 +3898,25 @@ impl Resources {
     }
 
     pub(crate) fn pending(&self) -> bool {
-        self.capture_pending || self.writeback_pending
+        self.capture_pending || self.writeback_pending || self.unfenced
+    }
+
+    /// After a hold's submit failed with some of its work already on the queue (the capture, maybe
+    /// the network): the empty buffer with the write-back fence, which covers everything earlier on the
+    /// queue, so the next hold waits for that work before it records any of those buffers again. When
+    /// even that fails nothing of these resources is used again ([`Self::wait_idle`] says pending).
+    ///
+    /// # Safety
+    /// The write-back fence is idle (not pending, waited on); `submit` submits on the hold's queue.
+    pub(crate) unsafe fn fence_submitted(&mut self, device: &ash::Device, submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>) {
+        // SAFETY: the fence is idle (contract); the empty buffer is idle with it.
+        let reset = unsafe { device.reset_fences(&[self.writeback_fence]) };
+        if reset.is_ok() && crate::note_vk(submit(Which::WriteBack, self.fence_cmd, self.writeback_fence)).is_ok() {
+            self.writeback_pending = true;
+        } else {
+            crate::log!("[preupscale] a hold's work went to the queue and no fence could be put after it: these hold resources are not used again");
+            self.unfenced = true;
+        }
     }
 
     fn padded_bytes(&self) -> usize {
@@ -3781,21 +3927,25 @@ impl Resources {
     /// Waits (bounded) for every submission of the layer's own that is still pending. `true` when
     /// nothing is pending afterwards. Reads the write-back's timestamps into `writeback_gpu_ms`.
     pub(crate) fn wait_idle(&mut self, device: &ash::Device, writeback_gpu_ms: &mut Option<f32>) -> bool {
-        let mut fences = Vec::new();
-        if self.capture_pending {
-            fences.push(self.capture_fence);
+        if self.unfenced {
+            return false;
         }
-        if self.writeback_pending {
-            fences.push(self.writeback_fence);
-        }
-        if fences.is_empty() {
-            return true;
-        }
+        let both = [self.capture_fence, self.writeback_fence];
+        let fences: &[vk::Fence] = match (self.capture_pending, self.writeback_pending) {
+            (true, true) => &both,
+            (true, false) => &both[..1],
+            (false, true) => &both[1..],
+            (false, false) => {
+                self.idle();
+                return true;
+            }
+        };
         // SAFETY: the layer's own fences, each submitted (only `pending` after a successful submit).
-        let wait = unsafe { device.wait_for_fences(&fences, true, CLEANUP_WAIT.as_nanos() as u64) };
+        let wait = unsafe { device.wait_for_fences(fences, true, CLEANUP_WAIT.as_nanos() as u64) };
         if crate::note_fence_wait(wait, "preupscale::wait_idle").is_err() {
             return false;
         }
+        self.idle();
         if std::mem::take(&mut self.writeback_pending) {
             if let Some(timer) = self.writeback_timer.as_mut() {
                 timer.read_if_pending(device);
@@ -3806,11 +3956,21 @@ impl Resources {
         true
     }
 
+    /// Nothing of these resources' is pending: the network may be taken by the other path, and the
+    /// fences reset or destroyed.
+    fn idle(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(loader) = self.pre_loader.take() {
+            loader.pre_idle();
+        }
+    }
+
     /// # Safety
     /// Nothing of this value's may still be pending on the GPU ([`Self::wait_idle`] returned true,
     /// or the device is idle).
-    pub(crate) unsafe fn destroy(self, device: &ash::Device) {
-        // SAFETY: forwarded; freeing the pool frees both command buffers.
+    pub(crate) unsafe fn destroy(mut self, device: &ash::Device) {
+        self.idle();
+        // SAFETY: forwarded; freeing the pool frees the command buffers.
         unsafe {
             if let Some(t) = &self.capture_timer {
                 t.destroy(device);
@@ -4072,7 +4232,7 @@ pub(crate) struct ExposureValue {
 
 fn aux_copy_layout(layout: Option<vk::ImageLayout>) -> Option<(vk::ImageLayout, bool)> {
     match layout? {
-        vk::ImageLayout::UNDEFINED | vk::ImageLayout::PREINITIALIZED => None,
+        vk::ImageLayout::UNDEFINED | vk::ImageLayout::PREINITIALIZED | ASPECTS_APART => None,
         l @ (vk::ImageLayout::GENERAL | vk::ImageLayout::TRANSFER_SRC_OPTIMAL) => Some((l, false)),
         _ => Some((vk::ImageLayout::TRANSFER_SRC_OPTIMAL, true)),
     }
@@ -4150,8 +4310,10 @@ fn capture_reads(
         .collect()
 }
 
-/// Records the capture into the proxy buffer at the padded size: the colour input (GENERAL) copied
-/// raw, or with `hdr`, the exposure input read into the HDR pass's buffer (or, with no readable one,
+/// Records the capture into `proxy` (slot 0's proxy buffer; `None` for the native backend, which reads
+/// the HDR pass's encoded image and leaves slot 0 to the after-the-upscaler path) at the padded size:
+/// the colour input (GENERAL) copied raw, or with `hdr`, the exposure input read into the HDR pass's
+/// buffer (or, with no readable one,
 /// [`ExposureSource::Auto`], measured from the colour input into the same buffer,
 /// [`hdr::HdrPass::record_auto_exposure`]) and the colour input encoded for the model
 /// ([`hdr::HdrPass::record_encode`]); in dump mode also the depth aspect, the
@@ -4167,8 +4329,9 @@ fn capture_reads(
 /// `target.colour` and, for [`ExposureSource::Auto`], its auto-exposure is built.
 #[allow(clippy::too_many_arguments)]
 unsafe fn record_capture(
-    device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>, native_mvec: Option<vk::Buffer>,
-    native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>, colour_before: Option<vk::Buffer>, extra: Option<&dyn Fn(vk::CommandBuffer)>,
+    device: &ash::Device, res: &Resources, target: &Target, dump: Option<&DumpBuffers>, hdr: Option<&hdr::HdrPass>, proxy: Option<vk::Buffer>,
+    native_mvec: Option<vk::Buffer>, native_depth: Option<(vk::Buffer, Option<&crate::gpu_timer::GpuTimer>)>, colour_before: Option<vk::Buffer>,
+    extra: Option<&dyn Fn(vk::CommandBuffer)>,
 ) -> ash::prelude::VkResult<()> {
     let auto = hdr.is_some() && ExposureSource::of(target) == ExposureSource::Auto;
     let cmd = res.capture_cmd;
@@ -4256,9 +4419,13 @@ unsafe fn record_capture(
                     // was cleared to, and nothing would be written back.
                     pass.record_auto_exposure(device, cmd);
                 }
-                pass.record_encode(device, cmd, res.proxy.buffer, target.paper_white);
+                pass.record_encode(device, cmd, proxy, target.paper_white);
             }
-            None => device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, res.proxy.buffer, &capture_regions(target.width, target.height)),
+            None => {
+                if let Some(proxy) = proxy {
+                    device.cmd_copy_image_to_buffer(cmd, target.colour, vk::ImageLayout::GENERAL, proxy, &capture_regions(target.width, target.height));
+                }
+            }
         }
         // The edit cache's passes (the native hold's), after every copy and the encode.
         if let Some(extra) = extra {
@@ -4283,7 +4450,8 @@ unsafe fn record_capture(
         .collect();
     // The auto-exposure's resolve wrote its state and the exposure value from a shader: those are
     // read by the host too.
-    let (close_stage, close_access) = if auto {
+    // Without the proxy copy the encode's own writes are the last of it.
+    let (close_stage, close_access) = if auto || (hdr.is_some() && proxy.is_none()) {
         (vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
     } else {
         (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
@@ -4489,7 +4657,7 @@ pub(crate) unsafe fn run_hold(
     let hdr_pass = if mode.hdr() { res.hdr.as_ref() } else { None };
     let dump_bufs = if dump { res.dump.as_ref() } else { None };
     // SAFETY: the capture buffer is idle (`wait_idle` above); the colour view was bound above.
-    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, None, None, None, None) }.is_err() {
+    if unsafe { record_capture(device, res, target, dump_bufs, hdr_pass, Some(res.proxy.buffer), None, None, None, None) }.is_err() {
         result.miss = Some("recording the capture failed");
         return result;
     }
@@ -4540,7 +4708,6 @@ pub(crate) unsafe fn run_hold(
         }
     }
     let source = match mode {
-        Mode::Off => return result,
         Mode::Dump => {
             if dump {
                 let n = target.width as usize * target.height as usize * 4;
@@ -4584,8 +4751,8 @@ pub(crate) unsafe fn run_hold(
         }
         // The encoded picture itself is the answer: the decode must give the frame back.
         Mode::Identity | Mode::Roundtrip => res.proxy.buffer,
-        // Model mode runs on the native backend (`run_native`), never here.
-        Mode::Model => {
+        // Model mode runs on the native backend (`run_native`), and off never holds: neither gets here.
+        Mode::Model | Mode::Off => {
             result.miss = Some("model mode runs on the native backend");
             return result;
         }
@@ -4888,13 +5055,41 @@ pub(crate) struct Session {
     seen: u64,
     /// The K-hold cache dump ([`cache_dump`]).
     cache_dump: cache_dump::CacheDump,
+    /// This device's entry in [`POST_OFF_UNTIL`].
+    post_off: PostOffEntry,
+}
+
+/// One session's entry in [`POST_OFF_UNTIL`], removed with the session (the device).
+pub(crate) struct PostOffEntry(u64);
+
+impl Default for PostOffEntry {
+    fn default() -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        Self(NEXT.fetch_add(1, Ordering::Relaxed))
+    }
+}
+
+impl PostOffEntry {
+    fn set(&self, until: Option<Instant>) {
+        let mut all = lock(&POST_OFF_UNTIL);
+        match until {
+            Some(until) => all.insert(self.0, until),
+            None => all.remove(&self.0),
+        };
+    }
+}
+
+impl Drop for PostOffEntry {
+    fn drop(&mut self) {
+        lock(&POST_OFF_UNTIL).remove(&self.0);
+    }
 }
 
 /// `NEURAL_FORGE_PROBE_PARAMS=1`: logs every word of DLSS Super Resolution's input-kernel parameters
 /// (hex, and its two halves as f32) for the first 2000 launches, to find the per-frame scalars
 /// (the camera jitter) beside the documented ones (docs/DLSS_KERNEL_CATALOGUE.md).
 fn probe_params(bytes: &[u8]) {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PROBE_PARAMS").is_ok_and(|v| v == "1"));
+    static ON: LazyLock<bool> = LazyLock::new(|| neural_forge_protocol::env::flag("NEURAL_FORGE_PROBE_PARAMS"));
     static COUNT: AtomicU64 = AtomicU64::new(0);
     if !*ON || COUNT.fetch_add(1, Ordering::Relaxed) >= 2000 {
         return;
@@ -4914,7 +5109,7 @@ fn probe_params(bytes: &[u8]) {
 /// whose name starts with the prefix, as 4-byte words (hex and f32), for finding a field such as the
 /// camera jitter in a kernel the layer does not know yet. Diagnostic only.
 fn probe_kernel(name: &str, bytes: &[u8]) {
-    static PREFIX: LazyLock<Option<String>> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PROBE_KERNEL").ok().filter(|p| !p.is_empty()));
+    static PREFIX: LazyLock<Option<String>> = LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_KERNEL").filter(|p| !p.is_empty()));
     static COUNT: AtomicU64 = AtomicU64::new(0);
     let Some(prefix) = PREFIX.as_deref() else { return };
     if !name.starts_with(prefix) || COUNT.fetch_add(1, Ordering::Relaxed) >= 3000 {
@@ -4934,7 +5129,7 @@ fn probe_kernel(name: &str, bytes: &[u8]) {
 /// the depth or motion vectors before its launch ([`Scan::dump_hazard`]). Diagnostic only: those
 /// images may then be read before the game finished them, which consecutive dumps show.
 pub(crate) fn dump_ignores_hazard() -> bool {
-    static IGNORE: LazyLock<bool> = LazyLock::new(|| std::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD").is_ok_and(|v| v == "ignore"));
+    static IGNORE: LazyLock<bool> = LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD").is_some_and(|v| v == "ignore"));
     *IGNORE
 }
 
@@ -4969,7 +5164,7 @@ const CAPTURE_GAP: Duration = Duration::from_secs(3);
 /// 1). Two or more give frame pairs for checking the motion vectors' convention.
 pub(crate) fn dump_frames() -> u32 {
     static FRAMES: LazyLock<u32> = LazyLock::new(|| {
-        std::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES").ok().and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(1)
+        neural_forge_protocol::env::var("NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES").and_then(|v| v.parse().ok()).filter(|&n| n >= 1).unwrap_or(1)
     });
     *FRAMES
 }
@@ -4994,7 +5189,7 @@ impl Session {
         if self.last_dlss.is_none_or(|t| t.elapsed() >= CAPTURE_GAP) {
             self.resumes += 1;
             self.resumed_at = Some(Instant::now());
-            if std::env::var_os("NEURAL_FORGE_CAPTURE_AT").is_some() || cache_dump::scheduled_any() {
+            if neural_forge_protocol::env::is_set("NEURAL_FORGE_CAPTURE_AT") || cache_dump::scheduled_any() {
                 crate::log!("[preupscale] DLSS frames resumed (#{}) after {} ms", self.resumes, self.last_dlss.map_or(0, |t| t.elapsed().as_millis()));
             }
         }
@@ -5026,7 +5221,7 @@ impl Session {
     /// presents on (no swapchain on the DLSS device, identified against an output-like image) must
     /// not get the model twice, before DLSS on one device and after it on the other.
     fn share_post_off(&self) {
-        *lock(&POST_OFF_UNTIL) = post_off_until(mode() == Mode::Model, self.engaged, self.last_dlss);
+        self.post_off.set(post_off_until(mode() == Mode::Model, self.engaged, self.last_dlss));
     }
 
     /// Whether a hold happened within [`RECENT`].
@@ -5398,7 +5593,7 @@ impl Session {
     /// pass whose resume number moves: GTA sometimes pauses once more while it starts.
     pub(crate) fn capture_at_due(&mut self) -> Option<u32> {
         static AT: LazyLock<Vec<CaptureAt>> =
-            LazyLock::new(|| std::env::var("NEURAL_FORGE_CAPTURE_AT").ok().and_then(|v| CaptureAt::parse_list(&v)).unwrap_or_default());
+            LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_CAPTURE_AT").and_then(|v| CaptureAt::parse_list(&v)).unwrap_or_default());
         self.capture_at_due_for(&AT)
     }
 
@@ -5444,9 +5639,10 @@ pub(crate) fn post_off(engaged: bool, last_dlss: Option<Instant>, now: Instant) 
     engaged && last_dlss.is_some_and(|t| now.saturating_duration_since(t) < HAND_BACK)
 }
 
-/// Until when the device that holds DLSS's input keeps the post path off ([`post_off`] as of its
-/// last DLSS submit or hold), shared by every device of the process; `None` when it does not.
-static POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
+/// Until when each device that holds DLSS's input keeps the post path off ([`post_off`] as of its
+/// last DLSS submit or hold), by session ([`PostOffEntry`]), read by every device of the process; a
+/// device that does not has no entry. Per device: one device's state never overwrites another's.
+static POST_OFF_UNTIL: Mutex<BTreeMap<u64, Instant>> = Mutex::new(BTreeMap::new());
 
 /// [`POST_OFF_UNTIL`]'s value for a device in model mode (`model`): [`post_off`] at any `now` is
 /// `now` before it.
@@ -5476,7 +5672,7 @@ static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// own [`Session::suppresses_post`]; it matters when DLSS runs on another device than the swapchain
 /// (only ever set in model mode).
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
-    (lock(&POST_OFF_UNTIL).is_some_and(|until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !ray_reconstruction_running(now)
+    (lock(&POST_OFF_UNTIL).values().any(|&until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !ray_reconstruction_running(now)
 }
 
 /// When a device of the process last saw DLSS Ray Reconstruction running ([`Tracker::rr_running`]).
@@ -6146,6 +6342,26 @@ mod tests {
         }
     }
 
+    /// Each device keeps its own deadline: one that does not hold (or holds no more) does not clear the
+    /// one that does, and a device gone takes its entry with it.
+    #[test]
+    fn each_device_keeps_its_own_post_off_deadline() {
+        let now = Instant::now();
+        let (holding, other) = (PostOffEntry::default(), PostOffEntry::default());
+        let ours = |e: &PostOffEntry| lock(&POST_OFF_UNTIL).get(&e.0).copied();
+        holding.set(Some(now + HAND_BACK));
+        other.set(None);
+        assert_eq!(ours(&holding), Some(now + HAND_BACK), "the other device's update leaves it");
+        assert_eq!(ours(&other), None);
+        other.set(Some(now + Duration::from_secs(1)));
+        holding.set(None);
+        assert_eq!(ours(&other), Some(now + Duration::from_secs(1)));
+        let key = other.0;
+        drop(other);
+        assert!(!lock(&POST_OFF_UNTIL).contains_key(&key), "removed with its session");
+        drop(holding);
+    }
+
     #[test]
     fn the_tracker_follows_registrations_launches_and_submitted_layouts() {
         let mut t = Tracker::default();
@@ -6263,6 +6479,29 @@ mod tests {
         t.free(&[cb(8)]);
         assert!(!t.armed(), "every launch buffer was reset or freed");
         assert!(t.submit_ok(&[vec![cb(7), cb(8)]]).is_none());
+    }
+
+    /// A pool reset (vkd3d-proton's command allocators) or destroyed ends its buffers' launches: the
+    /// tracking disarms without waiting for each buffer to be begun or freed again, and forgets a
+    /// destroyed pool's buffers. A reset buffer is as a begun one.
+    #[test]
+    fn a_reset_or_destroyed_pool_drops_its_buffers_launches() {
+        let t = Tracking::default();
+        let (pool, other) = (vk::CommandPool::from_raw(1), vk::CommandPool::from_raw(2));
+        t.allocated(pool, &[cb(1), cb(2)]);
+        t.allocated(other, &[cb(3)]);
+        t.launch(cb(1), vk::CuFunctionNVX::null(), None);
+        t.launch(cb(3), vk::CuFunctionNVX::null(), None);
+        t.reset_pool(pool, false);
+        assert!(t.armed(), "the other pool's launch buffer is still recorded");
+        assert!(t.submit_ok(&[vec![cb(1)]]).is_none(), "the reset pool's buffer carries no launch");
+        t.reset_pool(other, true);
+        assert!(!t.armed());
+        assert!(!lock(&t.pools).contains_key(&cb(3)), "a destroyed pool's buffers are forgotten");
+        assert!(lock(&t.pools).contains_key(&cb(1)), "a reset pool keeps its buffers");
+        t.launch(cb(2), vk::CuFunctionNVX::null(), None);
+        t.reset(cb(2));
+        assert!(!t.armed(), "a reset buffer carries nothing");
     }
 
     /// A protected `vkQueueSubmit2` is never parsed into a plan, wherever its protected batch is:
@@ -6797,6 +7036,72 @@ mod tests {
         assert_eq!(scan.depth_hazard, Some(Hazard::SameLayoutBarrier));
     }
 
+    /// The depth the input launch names wins over another depth image the buffer only reads before
+    /// the launch (a history depth some pass samples): the launch's own is final at the hold. The
+    /// read one is taken only where the named one is written in the buffer first (GTA V's ring, the
+    /// test above).
+    #[test]
+    fn the_launchs_own_depth_wins_over_one_only_read_before_it() {
+        let (mut t, _) = held_tracker();
+        let info = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            extent: vk::Extent3D { width: 1707, height: 960, depth: 1 },
+            format: vk::Format::D32_SFLOAT_S8_UINT,
+            usage: vk::ImageUsageFlags::STORAGE,
+            samples: vk::SampleCountFlags::TYPE_1,
+            ..Default::default()
+        };
+        let (own, history) = (vk::Image::from_raw(0x400), vk::Image::from_raw(0x500));
+        for (image, raw) in [(own, 0x400), (history, 0x500)] {
+            t.record_image(image, &info);
+            t.record_view(vk::ImageView::from_raw(raw + 1), image);
+            t.register(vk::ImageView::from_raw(raw + 1), Some(raw + 0x1000));
+        }
+        let _ = t.refresh();
+        t.barrier(cb(1), ImageSync::to(own, GENERAL));
+        t.barrier(cb(1), ImageSync::to(history, GENERAL));
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        let read = |image| ImageSync {
+            src_access: u64::from(vk::AccessFlags::SHADER_READ.as_raw()),
+            dst_access: u64::from(vk::AccessFlags::TRANSFER_READ.as_raw()),
+            ..general_to_general(image)
+        };
+        t.begin(cb(2));
+        t.barrier(cb(2), read(history));
+        t.launch(cb(2), Some(&param_block(&[0x1100, 0x1400, 0x1300])));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!(scan.inputs.map(|i| i.depth.0), Some(own), "the launch's own depth, not the one read before it");
+        assert_eq!((scan.depth_layout, scan.depth_hazard), (Some(GENERAL), None));
+    }
+
+    /// A barrier on one aspect of a depth/stencil image (`separateDepthStencilLayouts`) leaves its
+    /// aspects possibly apart: the hold neither copies nor transitions it from the tracked layout
+    /// until a barrier on both says where they are. A depth-only format's depth barrier is the whole.
+    #[test]
+    fn a_barrier_on_one_aspect_of_depth_and_stencil_leaves_no_layout_to_copy_from() {
+        let (mut t, params) = held_tracker();
+        let depth = vk::Image::from_raw(0x200);
+        let read_only = vk::ImageLayout::DEPTH_STENCIL_READ_ONLY_OPTIMAL;
+        let aspect = |a: vk::ImageAspectFlags| ImageSync { aspect: a.as_raw(), ..ImageSync::to(depth, read_only) };
+        t.barrier(cb(1), aspect(vk::ImageAspectFlags::DEPTH));
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        t.begin(cb(2));
+        t.launch(cb(2), Some(&params));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!(scan.depth_layout, Some(ASPECTS_APART));
+        assert_eq!(aux_copy_layout(scan.depth_layout), None, "no copy or transition from it");
+        assert!(!depth_copy_layout(vk::Format::D32_SFLOAT_S8_UINT, ASPECTS_APART));
+        t.barrier(cb(3), aspect(vk::ImageAspectFlags::DEPTH | vk::ImageAspectFlags::STENCIL));
+        let _ = t.submit_ok(&[vec![cb(3)]]);
+        t.begin(cb(2));
+        t.launch(cb(2), Some(&params));
+        let scan = t.submit_ok(&[vec![cb(2)]]).expect("launch-bearing");
+        assert_eq!(scan.depth_layout, Some(read_only), "both aspects together again");
+        // The separate depth layouts are only taken for a format without stencil.
+        assert!(!depth_copy_layout(vk::Format::D32_SFLOAT_S8_UINT, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL));
+        assert!(depth_copy_layout(vk::Format::D32_SFLOAT, vk::ImageLayout::DEPTH_READ_ONLY_OPTIMAL));
+    }
+
     /// Depth and motion vectors are read only by a dump: a barrier on them before the launch stops
     /// a dump, never a hold. This is GTA V Enhanced's launch buffer with DLSS Frame Generation on
     /// (probe `v201-fg-probe-1`): a dispatch, then depth and motion vectors copied for frame
@@ -7136,6 +7441,27 @@ mod tests {
         // No terminator within four pairs: refused, nothing past the ninth entry is read.
         let endless = [ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast(), ptr(1), block.as_ptr().cast()];
         assert_eq!(unsafe { launch_params(endless.as_ptr(), 1) }, None);
+        // An explicit count that ends between a key and its value: the value is not read (only three
+        // entries exist), and the list is refused. Four entries without the terminator are the list.
+        let cut = [ptr(2), std::ptr::from_ref(&size).cast(), ptr(1)];
+        assert_eq!(unsafe { launch_params(cut.as_ptr(), 3) }, None);
+        let whole = [ptr(2), std::ptr::from_ref(&size).cast(), ptr(1), block.as_ptr().cast()];
+        assert_eq!(unsafe { launch_params(whole.as_ptr(), 4) }, Some(&block[..]));
+    }
+
+    /// Only write bits count as a write in a barrier's source access: the transform feedback
+    /// counter's read bit is not one, shader storage writes (sync2, bit 34) and the video, optical flow
+    /// and micromap writes are.
+    #[test]
+    fn a_barrier_after_reads_only_does_not_follow_a_write() {
+        use vk::AccessFlags2 as A;
+        let after = |access: A| ImageSync { src_access: access.as_raw(), ..general_to_general(vk::Image::from_raw(7)) };
+        for read in [A::TRANSFORM_FEEDBACK_COUNTER_READ_EXT, A::SHADER_STORAGE_READ, A::VIDEO_ENCODE_READ_KHR, A::SHADER_READ | A::TRANSFER_READ] {
+            assert!(!after(read).may_follow_a_write(), "{read:?}");
+        }
+        for write in [A::SHADER_STORAGE_WRITE, A::VIDEO_DECODE_WRITE_KHR, A::VIDEO_ENCODE_WRITE_KHR, A::OPTICAL_FLOW_WRITE_NV, A::MICROMAP_WRITE_EXT, A::TRANSFORM_FEEDBACK_COUNTER_WRITE_EXT, A::MEMORY_WRITE] {
+            assert!(after(write).may_follow_a_write(), "{write:?}");
+        }
     }
 
     // ---- Identification by the input kernel's parameters (`Tracker::observe`). ----
@@ -8406,19 +8732,20 @@ mod tests {
         clamped
     }
 
-    /// The write-back: per channel, the original where the encoded input (`proxy`) was >= 0.999,
-    /// else the CPU inverse of the answer (`answer`) within relative 2e-3; alpha the original's.
+    /// The write-back: the whole original pixel where the encoded input's (`proxy`'s) peak channel
+    /// reached 0.999, else per channel the CPU inverse of the answer (`answer`) within relative 2e-3; alpha
+    /// the original's.
     #[allow(clippy::too_many_arguments)]
     fn check_decode(after: &[u8], original: &[u8], proxy: &[u8], answer: &[u8], w: u32, h: u32, e: f32, white: f32) {
         let (pw, _) = padded(w, h);
         for y in 0..h {
             for x in 0..w {
+                let peak = (0..3).map(|c| f16_to_f32(half_at(proxy, pw, x, y, c))).fold(f32::MIN, f32::max);
                 for c in 0..3 {
                     let got = half_at(after, w, x, y, c);
                     let orig = half_at(original, w, x, y, c);
-                    let enc = f16_to_f32(half_at(proxy, pw, x, y, c));
-                    if enc >= hdr::CLAMPED {
-                        assert_eq!(got, orig, "a clamped highlight keeps its original value at {x},{y} channel {c} (encoded {enc})");
+                    if peak >= hdr::CLAMPED {
+                        assert_eq!(got, orig, "a clamped highlight keeps its whole original pixel at {x},{y} channel {c} (encoded peak {peak})");
                         continue;
                     }
                     let want = hdr_ref::decode(f16_to_f32(half_at(answer, pw, x, y, c)), e, white);
@@ -8534,8 +8861,10 @@ mod tests {
                         let enc_bits = half_at(&proxy, pw, x, y, c);
                         let enc = f16_to_f32(enc_bits);
                         let got = f64::from(f16_to_f32(half_at(&after, w, x, y, c)));
-                        if enc >= hdr::CLAMPED {
-                            kept += 1;
+                        // The decode keeps the whole pixel where its encoded peak channel clamped.
+                        let peak = (0..3).map(|k| f16_to_f32(half_at(&proxy, pw, x, y, k))).fold(f32::MIN, f32::max);
+                        if peak >= hdr::CLAMPED {
+                            kept += usize::from(enc >= hdr::CLAMPED);
                             assert_eq!(got, x0);
                             continue;
                         }
@@ -8986,8 +9315,10 @@ mod tests {
                         let enc_bits = half_at(&proxy, pw, x, y, c);
                         let enc = f16_to_f32(enc_bits);
                         let got = f64::from(f16_to_f32(half_at(&after, w, x, y, c)));
-                        if enc >= hdr::CLAMPED {
-                            kept += 1;
+                        // The decode keeps the whole pixel where its encoded peak channel clamped.
+                        let peak = (0..3).map(|k| f16_to_f32(half_at(&proxy, pw, x, y, k))).fold(f32::MIN, f32::max);
+                        if peak >= hdr::CLAMPED {
+                            kept += usize::from(enc >= hdr::CLAMPED);
                             assert_eq!(got, x0);
                             continue;
                         }
@@ -9136,7 +9467,7 @@ mod tests {
             identification: 1,
         };
         let run = |res: &Resources, target: &Target, cache: Option<&CacheCopies>| unsafe {
-            record_capture(d, res, target, None, None, None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour), None).unwrap();
+            record_capture(d, res, target, None, None, Some(res.proxy.buffer), None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour), None).unwrap();
             record_writeback(d, res, target, res.proxy.buffer, None, cache, None).unwrap();
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             d.queue_submit(gpu.queue, &[vk::SubmitInfo::builder().command_buffers(&[res.capture_cmd, res.writeback_cmd]).build()], fence).unwrap();

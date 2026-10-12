@@ -21,36 +21,38 @@
 //!   bounds.
 //!
 //! A buffer the split can take (GTA V's) gets nothing recorded: [`super::Tracker::inline_point`]
-//! only answers where the split would be refused.
+//! only answers where the split would be refused. Nor does a secondary command buffer (only submitted
+//! primaries become jobs, so its hold would never be released), one from a pool of another queue
+//! family than DLSS's graphics one (its copies and blits need that queue; the worker only runs jobs
+//! there), or any while the model is switched off (F11).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::{mpsc, Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use ash::vk;
 
-use super::{Aux, InlinePoint};
+use super::{lock, Aux, InlinePoint};
 
 /// Staging slots per device. One per command buffer recorded with a hold and not yet re-recorded,
-/// so a few frames recorded ahead each have their own image and events.
+/// so a few frames recorded ahead each have their own image and events. A slot is free again only
+/// once its buffer cannot be pending any more: re-recorded, reset, freed, or its pool reset or
+/// destroyed (each reaches the layer); never by time, which could hand its image to another buffer
+/// while the first is submitted again unchanged.
 pub(crate) const MAX_SLOTS: usize = 8;
-
-/// A slot whose buffer has not been submitted for this long is taken back (its buffer's pool was
-/// reset or destroyed without `vkBeginCommandBuffer`/`vkFreeCommandBuffers` reaching the layer).
-const STALE: Duration = Duration::from_secs(10);
 
 /// `NEURAL_FORGE_INLINE=off` turns the hold inside DLSS's buffer off (no side queue is added to
 /// the device either); the split hold is unaffected.
 pub(crate) fn enabled() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("NEURAL_FORGE_INLINE").map_or(true, |v| v != "off" && v != "0"));
+    static ON: LazyLock<bool> = LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_INLINE").is_none_or(|v| v != "off" && v != "0"));
     *ON
 }
 
 /// `NEURAL_FORGE_INLINE=release` (diagnostics): record the hold into DLSS's buffers as usual, but
 /// release every one as soon as `captured` is set, without running the hold.
 fn release_only() -> bool {
-    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("NEURAL_FORGE_INLINE").is_ok_and(|v| v == "release"));
+    static ON: LazyLock<bool> = LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_INLINE").is_some_and(|v| v == "release"));
     *ON
 }
 
@@ -74,7 +76,6 @@ struct Slot {
     release: vk::Event,
     owner: Option<vk::CommandBuffer>,
     point: Option<InlinePoint>,
-    used: Instant,
     /// Since the owner recorded the hold: when, and how many times it was submitted (the one-time
     /// line when every slot is taken says what the owners are doing).
     recorded: Option<Instant>,
@@ -110,10 +111,13 @@ struct Slots {
     /// The pool each of the device's command buffers was allocated from: resetting or destroying a
     /// pool ends every one of its buffers' pending state, so their slots are free again.
     /// vkd3d-proton resets a DX12 command allocator's pool and records into other buffers in the
-    /// meantime, so a slot freed only at the same buffer's next `vkBeginCommandBuffer` stayed taken
-    /// until [`STALE`]: all eight were in use within a few frames (Black Myth: Wukong's benchmark,
-    /// 2026-10-05), and a buffer was held about once a second.
+    /// meantime, so a slot freed only at the same buffer's next `vkBeginCommandBuffer` stayed taken:
+    /// all eight were in use within a few frames (Black Myth: Wukong's benchmark, 2026-10-05).
     pool_of: HashMap<vk::CommandBuffer, vk::CommandPool>,
+    /// The queue family of each of the device's command pools (`vkCreateCommandPool`).
+    pool_family: HashMap<vk::CommandPool, u32>,
+    /// The device's secondary command buffers (`vkAllocateCommandBuffers`' level).
+    secondary: HashSet<vk::CommandBuffer>,
 }
 
 /// What runs the hold for a job on the worker thread (`device.rs`): the device's state and the
@@ -134,6 +138,9 @@ pub(crate) struct Inline {
     worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     stopping: Arc<AtomicBool>,
     said: Mutex<HashSet<String>>,
+    /// The shared memory's header once the device's state opened it ([`watch_switch`]): the model's
+    /// switch (F11, the GUI), read at every launch so nothing is recorded while it is off.
+    switch: AtomicPtr<neural_forge_protocol::ShmHeader>,
 }
 
 static INLINES: LazyLock<Mutex<HashMap<vk::Device, Arc<Inline>>>> = LazyLock::new(Default::default);
@@ -167,6 +174,7 @@ impl Inline {
             worker: Mutex::new(None),
             stopping: stopping.clone(),
             said: Mutex::new(HashSet::new()),
+            switch: AtomicPtr::new(std::ptr::null_mut()),
         });
         let worker = std::thread::Builder::new()
             .name("nf-inline-hold".into())
@@ -183,15 +191,15 @@ impl Inline {
                 }
             })
             .ok()?;
-        *inline.worker.lock().unwrap() = Some(worker);
-        INLINES.lock().unwrap().insert(inline.device.handle(), inline.clone());
+        *lock(&inline.worker) = Some(worker);
+        lock(&INLINES).insert(inline.device.handle(), inline.clone());
         crate::log!("[preupscale] hold inside DLSS's command buffer available: side queue in family {family}, DLSS's in {app_family} (NEURAL_FORGE_INLINE=off turns it off)");
         crate::logging::flush();
         Some(inline)
     }
 
     fn say_once(&self, what: String) {
-        if self.said.lock().unwrap().insert(what.clone()) {
+        if lock(&self.said).insert(what.clone()) {
             crate::log!("[preupscale] {what}");
             crate::logging::flush();
         }
@@ -199,7 +207,7 @@ impl Inline {
 
     /// `vkBeginCommandBuffer`: the buffer is not pending, so a slot it held is free again.
     pub(crate) fn begin(&self, cb: vk::CommandBuffer, flags: vk::CommandBufferUsageFlags) {
-        let mut s = self.slots.lock().unwrap();
+        let mut s = lock(&self.slots);
         release(&mut s, cb);
         if flags.contains(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE) {
             s.simultaneous.insert(cb);
@@ -210,31 +218,42 @@ impl Inline {
 
     /// `vkFreeCommandBuffers`.
     pub(crate) fn free(&self, cbs: &[vk::CommandBuffer]) {
-        let mut s = self.slots.lock().unwrap();
+        let mut s = lock(&self.slots);
         for cb in cbs {
             release(&mut s, *cb);
             s.simultaneous.remove(cb);
             s.pool_of.remove(cb);
+            s.secondary.remove(cb);
         }
     }
 
-    /// `vkAllocateCommandBuffers` returned `cbs` from `pool`.
-    pub(crate) fn allocated(&self, pool: vk::CommandPool, cbs: &[vk::CommandBuffer]) {
-        let mut s = self.slots.lock().unwrap();
+    /// `vkCreateCommandPool` made `pool` for queue family `family`.
+    pub(crate) fn pool_created(&self, pool: vk::CommandPool, family: u32) {
+        lock(&self.slots).pool_family.insert(pool, family);
+    }
+
+    /// `vkAllocateCommandBuffers` returned `cbs` of `level` from `pool`.
+    pub(crate) fn allocated(&self, pool: vk::CommandPool, level: vk::CommandBufferLevel, cbs: &[vk::CommandBuffer]) {
+        let mut s = lock(&self.slots);
         for cb in cbs {
             s.pool_of.insert(*cb, pool);
+            if level == vk::CommandBufferLevel::SECONDARY {
+                s.secondary.insert(*cb);
+            } else {
+                s.secondary.remove(cb);
+            }
         }
     }
 
     /// `vkResetCommandBuffer`: the buffer is not pending (Vulkan requires it), so its slot is free.
     pub(crate) fn reset(&self, cb: vk::CommandBuffer) {
-        release(&mut self.slots.lock().unwrap(), cb);
+        release(&mut lock(&self.slots), cb);
     }
 
     /// `vkResetCommandPool` (`destroyed`: `vkDestroyCommandPool`): none of the pool's buffers is
     /// pending (Vulkan requires it), so their slots are free.
     pub(crate) fn reset_pool(&self, pool: vk::CommandPool, destroyed: bool) {
-        let mut s = self.slots.lock().unwrap();
+        let mut s = lock(&self.slots);
         let owners: Vec<vk::CommandBuffer> = s.by_cb.keys().copied().filter(|cb| s.pool_of.get(cb) == Some(&pool)).collect();
         for cb in owners {
             release(&mut s, cb);
@@ -244,23 +263,54 @@ impl Inline {
             for cb in gone {
                 s.pool_of.remove(&cb);
                 s.simultaneous.remove(&cb);
+                s.secondary.remove(&cb);
             }
+            s.pool_family.remove(&pool);
         }
     }
 
     /// Whether `cb` carries a hold (the split path leaves it alone).
     pub(crate) fn owns(&self, cb: vk::CommandBuffer) -> bool {
-        self.slots.lock().unwrap().by_cb.contains_key(&cb)
+        lock(&self.slots).by_cb.contains_key(&cb)
+    }
+
+    /// Whether the model is switched off (F11, the GUI, `shmctl set enabled 0`), as far as known: before
+    /// the device's state opened the shared memory nothing is known, and the hold is recorded.
+    fn model_switched_off(&self) -> bool {
+        let header = self.switch.load(Ordering::Acquire);
+        // SAFETY: a header [`watch_switch`] stored: mapped for the life of the process.
+        !header.is_null() && unsafe { !((*header).neural_enabled() && (*header).apply_model.load(Ordering::Relaxed) != 0) }
     }
 
     /// Records the hold into `cb` right before the launch being recorded (the caller's hook returns
     /// `Unhandled`, so the launch follows these commands). `false` when it could not: a buffer that
     /// may be pending more than once at a time, no free slot, or a slot that could not be built.
     pub(crate) fn record(&self, cb: vk::CommandBuffer, point: InlinePoint) -> bool {
-        let mut s = self.slots.lock().unwrap();
+        // Switched off: nothing to hold for, so not even the copies and the event are recorded.
+        if self.model_switched_off() {
+            return false;
+        }
+        let mut s = lock(&self.slots);
         if s.simultaneous.contains(&cb) {
             self.say_once("a DLSS buffer recorded with SIMULTANEOUS_USE is not held inside".into());
             return false;
+        }
+        // Only submitted primaries become jobs: a secondary's hold would never be released.
+        if s.secondary.contains(&cb) {
+            self.say_once("DLSS is recorded in a secondary command buffer; it is not held inside".into());
+            return false;
+        }
+        // The hold's copies and blits need DLSS's graphics queue's family, and the worker only runs
+        // jobs submitted there: a buffer of another family's pool is not held (nor one of an unknown pool).
+        match s.pool_of.get(&cb).and_then(|p| s.pool_family.get(p)).copied() {
+            Some(family) if family == self.app_family => {}
+            family => {
+                self.say_once(match family {
+                    Some(f) => format!("DLSS is recorded for queue family {f}, not the graphics family {}; it is not held inside", self.app_family),
+                    None => "DLSS's command buffer comes from a pool the layer did not see created; it is not held inside".to_string(),
+                });
+                return false;
+            }
         }
         if s.by_cb.contains_key(&cb) {
             return false;
@@ -272,7 +322,7 @@ impl Inline {
             return false;
         }
         let now = Instant::now();
-        let free = s.slots.iter().position(|sl| sl.owner.is_none()).or_else(|| s.slots.iter().position(|sl| now.duration_since(sl.used) > STALE));
+        let free = s.slots.iter().position(|sl| sl.owner.is_none());
         let index = match free {
             Some(i) => i,
             None if s.slots.len() < MAX_SLOTS => {
@@ -285,21 +335,21 @@ impl Inline {
                 s.slots.len() - 1
             }
             None => {
-                let owners: Vec<String> = s
-                    .slots
-                    .iter()
-                    .map(|sl| {
-                        format!(
-                            "{:?} recorded {:.1}s ago, submitted {}x, pool {}",
-                            sl.owner,
-                            sl.recorded.map_or(f32::NAN, |r| now.duration_since(r).as_secs_f32()),
-                            sl.submits,
-                            sl.owner.and_then(|c| s.pool_of.get(&c)).map_or("unknown".to_string(), |p| format!("{p:?}"))
-                        )
-                    })
-                    .collect();
-                // Once (the details change every time).
-                if self.said.lock().unwrap().insert("all staging slots in use".into()) {
+                // Once (the details change every time): the owners are only described then.
+                if lock(&self.said).insert("all staging slots in use".into()) {
+                    let owners: Vec<String> = s
+                        .slots
+                        .iter()
+                        .map(|sl| {
+                            format!(
+                                "{:?} recorded {:.1}s ago, submitted {}x, pool {}",
+                                sl.owner,
+                                sl.recorded.map_or(f32::NAN, |r| now.duration_since(r).as_secs_f32()),
+                                sl.submits,
+                                sl.owner.and_then(|c| s.pool_of.get(&c)).map_or("unknown".to_string(), |p| format!("{p:?}"))
+                            )
+                        })
+                        .collect();
                     crate::log!(
                         "[preupscale] all {MAX_SLOTS} staging slots of the hold inside DLSS's buffer are in use; that buffer is not held (owners: {}; {} buffers with a known pool)",
                         owners.join("; "),
@@ -314,8 +364,9 @@ impl Inline {
             s.by_cb.remove(&old);
         }
         if s.slots[index].extent != extent {
-            // SAFETY: the slot is not owned by any buffer that could still be pending (`begin`
-            // freed it, or it went unsubmitted for `STALE`); the image is rebuilt at the new size.
+            // SAFETY: the slot is not owned by any buffer that could still be pending (its buffer was
+            // re-recorded, reset or freed, or its pool reset or destroyed); the image is rebuilt at the
+            // new size.
             unsafe { self.resize_slot(&mut s.slots[index], extent) };
         }
         // Also when the extent did not change: a slot whose build failed has no image to copy into.
@@ -337,7 +388,8 @@ impl Inline {
             .filter(|a| a.readable && slot.mvec != vk::Image::null())
             .filter(|_| point.mvec_extent.0 >= extent.0 && point.mvec_extent.1 >= extent.1)
             .and_then(|a| a.layout.map(|layout| (a.image, layout)));
-        // DLSS's depth aspect, copied into the slot's buffer for the native backend's depth copy.
+        // DLSS's depth aspect, copied into the slot's buffer for the native backend's depth copy (the
+        // edit cache's: with it off there is no buffer, and nothing is copied).
         let depth = point
             .depth_input
             .filter(|a| a.readable && slot.depth != vk::Buffer::null())
@@ -367,7 +419,6 @@ impl Inline {
             ..point
         });
         slot.owner = Some(cb);
-        slot.used = now;
         slot.recorded = Some(now);
         slot.submits = 0;
         s.by_cb.insert(cb, index);
@@ -391,13 +442,11 @@ impl Inline {
     /// The jobs of a submission about to be made on a queue of `family`: one per buffer carrying a
     /// hold, in submission order.
     pub(crate) fn jobs_for(&self, cbs: impl IntoIterator<Item = vk::CommandBuffer>, family: Option<u32>) -> Vec<Job> {
-        let mut s = self.slots.lock().unwrap();
-        let now = Instant::now();
+        let mut s = lock(&self.slots);
         let mut jobs = Vec::new();
         for cb in cbs {
             let Some(&i) = s.by_cb.get(&cb) else { continue };
             let slot = &mut s.slots[i];
-            slot.used = now;
             slot.submits += 1;
             if let Some(point) = slot.point {
                 // A queue the layer never saw (`vkGetDeviceQueue*`) counts as another family: the
@@ -425,7 +474,7 @@ impl Inline {
         if jobs.is_empty() {
             return;
         }
-        let tx = self.jobs.lock().unwrap();
+        let tx = lock(&self.jobs);
         let Some(tx) = tx.as_ref() else {
             // Stopping: release at once so the GPU never waits on a host that left.
             for job in jobs {
@@ -468,7 +517,6 @@ impl Inline {
                 release,
                 owner: None,
                 point: None,
-                used: Instant::now(),
                 recorded: None,
                 submits: 0,
             };
@@ -524,9 +572,11 @@ impl Inline {
         // Without it the hold still runs, with no history for the native backend.
         // SAFETY: the device is live.
         (slot.mvec, slot.mvec_memory) = unsafe { self.image(vk::Format::R16G16_SFLOAT, extent) }.unwrap_or_default();
-        // Without it the hold runs with no depth.
-        // SAFETY: the device is live.
-        (slot.depth, slot.depth_memory) = unsafe { self.buffer(u64::from(extent.0) * u64::from(extent.1) * 4) }.unwrap_or_default();
+        // Without it the hold runs with no depth; with the edit cache off there is none to copy.
+        if super::edit_cache_on() {
+            // SAFETY: the device is live.
+            (slot.depth, slot.depth_memory) = unsafe { self.buffer(u64::from(extent.0) * u64::from(extent.1) * 4) }.unwrap_or_default();
+        }
     }
 
     /// A device-local `TRANSFER_SRC | TRANSFER_DST` buffer of the layer's, shared by DLSS's family and
@@ -745,8 +795,13 @@ unsafe fn record_hold(
         depth_barrier(source, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, l, vk::AccessFlags::empty(), vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, f)
     }));
     let exposure_region = vk::ImageCopy { extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..region };
-    // The copy made available before the host sees `captured` and the side queue reads it.
-    let published = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+    // The copies made available to the host before `captured` is set (a HOST_READ in a HOST stage: the
+    // host's memory domain), so once the host saw the event its submit on the side queue makes them
+    // visible there (a queue submission's memory dependency on what the host can see).
+    let published = vk::MemoryBarrier::builder()
+        .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
+        .dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE)
+        .build();
     // The side queue's write-back (made available by its fence, which the host waited on before
     // setting `release`) visible to the copy back.
     let acquire = vk::MemoryBarrier::builder()
@@ -800,7 +855,7 @@ unsafe fn record_hold(
             };
             d.cmd_copy_image_to_buffer(cb, source, from, own, &[copy]);
         }
-        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[published], &[], &mvec_back);
+        d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[published], &[], &mvec_back);
         d.cmd_set_event(cb, captured, vk::PipelineStageFlags::TRANSFER);
         d.cmd_wait_events(cb, &[release], vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::TRANSFER, &[acquire], &[], &to_write);
         if convert {
@@ -836,6 +891,15 @@ unsafe fn free_mvec(d: &ash::Device, slot: &Slot) {
     }
 }
 
+/// The shared memory's header for `device`'s hold inside DLSS's buffer: from here on nothing is
+/// recorded there while the model is switched off ([`Inline::record`]). Set once; the mapping is
+/// never unmapped.
+pub(crate) fn watch_switch(device: vk::Device, header: *const neural_forge_protocol::ShmHeader) {
+    if let Some(inline) = lock(&INLINES).get(&device) {
+        inline.switch.store(header.cast_mut(), Ordering::Release);
+    }
+}
+
 /// Stops `device`'s worker and frees the slots: called from `vkDestroyDevice` before anything else
 /// of the device's is freed. Jobs still queued are released at once (the worker skips the hold
 /// while stopping), the worker is joined, then the device is waited idle so no buffer still uses a
@@ -844,10 +908,10 @@ unsafe fn free_mvec(d: &ash::Device, slot: &Slot) {
 /// # Safety
 /// The caller meets `vkDestroyDevice`'s external synchronization requirements.
 pub(crate) unsafe fn destroy(device: vk::Device) {
-    let Some(inline) = INLINES.lock().unwrap().remove(&device) else { return };
+    let Some(inline) = lock(&INLINES).remove(&device) else { return };
     inline.stopping.store(true, Ordering::Relaxed);
-    inline.jobs.lock().unwrap().take();
-    if let Some(worker) = inline.worker.lock().unwrap().take() {
+    lock(&inline.jobs).take();
+    if let Some(worker) = lock(&inline.worker).take() {
         let _ = worker.join();
     }
     let d = &inline.device;
@@ -855,7 +919,7 @@ pub(crate) unsafe fn destroy(device: vk::Device) {
     // queue's only user) has exited.
     match unsafe { d.device_wait_idle() } {
         Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
-            let mut s = inline.slots.lock().unwrap();
+            let mut s = lock(&inline.slots);
             for slot in s.slots.drain(..) {
                 // SAFETY: idle (or lost): nothing uses them.
                 unsafe {
@@ -886,6 +950,68 @@ mod tests {
         pub(super) static FAIL_IMAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
+    /// Only a primary of a pool of DLSS's graphics family is held inside, and nothing while the model
+    /// is switched off: a secondary's hold would never be released (only submitted primaries become
+    /// jobs), another family's queue may not take the copies and blits and its job only releases, and
+    /// a pool the layer never saw created has no known family. Nothing is recorded into any of them.
+    #[test]
+    fn only_a_graphics_familys_primary_is_held_inside_and_only_with_the_model_on() {
+        let Some((_entry, instance, physical_device, device, _queue, family)) = crate::composition::gpu::test_device() else { return };
+        let device = Arc::new(device);
+        let hold: HoldFn = Box::new(|_job, _queue| {});
+        let inline = Inline::start(device.clone(), &instance, physical_device, vk::Queue::null(), family, family, hold).expect("worker");
+        let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE;
+        let point = InlinePoint {
+            colour: vk::Image::null(),
+            desc: ImageDesc { width: 16, height: 8, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true },
+            layout: vk::ImageLayout::GENERAL,
+            exposure_input: None,
+            mvec_input: None,
+            mvec_extent: (16, 8),
+            depth_input: None,
+            identification: 0,
+            hazard: Hazard::MemoryBarrier,
+        };
+        let cb = |raw: u64| <vk::CommandBuffer as vk::Handle>::from_raw(raw);
+        let pool_of = |raw: u64| <vk::CommandPool as vk::Handle>::from_raw(raw);
+        let (pool, other_pool, unseen) = (pool_of(1), pool_of(2), pool_of(3));
+        inline.pool_created(pool, family);
+        inline.pool_created(other_pool, family + 1);
+        inline.allocated(pool, vk::CommandBufferLevel::SECONDARY, &[cb(10)]);
+        inline.allocated(other_pool, vk::CommandBufferLevel::PRIMARY, &[cb(11)]);
+        inline.allocated(unseen, vk::CommandBufferLevel::PRIMARY, &[cb(12)]);
+        for (c, why) in [(cb(10), "a secondary"), (cb(11), "another family's pool"), (cb(12), "a pool never seen created"), (cb(13), "a buffer never seen allocated")] {
+            assert!(!inline.record(c, point), "{why} is not held inside");
+            assert!(!inline.owns(c));
+        }
+        assert!(lock(&inline.slots).slots.is_empty(), "nothing was even built for them");
+        // The model switched off: nothing is recorded; on again, the hold is.
+        let mut header: Box<neural_forge_protocol::ShmHeader> = Box::default();
+        header.enabled.store(1, Ordering::Relaxed);
+        header.apply_model.store(0, Ordering::Relaxed);
+        inline.switch.store(&mut *header, Ordering::Release);
+        // SAFETY: test-only; the buffer is recorded on this thread and never submitted.
+        unsafe {
+            let real_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let real = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(real_pool).command_buffer_count(1)).unwrap()[0];
+            inline.pool_created(real_pool, family);
+            inline.allocated(real_pool, vk::CommandBufferLevel::PRIMARY, &[real]);
+            let begin = vk::CommandBufferBeginInfo::default();
+            device.begin_command_buffer(real, &begin).unwrap();
+            inline.begin(real, begin.flags);
+            assert!(!inline.record(real, point), "switched off");
+            header.apply_model.store(1, Ordering::Relaxed);
+            assert!(inline.record(real, point), "switched on again");
+            device.end_command_buffer(real).unwrap();
+            // Its pool reset: the slot is free for another buffer.
+            inline.reset_pool(real_pool, false);
+            assert!(!inline.owns(real));
+            inline.switch.store(std::ptr::null_mut(), Ordering::Release);
+            destroy(device.handle());
+            device.destroy_command_pool(real_pool, None);
+        }
+    }
+
     /// A slot whose staging image could not be built is never recorded with a null image: the next
     /// hold at the same size refuses again while building fails, and builds it once it succeeds.
     #[test]
@@ -911,6 +1037,8 @@ mod tests {
         unsafe {
             let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
             let cbs = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(3)).unwrap();
+            inline.pool_created(pool, family);
+            inline.allocated(pool, vk::CommandBufferLevel::PRIMARY, &cbs);
             let begin = vk::CommandBufferBeginInfo::default();
             let record = |cb, w, h| {
                 device.begin_command_buffer(cb, &begin).unwrap();
@@ -994,6 +1122,8 @@ mod tests {
             let cb = device
                 .allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1))
                 .unwrap()[0];
+            inline.pool_created(pool, family);
+            inline.allocated(pool, vk::CommandBufferLevel::PRIMARY, &[cb]);
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
             let to_general = vk::ImageMemoryBarrier::builder()
                 .old_layout(vk::ImageLayout::UNDEFINED)
@@ -1174,6 +1304,8 @@ mod mvec_tests {
             let inline = Inline::start(device.clone(), &instance, physical_device, vk::Queue::null(), family, family, hold).expect("worker");
             let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
             let cbs = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(2)).unwrap();
+            inline.pool_created(pool, family);
+            inline.allocated(pool, vk::CommandBufferLevel::PRIMARY, &cbs);
             let (cb, read) = (cbs[0], cbs[1]);
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
             let barrier = |image, old, new| {
@@ -1331,8 +1463,10 @@ mod convert_tests {
                     .subresource_range(range)
                     .build()
             };
+            inline.pool_created(pool, family);
             let run = |with_hold: bool| -> Vec<u8> {
                 let cb = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+                inline.allocated(pool, vk::CommandBufferLevel::PRIMARY, &[cb]);
                 let begin = vk::CommandBufferBeginInfo::default();
                 device.begin_command_buffer(cb, &begin).unwrap();
                 inline.begin(cb, begin.flags);

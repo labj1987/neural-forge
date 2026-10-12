@@ -312,13 +312,18 @@ sequenceDiagram
    that went to DLSS untouched, after 500 ms without a frame, on another extent, or after a frame
    whose exposure was unusable.
 4. **Write back and decode** (`W`): the decode shader inverts the encode and writes the colour input
-   in place, cropping the padding, keeping the original value where the encoded input was clamped
-   and keeping the original alpha; a closing barrier makes it visible to DLSS.
+   in place, cropping the padding, keeping the original pixel (all three channels, so no hue turns)
+   where the encoded input's peak channel was clamped and keeping the original alpha; a closing
+   barrier makes it visible to DLSS.
 5. **Forward the tail.** DLSS runs on the enhanced input.
 
 There is no CPU wait inside the hold: the only wait is the next hold's bounded wait for this hold's
-`W` fence, which covers `C` and `N` too (same queue, submitted before it). One network frame is in
-flight at a time.
+`W` fence, which covers `C` and `N` too (same queue, submitted before it). When a submit after `C`
+fails, an empty buffer is submitted with that fence instead, so the next hold still waits for what
+went before it records those buffers again. One network frame is in flight at a time, and the
+after-the-upscaler path does not take the network while that fence is unsignalled (nor the
+pre-upscaler path while a timed-out after-the-upscaler frame's is). The native hold's encode stays in
+the layer's image: nothing is copied into slot 0, the after-the-upscaler path's.
 
 **Inside DLSS's command buffer** (`preupscale/inline.rs`). Some games record their frame and DLSS
 in one command buffer (Crimson Desert), so there is no submit to split. There the layer records into
@@ -326,7 +331,11 @@ DLSS's buffer, at the input kernel's launch, a copy of the colour input (and the
 a staging image and a wait on an event; at the submit its worker thread runs the same `C`/`N`/`W` on
 the layer's own compute queue, then sets the event, and DLSS continues on the enhanced input. The
 network's launches there are separated by barriers instead of counter chaining (chaining faulted the
-GPU in Black Myth: Wukong; NATIVE_BACKEND.md, Phase 4b).
+GPU in Black Myth: Wukong; NATIVE_BACKEND.md, Phase 4b). Nothing is recorded into a secondary
+command buffer (only submitted primaries become jobs), into a buffer of a pool of another queue
+family than DLSS's graphics one (`vkCreateCommandPool` tells the family), or while the model is
+switched off; a slot is free again only once its buffer is re-recorded, reset or freed or its pool
+reset or destroyed.
 
 ### 4.6 The HDR encode and decode
 
@@ -346,10 +355,10 @@ input = sRGB_OETF(y),  alpha = 1
 ```
 
 ```
-y      = min(sRGB_EOTF(answer), 1 - 1e-4)
+y      = min(sRGB_EOTF(answer), 1 - 1e-4)            a NaN answer as 0
 v      = y                                         y < 0.75
          0.75 - ln(1 - (y - 0.75) / 0.25) / 5.770780        above
-scene' = v * W / e     (original kept where the encoded input was >= 0.999; alpha kept)
+scene' = v * W / e     (the original pixel kept where the encoded peak channel was >= 0.999; alpha kept)
 ```
 
 The shoulder and sRGB step follow OpenDLSS-NR's documented proxy; the exposure multiply, the
@@ -399,11 +408,15 @@ trip; PRE_UPSCALER_DESIGN.md, "Hand-off latency").
 
 ### 4.9 Depth, and the pre-upscaler cache dump
 
-**Depth.** Every native hold copies DLSS's depth into a device-local buffer of the layer's at the
-render extent (`native::DepthCopy`), as the first command of `C`, timed alone (`depth_copy_gpu_ms`
-in the `[preupscale]` summary line). Which depth (`Tracker::hold_depth`): a depth image the launch
-buffer synchronizes reads of before the launch (the frame's depth it copies into DLSS's own), else
-the one the input launch names where its layout is known, else the identified one. GTA V Enhanced
+**Depth.** With the edit cache on, every native hold copies DLSS's depth into a device-local buffer of
+the layer's at the render extent (`native::DepthCopy`), as the first command of `C`, timed alone
+(`depth_copy_gpu_ms` in the `[preupscale]` summary line); with it off nothing of depth is copied. Which
+depth (`Tracker::hold_depth`): the one the input launch names, where its layout is known and the launch
+buffer does not write it before the launch; else a depth image the launch buffer synchronizes reads of
+before the launch (the frame's depth it copies into DLSS's own); else the named one; else the
+identified one. A depth/stencil image after a barrier on one of its aspects only is not copied until
+a barrier on both says where they are, and the split hold copies only from the layouts
+`depth_copy_layout` takes, as the hold inside DLSS's buffer. GTA V Enhanced
 alternates two depth images frame by frame and copies the frame's one into a ring of three that
 DLSS reads, inside the launch buffer: the identified image held the previous frame's depth on every
 other hold, and the ring's image is written after the hold. The split hold copies the chosen
@@ -414,8 +427,9 @@ A barrier on that image in front of the launch that may follow a write (a layout
 ownership transfer, a write in its source access; `Scan::depth_hazard`) leaves that hold without
 depth instead of stopping it. Every depth image at the identified depth's extent has its barriers
 tracked. `NEURAL_FORGE_PROBE_DEPTH=1` logs the first 120 held buffers' depth choice and barriers.
-While the pre-upscaler path is on, depth images get `TRANSFER_SRC` added at creation, as RG16F images
-do (`wants_copyable`; `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked).
+While the pre-upscaler path and the edit cache are on, depth images get `TRANSFER_SRC` added at
+creation, as RG16F images do (`wants_copyable`; `NEURAL_FORGE_EDIT_CACHE=off` adds it to RG16F images
+only, `NEURAL_FORGE_PREUPSCALE=off` creates every image as asked).
 
 **The cache dump** (`preupscale::cache_dump`) writes K consecutive model-mode holds for the offline
 replay of the edit cache (`scripts/cache_replay.py`). Requests: `neural-forge-cli shmctl dump-cache
@@ -428,7 +442,9 @@ armed hold only adds copies: the colour input before the model in `C`, and in `W
 the colour input (the answer written back), the motion vectors and the depth copy, into host
 readbacks built for the dump and freed after it. They are read once the hold's `W` fence was waited
 on (the next hold on the split path, right after the worker's wait inside DLSS's buffer). A hold
-that misses, or a DLSS frame between two armed holds that went unheld, ends the dump there.
+that misses, or a DLSS frame between two armed holds that went unheld, ends the dump there. At most 8
+holds wait for the writer; a hold waits up to 2 s for it beyond that, then the dump ends. With the
+edit cache off a dump has no depth.
 
 Directory `$XDG_DATA_HOME/neural-forge/captures/preupscale-cache-<unix ms>/`, `manifest.json`
 rewritten after every hold:
@@ -475,7 +491,9 @@ always (exposure, vectors, depth, the encode), no N, and a write-back that carri
 correction to this hold; while the camera is still every hold refreshes. `model_interval` is the
 after-the-upscaler path's setting (5.3) and is not read here. `NEURAL_FORGE_EDIT_CACHE=off` (read
 once at start-up, like `NEURAL_FORGE_PREUPSCALE`) is the A/B and rollback switch: every hold
-refreshes at interval 1, and the picture is bit for bit 3.2.0's (the test
+refreshes at interval 1, and the hold is 3.2.0's: no depth image made copyable or copied, none of the
+cache's passes (nothing depends on them building), and the frame shaders read DLSS's packed vectors
+directly as 3.2.0's did; the picture is bit for bit 3.2.0's (the test
 `at_interval_1_the_network_sees_exactly_what_it_saw_before_the_accumulated_field`).
 
 - **Accumulated motion.** The network's history reads `NativePass::acc` (f32 x, y per texel, in the
@@ -483,7 +501,8 @@ refreshes at interval 1, and the picture is bit for bit 3.2.0's (the test
   interval 1 DLSS's vectors as they are (an exact conversion); above 1, `acc_t(x) = mv_t(x) +
   acc_{t-1}(x + mv_t(x) + jitter[t-1] - jitter[t])` (the previous field read bilinearly, zero right
   after a network frame; `mv` from the nearest surface of the 3x3 depth neighbourhood; NaN where the
-  chain leaves the frame, which the network's `hasHistory` and the cache both read as no history).
+  chain leaves the frame, which the network's `hasHistory` and the cache both read as no history). A
+  hold without vectors copied writes NaN everywhere and counts nothing for the cadence, and refreshes.
   The jitter telescopes: the network adds `last_jitter - jitter` (the last refresh's) as before, the
   cache `jitter[refresh] - jitter[t]`.
 - **Refresh capture** (in W, between the answer's copy and the decode): the edit `log2((v_answer +
@@ -536,8 +555,9 @@ refreshes at interval 1, and the picture is bit for bit 3.2.0's (the test
   fixed-point stops (+-2.5, steps of 7.6e-5 stop: the shaders stay within 1e-4 stop of the replay
   tool). A hold checks the features' size, and a rebuilt network (new features) drops the edit. The
   cache had 146 bytes a render pixel of its own before (408 MB at 2228x1253; LESSONS.md, "3.3 edit
-  cache: what was tried"). Reversed-Z is decided once per
-  extent from the first hold's depth counts (texels at 0 and 1, else the top and bottom quarters).
+  cache: what was tried"). Reversed-Z is decided once per extent, when 3 holds in a row with
+  conclusive depth counts agree (texels at 0 and 1, else the top and bottom quarters' sums, 64-bit);
+  a hold with under 5% of its depth drawn (neither 0 nor 1: a loading screen) tells nothing.
 - **Status**: `[preupscale]` gains `cached=N refresh=N still=N cache_gpu_ms median=X rejected=Y%`
   (still: the window's holds in the still regime); SHM v17
   `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected` (1/10000), `cache_gpu_ms_bits`;

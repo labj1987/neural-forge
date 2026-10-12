@@ -90,6 +90,8 @@ pub(crate) struct Setup {
     pub index: u32,
     /// A second queue of that family: the after-the-upscaler path's network frames (`native_post`).
     pub post_index: u32,
+    /// Which memory-properties query the instance may make (the VRAM readings, `crate::vram`).
+    pub properties2: crate::vram::Properties2,
 }
 
 /// The network for one frame size, as the hold uses it.
@@ -140,6 +142,35 @@ pub(crate) struct Loader {
     last_pre: std::sync::atomic::AtomicU64,
     last_post: std::sync::atomic::AtomicU64,
     post_busy: std::sync::atomic::AtomicBool,
+    /// The fence of the pre-upscaler path's last submitted hold while it has not been waited on
+    /// ([`Self::pre_submitted`]): the after-the-upscaler path does not take the network (whose build
+    /// for another size would free what that hold runs) until it has signalled.
+    pre_inflight: Mutex<Option<InFlight>>,
+    /// The after-the-upscaler frame that did not finish in time, still holding the claim
+    /// ([`Self::post_stalled`]): released once its fence signals.
+    post_inflight: Mutex<Option<InFlight>>,
+}
+
+/// A submission of one path that may still use the network, by its fence.
+#[derive(Clone, Copy)]
+struct InFlight {
+    device: vk::Device,
+    status: vk::PFN_vkGetFenceStatus,
+    fence: vk::Fence,
+}
+
+impl InFlight {
+    fn of(device: &ash::Device, fence: vk::Fence) -> Self {
+        Self { device: device.handle(), status: device.fp_v1_0().get_fence_status, fence }
+    }
+
+    /// Whether its work may still run: not signalled (a lost device runs nothing).
+    fn running(&self) -> bool {
+        // SAFETY: a fence of the live device, kept alive while recorded (`Loader::pre_idle`,
+        // `post_stalled`); vkGetFenceStatus needs no external synchronization.
+        let status = unsafe { (self.status)(self.device, self.fence) };
+        status == vk::Result::NOT_READY
+    }
 }
 
 /// Milliseconds since the first call in this process (a monotonic stamp for [`Loader`]'s claims).
@@ -166,6 +197,8 @@ impl Loader {
             last_pre: Default::default(),
             last_post: Default::default(),
             post_busy: Default::default(),
+            pre_inflight: Mutex::new(None),
+            post_inflight: Mutex::new(None),
         }
     }
 
@@ -177,7 +210,7 @@ impl Loader {
     /// [`Self::release_post`] once its work completed.
     pub(crate) fn claim_post(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
-        if epoch_ms().saturating_sub(self.last_pre.load(SeqCst)) < PATH_SWITCH_MS {
+        if epoch_ms().saturating_sub(self.last_pre.load(SeqCst)) < PATH_SWITCH_MS || self.pre_running() {
             return false;
         }
         self.post_busy.store(true, SeqCst);
@@ -194,11 +227,49 @@ impl Loader {
         self.post_busy.store(false, SeqCst);
     }
 
+    /// The after-the-upscaler frame holding the claim did not finish in time: its work (on `fence`)
+    /// may still use the network's buffers, so the claim is kept until that fence signals (checked by
+    /// [`Self::claim_pre`]). The fence stays alive: a stalled server destroys nothing.
+    pub(crate) fn post_stalled(&self, device: &ash::Device, fence: vk::Fence) {
+        *self.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(InFlight::of(device, fence));
+    }
+
+    /// Releases a stalled after-the-upscaler claim whose frame has finished since.
+    fn post_finished(&self) {
+        let mut stalled = self.post_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if stalled.is_some_and(|f| !f.running()) {
+            *stalled = None;
+            drop(stalled);
+            self.release_post();
+        }
+    }
+
+    /// The pre-upscaler path submitted a hold whose work `fence` covers.
+    pub(crate) fn pre_submitted(&self, device: &ash::Device, fence: vk::Fence) {
+        *self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(InFlight::of(device, fence));
+    }
+
+    /// The pre-upscaler path's work has completed (its fence was waited on), and the fence may be
+    /// reset or destroyed from here on.
+    pub(crate) fn pre_idle(&self) {
+        *self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    /// Whether a pre-upscaler hold's work may still use the network.
+    fn pre_running(&self) -> bool {
+        let mut inflight = self.pre_inflight.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        if inflight.is_some_and(|f| !f.running()) {
+            *inflight = None;
+        }
+        inflight.is_some()
+    }
+
     /// The pre-upscaler path may submit a frame now (the after-the-upscaler path is not running one and
     /// has not for a second). Notes the hold either way, which keeps the other path off.
     pub(crate) fn claim_pre(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
         self.last_pre.store(epoch_ms(), SeqCst);
+        self.post_finished();
         !self.post_busy.load(SeqCst) && epoch_ms().saturating_sub(self.last_post.load(SeqCst)) >= PATH_SWITCH_MS
     }
 
@@ -253,7 +324,7 @@ impl Loader {
     fn work(shared: &(Mutex<LoaderState>, Condvar), device: vk::Device, setup: Setup) {
         let (lock, wake) = shared;
         // This device's VRAM readings for the build lines (it outlives this thread: `Drop` joins it).
-        let vram = crate::vram::probe(setup.gipa, setup.instance, setup.physical);
+        let vram = crate::vram::probe(setup.gipa, setup.instance, setup.physical, setup.properties2);
         let mut retry = BuildRetry::default();
         let mut inject = neural_forge_protocol::env::var(FailInject::ENV).and_then(|v| FailInject::parse(&v));
         if let Some(f) = inject {
@@ -287,6 +358,7 @@ impl Loader {
             let t = Instant::now();
             let vram_before = vram.as_ref().map(crate::vram::reading);
             let mut open_stalled = false;
+            let mut switched = false;
             let result = match network.take() {
                 Some(n) => Ok(n),
                 None => Self::open(device, setup).map_err(|e| {
@@ -294,37 +366,47 @@ impl Loader {
                     e.message
                 }),
             }
-            .and_then(|mut n| match size {
-                None => Ok((n, None)),
-                Some(_) if inject.as_mut().is_some_and(FailInject::should_fail) => {
-                    network = Some(n);
-                    Err(format!("{} asked this build to fail", FailInject::ENV))
+            .and_then(|mut n| {
+                // The switch to barriers drops the chained graph; the build below records the new one
+                // once, for the size wanted now (never a build at the old size first).
+                if fall_back {
+                    // SAFETY: nothing of the previous build is pending (`fall_back` is called after the
+                    // frames that used it were drained).
+                    unsafe { n.fall_back_to_barriers() };
+                    switched = true;
                 }
-                Some((w, h)) => {
-                    // SAFETY: nothing of the previous build is pending: a wanted size or a fallback is only
-                    // asked for once the holds stopped using it (`ready` returns another size's build to
-                    // no hold; `fall_back` is called after the frames that used it were drained).
-                    // The fallback rebuilds at the previous build's size: built again for the size wanted now,
-                    // so `Built` is never labelled with a size it was not built for.
-                    let built = unsafe { if fall_back { n.fall_back_to_barriers().and_then(|_| n.build(w, h)) } else { n.build(w, h) } };
-                    match built {
-                        Ok(frame) => Ok((n, Some((w, h, frame)))),
-                        Err(why) => {
-                            network = Some(n);
-                            Err(format!("building the network for {w}x{h} failed: {why}"))
+                match size {
+                    None => Ok((n, None)),
+                    Some(_) if inject.as_mut().is_some_and(FailInject::should_fail) => {
+                        network = Some(n);
+                        Err(format!("{} asked this build to fail", FailInject::ENV))
+                    }
+                    Some((w, h)) => {
+                        // SAFETY: nothing of the previous build is pending: a wanted size or a fallback is
+                        // only asked for once the holds stopped using it (`ready` returns another size's
+                        // build to no hold; `fall_back` is called after the frames that used it were
+                        // drained; neither path takes the network while the other's work may run).
+                        match unsafe { n.build(w, h) } {
+                            Ok(frame) => Ok((n, Some((w, h, frame)))),
+                            Err(why) => {
+                                network = Some(n);
+                                Err(format!("building the network for {w}x{h} failed: {why}"))
+                            }
                         }
                     }
                 }
             });
+            let vram_after = vram.as_ref().filter(|_| matches!(result, Ok((_, Some(_))))).map(crate::vram::reading);
+            let stalled = result.is_err() && (open_stalled || network.as_ref().is_some_and(nn::Network::stalled));
             // The state log, written before the loader's lock is taken again: holds take it on the game's thread.
             match &result {
                 Ok((_, Some(_))) => note_recovered(),
                 Ok(_) => {}
-                Err(why) if open_stalled || network.as_ref().is_some_and(nn::Network::stalled) => {
-                    note_failure(&format!("{why} (the network's queue stopped responding; off until the game restarts)"));
-                }
+                Err(why) if stalled => note_failure(&format!("{why} (the network's queue stopped responding; off until the game restarts)")),
                 Err(why) => note_failure(why),
             }
+            // The log lines too: written once the lock is let go again.
+            let mut lines = Vec::new();
             state = lock.lock().unwrap();
             state.opened = true;
             match result {
@@ -332,44 +414,50 @@ impl Loader {
                     if let Some((w, h, frame)) = built {
                         state.generation += 1;
                         state.built = Some(Built { width: w, height: h, frame, graph: n.graph_commands(), graph_own: n.graph_commands_own(), generation: state.generation });
-                        crate::log!(
+                        lines.push(format!(
                             "[native] network {}built for {w}x{h} (field {}x{}, chained {}) in {} ms{}",
                             if fall_back { "re" } else { "" },
                             frame.field_width,
                             frame.field_height,
                             frame.chained != 0,
                             t.elapsed().as_millis(),
-                            match (vram_before, vram.as_ref().map(crate::vram::reading)) {
+                            match (vram_before, vram_after) {
                                 (Some((before, _)), Some((after, budget))) => format!(" (vram {before} -> {after} of {budget} MiB)"),
                                 _ => String::new(),
                             }
-                        );
+                        ));
                         retry.succeeded();
                         if let Some(streak) = retry.take_recovered() {
-                            crate::log!("[native] the network is up again after {streak} failed attempt(s)");
+                            lines.push(format!("[native] the network is up again after {streak} failed attempt(s)"));
                         }
                         state.failed = None;
                     }
                     state.network = Some(n);
                 }
-                Err(why) if open_stalled || network.as_ref().is_some_and(nn::Network::stalled) => {
+                Err(why) if stalled => {
                     // Its work may still run on the GPU: nothing of it is destroyed (dropping it leaks what
                     // it made) and nothing is tried again on this device.
-                    crate::log!("[native] {why}; a wait on the network's queue timed out, so the network is off on this device until the game restarts; frames go to DLSS untouched");
+                    lines.push(format!("[native] {why}; a wait on the network's queue timed out, so the network is off on this device until the game restarts; frames go to DLSS untouched"));
                     state.failed = Some(format!("{why} (the network's queue stopped responding; off until the game restarts)"));
                     state.dead = true;
                     drop(network);
                 }
                 Err(why) => {
                     let wait = retry.failed(Instant::now());
-                    crate::log!("[native] {why}; frames go to DLSS untouched, trying again in {} ms", wait.as_millis());
+                    lines.push(format!("[native] {why}; frames go to DLSS untouched, trying again in {} ms", wait.as_millis()));
                     state.failed = Some(why);
                     state.network = network;
-                    // A failed build leaves no graph; a fallback that failed is asked for again.
-                    state.fall_back |= fall_back;
+                    // A failed build leaves no graph; the switch to barriers, once made, stays, and one the
+                    // failed open never got to is asked for again.
+                    state.fall_back |= fall_back && !switched;
                 }
             }
+            drop(state);
+            for line in &lines {
+                crate::log!("{line}");
+            }
             crate::logging::flush();
+            state = lock.lock().unwrap();
         }
     }
 
@@ -394,10 +482,11 @@ impl Loader {
     }
 
     /// Counter waits that gave up since the last reset (read once the frames that ran the graph
-    /// completed), and where.
+    /// completed), and where; `None` when there were none (no allocation on that, every hold's, path).
     pub(crate) fn chain_timeouts(&self) -> Option<(u32, String)> {
         let state = self.shared.0.lock().unwrap();
-        state.network.as_ref().map(nn::Network::chain_timeouts)
+        let network = state.network.as_ref()?;
+        (network.chain_timeout_count() > 0).then(|| network.chain_timeouts())
     }
 
     /// Rebuilds the graph with barriers. The caller has drained every frame that used the current one.
@@ -610,8 +699,8 @@ pub(crate) struct NativePass {
     /// The motion back to the previous network frame the frame shaders read (binding 2), f32 x and y
     /// per texel: `preupscale_cache_motion.comp`'s accumulated field (`super::cache`).
     pub(crate) acc: OwnBuffer,
-    /// A test's switch: binding 2 is `mvec` and the frame shaders read it as packed halves
-    /// (`MOTION_HALF`), as they did before the accumulated field.
+    /// The edit cache is off: binding 2 is `mvec` and the frame shaders read it as packed halves
+    /// (`MOTION_HALF`), as they did before the accumulated field (3.2.0).
     motion_half: bool,
     answer: OwnBuffer,
     state: OwnBuffer,
@@ -638,15 +727,19 @@ pub(crate) struct NativePass {
 unsafe impl Send for NativePass {}
 
 impl NativePass {
+    /// With `motion_half` the frame shaders read DLSS's packed vectors (`MOTION_HALF`), as 3.2.0's
+    /// did: the edit cache off (`NEURAL_FORGE_EDIT_CACHE=off`). Without, the accumulated field.
+    ///
     /// # Safety
     /// `device` is live; `family` is the queue family the frames are submitted on.
-    pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32) -> Option<Self> {
+    pub(crate) unsafe fn build(
+        device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32, motion_half: bool,
+    ) -> Option<Self> {
         // SAFETY: forwarded.
-        unsafe { Self::build_failing_at(device, instance, physical_device, family, width, height, None, false) }
+        unsafe { Self::build_failing_at(device, instance, physical_device, family, width, height, None, motion_half) }
     }
 
-    /// [`Self::build`], failing on purpose at creation step `fail_at` (`0..BUILD_STEPS`) when given,
-    /// and with `motion_half` the frame shaders reading DLSS's packed vectors (a test's reference).
+    /// [`Self::build`], failing on purpose at creation step `fail_at` (`0..BUILD_STEPS`) when given.
     /// Built piece by piece; [`PassPartial`] destroys whatever exists on an early return.
     ///
     /// # Safety
@@ -982,10 +1075,11 @@ impl NativePass {
         }
     }
 
-    /// The command buffers for this frame, in submission order: the initialisation the first time,
-    /// then `N[parity]`. Writes the frame's parameters.
+    /// The command buffers for this frame, in submission order: the initialisation until one was
+    /// submitted, then `N[parity]`. Writes the frame's parameters. Each buffer submitted is reported
+    /// to [`Self::submitted`] (only then is the initialisation done and the timer pending).
     /// `mvec_scale` turns the copied motion vectors into render pixels ([`super::Target::mvec_scale`]).
-    pub(crate) fn frame(&mut self, built: &Built, history: bool, jitter: Option<[f32; 2]>, mvec_scale: [f32; 2], c: Conditioning) -> Vec<vk::CommandBuffer> {
+    pub(crate) fn frame(&mut self, built: &Built, history: bool, jitter: Option<[f32; 2]>, mvec_scale: [f32; 2], c: Conditioning) -> [Option<vk::CommandBuffer>; 2] {
         let p = (self.frames & 1) as usize;
         self.seed = if history { self.seed.wrapping_add(1) } else { 0 };
         let delta = match (self.last_jitter, jitter) {
@@ -1005,16 +1099,20 @@ impl NativePass {
         // ago) completed: the hold waits for the previous hold's work before it records anything.
         unsafe { std::ptr::copy_nonoverlapping(std::ptr::from_ref(&params).cast::<u8>(), self.params[p].ptr, PARAMS_BYTES as usize) };
         self.frames += 1;
-        self.last_parity = Some(p);
-        if let Some(timer) = self.timers[p].as_mut() {
-            timer.mark_submitted();
+        [(!self.initialised).then_some(self.commands[2]), Some(self.commands[p])]
+    }
+
+    /// `cmd`, one of [`Self::frame`]'s, was submitted: the initialisation is done, or `N[parity]`'s
+    /// timer is pending (read at the next hold).
+    pub(crate) fn submitted(&mut self, cmd: vk::CommandBuffer) {
+        if cmd == self.commands[2] {
+            self.initialised = true;
+        } else if let Some(p) = (0..2).find(|&p| self.commands[p] == cmd) {
+            self.last_parity = Some(p);
+            if let Some(timer) = self.timers[p].as_mut() {
+                timer.mark_submitted();
+            }
         }
-        let mut out = Vec::with_capacity(2);
-        if !std::mem::replace(&mut self.initialised, true) {
-            out.push(self.commands[2]);
-        }
-        out.push(self.commands[p]);
-        out
     }
 
     /// # Safety
@@ -1389,22 +1487,23 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("the hold's queue family is not one the network was recorded for");
         return result;
     };
-    // The native pass for this extent, its buffers recorded for this build.
-    // Another extent: the old pass is destroyed (idle: waited above), not dropped -- dropping it leaked
-    // its images, buffers and pool.
-    if res.native.as_ref().is_some_and(|n| !n.matches(target.width, target.height)) {
-        if let Some(old) = res.native.take() {
-            // SAFETY: idle (waited above).
-            unsafe { old.destroy(device) };
-        }
-    }
+    // With the edit cache off (`NEURAL_FORGE_EDIT_CACHE=off`) the hold is 3.2.0's: no depth copy, none of
+    // the cache's passes, and the frame shaders read DLSS's packed vectors as they did then
+    // (`MOTION_HALF`; bit for bit the accumulated field at interval 1, the test
+    // `at_interval_1_the_network_sees_exactly_what_it_saw_before_the_accumulated_field`).
+    let cache_on = ask.interval > 1;
+    // The resources are built for one extent (`Session::ensure` rebuilds them for another), so
+    // everything in them is at the colour input's.
+    debug_assert_eq!((res.width, res.height), (target.width, target.height));
+    debug_assert!(res.native.as_ref().is_none_or(|n| n.matches(target.width, target.height)));
+    debug_assert!(res.edit.as_ref().is_none_or(|c| c.matches(target.width, target.height)));
     let mut native = match res.native.take() {
         Some(n) => n,
         None => {
             let family = res.queue_family;
             // SAFETY: `device` is live; `family` is the frames' family.
             let built = res.native_retry.pass.build((target.width, target.height), now, || unsafe {
-                NativePass::build(device, instance, physical_device, family, target.width, target.height)
+                NativePass::build(device, instance, physical_device, family, target.width, target.height, !cache_on)
             });
             match built {
                 Some(n) => n,
@@ -1423,8 +1522,8 @@ pub(crate) unsafe fn run_native_hold(
     }
     // The history needs DLSS's motion vectors copied this frame.
     let mvec = copied_mvec(target.mvec);
-    // DLSS's depth, wherever it can be read, into the layer's own buffer.
-    let depth = depth_source(target);
+    // DLSS's depth, wherever it can be read, into the layer's own buffer: for the edit cache only.
+    let depth = depth_source(target).filter(|_| cache_on);
     if depth.is_some() && res.depth.is_none() {
         let family = res.queue_family;
         // SAFETY: `device` is live; `family` is the holds' family.
@@ -1435,13 +1534,7 @@ pub(crate) unsafe fn run_native_hold(
     let depth = depth.filter(|_| res.depth.is_some());
     // The edit cache (`super::cache`): its passes for this extent, and its store while the interval
     // is above 1 (at 1 only the motion pass runs, copying the vectors for the network as they are).
-    if res.edit.as_ref().is_some_and(|c| !c.matches(target.width, target.height)) {
-        if let Some(c) = res.edit.take() {
-            // SAFETY: idle (waited above).
-            unsafe { c.destroy(device) };
-        }
-    }
-    if res.edit.is_none() {
+    if cache_on && res.edit.is_none() {
         let family = res.queue_family;
         // SAFETY: `device` is live; `family` is the holds' family.
         res.edit = res.native_retry.edit.build((target.width, target.height), now, || unsafe {
@@ -1453,50 +1546,63 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("a storage view of the colour input could not be created");
         return result;
     };
-    let Some(edit) = res.edit.as_mut() else {
+    if cache_on && res.edit.is_none() {
         res.native = Some(native);
         result.miss = Some("the edit cache's passes could not be built");
         return result;
-    };
-    let wanted = ask.interval.max(1);
-    // Above interval 1 the cache's buffers are in the network's input features (`cache::ScratchLayout`).
-    let chained = wanted > 1 && edit.chain(built.frame.features_bytes);
-    if !chained {
-        edit.unchain();
     }
     native.gap.note_format(format_of(target));
-    let cache_hold = super::cache::Hold {
-        interval: if chained { wanted } else { 1 },
-        hold: ask.hold,
-        jitter,
-        mvec: mvec.is_some(),
-        depth: depth.is_some(),
-        history_ok: native.frames > 0 && native.gap.pending(Instant::now()).is_none(),
-        armed: arm.is_some(),
-        debug_mask: ask.debug_mask,
-        generation: built.generation,
-    };
-    let plan = edit.state.plan(&cache_hold);
-    let cached = plan.kind == super::cache::Kind::Cached;
-    let hdr_ref = res.hdr.as_ref().expect("built above");
-    let bindings = super::cache::Bindings {
-        colour: colour_view,
-        encoded: hdr_ref.encoded_view(),
-        answer: hdr_ref.answer_view(),
-        exposure: hdr_ref.exposure_buffer(),
-        depth: depth.and(res.depth.as_ref()).map(DepthCopy::buffer),
-        mvec: native.mvec.buffer,
-        acc: native.acc.buffer,
-        scratch: (built.frame.features, built.frame.features_bytes),
-    };
-    // SAFETY: nothing of the pass is pending; every handle is live.
-    unsafe { edit.bind(device, &bindings) };
-    edit.clear_counters();
-    let mut push = edit.push(plan.flags, depth.map_or(0, super::cache::depth_kind), target.mvec_scale, target.paper_white);
-    push.step_jitter = plan.step_jitter;
-    push.refresh_jitter = plan.refresh_jitter;
-    // The motion pass whenever there are vectors to copy, and always while the cache runs (its prep).
-    let run_motion = chained || mvec.is_some();
+    let history_ok = native.frames > 0 && native.gap.pending(Instant::now()).is_none();
+    // The cache's plan for this hold (a refresh at interval 1 with the cache off).
+    let mut cache_hold = None;
+    let mut plan = None;
+    let mut push = None;
+    let mut chained = false;
+    if let Some(edit) = res.edit.as_mut().filter(|_| cache_on) {
+        // Above interval 1 the cache's buffers are in the network's input features (`cache::ScratchLayout`).
+        chained = edit.chain(built.frame.features_bytes);
+        if !chained {
+            edit.unchain();
+        }
+        let h = super::cache::Hold {
+            interval: if chained { ask.interval } else { 1 },
+            hold: ask.hold,
+            jitter,
+            mvec: mvec.is_some(),
+            depth: depth.is_some(),
+            history_ok,
+            armed: arm.is_some(),
+            debug_mask: ask.debug_mask,
+            generation: built.generation,
+        };
+        let p = edit.state.plan(&h);
+        let hdr_ref = res.hdr.as_ref().expect("built above");
+        let bindings = super::cache::Bindings {
+            colour: colour_view,
+            encoded: hdr_ref.encoded_view(),
+            answer: hdr_ref.answer_view(),
+            exposure: hdr_ref.exposure_buffer(),
+            depth: depth.and(res.depth.as_ref()).map(DepthCopy::buffer),
+            mvec: native.mvec.buffer,
+            acc: native.acc.buffer,
+            scratch: (built.frame.features, built.frame.features_bytes),
+        };
+        // SAFETY: nothing of the pass is pending; every handle is live.
+        unsafe { edit.bind(device, &bindings) };
+        edit.clear_counters();
+        // No vectors copied this hold: the motion pass writes no history and counts nothing.
+        let flags = p.flags | if mvec.is_none() { super::cache::F_NO_MVEC } else { 0 };
+        let mut q = edit.push(flags, depth.map_or(0, super::cache::depth_kind), target.mvec_scale, target.paper_white);
+        q.step_jitter = p.step_jitter;
+        q.refresh_jitter = p.refresh_jitter;
+        cache_hold = Some(h);
+        plan = Some(p);
+        push = Some(q);
+    }
+    let cached = plan.is_some_and(|p| p.kind == super::cache::Kind::Cached);
+    // The motion pass while the cache runs (its prep and the accumulated field the network reads), at
+    // interval 1 whenever there are vectors to convert.
+    let run_motion = push.is_some() && (chained || mvec.is_some());
     // A cache dump's readbacks for an armed hold, built on its first one.
     if arm.is_some() && res.cache.is_none() {
         // SAFETY: `device` is live.
@@ -1510,13 +1616,18 @@ pub(crate) unsafe fn run_native_hold(
     });
     let hdr_pass = res.hdr.as_ref();
     let depth_copy = depth.and(res.depth.as_ref()).map(|d| (d.buffer(), d.timer.as_ref()));
-    let edit = res.edit.as_ref().expect("built above");
+    let edit = res.edit.as_ref().filter(|_| cache_on);
     let acc = native.acc.buffer;
-    // SAFETY (the four closures): recording into the hold's own buffers; the set was bound above.
-    let motion = |cmd: vk::CommandBuffer| unsafe { edit.record_motion(device, cmd, &push, acc) };
-    let capture_edit = |cmd: vk::CommandBuffer| unsafe { edit.record_capture(device, cmd, &push) };
-    let apply = |cmd: vk::CommandBuffer| unsafe { edit.record_apply(device, cmd, &push) };
-    // SAFETY: the capture buffer is idle; the colour view was bound above.
+    let no_push = super::cache::CachePush::default();
+    let push_ref = push.as_ref().unwrap_or(&no_push);
+    // SAFETY (the three closures, only called while the cache runs): recording into the hold's own
+    // buffers; the set was bound above.
+    let motion = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_motion(device, cmd, push_ref, acc) };
+    let capture_edit = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_capture(device, cmd, push_ref) };
+    let apply = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_apply(device, cmd, push_ref) };
+    // SAFETY: the capture buffer is idle; the colour view was bound above. The encode stays in the HDR
+    // pass's image: the network reads it there (no copy into slot 0's proxy, the after-the-upscaler
+    // path's).
     let recorded = unsafe {
         super::record_capture(
             device,
@@ -1524,6 +1635,7 @@ pub(crate) unsafe fn run_native_hold(
             target,
             None,
             hdr_pass,
+            None,
             mvec.map(|_| native.mvec.buffer),
             depth_copy,
             cache.map(|c| c.colour),
@@ -1550,10 +1662,9 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     }
     // A cached hold keeps the network's history as it is (no frame of the network): its parity,
-    // seed and jitter stay the last refresh's, and the 500 ms rule counts from this hold.
+    // seed and jitter stay the last refresh's.
     let (history, frame_cmds) = if cached {
-        native.gap.touch(Instant::now());
-        (false, Vec::new())
+        (false, [None, None])
     } else {
         let stale = native.gap.begin(Instant::now());
         if native.frames > 0 {
@@ -1581,34 +1692,60 @@ pub(crate) unsafe fn run_native_hold(
     }
     result.waits_consumed = true;
     res.game_exposure_read = (source == super::ExposureSource::Game).then_some(target.identification);
-    for cmd in frame_cmds {
+    // From here on something of this hold is on the queue: a failure fences what went (so the next
+    // hold waits for it before it records any of those buffers again), and the network's history and
+    // the cache's chain start afresh (the capture's motion pass moved the field on already).
+    let failed = |res: &mut super::Resources, submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>| {
+        // SAFETY: the write-back fence is idle (waited above; a failed submit leaves it as it was).
+        unsafe { res.fence_submitted(device, submit) };
+        if let Some(n) = res.native.as_mut() {
+            n.gap.skipped();
+        }
+        if let Some(e) = res.edit.as_mut() {
+            e.state.drop_edit();
+        }
+        if res.writeback_pending {
+            loader.pre_submitted(device, res.writeback_fence);
+        }
+    };
+    for cmd in frame_cmds.into_iter().flatten() {
         if crate::note_vk(submit(super::Which::Native, cmd, vk::Fence::null())).is_err() {
             // The capture ran; nothing reads its result. The decode is not submitted, so DLSS gets
             // the frame as it was.
-            if let Some(n) = res.native.as_mut() {
-                n.gap.skipped();
-            }
+            failed(res, submit);
             result.miss = Some("the network's submit failed");
             return result;
+        }
+        if let Some(n) = res.native.as_mut() {
+            n.submitted(cmd);
         }
     }
     // SAFETY: the layer's own fence, idle (`wait_idle` above, or never submitted).
     if unsafe { device.reset_fences(&[res.writeback_fence]) }.is_err() {
+        failed(res, submit);
         result.miss = Some("resetting the write-back fence failed");
         return result;
     }
     if crate::note_vk(submit(super::Which::WriteBack, res.writeback_cmd, res.writeback_fence)).is_err() {
+        failed(res, submit);
         result.miss = Some("the write-back submit failed");
         return result;
     }
     // The write-back's fence also covers the capture and the network, submitted before it on the
     // same queue.
     res.writeback_pending = true;
+    loader.pre_submitted(device, res.writeback_fence);
     if let Some(timer) = res.writeback_timer.as_mut() {
         timer.mark_submitted();
     }
-    if let Some(edit) = res.edit.as_mut() {
-        edit.state.went_through(&cache_hold, &plan);
+    if cached {
+        // The 500 ms rule counts from this hold, not the last network frame.
+        if let Some(n) = res.native.as_mut() {
+            n.gap.touch(Instant::now());
+        }
+    }
+    if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {
+        edit.state.went_through(h, p);
         edit.submitted(run_motion, cached || chained);
     }
     if let (Some(arm), Some(c)) = (arm.filter(|_| cache.is_some()), res.cache.as_mut()) {
@@ -1619,7 +1756,7 @@ pub(crate) unsafe fn run_native_hold(
             history,
             mvec: mvec.is_some(),
             depth,
-            depth_missing: depth.is_none().then(|| depth_missing(target)),
+            depth_missing: depth.is_none().then(|| if cache_on { depth_missing(target) } else { "the edit cache is off (NEURAL_FORGE_EDIT_CACHE=off): no depth is copied" }),
             depth_layout: target.depth.and_then(|a| a.layout),
             mvec_scale: target.mvec_scale,
             paper_white: target.paper_white,
@@ -1628,7 +1765,7 @@ pub(crate) unsafe fn run_native_hold(
     result.evaluated = true;
     result.wrote_back = true;
     result.cached = cached;
-    result.cache_still = cache_hold.interval > 1 && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
+    result.cache_still = cache_hold.is_some_and(|h| h.interval > 1) && res.edit.as_ref().is_some_and(|e| e.state.regime.still());
     result.timing.writeback = Some(t_hold.elapsed());
     result
 }
@@ -1757,7 +1894,7 @@ mod tests {
             });
             // The old path (packed halves) and the new (the field), side by side.
             let mut old = NativePass::build_failing_at(device, instance, physical, family, W, H, None, true).unwrap();
-            let mut new = NativePass::build(device, instance, physical, family, W, H).unwrap();
+            let mut new = NativePass::build(device, instance, physical, family, W, H, false).unwrap();
             assert!(old.record(device, &built, graph, encoded.view, exposure.buffer));
             assert!(new.record(device, &built, graph, encoded.view, exposure.buffer));
             let mut cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H).unwrap();
@@ -1800,9 +1937,11 @@ mod tests {
                 fx.one_shot(|cmd| cache.record_motion(device, cmd, &push, new.acc.buffer));
                 let h: Vec<f32> = (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, frame), residual(x, y, 1, frame), residual(x, y, 2, frame), 1.5])).collect();
                 std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
-                fx.submit(&old.frame(&built, history, jitter, scale, Conditioning::default()));
+                let cmds = old.frame(&built, history, jitter, scale, Conditioning::default());
+                fx.submit(&mut old, cmds);
                 let (old_lanes, old_answer) = (lanes(), answer_of(&old));
-                fx.submit(&new.frame(&built, history, jitter, scale, Conditioning::default()));
+                let cmds = new.frame(&built, history, jitter, scale, Conditioning::default());
+                fx.submit(&mut new, cmds);
                 let (new_lanes, new_answer) = (lanes(), answer_of(&new));
                 assert!(old_lanes == new_lanes, "frame {frame}: the network's input lanes differ");
                 assert!(old_answer == new_answer, "frame {frame}: the answer differs");
@@ -1887,12 +2026,17 @@ mod tests {
             }
         }
 
-        fn submit(&self, cmds: &[vk::CommandBuffer]) {
+        /// Submits a frame's buffers ([`NativePass::frame`]) and tells the pass, as the hold does.
+        fn submit(&self, pass: &mut NativePass, cmds: [Option<vk::CommandBuffer>; 2]) {
             let d = &self.gpu.3;
+            let cmds: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().collect();
             // SAFETY: recorded, idle command buffers of this device.
             unsafe {
-                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::builder().command_buffers(cmds).build()], vk::Fence::null()).unwrap();
+                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::builder().command_buffers(&cmds).build()], vk::Fence::null()).unwrap();
                 d.queue_wait_idle(self.gpu.4).unwrap();
+            }
+            for cmd in cmds {
+                pass.submitted(cmd);
             }
         }
     }
@@ -1953,7 +2097,7 @@ mod tests {
                 let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
                 device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
             });
-            let mut pass = NativePass::build(device, instance, physical, family, W, H).expect("the native pass builds");
+            let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
             assert!(pass.record(device, &built, graph, encoded.view, exposure.buffer));
             // The frame shaders read the accumulated field (the cache's motion pass makes it from
             // DLSS's vectors): no motion.
@@ -1972,8 +2116,8 @@ mod tests {
             // Frame 1: no history. Lanes 4-6 and 7-9 are the centred proxy; the answer is the residual on it.
             write_head(0, 10.0);
             let cmds = pass.frame(&built, false, None, [1.0, 1.0], Conditioning::default());
-            assert_eq!(cmds.len(), 2, "the initialisation, then the frame");
-            fx.submit(&cmds);
+            assert!(cmds.iter().all(Option::is_some), "the initialisation, then the frame");
+            fx.submit(&mut pass, cmds);
             let l = lanes(5, 3);
             for c in 0..3 {
                 assert_eq!(l[4 + c as usize], centre(proxy(5, 3, c)), "proxy lane {c}");
@@ -1995,7 +2139,7 @@ mod tests {
             // toward it by sigmoid(logit) * blendScale.
             write_head(1, 10.0);
             let cmds = pass.frame(&built, true, None, [1.0, 1.0], Conditioning::default());
-            fx.submit(&cmds);
+            fx.submit(&mut pass, cmds);
             let l = lanes(5, 3);
             assert_eq!(l[7], centre(neural(5, 3, 0, 0)), "history lane from the previous answer");
             let a2 = read_answer();
@@ -2014,7 +2158,7 @@ mod tests {
             // Frame 3: intensity 0.5, no history: the answer halfway from the proxy to the network's.
             write_head(2, 10.0);
             let cmds = pass.frame(&built, false, None, [1.0, 1.0], Conditioning { intensity: 0.5, ..Conditioning::default() });
-            fx.submit(&cmds);
+            fx.submit(&mut pass, cmds);
             let a3 = read_answer();
             for c in 0..3 {
                 let (p, n) = (proxy(7, 4, c), neural(7, 4, c, 2));
@@ -2028,7 +2172,7 @@ mod tests {
             fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, staging.buffer, pass.acc.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(W * H) * 8 }]));
             write_head(3, 10.0);
             let cmds = pass.frame(&built, true, None, [0.5, 0.25], Conditioning::default());
-            fx.submit(&cmds);
+            fx.submit(&mut pass, cmds);
             // The history is frame 3's network answer (before its intensity blend).
             assert_ne!(neural(6, 4, 0, 2), neural(7, 7, 0, 2), "the test tells the scaled position from the unscaled one");
             assert_eq!(lanes(5, 3)[7], centre(neural(6, 4, 0, 2)), "history lane from the previous answer where the scaled vector points");
