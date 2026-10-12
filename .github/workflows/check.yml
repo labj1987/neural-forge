@@ -1,0 +1,205 @@
+name: Build and check
+
+# The one build and check every change gets: ci.yml runs it on pushes and pull requests to main,
+# release.yml on a version tag (and then publishes what it built). Everything a release ships is
+# exercised before it is tagged: the tests (GPU ones on lavapipe), clippy, every script's self-test,
+# the AppImage itself, its glibc baseline, and its installed layer through the Vulkan loader.
+on:
+  workflow_call:
+    inputs:
+      release:
+        description: "Building a tagged release: the tag must match the version, and the files are uploaded"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+# An explicit `shell: bash` runs every step with `-eo pipefail`, so a failing `cargo test`
+# piped through `tee` still fails the step.
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    # Ubuntu 24.04 is the release baseline the README states.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      # A GPU test that finds no Vulkan device panics instead of skipping, so a broken
+      # lavapipe install fails CI instead of passing it with nothing run.
+      NEURAL_FORGE_REQUIRE_VULKAN: "1"
+      # Makes a missing or failing zsyncmake fatal in build-appimage.sh.
+      CI: "true"
+    steps:
+      # Actions are pinned to full commit SHAs (a tag can be moved); Dependabot proposes the
+      # updates (.github/dependabot.yml). The trailing comment is the release the SHA is.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The tag names the version that is released: refuse a tag that is not the workspace
+      # version before anything is built.
+      - name: Tag matches the Cargo version
+        if: inputs.release
+        run: |
+          version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "${GITHUB_REF_NAME#v}" != "$version" ]; then
+              echo "error: tag $GITHUB_REF_NAME does not match the Cargo version $version" >&2
+              exit 1
+          fi
+
+      # The release page carries this version's changes in full, from CHANGELOG.md (no link to it);
+      # every build checks the section exists, so a release cannot fail on it.
+      - name: Release notes from the changelog
+        run: |
+          python3 scripts/release_notes.py "$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)" > release-notes.md
+          cat release-notes.md
+
+      # The version in rust-toolchain.toml.
+      - name: Set up Rust Toolchain
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+        with:
+          toolchain: 1.96.0
+          components: clippy
+
+      - name: Toolchain matches rust-toolchain.toml
+        run: grep -q '^channel = "1.96.0"$' rust-toolchain.toml && rustc --version | grep -q '^rustc 1\.96\.0 '
+
+      # libgtk-4-dev/libadwaita-1-dev for the gui crate; a software Vulkan ICD (lavapipe) so the
+      # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion);
+      # spirv-tools for check_shaders.py's validation; zsync and desktop-file-utils for the
+      # AppImage; numpy and Pillow for the scripts' self-tests.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools spirv-tools \
+            zsync desktop-file-utils patch python3-numpy python3-pil
+
+      # Only lavapipe, never whatever other ICD the runner image happens to carry.
+      - name: Select the lavapipe Vulkan driver
+        run: |
+          icds="$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:)"
+          test -n "$icds"
+          echo "VK_DRIVER_FILES=$icds" >> "$GITHUB_ENV"
+          echo "VK_DRIVER_FILES=$icds"
+
+      # The pinned glslang, Vulkan-Headers, volk and OpenDLSS-NR (with its patches applied) that
+      # crates/native builds with, cached by their pins and patches: the build itself is offline.
+      - name: Cache the native backend's sources and tools
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: tools/native
+          key: native-tools-${{ hashFiles('scripts/fetch-native-tools.sh', 'third_party/opendlss-nr/patches/*.patch') }}
+
+      - name: Fetch the native backend's sources and tools
+        run: bash scripts/fetch-native-tools.sh
+
+      - name: cargo test
+        run: |
+          cargo test --locked 2>&1 | tee test-native.log
+          ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-native.log || true)"
+          echo "GPU tests that ran: $ran" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$ran" -gt 0
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      # scripts/install.py delegates install/uninstall to neural-forge-cli (the single
+      # implementation), so this exercises the same code the GUI's Setup tab runs.
+      - name: Installation coexistence tests
+        run: |
+          cargo build --locked -p neural-forge-cli
+          python3 scripts/test_install.py
+
+      - name: Script self-tests
+        run: |
+          python3 scripts/release_notes.py --self-test
+          python3 scripts/bench-iq.py --self-test
+          python3 scripts/bench-report.py --self-test
+          python3 scripts/agreement.py --self-test
+          python3 scripts/hdr_encode.py selftest
+          python3 scripts/test_cache_replay.py
+          python3 scripts/gen_third_party_crates.py --self-test
+          python3 scripts/check_pins.py --self-test
+
+      - name: Shader sources match committed SPIR-V
+        run: python3 scripts/check_shaders.py
+
+      - name: AppStream releases match the changelog
+        run: python3 scripts/sync_appdata_releases.py --check
+
+      - name: Third-party crate listing is current
+        run: python3 scripts/gen_third_party_crates.py --check
+
+      - name: Namespace contract
+        run: python3 scripts/check_namespace.py
+
+      - name: Vulkan loader smoke test
+        run: bash scripts/smoke-test.sh
+
+      # Runs as the runner user: the script writes only inside the checkout and its own build
+      # directory.
+      - name: Build AppImage
+        run: bash build-appimage.sh
+
+      - name: Check the release files
+        run: |
+          appimage="$(ls neural-forge-*-x86_64.AppImage)"
+          test -s "$appimage"
+          test -s "$appimage.zsync"
+          ls -l "$appimage" "$appimage.zsync"
+
+      # Unpack the file that gets published, not the build tree: what users run is what is checked.
+      - name: Extract the AppImage
+        run: |
+          appimage="$(ls neural-forge-*-x86_64.AppImage)"
+          rm -rf squashfs-root
+          "./$appimage" --appimage-extract > /dev/null
+          test -x squashfs-root/usr/bin/neural-forge-cli
+          test -s squashfs-root/usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt
+
+      # The README documents the oldest glibc a release runs on; a build on a newer base image
+      # or a newer dependency must not quietly raise it.
+      - name: glibc baseline
+        run: |
+          documented="$(grep -o 'glibc [0-9][0-9.]* or newer' README.md | head -1 | cut -d' ' -f2)"
+          test -n "$documented"
+          for bin in squashfs-root/usr/bin/neural-forge squashfs-root/usr/bin/neural-forge-cli \
+              squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so; do
+              needed="$(objdump -T "$bin" | grep -o 'GLIBC_[0-9][0-9.]*' | sed 's/^GLIBC_//' | sort -V | tail -1)"
+              echo "$bin needs glibc $needed (README documents $documented)"
+              test -n "$needed"
+              highest="$(printf '%s\n%s\n' "$needed" "$documented" | sort -V | tail -1)"
+              if [ "$highest" != "$documented" ]; then
+                  echo "error: $bin needs glibc $needed, newer than the documented $documented" >&2
+                  exit 1
+              fi
+          done
+
+      # Install the extracted AppImage's files with its own CLI into scratch XDG directories (never
+      # the runner user's real ones), then run the smoke example through the Vulkan loader against
+      # the installed release library, so the packaged layer is the one that gets exercised.
+      - name: Install the AppImage and smoke-test the installed layer
+        run: |
+          scratch="$(mktemp -d)"
+          export XDG_DATA_HOME="$scratch/data" XDG_CONFIG_HOME="$scratch/config" XDG_STATE_HOME="$scratch/state"
+          export NEURAL_FORGE_UID="ci-$$"
+          squashfs-root/usr/bin/neural-forge-cli install --appdir "$PWD/squashfs-root"
+          so="$XDG_DATA_HOME/neural-forge/lib/neural-forge/libneural_forge_layer.so"
+          test -f "$so"
+          cmp "$so" squashfs-root/usr/lib/neural-forge/libneural_forge_layer.so
+          NEURAL_FORGE_SMOKE_SO="$so" bash scripts/smoke-test.sh
+
+      - name: Upload the release files
+        if: inputs.release
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: release-files
+          path: |
+            neural-forge-*-x86_64.AppImage
+            neural-forge-*-x86_64.AppImage.zsync
+            release-notes.md
+          if-no-files-found: error

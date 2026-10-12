@@ -1,0 +1,71 @@
+name: Pin check
+
+# Weekly: are the pins Dependabot cannot see (the native toolchain, OpenDLSS-NR, appimagetool, the
+# AppImage runtime, the Rust toolchain) behind upstream? The answer lives in one standing issue, so
+# this sends as few notifications as possible: an issue is opened only when a pin first falls behind
+# and none is open, its body is edited in place (an edit notifies nobody) only when the report
+# changed, and it is closed once everything is current again. Never a comment, never a reopen.
+on:
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: pin-check
+  cancel-in-progress: false
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  pins:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Compare the pins with upstream
+        id: check
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python3 scripts/check_pins.py > report.md
+          status=$?
+          set -e
+          cat report.md
+          case $status in
+            0) echo "state=current" >> "$GITHUB_OUTPUT" ;;
+            10) echo "state=behind" >> "$GITHUB_OUTPUT" ;;
+            *) echo "upstream could not be asked; nothing is changed this week" >&2; exit 1 ;;
+          esac
+
+      - name: Keep the standing issue up to date
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ steps.check.outputs.state }}
+          TITLE: "Pinned versions behind upstream"
+        run: |
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --author 'app/github-actions' \
+            --search "in:title \"$TITLE\"" --json number,title --jq "map(select(.title == env.TITLE)) | .[0].number // empty")"
+          if [ "$STATE" = behind ]; then
+            if [ -z "$number" ]; then
+              gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body-file report.md
+            elif [ "$(gh issue view "$number" --repo "$GITHUB_REPOSITORY" --json body --jq .body)" != "$(cat report.md)" ]; then
+              gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file report.md
+            else
+              echo "issue #$number already says this"
+            fi
+          elif [ -n "$number" ]; then
+            gh issue edit "$number" --repo "$GITHUB_REPOSITORY" --body-file report.md
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY"
+          else
+            echo "every pin is current"
+          fi
