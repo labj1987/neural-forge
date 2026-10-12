@@ -146,6 +146,9 @@ pub(crate) struct Loader {
     /// ([`Self::pre_submitted`]): the after-the-upscaler path does not take the network (whose build
     /// for another size would free what that hold runs) until it has signalled.
     pre_inflight: Mutex<Option<InFlight>>,
+    /// Until when (ms since [`epoch_ms`]'s start) a pre-upscaler hold's work that no fence covers may
+    /// still run ([`Self::pre_unfenced`]): the after-the-upscaler path keeps off the network till then.
+    pre_unfenced_until: std::sync::atomic::AtomicU64,
     /// The after-the-upscaler frame that did not finish in time, still holding the claim
     /// ([`Self::post_stalled`]): released once its fence signals.
     post_inflight: Mutex<Option<InFlight>>,
@@ -198,6 +201,7 @@ impl Loader {
             last_post: Default::default(),
             post_busy: Default::default(),
             pre_inflight: Mutex::new(None),
+            pre_unfenced_until: Default::default(),
             post_inflight: Mutex::new(None),
         }
     }
@@ -210,7 +214,7 @@ impl Loader {
     /// [`Self::release_post`] once its work completed.
     pub(crate) fn claim_post(&self) -> bool {
         use std::sync::atomic::Ordering::SeqCst;
-        if epoch_ms().saturating_sub(self.last_pre.load(SeqCst)) < PATH_SWITCH_MS || self.pre_running() {
+        if epoch_ms().saturating_sub(self.last_pre.load(SeqCst)) < PATH_SWITCH_MS || self.pre_running() || epoch_ms() < self.pre_unfenced_until.load(SeqCst) {
             return false;
         }
         self.post_busy.store(true, SeqCst);
@@ -242,6 +246,13 @@ impl Loader {
             drop(stalled);
             self.release_post();
         }
+    }
+
+    /// A pre-upscaler hold's work went to the queue and no fence could be put after it: the network is
+    /// taken as in use for as long as any wait of the layer's is bounded ([`crate::FENCE_WAIT_TIMEOUT`]).
+    pub(crate) fn pre_unfenced(&self) {
+        let until = epoch_ms() + crate::FENCE_WAIT_TIMEOUT.as_millis() as u64;
+        self.pre_unfenced_until.fetch_max(until, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// The pre-upscaler path submitted a hold whose work `fence` covers.
@@ -1714,7 +1725,11 @@ pub(crate) unsafe fn run_native_hold(
             e.state.drop_edit();
         }
         if res.writeback_pending {
+            // The empty buffer's fence comes after the network's frame on the same queue: it covers it.
             loader.pre_submitted(device, res.writeback_fence);
+        } else {
+            // No fence could be put after it: the network may be in use for as long as a frame may run.
+            loader.pre_unfenced();
         }
     };
     for cmd in frame_cmds.into_iter().flatten() {
@@ -1782,6 +1797,29 @@ pub(crate) unsafe fn run_native_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A failed hold whose work no fence covers keeps the after-the-upscaler path off the network for
+    /// as long as a frame may run; nothing else does.
+    #[test]
+    fn unfenced_pre_upscaler_work_keeps_the_post_path_off_the_network() {
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup { gipa, instance: vk::Instance::null(), physical: vk::PhysicalDevice::null(), frame_family: 0, family: 0, index: 0, post_index: 0, properties2: crate::vram::Properties2::None };
+        let loader = Loader::start(vk::Device::null(), setup);
+        // No hold for longer than the path switch: the post path may claim.
+        loader.last_pre.store(0, std::sync::atomic::Ordering::SeqCst);
+        let _ = epoch_ms();
+        std::thread::sleep(std::time::Duration::from_millis(PATH_SWITCH_MS + 5));
+        assert!(loader.claim_post());
+        loader.release_post();
+        loader.last_post.store(0, std::sync::atomic::Ordering::SeqCst);
+        loader.pre_unfenced();
+        assert!(!loader.claim_post(), "unfenced work may still use the network");
+        loader.pre_unfenced_until.store(epoch_ms().saturating_sub(1), std::sync::atomic::Ordering::SeqCst);
+        assert!(loader.claim_post(), "once a frame can no longer be running");
+        loader.release_post();
+    }
 
     #[test]
     fn a_failure_is_new_once_per_reason_until_it_clears() {

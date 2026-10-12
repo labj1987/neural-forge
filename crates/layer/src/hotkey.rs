@@ -490,6 +490,7 @@ struct Focus {
     root: u32,
     active: u32,
     pid: u32,
+    client_list: u32,
     has_error: unsafe extern "C" fn(*mut c_void) -> c_int,
     get_property: unsafe extern "C" fn(*mut c_void, u8, u32, u32, u32, u32, u32) -> u32,
     get_property_reply: unsafe extern "C" fn(*mut c_void, u32, *mut *mut c_void) -> *mut c_void,
@@ -554,12 +555,12 @@ impl Focus {
                     libc::free(reply);
                     atom
                 };
-                let (active, pid) = (atom(c"_NET_ACTIVE_WINDOW"), atom(c"_NET_WM_PID"));
+                let (active, pid, client_list) = (atom(c"_NET_ACTIVE_WINDOW"), atom(c"_NET_WM_PID"), atom(c"_NET_CLIENT_LIST"));
                 if root == 0 || active == 0 || pid == 0 {
                     disconnect(conn);
                     return None;
                 }
-                Some(Focus { lib, conn, root, active, pid, has_error, get_property, get_property_reply, value, value_length, disconnect })
+                Some(Focus { lib, conn, root, active, pid, client_list, has_error, get_property, get_property_reply, value, value_length, disconnect })
             })()
         };
         if focus.is_none() {
@@ -591,20 +592,40 @@ impl Focus {
         unsafe { (self.has_error)(self.conn) != 0 }
     }
 
-    /// Whether the active window is this process's: `None` when the server does not say (no active
-    /// window property, a window without a PID, a broken connection).
+    /// Every 32-bit value of `property` on `window` (a list such as `_NET_CLIENT_LIST`), `None` without
+    /// it (or on any error).
+    fn property_list(&self, window: u32, property: u32, kind: u32) -> Option<Vec<u32>> {
+        // SAFETY: as `property`; the reply's value holds `value_length` 32-bit items.
+        unsafe {
+            let cookie = (self.get_property)(self.conn, 0, window, property, kind, 0, 4096);
+            let reply = (self.get_property_reply)(self.conn, cookie, std::ptr::null_mut());
+            if reply.is_null() {
+                return None;
+            }
+            let n = usize::try_from((self.value_length)(reply)).unwrap_or(0);
+            let list = std::slice::from_raw_parts((self.value)(reply).cast::<u32>(), n).to_vec();
+            libc::free(reply);
+            Some(list)
+        }
+    }
+
+    /// Whether the active window is this process's ([`focus_of`]): `None` when that cannot be told.
     fn game_focused(&self) -> Option<bool> {
-        // SAFETY: a live connection.
-        if unsafe { (self.has_error)(self.conn) } != 0 {
+        if self.broken() {
             return None;
         }
-        let window = self.property(self.root, self.active, XCB_ATOM_WINDOW)?;
-        if window == 0 {
-            // No X window is active: on a desktop's Xwayland a native Wayland window (or nothing) has
-            // the focus; inside gamescope (whose nested server holds only the game) it says nothing.
-            return std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_none().then_some(false);
+        let ours = std::process::id();
+        let window = self.property(self.root, self.active, XCB_ATOM_WINDOW);
+        let active_pid = window.filter(|&w| w != 0).and_then(|w| self.property(w, self.pid, XCB_ATOM_CARDINAL));
+        // Whether the game owns any X window at all (a game on winewayland has none).
+        let owns_x_window = self
+            .property_list(self.root, self.client_list, XCB_ATOM_WINDOW)
+            .map(|clients| clients.iter().any(|&w| self.property(w, self.pid, XCB_ATOM_CARDINAL) == Some(ours)));
+        // Inside gamescope the nested server holds only the game: no active X window says nothing.
+        if window == Some(0) && std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_some() {
+            return None;
         }
-        Some(self.property(window, self.pid, XCB_ATOM_CARDINAL)? == std::process::id())
+        focus_of(window, active_pid, owns_x_window, ours)
     }
 }
 
@@ -615,6 +636,28 @@ impl Drop for Focus {
             (self.disconnect)(self.conn);
             libc::dlclose(self.lib);
         }
+    }
+}
+
+/// Whether the game (process `ours`) has the focus, from the active window (`None`: the server does
+/// not say; `Some(0)`: no X window is active), that window's `_NET_WM_PID`, and whether any window of
+/// `_NET_CLIENT_LIST` is the game's (`None`: no list). `Some(false)` only when another client is
+/// positively known to have it: the active window is another process's, or none is active, while the
+/// game has an X window of its own. A game with no X window (winewayland) cannot be told about:
+/// `None`, and the key acts.
+fn focus_of(window: Option<u32>, active_pid: Option<u32>, owns_x_window: Option<bool>, ours: u32) -> Option<bool> {
+    if active_pid == Some(ours) {
+        return Some(true);
+    }
+    // Another client is known to have the focus only against an X window of the game's own.
+    if owns_x_window != Some(true) {
+        return None;
+    }
+    match (window?, active_pid) {
+        // No X window active while the game has one: something else (a Wayland window) has it.
+        (0, _) => Some(false),
+        (_, Some(_)) => Some(false),
+        (_, None) => None,
     }
 }
 
@@ -823,6 +866,27 @@ mod tests {
         assert!(!press_acts(Some(false), false));
         assert!(press_acts(Some(false), true));
         assert!(press_acts(None, false), "unknown focus (gamescope's nested server holds only the game): acts");
+    }
+
+    /// The focus is "another client's" only when that is positively known: the game owns an X window
+    /// and another process's window (or no X window) is active.
+    #[test]
+    fn the_focus_is_anothers_only_when_the_game_has_an_x_window() {
+        let (ours, other) = (100, 200);
+        // winewayland: the game has no X window, another X window is active: unknown, the key acts.
+        assert_eq!(focus_of(Some(7), Some(other), Some(false), ours), None);
+        assert!(press_acts(focus_of(Some(7), Some(other), Some(false), ours), false));
+        assert_eq!(focus_of(Some(0), None, Some(false), ours), None, "nothing active, no X window of the game's");
+        assert_eq!(focus_of(Some(7), Some(other), None, ours), None, "no client list: cannot tell");
+        // The game has an X window and another app is active: ignored.
+        assert_eq!(focus_of(Some(7), Some(other), Some(true), ours), Some(false));
+        assert!(!press_acts(focus_of(Some(7), Some(other), Some(true), ours), false));
+        assert_eq!(focus_of(Some(0), None, Some(true), ours), Some(false), "a Wayland window is active");
+        // The game's window is active: acts.
+        assert_eq!(focus_of(Some(9), Some(ours), Some(true), ours), Some(true));
+        assert!(press_acts(focus_of(Some(9), Some(ours), Some(true), ours), false));
+        assert_eq!(focus_of(Some(8), None, Some(true), ours), None, "an active window without a PID");
+        assert_eq!(focus_of(None, None, Some(true), ours), None, "no _NET_ACTIVE_WINDOW");
         assert!(press_acts(None, true));
     }
 }
