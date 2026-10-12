@@ -931,6 +931,39 @@ answer on every refresh, and a gain on the carried bands would only exaggerate t
 the cached holds in motion, where the trail, not the strength, is what limits them. Not in the
 shaders; `--low-gain` and `--high-gain` stay in the replay tool.
 
+### 3.3 edit cache: reduced model resolution before the upscaler (built, removed)
+
+Tried (handoff Phase 5.3): the network at a scale of DLSS's render extent (area-averaged input, history and
+vectors at its size) with its edit enlarged to the render extent by a joint bilateral upsample guided by the
+full-resolution luma and depth (upstream's JbuSigma 0.08; depth 0.15 stop), the decode and the edit cache
+unchanged. The 1.x lesson (below 100% left the zero-copy path) no longer applied: the native network builds for
+any size and the passes around it are the layer's own. Lowering the model resolution by default was authorized by
+Alex on 2026-10-11 ("do whatever gives the best FPS and the best visuals, even if it does involve reducing the
+resolution, as long as it doesn't hurt the actual picture"); the gate was the handoff's: added detail at least
+95% of full resolution's.
+
+Speed (GTA V Enhanced, 4K output, DLSS Balanced render 2228x1253, frame generation off, edit cache on): the
+network 11.9 ms at 100%, 7.2 ms at 75% (1671x940), 3.8 ms at 50% (1114x627); real fps 44.0-44.7 / 49.5-50.6 /
+53.7-56.6. Network memory 1.07 / 0.63 / 0.27 GB.
+
+Picture: the first measurement used bench-iq's whole-scene added detail, which the traffic and pedestrians GTA
+spawns swing by about 15% between runs of one build; on it 100% read x0.75-0.89 and 50% x1.03-1.08, as if the
+smaller network were better. Measured on a fixed box of the still shot's building facade (no traffic in it;
+log-luma Laplacian energy over model off, two runs each, the shot's frames 14-22 after its cut, and 10-18):
+
+| Network at 4K | Added detail on the facade | Share of 100%'s added detail |
+|---|---|---|
+| 100% | x1.247, x1.191 (x1.197, x1.149) | 100% |
+| 75% | x1.025, x1.030 (x1.011, x1.009) | about 12% |
+| 50% (the final-validation run's own facade box) | x1.244 against 100%'s x1.881 | about 28% |
+
+At 1440p 75% kept 88% on the whole-scene metric and 50% none. The 50% build also showed broad, soft diagonal
+streaks on flat lit surfaces (the Vinewood sign's faces) that 100% shows only faintly. Every scale lost far more
+than the 5% allowed, so the feature was removed (the shaders, `preupscale/reduced.rs`, the setting's effect before
+the upscaler, the default rule); only a fix found while building it stayed: a pass for another extent is now
+destroyed rather than dropped (dropping it leaked its images, buffers and pool). Measure detail on static areas
+only; a whole-scene number moves with what the game spawns.
+
 ### 3.3 edit cache: VRAM at 4K with frame generation
 
 At 4K with frame generation 4x the cache's gate failed: interval 2 ran at 19.1-22.5 real fps against

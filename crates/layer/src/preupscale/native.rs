@@ -1390,7 +1390,15 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     };
     // The native pass for this extent, its buffers recorded for this build.
-    let mut native = match res.native.take().filter(|n| n.matches(target.width, target.height)) {
+    // Another extent: the old pass is destroyed (idle: waited above), not dropped -- dropping it leaked
+    // its images, buffers and pool.
+    if res.native.as_ref().is_some_and(|n| !n.matches(target.width, target.height)) {
+        if let Some(old) = res.native.take() {
+            // SAFETY: idle (waited above).
+            unsafe { old.destroy(device) };
+        }
+    }
+    let mut native = match res.native.take() {
         Some(n) => n,
         None => {
             let family = res.queue_family;
