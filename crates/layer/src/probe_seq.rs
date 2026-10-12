@@ -248,8 +248,11 @@ impl Recording {
     }
 
     pub fn execute(&mut self, buffers: u32, launches: u32) {
-        if launches == 0 || self.keep(Op::Execute { buffers, launches }).is_none() {
+        if launches == 0 {
             self.gap().executes += 1;
+        } else {
+            // Kept even past the cap, like the launch markers: `total_launches` counts them.
+            self.ops.push(Op::Execute { buffers, launches });
         }
     }
 
@@ -533,6 +536,17 @@ mod tests {
         let mut quiet = Recording::default();
         quiet.image_barrier(barrier(0xc0, vk::ImageLayout::GENERAL, vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL, vk::AccessFlags2::NONE), true);
         assert_eq!(quiet.analyse(Some(colour)).class(), "transition-only");
+    }
+
+    #[test]
+    fn launches_in_secondaries_past_the_cap_are_counted() {
+        let mut r = Recording::new(vk::CommandBufferUsageFlags::empty(), 0);
+        for _ in 0..MAX_OPS + 10 {
+            r.image_barrier(ImageBarrier { image: vk::Image::null(), old: vk::ImageLayout::GENERAL, new: vk::ImageLayout::GENERAL, src_stage: 0, src_access: 0, dst_stage: 0, dst_access: 0 }, true);
+        }
+        r.execute(1, 3);
+        r.execute(2, 0);
+        assert_eq!(r.total_launches(), 3);
     }
 
     #[test]

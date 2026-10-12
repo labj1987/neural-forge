@@ -44,10 +44,15 @@ impl EntryPoints {
     }
     unsafe extern "system" fn get_image_view_handle64_nvx(device: vk::Device, info: *const vk::ImageViewHandleInfoNVX) -> u64 {
         // Recorded when this wrapper was handed out for `device`; if it somehow was not, ask
-        // the framework again (it forwards unknown names to the next layer).
+        // the framework again. The framework's own lookup (not this adapter's `get_device_proc_addr`)
+        // forwards a name it does not know -- this one is newer than it -- to the next layer, so it
+        // cannot hand back this wrapper; `next_of` refuses it all the same, since calling it would
+        // recurse. The answer is remembered for the next call.
         let next = crate::probe_ngx::handle64_next(device).or_else(|| {
-            let p = unsafe { Framework::get_device_proc_addr(device, crate::probe_ngx::HANDLE64_NAME.as_ptr()) }?;
-            Some(unsafe { std::mem::transmute::<unsafe extern "system" fn(), crate::probe_ngx::PfnGetImageViewHandle64Nvx>(p) })
+            let p = unsafe { Framework::get_device_proc_addr(device, crate::probe_ngx::HANDLE64_NAME.as_ptr()) };
+            let next = Self::next_of(p)?;
+            crate::probe_ngx::remember_handle64(device, next);
+            Some(next)
         });
         let Some(next) = next else { return 0 };
         let handle = unsafe { next(device, info) };
@@ -60,6 +65,15 @@ impl EntryPoints {
             }
         }
         handle
+    }
+    /// A looked-up `vkGetImageViewHandle64NVX` as the next layer's, or `None` for none -- or for this
+    /// layer's own wrapper, which would call itself.
+    fn next_of(p: vk::PFN_vkVoidFunction) -> Option<crate::probe_ngx::PfnGetImageViewHandle64Nvx> {
+        let p = p?;
+        // SAFETY: a non-null `vkGetDeviceProcAddr(device, "vkGetImageViewHandle64NVX")` has this signature.
+        let next = unsafe { std::mem::transmute::<unsafe extern "system" fn(), crate::probe_ngx::PfnGetImageViewHandle64Nvx>(p) };
+        let own: crate::probe_ngx::PfnGetImageViewHandle64Nvx = Self::get_image_view_handle64_nvx;
+        (next as usize != own as usize).then_some(next)
     }
     unsafe fn intercept(name: *const c_char, original: vk::PFN_vkVoidFunction) -> vk::PFN_vkVoidFunction {
         // Preserve null results (including invalid instance/device queries). Keep
@@ -83,6 +97,8 @@ impl EntryPoints {
             if crate::preupscale::active() { crate::preupscale::forget_device(device); }
             let destroy: vk::PFN_vkDestroyDevice = unsafe { std::mem::transmute(original) };
             unsafe { destroy(device, allocator); }
+            // A later device may be given the same handle: it starts with no device-lost latch.
+            crate::forget_lost_device(device);
         }
     }
 }
@@ -124,6 +140,17 @@ mod tests {
         }
         crate::probe_ngx::forget_device(device);
         assert!(crate::probe_ngx::handle64_next(device).is_none());
+    }
+
+    /// The fallback lookup never takes this layer's own wrapper as the next layer's: that would recurse.
+    #[test]
+    fn the_handle64_fallback_never_takes_the_wrapper_itself() {
+        let own: crate::probe_ngx::PfnGetImageViewHandle64Nvx = EntryPoints::get_image_view_handle64_nvx;
+        // SAFETY: only compared, never called through the wrong signature.
+        let own_void = unsafe { std::mem::transmute::<crate::probe_ngx::PfnGetImageViewHandle64Nvx, unsafe extern "system" fn()>(own) };
+        assert!(EntryPoints::next_of(Some(own_void)).is_none());
+        assert!(EntryPoints::next_of(None).is_none());
+        assert!(EntryPoints::next_of(Some(dummy)).is_some());
     }
 
     #[test]

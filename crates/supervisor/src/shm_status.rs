@@ -55,7 +55,16 @@ pub fn status_text(header: &ShmHeader) -> String {
     line(format_args!("preupscale_misses={}", header.preupscale_misses.load(Ordering::Relaxed)));
     line(format_args!("layer_measured_white={}", f32::from_bits(header.layer_measured_white_bits.load(Ordering::Relaxed))));
     line(format_args!("layer_composition_up={}", header.layer_composition_up.load(Ordering::Relaxed)));
-    line(format_args!("capture_request={}", header.capture_request.load(Ordering::Relaxed)));
+    match neural_forge_protocol::capture::pending(header) {
+        Some(r) => line(format_args!("capture_request=id {} for {} frames, waiting for the game", r.id, r.frames)),
+        None => line(format_args!("capture_request=none")),
+    }
+    if let Some(o) = neural_forge_protocol::capture::result(header) {
+        line(format_args!("capture_result=id {}: {}", o.id, o.message()));
+        for path in o.paths() {
+            line(format_args!("capture_path={path}"));
+        }
+    }
     line(format_args!("preupscale_dump_request={}", header.preupscale_dump_request.load(Ordering::Relaxed)));
     line(format_args!(
         "edit_cache: refresh_holds={} cached_holds={} rejected={:.2}% gpu_ms={:.3}",
@@ -92,7 +101,16 @@ mod tests {
     fn the_status_lists_live_fields_then_every_setting() {
         let header = ShmHeader::default();
         header.init_defaults();
-        header.capture_request.store(1, Ordering::Relaxed);
+        let id = neural_forge_protocol::capture::request(&header, 1).unwrap();
+        neural_forge_protocol::capture::publish(&header, &neural_forge_protocol::capture::Outcome {
+            id: 9,
+            state: neural_forge_protocol::capture::state::WRITTEN,
+            done: 1,
+            total: 1,
+            composed: 1,
+            paths: "/c/1-original.png\n/c/1-composited.png".into(),
+            ..Default::default()
+        });
         header.preupscale_dump_request.store(16, Ordering::Relaxed);
         header.cache_refresh_holds.store(30, Ordering::Relaxed);
         header.cache_cached_holds.store(29, Ordering::Relaxed);
@@ -101,7 +119,9 @@ mod tests {
         let text = status_text(&header);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "# live status");
-        assert!(lines.contains(&"capture_request=1"), "{text}");
+        assert!(lines.contains(&format!("capture_request=id {id} for 1 frames, waiting for the game").as_str()), "{text}");
+        assert!(lines.contains(&"capture_result=id 9: Captured"), "{text}");
+        assert!(lines.contains(&"capture_path=/c/1-composited.png"), "{text}");
         assert!(lines.contains(&"preupscale_dump_request=16"), "{text}");
         assert!(lines.contains(&"edit_cache: refresh_holds=30 cached_holds=29 rejected=12.34% gpu_ms=0.250"), "{text}");
         assert!(lines.contains(&"intensity=1"), "{text}");

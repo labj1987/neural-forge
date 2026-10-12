@@ -50,7 +50,11 @@ with NGX's ([NATIVE_BACKEND.md](NATIVE_BACKEND.md), 0.6). No NVIDIA code runs.
 environment, so only games with that launch option load it. Inside the game it stays inert on
 non-NVIDIA devices, on a second copy of itself, and in excluded processes (launchers, Wine
 desktop, overlays, or anything not named in `NEURAL_FORGE_TARGET_EXE`). The first eligible
-process takes a kernel file lease on `shm.bin.owner`; others cannot attach.
+process to present steadily takes a kernel file lease on `shm.bin.owner`; others cannot attach.
+Store launchers and their helpers (Ubisoft Connect, EA app, Battle.net, Epic, GOG Galaxy, Riot,
+Rockstar) and crash reporters are never eligible. The lease follows presenting: a process that has
+not presented for 10 s lets it go (and stops touching the channel, its model server included), so a
+helper that claimed it cannot keep the game from claiming it.
 
 ## 2. Shared memory
 
@@ -61,7 +65,7 @@ present hook and its model server thread. Layout (`crates/protocol/src/lib.rs`):
 
 | Offset | Size | Content |
 |---|---|---|
-| 0 | 64 KiB (`HEADER_BYTES`) | `ShmHeader` (664 bytes used) |
+| 0 | 64 KiB (`HEADER_BYTES`) | `ShmHeader` (1748 bytes used) |
 | 64 KiB | `MAX_FRAME` | slot 0 proxy: the frame the layer captured |
 | + `MAX_FRAME` | `MAX_FRAME` | slot 0 answer: the model's output |
 | + 2 `MAX_FRAME` | `MAX_FRAME` | slot 1 proxy |
@@ -93,6 +97,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   `server_busy_us` (v10).
 - **Layer status:** attached, frame counter, size, format, `layer_ms`, measured white, GPU
   capture/compose ms (v8), `layer_reason` (the native network's status line), `game_name`.
+- **Captures (v18):** `capture_request` (`(id << 16) | frames`, written only through
+  `neural_forge_protocol::capture::request`), `capture_next_id`, `capture_cancel`, and the
+  sequence-locked capture result the layer publishes: request id, state (running, written, failed,
+  cancelled), reason, pairs written and composed, the files' paths (5.7).
 - **Pre-upscaler status (v9):** `preupscale_state` (0 off, 1 waiting for DLSS input, 2 holding),
   `preupscale_width`/`height`, `preupscale_hold_ms`, `preupscale_misses`, `native_running` (v13).
 - **Reserved, read by nothing:** `format`, `hdr_encode`, `hdr_mode`/`hdr_detected`/`hdr_active`.
@@ -132,6 +140,7 @@ versions disagree. The layer applies the saved settings (`config.ini`) when it c
 | 15 | The helper's fields removed (passes, motion, rebuild spacing, VRAM and feature counts, its reason string, the DMA-BUF exchange); `helper_*` renamed `server_*` | 3.0.0 |
 | 16 | `device_lost_at` (Unix seconds of the session's `VK_ERROR_DEVICE_LOST`, 0 when none) | 3.2.0 |
 | 17 | `preupscale_dump_request`; the edit cache's `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected`, `cache_gpu_ms_bits` | 3.3.0 |
+| 18 | `capture_request` carries a request id; `capture_next_id`, `capture_cancel` and the capture result (state, reason, counts, paths) appended | unreleased |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17.
@@ -644,6 +653,22 @@ second after the other used it (`Loader::claim_pre`, `claim_post`).
 In the `pan` reproducer (2492x1370 window, no DLSS) the answer takes 15.7 ms, against 11.1 ms through
 2.x's helper (NGX's evaluate 10.8 ms): NVIDIA's network is about 20% faster than OpenDLSS-NR's at the
 same size on this GPU; 67-68 fps with every frame composited against 75-79 (NATIVE_BACKEND.md, 2.1).
+
+### 5.7 Captures
+
+`crates/layer/src/series.rs`, `neural_forge_protocol::capture`. The GUI's capture button,
+`shmctl capture [--frames N]` and `NEURAL_FORGE_CAPTURE_AT` ask for the next frame (a pair in the
+captures folder) or the next N (a `series-<ms>/` folder, N at most 1000). The present hook reads the
+swapchain image back before `capture::run` (the game's frame) and after it (what is presented,
+waiting on the composition's semaphore), so a capture is the live path's own result and changes
+nothing on screen; while frames are held before the upscaler both halves are the presented frame.
+PNGs are encoded on writer threads (temporary file, then renamed), never on the present thread; the
+last writer publishes the final outcome. Every request ends in an outcome with its id: written (with
+whether the effect composed the frames, or why not: effect off, no model server, no answer in time),
+failed (unreadable or HDR swapchain, readback or write failure, another capture running) or
+cancelled. A request left waiting when a game's layer opens the channel is dropped, so it never
+fires on a game started later; the GUI and `shmctl` withdraw a request no game took within 5 s.
+With `NEURAL_FORGE_PREUPSCALE=dump` the one-shot is the pre-upscaler dump's.
 
 ## 6. The network
 

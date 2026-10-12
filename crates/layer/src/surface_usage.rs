@@ -1,5 +1,7 @@
-//! Conservative admission for host capture. Never retry swapchain creation:
-//! Vulkan retires oldSwapchain even when creation fails.
+//! Conservative admission for host capture: which swapchains get `TRANSFER_SRC`/`TRANSFER_DST`
+//! added. A creation the driver refuses with the enlarged usage is made once more with the
+//! application's own create info and `oldSwapchain` cleared (`device.rs`, `create_swapchain_khr`):
+//! Vulkan retires `oldSwapchain` even when creation fails, so the old handle is never passed twice.
 use ash::vk;
 
 /// Structures that genuinely change what the swapchain's images *are*, and so have to

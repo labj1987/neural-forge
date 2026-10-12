@@ -112,9 +112,11 @@ pub struct ShmHeader {
     pub compare_zoom_bits: AtomicU32,
     pub compare_swap: AtomicU32,
     pub colour_mode: AtomicU32,
-    /// Writes one set of matched before/after frames per session when the layer next presents.
-    /// A value N above 1 instead captures the next N presented frames as a numbered series
-    /// (the layer's `series` module); 1 is the one-shot dump, unchanged.
+    /// A pending capture request, `(id << 16) | frames` (`crate::capture::encode_request`), 0 for
+    /// none: one frame is the one-shot pair, more a numbered series of the next presented frames
+    /// (the layer's `series` module), at most `crate::capture::MAX_FRAMES`. Written only through
+    /// `crate::capture::request`; the layer zeroes it when it takes the request and says what
+    /// became of it in the capture result (v18).
     pub capture_request: AtomicU32,
     /// A Linux key code the layer watches to toggle the pass, or 0 for none.
     pub toggle_key: AtomicU32,
@@ -288,6 +290,18 @@ pub struct ShmHeader {
     /// f32 bits: the cache passes' GPU time per hold in milliseconds, the median of the layer's last
     /// summary window (the latest reading before the first).
     pub cache_gpu_ms_bits: AtomicU32,
+
+    // --- v18 -----------------------------------------------------------------------------
+    /// The next capture request id a requester takes (`crate::capture::request`); ids run 1 to
+    /// [`crate::capture::MAX_ID`] and wrap.
+    pub capture_next_id: AtomicU32,
+    /// The id of a capture the requester wants stopped (`crate::capture::cancel`): a running series
+    /// ends at its next present, its pairs so far kept. 0 for none.
+    pub capture_cancel: AtomicU32,
+    /// What became of the latest capture request the layer took ([`crate::capture::Outcome`]),
+    /// guarded by its own sequence number like the free-text fields. Written by the layer only.
+    pub capture_result_seq: AtomicU32,
+    capture_result: [AtomicU32; crate::capture::RESULT_WORDS],
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -312,7 +326,11 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 688, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1748, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_next_id) == 688, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_cancel) == 692, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_result_seq) == 696, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_result) == 700, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, enabled) == 44, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, transfer_strength_bits) == 72, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, hdr_mode) == 568, "layout changed -- bump SHM_VERSION");
@@ -468,6 +486,9 @@ impl ShmHeader {
         for f in [&self.cache_refresh_holds, &self.cache_cached_holds, &self.cache_rejected, &self.cache_gpu_ms_bits] {
             f.store(0, Ordering::Relaxed);
         }
+        self.capture_next_id.store(0, Ordering::Relaxed);
+        self.capture_cancel.store(0, Ordering::Relaxed);
+        self.set_capture_result_words(&[0; crate::capture::RESULT_WORDS]);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
 
@@ -691,6 +712,15 @@ impl ShmHeader {
     pub fn game_name(&self) -> String {
         load_seq_guarded(&self.game_name_seq, &self.game_name)
     }
+    /// The capture result's raw words, written as one unit (`crate::capture::publish`).
+    pub(crate) fn set_capture_result_words(&self, words: &[u32; crate::capture::RESULT_WORDS]) {
+        store_words_seq_guarded(&self.capture_result_seq, &self.capture_result, words);
+    }
+    /// The capture result's raw words as one consistent snapshot, `None` while a write keeps
+    /// changing them (`crate::capture::result`).
+    pub(crate) fn capture_result_words(&self) -> Option<[u32; crate::capture::RESULT_WORDS]> {
+        load_words_seq_guarded(&self.capture_result_seq, &self.capture_result)
+    }
 }
 
 /// Reads a lo/hi `AtomicU32` pair as one `u64` frame counter.
@@ -748,6 +778,34 @@ fn store_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], s:
         word.store(u32::from_le_bytes(chunk), Ordering::Relaxed);
     }
     seq.store(odd.wrapping_add(1), Ordering::Release);
+}
+
+/// [`store_seq_guarded`] for a block of plain words.
+fn store_words_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], values: &[u32; W]) {
+    let odd = seq.load(Ordering::Relaxed) | 1;
+    seq.store(odd, Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::Release);
+    for (word, &value) in words.iter().zip(values) {
+        word.store(value, Ordering::Relaxed);
+    }
+    seq.store(odd.wrapping_add(1), Ordering::Release);
+}
+
+/// [`load_seq_guarded`] for a block of plain words: `None` when no consistent snapshot was seen.
+fn load_words_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W]) -> Option<[u32; W]> {
+    for _ in 0..64 {
+        let before = seq.load(Ordering::Acquire);
+        if before & 1 != 0 {
+            std::hint::spin_loop();
+            continue;
+        }
+        let snapshot: [u32; W] = std::array::from_fn(|i| words[i].load(Ordering::Relaxed));
+        std::sync::atomic::fence(Ordering::Acquire);
+        if seq.load(Ordering::Relaxed) == before {
+            return Some(snapshot);
+        }
+    }
+    None
 }
 
 fn load_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W]) -> String {
@@ -875,11 +933,39 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, cache_cached_holds), std::mem::offset_of!(ShmHeader, cache_refresh_holds) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, cache_rejected), std::mem::offset_of!(ShmHeader, cache_cached_holds) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, cache_gpu_ms_bits), std::mem::offset_of!(ShmHeader, cache_rejected) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, cache_gpu_ms_bits) + 4, std::mem::size_of::<ShmHeader>());
-        assert_eq!(crate::SHM_VERSION, 17);
+        assert_eq!(std::mem::offset_of!(ShmHeader, capture_next_id), std::mem::offset_of!(ShmHeader, cache_gpu_ms_bits) + 4);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.preupscale_dump_request.load(Ordering::Relaxed), 0, "a fresh session dumps nothing");
+    }
+
+    #[test]
+    fn the_capture_result_is_appended_after_the_cache_status() {
+        // v18 appends the capture request ids and the result block: every earlier field keeps its offset.
+        assert_eq!(std::mem::offset_of!(ShmHeader, capture_next_id), std::mem::offset_of!(ShmHeader, cache_gpu_ms_bits) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, capture_cancel), std::mem::offset_of!(ShmHeader, capture_next_id) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, capture_result_seq), std::mem::offset_of!(ShmHeader, capture_cancel) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, capture_result), std::mem::offset_of!(ShmHeader, capture_result_seq) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, capture_result) + crate::capture::RESULT_WORDS * 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 18);
+        let h = ShmHeader::default();
+        h.capture_cancel.store(3, Ordering::Relaxed);
+        h.set_capture_result_words(&[7; crate::capture::RESULT_WORDS]);
+        h.init_defaults();
+        assert_eq!(h.capture_cancel.load(Ordering::Relaxed), 0);
+        assert_eq!(h.capture_result_words(), Some([0; crate::capture::RESULT_WORDS]), "a fresh session has no capture result");
+    }
+
+    #[test]
+    fn a_word_block_reader_never_returns_a_write_in_progress() {
+        let h = ShmHeader::default();
+        h.set_capture_result_words(&[5; crate::capture::RESULT_WORDS]);
+        assert_eq!(h.capture_result_seq.load(Ordering::Relaxed) & 1, 0);
+        let even = h.capture_result_seq.load(Ordering::Relaxed);
+        h.capture_result_seq.store(even | 1, Ordering::Release);
+        assert_eq!(h.capture_result_words(), None, "an odd sequence is a write in progress");
+        h.capture_result_seq.store(even + 2, Ordering::Release);
+        assert_eq!(h.capture_result_words(), Some([5; crate::capture::RESULT_WORDS]));
     }
 
     #[test]

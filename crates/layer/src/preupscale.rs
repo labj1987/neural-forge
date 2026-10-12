@@ -3911,7 +3911,7 @@ impl Resources {
     pub(crate) unsafe fn fence_submitted(&mut self, device: &ash::Device, submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>) {
         // SAFETY: the fence is idle (contract); the empty buffer is idle with it.
         let reset = unsafe { device.reset_fences(&[self.writeback_fence]) };
-        if reset.is_ok() && crate::note_vk(submit(Which::WriteBack, self.fence_cmd, self.writeback_fence)).is_ok() {
+        if reset.is_ok() && crate::note_vk(device.handle(), submit(Which::WriteBack, self.fence_cmd, self.writeback_fence)).is_ok() {
             self.writeback_pending = true;
         } else {
             crate::log!("[preupscale] a hold's work went to the queue and no fence could be put after it: these hold resources are not used again");
@@ -3942,7 +3942,7 @@ impl Resources {
         };
         // SAFETY: the layer's own fences, each submitted (only `pending` after a successful submit).
         let wait = unsafe { device.wait_for_fences(fences, true, CLEANUP_WAIT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "preupscale::wait_idle").is_err() {
+        if crate::note_fence_wait(device.handle(), wait, "preupscale::wait_idle").is_err() {
             return false;
         }
         self.idle();
@@ -4666,7 +4666,7 @@ pub(crate) unsafe fn run_hold(
         result.miss = Some("resetting the capture fence failed");
         return result;
     }
-    if crate::note_vk(submit(Which::Capture, res.capture_cmd, res.capture_fence)).is_err() {
+    if crate::note_vk(device.handle(), submit(Which::Capture, res.capture_cmd, res.capture_fence)).is_err() {
         result.miss = Some("the capture submit failed");
         return result;
     }
@@ -4680,7 +4680,7 @@ pub(crate) unsafe fn run_hold(
     // SAFETY: the layer's own fence, just submitted.
     let wait = unsafe { device.wait_for_fences(&[res.capture_fence], true, FRAME_CAPTURE_WAIT.as_nanos() as u64) };
     result.timing.capture_wait = Some(t_capture.elapsed());
-    if crate::note_fence_wait(wait, "preupscale::capture").is_err() {
+    if crate::note_fence_wait(device.handle(), wait, "preupscale::capture").is_err() {
         result.miss = Some("the capture did not finish");
         return result;
     }
@@ -4770,7 +4770,7 @@ pub(crate) unsafe fn run_hold(
         result.miss = Some("resetting the write-back fence failed");
         return result;
     }
-    if crate::note_vk(submit(Which::WriteBack, res.writeback_cmd, res.writeback_fence)).is_err() {
+    if crate::note_vk(device.handle(), submit(Which::WriteBack, res.writeback_cmd, res.writeback_fence)).is_err() {
         result.miss = Some("the write-back submit failed");
         return result;
     }
@@ -4840,7 +4840,7 @@ impl DumpFrame {
             files.push("mvec.rg16f".to_string());
         }
         let preview = preview_rgba8(&self.colour, pw, self.width, self.height);
-        if crate::dump::write_png(&dir.join("colour-preview.png"), &preview, self.width, self.height, false, false) {
+        if crate::dump::write_png(&dir.join("colour-preview.png"), &preview, self.width, self.height, false, false).is_ok() {
             files.push("colour-preview.png".to_string());
         }
         let meta = format!(
@@ -5707,19 +5707,44 @@ pub(crate) fn gate(mode: Mode, session: &mut Session, shm: &mut ShmClient, layou
     }
 }
 
-/// Writes a dump off the submit thread and logs where it went.
-pub(crate) fn write_dump_async(frame: DumpFrame) {
+/// Writes a dump off the submit thread and logs where it went. `capture`: the one-shot capture
+/// request this dump serves (`NEURAL_FORGE_PREUPSCALE=dump`), whose outcome names the dump's folder.
+pub(crate) fn write_dump_async(frame: DumpFrame, capture: Option<(neural_forge_protocol::capture::Request, Option<crate::shm::Channel>)>) {
+    use neural_forge_protocol::capture::{reason, state, Outcome};
     let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
     let dir = crate::dump::captures_dir().join(format!("preupscale-{stamp}"));
-    let spawned = std::thread::Builder::new().name("nf-preupscale-dump".into()).spawn(move || {
-        match frame.write(&dir) {
-            Ok(files) => crate::log!("[preupscale] dump of the DLSS input ({}x{}, frame {}) written to {}: {}", frame.width, frame.height, frame.frame, dir.display(), files.join(", ")),
-            Err(e) => crate::log!("[preupscale] dump to {} failed: {e}", dir.display()),
+    let report = move |capture: &Option<(neural_forge_protocol::capture::Request, Option<crate::shm::Channel>)>, written: bool, dir: &std::path::Path| {
+        if let Some((request, channel)) = capture {
+            let outcome = Outcome {
+                id: request.id,
+                state: if written { state::WRITTEN } else { state::FAILED },
+                reason: if written { reason::DLSS_INPUT_DUMP } else { reason::WRITE_FAILED },
+                done: u32::from(written),
+                total: 1,
+                composed: 0,
+                paths: dir.display().to_string(),
+            };
+            crate::series::publish(channel.as_ref(), &outcome);
         }
+    };
+    let on_failure = (capture.clone(), dir.clone());
+    let spawned = std::thread::Builder::new().name("nf-preupscale-dump".into()).spawn(move || {
+        let written = match frame.write(&dir) {
+            Ok(files) => {
+                crate::log!("[preupscale] dump of the DLSS input ({}x{}, frame {}) written to {}: {}", frame.width, frame.height, frame.frame, dir.display(), files.join(", "));
+                true
+            }
+            Err(e) => {
+                crate::log!("[preupscale] dump to {} failed: {e}", dir.display());
+                false
+            }
+        };
         crate::logging::flush();
+        report(&capture, written, &dir);
     });
-    if spawned.is_err() {
-        crate::log!("[preupscale] could not start the dump writer thread");
+    if let Err(e) = spawned {
+        crate::log!("[preupscale] could not start the dump writer thread: {e}");
+        report(&on_failure.0, false, &on_failure.1);
     }
 }
 

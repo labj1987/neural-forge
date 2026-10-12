@@ -244,6 +244,8 @@ struct State {
     functions: HashMap<vk::CuFunctionNVX, String>,
     /// Launches recorded into each command buffer since it was last begun.
     launch_cmdbufs: HashMap<vk::CommandBuffer, u32>,
+    /// The command buffers of each pool, so a pool reset or destroyed drops their recordings.
+    pools: HashMap<vk::CommandPool, HashSet<vk::CommandBuffer>>,
     /// Every view ever registered (handle or address query), for the cumulative count.
     ever_registered: HashSet<vk::ImageView>,
     frame: Frame,
@@ -332,6 +334,11 @@ impl State {
 
     fn forget_image(&mut self, image: vk::Image) {
         self.images.remove(&image);
+        // A destroyed image's handle may come back as another image: it is of no interest until a
+        // view of it is registered again, and the colour input is identified anew.
+        if self.interest.remove(&image).is_some() && self.colour == Some(image) {
+            self.colour = identify_colour(&self.interest).0;
+        }
     }
 
     fn record_view(&mut self, view: vk::ImageView, info: &vk::ImageViewCreateInfo) {
@@ -349,6 +356,18 @@ impl State {
     fn forget_view(&mut self, view: vk::ImageView) {
         self.views.remove(&view);
         self.view_images.remove(&view);
+        // A reused handle is a new view: its first registration is reported (and read) again.
+        self.ever_registered.remove(&view);
+    }
+
+    fn allocated(&mut self, pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer]) {
+        self.pools.entry(pool).or_default().extend(command_buffers.iter().copied());
+    }
+
+    /// A pool reset (`destroyed`: destroyed) resets (frees) every buffer of it.
+    fn reset_pool(&mut self, pool: vk::CommandPool, destroyed: bool) {
+        let members: Vec<vk::CommandBuffer> = if destroyed { self.pools.remove(&pool).map(|m| m.into_iter().collect()).unwrap_or_default() } else { self.pools.get(&pool).map(|m| m.iter().copied().collect()).unwrap_or_default() };
+        self.free(&members);
     }
 
     fn register(&mut self, kind: &str, view: vk::ImageView, result: String) -> Vec<String> {
@@ -858,6 +877,18 @@ pub(crate) fn on_destroy_framebuffer(framebuffer: vk::Framebuffer) {
     }
 }
 
+pub(crate) fn on_allocate_command_buffers(pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer]) {
+    if enabled() {
+        state().allocated(pool, command_buffers);
+    }
+}
+
+pub(crate) fn on_reset_command_pool(pool: vk::CommandPool, destroyed: bool) {
+    if enabled() {
+        state().reset_pool(pool, destroyed);
+    }
+}
+
 pub(crate) fn on_free_command_buffers(command_buffers: &[vk::CommandBuffer]) {
     if enabled() {
         state().free(command_buffers);
@@ -1131,5 +1162,29 @@ mod tests {
         assert_eq!(s.registration_lines, MAX_EVENT_LINES);
         assert!(s.create_module(16, vk::Result::SUCCESS).is_empty());
         assert_eq!(s.ever_registered.len(), MAX_EVENT_LINES as usize + 10);
+    }
+
+    /// A destroyed view's or image's handle reused for another is new to the probe; a pool reset or
+    /// destroyed drops its buffers' recordings.
+    #[test]
+    fn destroyed_handles_and_reset_pools_are_forgotten() {
+        let mut s = State::default();
+        let view = vk::ImageView::from_raw(7);
+        s.register("vkGetImageViewHandleNVX", view, "0".into());
+        assert!(s.ever_registered.contains(&view));
+        s.forget_view(view);
+        assert!(!s.ever_registered.contains(&view));
+        let image = vk::Image::from_raw(9);
+        s.interest.insert(image, ViewDesc { width: 8, height: 8, format: vk::Format::R16G16B16A16_SFLOAT.as_raw(), usage: 0 });
+        s.colour = Some(image);
+        s.forget_image(image);
+        assert!(s.interest.is_empty() && s.colour.is_none());
+        let (pool, cb) = (vk::CommandPool::from_raw(3), vk::CommandBuffer::from_raw(4));
+        s.allocated(pool, &[cb]);
+        s.begin(cb, vk::CommandBufferUsageFlags::empty());
+        s.reset_pool(pool, false);
+        assert!(!s.recordings.contains_key(&cb));
+        s.reset_pool(pool, true);
+        assert!(s.pools.is_empty());
     }
 }

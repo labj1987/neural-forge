@@ -7,10 +7,16 @@
 //! * **evdev** reads the kernel's input devices directly. It works everywhere, since a Proton
 //!   game is still a Linux process, and has the lowest latency, but keyboards are `root:input`
 //!   with no uaccess ACL, so it needs the `input` group.
-//! * **XInput2** raw key events selected on the root window. It needs no permission and raw
-//!   events arrive whichever client has focus (including when the focused client is Wayland).
-//!   `XQueryKeymap`, which this layer used before, reports nothing for a real key press under
-//!   XWayland, so it is not an option.
+//! * **XInput2** raw key events selected on the root window. It needs no permission. On an X
+//!   server raw events arrive whichever client has focus; under XWayland only while an X client
+//!   (a Proton game is one) has the keyboard focus, so a press in a native Wayland window is never
+//!   seen. `XQueryKeymap`, which this layer used before, reports nothing for a real key press under
+//!   XWayland, so it is not an option. The connection is the layer's own: an I/O error on it (the
+//!   X server going away) marks the backend dead instead of letting Xlib end the game's process.
+//!
+//! The key is global, not the game window's: evdev sees every press on the machine, so the toggle
+//! fires whichever window has focus. Pick a key nothing else uses while a game runs. Only presses of
+//! the watched key are kept; every other key code read is dropped at once.
 //!
 //! Neither links X11: libX11/libXi are `dlopen`ed only when the evdev backend is unavailable, so
 //! a Vulkan process on a machine with no X at all is unaffected.
@@ -22,6 +28,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CString};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 /// The keys anyone would plausibly bind. Not the whole table: a name that is not here simply
@@ -189,7 +196,9 @@ impl Evdev {
 
     /// Drains every keyboard and appends the codes that went down. Drains rather than looking
     /// for one code: a read that leaves events behind makes the next answer stale.
-    fn poll(&mut self, pending: &mut Vec<u32>) {
+    /// Presses of `key` since the last poll.
+    fn poll(&mut self, key: u32) -> u32 {
+        let mut presses = 0;
         let now = Instant::now();
         if self.last_scan.is_none_or(|t| now.duration_since(t) >= Duration::from_secs(1)) {
             self.last_scan = Some(now);
@@ -206,12 +215,13 @@ impl Evdev {
                     break;
                 }
                 let count = n as usize / std::mem::size_of::<libc::input_event>();
-                pending.extend(events[..count].iter().filter(|e| e.type_ == EV_KEY && e.value == 1).map(|e| u32::from(e.code)));
+                presses += events[..count].iter().filter(|e| e.type_ == EV_KEY && e.value == 1 && u32::from(e.code) == key).count() as u32;
                 if (n as usize) < size {
                     break;
                 }
             }
         }
+        presses
     }
 }
 
@@ -329,6 +339,11 @@ impl X11 {
                 let select_events: unsafe extern "C" fn(*mut c_void, c_ulong, *mut XiEventMask, c_int) -> c_int =
                     sym(xi, "XISelectEvents")?;
                 let close_display = sym(x11, "XCloseDisplay")?;
+                // Needed to survive the connection's death (libX11 1.7 and later): without it, Xlib's
+                // I/O error path ends the process, so the backend is not used at all.
+                let set_io_error_handler: unsafe extern "C" fn(Option<IoErrorHandler>) -> Option<IoErrorHandler> = sym(x11, "XSetIOErrorHandler")?;
+                let set_io_error_exit_handler: unsafe extern "C" fn(*mut c_void, Option<IoErrorExitHandler>, *mut c_void) =
+                    sym(x11, "XSetIOErrorExitHandler")?;
                 let pending = sym(x11, "XPending")?;
                 let next_event = sym(x11, "XNextEvent")?;
                 let get_event_data = sym(x11, "XGetEventData")?;
@@ -338,6 +353,14 @@ impl X11 {
                 if display.is_null() {
                     return None;
                 }
+                // The I/O error handler is process-wide (the game's own Xlib use, Wine's, shares it):
+                // ours acts on this connection only and hands every other one to the handler that was
+                // there. The exit handler is this connection's own; returning from it keeps the
+                // process alive.
+                X11_DISPLAY.store(display, Ordering::Release);
+                let previous = set_io_error_handler(Some(io_error));
+                PREVIOUS_IO_ERROR.store(previous.map_or(0, |f| f as usize), Ordering::Release);
+                set_io_error_exit_handler(display, Some(io_error_exit), std::ptr::null_mut());
                 let fail = |display| {
                     // The connection was opened above; give it back on every failure path.
                     let close: unsafe extern "C" fn(*mut c_void) -> c_int = close_display;
@@ -373,7 +396,12 @@ impl X11 {
 
     /// Raw key presses are already edges, so no held state is tracked. An X keycode is the evdev
     /// code plus eight on every evdev-driven X server, which is all of them on Linux.
-    fn poll(&mut self, pending: &mut Vec<u32>) {
+    /// Presses of `key` since the last poll; none once the connection died.
+    fn poll(&mut self, key: u32) -> u32 {
+        let mut presses = 0;
+        if X11_DEAD.load(Ordering::Acquire) {
+            return 0;
+        }
         // SAFETY: `display` is live until Drop; the event/cookie structs match Xlib's layout for
         // the fields read, and every cookie fetched is freed.
         unsafe {
@@ -389,13 +417,17 @@ impl X11 {
                 }
                 if (*cookie).evtype == XI_RAW_KEY_PRESS {
                     let raw = (*cookie).data.cast::<XiRawEventHead>();
-                    if (*raw).detail >= 8 {
-                        pending.push((*raw).detail as u32 - 8);
+                    if (*raw).detail >= 8 && (*raw).detail as u32 - 8 == key {
+                        presses += 1;
                     }
                 }
                 (self.free_event_data)(self.display, cookie);
+                if X11_DEAD.load(Ordering::Acquire) {
+                    break;
+                }
             }
         }
+        presses
     }
 }
 
@@ -403,12 +435,44 @@ impl Drop for X11 {
     fn drop(&mut self) {
         // SAFETY: the connection is closed exactly once, before the libraries that own the
         // code doing so are unloaded.
+        // A connection Xlib reported an I/O error on is unusable: it (and the libraries its code is
+        // in, which the error path may still reference) is left as it is.
+        if X11_DEAD.load(Ordering::Acquire) {
+            return;
+        }
         unsafe {
             (self.close_display)(self.display);
             libc::dlclose(self.xi);
             libc::dlclose(self.x11);
         }
     }
+}
+
+type IoErrorHandler = unsafe extern "C" fn(*mut c_void) -> c_int;
+type IoErrorExitHandler = unsafe extern "C" fn(*mut c_void, *mut c_void);
+
+/// The layer's own X connection, the handler that was installed before ours, and whether our
+/// connection died.
+static X11_DISPLAY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+static PREVIOUS_IO_ERROR: AtomicUsize = AtomicUsize::new(0);
+static X11_DEAD: AtomicBool = AtomicBool::new(false);
+
+/// Xlib's I/O error handler: our connection is marked dead (Xlib then calls its exit handler,
+/// [`io_error_exit`], which returns); any other connection goes to the handler installed before.
+unsafe extern "C" fn io_error(display: *mut c_void) -> c_int {
+    if display == X11_DISPLAY.load(Ordering::Acquire) {
+        X11_DEAD.store(true, Ordering::Release);
+        return 0;
+    }
+    match PREVIOUS_IO_ERROR.load(Ordering::Acquire) {
+        0 => 0,
+        // SAFETY: the value is the handler `XSetIOErrorHandler` returned, with this signature.
+        previous => unsafe { std::mem::transmute::<usize, IoErrorHandler>(previous)(display) },
+    }
+}
+
+unsafe extern "C" fn io_error_exit(_display: *mut c_void, _data: *mut c_void) {
+    X11_DEAD.store(true, Ordering::Release);
 }
 
 // ---- the poller -----------------------------------------------------------------------------
@@ -422,8 +486,9 @@ enum Backend {
 
 pub struct Poller {
     backend: Backend,
-    /// Codes seen down since the last ask, so one drain serves any key the caller asks about.
-    pending: Vec<u32>,
+    /// Presses of `pending_key` read but not yet answered (a poll is throttled, a press never lost).
+    pending: u32,
+    pending_key: u32,
     last_poll: Option<Instant>,
 }
 
@@ -432,7 +497,7 @@ unsafe impl Send for Poller {}
 
 impl Default for Poller {
     fn default() -> Self {
-        Self { backend: Backend::Unopened, pending: Vec::new(), last_poll: None }
+        Self { backend: Backend::Unopened, pending: 0, pending_key: 0, last_poll: None }
     }
 }
 
@@ -480,20 +545,20 @@ impl Poller {
         // Drained events stay in `pending`, so throttling delays a press but never loses it.
         if self.last_poll.is_none_or(|t| now.duration_since(t) >= POLL_INTERVAL) {
             self.last_poll = Some(now);
-            match &mut self.backend {
-                Backend::Evdev(e) => e.poll(&mut self.pending),
-                Backend::X11(x) => x.poll(&mut self.pending),
-                Backend::Unopened | Backend::None => {}
+            if key != self.pending_key {
+                self.pending = 0;
+                self.pending_key = key;
             }
+            self.pending += match &mut self.backend {
+                Backend::Evdev(e) => e.poll(key),
+                Backend::X11(x) => x.poll(key),
+                Backend::Unopened | Backend::None => 0,
+            };
         }
-        if let Some(i) = self.pending.iter().position(|&c| c == key) {
-            self.pending.remove(i);
+        if self.pending > 0 && key == self.pending_key {
+            self.pending -= 1;
             true
         } else {
-            // Nothing this caller wanted; keep the list from growing forever.
-            if self.pending.len() > 256 {
-                self.pending.clear();
-            }
             false
         }
     }
@@ -530,9 +595,34 @@ mod tests {
     #[test]
     fn a_press_seen_by_one_drain_is_delivered_once() {
         let mut p = Poller { backend: Backend::None, ..Poller::default() };
-        p.pending.push(87);
+        p.pending = 1;
+        p.pending_key = 87;
         p.last_poll = Some(Instant::now());
+        assert!(!p.pressed(88), "another key's press is never one of these");
         assert!(p.pressed(87));
         assert!(!p.pressed(87));
+    }
+
+    /// An I/O error on the layer's own X connection marks it dead and never reaches the game's
+    /// handler; one on any other connection goes to the handler that was installed before.
+    #[test]
+    fn io_errors_on_other_connections_go_to_the_previous_handler() {
+        static SEEN: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn previous(display: *mut c_void) -> c_int {
+            SEEN.store(display as usize, Ordering::SeqCst);
+            7
+        }
+        let ours = 0x1000 as *mut c_void;
+        X11_DISPLAY.store(ours, Ordering::SeqCst);
+        PREVIOUS_IO_ERROR.store(previous as *const () as usize, Ordering::SeqCst);
+        assert_eq!(unsafe { io_error(0x2000 as *mut c_void) }, 7);
+        assert_eq!(SEEN.load(Ordering::SeqCst), 0x2000);
+        assert!(!X11_DEAD.load(Ordering::SeqCst));
+        assert_eq!(unsafe { io_error(ours) }, 0);
+        assert!(X11_DEAD.load(Ordering::SeqCst), "our connection is marked dead");
+        assert_eq!(SEEN.load(Ordering::SeqCst), 0x2000, "the game's handler never sees it");
+        X11_DEAD.store(false, Ordering::SeqCst);
+        X11_DISPLAY.store(std::ptr::null_mut(), Ordering::SeqCst);
+        PREVIOUS_IO_ERROR.store(0, Ordering::SeqCst);
     }
 }

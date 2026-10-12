@@ -986,8 +986,9 @@ that:
 - **Captures while holding.** `shmctl capture` and `capture --frames N` are taken by the present hook
   while frames are held (they used to stay pending): the swapchain image is read back after the
   application's present waits (relayed), and each pair's original and composited are both the
-  presented frame. The one-shot request becomes a series of one frame
-  (`captures/series-<ms>/000000-{original,composited}.png`).
+  presented frame. The one-shot is written as `captures/<ms>-{original,composited}.png`, and its
+  outcome says both images are the presented frame. With `NEURAL_FORGE_PREUPSCALE=dump` the one-shot
+  is the dump's instead (it writes DLSS's input), never both.
 - **Logs.** The paper-white line only prints in model and roundtrip. Each 300-hold summary ends with
   `holds_per_s=` (the window's rate), which `scripts/bench-report.py` reports as "held before
   upscaler/s" instead of the post path's "composited/s" (which then only counts loading screens).

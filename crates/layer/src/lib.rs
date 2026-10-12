@@ -175,23 +175,53 @@ fn copy_is_live(path: &str) -> bool {
     live
 }
 
-/// Latched by [`note_vk`] the first time a layer-issued Vulkan call reports `VK_ERROR_DEVICE_LOST`.
-/// After that every call fails the same way, so the layer takes the fail-open path directly:
-/// present untouched, submit nothing, log nothing more.
-static DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// The devices a layer-issued Vulkan call reported `VK_ERROR_DEVICE_LOST` on ([`note_vk`]). After that
+/// every call on that device fails the same way, so the layer takes the fail-open path there directly:
+/// present untouched, submit nothing, log nothing more. Another device of the process (a second
+/// GPU, or a device the game created after the loss) is not affected.
+static LOST_DEVICES: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
+/// Whether any device was lost: what the per-present and per-submit checks read first, a relaxed load.
+static ANY_DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-pub(crate) fn device_lost() -> bool {
-    DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed)
+/// Whether `device` reported `VK_ERROR_DEVICE_LOST`.
+pub(crate) fn device_lost(device: vk::Device) -> bool {
+    ANY_DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed) && LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner()).contains(&device)
 }
 
-/// Passes a Vulkan result through unchanged, latching the layer inert on `DEVICE_LOST`.
-pub(crate) fn note_vk<T>(result: ash::prelude::VkResult<T>) -> ash::prelude::VkResult<T> {
-    if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) && !DEVICE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        crate::log!("[layer] VK_ERROR_DEVICE_LOST; layer inert from here on");
-        crate::logging::flush();
-        // Once, with the latch: the channel's `device_lost_at` and the state log say it without a log.
-        crate::shm::note_device_lost();
-        crate::event!(neural_forge_protocol::state_log::DEVICE_LOST, "VK_ERROR_DEVICE_LOST; the layer is inert from here on");
+/// Whether any device of this process was lost (the channel's session record, `device_lost_at`).
+pub(crate) fn any_device_lost() -> bool {
+    ANY_DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// A destroyed device's handle may be reused by the next one: it starts unlatched.
+pub(crate) fn forget_lost_device(device: vk::Device) {
+    if any_device_lost() {
+        LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner()).retain(|&d| d != device);
+    }
+}
+
+/// Passes a Vulkan result of a call on `device` through unchanged, latching the layer inert on that
+/// device on `DEVICE_LOST`.
+pub(crate) fn note_vk<T>(device: vk::Device, result: ash::prelude::VkResult<T>) -> ash::prelude::VkResult<T> {
+    if matches!(result, Err(vk::Result::ERROR_DEVICE_LOST)) {
+        let first_of_device = {
+            let mut lost = LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
+            let first = !lost.contains(&device);
+            if first {
+                lost.push(device);
+            }
+            first
+        };
+        let first_of_process = !ANY_DEVICE_LOST.swap(true, std::sync::atomic::Ordering::Relaxed);
+        if first_of_device {
+            crate::log!("[layer] VK_ERROR_DEVICE_LOST on device {:#x}; the layer is inert on it from here on", vk::Handle::as_raw(device));
+            crate::logging::flush();
+        }
+        if first_of_process {
+            // Once, with the first loss: the channel's `device_lost_at` and the state log say it without a log.
+            crate::shm::note_device_lost();
+            crate::event!(neural_forge_protocol::state_log::DEVICE_LOST, "VK_ERROR_DEVICE_LOST; the layer is inert from here on");
+        }
     }
     result
 }
@@ -218,7 +248,7 @@ pub(crate) const FENCE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::
 /// name, plus a full breadcrumb dump, the first time one of these waits actually times
 /// out -- so a real occurrence is diagnosable ("this site stalled, and here is what led
 /// up to it") instead of indistinguishable from any other Vulkan error.
-pub(crate) fn note_fence_wait(result: ash::prelude::VkResult<()>, site: &'static str) -> ash::prelude::VkResult<()> {
+pub(crate) fn note_fence_wait(device: vk::Device, result: ash::prelude::VkResult<()>, site: &'static str) -> ash::prelude::VkResult<()> {
     crate::breadcrumbs::mark(site);
     if matches!(result, Err(vk::Result::TIMEOUT)) {
         static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -235,7 +265,7 @@ pub(crate) fn note_fence_wait(result: ash::prelude::VkResult<()>, site: &'static
             );
         }
     }
-    note_vk(result)
+    note_vk(device, result)
 }
 
 /// Why this process's device cannot run the network (`neural_forge_native::device_extend`'s refusal),
@@ -541,6 +571,7 @@ impl Drop for NeuralForgeInstanceHooks {
     fn drop(&mut self) {
         if let Some(ctx) = &self.ctx {
             let handle = ctx.instance.handle();
+
             PHYSICAL_DEVICE_INSTANCES.lock().unwrap().retain(|_, owner| owner.instance.handle() != handle);
         }
     }
@@ -795,9 +826,11 @@ impl Layer for NeuralForgeLayer {
     fn manifest() -> LayerManifest {
         let mut manifest = LayerManifest::default();
         manifest.name = LAYER_NAME;
-        manifest.spec_version = vk::API_VERSION_1_1;
+        // What `vkEnumerate*LayerProperties` reports: the same as the installed manifest
+        // (`data/neural_forge_layer.json`), checked by `manifest_tests`.
+        manifest.spec_version = vk::make_api_version(0, 1, 3, 277);
         manifest.implementation_version = 1;
-        manifest.description = "NeuralForge neural rendering injection layer (Linux side)";
+        manifest.description = "Neural Forge neural rendering injection layer (Linux side)";
         manifest
     }
 
@@ -827,6 +860,7 @@ impl Layer for NeuralForgeLayer {
         instance: Arc<ash::Instance>,
         next_get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
     ) -> Self::InstanceInfoContainer {
+        
         // Resolve below this layer: the physical-device handle supplied by the
         // framework belongs to that chain, not the loader's outer trampoline.
         let surface_caps = unsafe {
@@ -1009,13 +1043,19 @@ mod device_lost_tests {
     use super::*;
 
     #[test]
-    fn note_vk_passes_results_through_and_latches_only_device_lost() {
-        assert_eq!(note_vk::<()>(Ok(())), Ok(()));
-        assert_eq!(note_vk::<()>(Err(vk::Result::ERROR_OUT_OF_DATE_KHR)), Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
-        assert!(!device_lost(), "an ordinary error must not latch the layer inert");
-        assert_eq!(note_vk::<u32>(Err(vk::Result::ERROR_DEVICE_LOST)), Err(vk::Result::ERROR_DEVICE_LOST));
-        assert!(device_lost());
-        DEVICE_LOST.store(false, std::sync::atomic::Ordering::Relaxed); // other tests share the process
+    fn note_vk_passes_results_through_and_latches_only_the_lost_device() {
+        use ash::vk::Handle;
+        // Handles no other test uses; the latch is process-wide state.
+        let (lost, other) = (vk::Device::from_raw(0xdead_0001), vk::Device::from_raw(0xdead_0002));
+        assert_eq!(note_vk::<()>(lost, Ok(())), Ok(()));
+        assert_eq!(note_vk::<()>(lost, Err(vk::Result::ERROR_OUT_OF_DATE_KHR)), Err(vk::Result::ERROR_OUT_OF_DATE_KHR));
+        assert!(!device_lost(lost), "an ordinary error must not latch the layer inert");
+        assert_eq!(note_vk::<u32>(lost, Err(vk::Result::ERROR_DEVICE_LOST)), Err(vk::Result::ERROR_DEVICE_LOST));
+        assert!(device_lost(lost));
+        assert!(!device_lost(other), "another device of the process keeps working");
+        assert!(any_device_lost());
+        forget_lost_device(lost);
+        assert!(!device_lost(lost), "a destroyed device's handle starts unlatched");
     }
 
     #[test]
@@ -1180,5 +1220,29 @@ mod extra_queue_tests {
         assert_eq!(unsafe { std::slice::from_raw_parts(q.infos[1].p_queue_priorities, 2) }, &[1.0, 1.0]);
         // No graphics family requested: nothing to add beside.
         assert!(extra_queues(&families, &app[1..], 1).is_none());
+    }
+}
+
+#[cfg(test)]
+mod manifest_tests {
+    use super::*;
+
+    /// The layer properties the layer reports itself and the manifest the loader reads agree:
+    /// name, API version, implementation version and description.
+    #[test]
+    fn the_reported_layer_properties_match_the_installed_manifest() {
+        let json = include_str!("../../../data/neural_forge_layer.json");
+        let field = |key: &str| {
+            let at = json.find(&format!("\"{key}\"")).unwrap_or_else(|| panic!("{key} in the manifest"));
+            let rest = &json[at + key.len() + 2..];
+            let start = rest.find('"').unwrap() + 1;
+            rest[start..start + rest[start..].find('"').unwrap()].to_string()
+        };
+        let manifest = <NeuralForgeLayer as Layer>::manifest();
+        assert_eq!(field("name"), manifest.name);
+        let v = manifest.spec_version;
+        assert_eq!(field("api_version"), format!("{}.{}.{}", vk::api_version_major(v), vk::api_version_minor(v), vk::api_version_patch(v)));
+        assert_eq!(field("implementation_version"), manifest.implementation_version.to_string());
+        assert_eq!(field("description"), manifest.description);
     }
 }

@@ -4,9 +4,9 @@
 //!
 //! `status`/`set`/`toggle` operate on the setting surface
 //! `neural_forge_protocol::ShmHeader::persisted_settings`/`apply_persisted_setting` define (a value
-//! changed here is saved to `config.ini`, as a change from the GUI is), plus a few fields that are not
-//! user-facing settings: `debug_view` and `capture_request` in particular, which make this the tool
-//! for confirming the composition visually.
+//! changed here is saved to `config.ini`, as a change from the GUI is). `capture` asks the game's
+//! layer for a capture (`neural_forge_protocol::capture`) and reports what became of it, which
+//! makes this the tool for confirming the composition visually.
 
 use neural_forge_protocol::ShmHeader;
 use std::sync::atomic::Ordering;
@@ -17,45 +17,34 @@ pub fn usage() {
          \x20 status              print every setting and live status field\n\
          \x20 set <name> <value>  set one setting (float fields take a decimal value)\n\
          \x20 toggle <name>       flip a 0/1-valued setting\n\
-         \x20 capture [view]      dump the next frame's original+composited PNGs\n\
-         \x20                     (see neural_forge_layer::dump); optional debug_view 0-3\n\
-         \x20 capture --frames N  dump the next N presented frames (N > 1) as a series of\n\
-         \x20                     original+composited pairs, whichever present path runs\n\
-         \x20                     (see neural_forge_layer::series)\n\
+         \x20 capture [--frames N] [--view V]\n\
+         \x20                     save the next presented frame (or the next N, at most\n\
+         \x20                     {max_frames}, as a series-<ms>/ folder) as original+composited\n\
+         \x20                     PNGs under $XDG_DATA_HOME/neural-forge/captures/, and wait\n\
+         \x20                     for the game's layer to say what it wrote; --view sets\n\
+         \x20                     debug_view ({view_min}-{view_max}) first\n\
+         \x20 capture --cancel    stop the capture the channel is waiting on or running\n\
          \x20 dump-cache [--holds K]  dump the next K model-mode holds before the upscaler\n\
          \x20                     (default 16, at most 64) to $XDG_DATA_HOME/neural-forge/\n\
          \x20                     captures/preupscale-cache-<ms>/ (docs/ARCHITECTURE.md)\n\
          \x20 reset               reset every setting to its default; preserves the\n\
          \x20                     live layer session (see ShmHeader::reset_persisted_settings)\n\n\
          Opens config.ini's shm= channel, else $NEURAL_FORGE_SHM, else the default under\n\
-         /tmp/neural-forge-$UID -- the same one the layer uses."
+         /tmp/neural-forge-$UID -- the same one the layer uses.",
+        max_frames = neural_forge_protocol::capture::MAX_FRAMES,
+        view_min = debug_view_bounds().0,
+        view_max = debug_view_bounds().1,
     );
-}
-
-/// Extra fields worth real `set`/`toggle` access beyond what `persisted_settings`
-/// covers. Just `capture_request` now -- `debug_view`/`apply_model`/`compare_mode`/
-/// `hold_frame` moved into `persisted_settings` itself on 2026-09-10 (so a GUI change
-/// to any of them now survives a reboot too), leaving this for the one field that
-/// genuinely isn't a persisted preference: a one-shot trigger, not a setting.
-fn extra_field<'a>(header: &'a ShmHeader, name: &str) -> Option<(&'a std::sync::atomic::AtomicU32, bool)> {
-    Some(match name {
-        "capture_request" => (&header.capture_request, false),
-        _ => return None,
-    })
 }
 
 fn cmd_status(header: &ShmHeader) {
     print!("{}", neural_forge_supervisor::shm_status::status_text(header));
 }
 
-/// Shared by `set`/`toggle`: resolves `name` against the persisted settings first,
-/// then the extra live-status fields, returning whether it's float-valued and its
-/// current raw bits -- `None` if `name` isn't recognized by either.
+/// Shared by `set`/`toggle`: resolves `name` against the persisted settings, returning whether it's
+/// float-valued and its current raw bits -- `None` if `name` isn't one.
 fn resolve(header: &ShmHeader, name: &str) -> Option<(bool, u32)> {
-    if let Some((_, is_float, bits)) = header.persisted_settings().into_iter().find(|(n, ..)| *n == name) {
-        return Some((is_float, bits));
-    }
-    extra_field(header, name).map(|(field, is_float)| (is_float, field.load(Ordering::Relaxed)))
+    header.persisted_settings().into_iter().find(|(n, ..)| *n == name).map(|(_, is_float, bits)| (is_float, bits))
 }
 
 /// Writes one setting and bumps the sequence numbers the layer watches. The
@@ -67,11 +56,6 @@ fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
             return false;
         }
         header.tuning_seq.fetch_add(1, Ordering::Relaxed);
-        header.control_seq.fetch_add(1, Ordering::Relaxed);
-        return true;
-    }
-    if let Some((field, _)) = extra_field(header, name) {
-        field.store(bits, Ordering::Relaxed);
         header.control_seq.fetch_add(1, Ordering::Relaxed);
         return true;
     }
@@ -130,40 +114,129 @@ fn cmd_toggle(header: &ShmHeader, name: &str) -> bool {
     true
 }
 
-fn cmd_capture(header: &ShmHeader, args: &[String]) -> bool {
-    let mut view = None;
-    let mut frames = 1u32;
+/// `debug_view`'s range, from `SETTING_BOUNDS`.
+fn debug_view_bounds() -> (u32, u32) {
+    neural_forge_protocol::setting_bounds("debug_view").map_or((0, 0), |(min, max)| (min as u32, max as u32))
+}
+
+/// What `capture` was asked to do.
+#[derive(Debug, PartialEq, Eq)]
+enum CaptureArgs {
+    Take { frames: u32, view: Option<u32> },
+    Cancel,
+}
+
+fn capture_args(args: &[String]) -> Result<CaptureArgs, String> {
+    let (mut frames, mut view, mut cancel) = (None, None, false);
     let mut it = args.iter();
     while let Some(arg) = it.next() {
-        if arg == "--frames" {
-            match it.next().and_then(|v| v.parse::<u32>().ok()).filter(|&n| n >= 1) {
-                Some(n) => frames = n,
-                None => {
-                    eprintln!("shmctl capture: --frames takes a count of at least 1");
-                    return false;
-                }
+        match arg.as_str() {
+            "--frames" if frames.is_none() => {
+                let max = neural_forge_protocol::capture::MAX_FRAMES;
+                let n = it.next().and_then(|v| v.parse::<u32>().ok()).filter(|n| (1..=max).contains(n));
+                frames = Some(n.ok_or_else(|| format!("shmctl capture: --frames takes a count from 1 to {max}"))?);
             }
-        } else if view.is_none() {
-            view = Some(arg.as_str());
-        } else {
-            eprintln!("shmctl capture: unexpected argument {arg:?}");
+            "--view" if view.is_none() => {
+                let (min, max) = debug_view_bounds();
+                let v = it.next().and_then(|v| v.parse::<u32>().ok()).filter(|v| (min..=max).contains(v));
+                view = Some(v.ok_or_else(|| format!("shmctl capture: --view takes a debug view from {min} to {max}"))?);
+            }
+            "--cancel" => cancel = true,
+            other => return Err(format!("shmctl capture: unexpected argument {other:?}")),
+        }
+    }
+    match (cancel, frames, view) {
+        (true, None, None) => Ok(CaptureArgs::Cancel),
+        (true, ..) => Err("shmctl capture: --cancel takes no other option".into()),
+        (false, frames, view) => Ok(CaptureArgs::Take { frames: frames.unwrap_or(1), view }),
+    }
+}
+
+/// How long a request may wait for a game to take it (then it is withdrawn), and how long a taken
+/// capture may go without finishing: a base, plus a second a frame for a series.
+const TAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+fn result_wait(frames: u32) -> std::time::Duration {
+    std::time::Duration::from_secs(30 + u64::from(frames))
+}
+
+/// Waits for capture `id`'s outcome: withdraws the request when no game took it within `take_wait`,
+/// gives up after `result_wait`. Prints a series' progress as it goes.
+fn wait_for_capture(header: &ShmHeader, id: u32, take_wait: std::time::Duration, result_wait: std::time::Duration) -> Result<neural_forge_protocol::capture::Outcome, String> {
+    use neural_forge_protocol::capture;
+    let start = std::time::Instant::now();
+    let mut said = 0;
+    loop {
+        if let Some(outcome) = capture::result(header).filter(|o| o.id == id) {
+            if outcome.finished() {
+                return Ok(outcome);
+            }
+            if outcome.total > 1 && outcome.done >= said + 10 {
+                said = outcome.done;
+                eprintln!("shmctl capture: {} of {} frames written", outcome.done, outcome.total);
+            }
+        }
+        let taken = capture::pending(header).is_none_or(|r| r.id != id);
+        if !taken && start.elapsed() >= take_wait && capture::cancel(header, id) == capture::Cancelled::Withdrawn {
+            return Err("no game took the capture (withdrawn): start a game with Neural Forge on and wait until it is past its loading screen".into());
+        }
+        if start.elapsed() >= result_wait {
+            return Err("the game took the capture but did not finish it in time (its log may say why); `shmctl capture --cancel` stops it".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+fn cmd_capture(header: &ShmHeader, args: &[String]) -> bool {
+    use neural_forge_protocol::capture;
+    let parsed = match capture_args(args) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            eprintln!("{e}");
+            return false;
+        }
+    };
+    let (frames, view) = match parsed {
+        CaptureArgs::Cancel => {
+            let waiting = capture::pending(header).map(|r| r.id);
+            let running = capture::result(header).filter(|o| o.state == capture::state::RUNNING).map(|o| o.id);
+            let Some(id) = waiting.or(running) else {
+                println!("shmctl capture: no capture is waiting or running");
+                return true;
+            };
+            match capture::cancel(header, id) {
+                capture::Cancelled::Withdrawn => println!("capture {id} withdrawn before a game took it"),
+                capture::Cancelled::Signalled => println!("capture {id} stops at the game's next present"),
+            }
+            return true;
+        }
+        CaptureArgs::Take { frames, view } => (frames, view),
+    };
+    if let Some(view) = view {
+        if !store(header, "debug_view", view) {
+            eprintln!("shmctl capture: debug_view was not stored");
             return false;
         }
     }
-    if let Some(view) = view {
-        let Ok(mode) = view.parse::<u32>() else {
-            eprintln!("shmctl capture: debug_view must be 0-3, got {view:?}");
+    let id = match capture::request(header, frames) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("shmctl capture: {e} (`shmctl capture --cancel` withdraws it)");
             return false;
-        };
-        header.debug_view.store(mode, Ordering::Relaxed);
+        }
+    };
+    match wait_for_capture(header, id, TAKE_WAIT, result_wait(frames)) {
+        Ok(outcome) => {
+            println!("{}", outcome.message());
+            for path in outcome.paths() {
+                println!("  {path}");
+            }
+            outcome.state == capture::state::WRITTEN
+        }
+        Err(e) => {
+            eprintln!("shmctl capture: {e}");
+            false
+        }
     }
-    header.capture_request.store(frames, Ordering::Relaxed);
-    if frames == 1 {
-        println!("capture_request set -- check $XDG_DATA_HOME/neural-forge/captures on the layer's next present");
-    } else {
-        println!("capture_request={frames} -- the next {frames} presents go to a new $XDG_DATA_HOME/neural-forge/captures/series-<ms>/");
-    }
-    true
 }
 
 /// `dump-cache [--holds K]`: the hold count it asks for, or why the arguments are wrong.
@@ -199,7 +272,7 @@ pub fn check_args(args: &[String]) -> Result<(), String> {
         Some("status" | "reset") if n == 1 => Ok(()),
         Some("set") if n == 3 => Ok(()),
         Some("toggle") if n == 2 => Ok(()),
-        Some("capture") => Ok(()),
+        Some("capture") => capture_args(&args[1..]).map(|_| ()),
         Some("dump-cache") => dump_cache_holds(&args[1..]).map(|_| ()),
         Some(sub @ ("status" | "reset" | "set" | "toggle")) => Err(format!("wrong number of arguments for shmctl {sub}")),
         Some(other) => Err(format!("unknown shmctl subcommand {other:?}")),
@@ -296,18 +369,8 @@ mod tests {
     }
 
     #[test]
-    fn resolve_finds_an_extra_field() {
-        let header = ShmHeader::default();
-        let (is_float, bits) = resolve(&header, "capture_request").expect("capture_request should resolve");
-        assert!(!is_float);
-        assert_eq!(bits, 0);
-    }
-
-    #[test]
     fn resolve_finds_debug_view_via_persisted_settings() {
-        // debug_view/apply_model/compare_mode/hold_frame moved into
-        // ShmHeader::persisted_settings on 2026-09-10 -- confirms this module's
-        // `extra_field` no longer needs (and no longer has) a special case for them.
+        // debug_view/apply_model/compare_mode/hold_frame are persisted settings.
         let header = ShmHeader::default();
         let (is_float, _) = resolve(&header, "debug_view").expect("debug_view should resolve");
         assert!(!is_float);
@@ -337,21 +400,66 @@ mod tests {
     }
 
     #[test]
-    fn store_writes_through_extra_fields() {
+    fn capture_arguments_are_bounded() {
+        let a = |s: &str| s.split_whitespace().map(String::from).collect::<Vec<_>>();
+        let max = neural_forge_protocol::capture::MAX_FRAMES;
+        assert_eq!(capture_args(&a("")), Ok(CaptureArgs::Take { frames: 1, view: None }));
+        assert_eq!(capture_args(&a("--frames 150 --view 6")), Ok(CaptureArgs::Take { frames: 150, view: Some(6) }));
+        assert_eq!(capture_args(&a(&format!("--frames {max}"))), Ok(CaptureArgs::Take { frames: max, view: None }));
+        for bad in ["--frames 0", &format!("--frames {}", max + 1), "--frames", "--view 7", "--view x", "3", "--frames 2 --frames 3", "--cancel --frames 2"] {
+            assert!(capture_args(&a(bad)).is_err(), "{bad}");
+            assert!(check_args(&a(&format!("capture {bad}"))).is_err(), "{bad}");
+        }
+        assert_eq!(capture_args(&a("--cancel")), Ok(CaptureArgs::Cancel));
+        // A refused view stores nothing.
         let header = ShmHeader::default();
-        assert!(store(&header, "capture_request", 1));
-        assert_eq!(header.capture_request.load(Ordering::Relaxed), 1);
+        header.init_defaults();
+        assert!(!cmd_capture(&header, &a("--view 9")));
+        assert_eq!(header.debug_view.load(Ordering::Relaxed), 0);
+        assert_eq!(header.capture_request.load(Ordering::Relaxed), 0, "and asks for nothing");
+    }
+
+    /// The request goes out with its own id, the layer's outcome for that id is what is reported, and
+    /// a request no game takes is withdrawn rather than left to fire on a game started later.
+    #[test]
+    fn capture_waits_for_its_own_outcome_and_withdraws_an_untaken_request() {
+        use neural_forge_protocol::capture;
+        let header = std::sync::Arc::new(ShmHeader::default());
+        let id = capture::request(&header, 2).unwrap();
+        let layer = {
+            let header = header.clone();
+            std::thread::spawn(move || {
+                // Stands in for the game's layer: takes the request, publishes another id's outcome
+                // first (ignored), then this one's.
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                let request = loop {
+                    if let Some(r) = capture::take(&header, |_| true) {
+                        break r;
+                    }
+                    assert!(std::time::Instant::now() < deadline);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                };
+                capture::publish(&header, &capture::Outcome { id: request.id + 1, state: capture::state::WRITTEN, ..Default::default() });
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                capture::publish(&header, &capture::Outcome { id: request.id, state: capture::state::WRITTEN, done: 2, total: 2, composed: 2, paths: "/c/series-1".into(), ..Default::default() });
+            })
+        };
+        let outcome = wait_for_capture(&header, id, std::time::Duration::from_secs(5), std::time::Duration::from_secs(10)).unwrap();
+        layer.join().unwrap();
+        assert_eq!((outcome.id, outcome.done, outcome.paths.as_str()), (id, 2, "/c/series-1"));
+
+        let id = capture::request(&header, 1).unwrap();
+        let err = wait_for_capture(&header, id, std::time::Duration::from_millis(50), std::time::Duration::from_secs(10)).unwrap_err();
+        assert!(err.contains("no game took"), "{err}");
+        assert_eq!(capture::pending(&header), None, "withdrawn: nothing waits to fire on the next game");
     }
 
     #[test]
-    fn cmd_capture_sets_one_by_default_and_n_with_frames() {
+    fn capture_cancel_withdraws_a_waiting_request() {
         let header = ShmHeader::default();
-        assert!(cmd_capture(&header, &[]));
-        assert_eq!(header.capture_request.load(Ordering::Relaxed), 1);
-        assert!(cmd_capture(&header, &["--frames".to_string(), "150".to_string()]));
-        assert_eq!(header.capture_request.load(Ordering::Relaxed), 150);
-        assert!(!cmd_capture(&header, &["--frames".to_string(), "0".to_string()]));
-        assert!(!cmd_capture(&header, &["--frames".to_string()]));
+        neural_forge_protocol::capture::request(&header, 3).unwrap();
+        assert!(cmd_capture(&header, &["--cancel".to_string()]));
+        assert_eq!(header.capture_request.load(Ordering::Relaxed), 0);
     }
 
     #[test]

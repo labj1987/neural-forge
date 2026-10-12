@@ -227,11 +227,16 @@ python3 scripts/agreement.py --runs ref1:test1 ref2:test2 ref3:test3
 Two synchronous runs may not score exactly 1.0 if the model's answer to the same frame varies.
 Compare one synchronous run against another first: that score is the ceiling for any other path.
 
-**Capturing frames from a game.** `neural-forge-cli shmctl capture --frames N` captures the next N
-presented frames as `~/.local/share/neural-forge/captures/series-<ms>/<seq>-{original,composited}.png`
-plus an `index.tsv`. `capture` with no `--frames` is a one-shot dump. While the model runs before
-the upscaler there is no separate original (the enhanced frame went through DLSS), so both images
-of each pair are the presented frame.
+**Capturing frames from a game.** `neural-forge-cli shmctl capture --frames N` (N at most 1000)
+captures the next N presented frames as
+`~/.local/share/neural-forge/captures/series-<ms>/<seq>-{original,composited}.png` plus an
+`index.tsv`. `capture` with no `--frames` saves the next frame as `captures/<ms>-original.png` and
+`<ms>-composited.png`. Either way the frame is read back just before and just after the layer's own
+composition, so the pair is exactly what the live path presented. The command waits for the game's
+layer to say what it wrote (the paths, and whether the effect composed the frames, or why not); a
+request no game takes within 5 s is withdrawn. `shmctl capture --cancel` stops a running series.
+While the model runs before the upscaler there is no separate original (the enhanced frame went
+through DLSS), so both images of each pair are the presented frame, and the outcome says so.
 
 ## 5. Diagnosing the model before the upscaler
 
@@ -367,7 +372,8 @@ The `# live status` block:
 | `layer_capture_gpu_ms`, `layer_compose_gpu_ms` | The layer's own GPU time from timestamps (after the upscaler). |
 | `preupscale_state` | 0 off, 1 waiting for DLSS input, 2 holding. |
 | `preupscale_extent`, `preupscale_hold_ms`, `preupscale_misses` | DLSS's render size, the last hold's CPU time, and holds whose answer did not make it. |
-| `layer_measured_white`, `layer_composition_up`, `capture_request` | The white meter, whether the compose is up, a pending capture. |
+| `layer_measured_white`, `layer_composition_up` | The white meter, whether the compose is up. |
+| `capture_request`, `capture_result`, `capture_path` | A capture waiting for the game, and what became of the latest one: written, failed or cancelled, why, and its files. |
 
 The `# settings` block lists every live setting by name; `shmctl set NAME VALUE` and
 `shmctl toggle NAME` change them.

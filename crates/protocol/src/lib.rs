@@ -29,6 +29,7 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod cache_dump;
+pub mod capture;
 pub mod enums;
 mod header;
 #[cfg(unix)]
@@ -66,11 +67,13 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// server still writes from `helper_*` to `server_*`; v16 appends `device_lost_at`, so the GUI and
 /// `doctor` can say the GPU device was lost without a log; v17 appends `preupscale_dump_request`, the
 /// K-hold pre-upscaler cache dump's trigger, and the edit cache's status: its refresh and cached hold
-/// counts, the last cached hold's rejected share and the cache passes' GPU time).
+/// counts, the last cached hold's rejected share and the cache passes' GPU time; v18 makes
+/// `capture_request` carry a request id and appends the capture result (`capture`): what became of
+/// each request, why, and where its files are).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 17;
+pub const SHM_VERSION: u32 = 18;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;

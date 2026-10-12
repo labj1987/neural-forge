@@ -1467,6 +1467,11 @@ fn open_folder(dir: &std::path::Path, parent: Option<gtk4::Window>, toasts: &adw
     });
 }
 
+/// How long a capture request may wait for a game to take it before the GUI withdraws it, and how
+/// long a taken one-shot may take to be written.
+const CAPTURE_TAKE_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
+const CAPTURE_RESULT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// What the capture button's row says, from the channel: whether frames are held before the upscaler
 /// now, where a capture has no frame without the model's edit (see the button's tooltip).
 fn capture_subtitle(holding: bool) -> &'static str {
@@ -1488,14 +1493,13 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
     capture_row.set_subtitle(capture_subtitle(false));
     let capture_button = gtk4::Button::with_label("Capture");
     capture_button.set_valign(gtk4::Align::Center);
-    // `neural_forge_layer::capture::run` serves the request after the upscaler; while frames are held
-    // before it, `neural_forge_layer::series::take_request` serves it as a one-frame series instead.
+    // The game's layer serves the request (`neural_forge_layer::series`) and publishes what became of
+    // it (`neural_forge_protocol::capture`), which the toast reports.
     capture_button.set_tooltip_text(Some(
-        "After the upscaler, the next frame is saved as <time>-original.png (the game's frame) and \
-         <time>-composited.png (Neural Forge's result). While the model runs before the upscaler (a DLSS game), \
-         the layer has no frame without the model's edit when the game presents, so both images are the \
-         presented frame, in a series-<time> folder. A game that draws into its swapchain with a copy cannot \
-         be captured after the upscaler; the layer's log says so.",
+        "Saves the next frame the game presents as <time>-original.png (the game's frame) and \
+         <time>-composited.png (what Neural Forge presented). While the model runs before the upscaler \
+         (a DLSS game), the layer has no frame without the model's edit when the game presents, so both \
+         images are the presented frame. HDR and 10-bit games cannot be captured.",
     ));
     capture_row.add_suffix(&capture_button);
     group.add(&capture_row);
@@ -1518,27 +1522,69 @@ fn build_capture_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapp
     {
         let shm = std::sync::Arc::clone(shm);
         let toasts = toasts.clone();
+        // The request this window is waiting for: its id and when it was made.
+        let waiting: std::rc::Rc<std::cell::Cell<Option<(u32, std::time::Instant)>>> = std::rc::Rc::default();
         capture_button.connect_clicked(move |button| {
+            use neural_forge_protocol::capture;
             let header = shm.header();
-            if header.capture_request.load(Ordering::Relaxed) != 0 {
-                toasts.add_toast(adw::Toast::new("A capture is already waiting for the game's next frame"));
+            // A second click while waiting cancels.
+            if let Some((id, _)) = waiting.take() {
+                button.set_label("Capture");
+                if capture::cancel(header, id) == capture::Cancelled::Withdrawn {
+                    toasts.add_toast(adw::Toast::new("Capture cancelled"));
+                }
                 return;
             }
-            header.capture_request.store(1, Ordering::Relaxed);
-            // The layer clears the request when it has taken the frame.
+            let id = match capture::request(header, 1) {
+                Ok(id) => id,
+                Err(e) => {
+                    toasts.add_toast(adw::Toast::new(&glib::markup_escape_text(&format!("Not captured: {e}"))));
+                    return;
+                }
+            };
+            waiting.set(Some((id, std::time::Instant::now())));
+            button.set_label("Cancel");
             let shm = std::sync::Arc::clone(&shm);
             let toasts = toasts.clone();
             let captures_dir = captures_dir.clone();
-            let parent = button.root().and_downcast::<gtk4::Window>();
-            glib::timeout_add_seconds_local_once(2, move || {
-                if shm.header().capture_request.load(Ordering::Relaxed) != 0 {
-                    toasts.add_toast(adw::Toast::new("The capture is waiting for a game to present a frame"));
-                    return;
+            let waiting = waiting.clone();
+            let button = button.clone();
+            glib::timeout_add_local(std::time::Duration::from_millis(250), move || {
+                let Some((id, since)) = waiting.get() else { return glib::ControlFlow::Break };
+                let header = shm.header();
+                let done = |message: String, folder: bool| {
+                    waiting.set(None);
+                    button.set_label("Capture");
+                    let toast = adw::Toast::builder().title(glib::markup_escape_text(&message)).timeout(if folder { 6 } else { 8 }).build();
+                    if folder {
+                        toast.set_button_label(Some("Open folder"));
+                        let parent = button.root().and_downcast::<gtk4::Window>();
+                        let toasts_for_button = toasts.clone();
+                        let dir = captures_dir.clone();
+                        toast.connect_button_clicked(move |_| open_folder(&dir, parent.clone(), &toasts_for_button));
+                    }
+                    toasts.add_toast(toast);
+                    glib::ControlFlow::Break
+                };
+                if let Some(outcome) = capture::result(header).filter(|o| o.id == id && o.finished()) {
+                    let written = outcome.state == capture::state::WRITTEN;
+                    return done(outcome.message(), written);
                 }
-                let toast = adw::Toast::builder().title("Captured").button_label("Open folder").build();
-                let toasts_for_button = toasts.clone();
-                toast.connect_button_clicked(move |_| open_folder(&captures_dir, parent.clone(), &toasts_for_button));
-                toasts.add_toast(toast);
+                let taken = capture::pending(header).is_none_or(|r| r.id != id);
+                let elapsed = since.elapsed();
+                if !taken && elapsed >= CAPTURE_TAKE_WAIT {
+                    // Nobody took it: withdrawn, so it can never fire on a game started later.
+                    if capture::cancel(header, id) == capture::Cancelled::Withdrawn {
+                        return done(
+                            "Not captured: no game took the capture. Start a game with Neural Forge on and wait until it is past its loading screen".into(),
+                            false,
+                        );
+                    }
+                }
+                if elapsed >= CAPTURE_RESULT_WAIT {
+                    return done("Not captured: the game did not finish the capture (its log may say why)".into(), false);
+                }
+                glib::ControlFlow::Continue
             });
         });
     }

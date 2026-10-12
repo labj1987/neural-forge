@@ -1,51 +1,54 @@
-//! Real implementation of `neural_forge_protocol::ShmHeader::capture_request`: "writes one
-//! set of matched before/after frames per session when the layer next presents" --
-//! defined in the protocol from early on but never acted on anywhere until now.
-//! Doubles as the tool this project first used to visually confirm
-//! `composition::apply`'s output looks right at all, rather than just "doesn't crash
-//! and the round trip reports success" (see docs/history/development-before-neuralforge.md).
+//! Where captures go, and how a capture's PNGs are written (`crate::series` writes the one-shot pair
+//! and frame series; the pre-upscaler dump writes its preview through [`write_png`] too).
 
 use std::io::BufWriter;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+/// `$XDG_DATA_HOME/neural-forge/captures`, else `$HOME/.local/share/neural-forge/captures`. A
+/// relative `XDG_DATA_HOME` is invalid (the XDG base directory spec says to ignore it), as is a
+/// relative `HOME`: neither may decide where files land relative to the game's working directory.
 pub(crate) fn captures_dir() -> PathBuf {
-    let base = std::env::var("XDG_DATA_HOME").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| {
-        format!("{}/.local/share", std::env::var("HOME").unwrap_or_else(|_| "/".to_string()))
-    });
-    PathBuf::from(base).join("neural-forge").join("captures")
+    let xdg = neural_forge_protocol::env::var("XDG_DATA_HOME");
+    let home = neural_forge_protocol::env::var("HOME");
+    captures_dir_from(xdg.as_deref(), home.as_deref())
 }
 
-/// Writes `original`/`composited` (both `RGBA8`, `width`x`height`, same length) as a
-/// matched pair of PNGs under `captures_dir()`, named by the current time so repeated
-/// requests never collide. Fails silently (logs and returns) on any I/O error -- a
-/// failed debug dump must never be a reason to skip presenting the real frame, the
-/// same fail-open discipline `capture::run`'s own caller already applies to it.
-pub fn write_pair(original: &[u8], composited: &[u8], width: u32, height: u32, bgr_order: bool) {
-    let dir = captures_dir();
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        crate::log!("[dump] failed to create {}: {}", dir.display(), e);
-        return;
+fn captures_dir_from(xdg_data_home: Option<&str>, home: Option<&str>) -> PathBuf {
+    let absolute = |s: &&str| Path::new(s).is_absolute();
+    let base = match (xdg_data_home.filter(absolute), home.filter(absolute)) {
+        (Some(xdg), _) => PathBuf::from(xdg),
+        (None, Some(home)) => Path::new(home).join(".local/share"),
+        (None, None) => PathBuf::from("/tmp"),
+    };
+    base.join("neural-forge").join("captures")
+}
+
+/// Writes `rgba` (`width`x`height`, 4 bytes a pixel) as a PNG at `path`. The file appears complete or
+/// not at all: it is written to a temporary name beside `path`, finished (the PNG's last chunk) and
+/// flushed, then renamed into place, so an error part-way (a full disk) is reported here and never
+/// leaves a truncated PNG under the final name.
+///
+/// `fast` picks the PNG encoder's fastest compression (a series writes a pair per presented frame and
+/// must keep up); the one-shot keeps the default.
+pub(crate) fn write_png(path: &Path, rgba: &[u8], width: u32, height: u32, bgr_order: bool, fast: bool) -> std::io::Result<()> {
+    let name = path.file_name().ok_or_else(|| std::io::Error::other("no file name"))?.to_string_lossy();
+    let temp = path.with_file_name(format!(".{name}.{}.part", std::process::id()));
+    let result = encode_png(&temp, rgba, width, height, bgr_order, fast).and_then(|()| std::fs::rename(&temp, path));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
     }
-    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-    let ok_original = write_png(&dir.join(format!("{stamp}-original.png")), original, width, height, bgr_order, false);
-    let ok_composited = write_png(&dir.join(format!("{stamp}-composited.png")), composited, width, height, bgr_order, false);
-    crate::log!(
-        "[dump] capture_request: wrote {stamp}-{{original,composited}}.png under {} (original={} composited={})",
-        dir.display(),
-        ok_original,
-        ok_composited
-    );
+    result
 }
 
-/// `fast` picks the PNG encoder's fastest compression (a `crate::series` capture writes a
-/// pair per presented frame and must keep up); the one-shot dump keeps the default.
-pub(crate) fn write_png(path: &std::path::Path, rgba: &[u8], width: u32, height: u32, bgr_order: bool, fast: bool) -> bool {
-    let Ok(file) = std::fs::File::create(path) else { return false };
+fn encode_png(path: &Path, rgba: &[u8], width: u32, height: u32, bgr_order: bool, fast: bool) -> std::io::Result<()> {
+    if rgba.len() as u64 != u64::from(width) * u64::from(height) * 4 {
+        return Err(std::io::Error::other("pixel data does not match the size"));
+    }
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
     let mut encoder = png::Encoder::new(BufWriter::new(file), width, height);
     // Forced fully opaque, on purpose: this is `RGBA8` straight off a real present
-    // path (an opaque swapchain's own image, or the model server's `Output` resource), and
-    // neither source is under any obligation to write a meaningful alpha channel --
-    // a real opaque-composite-mode present never reads it either. Writing the real
+    // path (an opaque swapchain's own image), which is under no obligation to write a meaningful
+    // alpha channel -- a real opaque-composite-mode present never reads it either. Writing the real
     // (frequently 0) alpha through unmodified would make a real, correctly-composited
     // frame render as fully transparent in any normal PNG viewer, which looks exactly
     // like -- and was once genuinely mistaken here for -- a solid-white broken answer.
@@ -68,6 +71,54 @@ pub(crate) fn write_png(path: &std::path::Path, rgba: &[u8], width: u32, height:
     if fast {
         encoder.set_compression(png::Compression::Fast);
     }
-    let Ok(mut writer) = encoder.write_header() else { return false };
-    writer.write_image_data(&opaque).is_ok()
+    let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
+    writer.write_image_data(&opaque).map_err(std::io::Error::other)?;
+    // `finish` writes the closing chunk and flushes the buffered file, reporting either error;
+    // dropping the writer instead would swallow both.
+    writer.finish().map_err(std::io::Error::other)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(format!("target/test-scratch/dump-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn only_absolute_base_directories_are_used() {
+        assert_eq!(captures_dir_from(Some("/x/data"), Some("/home/u")), PathBuf::from("/x/data/neural-forge/captures"));
+        assert_eq!(captures_dir_from(Some("rel/data"), Some("/home/u")), PathBuf::from("/home/u/.local/share/neural-forge/captures"), "a relative XDG_DATA_HOME is ignored");
+        assert_eq!(captures_dir_from(None, Some("/home/u")), PathBuf::from("/home/u/.local/share/neural-forge/captures"));
+        assert_eq!(captures_dir_from(Some(""), Some("relative")), PathBuf::from("/tmp/neural-forge/captures"));
+    }
+
+    #[test]
+    fn a_png_is_written_whole_and_decodes_with_swapped_channels_and_opaque_alpha() {
+        let dir = scratch("png");
+        let path = dir.join("frame.png");
+        let pixels = [10u8, 20, 30, 0, 40, 50, 60, 7];
+        write_png(&path, &pixels, 2, 1, true, false).unwrap();
+        let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(&path).unwrap())).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        reader.next_frame(&mut buf).unwrap();
+        assert_eq!(buf, [30, 20, 10, 255, 60, 50, 40, 255]);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temporary file is left beside it");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_no_file_under_either_name() {
+        let dir = scratch("fail");
+        // A size the pixels do not match is refused before anything is created.
+        assert!(write_png(&dir.join("bad.png"), &[0; 7], 2, 1, false, true).is_err());
+        // A missing directory fails at the temporary file.
+        assert!(write_png(&dir.join("missing/x.png"), &[0; 8], 2, 1, false, true).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

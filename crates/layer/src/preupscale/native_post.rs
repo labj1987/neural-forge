@@ -323,6 +323,14 @@ fn serve(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalD
     let mut frames: u64 = 0;
     let mut last_request = Instant::now();
     while !quit.load(Ordering::Relaxed) && !gpu.stalled {
+        if !view.usable() {
+            // The process let the channel go (it stopped presenting): another game's layer may own
+            // it now, and its requests are not this server's. Picked up again once this process
+            // presents and takes the lease back.
+            last = Slot::ALL.map(|s| hdr.seq_req_slot(s).load(Ordering::Acquire));
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
         hdr.server_state.store(neural_forge_protocol::enums::server_state::RUNNING, Ordering::Relaxed);
         hdr.model_up.store(u32::from(loader.failed().is_none()), Ordering::Relaxed);
         for slot in Slot::ALL {
@@ -513,12 +521,12 @@ unsafe fn evaluate(
     let submitted = unsafe {
         device.reset_fences(&[gpu.fence]).and_then(|()| device.queue_submit(gpu.queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], gpu.fence))
     };
-    if crate::note_vk(submitted).is_err() {
+    if crate::note_vk(device.handle(), submitted).is_err() {
         return false;
     }
     // SAFETY: the fence was just submitted.
     let waited = unsafe { device.wait_for_fences(&[gpu.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-    if crate::note_fence_wait(waited, "native::post").is_err() {
+    if crate::note_fence_wait(device.handle(), waited, "native::post").is_err() {
         gpu.stalled = true;
         crate::log!("[native] the after-the-upscaler network frame did not finish in time; the after-the-upscaler path is not served from here on");
         return false;

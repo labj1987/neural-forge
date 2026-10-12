@@ -42,6 +42,39 @@ fn claim_primary(device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, he
     }
 }
 
+/// Whether `swapchain` holds the session's primary claim or would take it (nothing larger holds it):
+/// the swapchain a capture request is about, when it cannot be captured.
+fn would_be_primary(device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, height: u32) -> bool {
+    let guard = PRIMARY.lock().unwrap_or_else(|e| e.into_inner());
+    match &*guard {
+        Some(p) if p.device == device && p.swapchain == swapchain => true,
+        Some(p) => u64::from(width) * u64::from(height) > p.area,
+        None => true,
+    }
+}
+
+/// Whether an image's create info chains an external-memory structure: its memory is shared with
+/// another API or process, which agreed to exactly the usage the application asked for.
+fn shares_memory(info: &vk::ImageCreateInfo) -> bool {
+    let mut next = info.p_next.cast::<vk::BaseInStructure>();
+    while !next.is_null() {
+        // SAFETY: a valid create info's pNext chain is a list of valid structures starting with
+        // `sType`/`pNext`.
+        let s = unsafe { &*next };
+        if matches!(s.s_type, vk::StructureType::EXTERNAL_MEMORY_IMAGE_CREATE_INFO | vk::StructureType::EXTERNAL_MEMORY_IMAGE_CREATE_INFO_NV) {
+            return true;
+        }
+        next = s.p_next;
+    }
+    false
+}
+
+/// Whether the pre-upscaler dump (`NEURAL_FORGE_PREUPSCALE=dump`) serves one-shot capture requests:
+/// it writes DLSS's input for each one (docs/PRE_UPSCALER_DESIGN.md), and is then their one owner.
+fn dump_owns_one_shot() -> bool {
+    crate::preupscale::mode() == crate::preupscale::Mode::Dump
+}
+
 fn release_primary(device: vk::Device, swapchain: vk::SwapchainKHR) {
     let mut guard = PRIMARY.lock().unwrap();
     if matches!(&*guard, Some(p) if p.device == device && p.swapchain == swapchain) {
@@ -110,6 +143,17 @@ pub struct NeuralForgeDeviceInfo {
     next_queue_submit2: Option<vk::PFN_vkQueueSubmit2>,
     state: Arc<Mutex<State>>,
     tracker: Mutex<TapTracker>,
+    /// Which queue family a `VkQueue` handle belongs to -- learned by observing the
+    /// app's own `vkGetDeviceQueue`/`vkGetDeviceQueue2` calls (see those hooks below),
+    /// since Vulkan has no query that answers this for a handle after the fact. Needed
+    /// to build a command pool for whatever queue `queue_present_khr` hands us. Its own lock,
+    /// not the device state's: every `vkQueueSubmit` reads it, and the present holds the state
+    /// through its synchronous wait for the model's answer.
+    queue_families: std::sync::RwLock<HashMap<vk::Queue, u32>>,
+    /// Whether the render tap knows any source image (`TapTracker::tap_sources_by_destination` is not
+    /// empty), kept beside the tracker's lock so the barrier hooks -- every barrier the game records,
+    /// from every recording thread -- only take that lock when there is a source to track.
+    tap_sources: std::sync::atomic::AtomicBool,
 }
 
 /// See `NeuralForgeDeviceInfo::probe_next`. Each is `None` when the device lacks the
@@ -148,18 +192,8 @@ struct State {
     /// layer spent in that swapchain's previous present.
     warmup: HashMap<vk::SwapchainKHR, (swapchain::Warmup, std::time::Duration)>,
     shm: ShmClient,
-    /// Which queue family a `VkQueue` handle belongs to -- learned by observing the
-    /// app's own `vkGetDeviceQueue`/`vkGetDeviceQueue2` calls (see those hooks below),
-    /// since Vulkan has no query that answers this for a handle after the fact. Needed
-    /// to build a command pool for whatever queue `queue_present_khr` hands us.
-    queue_families: HashMap<vk::Queue, u32>,
-    capture: Option<capture::CaptureResources>,
     /// The Phase 2 non-blocking capture pipeline (`docs/ASYNC_CAPTURE_DESIGN.md`) `capture::run`
-    /// uses for its own hot-path captures. Kept separate from `capture` above (which
-    /// stays the single synchronous resource `run_sync` and `run`'s CPU-only
-    /// write-back fallback still use) rather than sharing one resource type across
-    /// both purposes -- a slot mid-flight for one would otherwise have to be safe to
-    /// borrow for the other's completely different, fully-synchronous contract.
+    /// uses for its captures.
     capture_pipeline: Option<capture::CapturePipeline>,
     /// The Phase 3 zero-copy capture path (`docs/EXTERNAL_MEMORY_HOST_DESIGN.md`) --
     /// mutually exclusive with `capture_pipeline` above, never both active for the
@@ -300,6 +334,9 @@ struct TapTracker {
     image_info: HashMap<vk::Image, ImageInfo>,
     /// The shape of the most recent write into each swapchain image with a tap source.
     tap_writes: HashMap<vk::Image, TapWrite>,
+    /// The command buffers allocated from each pool: a pool reset or destroyed resets or frees
+    /// them all without naming them, and their `pending` layouts go with them.
+    pools: HashMap<vk::CommandPool, HashSet<vk::CommandBuffer>>,
 }
 
 /// What `vkCreateImage` said about a possible tap source.
@@ -457,9 +494,28 @@ impl TapTracker {
         self.pending.remove(&command_buffer);
     }
 
-    fn free(&mut self, command_buffers: &[vk::CommandBuffer]) {
+    fn free(&mut self, pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer]) {
+        let members = self.pools.get_mut(&pool);
         for cb in command_buffers {
             self.pending.remove(cb);
+        }
+        if let Some(members) = members {
+            for cb in command_buffers {
+                members.remove(cb);
+            }
+        }
+    }
+
+    fn allocated(&mut self, pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer]) {
+        self.pools.entry(pool).or_default().extend(command_buffers.iter().copied());
+    }
+
+    /// `vkResetCommandPool` (`destroyed`: `vkDestroyCommandPool`): every buffer of the pool is reset
+    /// (or freed), so what was recorded into it is gone.
+    fn reset_pool(&mut self, pool: vk::CommandPool, destroyed: bool) {
+        let members = if destroyed { self.pools.remove(&pool) } else { self.pools.get(&pool).cloned() };
+        for cb in members.into_iter().flatten() {
+            self.pending.remove(&cb);
         }
     }
 
@@ -582,16 +638,23 @@ static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> =
 /// # Safety
 /// The caller must meet vkDestroyDevice's external synchronization requirements.
 pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
-    // First: its worker uses the device state freed below, and the GPU may be waiting on it.
+    let owned = CLEANUP.lock().unwrap().remove(&handle);
+    // First of all the network's own threads (the after-the-upscaler model server, the loader):
+    // they submit to the layer's queues, so they are stopped (joined) before anything below waits
+    // the device idle -- `vkDeviceWaitIdle` needs every queue of the device externally
+    // synchronized, which a thread still submitting breaks.
+    if let Some((_, state)) = &owned {
+        state.lock().unwrap_or_else(|e| e.into_inner()).preupscale.stop_native();
+    }
+    // Then the hold inside DLSS's buffer: its worker uses the device state freed below, and the GPU
+    // may be waiting on it.
     // SAFETY: forwarded.
     unsafe { crate::preupscale::inline::destroy(handle) };
-    let owned = CLEANUP.lock().unwrap().remove(&handle);
     if let Some((device, state)) = owned {
-        let mut state = state.lock().unwrap();
-        if state.capture.is_some() || state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || state.preupscale.res.is_some() {
+        let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
+        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || state.preupscale.res.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
-                    unsafe { capture::destroy(state.capture.take(), &device); }
                     unsafe { capture::destroy_pipeline(state.capture_pipeline.take(), &device); }
                     for slot in &mut state.direct_capture {
                         unsafe { capture::destroy_direct_capture(slot.take(), &device); }
@@ -608,9 +671,6 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                 Err(error) => crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources", error),
             }
         }
-        // The native network: its loading thread is joined and its own queue waited for; its frame
-        // work, if any ran, was drained with the device above.
-        state.preupscale.stop_native();
         // SAFETY: a series never leaves GPU work pending once a present returns (it waits on
         // its own fences), so no idle wait is needed; this also finishes writing its files.
         unsafe { state.series.destroy(&device); }
@@ -687,7 +747,7 @@ fn inline_hold(
     use crate::preupscale::{Mode, Which};
     const INLINE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
     let mode = crate::preupscale::mode();
-    if !mode.holds_inline() || !crate::layer_enabled() || crate::device_lost() || !presenting_steadily() {
+    if !mode.holds_inline() || !crate::layer_enabled() || crate::device_lost(device.handle()) || !presenting_steadily() {
         inline_tally("skipped (off, device lost or not presenting steadily)");
         return;
     }
@@ -752,7 +812,7 @@ fn inline_hold(
     if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
         return;
     }
-    if !native && capture::direct_slot_busy(direct_capture, Slot::Primary) {
+    if !native && capture::direct_slot_busy(direct_capture, Slot::Primary, device) {
         return;
     }
     // Staged, never imported: work on imported host memory from the layer's queue waited on the
@@ -832,9 +892,10 @@ fn inline_hold(
     session.check_exposure(job.point.identification, &hold);
     session.note(shm, &hold, started.elapsed(), extent);
     if let Some(frame) = hold.dump.take() {
-        crate::preupscale::write_dump_async(frame);
+        // A waiting one-shot is this dump's (`dump_owns_one_shot`): its outcome names the dump.
+        let capture = shm.take_capture_request().map(|request| (request, shm.channel()));
+        crate::preupscale::write_dump_async(frame, capture);
         session.dumped();
-        shm.take_capture_request();
     }
 }
 
@@ -848,6 +909,63 @@ fn inline_hold(
 /// # Safety
 /// `queue` must be the queue the present was requested on, externally synchronized for
 /// the duration of the call, and `app_waits` the present's own wait semaphores.
+/// Starts the capture the channel asks for, if this present serves it: refused (and said) when the
+/// swapchain cannot be read back. `held`: frames are held before the upscaler.
+fn take_capture(shm: &ShmClient, series: &mut crate::series::Series, readable: bool, held: bool) {
+    let Some(request) = crate::series::take_request(shm, dump_owns_one_shot()) else { return };
+    if readable {
+        series.start(request, &crate::dump::captures_dir(), shm.channel(), held);
+    } else {
+        crate::series::refuse(shm, request, neural_forge_protocol::capture::reason::UNREADABLE);
+    }
+}
+
+/// On a present nothing of the layer's composes (`why`, for the outcome), reads the presented frame
+/// back as both halves of the running capture's pair, after relaying the application's present waits
+/// (`relay_semaphore` takes the relay's semaphore for the real present). A relay that cannot be made
+/// ends the capture: its frames cannot be read in order.
+///
+/// # Safety
+/// `queue` is the present's queue, externally synchronized for the call, of `queue_family`; `image` is
+/// the presented swapchain image, `PRESENT_SRC_KHR`, with nothing of the layer's submitted for it yet.
+#[allow(clippy::too_many_arguments)]
+unsafe fn capture_untouched(
+    device: &ash::Device,
+    instance: &ash::Instance,
+    physical_device: vk::PhysicalDevice,
+    queue: vk::Queue,
+    queue_family: u32,
+    image: vk::Image,
+    (width, height, bgr_order): (u32, u32, bool),
+    readable: bool,
+    series: &mut crate::series::Series,
+    relay_semaphores: &mut crate::present_sync::PresentSemaphores,
+    present_info: &vk::PresentInfoKHR,
+    relay_semaphore: &mut Option<vk::Semaphore>,
+    why: u32,
+) {
+    if !readable || !series.running() {
+        return;
+    }
+    // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count`.
+    let app_waits: &[vk::Semaphore] = unsafe { preupscale_slice(present_info.p_wait_semaphores, present_info.wait_semaphore_count) };
+    if !app_waits.is_empty() {
+        // SAFETY: per this function's contract.
+        match unsafe { relay_app_waits(device, queue, relay_semaphores, image, app_waits) } {
+            Some(relay) => *relay_semaphore = Some(relay),
+            None => {
+                series.abandon(neural_forge_protocol::capture::reason::READBACK_FAILED);
+                return;
+            }
+        }
+    }
+    // SAFETY: per this function's contract; the relay (if any) is the only submission so far.
+    unsafe {
+        series.before(device, instance, physical_device, queue, queue_family, image, width, height);
+        series.after(device, queue, image, width, height, bgr_order, None, why);
+    }
+}
+
 /// Logs the real presented frame rate every 5 s, whether or not the effect is on --
 /// `layer_frames` counts only the presents the layer engages on, so it stops on loading screens
 /// and cannot say whether turning the effect off actually gave the frames back.
@@ -877,6 +995,26 @@ fn note_present_rate(composited: bool) {
 /// Holds (`crate::preupscale`) only happen while it is: loading screens are where engaging froze.
 static PRESENTING_STEADILY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Publishes whether the game renders steadily (once per present, over all its swapchains), logging a
+/// change.
+fn note_engaged(engaged: bool) {
+    static ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    PRESENTING_STEADILY.store(engaged, std::sync::atomic::Ordering::Relaxed);
+    if ENGAGED.swap(engaged, std::sync::atomic::Ordering::Relaxed) != engaged {
+        crate::log!(
+            "[layer] {}",
+            if engaged { "game is rendering steadily; engaging" } else { "game not rendering steadily (loading?); passing frames through untouched" }
+        );
+        crate::logging::flush();
+        // The state log's session marker: the first engagement only (this flips at
+        // every loading screen).
+        static ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if engaged && !ATTACHED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            crate::event!(neural_forge_protocol::state_log::ATTACH, "the game is rendering steadily; the layer engaged");
+        }
+    }
+}
+
 fn presenting_steadily() -> bool {
     PRESENTING_STEADILY.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -899,6 +1037,28 @@ unsafe fn preupscale_slice<'a, T>(ptr: *const T, len: u32) -> &'a [T] {
 /// running. Unknown settings (the mapping not open yet) are not idle: `capture::run` opens it.
 fn post_path_idle(effect_off: Option<bool>, bootstrap_complete: bool, capture_requested: bool, series_running: bool) -> bool {
     effect_off == Some(true) && bootstrap_complete && !capture_requested && !series_running
+}
+
+#[cfg(test)]
+mod shares_memory_tests {
+    use super::*;
+
+    /// An image whose memory is exported or imported keeps the usage the application gave it.
+    #[test]
+    fn external_memory_chains_are_recognised_anywhere_in_the_chain() {
+        let plain = vk::ImageCreateInfo::default();
+        assert!(!shares_memory(&plain));
+        let mut external = vk::ExternalMemoryImageCreateInfo::builder().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD).build();
+        let mut list = vk::ImageFormatListCreateInfo::default();
+        let info = vk::ImageCreateInfo::builder().push_next(&mut external).push_next(&mut list).build();
+        assert!(shares_memory(&info), "found behind another structure");
+        let mut nv = vk::ExternalMemoryImageCreateInfoNV::default();
+        let info = vk::ImageCreateInfo::builder().push_next(&mut nv).build();
+        assert!(shares_memory(&info));
+        let mut list = vk::ImageFormatListCreateInfo::default();
+        let info = vk::ImageCreateInfo::builder().push_next(&mut list).build();
+        assert!(!shares_memory(&info));
+    }
 }
 
 #[cfg(test)]
@@ -1112,6 +1272,8 @@ impl NeuralForgeDeviceInfo {
             next_queue_submit2,
             state,
             tracker: Mutex::new(TapTracker::default()),
+            queue_families: Default::default(),
+            tap_sources: Default::default(),
         }
     }
 
@@ -1158,6 +1320,7 @@ impl NeuralForgeDeviceInfo {
             let mut tracker = self.tracker.lock().unwrap();
             let first = tracker.observe_write(command_buffer, src, src_layout, dst);
             tracker.note_write_shape(dst, shape);
+            self.note_tap_sources(&tracker);
             first
         };
         if first == Some(true) {
@@ -1180,12 +1343,22 @@ impl NeuralForgeDeviceInfo {
         self.tracker.lock().unwrap().commit_submit(command_buffers.into_iter());
     }
 
+    /// Publishes whether the render tap has any source, after a change under the tracker's lock.
+    fn note_tap_sources(&self, tracker: &TapTracker) {
+        self.tap_sources.store(!tracker.tap_sources_by_destination.is_empty(), std::sync::atomic::Ordering::Release);
+    }
+
+    /// The family of `queue`, if the application took it through `vkGetDeviceQueue*`.
+    fn queue_family(&self, queue: vk::Queue) -> Option<u32> {
+        self.queue_families.read().unwrap_or_else(|e| e.into_inner()).get(&queue).copied()
+    }
+
     /// The jobs of the hold inside DLSS's buffer (`crate::preupscale::inline`) for a submission on
     /// `queue` of `cbs`, taken before the submission is made.
     fn inline_jobs(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
         if launch_queues_logged() {
             let cbs: Vec<vk::CommandBuffer> = cbs.into_iter().collect();
-            let family = self.state.lock().unwrap().queue_families.get(&queue).copied();
+            let family = self.queue_family(queue);
             if let Some(tracking) = &self.preupscale {
                 let n = cbs.iter().filter(|cb| tracking.has_launches(**cb)).count() as u32;
                 if n > 0 {
@@ -1199,7 +1372,7 @@ impl NeuralForgeDeviceInfo {
 
     fn inline_jobs_of(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
         let Some(inline) = &self.inline else { return Vec::new() };
-        let family = self.state.lock().unwrap().queue_families.get(&queue).copied();
+        let family = self.queue_family(queue);
         let mut jobs = inline.jobs_for(cbs, family);
         if let Some(tracking) = &self.preupscale {
             for job in &mut jobs {
@@ -1235,13 +1408,13 @@ impl NeuralForgeDeviceInfo {
             return None;
         }
         let mode = crate::preupscale::mode();
-        if !crate::layer_enabled() || !self.nvidia || crate::device_lost() {
+        if !crate::layer_enabled() || !self.nvidia || crate::device_lost(self.device.handle()) {
             return None;
         }
         let instance = self.instance.as_ref()?;
         let inputs = scan.inputs?;
         let mut state = self.state.lock().unwrap();
-        let State { shm, preupscale: session, queue_families, external_memory_host, direct_capture, .. } = &mut *state;
+        let State { shm, preupscale: session, external_memory_host, direct_capture, .. } = &mut *state;
         // DLSS is running on this device (held or not): the post path stays off for
         // `preupscale::HAND_BACK` after this once the device has held.
         session.saw_dlss();
@@ -1280,7 +1453,7 @@ impl NeuralForgeDeviceInfo {
             session.say_once("the colour input lacks the usage this mode needs (TRANSFER_SRC/TRANSFER_DST, or STORAGE); not holding");
             return None;
         }
-        let Some(&queue_family) = queue_families.get(&queue) else {
+        let Some(queue_family) = self.queue_family(queue) else {
             session.say_once("the DLSS submit's queue was never seen through vkGetDeviceQueue*; not holding");
             return None;
         };
@@ -1307,7 +1480,7 @@ impl NeuralForgeDeviceInfo {
         if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
             return None;
         }
-        if !native && capture::direct_slot_busy(direct_capture, Slot::Primary) {
+        if !native && capture::direct_slot_busy(direct_capture, Slot::Primary, &self.device) {
             return None;
         }
         // Failures from here on repeat every frame in a game where they happen at all: in model
@@ -1414,9 +1587,10 @@ impl NeuralForgeDeviceInfo {
             session.note_exposure_source(scan.identification, &inputs, &hold);
             session.note(shm, &hold, cpu, extent);
             if let Some(frame) = hold.dump.take() {
-                crate::preupscale::write_dump_async(frame);
+                // A waiting one-shot is this dump's (`dump_owns_one_shot`): its outcome names the dump.
+                let capture = shm.take_capture_request().map(|request| (request, shm.channel()));
+                crate::preupscale::write_dump_async(frame, capture);
                 session.dumped();
-                shm.take_capture_request();
             }
         }
         Some((result, accepted))
@@ -1588,7 +1762,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // table; `queue_family_index`/`queue_index` are the caller's own, forwarded
         // unchanged.
         unsafe { next(self.device.handle(), queue_family_index, queue_index, &mut queue) };
-        if self.state.lock().unwrap().queue_families.insert(queue, queue_family_index).is_none() {
+        if self.queue_families.write().unwrap_or_else(|e| e.into_inner()).insert(queue, queue_family_index).is_none() {
             crate::log!("[queues] device {:#x}: the application took queue {queue_index} of family {queue_family_index} ({queue:?})", vk::Handle::as_raw(self.device.handle()));
         }
         LayerResult::Handled(queue)
@@ -1601,7 +1775,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // table; `queue_info` is valid for the duration of this call (handed to us by
         // the loader for exactly this call).
         unsafe { next(self.device.handle(), queue_info, &mut queue) };
-        if self.state.lock().unwrap().queue_families.insert(queue, queue_info.queue_family_index).is_none() {
+        if self.queue_families.write().unwrap_or_else(|e| e.into_inner()).insert(queue, queue_info.queue_family_index).is_none() {
             crate::log!(
                 "[queues] device {:#x}: the application took queue {} of family {} ({queue:?}, vkGetDeviceQueue2)",
                 vk::Handle::as_raw(self.device.handle()),
@@ -1659,7 +1833,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             t.barriers(command_buffer, images.iter().map(|b| crate::preupscale::ImageSync::from_barrier(b, src_stage, dst_stage)), global);
         }
         // No logging here: this fires for every barrier the game records, from every
-        // recording thread.
+        // recording thread; and no lock while the render tap has no source to track.
+        if images.is_empty() || !self.tap_sources.load(std::sync::atomic::Ordering::Acquire) {
+            return LayerResult::Unhandled;
+        }
         let mut tracker = self.tracker.lock().unwrap();
         for barrier in images {
             tracker.record_barrier(command_buffer, barrier.image, barrier.new_layout);
@@ -1700,6 +1877,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             t.barriers(command_buffer, barrier2_images(info).unwrap_or(&[]).iter().map(crate::preupscale::ImageSync::from_barrier2), dependency_global(info));
         }
         let Some(images) = barrier2_images(info) else { return LayerResult::Unhandled };
+        if !self.tap_sources.load(std::sync::atomic::Ordering::Acquire) {
+            return LayerResult::Unhandled;
+        }
         let mut tracker = self.tracker.lock().unwrap();
         for barrier in images {
             tracker.record_barrier(command_buffer, barrier.image, barrier.new_layout);
@@ -1722,7 +1902,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     fn free_command_buffers(
-        &self, _command_pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer],
+        &self, command_pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer],
     ) -> LayerResult<()> {
         crate::probe_ngx::on_free_command_buffers(command_buffers);
         if let Some(t) = &self.preupscale {
@@ -1731,7 +1911,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if let Some(i) = &self.inline {
             i.free(command_buffers);
         }
-        self.tracker.lock().unwrap().free(command_buffers);
+        self.tracker.lock().unwrap().free(command_pool, command_buffers);
         LayerResult::Unhandled
     }
 
@@ -1749,15 +1929,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         LayerResult::Handled(result)
     }
 
-    /// Allocated here (through the next layer) only to learn the buffers' pool and level, for the hold
-    /// inside DLSS's buffer ([`crate::preupscale::inline::Inline::reset_pool`]) and the pre-upscaler
-    /// tracking ([`crate::preupscale::Tracking::reset_pool`]); without either, untouched.
+    /// Allocated here (through the next layer) only to learn the buffers' pool and level: a pool reset
+    /// or destroyed resets or frees its buffers without naming them, for the render tap's recorded
+    /// layouts, the hold inside DLSS's buffer ([`crate::preupscale::inline::Inline::reset_pool`]) and
+    /// the pre-upscaler tracking ([`crate::preupscale::Tracking::reset_pool`]).
     fn allocate_command_buffers(
         &self, allocate_info: &vk::CommandBufferAllocateInfo,
     ) -> LayerResult<ash::prelude::VkResult<Vec<vk::CommandBuffer>>> {
-        if self.inline.is_none() && self.preupscale.is_none() {
-            return LayerResult::Unhandled;
-        }
         // SAFETY: the application's own allocate info, forwarded unchanged to the next layer.
         let result = unsafe { self.device.allocate_command_buffers(allocate_info) };
         if let Ok(cbs) = &result {
@@ -1767,6 +1945,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             if let Some(t) = &self.preupscale {
                 t.allocated(allocate_info.command_pool, cbs);
             }
+            self.tracker.lock().unwrap_or_else(|e| e.into_inner()).allocated(allocate_info.command_pool, cbs);
+            crate::probe_ngx::on_allocate_command_buffers(allocate_info.command_pool, cbs);
         }
         LayerResult::Handled(result)
     }
@@ -1792,6 +1972,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if let Some(t) = &self.preupscale {
             t.reset_pool(command_pool, false);
         }
+        self.tracker.lock().unwrap_or_else(|e| e.into_inner()).reset_pool(command_pool, false);
+        crate::probe_ngx::on_reset_command_pool(command_pool, false);
         LayerResult::Unhandled
     }
 
@@ -1804,6 +1986,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if let Some(t) = &self.preupscale {
             t.reset_pool(command_pool, true);
         }
+        self.tracker.lock().unwrap_or_else(|e| e.into_inner()).reset_pool(command_pool, true);
+        crate::probe_ngx::on_reset_command_pool(command_pool, true);
         LayerResult::Unhandled
     }
 
@@ -1949,6 +2133,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             prune_orphaned_tap_source(&mut tracker, source);
                         }
                     }
+                    self.note_tap_sources(&tracker);
                 }
                 if let Some(gpu) = &mut state.gpu_compose { gpu.retire_present_images(&old.images); }
                 state.relay_semaphores.retire(&old.images);
@@ -1979,15 +2164,25 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let alloc_ptr = allocator.map_or(std::ptr::null(), std::ptr::from_ref);
         // The native backend copies DLSS's motion vectors for its history; a game that made them
         // without `TRANSFER_SRC` (Black Myth: Wukong) gets it added to its two-channel float images.
+        // Never to an image whose memory is shared with another API or process (an external-memory
+        // chain: its usage is part of what the other side agreed to), and an image the driver refuses
+        // with the bit is created exactly as the application asked.
         let mut info = *create_info;
-        if self.preupscale.is_some() && crate::preupscale::wants_copyable(create_info) {
+        let added = self.preupscale.is_some() && crate::preupscale::wants_copyable(create_info) && !shares_memory(create_info);
+        if added {
             info.usage |= vk::ImageUsageFlags::TRANSFER_SRC;
         }
-        let create_info = &info;
-        // SAFETY: `next` is the next layer/driver's own `vkCreateImage`; `create_info` (with
+        // SAFETY: `next` is the next layer/driver's own `vkCreateImage`; `info` (with
         // its whole pNext chain) and the allocator are the application's, passed unchanged but
         // for that usage bit.
-        let result = unsafe { next(self.device.handle(), create_info, alloc_ptr, &mut image) };
+        let mut result = unsafe { next(self.device.handle(), &info, alloc_ptr, &mut image) };
+        if result != vk::Result::SUCCESS && added {
+            image = vk::Image::null();
+            info = *create_info;
+            // SAFETY: as above, with the application's own create info.
+            result = unsafe { next(self.device.handle(), &info, alloc_ptr, &mut image) };
+        }
+        let create_info = &info;
         if result != vk::Result::SUCCESS {
             return LayerResult::Handled(Err(result));
         }
@@ -2012,6 +2207,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if had_layout || tracker.is_source(image) {
             tracker.tap_sources_by_destination.retain(|_, src| *src != image);
         }
+        self.note_tap_sources(&tracker);
         LayerResult::Unhandled
     }
 
@@ -2071,14 +2267,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // SAFETY: the next layer's own `vkGetImageViewAddressNVX`, writing into the
         // application's own output struct (its sType/pNext untouched).
         let result = unsafe { next(self.device.handle(), view, properties.as_mut_ptr()) };
-        let described = if result == vk::Result::SUCCESS {
-            // SAFETY: a successful call filled the struct.
-            let props = unsafe { properties.assume_init_ref() };
-            format!("address {:#x} size {}", props.device_address, props.size)
-        } else {
-            format!("{result:?}")
-        };
         if crate::probe_ngx::enabled() {
+            // The description is built only for the probe: this runs for every view DLSS asks about.
+            let described = if result == vk::Result::SUCCESS {
+                // SAFETY: a successful call filled the struct.
+                let props = unsafe { properties.assume_init_ref() };
+                format!("address {:#x} size {}", props.device_address, props.size)
+            } else {
+                format!("{result:?}")
+            };
             crate::probe_ngx::on_view_handle("vkGetImageViewAddressNVX", view, described);
         }
         if let Some(t) = self.preupscale.as_ref().filter(|_| result == vk::Result::SUCCESS) {
@@ -2457,7 +2654,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let mut relay_semaphore: Option<vk::Semaphore> = None;
         // Set when a frame series' readback consumed `wait_semaphore` (see `crate::series`).
         let mut series_composed = false;
-        if crate::layer_enabled() && self.nvidia && !crate::device_lost()
+        if crate::layer_enabled() {
+            // The channel's lease follows presenting (`ownership`): an atomic store.
+            crate::ownership::note_present();
+        }
+        if crate::layer_enabled() && self.nvidia && !crate::device_lost(self.device.handle())
             && present_info.swapchain_count > 0 && !present_info.p_swapchains.is_null() && !present_info.p_image_indices.is_null()
         {
             // SAFETY: `p_swapchains`/`p_image_indices`/`swapchain_count` are a valid,
@@ -2475,6 +2676,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 let State { shm, preupscale, .. } = &mut *state;
                 preupscale.publish_status(shm, extent);
             }
+            // Whether any of this present's swapchains renders steadily (`None`: none is the layer's).
+            let mut any_engaged: Option<bool> = None;
             for (&sc, &image_index) in swapchains.iter().zip(image_indices) {
                 if !state.swapchains.contains_key(&sc) {
                     continue;
@@ -2488,25 +2691,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     *last = std::time::Duration::ZERO;
                     ok
                 };
-                {
-                    static ENGAGED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                    PRESENTING_STEADILY.store(engaged, std::sync::atomic::Ordering::Relaxed);
-                    if ENGAGED.swap(engaged, std::sync::atomic::Ordering::Relaxed) != engaged {
-                        crate::log!(
-                            "[layer] {}",
-                            if engaged { "game is rendering steadily; engaging" } else { "game not rendering steadily (loading?); passing frames through untouched" }
-                        );
-                        crate::logging::flush();
-                        // The state log's session marker: the first engagement only (this flips at
-                        // every loading screen).
-                        static ATTACHED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                        if engaged && !ATTACHED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                            crate::event!(neural_forge_protocol::state_log::ATTACH, "the game is rendering steadily; the layer engaged");
-                        }
-                    }
-                }
+                any_engaged = Some(any_engaged.unwrap_or(false) || engaged);
                 if !engaged {
-                    break;
+                    // This swapchain is not rendering steadily; another one of the same present may be.
+                    continue;
                 }
                 // Before the format and capture checks: with the model before the upscaler (or an HDR
                 // swapchain) nothing is captured here, and the game is attached all the same.
@@ -2518,11 +2706,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     shm.poll_toggle_hotkey(hotkey);
                 }
                 let Some(sw) = state.swapchains.get(&sc) else { continue };
-                let Some(&image) = sw.images.get(image_index as usize) else { break };
+                let Some(&image) = sw.images.get(image_index as usize) else { continue };
                 if !swapchain::is_supported_format(sw.format) {
                     // Not merely `pass_through`: a pass-through swapchain can still be composed
                     // onto from a tracked render source, which is exactly what must not happen
                     // to a 10-bit or float swapchain (see `swapchain::is_supported_format`).
+                    // A capture of the game's frames cannot be served either: said, not left waiting.
+                    if state.shm.capture_requested() && would_be_primary(self.device.handle(), sc, sw.width, sw.height) {
+                        crate::series::refuse_waiting(&state.shm, dump_owns_one_shot(), neural_forge_protocol::capture::reason::UNSUPPORTED_FORMAT);
+                    }
                     static SAID_FORMAT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID_FORMAT.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         crate::log!("[layer] present skipped: swapchain format {:?} is not SDR 8-bit; HDR/10-bit swapchains present untouched", sw.format);
@@ -2547,6 +2739,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // Cannot happen (admission is exactly the enlarged usage), but reading an image
                     // without TRANSFER_SRC would be undefined behaviour on the GPU.
                     continue;
+                }
+                if !sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_SRC) && state.shm.capture_requested() && would_be_primary(self.device.handle(), sc, sw.width, sw.height) {
+                    // A swapchain the layer could not admit cannot be read back: a capture of it is
+                    // refused (said), never left waiting for a frame that cannot come.
+                    crate::series::refuse_waiting(&state.shm, dump_owns_one_shot(), neural_forge_protocol::capture::reason::UNREADABLE);
                 }
                 if sw.pass_through && !sw.image_usage.contains(vk::ImageUsageFlags::TRANSFER_DST) {
                     // The compose/write-back path lands its result with
@@ -2622,7 +2819,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     }
                     break;
                 }
-                let Some(&queue_family) = state.queue_families.get(&queue) else {
+                let Some(queue_family) = self.queue_family(queue) else {
                     // We've never seen this queue via a hooked `vkGetDeviceQueue`/
                     // `vkGetDeviceQueue2` call (e.g. an app using `VK_KHR_synchronization2`
                     // queue submission paths this layer doesn't intercept) -- no family
@@ -2637,7 +2834,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             "[layer] present skipped: the presenting queue was never seen through vkGetDeviceQueue/vkGetDeviceQueue2, \
                              so its family is unknown and no command pool can be built -- every frame will pass through untouched \
                              ({} queues known)",
-                            state.queue_families.len()
+                            self.queue_families.read().map_or(0, |q| q.len())
                         );
                         crate::logging::flush();
                     }
@@ -2652,7 +2849,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
                 };
-                let State { shm, capture, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, last_answer_encoded, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
+                let State { shm, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, last_answer_encoded, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
                 // Another device's hold counts too (DLSS on a device without the swapchain); never
                 // set with `NEURAL_FORGE_PREUPSCALE=off`, where no device holds.
                 let held_elsewhere = crate::preupscale::active() && crate::preupscale::post_off_by_any_device(std::time::Instant::now());
@@ -2679,40 +2876,19 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         // Captures are still served while frames are held (otherwise a `shmctl
                         // capture` request would stay pending): the presented frame, which already
                         // carries the model's edit made before DLSS, is read back as both halves of
-                        // each pair. The one-shot request is served as a series of one frame.
+                        // each pair, and the outcome says so.
                         if let Some(instance) = &self.instance {
                             if let Some(frames) = readable.then(|| preupscale.capture_at_due()).flatten() {
-                                series.start(frames, &crate::dump::captures_dir());
+                                series.start(neural_forge_protocol::capture::Request { id: 0, frames }, &crate::dump::captures_dir(), shm.channel(), true);
                             }
-                            if let Some(frames) = crate::series::take_request(shm, true) {
-                                if readable {
-                                    series.start(frames, &crate::dump::captures_dir());
-                                    crate::log!("[series] frames are held before the upscaler: the model already ran on DLSS's input, so each pair's original and composited are both the presented frame");
-                                    crate::logging::flush();
-                                } else {
-                                    crate::log!("[series] request for {frames} frames dropped: this swapchain cannot be read back");
-                                    crate::logging::flush();
-                                }
-                            }
-                            if readable && series.running() {
-                                // The readback must come after the game's rendering, as on the post
-                                // path: relay the application's present waits first.
-                                // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count`.
-                                let app_waits: &[vk::Semaphore] = unsafe { preupscale_slice(present_info.p_wait_semaphores, present_info.wait_semaphore_count) };
-                                let ordered = app_waits.is_empty() || {
-                                    // SAFETY: as for the post path's relay below.
-                                    let relay = unsafe { relay_app_waits(&self.device, queue, relay_semaphores, image, app_waits) };
-                                    relay_semaphore = relay;
-                                    relay.is_some()
-                                };
-                                if ordered {
-                                    // SAFETY: as for the post path's series below; nothing of the
-                                    // layer's but the relay was submitted for this present.
-                                    unsafe {
-                                        series.before(&self.device, instance, self.physical_device, queue, queue_family, image, width, height);
-                                        series.after(&self.device, queue, image, width, height, bgr_order, None);
-                                    }
-                                }
+                            take_capture(shm, series, readable, true);
+                            // SAFETY: `queue` is this present's, externally synchronized for its
+                            // duration; nothing of the layer's was submitted for it yet.
+                            unsafe {
+                                capture_untouched(
+                                    &self.device, instance, self.physical_device, queue, queue_family, image, (width, height, bgr_order), readable,
+                                    series, relay_semaphores, present_info, &mut relay_semaphore, neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
+                                );
                             }
                         }
                         break;
@@ -2730,6 +2906,17 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     }
                 }
                 if shm.model_known_unavailable() {
+                    // Nothing composes this session; a capture still shows what is presented.
+                    if let Some(instance) = &self.instance {
+                        take_capture(shm, series, readable, false);
+                        // SAFETY: as for the held path above.
+                        unsafe {
+                            capture_untouched(
+                                &self.device, instance, self.physical_device, queue, queue_family, image, (width, height, bgr_order), readable,
+                                series, relay_semaphores, present_info, &mut relay_semaphore, neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
+                            );
+                        }
+                    }
                     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
                         crate::log!("[layer] present skipped: the model server reported the model permanently unavailable for this session");
@@ -2751,7 +2938,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 // `NEURAL_FORGE_CAPTURE_AT` starts its series before the idle check, so the model-off
                 // runs of a flicker or added-detail comparison (`scripts/bench-iq.py`) capture too.
                 if let Some(frames) = readable.then(|| preupscale.capture_at_due()).flatten() {
-                    series.start(frames, &crate::dump::captures_dir());
+                    series.start(neural_forge_protocol::capture::Request { id: 0, frames }, &crate::dump::captures_dir(), shm.channel(), false);
                 }
                 let effect_off = shm.composition_settings().map(|s| !s.apply_model || !s.neural_enabled);
                 if post_path_idle(effect_off, *bootstrap_complete, shm.capture_requested(), series.running()) {
@@ -2797,18 +2984,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 }
                 if let Some(instance) = &self.instance {
                     engaged_swapchains.insert(sc);
-                    // `capture_request = N > 1`: a frame series (see `crate::series`). 1 stays the
-                    // one-shot dump's, and each path only ever consumes its own values. Before
-                    // `capture::run` has opened the mapping this finds nothing, and the series
-                    // starts one present later.
-                    if let Some(frames) = crate::series::take_request(shm, false) {
-                        if readable {
-                            series.start(frames, &crate::dump::captures_dir());
-                        } else {
-                            crate::log!("[series] request for {frames} frames dropped: this swapchain cannot be read back");
-                            crate::logging::flush();
-                        }
-                    }
+                    // A capture request (`crate::series`): the one-shot pair or a series, read back
+                    // around `capture::run`. Before `capture::run` has opened the mapping this finds
+                    // nothing, and the capture starts one present later.
+                    take_capture(shm, series, readable, false);
                     // The native backend answers this path's requests itself (`preupscale::native_post`).
                     preupscale.ensure_post_server(&self.device, instance, self.physical_device, *external_memory_host, shm);
                     let observing = readable && series.running();
@@ -2838,7 +3017,6 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             height,
                             proxy_format,
                             bgr_order,
-                            capture,
                             capture_pipeline,
                             direct_capture,
                             external_memory_host,
@@ -2859,7 +3037,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     if observing {
                         // SAFETY: same present, same queue, right after `before`. When the readback
                         // waited on the composition's semaphore, the present must not wait on it too.
-                        if unsafe { series.after(&self.device, queue, image, width, height, bgr_order, wait_semaphore) } && wait_semaphore.is_some() {
+                        if unsafe { series.after(&self.device, queue, image, width, height, bgr_order, wait_semaphore, capture::untouched_reason()) } && wait_semaphore.is_some() {
                             wait_semaphore = None;
                             series_composed = true;
                         }
@@ -2876,6 +3054,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     entry.1 = layer_start.elapsed();
                 }
                 break;
+            }
+            if let Some(engaged) = any_engaged {
+                note_engaged(engaged);
             }
         }
 
@@ -2929,6 +3110,29 @@ mod tap_source_lifetime_tests {
 
     fn image(raw: u64) -> vk::Image {
         vk::Image::from_raw(raw)
+    }
+
+    /// A pool reset or destroyed takes its buffers' recorded tap-source layouts with it; another
+    /// pool's are kept.
+    #[test]
+    fn a_pool_reset_or_destroy_drops_its_buffers_recorded_layouts() {
+        let mut state = TapTracker::default();
+        let (pool_a, pool_b) = (vk::CommandPool::from_raw(1), vk::CommandPool::from_raw(2));
+        let (a1, a2, b1) = (vk::CommandBuffer::from_raw(11), vk::CommandBuffer::from_raw(12), vk::CommandBuffer::from_raw(21));
+        state.allocated(pool_a, &[a1, a2]);
+        state.allocated(pool_b, &[b1]);
+        for cb in [a1, a2, b1] {
+            state.pending.insert(cb, vec![(image(5), vk::ImageLayout::GENERAL)]);
+        }
+        state.reset_pool(pool_a, false);
+        assert!(!state.pending.contains_key(&a1) && !state.pending.contains_key(&a2));
+        assert!(state.pending.contains_key(&b1), "another pool's buffer keeps its layouts");
+        assert!(state.pools.contains_key(&pool_a), "a reset pool keeps its buffers");
+        state.free(pool_b, &[b1]);
+        assert!(state.pools[&pool_b].is_empty() && state.pending.is_empty());
+        state.pending.insert(a1, vec![(image(5), vk::ImageLayout::GENERAL)]);
+        state.reset_pool(pool_a, true);
+        assert!(state.pending.is_empty() && !state.pools.contains_key(&pool_a));
     }
 
     /// The exact scenario `prune_orphaned_tap_source`'s own doc comment describes:
@@ -3148,7 +3352,7 @@ mod submit_order_tests {
         t.execute_secondary(cb(9), &[cb(1)]);
         t.commit_submit([cb(9)].into_iter());
         assert_eq!(t.tap_for(image(100)).map(|x| x.1), Some(vk::ImageLayout::GENERAL));
-        t.free(&[cb(1), cb(9)]);
+        t.free(vk::CommandPool::null(), &[cb(1), cb(9)]);
         assert!(t.pending.is_empty());
     }
 
@@ -3327,13 +3531,36 @@ mod submit_order_tests {
     /// swapchain hook: the one call in this file is the device-teardown drain.
     #[test]
     fn device_wait_idle_is_only_used_at_device_teardown() {
+        // Every source file of the layer: the two teardown drains are the only calls.
+        let allowed = [("device.rs", "unsafe fn destroy_private_resources"), ("preupscale/inline.rs", "pub(crate) unsafe fn destroy(")];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut files = vec![root.clone()];
+        let mut found = 0;
+        while let Some(path) = files.pop() {
+            if path.is_dir() {
+                files.extend(std::fs::read_dir(&path).unwrap().map(|e| e.unwrap().path()));
+                continue;
+            }
+            if path.extension().is_none_or(|e| e != "rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            // The code before the file's test module (a lone `#[cfg(test)]` item may come earlier).
+            let code = &source[..source.find("#[cfg(test)]\nmod ").unwrap_or(source.len())];
+            let name = path.strip_prefix(&root).unwrap().to_string_lossy().into_owned();
+            for (at, _) in code.match_indices(".device_wait_idle()") {
+                let teardown = allowed.iter().find(|(file, _)| *file == name).and_then(|(_, f)| code.find(f));
+                let inside = teardown.is_some_and(|t| at > t && at < t + code[t..].find("\n}\n").expect("end of the teardown function"));
+                assert!(inside, "{name}: device_wait_idle outside the device teardown");
+                found += 1;
+            }
+        }
+        assert_eq!(found, 2, "the two teardown drains");
+        // The network's threads submit to the layer's queues: stopped before either drain.
         let source = include_str!("device.rs");
-        let code = &source[..source.find("#[cfg(test)]").expect("test modules follow the code")];
-        let calls: Vec<usize> = code.match_indices(".device_wait_idle()").map(|(at, _)| at).collect();
-        let teardown = code.find("unsafe fn destroy_private_resources").expect("teardown function");
-        let after_teardown = teardown + code[teardown..].find("\n}\n").expect("end of teardown function");
-        assert_eq!(calls.len(), 1, "exactly one device_wait_idle, at device teardown");
-        assert!(calls.iter().all(|&at| at > teardown && at < after_teardown), "device_wait_idle outside destroy_private_resources");
+        let teardown = &source[source.find("unsafe fn destroy_private_resources").unwrap()..];
+        let stop = teardown.find("stop_native()").expect("the network is stopped at teardown");
+        assert!(stop < teardown.find("inline::destroy(").unwrap() && stop < teardown.find(".device_wait_idle()").unwrap());
     }
 
     /// Real (lavapipe) queue: the relay batch must consume the application's wait

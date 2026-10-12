@@ -3,6 +3,7 @@
 use std::fs::{File, OpenOptions};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{LazyLock, Mutex};
 
 fn basename(name: &str) -> String {
@@ -24,17 +25,48 @@ fn judged_name(args: &[String], exe: &str) -> String {
     }
 }
 
+/// Processes that are never the game, by their executable name with spaces, `-` and `_` removed:
+/// Wine's own services and helpers, store launchers and their web helpers (each presents a window of
+/// its own, often game-sized, for as long as it is open), crash reporters and gamescope. Without the
+/// supervisor's `NEURAL_FORGE_TARGET_EXE` the first process to present steadily claims the channel,
+/// so one of these could otherwise hold it while the game itself runs.
+const NEVER_THE_GAME: &[&str] = &[
+    // Wine and Proton.
+    "explorer.exe", "services.exe", "winedevice.exe", "plugplay.exe", "rpcss.exe", "svchost.exe", "conhost.exe",
+    "start.exe", "wineboot.exe", "winemenubuilder.exe", "tabtip.exe", "xalia.exe",
+    // Steam.
+    "steam.exe", "steamwebhelper.exe", "steamservice.exe", "steamerrorreporter.exe", "steamerrorreporter64.exe", "gameoverlayui.exe",
+    // Rockstar Games Launcher and Social Club (also matched by prefix below).
+    "launcher.exe", "launcherpatcher.exe", "rockstarservice.exe", "rockstarlauncher.exe", "socialclubhelper.exe", "socialclub.exe",
+    // Ubisoft Connect.
+    "upc.exe", "uplay.exe", "uplaywebcore.exe", "uplayservice.exe", "ubisoftconnect.exe", "ubisoftgamelauncher.exe", "ubisoftgamelauncher64.exe",
+    // EA app and Origin.
+    "eadesktop.exe", "ealauncher.exe", "eabackgroundservice.exe", "ealocalhostsvc.exe", "eacefsubprocess.exe", "origin.exe",
+    "originwebhelperservice.exe", "originthinsetupinternal.exe", "qtwebengineprocess.exe",
+    // Battle.net.
+    "battle.net.exe", "battle.netlauncher.exe", "agent.exe", "blizzarderror.exe", "blizzardbrowser.exe",
+    // Epic Games Launcher and Epic Online Services.
+    "epicgameslauncher.exe", "epicwebhelper.exe", "epiconlineserviceshost.exe", "epiconlineservicesuserhelper.exe",
+    "eosoverlayrenderer.exe", "eosoverlayrendererwin64shipping.exe", "eosoverlayrendererwin32shipping.exe",
+    // GOG Galaxy.
+    "galaxyclient.exe", "galaxyclienthelper.exe", "galaxycommunication.exe", "goggalaxynotificationsrenderer.exe",
+    // Amazon Games, Riot, Wargaming, Paradox.
+    "amazongamesui.exe", "riotclientservices.exe", "riotclientux.exe", "riotclientuxrender.exe", "wgc.exe", "paradoxlauncher.exe",
+    // Crash reporters.
+    "crashreportclient.exe", "unitycrashhandler64.exe", "unitycrashhandler32.exe",
+    "gamescope",
+];
+
+/// Name prefixes (spaces, `-` and `_` removed) of whole launcher families, whatever the helper.
+const NEVER_THE_GAME_PREFIXES: &[&str] =
+    &["rockstar", "socialclub", "xalia", "ubisoftconnect", "uplay", "battle.net", "epicgameslauncher", "epiconlineservices", "galaxyclient", "riotclient"];
+
 fn allowed(args: &[String], exe_path: &str, target: Option<&str>) -> bool {
     let exe = judged_name(args, exe_path);
     let compact = exe.replace([' ', '-', '_'], "");
-    if ["rockstar", "socialclub", "xalia"].iter().any(|prefix| compact.starts_with(prefix)) {
+    if exe.is_empty() || NEVER_THE_GAME.contains(&compact.as_str()) || NEVER_THE_GAME_PREFIXES.iter().any(|prefix| compact.starts_with(prefix)) {
         return false;
     }
-    if exe.is_empty() || ["explorer.exe", "xalia.exe", "launcher.exe",
-        "launcherpatcher.exe", "rockstarservice.exe", "rockstarlauncher.exe",
-        "socialclubhelper.exe", "socialclub.exe", "steam.exe", "steamwebhelper.exe",
-        "gameoverlayui.exe", "winedevice.exe", "services.exe", "gamescope"]
-        .contains(&exe.as_str()) { return false; }
     target.map(|names| names.split(',').any(|name| basename(name.trim()) == exe))
         .unwrap_or(true)
 }
@@ -83,20 +115,115 @@ fn acquire(path: &str) -> std::io::Result<File> {
     Ok(file)
 }
 
-// Keep the lease even during swapchain recreation. Never unlink
-// the lock file: doing so would let a new process lock a different inode.
-static LEASE: Mutex<Option<(String, File)>> = Mutex::new(None);
+/// How long the owner may go without presenting before it lets the channel go. A game presents
+/// every frame, its loading screens included; a launcher or helper that claimed the channel and then
+/// sat minimized or closed its window stops, and must not keep the game it started from claiming it.
+const LEASE_IDLE: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often a process without the lease tries for it again.
+const RETRY_EVERY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The lease, while this process holds it. Kept across swapchain recreation. The lock file is never
+/// unlinked: doing so would let a new process lock a different inode.
+struct Lease {
+    path: String,
+    _file: File,
+}
+
+static LEASE: Mutex<Option<Lease>> = Mutex::new(None);
+/// Whether this process holds the lease: what every user of the channel checks (`shm::ShmClient`,
+/// the model server's loop) before touching it, a relaxed load.
+static HELD: AtomicBool = AtomicBool::new(false);
+/// Milliseconds since [`epoch`] of this process's last present, and of its last attempt to claim.
+static LAST_PRESENT_MS: AtomicU64 = AtomicU64::new(0);
+static LAST_ATTEMPT_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+/// Bumped on every successful claim: a claim after a release is a new session on the channel.
+static GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// How many times this process has taken the lease (0: never).
+pub fn generation() -> u64 {
+    GENERATION.load(Ordering::Acquire)
+}
+
+fn epoch() -> std::time::Instant {
+    static EPOCH: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
+    *EPOCH
+}
+
+fn now_ms() -> u64 {
+    epoch().elapsed().as_millis() as u64
+}
+
+/// Whether this process holds the channel's lease now. Released when it stops presenting
+/// ([`LEASE_IDLE`]); a process that does not hold it must not read or write the channel.
+pub fn held() -> bool {
+    HELD.load(Ordering::Acquire)
+}
+
+/// Called on every present of this process: the lease follows presenting.
+pub fn note_present() {
+    LAST_PRESENT_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+/// Takes (or keeps) the lease on `shm_path`'s channel. Cheap while held; a process that does not hold
+/// it tries the lock at most once per [`RETRY_EVERY`].
 pub fn claim(shm_path: &str) -> bool {
     if !eligible() { return false; }
-    let mut lease = LEASE.lock().unwrap();
-    if let Some((path, _)) = &*lease { return path == shm_path; }
+    if held() {
+        return LEASE.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|l| l.path == shm_path);
+    }
+    let now = now_ms();
+    let last = LAST_ATTEMPT_MS.load(Ordering::Relaxed);
+    if last != u64::MAX && now.saturating_sub(last) < RETRY_EVERY.as_millis() as u64 {
+        return false;
+    }
+    LAST_ATTEMPT_MS.store(now, Ordering::Relaxed);
+    let mut lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(l) = &*lease { return l.path == shm_path; }
     match acquire(&format!("{shm_path}.owner")) {
         Ok(file) => {
             crate::log!("[ownership] pid {} owns {}", std::process::id(), shm_path);
-            *lease = Some((shm_path.to_owned(), file)); true
+            *lease = Some(Lease { path: shm_path.to_owned(), _file: file });
+            // A claim counts as presenting: the claim happens on a present (or a submit around one).
+            note_present();
+            GENERATION.fetch_add(1, Ordering::AcqRel);
+            HELD.store(true, Ordering::Release);
+            start_watchdog();
+            true
         }
         Err(_) => false, // another process owns this channel; present untouched
     }
+}
+
+/// Releases the lease once this process has not presented for [`LEASE_IDLE`]. One thread per
+/// process, started with the first claim; it only sleeps and compares two numbers.
+fn start_watchdog() {
+    static STARTED: AtomicBool = AtomicBool::new(false);
+    if STARTED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    let spawned = std::thread::Builder::new().name("nf-lease".into()).spawn(|| loop {
+        std::thread::sleep(std::time::Duration::from_secs(1));
+        release_if_idle(now_ms(), LEASE_IDLE);
+    });
+    if spawned.is_err() {
+        // Without the watchdog the lease is kept until the process exits, as before.
+        STARTED.store(false, Ordering::Relaxed);
+        crate::log!("[ownership] could not start the lease watchdog; the lease is kept until this process exits");
+    }
+}
+
+/// The watchdog's step: lets the lease go when the last present is more than `idle` ago.
+fn release_if_idle(now: u64, idle: std::time::Duration) -> bool {
+    if !held() || now.saturating_sub(LAST_PRESENT_MS.load(Ordering::Relaxed)) < idle.as_millis() as u64 {
+        return false;
+    }
+    let mut lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
+    HELD.store(false, Ordering::Release);
+    if let Some(l) = lease.take() {
+        crate::log!("[ownership] pid {} has not presented for {} s; released {}", std::process::id(), idle.as_secs(), l.path);
+        crate::logging::flush();
+    }
+    true
 }
 
 #[cfg(test)]
@@ -137,6 +264,45 @@ mod tests {
         assert!(allowed(&native, "/opt/mygame/mygame", Some("mygame")));
         assert!(!allowed(&native, "/opt/mygame/mygame", Some("out.exe")));
     }
+    /// The real launcher names (as Wine's `.exe` argument) never claim, targeted or not; a game still does.
+    #[test]
+    fn store_launchers_and_their_helpers_never_claim() {
+        let wine = "/usr/bin/wine64-preloader";
+        for exe in [
+            "upc.exe", "UbisoftConnect.exe", "UplayWebCore.exe", "EADesktop.exe", "EALauncher.exe", "EABackgroundService.exe",
+            "Battle.net.exe", "Agent.exe", "Battle.net Launcher.exe", "EpicGamesLauncher.exe", "EpicWebHelper.exe",
+            "EOSOverlayRenderer-Win64-Shipping.exe", "GalaxyClient.exe", "GalaxyClient Helper.exe", "RiotClientServices.exe",
+            "CrashReportClient.exe", "UnityCrashHandler64.exe", "QtWebEngineProcess.exe", "steamerrorreporter.exe",
+        ] {
+            let args = vec![wine.to_string(), format!("C:\\Program Files\\{exe}")];
+            assert!(!allowed(&args, wine, None), "{exe}");
+            assert!(!allowed(&args, wine, Some(exe)), "{exe}, targeted");
+        }
+        for game in ["GTA5_Enhanced.exe", "ACValhalla.exe", "Cyberpunk2077.exe", "eldenring.exe"] {
+            assert!(allowed(&[wine.to_string(), format!("Z:\\g\\{game}")], wine, None), "{game}");
+        }
+    }
+
+    /// The lease goes when the owner stops presenting, and not before.
+    #[test]
+    fn the_lease_is_released_after_presents_stop() {
+        let _serial = LEASE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("neural-forge-idle-test-{}", std::process::id()));
+        let file = acquire(path.to_str().unwrap()).unwrap();
+        *LEASE.lock().unwrap() = Some(Lease { path: "test".into(), _file: file });
+        HELD.store(true, Ordering::Release);
+        LAST_PRESENT_MS.store(1_000, Ordering::Relaxed);
+        let idle = std::time::Duration::from_secs(10);
+        assert!(!release_if_idle(10_999, idle), "presented within the window");
+        assert!(held());
+        assert!(release_if_idle(11_000, idle));
+        assert!(!held() && LEASE.lock().unwrap().is_none());
+        // The kernel lock went with it: another process (here another open) can take the channel.
+        assert!(acquire(path.to_str().unwrap()).is_ok());
+        assert!(!release_if_idle(99_000, idle), "nothing left to release");
+        std::fs::remove_file(path).unwrap();
+    }
+
     #[test]
     fn crashed_process_releases_lease() {
         let _serial = LEASE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());

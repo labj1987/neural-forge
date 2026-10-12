@@ -1,26 +1,34 @@
-//! Frame-series capture: `capture_request = N` with N above 1 dumps the next N presented
-//! frames as matched original/composited PNG pairs, for measuring how well the model's edit
-//! lands frame by frame (`scripts/agreement.py`, `crates/layer/examples/pan.rs`).
+//! Captures (`neural_forge_protocol::capture`): the one-shot pair the GUI's capture button and
+//! `shmctl capture` ask for, and frame series (`shmctl capture --frames N`,
+//! `NEURAL_FORGE_CAPTURE_AT`) of the next N presented frames as matched original/composited PNG
+//! pairs, for measuring how well the model's edit lands frame by frame (`scripts/agreement.py`,
+//! `crates/layer/examples/pan.rs`).
 //!
-//! The one-shot dump (`capture_request = 1`, [`crate::dump`]) is untouched. It goes through
-//! `capture::run_sync`, which is neither the default synchronous present's composition nor
-//! the pipelined one, so it cannot compare the two. A series is path-agnostic instead: it reads
-//! the swapchain image back just before `capture::run` (the game's frame) and again just after
-//! it (exactly what is presented, whichever path composed it), and leaves the present path
-//! itself alone.
+//! Both read the swapchain image back just before `capture::run` (the game's frame) and again just
+//! after it (exactly what is presented, whichever path composed it), and leave the present path itself
+//! alone: a capture shows the live pipeline's own result (its working scale, model-pixel cap, even
+//! model raster, mode-2 composition and white point), and the frame on screen is the one presented
+//! anyway. A one-shot is a series of one, written as `<ms>-original.png`/`<ms>-composited.png` in the
+//! captures folder; a series goes to its own `series-<ms>/` folder with an `index.tsv`.
 //!
-//! Cost while a series runs: two blocking image readbacks per present and two PNG encodes,
-//! done on writer threads. The frames are paced a little slower than without a capture; the
-//! writers are bounded, so a backlog blocks the present thread rather than growing memory
-//! without limit. The series ends by waiting for every file to be written.
+//! What became of a request is published on the channel as it goes ([`Report`]): running, then
+//! written (with the files' paths and how many pairs the effect composed), failed or cancelled, each
+//! with a reason. The PNGs are encoded and written on writer threads, never on the present thread; the
+//! last writer to finish publishes the final outcome.
+//!
+//! Cost while a capture runs: two blocking image readbacks per present. The writers are bounded
+//! ([`BACKLOG_BYTES`]): a long series whose PNGs cannot keep up paces the presents down to the
+//! writers' speed rather than growing memory without limit.
 
 use ash::vk;
+use neural_forge_protocol::capture::{reason, state, Outcome, Request};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 
-/// What the writers hold at most before the present thread waits on them.
-const BACKLOG_BYTES: usize = 1536 << 20;
+/// What the writers hold at most (queued pairs) before the present thread waits on them.
+const BACKLOG_BYTES: usize = 512 << 20;
 const WRITERS: usize = 4;
 
 struct Job {
@@ -50,15 +58,142 @@ struct Resources {
     composited: Readback,
 }
 
-/// A running series: where it writes, how many frames are left, and its writers.
+/// Where a capture's files go.
+#[derive(Clone)]
+enum Target {
+    /// The one-shot pair: `<dir>/<stem>-original.png` and `<dir>/<stem>-composited.png`.
+    Pair { dir: PathBuf, stem: String },
+    /// A series: `<dir>/<seq>-original.png` ... and `<dir>/index.tsv`.
+    Series { dir: PathBuf },
+}
+
+impl Target {
+    fn names(&self, seq: u32) -> (PathBuf, PathBuf) {
+        match self {
+            Target::Pair { dir, stem } => (dir.join(format!("{stem}-original.png")), dir.join(format!("{stem}-composited.png"))),
+            Target::Series { dir } => {
+                let (o, c) = pair_names(seq);
+                (dir.join(o), dir.join(c))
+            }
+        }
+    }
+
+    /// The outcome's paths: a one-shot's two files, a series' folder.
+    fn paths(&self) -> String {
+        match self {
+            Target::Pair { .. } => {
+                let (o, c) = self.names(0);
+                format!("{}\n{}", o.display(), c.display())
+            }
+            Target::Series { dir } => dir.display().to_string(),
+        }
+    }
+}
+
+/// How a capture ended on the present thread (its files may still be being written).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Close {
+    Complete,
+    Cancelled,
+    Failed(u32),
+}
+
+/// The published outcome of the running capture, shared with its writers: whoever changes it
+/// publishes it under the lock, so the header's result block has one writer at a time.
+pub(crate) struct Report {
+    channel: Option<crate::shm::Channel>,
+    progress: Mutex<Progress>,
+}
+
+struct Progress {
+    outcome: Outcome,
+    /// Pairs handed to the writers, and how many of them were written and failed.
+    queued: u32,
+    written: u32,
+    failed: u32,
+    /// Set when the present thread is done with the capture.
+    closed: Option<Close>,
+    /// Frames composed by the effect, and the first reason a frame was not.
+    composed: u32,
+    untouched: u32,
+    held: bool,
+}
+
+impl Report {
+    fn new(channel: Option<crate::shm::Channel>, request: Request, target: &Target, held: bool) -> Arc<Self> {
+        let outcome = Outcome { id: request.id, state: state::RUNNING, total: request.frames, paths: target.paths(), ..Outcome::default() };
+        let report = Arc::new(Self {
+            channel,
+            progress: Mutex::new(Progress { outcome, queued: 0, written: 0, failed: 0, closed: None, composed: 0, untouched: reason::NONE, held }),
+        });
+        report.update(|_| {});
+        report
+    }
+
+    /// Publishes a request that was refused before it started.
+    fn refuse(channel: Option<crate::shm::Channel>, request: Request, why: u32) {
+        let outcome = Outcome { id: request.id, state: state::FAILED, reason: why, total: request.frames, ..Outcome::default() };
+        publish(channel.as_ref(), &outcome);
+    }
+
+    /// Applies `change`, settles the outcome, publishes it. Never panics: a poisoned lock is taken over.
+    fn update(&self, change: impl FnOnce(&mut Progress)) {
+        let mut p = self.progress.lock().unwrap_or_else(|e| e.into_inner());
+        change(&mut p);
+        p.settle();
+        publish(self.channel.as_ref(), &p.outcome);
+    }
+
+    fn outcome(&self) -> Outcome {
+        self.progress.lock().unwrap_or_else(|e| e.into_inner()).outcome.clone()
+    }
+}
+
+/// Publishes `outcome` on the channel. The result block is a sequence-locked unit with one writer at
+/// a time; this lock is that one writer, whichever capture or thread publishes.
+pub(crate) fn publish(channel: Option<&crate::shm::Channel>, outcome: &Outcome) {
+    static PUBLISHING: Mutex<()> = Mutex::new(());
+    if let Some(hdr) = channel.and_then(crate::shm::Channel::header) {
+        let _one = PUBLISHING.lock().unwrap_or_else(|e| e.into_inner());
+        neural_forge_protocol::capture::publish(hdr, outcome);
+    }
+}
+
+impl Progress {
+    /// The outcome from the counts: still running until the present thread closed the capture and
+    /// every queued pair was written (or failed).
+    fn settle(&mut self) {
+        let o = &mut self.outcome;
+        o.done = self.written;
+        o.composed = self.composed;
+        let Some(close) = self.closed.filter(|_| self.written + self.failed == self.queued) else {
+            o.state = state::RUNNING;
+            return;
+        };
+        (o.state, o.reason) = match close {
+            Close::Cancelled => (state::CANCELLED, reason::NONE),
+            Close::Failed(why) => (state::FAILED, why),
+            Close::Complete if self.failed > 0 || self.written == 0 => (state::FAILED, reason::WRITE_FAILED),
+            Close::Complete if self.held => (state::WRITTEN, reason::BEFORE_UPSCALER),
+            Close::Complete if self.composed == self.written => (state::WRITTEN, reason::NONE),
+            Close::Complete if self.composed == 0 => {
+                (state::WRITTEN, if self.untouched == reason::NONE { reason::NOT_COMPOSED } else { self.untouched })
+            }
+            Close::Complete => (state::WRITTEN, reason::PARTLY_COMPOSED),
+        };
+    }
+}
+
+/// A running capture: where it writes, how many frames are left, and its writers.
 struct Active {
-    dir: PathBuf,
+    request: Request,
+    target: Target,
     remaining: u32,
     seq: u32,
     started: std::time::Instant,
     index: Option<std::io::BufWriter<std::fs::File>>,
     sender: Option<mpsc::SyncSender<Job>>,
-    writers: Vec<std::thread::JoinHandle<u32>>,
+    report: Arc<Report>,
     /// Set by [`Series::before`] when the original readback is on the queue.
     original_pending: bool,
 }
@@ -67,44 +202,88 @@ struct Active {
 pub struct Series {
     active: Option<Active>,
     resources: Option<Resources>,
+    /// Writers of finished captures still writing: waited for (bounded) only at device teardown.
+    draining: Vec<std::thread::JoinHandle<()>>,
 }
 
 // SAFETY: the raw mapped pointers are only dereferenced on the thread holding the device
 // state's `Mutex`, like every other Vulkan resource in that state.
 unsafe impl Send for Series {}
 
-/// The capture request this present takes, as a series length. Normally only a series
-/// (`capture_request` above 1): the one-shot (1) belongs to `capture::run`. While frames are `held`
-/// before the upscaler (`crate::preupscale`) the post path does not run, so the present takes the
-/// one-shot as well, as a series of one frame; otherwise the request would stay pending.
-pub fn take_request(shm: &crate::shm::ShmClient, held: bool) -> Option<u32> {
-    shm.take_series_request().or_else(|| (held && shm.take_capture_request()).then_some(1))
+/// Whether this present takes `request`. While frames are `held` before the upscaler
+/// (`crate::preupscale`) and with `NEURAL_FORGE_PREUPSCALE=dump`, a one-shot belongs to the
+/// pre-upscaler dump (`dump_owns_one_shot`), which writes DLSS's input instead; every other request
+/// is the present's.
+pub fn serves(request: &Request, dump_owns_one_shot: bool) -> bool {
+    request.frames != 1 || !dump_owns_one_shot
+}
+
+/// The capture request this present takes ([`serves`]).
+pub fn take_request(shm: &crate::shm::ShmClient, dump_owns_one_shot: bool) -> Option<Request> {
+    shm.take_capture(|r| serves(r, dump_owns_one_shot))
+}
+
+/// Publishes `request` as refused with `why` (and logs it).
+pub fn refuse(shm: &crate::shm::ShmClient, request: Request, why: u32) {
+    crate::log!("[capture] request {} for {} frames refused: {}", request.id, request.frames, reason::describe(why).unwrap_or("?"));
+    crate::logging::flush();
+    Report::refuse(shm.channel(), request, why);
+}
+
+/// Takes the waiting request and publishes it as failed with `why` (the present cannot capture this
+/// game's frames at all). Nothing to do without one.
+pub fn refuse_waiting(shm: &crate::shm::ShmClient, dump_owns_one_shot: bool, why: u32) {
+    if let Some(request) = take_request(shm, dump_owns_one_shot) {
+        refuse(shm, request, why);
+    }
 }
 
 impl Series {
-    /// Starts a series of `frames` presents, written under `base/series-<ms>/`.
-    pub fn start(&mut self, frames: u32, base: &Path) {
-        if self.active.is_some() {
-            crate::log!("[series] a series is already running; request for {frames} frames ignored");
+    /// Starts `request`'s capture under `base` (the captures folder): a one-shot pair, or a series
+    /// in its own `series-<ms>/` folder. `held`: frames are held before the upscaler, so both halves
+    /// of each pair are the presented frame (the outcome says so).
+    pub fn start(&mut self, request: Request, base: &Path, channel: Option<crate::shm::Channel>, held: bool) {
+        self.draining.retain(|w| !w.is_finished());
+        if !request.valid() {
+            crate::log!("[capture] request {} for {} frames refused: 1 to {} frames", request.id, request.frames, neural_forge_protocol::capture::MAX_FRAMES);
+            Report::refuse(channel, request, reason::BAD_COUNT);
             return;
         }
-        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
-        let dir = base.join(format!("series-{stamp}"));
-        if let Err(e) = std::fs::create_dir_all(&dir) {
-            crate::log!("[series] failed to create {}: {}", dir.display(), e);
+        if let Some(active) = &self.active {
+            crate::log!("[capture] capture {} is still running; request {} for {} frames refused", active.request.id, request.id, request.frames);
+            Report::refuse(channel, request, reason::BUSY);
+            // The running capture's own outcome again, so a reader of the channel sees it, not the refusal.
+            active.report.update(|_| {});
             return;
         }
-        let index = std::fs::File::create(dir.join("index.tsv")).ok().map(std::io::BufWriter::new);
-        crate::log!("[series] capturing the next {frames} presents into {}", dir.display());
+        let target = match create_target(base, request.frames) {
+            Ok(target) => target,
+            Err(e) => {
+                crate::log!("[capture] could not create the capture's files under {}: {e}", base.display());
+                crate::logging::flush();
+                Report::refuse(channel, request, reason::WRITE_FAILED);
+                return;
+            }
+        };
+        let index = match &target {
+            Target::Series { dir } => std::fs::File::create(dir.join("index.tsv")).ok().map(std::io::BufWriter::new),
+            Target::Pair { .. } => None,
+        };
+        match &target {
+            Target::Pair { dir, stem } => crate::log!("[capture] capturing the next present as {stem}-{{original,composited}}.png in {}", dir.display()),
+            Target::Series { dir } => crate::log!("[capture] capturing the next {} presents into {}", request.frames, dir.display()),
+        }
         crate::logging::flush();
+        let report = Report::new(channel, request, &target, held);
         self.active = Some(Active {
-            dir,
-            remaining: frames,
+            request,
+            target,
+            remaining: request.frames,
             seq: 0,
             started: std::time::Instant::now(),
             index,
             sender: None,
-            writers: Vec::new(),
+            report,
             original_pending: false,
         });
     }
@@ -113,9 +292,25 @@ impl Series {
         self.active.is_some()
     }
 
+    /// The running capture's published outcome (tests, and the log).
+    #[cfg(test)]
+    fn outcome(&self) -> Option<Outcome> {
+        self.active.as_ref().map(|a| a.report.outcome())
+    }
+
+    /// Ends the running capture because this present cannot read the frame (`why`), keeping the pairs
+    /// already taken.
+    pub fn abandon(&mut self, why: u32) {
+        if self.active.is_some() {
+            crate::log!("[capture] capture abandoned: {}", reason::describe(why).unwrap_or("?"));
+            self.finish(Close::Failed(why));
+        }
+    }
+
     /// Queues the readback of `image` as this present's original. Call before anything of the
     /// layer's own is submitted for this present; `image` is in `PRESENT_SRC_KHR` and every
     /// earlier submission on `queue` (the application's, via the relay) is ordered before it.
+    /// A capture the requester cancelled ends here instead.
     ///
     /// # Safety
     /// `queue` is externally synchronized for this call and the following [`Self::after`], and
@@ -135,6 +330,12 @@ impl Series {
     ) {
         let Some(active) = self.active.as_mut() else { return };
         active.original_pending = false;
+        let cancelled = active.report.channel.as_ref().and_then(crate::shm::Channel::header).is_some_and(|hdr| neural_forge_protocol::capture::cancel_requested(hdr, active.request.id));
+        if cancelled {
+            crate::log!("[capture] capture {} cancelled after {} frames", active.request.id, active.seq);
+            self.finish(Close::Cancelled);
+            return;
+        }
         let bytes = u64::from(width) * u64::from(height) * 4;
         if self.resources.as_ref().is_some_and(|r| r.bytes != bytes || r.queue_family != queue_family) {
             // SAFETY: every submission on these resources was waited on in `after`.
@@ -144,8 +345,8 @@ impl Series {
             self.resources = unsafe { create_resources(device, instance, physical_device, queue_family, bytes) };
         }
         let Some(r) = self.resources.as_ref() else {
-            crate::log!("[series] could not create readback resources; series abandoned");
-            self.finish();
+            crate::log!("[capture] could not create readback resources; capture abandoned");
+            self.finish(Close::Failed(reason::READBACK_FAILED));
             return;
         };
         // SAFETY: per this function's contract.
@@ -154,8 +355,10 @@ impl Series {
 
     /// Reads `image` back as this present's composited result, waiting on `compose_done` (the
     /// semaphore `capture::run` returned, if any) first, and hands the pair to the writers.
-    /// Returns `true` when `compose_done` was waited on here, so the real present must no
-    /// longer wait on it (a binary semaphore is consumed by one wait).
+    /// `untouched`: when `compose_done` is `None`, why the effect did not compose this frame (a
+    /// [`reason`] code; [`reason::NONE`] when unknown). Returns `true` when `compose_done` was
+    /// waited on here, so the real present must no longer wait on it (a binary semaphore is
+    /// consumed by one wait).
     ///
     /// # Safety
     /// Same as [`Self::before`], called once after it for the same present.
@@ -169,6 +372,7 @@ impl Series {
         height: u32,
         bgr_order: bool,
         compose_done: Option<vk::Semaphore>,
+        untouched: u32,
     ) -> bool {
         let Some(active) = self.active.as_mut() else { return false };
         let Some(r) = self.resources.as_ref() else { return false };
@@ -181,8 +385,8 @@ impl Series {
         let original_done = unsafe { wait_and_reset(device, &r.original) };
         let composited_done = submitted && unsafe { wait_and_reset(device, &r.composited) };
         if !(original_done && composited_done) {
-            crate::log!("[series] readback failed on frame {}; series abandoned", active.seq);
-            self.finish();
+            crate::log!("[capture] readback failed on frame {}; capture abandoned", active.seq);
+            self.finish(Close::Failed(reason::READBACK_FAILED));
             // A fence that never signalled leaves its resources in an unknown state: they are
             // leaked rather than freed under the GPU or reused with a pending fence.
             self.resources = None;
@@ -196,75 +400,61 @@ impl Series {
             (std::slice::from_raw_parts(r.original.ptr, len).to_vec(), std::slice::from_raw_parts(r.composited.ptr, len).to_vec())
         };
         let seq = active.seq;
+        let composed = compose_done.is_some();
         if let Some(index) = active.index.as_mut() {
             if seq == 0 {
                 // `gpu_composed`: the GPU composition ran for this present (it returned a
-                // semaphore). 0 is a frame that went out untouched, or the rare CPU fallback.
+                // semaphore). 0 is a frame that went out untouched.
                 let _ = writeln!(index, "seq\tms\tgpu_composed\twidth\theight");
             }
-            let _ = writeln!(index, "{seq}\t{:.3}\t{}\t{width}\t{height}", active.started.elapsed().as_secs_f64() * 1000.0, u8::from(compose_done.is_some()));
+            let _ = writeln!(index, "{seq}\t{:.3}\t{}\t{width}\t{height}", active.started.elapsed().as_secs_f64() * 1000.0, u8::from(composed));
         }
         if active.sender.is_none() {
-            let bound = (BACKLOG_BYTES / (2 * len.max(1))).max(2);
-            let (sender, receiver) = mpsc::sync_channel::<Job>(bound);
-            let receiver = std::sync::Arc::new(std::sync::Mutex::new(receiver));
-            for _ in 0..WRITERS {
-                let receiver = receiver.clone();
-                let dir = active.dir.clone();
-                active.writers.push(std::thread::spawn(move || {
-                    let mut failures = 0;
-                    loop {
-                        let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                        let Ok(job) = job else { return failures };
-                        if !write_job(&dir, &job) {
-                            failures += 1;
-                        }
-                    }
-                }));
+            match spawn_writers(&active.target, &active.report, len, active.request.frames) {
+                Some((sender, writers)) => {
+                    active.sender = Some(sender);
+                    self.draining.extend(writers);
+                }
+                None => {
+                    crate::log!("[capture] could not start a writer thread; capture abandoned");
+                    self.finish(Close::Failed(reason::WRITE_FAILED));
+                    return submitted;
+                }
             }
-            active.sender = Some(sender);
         }
-        if let Some(sender) = &active.sender {
-            let _ = sender.send(Job { seq, original, composited, width, height, bgr_order });
+        let Some(active) = self.active.as_mut() else { return submitted };
+        active.report.update(|p| {
+            p.queued += 1;
+            if composed {
+                p.composed += 1;
+            } else if p.untouched == reason::NONE {
+                p.untouched = untouched;
+            }
+        });
+        let sent = active.sender.as_ref().is_some_and(|s| s.send(Job { seq, original, composited, width, height, bgr_order }).is_ok());
+        if !sent {
+            // Every writer is gone (it panicked): the pair counts as failed.
+            active.report.update(|p| p.failed += 1);
         }
         active.seq += 1;
         active.remaining = active.remaining.saturating_sub(1);
         if active.remaining == 0 {
-            self.finish();
+            self.finish(Close::Complete);
         }
         submitted
     }
 
-    /// Ends the series: waits for every queued pair to be written, then says where they are.
-    fn finish(&mut self) {
-        self.finish_within(None);
-    }
-
-    /// [`Self::finish`], but gives the writers at most `limit`: past it they are left to finish
-    /// on their own threads (the process may exit first, losing the pairs still queued).
-    fn finish_within(&mut self, limit: Option<std::time::Duration>) {
+    /// Ends the running capture on the present thread. Never waits for its files: the writers drain
+    /// what is queued and the last of them publishes the final outcome.
+    fn finish(&mut self, close: Close) {
         let Some(mut active) = self.active.take() else { return };
         if let Some(mut index) = active.index.take() {
             let _ = index.flush();
         }
         drop(active.sender.take());
-        let deadline = limit.map(|l| std::time::Instant::now() + l);
-        while let Some(deadline) = deadline {
-            if active.writers.iter().all(|w| w.is_finished()) || std::time::Instant::now() >= deadline {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let (done, running): (Vec<_>, Vec<_>) = active.writers.drain(..).partition(|w| deadline.is_none() || w.is_finished());
-        let failures: u32 = done.into_iter().map(|w| w.join().unwrap_or(1)).sum();
-        if running.is_empty() {
-            crate::log!("[series] wrote {} frame pairs into {} ({} failed)", active.seq, active.dir.display(), failures);
-        } else {
-            crate::log!(
-                "[series] {} writers still busy at teardown: {} frame pairs captured into {}, the last ones may be missing",
-                running.len(), active.seq, active.dir.display()
-            );
-        }
+        let frames = active.seq;
+        active.report.update(|p| p.closed = Some(close));
+        crate::log!("[capture] {} frames captured ({close:?}); their files are written in the background", frames);
         crate::logging::flush();
     }
 
@@ -272,11 +462,79 @@ impl Series {
     /// Nothing submitted through this series may still be pending (it never is after
     /// [`Self::after`] returns).
     pub unsafe fn destroy(&mut self, device: &ash::Device) {
-        // Device teardown holds the layer's state lock: a game quitting mid-series must not
-        // wait out a long PNG backlog.
-        self.finish_within(Some(std::time::Duration::from_secs(2)));
+        if self.active.is_some() {
+            self.finish(Close::Failed(reason::GAME_ENDED));
+        }
+        // Device teardown holds the layer's state lock: a game quitting mid-capture must not
+        // wait out a long PNG backlog. Past the limit the writers finish on their own threads (the
+        // process may exit first, losing the pairs still queued).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while !self.draining.iter().all(|w| w.is_finished()) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if self.draining.iter().any(|w| !w.is_finished()) {
+            crate::log!("[capture] writers still busy at teardown; the last pairs may be missing");
+            crate::logging::flush();
+        }
+        self.draining.clear();
         unsafe { destroy_resources(self.resources.take(), device) };
     }
+}
+
+/// The one-shot's free `<ms>` stem in `base`, or a new `series-<ms>` folder under it. A name that is
+/// taken (two captures in one millisecond) gets a `-1`, `-2`, ... suffix instead of overwriting.
+fn create_target(base: &Path, frames: u32) -> std::io::Result<Target> {
+    std::fs::create_dir_all(base)?;
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0);
+    for n in 0..1000u32 {
+        let name = if n == 0 { stamp.to_string() } else { format!("{stamp}-{n}") };
+        if frames == 1 {
+            let target = Target::Pair { dir: base.to_path_buf(), stem: name };
+            let (o, c) = target.names(0);
+            if !o.exists() && !c.exists() {
+                return Ok(target);
+            }
+        } else {
+            let dir = base.join(format!("series-{name}"));
+            // `create_dir`, not `create_dir_all`: an existing folder is another series'.
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return Ok(Target::Series { dir }),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(e) => return Err(e),
+            }
+        }
+    }
+    Err(std::io::Error::other("no free capture name"))
+}
+
+/// Starts the capture's writers (at most one per frame): `None` when not one thread could be started.
+fn spawn_writers(target: &Target, report: &Arc<Report>, len: usize, frames: u32) -> Option<(mpsc::SyncSender<Job>, Vec<std::thread::JoinHandle<()>>)> {
+    let bound = (BACKLOG_BYTES / (2 * len.max(1))).max(1);
+    let (sender, receiver) = mpsc::sync_channel::<Job>(bound);
+    let receiver = Arc::new(Mutex::new(receiver));
+    let fast = matches!(target, Target::Series { .. });
+    let mut writers = Vec::new();
+    for i in 0..WRITERS.min(frames.max(1) as usize) {
+        let receiver = receiver.clone();
+        let target = target.clone();
+        let report = report.clone();
+        let spawned = std::thread::Builder::new().name(format!("nf-capture-{i}")).spawn(move || loop {
+            let job = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
+            let Ok(job) = job else { return };
+            let ok = write_job(&target, &job, fast);
+            report.update(|p| if ok { p.written += 1 } else { p.failed += 1 });
+            let outcome = report.outcome();
+            if outcome.finished() {
+                crate::log!("[capture] {}: {} pairs written to {}", outcome.message(), outcome.done, outcome.paths.replace('\n', ", "));
+                crate::logging::flush();
+            }
+        });
+        match spawned {
+            Ok(handle) => writers.push(handle),
+            Err(e) => crate::log!("[capture] could not start writer {i}: {e}"),
+        }
+    }
+    (!writers.is_empty()).then_some((sender, writers))
 }
 
 /// The file names one series frame is written under.
@@ -284,11 +542,16 @@ pub fn pair_names(seq: u32) -> (String, String) {
     (format!("{seq:06}-original.png"), format!("{seq:06}-composited.png"))
 }
 
-fn write_job(dir: &Path, job: &Job) -> bool {
-    let (original, composited) = pair_names(job.seq);
-    let a = crate::dump::write_png(&dir.join(original), &job.original, job.width, job.height, job.bgr_order, true);
-    let b = crate::dump::write_png(&dir.join(composited), &job.composited, job.width, job.height, job.bgr_order, true);
-    a && b
+fn write_job(target: &Target, job: &Job, fast: bool) -> bool {
+    let (original, composited) = target.names(job.seq);
+    let a = crate::dump::write_png(&original, &job.original, job.width, job.height, job.bgr_order, fast);
+    let b = crate::dump::write_png(&composited, &job.composited, job.width, job.height, job.bgr_order, fast);
+    for (path, result) in [(&original, &a), (&composited, &b)] {
+        if let Err(e) = result {
+            crate::log!("[capture] writing {} failed: {e}", path.display());
+        }
+    }
+    a.is_ok() && b.is_ok()
 }
 
 unsafe fn create_readback(
@@ -463,6 +726,7 @@ unsafe fn invalidate(device: &ash::Device, r: &Readback) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use neural_forge_protocol::capture::{self as protocol, MAX_FRAMES};
 
     fn clear(device: &ash::Device, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image, from: vk::ImageLayout, colour: [f32; 4]) {
         let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
@@ -490,48 +754,138 @@ mod tests {
         }
     }
 
-    /// The one-shot stays `capture::run`'s on the post path, and is taken (as one frame) while
-    /// frames are held before the upscaler; a series is taken either way, once.
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(format!("target/test-scratch/capture-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir
+    }
+
+    fn decode(path: &Path) -> Vec<u8> {
+        let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap())).read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().expect("PNG frame size fits in memory")];
+        reader.next_frame(&mut buf).unwrap();
+        buf
+    }
+
+    /// The published outcome once the writers are done with it (bounded).
+    fn finished(hdr: &neural_forge_protocol::ShmHeader, id: u32) -> Outcome {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(o) = protocol::result(hdr).filter(|o| o.id == id && o.finished()) {
+                return o;
+            }
+            assert!(std::time::Instant::now() < deadline, "capture {id} never finished: {:?}", protocol::result(hdr));
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    fn request(id: u32, frames: u32) -> Request {
+        Request { id, frames }
+    }
+
+    /// A one-shot belongs to the pre-upscaler dump only with `NEURAL_FORGE_PREUPSCALE=dump`; a series
+    /// is always the present's, and a request is taken once.
     #[test]
-    fn requests_are_taken_by_the_post_path_and_while_held() {
+    fn requests_are_served_by_one_owner_and_taken_once() {
         let header = Box::new(neural_forge_protocol::ShmHeader::default());
         let shm = crate::shm::ShmClient::test_over_header(&header);
-        let field = &header.capture_request;
-        use std::sync::atomic::Ordering::Relaxed;
         assert_eq!(take_request(&shm, false), None);
-        assert_eq!(take_request(&shm, true), None);
-        field.store(1, Relaxed);
-        assert_eq!(take_request(&shm, false), None, "the one-shot is left for capture::run");
-        assert_eq!(field.load(Relaxed), 1);
-        assert_eq!(take_request(&shm, true), Some(1), "held: the one-shot is served as one frame");
-        assert_eq!(field.load(Relaxed), 0);
-        assert_eq!(take_request(&shm, true), None, "served once");
-        field.store(30, Relaxed);
-        assert_eq!(take_request(&shm, true), Some(30));
-        field.store(2, Relaxed);
-        assert_eq!(take_request(&shm, false), Some(2));
-        assert_eq!(field.load(Relaxed), 0);
+        let id = protocol::request(&header, 1).unwrap();
+        assert_eq!(take_request(&shm, true), None, "with the dump on, the one-shot is the dump's");
+        assert_eq!(shm.take_capture_request(), Some(request(id, 1)), "the dump takes it");
+        let id = protocol::request(&header, 1).unwrap();
+        assert_eq!(take_request(&shm, false), Some(request(id, 1)));
+        assert_eq!(take_request(&shm, false), None, "served once");
+        let id = protocol::request(&header, 30).unwrap();
+        assert_eq!(shm.take_capture_request(), None, "a series is never the dump's");
+        assert_eq!(take_request(&shm, true), Some(request(id, 30)));
+    }
+
+    /// Requests that cannot start are answered at once, with the reason, for their own id.
+    #[test]
+    fn bad_counts_unwritable_folders_and_a_busy_capture_are_refused_with_a_reason() {
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        let shm = crate::shm::ShmClient::test_over_header(&header);
+        let base = scratch("refused");
+        let mut series = Series::default();
+        for frames in [0, MAX_FRAMES + 1] {
+            series.start(request(5, frames), &base, shm.channel(), false);
+            assert!(!series.running());
+            let o = protocol::result(&header).unwrap();
+            assert_eq!((o.id, o.state, o.reason), (5, state::FAILED, reason::BAD_COUNT), "{frames} frames");
+        }
+        // A file where the folder should be.
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        std::fs::write(&base, b"not a folder").unwrap();
+        series.start(request(6, 1), &base, shm.channel(), false);
+        assert!(!series.running());
+        assert_eq!(protocol::result(&header).map(|o| (o.id, o.state, o.reason)), Some((6, state::FAILED, reason::WRITE_FAILED)));
+        std::fs::remove_file(&base).unwrap();
+        // Busy: the second request is refused, and the running capture's own outcome is published again.
+        series.start(request(7, 3), &base, shm.channel(), false);
+        assert!(series.running());
+        series.start(request(8, 1), &base, shm.channel(), false);
+        let o = protocol::result(&header).unwrap();
+        assert_eq!((o.id, o.state, o.total), (7, state::RUNNING, 3), "the running capture is what the channel shows");
+        series.abandon(reason::GAME_ENDED);
+        assert_eq!(finished(&header, 7).reason, reason::GAME_ENDED);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The outcome from the counts: what a written capture says about its composited images.
+    #[test]
+    fn the_outcome_says_whether_the_effect_composed_the_frames() {
+        let settle = |queued, written, failed, composed, untouched, held, close| {
+            let mut p = Progress { outcome: Outcome::default(), queued, written, failed, closed: close, composed, untouched, held };
+            p.settle();
+            (p.outcome.state, p.outcome.reason, p.outcome.done)
+        };
+        assert_eq!(settle(2, 1, 0, 2, 0, false, Some(Close::Complete)).0, state::RUNNING, "a pair still being written");
+        assert_eq!(settle(2, 2, 0, 2, 0, false, None).0, state::RUNNING, "frames still to capture");
+        assert_eq!(settle(2, 2, 0, 2, 0, false, Some(Close::Complete)), (state::WRITTEN, reason::NONE, 2));
+        assert_eq!(settle(2, 2, 0, 0, reason::EFFECT_OFF, false, Some(Close::Complete)), (state::WRITTEN, reason::EFFECT_OFF, 2));
+        assert_eq!(settle(1, 1, 0, 0, reason::NONE, false, Some(Close::Complete)), (state::WRITTEN, reason::NOT_COMPOSED, 1));
+        assert_eq!(settle(3, 3, 0, 1, reason::NO_ANSWER, false, Some(Close::Complete)), (state::WRITTEN, reason::PARTLY_COMPOSED, 3));
+        assert_eq!(settle(1, 1, 0, 0, reason::BEFORE_UPSCALER, true, Some(Close::Complete)), (state::WRITTEN, reason::BEFORE_UPSCALER, 1));
+        assert_eq!(settle(2, 1, 1, 2, 0, false, Some(Close::Complete)), (state::FAILED, reason::WRITE_FAILED, 1));
+        assert_eq!(settle(1, 1, 0, 1, 0, false, Some(Close::Cancelled)), (state::CANCELLED, reason::NONE, 1));
+        assert_eq!(settle(0, 0, 0, 0, 0, false, Some(Close::Failed(reason::READBACK_FAILED))), (state::FAILED, reason::READBACK_FAILED, 0));
+    }
+
+    /// Two captures in the same millisecond never overwrite each other's files or share a folder.
+    #[test]
+    fn capture_names_never_collide() {
+        let base = scratch("names");
+        let a = create_target(&base, 1).unwrap();
+        let (o, c) = a.names(0);
+        std::fs::write(&o, b"x").unwrap();
+        std::fs::write(&c, b"x").unwrap();
+        let b = create_target(&base, 1).unwrap();
+        assert_ne!(b.names(0).0, o, "a taken stem is skipped");
+        let s1 = create_target(&base, 5).unwrap();
+        let s2 = create_target(&base, 5).unwrap();
+        assert_ne!(s1.paths(), s2.paths(), "each series gets a folder of its own");
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     /// A series of three presents where something (standing in for the composition) rewrites
     /// the image between `before` and `after`: each pair must hold the frame as it was before
     /// and after that write, the files must be named by sequence, and the series must end by
-    /// itself after the requested count, with an index row per frame.
-    ///
-    /// Then, on the same device (one device per test keeps the suite's memory small): while frames are held before the upscaler the present composes nothing, so a
-    /// one-shot request taken there reads the presented frame twice, both halves of its pair are the
-    /// final picture, and the request is served (no longer left pending).
+    /// itself after the requested count, with an index row per frame and an outcome that says the
+    /// effect did not compose them (no semaphore) and why. Then, on the same device: a one-shot
+    /// while frames are held before the upscaler (both halves the presented frame, said so), and a
+    /// series cancelled by its requester after two frames.
     #[test]
-    fn series_reads_back_each_present_before_and_after_the_composition() {
+    fn captures_read_back_each_present_before_and_after_the_composition() {
         let Some((_entry, instance, physical_device, device, queue, family)) = crate::composition::gpu::test_device() else {
             eprintln!("no Vulkan device; skipping");
             return;
         };
         let (width, height) = (16u32, 8u32);
-        let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).ancestors().nth(2).unwrap().join(format!("target/test-scratch/series-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let held_base = base.with_file_name(format!("series-held-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&held_base);
+        let base = scratch("series");
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        let shm = crate::shm::ShmClient::test_over_header(&header);
+        let series_dir;
         unsafe {
             let info = vk::ImageCreateInfo::builder()
                 .image_type(vk::ImageType::TYPE_2D)
@@ -552,8 +906,9 @@ mod tests {
             let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
 
             let mut series = Series::default();
-            series.start(3, &base);
+            series.start(request(11, 3), &base, shm.channel(), false);
             assert!(series.running());
+            assert_eq!(series.outcome().map(|o| (o.state, o.total)), Some((state::RUNNING, 3)));
             let mut layout = vk::ImageLayout::UNDEFINED;
             for frame in 0..4u32 {
                 let game = frame as f32 / 8.0;
@@ -562,28 +917,42 @@ mod tests {
                 let was_running = series.running();
                 series.before(&device, &instance, physical_device, queue, family, image, width, height);
                 clear(&device, queue, pool, image, layout, [game, 1.0, 0.0, 1.0]);
-                series.after(&device, queue, image, width, height, true, None);
+                series.after(&device, queue, image, width, height, true, None, reason::NO_ANSWER);
                 assert_eq!(was_running, frame < 3, "the series must end after exactly 3 presents");
             }
             assert!(!series.running());
+            let o = finished(&header, 11);
+            assert_eq!((o.state, o.reason, o.done, o.total, o.composed), (state::WRITTEN, reason::NO_ANSWER, 3, 3, 0), "{o:?}");
+            series_dir = PathBuf::from(o.paths.clone());
 
-            // Held before the upscaler: the one-shot is taken by the present, as one frame.
-            let header = Box::new(neural_forge_protocol::ShmHeader::default());
-            let shm = crate::shm::ShmClient::test_over_header(&header);
-            header.capture_request.store(1, std::sync::atomic::Ordering::Relaxed);
-            for frame in 0..2u32 {
-                if let Some(frames) = take_request(&shm, true) {
-                    series.start(frames, &held_base);
-                }
-                // The game's frame, the model's edit already in it.
-                clear(&device, queue, pool, image, layout, [0.25 + frame as f32 / 4.0, 0.5, 0.0, 1.0]);
-                let was_running = series.running();
+            // Held before the upscaler: a one-shot reads the presented frame twice.
+            series.start(request(12, 1), &base, shm.channel(), true);
+            clear(&device, queue, pool, image, layout, [0.25, 0.5, 0.0, 1.0]);
+            series.before(&device, &instance, physical_device, queue, family, image, width, height);
+            series.after(&device, queue, image, width, height, true, None, reason::BEFORE_UPSCALER);
+            assert!(!series.running(), "a one-shot is one frame");
+            let o = finished(&header, 12);
+            assert_eq!((o.state, o.reason, o.done), (state::WRITTEN, reason::BEFORE_UPSCALER, 1));
+            let paths: Vec<PathBuf> = o.paths().map(PathBuf::from).collect();
+            assert_eq!(paths.len(), 2);
+            assert!(paths[0].to_string_lossy().ends_with("-original.png") && paths[1].to_string_lossy().ends_with("-composited.png"));
+            assert_eq!(paths[0].parent(), Some(base.as_path()), "a one-shot's pair sits in the captures folder itself");
+            let (a, b) = (decode(&paths[0]), decode(&paths[1]));
+            assert_eq!(a, b, "held: both halves are the presented frame");
+            assert!(a[0].abs_diff(64) <= 1 && a[1].abs_diff(128) <= 1 && a[2] == 0 && a[3] == 255, "{:?}", &a[..4]);
+
+            // Cancelled by the requester after two frames: it stops at the next present, keeping both.
+            series.start(request(13, 10), &base, shm.channel(), false);
+            for _ in 0..2 {
                 series.before(&device, &instance, physical_device, queue, family, image, width, height);
-                series.after(&device, queue, image, width, height, true, None);
-                assert_eq!(was_running, frame == 0, "a one-shot is one frame");
+                series.after(&device, queue, image, width, height, true, None, reason::NONE);
             }
-            assert_eq!(header.capture_request.load(std::sync::atomic::Ordering::Relaxed), 0, "the request was served");
+            assert_eq!(protocol::cancel(&header, 13), protocol::Cancelled::Signalled);
+            series.before(&device, &instance, physical_device, queue, family, image, width, height);
             assert!(!series.running());
+            let o = finished(&header, 13);
+            assert_eq!((o.state, o.done), (state::CANCELLED, 2));
+
             series.destroy(&device);
             device.queue_wait_idle(queue).unwrap();
             device.destroy_command_pool(pool, None);
@@ -592,20 +961,14 @@ mod tests {
             device.destroy_device(None);
             instance.destroy_instance(None);
         }
-        let dir = std::fs::read_dir(&base).unwrap().next().unwrap().unwrap().path();
+        let dir = series_dir;
         assert!(dir.file_name().unwrap().to_string_lossy().starts_with("series-"));
-        let decode = |name: &str| {
-            let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(dir.join(name)).unwrap())).read_info().unwrap();
-            let mut buf = vec![0; reader.output_buffer_size().expect("PNG frame size fits in memory")];
-            reader.next_frame(&mut buf).unwrap();
-            buf
-        };
         for seq in 0..3u32 {
             let (original, composited) = pair_names(seq);
             let red = (seq as f32 / 8.0 * 255.0).round() as u8;
             // Written as true RGBA (the image is BGRA): red carries the frame, green the "edit".
-            let o = decode(&original);
-            let c = decode(&composited);
+            let o = decode(&dir.join(original));
+            let c = decode(&dir.join(composited));
             assert_eq!(&o[..4], &[red, 0, 0, 255], "frame {seq} original");
             assert_eq!(&c[..4], &[red, 255, 0, 255], "frame {seq} composited");
             assert!(o.chunks(4).all(|p| p == &o[..4]) && c.chunks(4).all(|p| p == &c[..4]));
@@ -613,22 +976,7 @@ mod tests {
         assert!(!dir.join(pair_names(3).0).exists(), "a fourth present must not be captured");
         let index = std::fs::read_to_string(dir.join("index.tsv")).unwrap();
         assert_eq!(index.lines().count(), 4, "header plus one row per frame:\n{index}");
+        assert!(std::fs::read_dir(&dir).unwrap().all(|e| !e.unwrap().file_name().to_string_lossy().ends_with(".part")), "no temporary file is left");
         let _ = std::fs::remove_dir_all(&base);
-
-        let dir = std::fs::read_dir(&held_base).unwrap().next().unwrap().unwrap().path();
-        let (original, composited) = pair_names(0);
-        let (o, c) = (decode_at(&dir, &original), decode_at(&dir, &composited));
-        assert_eq!(o, c, "held: both halves are the presented frame");
-        // The first held frame (0.25, 0.5, 0, 1), within a level of the driver's rounding.
-        assert!(o[0].abs_diff(64) <= 1 && o[1].abs_diff(128) <= 1 && o[2] == 0 && o[3] == 255, "{:?}", &o[..4]);
-        assert!(!dir.join(pair_names(1).0).exists());
-        let _ = std::fs::remove_dir_all(&held_base);
-    }
-
-    fn decode_at(dir: &std::path::Path, name: &str) -> Vec<u8> {
-        let mut reader = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(dir.join(name)).unwrap())).read_info().unwrap();
-        let mut buf = vec![0; reader.output_buffer_size().expect("PNG frame size fits in memory")];
-        reader.next_frame(&mut buf).unwrap();
-        buf
     }
 }

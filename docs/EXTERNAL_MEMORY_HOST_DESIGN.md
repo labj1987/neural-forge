@@ -214,13 +214,12 @@ region the driver can import, `capture::run` now skips all three:
   the compose command buffer copies the capture target into `gen_base` and the imported
   answer into `gen_answer`. Both are device-local and followed by their own buffer barriers.
   Every later compose of that generation reads only `gen_*`: a carried frame at
-  `model_interval > 1`, or the other async slot. A late answer, the next capture or
-  `run_sync` can overwrite the shared regions without changing the picture. A zero-copy
+  `model_interval > 1`, or the other async slot. A late answer or the next capture can overwrite the shared regions without changing the picture. A zero-copy
   compose for a generation `gen_*` do not hold returns `None`; it never reads shm.
 - **Helper handoff.** The helper writes the answer region from another process on another
   `VkDevice`, which GPU ordering cannot reach. `GpuCompose` remembers the fence of the
   submission that read the region (`answer_reader`). `capture::run` waits on that fence
-  before every `begin_async_request` and before `run_sync`. It is normally already signaled,
+  before every `begin_async_request`. It is normally already signaled,
   because the next capture was queued behind that compose.
 - **Resizes and queues.** The capture target and `gen_*` are rebuilt only when no direct
   capture is pending and both async compose slots have been waited. The import is replaced

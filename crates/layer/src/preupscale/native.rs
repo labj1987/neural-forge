@@ -1678,7 +1678,7 @@ pub(crate) unsafe fn run_native_hold(
     if let Some(d) = res.depth.as_mut() {
         d.valid = None;
     }
-    if crate::note_vk(submit(super::Which::Capture, res.capture_cmd, vk::Fence::null())).is_err() {
+    if crate::note_vk(device.handle(), submit(super::Which::Capture, res.capture_cmd, vk::Fence::null())).is_err() {
         result.miss = Some("the capture submit failed");
         return result;
     }
@@ -1709,7 +1709,7 @@ pub(crate) unsafe fn run_native_hold(
         }
     };
     for cmd in frame_cmds.into_iter().flatten() {
-        if crate::note_vk(submit(super::Which::Native, cmd, vk::Fence::null())).is_err() {
+        if crate::note_vk(device.handle(), submit(super::Which::Native, cmd, vk::Fence::null())).is_err() {
             // The capture ran; nothing reads its result. The decode is not submitted, so DLSS gets
             // the frame as it was.
             failed(res, submit);
@@ -1726,7 +1726,7 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("resetting the write-back fence failed");
         return result;
     }
-    if crate::note_vk(submit(super::Which::WriteBack, res.writeback_cmd, res.writeback_fence)).is_err() {
+    if crate::note_vk(device.handle(), submit(super::Which::WriteBack, res.writeback_cmd, res.writeback_fence)).is_err() {
         failed(res, submit);
         result.miss = Some("the write-back submit failed");
         return result;

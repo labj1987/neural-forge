@@ -1,12 +1,6 @@
-//! GPU dispatch of `shaders/compose.comp`, wired into `capture.rs`'s write-back as of
-//! 2026-09-10 -- the real fix for [`super::apply`]'s CPU path's real, measured
-//! performance cost (see that module's own doc comment, and docs/history/development-before-neuralforge.md,
-//! for the actual numbers: ~800ms/frame single-threaded, ~97/10s even
-//! multi-threaded on a 16-core machine, both far short of the no-composition
-//! baseline). Same algorithm (`compose.comp` is the hand-translated GPU twin of the
-//! exact `color.rs` functions `apply.rs` calls directly), same real-hardware
-//! verification target -- this is a different, faster execution strategy for
-//! identical math, not a rewrite of it.
+//! GPU dispatch of `shaders/compose.comp`: the composition of every frame the after-the-upscaler
+//! path presents (`capture::run`). The shader is the hand-translated GPU twin of the clean-room
+//! colour math in `color.rs`.
 //!
 //! Three storage images bound as inputs (`u_original`, `u_proxy`, `u_model_answer`)
 //! and one as output (`u_output`), all `R8G8B8A8_UNORM` (the 8-bit proxy formats). When the
@@ -14,23 +8,16 @@
 //! encodes the proxy itself; when it ran below the frame's size, `u_proxy` is the small
 //! encoded proxy, enlarged.
 //!
-//! Two execution paths, both real and tested:
-//! - [`GpuCompose::dispatch`]/[`GpuCompose::dispatch_into_image`]: one command buffer,
-//!   one fence, fully synchronous (submit, then wait). Used for the rare cases that
-//!   need the CPU to see the result before moving on (a pending `capture_request`
-//!   dump) or as the correctness reference the async path below is checked against.
-//! - [`GpuCompose::present_temporal_delta_async`]: the real per-frame
-//!   fast path. Double-buffered (`async_slots`, 2 of them) so the CPU never has to
-//!   block on *this* frame's own compute work -- it submits with a signal semaphore
-//!   and returns immediately, leaving `capture::run`/`device.rs` to chain that
-//!   semaphore into the real present call's own wait list (a GPU-side dependency, not
-//!   a CPU one) so the presentation engine -- not our code -- is what actually waits
-//!   for the compute work to finish before the frame goes on screen. The only new CPU
-//!   wait this introduces is on a slot's *own* fence, immediately before that same
-//!   slot is reused two dispatches later -- by then the GPU has almost always long
-//!   since finished, so that wait is normally instant. See its own doc comment for the
-//!   full reasoning, including why this needed real thought about semaphore reuse
-//!   safety, not just "make it not block."
+//! [`GpuCompose::present_temporal_delta_async`] is the one path: double-buffered (`async_slots`,
+//! 2 of them) so the CPU never has to block on *this* frame's own compute work -- it submits with
+//! a signal semaphore and returns immediately, leaving `capture::run`/`device.rs` to chain that
+//! semaphore into the real present call's own wait list (a GPU-side dependency, not a CPU one) so
+//! the presentation engine -- not our code -- is what actually waits for the compute work to
+//! finish before the frame goes on screen. The only CPU wait this introduces is on a slot's *own*
+//! fence, immediately before that same slot is reused two dispatches later -- by then the GPU has
+//! almost always long since finished, so that wait is normally instant. See its own doc comment
+//! for the full reasoning, including why this needed real thought about semaphore reuse safety,
+//! not just "make it not block."
 
 use ash::vk;
 
@@ -440,7 +427,7 @@ impl ComposeSlot {
     /// Submits `submit` with the slot's fence (after [`Self::reset`]).
     fn submit(&mut self, device: &ash::Device, queue: vk::Queue, submit: vk::SubmitInfo) -> bool {
         // SAFETY: the caller recorded and ended the buffers `submit` names; the fence is reset.
-        let ok = crate::note_vk(unsafe { device.queue_submit(queue, &[submit], self.fence) }).is_ok();
+        let ok = crate::note_vk(device.handle(), unsafe { device.queue_submit(queue, &[submit], self.fence) }).is_ok();
         self.armed = ok;
         ok
     }
@@ -455,7 +442,7 @@ fn wait_armed(device: &ash::Device, fences: &[Option<vk::Fence>], site: &'static
     }
     // SAFETY: the callers' own fences. Bounded: see `crate::FENCE_WAIT_TIMEOUT`.
     let wait = unsafe { device.wait_for_fences(&fences, true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-    crate::note_fence_wait(wait, site).is_ok()
+    crate::note_fence_wait(device.handle(), wait, site).is_ok()
 }
 
 impl ComposeSlot {
@@ -725,171 +712,6 @@ impl ComposeSlot {
         true
     }
 
-    fn begin_ensured(&mut self, device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32, original: &[u8], model_answer: &[u8]) -> Option<u64> {
-        let frame_bytes = (u64::from(width) * u64::from(height) * 4) as usize;
-        if original.len() < frame_bytes || model_answer.len() < frame_bytes {
-            return None;
-        }
-        if !self.ensure_sized(device, mem_props, width, height) {
-            return None;
-        }
-        let s = self.sized.as_ref().expect("just ensured above");
-        if (s.staging_capacity as usize) < frame_bytes * 2 {
-            return None;
-        }
-        // SAFETY: `s.staging_ptr` is a live mapping of at least `frame_bytes * 2`
-        // bytes; `original`/`model_answer` were just confirmed at least `frame_bytes`.
-        unsafe {
-            std::ptr::copy_nonoverlapping(original.as_ptr(), s.staging_ptr, frame_bytes);
-            std::ptr::copy_nonoverlapping(model_answer.as_ptr(), s.staging_ptr.add(frame_bytes), frame_bytes);
-        }
-        Some(frame_bytes as u64)
-    }
-
-    /// Records the shared portion of every dispatch variant onto `self.cmd` (already
-    /// begun): upload `original`/`model_answer` into this slot's own images, run the
-    /// compute shader, and copy `output` back into this slot's own `staging_buffer` at
-    /// offset 0. Callers record whatever happens after this themselves (download to a
-    /// CPU slice, vs. straight into another image).
-    ///
-    /// # Safety
-    /// `self.cmd` must already be recording.
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn record_upload_and_compute(&self, device: &ash::Device, pipeline: vk::Pipeline, pipeline_layout: vk::PipelineLayout, width: u32, height: u32, frame_bytes: u64, colour_strength: f32, transfer_strength: f32, max_ratio: f32, bgr_order: bool) {
-        let s = self.sized.as_ref().expect("caller already ensured this");
-        let region = |offset| image_copy_region(width, height, offset);
-        // SAFETY: `self.cmd` is recording (forwarded from this function's own
-        // contract); every image below was just (re)created by `ensure_sized` and is
-        // still `UNDEFINED` (or is being deliberately discarded via `UNDEFINED` as
-        // `oldLayout`, spec-legal and exactly what a fresh per-frame result needs --
-        // see the crash-fix writeup in docs/history/development-before-neuralforge.md for why this specific pattern is
-        // safe, unlike blindly assuming a *different* real prior layout).
-        unsafe {
-            let to_dst = [
-                image_barrier(s.original.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
-                image_barrier(s.model_answer.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
-                image_barrier(s.proxy.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE),
-            ];
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &to_dst);
-            device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region(0)]);
-            device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region(frame_bytes)]);
-            device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region(0)]);
-
-            let to_general = [
-                image_barrier(s.original.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
-                image_barrier(s.model_answer.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
-                image_barrier(s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::GENERAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ),
-                image_barrier(s.output.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::SHADER_WRITE),
-            ];
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &to_general);
-
-            device.cmd_bind_pipeline(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
-            device.cmd_bind_descriptor_sets(self.cmd, vk::PipelineBindPoint::COMPUTE, pipeline_layout, 0, std::slice::from_ref(&self.descriptor_set), &[]);
-            let push = PushConstants { colour_strength, transfer_strength, max_ratio, bgr_order: bgr_order as u32, mode: 0, ghost_guard: 0.0, compare_mode: 0, compare_split: 0.5, compare_zoom: 1.0, compare_swap: 0, colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: 0, white_point: 1.0, debug_view: 0, debug_scale: 1.0, reversible_mode: 0 };
-            let push_bytes = std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<PushConstants>());
-            device.cmd_push_constants(self.cmd, pipeline_layout, vk::ShaderStageFlags::COMPUTE, 0, push_bytes);
-            device.cmd_dispatch(self.cmd, width.div_ceil(8), height.div_ceil(8), 1);
-
-            let to_src = image_barrier(s.output.image, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::TRANSFER_READ);
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_src]);
-            device.cmd_copy_image_to_buffer(self.cmd, s.output.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.staging_buffer, &[region(0)]);
-        }
-    }
-
-    /// Records the copy from this slot's own `staging_buffer` (offset 0, just written
-    /// by `record_upload_and_compute`'s own final copy) straight into `target_image`,
-    /// then restores `target_image` to `PRESENT_SRC_KHR`. Deliberately buffer-mediated,
-    /// not a raw `vkCmdCopyImage` straight from `output` -- see
-    /// [`GpuCompose::dispatch_into_image`]'s own doc comment for why (format-mismatch
-    /// color corruption risk).
-    ///
-    /// Manages `target_image`'s own `PRESENT_SRC_KHR -> TRANSFER_DST_OPTIMAL ->
-    /// PRESENT_SRC_KHR` round trip itself (2026-09-10) -- until this, the contract was
-    /// "assumes already `TRANSFER_DST_OPTIMAL`", relying entirely on `capture::run`'s
-    /// own stage 1 having *already* transitioned it that far as a side effect of its
-    /// own unrelated readback. That coupling is exactly what made stage 1 and
-    /// composition inseparable, which is what forced every single present call through
-    /// a full, synchronous, model-round-trip-gated capture+composite cycle in the
-    /// first place (see `capture.rs`'s own doc comment on the pipelined redesign this
-    /// enabled) -- a real Vulkan-layout bug waiting to happen the moment anything tried
-    /// to call this without stage 1 having just run.
-    ///
-    /// # Safety
-    /// `self.cmd` must be recording, with `record_upload_and_compute` already called on
-    /// it this same recording, and `target_image` must currently be `PRESENT_SRC_KHR`
-    /// (true of any image `vkQueuePresentKHR`'s own precondition hasn't been violated
-    /// on, real swapchain images included).
-    unsafe fn record_copy_into_image(&self, device: &ash::Device, width: u32, height: u32, frame_bytes: u64, target_image: vk::Image) {
-        let s = self.sized.as_ref().expect("caller already ensured this");
-        // SAFETY: forwarded from this function's own contract.
-        unsafe {
-            let to_transfer_dst = image_barrier(
-                target_image,
-                vk::ImageLayout::PRESENT_SRC_KHR,
-                vk::ImageLayout::TRANSFER_DST_OPTIMAL,
-                vk::AccessFlags::empty(),
-                vk::AccessFlags::TRANSFER_WRITE,
-            );
-            device.cmd_pipeline_barrier(
-                self.cmd,
-                vk::PipelineStageFlags::ALL_COMMANDS,
-                vk::PipelineStageFlags::TRANSFER,
-                vk::DependencyFlags::empty(),
-                &[],
-                &[],
-                &[to_transfer_dst],
-            );
-            let buffer_barrier = vk::BufferMemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(s.staging_buffer)
-                .offset(0)
-                .size(frame_bytes)
-                .build();
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[buffer_barrier], &[]);
-            device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-            let to_present = image_barrier(target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
-        }
-    }
-
-    /// Records a raw held-answer update (only when `update` is true) followed by a
-    /// device-local buffer-to-swapchain copy.  This is deliberately shader-free: the
-    /// model answer is already encoded in the swapchain's byte order, and copying
-    /// through a buffer preserves those bytes without assuming the target format.
-    ///
-    /// # Safety
-    /// `self.cmd` is recording and `target_image` is currently `PRESENT_SRC_KHR`.
-    unsafe fn record_cached_raw_into_image(&self, device: &ash::Device, width: u32, height: u32, frame_bytes: u64, update: bool, target_image: vk::Image) {
-        let s = self.sized.as_ref().expect("caller already ensured this");
-        unsafe {
-            if update {
-                let copy = vk::BufferCopy::builder().src_offset(0).dst_offset(0).size(frame_bytes).build();
-                device.cmd_copy_buffer(self.cmd, s.staging_buffer, s.cached_buffer, &[copy]);
-            }
-            // This also covers reads in a later queue submission: queue order alone
-            // orders execution, while this memory dependency makes the cached write
-            // visible to its next transfer read.
-            let ready = vk::BufferMemoryBarrier::builder()
-                .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
-                .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
-                .buffer(s.cached_buffer)
-                .offset(0)
-                .size(frame_bytes)
-                .build();
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[ready], &[]);
-            let to_transfer_dst = image_barrier(target_image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_transfer_dst]);
-            device.cmd_copy_buffer_to_image(self.cmd, s.cached_buffer, target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
-            let to_present = image_barrier(target_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
-        }
-    }
-
     /// Records a lightweight temporal carry pass.  It reads the current swapchain
     /// image into device-local storage, applies the cached model delta, then writes
     /// the result back; no per-frame CPU readback or upload is involved.
@@ -1134,7 +956,6 @@ pub struct GpuCompose {
     pipeline: vk::Pipeline,
     descriptor_pool: vk::DescriptorPool,
     pool: vk::CommandPool,
-    sync: ComposeSlot,
     async_slots: [AsyncSlot; ASYNC_SLOTS],
     next_async_slot: usize,
     present_semaphores: crate::present_sync::PresentSemaphores,
@@ -1286,18 +1107,12 @@ impl GpuCompose {
             }
         };
 
-        let Some(sync) = ComposeSlot::new(device, cmd_pool, descriptor_pool, descriptor_set_layout) else {
-            cleanup_partial(device);
-            return None;
-        };
-
         let mut async_slots = Vec::with_capacity(ASYNC_SLOTS);
         for _ in 0..ASYNC_SLOTS {
             let Some(slot) = ComposeSlot::new(device, cmd_pool, descriptor_pool, descriptor_set_layout) else {
-                // SAFETY: `sync` and every already-built async slot so far own no GPU
+                // SAFETY: every already-built async slot so far owns no GPU
                 // work in flight (nothing has been submitted yet at construction time).
                 unsafe {
-                    sync.destroy(device);
                     for s in &async_slots {
                         let s: &AsyncSlot = s;
                         s.slot.destroy(device);
@@ -1315,7 +1130,6 @@ impl GpuCompose {
             pipeline,
             descriptor_pool,
             pool: cmd_pool,
-            sync,
             async_slots: async_slots.try_into().unwrap_or_else(|_| unreachable!("pushed exactly ASYNC_SLOTS elements above")),
             next_async_slot: 0,
             present_semaphores: Default::default(),
@@ -1324,168 +1138,6 @@ impl GpuCompose {
             timers_built: false,
             compose_gpu_ms: None,
         })
-    }
-
-    /// Runs `shaders/compose.comp` against `original`/`model_answer` (both `RGBA8`,
-    /// `width`x`height`), writing the composited result back into `model_answer` in
-    /// place -- the same signature and in-place-overwrite convention
-    /// [`super::apply::apply_rgba8`] uses, so `capture.rs` can call either
-    /// interchangeably. `false` (leaving `model_answer` untouched) on any failure,
-    /// fails open exactly like every other stage of the capture path.
-    ///
-    /// Downloads the result to a CPU-visible slice and fully waits for it -- use this
-    /// when something on the CPU actually needs to see the bytes (a pending
-    /// `capture_request` dump in particular). [`Self::present_temporal_delta_async`] is
-    /// the fast, non-blocking path for the common case where nothing does.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch(
-        &mut self,
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        queue: vk::Queue,
-        width: u32,
-        height: u32,
-        original: &[u8],
-        model_answer: &mut [u8],
-        colour_strength: f32,
-        transfer_strength: f32,
-        max_ratio: f32,
-        bgr_order: bool,
-    ) -> bool {
-        // SAFETY: `physical_device` is the device this instance was created against.
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let Some(frame_bytes) = self.sync.begin_ensured(device, &mem_props, width, height, original, model_answer) else { return false };
-
-        // SAFETY: `self.sync.cmd` was allocated with `RESET_COMMAND_BUFFER`.
-        if unsafe { device.reset_command_buffer(self.sync.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
-            return false;
-        }
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: `self.sync.cmd` was just reset.
-        if unsafe { device.begin_command_buffer(self.sync.cmd, &begin_info) }.is_err() {
-            return false;
-        }
-        // SAFETY: `self.sync.cmd` was just begun above.
-        unsafe {
-            self.sync.record_upload_and_compute(
-                device,
-                self.pipeline,
-                self.pipeline_layout,
-                width,
-                height,
-                frame_bytes,
-                colour_strength,
-                transfer_strength,
-                max_ratio,
-                bgr_order,
-            )
-        };
-        if unsafe { device.end_command_buffer(self.sync.cmd) }.is_err() {
-            return false;
-        }
-        // `self.sync.fence` starts signaled or was reset+waited-on by this same function's previous
-        // call; `self.sync.cmd` was just recorded and ended above.
-        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.sync.cmd)).build();
-        if !self.sync.reset(device) || !self.sync.submit(device, queue, submit) {
-            return false;
-        }
-        // SAFETY: `self.sync.fence` was just submitted against above. Bounded, not
-        // truly unbounded: see `crate::FENCE_WAIT_TIMEOUT`.
-        let wait = unsafe { device.wait_for_fences(&[self.sync.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "gpu::dispatch").is_err() {
-            return false;
-        }
-
-        let s = self.sync.sized.as_ref().expect("ensured by begin_ensured above");
-        // SAFETY: the fence wait above guarantees the download copy has completed;
-        // `s.staging_ptr` is host-coherent (no explicit invalidate needed).
-        unsafe { std::ptr::copy_nonoverlapping(s.staging_ptr, model_answer.as_mut_ptr(), frame_bytes as usize) };
-        true
-    }
-
-    /// Same composition as [`Self::dispatch`], but writes the result directly into
-    /// `target_image` (assumed already `TRANSFER_DST_OPTIMAL` -- exactly the layout
-    /// `capture::run`'s own stage 1 already leaves the real swapchain image in) instead
-    /// of downloading it to a CPU-visible slice, and in the *same* command
-    /// buffer/submission as the compute dispatch itself, restoring `target_image` to
-    /// `PRESENT_SRC_KHR` before returning. Still fully synchronous (blocks on this
-    /// dispatch's own fence) -- [`Self::present_temporal_delta_async`] writes into the
-    /// image without that block.
-    ///
-    /// Deliberately routes through the sync slot's own `staging_buffer` rather than a
-    /// raw `vkCmdCopyImage` straight from `output`: a raw image-to-image copy between
-    /// two images of different formats is a byte-for-byte copy with no
-    /// channel-swizzle, so it would silently corrupt colors if `target_image`'s real
-    /// format ever differs from this module's own hardcoded `FORMAT` -- e.g. a real
-    /// `B8G8R8A8` swapchain vs. this module's `R8G8B8A8`. A buffer-to-image copy has no
-    /// format attached to the source either, so it's exactly as agnostic to a *size*/
-    /// layout mismatch, the same reasoning `capture.rs`'s own original stage 2 already
-    /// relied on. **This does NOT make channel order automatically correct, though**
-    /// (a real, confirmed bug this comment used to claim otherwise about, 2026-09-11):
-    /// the bytes in that buffer are only correct for `target_image`'s real component
-    /// order because the shader itself now swizzles its output based on `bgr_order`
-    /// (see `compose.comp`'s `params.bgr_order` doc comment) -- the buffer copy's own
-    /// format-obliviousness was never the thing making this correct.
-    #[allow(clippy::too_many_arguments)]
-    pub fn dispatch_into_image(
-        &mut self,
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        queue: vk::Queue,
-        width: u32,
-        height: u32,
-        original: &[u8],
-        model_answer: &[u8],
-        colour_strength: f32,
-        transfer_strength: f32,
-        max_ratio: f32,
-        bgr_order: bool,
-        target_image: vk::Image,
-    ) -> bool {
-        // SAFETY: `physical_device` is the device this instance was created against.
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let Some(frame_bytes) = self.sync.begin_ensured(device, &mem_props, width, height, original, model_answer) else { return false };
-
-        // SAFETY: `self.sync.cmd` was allocated with `RESET_COMMAND_BUFFER`.
-        if unsafe { device.reset_command_buffer(self.sync.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
-            return false;
-        }
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        // SAFETY: `self.sync.cmd` was just reset.
-        if unsafe { device.begin_command_buffer(self.sync.cmd, &begin_info) }.is_err() {
-            return false;
-        }
-        // SAFETY: `self.sync.cmd` was just begun above.
-        unsafe {
-            self.sync.record_upload_and_compute(
-                device,
-                self.pipeline,
-                self.pipeline_layout,
-                width,
-                height,
-                frame_bytes,
-                colour_strength,
-                transfer_strength,
-                max_ratio,
-                bgr_order,
-            );
-            self.sync.record_copy_into_image(device, width, height, frame_bytes, target_image);
-        }
-        if unsafe { device.end_command_buffer(self.sync.cmd) }.is_err() {
-            return false;
-        }
-        // `self.sync.fence` starts signaled or was reset+waited-on by this same function's previous
-        // call; `self.sync.cmd` was just recorded and ended above.
-        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&self.sync.cmd)).build();
-        if !self.sync.reset(device) || !self.sync.submit(device, queue, submit) {
-            return false;
-        }
-        // SAFETY: `self.sync.fence` was just submitted against above. Bounded, not
-        // truly unbounded: see `crate::FENCE_WAIT_TIMEOUT`.
-        let wait = unsafe { device.wait_for_fences(&[self.sync.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        crate::note_fence_wait(wait, "gpu::dispatch_into_image").is_ok()
     }
 
     /// `answer_width`/`answer_height` are the answer's own resolution -- pass
@@ -1731,7 +1383,7 @@ impl GpuCompose {
         let Some(fence) = self.zc.answer_reader else { return true };
         // SAFETY: `fence` is one of this `GpuCompose`'s own async slot fences.
         let wait = unsafe { device.wait_for_fences(&[fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64) };
-        if crate::note_fence_wait(wait, "gpu::wait_answer_region_reads").is_err() {
+        if crate::note_fence_wait(device.handle(), wait, "gpu::wait_answer_region_reads").is_err() {
             return false;
         }
         self.zc.answer_reader = None;
@@ -1744,74 +1396,10 @@ impl GpuCompose {
         generation != 0 && self.zc.generation == generation && self.zc.frames.is_some()
     }
 
-    /// Presents a raw model answer every frame while uploading it only when the
-    /// model server produces a newer generation.  The normal compose path remains for
-    /// callers that need its math; this path is for the held-answer presentation
-    /// policy in `capture::run`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn present_cached_raw_async(
-        &mut self,
-        device: &ash::Device,
-        instance: &ash::Instance,
-        physical_device: vk::PhysicalDevice,
-        queue: vk::Queue,
-        width: u32,
-        height: u32,
-        raw_answer: &[u8],
-        generation: u64,
-        target_image: vk::Image,
-    ) -> Option<vk::Semaphore> {
-        let semaphore = self.present_semaphores.get(target_image, || unsafe {
-            device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
-        })?;
-        let idx = self.next_async_slot;
-        self.next_async_slot = (self.next_async_slot + 1) % ASYNC_SLOTS;
-        let async_slot = &mut self.async_slots[idx];
-        if !wait_armed(device, &[async_slot.slot.armed_fence()], "gpu::present_cached_raw_async slot reuse") {
-            return None;
-        }
-        if self.zc.answer_reader == Some(async_slot.slot.fence) {
-            self.zc.answer_reader = None;
-        }
-        // Same as the temporal-delta path: the reuse wait just above makes the slot's last
-        // timestamps (if that submission was a timed compose) readable.
-        if let Some(ms) = async_slot.timer.as_mut().and_then(|t| { t.read_if_pending(device); t.take_reading() }) {
-            self.compose_gpu_ms = Some(ms);
-        }
-        let frame_bytes = (u64::from(width) * u64::from(height) * 4) as usize;
-        if raw_answer.len() < frame_bytes || generation == 0 {
-            return None;
-        }
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        if !async_slot.slot.ensure_sized(device, &mem_props, width, height) {
-            return None;
-        }
-        let update = async_slot.slot.cached_generation != generation;
-        if update {
-            let s = async_slot.slot.sized.as_ref().expect("just ensured above");
-            if s.staging_capacity < frame_bytes as u64 { return None; }
-            unsafe { std::ptr::copy_nonoverlapping(raw_answer.as_ptr(), s.staging_ptr, frame_bytes); }
-            async_slot.slot.cached_generation = generation;
-        }
-        if unsafe { device.reset_command_buffer(async_slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        if unsafe { device.begin_command_buffer(async_slot.slot.cmd, &begin_info) }.is_err() { return None; }
-        unsafe { async_slot.slot.record_cached_raw_into_image(device, width, height, frame_bytes as u64, update, target_image); }
-        if unsafe { device.end_command_buffer(async_slot.slot.cmd) }.is_err() { return None; }
-        if !async_slot.slot.reset(device) { return None; }
-        let submit = vk::SubmitInfo::builder()
-            .command_buffers(std::slice::from_ref(&async_slot.slot.cmd))
-            .signal_semaphores(std::slice::from_ref(&semaphore))
-            .build();
-        if !async_slot.slot.submit(device, queue, submit) { return None; }
-        Some(semaphore)
-    }
-
-    /// Waits for every compose this `GpuCompose` has submitted (the async slots and the
-    /// synchronous one). Only its own fences, so it is legal from any hook on any thread.
+    /// Waits for every compose this `GpuCompose` has submitted. Only its own fences, so it is
+    /// legal from any hook on any thread.
     pub fn wait_in_flight(&self, device: &ash::Device) -> bool {
-        let mut fences: Vec<Option<vk::Fence>> = self.async_slots.iter().map(|s| s.slot.armed_fence()).collect();
-        fences.push(self.sync.armed_fence());
+        let fences = self.async_slots.each_ref().map(|s| s.slot.armed_fence());
         wait_armed(device, &fences, "gpu::wait_in_flight")
     }
 
@@ -1832,7 +1420,6 @@ impl GpuCompose {
         // SAFETY: forwarded from this function's own contract.
         unsafe {
             self.present_semaphores.destroy(device);
-            self.sync.destroy(device);
             for async_slot in &self.async_slots {
                 async_slot.slot.destroy(device);
                 if let Some(timer) = &async_slot.timer {
@@ -1964,226 +1551,6 @@ pub(crate) fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash
 mod tests {
     use super::*;
 
-    /// The real correctness check for this whole module: dispatches
-    /// `shaders/compose.comp` on a real (if software) Vulkan device and confirms
-    /// its output matches [`super::super::apply::apply_rgba8`] -- the same
-    /// already-real-hardware-verified CPU reference (see
-    /// docs/history/development-before-neuralforge.md) -- to within a small per-channel tolerance (GPU and CPU `pow`/`cbrt`
-    /// implementations are never bit-identical, only close). A real, non-uniform
-    /// test image (not one flat color) so the tone-mapping/OkLab branches this
-    /// algorithm actually has are exercised, not just the identity case.
-    #[test]
-    fn gpu_dispatch_matches_the_cpu_reference() {
-        let Some((_entry, instance, physical_device, device, queue, _queue_family)) = test_device() else {
-            eprintln!("gpu_dispatch_matches_the_cpu_reference: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, 0) else {
-            eprintln!("gpu_dispatch_matches_the_cpu_reference: GpuCompose::new failed (e.g. no compute-capable queue), skipping");
-            // SAFETY: nothing was created past the device/instance.
-            unsafe {
-                device.destroy_device(None);
-                instance.destroy_instance(None);
-            }
-            return;
-        };
-
-        let (width, height) = (8u32, 8u32);
-        let pixel_count = (width * height) as usize;
-        // A real gradient plus a few deliberately out-of-band pixels, not a flat
-        // color -- exercises the headroom/no-headroom branches, the OkLab hue
-        // correction, and the gamut-compression path all at once.
-        let original: Vec<u8> = (0..pixel_count)
-            .flat_map(|i| {
-                let t = (i * 37 % 256) as u8;
-                [t, t.wrapping_add(64), t.wrapping_add(128), 255]
-            })
-            .collect();
-        let model_answer: Vec<u8> = (0..pixel_count)
-            .flat_map(|i| {
-                let t = (i * 53 % 256) as u8;
-                [t.wrapping_add(20), t, t.wrapping_add(200), 255]
-            })
-            .collect();
-
-        let (colour_strength, transfer_strength, max_ratio) = (0.7, 0.8, 2.0);
-
-        let mut gpu_result = model_answer.clone();
-        let ok = gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut gpu_result, colour_strength, transfer_strength, max_ratio, false);
-        assert!(ok, "GpuCompose::dispatch returned false");
-
-        let mut cpu_result = model_answer.clone();
-        super::super::apply::apply_rgba8(&original, &mut cpu_result, colour_strength, transfer_strength, max_ratio, 0, false);
-
-        let mut max_diff = 0i32;
-        for (g, c) in gpu_result.chunks_exact(4).zip(cpu_result.chunks_exact(4)) {
-            for ch in 0..3 {
-                max_diff = max_diff.max((i32::from(g[ch]) - i32::from(c[ch])).abs());
-            }
-        }
-        assert!(max_diff <= 3, "GPU and CPU composition diverge by up to {max_diff} (expected <= 3): gpu={gpu_result:?} cpu={cpu_result:?}");
-
-        // A max_ratio below 1 (a corrupt or hand-edited header): the CPU reference raises it to
-        // just above 1; the shader's clamp() would otherwise get crossed bounds, which is
-        // undefined.
-        for max_ratio in [0.5f32, 1.0] {
-            let mut gpu_result = model_answer.clone();
-            assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut gpu_result, colour_strength, transfer_strength, max_ratio, false));
-            let mut cpu_result = model_answer.clone();
-            super::super::apply::apply_rgba8(&original, &mut cpu_result, colour_strength, transfer_strength, max_ratio, 0, false);
-            let max_diff = gpu_result.chunks_exact(4).zip(cpu_result.chunks_exact(4))
-                .flat_map(|(g, c)| (0..3).map(move |ch| (i32::from(g[ch]) - i32::from(c[ch])).abs()))
-                .max()
-                .unwrap_or(0);
-            assert!(max_diff <= 3, "max_ratio {max_ratio}: GPU and CPU diverge by up to {max_diff}");
-        }
-
-        // SAFETY: `gpu`'s own fence wait inside `dispatch` guarantees no GPU work
-        // is in flight; nothing else references `device`/`instance`.
-        unsafe {
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
-    }
-
-    #[test]
-    fn bgr_order_produces_the_same_true_colors_as_rgb_order_on_swapped_bytes() {
-        // Real regression test for the 2026-09-11 channel-swap bug: feeds the exact
-        // same semantic colors as `gpu_dispatch_matches_the_cpu_reference` above, but
-        // with R and B physically swapped in the byte layout (simulating a real
-        // `B8G8R8A8` swapchain) and `bgr_order: true` on every call. If the swizzle in
-        // `compose.comp`/`apply_rgba8` is correct, the *true* colors this produces
-        // (read back through the swapped indices) must match `gpu_dispatch_matches_
-        // the_cpu_reference`'s own RGB-order result exactly -- not just GPU agreeing
-        // with CPU (both could be equally wrong the same way), but this whole
-        // BGR-order run agreeing with that separate, independently-computed RGB-order
-        // run.
-        let Some((_entry, instance, physical_device, device, queue, _queue_family)) = test_device() else {
-            eprintln!("bgr_order_produces_the_same_true_colors_as_rgb_order_on_swapped_bytes: no Vulkan loader/ICD, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, 0) else {
-            eprintln!("bgr_order_produces_the_same_true_colors_as_rgb_order_on_swapped_bytes: GpuCompose::new failed, skipping");
-            // SAFETY: nothing was created past the device/instance.
-            unsafe {
-                device.destroy_device(None);
-                instance.destroy_instance(None);
-            }
-            return;
-        };
-
-        let (width, height) = (8u32, 8u32);
-        let pixel_count = (width * height) as usize;
-        // Same true colors as `gpu_dispatch_matches_the_cpu_reference`, but stored
-        // B,G,R,A -- swap index 0 and 2 relative to that test's own byte arrays.
-        let original_bgr: Vec<u8> = (0..pixel_count)
-            .flat_map(|i| {
-                let t = (i * 37 % 256) as u8;
-                [t.wrapping_add(128), t.wrapping_add(64), t, 255]
-            })
-            .collect();
-        let model_answer_bgr: Vec<u8> = (0..pixel_count)
-            .flat_map(|i| {
-                let t = (i * 53 % 256) as u8;
-                [t.wrapping_add(200), t, t.wrapping_add(20), 255]
-            })
-            .collect();
-
-        let (colour_strength, transfer_strength, max_ratio) = (0.7, 0.8, 2.0);
-
-        let mut gpu_result = model_answer_bgr.clone();
-        let ok = gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original_bgr, &mut gpu_result, colour_strength, transfer_strength, max_ratio, true);
-        assert!(ok, "GpuCompose::dispatch returned false");
-
-        let mut cpu_result = model_answer_bgr.clone();
-        super::super::apply::apply_rgba8(&original_bgr, &mut cpu_result, colour_strength, transfer_strength, max_ratio, 0, true);
-
-        // GPU and CPU must still agree with each other under bgr_order too.
-        let mut max_diff = 0i32;
-        for (g, c) in gpu_result.chunks_exact(4).zip(cpu_result.chunks_exact(4)) {
-            for ch in 0..3 {
-                max_diff = max_diff.max((i32::from(g[ch]) - i32::from(c[ch])).abs());
-            }
-        }
-        assert!(max_diff <= 3, "GPU and CPU composition diverge by up to {max_diff} under bgr_order=true (expected <= 3)");
-
-        // The true colors (read back through the swapped R/B indices) must match
-        // `gpu_dispatch_matches_the_cpu_reference`'s own RGB-order CPU result exactly
-        // -- proving the swizzle round-trips correctly end to end, not just that GPU
-        // and CPU are consistently wrong the same way.
-        let original_rgb: Vec<u8> = (0..pixel_count)
-            .flat_map(|i| {
-                let t = (i * 37 % 256) as u8;
-                [t, t.wrapping_add(64), t.wrapping_add(128), 255]
-            })
-            .collect();
-        let model_answer_rgb: Vec<u8> = (0..pixel_count)
-            .flat_map(|i| {
-                let t = (i * 53 % 256) as u8;
-                [t.wrapping_add(20), t, t.wrapping_add(200), 255]
-            })
-            .collect();
-        let mut reference_rgb = model_answer_rgb.clone();
-        super::super::apply::apply_rgba8(&original_rgb, &mut reference_rgb, colour_strength, transfer_strength, max_ratio, 0, false);
-
-        for (px_bgr, px_rgb_ref) in gpu_result.chunks_exact(4).zip(reference_rgb.chunks_exact(4)) {
-            // px_bgr is [B, G, R, A] -- reorder to true [R, G, B] before comparing.
-            let true_rgb = [px_bgr[2], px_bgr[1], px_bgr[0]];
-            let reference = [px_rgb_ref[0], px_rgb_ref[1], px_rgb_ref[2]];
-            for ch in 0..3 {
-                assert!(
-                    (i32::from(true_rgb[ch]) - i32::from(reference[ch])).abs() <= 3,
-                    "bgr_order=true's true colors {true_rgb:?} must match the independent RGB-order reference {reference:?}"
-                );
-            }
-        }
-
-        // SAFETY: `gpu`'s own fence wait inside `dispatch` guarantees no GPU work
-        // is in flight; nothing else references `device`/`instance`.
-        unsafe {
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
-    }
-
-    /// A second real dispatch at a *different* size than the first test used,
-    /// through the *same* `GpuCompose` instance-creation path -- confirms
-    /// `ensure_sized`'s rebuild-on-resize path (not just its happy-path "already
-    /// the right size" branch) actually works, real device included.
-    #[test]
-    fn gpu_dispatch_handles_a_resize() {
-        let Some((_entry, instance, physical_device, device, queue, _queue_family)) = test_device() else {
-            eprintln!("gpu_dispatch_handles_a_resize: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, 0) else {
-            eprintln!("gpu_dispatch_handles_a_resize: GpuCompose::new failed, skipping");
-            // SAFETY: nothing was created past the device/instance.
-            unsafe {
-                device.destroy_device(None);
-                instance.destroy_instance(None);
-            }
-            return;
-        };
-
-        for &(width, height) in &[(4u32, 4u32), (16u32, 12u32)] {
-            let pixel_count = (width * height) as usize;
-            let original = vec![128u8; pixel_count * 4];
-            let mut answer = vec![100u8; pixel_count * 4];
-            let ok = gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut answer, 1.0, 1.0, 2.0, false);
-            assert!(ok, "dispatch failed at {width}x{height}");
-        }
-
-        // SAFETY: same reasoning as the test above.
-        unsafe {
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
-    }
-
     /// A small host-visible/host-coherent buffer pre-filled with `bytes`, for
     /// uploading test fixture content into an image via `cmd_copy_buffer_to_image`.
     /// Caller destroys/frees both returned handles once the upload's fence signals.
@@ -2211,6 +1578,12 @@ mod tests {
     /// was shown (which puts the transfer modes in play).
     #[allow(clippy::too_many_arguments)]
     fn compose_once_scaled(width: u32, height: u32, current: &[u8], proxy: &[u8], answer: &[u8], answer_dims: (u32, u32), proxy_small: Option<&[u8]>, held: Option<&[u8]>, params: ComposeParams) -> Option<Vec<u8>> {
+        compose_once_ordered(width, height, current, proxy, answer, answer_dims, proxy_small, held, params, false)
+    }
+
+    /// [`compose_once_scaled`] with the frame's channel order: `bgr_order` for a `B8G8R8A8` swapchain.
+    #[allow(clippy::too_many_arguments)]
+    fn compose_once_ordered(width: u32, height: u32, current: &[u8], proxy: &[u8], answer: &[u8], answer_dims: (u32, u32), proxy_small: Option<&[u8]>, held: Option<&[u8]>, params: ComposeParams, bgr_order: bool) -> Option<Vec<u8>> {
         let (_entry, instance, physical_device, device, queue, queue_family) = test_device()?;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
         let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
@@ -2234,7 +1607,7 @@ mod tests {
             device.free_memory(staging.1, None);
         }
         let sem = gpu
-            .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_dims.0, answer_dims.1, ComposeInputs::Cpu { base: proxy, answer, proxy_small, held_original: held }, 1, false, target.image, params)
+            .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_dims.0, answer_dims.1, ComposeInputs::Cpu { base: proxy, answer, proxy_small, held_original: held }, 1, bgr_order, target.image, params)
             .expect("compose");
         let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
         let stage = vk::PipelineStageFlags::ALL_COMMANDS;
@@ -2252,6 +1625,26 @@ mod tests {
             instance.destroy_instance(None);
         }
         Some(out)
+    }
+
+    /// A `B8G8R8A8` frame (R and B swapped in memory, `bgr_order`) composes to the same true colours
+    /// as the same frame in `R8G8B8A8`: the shader reads and writes through the swizzle, so a BGRA
+    /// swapchain never gets a channel-swapped picture (the 2026-09-11 blue-tint bug).
+    #[test]
+    fn bgr_order_composes_the_same_true_colours_as_rgb_order() {
+        let (width, height) = (8u32, 8u32);
+        let n = (width * height) as usize;
+        let frame: Vec<u8> = (0..n).flat_map(|i| { let t = (i * 37 % 256) as u8; [t, t.wrapping_add(64), t.wrapping_add(128), 255] }).collect();
+        let answer: Vec<u8> = (0..n).flat_map(|i| { let t = (i * 53 % 256) as u8; [t.wrapping_add(20), t, t.wrapping_add(200), 255] }).collect();
+        let swap = |v: &[u8]| v.chunks_exact(4).flat_map(|p| [p[2], p[1], p[0], p[3]]).collect::<Vec<u8>>();
+        let params = ComposeParams { colour_strength: 0.7, transfer_strength: 0.8, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 1.0, transfer: 1, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let Some(rgb) = compose_once_ordered(width, height, &frame, &frame, &answer, (width, height), None, None, params, false) else {
+            eprintln!("bgr_order_composes_the_same_true_colours_as_rgb_order: no Vulkan device, skipping");
+            return;
+        };
+        let bgr = compose_once_ordered(width, height, &swap(&frame), &swap(&frame), &swap(&answer), (width, height), None, None, params, true).expect("compose");
+        assert_ne!(rgb, frame, "the answer must change the frame for this to test anything");
+        assert_eq!(swap(&bgr), rgb, "the BGRA run's true colours differ from the RGBA run's");
     }
 
     /// Ratio smoothing flattens a lone bright pixel in the model's answer to its neighbourhood;
@@ -2358,6 +1751,35 @@ mod tests {
         let no_colour_normal = compose_once(w, h, &blue, &blue, &red, no_colour).unwrap();
         let no_colour_view4 = compose_once(w, h, &blue, &blue, &red, ComposeParams { debug_view: 4, ..no_colour }).unwrap();
         assert_eq!(px(&no_colour_normal), px(&no_colour_view4), "view 4 falls back to the normal result where colour is never computed");
+    }
+
+    /// Debug view 2 is the model's answer as it arrived, also when a transfer mode rewrote the
+    /// answer it composes from (the model at half size, matched residual).
+    #[test]
+    fn debug_view_2_shows_the_answer_the_model_gave() {
+        let (w, h, sw, sh) = (16u32, 8u32, 8u32, 4u32);
+        let frame: Vec<u8> = (0..w * h).flat_map(|_| [60u8, 60, 60, 255]).collect();
+        let small_proxy: Vec<u8> = (0..sw * sh).flat_map(|_| [100u8, 100, 100, 255]).collect();
+        let answer: Vec<u8> = (0..sw * sh).flat_map(|_| [85u8, 85, 85, 255]).collect();
+        let params = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 1, model_small: false, white_point: 1.0, debug_view: 2, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let Some(out) = compose_once_scaled(w, h, &frame, &frame, &answer, (sw, sh), Some(&small_proxy), None, params) else {
+            eprintln!("debug view 2 test: no Vulkan device, skipping");
+            return;
+        };
+        let centre = ((4 * w + 8) * 4) as usize;
+        assert!(out[centre].abs_diff(85) <= 2, "view 2 shows the answer (85), not the rewritten one: {}", out[centre]);
+    }
+
+    /// The composed frame keeps the frame's own alpha.
+    #[test]
+    fn the_frames_alpha_is_kept() {
+        let (w, h) = (8u32, 8u32);
+        let frame: Vec<u8> = (0..w * h).flat_map(|_| [100u8, 120, 160, 77]).collect();
+        let answer: Vec<u8> = (0..w * h).flat_map(|_| [170u8, 110, 100, 255]).collect();
+        let params = ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 1, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let Some(out) = compose_once(w, h, &frame, &frame, &answer, params) else { return };
+        assert_ne!(out[..3], frame[..3], "the answer changed the colour");
+        assert!(out.chunks(4).all(|p| p[3] == 77), "alpha {:?}", &out[..4]);
     }
 
     /// Transfer modes with the model at half size. With no edit every mode hands back the frame;
@@ -2467,7 +1889,7 @@ mod tests {
         let mut gpu = GpuCompose::new(&device, family).expect("compose resources");
         // What every submit site does when `vkQueueSubmit` fails: the fence was reset, nothing was submitted.
         assert!(gpu.async_slots[0].slot.reset(&device));
-        assert!(gpu.sync.reset(&device));
+        assert!(gpu.async_slots[1].slot.reset(&device));
         let started = std::time::Instant::now();
         assert!(gpu.wait_in_flight(&device), "waited on a fence nothing will signal");
         assert!(gpu.wait_async_slots(&device));
@@ -2964,129 +2386,5 @@ mod tests {
             device.free_command_buffers(pool, &[cmd]);
         }
         result
-    }
-
-    /// Puts a freshly-created (`UNDEFINED`) test image into `PRESENT_SRC_KHR` --
-    /// `record_copy_into_image`'s real precondition (2026-09-10) now that it manages
-    /// its own `PRESENT_SRC_KHR -> TRANSFER_DST_OPTIMAL -> PRESENT_SRC_KHR` round trip
-    /// instead of assuming the caller already left it in `TRANSFER_DST_OPTIMAL`, the
-    /// same state any real swapchain image is already in per `vkQueuePresentKHR`'s own
-    /// contract -- this stands in for that real precondition.
-    fn transition_to_present_src(device: &ash::Device, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image) {
-        let alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
-        let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
-        unsafe {
-            device.begin_command_buffer(cmd, &begin_info).unwrap();
-            let to_present = image_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::empty(), vk::AccessFlags::empty());
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
-            device.end_command_buffer(cmd).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
-            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
-            device.destroy_fence(fence, None);
-            device.free_command_buffers(pool, &[cmd]);
-        }
-    }
-
-    /// The real point of `dispatch_into_image`: confirms it produces the *same*
-    /// composited result as [`GpuCompose::dispatch`] when writing directly into a
-    /// target image instead of a CPU slice -- real device, real image transitions,
-    /// real merged submission, not just "doesn't return false."
-    #[test]
-    fn dispatch_into_image_matches_dispatch() {
-        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
-            eprintln!("dispatch_into_image_matches_dispatch: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
-            eprintln!("dispatch_into_image_matches_dispatch: GpuCompose::new failed, skipping");
-            // SAFETY: nothing was created past the device/instance.
-            unsafe {
-                device.destroy_device(None);
-                instance.destroy_instance(None);
-            }
-            return;
-        };
-
-        let (width, height) = (8u32, 8u32);
-        let pixel_count = (width * height) as usize;
-        let original: Vec<u8> = (0..pixel_count).flat_map(|i| { let t = (i * 41 % 256) as u8; [t, t.wrapping_add(90), t.wrapping_add(30), 255] }).collect();
-        let model_answer: Vec<u8> = (0..pixel_count).flat_map(|i| { let t = (i * 61 % 256) as u8; [t.wrapping_add(10), t, t.wrapping_add(180), 255] }).collect();
-        let (colour_strength, transfer_strength, max_ratio) = (0.6, 0.9, 2.0);
-
-        // The reference: `dispatch`'s already-verified CPU-visible path.
-        let mut expected = model_answer.clone();
-        assert!(gpu.dispatch(&device, &instance, physical_device, queue, width, height, &original, &mut expected, colour_strength, transfer_strength, max_ratio, false));
-
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
-
-        // A standalone target image, standing in for a real swapchain image --
-        // `dispatch_into_image`'s own contract only requires `TRANSFER_DST_OPTIMAL`,
-        // which `capture::run`'s stage 1 already guarantees for the real one.
-        let target = make_target_image(&device, &mem_props, width, height);
-        transition_to_present_src(&device, queue, pool, target.image);
-
-        let model_answer_for_direct = model_answer.clone();
-        let ok = gpu.dispatch_into_image(
-            &device, &instance, physical_device, queue, width, height, &original, &model_answer_for_direct,
-            colour_strength, transfer_strength, max_ratio, false, target.image,
-        );
-        assert!(ok, "dispatch_into_image returned false");
-
-        let actual = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
-        assert_eq!(actual, expected, "dispatch_into_image's target image content must match dispatch's CPU-visible result exactly (same command sequence, same inputs)");
-
-        // SAFETY: `read_back_image`'s own fence wait guarantees no GPU work is in flight.
-        unsafe {
-            target.destroy(&device);
-            device.destroy_command_pool(pool, None);
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
-    }
-
-    #[test]
-    fn cached_raw_present_preserves_bytes_and_reuses_the_device_cache() {
-        let Some((_entry, instance, physical_device, device, queue, queue_family)) = test_device() else {
-            eprintln!("cached_raw_present_preserves_bytes_and_reuses_the_device_cache: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let Some(mut gpu) = GpuCompose::new(&device, queue_family) else {
-            unsafe { device.destroy_device(None); instance.destroy_instance(None); }
-            return;
-        };
-        let (width, height) = (8u32, 8u32);
-        let raw: Vec<u8> = (0..(width * height) as usize).flat_map(|i| {
-            let t = (i * 47 % 256) as u8;
-            [t.wrapping_add(200), t, t.wrapping_add(70), 255]
-        }).collect();
-        let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
-        let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
-        let targets = [make_target_image(&device, &mem_props, width, height), make_target_image(&device, &mem_props, width, height)];
-        for target in &targets { transition_to_present_src(&device, queue, pool, target.image); }
-        for target in &targets {
-            let sem = gpu.present_cached_raw_async(&device, &instance, physical_device, queue, width, height, &raw, 1, target.image).expect("cached raw present failed");
-            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-            let stage = vk::PipelineStageFlags::ALL_COMMANDS;
-            let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build();
-            unsafe {
-                device.queue_submit(queue, &[submit], fence).unwrap();
-                device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
-                device.destroy_fence(fence, None);
-            }
-            assert_eq!(read_back_image(&device, &mem_props, queue, pool, target.image, width, height), raw);
-        }
-        unsafe {
-            for target in &targets { target.destroy(&device); }
-            device.destroy_command_pool(pool, None);
-            gpu.destroy(&device);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
     }
 }

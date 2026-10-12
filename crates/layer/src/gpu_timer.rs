@@ -98,7 +98,7 @@ impl GpuTimer {
         // SAFETY: `self.pool` holds exactly two queries, `ticks` two u64 slots, and `TYPE_64`
         // makes each result 8 bytes at an 8-byte stride (ash passes `size_of::<u64>()`).
         let result = unsafe { device.get_query_pool_results(self.pool, 0, 2, &mut ticks, vk::QueryResultFlags::TYPE_64) };
-        if crate::note_vk(result).is_err() {
+        if crate::note_vk(device.handle(), result).is_err() {
             return;
         }
         let elapsed = (ticks[1] & self.valid_mask).wrapping_sub(ticks[0] & self.valid_mask) & self.valid_mask;
