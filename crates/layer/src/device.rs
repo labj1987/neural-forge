@@ -42,6 +42,24 @@ fn claim_primary(device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, he
     }
 }
 
+/// The family `queue` was taken from, read under the queue table's own lock (never the device
+/// state's, which the present holds through its wait).
+fn family_of(families: &std::sync::RwLock<HashMap<vk::Queue, u32>>, queue: vk::Queue) -> Option<u32> {
+    families.read().unwrap_or_else(|e| e.into_inner()).get(&queue).copied()
+}
+
+/// Whether a barrier hook must take the render tap's lock: only with image barriers and a known tap
+/// source (`tap_sources`); otherwise it returns at once.
+fn barriers_tracked(tap_sources: &std::sync::atomic::AtomicBool, image_barriers: usize) -> bool {
+    image_barriers > 0 && tap_sources.load(std::sync::atomic::Ordering::Acquire)
+}
+
+/// A present's engagement over its swapchains: engaged when any of them renders steadily. A
+/// swapchain that does not (an overlay, one still warming up) never hides the one that does.
+fn engaged_so_far(so_far: Option<bool>, engaged: bool) -> bool {
+    so_far.unwrap_or(false) || engaged
+}
+
 /// Whether `swapchain` holds the session's primary claim or would take it (nothing larger holds it):
 /// the swapchain a capture request is about, when it cannot be captured.
 fn would_be_primary(device: vk::Device, swapchain: vk::SwapchainKHR, width: u32, height: u32) -> bool {
@@ -142,6 +160,8 @@ pub struct NeuralForgeDeviceInfo {
     /// tracked state advances (and a held one is re-issued through it in parts).
     next_queue_submit2: Option<vk::PFN_vkQueueSubmit2>,
     state: Arc<Mutex<State>>,
+    /// The pre-upscaler path's state, apart from the present's ([`HoldState`]).
+    hold: Arc<Mutex<HoldState>>,
     tracker: Mutex<TapTracker>,
     /// Which queue family a `VkQueue` handle belongs to -- learned by observing the
     /// app's own `vkGetDeviceQueue`/`vkGetDeviceQueue2` calls (see those hooks below),
@@ -269,8 +289,33 @@ struct State {
     engaged_swapchains: HashSet<vk::SwapchainKHR>,
     /// A running `capture_request = N` frame series (see `crate::series`).
     series: crate::series::Series,
+}
+
+/// The pre-upscaler path's per-device state, under a lock of its own: the game's submit threads
+/// (the split hold in `vkQueueSubmit`) and the hold inside DLSS's buffer (`inline_hold`) take it on
+/// every DLSS submit, while the present holds [`State`] through the after-the-upscaler path's
+/// synchronous wait for the model's answer (up to `capture::SYNC_BUDGET`). The present takes this
+/// lock only briefly (its status, the hand-back, starting the model server), never across a wait
+/// of its own, so no submit waits on a present. Lock order: `State`, then `HoldState`; a holder of
+/// `HoldState` only ever `try_lock`s `State` ([`post_slot_busy`]).
+#[derive(Default)]
+struct HoldState {
+    /// The hold's own client of the channel (the mapping is the process's one, `shm::ShmClient`).
+    shm: ShmClient,
     /// The pre-upscaler path's resources and statistics (`crate::preupscale`); empty when off.
     preupscale: crate::preupscale::Session,
+    /// As [`State::external_memory_host`].
+    external_memory_host: bool,
+}
+
+/// Whether the after-the-upscaler path is using wire slot 0 (a request out, or a zero-copy capture
+/// still writing its proxy region): the hold's diagnostic modes write that region too. Never waits:
+/// a `State` held by the present is a post path at work, so busy.
+fn post_slot_busy(state: &Mutex<State>, device: &ash::Device) -> bool {
+    let Ok(mut state) = state.try_lock() else { return true };
+    let State { shm, direct_capture, .. } = &mut *state;
+    (shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false))
+        || capture::direct_slot_busy(direct_capture, Slot::Primary, device)
 }
 
 impl State {
@@ -288,8 +333,7 @@ impl State {
     fn drain_layer_work(&mut self, device: &ash::Device) -> bool {
         let captures = capture::wait_in_flight(self.capture_pipeline.as_ref(), &self.direct_capture, device);
         let composes = self.gpu_compose.as_ref().is_none_or(|gpu| gpu.wait_in_flight(device));
-        let holds = self.preupscale.drain(device);
-        captures && composes && holds
+        captures && composes
     }
 }
 
@@ -413,6 +457,11 @@ fn tap_format_matches(source: vk::Format, swapchain: vk::Format, copy: bool) -> 
 }
 
 impl TapTracker {
+    /// Whether the render tap knows any source image (what the barrier hooks' fast path reads).
+    fn has_sources(&self) -> bool {
+        !self.tap_sources_by_destination.is_empty()
+    }
+
     fn is_source(&self, image: vk::Image) -> bool {
         self.tap_sources_by_destination.values().any(|&src| src == image)
     }
@@ -627,7 +676,7 @@ unsafe fn imageless_attachments(begin: &vk::RenderPassBeginInfo) -> Option<Vec<v
     None
 }
 
-type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>);
+type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>, Arc<Mutex<HoldState>>);
 static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
@@ -643,16 +692,17 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     // they submit to the layer's queues, so they are stopped (joined) before anything below waits
     // the device idle -- `vkDeviceWaitIdle` needs every queue of the device externally
     // synchronized, which a thread still submitting breaks.
-    if let Some((_, state)) = &owned {
-        state.lock().unwrap_or_else(|e| e.into_inner()).preupscale.stop_native();
+    if let Some((_, _, hold)) = &owned {
+        hold.lock().unwrap_or_else(|e| e.into_inner()).preupscale.stop_native();
     }
     // Then the hold inside DLSS's buffer: its worker uses the device state freed below, and the GPU
     // may be waiting on it.
     // SAFETY: forwarded.
     unsafe { crate::preupscale::inline::destroy(handle) };
-    if let Some((device, state)) = owned {
+    if let Some((device, state, hold)) = owned {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
-        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || state.preupscale.res.is_some() {
+        let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
+        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || hold.preupscale.res.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     unsafe { capture::destroy_pipeline(state.capture_pipeline.take(), &device); }
@@ -666,7 +716,7 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                     // gone, so no present still waits on a relay semaphore.
                     unsafe { state.relay_semaphores.destroy(&device); }
                     // SAFETY: the device is idle (or lost): no hold's submission is pending.
-                    unsafe { state.preupscale.destroy(&device); }
+                    unsafe { hold.preupscale.destroy(&device); }
                 }
                 Err(error) => crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources", error),
             }
@@ -742,7 +792,7 @@ fn inline_chain_kept() -> bool {
 #[allow(clippy::too_many_arguments)]
 fn inline_hold(
     device: &Arc<ash::Device>, instance: &Arc<ash::Instance>, physical_device: vk::PhysicalDevice, state: &Arc<Mutex<State>>,
-    native_loader: Option<&crate::preupscale::NativeLoader>, job: &crate::preupscale::inline::Job, queue: vk::Queue,
+    hold_state: &Arc<Mutex<HoldState>>, native_loader: Option<&crate::preupscale::NativeLoader>, job: &crate::preupscale::inline::Job, queue: vk::Queue,
 ) {
     use crate::preupscale::{Mode, Which};
     const INLINE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
@@ -764,8 +814,8 @@ fn inline_hold(
     #[cfg(not(target_arch = "x86_64"))]
     let _ = native_loader;
     let started = std::time::Instant::now();
-    let mut state = loop {
-        match state.try_lock() {
+    let mut hold_guard = loop {
+        match hold_state.try_lock() {
             Ok(guard) => break guard,
             Err(std::sync::TryLockError::Poisoned(_)) => return,
             Err(std::sync::TryLockError::WouldBlock) if started.elapsed() < INLINE_LOCK_WAIT => std::thread::sleep(std::time::Duration::from_micros(100)),
@@ -775,7 +825,7 @@ fn inline_hold(
             }
         }
     };
-    let State { shm, preupscale: session, external_memory_host, direct_capture, .. } = &mut *state;
+    let HoldState { shm, preupscale: session, external_memory_host } = &mut *hold_guard;
     session.saw_dlss();
     if !shm.open() {
         inline_tally("skipped (no shared memory)");
@@ -809,10 +859,7 @@ fn inline_hold(
     };
     let extent = (job.point.desc.width, job.point.desc.height);
     // The diagnostic modes capture into slot 0: not while the post path has it.
-    if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
-        return;
-    }
-    if !native && capture::direct_slot_busy(direct_capture, Slot::Primary, device) {
+    if !native && post_slot_busy(state, device) {
         return;
     }
     // Staged, never imported: work on imported host memory from the layer's queue waited on the
@@ -1203,7 +1250,8 @@ impl NeuralForgeDeviceInfo {
         // nothing forced a flush past this first, coincidentally-flushed call).
         crate::logging::flush();
         let state = Arc::new(Mutex::new(State { external_memory_host, ..State::default() }));
-        CLEANUP.lock().unwrap().insert(handle, (device.clone(), state.clone()));
+        let hold = Arc::new(Mutex::new(HoldState { external_memory_host, ..HoldState::default() }));
+        CLEANUP.lock().unwrap().insert(handle, (device.clone(), state.clone(), hold.clone()));
         // SAFETY: create_info is the loader chain for this newly created device.
         let loader_data = unsafe { crate::loader_data::register(handle, create_info) };
         let nvidia = match &instance {
@@ -1228,7 +1276,7 @@ impl NeuralForgeDeviceInfo {
             // Also without DLSS's tracking (no VK_NVX_image_view_handle): the after-the-upscaler path
             // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
             if nvidia && active {
-                state.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup)));
+                hold.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup)));
             }
         }
         let side = crate::take_side_queue(handle);
@@ -1243,11 +1291,11 @@ impl NeuralForgeDeviceInfo {
                     crate::log!("[preupscale] the side queue for the hold inside DLSS's command buffer could not be set up; not holding there");
                     None
                 } else {
-                    let (dev, inst, pd, st) = (device.clone(), instance.clone(), physical_device, state.clone());
-                    let native_loader = state.lock().unwrap().preupscale.native.clone();
-                    let hold: crate::preupscale::inline::HoldFn =
-                        Box::new(move |job, queue| inline_hold(&dev, &inst, pd, &st, native_loader.as_ref(), job, queue));
-                    crate::preupscale::inline::Inline::start(device.clone(), instance, physical_device, queue, family, app_family, hold)
+                    let (dev, inst, pd, st, hs) = (device.clone(), instance.clone(), physical_device, state.clone(), hold.clone());
+                    let native_loader = hold.lock().unwrap().preupscale.native.clone();
+                    let hold_fn: crate::preupscale::inline::HoldFn =
+                        Box::new(move |job, queue| inline_hold(&dev, &inst, pd, &st, &hs, native_loader.as_ref(), job, queue));
+                    crate::preupscale::inline::Inline::start(device.clone(), instance, physical_device, queue, family, app_family, hold_fn)
                 }
             }
             _ => None,
@@ -1271,6 +1319,7 @@ impl NeuralForgeDeviceInfo {
             inline,
             next_queue_submit2,
             state,
+            hold,
             tracker: Mutex::new(TapTracker::default()),
             queue_families: Default::default(),
             tap_sources: Default::default(),
@@ -1345,12 +1394,12 @@ impl NeuralForgeDeviceInfo {
 
     /// Publishes whether the render tap has any source, after a change under the tracker's lock.
     fn note_tap_sources(&self, tracker: &TapTracker) {
-        self.tap_sources.store(!tracker.tap_sources_by_destination.is_empty(), std::sync::atomic::Ordering::Release);
+        self.tap_sources.store(tracker.has_sources(), std::sync::atomic::Ordering::Release);
     }
 
     /// The family of `queue`, if the application took it through `vkGetDeviceQueue*`.
     fn queue_family(&self, queue: vk::Queue) -> Option<u32> {
-        self.queue_families.read().unwrap_or_else(|e| e.into_inner()).get(&queue).copied()
+        family_of(&self.queue_families, queue)
     }
 
     /// The jobs of the hold inside DLSS's buffer (`crate::preupscale::inline`) for a submission on
@@ -1413,8 +1462,8 @@ impl NeuralForgeDeviceInfo {
         }
         let instance = self.instance.as_ref()?;
         let inputs = scan.inputs?;
-        let mut state = self.state.lock().unwrap();
-        let State { shm, preupscale: session, external_memory_host, direct_capture, .. } = &mut *state;
+        let mut hold_guard = self.hold.lock().unwrap_or_else(|e| e.into_inner());
+        let HoldState { shm, preupscale: session, external_memory_host } = &mut *hold_guard;
         // DLSS is running on this device (held or not): the post path stays off for
         // `preupscale::HAND_BACK` after this once the device has held.
         session.saw_dlss();
@@ -1477,10 +1526,7 @@ impl NeuralForgeDeviceInfo {
         let dump = crate::preupscale::gate(mode, session, shm, scan.depth_layout.is_some() && scan.mvec_layout.is_some())?;
         // The diagnostic modes capture into slot 0: it must be free (no request of the post path's
         // still out, no zero-copy capture still writing its proxy region).
-        if !native && shm.has_pending_request(Slot::Primary) && shm.poll_async_request(Slot::Primary) == Some(false) {
-            return None;
-        }
-        if !native && capture::direct_slot_busy(direct_capture, Slot::Primary, &self.device) {
+        if !native && post_slot_busy(&self.state, &self.device) {
             return None;
         }
         // Failures from here on repeat every frame in a game where they happen at all: in model
@@ -1834,7 +1880,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         }
         // No logging here: this fires for every barrier the game records, from every
         // recording thread; and no lock while the render tap has no source to track.
-        if images.is_empty() || !self.tap_sources.load(std::sync::atomic::Ordering::Acquire) {
+        if !barriers_tracked(&self.tap_sources, images.len()) {
             return LayerResult::Unhandled;
         }
         let mut tracker = self.tracker.lock().unwrap();
@@ -1877,7 +1923,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             t.barriers(command_buffer, barrier2_images(info).unwrap_or(&[]).iter().map(crate::preupscale::ImageSync::from_barrier2), dependency_global(info));
         }
         let Some(images) = barrier2_images(info) else { return LayerResult::Unhandled };
-        if !self.tap_sources.load(std::sync::atomic::Ordering::Acquire) {
+        if !barriers_tracked(&self.tap_sources, images.len()) {
             return LayerResult::Unhandled;
         }
         let mut tracker = self.tracker.lock().unwrap();
@@ -2117,7 +2163,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // submitted for one of this swapchain's images may still be in flight, and must
             // not be left referencing an image the driver is about to destroy. Only the
             // layer's own fences, and only for a swapchain the layer actually worked on.
-            if state.take_drain_needed(swapchain) && !state.drain_layer_work(&self.device) {
+            let holds_drained = || self.hold.lock().unwrap_or_else(|e| e.into_inner()).preupscale.drain(&self.device);
+            if state.take_drain_needed(swapchain) && !(state.drain_layer_work(&self.device) & holds_drained()) {
                 crate::log!("[layer] could not confirm the layer's own work on swapchain {swapchain:?} finished before its destruction");
                 crate::logging::flush();
             }
@@ -2673,8 +2720,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let mut state = self.state.lock().unwrap();
             if let Some(t) = &self.preupscale {
                 let extent = t.extent();
-                let State { shm, preupscale, .. } = &mut *state;
-                preupscale.publish_status(shm, extent);
+                self.hold.lock().unwrap_or_else(|e| e.into_inner()).preupscale.publish_status(&state.shm, extent);
             }
             // Whether any of this present's swapchains renders steadily (`None`: none is the layer's).
             let mut any_engaged: Option<bool> = None;
@@ -2691,13 +2737,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     *last = std::time::Duration::ZERO;
                     ok
                 };
-                any_engaged = Some(any_engaged.unwrap_or(false) || engaged);
+                any_engaged = Some(engaged_so_far(any_engaged, engaged));
                 if !engaged {
                     // This swapchain is not rendering steadily; another one of the same present may be.
                     continue;
                 }
                 // Before the format and capture checks: with the model before the upscaler (or an HDR
-                // swapchain) nothing is captured here, and the game is attached all the same.
+                // swapchain) nothing is captured here, and the game is attached all the same. The
+                // present's client opens the channel itself (the hold's is its own).
+                state.shm.open();
                 state.shm.beat();
                 // Before the HDR/10-bit and pass-through skips, so the toggle hotkey works on every
                 // swapchain the layer presents through.
@@ -2849,7 +2897,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     Some(source) if sw.pass_through => source,
                     _ => (image, vk::ImageLayout::PRESENT_SRC_KHR),
                 };
-                let State { shm, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, last_answer_encoded, relay_semaphores, engaged_swapchains, series, preupscale, .. } = &mut *state;
+                let State { shm, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, last_answer_encoded, relay_semaphores, engaged_swapchains, series, .. } = &mut *state;
+                // The hold's state, for the hand-back, its captures and the model server: let go
+                // before the post path's synchronous wait below.
+                let mut hold_guard = self.hold.lock().unwrap_or_else(|e| e.into_inner());
+                let preupscale = &mut hold_guard.preupscale;
                 // Another device's hold counts too (DLSS on a device without the swapchain); never
                 // set with `NEURAL_FORGE_PREUPSCALE=off`, where no device holds.
                 let held_elsewhere = crate::preupscale::active() && crate::preupscale::post_off_by_any_device(std::time::Instant::now());
@@ -2882,6 +2934,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                                 series.start(neural_forge_protocol::capture::Request { id: 0, frames }, &crate::dump::captures_dir(), shm.channel(), true);
                             }
                             take_capture(shm, series, readable, true);
+                            // The readbacks below wait on the GPU: not with the hold's state.
+                            drop(hold_guard);
                             // SAFETY: `queue` is this present's, externally synchronized for its
                             // duration; nothing of the layer's was submitted for it yet.
                             unsafe {
@@ -2907,6 +2961,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 }
                 if shm.model_known_unavailable() {
                     // Nothing composes this session; a capture still shows what is presented.
+                    drop(hold_guard);
                     if let Some(instance) = &self.instance {
                         take_capture(shm, series, readable, false);
                         // SAFETY: as for the held path above.
@@ -2990,6 +3045,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     take_capture(shm, series, readable, false);
                     // The native backend answers this path's requests itself (`preupscale::native_post`).
                     preupscale.ensure_post_server(&self.device, instance, self.physical_device, *external_memory_host, shm);
+                    drop(hold_guard);
                     let observing = readable && series.running();
                     if observing {
                         // SAFETY: as for `capture::run` below; `readable` checked TRANSFER_SRC, and
@@ -3255,6 +3311,78 @@ mod tap_source_lifetime_tests {
         // The unrelated source and its own destination are untouched.
         assert!(state.tapped_source_layouts.contains_key(&unrelated_source));
         assert_eq!(state.tap_sources_by_destination.get(&image(22)), Some(&unrelated_source));
+    }
+}
+
+#[cfg(test)]
+mod lock_structure_tests {
+    use super::*;
+
+    /// A present in its synchronous wait holds `State`; a submit (the hold, its queue table, the
+    /// post path's slot check) must neither wait on it nor deadlock: the hold's state and the queue
+    /// table are their own locks, and the slot check only `try_lock`s `State`.
+    #[test]
+    fn a_submit_never_waits_on_a_present_in_its_answer_wait() {
+        let Some((_entry, instance, _physical, device, queue, family)) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device; skipping");
+            return;
+        };
+        let state = Arc::new(Mutex::new(State::default()));
+        let hold = Arc::new(Mutex::new(HoldState::default()));
+        let families = std::sync::RwLock::new(HashMap::from([(queue, family)]));
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let present = {
+            let (state, hold) = (state.clone(), hold.clone());
+            std::thread::spawn(move || {
+                // The present: State for its whole duration, the hold's state only briefly.
+                let _state = state.lock().unwrap();
+                drop(hold.lock().unwrap());
+                entered.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(400)); // the answer wait
+            })
+        };
+        waiting.recv().unwrap();
+        let t = std::time::Instant::now();
+        let held = hold.lock().unwrap();
+        assert_eq!(family_of(&families, queue), Some(family));
+        assert!(post_slot_busy(&state, &device), "a State held by the present is a post path at work");
+        drop(held);
+        assert!(t.elapsed() < std::time::Duration::from_millis(100), "the submit side waited {:?} on the present", t.elapsed());
+        present.join().unwrap();
+        assert!(!post_slot_busy(&state, &device), "free once the present is done");
+        unsafe {
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+    }
+
+    /// The barrier hooks take the tracker's lock only with image barriers and a known tap source.
+    #[test]
+    fn barriers_skip_the_tracker_until_a_tap_source_exists() {
+        use ash::vk::Handle;
+        let flag = std::sync::atomic::AtomicBool::new(false);
+        let mut tracker = TapTracker::default();
+        flag.store(tracker.has_sources(), std::sync::atomic::Ordering::Release);
+        assert!(!barriers_tracked(&flag, 3), "no source: no lock");
+        tracker.tap_sources_by_destination.insert(vk::Image::from_raw(1), vk::Image::from_raw(2));
+        flag.store(tracker.has_sources(), std::sync::atomic::Ordering::Release);
+        assert!(barriers_tracked(&flag, 3));
+        assert!(!barriers_tracked(&flag, 0), "no image barrier: nothing to record");
+    }
+
+    /// One swapchain that does not render steadily (first in the present) does not stop a later one
+    /// that does from being processed, and the present counts as engaged.
+    #[test]
+    fn a_present_is_engaged_when_any_swapchain_is() {
+        let combine = |states: &[bool]| states.iter().fold(None, |acc, &e| Some(engaged_so_far(acc, e)));
+        assert_eq!(combine(&[false, true]), Some(true));
+        assert_eq!(combine(&[true, false]), Some(true));
+        assert_eq!(combine(&[false, false]), Some(false));
+        assert_eq!(combine(&[]), None);
+        let source = include_str!("device.rs");
+        let present = &source[source.find("fn queue_present_khr(").unwrap()..];
+        let gate = &present[present.find("if !engaged {").unwrap()..];
+        assert!(gate[..gate.find('}').unwrap()].contains("continue;"), "a swapchain not rendering steadily moves on to the next");
     }
 }
 
