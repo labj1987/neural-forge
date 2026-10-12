@@ -27,19 +27,30 @@ The AppImage (layer, GUI, CLI):
 bash build-appimage.sh
 ```
 
-Checks, in the order CI runs them:
+Checks, in the order CI runs them (`.github/workflows/check.yml`, on every push and pull request
+and again for a release tag):
 
 ```bash
-VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:) cargo test
+bash scripts/fetch-native-tools.sh
+VK_DRIVER_FILES=$(ls /usr/share/vulkan/icd.d/lvp_icd*.json | paste -sd:) cargo test --locked
+cargo clippy --locked --workspace --all-targets -- -D warnings
+cargo build --locked -p neural-forge-cli && python3 scripts/test_install.py
 ```
 
 ```bash
-python3 scripts/test_install.py && python3 scripts/check_shaders.py && python3 scripts/sync_appdata_releases.py --check
+for t in release_notes.py bench-iq.py bench-report.py agreement.py gen_third_party_crates.py check_pins.py; do
+    python3 scripts/$t --self-test
+done
+python3 scripts/hdr_encode.py selftest && python3 scripts/test_cache_replay.py
+python3 scripts/check_shaders.py && python3 scripts/sync_appdata_releases.py --check
+python3 scripts/gen_third_party_crates.py --check && python3 scripts/check_namespace.py
+bash scripts/smoke-test.sh
 ```
 
-```bash
-bash scripts/smoke-test.sh && python3 scripts/check_namespace.py
-```
+Then the AppImage (`bash build-appimage.sh`), its glibc baseline, and its layer installed with its
+own CLI into scratch XDG directories and run through the Vulkan loader
+(`NEURAL_FORGE_SMOKE_SO=<installed .so> bash scripts/smoke-test.sh`). The self-tests need
+`python3-numpy` and `python3-pil` (Pillow 10.2 or newer); the shader check needs `spirv-val`.
 
 - `scripts/smoke-test.sh` runs `crates/layer/examples/smoke.rs` through the real Vulkan loader
   with the layer enabled, in a debug build. Run it after any change near device creation: it
@@ -55,7 +66,7 @@ bash scripts/smoke-test.sh && python3 scripts/check_namespace.py
 ## 2. Deploy to a test machine
 
 ```bash
-scripts/deploy-rig.sh the test machine
+scripts/deploy-rig.sh <host>
 ```
 
 It builds the AppImage from the working tree, copies it to `~/AppImages/neural-forge.appimage` on
@@ -107,7 +118,8 @@ Summarise, and average three runs of one configuration:
 scripts/bench-report.py --host <host> --mean nron-1 nron-2 nron-3
 ```
 
-**What the numbers are.** Pass 4 is the long free-roam pass, about 117 s. Real fps is the pass-4
+**What the numbers are.** The long free-roam pass is GTA's fifth, about 117 s; GTA numbers its
+frame-time files from 0, so it is `Pass4-*.txt` and "pass 4" below. Real fps is the pass-4
 frame count divided by the sum of its frame times, from GTA's own frame-time file. Shown fps is
 MangoHud's per-frame log counted over pass 4's wall-clock window; MangoHud is always the last
 layer, so it sits below any frame generator and counts generated frames. GPU utilisation and
@@ -152,20 +164,26 @@ before the change. Remove any backup made for the test.
 capture `<frames>` consecutive presented frames as a series, `<ms>` after the `<resume>`-th time
 DLSS's frames resumed after a pause (a loading screen, the start of a benchmark pass), so every run
 captures the same moment; gta-bench.sh moves the series into the run's directory.
-`scripts/bench-iq.py RUN_DIR [--baseline MODEL_OFF_RUN_DIR]` measures it, and `bench-report.py`
-prints the same beside the fps (`--baseline LABEL`):
+`scripts/bench-iq.py RUN_DIR [--baseline MODEL_OFF_RUN_DIR] [--fg N]` measures it, and
+`bench-report.py` prints the same beside the fps (`--baseline LABEL`), passing the run's measured
+frame generation multiplier:
 
-- *Flicker*: the mean frame-to-frame change of log luma (`log2(Y + 0.05 x geomean)`) over the 6
-  frames, ignoring the 5% of pixels that change most (people walking, particles), as a percentage.
+- *Flicker*: the mean frame-to-frame change of log luma (`log2(Y + 0.05 x geomean)`) over the
+  window's frames (9 by default), ignoring the 5% of pixels that change most (people walking,
+  particles), as a percentage.
 - *Added detail*: the energy of the log-luma Laplacian on the pixels static in both runs, with the
   model over without it (x1.15 = 15% more local contrast).
 
-The moment is GTA's still shot in pass 5 (the long free-roam pass) at about 70.5 s: a cut from a
+The moment is GTA's still shot in the long free-roam pass (the fifth: capture resume 5, `Pass4`
+above) at about 70.5 s: a cut from a
 crane shot over the pavement to people standing beside a parked car, the camera still for about a
 second (median motion 0.001 px a frame; at least 0.16 px at every other moment sampled every 2 to
 3 s). The camera starts a pass up to about a second earlier or later from run to run, so the series
-is captured across the cut and bench-iq.py takes the 9 frames from the new shot's 31st frame (the
-first frames after a cut are DLSS's history converging; their change decays over about 30 frames).
+is captured across the cut and bench-iq.py takes the window from the new shot's 31st rendered frame
+(the first frames after a cut are DLSS's history converging; their change decays over about 30
+rendered frames). The series holds presented frames, so with frame generation the 30 rendered
+frames are 30 x the multiplier presented ones (`--fg N`; bench-report.py passes the run's measured
+ratio). A series without a cut is measured from its first frame, and the output says "no cut".
 Until 2026-10-11 the window started on the 41st frame: in the slower runs GTA's camera starts
 moving again 47-56 frames after the cut, inside that window (interval 1 read x1.133 and x1.172
 added detail there against x1.33-1.35 from the 31st), so numbers taken before then with the
@@ -181,7 +199,9 @@ than the real ones, in a cycle of 4 at 4x, so a 6-frame window (5 pairs) counts 
 cycle twice: three model-off runs (2026-10-11, 4x) gave 0.294 / 0.279 / 0.345% over 6 frames (24%
 apart), 0.325 / 0.310 / 0.320% over 5 frames (5%) and 0.318 / 0.306 / 0.329% over 9 (8%). With
 frame generation on, the window must cover whole cycles: the default is 9 frames (8 pairs, two cycles;
-the handoff that introduced this metric asked for 6). A flicker difference under 10% is noise. Added detail between two model-off runs: x0.97 and x0.98. `bench-iq.py --scan RUN_DIR` lists the change of every pair of a longer
+the handoff that introduced this metric asked for 6); in general the window's pair count is the
+smallest multiple of the multiplier that is at least 8 (9 frames at 1x, 2x and 4x, 10 at 3x). A
+flicker difference under 10% is noise. Added detail between two model-off runs: x0.97 and x0.98. `bench-iq.py --scan RUN_DIR` lists the change of every pair of a longer
 series and its stillest window, for choosing another moment.
 
 Results land in `$NF_BENCH_DIR/<label>` on the host (default `~/nf-spike/gta`): GTA's Benchmark
@@ -264,7 +284,7 @@ once on any new game before claiming the model before the upscaler works there.
 
 | Value | What it does | Use |
 |---|---|---|
-| unset or `model` | Encode, the network, decode, every frame (the default). | Normal play. |
+| unset or `model` | Encode, the network, decode (the default): the network every frame while the camera is still and every second frame in motion, the edit cache carrying it between (`NEURAL_FORGE_EDIT_CACHE=off`: the network every frame, no cache at all). | Normal play. |
 | `off` | Nothing; the 1.x path everywhere, byte-identical to 1.1.0. | A/B comparisons, rollback. |
 | `dump` | Once (and again on each `shmctl capture`): write DLSS's colour, depth, motion vectors and the 1x1 exposure images to `~/.local/share/neural-forge/captures/preupscale-<ms>/` (`colour.rgba16f`, `depth.r32f`, `mvec.rg16f`, `exposure.json`, `meta.json`, `colour-preview.png`). The frame goes on untouched. | Getting real DLSS input for offline experiments. |
 | `identity` | Capture and write the same bytes back, raw; no network. | The hold's own cost. Set `--set enabled=0` so the 1.x path does not run too. |

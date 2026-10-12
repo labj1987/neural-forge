@@ -63,17 +63,27 @@ aliases.
 
 ## Target ownership
 
-Known Wine desktop, Xalia, Rockstar, Social Club and Steam executables are
-excluded before swapchain setup. `NEURAL_FORGE_TARGET_EXE` accepts a case-insensitive,
-comma-separated list of executable basenames; configure it for the actual game exe.
-For GTA Enhanced use `GTA5_Enhanced.exe` after confirming that process name locally.
-The Steam AppID alone is insufficient: launchers inherit it too.
+`NEURAL_FORGE_TARGET_EXE` accepts a case-insensitive, comma-separated list of executable
+basenames, trimmed. When it is set, exactly those processes are eligible, even one whose name is on
+the built-in list below (a game whose executable is literally `Launcher.exe` works when it is the
+target). The supervisor always sets it when it switches a game on (GUI, `neural-forge-cli enable`):
+the program Steam's own launch entry for the game starts (`appcache/appinfo.vdf`, the entries for
+the installed branch), the other executables beside it (a store bootstrapper such as `PlayGTAV.exe`
+starts `GTA5_Enhanced.exe` from the same folder; anti-cheat's `start_protected_game.exe` its
+neighbour) and an Unreal Engine game's `<Project>/Binaries/Win64` binary, leaving out redistributable
+installers, anti-cheat services, crash reporters and store launchers. A target chosen by hand
+(`enable GAME --target-exe`) is kept in `config.ini` (`target_exe_<appid>`) and wins. The Steam AppID
+alone is insufficient: launchers inherit it too.
+
+Without a target, Wine's own processes, Steam's, store launchers and their helpers (Rockstar, Social
+Club, Ubisoft Connect, EA app, Battle.net, Epic, GOG Galaxy, Riot and others), crash reporters and
+gamescope are excluded before swapchain setup (`neural_forge_protocol::processes`), and the first
+other process to present steadily wins.
 
 The first eligible process to open a channel takes a nonblocking kernel file lease.
-Other processes cannot attach, write frames or change its dimensions. The lease lasts
-until process exit, survives swapchain recreation, and releases on
-crash without PID reuse/timeout guessing. Never unlink `shm.bin.owner` while a game
-runs. Within one process the existing largest-swapchain rule is retained.
-An unknown launcher can win first in unrestricted mode: use the explicit target for
-GTA. Multiple simultaneous games need distinct explicit private SHM channels
-(`NEURAL_FORGE_SHM`); the GUI manages one channel per user.
+Other processes cannot attach, write frames or change its dimensions. The lease survives
+swapchain recreation and releases on crash or exit without PID reuse/timeout guessing; it is also
+given up after 10 s without a present, so a process that claimed it and stopped presenting cannot
+keep the game from it. Never unlink `shm.bin.owner` while a game runs. Within one process the
+existing largest-swapchain rule is retained. Multiple simultaneous games need distinct explicit
+private SHM channels (`NEURAL_FORGE_SHM`); the GUI manages one channel per user.

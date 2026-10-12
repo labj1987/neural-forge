@@ -31,7 +31,7 @@ flowchart LR
 | Part | Crate | What it does |
 |---|---|---|
 | Vulkan layer, inside the game | `crates/layer` | Hooks device creation, command recording, `vkQueueSubmit` and `vkQueuePresentKHR`. Holds DLSS's input and runs the network on it before the upscaler; after the upscaler, captures frames, answers them with the network on a thread of its own (`preupscale/native_post.rs`) and composites the answer back. x86_64 only. |
-| Network | `crates/native` | OpenDLSS-NR's implementation of the DLSS 5 Neural Rendering network (vendored C++, GLSL and PTX kernels, `third_party/opendlss-nr`), built into the layer: loads the extracted weights, records the network's graph, runs it on the game's device. |
+| Network | `crates/native` | OpenDLSS-NR's implementation of the DLSS 5 Neural Rendering network (C++, GLSL and PTX kernels fetched at a pinned commit and patched, `third_party/opendlss-nr/UPSTREAM.md`), built into the layer: loads the extracted weights, records the network's graph, runs it on the game's device. |
 | GUI | `crates/gui` | GTK4/libadwaita settings app. Reads and writes live settings in shared memory, shows status, extracts the model. |
 | CLI | `crates/cli` | `neural-forge-cli`: install, model extraction, `doctor`, profiles, and `shmctl` for live settings. |
 | Supervisor | `crates/supervisor` | Library shared by GUI and CLI: paths, config, the channel's path, the model's extraction, installs the layer. |
@@ -48,13 +48,15 @@ with NGX's ([NATIVE_BACKEND.md](NATIVE_BACKEND.md), 0.6). No NVIDIA code runs.
 **Who loads the layer.** The layer is an implicit Vulkan layer. Its manifest
 (`data/neural_forge_layer.json`) enables it only when `NEURAL_FORGE_ENABLE=1` is in the
 environment, so only games with that launch option load it. Inside the game it stays inert on
-non-NVIDIA devices, on a second copy of itself, and in excluded processes (launchers, Wine
-desktop, overlays, or anything not named in `NEURAL_FORGE_TARGET_EXE`). The first eligible
-process to present steadily takes a kernel file lease on `shm.bin.owner`; others cannot attach.
-Store launchers and their helpers (Ubisoft Connect, EA app, Battle.net, Epic, GOG Galaxy, Riot,
-Rockstar) and crash reporters are never eligible. The lease follows presenting: a process that has
-not presented for 10 s lets it go (and stops touching the channel, its model server included), so a
-helper that claimed it cannot keep the game from claiming it.
+non-NVIDIA devices, on a second copy of itself, and in excluded processes. With
+`NEURAL_FORGE_TARGET_EXE` set (the supervisor writes the game's own executables whenever it switches
+a game on: PHASE1.md, "Target ownership") only the processes it names are eligible, whatever their
+name; without it, store launchers and their helpers (Ubisoft Connect, EA app, Battle.net, Epic, GOG
+Galaxy, Riot, Rockstar), Wine's and Steam's own processes, crash reporters and gamescope never are
+(`neural_forge_protocol::processes`). The first eligible process to present steadily takes a kernel
+file lease on `shm.bin.owner`; others cannot attach. The lease follows presenting: a process that
+has not presented for 10 s lets it go (and stops touching the channel, its model server included),
+so a helper that claimed it cannot keep the game from claiming it.
 
 ## 2. Shared memory
 
@@ -86,7 +88,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   swapchain or an old size is refused), `seq_eval` (v11).
 - **Handshake, slot 1 (v3):** `seq_req_b`, `seq_resp_b`, `width_b`, `height_b`, `proxy_format_b`.
 - **Liveness:** `server_heartbeat`, `layer_heartbeat`, `quit`.
-- **Change counters:** `control_seq` (any setting changed), `tuning_seq` (a model setting changed).
+- **Change counters:** `control_seq` (any setting changed), `tuning_seq`: the settings' sequence
+  lock. A preset, a profile, Reset or a saved setting is written as one unit
+  (`ShmHeader::write_settings`: `tuning_seq` odd while the values change, even after), so
+  `global_tuning` never reads half of one; 0 means nothing has configured the header yet.
 - **Model settings:** `enabled`, `style`, `auto_mask`, intensity, local tone, local structure,
   skin structure, `model_interval` (v6).
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
@@ -101,8 +106,13 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   `neural_forge_protocol::capture::request`), `capture_next_id`, `capture_cancel`, and the
   sequence-locked capture result the layer publishes: request id, state (running, written, failed,
   cancelled), reason, pairs written and composed, the files' paths (5.7).
-- **Pre-upscaler status (v9):** `preupscale_state` (0 off, 1 waiting for DLSS input, 2 holding),
-  `preupscale_width`/`height`, `preupscale_hold_ms`, `preupscale_misses`, `native_running` (v13).
+- **Pre-upscaler status (v9):** `preupscale_state` (`enums::preupscale_state`: off, waiting for DLSS
+  input, holding), `preupscale_width`/`height`, `preupscale_hold_ms`, `preupscale_misses`,
+  `native_running` (v13).
+- **Device loss (v16):** `device_lost_at`.
+- **Edit cache (v17):** `preupscale_dump_request` (cleared by `init_defaults` and when a game's layer
+  starts a session on the channel, so a request left for an earlier game never fires on the next),
+  `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected`, `cache_gpu_ms_bits`.
 - **Reserved, read by nothing:** `format`, `hdr_encode`, `hdr_mode`/`hdr_detected`/`hdr_active`.
 
 ### The handshake (after the upscaler)
@@ -118,6 +128,13 @@ hold), the server copies the proxy into the answer region and does not update `s
 
 The GUI and CLI refuse a header of another `version` instead of re-initialising it, and say which
 versions disagree. The layer applies the saved settings (`config.ini`) when it creates the header.
+Every process that opens the channel classifies, sizes and initialises it under the file's own
+`flock` (`mapping::with_init_lock`), and `init_defaults` stores the magic last, so two openers of a
+new file never both initialise it and none reads a header still being written. Diagnostics (`doctor`,
+the report, `shmctl status`) only look: `mapping::open_existing` maps an existing channel privately
+and read-only in effect, and creates nothing. Only the runtime directory itself
+(`/tmp/neural-forge-$UID`) is ever tightened to 0700; a custom channel path's directory must already
+be private.
 
 ### Protocol versions
 
@@ -140,10 +157,10 @@ versions disagree. The layer applies the saved settings (`config.ini`) when it c
 | 15 | The helper's fields removed (passes, motion, rebuild spacing, VRAM and feature counts, its reason string, the DMA-BUF exchange); `helper_*` renamed `server_*` | 3.0.0 |
 | 16 | `device_lost_at` (Unix seconds of the session's `VK_ERROR_DEVICE_LOST`, 0 when none) | 3.2.0 |
 | 17 | `preupscale_dump_request`; the edit cache's `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected`, `cache_gpu_ms_bits` | 3.3.0 |
-| 18 | `capture_request` carries a request id; `capture_next_id`, `capture_cancel` and the capture result (state, reason, counts, paths) appended | unreleased |
+| 18 | `capture_request` carries a request id; `capture_next_id`, `capture_cancel` and the capture result (state, reason, counts, paths) appended | 3.4.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
-the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17.
+the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18.
 
 ## 3. Which path a frame takes
 
@@ -561,8 +578,8 @@ directly as 3.2.0's did; the picture is bit for bit 3.2.0's (the test
   read, the pyramid and the shown edit in a cached write-back, the guided filter's grids over the
   first two once the apply has read them) live within it. The fingerprint is read from the frame
   where it is needed, the refresh's depth from the depth again. Edits are kept as three 16-bit
-  fixed-point stops (+-2.5, steps of 7.6e-5 stop: the shaders stay within 1e-4 stop of the replay
-  tool). A hold checks the features' size, and a rebuilt network (new features) drops the edit. The
+  fixed-point stops (+-2.5, steps of 7.6e-5 stop: the shaders stay within 8e-5 stop of the replay
+  tool, measured; the shader-against-tool test's tolerance is 1e-3). A hold checks the features' size, and a rebuilt network (new features) drops the edit. The
   cache had 146 bytes a render pixel of its own before (408 MB at 2228x1253; LESSONS.md, "3.3 edit
   cache: what was tried"). Reversed-Z is decided once per extent, when 3 holds in a row with
   conclusive depth counts agree (texels at 0 and 1, else the top and bottom quarters' sums, 64-bit);
@@ -672,7 +689,7 @@ With `NEURAL_FORGE_PREUPSCALE=dump` the one-shot is the pre-upscaler dump's.
 
 ## 6. The network
 
-`crates/native` (the vendored OpenDLSS-NR C++, `cpp/nf_native.cpp` glue, kernels built and embedded
+`crates/native` (OpenDLSS-NR's C++ at its pinned commit, patched, `cpp/nf_native.cpp` glue, kernels built and embedded
 by `build.rs`), `crates/layer/src/preupscale/native.rs` (the loader, the per-device state, the hold).
 
 - **Device setup** (`create_device`): on an NVIDIA device with the pre-upscaler path on, the layer
@@ -692,8 +709,11 @@ by `build.rs`), `crates/layer/src/preupscale/native.rs` (the loader, the per-dev
 
 ## 7. Settings, status and the GUI
 
-The GUI and CLI write settings straight into the header and bump `control_seq` (and `tuning_seq`
-for model settings). The layer reads them live; the native hold applies a change at the next frame.
+The GUI and CLI write settings straight into the header and bump `control_seq` (several at once,
+such as a strength preset, as one unit under `tuning_seq`). The layer reads them live; the native
+hold applies a change at the next frame. The GUI's periodic updates hold their widgets weakly and
+stop when the window closes; liveness everywhere is one rule (the heartbeat moved within 2 s), and
+the Setup tab reads Steam on a worker thread.
 Saved settings live in `~/.config/neural-forge/config.ini` as `set_<name>=` and are applied by the
 layer when it creates the header. Status comes from heartbeats and counters, refreshed once a
 second; the Status tab's "Model placement" line is `preupscale_state` with the extent, misses and
@@ -705,7 +725,10 @@ the layer's status line (`layer_reason`; a device that cannot run the network is
 `crates/supervisor/src/doctor.rs` is the one set of checks behind `neural-forge-cli doctor` and the
 Status tab's Diagnose button. Every check reads through `doctor::Roots` (proc/sys roots, the XDG
 dirs, the channel path, and `nvidia-smi`/`journalctl` as injected commands), so the tests drive each
-one from a fixture tree. A finding has a severity (ok, info, warning, failure), the evidence it read
+one from a fixture tree. The commands run with a 10 s limit (a wedged GPU can hang `nvidia-smi`) and
+each question is asked once per run; the doctor only looks (it creates neither the channel nor any
+user directory) and checks the model's stage files against the manifest's lengths and SHA-256. A
+finding has a severity (ok, info, warning, failure), the evidence it read
 and one fix; only a failure makes `doctor` exit non-zero. Log-driven findings match the producer's
 exact grammar and take the newest matching line as the verdict: the kernel's `NVRM: Xid (` lines,
 and the layer's state log.
@@ -718,7 +741,10 @@ timeout with its breadcrumb trail. It is written only for games launched with
 `NEURAL_FORGE_ENABLE=1`, never on the present path in steady state (the stderr sink and
 `crates/layer/src/logging.rs` are unchanged). Inside Steam's runtime container the game keeps the
 user's home and `XDG_*` variables, so the layer and `doctor` name the same file; a Flatpak Steam
-points `XDG_STATE_HOME` into its sandbox, and doctor reports a Flatpak-only Steam as unsupported.
+points `XDG_STATE_HOME` into its sandbox, and doctor reports a Flatpak-only Steam as unsupported,
+a game switched on in a Flatpak Steam next to a native one, and a game switched on without its
+target executable (with the launch options to set). The state log is appended under its `flock`, so
+two processes rotating it at once lose no line.
 
 `crates/supervisor/src/report.rs` writes `neural-forge-report-<unix>.zip` (its own zip writer, text
 deflated with `miniz_oxide`, already linked through `png`) to the XDG desktop dir, else `~/Desktop`,
@@ -726,7 +752,13 @@ else `$HOME`: a summary (version, GPU, driver, compute capability, kernel, sessi
 Proton tool from Steam's `CompatToolMapping`, all findings), `config.ini`, the model manifest, the
 state logs (last 4 MiB each), this boot's Xid lines, the channel status (`shm_status.rs`, the text
 `shmctl status` prints) and the newest capture pair. Every text member and member name is redacted:
-the home directory becomes `~` and the user name `<user>` (whole tokens only).
+the home directory becomes `~` (only a whole path), the user name `<user>` and the host name
+`<host>` (whole tokens; a name under three characters only as a whole path component), and the
+Xid lines lose their host field. The doctor's findings list the installed Steam games with their
+library folders; the CLI help and the GUI say so. The game's app id comes from the executable the
+channel names (the game whose targets name it, else the one holding it least deep; a tie is
+reported as ambiguous), its Proton from that game's own Steam root. Zip times are local; a second
+report in the same second gets its own name.
 
 ### 7.2 Steam launch options
 
@@ -740,9 +772,18 @@ file: it splices the one quoted value (or inserts the missing key or app block w
 layout and line endings), re-parses the result and requires the tree to equal the original plus
 exactly that change. It refuses while a `steam` or `steamwebhelper` process runs (Steam rewrites the
 file on exit), backs up to `.neural-forge.orig` once ever and `.neural-forge.bak` before each edit,
-and replaces the file atomically with its mode kept. Every account that has the game is edited; a
-game no account has gets its block only in the most recently modified account. Refused or failed
-edits return the string to paste instead.
+and replaces the file atomically with its mode kept (a symlinked file is written through, and the
+directory is fsynced). Every account that has the game is edited, and switching on also the most
+recently modified account (the one signed in), which gets the game's block if it lacks it. Refused
+or failed edits return the string to paste instead. An appid listed in two libraries or roots is one
+game (the native root's); a game of the Flatpak Steam cannot be switched on.
+
+Switching on always writes `NEURAL_FORGE_TARGET_EXE`: `steam::target_for`, the executable chosen by
+hand for the game (`config.ini`'s `target_exe_<appid>`), else `steam::target_exes`, derived from
+Steam's binary app cache (`appinfo.rs`: `appcache/appinfo.vdf` version 29, the launch entries for
+Windows or Linux and the installed branch) and the game's folder (PHASE1.md, "Target ownership").
+Without the app cache the folder's top-level executables and Unreal's binaries are used. Switching
+off removes it with the rest; switching on again writes it again.
 
 ## 8. Failure behaviour
 

@@ -34,7 +34,14 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 ## Build and test
 
 - Run `bash scripts/fetch-native-tools.sh` once before building: it fetches the pinned glslang,
-  Vulkan-Headers and volk that `crates/native` builds with into `tools/native/`.
+  Vulkan-Headers, volk and OpenDLSS-NR source (with `third_party/opendlss-nr/patches/` applied, each
+  exactly) that `crates/native` builds with into `tools/native/`; the build is offline after that.
+  OpenDLSS-NR is not vendored: change it through a patch there (UPSTREAM.md lists each with its reason).
+- CI (`.github/workflows/check.yml`, run by ci.yml on every push and pull request and by release.yml
+  on a tag) runs the tests, clippy, every script's self-test, the shader check, the AppImage build and
+  its installed-layer smoke test. A new script with a self-test is added there. The weekly pin check
+  (`scripts/check_pins.py`, pin-check.yml) keeps one issue about pins behind upstream; it must never
+  comment or open more than that one (each notification is an email).
 - `cargo test` and `cargo build --release` build every crate (x86_64 Linux only; there is no
   Windows helper and no 32-bit layer since 3.0).
 - `bash build-appimage.sh` packages Neural Forge.
@@ -42,11 +49,18 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   CI does. On a machine with an NVIDIA GPU, never run them without it.
 - Run `python3 scripts/check_namespace.py`, `python3 scripts/test_install.py`,
   and `bash scripts/smoke-test.sh` for namespace, installation and Vulkan checks.
+- Shaders: `python3 scripts/check_shaders.py --update` rebuilds the committed SPIR-V with the pinned
+  glslang only (never one on PATH) and needs `spirv-val`.
+- Every component compiled or linked into the shipped binaries must have its licence text in the
+  AppImage: `scripts/gen_third_party_crates.py --licences` collects them from the crates' and the
+  native sources at build time and fails on one without.
+- Launch options: the supervisor always writes `NEURAL_FORGE_TARGET_EXE` (the game's own executables,
+  `steam::target_for`), and an explicit target wins over the layer's built-in exclusions.
 - `extract-model` gates on the network's shape, not the DLL's version: it takes any build of
   `nvngx_dlssnr.dll` whose `WEIGHTS_HT` holds exactly the tensors in
   `crates/supervisor/src/model_shape.rs` (names and byte lengths). That table changes together with
-  the vendored graph in `third_party/opendlss-nr`: regenerate it with `scripts/gen_model_shape.py`
-  when the vendored copy moves to a new network. `VERIFIED_BUILDS` only marks builds compared with
+  OpenDLSS-NR's graph: regenerate it with `scripts/gen_model_shape.py` when the pinned commit
+  (`third_party/opendlss-nr/UPSTREAM.md`) moves to a new network. `VERIFIED_BUILDS` only marks builds compared with
   NVIDIA's runtime; it gates nothing.
 
 ## Changelog
@@ -93,7 +107,8 @@ Current target-machine evidence and unresolved Vulkan errors are in
 Since 2.0 the model runs **before** DLSS Super Resolution by default (`crates/layer/src/preupscale.rs`,
 docs/PRE_UPSCALER_DESIGN.md): on a device with `VK_NVX_image_view_handle`, the layer identifies
 DLSS's registered colour input, holds the game's DLSS submit, runs the network on the
-render-resolution frame every frame (with DLSS's motion vectors and the jitter for the history) and
+render-resolution frame (every frame while the camera is still, every second frame in motion with the
+edit cache carrying it between; with DLSS's motion vectors and the jitter for the history) and
 writes the answer back before DLSS runs. Games that record their frame in DLSS's own command buffer
 are held inside it (`preupscale/inline.rs`, on the layer's side compute queue). The colour input is
 what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's

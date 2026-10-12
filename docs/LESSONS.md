@@ -655,7 +655,7 @@ one place. Per stage, the Laplacian energy of the carried luma edit over the mod
 that hold (still dump: pixels whose accumulated motion is under 0.05 px; pan and drive: every pixel
 on the chain), and the picture's detail before DLSS (log-luma Laplacian energy over the frame's):
 
-| dump, lag | refresh's edit | nearest | bilinear | Catmull-Rom | depth-admitted bilinear (shipped) | low band | after confidence | picture: model / nearest / bilinear |
+| dump, lag | refresh's edit | nearest | bilinear | Catmull-Rom | depth-admitted bilinear (shipped then; since replaced by the strongest tap, below) | low band | after confidence | picture: model / nearest / bilinear |
 |---|---|---|---|---|---|---|---|---|
 | still, 1 | 1.004 | 1.001 | 0.178 | 0.359 | 0.179 | 0.050 | 0.194 | x1.037 / x1.021 / x1.003 |
 | still, 2 | 0.999 | 0.998 | 0.268 | 0.520 | 0.269 | 0.049 | 0.259 | x1.029 / x1.019 / x1.004 |

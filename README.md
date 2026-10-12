@@ -53,7 +53,8 @@ The model runs in one of two places. The layer picks the place for each game by 
 - **Before the upscaler**, when the game uses DLSS Super Resolution (at Quality, Balanced,
   Performance or DLAA). The layer recognises the frame the game hands to
   DLSS: the scene at render resolution, in HDR (16-bit float), without the HUD. It holds that DLSS
-  submission, runs the network on the frame every frame, with DLSS's motion vectors and camera
+  submission, runs the network on the frame (every frame while the camera is still, every second
+  frame in motion, with the edit cache carrying it between), with DLSS's motion vectors and camera
   jitter for its history, and writes the answer back before DLSS upscales it. DLSS then upscales the
   enhanced frame. The model works on fewer pixels and gets the input it was made for. Games that
   record their frame in DLSS's own command buffer (Crimson Desert) are held inside that buffer.
@@ -231,14 +232,18 @@ stay; Neural Forge does not touch its files.
    options already there:
 
    ```text
-   NEURAL_FORGE_ENABLE=1 %command%
+   NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=<the game's executable> %command%
    ```
 
-   With Steam running, the list is read-only: copy the launch option from below it and paste it into
-   the game's Properties > General > Launch options instead. For a game that starts several
-   processes, add `NEURAL_FORGE_TARGET_EXE=<game>.exe` (the Setup tab's "Target executable" field
-   builds that string). Steam's file is backed up next to it before every change
-   (`localconfig.vdf.neural-forge.bak`, and the first state found as
+   The executable is found from Steam's own data for the game (the program Steam starts, the
+   executables beside it, and an Unreal Engine game's real binary), so only the game itself can use
+   Neural Forge, never a store launcher or helper it starts first; the games list shows it. To name
+   it yourself: `neural-forge-cli enable GAME --target-exe Game.exe` (remembered for that game, also
+   when the GUI switches it on again; `--target-exe auto` goes back to the found one). With Steam
+   running, the list is read-only: pick the game in the "Steam launch option" group below it, copy
+   the launch option and paste it into the game's Properties > General > Launch options instead. A
+   game of the Flatpak Steam cannot be switched on (see Troubleshooting). Steam's file is backed up
+   next to it before every change (`localconfig.vdf.neural-forge.bak`, and the first state found as
    `localconfig.vdf.neural-forge.orig`).
 3. In the game, use DLSS Super Resolution (Quality, Balanced or Performance) to get the model
    before the upscaler. Turn on the game's own DLSS Frame Generation if you want it.
@@ -282,7 +287,7 @@ this version re-creates the shared memory.
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust), and captures: take one (the next frame as before/after PNGs) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), your installed Steam games with a Neural Forge switch each, and the launch option to copy by hand. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), your installed Steam games with a Neural Forge switch each (and the executable it targets), and the launch option to copy by hand for a game you pick. |
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and
@@ -291,7 +296,11 @@ composition step), so "Model every Nth frame" and the Composition tab only chang
 path. The Model tab's tuning and the switch apply to both.
 
 Settings are live: the GUI and the running layer share them through shared memory.
-`neural-forge-cli shmctl status|set|toggle|capture` does the same from a terminal.
+`neural-forge-cli shmctl status|set|toggle|capture` does the same from a terminal. The Debug tab's
+Capture button (and `shmctl capture`) saves the next presented frame before and after Neural
+Forge's composition and says what happened: where the files are and whether the effect changed the
+frame, or why nothing was written; clicking again while it waits cancels it, and a request no game
+takes is withdrawn after 5 seconds.
 
 ## Known issues
 
@@ -334,16 +343,16 @@ the code (`crates/`, `scripts/`).
 |---|---|---|
 | `NEURAL_FORGE_ENABLE=1` | layer (manifest) | Turns the layer on for this game. |
 | `NEURAL_FORGE_DISABLE=1` | layer (manifest) | Forces it off, overriding `ENABLE`. |
-| `NEURAL_FORGE_TARGET_EXE=a.exe,b.exe` | layer | Only these executables (case-insensitive basenames) may use the layer. |
+| `NEURAL_FORGE_TARGET_EXE=a.exe,b.exe` | layer | Only these executables (case-insensitive basenames) may use the layer, even one whose name is on the built-in list of launchers and helpers (a game whose executable is `Launcher.exe`). Switching a game on sets it to the game's own executables. Without it, the first process not on that list to present steadily takes the layer. |
 | `NEURAL_FORGE_PREUPSCALE=off` | layer | Never run the model before the upscaler: the 1.x path everywhere. Unset (or `model`) is the default. An unknown value is logged and treated as `off`. |
 | `NEURAL_FORGE_PREUPSCALE=dump\|identity\|roundtrip` | layer | Diagnostics: write DLSS's input to `captures/`, hold without the model (raw copy back), or run the HDR encode and decode with no model. See [docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md). |
-| `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves). For A/B comparisons and benchmarks; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
+| `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves), with none of the cache at all: 3.2.0's hold exactly (the game's depth is neither made copyable nor copied). For A/B comparisons, benchmarks and rollback; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
 | `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=3` | layer | The HDR encode's paper white (default 3; a positive number up to 1000). Tuning only. |
 | `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: the old pipelined present. Higher frame rate, but answers land on later frames and ghost. |
 | `NEURAL_FORGE_TOGGLE_KEY=F10` | layer | Toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
 | `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | layer | Forces one keyboard backend (default: evdev, then XInput2). |
 | `NEURAL_FORGE_MAX_MODEL_PIXELS=N` | layer | Largest raster the after-the-upscaler path gives the model (default 3840x2160 = 8294400). |
-| `NEURAL_FORGE_LOG=/path` | layer | Log file (default: stderr). |
+| `NEURAL_FORGE_LOG=/path` | layer | Log file (default: stderr), written by its own thread and rotated to `/path.1` at 64 MiB. |
 | `NEURAL_FORGE_LOG_TIME=1` | layer | Testing aid: timestamp every log line. |
 | `NEURAL_FORGE_SHM`, `NEURAL_FORGE_UID` | all | The shared-memory file, and the uid its directory is named after. Normally left alone. |
 | `NEURAL_FORGE_PROBE_NGX=1` | layer | Testing aid: log the game's DLSS work as it reaches Vulkan ([docs/PRE_UPSCALER_PROBE.md](docs/PRE_UPSCALER_PROBE.md)). |
@@ -385,19 +394,24 @@ folder and user name are replaced in it.
   no model extracted, a missing device feature, or a failed build (retried on its own). The full
   layer log (`NEURAL_FORGE_LOG=/path` in the launch options) has the `[native]` lines.
 - **Steam installed as a Flatpak.** Its games run in a sandbox that does not see the layer installed
-  in your home folder; use your distribution's Steam package.
+  in your home folder; use your distribution's Steam package. With both installed, only the native
+  Steam's games can be switched on; the doctor warns about a Flatpak game that is.
 - **Steam Linux Runtime (pressure-vessel).** The game must see `/tmp/neural-forge-$UID`. If it
   does not, add `PRESSURE_VESSEL_FILESYSTEMS_RW=/tmp/neural-forge-$UID` to the launch options.
-- **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone. If a game
-  still conflicts, set `NEURAL_FORGE_TARGET_EXE` to the game's executable.
+- **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone, and only the
+  executables in `NEURAL_FORGE_TARGET_EXE` (which switching a game on sets) can use Neural Forge.
+- **A game switched on before 3.4.0** has no target executable in its launch options, so a launcher
+  could take the effect: switch it off and on again in the Setup tab, or run `neural-forge-cli
+  enable GAME` (the doctor lists such games).
 - **32-bit games** are not supported (see [Requirements](#requirements)).
 
 ### CLI
 
 `neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
-`enable GAME [--target-exe EXE]`, `disable GAME`, `config`, `import-binaries DIR`,
+`enable GAME [--target-exe EXE|auto]`, `disable GAME`, `config`, `import-binaries DIR`,
 `extract-model DIR`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`, and
-`shmctl status|set NAME VALUE|toggle NAME|capture [--frames N]|reset` for the live settings.
+`shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--cancel]|reset` for the live settings.
+`doctor`, `report` and `shmctl status` only look: they create and change nothing.
 `neural-forge-cli help` has the details.
 
 ### Files
@@ -431,7 +445,7 @@ bash build-appimage.sh
 ```
 
 The first fetches the pinned glslang, Vulkan-Headers and volk the native backend (`crates/native`,
-the vendored OpenDLSS-NR C++) builds with. The second builds everything (protocol, layer, native,
+OpenDLSS-NR's C++ source at its pinned commit, patched) builds with. The second builds everything (protocol, layer, native,
 GUI, CLI, supervisor). The third packs it into an AppImage (see `build-appimage.sh` for the package
 list). Checks:
 
@@ -481,8 +495,9 @@ well: a requirement for the adapted code, not just a preference.
 This project's own code is licensed under the **GNU Affero General Public License v3.0 or later
 (AGPL-3.0-or-later)**; see [LICENSE](LICENSE). It links against and depends on NVIDIA's
 proprietary model weights at run time (extracted by the user from NVIDIA's DLL), which are not
-covered by that license and are not redistributed here. The vendored OpenDLSS-NR sources keep their
-MIT licence (`third_party/opendlss-nr/LICENSE`). Statically linked Rust crates and their licences are listed in
+covered by that license and are not redistributed here. The OpenDLSS-NR sources keep their
+MIT licence; its source is fetched at a pinned commit and patched at build time
+(`third_party/opendlss-nr/UPSTREAM.md`). Statically linked Rust crates and their licences are listed in
 [THIRD_PARTY_CRATES.md](THIRD_PARTY_CRATES.md).
 
 ## Acknowledgements
@@ -490,7 +505,7 @@ MIT licence (`third_party/opendlss-nr/LICENSE`). Statically linked Rust crates a
 - [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) (bmitch87): the architecture, the
   composition strategy and many ported functions ([ATTRIBUTION.md](ATTRIBUTION.md)).
 - [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (maan): the network implementation the
-  layer runs since 3.0 (vendored in `crates/native`), and earlier the history reset rule and the
+  layer runs since 3.0 (fetched at a pinned commit with this project's patches, `third_party/opendlss-nr`, and built by `crates/native`), and earlier the history reset rule and the
   documented proxy encode used before the upscaler.
 - [OptiScaler](https://github.com/cdozdil/OptiScaler) and
   [OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR): the idea of running the model

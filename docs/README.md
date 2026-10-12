@@ -12,7 +12,7 @@ disagree, the more recent measurement wins.
 
 ## How it works
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): the layer, the shared-memory channel (versions 1-15), both
+- [ARCHITECTURE.md](ARCHITECTURE.md): the layer, the shared-memory channel (versions 1-18), both
   frame paths step by step, the network the layer runs, and the timing of each stage.
 - [NATIVE_BACKEND.md](NATIVE_BACKEND.md): how the network moved into the layer for 3.0 (OpenDLSS-NR,
   the model directory and its extractor, the device setup, the hold inside DLSS's buffer), and every
