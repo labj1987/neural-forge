@@ -26,15 +26,21 @@ NEEDS_NUMPY = "numpy is not installed (apt-get install -y python3-numpy); cache 
 
 
 def carried(dump, t, lag, p, rev=True):
-    """Hold t's shown edits per mode, carried from hold t - lag, with the frames used."""
+    """Hold t's shown edits per mode, carried from hold t - lag along the layer's chain (the
+    accumulated field's recurrence, cc.acc_step), with the frames used."""
     frames = cr.Frames(dump, rev, p, lag + 1)
-    h, w = dump.height, dump.width
-    pos, on = cc.pixel_centres(h, w), np.ones((h, w), bool)
-    for k in range(t, t - lag, -1):
-        pos = cc.chain_step(pos, frames[k], frames[k - 1], p)
-        on &= cc.on_screen(pos, h, w)
+    pos, on = cr.carried_position(frames, t, lag, p)
     shown, _ = cr.shown_edits(frames[t - lag], frames[t], pos, on, p)
     return shown, frames[t]
+
+
+def rewrite_manifest(path, change):
+    """Applies `change` to the dump's manifest (a dict) and writes it back."""
+    with open(os.path.join(path, "manifest.json"), encoding="utf-8") as fh:
+        m = json.load(fh)
+    change(m)
+    with open(os.path.join(path, "manifest.json"), "w", encoding="utf-8") as fh:
+        json.dump(m, fh)
 
 
 def kept(shown, dst, p, mask):
@@ -86,6 +92,83 @@ class CacheReplayTests(unittest.TestCase):
             self.assertTrue(rev, f"{kind}: {why}")
         flipped = [1.0 - cc.load_dump(self.dirs["still"]).hold(0).depth]
         self.assertFalse(cc.infer_reverse_z(flipped)[0])
+
+    def test_cleared_depth_alone_tells_nothing(self):
+        # A loading screen's all-zero depth is no evidence (the layer's cache::DEPTH_GEOMETRY_MIN);
+        # with one real frame beside it the real frame decides.
+        blank = np.zeros((8, 16), np.float32)
+        self.assertIsNone(cc.infer_reverse_z([blank])[0])
+        real = cc.load_dump(self.dirs["depth-edge"]).hold(0).depth
+        self.assertTrue(cc.infer_reverse_z([blank, real])[0])
+        self.assertFalse(cc.infer_reverse_z([blank, 1.0 - real])[0])
+
+    def test_null_fields_load_and_refresh(self):
+        """A manifest's null jitter or exposure and a hold without vectors or depth load (no NaN, no
+        TypeError), and the cadence refreshes on such holds as the layer does."""
+        with tempfile.TemporaryDirectory() as d:
+            holds, _, _ = cr.synthetic_holds("pan", w=32, h=16, n=6)
+            cc.write_dump(d, holds)
+
+            def change(m):
+                m["frames"][1]["jitter"] = None
+                m["frames"][3]["exposure"] = None
+                m["frames"][5]["mvec_valid"] = False
+            rewrite_manifest(d, change)
+            dump = cc.load_dump(d)
+            h1, h3, h5 = dump.hold(1), dump.hold(3), dump.hold(5)
+            self.assertFalse(h1.jitter_known)
+            self.assertTrue(np.isfinite(h1.jitter).all())
+            self.assertEqual(h3.exposure, 0.0)
+            self.assertFalse(h5.mvec_valid)
+            self.assertFalse(h5.mvec.any())
+            p = cc.Params()
+            frames = cr.Frames(dump, True, p, 3)
+            got = [(t, refresh) for t, _, refresh, _, _, _ in cr.run_cadence(dump, frames, cr.Cadence(interval=4), p)]
+            # 0 refreshes; 1 has no jitter: refreshes and stores nothing, so 2 refreshes; 3 is left out
+            # (unusable exposure); 4 refreshes after it; 5 has no vectors: refreshes.
+            self.assertEqual(got, [(0, True), (1, True), (2, True), (4, True), (5, True)])
+            r = cr.replay(dump, [1], p, True)["results"][1]["cache"]
+            self.assertEqual(r["samples"], 0, "no hold here could be cached from the one before")
+
+        with tempfile.TemporaryDirectory() as d:
+            holds, _, _ = cr.synthetic_holds("depth-edge", w=32, h=16, n=3)
+            cc.write_dump(d, holds)
+            rewrite_manifest(d, lambda m: m["frames"][2].update(depth_valid=False))
+            dump = cc.load_dump(d)
+            self.assertIsNone(dump.hold(2).depth)
+            frames = cr.Frames(dump, True, cc.Params(), 3)
+            got = [refresh for _, _, refresh, _, _, _ in cr.run_cadence(dump, frames, cr.Cadence(interval=4), cc.Params())]
+            self.assertEqual(got, [True, False, True], "another presence of depth than the refresh's refreshes")
+
+    def test_export_carry_ends_where_the_carry_from_hold_0_ends(self):
+        with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as out:
+            holds, _, _ = cr.synthetic_holds("pan", w=32, h=16, n=6)
+            cc.write_dump(d, holds)
+            rewrite_manifest(d, lambda m: m["frames"][3].update(exposure=0.0))
+            dump = cc.load_dump(d)
+            self.assertEqual(cr.export_carry(dump, cc.Params(), True, out), 2)
+            self.assertEqual(sorted(f for f in os.listdir(out) if f.startswith("cache-")), ["cache-01.f32", "cache-02.f32"])
+            self.assertEqual(cr.export_carry(cc.load_dump(self.dirs["pan"]), cc.Params(), True, out), 5)
+
+    def test_the_recurrence_accumulates_the_motion_back_to_the_refresh(self):
+        """The shipped chain over several holds (acc_prev read): in the pan every hold moves 2.5 px right
+        and 1 down, so three holds after the refresh the field is three steps, wherever the chain stays
+        on screen, and NaN where it left."""
+        dump = cc.load_dump(self.dirs["pan"])
+        p = cc.Params()
+        frames = cr.Frames(dump, True, p, 4)
+        acc = None
+        for k in (3, 4, 5):
+            acc = cc.acc_step(acc, frames[k], frames[k - 1].jitter, p)
+        h, w = dump.height, dump.width
+        on = np.isfinite(acc).all(axis=-1)
+        np.testing.assert_allclose(acc[on], np.broadcast_to([7.5, 3.0], acc[on].shape), atol=1e-5)
+        self.assertTrue(on[: h - 4, : w - 8].all())
+        self.assertFalse(on[-1, -1], "the bottom right corner's chain leaves the frame")
+        pos, ok = cr.carried_position(frames, 5, 3, p)
+        np.testing.assert_array_equal(ok, on)
+        want = cc.pixel_centres(h, w) + np.array([7.5, 3.0], np.float32) + (frames[2].jitter - frames[5].jitter)
+        np.testing.assert_allclose(pos[on], want[on], atol=1e-5)
 
     def test_still_keeps_everything(self):
         dump = cc.load_dump(self.dirs["still"])

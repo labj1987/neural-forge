@@ -3,11 +3,12 @@
 // "Implementation (layer)"): the inverse of preupscale_encode.comp, applied to the model's answer
 // and written over DLSS's colour input in place, padding cropped.
 //
-// Per channel: y = sRGB EOTF(clamp(answer, 0, 1)), clamped to <= 1 - 1e-4; at or above 0.75 the
-// shoulder's inverse v = 0.75 - ln(1 - (y - 0.75) / 0.25) / K, else v = y; scene' = v * paper_white
-// / e. Where the encoded input of that channel was >= 0.999 (a blown highlight: sky, sun; the
-// inverse cannot bring it back) and flags bit 0 is set, the original scene value is kept. Alpha is
-// always the original. With an unusable exposure value nothing is written.
+// Per channel: y = sRGB EOTF(clamp(answer, 0, 1)) (a NaN answer as 0), clamped to <= 1 - 1e-4; at or
+// above 0.75 the shoulder's inverse v = 0.75 - ln(1 - (y - 0.75) / 0.25) / K, else v = y; scene' = v
+// * paper_white / e. Where the encoded input's peak channel was >= 0.999 (a blown highlight: sky,
+// sun; the inverse cannot bring it back) and flags bit 0 is set, the original pixel is kept, all
+// three channels: keeping only the clamped one beside the model's other two would turn its hue.
+// Alpha is always the original. With an unusable exposure value nothing is written.
 //
 // In place: every invocation reads its own pixel of the colour input before writing it, and no
 // other, so there is no hazard within the dispatch.
@@ -43,7 +44,8 @@ bool exposure_ok(float e) {
 }
 
 float srgb_eotf(float s) {
-  s = clamp(s, 0.0, 1.0);
+  // clamp() of a NaN is undefined (FClamp): the network's NaN reads as 0, as the encode reads one.
+  s = isnan(s) ? 0.0 : clamp(s, 0.0, 1.0);
   return s <= 0.04045 ? s / 12.92 : pow((s + 0.055) / 1.055, 2.4);
 }
 
@@ -72,9 +74,7 @@ void main() {
   vec3 encoded = imageLoad(u_encoded, at).rgb;
   vec3 answer = imageLoad(u_answer, at).rgb;
   bool keep = (p.flags & KEEP_CLAMPED) != 0u;
-  vec3 result;
-  for (int c = 0; c < 3; c++) {
-    result[c] = keep && encoded[c] >= CLAMPED ? original[c] : decode(answer[c], inv_scale);
-  }
+  vec3 result = vec3(decode(answer.r, inv_scale), decode(answer.g, inv_scale), decode(answer.b, inv_scale));
+  if (keep && max(encoded.r, max(encoded.g, encoded.b)) >= CLAMPED) result = original.rgb;
   imageStore(u_colour, at, vec4(result, original.a));
 }

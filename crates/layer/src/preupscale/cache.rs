@@ -58,6 +58,9 @@ pub(crate) const F_CHAINED: u32 = 8;
 pub(crate) const F_DEBUG_MASK: u32 = 32;
 pub(crate) const F_KEEP_CLAMPED: u32 = 64;
 pub(crate) const F_COUNT_DEPTH: u32 = 256;
+/// The hold has no motion vectors (none copied: the motion buffer holds an older hold's): the motion
+/// pass writes a field of NaN (no history) and counts nothing for the cadence.
+pub(crate) const F_NO_MVEC: u32 = 512;
 /// Tests: the capture's answer image holds the decoded answer (the replay tool's dumps store it so).
 #[cfg(test)]
 const F_SCENE_ANSWER: u32 = 128;
@@ -75,6 +78,10 @@ const STAT_EDIT_OK: usize = 8;
 const STAT_APPLY_BAD: usize = 9;
 const STAT_STILL: usize = 10;
 const STAT_MOTION_N: usize = 11;
+/// The high 32 bits of `STAT_TOP_SUM` and `STAT_BOTTOM_SUM` (a quarter of the rows of a 5120x2160 or
+/// larger frame sums past 2^32).
+const STAT_TOP_SUM_HI: usize = 12;
+const STAT_BOTTOM_SUM_HI: usize = 13;
 const STAT_WORDS: usize = 16;
 const STAT_BYTES: u64 = STAT_WORDS as u64 * 4;
 
@@ -383,8 +390,10 @@ pub(crate) struct State {
     /// and the network's build it used.
     last_seen: Option<u64>,
     generation: u64,
-    /// The depth's convention, decided from the first counts (`infer_reverse_z`).
+    /// The depth's convention, decided once [`REVERSE_Z_HOLDS`] holds in a row with conclusive counts
+    /// agreed (`infer_reverse_z`); the streak so far.
     reverse_z: Option<bool>,
+    reverse_z_streak: (Option<bool>, u32),
     /// The kind of the last submitted hold whose counters are still to be read.
     pending: Option<Kind>,
     /// The adaptive cadence, from the counts of the holds before.
@@ -492,16 +501,29 @@ impl State {
     }
 }
 
-/// `infer_reverse_z` from the prep pass's counts: the cleared value first (a real share of texels
+/// Holds in a row whose depth counts must agree before the convention is decided: one frame that
+/// says little (a loading screen, a fade) does not fix it for the extent.
+pub(crate) const REVERSE_Z_HOLDS: u32 = 3;
+
+/// The share of depth texels that must be neither 0 nor 1 (drawn geometry) for a hold's counts to
+/// count (`cache_common.DEPTH_GEOMETRY_MIN`): a frame of cleared depth alone, or depth never written,
+/// tells nothing about which way it runs.
+pub(crate) const DEPTH_GEOMETRY_MIN: f64 = 0.05;
+
+/// `infer_reverse_z` from one hold's prep counts: the cleared value first (a real share of texels
 /// at exactly 0, few at 1, is reversed-Z), else the ground (depth growing toward the bottom is
 /// reversed-Z; means of the top and bottom quarters, where the replay tool takes medians). `None`
-/// when the counts cannot tell.
+/// when the counts cannot tell, and for a frame with too little drawn geometry
+/// ([`DEPTH_GEOMETRY_MIN`]).
 pub(crate) fn infer_reverse_z(counts: &[u32; STAT_WORDS]) -> Option<bool> {
     let n = counts[STAT_DEPTH_N];
     if n == 0 {
         return None;
     }
     let (z0, z1) = (f64::from(counts[STAT_Z0]) / f64::from(n), f64::from(counts[STAT_Z1]) / f64::from(n));
+    if 1.0 - z0 - z1 < DEPTH_GEOMETRY_MIN {
+        return None;
+    }
     if z0.max(z1) > 0.005 && (z0 > 2.0 * z1 || z1 > 2.0 * z0) {
         return Some(z0 > z1);
     }
@@ -509,9 +531,28 @@ pub(crate) fn infer_reverse_z(counts: &[u32; STAT_WORDS]) -> Option<bool> {
     if tn == 0 || bn == 0 {
         return None;
     }
-    let top = f64::from(counts[STAT_TOP_SUM]) / f64::from(tn);
-    let bottom = f64::from(counts[STAT_BOTTOM_SUM]) / f64::from(bn);
+    let sum = |lo: usize, hi: usize| (u64::from(counts[hi]) << 32 | u64::from(counts[lo])) as f64;
+    let top = sum(STAT_TOP_SUM, STAT_TOP_SUM_HI) / f64::from(tn);
+    let bottom = sum(STAT_BOTTOM_SUM, STAT_BOTTOM_SUM_HI) / f64::from(bn);
     (top != bottom).then_some(bottom > top)
+}
+
+impl State {
+    /// One hold's verdict on the depth's convention ([`infer_reverse_z`]); decides it once
+    /// [`REVERSE_Z_HOLDS`] conclusive holds in a row agree. Inconclusive holds neither count nor break
+    /// the streak. `true` when this hold decided it.
+    pub(crate) fn vote_reverse_z(&mut self, verdict: Option<bool>) -> bool {
+        let Some(v) = verdict.filter(|_| self.reverse_z.is_none()) else { return false };
+        self.reverse_z_streak = match self.reverse_z_streak {
+            (Some(prev), n) if prev == v => (Some(v), n + 1),
+            _ => (Some(v), 1),
+        };
+        if self.reverse_z_streak.1 < REVERSE_Z_HOLDS {
+            return false;
+        }
+        self.reverse_z = Some(v);
+        true
+    }
 }
 
 /// The pass for one extent: seven pipelines over one descriptor set, the counters, the timers.
@@ -879,13 +920,17 @@ impl CachePass {
         let c = self.counters();
         let mut out = Outcome::default();
         self.state.regime.observe(c[STAT_STILL], c[STAT_MOTION_N]);
-        if !decided {
-            if let Some(rev) = infer_reverse_z(&c) {
-                crate::log!("[preupscale] edit cache: depth is {} ({} of {} texels at 0, {} at 1)", if rev { "reversed-Z" } else { "forward" }, c[STAT_Z0], c[STAT_DEPTH_N], c[STAT_Z1]);
-                self.state.reverse_z = Some(rev);
-                // The stored edit's depth was read with the assumed convention.
-                self.state.drop_edit();
-            }
+        if !decided && self.state.vote_reverse_z(infer_reverse_z(&c)) {
+            let rev = self.state.reverse_z == Some(true);
+            crate::log!(
+                "[preupscale] edit cache: depth is {} ({REVERSE_Z_HOLDS} holds agreeing; the last: {} of {} texels at 0, {} at 1)",
+                if rev { "reversed-Z" } else { "forward" },
+                c[STAT_Z0],
+                c[STAT_DEPTH_N],
+                c[STAT_Z1]
+            );
+            // The stored edit's depth was read with the assumed convention.
+            self.state.drop_edit();
         }
         match kind {
             Kind::Refresh => {
@@ -1168,6 +1213,95 @@ mod tests {
         assert_eq!(infer_reverse_z(&c), Some(true), "depth grows toward the bottom");
         c[STAT_BOTTOM_SUM] = 100;
         assert_eq!(infer_reverse_z(&c), None);
+    }
+
+    /// A frame with (almost) no geometry tells nothing: an all-zero depth (a loading screen, depth
+    /// never written) once fixed reversed-Z for the extent.
+    #[test]
+    fn a_frame_of_cleared_depth_alone_is_not_evidence() {
+        let mut c = [0u32; STAT_WORDS];
+        c[STAT_DEPTH_N] = 1000;
+        c[STAT_Z0] = 1000;
+        assert_eq!(infer_reverse_z(&c), None, "all zero");
+        c[STAT_Z0] = 960;
+        assert_eq!(infer_reverse_z(&c), None, "96% cleared, 4% drawn");
+        c[STAT_Z0] = 940;
+        assert_eq!(infer_reverse_z(&c), Some(true), "6% drawn");
+        (c[STAT_Z0], c[STAT_Z1]) = (0, 1000);
+        assert_eq!(infer_reverse_z(&c), None, "all one");
+    }
+
+    /// The ground's sums carry into their high words: a quarter of the rows of a 5120x2160 frame at
+    /// depth 1 sums to 2048 x 2,764,800, past 2^32.
+    #[test]
+    fn the_ground_reads_sums_past_32_bits() {
+        let mut c = [0u32; STAT_WORDS];
+        let n = 5120u64 * 540;
+        c[STAT_DEPTH_N] = (5120 * 2160) as u32;
+        (c[STAT_TOP_N], c[STAT_BOTTOM_N]) = (n as u32, n as u32);
+        let (top, bottom) = (n * 1000, n * 2000);
+        assert!(bottom > u64::from(u32::MAX));
+        (c[STAT_TOP_SUM], c[STAT_TOP_SUM_HI]) = (top as u32, (top >> 32) as u32);
+        (c[STAT_BOTTOM_SUM], c[STAT_BOTTOM_SUM_HI]) = (bottom as u32, (bottom >> 32) as u32);
+        assert_eq!(infer_reverse_z(&c), Some(true), "the bottom is nearer");
+        // Without the high word the bottom's low 32 bits are below the top's sum.
+        assert!(u64::from(bottom as u32) < top);
+    }
+
+    #[test]
+    fn reversed_z_is_decided_once_enough_holds_agree() {
+        let mut s = State::default();
+        assert!(!s.vote_reverse_z(Some(true)));
+        assert!(!s.vote_reverse_z(None), "inconclusive: no vote");
+        assert!(!s.vote_reverse_z(Some(false)), "a disagreeing hold starts the streak again");
+        assert!(!s.vote_reverse_z(Some(false)));
+        assert_eq!(s.reverse_z, None);
+        assert!(s.vote_reverse_z(Some(false)), "the third in a row decides");
+        assert_eq!(s.reverse_z, Some(false));
+        assert!(!s.vote_reverse_z(Some(true)), "decided: no more votes");
+        assert_eq!(s.reverse_z, Some(false));
+    }
+
+    /// On the GPU: the prep pass's ground sums carry into their high words (the counters start just
+    /// below 2^32, as a quarter of an 8K frame's rows reaches), and a hold without vectors
+    /// (`F_NO_MVEC`) makes the motion pass write no history and count nothing, whatever the motion
+    /// buffer holds.
+    #[test]
+    fn the_prep_sums_carry_and_a_hold_without_vectors_has_no_motion() {
+        let Some(rig) = Rig::new(16, 8) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (w, h) = (rig.w, rig.h);
+        let n = (w * h) as usize;
+        let depth: Vec<u8> = (0..n).flat_map(|_| 0.5f32.to_le_bytes()).collect();
+        Rig::write(&rig.depth, &depth);
+        let near_top = u32::MAX - 100;
+        // SAFETY: host-coherent counters, idle.
+        unsafe {
+            let stats = rig.pass.stats.ptr.cast::<u32>();
+            std::ptr::write_bytes(rig.pass.stats.ptr, 0, STAT_BYTES as usize);
+            *stats.add(STAT_TOP_SUM) = near_top;
+        }
+        let push = rig.pass.push(F_CHAINED | F_FRESH | F_REVERSE_Z | F_COUNT_DEPTH, 1, [1.0, 1.0], 3.0);
+        // SAFETY: recording into the rig's buffers; the set was bound.
+        rig.one_shot(|cmd| unsafe { rig.pass.record_motion(&rig.gpu.3, cmd, &push, rig.acc.buffer) });
+        let c = rig.pass.counters();
+        // The top quarter (2 rows of 16) at depth 0.5: 32 x 1024 added to just below 2^32.
+        let top = u64::from(c[STAT_TOP_SUM_HI]) << 32 | u64::from(c[STAT_TOP_SUM]);
+        assert_eq!(top, u64::from(near_top) + 32 * 1024, "the sum carried into its high word");
+        assert_eq!((c[STAT_TOP_N], c[STAT_BOTTOM_SUM_HI]), (32, 0));
+        assert_eq!(c[STAT_MOTION_N], n as u32, "a hold with vectors counts every texel");
+        // Without vectors: NaN everywhere, nothing counted, though the buffer holds vectors.
+        let vectors: Vec<u8> = (0..n).flat_map(|_| 0x3c00_3c00u32.to_le_bytes()).collect();
+        Rig::write(&rig.mvec, &vectors);
+        rig.pass.clear_counters();
+        let push = rig.pass.push(F_CHAINED | F_FRESH | F_NO_MVEC, 1, [1.0, 1.0], 3.0);
+        // SAFETY: as above.
+        rig.one_shot(|cmd| unsafe { rig.pass.record_motion(&rig.gpu.3, cmd, &push, rig.acc.buffer) });
+        assert!(rig.read_f32(rig.acc.buffer, 2 * n).iter().all(|v| v.is_nan()), "no history from a hold without vectors");
+        let c = rig.pass.counters();
+        assert_eq!((c[STAT_STILL], c[STAT_MOTION_N]), (0, 0), "nothing counted for the cadence");
     }
 
     /// The test's GPU objects around a [`CachePass`].

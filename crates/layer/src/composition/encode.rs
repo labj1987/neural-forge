@@ -116,7 +116,8 @@ pub fn hybrid_encode(v: [f32; 3]) -> [f32; 3] {
 ///
 /// `white_point` is what the model should treat as white; the resolve undoes the divide.
 pub fn encode_proxy(frame_linear: [f32; 3], white_point: f32, mode: u32) -> [f32; 3] {
-    let scale_by = 1.0 / white_point.max(1e-6);
+    // compose.comp's floor too (1e-4), so the encode and the composite agree on any white point.
+    let scale_by = 1.0 / white_point.max(1e-4);
     let normalized = scale(frame_linear, scale_by);
     match mode {
         reversible_mode::KNEE => soft_knee(normalized),

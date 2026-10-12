@@ -131,6 +131,9 @@ def replay(dump: cc.Dump, lags, p: cc.Params, reverse_z: bool, oracle: bool = Fa
             src = dst if oracle or L == 0 else frames[t - L]
             if not src.usable:
                 continue
+            # The layer refreshes on any hold it cannot cache (cc.can_carry): no carry over one.
+            if L > 0 and not oracle and not all(cc.can_carry(src, frames[k]) for k in range(t - L + 1, t + 1)):
+                continue
             if L > 0 and not oracle and p.chain == "recurrence":
                 pos, on = carried_position(frames, t, L, p)
             if oracle or L == 0:
@@ -172,10 +175,12 @@ def carried_position(frames, t: int, lag: int, p: cc.Params) -> tuple:
 
 def export_carry(dump: cc.Dump, p: cc.Params, reverse_z: bool, out: str) -> int:
     """For the layer's shader test: the refresh at hold 0 carried to every later hold by the
-    recurrence. Writes per hold t >= 1 `cache-TT.f32` (H x W x 3, the shown edit: mode "cache" with the
-    guided filter, as run_cadence shows it), `acc-TT.f32` (H x W x 2, the accumulated motion, NaN off
-    the chain) and `weight-TT.f32` (H x W, valid x validity), and `holds.txt` (per hold: jitter x,
-    jitter y, exposure), all f32 little-endian. Returns the number of holds carried to."""
+    recurrence, as long as that carry lasts (the first hold the run refreshes on, or leaves out for an
+    unusable exposure, ends it). Writes per hold t >= 1 carried to `cache-TT.f32` (H x W x 3, the shown
+    edit: mode "cache" with the guided filter, as run_cadence shows it), `acc-TT.f32` (H x W x 2, the
+    accumulated motion, NaN off the chain) and `weight-TT.f32` (H x W, valid x validity), and
+    `holds.txt` (per hold: jitter x, jitter y, exposure), all f32 little-endian. Returns the number of
+    holds carried to."""
     os.makedirs(out, exist_ok=True)
     frames = Frames(dump, reverse_z, p, len(dump))
     with open(os.path.join(out, "holds.txt"), "w", encoding="utf-8") as fh:
@@ -184,15 +189,23 @@ def export_carry(dump: cc.Dump, p: cc.Params, reverse_z: bool, out: str) -> int:
             fh.write(f"{float(f.jitter[0])!r} {float(f.jitter[1])!r} {float(dump.hold(k).exposure)!r}\n")
     src = frames[0]
     acc = None
-    shown = {t: e for t, _, _, e, _, _ in run_cadence(dump, frames, Cadence(interval=len(dump) + 1), p)}
-    for t in range(1, len(dump)):
-        acc = cc.acc_step(acc, frames[t], frames[t - 1].jitter, p)
-        pos, on = cc.chained_position(acc, frames[t], src, p)
-        r = cc.carry(src, frames[t], pos, on, p)
-        shown[t].astype("<f4").tofile(os.path.join(out, f"cache-{t:02d}.f32"))
+    carried = 0
+    for t, _, refresh, shown, dst, _ in run_cadence(dump, frames, Cadence(interval=len(dump) + 1), p):
+        if t == 0:
+            if not refresh:
+                break
+            continue
+        # The run restarted (a refresh) or left a hold out: hold 0's carry ends here.
+        if refresh or t != carried + 1:
+            break
+        acc = cc.acc_step(acc, dst, frames[t - 1].jitter, p)
+        pos, on = cc.chained_position(acc, dst, src, p)
+        r = cc.carry(src, dst, pos, on, p)
+        shown.astype("<f4").tofile(os.path.join(out, f"cache-{t:02d}.f32"))
         acc.astype("<f4").tofile(os.path.join(out, f"acc-{t:02d}.f32"))
         (r["valid"] * r["validity"]).astype("<f4").tofile(os.path.join(out, f"weight-{t:02d}.f32"))
-    return len(dump) - 1
+        carried = t
+    return carried
 
 
 def print_table(results: dict, out=None) -> None:
@@ -340,16 +353,19 @@ def run_cadence(dump: cc.Dump, frames: Frames, cad: Cadence, p: cc.Params):
     for t in range(cad.phase, len(dump)):
         dst = frames[t]
         n = regime.interval() if regime else cad.interval
-        if regime:
+        # The motion pass counts nothing on a hold without vectors (F_NO_MVEC).
+        if regime and dst.mvec_valid:
             regime.observe(still_counts(dst.mv))
         if not dst.usable:
             src = prev = None
             continue
         consecutive = prev is not None and prev.index == dst.index - 1
-        refresh = src is None or not consecutive or since + 1 >= n
+        # Any hold the layer cannot cache refreshes (cc.can_carry: jitter, vectors, depth presence).
+        refresh = src is None or not consecutive or since + 1 >= n or not cc.can_carry(src, dst)
         step = step_position(prev, dst, p) if consecutive else None
         if refresh:
-            src, acc, since = dst, None, 0
+            # A refresh without a known jitter stores no edit: the next hold refreshes too.
+            src, acc, since = (dst if cc.can_source(dst) else None), None, 0
             stale = np.zeros(dst.lin.shape, np.float32)
             shown = dst.edit
         else:

@@ -15,9 +15,10 @@
 // 1, resolve (one workgroup): the lowest and highest 1% of the samples (TRIM) are dropped, the
 //    rest gives the mean log2 luma; target log2 e = log2(key) - mean. Temporal adaptation in log
 //    space: log2 e += rate * (target - log2 e), or log2 e = target when the state is not valid
-//    (first frame, or reset by the CPU on a new identification). Clamped to [-16, 15]. e is
-//    written as a half into the exposure buffer the encode and the decode read (low 16 bits), the
-//    same slot the game's 1x1 R16_SFLOAT texel is copied into otherwise. No samples (a black frame)
+//    (first frame, or reset by the CPU on a new identification). Clamped to [-14, 15], so e is a
+//    normal half (2^-14 is the smallest; a driver may flush a subnormal one to 0, which exposure_ok
+//    refuses). e is written as a half into the exposure buffer the encode and the decode read (low
+//    16 bits), the same slot the game's 1x1 R16_SFLOAT texel is copied into otherwise. No samples (a black frame)
 //    keeps the previous e, or 1 when there is none.
 //
 // The CPU reference is `preupscale::hdr::auto_exposure_reference`; constants must match.
@@ -27,7 +28,7 @@ const uint BINS = 256u;
 const float LOG2_LO = -24.0;
 const float LOG2_HI = 16.0;
 const float TRIM = 0.01;
-const float MIN_LOG2_E = -16.0;
+const float MIN_LOG2_E = -14.0;
 const float MAX_LOG2_E = 15.0;
 
 // The game's colour input, in GENERAL. Only read.

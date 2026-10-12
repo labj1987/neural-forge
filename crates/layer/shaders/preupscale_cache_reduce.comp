@@ -96,11 +96,13 @@ const uint F_DEBUG_MASK = 32u;   // the apply writes the rejection mask instead 
 const uint F_KEEP_CLAMPED = 64u; // the decode's rule: keep the original where the encode clamped
 const uint F_SCENE_ANSWER = 128u; // (tests) the capture's answer image holds the decoded answer
 const uint F_COUNT_DEPTH = 256u; // the prep pass counts the depth for telling reversed-Z (until decided)
+const uint F_NO_MVEC = 512u;     // the hold has no motion vectors: the field is NaN (no history), none counted
 
 const uint STAT_Z0 = 0u;         // depth texels at exactly 0 / 1
 const uint STAT_Z1 = 1u;
 const uint STAT_DEPTH_N = 2u;
-const uint STAT_TOP_SUM = 3u;    // depth x 2048 summed over the top / bottom quarter rows
+const uint STAT_TOP_SUM = 3u;    // depth x 2048 summed over the top / bottom quarter rows (low 32
+                                 // bits; the high ones in STAT_TOP_SUM_HI / STAT_BOTTOM_SUM_HI)
 const uint STAT_TOP_N = 4u;
 const uint STAT_BOTTOM_SUM = 5u;
 const uint STAT_BOTTOM_N = 6u;
@@ -109,6 +111,8 @@ const uint STAT_EDIT_OK = 8u;    // refresh capture: 1 = an edit was stored (usa
 const uint STAT_APPLY_BAD = 9u;  // cached hold: 1 = unusable exposure, nothing was written
 const uint STAT_STILL = 10u;      // motion pass: texels moving under a quarter of the pace (the
 const uint STAT_MOTION_N = 11u;   // adaptive cadence's regime), and all it counted
+const uint STAT_TOP_SUM_HI = 12u; // the sums' high 32 bits (a quarter of an 8K frame overflows 32)
+const uint STAT_BOTTOM_SUM_HI = 13u;
 
 const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float KNEE = 0.75;
@@ -143,10 +147,11 @@ vec3 clamp_edit(vec3 e) {
 }
 
 // EDIT16: every stored edit is a clamped one (or a mix of clamped ones), within +-edit_range(), in
-// steps of 2 edit_range() / 65535 (7.6e-5 stop: within 3.9e-5 of the f32 the tool keeps).
+// steps of 2 edit_range() / 65535 (7.6e-5 stop: within 3.9e-5 of the f32 the tool keeps). Rounded
+// half to even (roundEven, as numpy rounds): round() leaves .5 to the driver.
 float edit_range() { return p.max_luma_edit > 0.0 ? p.max_luma_edit + p.chroma_stops : 16.0; }
 
-uint fixed16(float e, float r) { return uint(round((clamp(e, -r, r) + r) / (2.0 * r) * 65535.0)); }
+uint fixed16(float e, float r) { return uint(roundEven((clamp(e, -r, r) + r) / (2.0 * r) * 65535.0)); }
 
 float unfixed16(uint q, float r) { return float(q) / 65535.0 * (2.0 * r) - r; }
 
@@ -162,7 +167,7 @@ vec3 unpack_edit(uvec2 w) {
 
 uint spare_of(uvec2 w) { return w.y >> 16u; }
 
-uint unorm16(float v) { return uint(round(clamp(v, 0.0, 1.0) * 65535.0)); }
+uint unorm16(float v) { return uint(roundEven(clamp(v, 0.0, 1.0) * 65535.0)); }
 
 float soft(float d, float tol) { return clamp((2.0 * tol - d) / max(tol, 1e-4), 0.0, 1.0); }
 

@@ -19,7 +19,10 @@ Encodes (E = the exposure scale: the exposure value under --convention, divided 
 
   opendlss         v = scene * E; per channel, above 0.75: 0.75 + 0.25 (1 - exp(-5.770780 (v - 0.75)));
                    then the sRGB OETF. Inverse: sRGB EOTF; for y in [0.75, 1): v = 0.75 -
-                   ln(1 - (y - 0.75) / 0.25) / 5.770780 (y clamped below 1 - 1e-4); / E.
+                   ln(1 - (y - 0.75) / 0.25) / 5.770780 (y clamped below 1 - 1e-4); / E. As the
+                   layer's decode (preupscale_decode.comp), the original pixel is kept, all three
+                   channels, where the encoded input's peak channel was >= 0.999 (--no-keep-clamped:
+                   the inverse everywhere).
   opendlss-linear  the same without the sRGB step.
   lumaknee         v = scene * E; on luminance (Rec.709 weights), above 0.75: L' = 0.75 + 0.25
                    (1 - exp(-(L - 0.75) / 0.25)), rgb *= L' / L, then the peak channel brought to 1
@@ -34,6 +37,11 @@ The display mapping for both pictures is the encode's own forward curve after th
 sRGB (so a perfect identity answer gives identical PNGs); `ref_*` statistics use one display for
 every encode (opendlss's shoulder at --ref-white, then sRGB), so edit magnitudes compare across
 encodes and paper whites.
+
+The exposure value (E before the divide) must be one the layer would use: finite, above 1e-6 and
+below 65504 (preupscale::hdr::exposure_ok); the layer writes nothing back with another.
+
+  selftest                          checks the curves, the clamped-keep rule and the exposure check
 
 Needs Python 3, numpy and Pillow (the rig has both; run it there).
 """
@@ -51,6 +59,16 @@ K = 5.770780
 KNEE = 0.75
 LUMA = np.array([0.2126, 0.7152, 0.0722], dtype=np.float64)
 ENCODES = ("opendlss", "opendlss-linear", "lumaknee", "reinhard", "sdr8", "raw")
+# The layer's paper white (preupscale::hdr::DEFAULT_PAPER_WHITE) and its decode's clamped threshold.
+DEFAULT_PAPER_WHITE = 3.0
+CLAMPED = 0.999
+# The encodes the layer's decode rule (the clamped-keep) belongs to.
+KEEPS_CLAMPED = ("opendlss", "opendlss-linear", "sdr8")
+
+
+def exposure_ok(e):
+    """preupscale::hdr::exposure_ok: a value the layer divides by."""
+    return math.isfinite(e) and 1e-6 < e < 65504.0
 
 
 # ---- Transfer functions. ----
@@ -142,15 +160,22 @@ def exposure_scale(exposure, args):
     """The scale the scene is multiplied by before the curve, from --exposure, or the chosen
     exposure image's first channel and --convention (mul: scene * e, div: scene / e), divided by
     --white (OpenDLSS-NR's paperWhite, in exposed units)."""
+    if not (math.isfinite(args.white) and args.white > 0):
+        sys.exit(f"--white {args.white} is not a positive paper white")
     if args.exposure is not None:
-        return float(args.exposure) / args.white
-    if not exposure:
-        sys.exit("no exposure.json in the dump; pass --exposure")
-    images = [i for i in exposure["images"] if i.get("values")]
-    if not images:
-        sys.exit("exposure.json has no read values; pass --exposure")
-    e = float(images[min(args.exposure_image, len(images) - 1)]["values"][0])
-    return (e if args.convention == "mul" else 1.0 / e) / args.white
+        e = float(args.exposure)
+    else:
+        if not exposure:
+            sys.exit("no exposure.json in the dump; pass --exposure")
+        images = [i for i in exposure["images"] if i.get("values")]
+        if not images:
+            sys.exit("exposure.json has no read values; pass --exposure")
+        e = float(images[min(args.exposure_image, len(images) - 1)]["values"][0])
+        if args.convention == "div":
+            e = 1.0 / e if e != 0.0 else math.inf
+    if not exposure_ok(e):
+        sys.exit(f"the exposure {e} is not usable (zero, negative or not finite); the layer writes nothing back with it")
+    return e / args.white
 
 
 def write_f16(path, rgb):
@@ -175,13 +200,19 @@ def encode(enc, scene, e):
     return srgb_oetf(y) if srgb else y
 
 
-def decode(enc, answer, e):
-    """The answer back in scene-linear units."""
+def decode(enc, answer, e, sent=None, original=None):
+    """The answer back in scene-linear units. Given what was sent (`sent`, the encoded input) and the
+    `original` scene, the layer's rule for its encodes: the original pixel is kept where the encoded
+    peak channel was clamped (>= CLAMPED), so no pixel mixes kept and decoded channels."""
     _, inv, srgb = CURVES[enc]
     if enc == "raw":
         return answer
     y = srgb_eotf(answer) if srgb else answer
-    return inv(y) / e
+    back = inv(y) / e
+    if sent is not None and original is not None and enc in KEEPS_CLAMPED:
+        kept = sent.max(axis=-1) >= CLAMPED
+        back = np.where(kept[..., None], original, back)
+    return back
 
 
 def display(enc, scene, e):
@@ -240,7 +271,8 @@ def cmd_encode(args):
         stored = np.round(np.clip(y, 0, 1) * 255.0) / 255.0
     else:
         stored = np.clip(y, 0, 65504).astype(np.float16).astype(np.float64)
-    back = decode(args.enc, stored, e)
+    keep = args.keep_clamped
+    back = decode(args.enc, stored, e, stored if keep else None, scene if keep else None)
     rel = np.abs(back - scene) / np.maximum(scene, 1e-3)
     l = luma(scene)
     print(json.dumps({
@@ -300,8 +332,9 @@ def cmd_judge(args):
         sent = np.clip(encode(args.enc, scene, e), 0, 65504).astype(np.float16).astype(np.float64)
     finite = np.isfinite(answer).all(axis=-1)
     answer = np.nan_to_num(answer, nan=0.0, posinf=65504.0, neginf=0.0)
-    back = decode(args.enc, answer, e)
-    back_sent = decode(args.enc, sent, e)
+    keep = args.keep_clamped
+    back = decode(args.enc, answer, e, sent if keep else None, scene if keep else None)
+    back_sent = decode(args.enc, sent, e, sent if keep else None, scene if keep else None)
     din = display(args.enc, back_sent, e)
     dout = display(args.enc, back, e)
     ref = e * args.white / args.ref_white
@@ -329,6 +362,36 @@ def cmd_judge(args):
     with open(os.path.join(args.outdir, f"{tag}.json"), "w") as f:
         json.dump(stats, f, indent=1)
     print(json.dumps(stats))
+
+
+def cmd_selftest(_args):
+    """The curves invert, the clamped-keep rule keeps whole pixels, and an unusable exposure is refused."""
+    scene = np.array([[[0.05, 0.2, 0.4], [1.0, 2.0, 0.3], [40.0, 0.5, 0.1], [9.0, 9.0, 9.0]]])
+    e = 1.5 / DEFAULT_PAPER_WHITE
+    sent = encode("opendlss", scene, e)
+    back = decode("opendlss", sent, e)
+    ok = sent.max(axis=-1) < CLAMPED
+    assert np.allclose(back[ok], scene[ok], rtol=1e-6), (back, scene)
+    # A pixel whose peak channel clamped keeps all three channels of the original, whatever the answer.
+    answer = sent * 0.9
+    kept = decode("opendlss", answer, e, sent, scene)
+    clamped = ~ok
+    assert clamped.any() and np.array_equal(kept[clamped], scene[clamped]), kept
+    assert np.allclose(kept[ok], decode("opendlss", answer, e)[ok])
+    for bad in (0.0, -1.0, math.inf, math.nan, 70000.0):
+        assert not exposure_ok(bad), bad
+    assert exposure_ok(1.0) and exposure_ok(2.0 ** -14)
+
+    class Args:
+        white, exposure, convention, exposure_image = DEFAULT_PAPER_WHITE, 0.0, "mul", 0
+    try:
+        exposure_scale(None, Args)
+        raise AssertionError("an exposure of 0 was taken")
+    except SystemExit:
+        pass
+    Args.exposure = 1.5
+    assert exposure_scale(None, Args) == 0.5
+    print("hdr_encode self-test: ok")
 
 
 def cmd_montage(args):
@@ -359,8 +422,10 @@ def main():
         sp.add_argument("--convention", choices=("mul", "div"), default="mul", help="scene * e (mul) or scene / e (div)")
         sp.add_argument("--exposure-image", type=int, default=0, help="which read exposure.json image (default 0)")
         sp.add_argument("--exposure", type=float, help="override: the scale itself")
-        sp.add_argument("--white", type=float, default=1.0,
-                        help="paper white in exposed units: the scale is divided by it (default 1: exposed 1.0 is white)")
+        sp.add_argument("--white", type=float, default=DEFAULT_PAPER_WHITE,
+                        help=f"paper white in exposed units: the scale is divided by it (default {DEFAULT_PAPER_WHITE:g}, the layer's)")
+        sp.add_argument("--no-keep-clamped", dest="keep_clamped", action="store_false",
+                        help="decode every pixel, also where the encoded input clamped (the layer keeps those)")
 
     sp = sub.add_parser("info")
     sp.add_argument("dump")
@@ -380,6 +445,7 @@ def main():
     sp.add_argument("--ref-white", type=float, default=3.0,
                     help="paper white of the common reference display behind the ref_* statistics (default 3)")
     exposure_args(sp)
+    sub.add_parser("selftest")
     sp = sub.add_parser("montage")
     sp.add_argument("outdir")
     sp.add_argument("out")
@@ -387,7 +453,7 @@ def main():
     sp.add_argument("--crop", help="x,y,w,h before scaling")
     sp.add_argument("--scale", type=float, default=1.0)
     args = p.parse_args()
-    {"info": cmd_info, "encode": cmd_encode, "judge": cmd_judge, "montage": cmd_montage}[args.cmd](args)
+    {"info": cmd_info, "encode": cmd_encode, "judge": cmd_judge, "montage": cmd_montage, "selftest": cmd_selftest}[args.cmd](args)
 
 
 if __name__ == "__main__":

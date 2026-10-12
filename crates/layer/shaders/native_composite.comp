@@ -17,8 +17,9 @@ layout(set = 0, binding = 1) uniform sampler2D u_history;
 // The motion back to the previous network frame (preupscale_cache_motion.comp's accumulated field), valid
 // extent, f32 x and y per texel in the motion vectors' own units (times p.more.yz = render pixels; NaN where
 // the cache's chain left the frame). At interval 1 it holds DLSS's vectors of this frame converted exactly, so
-// the reprojection is the same as reading the packed halves. MOTION_HALF (a test's switch, never set by the
-// layer) reads DLSS's packed half2 vectors directly, as this shader did before the field existed.
+// the reprojection is the same as reading the packed halves. MOTION_HALF (set with the edit cache off,
+// NEURAL_FORGE_EDIT_CACHE=off) reads DLSS's packed half2 vectors directly, as this shader did before the
+// field existed (3.2.0).
 layout(constant_id = 0) const bool MOTION_HALF = false;
 layout(set = 0, binding = 2, std430) readonly buffer Motion { uint mv[]; } u_motion;
 // f32 [field][4]: RGB residual, blend logit. (Binding 3 is the preprocess's features.)
@@ -185,5 +186,16 @@ void main() {
   if (style != 0.0 || intensity != 1.0) {
     for (int c = 0; c < 3; c++) published[c] = truncateHalf(clamp(fma(intensity, styled[c] - proxy[c], proxy[c]), 0.0, 1.0));
   }
-  u_answer.texel[id.y * p.frame.x + id.x] = uvec2(packHalf2x16(published.rg), packHalf2x16(vec2(published.b, 1.0)));
+  uvec2 texel = uvec2(packHalf2x16(published.rg), packHalf2x16(vec2(published.b, 1.0)));
+  u_answer.texel[id.y * p.frame.x + id.x] = texel;
+  // The answer's padding (an odd extent's last column and row, up to the even padded extent) repeats
+  // the edge, as the encode's does, so nothing reading the padded answer finds it unwritten. (The
+  // network's field padding, native_preprocess.comp's, mirrors instead: that is OpenDLSS-NR's geometry,
+  // not the proxy's.)
+  uvec2 padded_size = uvec2(p.frame.x, p.dims.w + (p.dims.w & 1u));
+  bool right = id.x + 1u == p.dims.z && id.x + 1u < padded_size.x;
+  bool below = id.y + 1u == p.dims.w && id.y + 1u < padded_size.y;
+  if (right) u_answer.texel[id.y * p.frame.x + id.x + 1u] = texel;
+  if (below) u_answer.texel[(id.y + 1u) * p.frame.x + id.x] = texel;
+  if (right && below) u_answer.texel[(id.y + 1u) * p.frame.x + id.x + 1u] = texel;
 }

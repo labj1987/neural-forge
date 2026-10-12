@@ -21,8 +21,9 @@ layout(set = 0, binding = 1) uniform sampler2D u_history;
 // The motion back to the previous network frame (preupscale_cache_motion.comp's accumulated field), valid
 // extent, f32 x and y per texel in the motion vectors' own units (times p.more.yz = render pixels; NaN where
 // the cache's chain left the frame). At interval 1 it holds DLSS's vectors of this frame converted exactly, so
-// the reprojection is the same as reading the packed halves. MOTION_HALF (a test's switch, never set by the
-// layer) reads DLSS's packed half2 vectors directly, as this shader did before the field existed.
+// the reprojection is the same as reading the packed halves. MOTION_HALF (set with the edit cache off,
+// NEURAL_FORGE_EDIT_CACHE=off) reads DLSS's packed half2 vectors directly, as this shader did before the
+// field existed (3.2.0).
 layout(constant_id = 0) const bool MOTION_HALF = false;
 layout(set = 0, binding = 2, std430) readonly buffer Motion { uint mv[]; } u_motion;
 // f32 [field][16] as 4 x vec4 per pixel.

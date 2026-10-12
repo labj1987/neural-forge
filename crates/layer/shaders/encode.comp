@@ -124,7 +124,8 @@ void main() {
   vec4 stored = imageLoad(u_proxy, pixel);
   vec3 frame = SrgbDecode(bgr ? stored.bgr : stored.rgb);
 
-  vec3 normalized = frame / max(params.white_point, 1e-6);
+  // The same floor compose.comp divides by and multiplies back with (1e-4).
+  vec3 normalized = frame / max(params.white_point, 1e-4);
   vec3 display;
   if (params.reversible_mode == 0u) {
     display = SoftKnee(normalized);

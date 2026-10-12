@@ -108,15 +108,20 @@ def exposure_ok(e) -> bool:
 
 @dataclass
 class Hold:
-    """One dumped hold, as stored: scene-linear colour and answer, vectors in render pixels."""
+    """One dumped hold, as stored: scene-linear colour and answer, vectors in render pixels.
+
+    A hold the layer could not have cached (no jitter known, no vectors copied) says so: the layer
+    refreshes on it, and so do the tools (`Frame.carryable`)."""
 
     index: int
-    jitter: np.ndarray        # (2,), render pixels
-    exposure: float
+    jitter: np.ndarray        # (2,), render pixels (zeros when the manifest's jitter is null)
+    exposure: float           # 0 when the manifest's exposure is null: unusable
     colour: np.ndarray        # H x W x 3 f32, scene-linear, as stored (not sanitised)
     answer: np.ndarray        # H x W x 3 f32
-    mvec: np.ndarray          # H x W x 2 f32, render pixels (mvec_scale applied)
-    depth: np.ndarray | None  # H x W f32 device depth, None when the dump has none
+    mvec: np.ndarray          # H x W x 2 f32, render pixels (mvec_scale applied); zeros when not valid
+    depth: np.ndarray | None  # H x W f32 device depth, None when the dump or this hold has none
+    jitter_known: bool = True
+    mvec_valid: bool = True
 
 
 @dataclass
@@ -145,12 +150,20 @@ class Dump:
     def hold(self, k: int) -> Hold:
         f = self.frames[k]
         files = f["files"]
+        mvec_valid = f.get("mvec_valid", True) is not False
         mv = self._read(files["mvec"], "<f2", 2) * np.array(self.mvec_scale, F32)
-        depth = self._read(files["depth"], "<f4", 1) if self.has_depth and files.get("depth") else None
-        return Hold(index=int(f.get("index", k)), jitter=np.array(f.get("jitter", [0.0, 0.0]), F32),
-                    exposure=float(f.get("exposure", 0.0)),
+        if not mvec_valid:
+            mv = np.zeros_like(mv)
+        depth_valid = f.get("depth_valid", True) is not False
+        depth = self._read(files["depth"], "<f4", 1) if self.has_depth and depth_valid and files.get("depth") else None
+        # null: unknown jitter (no carry from or to this hold), unusable exposure.
+        jitter = f.get("jitter", [0.0, 0.0])
+        exposure = f.get("exposure", 0.0)
+        return Hold(index=int(f.get("index", k)), jitter=np.array(jitter if jitter is not None else [0.0, 0.0], F32),
+                    exposure=float(exposure) if exposure is not None else 0.0,
                     colour=self._read(files["colour"], "<f2", 4)[..., :3],
-                    answer=self._read(files["answer"], "<f2", 4)[..., :3], mvec=mv, depth=depth)
+                    answer=self._read(files["answer"], "<f2", 4)[..., :3], mvec=mv, depth=depth,
+                    jitter_known=jitter is not None, mvec_valid=mvec_valid)
 
 
 def load_dump(path: str) -> Dump:
@@ -202,13 +215,24 @@ def write_dump(path: str, holds: list, paper_white: float = 3.0, game: str = "sy
         json.dump(manifest, fh, indent=1)
 
 
+# The share of depth texels that must be neither 0 nor 1 for depth to tell its convention (the layer's
+# cache::DEPTH_GEOMETRY_MIN): cleared depth alone, or depth never written, says nothing.
+DEPTH_GEOMETRY_MIN = 0.05
+
+
 def infer_reverse_z(depths: list) -> tuple:
     """Which way the dump's depth runs. Returns (reverse_z or None, reason).
 
     Reversed-Z puts the near plane at 1 and the far plane (sky, cleared depth) at 0. First the cleared
     value: a real share of texels at exactly 0 (and few at 1) is reversed-Z, the other way forward.
     Failing that, the ground: the bottom of a game frame is nearer than its top, so depth growing
-    toward the bottom is reversed-Z."""
+    toward the bottom is reversed-Z. Holds with less drawn geometry than DEPTH_GEOMETRY_MIN are left
+    out, as the layer leaves them out."""
+    depths = [x for x in depths
+              if 1.0 - float(np.mean(np.nan_to_num(x, nan=0.5) == 0.0)) - float(np.mean(np.nan_to_num(x, nan=0.5) == 1.0))
+              >= DEPTH_GEOMETRY_MIN]
+    if not depths:
+        return None, f"no hold has {100 * DEPTH_GEOMETRY_MIN:.0f}% of its depth drawn (neither 0 nor 1); cannot tell"
     d = np.concatenate([np.nan_to_num(x, nan=0.5).ravel() for x in depths])
     z0, z1 = float(np.mean(d == 0.0)), float(np.mean(d == 1.0))
     if max(z0, z1) > 0.005 and (z0 > 2 * z1 or z1 > 2 * z0):
@@ -355,6 +379,9 @@ def level_taps(h: int, w: int, lh: int, lw: int):
 class Frame:
     index: int
     usable: bool              # exposure usable: the decode wrote an answer
+    jitter_known: bool        # the manifest's jitter was not null
+    mvec_valid: bool          # its vectors were copied (the layer's motion pass had them)
+    has_depth: bool           # this hold had depth
     jitter: np.ndarray
     v_colour: np.ndarray      # H x W x 3
     edit: np.ndarray          # H x W x 3, the model's (clamped) edit: "true" for this hold
@@ -408,7 +435,8 @@ def prepare(hold: Hold, dump_white: float, reverse_z: bool, p: Params) -> Frame:
     if p.nearest_surface and hold.depth is not None:
         mv = nearest_surface_motion(mv, lin)
     da = display(va)
-    return Frame(index=hold.index, usable=usable, jitter=hold.jitter, v_colour=vc, edit=edit_of(vc, va, p),
+    return Frame(index=hold.index, usable=usable, jitter_known=hold.jitter_known, mvec_valid=hold.mvec_valid,
+                 has_depth=hold.depth is not None, jitter=hold.jitter, v_colour=vc, edit=edit_of(vc, va, p),
                  lin=lin, log_luma=prt3[..., 0].copy(), prt=prt3,
                  prt_lo=nb.min(axis=0), prt_hi=nb.max(axis=0), mv=mv.astype(F32), disp_answer=da,
                  base=float(np.abs(display(vc) - da).mean()))
@@ -473,6 +501,18 @@ def chained_position(acc: np.ndarray, cur: Frame, src: Frame, p: Params) -> tupl
 # --------------------------------------------------------------------------------------------------
 # One carry: refresh hold `src` -> this hold `dst`, at chained positions `pos`
 # --------------------------------------------------------------------------------------------------
+
+def can_source(src: Frame) -> bool:
+    """`cache::State::went_through`: a refresh stores an edit for the holds after it only with a usable
+    exposure and a known jitter."""
+    return src.usable and src.jitter_known
+
+
+def can_carry(src: Frame, dst: Frame) -> bool:
+    """`cache::State::plan`: a hold is cached from `src` only with a usable exposure, a known jitter,
+    vectors copied and the refresh's presence of depth; any other hold refreshes."""
+    return can_source(src) and dst.usable and dst.jitter_known and dst.mvec_valid and dst.has_depth == src.has_depth
+
 
 def soft(d: np.ndarray, tol: float) -> np.ndarray:
     return np.clip((2.0 * tol - d) / max(tol, 1e-4), 0, 1)
