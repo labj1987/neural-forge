@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # build-appimage.sh — build the Neural Forge AppImage.
 # Run from the repo root on Ubuntu (the GitHub Actions runner), as an ordinary user: it writes
-# only inside the checkout. Only its from-scratch dependency install below needs root.
+# only inside the checkout (and, on a machine without Rust, rustup's ~/.cargo and ~/.rustup).
+# Only its from-scratch system package install below needs root, through sudo.
 #
 # Packaging is appimagetool run directly on a hand-built AppDir, plus zsyncmake for the
 # update sidecar. GTK 4 and libadwaita come from the host system and are not bundled.
@@ -21,20 +22,32 @@ APPDIR="$BUILD_DIR/AppDir"
 echo "==> Building $NAME $VERSION AppImage"
 
 # ── Build dependencies ────────────────────────────────────────────────
-if ! command -v cargo >/dev/null 2>&1 || ! pkg-config --exists gtk4 2>/dev/null; then
+SUDO=""
+if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
+if ! pkg-config --exists gtk4 2>/dev/null || ! command -v g++ >/dev/null 2>&1 || ! command -v patch >/dev/null 2>&1; then
     echo "==> Installing build dependencies"
     # Tolerate an unrelated third-party repo (e.g. a runner image's preinstalled
     # Google Chrome source) failing to refresh -- apt falls back to its cached index
     # for that repo and still refreshes everything else; only `apt-get install`
     # failing on a package we actually need should be fatal.
-    apt-get update -qq || true
-    # g++ brings the static libstdc++ that crates/native links; curl and python3 are what
+    $SUDO apt-get update -qq || true
+    # g++ brings the static libstdc++ that crates/native links; curl, patch and python3 are what
     # scripts/fetch-native-tools.sh and the crate's build script run.
-    apt-get install -y -qq cargo rustc g++ curl python3 libgtk-4-dev libadwaita-1-dev \
+    $SUDO apt-get install -y -qq g++ curl patch python3 libgtk-4-dev libadwaita-1-dev \
         pkg-config wget desktop-file-utils zsync
 fi
-# The pinned glslang, Vulkan-Headers and volk that crates/native builds with (SHA-256-checked,
-# skipped when already in tools/native/).
+# Rust from rustup, at the version rust-toolchain.toml pins (the distribution's cargo is too old for
+# Cargo.lock and the code): rustup reads the file and installs that toolchain on first use.
+if ! command -v rustup >/dev/null 2>&1; then
+    echo "==> Installing rustup (the toolchain comes from rust-toolchain.toml)"
+    curl --proto '=https' --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
+    # shellcheck disable=SC1091
+    source "$HOME/.cargo/env"
+fi
+TOOLCHAIN="$(sed -n 's/^channel = "\(.*\)"$/\1/p' rust-toolchain.toml)"
+rustup run "$TOOLCHAIN" rustc --version >/dev/null 2>&1 || rustup toolchain install "$TOOLCHAIN"
+# The pinned glslang, Vulkan-Headers, volk and patched OpenDLSS-NR that crates/native builds with
+# (SHA-256-checked, skipped when already in tools/native/).
 bash scripts/fetch-native-tools.sh
 # ── Release build ─────────────────────────────────────────────────────
 echo "==> cargo build --release (protocol/layer/native/gui/cli)"
@@ -49,9 +62,10 @@ mkdir -p "$APPDIR/usr/bin" \
          "$APPDIR/usr/share/metainfo" \
          "$APPDIR/usr/share/vulkan/implicit_layer.d"
 
-cp "target/release/$NAME"                      "$APPDIR/usr/bin/"
-cp "target/release/$NAME-cli"                       "$APPDIR/usr/bin/"
-cp "target/release/$LIB"                            "$APPDIR/usr/lib/$LIBDIR/"
+RELEASE="${CARGO_TARGET_DIR:-target}/release"
+cp "$RELEASE/$NAME"                                 "$APPDIR/usr/bin/"
+cp "$RELEASE/$NAME-cli"                             "$APPDIR/usr/bin/"
+cp "$RELEASE/$LIB"                                  "$APPDIR/usr/lib/$LIBDIR/"
 sed "s#\./libneural_forge_layer\.so#../../../lib/$LIBDIR/$LIB#" \
     "data/$MANIFEST" > "$APPDIR/usr/share/vulkan/implicit_layer.d/$MANIFEST"
 cp data/io.github.labj1987.NeuralForge.desktop                               "$APPDIR/usr/share/applications/"
@@ -62,11 +76,14 @@ python3 scripts/sync_appdata_releases.py
 cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/metainfo/"
 
 # Licence notices that must ship with any build: this project's own AGPL text, the GPL-3.0 text
-# and RenoDX MIT notice for the OptiScaler-derived shader lineage, and the statically linked
-# crates' licence listing (regenerated here so it cannot drift from Cargo.lock).
+# and RenoDX MIT notice for the OptiScaler-derived shader lineage (third_party/optiscaler), the
+# OpenDLSS-NR patches and their reasons, the statically linked crates' listing (regenerated here so
+# it cannot drift from Cargo.lock), and the full licence and notice texts of every linked crate and
+# of OpenDLSS-NR, volk and the Vulkan-Headers compiled into the layer, collected from their sources.
 DOCDIR="$APPDIR/usr/share/doc/$NAME"
 mkdir -p "$DOCDIR"
 python3 scripts/gen_third_party_crates.py
+python3 scripts/gen_third_party_crates.py --licences "$DOCDIR/THIRD_PARTY_LICENSES.txt"
 cp LICENSE ATTRIBUTION.md THIRD_PARTY_CRATES.md "$DOCDIR/"
 cp -r third_party "$DOCDIR/"
 

@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# Downloads the pinned tools the native backend (crates/native) builds with into tools/native/ (git-ignored):
-#   glslang 16.6.0 (Linux x86_64 release binary), Vulkan-Headers v1.4.363, volk vulkan-sdk-1.4.357.0.
-# Every archive is checked against the SHA-256 pinned below before it is unpacked. Re-running skips a tool whose
-# unpacked copy carries the stamp of the same pinned archive, so it is safe to run on every build.
+# Downloads the pinned sources and tools the native backend (crates/native) builds with into tools/native/
+# (git-ignored):
+#   glslang 16.6.0 (Linux x86_64 release binary), Vulkan-Headers v1.4.363, volk vulkan-sdk-1.4.357.0, and
+#   OpenDLSS-NR at commit 9d08f41 with this project's patches (third_party/opendlss-nr/patches/) applied.
+# Every archive is checked against the SHA-256 pinned below before it is unpacked; every patch must apply
+# cleanly. Re-running skips a tool whose unpacked copy carries the stamp of the same pinned archive (and, for
+# OpenDLSS-NR, the same patches), so it is safe to run on every build, and a filled tools/native/ builds
+# offline. scripts/check_pins.py reads the pins below.
 #   bash scripts/fetch-native-tools.sh            (NEURAL_FORGE_NATIVE_TOOLS=<dir> to unpack elsewhere)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOOLS="${NEURAL_FORGE_NATIVE_TOOLS:-$ROOT/tools/native}"
+PATCHES="$ROOT/third_party/opendlss-nr/patches"
 mkdir -p "$TOOLS"
 
 # name | url | sha256 | file that must exist after unpacking (relative to tools/native/<name>)
@@ -15,12 +20,59 @@ PINS=(
   "glslang|https://github.com/KhronosGroup/glslang/releases/download/16.6.0/glslang-16.6.0-linux-x86_64-release.tar.gz|2c34071f56ecf39d16233294d3739cf43f981fd39080f2fd9dccb782101191ce|bin/glslang"
   "Vulkan-Headers|https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/v1.4.363.tar.gz|cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68|include/vulkan/vulkan_core.h"
   "volk|https://github.com/zeux/volk/archive/refs/tags/vulkan-sdk-1.4.357.0.tar.gz|6400c7b23e24d17e4f04bac49b55b06c4e87677d33398e90344743ec73560ca6|volk.c"
+  "OpenDLSS-NR|https://github.com/maanHimself/OpenDLSS-NR/archive/9d08f4184bbcb9d858e2fb7a7834ec0837a9d2f1.tar.gz|1301bfc9ee8e3868e9df579d7c9bfeb537a82b4be97c164e0c7925661d787125|src/vk_context.cpp"
 )
+
+# What the native backend uses of OpenDLSS-NR (third_party/opendlss-nr/UPSTREAM.md): everything else in the
+# archive is removed before the patches are applied, so the tree is exactly what is built and shipped.
+OPENDLSS_KEEP=(src shaders scripts/ptx LICENSE NOTICE)
+OPENDLSS_DROP=(src/main.cpp src/verify.cpp)
+
+# The stamp a tool's unpacked copy carries: the archive's SHA-256, and for OpenDLSS-NR the patches' too.
+stamp_for() {
+  local name="$1" sha="$2"
+  if [ "$name" = "OpenDLSS-NR" ]; then
+    printf '%s\n' "$sha"
+    (cd "$PATCHES" && sha256sum -- *.patch)
+  else
+    printf '%s\n' "$sha"
+  fi
+}
+
+# Trims an unpacked OpenDLSS-NR to what is used and applies the patches in order; fails on any that does
+# not apply cleanly (a hunk with an offset or fuzz is a failure too).
+prepare_opendlss() {
+  local top="$1" kept
+  kept="$(mktemp -d "$TOOLS/.keep.XXXXXX")"
+  for path in "${OPENDLSS_KEEP[@]}"; do
+    mkdir -p "$kept/$(dirname "$path")"
+    mv "$top/$path" "$kept/$path"
+  done
+  rm -rf "$top"
+  mv "$kept" "$top"
+  for path in "${OPENDLSS_DROP[@]}"; do
+    rm -f "$top/$path"
+  done
+  for patch in "$PATCHES"/*.patch; do
+    out="$(cd "$top" && patch -p1 --forward --batch --fuzz=0 --no-backup-if-mismatch < "$patch" 2>&1)" || {
+      echo "OpenDLSS-NR: $(basename "$patch") does not apply:" >&2
+      echo "$out" >&2
+      exit 1
+    }
+    if grep -q 'offset\|fuzz' <<<"$out"; then
+      echo "OpenDLSS-NR: $(basename "$patch") applies only with an offset or fuzz:" >&2
+      echo "$out" >&2
+      exit 1
+    fi
+    echo "OpenDLSS-NR: applied $(basename "$patch")"
+  done
+}
 
 for pin in "${PINS[@]}"; do
   IFS='|' read -r name url sha check <<<"$pin"
   dest="$TOOLS/$name"
-  if [ -e "$dest/$check" ] && [ "$(cat "$dest/.fetched-sha256" 2>/dev/null)" = "$sha" ]; then
+  stamp="$(stamp_for "$name" "$sha")"
+  if [ -e "$dest/$check" ] && [ "$(cat "$dest/.fetched-sha256" 2>/dev/null)" = "$stamp" ]; then
     echo "$name: up to date ($dest)"
     continue
   fi
@@ -42,7 +94,10 @@ for pin in "${PINS[@]}"; do
     [ "${#entries[@]}" -eq 1 ] && top="${entries[0]}"
   fi
   [ -e "$top/$check" ] || { echo "$name: $check not found in the archive" >&2; exit 1; }
-  echo "$sha" >"$top/.fetched-sha256"
+  if [ "$name" = "OpenDLSS-NR" ]; then
+    prepare_opendlss "$top"
+  fi
+  echo "$stamp" >"$top/.fetched-sha256"
   rm -rf "$dest"
   mv "$top" "$dest"
   rm -rf "$stage"

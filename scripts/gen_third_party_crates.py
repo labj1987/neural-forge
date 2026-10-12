@@ -1,19 +1,31 @@
 #!/usr/bin/env python3
-"""Generates THIRD_PARTY_CRATES.md: every crate linked into a shipped binary, with its license.
+"""Lists, and gathers the licence texts of, everything third-party linked into Neural Forge's binaries.
 
-Covers the workspace members (layer, native backend, GUI, CLI), walking
-normal (non-dev, non-build) dependencies only, since those are what get statically linked.
+The crates: every crate the workspace members (layer, native backend, supervisor, GUI, CLI, protocol) link,
+walking normal (non-dev, non-build) dependencies only and leaving out proc-macro crates (they run in the
+compiler and are not linked), nor anything reached only through one. The C and C++ code compiled into
+the layer: OpenDLSS-NR, volk and the Vulkan-Headers, from tools/native (scripts/fetch-native-tools.sh).
 
-  gen_third_party_crates.py           rewrite THIRD_PARTY_CRATES.md
-  gen_third_party_crates.py --check   exit 1 if it is out of date (for CI)
+  gen_third_party_crates.py                  rewrite THIRD_PARTY_CRATES.md (the crate listing)
+  gen_third_party_crates.py --check          exit 1, with a diff, if THIRD_PARTY_CRATES.md is out of date
+  gen_third_party_crates.py --licences OUT   write OUT: every licence and notice file of every crate (from
+                                             its source in the cargo registry or git checkout, offline)
+                                             and of the native code; fails if one has none
+  gen_third_party_crates.py --self-test      check the dependency walk on a synthetic graph
+
+build-appimage.sh ships OUT as usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt.
 """
+import difflib
 import json
+import os
+import re
 import subprocess
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "THIRD_PARTY_CRATES.md"
+TARGET = "x86_64-unknown-linux-gnu"
 
 # Crates whose manifest declares no `license` (git dependencies). Checked against the licence files in their
 # source: google/vk-layer-for-rust ships the Apache-2.0 text in its LICENSE and an Apache header in each manifest.
@@ -21,6 +33,16 @@ LICENSE_OVERRIDES = {
     "vulkan-layer": "Apache-2.0",
     "vulkan-layer-macros": "Apache-2.0",
 }
+
+# A crate's licence and notice files, by name.
+LICENCE_FILE = re.compile(r"^(licen[cs]e|copying|notice|copyright|unlicense|authors)([-_.].*)?$", re.I)
+
+# The native code compiled into the layer: (name, licence, files under tools/native).
+NATIVE = [
+    ("OpenDLSS-NR", "MIT", ["OpenDLSS-NR/LICENSE", "OpenDLSS-NR/NOTICE"]),
+    ("volk", "MIT", ["volk/LICENSE.md"]),
+    ("Vulkan-Headers", "Apache-2.0 OR MIT", ["Vulkan-Headers/LICENSE.md", "Vulkan-Headers/LICENSES/Apache-2.0.txt", "Vulkan-Headers/LICENSES/MIT.txt"]),
+]
 
 
 def source_url(pkg):
@@ -36,54 +58,155 @@ def source_url(pkg):
 
 def metadata(*extra):
     out = subprocess.run(
-        ["cargo", "metadata", "--format-version", "1", "--locked", *extra],
+        ["cargo", "metadata", "--format-version", "1", "--locked", "--filter-platform", TARGET, *extra],
         cwd=ROOT, check=True, capture_output=True, text=True,
     ).stdout
     return json.loads(out)
 
 
-def linked(meta, workspace_names):
+def proc_macro(pkg):
+    return any("proc-macro" in t["kind"] for t in pkg["targets"])
+
+
+def linked(meta):
+    """The packages linked into the workspace's binaries: the members and their normal dependencies,
+    proc-macro crates (and what only they reach) left out."""
     pkgs = {p["id"]: p for p in meta["packages"]}
     nodes = {n["id"]: n for n in meta["resolve"]["nodes"]}
-    seen, stack = set(), [i for i, p in pkgs.items() if p["name"] in workspace_names]
+    members = set(meta["workspace_members"])
+    seen, stack = set(), list(members)
     while stack:
         i = stack.pop()
         if i in seen:
             continue
         seen.add(i)
         for dep in nodes[i]["deps"]:
-            if any(k["kind"] is None for k in dep["dep_kinds"]):
+            if any(k["kind"] is None for k in dep["dep_kinds"]) and not proc_macro(pkgs[dep["pkg"]]):
                 stack.append(dep["pkg"])
-    return [pkgs[i] for i in seen]
+    return [pkgs[i] for i in sorted(seen) if i not in members]
 
 
-def main():
-    rows = {}
-    for target in ("x86_64-unknown-linux-gnu",):
-        meta = metadata("--filter-platform", target)
-        members = {p["name"] for p in meta["packages"] if p["source"] is None}
-        for p in linked(meta, members):
-            if p["source"] is None:
-                continue  # this workspace's own crates: AGPL-3.0-or-later, see LICENSE
-            rows[(p["name"], p["version"])] = (
-                p.get("license") or LICENSE_OVERRIDES.get(p["name"], "see crate"), source_url(p))
+def licence_of(pkg):
+    return pkg.get("license") or LICENSE_OVERRIDES.get(pkg["name"], "see crate")
+
+
+def listing(meta):
+    rows = {(p["name"], p["version"]): (licence_of(p), source_url(p)) for p in linked(meta)}
     lines = [
         "# Third-party Rust crates",
         "",
-        "Statically linked into the Neural Forge binaries (layer, GUI and CLI).",
-        "Generated by `scripts/gen_third_party_crates.py` from `Cargo.lock`; do not edit.",
-        "Each crate's own license text is in its published source (crates.io / the repository).",
+        "Statically linked into the Neural Forge binaries (layer, GUI and CLI); proc-macro crates, which run",
+        "only in the compiler, are not. Generated by `scripts/gen_third_party_crates.py` from `Cargo.lock`; do",
+        "not edit. Every crate's licence and notice files ship in the AppImage, collected from the crates'",
+        "sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.",
         "",
         "| Crate | Version | License | Source |",
         "|---|---|---|---|",
     ]
     for (name, version), (lic, repo) in sorted(rows.items()):
         lines.append(f"| {name} | {version} | {lic} | {repo} |")
-    text = "\n".join(lines) + "\n"
-    if "--check" in sys.argv:
-        sys.exit(0 if OUT.exists() and OUT.read_text() == text else 1)
+    return "\n".join(lines) + "\n", len(rows)
+
+
+def licence_files(pkg):
+    """The crate's licence and notice files: in its own directory, else (a crate inside a git checkout's
+    workspace) in the nearest directory above it, up to the checkout's root."""
+    d = Path(pkg["manifest_path"]).parent
+    stop = None
+    if (pkg.get("source") or "").startswith("git+"):
+        parts = d.parts
+        if "checkouts" in parts:
+            stop = Path(*parts[: parts.index("checkouts") + 3])
+    extra = [d / pkg["license_file"]] if pkg.get("license_file") else []
+    while True:
+        found = sorted(f for f in d.iterdir() if f.is_file() and LICENCE_FILE.match(f.name)) if d.is_dir() else []
+        found = [f for f in found if not f.name.lower().startswith("authors")] + [f for f in found if f.name.lower().startswith("authors")]
+        if found or stop is None or d == stop or d == d.parent:
+            break
+        d = d.parent
+    return list(dict.fromkeys([f for f in extra if f.is_file()] + found))
+
+
+def section(title, files):
+    out = [f"{'=' * 78}\n{title}\n{'=' * 78}\n"]
+    for f in files:
+        out.append(f"--- {f.name} ---\n{f.read_text(errors='replace').rstrip()}\n\n")
+    return "".join(out)
+
+
+def licences(meta, out_path):
+    tools = Path(os.environ.get("NEURAL_FORGE_NATIVE_TOOLS", "").strip() or ROOT / "tools/native")
+    parts = [
+        "Third-party licences and notices for Neural Forge\n\n"
+        "Neural Forge itself is AGPL-3.0-or-later (LICENSE). Below: every Rust crate statically linked into its\n"
+        "binaries (THIRD_PARTY_CRATES.md lists them) and the C/C++ code compiled into its Vulkan layer, each\n"
+        "with its licence and notice files as its source ships them. Generated by\n"
+        "scripts/gen_third_party_crates.py at build time; ATTRIBUTION.md says what each project contributed.\n\n"
+    ]
+    missing = []
+    for name, lic, rel in NATIVE:
+        files = [tools / r for r in rel]
+        absent = [str(f) for f in files if not f.is_file()]
+        if absent:
+            missing.append(f"{name}: {', '.join(absent)} (run scripts/fetch-native-tools.sh)")
+            continue
+        parts.append(section(f"{name} ({lic}), compiled into the Vulkan layer", files))
+    for pkg in sorted(linked(meta), key=lambda p: (p["name"], p["version"])):
+        files = licence_files(pkg)
+        if not files:
+            missing.append(f"{pkg['name']} {pkg['version']}: no licence file in {Path(pkg['manifest_path']).parent}")
+            continue
+        parts.append(section(f"{pkg['name']} {pkg['version']} ({licence_of(pkg)}) {source_url(pkg)}".rstrip(), files))
+    if missing:
+        sys.exit("licence texts missing:\n  " + "\n  ".join(missing))
+    Path(out_path).write_text("".join(parts))
+    print(f"wrote {out_path}: {len(parts) - 1} components")
+
+
+def self_test():
+    pkg = lambda i, kinds=("lib",): {"id": i, "name": i, "version": "1.0.0", "targets": [{"kind": list(kinds)}], "source": "registry"}
+    meta = {
+        "packages": [pkg("app", ("bin",)), pkg("lib"), pkg("macro", ("proc-macro",)), pkg("syn"), pkg("build"), pkg("dev"), pkg("shared")],
+        "workspace_members": ["app"],
+        "resolve": {"nodes": [
+            {"id": "app", "deps": [
+                {"pkg": "lib", "dep_kinds": [{"kind": None}]},
+                {"pkg": "macro", "dep_kinds": [{"kind": None}]},
+                {"pkg": "build", "dep_kinds": [{"kind": "build"}]},
+                {"pkg": "dev", "dep_kinds": [{"kind": "dev"}]},
+            ]},
+            {"id": "lib", "deps": [{"pkg": "shared", "dep_kinds": [{"kind": None}]}]},
+            {"id": "macro", "deps": [{"pkg": "syn", "dep_kinds": [{"kind": None}]}, {"pkg": "shared", "dep_kinds": [{"kind": None}]}]},
+            {"id": "syn", "deps": []}, {"id": "build", "deps": []}, {"id": "dev", "deps": []}, {"id": "shared", "deps": []},
+        ]},
+    }
+    names = sorted(p["name"] for p in linked(meta))
+    assert names == ["lib", "shared"], names
+    for name in ["LICENSE", "LICENSE-MIT", "license.txt", "COPYING", "NOTICE", "UNLICENSE", "LICENCE-APACHE"]:
+        assert LICENCE_FILE.match(name), name
+    for name in ["README.md", "Cargo.toml", "licensing.rs"]:
+        assert not LICENCE_FILE.match(name), name
+    print("gen_third_party_crates self-test ok")
+
+
+def main():
+    args = sys.argv[1:]
+    if args == ["--self-test"]:
+        return self_test()
+    if args[:1] == ["--licences"] and len(args) == 2:
+        return licences(metadata("--offline"), args[1])
+    text, count = listing(metadata())
+    if args == ["--check"]:
+        current = OUT.read_text() if OUT.exists() else ""
+        if current != text:
+            sys.stdout.writelines(difflib.unified_diff(current.splitlines(True), text.splitlines(True), "THIRD_PARTY_CRATES.md", "generated"))
+            print("THIRD_PARTY_CRATES.md is out of date: run scripts/gen_third_party_crates.py", file=sys.stderr)
+            sys.exit(1)
+        return
+    if args:
+        sys.exit(__doc__)
     OUT.write_text(text)
-    print(f"wrote {OUT.name}: {len(rows)} crates")
+    print(f"wrote {OUT.name}: {count} crates")
 
 
 main()

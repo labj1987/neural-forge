@@ -1,5 +1,5 @@
 // The SPIR-V and PTX kernels build.rs embeds. The definitions are generated (OUT_DIR/nf_assets.cpp): every
-// third_party/opendlss-nr/shaders/*.comp as kind "spv" and every PTX generator output as kind "ptx", each
+// OpenDLSS-NR shaders/*.comp (tools/native/OpenDLSS-NR) as kind "spv" and every PTX generator output as kind "ptx", each
 // named by its file name without the extension, as OpenDLSS-NR's nr::AssetLoader expects.
 #pragma once
 

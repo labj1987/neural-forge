@@ -1,12 +1,17 @@
-# OpenDLSS-NR (vendored)
+# OpenDLSS-NR (fetched at a pinned commit, patched)
 
 - Upstream: https://github.com/maanHimself/OpenDLSS-NR
 - Commit: `9d08f4184bbcb9d858e2fb7a7834ec0837a9d2f1`
-- License: MIT (`LICENSE`, `NOTICE`)
+- License: MIT (`LICENSE`, `NOTICE` in the fetched source; shipped in the AppImage)
 
-Built by `crates/native/build.rs` (neural-forge-native) with the toolchain pinned in
-`scripts/fetch-native-tools.sh`. No compiled SPIR-V or PTX is committed: both are generated at build time
-and embedded into the library.
+Not kept in this repository: `scripts/fetch-native-tools.sh` downloads the commit's archive (SHA-256
+pinned), keeps what is listed under "Included", and applies `patches/` in order, refusing any patch that
+does not apply exactly (no offset, no fuzz), into `tools/native/OpenDLSS-NR/` with the rest of the native
+toolchain. `crates/native/build.rs` (neural-forge-native) builds from there. No compiled SPIR-V or PTX is
+committed: both are generated at build time and embedded into the library. To move to another upstream
+commit: change the pin (URL and SHA-256) in `scripts/fetch-native-tools.sh` and the commit above, rebase the
+patches onto it, and regenerate `crates/supervisor/src/model_shape.rs` if the network changed
+(`scripts/gen_model_shape.py`). `scripts/check_pins.py` (the weekly pin check) reports a newer commit.
 
 ## Included
 
@@ -16,7 +21,7 @@ and embedded into the library.
 - `scripts/ptx/`: the PTX generators (`ptxgen.py`, `swin.py`, the `*_e4m3.py` kernels, `test_fast_divmod.py`).
 - `NOTICE`, `LICENSE`.
 
-## Not included
+## Not included (removed by the fetch)
 
 - `src/main.cpp` (the `dlss5vk` command-line tool) and `src/verify.cpp`, which only that tool uses
   (`runVerify`). `src/reference.*` stays: `ref::siluTable()` feeds `Kernels::setSiluTable`.
@@ -26,8 +31,8 @@ and embedded into the library.
 
 ## Local changes
 
-Each one is also a patch in `patches/`, relative to this directory and applied in order
-(`git apply --directory=third_party/opendlss-nr patches/NNNN-*.patch` on a fresh copy of upstream).
+Each one is a patch in `patches/`, relative to the source's root (`patch -p1`), applied in order by
+`scripts/fetch-native-tools.sh`.
 
 1. `patches/0001-include-cstring.patch`: `src/vk_context.h` includes `<cstring>`. It uses `memcpy`
    and only compiled with MSVC, whose headers pull `<cstring>` in transitively; GCC's do not.
