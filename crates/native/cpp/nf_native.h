@@ -28,8 +28,9 @@ uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance i
 
 // Extends `in` (the create info about to go to the next layer's vkCreateDevice) with the network's
 // extensions and features, writing the result to `out`. `in` and its chain are only read: `out`'s chain
-// is a copy of the application's (each structure's size from the Vulkan registry; a structure this
-// build does not know fails the call) with the flags set in the copies, and the structures the
+// is a copy of the application's (each structure's size from the Vulkan registry, the loader's own
+// link and callback nodes included; from the first structure this build does not know on, the rest stays
+// the application's, linked as it is and never written) with the flags set in the copies, and the structures the
 // application has none of prepended, all in memory owned by `*state`. Fails when the application
 // enables VK_EXT_buffer_device_address (it excludes the core feature the kernels need). `out`, its
 // extension list and its chain stay valid until nf_native_device_restore(*state), which frees them

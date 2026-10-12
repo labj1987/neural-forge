@@ -54,9 +54,10 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Every component compiled or linked into the shipped binaries must have its licence text in the
   AppImage: `scripts/gen_third_party_crates.py --licences` collects them from the crates' and the
   native sources at build time and fails on one without.
-- Toggle key: it acts only while the game's window has the X focus (`hotkey.rs`); inside gamescope
-  it is off unless `NEURAL_FORGE_HOTKEY_GLOBAL=1`. Keep that default: a key read from `/dev/input`
-  otherwise fires while the user types in another window.
+- Toggle key: a press is ignored only while another X client is known to have the focus
+  (`hotkey.rs`); where the focus cannot be told (gamescope's nested Xwayland holds only the game, a
+  bare X server without `_NET_ACTIVE_WINDOW`) it acts, and `NEURAL_FORGE_HOTKEY_GLOBAL=1` makes it act
+  even then. Keep that: a key read from `/dev/input` otherwise fires while the user types elsewhere.
 - Launch options: the supervisor always writes `NEURAL_FORGE_TARGET_EXE` (the game's own executables,
   `steam::target_for`), and an explicit target wins over the layer's built-in exclusions.
 - `extract-model` gates on the network's shape, not the DLL's version: it takes any build of

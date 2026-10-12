@@ -365,3 +365,75 @@ fn device_extend_copies_the_applications_chain() {
         g.instance.destroy_instance(None);
     }
 }
+
+/// The chain a layer gets from the loader: its link node (`VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO`,
+/// 48) is copied like any other, and a structure this build does not know is kept, as the application's,
+/// at the end of the chain instead of failing the call. A structure the network sets after such a one
+/// is refused (it could only be written in place).
+#[test]
+fn device_extend_keeps_the_loaders_nodes_and_unknown_ones() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let g = gpu();
+    let gipa = g._entry.static_fn().get_instance_proc_addr;
+    let priorities = [1.0f32];
+    let queues = [vk::DeviceQueueCreateInfo::builder().queue_family_index(g.family).queue_priorities(&priorities).build()];
+    // An unknown structure: an sType no registry has, followed by nothing the network sets.
+    #[repr(C)]
+    struct Unknown {
+        s_type: vk::StructureType,
+        p_next: *const std::ffi::c_void,
+        payload: [u64; 4],
+    }
+    let unknown = Unknown { s_type: vk::StructureType::from_raw(0x7fff_0123), p_next: std::ptr::null(), payload: [7; 4] };
+    // The loader's node, as vk_layer.h lays it out: sType, pNext, function, then a union of pointers.
+    #[repr(C)]
+    struct LoaderNode {
+        s_type: vk::StructureType,
+        p_next: *const std::ffi::c_void,
+        function: u32,
+        u: *const std::ffi::c_void,
+    }
+    let loader = LoaderNode { s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::from_ref(&unknown).cast(), function: 0, u: 0x1234 as *const _ };
+    let mut v12 = vk::PhysicalDeviceVulkan12Features { p_next: std::ptr::from_ref(&loader).cast_mut().cast(), ..Default::default() };
+    let info = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut v12).cast(), ..vk::DeviceCreateInfo::builder().queue_create_infos(&queues).build() };
+    // SAFETY: valid create info, outliving the extension; the chain is only read.
+    let extension = unsafe { device_extend(gipa, g.instance.handle(), g.physical, &info) }.expect("the loader's node and an unknown one do not stop the additions");
+    let (mut copied_loader, mut tail, mut v12_set) = (None, None, false);
+    // SAFETY: the extended chain is valid while `extension` lives.
+    unsafe {
+        let mut node = extension.info.p_next.cast::<vk::BaseInStructure>();
+        while !node.is_null() {
+            match (*node).s_type {
+                vk::StructureType::LOADER_DEVICE_CREATE_INFO => copied_loader = Some(node),
+                vk::StructureType::PHYSICAL_DEVICE_VULKAN_1_2_FEATURES => v12_set = (*node.cast::<vk::PhysicalDeviceVulkan12Features>()).buffer_device_address == 1,
+                t if t == unknown.s_type => tail = Some(node),
+                _ => {}
+            }
+            node = (*node).p_next;
+        }
+        let copied_loader = copied_loader.expect("the loader's node is in the chain");
+        assert_ne!(copied_loader.cast::<LoaderNode>(), std::ptr::from_ref(&loader), "copied");
+        assert_eq!((*copied_loader.cast::<LoaderNode>()).u, loader.u, "with its contents");
+    }
+    assert_eq!(tail.map(|t| t.cast::<Unknown>()), Some(std::ptr::from_ref(&unknown)), "the unknown structure is the application's own, linked as it is");
+    assert!(v12_set);
+    assert_eq!((v12.buffer_device_address, loader.p_next), (0, std::ptr::from_ref(&unknown).cast()), "nothing of the application's was written");
+    drop(extension);
+    // A structure the network sets after the unknown one: refused, not written.
+    let mut after = vk::PhysicalDeviceVulkan12Features::default();
+    let unknown_first = Unknown { s_type: unknown.s_type, p_next: std::ptr::from_mut(&mut after).cast(), payload: [0; 4] };
+    let info = vk::DeviceCreateInfo { p_next: std::ptr::from_ref(&unknown_first).cast(), ..vk::DeviceCreateInfo::builder().queue_create_infos(&queues).build() };
+    // SAFETY: as above.
+    let refused = unsafe { device_extend(gipa, g.instance.handle(), g.physical, &info) };
+    assert!(refused.is_err_and(|e| e.contains("after one this build does not know")));
+    assert_eq!(after.buffer_device_address, 0);
+    // SAFETY: nothing of the device is in use.
+    unsafe {
+        g.device.destroy_device(None);
+        g.instance.destroy_instance(None);
+    }
+}

@@ -87,6 +87,14 @@ fn shares_memory(info: &vk::ImageCreateInfo) -> bool {
     false
 }
 
+/// The create info an application's image is actually created with on a device with the pre-upscaler
+/// tracking: `TRANSFER_SRC` added where `preupscale::wants_copyable` asks for it and the memory is not
+/// shared. `None`: created as asked. Also what a memory-requirements query for such an image is
+/// answered from (`vkGetDeviceImage*MemoryRequirements`), so memory placed by those numbers fits.
+fn copyable_create_info(info: &vk::ImageCreateInfo) -> Option<vk::ImageCreateInfo> {
+    (crate::preupscale::wants_copyable(info) && !shares_memory(info)).then(|| vk::ImageCreateInfo { usage: info.usage | vk::ImageUsageFlags::TRANSFER_SRC, ..*info })
+}
+
 /// Whether the pre-upscaler dump (`NEURAL_FORGE_PREUPSCALE=dump`) serves one-shot capture requests:
 /// it writes DLSS's input for each one (docs/PRE_UPSCALER_DESIGN.md), and is then their one owner.
 fn dump_owns_one_shot() -> bool {
@@ -146,6 +154,10 @@ pub struct NeuralForgeDeviceInfo {
     next_get_device_queue: Option<vk::PFN_vkGetDeviceQueue>,
     next_get_device_queue2: Option<vk::PFN_vkGetDeviceQueue2>,
     next_create_image: Option<vk::PFN_vkCreateImage>,
+    /// The next layer's `vkGetDeviceImageMemoryRequirements` and its sparse variant (core, else the KHR
+    /// names), resolved with the pre-upscaler tracking: answered for the usage `create_image` adds.
+    next_image_requirements: Option<vk::PFN_vkGetDeviceImageMemoryRequirements>,
+    next_image_sparse_requirements: Option<vk::PFN_vkGetDeviceImageSparseMemoryRequirements>,
     /// The next layer's entry points the `NEURAL_FORGE_PROBE_NGX` probe and the
     /// `NEURAL_FORGE_PREUPSCALE` tracking forward through; `None` (never resolved) when both are off.
     probe_next: Option<ProbeNext>,
@@ -296,7 +308,7 @@ struct State {
 /// every DLSS submit, while the present holds [`State`] through the after-the-upscaler path's
 /// synchronous wait for the model's answer (up to `capture::SYNC_BUDGET`). The present takes this
 /// lock only briefly (its status, the hand-back, starting the model server), never across a wait
-/// of its own, so no submit waits on a present. Lock order: `State`, then `HoldState`; a holder of
+/// of its own, so no submit waits on a present (and no present on a hold: [`try_hold`]). Lock order: `State`, then `HoldState`; a holder of
 /// `HoldState` only ever `try_lock`s `State` ([`post_slot_busy`]).
 #[derive(Default)]
 struct HoldState {
@@ -676,6 +688,15 @@ unsafe fn imageless_attachments(begin: &vk::RenderPassBeginInfo) -> Option<Vec<v
     None
 }
 
+/// The hold's state if no hold has it now (a poisoned lock is taken as it is).
+fn try_hold(hold: &Mutex<HoldState>) -> Option<std::sync::MutexGuard<'_, HoldState>> {
+    match hold.try_lock() {
+        Ok(guard) => Some(guard),
+        Err(std::sync::TryLockError::Poisoned(e)) => Some(e.into_inner()),
+        Err(std::sync::TryLockError::WouldBlock) => None,
+    }
+}
+
 type CleanupState = (Arc<ash::Device>, Arc<Mutex<State>>, Arc<Mutex<HoldState>>);
 static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -688,10 +709,11 @@ static CLEANUP: std::sync::LazyLock<Mutex<HashMap<vk::Device, CleanupState>>> =
 /// The caller must meet vkDestroyDevice's external synchronization requirements.
 pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     let owned = CLEANUP.lock().unwrap().remove(&handle);
-    // First of all the network's own threads (the after-the-upscaler model server, the loader):
-    // they submit to the layer's queues, so they are stopped (joined) before anything below waits
-    // the device idle -- `vkDeviceWaitIdle` needs every queue of the device externally
-    // synchronized, which a thread still submitting breaks.
+    // The order: first every thread that submits (the network's own: the after-the-upscaler model
+    // server and the loader; then the hold inside DLSS's buffer's worker), joined, because
+    // `vkDeviceWaitIdle` needs every queue of the device externally synchronized; then the device
+    // waited idle; only then is the network closed (its buffers may be used by work still on the
+    // game's queues until then) and the rest freed.
     if let Some((_, _, hold)) = &owned {
         hold.lock().unwrap_or_else(|e| e.into_inner()).preupscale.stop_native();
     }
@@ -702,9 +724,11 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     if let Some((device, state, hold)) = owned {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
-        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || hold.preupscale.res.is_some() {
+        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || hold.preupscale.res.is_some() || hold.preupscale.native.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
+                    // Idle: nothing uses the network any more.
+                    hold.preupscale.close_native();
                     unsafe { capture::destroy_pipeline(state.capture_pipeline.take(), &device); }
                     for slot in &mut state.direct_capture {
                         unsafe { capture::destroy_direct_capture(slot.take(), &device); }
@@ -718,7 +742,13 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                     // SAFETY: the device is idle (or lost): no hold's submission is pending.
                     unsafe { hold.preupscale.destroy(&device); }
                 }
-                Err(error) => crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources", error),
+                Err(error) => {
+                    crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources (the network is left open)", error);
+                    // Its buffers may still be in use: leaked rather than closed.
+                    if let Some(loader) = hold.preupscale.native.take() {
+                        std::mem::forget(loader);
+                    }
+                }
             }
         }
         // SAFETY: a series never leaves GPU work pending once a present returns (it waits on
@@ -1314,6 +1344,19 @@ impl NeuralForgeDeviceInfo {
             next_get_device_queue: get_queue,
             next_get_device_queue2: get_queue2,
             next_create_image: create_image,
+            // SAFETY: names resolved from the device's own next-layer gdpa, typed as those commands.
+            next_image_requirements: preupscale_mode
+                .then(|| unsafe {
+                    resolve(next_get_device_proc_addr, handle, c"vkGetDeviceImageMemoryRequirements")
+                        .or_else(|| resolve(next_get_device_proc_addr, handle, c"vkGetDeviceImageMemoryRequirementsKHR"))
+                })
+                .flatten(),
+            next_image_sparse_requirements: preupscale_mode
+                .then(|| unsafe {
+                    resolve(next_get_device_proc_addr, handle, c"vkGetDeviceImageSparseMemoryRequirements")
+                        .or_else(|| resolve(next_get_device_proc_addr, handle, c"vkGetDeviceImageSparseMemoryRequirementsKHR"))
+                })
+                .flatten(),
             probe_next,
             preupscale,
             inline,
@@ -2203,6 +2246,34 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     /// Purely observational -- the app's own destroy is always forwarded unchanged.
     /// Records a possible tap source's extent and format (see `TapTracker::image_info`).
     /// The application's call goes through unchanged.
+    /// An image `create_image` adds `TRANSFER_SRC` to is queried with it too (placed resources are
+    /// sized by these numbers before the image exists).
+    fn get_device_image_memory_requirements(
+        &self, info: &vk::DeviceImageMemoryRequirements, requirements: &mut std::mem::MaybeUninit<vk::MemoryRequirements2>,
+    ) -> LayerResult<()> {
+        let Some(next) = self.next_image_requirements.filter(|_| self.preupscale.is_some()) else { return LayerResult::Unhandled };
+        // SAFETY: the application's query: a valid create info.
+        let Some(create) = copyable_create_info(unsafe { &*info.p_create_info }) else { return LayerResult::Unhandled };
+        let query = vk::DeviceImageMemoryRequirements { p_create_info: &create, ..*info };
+        // SAFETY: the next layer's command with the application's query, but for that usage bit.
+        unsafe { next(self.device.handle(), &query, requirements.as_mut_ptr()) };
+        LayerResult::Handled(())
+    }
+
+    fn get_device_image_sparse_memory_requirements(
+        &self, info: &vk::DeviceImageMemoryRequirements, count: &mut std::mem::MaybeUninit<u32>,
+        requirements: Option<&mut [std::mem::MaybeUninit<vk::SparseImageMemoryRequirements2>]>,
+    ) -> LayerResult<()> {
+        let Some(next) = self.next_image_sparse_requirements.filter(|_| self.preupscale.is_some()) else { return LayerResult::Unhandled };
+        // SAFETY: as above.
+        let Some(create) = copyable_create_info(unsafe { &*info.p_create_info }) else { return LayerResult::Unhandled };
+        let query = vk::DeviceImageMemoryRequirements { p_create_info: &create, ..*info };
+        let out = requirements.map_or(std::ptr::null_mut(), |r| r.as_mut_ptr().cast());
+        // SAFETY: as above; `count` and `out` are the application's, as the two-call idiom has them.
+        unsafe { next(self.device.handle(), &query, count.as_mut_ptr(), out) };
+        LayerResult::Handled(())
+    }
+
     fn create_image(
         &self, create_info: &vk::ImageCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
     ) -> LayerResult<ash::prelude::VkResult<vk::Image>> {
@@ -2214,11 +2285,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // Never to an image whose memory is shared with another API or process (an external-memory
         // chain: its usage is part of what the other side agreed to), and an image the driver refuses
         // with the bit is created exactly as the application asked.
-        let mut info = *create_info;
-        let added = self.preupscale.is_some() && crate::preupscale::wants_copyable(create_info) && !shares_memory(create_info);
-        if added {
-            info.usage |= vk::ImageUsageFlags::TRANSFER_SRC;
-        }
+        let copyable = self.preupscale.as_ref().and_then(|_| copyable_create_info(create_info));
+        let added = copyable.is_some();
+        let mut info = copyable.unwrap_or(*create_info);
         // SAFETY: `next` is the next layer/driver's own `vkCreateImage`; `info` (with
         // its whole pNext chain) and the allocator are the application's, passed unchanged but
         // for that usage bit.
@@ -2718,9 +2787,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 )
             };
             let mut state = self.state.lock().unwrap();
+            // Never waits for a hold running on another thread (the hold inside DLSS's buffer keeps the
+            // hold's state across its GPU wait): the status is published again at the next present.
             if let Some(t) = &self.preupscale {
                 let extent = t.extent();
-                self.hold.lock().unwrap_or_else(|e| e.into_inner()).preupscale.publish_status(&state.shm, extent);
+                if let Some(hold) = try_hold(&self.hold) {
+                    hold.preupscale.publish_status(&state.shm, extent);
+                }
             }
             // Whether any of this present's swapchains renders steadily (`None`: none is the layer's).
             let mut any_engaged: Option<bool> = None;
@@ -2899,8 +2972,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 };
                 let State { shm, capture_pipeline, direct_capture, external_memory_host, gpu_compose, original_scratch, model_scratch, inflight, bootstrap_complete, answer_scratch, raw_answer_base, raw_answer_generation, last_answer, last_answer_dims, last_answer_encoded, relay_semaphores, engaged_swapchains, series, .. } = &mut *state;
                 // The hold's state, for the hand-back, its captures and the model server: let go
-                // before the post path's synchronous wait below.
-                let mut hold_guard = self.hold.lock().unwrap_or_else(|e| e.into_inner());
+                // before the post path's synchronous wait below. Busy, a hold runs on another thread
+                // right now (DLSS runs, the model is applied before the upscaler): this present goes
+                // as it is, and the hand-back and any capture are looked at again at the next one, which
+                // finds it free (holds come once a DLSS frame; the hand-back is only due without them).
+                let Some(mut hold_guard) = try_hold(&self.hold) else { break };
                 let preupscale = &mut hold_guard.preupscale;
                 // Another device's hold counts too (DLSS on a device without the swapchain); never
                 // set with `NEURAL_FORGE_PREUPSCALE=off`, where no device holds.
@@ -2950,6 +3026,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // The post path is about to write slot 0's proxy region (from the CPU, or on
                     // the GPU, possibly on another queue): a hold's write-back that still reads it
                     // must be finished first. Normally long done; bounded either way.
+                    preupscale.recover_unfenced(&self.device);
                     if preupscale.res.as_ref().is_some_and(crate::preupscale::Resources::pending) {
                         let mut gpu = None;
                         let drained = preupscale.res.as_mut().is_some_and(|r| r.wait_idle(&self.device, &mut gpu));
@@ -3389,6 +3466,34 @@ mod lock_structure_tests {
 #[cfg(test)]
 mod submit_order_tests {
     use super::*;
+
+    /// The usage an image is created with and the usage its memory-requirements query is answered for
+    /// are one rule: an RG16F or (the edit cache on) depth image gets `TRANSFER_SRC`, one that shares
+    /// its memory or already has it does not, and nothing else changes.
+    #[test]
+    fn images_are_created_and_queried_with_the_same_added_usage() {
+        let base = vk::ImageCreateInfo {
+            image_type: vk::ImageType::TYPE_2D,
+            format: vk::Format::R16G16_SFLOAT,
+            extent: vk::Extent3D { width: 64, height: 32, depth: 1 },
+            samples: vk::SampleCountFlags::TYPE_1,
+            tiling: vk::ImageTiling::OPTIMAL,
+            usage: vk::ImageUsageFlags::STORAGE,
+            ..Default::default()
+        };
+        let added = copyable_create_info(&base).expect("RG16F gets TRANSFER_SRC");
+        assert_eq!(added.usage, vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC);
+        assert_eq!((added.format, added.extent, added.tiling), (base.format, base.extent, base.tiling), "nothing else changes");
+        let depth = vk::ImageCreateInfo { format: vk::Format::D32_SFLOAT_S8_UINT, usage: vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT, ..base };
+        assert_eq!(copyable_create_info(&depth).is_some(), crate::preupscale::edit_cache_on());
+        let external = vk::ExternalMemoryImageCreateInfo::default();
+        let shared = vk::ImageCreateInfo { p_next: std::ptr::from_ref(&external).cast(), ..base };
+        assert!(copyable_create_info(&shared).is_none(), "shared memory: as asked");
+        let has = vk::ImageCreateInfo { usage: vk::ImageUsageFlags::TRANSFER_SRC, ..base };
+        assert!(copyable_create_info(&has).is_none());
+        let colour = vk::ImageCreateInfo { format: vk::Format::R16G16B16A16_SFLOAT, ..base };
+        assert!(copyable_create_info(&colour).is_none());
+    }
     use ash::vk::Handle;
 
     fn image(raw: u64) -> vk::Image { vk::Image::from_raw(raw) }
@@ -3689,6 +3794,9 @@ mod submit_order_tests {
         let teardown = &source[source.find("unsafe fn destroy_private_resources").unwrap()..];
         let stop = teardown.find("stop_native()").expect("the network is stopped at teardown");
         assert!(stop < teardown.find("inline::destroy(").unwrap() && stop < teardown.find(".device_wait_idle()").unwrap());
+        // And the network is closed only once the device went idle.
+        let close = teardown.find("close_native()").expect("the network is closed at teardown");
+        assert!(close > teardown.find(".device_wait_idle()").unwrap());
     }
 
     /// Real (lavapipe) queue: the relay batch must consume the application's wait

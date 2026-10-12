@@ -45,7 +45,8 @@ fn encode_png(path: &Path, rgba: &[u8], width: u32, height: u32, bgr_order: bool
         return Err(std::io::Error::other("pixel data does not match the size"));
     }
     let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
-    let mut encoder = png::Encoder::new(BufWriter::new(file), width, height);
+    let mut buffered = BufWriter::new(file);
+    let mut encoder = png::Encoder::new(&mut buffered, width, height);
     // Forced fully opaque, on purpose: this is `RGBA8` straight off a real present
     // path (an opaque swapchain's own image), which is under no obligation to write a meaningful
     // alpha channel -- a real opaque-composite-mode present never reads it either. Writing the real
@@ -73,9 +74,12 @@ fn encode_png(path: &Path, rgba: &[u8], width: u32, height: u32, bgr_order: bool
     }
     let mut writer = encoder.write_header().map_err(std::io::Error::other)?;
     writer.write_image_data(&opaque).map_err(std::io::Error::other)?;
-    // `finish` writes the closing chunk and flushes the buffered file, reporting either error;
-    // dropping the writer instead would swallow both.
-    writer.finish().map_err(std::io::Error::other)
+    // `finish` writes the closing chunk; then the buffer is flushed into the file (`into_inner` reports a
+    // failed flush, which dropping the writer would swallow) and the file synced, before the caller
+    // renames it into place.
+    writer.finish().map_err(std::io::Error::other)?;
+    let file = buffered.into_inner().map_err(std::io::IntoInnerError::into_error)?;
+    file.sync_all()
 }
 
 #[cfg(test)]

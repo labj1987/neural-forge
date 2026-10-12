@@ -4,6 +4,7 @@
 #include "nf_assets.h"
 
 #include <volk.h>
+#include <vulkan/vk_layer.h>
 
 #include <algorithm>
 #include <atomic>
@@ -211,6 +212,10 @@ const ChainStruct kDeviceChain[] = {
 };
 
 size_t deviceChainSize(VkStructureType type) {
+  // The loader's own nodes, which every device create info reaching a layer carries (its layer link and
+  // device callbacks): not in the registry as extending VkDeviceCreateInfo.
+  if (type == VK_STRUCTURE_TYPE_LOADER_INSTANCE_CREATE_INFO) return sizeof(VkLayerInstanceCreateInfo);
+  if (type == VK_STRUCTURE_TYPE_LOADER_DEVICE_CREATE_INFO) return sizeof(VkLayerDeviceCreateInfo);
   for (const ChainStruct& s : kDeviceChain)
     if (s.type == type) return s.size;
   return 0;
@@ -226,15 +231,19 @@ struct Extension {
 };
 
 // The application's chain, copied node by node (shallow: what the nodes point at stays the
-// application's and is only read). Throws for a structure of unknown size.
-void* copyChain(Extension& x, const void* chain) {
+// application's and is only read), up to the first structure of a size this build does not know: that
+// one and everything after it stay linked as the application's own (`*tail`), never written.
+void* copyChain(Extension& x, const void* chain, const void** tail) {
   void* head = nullptr;
   void** link = &head;
+  *tail = nullptr;
   for (auto* s = static_cast<const VkBaseInStructure*>(chain); s; s = s->pNext) {
     const size_t size = deviceChainSize(s->sType);
-    if (!size)
-      throw std::runtime_error("the device create info chains a structure this build does not know (sType " +
-                               std::to_string(static_cast<int>(s->sType)) + "), so the network's additions are not made");
+    if (!size) {
+      *link = const_cast<VkBaseInStructure*>(s);
+      *tail = s;
+      break;
+    }
     x.nodes.emplace_back(new char[size]);
     memcpy(x.nodes.back().get(), s, size);
     auto* copy = reinterpret_cast<VkBaseOutStructure*>(x.nodes.back().get());
@@ -382,13 +391,22 @@ uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance inst
     };
     for (const char* name : kExtensions) addExtension(name);
     // Every flag is set in the copy of the chain (the application's structure's copy, or one prepended).
-    void* head = copyChain(*x, in->pNext);
+    const void* tail = nullptr;
+    void* head = copyChain(*x, in->pNext, &tail);
+    // A structure this side sets that lies in the uncopied tail could only be written in place, or
+    // given twice: refused.
+    auto copied = [&](VkStructureType type) -> VkBaseOutStructure* {
+      if (tail && find(tail, type))
+        throw std::runtime_error("the device create info chains a structure the network sets (sType " +
+                                 std::to_string(static_cast<int>(type)) + ") after one this build does not know");
+      return find(head, type);
+    };
     for (const Need& need : kNeeds) {
-      if (VkBaseOutStructure* aggregate = need.aggregate ? find(head, need.aggregate) : nullptr) {
+      if (VkBaseOutStructure* aggregate = need.aggregate ? copied(need.aggregate) : nullptr) {
         flag(aggregate, need.aggregateOffset) = VK_TRUE;
         continue;
       }
-      VkBaseOutStructure* single = find(head, need.single);   // the application's copy, or one prepended already
+      VkBaseOutStructure* single = copied(need.single);   // the application's copy, or one prepended already
       if (!single) {
         x->nodes.emplace_back(new char[need.singleSize]());
         single = reinterpret_cast<VkBaseOutStructure*>(x->nodes.back().get());
@@ -401,7 +419,7 @@ uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance inst
     }
     // Core features: in the copy of the application's VkPhysicalDeviceFeatures2, else in a copy of its
     // pEnabledFeatures.
-    if (VkBaseOutStructure* f2 = find(head, VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)) {
+    if (VkBaseOutStructure* f2 = copied(VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2)) {
       auto* features = &reinterpret_cast<VkPhysicalDeviceFeatures2*>(f2)->features;
       for (size_t offset : kCoreNeeds) flag(features, offset) = VK_TRUE;
     } else {

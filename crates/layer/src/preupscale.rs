@@ -357,6 +357,9 @@ pub(crate) const COMMANDS: &[VulkanCommand] = &[
     // Each pool's queue family: the hold inside DLSS's buffer is only recorded into a buffer of
     // DLSS's graphics family ([`inline::Inline::record`]).
     VulkanCommand::CreateCommandPool,
+    // An image `vkCreateImage` gets `TRANSFER_SRC` added to ([`wants_copyable`]) is queried with it.
+    VulkanCommand::GetDeviceImageMemoryRequirements,
+    VulkanCommand::GetDeviceImageSparseMemoryRequirements,
 ];
 
 /// What a CUDA kernel is, by the name `vkCreateCuFunctionNVX` gave it (docs/PRE_UPSCALER_DESIGN.md, "DLSS Ray
@@ -3914,7 +3917,7 @@ impl Resources {
         if reset.is_ok() && crate::note_vk(device.handle(), submit(Which::WriteBack, self.fence_cmd, self.writeback_fence)).is_ok() {
             self.writeback_pending = true;
         } else {
-            crate::log!("[preupscale] a hold's work went to the queue and no fence could be put after it: these hold resources are not used again");
+            crate::log!("[preupscale] a hold's work went to the queue and no fence could be put after it: these hold resources are left behind and built again (unless the device is lost)");
             self.unfenced = true;
         }
     }
@@ -5257,6 +5260,19 @@ impl Session {
         }
     }
 
+    /// Hold resources that a failed submit left without a fence ([`Resources::fence_submitted`]) are
+    /// let go of on a device that is not lost: leaked, not destroyed (what went to the queue may still
+    /// use them), so the next hold builds new ones and the after-the-upscaler path is not kept waiting
+    /// on them. On a lost device they stay, and nothing holds there again.
+    pub(crate) fn recover_unfenced(&mut self, device: &ash::Device) {
+        if self.res.as_ref().is_some_and(|r| r.unfenced) && !crate::device_lost(device.handle()) {
+            crate::log!("[preupscale] hold resources without a fence for their last work are left behind (leaked) and built again");
+            if let Some(old) = self.res.take() {
+                std::mem::forget(old);
+            }
+        }
+    }
+
     /// Waits for the layer's own pending work (bounded). `true` when none is left.
     pub(crate) fn drain(&mut self, device: &ash::Device) -> bool {
         let mut gpu = None;
@@ -5282,6 +5298,7 @@ impl Session {
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
         width: u32, height: u32, shm: &ShmClient, import: bool,
     ) -> bool {
+        self.recover_unfenced(device);
         // A staged set serves either way; an imported one only where imports are wanted.
         if self.res.as_ref().is_some_and(|r| r.matches(queue_family, width, height) && (import || !r.imported())) {
             return true;
@@ -5581,6 +5598,19 @@ impl Session {
     pub(crate) fn stop_native(&mut self) {
         #[cfg(target_arch = "x86_64")]
         drop(self.post_server.take());
+        #[cfg(target_arch = "x86_64")]
+        if let Some(loader) = &self.native {
+            loader.stop_worker();
+        }
+    }
+
+    /// Closes the network (the device's teardown, once every thread using it was joined and the device
+    /// went idle). What still holds the loader (the hold's resources) is dropped with it.
+    pub(crate) fn close_native(&mut self) {
+        #[cfg(target_arch = "x86_64")]
+        if let Some(res) = self.res.as_mut() {
+            res.pre_loader = None;
+        }
         drop(self.native.take());
     }
 
@@ -8570,6 +8600,28 @@ mod tests {
             }
         }
         out
+    }
+
+    /// Resources a failed submit left without a fence are let go of (leaked) on a live device, so the
+    /// next hold builds new ones and the after-the-upscaler path does not wait on them for good.
+    #[test]
+    fn unfenced_hold_resources_are_rebuilt_on_a_live_device() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let d = &gpu.device;
+        let shm = scratch_shm("unfenced");
+        let mut session = Session::default();
+        // SAFETY: a fresh device; nothing of the resources is ever submitted.
+        assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false) });
+        session.res.as_mut().unwrap().unfenced = true;
+        assert!(session.res.as_ref().unwrap().pending());
+        // SAFETY: as above.
+        assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false) }, "built again");
+        assert!(!session.res.as_ref().unwrap().pending(), "fresh resources");
+        // SAFETY: nothing submitted.
+        unsafe { session.destroy(d) };
     }
 
     fn scratch_shm(tag: &str) -> ShmClient {

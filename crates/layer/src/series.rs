@@ -119,8 +119,23 @@ struct Progress {
     held: bool,
 }
 
+/// The request id of the last capture this process started (`u64::MAX`: none): a channel this process
+/// takes back must not have its own running capture reported as ended ([`own_capture`]).
+static OWN_CAPTURE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+
+/// Whether the capture with request `id` is one this process started.
+pub(crate) fn own_capture(id: u32) -> bool {
+    OWN_CAPTURE.load(std::sync::atomic::Ordering::Acquire) == u64::from(id)
+}
+
+#[cfg(test)]
+pub(crate) fn set_own_capture(id: u32) {
+    OWN_CAPTURE.store(u64::from(id), std::sync::atomic::Ordering::Release);
+}
+
 impl Report {
     fn new(channel: Option<crate::shm::Channel>, request: Request, target: &Target, held: bool) -> Arc<Self> {
+        OWN_CAPTURE.store(u64::from(request.id), std::sync::atomic::Ordering::Release);
         let outcome = Outcome { id: request.id, state: state::RUNNING, total: request.frames, paths: target.paths(), ..Outcome::default() };
         let report = Arc::new(Self {
             channel,

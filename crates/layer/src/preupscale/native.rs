@@ -499,18 +499,27 @@ impl Loader {
     }
 }
 
-impl Drop for Loader {
-    fn drop(&mut self) {
+impl Loader {
+    /// Stops the loading thread (joined: it submits to the network's queue) and keeps the network: the
+    /// device's teardown waits for the device to go idle before the network is closed (by dropping the
+    /// loader).
+    pub(crate) fn stop_worker(&self) {
         {
             let (lock, wake) = &*self.shared;
-            lock.lock().unwrap().quit = true;
+            lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner).quit = true;
             wake.notify_all();
         }
-        if let Some(worker) = self.worker.lock().unwrap().take() {
+        if let Some(worker) = self.worker.lock().unwrap_or_else(std::sync::PoisonError::into_inner).take() {
             let _ = worker.join();
         }
-        // The network (closed here) must not be pending: the device's teardown drained the layer's work.
-        self.shared.0.lock().unwrap().network.take();
+    }
+}
+
+impl Drop for Loader {
+    fn drop(&mut self) {
+        self.stop_worker();
+        // The network (closed here) must not be pending: the device's teardown waited for its work.
+        self.shared.0.lock().unwrap_or_else(std::sync::PoisonError::into_inner).network.take();
     }
 }
 

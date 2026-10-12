@@ -585,6 +585,12 @@ impl Focus {
         }
     }
 
+    /// Whether the connection to the X server broke (it is then opened again, [`Poller::pressed`]).
+    fn broken(&self) -> bool {
+        // SAFETY: a connection of this object's, open until drop.
+        unsafe { (self.has_error)(self.conn) != 0 }
+    }
+
     /// Whether the active window is this process's: `None` when the server does not say (no active
     /// window property, a window without a PID, a broken connection).
     fn game_focused(&self) -> Option<bool> {
@@ -594,8 +600,9 @@ impl Focus {
         }
         let window = self.property(self.root, self.active, XCB_ATOM_WINDOW)?;
         if window == 0 {
-            // No X window is active: a native Wayland window (or nothing) has the focus.
-            return Some(false);
+            // No X window is active: on a desktop's Xwayland a native Wayland window (or nothing) has
+            // the focus; inside gamescope (whose nested server holds only the game) it says nothing.
+            return std::env::var_os("GAMESCOPE_WAYLAND_DISPLAY").is_none().then_some(false);
         }
         Some(self.property(window, self.pid, XCB_ATOM_CARDINAL)? == std::process::id())
     }
@@ -612,13 +619,17 @@ impl Drop for Focus {
 }
 
 /// What a press of the toggle key does, given whether the game has the focus (`None`: unknown) and
-/// whether the user asked for a global key (`NEURAL_FORGE_HOTKEY_GLOBAL=1`).
+/// whether the user asked for a global key (`NEURAL_FORGE_HOTKEY_GLOBAL=1`). Only a press known to
+/// go to another client is ignored: where the focus cannot be told (gamescope's nested Xwayland, which
+/// holds only the game; a bare X server without `_NET_ACTIVE_WINDOW`; no X server) the key acts, as it
+/// always did.
 fn press_acts(focused: Option<bool>, global: bool) -> bool {
-    match focused {
-        Some(focused) => focused || global,
-        None => global,
-    }
+    focused.is_none_or(|focused| focused || global)
 }
+
+/// How long after the X server could not be reached (or its connection broke) the focus check tries
+/// to connect again.
+const FOCUS_RETRY: Duration = Duration::from_secs(5);
 
 // ---- the poller -----------------------------------------------------------------------------
 
@@ -635,8 +646,10 @@ pub struct Poller {
     pending: u32,
     pending_key: u32,
     last_poll: Option<Instant>,
-    /// The focus check, opened with the first press (`None` inside: there is no X server to ask).
+    /// The focus check, opened with the first press (`None` inside: there is no X server to ask), and
+    /// when it was last opened (a broken or missing one is opened again after [`FOCUS_RETRY`]).
     focus: Option<Option<Focus>>,
+    focus_opened: Option<Instant>,
 }
 
 // The backends hold raw descriptors/pointers used only from the layer's serialized present hook.
@@ -644,7 +657,7 @@ unsafe impl Send for Poller {}
 
 impl Default for Poller {
     fn default() -> Self {
-        Self { backend: Backend::Unopened, pending: 0, pending_key: 0, last_poll: None, focus: None }
+        Self { backend: Backend::Unopened, pending: 0, pending_key: 0, last_poll: None, focus: None, focus_opened: None }
     }
 }
 
@@ -709,15 +722,26 @@ impl Poller {
         // Both backends see every press on the machine: the key acts only while the game has the
         // focus, or anywhere when the user asked for that.
         static GLOBAL: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| neural_forge_protocol::env::flag("NEURAL_FORGE_HOTKEY_GLOBAL"));
-        let focus = self.focus.get_or_insert_with(Focus::open);
+        let now = Instant::now();
+        // A connection that broke, or an X server that could not be reached, is tried again (not on
+        // every press: at most every FOCUS_RETRY).
+        let stale = self.focus.as_ref().is_some_and(|f| f.as_ref().is_none_or(Focus::broken));
+        if stale && self.focus_opened.is_none_or(|t| now.duration_since(t) >= FOCUS_RETRY) {
+            self.focus = None;
+        }
+        let opened = &mut self.focus_opened;
+        let focus = self.focus.get_or_insert_with(|| {
+            *opened = Some(now);
+            Focus::open()
+        });
         let focused = focus.as_ref().and_then(Focus::game_focused);
         let acts = press_acts(focused, *GLOBAL);
-        if focused.is_none() && !*GLOBAL {
+        if focused.is_none() {
             static SAID: AtomicBool = AtomicBool::new(false);
             if !SAID.swap(true, Ordering::Relaxed) {
                 crate::log!(
-                    "[hotkey] the toggle key was pressed, but whether the game has the focus cannot be told here (no X server, \
-                     or no _NET_ACTIVE_WINDOW): ignored; NEURAL_FORGE_HOTKEY_GLOBAL=1 makes it act whatever has the focus"
+                    "[hotkey] the toggle key was pressed where the game's focus cannot be told (gamescope, no X server, or no \
+                     _NET_ACTIVE_WINDOW): it acts"
                 );
             }
         }
@@ -798,7 +822,7 @@ mod tests {
         assert!(press_acts(Some(true), false));
         assert!(!press_acts(Some(false), false));
         assert!(press_acts(Some(false), true));
-        assert!(!press_acts(None, false));
+        assert!(press_acts(None, false), "unknown focus (gamescope's nested server holds only the game): acts");
         assert!(press_acts(None, true));
     }
 }

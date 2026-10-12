@@ -161,9 +161,17 @@ static SESSION_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 
 fn start_session(hdr: &neural_forge_protocol::ShmHeader) {
     let generation = crate::ownership::generation();
-    if SESSION_GENERATION.swap(generation, Ordering::AcqRel) != generation {
+    if SESSION_GENERATION.swap(generation, Ordering::AcqRel) != generation && !own_session_continues(hdr) {
         neural_forge_protocol::capture::reset_session(hdr);
     }
+}
+
+/// The lease came back to this process while its own capture still runs on the channel (nobody held it
+/// in between to start another): the same session, not reset (that would report this process's capture
+/// as ended by the game, then as written).
+fn own_session_continues(hdr: &neural_forge_protocol::ShmHeader) -> bool {
+    use neural_forge_protocol::capture;
+    capture::result(hdr).is_some_and(|o| o.state == capture::state::RUNNING && crate::series::own_capture(o.id))
 }
 
 /// The channel's header for another thread of this process (a capture's writers publishing its
@@ -867,7 +875,12 @@ impl ShmClient {
         if !self.frame_backed[slot.index()] {
             return false;
         }
-        let hdr = self.header().expect("just opened above");
+        // Normally just opened above; gone if the lease was let go in between (the mapping released):
+        // the round trip fails open, never a panic in the game.
+        let Some(hdr) = self.header() else {
+            self.dead = true;
+            return false;
+        };
         if hdr.quit.load(Ordering::Relaxed) != 0 {
             self.dead = true;
             return false;
@@ -1055,6 +1068,22 @@ fn ensure_private_parent_dir(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The lease back in the same process while its own capture runs: the session goes on (the capture
+    /// is not reported as ended); another process's running capture, or none, is a new session.
+    #[test]
+    fn a_reacquired_lease_keeps_this_processs_running_capture() {
+        use neural_forge_protocol::capture;
+        let hdr = neural_forge_protocol::ShmHeader::default();
+        hdr.init_defaults();
+        assert!(!own_session_continues(&hdr), "nothing running");
+        capture::publish(&hdr, &capture::Outcome { id: 4242, state: capture::state::RUNNING, total: 3, ..Default::default() });
+        assert!(!own_session_continues(&hdr), "another process's capture");
+        crate::series::set_own_capture(4242);
+        assert!(own_session_continues(&hdr), "this process's own");
+        capture::publish(&hdr, &capture::Outcome { id: 4242, state: capture::state::WRITTEN, total: 3, ..Default::default() });
+        assert!(!own_session_continues(&hdr), "finished: a new session");
+    }
     use neural_forge_protocol::ShmHeader;
     use std::os::unix::fs::PermissionsExt;
     use std::sync::atomic::AtomicU64;

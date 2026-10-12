@@ -53,9 +53,9 @@ fixes across the model before the upscaler, the app and its diagnosis.
   network, instead of having its device created wrongly; the game's own device settings are no longer
   modified.
 - Less stutter in DLSS games with the effect after the upscaler.
-- The toggle key now acts only while the game's window has the focus, so typing the key in another
-  window no longer switches the model. Inside gamescope, where the focus cannot be known, it is off
-  unless you set `NEURAL_FORGE_HOTKEY_GLOBAL=1` in the game's launch options.
+- The toggle key no longer switches the model while another window has the focus, so typing the key
+  there does nothing (set `NEURAL_FORGE_HOTKEY_GLOBAL=1` in the game's launch options to have it act
+  anyway). Inside gamescope, which shows only the game, it works as before.
 - The toggle key can no longer close the game when the X server connection drops, and setting it to
   none really disables it. A full `/tmp` no longer crashes the game: frames simply go through untouched.
 - Debug view 2 shows the model's own answer again when the model runs below the frame's size, and the
