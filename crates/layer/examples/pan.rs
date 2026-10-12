@@ -20,7 +20,7 @@
 //! ```
 //!
 //! `--capture-at FRAME` asks the Neural Forge layer in this process for a frame series
-//! (`capture_request = --capture-frames`, see `crates/layer/src/series.rs`) right before frame
+//! (a capture request for `--capture-frames` frames, see `crates/layer/src/series.rs`) right before frame
 //! FRAME is presented, through the same shared memory the layer opens (`NEURAL_FORGE_SHM`, else
 //! the default path). The layer takes the request on that very present when it is engaged by
 //! then, so every run captures the same frames; pan prints the frame the series really started
@@ -88,7 +88,7 @@ fn parse_args() -> Args {
             "--frames" => a.frames = value.parse().unwrap_or_else(|_| bad()),
             "--save" => a.save = Some(value.into()),
             "--capture-at" => a.capture_at = Some(value.parse().unwrap_or_else(|_| bad())),
-            "--capture-frames" => a.capture_frames = value.parse::<u32>().ok().filter(|&n| n > 1).unwrap_or_else(|| bad()),
+            "--capture-frames" => a.capture_frames = value.parse::<u32>().ok().filter(|&n| n > 1 && n <= neural_forge_protocol::capture::MAX_FRAMES).unwrap_or_else(|| bad()),
             "--present-mode" => {
                 a.present_mode = match value.as_str() {
                     "fifo" => vk::PresentModeKHR::FIFO,
@@ -310,7 +310,11 @@ fn render_frame(out: &mut [u32], tex: &[u32], width: usize, height: usize, frame
             });
         }
     });
-    stamp(out, width, frame as u32);
+    // The stamp needs its corner: a window resized below it (or a tiled one) gets no stamp rather
+    // than writes past the frame.
+    if width >= STAMP_WIDTH as usize && height >= 2 * BLOCK as usize {
+        stamp(out, width, frame as u32);
+    }
 }
 
 /// Writes the frame stamp (see the module doc comment) into the top-left corner.
@@ -638,16 +642,43 @@ impl Gpu {
         matches!(self.format.format, vk::Format::B8G8R8A8_UNORM | vk::Format::B8G8R8A8_SRGB)
     }
 
-    fn create_swapchain(&self, width: u32, height: u32, old: vk::SwapchainKHR) -> Swapchain {
+    /// The extent a swapchain for this surface gets now: the window's own size when the platform
+    /// says it (0x0 while the window is minimised: no swapchain can be made then), else the
+    /// requested size within the surface's limits.
+    fn surface_extent(&self, width: u32, height: u32) -> vk::Extent2D {
         let caps = check(unsafe { self.surface_fn.get_physical_device_surface_capabilities(self.physical_device, self.surface) }, "surface caps");
-        let extent = if caps.current_extent.width != u32::MAX {
+        Self::extent_of(&caps, width, height)
+    }
+
+    fn extent_of(caps: &vk::SurfaceCapabilitiesKHR, width: u32, height: u32) -> vk::Extent2D {
+        if caps.current_extent.width != u32::MAX {
             caps.current_extent
         } else {
             vk::Extent2D {
                 width: width.clamp(caps.min_image_extent.width, caps.max_image_extent.width),
                 height: height.clamp(caps.min_image_extent.height, caps.max_image_extent.height),
             }
-        };
+        }
+    }
+
+    /// Waits (bounded only by the window being closed) until the window has a size a swapchain can
+    /// be made at: a minimised window's extent is 0x0.
+    fn wait_for_extent(&self, width: u32, height: u32, xcb: &Xcb) -> bool {
+        loop {
+            let e = self.surface_extent(width, height);
+            if e.width > 0 && e.height > 0 {
+                return true;
+            }
+            if xcb.quit_requested() {
+                return false;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    fn create_swapchain(&self, width: u32, height: u32, old: vk::SwapchainKHR) -> Swapchain {
+        let caps = check(unsafe { self.surface_fn.get_physical_device_surface_capabilities(self.physical_device, self.surface) }, "surface caps");
+        let extent = Self::extent_of(&caps, width, height);
         if !caps.supported_usage_flags.contains(vk::ImageUsageFlags::TRANSFER_DST) {
             eprintln!("pan: the surface does not allow TRANSFER_DST swapchain images");
             std::process::exit(1);
@@ -785,6 +816,9 @@ fn main() {
     let tex = build_texture(args.contrast, gpu.bgr());
     eprintln!("pan: texture {TW}x{TH} built in {:.0?}", t.elapsed());
 
+    if !gpu.wait_for_extent(args.width, args.height, &xcb) {
+        return;
+    }
     let mut swapchain = gpu.create_swapchain(args.width, args.height, vk::SwapchainKHR::null());
     let mut staging_bytes = u64::from(swapchain.extent.width) * u64::from(swapchain.extent.height) * 4;
     let mut staging: Vec<Staging> = (0..FRAMES_IN_FLIGHT).map(|_| gpu.create_staging(staging_bytes)).collect();
@@ -797,12 +831,15 @@ fn main() {
     let mut recreate = false;
     // The layer's shared memory, opened only for `--capture-at`; `Some` while the request
     // is outstanding.
-    let mut capture: Option<neural_forge_protocol::mapping::Mapping> = None;
+    let mut capture: Option<(neural_forge_protocol::mapping::Mapping, u32)> = None;
     while args.frames == 0 || frame < args.frames {
         if xcb.quit_requested() {
             break;
         }
         if recreate {
+            if !gpu.wait_for_extent(args.width, args.height, &xcb) {
+                break;
+            }
             check(unsafe { d.device_wait_idle() }, "vkDeviceWaitIdle");
             let old = swapchain;
             swapchain = gpu.create_swapchain(args.width, args.height, old.handle);
@@ -852,9 +889,13 @@ fn main() {
         if args.capture_at == Some(frame) {
             match neural_forge_protocol::mapping::open() {
                 Ok(mapping) => {
-                    mapping.header().capture_request.store(args.capture_frames, std::sync::atomic::Ordering::Relaxed);
-                    eprintln!("pan: requested a {}-frame capture at frame {frame}", args.capture_frames);
-                    capture = Some(mapping);
+                    match neural_forge_protocol::capture::request(mapping.header(), args.capture_frames) {
+                        Ok(id) => {
+                            eprintln!("pan: requested a {}-frame capture (id {id}) at frame {frame}", args.capture_frames);
+                            capture = Some((mapping, id));
+                        }
+                        Err(e) => eprintln!("pan: the capture request was refused: {e}"),
+                    }
                 }
                 Err(e) => eprintln!("pan: cannot open the layer's shared memory for --capture-at: {e}"),
             }
@@ -864,7 +905,7 @@ fn main() {
             .swapchains(std::slice::from_ref(&swapchain.handle))
             .image_indices(std::slice::from_ref(&image_index));
         let presented = unsafe { gpu.swapchain_fn.queue_present(gpu.queue, &present) };
-        if capture.as_ref().is_some_and(|m| m.header().capture_request.load(std::sync::atomic::Ordering::Relaxed) == 0) {
+        if capture.as_ref().is_some_and(|(m, id)| neural_forge_protocol::capture::pending(m.header()).is_none_or(|r| r.id != *id)) {
             eprintln!("pan: the layer took the capture request on frame {frame}: the series is frames {frame}..{}", frame + u64::from(args.capture_frames) - 1);
             capture = None;
         }

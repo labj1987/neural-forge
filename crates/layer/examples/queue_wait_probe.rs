@@ -89,9 +89,13 @@ fn main() {
                 parked_time.as_secs_f64() * 1e3,
                 p.map(|_| "ok")
             );
-            if r.is_err() {
-                // It may finish once released.
-                let _ = device.wait_for_fences(&[fence], true, 5_000_000_000);
+            // It may finish once released.
+            let finished = r.is_ok() || device.wait_for_fences(&[fence], true, 5_000_000_000).is_ok();
+            if !(finished && p.is_ok()) {
+                // Work still pending: the parked buffer cannot be submitted again (it is not
+                // SIMULTANEOUS_USE) nor anything it uses freed. Nothing more can be measured.
+                eprintln!("{name}: the GPU work did not finish; stopping the probe");
+                std::process::exit(1);
             }
             device.destroy_fence(park_fence, None);
             device.destroy_fence(fence, None);
