@@ -1732,6 +1732,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let Some(next_create) = self.next_create_swapchain_khr else {
             return LayerResult::Unhandled;
         };
+        if crate::layer_enabled() && !crate::ownership::eligible()
+            && swapchain::is_plausible_game_size(create_info.image_extent.width, create_info.image_extent.height)
+        {
+            crate::ownership::note_excluded_swapchain(create_info.image_extent.width, create_info.image_extent.height);
+        }
         let eligible = crate::layer_enabled() && self.nvidia && crate::ownership::eligible()
             && swapchain::is_supported_format(create_info.image_format)
             && create_info.image_extent.width <= neural_forge_protocol::MAX_W
@@ -3027,6 +3032,10 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // the GPU, possibly on another queue): a hold's write-back that still reads it
                     // must be finished first. Normally long done; bounded either way.
                     preupscale.recover_unfenced(&self.device);
+                    if preupscale.post_held_off() {
+                        // Left-behind hold work may still read slot 0: this frame goes on untouched.
+                        break;
+                    }
                     if preupscale.res.as_ref().is_some_and(crate::preupscale::Resources::pending) {
                         let mut gpu = None;
                         let drained = preupscale.res.as_mut().is_some_and(|r| r.wait_idle(&self.device, &mut gpu));

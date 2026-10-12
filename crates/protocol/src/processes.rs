@@ -45,9 +45,42 @@ pub fn never_the_game(name: &str) -> bool {
     !compact.is_empty() && (NAMES.contains(&compact.as_str()) || PREFIXES.iter().any(|prefix| compact.starts_with(prefix)))
 }
 
+/// Executables a game folder ships that are not the game: redistributable installers, anti-cheat
+/// services and crash reporters (matched on the lowercase name), and every process of [`never_the_game`].
+pub fn game_helper(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    never_the_game(&n)
+        || ["setup", "redist", "prereq", "unins", "installer", "dotnet", "crashreport", "crashhandler", "crashpad", "crs-", "beservice", "easyanticheat", "start_protected_game", "bugsplat", "vcredist", "cefsubprocess", "webhelper"]
+            .iter()
+            .any(|part| n.contains(part))
+}
+
+/// Names of programs that start the game rather than being it: store and publisher launchers,
+/// bootstrappers, updaters and patchers (`Bethesda.net_Launcher.exe`, `ffxivboot64.exe`).
+pub fn launcher_like(name: &str) -> bool {
+    let n = name.to_ascii_lowercase();
+    never_the_game(&n)
+        || ["launcher", "updater", "patcher"].iter().any(|p| n.contains(p))
+        || n.ends_with("boot.exe")
+        || n.ends_with("boot64.exe")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launchers_and_helpers_are_told_from_games() {
+        for name in ["Bethesda.net_Launcher.exe", "REDprelauncher.exe", "ffxivlauncher64.exe", "ffxivboot64.exe", "BethesdaNetUpdater.exe"] {
+            assert!(launcher_like(name), "{name}");
+        }
+        for name in ["CrashReportClient.exe", "vc_redist.x64.exe", "UnrealCEFSubProcess.exe", "start_protected_game.exe"] {
+            assert!(game_helper(name), "{name}");
+        }
+        for name in ["eso64.exe", "ffxiv_dx11.exe", "GTA5_Enhanced.exe", "Cyberpunk2077.exe"] {
+            assert!(!launcher_like(name) && !game_helper(name), "{name}");
+        }
+    }
 
     #[test]
     fn names_are_matched_without_case_spaces_dashes_or_underscores() {

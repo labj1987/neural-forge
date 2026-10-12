@@ -46,9 +46,9 @@ pub const NATIVE_RECOVERED: &str = "native-recovered";
 /// and the breadcrumb trail.
 pub const FENCE_TIMEOUT: &str = "fence-timeout";
 
-/// A process `NEURAL_FORGE_TARGET_EXE` leaves out made a Vulkan device (at most once per process);
-/// the event's process is its executable, the message names the target. A game whose executable
-/// the target misses shows up here.
+/// A process `NEURAL_FORGE_TARGET_EXE` leaves out, and that is no known launcher or helper, made a
+/// game-sized swapchain (at most once per process); the event's process is its executable, the
+/// message names the size and the target. A game whose executable the target misses shows up here.
 pub const TARGET_EXCLUDED: &str = "target-excluded";
 
 pub const KINDS: [&str; 8] = [ATTACH, DUPLICATE, DEVICE_LOST, NATIVE_UNAVAILABLE, NATIVE_FAILED, NATIVE_RECOVERED, FENCE_TIMEOUT, TARGET_EXCLUDED];

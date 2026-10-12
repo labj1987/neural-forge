@@ -577,9 +577,17 @@ impl ShmHeader {
         for (name, bits) in settings {
             all &= self.apply_persisted_setting(name, *bits);
         }
-        self.tuning_seq.store(odd.wrapping_add(1).max(2), Ordering::Release);
+        // Only if this writer still owns the section: one taken over as dead while it was merely slow
+        // must not move the sequence back under the writer that took over (that one finishes it).
+        self.finish_settings_write(odd);
         self.control_seq.fetch_add(1, Ordering::Relaxed);
         all
+    }
+
+    /// Ends the write section entered at `odd`, only if this writer still owns it: one taken over as
+    /// dead while it was merely slow must not move the sequence back under the writer that took over.
+    fn finish_settings_write(&self, odd: u32) {
+        let _ = self.tuning_seq.compare_exchange(odd, odd.wrapping_add(1).max(2), Ordering::Release, Ordering::Relaxed);
     }
 
     /// Whether this mapping is one of ours and laid out the way this build expects.
@@ -1038,6 +1046,20 @@ mod tests {
         assert!(h.write_settings(&[("intensity", 0.75f32.to_bits())]));
         assert_eq!(h.tuning_seq.load(Ordering::Relaxed), dead + 3);
         assert_eq!(h.global_tuning().intensity, 0.75);
+    }
+
+    #[test]
+    fn a_writer_taken_over_does_not_move_the_sequence_back() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        // A slow writer holds 5; another found it dead and took over with 7, then finished at 8.
+        h.tuning_seq.store(8, Ordering::Relaxed);
+        // The slow writer finishing now must leave 8 alone (its own end would be 6).
+        h.finish_settings_write(5);
+        assert_eq!(h.tuning_seq.load(Ordering::Relaxed), 8);
+        // And a write started after it still works from 8.
+        assert!(h.write_settings(&[("intensity", 1.5f32.to_bits())]));
+        assert_eq!(h.tuning_seq.load(Ordering::Relaxed), 10);
     }
 
     #[test]

@@ -546,6 +546,15 @@ unsafe fn call_next_create_device(
 ) -> vk::Result {
     if let Some(link) = link {
         link.restore();
+        // A request built from a copy of the application's chain (the native backend's,
+        // `neural_forge_native::device_extend`) carries its own copy of the link node, holding the
+        // `pLayerInfo` of the moment it was copied: after an attempt the layer below advanced, that
+        // is the wrong one. The copy's node gets the framework's link too.
+        // SAFETY: the request's chain is valid and its link node (the application's or the copy)
+        // writable for this call.
+        if let Some(copy) = unsafe { DeviceLink::find(info) }.filter(|copy| copy.node != link.node) {
+            unsafe { (*copy.node).layer_info = link.info };
+        }
     }
     // SAFETY: forwarded from this function's contract.
     unsafe { next(physical_device, info, allocator, p_device.as_mut_ptr()) }
@@ -1144,6 +1153,36 @@ mod device_link_tests {
             assert_eq!(seen.len(), 6);
             assert!(seen.iter().all(|&l| l == original), "an attempt saw an advanced link: {seen:?} (original {original:?})");
         });
+    }
+
+    /// A request built from a copy of the chain (as the native backend's is), copied after an
+    /// attempt that the layer below advanced the original for, still reaches it with the original link.
+    #[test]
+    fn a_copied_chain_made_after_a_refused_attempt_sees_the_original_link() {
+        let mut lower = VkLayerDeviceLink { pNext: std::ptr::null_mut(), pfnNextGetInstanceProcAddr: gipa, pfnNextGetDeviceProcAddr: gdpa };
+        let mut below = VkLayerDeviceLink { pNext: &mut lower, pfnNextGetInstanceProcAddr: gipa, pfnNextGetDeviceProcAddr: gdpa };
+        let original: *mut VkLayerDeviceLink = &mut below;
+        let mut node = LoaderDeviceCreateInfo { s_type: LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::null(), function: LAYER_LINK_INFO, layer_info: original };
+        let info = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut node).cast(), ..Default::default() };
+        // SAFETY: the chain above.
+        let link = unsafe { DeviceLink::find(&info) }.unwrap();
+        SEEN.with_borrow_mut(Vec::clear);
+        REFUSE.set(1);
+        let mut p_device = std::mem::MaybeUninit::uninit();
+        // The first attempt, on the application's chain, is refused after the layer below advanced it.
+        // SAFETY: the fake layer below; the request and link above.
+        let first = unsafe { call_next_create_device(next_layer, Some(&link), vk::PhysicalDevice::null(), &info, std::ptr::null(), &mut p_device) };
+        assert_eq!(first, vk::Result::ERROR_FEATURE_NOT_PRESENT);
+        // The retry copies the chain now, link node and its advanced `pLayerInfo` included.
+        // SAFETY: the node above, written by the layer below through the request.
+        let advanced = unsafe { (*link.node).layer_info };
+        let mut copied = LoaderDeviceCreateInfo { s_type: LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::null(), function: LAYER_LINK_INFO, layer_info: advanced };
+        assert_ne!(copied.layer_info, original, "the layer below advanced the application's node");
+        let retry = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut copied).cast(), ..Default::default() };
+        // SAFETY: as above, with the copied chain.
+        let second = unsafe { call_next_create_device(next_layer, Some(&link), vk::PhysicalDevice::null(), &retry, std::ptr::null(), &mut p_device) };
+        assert_eq!(second, vk::Result::SUCCESS);
+        SEEN.with_borrow(|seen| assert_eq!(seen.as_slice(), [original, original], "an attempt saw an advanced link"));
     }
 
     /// In a process the layer is off in (`NEURAL_FORGE_ENABLE` is unset in tests), the hook hands the

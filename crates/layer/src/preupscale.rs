@@ -5016,6 +5016,9 @@ pub(crate) struct Session {
     /// Launch-bearing submits a due dump waited for the depth and motion-vector layouts.
     dump_waits: u32,
     said: HashSet<&'static str>,
+    /// Until when the after-the-upscaler path keeps off slot 0: hold resources were left behind
+    /// without a fence ([`Self::recover_unfenced`]), and their write-back may still read it.
+    post_held_off_until: Option<Instant>,
     /// The last launch-bearing submit with DLSS's inputs identified (held or not).
     last_dlss: Option<Instant>,
     /// A model-mode hold on this device ran the network: the pre-upscaler path works here, so the
@@ -5270,7 +5273,17 @@ impl Session {
             if let Some(old) = self.res.take() {
                 std::mem::forget(old);
             }
+            // What they went to the queue with may still read slot 0, which the after-the-upscaler
+            // path writes: it keeps off as long as any wait of the layer's is bounded (on the native
+            // path the network's loader holds it off the same way, `Loader::pre_unfenced`).
+            self.post_held_off_until = Some(Instant::now() + crate::FENCE_WAIT_TIMEOUT);
         }
+    }
+
+    /// Whether the after-the-upscaler path must leave slot 0 alone this present (see
+    /// [`Self::recover_unfenced`]).
+    pub(crate) fn post_held_off(&self) -> bool {
+        self.post_held_off_until.is_some_and(|until| Instant::now() < until)
     }
 
     /// Waits for the layer's own pending work (bounded). `true` when none is left.

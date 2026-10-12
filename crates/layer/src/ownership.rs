@@ -53,20 +53,27 @@ static ELIGIBLE: LazyLock<bool> = LazyLock::new(|| {
     let (args, exe) = this_process();
     let target = neural_forge_protocol::env::var("NEURAL_FORGE_TARGET_EXE");
     let ok = allowed(&args, &exe, target.as_deref());
-    if !ok {
-        crate::log!("[ownership] process excluded from NeuralForge session");
-        // Asked when the process makes its Vulkan device, so once per process. A name the target
-        // leaves out that is not a known launcher or helper may be the game itself: the state log
-        // says so, and `doctor` turns it into the fix (the executable to target).
-        let name = judged_name(&args, &exe);
-        if let Some(target) = target.filter(|_| !neural_forge_protocol::processes::never_the_game(&name)) {
-            crate::event!(neural_forge_protocol::state_log::TARGET_EXCLUDED, "NEURAL_FORGE_TARGET_EXE={target} leaves out {name}");
-        }
-    }
+    if !ok { crate::log!("[ownership] process excluded from NeuralForge session"); }
     ok
 });
 
 pub fn eligible() -> bool { *ELIGIBLE }
+
+/// A process the layer is enabled in but the target excludes made a game-sized swapchain: it is
+/// showing a picture, and unless it is a launcher or helper (`processes::launcher_like`,
+/// `processes::game_helper`) it may be the game the target missed. The state log says so once per
+/// process, and `doctor` turns it into the fix (the executable to target).
+pub fn note_excluded_swapchain(width: u32, height: u32) {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    let Some(target) = neural_forge_protocol::env::var("NEURAL_FORGE_TARGET_EXE") else { return };
+    let name = process_name();
+    if eligible() || name.is_empty() || neural_forge_protocol::processes::launcher_like(name) || neural_forge_protocol::processes::game_helper(name) {
+        return;
+    }
+    if !SAID.swap(true, Ordering::Relaxed) {
+        crate::event!(neural_forge_protocol::state_log::TARGET_EXCLUDED, "{width}x{height} swapchain; NEURAL_FORGE_TARGET_EXE={target} leaves out {name}");
+    }
+}
 
 /// This process's executable name as the target filter sees it (the Windows `.exe` for a Proton
 /// game), for the GUI's "Game" row.
