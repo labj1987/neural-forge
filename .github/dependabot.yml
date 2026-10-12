@@ -18,6 +18,14 @@ updates:
     # only fail the minor group, never the patch one. Major updates each get their own pull request.
     allow:
       - dependency-type: all
+    # ash 0.38 drops the builder API the layer and the native crate use throughout, and the layer
+    # framework (vk-layer-for-rust) is built on ash 0.37: moving needs a port of every Vulkan call site
+    # and a framework that has moved too, not a version bump. Only its 0.37 patch releases come here.
+    ignore:
+      - dependency-name: ash
+        update-types:
+          - version-update:semver-major
+          - version-update:semver-minor
     groups:
       cargo-patch:
         patterns:
