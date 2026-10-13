@@ -115,6 +115,10 @@ void nf_native_fall_back_to_barriers(NfNative* n);
 // caller treats the network as dead for this device.
 uint32_t nf_native_stalled(const NfNative* n);
 
+// GPU bytes of the weights: the records' raw buffers as loaded and now (after the first build only the scale
+// vectors the kernels read through them), and the matrices built from the records.
+void nf_native_weight_bytes(const NfNative* n, uint64_t* raw_loaded, uint64_t* raw, uint64_t* matrices);
+
 // Destroys everything this side made. Nothing of it may be pending.
 void nf_native_close(NfNative* n);
 

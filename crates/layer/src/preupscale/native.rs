@@ -369,13 +369,16 @@ impl Loader {
             let t = Instant::now();
             let vram_before = vram.as_ref().map(crate::vram::reading);
             let mut open_stalled = false;
+            let mut opened = None;
             let mut switched = false;
             let result = match network.take() {
                 Some(n) => Ok(n),
-                None => Self::open(device, setup).map_err(|e| {
-                    open_stalled = e.stalled;
-                    e.message
-                }),
+                None => Self::open(device, setup)
+                    .inspect(|_| opened = Some((t.elapsed(), vram.as_ref().map(crate::vram::reading))))
+                    .map_err(|e| {
+                        open_stalled = e.stalled;
+                        e.message
+                    }),
             }
             .and_then(|mut n| {
                 // The switch to barriers drops the chained graph; the build below records the new one
@@ -420,6 +423,18 @@ impl Loader {
             let mut lines = Vec::new();
             state = lock.lock().unwrap();
             state.opened = true;
+            if let (Some((took, after)), Ok((n, _))) = (opened, &result) {
+                let weights = n.weight_bytes();
+                lines.push(format!(
+                    "[native] model loaded in {} ms{}: {} MiB of weight records on the GPU",
+                    took.as_millis(),
+                    match (vram_before, after) {
+                        (Some((before, _)), Some((after, budget))) => format!(" (vram {before} -> {after} of {budget} MiB)"),
+                        _ => String::new(),
+                    },
+                    weights.raw_loaded >> 20
+                ));
+            }
             match result {
                 Ok((n, built)) => {
                     if let Some((w, h, frame)) = built {
@@ -436,6 +451,13 @@ impl Loader {
                                 (Some((before, _)), Some((after, budget))) => format!(" (vram {before} -> {after} of {budget} MiB)"),
                                 _ => String::new(),
                             }
+                        ));
+                        let weights = n.weight_bytes();
+                        lines.push(format!(
+                            "[native] weights on the GPU: {} MiB of matrices, {} KiB of scale vectors (the records were {} MiB as loaded)",
+                            weights.matrices >> 20,
+                            weights.raw >> 10,
+                            weights.raw_loaded >> 20
                         ));
                         retry.succeeded();
                         if let Some(streak) = retry.take_recovered() {

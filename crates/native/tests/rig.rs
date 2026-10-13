@@ -6,7 +6,9 @@
 //! Runs only with `NEURAL_FORGE_NATIVE_RIG=<dump dir>` (holding `features.f32` and `head.f32` of a
 //! 1486x836 frame); `NEURAL_FORGE_NATIVE_MODEL` overrides the model directory (default: the user data
 //! dir's `neural-forge/model`). The same variable runs the rebuild test (a small build, then a large one
-//! on the same network), the fallback to barriers and the device-creation test.
+//! on the same network), the fallback to barriers and the device-creation test. With
+//! `NEURAL_FORGE_NATIVE_HEADS=<dir>` too, the heads at every size the layer builds are compared with a
+//! saved run there (or saved, the first time): run once on a known-good build, then on the change.
 //!
 //! One network per process at a time (`nf_native_open` refuses a second): the tests take [`ONE`] so
 //! the harness's threads run them one after another.
@@ -188,6 +190,7 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
     // SAFETY: nothing of a previous build exists.
     let frame = unsafe { net.build(WIDTH, HEIGHT) }.expect("build");
     eprintln!("open {:?}, build {:?}, frame {frame:?}", opened, t.elapsed() - opened);
+    eprintln!("weights on the GPU: {:?}", net.weight_bytes());
     assert_eq!((frame.field_width, frame.field_height), (1536, 896));
     assert_eq!(features.len() as u64, u64::from(frame.field_width) * u64::from(frame.field_height) * 64);
     let head_bytes = u64::from(frame.field_width) * u64::from(frame.field_height) * 16;
@@ -311,6 +314,108 @@ fn the_fallback_to_barriers_builds_once_without_chaining() {
         g.device.destroy_device(None);
         g.instance.destroy_instance(None);
     }
+}
+
+/// The head at every size the layer builds, on one network in the order the layer builds them (the
+/// output size for the after-the-upscaler path first, then render sizes), with the dump's features
+/// tiled over each field. With `NEURAL_FORGE_NATIVE_HEADS=<dir>` each head is compared byte for byte
+/// with `head-<W>x<H>.f32` there, or written there when that file does not exist yet: the check that a
+/// change to how the network is built (not what it computes) leaves every output byte as it was.
+#[test]
+fn the_heads_at_the_layers_sizes_match_a_saved_run() {
+    let _one = one_at_a_time();
+    let (Some(dump), Some(heads)) =
+        (std::env::var_os("NEURAL_FORGE_NATIVE_RIG").map(PathBuf::from), std::env::var_os("NEURAL_FORGE_NATIVE_HEADS").map(PathBuf::from))
+    else {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG or NEURAL_FORGE_NATIVE_HEADS unset: skipped");
+        return;
+    };
+    let model = model_dir();
+    let source = std::fs::read(dump.join("features.f32")).unwrap();
+    let (source_width, source_height) = (1536usize, 896usize);
+    assert_eq!(source.len(), source_width * source_height * 64);
+    let g = gpu();
+    let open = OpenInfo {
+        gipa: g._entry.static_fn().get_instance_proc_addr,
+        instance: g.instance.handle(),
+        physical: g.physical,
+        device: g.device.handle(),
+        queue_family: g.compute,
+        queue_index: 0,
+        frame_family: g.family,
+        model_dir: &model,
+        chain: std::env::var("NEURAL_FORGE_NATIVE_CHAIN").map_or(true, |v| v != "0"),
+        fence_timeout_ms: 5000,
+        init_dispatchable: None,
+    };
+    // SAFETY: the device was made with device_extend; the compute queue is the network's alone.
+    let mut net = unsafe { Network::open(&open) }.expect("open");
+    let d = &g.device;
+    let mut mismatches = Vec::new();
+    for (width, height) in [(2560, 1440), (1486, 836), (3840, 2160), (2228, 1253)] {
+        // SAFETY: the previous size's frame completed (waited on) before this build.
+        let frame = unsafe { net.build(width, height) }.expect("build");
+        let (fw, fh) = (frame.field_width as usize, frame.field_height as usize);
+        let mut features = vec![0u8; fw * fh * 64];
+        for y in 0..fh {
+            for x in 0..fw {
+                let from = ((y % source_height) * source_width + (x % source_width)) * 64;
+                features[(y * fw + x) * 64..][..64].copy_from_slice(&source[from..from + 64]);
+            }
+        }
+        let head_bytes = (fw * fh * 16) as u64;
+        let (up, up_mem, up_ptr) = g.host_buffer(features.len() as u64, vk::BufferUsageFlags::TRANSFER_SRC);
+        let (down, down_mem, down_ptr) = g.host_buffer(head_bytes, vk::BufferUsageFlags::TRANSFER_DST);
+        // SAFETY: live device and handles; the frame completes before anything is destroyed.
+        let got = unsafe {
+            std::ptr::copy_nonoverlapping(features.as_ptr(), up_ptr, features.len());
+            let queue = d.get_device_queue(g.family, 0);
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.family), None).unwrap();
+            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            d.cmd_copy_buffer(cmd, up, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: features.len() as u64 }]);
+            let to_compute = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute.build()], &[], &[]);
+            d.cmd_execute_commands(cmd, &[net.graph_commands()]);
+            let to_copy = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_copy.build()], &[], &[]);
+            d.cmd_copy_buffer(cmd, frame.head, down, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: head_bytes }]);
+            d.end_command_buffer(cmd).unwrap();
+            d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+            d.wait_for_fences(&[fence], true, 5_000_000_000).expect("the graph completes");
+            let got = std::slice::from_raw_parts(down_ptr, head_bytes as usize).to_vec();
+            d.destroy_fence(fence, None);
+            d.destroy_command_pool(pool, None);
+            for (b, m) in [(up, up_mem), (down, down_mem)] {
+                d.destroy_buffer(b, None);
+                d.free_memory(m, None);
+            }
+            got
+        };
+        assert_eq!(net.chain_timeouts().0, 0);
+        let saved = heads.join(format!("head-{width}x{height}.f32"));
+        match std::fs::read(&saved) {
+            Ok(expected) => {
+                let differing = got.as_chunks::<4>().0.iter().zip(expected.as_chunks::<4>().0.iter()).filter(|(a, b)| a != b).count();
+                eprintln!("{width}x{height} (field {fw}x{fh}, chained {}): {differing} of {} head values differ from {}", frame.chained, got.len() / 4, saved.display());
+                if differing != 0 || expected.len() != got.len() {
+                    mismatches.push(format!("{width}x{height}"));
+                }
+            }
+            Err(_) => {
+                std::fs::write(&saved, &got).unwrap();
+                eprintln!("{width}x{height} (field {fw}x{fh}): written to {}", saved.display());
+            }
+        }
+    }
+    drop(net);
+    // SAFETY: nothing of the network is left.
+    unsafe {
+        d.destroy_device(None);
+        g.instance.destroy_instance(None);
+    }
+    assert!(mismatches.is_empty(), "heads differ at {mismatches:?}");
 }
 
 /// `device_extend` only reads the application's create info: its own feature structure keeps its flags,

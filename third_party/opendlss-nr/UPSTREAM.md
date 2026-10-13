@@ -77,3 +77,15 @@ Each one is a patch in `patches/`, relative to the source's root (`patch -p1`), 
    once, leaking what they own; `Context`'s also when its own last wait for its queue is the one that timed out. Before, a timeout threw and the owners' destructors then freed buffers the
    timed-out submit could still be using. neural-forge-native reports the flag (`nf_native_stalled`) and the
    layer stops using the network on that device.
+8. `patches/0008-compact-aux.patch`: every tensor record was uploaded whole as its `raw` buffer, but the kernels read only
+   its scale vectors through it (the per-channel f16 skip and blend scales, the per-head f32 attention scales); its
+   matrices and attention priors are read from the re-laid buffers that `fp8Matrix`, `fp8MatrixPermuted`, `f16Matrix` and
+   `relativeBias` build from the host copy. So the packed weights were on the GPU twice. Those four now mark the record
+   bytes they read, and `Model::compactAux()` replaces each `raw` with only the unmarked bytes, every run of them kept at
+   its offset's alignment modulo 16. `Tensor::auxOffset` maps a record offset to the compacted buffer; every kernel entry
+   point that reads `raw` (`gemmFp8`, `fusedBlock32`, `expertFfnPtx`, `postBlend`, `upsampleResidual`, `qkvAttention`,
+   `windowNormalize`, `globalNormalize`, `globalNormalizePtx`, `globalAttention`) passes its offsets through it, and it
+   throws for a read that overlaps a matrix's bytes. Until `compactAux` runs the mapping is the identity.
+   neural-forge-native calls it after the warm-up run of a network's first build, when every matrix exists and nothing
+   recorded with the whole records can still run. Measured: the records' 140.8 MiB on the GPU become 98 KiB, and the
+   network's output is bit-identical (every size the layer builds, chained and not, the GLSL routes too).

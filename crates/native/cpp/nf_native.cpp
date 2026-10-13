@@ -270,6 +270,7 @@ struct NfNative {
   VkCommandPool ownPool = VK_NULL_HANDLE;
   VkCommandBuffer ownSecondary = VK_NULL_HANDLE;
   float blendScale = 1.0f;
+  uint64_t rawLoaded = 0;
   uint64_t fenceTimeoutNs = 5'000'000'000ull;
 
   bool stalled() const { return context && context->stalled(); }
@@ -309,6 +310,9 @@ struct NfNative {
     context->endAndSubmit(warm, true);
     const nr::Kernels::ChainTimeouts timeouts = kernels->chainTimeouts();
     if (timeouts.waits) throw std::runtime_error("the warm-up run's counter chain timed out at " + timeouts.counter);
+    // The warm-up built every matrix the graph uses and has completed: the records' raw buffers now keep only the
+    // bytes the kernels read through them (OpenDLSS-NR patch 0008). The recordings below use those.
+    model->compactAux();
     // The frame recordings (one per queue family they run on): descriptor pool 1 stays reserved for them.
     context->resetDescriptorPool(1);
     secondary = recordSecondary(secondaryPool);
@@ -480,6 +484,7 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
                                                open->queue_index, n->fenceTimeoutNs, open->init_dispatchable, open->init_user,
                                                open->frame_family);
     n->model = std::make_unique<nr::Model>(*n->context, open->model_dir, true);
+    n->rawLoaded = n->model->rawBytes();
     n->kernels = std::make_unique<nr::Kernels>(*n->context, std::string());
     n->kernels->setSiluTable(ref::siluTable());
     VkCommandPoolCreateInfo pool{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
@@ -535,6 +540,12 @@ uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame) {
 }
 
 uint32_t nf_native_stalled(const NfNative* n) { return n->stalled() ? 1 : 0; }
+
+void nf_native_weight_bytes(const NfNative* n, uint64_t* raw_loaded, uint64_t* raw, uint64_t* matrices) {
+  *raw_loaded = n->rawLoaded;
+  *raw = n->model->rawBytes();
+  *matrices = n->model->matrixBytes();
+}
 
 VkCommandBuffer nf_native_graph_commands(const NfNative* n) { return n->secondary; }
 

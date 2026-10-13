@@ -54,6 +54,7 @@ mod ffi {
         pub fn nf_native_reset_chain_timeouts(n: *mut c_void);
         pub fn nf_native_fall_back_to_barriers(n: *mut c_void);
         pub fn nf_native_stalled(n: *const c_void) -> u32;
+        pub fn nf_native_weight_bytes(n: *const c_void, raw_loaded: *mut u64, raw: *mut u64, matrices: *mut u64);
         pub fn nf_native_close(n: *mut c_void);
     }
 }
@@ -157,6 +158,14 @@ pub struct Frame {
     /// `block70.layer0.blend_scale`, clamped to [0, 1].
     pub blend_scale: f32,
     pub chained: u32,
+}
+
+/// [`Network::weight_bytes`].
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WeightBytes {
+    pub raw_loaded: u64,
+    pub raw: u64,
+    pub matrices: u64,
 }
 
 /// Where the network runs.
@@ -288,6 +297,15 @@ impl Network {
     pub fn stalled(&self) -> bool {
         // SAFETY: `raw` is live.
         unsafe { ffi::nf_native_stalled(self.raw) != 0 }
+    }
+
+    /// GPU bytes of the weights: the records' raw buffers as loaded and now (after the first build only
+    /// the scale vectors the kernels read through them), and the matrices built from the records.
+    pub fn weight_bytes(&self) -> WeightBytes {
+        let mut w = WeightBytes::default();
+        // SAFETY: `raw` is live; the out-pointers are to locals.
+        unsafe { ffi::nf_native_weight_bytes(self.raw, &mut w.raw_loaded, &mut w.raw, &mut w.matrices) };
+        w
     }
 
     /// Counter waits that gave up since the last reset (no allocation: for every frame's check).
