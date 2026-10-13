@@ -998,7 +998,9 @@ of 12.2 GB in every 4K run (GTA fills what is free). The cache's buffers were 14
   364 bytes a field texel) is at the edge of the card whatever the cache does, and which side of it a
   run lands on decides the result, not the interval. Frame generation also did not engage in three
   of the later runs (1.0x), which the gate has to repeat. Left open: the network's own VRAM (its
-  activations, or a memory priority so the driver does not starve it), not the cache's.
+  activations, or a memory priority so the driver does not starve it), not the cache's. (The
+  weights' second copy on the GPU is gone since 3.4.1: "The network's weights were on the GPU twice",
+  below.)
 - **The network's rebuild returns its memory.** Every run first builds the network at the output
   size for the after-the-upscaler path (the menus, before any DLSS frame), then at the render size
   for the hold. `VK_EXT_memory_budget`, now on the `[native] network built` lines: at 1440p the
@@ -1008,6 +1010,41 @@ of 12.2 GB in every 4K run (GTA fills what is free). The cache's buffers were 14
   read while GTA was at its budget (9.9 GB) and allocating; the 1440p match says it is GTA filling
   what was freed, not memory kept. The post path's build is not skippable: DLSS appears only once
   the benchmark starts, after the menus the after-the-upscaler path serves.
+
+## October 13: the network's weights were on the GPU twice (3.4.1)
+
+Idea from lmxxf's dlss5-on-amd-9070xt-porting 0.42 by Kien (MIT), which freed 216 MiB of held weight
+capacity on AMD by compacting its own FP8 weight buffers (a different layout, the same principle). No code
+was taken from it.
+
+- **The duplicate.** OpenDLSS-NR's `nr::Model` uploaded each of the 153 tensor records whole as its `raw`
+  buffer. The kernels read their matrices and attention priors only from the buffers that `fp8Matrix`,
+  `fp8MatrixPermuted`, `f16Matrix` and `relativeBias` re-lay from the host copy; through `raw` they read
+  only the scale vectors (per-channel f16 skip and blend scales, per-head f32 attention scales). A map of
+  every read through `raw` (each `Kernels` entry point, the PTX generators and the GLSL shaders) found no
+  matrix read there. Measured (the rig, `Network::weight_bytes`): the records take 147,683,904 bytes
+  (140.8 MiB) on the GPU, the kernels need 100,160 of them (98 KiB), and the matrices take 145.7 MiB. So
+  140.7 MiB were dead: about half of the "294 MiB of weights" above.
+- **The design.** The matrix builders mark the record bytes they read; `Model::compactAux()` (patch 0008)
+  replaces each `raw` with only the unmarked runs, each kept at its offset's alignment modulo 16, and
+  `Tensor::auxOffset` maps a record offset to the compacted one at every kernel entry point that reads
+  `raw` (it throws for a read overlapping a matrix's bytes, so a missed read fails loudly instead of
+  reading garbage). The matrices are built while the first graph records, after that graph already
+  holds `raw`'s address, so the compaction cannot happen at load: neural-forge-native runs it after the
+  first build's warm-up, which already re-records the graph for the frames. Marking with a per-byte map
+  lookup made the build 4.7 s instead of 0.37; one lookup per matrix gives 0.55 s (the 153 small uploads).
+- **Bit-exact.** The heads against v3.4.0's at all four sizes the layer builds (1486x836, 2228x1253,
+  2560x1440, 3840x2160; the rig test `the_heads_at_the_layers_sizes_match_a_saved_run`, the dump's
+  features tiled over each field), with counter chaining on and off and with every PTX route off (the
+  GLSL kernels): 0 values differ. The dump test is bit-exact too. An in-game capture comparison was not
+  made: GTA's benchmark does not give the same frame at the same index from run to run.
+- **In game (GTA V Enhanced, 1440p DLSS Balanced, frame generation 4x as set).** Opening and building
+  the network adds 1536 MiB, against 1674 before (138 MiB less; the model load itself adds 148 MiB of
+  which 140 are the records, compacted at the build). Real fps 56.3 / 58.4 / 56.9 against 56.5 / 56.8,
+  the network at 6.56-6.67 ms against 6.57-6.59: unchanged. At 4K with frame generation 4x one of two
+  runs of the patched build still collapsed with `ctxBufPoolReserve ... Out of memory` (3.2 real fps),
+  so 140 MiB does not move GTA at 4K off the card's limit. 4K is no longer tested on the 12 GB test
+  machine (AGENTS.md).
 
 ## Deliberately not done, or left open
 

@@ -4,6 +4,12 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.4.1 — 2026-10-13
+
+- The model uses about 140 MB less video memory: it no longer keeps a second, unused copy of its
+  weights on the graphics card. Measured in GTA V Enhanced at 1440p, loading and building the model
+  takes 1536 MB instead of 1674 MB. The picture is exactly the same, and the frame rate is unchanged.
+
 ## 3.4.0 — 2026-10-12
 
 Neural Forge now always knows which program is your game, captures show exactly what you saw, and

@@ -4,7 +4,9 @@ Repository: https://github.com/labj1987/neural-forge
 
 Read [docs/PHASE1.md](docs/PHASE1.md) for the current namespace, installation contract and
 target-ownership rules. Benchmarks run with `scripts/gta-bench.sh`
-([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)); the old Phase 1 plan is in
+([docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md)) at 2560x1440, 288 Hz, VRR (the desktop's HDR as
+it is set; HDR in the game only when asked for), the only configuration games are tested in: never at 4K, which the test machine's 12 GB card cannot hold steadily (GTA with frame
+generation collapses at its memory limit); the old Phase 1 plan is in
 [docs/history/phase1-benchmark-plan.md](docs/history/phase1-benchmark-plan.md). The former app name was dlssnr; upstream DLSS5VKLayer remains a
 separate application and must not be modified or uninstalled by this project.
 
