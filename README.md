@@ -3,8 +3,8 @@
 Neural Forge runs NVIDIA's DLSS 5 Neural Rendering model (the network in `nvngx_dlssnr.dll`, NGX
 "Feature 18") in Linux and Proton games. A Vulkan implicit layer inside the game runs the network
 itself, on the game's GPU, with [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR)'s
-implementation of it, and writes the model's answer back into the game's picture. Since 3.0 there is
-no Windows helper, no Wine prefix and no runner: NVIDIA's DLL is needed once, to extract the model's
+implementation of it, and writes the model's answer back into the game's picture. There is no
+Windows helper, no Wine prefix and no runner: NVIDIA's DLL is needed once, to extract the model's
 weights from it. It is written in Rust, with a GTK4/libadwaita settings app and a CLI. It started
 as a from-scratch rebuild of [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer)'s
 architecture and now adapts some of its source (AGPL-3.0); [ATTRIBUTION.md](ATTRIBUTION.md) says
@@ -17,36 +17,40 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab: the Neural rendering switch, style, strength presets, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present from build 310.8.0.0, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: layer state, the Model placement line, the model, the settings reset and profiles, and the Diagnosis group with Diagnose and Save report](screenshots/status.png) |
+| ![Model tab: the Neural rendering switch, style, strength presets, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present (the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: layer state, the Model placement line, the model, the settings reset and profiles, and the Diagnosis group with Diagnose and Save report](screenshots/status.png) |
 
-The screenshots show 3.4.1 with default settings and no game running.
+The screenshots show default settings with no game running.
 
 ### In games
 
-The same moment with the effect on (left) and off (right), toggled in game. GTA V Enhanced on 3.0.0,
-2026-10-07: RTX 5070 at 2560x1440, DLSS Balanced, DLSS Frame Generation 4x, ray tracing on, the
-model before the upscaler. The fps counter in the top-left corner is MangoHud, counting
-frame-generated frames. Each pair was taken a few seconds apart, so the camera and traffic moved a
-little.
+The same moment with the effect on (left) and off (right), toggled in game: GTA V Enhanced, RTX 5070
+at 2560x1440, DLSS Balanced, DLSS Frame Generation 4x, ray tracing on, the full network before the
+upscaler. The fps counter in the top-left corner is MangoHud, counting frame-generated frames. Each
+pair was taken a few seconds apart, so the camera and traffic moved a little.
 
 A shop front: 201 fps shown with the effect, 305 without.
 
-![GTA V Enhanced on 3.0.0, a shop front, Neural Forge on and off](screenshots/gta-v-3.0-shop.jpg)
+![GTA V Enhanced, a shop front, Neural Forge on and off](screenshots/gta-v-3.0-shop.jpg)
 
 A parking lot: 192 fps shown with the effect, 233 without.
 
-![GTA V Enhanced on 3.0.0, a parking lot, Neural Forge on and off](screenshots/gta-v-3.0-parking.jpg)
+![GTA V Enhanced, a parking lot, Neural Forge on and off](screenshots/gta-v-3.0-parking.jpg)
 
 A residential street: 215 fps shown with the effect, 276 without.
 
-![GTA V Enhanced on 3.0.0, a residential street, Neural Forge on and off](screenshots/gta-v-3.0-street.jpg)
+![GTA V Enhanced, a residential street, Neural Forge on and off](screenshots/gta-v-3.0-street.jpg)
 
 ## How it works
 
 The network runs inside the game's process, in the Vulkan layer, on the game's GPU. NVIDIA's DLL is
 not loaded at run time: the layer reads the model's weights from the folder `extract-model` wrote
-(see [Install](#install)). The network's answer for an input frame is bit-exact with NGX's own
-([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), 0.6).
+(see [Install](#install)). Two networks come in NVIDIA's DLL, and you choose one:
+
+- **Full** (71 blocks), in every build of the DLL. Its answer for an input frame is bit-exact with
+  NGX's own ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), 0.6).
+- **Small** (31 blocks, the same kinds of blocks with fewer of each), in build 310.9.16. It
+  takes about half the GPU time and changes the picture a little less. It has not been compared with
+  NVIDIA's runtime.
 
 The model runs in one of two places. The layer picks the place for each game by itself:
 
@@ -62,13 +66,12 @@ The model runs in one of two places. The layer picks the place for each game by 
   input is the noisy ray-traced frame before its denoising, which is not a frame the model can
   improve. Switching Ray Reconstruction on or off in a game moves the model within a few frames.
 - **After the upscaler**, for everything else: native resolution, games without DLSS, and
-  devices without NVIDIA's `VK_NVX_image_view_handle`. This is the 1.x path: the finished 8-bit
+  devices without NVIDIA's `VK_NVX_image_view_handle`. The finished 8-bit
   frame is captured at present, answered by the network and composited back onto the same frame
   before it is shown. It has no history (no motion vectors there).
 
 The game's own **DLSS Frame Generation** works with the model before the upscaler. Generated
-frames are built from enhanced frames, and the model runs once per real frame. NVIDIA Smooth
-Motion is no longer needed or set up by the app.
+frames are built from enhanced frames, and the model runs once per real frame.
 
 `NEURAL_FORGE_PREUPSCALE=off` in the launch options switches back to the after-the-upscaler path
 everywhere. Use it to compare the two, or to roll back if something looks wrong.
@@ -77,87 +80,39 @@ How it works, step by step: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Measured results
 
-### 3.3.0 against 3.2.0
+GTA V Enhanced's built-in benchmark on the test machine: RTX 5070 (12 GB), 2560x1440, DLSS Balanced,
+DLSS Frame Generation 4x, ray tracing on, script mods off, one run each, pass 4 (about 117 s). Real
+fps is the game's own frames; shown fps counts the generated ones too. Measured 2026-10-16.
 
-GTA V Enhanced's built-in benchmark, RTX 5070 (12 GB), driver 615.78.08, DLSS Balanced, ray tracing on, script mods
-off, one run each (real fps over the benchmark's passes 1-3; shown fps with frame generation). 3.3.0 runs the network
-before the upscaler on every second frame in motion and on every frame while the camera is still (the edit cache).
-Details: [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-10-11). 4K with frame generation 4x sits
-at the 12 GB card's video-memory limit with the model on, in 3.2.0 as in 3.3.0: how much the network slows down
-there changes from run to run, so its numbers are not a comparison.
+| Model | Real fps | Shown fps | Network time per frame | Weights in video memory |
+|---|---|---|---|---|
+| Off (Neural Forge not loaded) | 76.8 | 309.0 | - | - |
+| Full network | 56.8 | 228.1 | 16.0 ms | 140 MB |
+| Small network | 63.7 | 256.2 | 9.95 ms | 108 MB |
 
-3.4.0 did not change the frame path. 3.4.1 drops a second, unused copy of the model's weights on the GPU: in GTA V
-Enhanced at 1440p with frame generation 4x, loading and building the network takes 1536 MiB of video memory instead
-of 1674, the output is bit-identical, and the frame rate is unchanged (56.3 to 58.4 real fps against 56.5 and 56.8;
-[docs/LESSONS.md](docs/LESSONS.md)). Since 3.4.1 games are tested and benchmarked at 2560x1440 only: 4K on the 12 GB
-test card sits at its memory limit with the model on, and the 140 MiB saved does not move it off.
-
-| Configuration | Model off | 3.2.0 | 3.3.0 |
-|---|---|---|---|
-| 1440p, frame generation off | 112.6 fps | 71.5 fps | **81.3 fps** |
-| 1440p, frame generation 4x | 77.7 real / 310.8 shown | 49.5 real / 197.9 shown | **55.7 real / 222.7 shown** |
-| 4K, frame generation off | 88.1 fps | 39.9 fps | **44.4 fps** |
-| 4K, frame generation 4x | 51.8 real / 207.1 shown | 3.8 to 35.2 real, run to run | 22.2 real / 88.6 shown (one run) |
-
-### 3.1.0, 3.0 and 2.0.10 (NVIDIA's runtime through the helper)
-
-Same machine for all three. Machine: RTX 5070 (12 GB), NVIDIA driver 615.78.08, desktop 2560x1440 at
-288 Hz with HDR on. GTA V is its built-in benchmark, pass 4 (116 s), DLSS Balanced, script mods off;
-the others are one run each through the same launch, 60 s measured, settings as found (frame
-generation on wherever the game has it). 3.1.0 was measured on 2026-10-08. Sources:
-[docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md) (Phase 3, Phase 4b) and [CHANGELOG.md](CHANGELOG.md).
-
-| Game | 3.1.0 | 3.0 | 2.0.10 |
-|---|---|---|---|
-| GTA V Enhanced, frame generation 4x | **50.2 real / 201.4 shown** | 49.7 real / 199.5 shown | 50.1 real / 200.4 shown |
-| GTA V Enhanced, frame generation off | 71.6 fps | 71.4 fps (70.9, 71.8) | 69.7 fps (69.8, 69.8, 69.5) |
-| Crimson Desert, in game (held inside DLSS's buffer, Ray Reconstruction, frame generation) | **150.9 fps** shown | 148.5 fps shown | 146.3 fps shown |
-| GTA San Andreas - The Definitive Edition, in game | 87.0 frames/s held | 87.6 frames/s held | 77.1 frames/s held |
-| Marvel's Spider-Man Remastered (menu) | 119.7 fps shown | 120 fps shown | 109 fps shown |
-| Shadow Warrior 3 (menu) | 115.4 fps shown | 115.7 fps shown | 99.3 fps shown |
-| God of War (2018), in game | 37.6 fps | 27-30 fps | 27.5 fps |
-
-Crimson Desert since 3.1.4 (2026-10-09, one run each, same save): with Ray Reconstruction on, as in
-the table, the model runs after the upscaler: 67.7 fps shown. With Ray Reconstruction off, the model
-runs before the upscaler on every real frame: 29.0 real frames held per second, 173.8 fps shown.
-
-3.1.0 did not change the frame path, and its numbers are within run-to-run spread of 3.0's (about
-3 fps in GTA V), except God of War: one run, in a different spot from 3.0's, so it is not yet a
-demonstrated gain. At 4K (not a configuration the test machine plays) the network is probably slower
-than NVIDIA's runtime: one run with 3.0, 21.9 fps, likely VRAM-bound. The after-the-upscaler path is
-about 12% slower than NVIDIA's runtime was there.
+The network's time per frame on its own (`dlss5vk bench`, 1707x960, the DLSS input of GTA V at DLSS
+Quality): full 7.03 ms, small 3.81 ms. In the game it also waits for the game's own GPU work. Games
+are tested at 2560x1440 only (see [Known issues](#known-issues) for 4K). Details and the record of
+every measurement: [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) and
+[docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md).
 
 ## Tested games
 
-Each game was run with 3.1.0 on the test machine (RTX 5070, 2560x1440, Proton) with its own settings
-as found: DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. One run
-each, 60 s measured, 2026-10-08 (Hogwarts Legacy with 3.1.4, 2026-10-09). In every game the model
-ran before the upscaler on every real frame, with no missed frames and no GPU fault, except where
-Ray Reconstruction moves it after the upscaler. With 3.3.0's edit cache, GTA San Andreas DE, Crimson
-Desert and Hogwarts Legacy were play-checked again (attached, effect shown, toggle key off and on, no
-missed frame, fence timeout or GPU fault). All testing is at 2560x1440. Numbers are in [Measured results](#measured-results) above;
-the full record of earlier versions is in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
+Each game was run on the test machine (RTX 5070, 2560x1440, Proton) with its own settings as found:
+DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. In each one the model
+ran with no missed frames and no GPU fault.
 
-| Game | Engine, API | DLSS used | Where measured | 3.1.0 |
-|---|---|---|---|---|
-| GTA V Enhanced (built-in benchmark) | RAGE, DX12 | Super Resolution, Frame Generation 4x | Benchmark pass 4 | 50.2 real / 201.4 fps shown |
-| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | In game, held inside DLSS's buffer (since 3.1.4 after the upscaler with Ray Reconstruction on, see above) | 150.9 fps shown |
-| GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | In game | 87.0 frames/s held |
-| God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | In game | 37.6 fps |
-| Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Menu | 119.7 fps shown |
-| Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Menu | 115.4 fps shown |
-| Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | In game, held inside DLSS's buffer | 56.3 real / 117.7 fps shown (without frame generation: 70.7 fps, 164.9 with NR off) |
-| Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Character select, held inside DLSS's buffer (3.1.2) | 68.7 real / 139.0 fps shown |
-| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction | In game (3.1.4) | about 64 fps shown with Ray Reconstruction on (the model after the upscaler); with it off the model runs before the upscaler, with the model's history since 3.1.5 |
-
-The two Unreal Engine 5 games ran without the GPU fault the Black Myth: Wukong Benchmark Tool showed
-with 3.0 ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), Phase 4b): Lords of the Fallen in game
-with frame generation on, Remnant II at its character select screen with frame generation on. Before
-3.1.2 Remnant II ran the model after the upscaler (77.8 fps shown there), because its DLSS input
-alternates between two images. The network costs about 8 ms per real frame at
-DLSS Balanced's 1488x836 input; in a game this light without it (Lords of the Fallen, 164.9 fps with
-NR off) that is more than half the frame rate, which frame generation largely hides. Cyberpunk 2077, Resident Evil Requiem and the Wukong tool are no longer installed on the test
-machine and were last tested with 2.0.8.
+| Game | Engine, API | DLSS used | Where the model runs |
+|---|---|---|---|
+| GTA V Enhanced | RAGE, DX12 | Super Resolution, Frame Generation 4x | Before the upscaler |
+| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | After the upscaler with Ray Reconstruction on; before it, inside DLSS's buffer, with it off |
+| GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | Before the upscaler |
+| God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | Before the upscaler |
+| Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Before the upscaler |
+| Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Before the upscaler |
+| Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | Before the upscaler, inside DLSS's buffer |
+| Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler, inside DLSS's buffer |
+| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction | After the upscaler with Ray Reconstruction on; before it with it off |
 
 Setup notes for these games:
 
@@ -189,9 +144,7 @@ Setup notes for these games:
 - GTK 4.12 or newer and libadwaita 1.5 or newer, from the system. The AppImage uses the host's
   GTK and libadwaita. Release builds are made on Ubuntu 24.04 (GTK 4.14, libadwaita 1.5).
 - NVIDIA's own Neural Rendering DLL (`nvngx_dlssnr.dll`), once, to extract the model's weights
-  from. Build 310.8.0 is the verified build: its output was compared bit for bit with NVIDIA's
-  runtime. Another build that carries the same network is accepted and flagged as not verified.
-  Build 310.9.16 also carries a small network (below), which is never verified.
+  from: any build that carries the full network, and build 310.9.16 for the small one.
   This project does not and cannot ship the DLL or the weights.
 - For the model before the upscaler: a game that uses DLSS through Vulkan (under Proton, a DX12 game
   through vkd3d-proton and DXVK-NVAPI).
@@ -224,25 +177,21 @@ NVIDIA's SDK), with the Setup tab's **Extract from DLL** button or with:
 neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll
 ```
 
-The weights are written to `~/.local/share/neural-forge/model` (about 141 MB), with hashes the
-layer checks when it loads them. The DLL is not needed after that. Restart the game afterwards.
-
-**The small network.** Build 310.9.16 of the DLL carries a second, smaller network next to the full
-one: 31 blocks instead of 71, the same kinds of blocks with fewer of each. It takes about half the
-GPU time (3.8 ms instead of 7.0 ms per frame at GTA V's DLSS input, 1707x960, on an RTX 5070) and
-changes the picture a little less than the full network. Choose it in the Setup tab's **Network** row
-(which re-extracts from the imported DLL), or with:
+That writes the full network. For the small one, pick **Small** in the Setup tab's **Network** row
+(it re-extracts from the imported DLL), or run:
 
 ```bash
 neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll --network small
 ```
 
-It is never marked verified: it has not been compared with NVIDIA's runtime. Like the full network it
-uses FP8 tensor cores, so it needs the same GPU (RTX 40-series or newer).
+The weights are written to `~/.local/share/neural-forge/model` (141 MB full, 114 MB small), with
+hashes the layer checks when it loads them. The DLL is not needed after that. Restart the game
+afterwards.
 
-Build 310.8.0 is the verified build. Any other build is accepted when it carries the same network
-(the same tensors, each the same size), and the Setup tab and `extract-model` mark it "not verified
-against NVIDIA's runtime". A DLL with a different network is refused with a report of what differs.
+Build 310.8.0's full network is the verified one: its output was compared bit for bit with NVIDIA's
+runtime. Other builds with the same network, and the small network of any build, are marked "not
+verified against NVIDIA's runtime". A DLL with a network Neural Forge does not implement is refused
+with a report of what differs.
 
 Nothing needs root: everything lives under `~/.config/neural-forge`, `~/.local/share/neural-forge`,
 `~/.local/state/neural-forge` and `/tmp/neural-forge-$UID/`. An upstream DLSS5VKLayer install can
@@ -276,20 +225,9 @@ stay; Neural Forge does not touch its files.
 4. Start the game. The layer waits until the game has rendered steadily for 5 seconds, and stays
    out of the way on loading screens.
 
-**HDR output (optional).** Under Proton-GE with Wine's Wayland driver:
-
-```text
-PROTON_ENABLE_WAYLAND=1 PROTON_ENABLE_HDR=1 NEURAL_FORGE_ENABLE=1 %command%
-```
-
-The game's own HDR setting must be on as well. The model before the upscaler works on DLSS's
-input, so the output format does not matter to it. The after-the-upscaler path does not process
-HDR (10-bit PQ or 16-bit float) swapchains: those frames are presented untouched.
-
 **The toggle key (F11 by default)** switches the model off and on in both paths. The layer reads
 the keyboard through evdev, which needs your user in the `input` group; without it, it falls back
-to XInput2 raw keys on an X11/XWayland display. Under Wine's Wayland driver the game is not an X11
-client, so use evdev:
+to XInput2 raw keys on an X11/XWayland display:
 
 ```bash
 sudo usermod -aG input "$USER"
@@ -315,7 +253,7 @@ this version re-creates the shared memory.
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another, and the launch option to copy by hand for a game you pick. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), the network (Full or Small), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another, and the launch option to copy by hand for a game you pick. |
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and
@@ -334,30 +272,27 @@ takes is withdrawn after 5 seconds.
 
 - **GTA V Enhanced sometimes crashes during "Game Init".** It is an access violation at
   `GTA5_Enhanced.exe+0x12c6eb`, in the game itself, and not Neural Forge's: the test machine has
-  32 crash dumps at that address, 11 of them with 1.0.1 and others from before Neural Forge
-  existed. Relaunching works ([docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md), "2.0.0").
+  crash dumps at that address from before Neural Forge existed. Relaunching works
+  ([docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md)).
 - **Each DLSS game needs a test run before it is claimed:** engines hand DLSS its inputs in
   different ways, and several broke an assumption the first time. See [Tested games](#tested-games).
 - **The game's DLSS Frame Generation does not always switch on.** In the benchmark runs the game
   generated frames in some launches and not in others with the same settings, with or without
   Neural Forge. The fps counter shows which happened.
-- **4K is not tested any more, and is probably slower than NVIDIA's runtime was** (one run with
-  3.0, 21.9 fps in GTA V at 4K DLSS Balanced, likely VRAM: the network needs about 1.5 GB at that
-  size, about 140 MB less since 3.4.1). On a 12 GB card, 4K with frame generation and the model on
-  sits at the memory limit and its frame rate changes from run to run. A network build that fails is
-  retried on a schedule, and frames go to DLSS untouched meanwhile.
+- **4K is not tested.** The network needs about 1.5 GB of video memory at that size, and on a 12 GB
+  card 4K with frame generation and the model on sits at the memory limit: its frame rate changes
+  from run to run. A network build that fails is retried on a schedule, and frames go to DLSS
+  untouched meanwhile.
 - **Unreal Engine 5 games are only partly tested.** Lords of the Fallen ran in game with frame
   generation, and Remnant II at its character select screen with frame generation, with no GPU fault
-  in those measurements. One Remnant II launch of seven hit `Xid 32` and froze as the model started
-  after the upscaler with frame generation running, on a build that did not yet hold it before the
-  upscaler; the two runs since 3.1.2 holds it there had none. The cause is not known. The Black Myth: Wukong Benchmark Tool faulted the GPU
+  in those measurements. The Black Myth: Wukong Benchmark Tool faulted the GPU
   intermittently (`Xid 13` then `Xid 32`) in the first frames with frame generation on, and its
   motion vectors cannot be copied, so the network runs there without history.
 - **NVIDIA `Xid 109` (`CTX_SWITCH_TIMEOUT`) or `Xid 119` GPU hangs.** This is a widely reported
   NVIDIA Linux driver bug under Proton, also seen in games with no DLSS or neural rendering at all
   ([nvidia forums thread 283722](https://forums.developer.nvidia.com/t/xid109-ctx-switch-timeout-driver-crashes-in-many-applications/283722),
   [NVIDIA/open-gpu-kernel-modules#1097](https://github.com/NVIDIA/open-gpu-kernel-modules/issues/1097)).
-  Versions before 0.1.61 had a real bug that could cause it; update first. Check `journalctl -k`
+  Check `journalctl -k`
   for an `Xid` line before blaming Neural Forge.
   [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-09-16) has the diagnosis and the
   workarounds other users report.
@@ -374,11 +309,11 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_ENABLE=1` | layer (manifest) | Turns the layer on for this game. |
 | `NEURAL_FORGE_DISABLE=1` | layer (manifest) | Forces it off, overriding `ENABLE`. |
 | `NEURAL_FORGE_TARGET_EXE=a.exe,b.exe` | layer | Only these executables (case-insensitive basenames) may use the layer, even one whose name is on the built-in list of launchers and helpers (a game whose executable is `Launcher.exe`). Switching a game on sets it to the game's own executables. Without it, the first process not on that list to present steadily takes the layer. |
-| `NEURAL_FORGE_PREUPSCALE=off` | layer | Never run the model before the upscaler: the 1.x path everywhere. Unset (or `model`) is the default. An unknown value is logged and treated as `off`. |
+| `NEURAL_FORGE_PREUPSCALE=off` | layer | Never run the model before the upscaler: the after-the-upscaler path everywhere. Unset (or `model`) is the default. An unknown value is logged and treated as `off`. |
 | `NEURAL_FORGE_PREUPSCALE=dump\|identity\|roundtrip` | layer | Diagnostics: write DLSS's input to `captures/`, hold without the model (raw copy back), or run the HDR encode and decode with no model. See [docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md). |
-| `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves), with none of the cache at all: 3.2.0's hold exactly (the game's depth is neither made copyable nor copied). For A/B comparisons, benchmarks and rollback; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
+| `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves), with none of the cache at all (the game's depth is neither made copyable nor copied). For A/B comparisons, benchmarks and rollback; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
 | `NEURAL_FORGE_PREUPSCALE_PAPER_WHITE=3` | layer | The HDR encode's paper white (default 3; a positive number up to 1000). Tuning only. |
-| `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: the old pipelined present. Higher frame rate, but answers land on later frames and ghost. |
+| `NEURAL_FORGE_PIPELINED=1` | layer | After the upscaler: a pipelined present. Higher frame rate, but answers land on later frames and ghost. |
 | `NEURAL_FORGE_TOGGLE_KEY=F10` | layer | Toggle key by name (`F1`-`F12`, `Home`, `N`...) or Linux key code; overrides the GUI's. |
 | `NEURAL_FORGE_HOTKEY_BACKEND=evdev\|x11` | layer | Forces one keyboard backend (default: evdev, then XInput2). |
 | `NEURAL_FORGE_HOTKEY_GLOBAL=1` | layer | The toggle key acts even when another window has the focus. By default a press is ignored only while another window is known to have the focus; where that cannot be told (inside gamescope) the key acts. |
@@ -418,7 +353,7 @@ folder and user name are replaced in it.
   frames after DLSS starts, and the model then works on the full output-size frame, so it costs more
   than with DLSS Quality or Balanced.
 - **Something looks wrong.** Add `NEURAL_FORGE_PREUPSCALE=off` to the launch options to compare
-  with the 1.x path, and remove it again afterwards. F11 switches the model off and on in either.
+  with the after-the-upscaler path, and remove it again afterwards. F11 switches the model off and on in either.
 - **F11 does nothing.** Add yourself to the `input` group (see [Usage](#usage)). The layer log
   (`NEURAL_FORGE_LOG`) has a `[hotkey]` line saying which backend it uses.
 - **The model does not run.** The Status tab's Model placement line, or Diagnose, gives the reason:
@@ -431,16 +366,13 @@ folder and user name are replaced in it.
   does not, add `PRESSURE_VESSEL_FILESYSTEMS_RW=/tmp/neural-forge-$UID` to the launch options.
 - **Steam overlay problems.** The layer leaves the overlay's own small swapchain alone, and only the
   executables in `NEURAL_FORGE_TARGET_EXE` (which switching a game on sets) can use Neural Forge.
-- **A game switched on before 3.4.0** has no target executable in its launch options, so a launcher
-  could take the effect: switch it off and on again in the Setup tab, or run `neural-forge-cli
-  enable GAME` (the doctor lists such games).
 - **32-bit games** are not supported (see [Requirements](#requirements)).
 
 ### CLI
 
 `neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
 `enable GAME [--target-exe EXE[,EXE...]|auto]`, `disable GAME`, `config`, `import-binaries DIR`,
-`extract-model DIR`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`, and
+`extract-model DIR [--network full|small]`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`, and
 `shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset`
 for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
 `neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
@@ -499,28 +431,26 @@ in [docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md).
 
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md): the layer, the shared-memory channel and both
   frame paths, step by step.
-- [docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md): how the network came into the layer, with the
-  measurements against NVIDIA's runtime.
+- [docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md): how the network runs in the layer, the two
+  networks, and the measurements against NVIDIA's runtime.
 - [docs/LESSONS.md](docs/LESSONS.md): what was tried, what worked, what didn't, and why.
 - [docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md): how to build, deploy, benchmark,
   probe and read the logs.
 
 ## Legal
 
-Since 3.0 Neural Forge does not load or run NVIDIA's DLL, and it contains no workaround for NGX's
-caller check (versions up to 2.0.10 spoofed it in their Windows helper; that code is gone).
-`extract-model` reads the model's weights out of the resource data of your own copy of
+Neural Forge does not load or run NVIDIA's DLL, and it contains no workaround for NGX's caller
+check. `extract-model` reads the model's weights out of the resource data of your own copy of
 `nvngx_dlssnr.dll`: no code is read, nothing is decrypted, no check is bypassed. The weights are
 NVIDIA's; they are not distributed here, and running them outside NVIDIA's runtime may be restricted
 by NVIDIA's NGX licence, depending on jurisdiction and how you use it. There's no licence grant
 here for NVIDIA's model and none implied. Use it at your own legal risk, for personal,
 non-commercial use.
 
-Since 2026-09-17 this project directly reads and adapts source from
+This project reads and adapts source from
 [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) (AGPL-3.0); see
-[ATTRIBUTION.md](ATTRIBUTION.md) for what is taken and from where. Earlier versions of the
-composition pipeline were clean-room (no GPL/AGPL code read or ported); that boundary no longer
-holds. Upstream's license is AGPL-3.0, which is why this project's license is AGPL-3.0-or-later as
+[ATTRIBUTION.md](ATTRIBUTION.md) for what is taken and from where. Upstream's license is AGPL-3.0,
+which is why this project's license is AGPL-3.0-or-later as
 well: a requirement for the adapted code, not just a preference.
 
 ## License
@@ -538,8 +468,9 @@ MIT licence; its source is fetched at a pinned commit and patched at build time
 - [DLSS5VKLayer](https://github.com/bmitch87/DLSS5VKLayer) (bmitch87): the architecture, the
   composition strategy and many ported functions ([ATTRIBUTION.md](ATTRIBUTION.md)).
 - [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (maan): the network implementation the
-  layer runs since 3.0 (fetched at a pinned commit with this project's patches, `third_party/opendlss-nr`, and built by `crates/native`), and earlier the history reset rule and the
-  documented proxy encode used before the upscaler.
+  layer runs (fetched at a pinned commit with this project's patches, `third_party/opendlss-nr`, and
+  built by `crates/native`), the history reset rule, and the documented proxy encode the HDR encode
+  before the upscaler follows.
 - [OptiScaler](https://github.com/cdozdil/OptiScaler) and
   [OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR): the idea of running the model
   before the upscaler and of reading the game's exposure (design only).

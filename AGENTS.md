@@ -72,6 +72,16 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   (`third_party/opendlss-nr/UPSTREAM.md`) moves to a new network. `VERIFIED_BUILDS` only marks builds compared with
   NVIDIA's runtime; it gates nothing.
 
+## README
+
+- The README describes the newest release only: what it does, how to install and use it, its
+  current measurements and known issues, all in the present tense. No version history ("since 3.0",
+  "3.4.1 drops ...", tables comparing releases, notes for settings made with an older version,
+  screenshots captioned with an old version). Users run the latest release; history belongs in
+  CHANGELOG.md and the docs.
+- Every release re-reads the whole README and updates or removes what the release changed, including
+  the screenshots and the measured results.
+
 ## Changelog
 
 - One `## X.Y.Z — YYYY-MM-DD` heading per released version, newest first. No entries for builds
