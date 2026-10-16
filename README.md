@@ -19,7 +19,8 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 |---|---|---|
 | ![Model tab: the Neural rendering switch, style, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present from build 310.8.0.0, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: telemetry, layer state, the Model placement line and the model](screenshots/status.png) |
 
-The screenshots show 3.0.0 with default settings and no game running.
+The Setup screenshot shows 3.4.0, the Model settings and Status screenshots 3.0.0 (before the strength
+presets and the Diagnosis group), all with default settings and no game running.
 
 ### In games
 
@@ -41,7 +42,7 @@ A residential street: 215 fps shown with the effect, 276 without.
 
 ![GTA V Enhanced on 3.0.0, a residential street, Neural Forge on and off](screenshots/gta-v-3.0-street.jpg)
 
-## What 3.0 does
+## How it works
 
 The network runs inside the game's process, in the Vulkan layer, on the game's GPU. NVIDIA's DLL is
 not loaded at run time: the layer reads the model's weights from the folder `extract-model` wrote
@@ -86,6 +87,12 @@ Details: [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-10-11)
 at the 12 GB card's video-memory limit with the model on, in 3.2.0 as in 3.3.0: how much the network slows down
 there changes from run to run, so its numbers are not a comparison.
 
+3.4.0 did not change the frame path. 3.4.1 drops a second, unused copy of the model's weights on the GPU: in GTA V
+Enhanced at 1440p with frame generation 4x, loading and building the network takes 1536 MiB of video memory instead
+of 1674, the output is bit-identical, and the frame rate is unchanged (56.3 to 58.4 real fps against 56.5 and 56.8;
+[docs/LESSONS.md](docs/LESSONS.md)). Since 3.4.1 games are tested and benchmarked at 2560x1440 only: 4K on the 12 GB
+test card sits at its memory limit with the model on, and the 140 MiB saved does not move it off.
+
 | Configuration | Model off | 3.2.0 | 3.3.0 |
 |---|---|---|---|
 | 1440p, frame generation off | 112.6 fps | 71.5 fps | **81.3 fps** |
@@ -125,8 +132,11 @@ about 12% slower than NVIDIA's runtime was there.
 
 Each game was run with 3.1.0 on the test machine (RTX 5070, 2560x1440, Proton) with its own settings
 as found: DLSS on, the game's frame generation on wherever it has it, no frame-rate cap. One run
-each, 60 s measured, 2026-10-08. In every game the model ran before the upscaler on every real frame,
-with no missed frames and no GPU fault. Numbers are in [Measured results](#measured-results) above;
+each, 60 s measured, 2026-10-08 (Hogwarts Legacy with 3.1.4, 2026-10-09). In every game the model
+ran before the upscaler on every real frame, with no missed frames and no GPU fault, except where
+Ray Reconstruction moves it after the upscaler. With 3.3.0's edit cache, GTA San Andreas DE, Crimson
+Desert and Hogwarts Legacy were play-checked again (attached, effect shown, toggle key off and on, no
+missed frame, fence timeout or GPU fault). All testing is at 2560x1440. Numbers are in [Measured results](#measured-results) above;
 the full record of earlier versions is in [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md).
 
 | Game | Engine, API | DLSS used | Where measured | 3.1.0 |
@@ -139,6 +149,7 @@ the full record of earlier versions is in [docs/HARDWARE_VALIDATION.md](docs/HAR
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Menu | 115.4 fps shown |
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | In game, held inside DLSS's buffer | 56.3 real / 117.7 fps shown (without frame generation: 70.7 fps, 164.9 with NR off) |
 | Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Character select, held inside DLSS's buffer (3.1.2) | 68.7 real / 139.0 fps shown |
+| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction | In game (3.1.4) | about 64 fps shown with Ray Reconstruction on (the model after the upscaler); with it off the model runs before the upscaler, with the model's history since 3.1.5 |
 
 The two Unreal Engine 5 games ran without the GPU fault the Black Myth: Wukong Benchmark Tool showed
 with 3.0 ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), Phase 4b): Lords of the Fallen in game
@@ -287,11 +298,11 @@ this version re-creates the shared memory.
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, model resolution and model every Nth frame (after the upscaler only), and the toggle key. |
+| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, model every Nth frame (after the upscaler only), and the toggle key. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
-| Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust), and captures: take one (the next frame as before/after PNGs) and open the captures folder. |
+| Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), your installed Steam games with a Neural Forge switch each (and the executable it targets), and the launch option to copy by hand for a game you pick. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another, and the launch option to copy by hand for a game you pick. |
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and
@@ -317,8 +328,10 @@ takes is withdrawn after 5 seconds.
 - **The game's DLSS Frame Generation does not always switch on.** In the benchmark runs the game
   generated frames in some launches and not in others with the same settings, with or without
   Neural Forge. The fps counter shows which happened.
-- **4K is probably slower than NVIDIA's runtime was** (one run, 21.9 fps in GTA V at 4K DLSS
-  Balanced, likely VRAM: the network needs about 1.5 GB at that size). A network build that fails is
+- **4K is not tested any more, and is probably slower than NVIDIA's runtime was** (one run with
+  3.0, 21.9 fps in GTA V at 4K DLSS Balanced, likely VRAM: the network needs about 1.5 GB at that
+  size, about 140 MB less since 3.4.1). On a 12 GB card, 4K with frame generation and the model on
+  sits at the memory limit and its frame rate changes from run to run. A network build that fails is
   retried on a schedule, and frames go to DLSS untouched meanwhile.
 - **Unreal Engine 5 games are only partly tested.** Lords of the Fallen ran in game with frame
   generation, and Remnant II at its character select screen with frame generation, with no GPU fault
@@ -413,11 +426,12 @@ folder and user name are replaced in it.
 ### CLI
 
 `neural-forge-cli <command>`: `init`, `status`, `doctor`, `report [--appid ID]`, `games`,
-`enable GAME [--target-exe EXE|auto]`, `disable GAME`, `config`, `import-binaries DIR`,
+`enable GAME [--target-exe EXE[,EXE...]|auto]`, `disable GAME`, `config`, `import-binaries DIR`,
 `extract-model DIR`, `install --appdir DIR`, `uninstall [--purge]`, `profile list|save|load|delete NAME`, and
-`shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--cancel]|reset` for the live settings.
-`doctor`, `report` and `shmctl status` only look: they create and change nothing.
-`neural-forge-cli help` has the details.
+`shmctl status|set NAME VALUE|toggle NAME|capture [--frames N] [--view V]|capture --cancel|dump-cache [--holds K]|reset`
+for the live settings. `doctor`, `report` and `shmctl status` only look: they create and change nothing.
+`neural-forge-cli help [COMMAND]` (or `COMMAND --help`) has the details; an unknown or misspelt
+argument prints the usage and exits with status 2.
 
 ### Files
 
@@ -449,10 +463,11 @@ cargo build --release
 bash build-appimage.sh
 ```
 
-The first fetches the pinned glslang, Vulkan-Headers and volk the native backend (`crates/native`,
-OpenDLSS-NR's C++ source at its pinned commit, patched) builds with. The second builds everything (protocol, layer, native,
+Every build uses Rust 1.99.0, pinned in `rust-toolchain.toml`. The first command fetches what the native backend (`crates/native`) builds with: the pinned glslang,
+Vulkan-Headers and volk, and OpenDLSS-NR's C++ source at its pinned commit with this project's patches applied. The second builds everything (protocol, layer, native,
 GUI, CLI, supervisor). The third packs it into an AppImage (see `build-appimage.sh` for the package
-list). Checks:
+list). CI runs the same build, the checks below, clippy and the AppImage's installed-layer smoke
+test on every push. Checks:
 
 ```bash
 cargo test
