@@ -89,3 +89,11 @@ Each one is a patch in `patches/`, relative to the source's root (`patch -p1`), 
    neural-forge-native calls it after the warm-up run of a network's first build, when every matrix exists and nothing
    recorded with the whole records can still run. Measured: the records' 140.8 MiB on the GPU become 98 KiB, and the
    network's output is bit-identical (every size the layer builds, chained and not, the GLSL routes too).
+9. `patches/0009-small-network-topology.patch`: the graph's stage boundaries were hard-coded for the 71-block
+   network. `nr::Topology` holds them (the last 32-channel encoder block, the first and last block of each fused
+   encoder and decoder stage, the split-512 stages, the ViT range, the 512 decoder's transition and the post block)
+   and `Topology::forBlockCount` gives the full network's (71 blocks) or the small one's (31: `WEIGHTS_CC_SMALL_FP8`
+   in build 310.9.16, the same block types with fewer per stage); `Graph` takes it from `Model::blockCount()` and
+   refuses any other count, as the removed `kBlockCount` check did. Every block number in `record` and `encodeVit`
+   comes from it. The full network's output is unchanged: bit-exact against NGX's answer on fixture d1w
+   (docs/NATIVE_BACKEND.md, 0.6). `referenceBoundaryNames` (parity fixtures only) still lists the full network's.

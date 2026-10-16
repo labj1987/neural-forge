@@ -2,9 +2,11 @@
 //! user's own `nvngx_dlssnr.dll` and written in the layout OpenDLSS-NR's `nr::Model` reads
 //! (`manifest.json` plus eleven stage files under `model/`, its docs/weights.md).
 //!
-//! The weights are one `RT_RCDATA` resource named `WEIGHTS_HT`. Only the PE headers, the
-//! resource directory and that resource's own record framing are read; no code in the DLL is.
-//! The resource is a `u64` total length followed by records laid end to end:
+//! A network's weights are one `RT_RCDATA` resource: `WEIGHTS_HT` for the full network (71 blocks),
+//! and since build 310.9.16 also `WEIGHTS_CC_SMALL_FP8` for a small one (31 blocks of the same
+//! types, fewer per stage; [`Network`]). Only the PE headers, the resource directory and that
+//! resource's own record framing are read; no code in the DLL is. Both resources are a `u64` total
+//! length followed by records laid end to end:
 //!
 //! | field | bytes |
 //! | --- | --- |
@@ -18,8 +20,9 @@
 //! | trailer, unread | the rest of `a` |
 //!
 //! The gate is the network, not the DLL's version: a build is extracted when its records hold
-//! exactly the tensors in [`model_shape::EXPECTED`] (same names, same byte lengths), which is what
-//! the graph implements. A build outside [`VERIFIED_BUILDS`] is marked unverified in the manifest.
+//! exactly the tensors the graph implements for the chosen network ([`model_shape::EXPECTED`],
+//! [`model_shape::EXPECTED_SMALL`]: same names, same byte lengths). Only the full network of a build
+//! in [`VERIFIED_BUILDS`] is marked verified in the manifest.
 //!
 //! Nothing produced here is ever committed, uploaded or packaged.
 
@@ -29,17 +32,17 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
-/// The builds whose output was compared bit for bit with NVIDIA's runtime. Not a gate: another build
-/// with the same network is extracted too, and marked unverified.
+/// The builds whose full network's output was compared bit for bit with NVIDIA's runtime. Not a
+/// gate: another build with the same network is extracted too, and marked unverified. The small
+/// network has never been compared (the NGX helper that did it is gone since 3.0).
 pub const VERIFIED_BUILDS: &[[u16; 3]] = &[[310, 8, 0]];
 pub const DLL_NAME: &str = "nvngx_dlssnr.dll";
-const RESOURCE_NAME: &str = "WEIGHTS_HT";
 /// How many names each list of a shape report shows.
 const REPORT_NAMES: usize = 10;
 const RT_RCDATA: u32 = 10;
 const RT_VERSION: u32 = 16;
 
-/// Stage files: the network's resolution stages, encoder to decoder (blocks inclusive).
+/// Stage files: the full network's resolution stages, encoder to decoder (blocks inclusive).
 const STAGES: [(&str, u32, u32); 11] = [
     ("encoder32", 0, 4),
     ("encoder64", 5, 8),
@@ -53,6 +56,79 @@ const STAGES: [(&str, u32, u32); 11] = [
     ("decoder64", 62, 65),
     ("decoder32", 66, 70),
 ];
+
+/// The small network's stages: the same eleven, two blocks per resolution stage where the full one
+/// has four to nine (the ViT keeps its eight). The graph's `Topology` (patches/0009) mirrors these.
+const STAGES_SMALL: [(&str, u32, u32); 11] = [
+    ("encoder32", 0, 2),
+    ("encoder64", 3, 4),
+    ("encoder128", 5, 6),
+    ("encoder256", 7, 8),
+    ("encoder512", 9, 10),
+    ("vit", 11, 18),
+    ("decoder512", 19, 21),
+    ("decoder256", 22, 23),
+    ("decoder128", 24, 25),
+    ("decoder64", 26, 27),
+    ("decoder32", 28, 30),
+];
+
+/// Which of the DLL's networks the model directory holds.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Network {
+    /// `WEIGHTS_HT`, 71 blocks: the network every build carries.
+    Full,
+    /// `WEIGHTS_CC_SMALL_FP8`, 31 blocks: about half the GPU time of the full one.
+    Small,
+}
+
+impl Network {
+    pub const ALL: [Network; 2] = [Network::Full, Network::Small];
+
+    /// The name the CLI takes and the manifest records.
+    pub fn name(self) -> &'static str {
+        match self {
+            Network::Full => "full",
+            Network::Small => "small",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Network> {
+        Network::ALL.into_iter().find(|n| n.name() == name)
+    }
+
+    /// The DLL resource holding its weights.
+    pub fn resource(self) -> &'static str {
+        match self {
+            Network::Full => "WEIGHTS_HT",
+            Network::Small => "WEIGHTS_CC_SMALL_FP8",
+        }
+    }
+
+    fn stages(self) -> &'static [(&'static str, u32, u32); 11] {
+        match self {
+            Network::Full => &STAGES,
+            Network::Small => &STAGES_SMALL,
+        }
+    }
+
+    /// The tensors the graph implements for it.
+    pub fn expected(self) -> &'static [(&'static str, u64)] {
+        match self {
+            Network::Full => model_shape::EXPECTED,
+            Network::Small => model_shape::EXPECTED_SMALL,
+        }
+    }
+}
+
+impl fmt::Display for Network {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Network::Full => "full network",
+            Network::Small => "small network",
+        })
+    }
+}
 
 #[derive(Debug)]
 pub enum ModelError {
@@ -232,7 +308,7 @@ fn parse_name(name: &str) -> Option<(u32, u32, String)> {
     valid.then(|| (block, layer, parameter.to_string()))
 }
 
-/// Walks the `WEIGHTS_HT` records (module docs). Every field is checked; any surprise is refused.
+/// Walks a weights resource's records (module docs). Every field is checked; any surprise is refused.
 /// Which tensors the records hold is [`check_shape`]'s question.
 pub fn parse_weights(blob: &[u8]) -> Result<Vec<Tensor<'_>>, ModelError> {
     let total = u64_at(blob, 0).ok_or_else(|| w_err("shorter than its header"))?;
@@ -291,7 +367,7 @@ fn blocks_of<'n>(names: impl Iterator<Item = &'n str>) -> String {
     }
 }
 
-/// Whether the records hold exactly the tensors in `expected` (`model_shape::EXPECTED` outside tests):
+/// Whether the records hold exactly the tensors in `expected` ([`Network::expected`] outside tests):
 /// the same set of names, each the same length. Otherwise a report of what differs.
 pub fn check_shape(tensors: &[Tensor], expected: &[(&str, u64)]) -> Result<(), ModelError> {
     let wanted: HashMap<&str, u64> = expected.iter().copied().collect();
@@ -331,8 +407,8 @@ pub fn check_shape(tensors: &[Tensor], expected: &[(&str, u64)]) -> Result<(), M
     Err(ModelError::Shape(report))
 }
 
-fn stage_of(block: u32) -> Option<&'static str> {
-    STAGES.iter().find(|(_, first, last)| (*first..=*last).contains(&block)).map(|s| s.0)
+fn stage_of(network: Network, block: u32) -> Option<&'static str> {
+    network.stages().iter().find(|(_, first, last)| (*first..=*last).contains(&block)).map(|s| s.0)
 }
 
 /// Upper case: `nr::Model` compares its own upper-case digest (`sha256.h`) as a string.
@@ -340,15 +416,16 @@ fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02X}")).collect()
 }
 
-/// Whether `build` is one of [`VERIFIED_BUILDS`].
-pub fn is_verified(build: [u16; 4]) -> bool {
-    VERIFIED_BUILDS.iter().any(|v| v[..] == build[..3])
+/// Whether `network` of `build` was compared with NVIDIA's runtime: the full network of a build in
+/// [`VERIFIED_BUILDS`].
+pub fn is_verified(network: Network, build: [u16; 4]) -> bool {
+    network == Network::Full && VERIFIED_BUILDS.iter().any(|v| v[..] == build[..3])
 }
 
 /// Lays the tensors into the stage files and the manifest. Returns (relative path, bytes) pairs; a
 /// tensor of a block no stage holds is an error ([`check_shape`] refuses such a DLL first).
-pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Result<Vec<(String, Vec<u8>)>, ModelError> {
-    if let Some(t) = tensors.iter().find(|t| stage_of(t.block).is_none()) {
+pub fn build_model(tensors: &[Tensor], network: Network, build: [u16; 4], dll_sha256: &str) -> Result<Vec<(String, Vec<u8>)>, ModelError> {
+    if let Some(t) = tensors.iter().find(|t| stage_of(network, t.block).is_none()) {
         return Err(ModelError::Weights(format!("{}: block {} is in no stage of the graph", t.name, t.block)));
     }
     let mut sorted: Vec<&Tensor> = tensors.iter().collect();
@@ -356,9 +433,9 @@ pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Res
     let mut files = Vec::new();
     let mut stages = Vec::new();
     let mut records = Vec::new();
-    for (id, _, _) in STAGES {
+    for &(id, _, _) in network.stages() {
         let mut packed = Vec::new();
-        for t in sorted.iter().filter(|t| stage_of(t.block) == Some(id)) {
+        for t in sorted.iter().filter(|t| stage_of(network, t.block) == Some(id)) {
             // 16-byte alignment keeps every tensor's start aligned for the host's re-layout copies.
             packed.resize(packed.len().next_multiple_of(16), 0);
             records.push(serde_json::json!({
@@ -378,9 +455,10 @@ pub fn build_model(tensors: &[Tensor], build: [u16; 4], dll_sha256: &str) -> Res
             "file": DLL_NAME,
             "build": format!("{}.{}.{}.{}", build[0], build[1], build[2], build[3]),
             "sha256": dll_sha256,
-            "resource": RESOURCE_NAME,
-            "verified": is_verified(build),
+            "resource": network.resource(),
+            "verified": is_verified(network, build),
         },
+        "network": network.name(),
         "totals": {
             "blockCount": tensors.iter().map(|t| t.block).collect::<BTreeSet<_>>().len(),
             "tensorCount": tensors.len(),
@@ -429,7 +507,14 @@ pub fn check_installed(dir: &Path) -> Result<String, String> {
     Ok(build)
 }
 
-/// Whether the installed model came from a build in [`VERIFIED_BUILDS`] (the manifest's
+/// Which network the installed model is (the manifest's `network`), or `None` when there is no
+/// readable manifest. A manifest without the field was written before 3.5.0, from the full network.
+pub fn installed_network(dir: &Path) -> Option<Network> {
+    let manifest = read_manifest(dir)?;
+    Some(manifest["network"].as_str().and_then(Network::parse).unwrap_or(Network::Full))
+}
+
+/// Whether the installed model is the full network of a build in [`VERIFIED_BUILDS`] (the manifest's
 /// `source.verified`), or `None` when there is no readable manifest. A manifest without the field
 /// is unverified.
 pub fn installed_verified(dir: &Path) -> Option<bool> {
@@ -439,37 +524,43 @@ pub fn installed_verified(dir: &Path) -> Option<bool> {
 #[derive(Debug)]
 pub struct Extracted {
     pub dir: PathBuf,
+    pub network: Network,
     pub build: String,
-    /// The build is in [`VERIFIED_BUILDS`].
+    /// [`is_verified`].
     pub verified: bool,
     pub tensors: usize,
     pub bytes: usize,
 }
 
-/// `source` is the DLL or a directory holding it. Replaces `out` as a whole ([`replace_tree`]), so a
-/// model directory is never half old and half new.
-/// Any build is taken whose records hold the tensors the graph implements ([`check_shape`]); nothing
-/// is written otherwise.
-pub fn extract(source: &Path, out: &Path) -> Result<Extracted, ModelError> {
-    extract_shaped(source, out, model_shape::EXPECTED)
+/// `source` is the DLL or a directory holding it; `network` is which of its networks to write.
+/// Replaces `out` as a whole ([`replace_tree`]), so a model directory is never half old and half new.
+/// Any build is taken whose records hold the tensors the graph implements for that network
+/// ([`check_shape`]); nothing is written otherwise.
+pub fn extract(source: &Path, out: &Path, network: Network) -> Result<Extracted, ModelError> {
+    extract_shaped(source, out, network, network.expected())
 }
 
-fn extract_shaped(source: &Path, out: &Path, expected: &[(&str, u64)]) -> Result<Extracted, ModelError> {
+fn extract_shaped(source: &Path, out: &Path, network: Network, expected: &[(&str, u64)]) -> Result<Extracted, ModelError> {
     let dll = if source.is_dir() { source.join(DLL_NAME) } else { source.to_path_buf() };
     let image = std::fs::read(&dll).map_err(|e| ModelError::Io(dll.clone(), e))?;
     let resources = Resources::parse(&image)?;
     let version = file_version(&resources).ok_or_else(|| pe_err("no version resource"))?;
-    let blob = resources
-        .get(RT_RCDATA, Key::Name(RESOURCE_NAME))
-        .ok_or_else(|| w_err(format!("no RCDATA resource named {RESOURCE_NAME}")))?;
+    let resource = network.resource();
+    let blob = resources.get(RT_RCDATA, Key::Name(resource)).ok_or_else(|| {
+        w_err(format!(
+            "build {}.{}.{}.{} has no {network} (no RCDATA resource named {resource})",
+            version[0], version[1], version[2], version[3]
+        ))
+    })?;
     let tensors = parse_weights(blob)?;
     check_shape(&tensors, expected)?;
-    let files = build_model(&tensors, version, &sha256_hex(&image))?;
+    let files = build_model(&tensors, network, version, &sha256_hex(&image))?;
     replace_tree(out, &files)?;
     Ok(Extracted {
         dir: out.to_path_buf(),
+        network,
         build: format!("{}.{}.{}", version[0], version[1], version[2]),
-        verified: is_verified(version),
+        verified: is_verified(network, version),
         tensors: tensors.len(),
         bytes: tensors.iter().map(|t| t.bytes.len()).sum(),
     })
@@ -645,6 +736,11 @@ mod tests {
 
     /// A minimal PE32+ image: one section holding a resource tree with WEIGHTS_HT and a version.
     fn dll(weights: &[u8], version: [u16; 4]) -> Vec<u8> {
+        dll_with("WEIGHTS_HT", weights, version)
+    }
+
+    /// The same with the weights under the RCDATA name `resource`.
+    fn dll_with(resource: &str, weights: &[u8], version: [u16; 4]) -> Vec<u8> {
         const VA: u32 = 0x1000;
         let mut fixed = vec![0u8; 8];
         fixed.extend(0xfeef_04bdu32.to_le_bytes());
@@ -669,8 +765,8 @@ mod tests {
         dir(&mut rsrc, 0x060, 0, 1, &[(1, sub | 0xa0)]);
         dir(&mut rsrc, 0x080, 0, 1, &[(1033, 0x100)]);
         dir(&mut rsrc, 0x0a0, 0, 1, &[(1033, 0x110)]);
-        let utf16: Vec<u8> = RESOURCE_NAME.encode_utf16().flat_map(u16::to_le_bytes).collect();
-        rsrc[0x180..0x182].copy_from_slice(&(RESOURCE_NAME.len() as u16).to_le_bytes());
+        let utf16: Vec<u8> = resource.encode_utf16().flat_map(u16::to_le_bytes).collect();
+        rsrc[0x180..0x182].copy_from_slice(&(resource.len() as u16).to_le_bytes());
         rsrc[0x182..0x182 + utf16.len()].copy_from_slice(&utf16);
         let version_at = rsrc.len();
         rsrc.extend(&fixed);
@@ -802,6 +898,81 @@ mod tests {
     }
 
     #[test]
+    fn the_small_table_is_the_310_9_16_small_network() {
+        let rows = model_shape::EXPECTED_SMALL;
+        assert_eq!(rows.len(), 77);
+        assert_eq!(rows.iter().map(|(n, _)| n).collect::<BTreeSet<_>>().len(), rows.len());
+        let blocks: BTreeSet<u32> = rows.iter().map(|(n, _)| parse_name(n).unwrap().0).collect();
+        assert_eq!(blocks, (0..=30).collect());
+        assert_eq!(rows.iter().map(|(_, len)| len).sum::<u64>(), 113_887_490);
+        assert_eq!(rows[rows.len() - 2], ("block30.layer0.blend_scale", 2));
+        // Every small block has the shape of a full-network block: the graph runs it with the same kernels.
+        let shape_of = |table: &[(&str, u64)], block: u32| -> Vec<(u32, String, u64)> {
+            let mut v: Vec<_> = table
+                .iter()
+                .filter_map(|(n, len)| parse_name(n).filter(|p| p.0 == block).map(|(_, l, p)| (l, p, *len)))
+                .collect();
+            v.sort();
+            v
+        };
+        let full: BTreeSet<_> = (0..=70).map(|b| shape_of(model_shape::EXPECTED, b)).collect();
+        assert!((0..=30).all(|b| full.contains(&shape_of(rows, b))));
+    }
+
+    #[test]
+    fn every_block_of_each_network_is_in_one_of_its_stages() {
+        for network in Network::ALL {
+            for (name, _) in network.expected() {
+                assert!(stage_of(network, parse_name(name).unwrap().0).is_some(), "{network}: {name}");
+            }
+        }
+    }
+
+    #[test]
+    fn extracts_the_small_network_unverified_whatever_the_build() {
+        let dir = scratch("small");
+        let small: Vec<(String, u64)> = (0..31).map(|b| (format!("block{b}.layer0.layer"), 20 + b as u64)).collect();
+        std::fs::write(dir.join(DLL_NAME), dll_with("WEIGHTS_CC_SMALL_FP8", &blob_of(&small), [310, 8, 0, 0])).unwrap();
+        let out = dir.join("model");
+        let done = extract_shaped(&dir, &out, Network::Small, &table(&small)).unwrap();
+        assert_eq!((done.network, done.verified, done.tensors), (Network::Small, false, 31));
+        assert_eq!(installed_network(&out), Some(Network::Small));
+        assert_eq!(installed_verified(&out), Some(false));
+        let manifest = read_manifest(&out).unwrap();
+        assert_eq!(manifest["source"]["resource"], "WEIGHTS_CC_SMALL_FP8");
+        assert_eq!(manifest["totals"]["blockCount"], 31);
+        // Blocks 9-10 are the small network's encoder 512 stage.
+        let stage = |block: u64| manifest["tensors"].as_array().unwrap().iter().find(|t| t["block"] == block).unwrap()["stage"].clone();
+        assert_eq!((stage(10), stage(11), stage(30)), ("encoder512".into(), "vit".into(), "decoder32".into()));
+        assert_eq!(check_installed(&out), Ok("310.8.0.0".to_string()));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_dll_without_the_small_network_says_so() {
+        let dir = scratch("no-small");
+        std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 8, 0, 0])).unwrap();
+        let out = dir.join("model");
+        let err = extract(&dir, &out, Network::Small).unwrap_err();
+        assert!(err.to_string().contains("build 310.8.0.0 has no small network (no RCDATA resource named WEIGHTS_CC_SMALL_FP8)"), "{err}");
+        assert!(!out.exists());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn network_names_round_trip_and_an_old_manifest_is_the_full_network() {
+        for network in Network::ALL {
+            assert_eq!(Network::parse(network.name()), Some(network));
+        }
+        assert_eq!(Network::parse("tiny"), None);
+        let dir = scratch("manifest-no-network");
+        std::fs::write(dir.join("manifest.json"), r#"{"source": {"build": "310.8.0.0"}}"#).unwrap();
+        assert_eq!(installed_network(&dir), Some(Network::Full));
+        assert_eq!(installed_network(&dir.join("nowhere")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
     fn refuses_a_tensor_longer_than_its_record() {
         let mut blob = weights();
         // block0's tensor length field sits after the length (8), name (19) and two record lengths (16).
@@ -813,7 +984,7 @@ mod tests {
     fn manifest_slices_reproduce_every_tensor() {
         let blob = weights();
         let tensors = parse_weights(&blob).unwrap();
-        let files = build_model(&tensors, [310, 8, 0, 0], "00").unwrap();
+        let files = build_model(&tensors, Network::Full, [310, 8, 0, 0], "00").unwrap();
         let manifest: serde_json::Value = serde_json::from_slice(&files.last().unwrap().1).unwrap();
         assert_eq!(manifest["totals"]["blockCount"], 71);
         assert_eq!(manifest["stages"].as_array().unwrap().len(), 11);
@@ -838,7 +1009,7 @@ mod tests {
     fn a_block_outside_the_graph_is_an_error_not_a_panic() {
         let bytes = [0u8; 4];
         let tensors = [Tensor { name: "block71.layer0.layer".into(), block: 71, layer: 0, parameter: "layer".into(), bytes: &bytes }];
-        assert!(matches!(build_model(&tensors, [310, 8, 0, 0], "00"), Err(ModelError::Weights(_))));
+        assert!(matches!(build_model(&tensors, Network::Full, [310, 8, 0, 0], "00"), Err(ModelError::Weights(_))));
     }
 
     #[test]
@@ -847,7 +1018,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let bytes = [7u8; 32];
         let tensors = [Tensor { name: "block0.layer0.layer".into(), block: 0, layer: 0, parameter: "layer".into(), bytes: &bytes }];
-        let files = build_model(&tensors, [310, 8, 0, 0], "00").unwrap();
+        let files = build_model(&tensors, Network::Full, [310, 8, 0, 0], "00").unwrap();
         for (rel, data) in &files {
             std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
             std::fs::write(dir.join(rel), data).unwrap();
@@ -868,8 +1039,9 @@ mod tests {
         let dir = scratch("verified");
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 8, 0, 3])).unwrap();
         let out = dir.join("model");
-        let done = extract_shaped(&dir, &out, &table(&shape())).unwrap();
+        let done = extract_shaped(&dir, &out, Network::Full, &table(&shape())).unwrap();
         assert_eq!((done.build.as_str(), done.verified, done.tensors), ("310.8.0", true, TENSOR_COUNT));
+        assert_eq!(installed_network(&out), Some(Network::Full));
         assert!(out.join("manifest.json").is_file() && out.join("model/vit.e4m3").is_file());
         assert_eq!(installed(&out).as_deref(), Some("310.8.0.3"));
         assert_eq!(installed_verified(&out), Some(true));
@@ -883,7 +1055,7 @@ mod tests {
         let dir = scratch("unverified");
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 9, 1, 0])).unwrap();
         let out = dir.join("model");
-        let done = extract_shaped(&dir, &out, &table(&shape())).unwrap();
+        let done = extract_shaped(&dir, &out, Network::Full, &table(&shape())).unwrap();
         assert_eq!((done.build.as_str(), done.verified), ("310.9.1", false));
         assert_eq!(installed(&out).as_deref(), Some("310.9.1.0"));
         assert_eq!(installed_verified(&out), Some(false));
@@ -904,7 +1076,7 @@ mod tests {
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 8, 0, 0])).unwrap();
         let out = dir.join("model");
         // The fixture's tiny tensors are not the real network.
-        let err = extract(&dir, &out).unwrap_err();
+        let err = extract(&dir, &out, Network::Full).unwrap_err();
         assert!(matches!(err, ModelError::Shape(_)), "{err}");
         assert!(err.to_string().contains("the graph expects 153 tensors in 71 blocks (0-70), 147683778 bytes"), "{err}");
         assert!(!out.exists());

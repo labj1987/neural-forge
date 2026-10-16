@@ -191,6 +191,7 @@ Setup notes for these games:
 - NVIDIA's own Neural Rendering DLL (`nvngx_dlssnr.dll`), once, to extract the model's weights
   from. Build 310.8.0 is the verified build: its output was compared bit for bit with NVIDIA's
   runtime. Another build that carries the same network is accepted and flagged as not verified.
+  Build 310.9.16 also carries a small network (below), which is never verified.
   This project does not and cannot ship the DLL or the weights.
 - For the model before the upscaler: a game that uses DLSS through Vulkan (under Proton, a DX12 game
   through vkd3d-proton and DXVK-NVAPI).
@@ -225,6 +226,19 @@ neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll
 
 The weights are written to `~/.local/share/neural-forge/model` (about 141 MB), with hashes the
 layer checks when it loads them. The DLL is not needed after that. Restart the game afterwards.
+
+**The small network.** Build 310.9.16 of the DLL carries a second, smaller network next to the full
+one: 31 blocks instead of 71, the same kinds of blocks with fewer of each. It takes about half the
+GPU time (3.8 ms instead of 7.0 ms per frame at GTA V's DLSS input, 1707x960, on an RTX 5070) and
+changes the picture a little less than the full network. Choose it in the Setup tab's **Network** row
+(which re-extracts from the imported DLL), or with:
+
+```bash
+neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll --network small
+```
+
+It is never marked verified: it has not been compared with NVIDIA's runtime. Like the full network it
+uses FP8 tensor cores, so it needs the same GPU (RTX 40-series or newer).
 
 Build 310.8.0 is the verified build. Any other build is accepted when it carries the same network
 (the same tensors, each the same size), and the Setup tab and `extract-model` mark it "not verified

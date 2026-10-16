@@ -4,6 +4,23 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.5.0 — 2026-10-16
+
+Neural Forge can now run the small network that build 310.9.16 of NVIDIA's DLL added: about half the
+network time of the full one.
+
+- **The small network.** Build 310.9.16 of `nvngx_dlssnr.dll` carries a second network next to the full
+  one: 31 blocks instead of 71, the same kinds of blocks with fewer of each. Choose it in the Setup tab's
+  new Network row, which re-extracts from the imported DLL, or with
+  `neural-forge-cli extract-model DIR --network small`. Measured in GTA V Enhanced at 1440p with frame
+  generation 4x: 63.7 real fps (256.2 shown) instead of 56.8 (228.1) with the full network, the network's
+  time per frame 9.95 ms instead of 16.0 ms, and 108 MB of weights on the graphics card instead of 140 MB.
+  It changes the picture a little less than the full network. It has not been compared with NVIDIA's
+  runtime, so it is always shown as not verified.
+- The full network is unchanged and stays the default: on the reference frame its output is bit for bit
+  NVIDIA's, as before.
+- The Setup tab, `status`, `doctor` and the layer's log say which network the model is.
+
 ## 3.4.1 — 2026-10-13
 
 - The model uses about 140 MB less video memory: it no longer keeps a second, unused copy of its

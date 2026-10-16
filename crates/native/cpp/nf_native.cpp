@@ -492,7 +492,8 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
     VK_CHECK(vkCreateCommandPool(open->device, &pool, nullptr, &n->secondaryPool));
     pool.queueFamilyIndex = open->queue_family;
     VK_CHECK(vkCreateCommandPool(open->device, &pool, nullptr, &n->ownPool));
-    const nr::Tensor& blend = n->model->tensor(70, 0, "blend_scale");
+    // The post block, the last one: 70 in the full network, 30 in the small one.
+    const nr::Tensor& blend = n->model->tensor((int)n->model->blockCount() - 1, 0, "blend_scale");
     if (blend.byteLength >= 2) {
       uint16_t half;
       memcpy(&half, blend.bytes, 2);

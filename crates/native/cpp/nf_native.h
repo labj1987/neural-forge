@@ -80,7 +80,7 @@ typedef struct NfNativeFrame {
   VkDeviceSize features_bytes;
   VkBuffer head;                        // f32 [field_height][field_width][4], read by the layer
   VkDeviceSize head_bytes;
-  float blend_scale;                    // block70.layer0.blend_scale, clamped to [0, 1]
+  float blend_scale;                    // the post block's blend_scale (block 70, 30 small), clamped to [0, 1]
   uint32_t chained;                     // the recorded graph links its launches by counters
 } NfNativeFrame;
 

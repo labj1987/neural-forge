@@ -63,8 +63,11 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
 - Launch options: the supervisor always writes `NEURAL_FORGE_TARGET_EXE` (the game's own executables,
   `steam::target_for`), and an explicit target wins over the layer's built-in exclusions.
 - `extract-model` gates on the network's shape, not the DLL's version: it takes any build of
-  `nvngx_dlssnr.dll` whose `WEIGHTS_HT` holds exactly the tensors in
-  `crates/supervisor/src/model_shape.rs` (names and byte lengths). That table changes together with
+  `nvngx_dlssnr.dll` whose weights resource holds exactly the tensors in
+  `crates/supervisor/src/model_shape.rs` (names and byte lengths): `WEIGHTS_HT` for the full network
+  (`EXPECTED`, 71 blocks), `WEIGHTS_CC_SMALL_FP8` for the small one (`EXPECTED_SMALL`, 31 blocks,
+  `--network small`). The graph picks its block ranges from the model's block count
+  (`patches/0009`, `nr::Topology`); a third network needs a new `Topology` and stage table. That table changes together with
   OpenDLSS-NR's graph: regenerate it with `scripts/gen_model_shape.py` when the pinned commit
   (`third_party/opendlss-nr/UPSTREAM.md`) moves to a new network. `VERIFIED_BUILDS` only marks builds compared with
   NVIDIA's runtime; it gates nothing.

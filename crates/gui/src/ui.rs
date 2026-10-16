@@ -9,6 +9,7 @@ use neural_forge_protocol::enums::{colour_mode, reversible_mode};
 use gtk4::prelude::*;
 use libadwaita as adw;
 use libadwaita::prelude::*;
+use neural_forge_supervisor::model::Network;
 
 use crate::shm::{bind_bool, bind_float, bind_u32, Shm};
 
@@ -872,17 +873,48 @@ fn build_launch_option_group() -> (adw::PreferencesGroup, impl Fn(&SteamScan)) {
     (group, fill)
 }
 
-/// The model's row text: present with the build it came from (and whether that build is verified),
-/// or missing.
+/// The model's row text: present with the network and build it came from (and whether that is
+/// verified), or missing.
 fn model_status() -> (String, bool) {
     let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+    let network = neural_forge_supervisor::model::installed_network(&dir).unwrap_or(Network::Full);
     match neural_forge_supervisor::model::installed(&dir) {
         Some(build) if neural_forge_supervisor::model::installed_verified(&dir) == Some(false) => {
-            (format!("present, from build {build}, not verified against NVIDIA's runtime"), true)
+            (format!("present: the {network} of build {build}, not verified against NVIDIA's runtime"), true)
         }
-        Some(build) => (format!("present, from build {build}"), true),
+        Some(build) => (format!("present: the {network} of build {build}"), true),
         None => ("missing: extract it from nvngx_dlssnr.dll below".to_string(), false),
     }
+}
+
+/// The Network row's choices, in [`Network::ALL`]'s order.
+const NETWORK_CHOICES: [&str; 2] = ["Full", "Small"];
+
+/// Extracts `network` from the DLL at `path` into the model directory, says how it went in a toast
+/// and brings the status row up to date.
+async fn extract_model(path: std::path::PathBuf, network: Network, toasts: adw::ToastOverlay, status_row: adw::ActionRow, icon: gtk4::Image) {
+    let out = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+    match gio::spawn_blocking(move || neural_forge_supervisor::model::extract(&path, &out, network)).await {
+        Ok(Ok(done)) => {
+            let unverified = if done.verified { "" } else { " (not verified against NVIDIA's runtime)" };
+            toasts.add_toast(toast(&format!(
+                "Extracted the {} of build {}{unverified} -- restart the game to use it",
+                done.network, done.build
+            )))
+        }
+        // The report is too long for a toast: its summary line there, all of it in the log.
+        Ok(Err(neural_forge_supervisor::model::ModelError::Shape(report))) => {
+            eprintln!("neural-forge: extraction refused:\n{report}");
+            let summary = report.lines().next().unwrap_or_default();
+            toasts.add_toast(toast(&format!("Extraction refused, a different network: {summary}")));
+        }
+        Ok(Err(e)) => toasts.add_toast(toast(&format!("Extraction failed: {e}"))),
+        Err(_) => toasts.add_toast(toast("Extraction failed: the worker panicked")),
+    }
+    let (text, present) = model_status();
+    status_row.set_subtitle(&text);
+    icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
+    model_changed();
 }
 
 /// The native backend's one setup step: point at NVIDIA's DLL once and extract the model from it.
@@ -900,6 +932,18 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     status_row.add_prefix(&icon);
     group.add(&status_row);
 
+    // Which network to extract. Changing it re-extracts from the DLL `import-binaries` keeps, when
+    // there is one; otherwise it applies to the next Extract.
+    let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+    let installed = neural_forge_supervisor::model::installed_network(&dir).unwrap_or(Network::Full);
+    let network_row = adw::ComboRow::new();
+    network_row.set_title("Network");
+    network_row.set_subtitle("Small: 31 blocks instead of 71, about half the GPU time (build 310.9.16 of the DLL)");
+    network_row.set_model(Some(&gtk4::StringList::new(&NETWORK_CHOICES)));
+    network_row.set_selected(Network::ALL.iter().position(|n| *n == installed).unwrap_or(0) as u32);
+    group.add(&network_row);
+    let chosen = |row: &adw::ComboRow| Network::ALL.get(row.selected() as usize).copied().unwrap_or(Network::Full);
+
     let extract_row = adw::ActionRow::new();
     extract_row.set_title("Extract from DLL");
     extract_row.set_subtitle("Choose nvngx_dlssnr.dll; the model is written to Neural Forge's data folder");
@@ -909,10 +953,24 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     extract_row.set_activatable_widget(Some(&button));
     group.add(&extract_row);
 
+    {
+        let (toasts, status_row, icon) = (toasts.clone(), status_row.clone(), icon.clone());
+        network_row.connect_selected_notify(move |row| {
+            let network = chosen(row);
+            let dll = std::path::PathBuf::from(neural_forge_supervisor::paths::binaries_dir()).join(neural_forge_supervisor::model::DLL_NAME);
+            let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+            if !dll.is_file() || neural_forge_supervisor::model::installed_network(&dir) == Some(network) {
+                return;
+            }
+            glib::spawn_future_local(extract_model(dll, network, toasts.clone(), status_row.clone(), icon.clone()));
+        });
+    }
+
     let toasts = toasts.clone();
     button.connect_clicked(move |button| {
         let toasts = toasts.clone();
         let (status_row, icon) = (status_row.clone(), icon.clone());
+        let network = chosen(&network_row);
         let parent = button.root().and_downcast::<gtk4::Window>();
         let dialog = gtk4::FileDialog::builder().title("Select nvngx_dlssnr.dll").build();
         dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
@@ -921,30 +979,7 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 toasts.add_toast(toast("That file has no local path -- choose a file on this computer"));
                 return;
             };
-            glib::spawn_future_local(async move {
-                let out = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
-                match gio::spawn_blocking(move || neural_forge_supervisor::model::extract(&path, &out)).await {
-                    Ok(Ok(done)) => {
-                        let unverified = if done.verified { "" } else { " (not verified against NVIDIA's runtime)" };
-                        toasts.add_toast(toast(&format!(
-                            "Model extracted from build {}{unverified} -- restart the game to use it",
-                            done.build
-                        )))
-                    }
-                    // The report is too long for a toast: its summary line there, all of it in the log.
-                    Ok(Err(neural_forge_supervisor::model::ModelError::Shape(report))) => {
-                        eprintln!("neural-forge: extraction refused:\n{report}");
-                        let summary = report.lines().next().unwrap_or_default();
-                        toasts.add_toast(toast(&format!("Extraction refused, a different network: {summary}")));
-                    }
-                    Ok(Err(e)) => toasts.add_toast(toast(&format!("Extraction failed: {e}"))),
-                    Err(_) => toasts.add_toast(toast("Extraction failed: the worker panicked")),
-                }
-                let (text, present) = model_status();
-                status_row.set_subtitle(&text);
-                icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
-                model_changed();
-            });
+            glib::spawn_future_local(extract_model(path, network, toasts, status_row, icon));
         });
     });
     group

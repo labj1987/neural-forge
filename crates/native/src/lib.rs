@@ -155,7 +155,7 @@ pub struct Frame {
     /// f32 `[field_height][field_width][4]`: the RGB residual and the blend logit.
     pub head: vk::Buffer,
     pub head_bytes: vk::DeviceSize,
-    /// `block70.layer0.blend_scale`, clamped to [0, 1].
+    /// The post block's `blend_scale` (`block70`, `block30` in the small network), clamped to [0, 1].
     pub blend_scale: f32,
     pub chained: u32,
 }

@@ -63,9 +63,9 @@ pub(crate) fn model_present() -> bool {
     model_dir().join("manifest.json").is_file()
 }
 
-/// "build 310.8.0.0, verified": the manifest's `source.build` and `source.verified`, for the log.
-/// Both keys appear once in `extract-model`'s manifest, so a string scan is enough. A manifest
-/// without `verified` is unverified.
+/// "full network, build 310.8.0.0, verified": the manifest's `network`, `source.build` and
+/// `source.verified`, for the log. Each key appears once in `extract-model`'s manifest, so a string
+/// scan is enough. A manifest without `verified` is unverified; one without `network` is the full one.
 fn model_source(text: &str) -> String {
     let field = |key: &str| {
         let (_, rest) = text.split_once(&format!("\"{key}\": "))?;
@@ -73,7 +73,8 @@ fn model_source(text: &str) -> String {
     };
     let build = field("build").unwrap_or_else(|| "unknown".to_string());
     let verified = field("verified").is_some_and(|v| v == "true");
-    format!("build {build}, {}", if verified { "verified" } else { "not verified against NVIDIA's runtime" })
+    let network = field("network").unwrap_or_else(|| "full".to_string());
+    format!("{network} network, build {build}, {}", if verified { "verified" } else { "not verified against NVIDIA's runtime" })
 }
 
 /// Where the network runs on a device: what `create_device` added for it.
@@ -1854,12 +1855,14 @@ mod tests {
     }
 
     #[test]
-    fn model_source_reads_build_and_verified() {
+    fn model_source_reads_network_build_and_verified() {
         let source = |extra: &str| format!("{{\n  \"source\": {{\n    \"build\": \"310.9.1.0\",\n    \"resource\": \"WEIGHTS_HT\"{extra}\n  }}\n}}");
-        assert_eq!(model_source(&source(",\n    \"verified\": false")), "build 310.9.1.0, not verified against NVIDIA's runtime");
-        assert_eq!(model_source(&source(",\n    \"verified\": true")), "build 310.9.1.0, verified");
-        assert_eq!(model_source(&source("")), "build 310.9.1.0, not verified against NVIDIA's runtime");
-        assert_eq!(model_source(""), "build unknown, not verified against NVIDIA's runtime");
+        assert_eq!(model_source(&source(",\n    \"verified\": false")), "full network, build 310.9.1.0, not verified against NVIDIA's runtime");
+        assert_eq!(model_source(&source(",\n    \"verified\": true")), "full network, build 310.9.1.0, verified");
+        assert_eq!(model_source(&source("")), "full network, build 310.9.1.0, not verified against NVIDIA's runtime");
+        assert_eq!(model_source(""), "full network, build unknown, not verified against NVIDIA's runtime");
+        let small = "{\n  \"source\": {\n    \"build\": \"310.9.16.0\",\n    \"verified\": false\n  },\n  \"network\": \"small\",\n  \"stages\": []\n}";
+        assert_eq!(model_source(small), "small network, build 310.9.16.0, not verified against NVIDIA's runtime");
     }
 
     #[test]

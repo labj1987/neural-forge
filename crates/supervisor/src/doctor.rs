@@ -344,7 +344,8 @@ fn check_model(roots: &Roots) -> Finding {
     match crate::model::check_installed(&roots.model_dir) {
         Ok(build) => {
             let note = if crate::model::installed_verified(&roots.model_dir) == Some(false) { ", not verified against NVIDIA's runtime" } else { "" };
-            Finding::new("model", Severity::Ok, format!("the model is extracted and intact (build {build}{note})"), dir, None)
+            let network = crate::model::installed_network(&roots.model_dir).unwrap_or(crate::model::Network::Full);
+            Finding::new("model", Severity::Ok, format!("the model is extracted and intact ({network}, build {build}{note})"), dir, None)
         }
         Err(why) if crate::model::installed(&roots.model_dir).is_none() => {
             Finding::new("model", Severity::Failure, "the model is not extracted: the network has nothing to load", why, Some(extract.into()))
@@ -1223,14 +1224,14 @@ mod tests {
         write(&f.roots.config_file, "");
         let bytes = [1u8; 16];
         let tensors = [crate::model::Tensor { name: "block0.layer0.layer".into(), block: 0, layer: 0, parameter: "layer".into(), bytes: &bytes }];
-        for (rel, data) in crate::model::build_model(&tensors, [310, 8, 0, 0], "00").unwrap() {
+        for (rel, data) in crate::model::build_model(&tensors, crate::model::Network::Full, [310, 8, 0, 0], "00").unwrap() {
             std::fs::create_dir_all(f.roots.model_dir.join(&rel).parent().unwrap()).unwrap();
             std::fs::write(f.roots.model_dir.join(&rel), data).unwrap();
         }
         write(&f.roots.binaries_dir.join("nvngx_dlssnr.dll"), "");
         let v = run(&f.roots);
         assert_eq!(one(&v, "config").severity, Severity::Ok);
-        assert_eq!(one(&v, "model").summary, "the model is extracted and intact (build 310.8.0.0)");
+        assert_eq!(one(&v, "model").summary, "the model is extracted and intact (full network, build 310.8.0.0)");
         // A stage file that no longer matches the manifest: damaged, not OK.
         let first = std::fs::read_dir(f.roots.model_dir.join("model")).unwrap().flatten().map(|e| e.path()).find(|p| std::fs::metadata(p).unwrap().len() > 0).unwrap();
         std::fs::write(&first, [9u8; 16]).unwrap();

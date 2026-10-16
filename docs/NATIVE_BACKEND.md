@@ -724,6 +724,65 @@ helper and everything associated with it". Done on `release-3.0`:
 - **Checks:** every crate builds without warnings, `cargo test` (layer on lavapipe) passes, as do
   `test_install.py`, `check_shaders.py` and `check_namespace.py`.
 
+## The small network (3.5.0, 2026-10-16)
+
+Build 310.9.16.0 of `nvngx_dlssnr.dll` (266 MB, from a game update the maintainer received) carries a second
+weights resource next to `WEIGHTS_HT`: `RT_RCDATA "WEIGHTS_CC_SMALL_FP8"`, 113,893,343 bytes, in the same record
+framing (0.4). Its `WEIGHTS_HT` is byte-identical to 310.8.0's (the eleven stage files have the same SHA-256).
+As in 0.4, only the PE headers, the resource directory and the records were read; no code in the DLL.
+
+**What it is, from the records alone.** 77 tensors, blocks 0-30, 113,887,490 bytes, `block30.layer0.blend_scale`
+last but one. Every block has exactly the names and byte lengths of a block type of the full network, in the
+same order of types, with fewer repeats per stage:
+
+| Stage | Full (blocks) | Small (blocks) |
+|---|---|---|
+| pre (block 0), encoder 32 | 0, 1-4 | 0, 1-2 |
+| encoder 64 / 128 / 256 | 5-8 / 9-14 / 15-22 | 3-4 / 5-6 / 7-8 |
+| encoder 512 (split blocks) | 23-30 | 9-10 |
+| ViT | 31-38 | 11-18 |
+| decoder 512 (transition, split blocks) | 39, 40-47 | 19, 20-21 |
+| decoder 256 / 128 / 64 / 32 | 48-55 / 56-61 / 62-65 / 66-69 | 22-23 / 24-25 / 26-27 / 28-29 |
+| post | 70 | 30 |
+
+The first and last block of each stage carry the same transition weights as the full network's (block 2 is
+block 4's 22,720 bytes, block 10 has block 30's ViT projection, block 19 is block 39's 525,312, and so on).
+`model_shape::EXPECTED_SMALL` is the table; a unit test checks that every small block has a full block's shape.
+
+**The graph.** `patches/0009` (UPSTREAM.md, 9) takes the block ranges from `nr::Topology`, chosen by the
+model's block count. Nothing else changes: the same kernels, layouts and chaining. The window phase advances
+per block at each level as in the full network, so the small network's encoder stages use phases 0-1 and its
+decoder stages continue from 2. That rule is upstream's, found for the full network; for the small one it is
+the graph's assumption, checked only by the picture below. The extractor (`model.rs`) takes `Network::Full`
+or `Network::Small` (`extract-model DIR --network small`, the Setup tab's Network row) and records it in the
+manifest (`network`); `nf_native.cpp` reads `blend_scale` from the last block.
+
+**Checks** (`dlss5vk` built from the pinned commit with the same change, the 0.6 fixtures, RTX 5070):
+
+- The full network through the changed graph: bit-exact against NGX's answer on frame d1w (as in 0.6).
+- The small network on frames d1w, d4w-d8w (1486x836): no non-finite value, the same answer over three
+  production submissions, and the same answer with barriers instead of chaining, on every frame.
+- Against the full network on d1w (both composed as in 0.6): PSNR 36.19 dB, mean difference 0.0109 on 0..1.
+  Against the input, the full network's answer is at 30.29 dB and the small one's at 32.97 dB: the small
+  network changes the frame less. Side by side, the small network's picture is coherent and follows the full
+  one's (no blocking, seams or colour shift).
+- GPU time (`dlss5vk bench`, 200 frames at GTA's DLSS input 1707x960, median): full 7.03 ms over 249
+  dispatches, small 3.81 ms over 125.
+- Not done: no comparison with NVIDIA's runtime. The NGX helper that made 0.6's is gone since 3.0, so the
+  small network is always marked unverified, whatever the build.
+
+**In GTA V Enhanced** (3.5.0 on the test machine, `gta-bench.sh`, 1440p, the maintainer's settings with
+frame generation 4x, one run each, pass 4):
+
+| Model | Real fps | Shown fps | Network (`server`, median) | Weights on the GPU |
+|---|---|---|---|---|
+| Full network, 3.4.1 (same day) | 58.6 | 234.9 | 16.1 ms | 140 MiB |
+| Full network, 3.5.0 | 56.8 | 228.1 | 16.0 ms | 140 MiB |
+| Small network, 3.5.0 | 63.7 | 256.2 | 9.95 ms | 108 MiB |
+
+The full network's time is unchanged by the graph change; the earlier 3.4.x runs on 2026-10-13 gave 56.3 and
+57.6 real fps. The small network held 64.1 frames/s before the upscaler with no misses logged.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

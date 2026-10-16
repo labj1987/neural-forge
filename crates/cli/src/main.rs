@@ -7,6 +7,7 @@ mod shmctl;
 
 use std::process::ExitCode;
 
+use neural_forge_supervisor::model::Network;
 use neural_forge_supervisor::{paths, Config};
 
 fn usage() {
@@ -19,8 +20,10 @@ fn usage() {
          \x20                     install, GPU, driver, kernel log and the last session\n\
          \x20 config               print the effective config\n\
          \x20 import-binaries DIR  copy NVIDIA's nvngx_dlssnr.dll into the user data dir\n\
-         \x20 extract-model DIR    write the model directory from nvngx_dlssnr.dll\n\
-         \x20                     (DIR holds it, or is the DLL) into the user data dir\n\
+         \x20 extract-model DIR [--network full|small]\n\
+         \x20                     write the model directory from nvngx_dlssnr.dll\n\
+         \x20                     (DIR holds it, or is the DLL) into the user data dir;\n\
+         \x20                     small: the faster 31-block network (build 310.9.16 has it)\n\
          \x20 install --appdir DIR install an extracted AppImage AppDir into\n\
          \x20                     persistent user storage (see scripts/install.py --\n\
          \x20                     same operation, same record, either tool works)\n\
@@ -235,7 +238,11 @@ fn cmd_status() -> ExitCode {
     println!("config: {}", paths::config_file());
     println!("channel: {}", neural_forge_supervisor::channel_path(&Config::load()));
     match model_build() {
-        Some(build) => println!("model: build {build}{} in {}", unverified_note(), neural_forge_supervisor::model::model_dir()),
+        Some(build) => {
+            let dir = neural_forge_supervisor::model::model_dir();
+            let network = neural_forge_supervisor::model::installed_network(std::path::Path::new(&dir)).unwrap_or(Network::Full);
+            println!("model: {network}, build {build}{} in {dir}", unverified_note())
+        }
         None => println!("model: not extracted (see `neural-forge-cli extract-model DIR`)"),
     }
     println!("state: {}", paths::state_dir());
@@ -317,18 +324,21 @@ fn cmd_import_binaries(dir: &str) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn cmd_extract_model(source: &str) -> ExitCode {
+fn cmd_extract_model(source: &str, network: Network) -> ExitCode {
     let out = neural_forge_supervisor::model::model_dir();
-    match neural_forge_supervisor::model::extract(std::path::Path::new(source), std::path::Path::new(&out)) {
+    match neural_forge_supervisor::model::extract(std::path::Path::new(source), std::path::Path::new(&out), network) {
         Ok(done) => {
             println!(
-                "extracted build {} ({} tensors, {} bytes) to {}",
+                "extracted the {} of build {} ({} tensors, {} bytes) to {}",
+                done.network,
                 done.build,
                 done.tensors,
                 done.bytes,
                 done.dir.display()
             );
-            if !done.verified {
+            if done.network == Network::Small {
+                println!("The small network's output has not been compared with NVIDIA's runtime.");
+            } else if !done.verified {
                 let v = neural_forge_supervisor::model::VERIFIED_BUILDS[0];
                 println!(
                     "Build {} has the same network as the verified build {}.{}.{}, but its output has not been compared with NVIDIA's runtime.",
@@ -485,7 +495,7 @@ enum Command {
     Doctor,
     Config,
     ImportBinaries(String),
-    ExtractModel(String),
+    ExtractModel { source: String, network: Network },
     Install(String),
     Uninstall { purge: bool },
     Shmctl(Vec<String>),
@@ -545,7 +555,25 @@ fn parse(args: &[String]) -> Result<Command, UsageError> {
         "doctor" => none(Command::Doctor),
         "config" => none(Command::Config),
         "import-binaries" => one("a directory").map(Command::ImportBinaries),
-        "extract-model" => one("a directory or the DLL").map(Command::ExtractModel),
+        "extract-model" => {
+            let (network, source) = match rest.as_slice() {
+                [source] => (None, *source),
+                ["--network", name, source] | [source, "--network", name] => (Some(*name), *source),
+                [] => return Err(err("extract-model takes a directory or the DLL".into())),
+                [_, "--network"] | ["--network", _] => return Err(err("--network takes full or small".into())),
+                [_, other, ..] if *other != "--network" => return Err(unexpected(&rest[1..])),
+                [_, _, _, extra @ ..] => return Err(unexpected(extra)),
+                _ => return Err(err("extract-model takes DIR [--network full|small]".into())),
+            };
+            if source.starts_with('-') {
+                return Err(err(format!("unknown option {source:?}")));
+            }
+            let network = match network {
+                None => Network::Full,
+                Some(name) => Network::parse(name).ok_or_else(|| err(format!("unknown network {name:?} (full or small)")))?,
+            };
+            Ok(Command::ExtractModel { source: source.to_string(), network })
+        }
         "install" => match rest.as_slice() {
             ["--appdir", dir] => Ok(Command::Install((*dir).to_string())),
             ["--appdir"] | [] => Err(err("install takes --appdir DIR".into())),
@@ -613,7 +641,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "doctor" => "usage: neural-forge-cli doctor\n  say why neural rendering is or is not running (the install, GPU, driver, kernel log and the\n  last game session), worst first; exits 1 only on a failure",
         "config" => "usage: neural-forge-cli config\n  print the effective config",
         "import-binaries" => "usage: neural-forge-cli import-binaries DIR\n  copy NVIDIA's nvngx_dlssnr.dll from DIR into the user data dir",
-        "extract-model" => "usage: neural-forge-cli extract-model DIR\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL)",
+        "extract-model" => "usage: neural-forge-cli extract-model DIR [--network full|small]\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL). full (the\n  default) is the 71-block network every build carries; small is the 31-block network build\n  310.9.16 added, about half the GPU time. The game uses the new model when it next starts",
         "install" => "usage: neural-forge-cli install --appdir DIR\n  install an extracted AppImage AppDir into persistent user storage",
         "uninstall" => {
             "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also removes config, data\n  (the DLL, the model), state and /tmp/neural-forge-$UID"
@@ -658,7 +686,7 @@ fn main() -> ExitCode {
         Command::Doctor => cmd_doctor(),
         Command::Config => cmd_config(),
         Command::ImportBinaries(dir) => cmd_import_binaries(&dir),
-        Command::ExtractModel(source) => cmd_extract_model(&source),
+        Command::ExtractModel { source, network } => cmd_extract_model(&source, network),
         Command::Install(appdir) => cmd_install(&appdir),
         Command::Uninstall { purge } => cmd_uninstall(purge),
         Command::Shmctl(args) => shmctl::run(&args),
@@ -729,7 +757,13 @@ mod tests {
     fn well_formed_commands_parse() {
         assert_eq!(parse_str("init"), Ok(Command::Init));
         assert_eq!(parse_str("install --appdir /x"), Ok(Command::Install("/x".into())));
-        assert_eq!(parse_str("extract-model /d"), Ok(Command::ExtractModel("/d".into())));
+        assert_eq!(parse_str("extract-model /d"), Ok(Command::ExtractModel { source: "/d".into(), network: Network::Full }));
+        assert_eq!(parse_str("extract-model /d --network small"), Ok(Command::ExtractModel { source: "/d".into(), network: Network::Small }));
+        assert_eq!(parse_str("extract-model --network full /d"), Ok(Command::ExtractModel { source: "/d".into(), network: Network::Full }));
+        assert!(parse_str("extract-model /d --network tiny").is_err());
+        assert!(parse_str("extract-model /d --network").is_err());
+        assert!(parse_str("extract-model /d --small").is_err());
+        assert!(parse_str("extract-model --network small").is_err());
         assert_eq!(parse_str("profile load gta"), Ok(Command::Profile(vec!["load".into(), "gta".into()])));
         assert_eq!(parse_str("profile"), Ok(Command::Profile(vec![])));
         assert_eq!(parse_str("shmctl set intensity 0.5"), Ok(Command::Shmctl(vec!["set".into(), "intensity".into(), "0.5".into()])));
