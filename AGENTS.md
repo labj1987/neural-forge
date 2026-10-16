@@ -81,6 +81,9 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   CHANGELOG.md and the docs.
 - Every release re-reads the whole README and updates or removes what the release changed, including
   the screenshots and the measured results.
+- Screenshots are always the dark theme, 1240x1400 (the window at 2x). A headless run (Xvfb) has no
+  portal and falls back to light: set `ADW_DEBUG_COLOR_SCHEME=prefer-dark`, and look at every image
+  before committing it.
 
 ## Changelog
 
