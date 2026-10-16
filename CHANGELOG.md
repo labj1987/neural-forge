@@ -4,6 +4,12 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.5.1 — 2026-10-16
+
+- The check mark beside a present model (Setup tab) and beside each passing Diagnose check (Status
+  tab) now shows with every icon theme. It used an icon that only some themes have, so with GNOME's
+  default theme a broken-image placeholder appeared instead.
+
 ## 3.5.0 — 2026-10-16
 
 Neural Forge can now run the small network that build 310.9.16 of NVIDIA's DLL added: about half the

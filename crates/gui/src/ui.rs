@@ -913,7 +913,7 @@ async fn extract_model(path: std::path::PathBuf, network: Network, toasts: adw::
     }
     let (text, present) = model_status();
     status_row.set_subtitle(&text);
-    icon.set_icon_name(Some(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" }));
+    icon.set_icon_name(Some(if present { "object-select-symbolic" } else { "dialog-warning-symbolic" }));
     model_changed();
 }
 
@@ -928,7 +928,7 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let status_row = adw::ActionRow::new();
     status_row.set_title("Model");
     status_row.set_subtitle(&text);
-    let icon = gtk4::Image::from_icon_name(if present { "emblem-ok-symbolic" } else { "dialog-warning-symbolic" });
+    let icon = gtk4::Image::from_icon_name(if present { "object-select-symbolic" } else { "dialog-warning-symbolic" });
     status_row.add_prefix(&icon);
     group.add(&status_row);
 
@@ -1948,7 +1948,7 @@ fn finding_row(finding: &neural_forge_supervisor::doctor::Finding) -> adw::Actio
         Severity::Failure => ("dialog-error-symbolic", "error"),
         Severity::Warning => ("dialog-warning-symbolic", "warning"),
         Severity::Info => ("dialog-information-symbolic", "dim-label"),
-        Severity::Ok => ("emblem-ok-symbolic", "success"),
+        Severity::Ok => ("object-select-symbolic", "success"),
     };
     let image = gtk4::Image::from_icon_name(icon);
     image.add_css_class(class);
