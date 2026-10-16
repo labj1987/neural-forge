@@ -23,8 +23,10 @@ otherwise. "History" means [history/development-before-neuralforge.md](history/d
 5. [October 1-2: measurement groundwork (1.0.1, 1.1.0)](#october-1-2-measurement-groundwork-101-110)
 6. [October 2: the model before the upscaler (2.0)](#october-2-the-model-before-the-upscaler-20)
 7. [October 11: the edit cache (3.3)](#october-11-the-edit-cache-33)
-8. [Deliberately not done, or left open](#deliberately-not-done-or-left-open)
-9. [Working practices that came out of all this](#working-practices-that-came-out-of-all-this)
+8. [October 13: the network's weights were on the GPU twice (3.4.1)](#october-13-the-networks-weights-were-on-the-gpu-twice-341)
+9. [October 16: skipping the network's work on the padding (tried, not done)](#october-16-skipping-the-networks-work-on-the-padding-tried-not-done)
+10. [Deliberately not done, or left open](#deliberately-not-done-or-left-open)
+11. [Working practices that came out of all this](#working-practices-that-came-out-of-all-this)
 
 ## September 9-12: getting a model answer at all
 
@@ -1046,6 +1048,40 @@ was taken from it.
   so 140 MiB does not move GTA at 4K off the card's limit. 4K is no longer tested on the 12 GB test
   machine (AGENTS.md).
 
+## October 16: skipping the network's work on the padding (tried, not done)
+
+Idea from AMDLSS5 (`src/helper/runtime/pad_apara.h`, all rights reserved; only the idea was looked at,
+no code or constants): the network runs on the padded field (1536x896 for DLSS Balanced's 1486x836,
+docs/NATIVE_BACKEND.md, "Field padding"), so about 10% of every launch at that size covers rows and
+columns the layer throws away. Propagate from the head back to the input how far each stage's output is
+still needed, and launch only the windows inside that bound. With every stage trimmed by 10% the ceiling
+looked like 0.5 ms of the network's 6.6.
+
+- **The bottleneck sees every padded token.** The ViT (blocks 31-38) attends over all of level 5's
+  tokens, the whole 24x16 grid at 1536x896; the attention kernels mask only the rows that round the
+  token count up to a multiple of 64 (`token < tokens`). Level 5's rows 14-15 hold nothing but padding
+  (836 / 64 = 13.1), and every output pixel attends to those 48 tokens. So each encoder stage (blocks
+  0-30 and the transitions) and the ViT must run over the whole field, as they do now: a bound pulled
+  back from the head stops at the bottleneck. This is also why the field size changes pixels inside
+  the image.
+- **What is left: the top two decoder levels.** Below the bottleneck only level 0 (768x448) and the field
+  itself have whole windows of padding; at level 1 it is at most one window row of 28 in the shifted
+  phases, and none deeper. Pulled back through the 8x8 windows of each phase (shifted windows are an
+  offset grid with one more window per shifted axis, not a cyclic roll), at 1486x836 block 70 needs
+  187x105 of its 193x113 windows (phase 4,4), and blocks 69, 68, 67 and 66 need 94x53 of 96x57, 95x53 of
+  97x56, 95x54 of 97x57 and 95x54 of 96x56: 10% and about 7% fewer.
+- **Measured.** A per-launch timestamp profile on the rig (the dump's features, 1486x836, barriers):
+  the network takes 6.11 ms, the encoder and ViT 3.35 of it, block 70 0.32 and blocks 66-69 0.33 together.
+  Block 70 walking 19,635 windows instead of 21,809 (a timing-only build, its output wrong) took
+  0.2908 ms against 0.3215: 0.031 ms, the window count's share. Blocks 66-69 at their ratios add about
+  0.023, so the trim can save at most about 0.054 ms, 0.9% of the network. The other sizes have less
+  padding (2560x1440 has 32 rows of it: block 70 would skip 4 of 185 window rows).
+- **Inside the noise, so not built.** The network's own time varies 6.56-6.67 ms between GTA runs
+  (3.4.1, above) and the benchmark about 3 fps at 1440p; 0.054 ms of a 17.8 ms real frame (56 real fps
+  with frame generation 4x) is about 0.2 fps. No patch was written, so the bit-exact gate, the GTA
+  benchmark and the play checks were not run. Worth revisiting only if a network change keeps padded
+  tokens out of the bottleneck (then the bound reaches the encoder and the 0.5 ms ceiling is real).
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
@@ -1064,6 +1100,8 @@ was taken from it.
 - **DMA-BUF and a native Linux helper:** closed (above).
 - **Queue priority:** refused by the driver without privileges.
 - **Building a frame generator into Neural Forge:** out of scope; the game's own works.
+- **Skipping the network's work on the padding:** at most 0.054 ms of 6.1 at 1486x836, because the
+  ViT attends over the padded tokens and the encoder must run over the whole field (October 16, above).
 - **A before/after capture while the model runs before the upscaler.** The capture request (`shmctl
   capture`, the Debug tab's Capture button) is served after the upscaler as a matched pair: the game's
   frame and the composited result (`capture::run`, `dump::write_pair`). While frames are held before
