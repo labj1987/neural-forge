@@ -4,6 +4,18 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.5.2 — 2026-10-17
+
+- **The small network is now the default.** Extracting the model (the Setup tab's Extract button, or
+  `neural-forge-cli extract-model` without `--network`) writes the small network when the DLL has it
+  (build 310.9.16), and the full one from older builds. It runs in about half the GPU time. You can
+  still pick Full in the Setup tab's Network row.
+- **The small network is verified.** Its output is now confirmed bit for bit against NVIDIA's own
+  runtime, which runs the small network by default from build 310.9.16. The full network of build
+  310.9.16 is confirmed the same way. Neither shows "not verified" any more.
+- If your model came from build 310.9.16, extract it again (or pick its network in the Setup tab
+  again) to have it shown as verified.
+
 ## 3.5.1 — 2026-10-16
 
 - The check mark beside a present model (Setup tab) and beside each passing Diagnose check (Status

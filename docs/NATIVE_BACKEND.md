@@ -183,7 +183,7 @@ expected; names expected but missing; names present but not expected (a repeated
 names with a different length (`name: found N, expected M`), ten of each; and "This DLL carries a
 different network. Neural Forge needs new graph code for it." A retrain that keeps the architecture
 passes; `blend_scale` is read from the weights (`nf_native.cpp`), so a new value is picked up.
-`VERIFIED_BUILDS` (`[[310, 8, 0]]`) lists the builds whose output was compared bit for bit with
+`VERIFIED` (the full network of 310.8.0 and 310.9.16, the small one of 310.9.16) lists the networks and builds whose output was compared bit for bit with
 NVIDIA's runtime; the manifest's `source.verified` says whether the source build is one, the CLI,
 the Setup tab and the layer's load log line show it, and it gates nothing. A manifest without the
 field was written by 3.0.0, from 310.8.0. Fifteen unit tests run the walk, the shape check and the
@@ -768,8 +768,7 @@ manifest (`network`); `nf_native.cpp` reads `blend_scale` from the last block.
   one's (no blocking, seams or colour shift).
 - GPU time (`dlss5vk bench`, 200 frames at GTA's DLSS input 1707x960, median): full 7.03 ms over 249
   dispatches, small 3.81 ms over 125.
-- Not done: no comparison with NVIDIA's runtime. The NGX helper that made 0.6's is gone since 3.0, so the
-  small network is always marked unverified, whatever the build.
+- Against NVIDIA's runtime: see "Against NGX (3.5.2)" below.
 
 **In GTA V Enhanced** (3.5.0 on the test machine, `gta-bench.sh`, 1440p, the maintainer's settings with
 frame generation 4x, one run each, pass 4):
@@ -782,6 +781,29 @@ frame generation 4x, one run each, pass 4):
 
 The full network's time is unchanged by the graph change; the earlier 3.4.x runs on 2026-10-13 gave 56.3 and
 57.6 real fps. The small network held 64.1 frames/s before the upscaler with no misses logged.
+
+### Against NGX (3.5.2, 2026-10-17)
+
+The released 2.0.10 helper, NGX with build 310.9.16 of the DLL, in its own XDG directories and channel, no
+game running, driven by `trigger_helper_roundtrip` as in 0.6 (frame d1w: 32 requests, 2 s, one more, so
+the answer is NGX's first frame after a reset). Only the parameter object the helper hands NGX was
+watched; no code in the DLL was read. The DLL reads no new key that selects a network; three keys it
+reads and the helper never sets are new against 310.8 (`DLSSNR.MaskBlendMode`, `DLSSNR.UICorrection`,
+`DLSS.Indicator.Invert.X/Y.Axis`). `DLSSNR.Hint.Render.Preset` picks the network:
+
+| Preset | First answer after a reset | `dlss5vk parity`, small network | `dlss5vk parity`, full network | Helper busy (1486x836, median of 40) |
+|---|---|---|---|---|
+| 0 (the default; 2 and 4 give the same first frame) | one answer | **bit-exact (3726888)** | 99.3% differ | 3.6 ms |
+| 1 | 310.8.0's full answer, byte for byte | 99.3% differ | **bit-exact (3726888)** | 5.1 ms |
+
+So NGX runs the small network at its default preset from build 310.9.16, and the native small network
+computes it identically (the window phases of patch 0009 included). 3.5.2 marks the small and full
+networks of 310.9.16 verified and makes the small one the default extraction where the DLL has it.
+Presets 2 and 4 give different answers from 0 over a run with history; not followed further.
+
+GTA V Enhanced on the helper with that model (2.0.10 installed, preset 0, `gta-bench.sh`, the maintainer's
+settings with frame generation 4x and FG Preset C, one run, pass 4): 63.5 real fps, the model held
+before the upscaler at 1486x836, 61 holds/s, 0 misses, helper busy 4.2 ms.
 
 ## Decided before Phase 1
 

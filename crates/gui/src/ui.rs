@@ -935,10 +935,11 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     // Which network to extract. Changing it re-extracts from the DLL `import-binaries` keeps, when
     // there is one; otherwise it applies to the next Extract.
     let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
-    let installed = neural_forge_supervisor::model::installed_network(&dir).unwrap_or(Network::Full);
+    // Before any model is extracted the row shows the default, the small network.
+    let installed = neural_forge_supervisor::model::installed_network(&dir).unwrap_or(Network::Small);
     let network_row = adw::ComboRow::new();
     network_row.set_title("Network");
-    network_row.set_subtitle("Small: 31 blocks instead of 71, about half the GPU time (build 310.9.16 of the DLL)");
+    network_row.set_subtitle("Small, the default: 31 blocks instead of 71, about half the GPU time (build 310.9.16 of the DLL; older builds have only Full)");
     network_row.set_model(Some(&gtk4::StringList::new(&NETWORK_CHOICES)));
     network_row.set_selected(Network::ALL.iter().position(|n| *n == installed).unwrap_or(0) as u32);
     group.add(&network_row);

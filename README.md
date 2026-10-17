@@ -46,11 +46,14 @@ The network runs inside the game's process, in the Vulkan layer, on the game's G
 not loaded at run time: the layer reads the model's weights from the folder `extract-model` wrote
 (see [Install](#install)). Two networks come in NVIDIA's DLL, and you choose one:
 
-- **Full** (71 blocks), in every build of the DLL. Its answer for an input frame is bit-exact with
-  NGX's own ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), 0.6).
-- **Small** (31 blocks, the same kinds of blocks with fewer of each), in build 310.9.16. It
-  takes about half the GPU time and changes the picture a little less. It has not been compared with
-  NVIDIA's runtime.
+- **Small** (31 blocks, the same kinds of blocks with fewer of each), in build 310.9.16, and the
+  default when the DLL has it. It takes about half the GPU time of the full one and changes the
+  picture a little less. It is what NVIDIA's own runtime runs from build 310.9.16 at its default
+  preset.
+- **Full** (71 blocks), in every build of the DLL, and the default for builds without the small one.
+
+Each network's answer for an input frame is bit-exact with NGX's own
+([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), 0.6 and "The small network").
 
 The model runs in one of two places. The layer picks the place for each game by itself:
 
@@ -144,7 +147,7 @@ Setup notes for these games:
 - GTK 4.12 or newer and libadwaita 1.5 or newer, from the system. The AppImage uses the host's
   GTK and libadwaita. Release builds are made on Ubuntu 24.04 (GTK 4.14, libadwaita 1.5).
 - NVIDIA's own Neural Rendering DLL (`nvngx_dlssnr.dll`), once, to extract the model's weights
-  from: any build that carries the full network, and build 310.9.16 for the small one.
+  from: build 310.9.16 for the small network, or any build that carries the full one.
   This project does not and cannot ship the DLL or the weights.
 - For the model before the upscaler: a game that uses DLSS through Vulkan (under Proton, a DX12 game
   through vkd3d-proton and DXVK-NVAPI).
@@ -177,20 +180,21 @@ NVIDIA's SDK), with the Setup tab's **Extract from DLL** button or with:
 neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll
 ```
 
-That writes the full network. For the small one, pick **Small** in the Setup tab's **Network** row
-(it re-extracts from the imported DLL), or run:
+That writes the small network when the DLL has it (build 310.9.16), and the full one otherwise. To
+choose, pick **Small** or **Full** in the Setup tab's **Network** row (it re-extracts from the
+imported DLL), or run:
 
 ```bash
-neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll --network small
+neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll --network full
 ```
 
 The weights are written to `~/.local/share/neural-forge/model` (141 MB full, 114 MB small), with
 hashes the layer checks when it loads them. The DLL is not needed after that. Restart the game
 afterwards.
 
-Build 310.8.0's full network is the verified one: its output was compared bit for bit with NVIDIA's
-runtime. Other builds with the same network, and the small network of any build, are marked "not
-verified against NVIDIA's runtime". A DLL with a network Neural Forge does not implement is refused
+The verified networks are the small and full ones of build 310.9.16 and the full one of build
+310.8.0: their output was compared bit for bit with NVIDIA's runtime. Other builds with the same
+networks are marked "not verified against NVIDIA's runtime". A DLL with a network Neural Forge does not implement is refused
 with a report of what differs.
 
 Nothing needs root: everything lives under `~/.config/neural-forge`, `~/.local/share/neural-forge`,

@@ -69,7 +69,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   `--network small`). The graph picks its block ranges from the model's block count
   (`patches/0009`, `nr::Topology`); a third network needs a new `Topology` and stage table. That table changes together with
   OpenDLSS-NR's graph: regenerate it with `scripts/gen_model_shape.py` when the pinned commit
-  (`third_party/opendlss-nr/UPSTREAM.md`) moves to a new network. `VERIFIED_BUILDS` only marks builds compared with
+  (`third_party/opendlss-nr/UPSTREAM.md`) moves to a new network. `VERIFIED` only marks the networks and builds compared with
   NVIDIA's runtime; it gates nothing.
 
 ## README
