@@ -240,7 +240,7 @@ fn cmd_status() -> ExitCode {
     match model_build() {
         Some(build) => {
             let dir = neural_forge_supervisor::model::model_dir();
-            let network = neural_forge_supervisor::model::installed_network(std::path::Path::new(&dir)).unwrap_or(Network::Full);
+            let network = neural_forge_supervisor::model::installed_network_text(std::path::Path::new(&dir));
             println!("model: {network}, build {build}{} in {dir}", unverified_note())
         }
         None => println!("model: not extracted (see `neural-forge-cli extract-model DIR`)"),
@@ -341,6 +341,9 @@ fn cmd_extract_model(source: &str, network: Option<Network>) -> ExitCode {
                 done.bytes,
                 done.dir.display()
             );
+            if let Some(why) = &done.fallback {
+                println!("The default is the small network, but {why}.");
+            }
             if !done.verified {
                 let verified: Vec<String> = neural_forge_supervisor::model::VERIFIED
                     .iter()

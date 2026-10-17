@@ -4,6 +4,23 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.5.3 — 2026-10-17
+
+- **Extracting with an older DLL works the first time.** With no model yet, the Setup tab's Extract
+  button now writes the small network when the DLL has it and the full one from builds before
+  310.9.16, as `neural-forge-cli extract-model` does. Before, it asked for the small network and
+  failed on older builds until you picked Full.
+- **Changing the network can no longer leave a broken model.** The Network row and the Extract button
+  are greyed out while a model is being extracted. Before, changing the network again during an
+  extraction, or extracting from the button at the same time, could leave a damaged model or one
+  that wasn't the network the row showed.
+- The Network row always shows the network that is installed. If an extraction fails, it goes back to
+  it instead of staying on the one that failed.
+- If a later build of the DLL changes the small network, extracting without choosing a network writes
+  the full one instead of failing, and says why.
+- A model whose network this version doesn't know is shown as an unknown network, and Diagnose
+  reports it, instead of calling it the full network.
+
 ## 3.5.2 — 2026-10-17
 
 - **The small network is now the default.** Extracting the model (the Setup tab's Extract button, or

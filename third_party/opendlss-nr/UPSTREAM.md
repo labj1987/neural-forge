@@ -95,5 +95,6 @@ Each one is a patch in `patches/`, relative to the source's root (`patch -p1`), 
    and `Topology::forBlockCount` gives the full network's (71 blocks) or the small one's (31: `WEIGHTS_CC_SMALL_FP8`
    in build 310.9.16, the same block types with fewer per stage); `Graph` takes it from `Model::blockCount()` and
    refuses any other count, as the removed `kBlockCount` check did. Every block number in `record` and `encodeVit`
-   comes from it. The full network's output is unchanged: bit-exact against NGX's answer on fixture d1w
-   (docs/NATIVE_BACKEND.md, 0.6). `referenceBoundaryNames` (parity fixtures only) still lists the full network's.
+   comes from it, as do the boundary capture names and `referenceBoundaryNames` (parity fixtures only; a member
+   now, since the list depends on the network). The full network's output is unchanged: bit-exact against NGX's
+   answer on fixture d1w (docs/NATIVE_BACKEND.md, 0.6).

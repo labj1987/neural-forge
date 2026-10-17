@@ -344,7 +344,7 @@ fn check_model(roots: &Roots) -> Finding {
     match crate::model::check_installed(&roots.model_dir) {
         Ok(build) => {
             let note = if crate::model::installed_verified(&roots.model_dir) == Some(false) { ", not verified against NVIDIA's runtime" } else { "" };
-            let network = crate::model::installed_network(&roots.model_dir).unwrap_or(crate::model::Network::Full);
+            let network = crate::model::installed_network_text(&roots.model_dir);
             Finding::new("model", Severity::Ok, format!("the model is extracted and intact ({network}, build {build}{note})"), dir, None)
         }
         Err(why) if crate::model::installed(&roots.model_dir).is_none() => {

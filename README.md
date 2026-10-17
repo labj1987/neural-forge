@@ -195,7 +195,8 @@ afterwards.
 The verified networks are the small and full ones of build 310.9.16 and the full one of build
 310.8.0: their output was compared bit for bit with NVIDIA's runtime. Other builds with the same
 networks are marked "not verified against NVIDIA's runtime". A DLL with a network Neural Forge does not implement is refused
-with a report of what differs.
+with a report of what differs. When only the small network differs and you didn't choose one, the full network is
+extracted instead, and you're told why.
 
 Nothing needs root: everything lives under `~/.config/neural-forge`, `~/.local/share/neural-forge`,
 `~/.local/state/neural-forge` and `/tmp/neural-forge-$UID/`. An upstream DLSS5VKLayer install can

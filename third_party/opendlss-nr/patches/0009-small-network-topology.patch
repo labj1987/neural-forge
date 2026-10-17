@@ -1,5 +1,5 @@
 diff --git a/src/nr_graph.cpp b/src/nr_graph.cpp
-index 2f10067..dbc7a29 100644
+index 2f10067..66e2ede 100644
 --- a/src/nr_graph.cpp
 +++ b/src/nr_graph.cpp
 @@ -142,7 +142,7 @@ Graph::Routes Graph::routesFromEnvironment() {
@@ -21,10 +21,22 @@ index 2f10067..dbc7a29 100644
  }
  
  Graph::~Graph() {
-@@ -194,6 +191,14 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
+@@ -194,18 +191,24 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
    return activations_.back().get();
  }
  
+-const std::vector<std::string>& Graph::referenceBoundaryNames() {
+-  static const std::vector<std::string> names = [] {
+-    std::vector<std::string> list;
+-    const int transitionsAfter[] = {0, 4, 8, 14, 22};
+-    for (int block = 0; block <= 69; ++block) {
+-      list.push_back("block-" + std::to_string(block));
+-      if (std::find(std::begin(transitionsAfter), std::end(transitionsAfter), block) != std::end(transitionsAfter))
+-        list.push_back("transition-" + std::to_string(block) + "-" + std::to_string(block + 1));
+-    }
+-    return list;
+-  }();
+-  return names;
 +Topology Topology::forBlockCount(uint32_t blocks) {
 +  if (blocks == 71)
 +    return {4, {5, 9, 15}, {8, 14, 22}, 23, 30, 31, 38, 39, 40, 47, {48, 56, 62, 66}, {55, 61, 65, 69}, 70};
@@ -33,10 +45,20 @@ index 2f10067..dbc7a29 100644
 +  throw std::runtime_error("no graph for a model of " + std::to_string(blocks) + " blocks (71 or 31)");
 +}
 +
- const std::vector<std::string>& Graph::referenceBoundaryNames() {
-   static const std::vector<std::string> names = [] {
-     std::vector<std::string> list;
-@@ -593,7 +598,8 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
++std::vector<std::string> Graph::referenceBoundaryNames() const {
++  const Topology& t = topology_;
++  std::vector<std::string> list;
++  const int transitionsAfter[] = {0, t.enc32Last, t.encLast[0], t.encLast[1], t.encLast[2]};
++  for (int block = 0; block < t.post; ++block) {
++    list.push_back("block-" + std::to_string(block));
++    if (std::find(std::begin(transitionsAfter), std::end(transitionsAfter), block) != std::end(transitionsAfter))
++      list.push_back("transition-" + std::to_string(block) + "-" + std::to_string(block + 1));
++  }
++  return list;
+ }
+ 
+ void Graph::capture(VkCommandBuffer commands, const std::string& name, const Activation& source) {
+@@ -593,7 +596,8 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
    // the producer's column-group count at kSyncRows + 4 * {0 expand, 1 contract, 2 qkv, 4 projection}).
    const bool chain = routes_.vitChain;
    auto vitCounter = [&](int block, int op) { return kernels_.syncAddress(block, Kernels::kSyncRows) + 4 * op; };
@@ -46,7 +68,7 @@ index 2f10067..dbc7a29 100644
      kernels_.setStageLabel("block " + std::to_string(block) + " vit");
      const Tensor& expand = model_.tensor(block, 0);
      const Tensor& contract = model_.tensor(block, 1);
-@@ -605,7 +611,7 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
+@@ -605,7 +609,7 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
      e.output = expanded; e.silu = true; e.quantize = true;
      e.chainSingle = true;
      if (chain) {
@@ -55,7 +77,7 @@ index 2f10067..dbc7a29 100644
        e.chainSignal = vitCounter(block, 0); e.chained = true;
      }
      kernels_.gemmFp8(commands, e);
-@@ -662,7 +668,7 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
+@@ -662,7 +666,7 @@ void Graph::encodeVit(VkCommandBuffer commands, Activation& state, uint32_t toke
      p.output = &state; p.quantize = true;
      p.residual = ffnResidual; p.scaleResidual = true; p.auxTensor = &projection; p.auxByteOffset = channels * channels;
      if (chain && attnPtx) { p.chainWaitRows = vitCounter(block, 3); p.chainWaitExpected = heads * (padded / 64); }
@@ -64,7 +86,7 @@ index 2f10067..dbc7a29 100644
      kernels_.gemmFp8(commands, p);
      capture(commands, "block-" + std::to_string(block), state);
    }
-@@ -758,11 +764,13 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -758,11 +762,13 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
    const uint32_t rows1 = d1.width * d1.height;
    Activation* downsampled32 = allocate("encoder 32 downsample", rows1, 32, Format::E4);
    const bool poolBlock4 = options_.fusedBlocks && !options_.captureIntermediates && fusePool;
@@ -82,7 +104,7 @@ index 2f10067..dbc7a29 100644
      std::swap(state, scratch);
      capture(commands, "block-" + std::to_string(block), *state);
    }
-@@ -774,7 +782,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -774,15 +780,17 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
    {
      GemmFp8Args t;
      t.input = downsampled32; t.rows = rows1; t.K = 32; t.N = 64;
@@ -91,7 +113,8 @@ index 2f10067..dbc7a29 100644
      t.output = next64; t.quantize = true;
      kernels_.gemmFp8(commands, t);
    }
-@@ -782,7 +790,9 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+-  capture(commands, "transition-4-5", *next64);
++  capture(commands, "transition-" + std::to_string(e32) + "-" + std::to_string(e32 + 1), *next64);
  
    // ---- Encoder fused stages 64 / 128 / 256.
    struct FusedStage { Geometry::Level level, next; uint32_t channels; int first, last, levelIndex; };
@@ -102,7 +125,7 @@ index 2f10067..dbc7a29 100644
    Activation* skips[3] = {};
    Activation* stageInput = next64;
    for (int s = 0; s < 3; ++s) {
-@@ -830,9 +840,9 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -830,9 +838,9 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
      Activation* sc = allocate("encoder 512 state", rows4, 512, Format::E4);
      Activation* raw = allocate("encoder 512 raw transition", rows4, 512, Format::F16);
      SplitTemporaries temps = createSplitTemporaries("encoder 512", rows4);
@@ -114,7 +137,7 @@ index 2f10067..dbc7a29 100644
        std::swap(st, sc);
        capture(commands, "block-" + std::to_string(block), *st);
      }
-@@ -844,7 +854,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -844,7 +852,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
      Activation* vitState = allocate("ViT state", tokens, 1024, Format::E4);
      GemmFp8Args t;
      t.input = pooled; t.rows = tokens; t.K = 512; t.N = 1024;
@@ -123,7 +146,7 @@ index 2f10067..dbc7a29 100644
      t.output = vitState; t.quantize = true;
      kernels_.gemmFp8(commands, t);
  
-@@ -856,19 +866,19 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -856,19 +864,19 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
      Activation* projected512 = allocate("decoder 512 projection", tokens, 512, Format::F16);
      GemmFp8Args p;
      p.input = vitState; p.rows = tokens; p.K = 1024; p.N = 512; p.partition = 256;
@@ -148,7 +171,7 @@ index 2f10067..dbc7a29 100644
        std::swap(dst, dsc);
        capture(commands, "block-" + std::to_string(block), *dst);
      }
-@@ -877,8 +887,10 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -877,8 +885,10 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
  
    // ---- Decoder fused stages 256 / 128 / 64 / 32.
    struct DecoderStage { Geometry::Level low, high; uint32_t channels; int first, last, levelIndex; Activation* skip; };
@@ -161,16 +184,23 @@ index 2f10067..dbc7a29 100644
    for (const DecoderStage& stage : decoderStages) {
      const uint32_t lowRows = stage.low.width * stage.low.height;
      const uint32_t rows = stage.high.width * stage.high.height;
-@@ -949,7 +961,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -947,12 +957,12 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+     stageInput = st;
+   }
  
-   // ---- Full-resolution post block 70 and the RGBA head.
+-  // ---- Full-resolution post block 70 and the RGBA head.
++  // ---- Full-resolution post block (70; 30 in the small network) and the RGBA head.
    {
 -    const Tensor& tensor = model_.tensor(70);
 +    const Tensor& tensor = model_.tensor(tp.post);
      kernels_.setStageLabel("post");
      FusedLayout layout = postFusedLayout();
-     if (tensor.byteLength != layout.endWithoutPadding) throw std::runtime_error("unexpected block70 layout");
-@@ -961,7 +973,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+-    if (tensor.byteLength != layout.endWithoutPadding) throw std::runtime_error("unexpected block70 layout");
++    if (tensor.byteLength != layout.endWithoutPadding) throw std::runtime_error("unexpected post block (block " + std::to_string(tp.post) + ") layout");
+     head_ = allocate("RGBA neural head", fullRows, 4, Format::F32);
+     if (options_.fusedBlocks && !options_.captureIntermediates && routes_.fusePost) {
+       // The post blend (2x upsample of block 69 + block 0, learned scales) feeds block 70 in registers and the
+@@ -961,7 +971,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
        const vk::Buffer& headWeights = model_.f16Matrix(tensor, layout.postWeights, 32, 4, paddedN);
        uint32_t shiftX, shiftY;
        windowPhase(takeWindowPhase(kFullLevel), shiftX, shiftY);
@@ -179,7 +209,7 @@ index 2f10067..dbc7a29 100644
        Kernels::FusedBlock32Args f;
        f.state = adapter; f.lowRes = stageInput; f.lowWidth = d0.width;
        f.inputScaleByteOffset = layout.inputScale; f.adapterScaleByteOffset = layout.adapterScale;
-@@ -981,7 +993,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -981,7 +991,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
        f.attentionScaleByteOffset = layout.scale;
        f.headWeights = &headWeights; f.head = head_;
        f.width = g.fullWidth; f.height = g.fullHeight; f.shiftX = shiftX; f.shiftY = shiftY;
@@ -188,7 +218,7 @@ index 2f10067..dbc7a29 100644
        kernels_.fusedBlock32(commands, f);
      } else {
        Activation* rawMerged = allocate("post raw merge", fullRows, 32, Format::F16);
-@@ -990,7 +1002,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
+@@ -990,7 +1000,7 @@ void Graph::record(VkCommandBuffer commands, const Activation& inputFeatures) {
                           *merged, d0.width, d0.height, g.fullWidth, g.fullHeight);
        Activation* rawBlockOutput = allocate("post raw block output", fullRows, 32, Format::F16);
        Temporaries temps = createTemporaries("post", fullRows, 32);
@@ -198,7 +228,7 @@ index 2f10067..dbc7a29 100644
        kernels_.setStageLabel("head");
        uint32_t paddedN = 0;
 diff --git a/src/nr_graph.h b/src/nr_graph.h
-index a21ae0f..931492d 100644
+index a21ae0f..2cde94e 100644
 --- a/src/nr_graph.h
 +++ b/src/nr_graph.h
 @@ -1,4 +1,4 @@
@@ -237,7 +267,21 @@ index a21ae0f..931492d 100644
    struct Options {
      bool captureBoundaries = false;  // copy every block/transition output for parity checks
      bool captureIntermediates = false;  // also copy the intra-block tensors (FFN, QKV, attention)
-@@ -129,6 +141,7 @@ class Graph {
+@@ -55,9 +67,10 @@ class Graph {
+   const Geometry& geometry() const { return geometry_; }
+   // Whether consecutive launches are linked by device counters instead of barriers (docs/execution.md).
+   bool chained() const { return routes_.chain || routes_.vitChain; }
+-  // The stored outputs a boundary fixture can hold references for, in graph order: blocks 0-69 and the five encoder
+-  // stage transitions. Block 70 feeds the head on chip; the pooled-* captures have no reference counterpart.
+-  static const std::vector<std::string>& referenceBoundaryNames();
++  // The stored outputs a boundary fixture can hold references for, in graph order: every block before the post one
++  // (0-69, 0-29 in the small network) and the five encoder stage transitions. The post block feeds the head on chip;
++  // the pooled-* captures have no reference counterpart.
++  std::vector<std::string> referenceBoundaryNames() const;
+ 
+   Activation* allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format);
+ 
+@@ -129,6 +142,7 @@ class Graph {
    Kernels& kernels_;
    Geometry geometry_;
    Options options_;
