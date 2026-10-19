@@ -1,0 +1,90 @@
+#version 450
+// The scene-cut detector (`preupscale::scene_cut`, docs/DLSSNR_PARAMETERS.md, "History reset"): a luma
+// thumbnail of the encoded capture on an 8-pixel step, compared with the previous hold's, in the capture
+// (`C`) of every native hold, right after the encode. The 1.x helper's detector on the CPU (`scene.rs`),
+// moved onto the GPU: each sampled channel of the encoded proxy (display-referred, [0, 1]) clamped (NaN
+// to 0) and rounded to 8 bits, the three averaged (integer division); a cut when the mean absolute
+// difference of the two thumbnails is at least the threshold (40 of 255 by default), in integers.
+//
+// Two dispatches of this shader (DECIDE false, then true, with a barrier between): the first writes the
+// thumbnail in place (each sample's word belongs to one invocation, which reads the previous hold's value
+// before it writes its own) and one partial sum per workgroup; the second, one workgroup, adds the
+// partials, writes the frame shaders' cut word (`State.cut`, the native pass's state buffer, which
+// native_preprocess.comp and native_composite.comp read as "no history" on this same frame) and the
+// host-visible result the next hold reads for the log and the counter.
+layout(local_size_x = 256) in;
+
+layout(constant_id = 0) const bool DECIDE = false;
+
+// The encoded proxy (padded extent; the valid part is read), GENERAL.
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_encoded;
+// The thumbnail: one 8-bit luma value a word, row-major over ceil(width / 8) x ceil(height / 8).
+layout(set = 0, binding = 1, std430) buffer Thumb { uint luma[]; } u_thumb;
+// One partial sum of absolute differences per first-dispatch workgroup.
+layout(set = 0, binding = 2, std430) buffer Partial { uint sum[]; } u_partial;
+// Host-visible: compared (0 on the first hold), cut, the sum of absolute differences, the sample count.
+layout(set = 0, binding = 3, std430) writeonly buffer Result { uint words[4]; } u_result;
+// The native pass's state (native_preprocess.comp's `State`): `cut` is this shader's.
+layout(set = 0, binding = 4, std430) buffer State { uint ok[2]; uint cut; } u_state;
+
+layout(push_constant) uniform Params {
+  uvec2 size;       // the render extent
+  uint threshold;   // the mean absolute difference (0-255) that is a cut; 0 never cuts
+  uint compare;     // 1: the thumbnail holds the previous hold's (else this hold only writes it)
+} p;
+
+const uint STEP = 8u;
+
+shared uint s_sum[256];
+
+// encoded_u8: clamped to [0, 1] (NaN to 0, +Inf to 255), rounded to nearest.
+uint quantise(float v) {
+  return isnan(v) ? 0u : uint(clamp(v, 0.0, 1.0) * 255.0 + 0.5);
+}
+
+uvec2 thumb_size() { return (p.size + (STEP - 1u)) / STEP; }
+
+void reduce(uint local) {
+  barrier();
+  for (uint half_n = 128u; half_n > 0u; half_n >>= 1u) {
+    if (local < half_n) s_sum[local] += s_sum[local + half_n];
+    barrier();
+  }
+}
+
+void main() {
+  uvec2 t = thumb_size();
+  uint n = t.x * t.y;
+  uint local = gl_LocalInvocationID.x;
+  if (!DECIDE) {
+    uint i = gl_GlobalInvocationID.x;
+    uint d = 0u;
+    if (i < n) {
+      ivec2 at = ivec2(int((i % t.x) * STEP), int((i / t.x) * STEP));
+      vec3 c = imageLoad(u_encoded, at).rgb;
+      uint q = (quantise(c.r) + quantise(c.g) + quantise(c.b)) / 3u;
+      uint previous = u_thumb.luma[i];
+      u_thumb.luma[i] = q;
+      if (p.compare != 0u) d = q > previous ? q - previous : previous - q;
+    }
+    s_sum[local] = d;
+    reduce(local);
+    if (local == 0u) u_partial.sum[gl_WorkGroupID.x] = s_sum[0];
+  } else {
+    uint groups = (n + 255u) / 256u;
+    uint d = 0u;
+    for (uint g = local; g < groups; g += 256u) d += u_partial.sum[g];
+    s_sum[local] = d;
+    reduce(local);
+    if (local == 0u) {
+      uint sum = p.compare != 0u ? s_sum[0] : 0u;
+      // floor(sum / n) >= threshold, without the division (n * 255 fits 32 bits up to 8K).
+      bool cut = p.compare != 0u && p.threshold > 0u && n > 0u && sum >= p.threshold * n;
+      u_state.cut = cut ? 1u : 0u;
+      u_result.words[0] = p.compare;
+      u_result.words[1] = cut ? 1u : 0u;
+      u_result.words[2] = sum;
+      u_result.words[3] = n;
+    }
+  }
+}

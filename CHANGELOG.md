@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.7.0 — 2026-10-19
+
+- **Scene cuts start the model afresh.** Before the upscaler, when the picture changes completely from
+  one frame to the next (a cut in a cutscene, a respawn, a camera switch), the model no longer blends
+  the previous scene into the first frames of the new one. The Debug tab counts these frames under
+  Scene cuts.
+
 ## 3.6.0 — 2026-10-19
 
 - **Passes.** The Model tab has a Passes setting: the model can run up to 10 times over each frame,

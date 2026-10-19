@@ -23,7 +23,8 @@ disassembling or decompiling an NVIDIA DLL** (the DLSS and NGX SDK licence prohi
   unset, the feature runs without them. Every open-source consumer leaves them null too.
 - **A history reset exists, and it works:** `DLSSNR.Reset`, read as an integer on every evaluate.
   The helper sets it at every point where the history stops belonging to the frame (table below).
-  Its one gap is scene cuts while motion vectors are off, which is not the shipped configuration.
+  Its one gap was scene cuts while motion vectors are off, which was not the shipped configuration;
+  the native backend's detector (3.7.0) runs whether they are on or not.
 - **18 of the helper's writes are never read.** Among them is `Feature_Flags`, whose bits the
   helper had wrong against the public SDK. A black-box A/B with the bits corrected gave
   byte-identical answers, because nothing reads the key. `Sharpness` is not read either, so the
@@ -156,16 +157,30 @@ feature, not reset, when the resolution or formats change.
 | Pause over 500 ms | reset (`Stale::Idle`) | not handled | not handled | not handled | n/a |
 | Proxy format changed | reset (`Stale::FormatChanged`) | reset (via rebuild) | reset | reset | reset |
 | Scene cut detected from the picture | reset, **only while motion vectors are on** (`scene.rs`, threshold 40 on an 8-pixel-step luma thumbnail) | no model reset; drops the flow history and zeroes motion (threshold 55, two frames) | no detector | no detector | n/a |
+| Scene cut, the native backend (3.7.0) | reset on every hold, motion vectors or not (`preupscale::scene_cut`, `Stale::SceneCut`): the same thumbnail and threshold on the GPU, in the capture; the cut frame itself starts afresh in every pass, a cut on a cached hold resets the next network frame and refreshes the edit cache | | | | |
 | The game's own NGX reset flag | not visible | not visible | reset | reset | reset |
 
 Findings:
 
 - **Resolution changes are covered twice**: the feature is rebuilt (the key includes the size), and
   the new resource set's first evaluate resets.
-- **Cuts with motion vectors off are not detected.** `MotionState::prepare` returns "no cut" as soon
-  as motion is off, so the thumbnail is never taken. Motion vectors are on by default (quality FAST
-  since 0.1.98) and in the GTA baseline, so this only affects a configuration nobody runs. Taking
-  the thumbnail regardless would close it at the cost of a CPU pass over every 64th pixel.
+- **Cuts with motion vectors off are not detected** (the helper). `MotionState::prepare` returns "no
+  cut" as soon as motion is off, so the thumbnail is never taken. Motion vectors are on by default
+  (quality FAST since 0.1.98) and in the GTA baseline, so this only affects a configuration nobody
+  runs. Taking the thumbnail regardless would close it at the cost of a CPU pass over every 64th pixel.
+- **The native backend's detector (3.7.0)** is the helper's rule on the GPU, independent of the motion
+  vectors: in the capture (`C`) of every native hold, after the encode,
+  `shaders/preupscale_scene_cut.comp` takes the thumbnail of the encoded capture (every 8th pixel on
+  each axis; each channel clamped to [0, 1], NaN to 0, rounded to 8 bits, the three averaged) and
+  compares it with the previous hold's; a cut when the integer mean absolute difference is at least
+  40 of 255 (`scene_cut::THRESHOLD`). The encoded capture is the same display-referred [0, 1] value the
+  helper quantised (`ebad222`), so 40 means what it meant there. The decision is written into the native
+  pass's state buffer (`State.cut`), which `native_preprocess.comp` and `native_composite.comp` read as
+  "no history" (seed 0, no blend) on the same frame, for every pass; the host reads the result at the
+  next hold, after its usual wait, for the log line, the counter (SHM v20 `scene_cuts`, `shmctl status`
+  `scene_cuts=N`, the Debug tab's Scene cuts row) and the CPU's side (`restart_seed`, or
+  `HistoryGap::scene_cut` and `cache::State::drop_edit` for a cut on a cached hold). No readback stall.
+  `NEURAL_FORGE_SCENE_CUT=off|<1-255>` switches it off or sets the threshold, for testing.
 - **The game's own reset is out of reach.** OptiScaler, RenoDX and the AMD project sit inside the
   game's NGX calls and forward its `Reset`. Neural Forge sees DLSS from a Vulkan layer, where the
   game's NGX parameter block is not visible; the picture-based detector is its substitute.
@@ -193,7 +208,7 @@ The maintainer's bar: a change ships only if it raises fps or improves image qua
 | Correct `Feature_Flags` bits | yes | yes | no difference to measure | no: byte-identical answers | committed, unreleased |
 | Remove the 18 unread writes | yes | yes | no | no | no |
 | Bind `UI`, `UIAlpha` or `ControlMask` | no (no source image; mask meaning not public) | no | | unknown | no |
-| Scene-cut reset with motion vectors off | yes | yes | no (the bench runs with motion on) | only in a configuration nobody runs | no |
+| Scene-cut reset with motion vectors off | yes | yes | no (the bench runs with motion on) | only in a configuration nobody runs | no (the helper); the native backend's detector runs either way since 3.7.0 |
 | Hide or remove the sharpness setting | yes | yes | no | no (it already does nothing) | no; the maintainer's call, since it is a GUI change |
 
 No 2.0.9.

@@ -101,6 +101,8 @@ pub(crate) mod inline;
 pub(crate) mod native;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native_post;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod scene_cut;
 
 /// The native backend's per-device network ([`native::Loader`]); the native crate builds for x86_64 only.
 #[cfg(target_arch = "x86_64")]
@@ -3782,6 +3784,9 @@ pub(crate) struct Resources {
     /// The edit cache's passes (`cache`), built on the first native hold.
     #[cfg(target_arch = "x86_64")]
     pub(crate) edit: Option<cache::CachePass>,
+    /// The scene-cut detector (`scene_cut`), built on the first native hold unless it is switched off.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) scene: Option<scene_cut::ScenePass>,
     /// A running cache dump's readbacks (`cache_dump`), built on its first armed hold and freed
     /// after it.
     pub(crate) cache: Option<cache_dump::Buffers>,
@@ -3883,6 +3888,8 @@ impl Resources {
             depth: None,
             #[cfg(target_arch = "x86_64")]
             edit: None,
+            #[cfg(target_arch = "x86_64")]
+            scene: None,
             cache: None,
             #[cfg(target_arch = "x86_64")]
             pre_loader: None,
@@ -4004,6 +4011,10 @@ impl Resources {
             #[cfg(target_arch = "x86_64")]
             if let Some(edit) = &self.edit {
                 edit.destroy(device);
+            }
+            #[cfg(target_arch = "x86_64")]
+            if let Some(scene) = &self.scene {
+                scene.destroy(device);
             }
             if let Some(cache) = &self.cache {
                 cache.destroy(device);
@@ -4183,6 +4194,10 @@ pub(crate) struct HoldResult {
     pub cache_gpu_ms: Option<f32>,
     /// The previous cached hold's share of rejected pixels (0..1), read likewise.
     pub cache_rejected: Option<f32>,
+    /// The native backend: the network's history was reset for a scene cut (`scene_cut`), counted here
+    /// once per cut: on the GPU for the previous hold's network frame (read here), or on this hold's
+    /// network frame for a cut on the cached hold before it.
+    pub scene_cut: bool,
 }
 
 impl HoldResult {
@@ -4930,6 +4945,8 @@ struct Stats {
     refresh_holds: u32,
     cached_holds: u32,
     last_rejected: Option<f32>,
+    /// History resets for a scene cut (`HoldResult::scene_cut`) since the path started.
+    scene_cuts: u32,
     cache_gpu_published: Option<f32>,
     /// [`HoldTiming`]'s phases in milliseconds, per hold that reached them.
     prep_ms: Vec<f32>,
@@ -5459,6 +5476,9 @@ impl Session {
         if result.cache_rejected.is_some() {
             s.last_rejected = result.cache_rejected;
         }
+        if result.scene_cut {
+            s.scene_cuts = s.scene_cuts.wrapping_add(1);
+        }
         if result.native && result.evaluated {
             if result.cache_still {
                 s.window_still += 1;
@@ -5494,6 +5514,7 @@ impl Session {
         if result.native {
             let gpu = s.cache_gpu_published.or_else(|| s.cache_gpu_ms.last().copied());
             shm.publish_cache(s.refresh_holds, s.cached_holds, s.last_rejected, gpu);
+            shm.publish_scene_cuts(s.scene_cuts);
         }
         shm.publish_preupscale_state(if holding { neural_forge_protocol::enums::preupscale_state::HOLDING } else { neural_forge_protocol::enums::preupscale_state::WAITING }, self.last_hold_native, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {

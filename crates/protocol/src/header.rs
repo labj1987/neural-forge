@@ -372,6 +372,12 @@ pub struct ShmHeader {
     pub passes: AtomicU32,
     /// Each pass's overrides of the Model tab's values ([`PassControl`]), pass 1 first.
     pub pass: [PassControl; crate::MAX_PASSES],
+
+    // --- v20 -----------------------------------------------------------------------------
+    /// Times the layer reset the network's history before the upscaler because the picture changed as a
+    /// whole (a scene cut: the mean luma difference of two frames' thumbnails at or above the
+    /// threshold), counted since the layer opened the channel.
+    pub scene_cuts: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -396,7 +402,8 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2032, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2036, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, scene_cuts) == 2032, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, passes) == 1748, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 1752, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_next_id) == 688, "layout changed -- bump SHM_VERSION");
@@ -644,6 +651,7 @@ impl ShmHeader {
         for f in [&self.cache_refresh_holds, &self.cache_cached_holds, &self.cache_rejected, &self.cache_gpu_ms_bits] {
             f.store(0, Ordering::Relaxed);
         }
+        self.scene_cuts.store(0, Ordering::Relaxed);
         self.capture_next_id.store(0, Ordering::Relaxed);
         self.capture_cancel.store(0, Ordering::Relaxed);
         self.set_capture_result_words(&[0; crate::capture::RESULT_WORDS]);
@@ -1446,8 +1454,19 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, passes), std::mem::offset_of!(ShmHeader, capture_result) + crate::capture::RESULT_WORDS * 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass), std::mem::offset_of!(ShmHeader, passes) + 4);
         assert_eq!(std::mem::size_of::<PassControl>(), 28);
-        assert_eq!(std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28, std::mem::size_of::<ShmHeader>());
-        assert_eq!(crate::SHM_VERSION, 19);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28, std::mem::offset_of!(ShmHeader, scene_cuts));
+    }
+
+    #[test]
+    fn the_scene_cut_counter_is_appended_after_the_passes() {
+        // v20 appends one word: every earlier field keeps its offset, and the new one sits last.
+        assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
+        assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 20);
+        let h = ShmHeader::default();
+        h.scene_cuts.store(5, Ordering::Relaxed);
+        h.init_defaults();
+        assert_eq!(h.scene_cuts.load(Ordering::Relaxed), 0, "a fresh session has seen no cut");
     }
 
     #[test]

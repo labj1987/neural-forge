@@ -580,6 +580,13 @@ impl ShmClient {
         }
     }
 
+    /// History resets for a scene cut before the upscaler since the layer opened the channel
+    /// (`ShmHeader::scene_cuts`).
+    pub fn publish_scene_cuts(&self, cuts: u32) {
+        let Some(hdr) = self.header() else { return };
+        hdr.scene_cuts.store(cuts, Ordering::Relaxed);
+    }
+
     /// A pending K-hold cache dump request (`ShmHeader::preupscale_dump_request`), taken: the field is
     /// zeroed so the CLI and the status see it was. One atomic load when there is none.
     pub fn take_preupscale_dump_request(&self) -> Option<u32> {

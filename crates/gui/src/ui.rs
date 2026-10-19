@@ -588,6 +588,29 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         });
     }
 
+    // Scene cuts before the upscaler: frames where the picture changed as a whole, so the model started
+    // afresh instead of blending in the previous scene.
+    let cuts_row = adw::ActionRow::builder().title("Scene cuts").subtitle("Not running").build();
+    debug_group.add(&cuts_row);
+    {
+        let shm = std::sync::Arc::clone(&shm);
+        let live = Liveness::default();
+        every(&cuts_row, SECOND, move |cuts_row| {
+            let hdr = shm.header();
+            // Counted only while the model runs before the upscaler (the edit cache counts its frames then).
+            let running = hdr.cache_refresh_holds.load(Ordering::Relaxed) != 0;
+            let text = if !live.alive(hdr) || !running {
+                "Not running".to_string()
+            } else {
+                match hdr.scene_cuts.load(Ordering::Relaxed) {
+                    1 => "1 frame where the picture changed completely: the model started afresh there".to_string(),
+                    n => format!("{n} frames where the picture changed completely: the model started afresh there"),
+                }
+            };
+            cuts_row.set_subtitle(&text);
+        });
+    }
+
     let (debug_scale, set_debug_scale) = bind_float(&shm, Some("debug_scale"), |h| &h.debug_scale_bits);
     debug_group.add(&spin_row(
         "Debug view 5 amplification",
