@@ -2500,12 +2500,15 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             return LayerResult::Handled(());
                         }
                         let identification = point.identification;
-                        if inline.record(command_buffer, point) {
-                            t.inline_recorded(identification);
-                            t.after_recorded();
-                            crate::preupscale::note_after_dlss();
-                        } else {
-                            t.after_missed();
+                        match inline.record_outcome(command_buffer, point) {
+                            crate::preupscale::inline::Recorded::Held => {
+                                t.inline_recorded(identification);
+                                t.after_recorded();
+                                crate::preupscale::note_after_dlss();
+                            }
+                            // A buffer that already holds one, busy slots: no sign the output cannot be held.
+                            crate::preupscale::inline::Recorded::Skipped => {}
+                            crate::preupscale::inline::Recorded::Refused => t.after_missed(),
                         }
                         return LayerResult::Handled(());
                     }

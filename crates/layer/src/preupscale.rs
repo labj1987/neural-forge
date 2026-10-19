@@ -1163,6 +1163,10 @@ const OUTPUT_SETTLE: u32 = 8;
 /// ([`Tracker::after_missed`]).
 const AFTER_MISSES: u32 = 8;
 
+/// How long an output that counted as not learnable stays so before the hold after it is tried again: a
+/// layout first seen a few frames late, or a game still loading, does not keep the passes away for good.
+const AFTER_RETRY: Duration = Duration::from_secs(5);
+
 /// Per-device tracking state. Every hook that feeds it only does map operations under the lock.
 #[derive(Default)]
 pub(crate) struct Tracker {
@@ -1173,6 +1177,10 @@ pub(crate) struct Tracker {
     after_at: Option<(vk::CommandBuffer, DlssOutput, placement::Plan)>,
     /// Holds after DLSS's output missed in a row, and for which output ([`Self::after_missed`]).
     after_misses: (Option<DlssOutput>, u32),
+    /// The output that counted as not learnable, and until when ([`AFTER_RETRY`]).
+    after_refused: Option<(DlssOutput, Instant)>,
+    /// Outputs whose refusal was logged (once each).
+    after_refused_said: Vec<DlssOutput>,
     output_streak: Option<(DlssOutput, u32)>,
     images: HashMap<vk::Image, ImageDesc>,
     views: HashMap<vk::ImageView, vk::Image>,
@@ -2084,7 +2092,11 @@ impl Tracker {
     /// DLSS's output learnt. The hook before the upscaler is taken as there: where DLSS's input is not
     /// identified nothing is held anyway.
     pub(crate) fn frame(&self) -> placement::Frame {
-        let refused = self.after_misses.0.is_some() && self.after_misses.0 == self.dlss_output && self.after_misses.1 >= AFTER_MISSES;
+        self.frame_at(Instant::now())
+    }
+
+    fn frame_at(&self, now: Instant) -> placement::Frame {
+        let refused = self.after_refused.is_some_and(|(o, until)| Some(o) == self.dlss_output && now < until);
         placement::Frame { rr: self.rr_running(), output: self.dlss_output.is_some() && !refused, hook: true }
     }
 
@@ -2107,29 +2119,39 @@ impl Tracker {
         point
     }
 
-    /// A hold after DLSS's output could not be had (the point, or recording it): after [`AFTER_MISSES`] in a
-    /// row its output counts as not learnable ([`Self::frame`]), so its passes go where `auto` would, for as
-    /// long as DLSS keeps that output (logged once).
+    /// A hold after DLSS's output was refused (its point, or a buffer it cannot be recorded in; not a
+    /// buffer that already holds one or busy staging slots, [`inline::Recorded`]): after [`AFTER_MISSES`] in
+    /// a row its output counts as not learnable ([`Self::frame`]) for [`AFTER_RETRY`], so its passes go where
+    /// `auto` would meanwhile; then it is tried again (logged once per output).
     pub(crate) fn after_missed(&mut self) {
+        self.after_missed_at(Instant::now());
+    }
+
+    fn after_missed_at(&mut self, now: Instant) {
         let Some(o) = self.dlss_output else { return };
         match &mut self.after_misses {
             (seen, n) if *seen == Some(o) => *n += 1,
             m => *m = (Some(o), 1),
         }
-        if self.after_misses.1 == AFTER_MISSES {
-            crate::log!(
-                "[placement] no hold after DLSS's output {} could be had in {AFTER_MISSES} tries in a row (its format, usage or layout, or the buffer it is recorded in); the passes placed there run where auto runs them",
-                hex(o.image)
-            );
-            crate::logging::flush();
+        if self.after_misses.1 >= AFTER_MISSES {
+            self.after_misses = (None, 0);
+            self.after_refused = Some((o, now + AFTER_RETRY));
+            if !self.after_refused_said.contains(&o) {
+                self.after_refused_said.push(o);
+                crate::log!(
+                    "[placement] no hold after DLSS's output {} could be had in {AFTER_MISSES} tries in a row (its format, usage or layout, or the buffer it is recorded in); the passes placed there run where auto runs them, and it is tried again every {} s",
+                    hex(o.image),
+                    AFTER_RETRY.as_secs()
+                );
+                crate::logging::flush();
+            }
         }
     }
 
-    /// A hold after DLSS's output was recorded: the count of misses starts over.
+    /// A hold after DLSS's output was recorded: the count of misses starts over, and a refusal ends.
     pub(crate) fn after_recorded(&mut self) {
-        if self.after_misses.1 < AFTER_MISSES {
-            self.after_misses = (None, 0);
-        }
+        self.after_misses = (None, 0);
+        self.after_refused = None;
     }
 
     fn after_point_at(&self, cb: vk::CommandBuffer, o: DlssOutput, plan: &placement::Plan) -> Option<InlinePoint> {
@@ -8697,30 +8719,34 @@ mod tests {
         assert!(!post_serves_for((2, s), false, false));
     }
 
-    /// A hold after DLSS's output that cannot be had (its point or its recording) eight times in a row makes
-    /// the output count as not learnable, so the passes placed there go where `auto` runs them; a hold recorded
-    /// before that starts the count over.
+    /// A hold after DLSS's output that is refused (its point or its recording) eight times in a row makes the
+    /// output count as not learnable for [`AFTER_RETRY`], so the passes placed there go where `auto` runs them
+    /// meanwhile; then it is tried again. A hold recorded starts the count over and ends a refusal.
     #[test]
-    fn a_hold_after_dlss_that_keeps_missing_gives_its_passes_back() {
+    fn a_hold_after_dlss_that_keeps_missing_gives_its_passes_back_for_a_while() {
         let mut t = Tracker::default();
-        assert!(!t.frame().output, "no output learnt");
+        let t0 = Instant::now();
+        assert!(!t.frame_at(t0).output, "no output learnt");
         let o = DlssOutput { function: vk::CuFunctionNVX::from_raw(9), image: img(0x400), input: img(0x100), depth: img(0x200), mvec: img(0x300), rr: true };
         t.dlss_output = Some(o);
-        assert!(t.frame().output);
+        assert!(t.frame_at(t0).output);
         for _ in 0..AFTER_MISSES - 1 {
-            t.after_missed();
+            t.after_missed_at(t0);
         }
         t.after_recorded();
         for _ in 0..AFTER_MISSES - 1 {
-            t.after_missed();
+            t.after_missed_at(t0);
         }
-        assert!(t.frame().output, "a recorded hold started the count over");
-        t.after_missed();
-        assert!(!t.frame().output, "{AFTER_MISSES} misses in a row");
-        t.after_recorded();
-        assert!(!t.frame().output, "for as long as DLSS keeps that output");
+        assert!(t.frame_at(t0).output, "a recorded hold started the count over");
+        t.after_missed_at(t0);
+        assert!(!t.frame_at(t0).output, "{AFTER_MISSES} misses in a row");
+        assert!(!t.frame_at(t0 + AFTER_RETRY - Duration::from_millis(1)).output, "until the retry");
+        assert!(t.frame_at(t0 + AFTER_RETRY).output, "tried again after {AFTER_RETRY:?}");
         t.dlss_output = Some(DlssOutput { image: img(0x410), ..o });
-        assert!(t.frame().output, "another output is tried again");
+        assert!(t.frame_at(t0).output, "another output is tried at once");
+        t.dlss_output = Some(o);
+        t.after_recorded();
+        assert!(t.frame_at(t0).output, "a hold recorded ends the refusal");
     }
 
     /// DLSS Ray Reconstruction (Crimson Desert with it on): its first encoder names the colour input,

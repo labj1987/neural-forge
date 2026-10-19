@@ -1108,9 +1108,12 @@ Reconstruction running, DLSS's output learnt, and DLSS's input identified (the h
 Reconstruction runs (whose input is the noisy frame, never held), at present where neither hold exists.
 `before` with Ray Reconstruction is 3.7.0's behaviour: its frames go to the after-the-upscaler path. DLSS's
 output is learnt when eight submitted DLSS buffers in a row name the same output kernel and image ("DLSS's
-output:" in the log); it counts as not learnable once eight holds after it in a row could not be had (its
-format, usage or layout, a buffer that cannot carry a hold), logged once, for as long as DLSS keeps that
-output, so `upscaled` then runs where `auto` would instead of not at all.
+output:" in the log); it counts as not learnable once eight holds after it in a row are refused (its
+format, usage or layout, a buffer that cannot carry a hold; not a buffer that already holds one or busy
+staging slots, which pass), logged once, and is tried again 5 s later, so `upscaled` runs where `auto` would
+meanwhile instead of not at all. A hold recorded starts the count over. (A first version kept the refusal
+for as long as DLSS kept that output: in Crimson Desert with Ray Reconstruction on, the misses while the game
+loads were enough to send every frame of the session to the after-the-upscaler path.)
 
 **Per pass.** Passes run in order, and each pass whose placement resolves to a stage runs there
 (`placement::Plan`). Two rules keep the plan sound, each move logged once (`[placement]`):

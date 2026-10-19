@@ -151,6 +151,17 @@ pub(crate) struct Inline {
 
 static INLINES: LazyLock<Mutex<HashMap<vk::Device, Arc<Inline>>>> = LazyLock::new(Default::default);
 
+/// What [`Inline::record_outcome`] did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Recorded {
+    /// The hold is recorded.
+    Held,
+    /// Not recorded this time, for a reason that passes.
+    Skipped,
+    /// Not recorded, for a reason that stays with this buffer or image.
+    Refused,
+}
+
 impl Inline {
     /// Starts the worker for `device`'s side queue (`queue` in `family`).
     /// Starts the worker for `device`'s side `queue` in `family`; DLSS's buffers run on `app_family`.
@@ -300,19 +311,26 @@ impl Inline {
     /// `Unhandled`, so the launch follows these commands). `false` when it could not: a buffer that
     /// may be pending more than once at a time, no free slot, or a slot that could not be built.
     pub(crate) fn record(&self, cb: vk::CommandBuffer, point: InlinePoint) -> bool {
+        self.record_outcome(cb, point) == Recorded::Held
+    }
+
+    /// [`Self::record`], saying why nothing was recorded: [`Recorded::Skipped`] for what passes (switched
+    /// off, a buffer that already holds this stage, every staging slot busy), [`Recorded::Refused`] for what
+    /// stays (the buffer's kind, pool or family, the format, a staging image that cannot be built).
+    pub(crate) fn record_outcome(&self, cb: vk::CommandBuffer, point: InlinePoint) -> Recorded {
         // Switched off: nothing to hold for, so not even the copies and the event are recorded.
         if self.model_switched_off() {
-            return false;
+            return Recorded::Skipped;
         }
         let mut s = lock(&self.slots);
         if s.simultaneous.contains(&cb) {
             self.say_once("a DLSS buffer recorded with SIMULTANEOUS_USE is not held inside".into());
-            return false;
+            return Recorded::Refused;
         }
         // Only submitted primaries become jobs: a secondary's hold would never be released.
         if s.secondary.contains(&cb) {
             self.say_once("DLSS is recorded in a secondary command buffer; it is not held inside".into());
-            return false;
+            return Recorded::Refused;
         }
         // The hold's copies and blits need DLSS's graphics queue's family, and the worker only runs
         // jobs submitted there: a buffer of another family's pool is not held (nor one of an unknown pool).
@@ -323,19 +341,19 @@ impl Inline {
                     Some(f) => format!("DLSS is recorded for queue family {f}, not the graphics family {}; it is not held inside", self.app_family),
                     None => "DLSS's command buffer comes from a pool the layer did not see created; it is not held inside".to_string(),
                 });
-                return false;
+                return Recorded::Refused;
             }
         }
         // One hold per stage in a buffer: a second launch at the same point (re-recorded launches, a second
         // output kernel) adds none.
         if s.by_cb.get(&cb).is_some_and(|slots| slots.iter().any(|&i| s.slots[i].point.is_some_and(|p| p.hold.stage == point.hold.stage))) {
-            return false;
+            return Recorded::Skipped;
         }
         let extent = (point.desc.width, point.desc.height);
         let convert = point.desc.format != vk::Format::R16G16B16A16_SFLOAT;
         if convert && !self.blit_r11g11b10 {
             self.say_once(format!("the colour input is {:?} and the device cannot blit it to RGBA16F; not holding", point.desc.format));
-            return false;
+            return Recorded::Refused;
         }
         let now = Instant::now();
         let free = s.slots.iter().position(|sl| sl.owner.is_none());
@@ -345,7 +363,7 @@ impl Inline {
                 // SAFETY: the device is live.
                 let Some(slot) = (unsafe { self.build_slot(extent) }) else {
                     self.say_once("a staging image for the hold inside DLSS's buffer could not be built; not holding there".into());
-                    return false;
+                    return Recorded::Refused;
                 };
                 s.slots.push(slot);
                 s.slots.len() - 1
@@ -373,7 +391,7 @@ impl Inline {
                     );
                     crate::logging::flush();
                 }
-                return false;
+                return Recorded::Skipped;
             }
         };
         if let Some(old) = s.slots[index].owner.take() {
@@ -390,7 +408,7 @@ impl Inline {
         // Also when the extent did not change: a slot whose build failed has no image to copy into.
         if s.slots[index].image == vk::Image::null() {
             self.say_once(format!("a staging image of {}x{} could not be built; that buffer is not held inside", extent.0, extent.1));
-            return false;
+            return Recorded::Refused;
         }
         let slot = &mut s.slots[index];
         // DLSS's exposure input, copied beside the colour input when it can be read from where it is
@@ -458,7 +476,7 @@ impl Inline {
                 (None, None) => "not known".to_string(),
             }
         ));
-        true
+        Recorded::Held
     }
 
     /// The jobs of a submission about to be made on a queue of `family`: one per buffer carrying a
@@ -1007,7 +1025,7 @@ mod tests {
         inline.allocated(other_pool, vk::CommandBufferLevel::PRIMARY, &[cb(11)]);
         inline.allocated(unseen, vk::CommandBufferLevel::PRIMARY, &[cb(12)]);
         for (c, why) in [(cb(10), "a secondary"), (cb(11), "another family's pool"), (cb(12), "a pool never seen created"), (cb(13), "a buffer never seen allocated")] {
-            assert!(!inline.record(c, point), "{why} is not held inside");
+            assert_eq!(inline.record_outcome(c, point), Recorded::Refused, "{why} is not held inside");
             assert!(!inline.owns(c));
         }
         assert!(lock(&inline.slots).slots.is_empty(), "nothing was even built for them");
@@ -1025,9 +1043,11 @@ mod tests {
             let begin = vk::CommandBufferBeginInfo::default();
             device.begin_command_buffer(real, &begin).unwrap();
             inline.begin(real, begin.flags);
-            assert!(!inline.record(real, point), "switched off");
+            assert_eq!(inline.record_outcome(real, point), Recorded::Skipped, "switched off");
             header.apply_model.store(1, Ordering::Relaxed);
-            assert!(inline.record(real, point), "switched on again");
+            assert_eq!(inline.record_outcome(real, point), Recorded::Held, "switched on again");
+            // A second launch at the same stage in that buffer adds no hold, and that passes.
+            assert_eq!(inline.record_outcome(real, point), Recorded::Skipped, "this stage is held in it already");
             device.end_command_buffer(real).unwrap();
             // Its pool reset: the slot is free for another buffer.
             inline.reset_pool(real_pool, false);
