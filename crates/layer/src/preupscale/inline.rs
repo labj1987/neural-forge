@@ -386,7 +386,7 @@ impl Inline {
         let mvec = point
             .mvec_input
             .filter(|a| a.readable && slot.mvec != vk::Image::null())
-            .filter(|_| point.mvec_extent.0 >= extent.0 && point.mvec_extent.1 >= extent.1)
+            .filter(|_| point.mvec_extent.0 > 0 && point.mvec_extent.1 > 0)
             .and_then(|a| a.layout.map(|layout| (a.image, layout)));
         // DLSS's depth aspect, copied into the slot's buffer for the native backend's depth copy (the
         // edit cache's: with it off there is no buffer, and nothing is copied).

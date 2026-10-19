@@ -197,6 +197,8 @@ struct ProbeNext {
     create_cu_module_nvx: Option<vk::PFN_vkCreateCuModuleNVX>,
     create_cu_function_nvx: Option<vk::PFN_vkCreateCuFunctionNVX>,
     create_framebuffer: Option<vk::PFN_vkCreateFramebuffer>,
+    /// The next layer's launch: the hold after DLSS's output kernel is recorded after it.
+    cmd_cu_launch_kernel_nvx: Option<vk::PFN_vkCmdCuLaunchKernelNVX>,
 }
 
 impl ProbeNext {
@@ -212,6 +214,7 @@ impl ProbeNext {
                 create_cu_module_nvx: resolve(get_proc, device, c"vkCreateCuModuleNVX"),
                 create_cu_function_nvx: resolve(get_proc, device, c"vkCreateCuFunctionNVX"),
                 create_framebuffer: resolve(get_proc, device, c"vkCreateFramebuffer"),
+                cmd_cu_launch_kernel_nvx: resolve(get_proc, device, c"vkCmdCuLaunchKernelNVX"),
             }
         }
     }
@@ -2466,7 +2469,24 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // "DLSS Frame Generation").
             // SAFETY: `p_extras` is the application's own launch-parameter list, valid for this call.
             let params = unsafe { crate::preupscale::launch_params(launch_info.p_extras, launch_info.extra_count) };
-            if let Some(point) = t.launch(command_buffer, launch_info.function, params) {
+            let (before, after) = t.launch_with_after(command_buffer, launch_info.function, params);
+            // The hold right after DLSS's output kernel (`preupscale::after_dlss`): the launch goes to the
+            // next layer first, then the hold is recorded behind it.
+            if let (Some(point), Some(inline), Some(next)) = (
+                after.filter(|_| crate::preupscale::mode().holds_inline()),
+                self.inline.as_ref(),
+                self.probe_next.as_ref().and_then(|n| n.cmd_cu_launch_kernel_nvx),
+            ) {
+                // SAFETY: the next layer's own `vkCmdCuLaunchKernelNVX`, with the application's arguments.
+                unsafe { next(command_buffer, launch_info) };
+                let identification = point.identification;
+                if inline.record(command_buffer, point) {
+                    t.inline_recorded(identification);
+                    crate::preupscale::note_after_dlss();
+                }
+                return LayerResult::Handled(());
+            }
+            if let Some(point) = before {
                 // DLSS's buffer renders its own input before this launch: the hold goes here, inside
                 // it (`crate::preupscale::inline`), when the mode holds at all.
                 if let Some(inline) = self.inline.as_ref().filter(|_| crate::preupscale::mode().holds_inline()) {

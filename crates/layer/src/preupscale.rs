@@ -1129,9 +1129,55 @@ struct Rendering {
     last_suspending: bool,
 }
 
+/// DLSS's output kernel, its output image and the inputs of the same buffer ([`Tracker::dlss_output`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DlssOutput {
+    pub function: vk::CuFunctionNVX,
+    pub image: vk::Image,
+    pub input: vk::Image,
+    pub depth: vk::Image,
+    pub mvec: vk::Image,
+    /// The buffer is Ray Reconstruction's.
+    pub rr: bool,
+}
+
+/// Submitted DLSS buffers in a row naming the same output kernel and image before it is taken.
+const OUTPUT_SETTLE: u32 = 8;
+
+/// Where the model runs relative to DLSS's output (`NEURAL_FORGE_AFTER_DLSS`): `rr` (the default) holds
+/// right after DLSS's output kernel while Ray Reconstruction runs, whose input is the noisy frame (the
+/// model sees the denoised, upscaled frame there, before the game's post-processing and HUD, with DLSS's
+/// motion vectors for its history); `always` does so for Super Resolution too (instead of before it);
+/// `off` never (Ray Reconstruction then leaves the model to the after-the-upscaler path, as before 3.8).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AfterDlss {
+    Off,
+    RayReconstruction,
+    Always,
+}
+
+pub(crate) fn after_dlss() -> AfterDlss {
+    static AT: LazyLock<AfterDlss> = LazyLock::new(|| match neural_forge_protocol::env::var("NEURAL_FORGE_AFTER_DLSS").as_deref() {
+        None | Some("rr") => AfterDlss::RayReconstruction,
+        Some("always") => AfterDlss::Always,
+        Some("off" | "0") => AfterDlss::Off,
+        Some(other) => {
+            crate::log!("[preupscale] NEURAL_FORGE_AFTER_DLSS={other:?} is not one of rr, always, off; rr");
+            AfterDlss::RayReconstruction
+        }
+    });
+    *AT
+}
+
 /// Per-device tracking state. Every hook that feeds it only does map operations under the lock.
 #[derive(Default)]
 pub(crate) struct Tracker {
+    /// DLSS's output kernel and image, learned from submitted buffers ([`DlssOutput`]).
+    dlss_output: Option<DlssOutput>,
+    /// The launch just recorded is DLSS's output kernel naming its output, and the model runs after DLSS
+    /// ([`after_dlss`]): the hold goes right after it (taken by [`TrackerHandle::launch`]).
+    after_at: Option<(vk::CommandBuffer, DlssOutput)>,
+    output_streak: Option<(DlssOutput, u32)>,
     images: HashMap<vk::Image, ImageDesc>,
     views: HashMap<vk::ImageView, vk::Image>,
     /// Views registered through `vkGetImageViewHandle*NVX`/`vkGetImageViewAddressNVX`, and their image.
@@ -1368,6 +1414,10 @@ pub(crate) struct LaunchRefs {
     pub before_first: Option<Before>,
     /// The same for the first launch naming each image of [`Self::images`].
     pub before_named: Vec<(vk::Image, Before)>,
+    /// The last launch after the input launch that names a colour candidate larger than the input
+    /// (DLSS's output kernel writing the upscaled frame, Super Resolution's or Ray Reconstruction's), and
+    /// that output image ([`Tracker::dlss_output`]).
+    pub output: Option<(vk::CuFunctionNVX, vk::Image)>,
     /// The camera jitter the buffer's DLSS Super Resolution input launch was given: word 3 of a 310.x
     /// `hiluma_engine_input*` kernel's parameters, x in its low and y in its high 32 bits, render
     /// pixels (docs/NATIVE_BACKEND.md, "Motion vectors"). `None` for other kernels.
@@ -1722,6 +1772,27 @@ impl Tracker {
                 }
             }
         }
+        // DLSS's output: after the buffer's input launch, a launch naming a colour candidate larger than
+        // the input (the upscaled frame); the last such launch of the buffer is its output kernel.
+        if let Some(InputLaunch::Inputs { colour, .. }) = self.launch.get(&command_buffer).and_then(|r| r.input.clone()) {
+            let input = self.images.get(&colour).map(|d| (d.width, d.height));
+            let out = named.iter().copied().find(|i| {
+                *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && input.is_some_and(|(w, h)| d.width > w && d.height > h))
+            });
+            if let Some(out) = out {
+                self.launch.entry(command_buffer).or_default().output = Some((function, out));
+            }
+        }
+        if let Some(o) = self.dlss_output.filter(|o| o.function == function && named.contains(&o.image)) {
+            let wanted = match after_dlss() {
+                AfterDlss::Off => false,
+                AfterDlss::RayReconstruction => o.rr || self.rr_running(),
+                AfterDlss::Always => true,
+            };
+            if wanted {
+                self.after_at = Some((command_buffer, o));
+            }
+        }
         let refs = self.launch.entry(command_buffer).or_default();
         // Whether this launch is the buffer's first one read as an input launch.
         let mut fresh_input = false;
@@ -2012,6 +2083,55 @@ impl Tracker {
     /// Takes the mark [`Self::launch_kernel`] left for the launch just recorded.
     pub(crate) fn take_inline_at(&mut self) -> Option<(vk::CommandBuffer, vk::Image)> {
         self.inline_at.take()
+    }
+
+    /// The hold right after DLSS's output kernel just recorded into `cb` ([`after_dlss`]): on DLSS's output
+    /// image (RGBA16F or R11G11B10, transferable, in a layout known here), with DLSS's motion vectors of
+    /// the same buffer at the render size (resampled up to the output's; [`InlinePoint::mvec_scale`] is
+    /// then output over render pixels) and no depth copy (the depth is at the render size), the exposure
+    /// measured from the frame.
+    pub(crate) fn after_point(&mut self) -> Option<InlinePoint> {
+        let (cb, o) = self.after_at.take()?;
+        let desc = *self.images.get(&o.image)?;
+        let copyable = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        if !OUTPUT_FORMATS.contains(&desc.format) || !desc.plain || !desc.usage.contains(copyable) {
+            return None;
+        }
+        if self.rendering.get(&cb).is_some_and(|r| r.last_suspending || r.open_resume) {
+            return None;
+        }
+        let layout_of = |image: vk::Image, d: &ImageDesc| {
+            self.pending
+                .get(&cb)
+                .and_then(|p| p.iter().rev().find(|s| s.image == image).map(|s| s.new_layout))
+                .or_else(|| self.attached.get(&cb).and_then(|a| a.iter().rev().find(|(i, _)| *i == image).map(|(_, l)| *l)))
+                .or_else(|| self.committed.get(&image).copied())
+                .or(d.usage.contains(vk::ImageUsageFlags::STORAGE).then_some(vk::ImageLayout::GENERAL))
+        };
+        let layout = layout_of(o.image, &desc)?;
+        if !INLINE_LAYOUTS.contains(&layout) {
+            return None;
+        }
+        let mvec = self.images.get(&o.mvec).copied();
+        let mvec_input = mvec.map(|d| {
+            let layout = layout_of(o.mvec, &d);
+            let readable = d.usage.contains(vk::ImageUsageFlags::TRANSFER_SRC)
+                && d.format == vk::Format::R16G16_SFLOAT
+                && layout.is_some_and(|l| MVEC_COPY_LAYOUTS.contains(&l));
+            Aux { image: o.mvec, format: d.format, layout, readable }
+        });
+        Some(InlinePoint {
+            colour: o.image,
+            desc,
+            layout,
+            exposure_input: None,
+            mvec_input,
+            mvec_extent: mvec.map_or((0, 0), |d| (d.width, d.height)),
+            depth_input: None,
+            // Its own identification: the output image's handle with the top bit set (never an input's).
+            identification: o.image.as_raw() | (1 << 63),
+            hazard: Hazard::NotSplittable,
+        })
     }
 
     /// Whether any command buffer carries a launch, recorded barriers or other synchronization.
@@ -2370,6 +2490,37 @@ impl Tracker {
     /// Called before it at every launch-bearing submit. Returns once-only log lines.
     pub(crate) fn observe(&mut self, batches: &[Vec<vk::CommandBuffer>]) -> Vec<String> {
         let mut lines = Vec::new();
+        // DLSS's output kernel and output image (`LaunchRefs::output`), learned once the same pair has
+        // been seen in OUTPUT_SETTLE submitted DLSS buffers in a row; logged on each change.
+        for cb in batches.iter().flatten() {
+            let Some(refs) = self.launch.get(cb) else { continue };
+            let Some((function, image)) = refs.output else { continue };
+            let Some(InputLaunch::Inputs { colour, depth, mvec }) = refs.input.clone() else { continue };
+            let seen = DlssOutput { function, image, input: colour, depth, mvec, rr: refs.input_rr || !refs.rr.is_empty() };
+            match &mut self.output_streak {
+                Some((o, n)) if *o == seen => *n += 1,
+                _ => self.output_streak = Some((seen, 1)),
+            }
+            if let Some((o, n)) = self.output_streak.filter(|(_, n)| *n >= OUTPUT_SETTLE) {
+                let _ = n;
+                if self.dlss_output != Some(o) {
+                    self.dlss_output = Some(o);
+                    let name = |f: vk::CuFunctionNVX| self.functions.get(&f).map_or("unnamed".to_string(), |(_, n)| n.clone());
+                    let desc = |i: vk::Image| self.images.get(&i).map_or("unregistered".to_string(), |d| format!("{}x{} {:?}", d.width, d.height, d.format));
+                    lines.push(format!(
+                        "DLSS's output: image {} ({}), written by {} after its input launch on {} ({}; depth {}, motion vectors {}){}",
+                        hex(o.image),
+                        desc(o.image),
+                        name(o.function),
+                        hex(o.input),
+                        desc(o.input),
+                        hex(o.depth),
+                        hex(o.mvec),
+                        if o.rr { "; Ray Reconstruction" } else { "" }
+                    ));
+                }
+            }
+        }
         let mut any = false;
         let mut changed = false;
         // This submit's input launches, in submission order, for the switch below.
@@ -3007,10 +3158,22 @@ impl Tracking {
     /// A launch recorded into `command_buffer`. Returns where a hold should run inside the buffer,
     /// right before this launch, when it is the buffer's first to name a colour candidate and the
     /// split in front of the buffer would be refused ([`Tracker::inline_point`]).
+    #[cfg(test)]
     pub(crate) fn launch(&self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) -> Option<InlinePoint> {
+        self.launch_with_after(command_buffer, function, params).0
+    }
+
+    /// [`Self::launch`], and the hold right after this launch when it is DLSS's output kernel and the
+    /// model runs after DLSS ([`Tracker::after_point`]).
+    pub(crate) fn launch_with_after(&self, command_buffer: vk::CommandBuffer, function: vk::CuFunctionNVX, params: Option<&[u8]>) -> (Option<InlinePoint>, Option<InlinePoint>) {
         let mut t = self.lock();
         t.launch_kernel(command_buffer, function, params);
         self.rearm(&t);
+        let after = t.after_point();
+        (Self::before_point(&mut t), after)
+    }
+
+    fn before_point(t: &mut Tracker) -> Option<InlinePoint> {
         let (cb, colour) = t.take_inline_at()?;
         let point = t.inline_point(cb, colour);
         if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) {
@@ -5201,7 +5364,7 @@ impl Session {
     /// ([`post_off`]).
     pub(crate) fn suppresses_post(&self) -> bool {
         let now = Instant::now();
-        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, now) && !ray_reconstruction_running(now)
+        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, now) && !rr_needs_post(now)
     }
 
     /// How many launch-bearing submits with DLSS's inputs identified reached the hold point
@@ -5740,11 +5903,26 @@ static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// own [`Session::suppresses_post`]; it matters when DLSS runs on another device than the swapchain
 /// (only ever set in model mode).
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
-    (lock(&POST_OFF_UNTIL).values().any(|&until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !ray_reconstruction_running(now)
+    (lock(&POST_OFF_UNTIL).values().any(|&until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !rr_needs_post(now)
 }
 
 /// When a device of the process last saw DLSS Ray Reconstruction running ([`Tracker::rr_running`]).
 static RAY_RECONSTRUCTION_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// When a hold was last recorded right after DLSS's output kernel ([`after_dlss`]).
+static AFTER_DLSS_AT: Mutex<Option<Instant>> = Mutex::new(None);
+
+/// A hold was recorded after DLSS's output kernel: the model runs there, so Ray Reconstruction does not
+/// hand it to the after-the-upscaler path ([`rr_needs_post`]).
+pub(crate) fn note_after_dlss() {
+    *lock(&AFTER_DLSS_AT) = Some(Instant::now());
+}
+
+/// Ray Reconstruction runs and the model does not run after DLSS's output: the after-the-upscaler path
+/// takes it.
+pub(crate) fn rr_needs_post(now: Instant) -> bool {
+    ray_reconstruction_running(now) && !lock(&AFTER_DLSS_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK)
+}
 
 /// How long after Ray Reconstruction's last launch-bearing submit the post path keeps running in its
 /// place. Its submits come several times per real frame; a second covers a hitch.
