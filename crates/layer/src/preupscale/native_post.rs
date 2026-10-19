@@ -49,7 +49,7 @@ const SETS: usize = 2 * neural_forge_protocol::MAX_PASSES + 2;
 
 /// The set layout's bindings (the shaders': 0 input, 1 features or head, 2 answer, 3 the pass's history,
 /// 4 the reprojected history, 5 the frame's proxy, 6 the previous frame's, 7 the optical flow).
-const BINDINGS: u32 = 8;
+const BINDINGS: u32 = 9;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -66,6 +66,17 @@ struct CompositePush {
     dims: [u32; 4],
     frame: [u32; 4],
     control: [f32; 4],
+    /// The colour of the edit ([`super::colour::PassColour`]; native_post_composite.comp's).
+    colour: [f32; 4],
+    colour_flags: [u32; 4],
+    lut_scale: [f32; 4],
+    lut_offset: [f32; 4],
+}
+
+impl CompositePush {
+    fn with_colour(self, c: super::colour::PassColour) -> Self {
+        Self { colour: c.colour, colour_flags: c.flags, lut_scale: c.lut_scale, lut_offset: c.lut_offset, ..self }
+    }
 }
 
 /// Which server answers the after-the-upscaler requests in this process: the channel is the process's, so
@@ -187,6 +198,13 @@ impl Drop for PostServer {
     }
 }
 
+/// [`Gpu::lut`]: the table's entries in a host-visible buffer, and which table they are.
+struct PostLut {
+    buffer: HostBuffer,
+    entries: usize,
+    lut: Arc<super::colour::Lut>,
+}
+
 /// The per-request GPU objects.
 struct Gpu {
     queue: vk::Queue,
@@ -200,6 +218,8 @@ struct Gpu {
     /// Pass feedback below 1 (`native_post_feedback.comp`): its pipeline layout and pipeline, built the first
     /// time it is.
     feedback: Option<(vk::PipelineLayout, vk::Pipeline)>,
+    /// The colour of the edit's look-up table (binding 8 of the composite's sets), the last pass's.
+    lut: Option<PostLut>,
     command_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -235,6 +255,8 @@ struct Bound {
     /// How many passes' history buffers exist (0: none).
     history: usize,
     flow: bool,
+    /// The look-up table's buffer (null: none).
+    lut: vk::Buffer,
 }
 
 /// The optical flow's state on the server's device.
@@ -407,6 +429,7 @@ impl Gpu {
             pool: vk::DescriptorPool::null(),
             sets: [vk::DescriptorSet::null(); SETS],
             feedback: None,
+            lut: None,
             command_pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -441,6 +464,9 @@ impl Gpu {
             if let Some((layout, pipeline)) = self.feedback.take() {
                 device.destroy_pipeline(pipeline, None);
                 device.destroy_pipeline_layout(layout, None);
+            }
+            if let Some(l) = self.lut.take() {
+                l.buffer.destroy(device);
             }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
@@ -543,6 +569,9 @@ fn process(
     let tunings = hdr.pass_tunings();
     let passes: Vec<Conditioning> = tunings.passes().iter().map(|&t| Conditioning::from(t)).collect();
     let feedback = tunings.feedback;
+    // The colour of the edit, and its look-up table (read from config.ini's `edit_lut` in the background).
+    let colour = tunings.colour;
+    let lut = super::colour::current(&colour);
     // The claim is released whatever happens after it (a claim held while the network is not built at
     // this size would keep the pre-upscaler path off it for good), except after a frame that did not
     // finish in time: its work may still use the network, so the claim stays until its fence signals
@@ -552,7 +581,7 @@ fn process(
         // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
         let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
             // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
-            unsafe { evaluate(device, instance, physical, import, Some(loader), (view.regions(slot).0, view.regions(slot).1, view.capacity()), gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes, feedback) }
+            unsafe { evaluate(device, instance, physical, import, Some(loader), (view.regions(slot).0, view.regions(slot).1, view.capacity()), gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes, feedback, &colour, lut.as_ref()) }
         });
         if gpu.stalled {
             loader.post_stalled(device, gpu.fence);
@@ -599,6 +628,37 @@ fn process(
     neural_forge_protocol::store64(&hdr.server_frames_lo, &hdr.server_frames_hi, *frames);
 }
 
+/// Puts `lut` in [`Gpu::lut`] when it is another table than the one there (a new buffer for another size: the
+/// sets are bound again). `None` keeps what is there (the strength may come back up).
+///
+/// # Safety
+/// Nothing of `gpu`'s is pending.
+unsafe fn upload_lut(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, gpu: &mut Gpu, lut: Option<&Arc<super::colour::Lut>>) {
+    let Some(l) = lut else { return };
+    if gpu.lut.as_ref().is_some_and(|g| g.lut.generation == l.generation) {
+        return;
+    }
+    let entries = l.entries();
+    if gpu.lut.as_ref().is_some_and(|g| g.entries != entries.len()) {
+        if let Some(old) = gpu.lut.take() {
+            // SAFETY: not pending (contract).
+            unsafe { old.buffer.destroy(device) };
+        }
+    }
+    if gpu.lut.is_none() {
+        let Some(buffer) = super::own_host_buffer_with(device, instance, physical, (entries.len() * 16) as u64, vk::BufferUsageFlags::STORAGE_BUFFER) else {
+            crate::log!("[colour] no buffer for the look-up table after the upscaler; it is left out");
+            return;
+        };
+        gpu.lut = Some(PostLut { buffer, entries: entries.len(), lut: Arc::clone(l) });
+    }
+    if let Some(g) = gpu.lut.as_mut() {
+        // SAFETY: host-coherent, mapped and sized for `entries`; not in use (contract).
+        unsafe { std::ptr::copy_nonoverlapping(entries.as_ptr().cast::<u8>(), g.buffer.ptr, entries.len() * 16) };
+        g.lut = Arc::clone(l);
+    }
+}
+
 /// One frame through the network, once per entry of `passes` (each pass's settings, at least one). `false`
 /// (and the caller echoes) on anything short of a written answer. `regions` are the slot's proxy and answer
 /// regions and their size; `loader` (`None` in tests) is told about counter-chain timeouts.
@@ -613,7 +673,8 @@ fn process(
 #[allow(clippy::too_many_arguments)]
 unsafe fn evaluate(
     device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: Option<&Loader>, regions: (*mut u8, *mut u8, usize), gpu: &mut Gpu, slot: Slot,
-    built: &Built, width: u32, height: u32, bgra: bool, passes: &[Conditioning], feedback: f32,
+    built: &Built, width: u32, height: u32, bgra: bool, passes: &[Conditioning], feedback: f32, colour: &neural_forge_protocol::ColourSettings,
+    lut: Option<&Arc<super::colour::Lut>>,
 ) -> bool {
     let s = slot.index();
     let bytes = u64::from(width) * u64::from(height) * 4;
@@ -678,6 +739,10 @@ unsafe fn evaluate(
     if history && !unsafe { ensure_history(device, instance, physical, gpu, s, width, height, passes.len()) } {
         return false;
     }
+    // SAFETY: nothing of `gpu`'s is pending (contract).
+    unsafe { upload_lut(device, instance, physical, gpu, lut.filter(|_| colour.lut_strength > 0.0)) };
+    let lut = gpu.lut.as_ref().filter(|_| colour.lut_strength > 0.0).map(|l| &*l.lut);
+    let lut_buffer = gpu.lut.as_ref().map_or(vk::Buffer::null(), |l| l.buffer.buffer);
     let Some(b) = gpu.slots[s].as_ref() else { return false };
     let hist = b.hist.as_ref().filter(|_| history);
     // The flow's vectors: the session's (on a frame whose passes have a history) or, in the tests, the
@@ -711,7 +776,7 @@ unsafe fn evaluate(
     let f = built.frame;
     let scratch = b.scratch.as_ref().map(|o| o.buffer);
     let flow_buffer = hist.and_then(|h| h.flow.as_ref()).map(|x| x.buffer);
-    let key = Bound { slot: s, width, height, generation: built.generation, scratch: scratch.is_some(), passes: passes.len(), history: hist.map_or(0, |h| h.passes.len()), flow: flow_buffer.is_some() };
+    let key = Bound { slot: s, width, height, generation: built.generation, scratch: scratch.is_some(), passes: passes.len(), history: hist.map_or(0, |h| h.passes.len()), flow: flow_buffer.is_some(), lut: lut_buffer };
     if gpu.bound != Some(key) {
         let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
         let proxy_i = info(b.proxy.buffer);
@@ -722,6 +787,8 @@ unsafe fn evaluate(
         let reproj_i = or_proxy(hist.map(|h| h.reproj.buffer));
         let previous_i = or_proxy(hist.map(|h| h.previous.buffer));
         let flow_i = or_proxy(flow_buffer);
+        // The look-up table, or the proxy as a stand-in until there is one (nothing reads it then).
+        let lut_i = or_proxy(Some(lut_buffer).filter(|l| *l != vk::Buffer::null()));
         let history_i: Vec<[vk::DescriptorBufferInfo; 1]> = (0..passes.len()).map(|k| or_proxy(hist.and_then(|h| h.passes.get(k)).map(|o| o.buffer))).collect();
         let w = |set, n, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
         let mut writes = Vec::new();
@@ -730,7 +797,7 @@ unsafe fn evaluate(
             let input = if k == 0 { &proxy_i } else { &scratch_i };
             let (pre, post) = (gpu.sets[2 * k], gpu.sets[2 * k + 1]);
             writes.extend([w(pre, 0, input), w(pre, 1, &feat_i), w(pre, 3, history_k), w(pre, 4, &reproj_i), w(pre, 5, &proxy_i), w(pre, 6, &previous_i), w(pre, 7, &flow_i)]);
-            writes.extend([w(post, 0, input), w(post, 1, &head_i), w(post, 2, &ans_i), w(post, 3, history_k), w(post, 4, &reproj_i)]);
+            writes.extend([w(post, 0, input), w(post, 1, &head_i), w(post, 2, &ans_i), w(post, 3, history_k), w(post, 4, &reproj_i), w(post, 8, &lut_i)]);
         }
         if scratch.is_some() {
             // Pass feedback: from the frame (pass 2) and from the scratch in place (after), into the scratch.
@@ -764,9 +831,11 @@ unsafe fn evaluate(
             dims: pre.dims,
             frame: [0, u32::from(bgra), u32::from(has), u32::from(history)],
             control: [c.style as f32, c.local_tone, c.intensity, if history { blend_scale } else { 0.0 }],
+            ..Default::default()
         };
         (pre, post)
     };
+    let runs = passes.len();
     let barrier = |src: vk::AccessFlags, dst: vk::AccessFlags| [vk::MemoryBarrier::builder().src_access_mask(src).dst_access_mask(dst).build()];
     // The optical flow runs on frames whose passes have a history; every frame's proxy goes into the session
     // (the next frame's reference): in its own submit before the flow, else in the frame's.
@@ -793,6 +862,7 @@ unsafe fn evaluate(
             }
             for (k, c) in passes.iter().enumerate() {
                 let (pre, post) = push(c, decision.passes[k]);
+                let post = post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true));
                 // Every pass after the first reads the previous one's answer: copied into `scratch`, after the
                 // composite wrote it and before this pass's shaders read it (and the next composite rewrites it).
                 if k > 0 {
@@ -1063,6 +1133,96 @@ mod tests {
         unsafe { device.destroy_device(None) };
     }
 
+    /// The colour of the edit after the upscaler (`native_post_composite.comp` with its colour bits), on the
+    /// real pipeline and an RGBA8 proxy with a head the test writes: the step bits with neutral values give
+    /// the plain answer bit for bit; saturation 0 leaves a grey change; the dither moves a level by at most one
+    /// step (each pixel the level below or above the value), uses both over a flat area and averages to it,
+    /// where without it every pixel is the same rounded level.
+    #[test]
+    fn the_colour_of_the_edit_after_the_upscaler_reshapes_and_dithers_the_8_bit_answer() {
+        let Some((_entry, _instance, physical, device, _queue, family)) = crate::composition::gpu::test_device() else { return };
+        let instance = &_instance;
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0, properties2: crate::vram::Properties2::None, flow: None };
+        const W: u32 = 16;
+        const H: u32 = 16;
+        // SAFETY: a live test device whose queue 0 of `family` exists; every object is waited for.
+        unsafe {
+            let mut gpu = Gpu::new(&device, setup).expect("builds");
+            let host = |bytes: u64| super::super::own_host_buffer_with(&device, instance, physical, bytes, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let (proxy, head, answer, lut, history) = (host(u64::from(W * H) * 4), host(u64::from(W * H) * 16), host(u64::from(W * H) * 4), host(64), host(u64::from(W * H) * 8));
+            let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
+            let (pi, hi, ai, li, si) = (info(proxy.buffer), info(head.buffer), info(answer.buffer), info(lut.buffer), info(history.buffer));
+            let w = |n, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(gpu.sets[1]).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
+            // No history (frame.z and .w 0): its two bindings point at a buffer nothing reads.
+            device.update_descriptor_sets(&[w(0, &pi), w(1, &hi), w(2, &ai), w(3, &si), w(4, &si), w(8, &li)], &[]);
+            let fill = |proxy_of: &dyn Fn(u32, u32, u32) -> u8, edit: &dyn Fn(u32, u32, u32) -> f32| {
+                let p: Vec<u8> = (0..H).flat_map(|y| (0..W).flat_map(move |x| [proxy_of(x, y, 0), proxy_of(x, y, 1), proxy_of(x, y, 2), 255])).collect();
+                std::ptr::copy_nonoverlapping(p.as_ptr(), proxy.ptr, p.len());
+                let h: Vec<f32> = (0..H).flat_map(|y| (0..W).flat_map(move |x| [4.0 * edit(x, y, 0), 4.0 * edit(x, y, 1), 4.0 * edit(x, y, 2), 0.0])).collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+            };
+            let run = |c: super::super::colour::PassColour| -> Vec<u8> {
+                let push = CompositePush { dims: [W, H, W, H], frame: [0, 0, 0, 0], control: [0.0, 1.0, 1.0, 0.0], ..Default::default() }.with_colour(c);
+                let cmd = gpu.cmd;
+                device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[1]);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[1], 0, &[gpu.sets[1]], &[]);
+                device.cmd_push_constants(cmd, gpu.layouts[1], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<CompositePush>()));
+                device.cmd_dispatch(cmd, W.div_ceil(8), H.div_ceil(8), 1);
+                let to_host = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ).build();
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]);
+                device.end_command_buffer(cmd).unwrap();
+                device.reset_fences(&[gpu.fence]).unwrap();
+                device.queue_submit(gpu.queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], gpu.fence).unwrap();
+                device.wait_for_fences(&[gpu.fence], true, u64::MAX).unwrap();
+                std::slice::from_raw_parts(answer.ptr, (W * H * 4) as usize).to_vec()
+            };
+            use super::super::colour::{PassColour, DITHER, GUARD, STEP};
+            let flags = |f: u32| PassColour { colour: [1.0; 4], flags: [f, 0, 0, 0], lut_offset: [0.0, 0.0, 0.0, 0.05], ..PassColour::default() };
+            // A varied proxy and an edit of up to 12/255 a channel, with chroma.
+            let proxy_of = |x: u32, y: u32, c: u32| (60 + (x * 13 + y * 7 + c * 29) % 120) as u8;
+            let edit = |x: u32, y: u32, c: u32| (((x * 5 + y * 3 + c * 2) % 7) as f32 - 3.0) * 4.0 / 255.0;
+            fill(&proxy_of, &edit);
+            let plain = run(PassColour::default());
+            assert_eq!(run(flags(STEP | GUARD)), plain, "neutral values leave the 8-bit answer bit for bit");
+            let at = |a: &[u8], x: u32, y: u32, c: u32| a[((y * W + x) * 4 + c) as usize];
+            let grey = run(PassColour { colour: [0.0, 1.0, 1.0, 0.0], ..flags(STEP | GUARD) });
+            for y in 0..H {
+                for x in 0..W {
+                    let d: Vec<i32> = (0..3).map(|c| i32::from(at(&grey, x, y, c)) - i32::from(proxy_of(x, y, c))).collect();
+                    assert!((d[0] - d[1]).abs() <= 1 && (d[1] - d[2]).abs() <= 1, "saturation 0 leaves a grey change at {x},{y}: {d:?}");
+                }
+            }
+            assert!((0..W).any(|x| (0..3).map(|c| i32::from(at(&plain, x, 0, c)) - i32::from(proxy_of(x, 0, c))).collect::<Vec<_>>().windows(2).any(|w| (w[0] - w[1]).abs() > 2)), "the test's edit has chroma");
+
+            // The dither on a flat area whose answer lies a third of a step above level 100.
+            fill(&|_, _, _| 100, &|_, _, _| 0.34 / 255.0);
+            let level = |v: u8| f32::from(v);
+            let undithered = run(PassColour::default());
+            assert!(undithered.chunks(4).all(|p| p[..3] == [100, 100, 100]), "without the dither every pixel rounds to 100");
+            let dithered = run(flags(DITHER));
+            let values: Vec<f32> = dithered.chunks(4).flat_map(|p| p[..3].iter().map(|&v| level(v)).collect::<Vec<_>>()).collect();
+            assert!(values.iter().all(|&v| v == 100.0 || v == 101.0), "a level below or above the value, never further");
+            // The value on the CPU: the residual on the proxy, truncated to the half grid (a normal half here).
+            let p = 100.0f32 / 255.0;
+            let v = f32::from_bits((((4.0 * 0.34 / 255.0f32) * 0.03125 + (p * 0.125 - 0.0625)) * 8.0 + 0.5).to_bits() & !0x1fff) * 255.0;
+            assert!(v > 100.2 && v < 100.4, "the test's value: {v}");
+            let mean = values.iter().sum::<f32>() / values.len() as f32;
+            assert!((mean - v).abs() < 0.025, "the dither averages to the value: {mean} against {v}");
+            assert_eq!(dithered.chunks(4).map(|p| p[3]).collect::<Vec<_>>(), vec![255; (W * H) as usize], "alpha is the proxy's");
+
+            for b in [&proxy, &head, &answer, &lut, &history] {
+                b.destroy(&device);
+            }
+            gpu.destroy(&device);
+            device.destroy_device(None);
+        }
+    }
+
     /// The layer posts its first request in the present that starts the server: one still unanswered when
     /// the server starts is served, whatever the previous session left in the channel.
     #[test]
@@ -1148,7 +1308,7 @@ mod tests {
             }
             let regions = (self.proxy.as_mut_ptr(), self.answer.as_mut_ptr(), self.proxy.len());
             // SAFETY: the regions live as long as the rig; nothing of the rig's is pending.
-            let ok = unsafe { evaluate(&self.device, &self.instance, self.physical, false, None, regions, &mut self.gpu, Slot::Primary, &self.built, W, H, false, passes, 1.0) };
+            let ok = unsafe { evaluate(&self.device, &self.instance, self.physical, false, None, regions, &mut self.gpu, Slot::Primary, &self.built, W, H, false, passes, 1.0, &neural_forge_protocol::ColourSettings::DEFAULT, None) };
             assert!(ok, "the frame was answered");
             self.answer.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c)).collect()
         }

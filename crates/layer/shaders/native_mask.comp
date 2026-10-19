@@ -30,6 +30,12 @@ layout(set = 0, binding = 4, std140) uniform Params {
   vec4 sky;          // margin on the device-depth scale, unused
   vec4 dark;         // brightness threshold, intensity, structure, unused
   vec4 moving;       // motion threshold (render pixels per frame), intensity, structure, unused
+  uvec4 full;        // the render extent (width, height), its padded width, the depth copy's kind
+  vec4 ratio;        // the pass's extent over the render extent (x, y), the enlarge's guide sigma, unused
+  vec4 colour;        // the colour of the edit (native_colour.comp's)
+  uvec4 colour_flags;
+  vec4 lut_scale;
+  vec4 lut_offset;
 } p;
 layout(set = 0, binding = 10, std430) writeonly buffer Mask { uint m[]; } u_mask;
 // DLSS's depth as the capture copied it (`native::DepthCopy`), raw texels as p.mask.y says.

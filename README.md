@@ -260,7 +260,7 @@ this version re-creates the shared memory.
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution (before the upscaler) and per-pass settings, model every Nth frame (after the upscaler only), and the toggle key. |
+| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution (before the upscaler) and per-pass settings, model every Nth frame (after the upscaler only), the toggle key, and the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -293,8 +293,8 @@ generation 4x (real frames per second, pass 4 of the built-in benchmark):
 Two passes of the small network cost about as much as one pass of the full network, and look
 over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
 blend toward each other's pictures over time. **Per-pass settings** (Edit…) let each pass use its own
-intensity, local tone, local structure, skin structure, style, auto mask or model resolution instead of the
-Model tab's.
+intensity, local tone, local structure, skin structure, style, auto mask, model resolution or colour of the change
+instead of the Model tab's.
 **Pass feedback** (0 to 1, default 1) sets how much of a pass's picture the next pass works on; lower
 values keep more of the pass's own input, so the passes add less to each other.
 
@@ -306,6 +306,18 @@ the model costs less GPU time and memory but adds less detail of its own. Full i
 without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
 on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
 and shows a moment of untouched frames while the model is prepared for the new size.
+
+**Colour** (Model tab) shapes the model's change to the frame instead of the frame, before and after the
+upscaler. **Saturation**, **contrast** and **detail of the change** (0 to 4, default 1) scale how much the
+model changes colour, how much it brightens or darkens, and its fine detail against its broad change; at 0
+the frame keeps its own colours, its own brightness, or only the broad change. They apply to every pass, and
+the per-pass settings can give a pass its own. **Gamut guard** (on) shortens a change that would push a
+colour past what the frame can hold instead of clipping one channel, so the hue stays. **Dither** (off)
+breaks up banding in smooth gradients after the upscaler. **Look-up table** applies a 3D `.cube` file (17 to
+65 points; the Choose button or `neural-forge-cli shmctl lut FILE`) to the last pass's result where the model
+changed the picture: its strength (0, off) grows with the size of the change and is full at **Look-up table
+full at**, so a pixel the model left alone keeps its colour. At their defaults the picture is exactly the
+model's.
 
 ![Per-pass settings: the pass to edit, and an override switch with its value for intensity, local tone, local structure, skin structure, style and auto mask](screenshots/passes.png)
 

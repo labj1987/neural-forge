@@ -28,6 +28,10 @@ layout(set = 0, binding = 4, std140) uniform Params {
   vec4 moving;
   uvec4 full;        // the render extent (width, height), its padded width, the depth copy's kind
   vec4 ratio;        // the pass's extent over the render extent (x, y), the guide sigma, unused
+  vec4 colour;       // the colour of the edit (native_colour.comp's)
+  uvec4 colour_flags;
+  vec4 lut_scale;
+  vec4 lut_offset;
 } p;
 // The pass's answer (native_composite.comp's, rows of the pass's padded width).
 layout(set = 0, binding = 8, std430) readonly buffer Answer { uvec2 texel[]; } u_answer;

@@ -29,7 +29,10 @@ pub fn usage() {
          \x20                     (default 16, at most 64) to $XDG_DATA_HOME/neural-forge/\n\
          \x20                     captures/preupscale-cache-<ms>/ (docs/ARCHITECTURE.md)\n\
          \x20 reset               reset every setting to its default; preserves the\n\
-         \x20                     live layer session (see ShmHeader::reset_persisted_settings)\n\n\
+         \x20                     live layer session (see ShmHeader::reset_persisted_settings)\n\
+         \x20 lut <FILE|none>     name the colour of the edit's look-up table (a 3D .cube\n\
+         \x20                     file) in config.ini, or none, and have the layer read it\n\
+         \x20                     again; edit_lut_strength above 0 turns it on\n\n\
          Opens config.ini's shm= channel, else $NEURAL_FORGE_SHM, else the default under\n\
          /tmp/neural-forge-$UID -- the same one the layer uses.",
         max_frames = neural_forge_protocol::capture::MAX_FRAMES,
@@ -85,6 +88,40 @@ fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
         return false;
     }
     println!("{name}={value}");
+    true
+}
+
+/// `lut FILE|none`: checks the file parses as a 3D `.cube` table, names it in `config.ini` (`edit_lut`; none
+/// removes the key) and bumps `edit_lut_seq` so a running layer reads it again.
+fn cmd_lut(header: &ShmHeader, file: &str) -> bool {
+    let key = neural_forge_protocol::cube::CONFIG_KEY;
+    let mut cfg = neural_forge_supervisor::Config::load();
+    if file == "none" {
+        cfg.settings.remove(key);
+    } else {
+        let path = match std::fs::canonicalize(file) {
+            Ok(p) => p.to_string_lossy().into_owned(),
+            Err(e) => {
+                eprintln!("shmctl lut: {file}: {e}");
+                return false;
+            }
+        };
+        match neural_forge_protocol::cube::load(&path) {
+            Ok(cube) => println!("{path}: {} points a side", cube.size),
+            Err(e) => {
+                eprintln!("shmctl lut: {e}");
+                return false;
+            }
+        }
+        cfg.settings.insert(key.to_string(), path);
+    }
+    if let Err(e) = cfg.save() {
+        eprintln!("shmctl lut: saving config.ini failed: {e}");
+        return false;
+    }
+    header.edit_lut_seq.fetch_add(1, Ordering::Relaxed);
+    header.control_seq.fetch_add(1, Ordering::Relaxed);
+    println!("{key}={}", cfg.settings.get(key).map_or("", String::as_str));
     true
 }
 
@@ -266,7 +303,8 @@ pub fn check_args(args: &[String]) -> Result<(), String> {
         Some("toggle") if n == 2 => Ok(()),
         Some("capture") => capture_args(&args[1..]).map(|_| ()),
         Some("dump-cache") => dump_cache_holds(&args[1..]).map(|_| ()),
-        Some(sub @ ("status" | "reset" | "set" | "toggle")) => Err(format!("wrong number of arguments for shmctl {sub}")),
+        Some("lut") if n == 2 => Ok(()),
+        Some(sub @ ("status" | "reset" | "set" | "toggle" | "lut")) => Err(format!("wrong number of arguments for shmctl {sub}")),
         Some(other) => Err(format!("unknown shmctl subcommand {other:?}")),
     }
 }
@@ -306,6 +344,7 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
         },
         Some("capture") => cmd_capture(header, &args[1..]),
         Some("dump-cache") => cmd_dump_cache(header, &args[1..]),
+        Some("lut") => cmd_lut(header, &args[1]),
         Some("reset") => {
             header.reset_persisted_settings();
             println!("settings reset to defaults; layer session preserved");

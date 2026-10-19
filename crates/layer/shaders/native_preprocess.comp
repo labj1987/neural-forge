@@ -38,6 +38,12 @@ layout(set = 0, binding = 4, std140) uniform Params {
   vec4 sky;          // the mask's sky margin, unused
   vec4 dark;         // the mask's dark rule: threshold, intensity, structure, unused
   vec4 moving;       // the mask's motion rule: threshold, intensity, structure, unused
+  uvec4 full;        // the render extent (width, height), its padded width, the depth copy's kind
+  vec4 ratio;        // the pass's extent over the render extent (x, y), the enlarge's guide sigma, unused
+  vec4 colour;       // the colour of the edit (native_colour.comp): saturation, contrast, detail, unused
+  uvec4 colour_flags; // its steps, the look-up table's size, unused x2
+  vec4 lut_scale;    // the table's per-channel scale, strength
+  vec4 lut_offset;   // the table's per-channel offset, adapt
 } p;
 // The control mask (native_mask.comp): r intensity, g local tone, b structure, per pixel of the valid
 // extent. Read only while p.mask.x names a rule.

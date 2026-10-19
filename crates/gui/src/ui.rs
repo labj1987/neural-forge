@@ -713,6 +713,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
 
     let model_page = adw::PreferencesPage::new();
     model_page.add(&model_group);
+    model_page.add(&build_colour_group(&shm, &toasts));
     view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
 
     // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
@@ -909,6 +910,95 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     window.present();
 }
 
+/// The Model tab's Colour group: the colour of the network's edit (its change to the frame) for every pass
+/// (the per-pass dialog overrides the three scales), the gamut guard, the dither after the upscaler and the
+/// look-up table, whose `.cube` file is named by `edit_lut` in `config.ini` (the layer reads it itself).
+fn build_colour_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+    let group = adw::PreferencesGroup::new();
+    group.set_title("Colour");
+    group.set_description(Some("Shapes the model's change to the frame, not the frame: 1 leaves the change as the model made it"));
+    let (v, set) = bind_float(shm, Some("edit_saturation"), |h| &h.edit_saturation_bits);
+    group.add(&spin_row("Saturation of the change", "Scales how much the model changes colour: 0 keeps the frame's colours, above 1 adds to the model's", v, "edit_saturation", 0.05, set));
+    let (v, set) = bind_float(shm, Some("edit_contrast"), |h| &h.edit_contrast_bits);
+    group.add(&spin_row("Contrast of the change", "Scales how much the model brightens or darkens: 0 keeps the frame's brightness", v, "edit_contrast", 0.05, set));
+    let (v, set) = bind_float(shm, Some("edit_detail"), |h| &h.edit_detail_bits);
+    group.add(&spin_row("Detail of the change", "Scales the fine part of the change against its broad part: 0 keeps only the broad change", v, "edit_detail", 0.05, set));
+    let (v, set) = bind_bool(shm, Some("edit_gamut_guard"), |h| &h.edit_gamut_guard);
+    group.add(&switch_row("Gamut guard", "Where a change would push a colour past what the frame can hold, shorten the change instead of clipping a channel (keeps the hue)", v, set));
+    let (v, set) = bind_bool(shm, Some("edit_dither"), |h| &h.edit_dither);
+    group.add(&switch_row("Dither", "Against banding in smooth gradients after the upscaler: a fixed pattern of half a step before the 8-bit answer is rounded", v, set));
+
+    let lut_row = adw::ActionRow::new();
+    lut_row.set_title("Look-up table");
+    let current = || neural_forge_supervisor::Config::load().settings.get(neural_forge_protocol::cube::CONFIG_KEY).cloned().filter(|p| !p.is_empty());
+    let describe = |path: Option<String>| path.unwrap_or_else(|| "None: choose a .cube file (17 to 65 points)".to_string());
+    lut_row.set_subtitle(&glib::markup_escape_text(&describe(current())));
+    let choose = gtk4::Button::with_label("Choose…");
+    choose.set_valign(gtk4::Align::Center);
+    let clear = gtk4::Button::from_icon_name("edit-clear-symbolic");
+    clear.set_valign(gtk4::Align::Center);
+    clear.set_tooltip_text(Some("No look-up table"));
+    lut_row.add_suffix(&choose);
+    lut_row.add_suffix(&clear);
+    group.add(&lut_row);
+    // Names the file in config.ini and tells the layer to read it again.
+    let set_lut = {
+        let shm = std::sync::Arc::clone(shm);
+        let toasts = toasts.clone();
+        let lut_row = lut_row.clone();
+        std::rc::Rc::new(move |path: Option<String>| {
+            let mut cfg = neural_forge_supervisor::Config::load();
+            match &path {
+                Some(p) => cfg.settings.insert(neural_forge_protocol::cube::CONFIG_KEY.to_string(), p.clone()),
+                None => cfg.settings.remove(neural_forge_protocol::cube::CONFIG_KEY),
+            };
+            if let Err(e) = cfg.save() {
+                toasts.add_toast(toast(&format!("Saving config.ini failed: {e}")));
+                return;
+            }
+            shm.header().edit_lut_seq.fetch_add(1, Ordering::Relaxed);
+            shm.header().control_seq.fetch_add(1, Ordering::Relaxed);
+            lut_row.set_subtitle(&glib::markup_escape_text(&describe(path)));
+        })
+    };
+    {
+        let set_lut = std::rc::Rc::clone(&set_lut);
+        let toasts = toasts.clone();
+        choose.connect_clicked(move |button| {
+            let parent = button.root().and_downcast::<gtk4::Window>();
+            let filter = gtk4::FileFilter::new();
+            filter.set_name(Some("3D look-up tables (.cube)"));
+            filter.add_suffix("cube");
+            let filters = gio::ListStore::new::<gtk4::FileFilter>();
+            filters.append(&filter);
+            let dialog = gtk4::FileDialog::builder().title("Select a .cube look-up table").filters(&filters).build();
+            let set_lut = std::rc::Rc::clone(&set_lut);
+            let toasts = toasts.clone();
+            dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
+                let Ok(file) = result else { return };
+                let Some(path) = file.path() else {
+                    toasts.add_toast(toast("That file has no local path -- choose a file on this computer"));
+                    return;
+                };
+                let path = path.to_string_lossy().into_owned();
+                match neural_forge_protocol::cube::load(&path) {
+                    Ok(cube) => {
+                        set_lut(Some(path));
+                        toasts.add_toast(toast(&format!("Look-up table set: {} points a side. Raise its strength to use it", cube.size)));
+                    }
+                    Err(e) => toasts.add_toast(toast(&format!("Not a usable look-up table: {e}"))),
+                }
+            });
+        });
+    }
+    clear.connect_clicked(move |_| set_lut(None));
+    let (v, set) = bind_float(shm, Some("edit_lut_strength"), |h| &h.edit_lut_strength_bits);
+    group.add(&spin_row("Look-up table strength", "0 is off. Applied where the model changed the picture, on its last pass", v, "edit_lut_strength", 0.05, set));
+    let (v, set) = bind_float(shm, Some("edit_lut_adapt"), |h| &h.edit_lut_adapt_bits);
+    group.add(&spin_row("Look-up table full at", "How large a change gets the table's full strength (0-1 of the picture's range); smaller changes get less, an unchanged pixel none", v, "edit_lut_adapt", 0.01, set));
+    group
+}
+
 /// One field of the per-pass dialog.
 struct PassField {
     title: &'static str,
@@ -943,6 +1033,9 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
         PassField { title: "Style", field: "style", bit: po::STYLE, kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]), get: |h, k| &h.pass[k].style },
         PassField { title: "Auto mask", field: "auto_mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |h, k| &h.pass[k].auto_mask },
         PassField { title: "Model resolution", field: "scale", bit: po::SCALE, kind: PassFieldKind::Scale, get: |h, k| &h.pass_scale_bits[k] },
+        PassField { title: "Edit saturation", field: "edit_saturation", bit: po::EDIT_SATURATION, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].saturation_bits },
+        PassField { title: "Edit contrast", field: "edit_contrast", bit: po::EDIT_CONTRAST, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].contrast_bits },
+        PassField { title: "Edit detail", field: "edit_detail", bit: po::EDIT_DETAIL, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].detail_bits },
     ];
     let max = neural_forge_protocol::MAX_PASSES;
 

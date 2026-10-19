@@ -30,6 +30,7 @@
 
 pub mod cache_dump;
 pub mod capture;
+pub mod cube;
 pub mod enums;
 mod header;
 #[cfg(unix)]
@@ -46,7 +47,7 @@ mod slot;
 #[cfg(unix)]
 pub mod state_log;
 
-pub use header::{load64, pass_setting, resolved_scale, setting_bounds, store64, MaskSettings, PassControl, PassTunings, ShmHeader, Tuning, SETTING_BOUNDS};
+pub use header::{load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, MaskSettings, PassColour, PassControl, PassTunings, ShmHeader, Tuning, SETTING_BOUNDS};
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
 
@@ -75,7 +76,9 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// extracted networks the layer runs, the control mask's rules (`mask_*`: keep the game's sky, and the
 /// optional dark and motion rules), `pass_feedback`, and `scene_cuts`, the count of history resets for a
 /// scene cut before the upscaler); v21 appends the model resolution before the upscaler
-/// (`preupscale_scale`) and each pass's own (`pass_scale`, used with the `SCALE` override bit)).
+/// (`preupscale_scale`) and each pass's own (`pass_scale`, used with the `SCALE` override bit), the colour of the network's
+/// edit (`edit_*`: its saturation, contrast and detail for every pass, the gamut guard, the dither, the look-up
+/// table's strength, its adaptation and reload counter) and each pass's own colour values (`pass_colour`)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.

@@ -99,7 +99,10 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   skin structure, `model_interval` (v6), `passes` and `pass[10]` (v19), `network` (v20,
   `enums::network`: 0 the full network, 1 the small one), `preupscale_scale` and `pass_scale[10]` (v21:
   the model resolution before the upscaler, a scale of DLSS's input size, and each pass's own, used where
-  its `overrides` has `pass_override::SCALE`; NATIVE_BACKEND.md, "Model resolution before the upscaler").
+  its `overrides` has `pass_override::SCALE`; NATIVE_BACKEND.md, "Model resolution before the upscaler"), and the colour of the
+  edit (v21 too: `edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`,
+  `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`, the reload counter for `config.ini`'s `edit_lut` file,
+  and `pass_colour[10]`, each pass's own three scales; NATIVE_BACKEND.md, "The colour of the edit").
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
   transfer mode, white point fields, `working_scale`, compare and debug views, `reversible_mode`,
   `apply_model`, `hold_frame`, `ghost_guard` (v4), colour trust and ratio smoothing (v5).
@@ -166,7 +169,7 @@ be private.
 | 18 | `capture_request` carries a request id; `capture_next_id`, `capture_cancel` and the capture result (state, reason, counts, paths) appended | 3.4.0 |
 | 19 | `passes` and `pass[10]` (each pass's overrides of the Model tab's values: `overrides` bits and their values) appended | 3.6.0 |
 | 20 | `network` (which extracted network the layer runs) and the control mask's rules (`mask_sky`, `mask_sky_margin`, `mask_dark*`, `mask_motion*`) appended | 3.7.0 |
-| 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended | 3.8.0 |
+| 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512) | 3.8.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.

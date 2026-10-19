@@ -15,6 +15,18 @@ first shipped them; their phase is kept as a subheading.
   (Per-pass settings), working on the previous pass's full-size picture.
 - Changing the model resolution starts the model's history afresh and shows a moment of untouched frames
   while the model is prepared for the new size.
+- **Colour of the model's change** (Model tab, Colour group): controls that act on what the model changes,
+  not on the frame, before and after the upscaler. **Saturation**, **contrast** and **detail of the change**
+  (0 to 4, default 1) scale how much the model changes colour, how much it brightens or darkens, and its fine
+  detail against its broad change. They apply to every pass; the per-pass settings can give a pass its own.
+- **Gamut guard** (on by default): when a stronger change would push a colour past what the frame can hold,
+  the change is shortened instead of one channel clipping, so the hue stays. It only acts when you raise the
+  controls above: at their defaults the picture is exactly as before.
+- **Dither** (off by default): breaks up banding in smooth gradients after the upscaler.
+- **Look-up table**: choose a 3D `.cube` file (17 to 65 points) in the Colour group, or with
+  `neural-forge-cli shmctl lut FILE` (`none` removes it), and raise its strength. It grades the last pass's
+  result where the model changed the picture, more where it changed more ("Look-up table full at" sets how
+  much change gets the full strength); a pixel the model left alone keeps its colour.
 
 ## 3.7.0 — 2026-10-19
 

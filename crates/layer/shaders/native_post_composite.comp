@@ -8,6 +8,15 @@
 // and intensity, is this pass's next history (p.frame.w set). Without one (NEURAL_FORGE_POST_MOTION=none,
 // the shipped behaviour) nothing blends. The answer is 8 bits in the proxy's own channel order, rounded to
 // nearest (as an RGBA8 image store rounds), alpha copied.
+//
+// The colour of the edit (docs/NATIVE_BACKEND.md, "The colour of the edit"; native_colour.comp's steps on the
+// 8-bit proxy's own values): with p.colour_flags.x bit 1 the change e = published - proxy is reshaped
+// (detail against its 3x3 binomial low-pass, from the neighbours' answers worked out here; saturation and
+// contrast around its BT.709 luma; the look-up table on the last pass, scaled by the edit's size; the gamut
+// guard shortening it along itself to stay in 0-1). Bit 16 dithers the quantisation: an 8x8 ordered
+// offset in (-0.5, 0.5) of the 8-bit step, so a level is the neighbour above or below it, never further.
+// The history is stored before any of this: it stays the network's answer. With no bit set the answer is
+// computed exactly as before.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Proxy { uint texel[]; } u_proxy;
@@ -18,12 +27,25 @@ layout(set = 0, binding = 2, std430) writeonly buffer Answer { uint texel[]; } u
 layout(set = 0, binding = 3, std430) writeonly buffer History { uvec2 texel[]; } u_history;
 // native_post_preprocess.comp's reprojected history: as History, the second half of .y 1 where it is kept.
 layout(set = 0, binding = 4, std430) readonly buffer Reproj { uvec2 texel[]; } u_reproj;
+// The look-up table: size^3 RGB entries, red fastest (read only with bit 4).
+layout(set = 0, binding = 8, std430) readonly buffer Lut { vec4 entry[]; } u_lut;
 
 layout(push_constant) uniform Params {
   uvec4 dims;      // field width, field height, valid width, valid height
   uvec4 frame;     // unused, BGRA (1) or RGBA (0), blend toward the history (1), write the history (1)
   vec4 control;    // style, local tone, intensity, blend scale
+  vec4 colour;     // the edit's saturation, contrast, detail, unused
+  uvec4 colour_flags; // 1 a step runs, 2 gamut guard, 4 look-up table, 8 detail, 16 dither; table size; unused x2
+  vec4 lut_scale;  // per channel (size - 1) / (domain max - min); strength
+  vec4 lut_offset; // per channel -domain min x scale; adapt
 } p;
+
+const uint STEP = 1u;
+const uint GUARD = 2u;
+const uint LUT = 4u;
+const uint DETAIL = 8u;
+const uint DITHER = 16u;
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 
 float truncateHalf(float value) {
   uint bits = floatBitsToUint(value);
@@ -99,6 +121,111 @@ vec3 nrStyle(vec3 neural, float style, float tone) {
   return clamp(nrRgb(vec3(again.x, clamp(exp2(log2(again.y)), 0.0, 1.0), again.z)), vec3(0.0), vec3(1.0));
 }
 
+// The answer at `xy` before quantisation, and the proxy there (main's arithmetic, history blend included, for
+// the detail step's neighbours).
+vec3 publishedAt(uvec2 xy, out vec3 proxy) {
+  uint at = xy.y * p.dims.z + xy.x;
+  vec4 texel = unpackUnorm4x8(u_proxy.texel[at]);
+  proxy = p.frame.y != 0u ? texel.bgr : texel.rgb;
+  uint feature = (xy.y * p.dims.x + xy.x) * 4u;
+  vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);
+  vec3 neural = clamp(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5, vec3(0.0), vec3(1.0));
+  if (p.frame.z != 0u) {
+    uvec2 r = u_reproj.texel[at];
+    vec2 last = unpackHalf2x16(r.y);
+    if (last.y > 0.0) {
+      float scale = clamp(p.control.w, 0.0, 1.0);
+      float weight = clamp((1.0 / (1.0 + exp2(u_head.head[feature + 3u] * uintBitsToFloat(0xbfb8aa3bu)))) * scale, 0.0, 1.0);
+      vec3 hist = vec3(unpackHalf2x16(r.x), last.x);
+      neural = fma(vec3(weight), hist - neural, neural);
+    }
+  }
+  vec3 history = vec3(truncateHalf(neural.r), truncateHalf(neural.g), truncateHalf(neural.b));
+  float style = p.control.x;
+  float intensity = p.control.z;
+  vec3 styled = style != 0.0 ? nrStyle(history, style, p.control.y) : history;
+  vec3 published = history;
+  if (style != 0.0 || intensity != 1.0) {
+    for (int c = 0; c < 3; c++) published[c] = truncateHalf(clamp(fma(intensity, styled[c] - proxy[c], proxy[c]), 0.0, 1.0));
+  }
+  return published;
+}
+
+vec3 lutEntry(uint r, uint g, uint b) {
+  uint n = p.colour_flags.y;
+  return u_lut.entry[r + n * (g + n * b)].rgb;
+}
+
+// Trilinear, as `neural_forge_protocol::cube::Cube::sample`.
+vec3 lutSample(vec3 rgb) {
+  float last = float(p.colour_flags.y - 1u);
+  vec3 t = clamp(rgb * p.lut_scale.xyz + p.lut_offset.xyz, vec3(0.0), vec3(last));
+  uvec3 b = uvec3(min(floor(t), vec3(last - 1.0)));
+  vec3 f = t - vec3(b);
+  vec3 c00 = mix(lutEntry(b.x, b.y, b.z), lutEntry(b.x + 1u, b.y, b.z), f.x);
+  vec3 c10 = mix(lutEntry(b.x, b.y + 1u, b.z), lutEntry(b.x + 1u, b.y + 1u, b.z), f.x);
+  vec3 c01 = mix(lutEntry(b.x, b.y, b.z + 1u), lutEntry(b.x + 1u, b.y, b.z + 1u), f.x);
+  vec3 c11 = mix(lutEntry(b.x, b.y + 1u, b.z + 1u), lutEntry(b.x + 1u, b.y + 1u, b.z + 1u), f.x);
+  return mix(mix(c00, c10, f.y), mix(c01, c11, f.y), f.z);
+}
+
+// The 8x8 Bayer matrix's value at `xy`, as an offset in (-0.5, 0.5).
+float bayer(uvec2 xy) {
+  uint x = xy.x & 7u;
+  uint y = xy.y & 7u;
+  uint v = 0u;
+  uint xc = x ^ y;
+  // Interleave the bits of x ^ y and y, the coordinates' lowest bits into the value's highest: the
+  // recursive Bayer construction (2x2: 0 2 / 3 1).
+  for (int bit = 0; bit < 3; bit++) {
+    v = (v << 2u) | (((xc >> uint(bit)) & 1u) << 1u) | ((y >> uint(bit)) & 1u);
+  }
+  return (float(v) + 0.5) / 64.0 - 0.5;
+}
+
+// The colour steps on one pixel (native_colour.comp's, on the 8-bit proxy's values).
+vec3 colourOf(uvec2 id, vec3 proxy, vec3 published) {
+  uint flags = p.colour_flags.x;
+  vec3 e = published - proxy;
+  vec3 r = published;
+  bool changed = false;
+  if ((flags & DETAIL) != 0u) {
+    vec3 low = vec3(0.0);
+    for (int dy = -1; dy <= 1; dy++) {
+      for (int dx = -1; dx <= 1; dx++) {
+        uvec2 q = uvec2(clamp(ivec2(id) + ivec2(dx, dy), ivec2(0), ivec2(p.dims.zw) - 1));
+        vec3 qp;
+        vec3 qa = publishedAt(q, qp);
+        low += float((2 - abs(dx)) * (2 - abs(dy))) * (qa - qp);
+      }
+    }
+    low *= 1.0 / 16.0;
+    e = low + p.colour.z * (e - low);
+    changed = true;
+  }
+  if (p.colour.x != 1.0 || p.colour.y != 1.0) {
+    float l = dot(e, LUMA);
+    e = p.colour.y * vec3(l) + p.colour.x * (e - vec3(l));
+    changed = true;
+  }
+  if (changed) r = proxy + e;
+  if ((flags & LUT) != 0u) {
+    vec3 d = abs(r - proxy);
+    float w = p.lut_scale.w * min(1.0, max(d.r, max(d.g, d.b)) / p.lut_offset.w);
+    if (w > 0.0) r = mix(r, lutSample(clamp(r, vec3(0.0), vec3(1.0))), w);
+  }
+  if ((flags & GUARD) != 0u) {
+    vec3 d = r - proxy;
+    float t = 1.0;
+    for (int c = 0; c < 3; c++) {
+      if (r[c] > 1.0) t = min(t, (1.0 - proxy[c]) / d[c]);
+      else if (r[c] < 0.0) t = min(t, -proxy[c] / d[c]);
+    }
+    if (t < 1.0) r = proxy + max(t, 0.0) * d;
+  }
+  return clamp(r, vec3(0.0), vec3(1.0));
+}
+
 void main() {
   uvec2 id = gl_GlobalInvocationID.xy;
   if (id.x >= p.dims.z || id.y >= p.dims.w) return;
@@ -128,6 +255,9 @@ void main() {
   if (style != 0.0 || intensity != 1.0) {
     for (int c = 0; c < 3; c++) published[c] = truncateHalf(clamp(fma(intensity, styled[c] - proxy[c], proxy[c]), 0.0, 1.0));
   }
+  uint flags = p.colour_flags.x;
+  if ((flags & STEP) != 0u) published = colourOf(id, proxy, published);
+  if ((flags & DITHER) != 0u) published = published + vec3(bayer(id) / 255.0);
   vec3 out3 = bgra ? published.bgr : published;
   u_answer.texel[at] = packUnorm4x8(vec4(out3, texel.a));
 }

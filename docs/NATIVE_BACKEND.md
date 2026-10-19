@@ -1017,6 +1017,71 @@ Not measured yet. To measure in GTA V Enhanced at 1440p (frame generation on, as
 preset, and bench-iq's added detail and flicker on a static box (the still shot's facade, as in LESSONS.md;
 the whole-scene number moves with what the game spawns), Full against each preset.
 
+## The colour of the edit (3.8.0, 2026-10-19)
+
+Controls that act on the network's **change** to the frame rather than on the frame: the edit e = answer -
+input of a pass, in the domain the pass works in (before the upscaler the encoded picture,
+`preupscale_encode.comp`'s per-channel shoulder and sRGB curve of the scene-linear input; after it the 8-bit
+proxy's own values). The idea of shaping the change, per pass or for the whole stack, with an adaptive look-up
+table on top, comes from another DLSS-NR app's feature list; the design here is this project's own.
+
+| Control | Setting (default) | Step |
+|---|---|---|
+| Detail | `edit_detail` (1) | e = low + detail x (e - low), low the edit's 3x3 binomial blur ([1 2 1] squared / 16, edges clamped) |
+| Saturation | `edit_saturation` (1) | l = BT.709 luma of e (0.2126, 0.7152, 0.0722; on the encoded values), e = contrast x l + saturation x (e - l): the grey part scaled by contrast, the part of no luma by saturation |
+| Contrast | `edit_contrast` (1) | (the same line) |
+| Look-up table | `edit_lut_strength` (0, off), `edit_lut_adapt` (0.05); the file is `edit_lut` in `config.ini` | on the last pass's result r: r = mix(r, LUT(r), strength x min(1, max channel abs(r - input) / adapt)), trilinear in a 3D `.cube` table (2 to 65 points, `DOMAIN_MIN`/`MAX` honoured) |
+| Gamut guard | `edit_gamut_guard` (on) | where input + e leaves 0-1 in a channel, e is shortened along itself (r = input + t x e, the largest t <= 1 that fits); without it each channel clamps |
+| Dither | `edit_dither` (off) | after the upscaler only: an 8x8 Bayer offset in (-0.5, 0.5) of the 8-bit step added before the answer is rounded |
+
+The order is detail, saturation and contrast, the table, the guard, then the clamp to 0-1 and the half-float
+truncation (before the upscaler) or the 8-bit rounding (after it). The three scales apply to every pass (the
+Model tab's value, "the whole stack"), and a pass may override any of them in the per-pass dialog
+(`pass<N>_edit_saturation`, `_contrast`, `_detail`, override bits 128, 256 and 512 of `pass<N>_overrides`);
+the guard and the dither apply to every pass that has a step, the table to the last pass of the frame only, so
+it grades the stack's result once.
+
+**Why the guard is on by default.** The encode maps scene-linear 0 to 0 in each channel and the shoulder's top to
+1, so an encoded channel below 0 is a colour outside BT.709's primaries in linear terms and one above 1 cannot be
+written back; clamping one channel turns the hue (the decode clamps per channel too). Shortening the whole change
+keeps its direction. In range, t is 1 and the guard does nothing (the test compares a guarded and an unguarded
+in-range pixel bit for bit); with the scales at 1 the network's own answer is already clamped by the composite
+and the stage is not recorded at all, so the guard on changes no default picture. On the test's red pixel at
+saturation 2, the clamp turns the change's green-to-red ratio from -0.26 to -0.52 and the guard keeps it within
+0.01.
+
+**Where it runs.** Before the upscaler, `native_colour.comp` runs after each pass's composite in that pass's
+`N`, in two dispatches (phase 0 the edit's low-pass into its own buffer, phase 1 the steps in place in the
+answer), sharing the frame shaders' set layout (bindings 12, the low-pass, and 13, the table) and `Params` (four
+vec4s appended). The history (`u_next`) is written by the composite before it, so it stays the network's own
+answer and the next frame reprojects what the network made, never the reshaped picture; the edit cache captures
+the reshaped answer, so the frames in between carry it. The stage is recorded only while some pass of the frame
+reshapes its edit or the table applies (`colour::wanted`; the buffers are recorded again when that changes), and
+a pass whose values are neutral returns at once: its answer is untouched, bit for bit. After the upscaler the
+steps are inline in `native_post_composite.comp` (the detail's low-pass computes the eight neighbours' answers
+there, so it costs about nine times the composite while detail is not 1); with no bit set the shader takes the
+path it took before.
+
+**The look-up table.** It is not in the shared memory: a 65-point table is 4.4 MB and the header is 64 KiB of
+settings. `edit_lut` in `config.ini` names the file (the GUI's Colour group and `neural-forge-cli shmctl lut
+FILE|none` set it, after checking it parses, and bump `edit_lut_seq`); the layer reads it on a thread of its own
+(`preupscale::colour::current`, through `persist::read_config`) when `edit_lut_seq` moves on while the strength
+is above 0, and the previous table (or none) stays in use until it is read. Each path uploads it into a
+host-visible buffer of its own. The table's strength adapts to the edit: a pixel the network left alone keeps
+its colour at any strength, and the full strength is reached at an edit of `edit_lut_adapt`.
+
+Tests on lavapipe (`the_colour_of_the_edit_reshapes_the_answer_and_leaves_the_history`,
+`the_colour_of_the_edit_after_the_upscaler_reshapes_and_dithers_the_8_bit_answer`, and the settings' own):
+neutral values give the answer bit for bit with the stage recorded or not, and the history lane is the network's
+answer; saturation 0 leaves a grey change of the edit's luma, contrast 0 one of no luma; detail 0 removes a
+checkerboard and keeps the broad change; the guard as above; the table at strength 0 changes nothing, at full
+strength it is the table where the edit is large and nothing where there is none; the dither gives each pixel the
+level below or above its value and averages to it. Each fails with its step taken out of the shader (checked
+once).
+
+Not measured in a game yet: what the controls cost on the RTX 5070 (the low-pass and the steps are two
+full-frame dispatches per pass that has a step) and how they look.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

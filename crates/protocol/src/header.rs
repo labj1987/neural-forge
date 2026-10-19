@@ -46,6 +46,20 @@ impl PassControl {
     }
 }
 
+impl PassControl {
+    /// `global` with this pass's colour overrides (from `own`) applied.
+    pub fn apply_colour(&self, own: &PassColour, global: EditColour) -> EditColour {
+        use crate::enums::pass_override::*;
+        let mask = self.overrides.load(Ordering::Relaxed);
+        let f = |bit: u32, a: &AtomicU32, g: f32| if mask & bit != 0 { f32::from_bits(a.load(Ordering::Relaxed)) } else { g };
+        EditColour {
+            saturation: f(EDIT_SATURATION, &own.saturation_bits, global.saturation),
+            contrast: f(EDIT_CONTRAST, &own.contrast_bits, global.contrast),
+            detail: f(EDIT_DETAIL, &own.detail_bits, global.detail),
+        }
+    }
+}
+
 /// The network's passes as one frame runs them: how many, and each one's settings (the Model tab's
 /// with that pass's overrides). Entries past `count` are the Model tab's.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -57,17 +71,79 @@ pub struct PassTunings {
     /// Each pass's model resolution before the upscaler, a scale of DLSS's input size
     /// (`preupscale_scale`, or the pass's own `pass<N>_scale` where it overrides it); 1 is full size.
     pub scales: [f32; crate::MAX_PASSES],
+    /// The colour of each pass's edit and the stack's colour controls.
+    pub colour: ColourSettings,
 }
 
 impl PassTunings {
     /// One pass with `tuning`, at full size.
     pub fn single(tuning: Tuning) -> Self {
-        Self { count: 1, tunings: [tuning; crate::MAX_PASSES], feedback: 1.0, scales: [1.0; crate::MAX_PASSES] }
+        Self { count: 1, tunings: [tuning; crate::MAX_PASSES], feedback: 1.0, scales: [1.0; crate::MAX_PASSES], colour: ColourSettings::DEFAULT }
     }
 
     pub fn passes(&self) -> &[Tuning] {
         &self.tunings[..self.count]
     }
+}
+
+/// One pass's own values for the colour of the edit ([`ShmHeader::pass_colour`]); which of them it uses
+/// is in its [`PassControl::overrides`] (`EDIT_SATURATION`, `EDIT_CONTRAST`, `EDIT_DETAIL`).
+#[repr(C)]
+#[derive(Default)]
+pub struct PassColour {
+    pub saturation_bits: AtomicU32,
+    pub contrast_bits: AtomicU32,
+    pub detail_bits: AtomicU32,
+}
+
+impl PassColour {
+    /// The Model tab's defaults (neutral), so an override switched on later starts from them.
+    pub fn reset_to_defaults(&self) {
+        for a in [&self.saturation_bits, &self.contrast_bits, &self.detail_bits] {
+            a.store(1.0f32.to_bits(), Ordering::Relaxed);
+        }
+    }
+}
+
+/// How one pass shapes the network's change (the edit: its answer minus its input): the scale of the
+/// edit's chroma (`saturation`), of its luma (`contrast`) and of its high frequencies against its low ones
+/// (`detail`). 1, 1, 1 leaves the edit as the network made it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct EditColour {
+    pub saturation: f32,
+    pub contrast: f32,
+    pub detail: f32,
+}
+
+impl EditColour {
+    pub const NEUTRAL: Self = Self { saturation: 1.0, contrast: 1.0, detail: 1.0 };
+
+    pub fn is_neutral(&self) -> bool {
+        *self == Self::NEUTRAL
+    }
+}
+
+/// The colour of the edit for every pass ([`ShmHeader::pass_tunings`]): each pass's own scales (the
+/// Model tab's with that pass's overrides), and the controls for the whole stack: the gamut guard, the
+/// dither of the 8-bit answer after the upscaler, and the look-up table on the last pass's result.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ColourSettings {
+    pub each: [EditColour; crate::MAX_PASSES],
+    /// Pull a change that would leave the source's range (encoded 0-1 per channel, so also the BT.709
+    /// primaries) back along itself instead of clipping channels.
+    pub gamut_guard: bool,
+    /// An ordered dither of +-0.5 of the 8-bit step before the after-the-upscaler answer is quantised.
+    pub dither: bool,
+    /// The look-up table's strength (0: off) and the edit size at which it applies in full.
+    pub lut_strength: f32,
+    pub lut_adapt: f32,
+    /// Bumped when `edit_lut` in `config.ini` names another file (or the same one changed).
+    pub lut_seq: u32,
+}
+
+impl ColourSettings {
+    /// Every control at its default: the edit as the network made it.
+    pub const DEFAULT: Self = Self { each: [EditColour::NEUTRAL; crate::MAX_PASSES], gamut_guard: true, dither: false, lut_strength: 0.0, lut_adapt: 0.05, lut_seq: 0 };
 }
 
 /// The control mask's rules ([`ShmHeader::mask_settings`]), as plain values.
@@ -451,6 +527,28 @@ pub struct ShmHeader {
     /// f32 bits: each pass's own model resolution (`pass<N>_scale`), used where the pass's `overrides` has
     /// [`crate::enums::pass_override::SCALE`]. Default 1.
     pub pass_scale_bits: [AtomicU32; crate::MAX_PASSES],
+    /// The colour of the network's edit (docs/NATIVE_BACKEND.md, "The colour of the edit"), for every
+    /// pass: f32 bits, the scale of the edit's chroma (`edit_saturation`), of its luma around zero
+    /// (`edit_contrast`) and of its high frequencies against its low ones (`edit_detail`), 0 to 4, 1 (the
+    /// default) as the network made it.
+    pub edit_saturation_bits: AtomicU32,
+    pub edit_contrast_bits: AtomicU32,
+    pub edit_detail_bits: AtomicU32,
+    /// 1 (the default): where the shaped edit would take a channel out of the encoded 0-1 range, the whole
+    /// change is shortened along itself until it fits instead of the channel clipping.
+    pub edit_gamut_guard: AtomicU32,
+    /// 1: an ordered dither of +-0.5 of the 8-bit step before the after-the-upscaler answer is quantised.
+    /// Default 0.
+    pub edit_dither: AtomicU32,
+    /// f32 bits: the look-up table (`edit_lut` in `config.ini`, a `.cube` file) on the last pass's result,
+    /// 0 (the default, off) to 1, scaled per pixel by the edit's size over `edit_lut_adapt` (0.001 to 1,
+    /// default 0.05), capped at 1: a pixel the network left alone keeps its colour.
+    pub edit_lut_strength_bits: AtomicU32,
+    pub edit_lut_adapt_bits: AtomicU32,
+    /// Bumped by whoever changes `edit_lut` in `config.ini`: the layer reads the file again. Not a setting.
+    pub edit_lut_seq: AtomicU32,
+    /// Each pass's own colour values ([`PassColour`]), used where its `overrides` say so.
+    pub pass_colour: [PassColour; crate::MAX_PASSES],
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -475,7 +573,10 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2128, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2280, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_saturation_bits) == 2128, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_lut_seq) == 2156, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_colour) == 2160, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits) == 2084, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_scale_bits) == 2088, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) == 2076, "layout changed -- bump SHM_VERSION");
@@ -517,7 +618,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 127] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 164] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -556,70 +657,70 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 127] = [
     // How many times the network runs over one frame (`resolved_passes`).
     ("passes", 1.0, 10.0),
     // Each pass's overrides (`enums::pass_override` bits) and its own values for them.
-    ("pass1_overrides", 0.0, 127.0),
+    ("pass1_overrides", 0.0, 1023.0),
     ("pass1_intensity", 0.0, 4.0),
     ("pass1_local_tone", 0.0, 4.0),
     ("pass1_local_structure", 0.0, 4.0),
     ("pass1_skin_structure", -1.0, 4.0),
     ("pass1_style", 0.0, 2.0),
     ("pass1_auto_mask", 0.0, 1.0),
-    ("pass2_overrides", 0.0, 127.0),
+    ("pass2_overrides", 0.0, 1023.0),
     ("pass2_intensity", 0.0, 4.0),
     ("pass2_local_tone", 0.0, 4.0),
     ("pass2_local_structure", 0.0, 4.0),
     ("pass2_skin_structure", -1.0, 4.0),
     ("pass2_style", 0.0, 2.0),
     ("pass2_auto_mask", 0.0, 1.0),
-    ("pass3_overrides", 0.0, 127.0),
+    ("pass3_overrides", 0.0, 1023.0),
     ("pass3_intensity", 0.0, 4.0),
     ("pass3_local_tone", 0.0, 4.0),
     ("pass3_local_structure", 0.0, 4.0),
     ("pass3_skin_structure", -1.0, 4.0),
     ("pass3_style", 0.0, 2.0),
     ("pass3_auto_mask", 0.0, 1.0),
-    ("pass4_overrides", 0.0, 127.0),
+    ("pass4_overrides", 0.0, 1023.0),
     ("pass4_intensity", 0.0, 4.0),
     ("pass4_local_tone", 0.0, 4.0),
     ("pass4_local_structure", 0.0, 4.0),
     ("pass4_skin_structure", -1.0, 4.0),
     ("pass4_style", 0.0, 2.0),
     ("pass4_auto_mask", 0.0, 1.0),
-    ("pass5_overrides", 0.0, 127.0),
+    ("pass5_overrides", 0.0, 1023.0),
     ("pass5_intensity", 0.0, 4.0),
     ("pass5_local_tone", 0.0, 4.0),
     ("pass5_local_structure", 0.0, 4.0),
     ("pass5_skin_structure", -1.0, 4.0),
     ("pass5_style", 0.0, 2.0),
     ("pass5_auto_mask", 0.0, 1.0),
-    ("pass6_overrides", 0.0, 127.0),
+    ("pass6_overrides", 0.0, 1023.0),
     ("pass6_intensity", 0.0, 4.0),
     ("pass6_local_tone", 0.0, 4.0),
     ("pass6_local_structure", 0.0, 4.0),
     ("pass6_skin_structure", -1.0, 4.0),
     ("pass6_style", 0.0, 2.0),
     ("pass6_auto_mask", 0.0, 1.0),
-    ("pass7_overrides", 0.0, 127.0),
+    ("pass7_overrides", 0.0, 1023.0),
     ("pass7_intensity", 0.0, 4.0),
     ("pass7_local_tone", 0.0, 4.0),
     ("pass7_local_structure", 0.0, 4.0),
     ("pass7_skin_structure", -1.0, 4.0),
     ("pass7_style", 0.0, 2.0),
     ("pass7_auto_mask", 0.0, 1.0),
-    ("pass8_overrides", 0.0, 127.0),
+    ("pass8_overrides", 0.0, 1023.0),
     ("pass8_intensity", 0.0, 4.0),
     ("pass8_local_tone", 0.0, 4.0),
     ("pass8_local_structure", 0.0, 4.0),
     ("pass8_skin_structure", -1.0, 4.0),
     ("pass8_style", 0.0, 2.0),
     ("pass8_auto_mask", 0.0, 1.0),
-    ("pass9_overrides", 0.0, 127.0),
+    ("pass9_overrides", 0.0, 1023.0),
     ("pass9_intensity", 0.0, 4.0),
     ("pass9_local_tone", 0.0, 4.0),
     ("pass9_local_structure", 0.0, 4.0),
     ("pass9_skin_structure", -1.0, 4.0),
     ("pass9_style", 0.0, 2.0),
     ("pass9_auto_mask", 0.0, 1.0),
-    ("pass10_overrides", 0.0, 127.0),
+    ("pass10_overrides", 0.0, 1023.0),
     ("pass10_intensity", 0.0, 4.0),
     ("pass10_local_tone", 0.0, 4.0),
     ("pass10_local_structure", 0.0, 4.0),
@@ -653,6 +754,45 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 127] = [
     ("pass8_scale", crate::enums::model_scale::MIN, 1.0),
     ("pass9_scale", crate::enums::model_scale::MIN, 1.0),
     ("pass10_scale", crate::enums::model_scale::MIN, 1.0),
+    // The colour of the edit (`ColourSettings`).
+    ("edit_saturation", 0.0, 4.0),
+    ("edit_contrast", 0.0, 4.0),
+    ("edit_detail", 0.0, 4.0),
+    ("edit_gamut_guard", 0.0, 1.0),
+    ("edit_dither", 0.0, 1.0),
+    ("edit_lut_strength", 0.0, 1.0),
+    ("edit_lut_adapt", 0.001, 1.0),
+    // Each pass's own colour values (its `overrides` say which it uses).
+    ("pass1_edit_saturation", 0.0, 4.0),
+    ("pass1_edit_contrast", 0.0, 4.0),
+    ("pass1_edit_detail", 0.0, 4.0),
+    ("pass2_edit_saturation", 0.0, 4.0),
+    ("pass2_edit_contrast", 0.0, 4.0),
+    ("pass2_edit_detail", 0.0, 4.0),
+    ("pass3_edit_saturation", 0.0, 4.0),
+    ("pass3_edit_contrast", 0.0, 4.0),
+    ("pass3_edit_detail", 0.0, 4.0),
+    ("pass4_edit_saturation", 0.0, 4.0),
+    ("pass4_edit_contrast", 0.0, 4.0),
+    ("pass4_edit_detail", 0.0, 4.0),
+    ("pass5_edit_saturation", 0.0, 4.0),
+    ("pass5_edit_contrast", 0.0, 4.0),
+    ("pass5_edit_detail", 0.0, 4.0),
+    ("pass6_edit_saturation", 0.0, 4.0),
+    ("pass6_edit_contrast", 0.0, 4.0),
+    ("pass6_edit_detail", 0.0, 4.0),
+    ("pass7_edit_saturation", 0.0, 4.0),
+    ("pass7_edit_contrast", 0.0, 4.0),
+    ("pass7_edit_detail", 0.0, 4.0),
+    ("pass8_edit_saturation", 0.0, 4.0),
+    ("pass8_edit_contrast", 0.0, 4.0),
+    ("pass8_edit_detail", 0.0, 4.0),
+    ("pass9_edit_saturation", 0.0, 4.0),
+    ("pass9_edit_contrast", 0.0, 4.0),
+    ("pass9_edit_detail", 0.0, 4.0),
+    ("pass10_edit_saturation", 0.0, 4.0),
+    ("pass10_edit_contrast", 0.0, 4.0),
+    ("pass10_edit_detail", 0.0, 4.0),
 ];
 
 /// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
@@ -747,6 +887,17 @@ impl ShmHeader {
         self.preupscale_scale_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         for s in &self.pass_scale_bits {
             s.store(1.0f32.to_bits(), Ordering::Relaxed);
+        }
+        self.edit_saturation_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.edit_contrast_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.edit_detail_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.edit_gamut_guard.store(1, Ordering::Relaxed);
+        self.edit_dither.store(0, Ordering::Relaxed);
+        self.edit_lut_strength_bits.store(0.0f32.to_bits(), Ordering::Relaxed);
+        self.edit_lut_adapt_bits.store(0.05f32.to_bits(), Ordering::Relaxed);
+        self.edit_lut_seq.store(0, Ordering::Relaxed);
+        for p in &self.pass_colour {
+            p.reset_to_defaults();
         }
 
         self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
@@ -926,7 +1077,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 127] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 164] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -1057,6 +1208,43 @@ impl ShmHeader {
             ("pass8_scale", true, self.pass_scale_bits[7].load(Ordering::Relaxed)),
             ("pass9_scale", true, self.pass_scale_bits[8].load(Ordering::Relaxed)),
             ("pass10_scale", true, self.pass_scale_bits[9].load(Ordering::Relaxed)),
+            ("edit_saturation", true, self.edit_saturation_bits.load(Ordering::Relaxed)),
+            ("edit_contrast", true, self.edit_contrast_bits.load(Ordering::Relaxed)),
+            ("edit_detail", true, self.edit_detail_bits.load(Ordering::Relaxed)),
+            ("edit_gamut_guard", false, self.edit_gamut_guard.load(Ordering::Relaxed)),
+            ("edit_dither", false, self.edit_dither.load(Ordering::Relaxed)),
+            ("edit_lut_strength", true, self.edit_lut_strength_bits.load(Ordering::Relaxed)),
+            ("edit_lut_adapt", true, self.edit_lut_adapt_bits.load(Ordering::Relaxed)),
+            ("pass1_edit_saturation", true, self.pass_colour[0].saturation_bits.load(Ordering::Relaxed)),
+            ("pass1_edit_contrast", true, self.pass_colour[0].contrast_bits.load(Ordering::Relaxed)),
+            ("pass1_edit_detail", true, self.pass_colour[0].detail_bits.load(Ordering::Relaxed)),
+            ("pass2_edit_saturation", true, self.pass_colour[1].saturation_bits.load(Ordering::Relaxed)),
+            ("pass2_edit_contrast", true, self.pass_colour[1].contrast_bits.load(Ordering::Relaxed)),
+            ("pass2_edit_detail", true, self.pass_colour[1].detail_bits.load(Ordering::Relaxed)),
+            ("pass3_edit_saturation", true, self.pass_colour[2].saturation_bits.load(Ordering::Relaxed)),
+            ("pass3_edit_contrast", true, self.pass_colour[2].contrast_bits.load(Ordering::Relaxed)),
+            ("pass3_edit_detail", true, self.pass_colour[2].detail_bits.load(Ordering::Relaxed)),
+            ("pass4_edit_saturation", true, self.pass_colour[3].saturation_bits.load(Ordering::Relaxed)),
+            ("pass4_edit_contrast", true, self.pass_colour[3].contrast_bits.load(Ordering::Relaxed)),
+            ("pass4_edit_detail", true, self.pass_colour[3].detail_bits.load(Ordering::Relaxed)),
+            ("pass5_edit_saturation", true, self.pass_colour[4].saturation_bits.load(Ordering::Relaxed)),
+            ("pass5_edit_contrast", true, self.pass_colour[4].contrast_bits.load(Ordering::Relaxed)),
+            ("pass5_edit_detail", true, self.pass_colour[4].detail_bits.load(Ordering::Relaxed)),
+            ("pass6_edit_saturation", true, self.pass_colour[5].saturation_bits.load(Ordering::Relaxed)),
+            ("pass6_edit_contrast", true, self.pass_colour[5].contrast_bits.load(Ordering::Relaxed)),
+            ("pass6_edit_detail", true, self.pass_colour[5].detail_bits.load(Ordering::Relaxed)),
+            ("pass7_edit_saturation", true, self.pass_colour[6].saturation_bits.load(Ordering::Relaxed)),
+            ("pass7_edit_contrast", true, self.pass_colour[6].contrast_bits.load(Ordering::Relaxed)),
+            ("pass7_edit_detail", true, self.pass_colour[6].detail_bits.load(Ordering::Relaxed)),
+            ("pass8_edit_saturation", true, self.pass_colour[7].saturation_bits.load(Ordering::Relaxed)),
+            ("pass8_edit_contrast", true, self.pass_colour[7].contrast_bits.load(Ordering::Relaxed)),
+            ("pass8_edit_detail", true, self.pass_colour[7].detail_bits.load(Ordering::Relaxed)),
+            ("pass9_edit_saturation", true, self.pass_colour[8].saturation_bits.load(Ordering::Relaxed)),
+            ("pass9_edit_contrast", true, self.pass_colour[8].contrast_bits.load(Ordering::Relaxed)),
+            ("pass9_edit_detail", true, self.pass_colour[8].detail_bits.load(Ordering::Relaxed)),
+            ("pass10_edit_saturation", true, self.pass_colour[9].saturation_bits.load(Ordering::Relaxed)),
+            ("pass10_edit_contrast", true, self.pass_colour[9].contrast_bits.load(Ordering::Relaxed)),
+            ("pass10_edit_detail", true, self.pass_colour[9].detail_bits.load(Ordering::Relaxed)),
         ]
     }
 
@@ -1207,6 +1395,43 @@ impl ShmHeader {
             "pass8_scale" => &self.pass_scale_bits[7],
             "pass9_scale" => &self.pass_scale_bits[8],
             "pass10_scale" => &self.pass_scale_bits[9],
+            "edit_saturation" => &self.edit_saturation_bits,
+            "edit_contrast" => &self.edit_contrast_bits,
+            "edit_detail" => &self.edit_detail_bits,
+            "edit_gamut_guard" => &self.edit_gamut_guard,
+            "edit_dither" => &self.edit_dither,
+            "edit_lut_strength" => &self.edit_lut_strength_bits,
+            "edit_lut_adapt" => &self.edit_lut_adapt_bits,
+            "pass1_edit_saturation" => &self.pass_colour[0].saturation_bits,
+            "pass1_edit_contrast" => &self.pass_colour[0].contrast_bits,
+            "pass1_edit_detail" => &self.pass_colour[0].detail_bits,
+            "pass2_edit_saturation" => &self.pass_colour[1].saturation_bits,
+            "pass2_edit_contrast" => &self.pass_colour[1].contrast_bits,
+            "pass2_edit_detail" => &self.pass_colour[1].detail_bits,
+            "pass3_edit_saturation" => &self.pass_colour[2].saturation_bits,
+            "pass3_edit_contrast" => &self.pass_colour[2].contrast_bits,
+            "pass3_edit_detail" => &self.pass_colour[2].detail_bits,
+            "pass4_edit_saturation" => &self.pass_colour[3].saturation_bits,
+            "pass4_edit_contrast" => &self.pass_colour[3].contrast_bits,
+            "pass4_edit_detail" => &self.pass_colour[3].detail_bits,
+            "pass5_edit_saturation" => &self.pass_colour[4].saturation_bits,
+            "pass5_edit_contrast" => &self.pass_colour[4].contrast_bits,
+            "pass5_edit_detail" => &self.pass_colour[4].detail_bits,
+            "pass6_edit_saturation" => &self.pass_colour[5].saturation_bits,
+            "pass6_edit_contrast" => &self.pass_colour[5].contrast_bits,
+            "pass6_edit_detail" => &self.pass_colour[5].detail_bits,
+            "pass7_edit_saturation" => &self.pass_colour[6].saturation_bits,
+            "pass7_edit_contrast" => &self.pass_colour[6].contrast_bits,
+            "pass7_edit_detail" => &self.pass_colour[6].detail_bits,
+            "pass8_edit_saturation" => &self.pass_colour[7].saturation_bits,
+            "pass8_edit_contrast" => &self.pass_colour[7].contrast_bits,
+            "pass8_edit_detail" => &self.pass_colour[7].detail_bits,
+            "pass9_edit_saturation" => &self.pass_colour[8].saturation_bits,
+            "pass9_edit_contrast" => &self.pass_colour[8].contrast_bits,
+            "pass9_edit_detail" => &self.pass_colour[8].detail_bits,
+            "pass10_edit_saturation" => &self.pass_colour[9].saturation_bits,
+            "pass10_edit_contrast" => &self.pass_colour[9].contrast_bits,
+            "pass10_edit_detail" => &self.pass_colour[9].detail_bits,
             _ => return false,
         };
         field.store(bits, Ordering::Relaxed);
@@ -1243,8 +1468,37 @@ impl ShmHeader {
                     *s = resolved_scale(self.pass_scale_bits[k].load(Ordering::Relaxed));
                 }
             }
-            PassTunings { count: self.resolved_passes() as usize, tunings, feedback, scales }
+            PassTunings { count: self.resolved_passes() as usize, tunings, feedback, scales, colour: self.colour_now() }
         })
+    }
+
+    /// The colour of the edit ([`ColourSettings`]), each value clamped to its range (a non-finite one is
+    /// the default). Read inside [`Self::pass_tunings`]'s unit.
+    fn colour_now(&self) -> ColourSettings {
+        let f = |a: &AtomicU32, name: &str, default: f32| {
+            let (lo, hi) = setting_bounds(name).expect("a colour setting");
+            let v = f32::from_bits(a.load(Ordering::Relaxed));
+            if v.is_finite() { v.clamp(lo, hi) } else { default }
+        };
+        let global = EditColour {
+            saturation: f(&self.edit_saturation_bits, "edit_saturation", 1.0),
+            contrast: f(&self.edit_contrast_bits, "edit_contrast", 1.0),
+            detail: f(&self.edit_detail_bits, "edit_detail", 1.0),
+        };
+        let mut each = [global; crate::MAX_PASSES];
+        for ((e, p), own) in each.iter_mut().zip(&self.pass).zip(&self.pass_colour) {
+            let c = p.apply_colour(own, global);
+            let g = |v: f32| if v.is_finite() { v.clamp(0.0, 4.0) } else { 1.0 };
+            *e = EditColour { saturation: g(c.saturation), contrast: g(c.contrast), detail: g(c.detail) };
+        }
+        ColourSettings {
+            each,
+            gamut_guard: self.edit_gamut_guard.load(Ordering::Relaxed) != 0,
+            dither: self.edit_dither.load(Ordering::Relaxed) != 0,
+            lut_strength: f(&self.edit_lut_strength_bits, "edit_lut_strength", 0.0),
+            lut_adapt: f(&self.edit_lut_adapt_bits, "edit_lut_adapt", 0.05),
+            lut_seq: self.edit_lut_seq.load(Ordering::Relaxed),
+        }
     }
 
     /// The Network setting ([`crate::enums::network`]); a value out of range is the full network.
@@ -1708,6 +1962,44 @@ mod tests {
     }
 
     #[test]
+    fn the_colour_of_the_edit_is_appended_after_the_model_resolution() {
+        // v21 appends the colour of the edit after the model resolution: every earlier field keeps its offset,
+        // the per-pass values last.
+        assert_eq!(std::mem::offset_of!(ShmHeader, edit_saturation_bits), std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4);
+        assert_eq!(std::mem::size_of::<PassColour>(), 12);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour), std::mem::offset_of!(ShmHeader, edit_lut_seq) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 21);
+        let h = ShmHeader::default();
+        h.edit_lut_seq.store(9, Ordering::Relaxed);
+        h.init_defaults();
+        let c = h.pass_tunings().colour;
+        assert_eq!(c, ColourSettings::DEFAULT, "neutral scales, the guard on, no dither and no look-up table");
+        assert!(c.each.iter().all(EditColour::is_neutral));
+    }
+
+    #[test]
+    fn a_pass_takes_only_the_colour_values_it_overrides() {
+        use crate::enums::pass_override::*;
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert!(h.write_settings(&[
+            ("edit_saturation", 0.5f32.to_bits()),
+            ("edit_detail", 2.0f32.to_bits()),
+            ("pass2_edit_saturation", 1.5f32.to_bits()),
+            ("pass2_edit_contrast", 0.25f32.to_bits()),
+            ("pass2_overrides", EDIT_SATURATION),
+            ("edit_lut_adapt", 0.0f32.to_bits()),
+        ]));
+        let c = h.pass_tunings().colour;
+        assert_eq!(c.each[0], EditColour { saturation: 0.5, contrast: 1.0, detail: 2.0 }, "pass 1 follows the Model tab");
+        assert_eq!(c.each[1], EditColour { saturation: 1.5, contrast: 1.0, detail: 2.0 }, "pass 2's contrast is not overridden");
+        assert_eq!(c.lut_adapt, 0.001, "clamped to its range");
+        h.edit_contrast_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        assert_eq!(h.pass_tunings().colour.each[0].contrast, 1.0, "a non-finite value is the default");
+    }
+
+    #[test]
     fn one_pass_following_the_model_tab_is_the_default() {
         let h = ShmHeader::default();
         h.passes.store(7, Ordering::Relaxed);
@@ -1762,8 +2054,8 @@ mod tests {
         assert_eq!(h.pass[9].overrides.load(Ordering::Relaxed), 1);
         assert_eq!(h.pass_tunings().tunings[9].intensity, 0.5);
         assert!(!h.apply_persisted_setting("pass11_intensity", 0), "there is no eleventh pass");
-        assert!(h.apply_persisted_setting("pass1_overrides", 255));
-        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "clamped to the seven fields");
+        assert!(h.apply_persisted_setting("pass1_overrides", 4095));
+        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "clamped to the ten fields");
     }
 
     #[test]
@@ -1771,7 +2063,7 @@ mod tests {
         // v21 appends the model resolution and each pass's own: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits), std::mem::offset_of!(ShmHeader, scene_cuts) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits), std::mem::offset_of!(ShmHeader, preupscale_scale_bits) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4, std::mem::offset_of!(ShmHeader, edit_saturation_bits));
         assert_eq!(crate::SHM_VERSION, 21);
         let h = ShmHeader::default();
         h.preupscale_scale_bits.store(0.5f32.to_bits(), Ordering::Relaxed);

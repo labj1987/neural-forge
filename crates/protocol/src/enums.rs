@@ -140,7 +140,11 @@ pub mod pass_override {
     /// The pass's own model resolution before the upscaler (`pass<N>_scale`) instead of
     /// `preupscale_scale`.
     pub const SCALE: u32 = 64;
-    pub const ALL: u32 = 127;
+    /// The colour of the edit (`ShmHeader::pass_colour`).
+    pub const EDIT_SATURATION: u32 = 128;
+    pub const EDIT_CONTRAST: u32 = 256;
+    pub const EDIT_DETAIL: u32 = 512;
+    pub const ALL: u32 = 1023;
 }
 
 /// The model resolution presets before the upscaler (`preupscale_scale`, `pass<N>_scale`): the network's

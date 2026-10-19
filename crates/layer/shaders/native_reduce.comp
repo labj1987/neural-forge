@@ -29,6 +29,10 @@ layout(set = 0, binding = 4, std140) uniform Params {
   vec4 moving;
   uvec4 full;        // the render extent (width, height), its padded width, the depth copy's kind (0 none)
   vec4 ratio;        // the pass's extent over the render extent (x, y), the enlarge's guide sigma, unused
+  vec4 colour;       // the colour of the edit (native_colour.comp's)
+  uvec4 colour_flags;
+  vec4 lut_scale;
+  vec4 lut_offset;
 } p;
 // The depth at the pass's extent: f32 device depth bits (native_mask.comp reads it as kind 1).
 layout(set = 0, binding = 11, std430) writeonly buffer Depth { uint raw[]; } u_depth;

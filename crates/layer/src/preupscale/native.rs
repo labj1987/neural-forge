@@ -54,6 +54,7 @@ const MASK_SPV: &[u8] = include_bytes!("../../shaders/native_mask.spv");
 const FEEDBACK_SPV: &[u8] = include_bytes!("../../shaders/native_feedback.spv");
 const REDUCE_SPV: &[u8] = include_bytes!("../../shaders/native_reduce.spv");
 const ENLARGE_SPV: &[u8] = include_bytes!("../../shaders/native_enlarge.spv");
+const COLOUR_SPV: &[u8] = include_bytes!("../../shaders/native_colour.spv");
 
 /// `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`: the frames record everything but the network's launches.
 fn skip_graph() -> bool {
@@ -739,6 +740,11 @@ pub(crate) struct Params {
     full: [u32; 4],
     /// The pass's extent over the render extent (x, y), the enlarge's guide sigma, unused.
     ratio: [f32; 4],
+    /// The colour of the edit (`native_colour.comp`; [`super::colour::PassColour`]).
+    colour: [f32; 4],
+    colour_flags: [u32; 4],
+    lut_scale: [f32; 4],
+    lut_offset: [f32; 4],
 }
 
 /// The model resolution's guide sigma (`native_enlarge.comp`), in the encoded picture's units: how far a
@@ -871,11 +877,13 @@ pub(crate) struct Passes {
     pub feedback: f32,
     /// Each pass's model resolution, a scale of the render extent (1: the network at it).
     pub scales: [f32; neural_forge_protocol::MAX_PASSES],
+    /// The colour of each pass's edit, and the stack's colour controls.
+    pub colour: neural_forge_protocol::ColourSettings,
 }
 
 impl Passes {
     pub(crate) fn one(c: Conditioning) -> Self {
-        Self { count: 1, each: [c; neural_forge_protocol::MAX_PASSES], mask: Mask::default(), feedback: 1.0, scales: [1.0; neural_forge_protocol::MAX_PASSES] }
+        Self { count: 1, each: [c; neural_forge_protocol::MAX_PASSES], mask: Mask::default(), feedback: 1.0, scales: [1.0; neural_forge_protocol::MAX_PASSES], colour: neural_forge_protocol::ColourSettings::DEFAULT }
     }
 }
 
@@ -891,7 +899,7 @@ impl From<neural_forge_protocol::PassTunings> for Passes {
         for (c, &tuning) in each.iter_mut().zip(t.tunings.iter()) {
             *c = Conditioning::from(tuning);
         }
-        Self { count: t.count.clamp(1, neural_forge_protocol::MAX_PASSES), each, mask: Mask::default(), feedback: t.feedback, scales: t.scales }
+        Self { count: t.count.clamp(1, neural_forge_protocol::MAX_PASSES), each, mask: Mask::default(), feedback: t.feedback, scales: t.scales, colour: t.colour }
     }
 }
 
@@ -998,7 +1006,7 @@ impl Feedback {
 const MORE: usize = neural_forge_protocol::MAX_PASSES - 1;
 /// The storage images and storage buffers one frame set binds.
 const IMAGES_PER_SET: u32 = 3;
-const BUFFERS_PER_SET: u32 = 11;
+const BUFFERS_PER_SET: u32 = 13;
 
 /// A device-local buffer of the layer's own.
 pub(crate) struct OwnBuffer {
@@ -1189,6 +1197,29 @@ pub(crate) struct NativePass {
     mask: Option<MaskPass>,
     /// The depth buffer the sets point binding 11 at (the stand-in's while none is copied).
     mask_depth: vk::Buffer,
+    /// The colour of the edit (`native_colour.comp`): its two pipelines and the edit's low-pass, built the
+    /// first time a pass reshapes its edit; `colour_wanted` says whether this frame records it
+    /// ([`Self::prepare_colour`]) and `colour_recorded` whether the buffers were recorded with it.
+    colour: Option<ColourPass>,
+    colour_wanted: bool,
+    colour_recorded: bool,
+    /// The look-up table on the GPU (binding 13), the last pass's.
+    lut: Option<LutBuffer>,
+}
+
+/// [`NativePass::colour`].
+struct ColourPass {
+    /// Phase 0 (the edit's low-pass) and 1 (the steps).
+    pipelines: [vk::Pipeline; 2],
+    low: OwnBuffer,
+}
+
+/// [`NativePass::lut`]: the table's entries (vec4 each) in a host-visible buffer, and the table it holds.
+struct LutBuffer {
+    buffer: HostBuffer,
+    entries: usize,
+    generation: u64,
+    lut: Arc<super::colour::Lut>,
 }
 
 /// One extent below the render extent ([`NativePass::extents`]): what its passes read and write there.
@@ -1345,6 +1376,10 @@ impl NativePass {
             binding(13, vk::DescriptorType::STORAGE_BUFFER),
             binding(14, vk::DescriptorType::STORAGE_BUFFER),
             binding(15, vk::DescriptorType::STORAGE_BUFFER),
+            // The colour of the edit, at the render extent: the edit's low-pass and the look-up table
+            // (`native_colour.comp`).
+            binding(16, vk::DescriptorType::STORAGE_BUFFER),
+            binding(17, vk::DescriptorType::STORAGE_BUFFER),
         ];
         let mut steps = 0usize;
         // `Some` unless this creation step is the one to fail.
@@ -1484,6 +1519,10 @@ impl NativePass {
                 more: None,
                 mask: None,
                 mask_depth: vk::Buffer::null(),
+                colour: None,
+                colour_wanted: false,
+                colour_recorded: false,
+                lut: None,
                 gap: HistoryGap::default(),
                 history_network: None,
             })
@@ -1624,9 +1663,20 @@ impl NativePass {
             return false;
         }
         let depth = depth.unwrap_or_else(|| self.mask.as_ref().map_or(vk::Buffer::null(), |m| m.no_depth.buffer));
+        // SAFETY: forwarded; nothing of this pass is pending. Without its pipelines the edit is left as it is.
+        if self.colour_wanted && !unsafe { self.ensure_colour(device, instance, physical_device) } {
+            crate::log!("[colour] the colour-of-the-edit pipelines could not be built; the edit is left as the network made it");
+            self.colour_wanted = false;
+        }
         let more_done = self.more.as_ref().is_none_or(|m| m.recorded == Some(generation));
-        if self.recorded == Some(generation) && more_done && self.mask_depth == depth {
+        if self.recorded == Some(generation) && more_done && self.mask_depth == depth && self.colour_recorded == self.colour_wanted {
             return true;
+        }
+        if self.colour_recorded != self.colour_wanted {
+            self.colour_recorded = self.colour_wanted;
+            if let Some(m) = self.more.as_mut() {
+                m.recorded = None;
+            }
         }
         if self.mask_depth != depth {
             // Every set points at the depth: all are written again.
@@ -1683,6 +1733,97 @@ impl NativePass {
             m.recorded_pass = recorded_pass;
         }
         ok && more_ok
+    }
+
+    /// The colour of the edit for this frame: whether any of its passes reshapes its edit (then the frame
+    /// buffers record `native_colour.comp` after each composite), and the look-up table, uploaded when it
+    /// changed. A table whose buffer cannot be made is left out (logged).
+    ///
+    /// # Safety
+    /// `device` is live; nothing of this pass is pending.
+    pub(crate) unsafe fn prepare_colour(
+        &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, passes: &Passes, lut: Option<&Arc<super::colour::Lut>>,
+    ) {
+        let lut = lut.filter(|_| passes.colour.lut_strength > 0.0);
+        match lut {
+            None => {}
+            Some(l) if self.lut.as_ref().is_some_and(|b| b.generation == l.generation) => {}
+            Some(l) => {
+                let entries = l.entries();
+                if self.lut.as_ref().is_none_or(|b| b.entries != entries.len()) {
+                    if let Some(old) = self.lut.take() {
+                        // SAFETY: not pending (contract).
+                        unsafe { old.buffer.destroy(device) };
+                        destroyed(1);
+                        // The sets point at it: written and recorded again.
+                        self.recorded = None;
+                    }
+                    let bytes = (entries.len() * 16) as u64;
+                    match own_host_buffer_with(device, instance, physical_device, bytes, vk::BufferUsageFlags::STORAGE_BUFFER) {
+                        Some(buffer) => {
+                            made(());
+                            self.lut = Some(LutBuffer { buffer, entries: entries.len(), generation: 0, lut: Arc::clone(l) });
+                            self.recorded = None;
+                        }
+                        None => crate::log!("[colour] no buffer for the look-up table; it is left out"),
+                    }
+                }
+                if let Some(b) = self.lut.as_mut() {
+                    // SAFETY: host-coherent, mapped and sized for `entries`; not in use (contract).
+                    unsafe { std::ptr::copy_nonoverlapping(entries.as_ptr().cast::<u8>(), b.buffer.ptr, entries.len() * 16) };
+                    b.generation = l.generation;
+                    b.lut = Arc::clone(l);
+                }
+            }
+        }
+        let loaded = lut.is_some() && self.lut.is_some();
+        self.colour_wanted = super::colour::wanted(&passes.colour, passes.count, loaded);
+    }
+
+    /// Builds [`ColourPass`] once. `false` when it could not be built.
+    ///
+    /// # Safety
+    /// `device` is live; nothing of this pass is pending.
+    unsafe fn ensure_colour(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> bool {
+        if self.colour.is_some() {
+            return true;
+        }
+        let pipeline = |phase: u32| {
+            let data = phase.to_le_bytes();
+            let entry = [vk::SpecializationMapEntry { constant_id: 1, offset: 0, size: 4 }];
+            let spec = vk::SpecializationInfo::builder().map_entries(&entry).data(&data).build();
+            // SAFETY: `device` is live; the layout is this pass's.
+            unsafe { hdr::compute_pipeline_with(device, self.pipeline_layout, COLOUR_SPV, Some(&spec)) }
+        };
+        let (low_pass, steps) = (pipeline(0), pipeline(1));
+        // SAFETY: as above.
+        let low = unsafe { OwnBuffer::new(device, instance, physical_device, u64::from(self.width) * u64::from(self.height) * 16, vk::BufferUsageFlags::STORAGE_BUFFER) };
+        match (low_pass, steps, low) {
+            (Some(a), Some(b), Some(low)) => {
+                made(());
+                made(());
+                made(());
+                self.colour = Some(ColourPass { pipelines: [a, b], low });
+                // The sets point binding 12 at the low-pass: written and recorded again.
+                self.recorded = None;
+                if let Some(m) = self.more.as_mut() {
+                    m.recorded = None;
+                }
+                true
+            }
+            (a, b, low) => {
+                // SAFETY: never used.
+                unsafe {
+                    for p in [a, b].into_iter().flatten() {
+                        device.destroy_pipeline(p, None);
+                    }
+                    if let Some(l) = low {
+                        l.destroy(device);
+                    }
+                }
+                false
+            }
+        }
     }
 
     /// Builds [`MaskPass`] once. `false` when it could not be built (the frame then misses).
@@ -1748,6 +1889,10 @@ impl NativePass {
         let mask = lane.map_or_else(|| self.mask.as_ref().map_or(vk::Buffer::null(), |m| m.buffer.buffer), |l| l.mask.buffer);
         let (mask_buf, depth_buf) = (buf(mask, vk::WHOLE_SIZE), buf(lane.map_or(self.mask_depth, |l| l.depth.buffer), vk::WHOLE_SIZE));
         let (full_motion_buf, full_depth_buf, full_answer_buf) = (buf(full_motion, vk::WHOLE_SIZE), buf(self.mask_depth, vk::WHOLE_SIZE), buf(self.answer.buffer, vk::WHOLE_SIZE));
+        // The colour of the edit's buffers, or the mask's 16-byte stand-in until they exist (nothing reads them).
+        let stand_in = self.mask.as_ref().map_or(vk::Buffer::null(), |m| m.no_depth.buffer);
+        let low_buf = buf(self.colour.as_ref().map_or(stand_in, |c| c.low.buffer), vk::WHOLE_SIZE);
+        let lut_buf = buf(self.lut.as_ref().map_or(stand_in, |l| l.buffer.buffer), vk::WHOLE_SIZE);
         let (mv, feat, head, params, state, expo, ans) = (
             buf(lane.map_or(full_motion, |l| l.motion.buffer), vk::WHOLE_SIZE),
             buf(f.features, vk::WHOLE_SIZE),
@@ -1775,6 +1920,8 @@ impl NativePass {
             w(13, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_motion_buf).build(),
             w(14, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_depth_buf).build(),
             w(15, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_answer_buf).build(),
+            w(16, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&low_buf).build(),
+            w(17, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&lut_buf).build(),
         ];
         // SAFETY: the set is not in use (contract); every handle is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -2143,6 +2290,24 @@ impl NativePass {
                 let (pw, ph) = super::padded(self.width, self.height);
                 device.cmd_dispatch(cmd, pw.div_ceil(8), ph.div_ceil(8), 1);
             }
+            // The colour of the edit (`native_colour.comp`), at the render extent on the pass's full-size answer
+            // (after the enlarge below it): the edit's low-pass, then the steps in place. Each returns at once
+            // for a pass whose parameters leave its edit alone. The history was written above, unreshaped.
+            if let Some(c) = self.colour.as_ref().filter(|_| self.colour_recorded) {
+                for pipeline in c.pipelines {
+                    device.cmd_pipeline_barrier(
+                        cmd,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::PipelineStageFlags::COMPUTE_SHADER,
+                        vk::DependencyFlags::empty(),
+                        &[compute(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)],
+                        &[],
+                        &[],
+                    );
+                    device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                    device.cmd_dispatch(cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+                }
+            }
             // The answer to `W`'s copy, the history to the next frame's samplers.
             device.cmd_pipeline_barrier(
                 cmd,
@@ -2241,9 +2406,19 @@ impl NativePass {
         self.last_jitter = jitter;
         let render = (self.width, self.height);
         let generation = Graph::of(graphs, self.extents[0]).map(|g| g.built.generation);
+        // The passes this frame runs: pass 1, then each later one recorded for this build (the loop below). The
+        // last of them gets the look-up table.
+        let runs = 1 + self.more.as_ref().filter(|m| generation.is_some() && m.recorded == generation).map_or(0, |m| {
+            (1..passes.count.min(neural_forge_protocol::MAX_PASSES)).take_while(|&k| m.history[k - 1].is_some() && m.recorded_pass[k - 1] == generation).count()
+        });
+        let lut = self.lut.as_ref().map(|l| &*l.lut);
+        let recorded = self.colour_recorded;
+        let colour = |k: usize| {
+            if recorded { super::colour::PassColour::of(&passes.colour, k, k + 1 == runs, lut, false) } else { super::colour::PassColour::default() }
+        };
         // A pass without history (pass 2 on whose previous frame it did not run) starts afresh: seed 0, no
         // jitter step, no blend toward its history.
-        let params = |c: &Conditioning, history: bool, extent: (u32, u32)| {
+        let params = |c: &Conditioning, history: bool, extent: (u32, u32), index: usize| {
             let f = Graph::of(graphs, extent).map_or_else(nn::Frame::default, |g| g.built.frame);
             let (width, height) = extent;
             let scaled = extent != render;
@@ -2265,6 +2440,10 @@ impl NativePass {
                 moving: [threshold, passes.mask.motion[1], passes.mask.motion[2], 0.0],
                 full: [render.0, render.1, self.padded_width, passes.mask.depth_kind],
                 ratio: [k[0], k[1], GUIDE_SIGMA, 0.0],
+                colour: colour(index).colour,
+                colour_flags: colour(index).flags,
+                lut_scale: colour(index).lut_scale,
+                lut_offset: colour(index).lut_offset,
             }
         };
         let write = |buffer: &HostBuffer, params: Params| {
@@ -2272,7 +2451,7 @@ impl NativePass {
             // ago) completed: the hold waits for the previous hold's work before it records anything.
             unsafe { std::ptr::copy_nonoverlapping(std::ptr::from_ref(&params).cast::<u8>(), buffer.ptr, PARAMS_BYTES as usize) };
         };
-        write(&self.params[p], params(&passes.each[0], history, self.extents[0]));
+        write(&self.params[p], params(&passes.each[0], history, self.extents[0], 0));
         let mut later = Vec::new();
         let frame = self.frames;
         let extents = self.extents;
@@ -2282,7 +2461,7 @@ impl NativePass {
                     break;
                 }
                 let own = history && frame > 0 && m.last_run[k - 1] == Some(frame - 1);
-                write(&m.params[k - 1][p], params(&passes.each[k], own, extent));
+                write(&m.params[k - 1][p], params(&passes.each[k], own, extent, k));
                 m.last_run[k - 1] = Some(frame);
                 later.push(m.commands[k - 1][p]);
             }
@@ -2318,6 +2497,17 @@ impl NativePass {
                 m.buffer.destroy(device);
                 m.no_depth.destroy(device);
                 destroyed(3);
+            }
+            if let Some(c) = &self.colour {
+                for p in c.pipelines {
+                    device.destroy_pipeline(p, None);
+                }
+                c.low.destroy(device);
+                destroyed(3);
+            }
+            if let Some(l) = &self.lut {
+                l.buffer.destroy(device);
+                destroyed(1);
             }
             for lane in &self.lanes {
                 lane.destroy(device);
@@ -2648,7 +2838,7 @@ pub(crate) struct CacheAsk {
 pub(crate) unsafe fn run_native_hold(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut super::Resources, target: &Target,
     loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, passes: Passes, arm: Option<super::cache_dump::Arm>, ask: CacheAsk, choice: u32,
-    submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
+    lut: Option<&Arc<super::colour::Lut>>, submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> super::HoldResult {
     let mut result = super::HoldResult { native: true, ..Default::default() };
     let t_hold = Instant::now();
@@ -2838,6 +3028,9 @@ pub(crate) unsafe fn run_native_hold(
     let mut passes = passes;
     passes.mask = passes.mask.for_frame(depth.map_or(0, super::cache::depth_kind), res.edit.as_ref().and_then(|e| e.state.reverse_z()));
     let depth_buffer = depth.and(res.depth.as_ref()).map(DepthCopy::buffer);
+    // The colour of the edit: whether this frame records it, and the look-up table.
+    // SAFETY: nothing of the pass is pending (`wait_idle` above).
+    unsafe { native.prepare_colour(device, instance, physical_device, &passes, lut) };
     // SAFETY: nothing of the pass is pending (`wait_idle` above); the HDR pass outlives it in `res`.
     if !unsafe { native.record_graphs(device, instance, physical_device, &graphs, encoded, exposure, depth_buffer) } {
         res.native = Some(native);
@@ -3692,6 +3885,237 @@ mod tests {
             device.destroy_command_pool(pool, None);
         }
     }
+    /// The colour of the edit before the upscaler (`native_colour.comp`), on edits the head makes exactly
+    /// (neural = proxy + residual / 4 on mid-range proxies): neutral values leave the answer and the history
+    /// bit for bit as the network made them, even with the stage recorded; saturation 0 leaves a grey change of
+    /// the same luma; contrast 0 a change of no luma; detail 0 removes a checkerboard and keeps the broad part;
+    /// the gamut guard keeps the red channel from clipping and the change's direction (hue), where the clamp
+    /// without it turns it; the look-up table at strength 0 changes nothing and at full strength is the table
+    /// where the edit is large, and nothing where the network left the pixel alone.
+    #[test]
+    fn the_colour_of_the_edit_reshapes_the_answer_and_leaves_the_history() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+                network: network::FULL,
+            };
+            // Mid-range proxies (0.25 to 0.49, exact halves), so a change of up to 1/8 never clips by itself.
+            let mid = |x: u32, y: u32, c: u32| 0.25 + ((x * 7 + y * 3 + c * 5) % 32) as f32 / 128.0;
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
+            let mut first = true;
+            let mut fill = |proxy: &dyn Fn(u32, u32, u32) -> f32| {
+                let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+                std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+                let was_first = first;
+                first = false;
+                fx.one_shot(|cmd| {
+                    if was_first {
+                        let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                        device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
+                    }
+                    device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+                });
+            };
+            fill(&mid);
+            let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            // The head for an edit of `edit(x, y, c)` (neural = proxy + residual / 4, exact on these values).
+            let write_head = |edit: &dyn Fn(u32, u32, u32) -> f32| {
+                let h: Vec<f32> = (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [4.0 * edit(x, y, 0), 4.0 * edit(x, y, 1), 4.0 * edit(x, y, 2), 10.0])).collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+            };
+            let answer = pass.answer();
+            let read_answer = || -> Vec<f32> {
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }]));
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).iter().map(|&h| f16(h)).collect()
+            };
+            let at = |a: &[f32], x: u32, y: u32| -> [f32; 3] { std::array::from_fn(|c| a[((y * pw + x) * 4 + c as u32) as usize]) };
+            let lanes = |x: u32, y: u32| -> Vec<f32> { std::slice::from_raw_parts(features.ptr.cast::<f32>().add(((y * FW + x) * 16) as usize), 16).to_vec() };
+            let luma = |e: [f32; 3]| e[0] * LUMA[0] + e[1] * LUMA[1] + e[2] * LUMA[2];
+            // One frame with `colour` (no history unless `history`); `force` records the stage even when
+            // nothing asks for it.
+            let mut run = |colour: neural_forge_protocol::ColourSettings, lut: Option<&Arc<super::super::colour::Lut>>, history: bool, force: bool| -> (Vec<f32>, bool) {
+                let passes = Passes { colour, ..Passes::default() };
+                pass.prepare_colour(device, instance, physical, &passes, lut);
+                if force {
+                    pass.colour_wanted = true;
+                }
+                assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+                let (cmds, _) = pass.frame_passes(&built, history, None, [1.0, 1.0], &passes);
+                fx.submit(&mut pass, cmds);
+                (read_answer(), pass.colour_recorded)
+            };
+            let neutral = neural_forge_protocol::ColourSettings::DEFAULT;
+            // A varied edit of up to 1/16 a channel.
+            let edit = |x: u32, y: u32, c: u32| (((x * 5 + y * 11 + c * 3) % 9) as f32 - 4.0) / 64.0;
+            let want = |x: u32, y: u32, c: u32| trunc_half(mid(x, y, c) + edit(x, y, c));
+            write_head(&edit);
+
+            // Neutral: as the network made it, without the stage and with it recorded.
+            let (plain, recorded) = run(neutral, None, false, false);
+            assert!(!recorded, "nothing asks for the stage by default");
+            for y in 0..H {
+                for x in 0..W {
+                    for c in 0..3 {
+                        assert_eq!(at(&plain, x, y)[c as usize], want(x, y, c), "the network's answer at {x},{y} channel {c}");
+                    }
+                }
+            }
+            let (forced, recorded) = run(neutral, None, false, true);
+            assert!(recorded);
+            assert_eq!(forced.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), plain.iter().map(|v| v.to_bits()).collect::<Vec<_>>(), "neutral values leave the answer bit for bit");
+
+            // Saturation 0: a grey change of the edit's luma. The history the next frame reads is the network's
+            // answer, not the reshaped one.
+            let (grey, recorded) = run(neural_forge_protocol::ColourSettings { each: [neural_forge_protocol::EditColour { saturation: 0.0, ..neural_forge_protocol::EditColour::NEUTRAL }; neural_forge_protocol::MAX_PASSES], ..neutral }, None, false, false);
+            assert!(recorded);
+            for (x, y) in [(5, 3), (0, 0), (W - 1, H - 1), (11, 7)] {
+                let e: [f32; 3] = std::array::from_fn(|c| want(x, y, c as u32) - mid(x, y, c as u32));
+                let g = at(&grey, x, y);
+                let d: [f32; 3] = std::array::from_fn(|c| g[c] - mid(x, y, c as u32));
+                assert!((d[0] - d[1]).abs() <= 2f32.powi(-10) && (d[1] - d[2]).abs() <= 2f32.powi(-10), "saturation 0 leaves a grey change at {x},{y}: {d:?}");
+                assert!((d[1] - luma(e)).abs() <= 2f32.powi(-10), "of the edit's luma at {x},{y}: {d:?} against {}", luma(e));
+                assert!(e.iter().zip(&e[1..]).any(|(a, b)| a != b), "the test's edit has chroma at {x},{y}");
+            }
+            let mut history_colour = neutral;
+            history_colour.each[0].saturation = 0.0;
+            run(history_colour, None, true, false);
+            assert_eq!(lanes(5, 3)[7], centre(want(5, 3, 0)), "the history lane is the network's answer, not the reshaped one");
+
+            // Contrast 0: the change has no luma; its chroma is the edit's.
+            let (flat, _) = run(neural_forge_protocol::ColourSettings { each: [neural_forge_protocol::EditColour { contrast: 0.0, ..neural_forge_protocol::EditColour::NEUTRAL }; neural_forge_protocol::MAX_PASSES], ..neutral }, None, false, false);
+            for (x, y) in [(5, 3), (0, 0), (W - 1, H - 1), (11, 7)] {
+                let e: [f32; 3] = std::array::from_fn(|c| want(x, y, c as u32) - mid(x, y, c as u32));
+                let f = at(&flat, x, y);
+                let d: [f32; 3] = std::array::from_fn(|c| f[c] - mid(x, y, c as u32));
+                assert!(luma(d).abs() <= 2f32.powi(-10), "contrast 0 leaves no luma change at {x},{y}: {d:?}");
+                for c in 0..3 {
+                    assert!((d[c] - (e[c] - luma(e))).abs() <= 2f32.powi(-10), "the chroma stays at {x},{y} channel {c}");
+                }
+                assert!(luma(e).abs() > 2f32.powi(-8) || (x, y) != (5, 3), "the test's edit has luma");
+            }
+
+            // Detail 0: a checkerboard on a broad change of 1/64 leaves the broad change (away from the edges,
+            // where the blur clamps).
+            let checker = |x: u32, y: u32, c: u32| {
+                let sign = if (x + y).is_multiple_of(2) { 1.0 } else { -1.0 };
+                1.0 / 64.0 + sign * (c + 1) as f32 / 64.0
+            };
+            write_head(&checker);
+            let (broad, _) = run(neural_forge_protocol::ColourSettings { each: [neural_forge_protocol::EditColour { detail: 0.0, ..neural_forge_protocol::EditColour::NEUTRAL }; neural_forge_protocol::MAX_PASSES], ..neutral }, None, false, false);
+            for y in 1..H - 1 {
+                for x in 1..W - 1 {
+                    for c in 0..3 {
+                        let d = at(&broad, x, y)[c as usize] - mid(x, y, c);
+                        assert!((d - 1.0 / 64.0).abs() <= 2f32.powi(-10), "detail 0 keeps the broad change only at {x},{y} channel {c}: {d}");
+                    }
+                }
+            }
+
+            // The gamut guard: proxy (0.875, 0.5, 0.5), edit (1/8, -1/32, -1/32); saturation 2 would take red
+            // past 1. With the guard the change is shortened along itself; without, red clips and the hue turns.
+            fill(&|_, _, c| if c == 0 { 0.875 } else { 0.5 });
+            write_head(&|x, _, c| match (x < W / 2, c) {
+                (true, 0) => 0.125,
+                (true, _) => -0.03125,
+                (false, 0) => 0.03125,
+                (false, _) => -0.0078125,
+            });
+            let sat2 = |guard: bool| neural_forge_protocol::ColourSettings {
+                each: [neural_forge_protocol::EditColour { saturation: 2.0, ..neural_forge_protocol::EditColour::NEUTRAL }; neural_forge_protocol::MAX_PASSES],
+                gamut_guard: guard,
+                ..neutral
+            };
+            let (guarded, _) = run(sat2(true), None, false, false);
+            let (clipped, _) = run(sat2(false), None, false, false);
+            let shaped = |e: [f32; 3]| -> [f32; 3] { std::array::from_fn(|c| luma(e) + 2.0 * (e[c] - luma(e))) };
+            let e = shaped([0.125, -0.03125, -0.03125]);
+            assert!(0.875 + e[0] > 1.0, "the test's shaped change leaves the range");
+            let g = at(&guarded, 2, 2);
+            assert!(g[0] <= 1.0, "the guard keeps red in range");
+            let ratio = (g[1] - 0.5) / (g[0] - 0.875);
+            assert!((ratio - e[1] / e[0]).abs() < 0.01, "the guarded change keeps its direction: {ratio} against {}", e[1] / e[0]);
+            let k = at(&clipped, 2, 2);
+            assert_eq!(k[0], 1.0, "without the guard red clips");
+            let clipped_ratio = (k[1] - 0.5) / (k[0] - 0.875);
+            assert!((clipped_ratio - e[1] / e[0]).abs() > 0.05, "and the clipped change turns: {clipped_ratio}");
+            // A pixel whose shaped change stays in range is the same either way, bit for bit.
+            let inside = at(&guarded, W - 2, 2);
+            assert!(inside[0] < 1.0);
+            assert_eq!(inside.map(f32::to_bits), at(&clipped, W - 2, 2).map(f32::to_bits), "in range, the guard changes nothing");
+
+            // The look-up table (a channel rotation, exact under trilinear): strength 0 changes nothing; at full
+            // strength the result is the table's where the edit is large, and untouched where there is none.
+            fill(&mid);
+            write_head(&|x, _, _| if x < W / 2 { 0.0 } else { 0.0625 });
+            let mut cube = neural_forge_protocol::cube::Cube::identity(2);
+            for e in &mut cube.table {
+                *e = [e[2], e[0], e[1]];
+            }
+            let lut = Arc::new(super::super::colour::Lut { generation: 7, cube });
+            let (none, _) = run(neutral, Some(&lut), false, true);
+            let (full, _) = run(neural_forge_protocol::ColourSettings { lut_strength: 1.0, lut_adapt: 0.01, ..neutral }, Some(&lut), false, false);
+            for (x, y) in [(1, 1), (W - 1, H - 1), (W / 2, 3)] {
+                let n = at(&none, x, y);
+                let want_n: [f32; 3] = std::array::from_fn(|c| trunc_half(mid(x, y, c as u32) + if x < W / 2 { 0.0 } else { 0.0625 }));
+                assert_eq!(n, want_n, "strength 0 is the network's answer at {x},{y}");
+                let f = at(&full, x, y);
+                if x < W / 2 {
+                    assert_eq!(f, n, "no edit, no table at {x},{y}");
+                } else {
+                    let rotated = [n[2], n[0], n[1]];
+                    for c in 0..3 {
+                        assert!((f[c] - rotated[c]).abs() <= 2f32.powi(-10), "the table where the edit is large at {x},{y} channel {c}: {f:?} against {rotated:?}");
+                    }
+                }
+            }
+
+            pass.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
     /// Two passes, the second with its own intensity: pass 2 reads pass 1's answer as its colour input (its
     /// proxy lanes), its answer is the network's on that picture blended by its own intensity, and the
     /// encoded capture is put back after it for the write-back.
