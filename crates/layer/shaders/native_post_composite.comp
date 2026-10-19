@@ -2,19 +2,27 @@
 // The native backend after the upscaler (docs/NATIVE_BACKEND.md, "2.1"): the network's head on the 8-bit
 // proxy, in the proxy's own format, for the unchanged after-the-upscaler composition to use. The residual,
 // the half-grid truncation, the style operator and the intensity blend are native_composite.comp's
-// (OpenDLSS-NR's, MIT, commit 9d08f41). No history: there are no motion vectors here. The answer is 8 bits in
-// the proxy's own channel order, rounded to nearest (as an RGBA8 image store rounds), alpha copied.
+// (OpenDLSS-NR's, MIT, commit 9d08f41). With a history (docs/NATIVE_BACKEND.md, "History after the
+// upscaler"; p.frame.z set) the blend toward the reprojected previous output by sigmoid(logit) x blend scale
+// is native_composite.comp's too, where native_post_preprocess.comp kept it; the result, before the style
+// and intensity, is this pass's next history (p.frame.w set). Without one (NEURAL_FORGE_POST_MOTION=none,
+// the shipped behaviour) nothing blends. The answer is 8 bits in the proxy's own channel order, rounded to
+// nearest (as an RGBA8 image store rounds), alpha copied.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Proxy { uint texel[]; } u_proxy;
 // f32 [field][4]: RGB residual, blend logit.
 layout(set = 0, binding = 1, std430) readonly buffer Head { float head[]; } u_head;
 layout(set = 0, binding = 2, std430) writeonly buffer Answer { uint texel[]; } u_answer;
+// This pass's history (RGB, valid extent: packHalf2x16(r, g), packHalf2x16(b, 1)), written for the next frame.
+layout(set = 0, binding = 3, std430) writeonly buffer History { uvec2 texel[]; } u_history;
+// native_post_preprocess.comp's reprojected history: as History, the second half of .y 1 where it is kept.
+layout(set = 0, binding = 4, std430) readonly buffer Reproj { uvec2 texel[]; } u_reproj;
 
 layout(push_constant) uniform Params {
   uvec4 dims;      // field width, field height, valid width, valid height
-  uvec4 frame;     // unused, BGRA (1) or RGBA (0), unused x2
-  vec4 control;    // style, local tone, intensity, unused
+  uvec4 frame;     // unused, BGRA (1) or RGBA (0), blend toward the history (1), write the history (1)
+  vec4 control;    // style, local tone, intensity, blend scale
 } p;
 
 float truncateHalf(float value) {
@@ -101,7 +109,18 @@ void main() {
   uint feature = (id.y * p.dims.x + id.x) * 4u;
   vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);
   vec3 neural = clamp(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5, vec3(0.0), vec3(1.0));
+  if (p.frame.z != 0u) {
+    uvec2 r = u_reproj.texel[at];
+    vec2 last = unpackHalf2x16(r.y);
+    if (last.y > 0.0) {
+      float scale = clamp(p.control.w, 0.0, 1.0);
+      float weight = clamp((1.0 / (1.0 + exp2(u_head.head[feature + 3u] * uintBitsToFloat(0xbfb8aa3bu)))) * scale, 0.0, 1.0);
+      vec3 hist = vec3(unpackHalf2x16(r.x), last.x);
+      neural = fma(vec3(weight), hist - neural, neural);
+    }
+  }
   vec3 history = vec3(truncateHalf(neural.r), truncateHalf(neural.g), truncateHalf(neural.b));
+  if (p.frame.w != 0u) u_history.texel[at] = uvec2(packHalf2x16(history.rg), packHalf2x16(vec2(history.b, 1.0)));
   float style = p.control.x;
   float intensity = p.control.z;
   vec3 styled = style != 0.0 ? nrStyle(history, style, p.control.y) : history;

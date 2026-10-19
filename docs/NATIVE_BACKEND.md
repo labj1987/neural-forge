@@ -461,9 +461,10 @@ of the layer's own, waited for (bounded). Anything else is echoed, as the helper
 the heartbeat and `helper_state` keep the layer's `helper_alive` true. The regions are imported as host
 memory where the device allows (staged copies otherwise).
 
-- **No history**: there are no motion vectors after the upscaler, so every frame is a first frame, with a
-  fixed seed (a changing seed with nothing blending frames would shimmer). The helper's NGX had a history
-  fed by its optical flow. **For the maintainer**: worth a look for shimmer in a game on this path.
+- **History, selectable**: there are no motion vectors after the upscaler. By default
+  (`NEURAL_FORGE_POST_MOTION=none`) every frame is a first frame, with a fixed seed (a changing seed with
+  nothing blending frames would shimmer). `zero` and `flow` give the path a history (zero motion, or the
+  GPU's optical flow, as the helper's NGX had): "History after the upscaler" below.
 - **Never both paths at once**: the pre-upscaler hold and this server share the network's frame state; each
   refuses for a second after the other used it (`Loader::claim_pre`, `claim_post`).
 - **A helper process that is running wins**: the server does not start if the helper's heartbeat moves.
@@ -885,6 +886,65 @@ against the effect off at 0.931%):
 (One pass: 1.27%, x1.32.) Lower feedback lowers the added detail steadily (the over-processing of extra
 passes); flicker does not move beyond the run-to-run noise. No value is clearly better, so 1 stays the
 default.
+
+## History after the upscaler (selectable, 2026-10-19)
+
+Without a history every frame after the upscaler is a first frame, which costs temporal stability
+(shimmer). `NEURAL_FORGE_POST_MOTION` selects one, for measurement (read once, logged once; `none` stays the
+default until it is measured in game):
+
+| Value | History |
+|---|---|
+| `none` (default) | None: lanes 7-9 copy the proxy, seed 0, no blend. Bit for bit as 3.7.0 (`the_shipped_frame_stays_bit_for_bit` pins the answers and lanes from 3.7.0's shaders). |
+| `zero` | Each pass's previous output at the same pixel. |
+| `flow` | Each pass's previous output where the GPU's optical flow (`VK_NV_optical_flow`) says the pixel was, read with the pre-upscaler preprocess's five-tap Catmull-Rom filter. `zero` where the device has no optical flow (logged once, with the reason). |
+
+With a history the after-the-upscaler shaders do what the pre-upscaler ones do with theirs:
+`native_post_preprocess.comp` puts the centred previous output into lanes 7-9 and the noise seed counts frames
+since the last reset; `native_post_composite.comp` blends toward it by sigmoid(head logit) x blend scale and
+keeps the result (before the style and intensity, as half floats) as the pass's next history. Every pass of a
+multi-pass frame has its own history buffer; a pass that did not run on the previous frame (the Passes setting
+grew) starts afresh. What gets no history:
+
+- **Per pixel**: where the frame changed there by more than `NEURAL_FORGE_POST_HISTORY_REJECT` (0 to 1,
+  default 0.12) since the previous frame (the largest channel difference of the 8-bit proxies, in the
+  encoded 0-1 scale; with the flow against the previous frame where the pixel was, bilinear), or where the
+  previous position is off screen. The idea is uzbekunknown/dlss-nr-on-intel's (Apache-2.0,
+  `notes/phase72-preset-b.md` "Flicker", the daemon's `History` with `STALE = 0.12`; ideas only).
+- **The whole frame** (`post_history::SlotHistory`): a scene cut (the pre-upscaler detector's rule on the
+  CPU: a luma thumbnail of the proxy on an 8-pixel step, a cut at a mean difference of 40 of 255;
+  `NEURAL_FORGE_SCENE_CUT` applies here too), another size or format, a request that did not reach the
+  network (the effect off, the model not ready, a failed frame), more than 500 ms since the previous frame,
+  another network build. Each reset is logged (`[native] after the upscaler: resetting the history (...)`).
+
+**The optical flow** (`post_flow`). With `flow` selected, `create_device` adds the extension, its
+`opticalFlow` feature and one queue of the family flagged `QUEUE_OPTICAL_FLOW_BIT_NV` (family 5 on the RTX
+5070, its only queue), where the device has all three and the application does not use that family itself;
+a request with them that the driver refuses is made again without. The RTX 5070's driver offers output grids
+of 1x1, 2x2 and 4x4 for 32x32 to 8192x8192, inputs `B8G8R8A8_UNORM`, `R8_UNORM` and NV12, vectors
+`R16G16_S10_5_NV` (queried 2026-10-19). Per slot and frame size a session at the proxy's size with the 4x4
+grid, performance level fast: two input images used in turn (the proxy's four bytes copied in as they are,
+RGBA or BGRA: both frames are the same) and one flow image. The frame's proxy is the input and the previous
+frame's the reference, so a vector points from where a pixel is to where it was. A frame with a history is
+three submits: the proxy into the session on the compute queue (signalling a semaphore), the flow on the
+optical-flow queue (waiting for it, signalling another), and the frame, which waits for that one at its
+transfer stage, copies the vectors into a host-visible buffer the preprocess reads (interpolated between the
+grid cells' centres) and is waited for by the server thread, as every frame is. A submit of the flow's that
+fails gives it up (both queues drain; `zero` from then on). The entry points are resolved by hand and checked.
+
+**Not tested on the GPU it is for**: lavapipe has no optical flow, so the tests feed the same shader path a
+synthetic flow field (`the_flow_reprojects_the_history`: a 3-pixel pan with the matching flow reads the first
+frame's output 3 pixels back) and check the fallback (`flow_without_the_extension_runs_as_zero_motion`). The
+flow's direction (input to reference) is the extension's documented meaning; a game run should confirm it
+(the wrong sign would reject most moving pixels, visible as no history while panning).
+
+**The GPU work it adds** (per slot, at W x H; nothing with `none`):
+
+| | `zero` | `flow` (on top of `zero`) |
+|---|---|---|
+| Buffers | previous proxy 4 B/px, reprojected history 8 B/px, one history per pass 8 B/px (1440p, one pass: 74 MB) | two input images 4 B/px, the flow image and its host-visible copy 4 B per 4x4 cell (1440p: 30 MB + 2 x 0.9 MB) |
+| Per pass | the preprocess reads 8 B (history) + 8 B (two proxies) and writes 8 B per pixel; the composite reads and writes 8 B per pixel; same dispatches as before | the preprocess's history read is the five-tap filter (up to 20 texel reads) and four flow reads |
+| Per frame | one buffer copy of the proxy (4 B/px); the cut thumbnail on the CPU (1/64 of the pixels) | one buffer-to-image copy of the proxy, the optical flow at the proxy's size, one image-to-buffer copy of the vectors, two more submits and their semaphores |
 
 ## Decided before Phase 1
 

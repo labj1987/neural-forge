@@ -476,6 +476,27 @@ fn extra_queues(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQueue
     None
 }
 
+/// The family to add the optical-flow queue in (`preupscale::post_flow::queue_family`), from what the
+/// physical device offers.
+///
+/// # Safety
+/// `gipa` is the next layer's for `instance`, which `physical_device` belongs to.
+#[cfg(target_arch = "x86_64")]
+unsafe fn flow_family(
+    instance: &InstanceContext, gipa: vk::PFN_vkGetInstanceProcAddr, physical_device: vk::PhysicalDevice, families: &[vk::QueueFamilyProperties], queues: &[vk::DeviceQueueCreateInfo],
+) -> Result<u32, String> {
+    // SAFETY: `physical_device` belongs to the instance.
+    let extension = unsafe { instance.instance.enumerate_device_extension_properties(physical_device) }.is_ok_and(|list| {
+        list.iter().any(|e| {
+            // SAFETY: a NUL-terminated, driver-supplied name.
+            (unsafe { CStr::from_ptr(e.extension_name.as_ptr()) }) == preupscale::post_flow::EXTENSION
+        })
+    });
+    // SAFETY: forwarded.
+    let feature = extension && unsafe { preupscale::post_flow::feature(gipa, instance.instance.handle(), physical_device, instance.properties2) };
+    preupscale::post_flow::queue_family(extension, feature, families, queues)
+}
+
 /// `create_info`'s queue requests, and the physical device's families.
 fn queue_requests<'a>(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &'a vk::DeviceCreateInfo) -> (&'a [vk::DeviceQueueCreateInfo], Vec<vk::QueueFamilyProperties>) {
     let infos = if create_info.queue_create_info_count == 0 || create_info.p_queue_create_infos.is_null() {
@@ -691,7 +712,35 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                                 note_native_unavailable(&why);
                             }
                             Ok(extension) => {
-                                let result = next_create_device(&extension.info, p_device);
+                                // NEURAL_FORGE_POST_MOTION=flow: the optical flow's extension, feature and queue on
+                                // top, where the device has them (`post_flow`); refused, the request is made
+                                // again without, and `flow` runs as `zero`.
+                                let mut flow = None;
+                                let mut result = vk::Result::ERROR_INITIALIZATION_FAILED;
+                                if preupscale::post_history::motion() == preupscale::post_history::Motion::Flow {
+                                    // SAFETY: the next layer's gipa for this instance and device; `queues` is the
+                                    // request's queue list.
+                                    let family = unsafe { flow_family(&instance, gipa, physical_device, &families, &queues) };
+                                    match family {
+                                        Err(why) => log!("[native] no optical flow after the upscaler: {why}"),
+                                        // SAFETY: the extended request is valid and outlives the call.
+                                        Ok(family) => match unsafe { preupscale::post_flow::Request::new(&extension.info, family) } {
+                                            None => log!("[native] no optical flow after the upscaler: the application chains its own optical-flow features"),
+                                            Some(request) => {
+                                                result = next_create_device(&request.info, p_device);
+                                                if result == vk::Result::SUCCESS {
+                                                    flow = Some(preupscale::post_flow::FlowQueue { family, index: 0 });
+                                                    log!("[native] the optical flow's extension, feature and queue 0 of family {family} added");
+                                                } else {
+                                                    log!("[native] adding the optical flow was refused ({result:?}); creating the device without it");
+                                                }
+                                            }
+                                        },
+                                    }
+                                }
+                                if flow.is_none() {
+                                    result = next_create_device(&extension.info, p_device);
+                                }
                                 drop(extension);
                                 if result == vk::Result::SUCCESS {
                                     // SAFETY: written by the successful call.
@@ -708,6 +757,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                                         index,
                                         post_index: index + 1,
                                         properties2: instance.properties2,
+                                        flow,
                                     };
                                     NATIVE_DEVICES.lock().unwrap().get_or_insert_default().insert(device, setup);
                                     log!("[native] device created with the network's extensions and features, loading queue {index} of family {family}");

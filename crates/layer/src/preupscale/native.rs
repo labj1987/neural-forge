@@ -128,6 +128,8 @@ pub(crate) struct Setup {
     pub post_index: u32,
     /// Which memory-properties query the instance may make (the VRAM readings, `crate::vram`).
     pub properties2: crate::vram::Properties2,
+    /// The optical-flow queue (`NEURAL_FORGE_POST_MOTION=flow` on a device that has one; `native_post`).
+    pub flow: Option<super::post_flow::FlowQueue>,
 }
 
 /// The network for one frame size, as the hold uses it.
@@ -2688,7 +2690,7 @@ mod tests {
         unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
             None
         }
-        let setup = Setup { gipa, instance: vk::Instance::null(), physical: vk::PhysicalDevice::null(), frame_family: 0, family: 0, index: 0, post_index: 0, properties2: crate::vram::Properties2::None };
+        let setup = Setup { gipa, instance: vk::Instance::null(), physical: vk::PhysicalDevice::null(), frame_family: 0, family: 0, index: 0, post_index: 0, properties2: crate::vram::Properties2::None, flow: None };
         let loader = Loader::start(vk::Device::null(), setup);
         // No hold for longer than the path switch: the post path may claim.
         loader.last_pre.store(0, std::sync::atomic::Ordering::SeqCst);
