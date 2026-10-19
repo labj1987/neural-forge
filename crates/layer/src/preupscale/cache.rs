@@ -440,6 +440,11 @@ impl State {
     }
 
     /// Whether this hold is cached or refreshes, and its passes' flags. Takes the stored edit out.
+    /// The depth's convention once decided ([`infer_reverse_z`]): `Some(true)` for reversed-Z.
+    pub(crate) fn reverse_z(&self) -> Option<bool> {
+        self.reverse_z
+    }
+
     pub(crate) fn plan(&mut self, h: &Hold) -> Plan {
         let consecutive = self.last_seen.is_some_and(|s| s.wrapping_add(1) == h.hold) && self.generation == h.generation;
         let had = std::mem::take(&mut self.valid);

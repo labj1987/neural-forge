@@ -1,0 +1,89 @@
+#version 450
+// The control mask before the upscaler (docs/NATIVE_BACKEND.md, "Control mask"): one RGBA8 texel per pixel
+// of the valid extent, r scaling the intensity blend (native_composite.comp), g the local-tone lane and b
+// the structure lanes (native_preprocess.comp). The semantics follow GrimsVerk's ControlMask research
+// (https://grimsverk.github.io/nr-runtime-research/controlmask.html; ideas only, no code). Built from a
+// neutral (1, 1, 1) by the rules p.mask.x names, in order; each rule can only lower a value, so a later
+// rule never gives back what an earlier one took:
+//
+// - sky (1): no edit (r = 0) where the depth is within the margin of the far plane, fading back in by twice
+//   the margin, the weight averaged over the 5x5 depth texels around the pixel so silhouettes do not flicker;
+// - dark (2): below the brightness threshold (luma of the encoded capture, 0-1), r and b fade toward the
+//   rule's values, fully at black;
+// - motion (4): above the motion threshold (render pixels per frame), r and b fade toward the rule's values,
+//   fully at twice the threshold.
+//
+// With p.mask.x 0 nothing is written and nothing reads the mask. The descriptor set layout and Params are
+// native_preprocess.comp's (field for field, append only).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(constant_id = 0) const bool MOTION_HALF = false;
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_encoded;
+layout(set = 0, binding = 2, std430) readonly buffer Motion { uint mv[]; } u_motion;
+layout(set = 0, binding = 4, std140) uniform Params {
+  uvec4 dims;
+  uvec4 frame;
+  vec4 motion;
+  vec4 control;
+  vec4 more;
+  uvec4 mask;        // rules (1 sky, 2 dark, 4 motion), depth kind (0 none, 1 f32, 2 D24, 3 D16), reversed depth, unused
+  vec4 sky;          // margin on the device-depth scale, unused
+  vec4 dark;         // brightness threshold, intensity, structure, unused
+  vec4 moving;       // motion threshold (render pixels per frame), intensity, structure, unused
+} p;
+layout(set = 0, binding = 10, std430) writeonly buffer Mask { uint m[]; } u_mask;
+// DLSS's depth as the capture copied it (`native::DepthCopy`), raw texels as p.mask.y says.
+layout(set = 0, binding = 11, std430) readonly buffer Depth { uint raw[]; } u_depth;
+
+// One texel of the depth as f32 device depth (preupscale_cache_prep.comp's device_depth).
+float device_depth(uint i) {
+  if (p.mask.y == 3u) {
+    uint word = u_depth.raw[i >> 1u];
+    return float((i & 1u) == 0u ? word & 0xffffu : word >> 16u) / 65535.0;
+  }
+  uint raw = u_depth.raw[i];
+  return p.mask.y == 2u ? float(raw & 0x00ffffffu) / 16777215.0 : uintBitsToFloat(raw);
+}
+
+// How much the sky rule applies at a depth texel: 1 within the margin of the far plane, 0 from twice it.
+float sky_weight(uint i) {
+  float d = device_depth(i);
+  if (isnan(d) || isinf(d)) return 0.0;
+  float far = p.mask.z != 0u ? d : 1.0 - d;
+  float margin = max(p.sky.x, 1e-9);
+  return clamp((2.0 * margin - far) / margin, 0.0, 1.0);
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= p.dims.z || id.y >= p.dims.w || p.mask.x == 0u) return;
+  uint at = id.y * p.dims.z + id.x;
+  float r = 1.0;
+  float b = 1.0;
+  if ((p.mask.x & 1u) != 0u && p.mask.y != 0u) {
+    float sum = 0.0;
+    for (int dy = -2; dy <= 2; dy++) {
+      for (int dx = -2; dx <= 2; dx++) {
+        uvec2 q = uvec2(clamp(ivec2(id) + ivec2(dx, dy), ivec2(0), ivec2(p.dims.zw) - 1));
+        sum += sky_weight(q.y * p.dims.z + q.x);
+      }
+    }
+    r = min(r, 1.0 - sum / 25.0);
+  }
+  if ((p.mask.x & 2u) != 0u) {
+    vec3 c = clamp(imageLoad(u_encoded, ivec2(id)).rgb, 0.0, 1.0);
+    float y = dot(c, vec3(0.2126, 0.7152, 0.0722));
+    float w = clamp(1.0 - y / max(p.dark.x, 1e-6), 0.0, 1.0);
+    r = min(r, mix(1.0, p.dark.y, w));
+    b = min(b, mix(1.0, p.dark.z, w));
+  }
+  if ((p.mask.x & 4u) != 0u) {
+    vec2 motion = MOTION_HALF ? unpackHalf2x16(u_motion.mv[at]) : vec2(uintBitsToFloat(u_motion.mv[2u * at]), uintBitsToFloat(u_motion.mv[2u * at + 1u]));
+    float speed = length(motion * p.more.yz);
+    float t = max(p.moving.x, 1e-6);
+    float w = isnan(speed) ? 0.0 : clamp((speed - t) / t, 0.0, 1.0);
+    r = min(r, mix(1.0, p.moving.y, w));
+    b = min(b, mix(1.0, p.moving.z, w));
+  }
+  u_mask.m[at] = packUnorm4x8(vec4(r, 1.0, b, 1.0));
+}

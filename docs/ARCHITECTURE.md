@@ -70,7 +70,7 @@ present hook and its model server thread. Layout (`crates/protocol/src/lib.rs`):
 
 | Offset | Size | Content |
 |---|---|---|
-| 0 | 64 KiB (`HEADER_BYTES`) | `ShmHeader` (2036 bytes used) |
+| 0 | 64 KiB (`HEADER_BYTES`) | `ShmHeader` (2076 bytes used) |
 | 64 KiB | `MAX_FRAME` | slot 0 proxy: the frame the layer captured |
 | + `MAX_FRAME` | `MAX_FRAME` | slot 0 answer: the model's output |
 | + 2 `MAX_FRAME` | `MAX_FRAME` | slot 1 proxy |
@@ -163,7 +163,7 @@ be private.
 | 17 | `preupscale_dump_request`; the edit cache's `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected`, `cache_gpu_ms_bits` | 3.3.0 |
 | 18 | `capture_request` carries a request id; `capture_next_id`, `capture_cancel` and the capture result (state, reason, counts, paths) appended | 3.4.0 |
 | 19 | `passes` and `pass[10]` (each pass's overrides of the Model tab's values: `overrides` bits and their values) appended | 3.6.0 |
-| 20 | `network` (which extracted network the layer runs) appended | 3.7.0 |
+| 20 | `network` (which extracted network the layer runs) and the control mask's rules (`mask_sky`, `mask_sky_margin`, `mask_dark*`, `mask_motion*`) appended | 3.7.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20.

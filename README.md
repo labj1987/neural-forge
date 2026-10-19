@@ -268,6 +268,12 @@ checked against depth and colour (the edit cache). The model's answer is written
 composition step), so "Model every Nth frame" and the Composition tab only change the after-the-upscaler
 path. The Model tab's tuning and the switch apply to both.
 
+**Keep the game's sky** (on by default) leaves the sky untouched before the upscaler: no edit where the
+game's depth is at the far plane, fading in over the distance just in front of it. **More mask rules** can
+also fade the edit out in dark areas or in fast motion (both off by default). Together they are a per-pixel
+mask of the model's intensity and structure, after NVIDIA's control mask (the semantics come from
+GrimsVerk's runtime research).
+
 **Passes** (1 to 10, default 1) runs the model that many times over each frame, before or after the
 upscaler: every pass after the first works on the previous pass's picture. Each pass costs about as much
 GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 1440p with frame

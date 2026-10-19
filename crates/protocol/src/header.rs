@@ -65,6 +65,41 @@ impl PassTunings {
     }
 }
 
+/// The control mask's rules ([`ShmHeader::mask_settings`]), as plain values.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MaskSettings {
+    pub sky: bool,
+    pub sky_margin: f32,
+    pub dark: bool,
+    pub dark_threshold: f32,
+    pub dark_intensity: f32,
+    pub dark_structure: f32,
+    pub motion: bool,
+    pub motion_threshold: f32,
+    pub motion_intensity: f32,
+    pub motion_structure: f32,
+}
+
+impl MaskSettings {
+    /// Every rule off: the mask is neutral and nothing reads it.
+    pub const OFF: Self = Self {
+        sky: false,
+        sky_margin: 0.00001,
+        dark: false,
+        dark_threshold: 0.05,
+        dark_intensity: 0.5,
+        dark_structure: 0.5,
+        motion: false,
+        motion_threshold: 16.0,
+        motion_intensity: 0.5,
+        motion_structure: 0.5,
+    };
+
+    pub fn any(&self) -> bool {
+        self.sky || self.dark || self.motion
+    }
+}
+
 /// The model's settings (the Model tab's), read out of the header as plain values.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tuning {
@@ -378,6 +413,21 @@ pub struct ShmHeader {
     /// default) or the small one. The layer switches a running game over at its next frame
     /// (`preupscale::native::Loader::ready`).
     pub network: AtomicU32,
+    /// The control mask before the upscaler ([`MaskSettings`]): per pixel, how much of the model's edit is
+    /// kept (intensity) and how much structure it is given. `mask_sky` (default on) keeps the game's sky:
+    /// no edit where the depth is within `mask_sky_margin` of the far plane, fading in by twice the margin.
+    /// `mask_dark` (off) and `mask_motion` (off) fade intensity and structure toward their own values below
+    /// a brightness (`mask_dark_threshold`, on the encoded 0-1 scale) and above a motion (pixels per frame).
+    pub mask_sky: AtomicU32,
+    pub mask_sky_margin_bits: AtomicU32,
+    pub mask_dark: AtomicU32,
+    pub mask_dark_threshold_bits: AtomicU32,
+    pub mask_dark_intensity_bits: AtomicU32,
+    pub mask_dark_structure_bits: AtomicU32,
+    pub mask_motion: AtomicU32,
+    pub mask_motion_threshold_bits: AtomicU32,
+    pub mask_motion_intensity_bits: AtomicU32,
+    pub mask_motion_structure_bits: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -402,8 +452,9 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2036, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2076, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, network) == 2032, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, mask_sky) == 2036, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, passes) == 1748, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 1752, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_next_id) == 688, "layout changed -- bump SHM_VERSION");
@@ -439,7 +490,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 105] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 115] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -550,6 +601,17 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 105] = [
     ("pass10_auto_mask", 0.0, 1.0),
     // `enums::network`: 0 the full network, 1 the small one.
     ("network", 0.0, (crate::enums::network::COUNT - 1) as f32),
+    // The control mask (`MaskSettings`).
+    ("mask_sky", 0.0, 1.0),
+    ("mask_sky_margin", 1e-07, 0.01),
+    ("mask_dark", 0.0, 1.0),
+    ("mask_dark_threshold", 0.0, 1.0),
+    ("mask_dark_intensity", 0.0, 1.0),
+    ("mask_dark_structure", 0.0, 1.0),
+    ("mask_motion", 0.0, 1.0),
+    ("mask_motion_threshold", 0.5, 256.0),
+    ("mask_motion_intensity", 0.0, 1.0),
+    ("mask_motion_structure", 0.0, 1.0),
 ];
 
 /// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
@@ -623,6 +685,16 @@ impl ShmHeader {
             p.reset_to_defaults();
         }
         self.network.store(crate::enums::network::FULL, Ordering::Relaxed);
+        self.mask_sky.store(1, Ordering::Relaxed);
+        self.mask_sky_margin_bits.store(0.00001f32.to_bits(), Ordering::Relaxed);
+        self.mask_dark.store(0, Ordering::Relaxed);
+        self.mask_dark_threshold_bits.store(0.05f32.to_bits(), Ordering::Relaxed);
+        self.mask_dark_intensity_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+        self.mask_dark_structure_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+        self.mask_motion.store(0, Ordering::Relaxed);
+        self.mask_motion_threshold_bits.store(16.0f32.to_bits(), Ordering::Relaxed);
+        self.mask_motion_intensity_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+        self.mask_motion_structure_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
 
         self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
@@ -800,7 +872,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 105] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 115] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -909,6 +981,16 @@ impl ShmHeader {
             ("pass10_style", false, self.pass[9].style.load(Ordering::Relaxed)),
             ("pass10_auto_mask", false, self.pass[9].auto_mask.load(Ordering::Relaxed)),
             ("network", false, self.network.load(Ordering::Relaxed)),
+            ("mask_sky", false, self.mask_sky.load(Ordering::Relaxed)),
+            ("mask_sky_margin", true, self.mask_sky_margin_bits.load(Ordering::Relaxed)),
+            ("mask_dark", false, self.mask_dark.load(Ordering::Relaxed)),
+            ("mask_dark_threshold", true, self.mask_dark_threshold_bits.load(Ordering::Relaxed)),
+            ("mask_dark_intensity", true, self.mask_dark_intensity_bits.load(Ordering::Relaxed)),
+            ("mask_dark_structure", true, self.mask_dark_structure_bits.load(Ordering::Relaxed)),
+            ("mask_motion", false, self.mask_motion.load(Ordering::Relaxed)),
+            ("mask_motion_threshold", true, self.mask_motion_threshold_bits.load(Ordering::Relaxed)),
+            ("mask_motion_intensity", true, self.mask_motion_intensity_bits.load(Ordering::Relaxed)),
+            ("mask_motion_structure", true, self.mask_motion_structure_bits.load(Ordering::Relaxed)),
         ]
     }
 
@@ -1037,6 +1119,16 @@ impl ShmHeader {
             "pass10_style" => &self.pass[9].style,
             "pass10_auto_mask" => &self.pass[9].auto_mask,
             "network" => &self.network,
+            "mask_sky" => &self.mask_sky,
+            "mask_sky_margin" => &self.mask_sky_margin_bits,
+            "mask_dark" => &self.mask_dark,
+            "mask_dark_threshold" => &self.mask_dark_threshold_bits,
+            "mask_dark_intensity" => &self.mask_dark_intensity_bits,
+            "mask_dark_structure" => &self.mask_dark_structure_bits,
+            "mask_motion" => &self.mask_motion,
+            "mask_motion_threshold" => &self.mask_motion_threshold_bits,
+            "mask_motion_intensity" => &self.mask_motion_intensity_bits,
+            "mask_motion_structure" => &self.mask_motion_structure_bits,
             _ => return false,
         };
         field.store(bits, Ordering::Relaxed);
@@ -1072,6 +1164,28 @@ impl ShmHeader {
     pub fn network_choice(&self) -> u32 {
         let v = self.network.load(Ordering::Relaxed);
         if v < crate::enums::network::COUNT { v } else { crate::enums::network::FULL }
+    }
+
+    /// The control mask's rules, each value clamped to its range.
+    pub fn mask_settings(&self) -> MaskSettings {
+        let f = |a: &AtomicU32, name: &str| {
+            let (lo, hi) = setting_bounds(name).expect("a mask setting");
+            let v = f32::from_bits(a.load(Ordering::Relaxed));
+            if v.is_finite() { v.clamp(lo, hi) } else { lo }
+        };
+        let on = |a: &AtomicU32| a.load(Ordering::Relaxed) != 0;
+        self.read_settings(|| MaskSettings {
+            sky: on(&self.mask_sky),
+            sky_margin: f(&self.mask_sky_margin_bits, "mask_sky_margin"),
+            dark: on(&self.mask_dark),
+            dark_threshold: f(&self.mask_dark_threshold_bits, "mask_dark_threshold"),
+            dark_intensity: f(&self.mask_dark_intensity_bits, "mask_dark_intensity"),
+            dark_structure: f(&self.mask_dark_structure_bits, "mask_dark_structure"),
+            motion: on(&self.mask_motion),
+            motion_threshold: f(&self.mask_motion_threshold_bits, "mask_motion_threshold"),
+            motion_intensity: f(&self.mask_motion_intensity_bits, "mask_motion_intensity"),
+            motion_structure: f(&self.mask_motion_structure_bits, "mask_motion_structure"),
+        })
     }
 
     /// The Passes setting, clamped to 1 to [`crate::MAX_PASSES`].
@@ -1459,6 +1573,21 @@ mod tests {
     }
 
     #[test]
+    fn the_control_mask_is_appended_after_the_passes() {
+        // v20 appends the mask's rules: every earlier field keeps its offset.
+        assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 20);
+        let h = ShmHeader::default();
+        h.init_defaults();
+        let m = h.mask_settings();
+        assert!(m.sky && !m.dark && !m.motion, "keeping the sky is the only rule on by default");
+        assert_eq!(m, MaskSettings { sky: true, ..MaskSettings::OFF });
+        assert!(h.write_settings(&[("mask_motion", 1), ("mask_motion_threshold", 1000.0f32.to_bits())]));
+        assert_eq!(h.mask_settings().motion_threshold, 256.0, "clamped to its range");
+    }
+
+    #[test]
     fn the_passes_are_appended_after_the_capture_result() {
         // v19 appends the pass count and the per-pass overrides: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, passes), std::mem::offset_of!(ShmHeader, capture_result) + crate::capture::RESULT_WORDS * 4);
@@ -1471,7 +1600,7 @@ mod tests {
     fn the_network_is_appended_after_the_passes() {
         // v20 appends the Network setting: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, network), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
-        assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::offset_of!(ShmHeader, mask_sky));
         assert_eq!(crate::SHM_VERSION, 20);
         let h = ShmHeader::default();
         h.init_defaults();

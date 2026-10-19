@@ -34,7 +34,14 @@ layout(set = 0, binding = 4, std140) uniform Params {
   vec4 motion;       // jitter[t-1] - jitter[t] (x, y), blend scale, intensity
   vec4 control;      // style, local tone, local structure, skin structure (< 0: follow structure)
   vec4 more;         // auto mask (> 0 on), motion-vector scale (x, y), unused
+  uvec4 mask;        // the control mask's rules (0: no mask, nothing reads it; native_mask.comp), depth kind, reversed depth, unused
+  vec4 sky;          // the mask's sky margin, unused
+  vec4 dark;         // the mask's dark rule: threshold, intensity, structure, unused
+  vec4 moving;       // the mask's motion rule: threshold, intensity, structure, unused
 } p;
+// The control mask (native_mask.comp): r intensity, g local tone, b structure, per pixel of the valid
+// extent. Read only while p.mask.x names a rule.
+layout(set = 0, binding = 10, std430) readonly buffer Mask { uint m[]; } u_mask;
 // [0], [1]: whether the frame of that parity was encoded with a usable exposure (written by the composite).
 layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; } u_state;
 
@@ -148,9 +155,28 @@ void main() {
   float autoMask = p.more.x;
   float structure = p.control.z;
   float skin = p.control.w;
+  float tone = p.control.y;
+  float lane12 = autoMask > 0.0 ? 1.0 : structure;
+  float lane13 = autoMask > 0.0 ? (skin < 0.0 ? structure : skin) : -1.0;
+  float lane14 = autoMask > 0.0 ? structure : -1.0;
+  // The control mask (native_mask.comp): g scales local tone (lane 11; the style grade is not scaled); b
+  // scales structure: with auto mask off lane 12 is structure x b, with it on NVIDIA's skin and structure
+  // lanes take the lower of themselves and structure x b (ControlMask's blend mode 2), so the mask only ever
+  // lowers structure and NVIDIA's skin handling stays. A b of 1 changes nothing.
+  if (p.mask.x != 0u) {
+    vec3 m = unpackUnorm4x8(u_mask.m[source.y * p.dims.z + source.x]).rgb;
+    tone *= m.g;
+    if (m.b < 1.0) {
+      float scaled = structure * m.b;
+      if (autoMask > 0.0) {
+        lane13 = min(lane13, scaled);
+        lane14 = min(lane14, scaled);
+      } else {
+        lane12 = scaled;
+      }
+    }
+  }
   u_features.features[base + 1u] = vec4(centered, history.r);
-  u_features.features[base + 2u] = vec4(history.g, history.b, p.control.x / 128.0, roundF16(p.control.y));
-  u_features.features[base + 3u] = vec4(roundF16(autoMask > 0.0 ? 1.0 : structure),
-                                        roundF16(autoMask > 0.0 ? (skin < 0.0 ? structure : skin) : -1.0),
-                                        roundF16(autoMask > 0.0 ? structure : -1.0), 0.0);
+  u_features.features[base + 2u] = vec4(history.g, history.b, p.control.x / 128.0, roundF16(tone));
+  u_features.features[base + 3u] = vec4(roundF16(lane12), roundF16(lane13), roundF16(lane14), 0.0);
 }

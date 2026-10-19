@@ -818,6 +818,43 @@ GTA V Enhanced on the helper with that model (2.0.10 installed, preset 0, `gta-b
 settings with frame generation 4x and FG Preset C, one run, pass 4): 63.5 real fps, the model held
 before the upscaler at 1486x836, 61 holds/s, 0 misses, helper busy 4.2 ms.
 
+## The control mask (3.7.0, 2026-10-19)
+
+A per-pixel control of the network's edit before the upscaler, after NVIDIA's `DLSSNR.ControlMask`. The
+native backend reimplements the network, so it implements the mask's semantics directly instead of an NGX
+parameter. The semantics follow GrimsVerk's static analysis of both runtimes and their working ControlMask
+implementation (https://grimsverk.github.io/nr-runtime-research/static.html and controlmask.html; ideas
+only, no code):
+
+| Channel | Acts on | Here |
+|---|---|---|
+| r | the final blend: `out = orig + intensity x r x (NR - orig)` | `native_composite.comp` (NGX saturates `intensity x r`; here the product is used as it is, so an intensity above 1 still extrapolates and an all-ones mask is exactly no mask) |
+| g | network input channel 11 = local tone x g (the Style grade is not scaled) | `native_preprocess.comp` |
+| b | auto mask off: channel 12 = structure x b; on: NVIDIA's skin and structure channels (13, 14) take min(channel, structure x b), ControlMask's blend mode 2, the only one here, so NVIDIA's skin handling is kept and the mask only lowers structure | `native_preprocess.comp` (a b of 1 leaves every channel as it was) |
+| a | unused | |
+
+`native_mask.comp` builds it every network frame at the model's working size (one RGBA8 texel per pixel of
+DLSS's input), in pass 1's `N` before the preprocess, from a neutral 1, 1, 1 by these rules in order, each
+only lowering a value:
+
+- **Keep the game's sky** (`mask_sky`, on by default): r = 0 where the depth is within `mask_sky_margin`
+  (default 0.00001, the sky only; 0.001 takes in distant scenery) of the far plane, back to 1 at twice the
+  margin, averaged over the 5x5 depth texels around the pixel so silhouettes do not flicker. It reads the edit
+  cache's depth copy, in the convention the cache decides from its first holds (`infer_reverse_z`; GTA V
+  Enhanced is reversed-Z, the cache's verdict), so it is off until then and without the edit cache
+  (`NEURAL_FORGE_EDIT_CACHE=off` copies no depth). After the upscaler there is no depth: the mask is before
+  the upscaler only.
+- **Dark areas** (`mask_dark`, off): below the brightness `mask_dark_threshold` (luma of the encoded capture,
+  0-1), r and b fade toward `mask_dark_intensity` and `mask_dark_structure`, fully at black.
+- **Fast motion** (`mask_motion`, off): above `mask_motion_threshold` render pixels per frame (the motion the
+  network's history reads), r and b fade toward `mask_motion_intensity` and `mask_motion_structure`, fully at
+  twice the threshold.
+
+With no rule on, the mask pass writes nothing and no shader reads it: the frame is bit for bit as without the
+mask (`the_control_mask_keeps_the_sky_lowers_structure_and_changes_nothing_when_all_ones` also checks an
+all-ones mask against none). Every pass of a multi-pass frame reads the same mask, built from the original
+frame.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

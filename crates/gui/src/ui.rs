@@ -411,6 +411,35 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     }
     model_group.add(&pass_row);
 
+    // The control mask (before the upscaler): the sky rule, and the optional dark and motion rules.
+    let (mask_sky, set_mask_sky) = bind_bool(&shm, Some("mask_sky"), |h| &h.mask_sky);
+    model_group.add(&switch_row(
+        "Keep the game's sky",
+        "No edit where the game draws its sky (from the depth, before the upscaler)",
+        mask_sky,
+        set_mask_sky,
+    ));
+    let mask_more = adw::ExpanderRow::new();
+    mask_more.set_title("More mask rules");
+    mask_more.set_subtitle("Edit less in dark or fast-moving parts of the picture (before the upscaler)");
+    let (mask_dark, set_mask_dark) = bind_bool(&shm, Some("mask_dark"), |h| &h.mask_dark);
+    mask_more.add_row(&switch_row("Dark areas", "Below the brightness, fade the edit toward the values below", mask_dark, set_mask_dark));
+    let (v, set) = bind_float(&shm, Some("mask_dark_threshold"), |h| &h.mask_dark_threshold_bits);
+    mask_more.add_row(&spin_row("Dark brightness", "0 is black, 1 white", v, "mask_dark_threshold", 0.01, set));
+    let (v, set) = bind_float(&shm, Some("mask_dark_intensity"), |h| &h.mask_dark_intensity_bits);
+    mask_more.add_row(&spin_row("Dark intensity", "Of the intensity, at black", v, "mask_dark_intensity", 0.05, set));
+    let (v, set) = bind_float(&shm, Some("mask_dark_structure"), |h| &h.mask_dark_structure_bits);
+    mask_more.add_row(&spin_row("Dark structure", "Of the structure, at black", v, "mask_dark_structure", 0.05, set));
+    let (mask_motion, set_mask_motion) = bind_bool(&shm, Some("mask_motion"), |h| &h.mask_motion);
+    mask_more.add_row(&switch_row("Fast motion", "Above the motion, fade the edit toward the values below", mask_motion, set_mask_motion));
+    let (v, set) = bind_float(&shm, Some("mask_motion_threshold"), |h| &h.mask_motion_threshold_bits);
+    mask_more.add_row(&spin_row("Motion", "Pixels per frame where the fade starts (full at twice)", v, "mask_motion_threshold", 1.0, set));
+    let (v, set) = bind_float(&shm, Some("mask_motion_intensity"), |h| &h.mask_motion_intensity_bits);
+    mask_more.add_row(&spin_row("Motion intensity", "Of the intensity, at twice the motion", v, "mask_motion_intensity", 0.05, set));
+    let (v, set) = bind_float(&shm, Some("mask_motion_structure"), |h| &h.mask_motion_structure_bits);
+    mask_more.add_row(&spin_row("Motion structure", "Of the structure, at twice the motion", v, "mask_motion_structure", 0.05, set));
+    model_group.add(&mask_more);
+
     let (interval, set_interval) = bind_u32(&shm, Some("model_interval"), |h| &h.model_interval);
     let interval_row = spin_row(
         "Model every Nth frame",
