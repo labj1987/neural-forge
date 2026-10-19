@@ -727,7 +727,7 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     if let Some((device, state, hold)) = owned {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
-        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || hold.preupscale.res.is_some() || hold.preupscale.native.is_some() {
+        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || hold.preupscale.has_res() || hold.preupscale.native.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     // Idle: nothing uses the network any more.
@@ -900,7 +900,9 @@ fn inline_hold(
     // within 5 s, then Xid 69).
     let _ = external_memory_host;
     // SAFETY: the SHM mapping is never unmapped once open.
-    if !unsafe { session.ensure(device, instance, physical_device, job.side_family, extent.0, extent.1, shm, false) } {
+    // The hold's stage's own resources: before the upscaler, or after DLSS's output at the output size.
+    let stage = job.point.hold.stage;
+    if !unsafe { session.ensure(device, instance, physical_device, job.side_family, extent.0, extent.1, shm, false, stage) } {
         if mode == Mode::Model {
             session.note(shm, &crate::preupscale::HoldResult::local("the hold's resources could not be built"), started.elapsed(), extent);
         }
@@ -922,7 +924,9 @@ fn inline_hold(
         identification: job.point.identification,
     };
     let seen = session.seen();
-    let Some(res) = session.res.as_mut() else { return };
+    // The stage's resources (`Session::res`, `Session::res_after`), as fields: the loader is borrowed beside them.
+    let res = if stage == crate::preupscale::placement::Stage::Upscaled { session.res_after.as_mut() } else { session.res.as_mut() };
+    let Some(res) = res else { return };
     let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| {
         let info = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build();
         // SAFETY: the side queue is used by this worker thread only.
@@ -935,7 +939,7 @@ fn inline_hold(
         // SAFETY: as below; the loader belongs to this device, and the side queue's family is the
         // network's own (its graph is recorded for it too).
         Some(loader) => unsafe {
-            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, arm, seen, &mut submit)
+            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, arm, seen, job.point.hold, &mut submit)
         },
         None => unsafe {
             crate::preupscale::run_hold(device, instance, physical_device, res, &target, mode, dump, 0, &mut submit)
@@ -1471,7 +1475,9 @@ impl NeuralForgeDeviceInfo {
         let mut jobs = inline.jobs_for(cbs, family);
         if let Some(tracking) = &self.preupscale {
             for job in &mut jobs {
-                job.jitter = tracking.jitter_px_of(job.cb);
+                // The camera jitter is the render frame's. DLSS's output, which the hold after it works on, is not
+                // jittered: its jitter is zero (known, so the edit cache keeps its interval there).
+                job.jitter = if job.point.hold.stage == crate::preupscale::placement::Stage::Upscaled { Some([0.0, 0.0]) } else { tracking.jitter_px_of(job.cb) };
             }
         }
         jobs
@@ -1499,7 +1505,7 @@ impl NeuralForgeDeviceInfo {
         use crate::preupscale::{Mode, Which};
         let scan = tracking.scan(cbs)?;
         // DLSS's buffer carries the hold inside it (`crate::preupscale::inline`): nothing to split.
-        if self.inline.as_ref().is_some_and(|i| cbs.get(scan.batch).and_then(|b| b.get(scan.index)).is_some_and(|cb| i.owns(*cb))) {
+        if self.inline.as_ref().is_some_and(|i| cbs.get(scan.batch).and_then(|b| b.get(scan.index)).is_some_and(|cb| i.owns_before(*cb))) {
             return None;
         }
         let mode = crate::preupscale::mode();
@@ -1513,6 +1519,9 @@ impl NeuralForgeDeviceInfo {
         // DLSS is running on this device (held or not): the post path stays off for
         // `preupscale::HAND_BACK` after this once the device has held.
         session.saw_dlss();
+        // No pass runs before the upscaler (`preupscale::placement`: they run after DLSS or at present): the
+        // frame goes to DLSS untouched.
+        let at = tracking.split_hold((inputs.colour.1.width, inputs.colour.1.height))?;
         if !presenting_steadily() {
             return None;
         }
@@ -1589,7 +1598,7 @@ impl NeuralForgeDeviceInfo {
             }
         };
         // SAFETY: the SHM mapping is never unmapped once open.
-        if !unsafe { session.ensure(&self.device, instance, self.physical_device, queue_family, colour.width, colour.height, shm, *external_memory_host) } {
+        if !unsafe { session.ensure(&self.device, instance, self.physical_device, queue_family, colour.width, colour.height, shm, *external_memory_host, crate::preupscale::placement::Stage::Before) } {
             if mode == Mode::Model {
                 session.note(shm, &crate::preupscale::HoldResult::local("the hold's resources could not be built"), std::time::Duration::ZERO, extent);
             }
@@ -1660,7 +1669,7 @@ impl NeuralForgeDeviceInfo {
             let hold = match loader {
                 // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
                 Some(loader) => unsafe {
-                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, arm, seen, &mut layer_submit)
+                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, arm, seen, at, &mut layer_submit)
                 },
                 None => unsafe {
                     crate::preupscale::run_hold(&self.device, instance, self.physical_device, res, &target, mode, dump, scan.evaluation, &mut layer_submit)
@@ -2470,30 +2479,37 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // SAFETY: `p_extras` is the application's own launch-parameter list, valid for this call.
             let params = unsafe { crate::preupscale::launch_params(launch_info.p_extras, launch_info.extra_count) };
             let (before, after) = t.launch_with_after(command_buffer, launch_info.function, params);
-            // The hold right after DLSS's output kernel (`preupscale::after_dlss`): the launch goes to the
-            // next layer first, then the hold is recorded behind it.
-            if let (Some(point), Some(inline), Some(next)) = (
-                after.filter(|_| crate::preupscale::mode().holds_inline()),
-                self.inline.as_ref(),
-                self.probe_next.as_ref().and_then(|n| n.cmd_cu_launch_kernel_nvx),
-            ) {
-                // SAFETY: the next layer's own `vkCmdCuLaunchKernelNVX`, with the application's arguments.
-                unsafe { next(command_buffer, launch_info) };
+            let inline = self.inline.as_ref().filter(|_| crate::preupscale::mode().holds_inline());
+            if let (Some(point), Some(inline)) = (before, inline) {
+                // DLSS's buffer renders its own input before this launch: the hold goes here, inside
+                // it (`crate::preupscale::inline`), when the mode holds at all.
                 let identification = point.identification;
                 if inline.record(command_buffer, point) {
                     t.inline_recorded(identification);
-                    crate::preupscale::note_after_dlss();
                 }
-                return LayerResult::Handled(());
             }
-            if let Some(point) = before {
-                // DLSS's buffer renders its own input before this launch: the hold goes here, inside
-                // it (`crate::preupscale::inline`), when the mode holds at all.
-                if let Some(inline) = self.inline.as_ref().filter(|_| crate::preupscale::mode().holds_inline()) {
-                    let identification = point.identification;
-                    if inline.record(command_buffer, point) {
-                        t.inline_recorded(identification);
+            // The hold right after DLSS's output kernel (`preupscale::placement`, the passes placed after
+            // DLSS): the launch goes to the next layer first, then the hold is recorded behind it.
+            if let Some(point) = after {
+                match (inline, self.probe_next.as_ref().and_then(|n| n.cmd_cu_launch_kernel_nvx)) {
+                    (Some(inline), Some(next)) => {
+                        // SAFETY: the next layer's own `vkCmdCuLaunchKernelNVX`, with the application's arguments.
+                        unsafe { next(command_buffer, launch_info) };
+                        // Switched off (F11): nothing is recorded, and that is no miss.
+                        if inline.model_switched_off() {
+                            return LayerResult::Handled(());
+                        }
+                        let identification = point.identification;
+                        if inline.record(command_buffer, point) {
+                            t.inline_recorded(identification);
+                            t.after_recorded();
+                            crate::preupscale::note_after_dlss();
+                        } else {
+                            t.after_missed();
+                        }
+                        return LayerResult::Handled(());
                     }
+                    _ => t.after_missed(),
                 }
             }
         }
@@ -3018,9 +3034,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         crate::log!(
                             "[preupscale] {}",
                             if suppressed {
-                                "the model runs before the upscaler; the post-upscaler compose is off while frames are held"
+                                "the model runs in the game's frame (before the upscaler or after DLSS); the post-upscaler compose is off while frames are held"
                             } else {
-                                "no DLSS submit in the last 30 s (DLSS off, DLAA, or never held); the post-upscaler compose runs as before"
+                                "the post-upscaler compose runs: no DLSS submit held in the last 30 s (DLSS off, DLAA, or never held), or every pass is placed at present"
                             }
                         );
                         crate::logging::flush();
@@ -3059,6 +3075,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     if preupscale.res.as_ref().is_some_and(crate::preupscale::Resources::pending) {
                         let mut gpu = None;
                         let drained = preupscale.res.as_mut().is_some_and(|r| r.wait_idle(&self.device, &mut gpu));
+                        // (The hold after DLSS's output never leaves work pending: its worker waits for it.)
                         preupscale.note_writeback_gpu(gpu);
                         if !drained {
                             break;

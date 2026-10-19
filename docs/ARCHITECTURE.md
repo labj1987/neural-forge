@@ -102,7 +102,15 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   its `overrides` has `pass_override::SCALE`; NATIVE_BACKEND.md, "Model resolution before the upscaler"), and the colour of the
   edit (v21 too: `edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`,
   `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`, the reload counter for `config.ini`'s `edit_lut` file,
-  and `pass_colour[10]`, each pass's own three scales; NATIVE_BACKEND.md, "The colour of the edit").
+  and `pass_colour[10]`, each pass's own three scales; NATIVE_BACKEND.md, "The colour of the edit"), then
+  where the model runs and the HUD at present (v21 too, appended at 2280): `placement` (2280,
+  `enums::placement`: 0 auto, 1 before, 2 upscaled, 3 present), `pass_placement[10]` (2284, each pass's own,
+  used where its `overrides` has `pass_override::PLACEMENT`, 1024), `hud_detect` (2324, default 1),
+  `hud_region_count` (2328) and `hud_region[8]` (2332, 24 bytes each: f32 bits of x, y, w, h in 0-1 of the
+  frame, `mode` (`enums::hud_mode`: 0 keep, 1 soften), f32 bits of the soften strength); the header ends at
+  2524. `config.ini` holds the regions as text (`set_hud_regions=x,y,w,h[,keep|soften[,strength]];...`,
+  `persist::HUD_REGIONS`), the one setting that is not a number. NATIVE_BACKEND.md, "Where the model runs"
+  and "The HUD at present".
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
   transfer mode, white point fields, `working_scale`, compare and debug views, `reversible_mode`,
   `apply_model`, `hold_frame`, `ghost_guard` (v4), colour trust and ratio smoothing (v5).
@@ -169,7 +177,7 @@ be private.
 | 18 | `capture_request` carries a request id; `capture_next_id`, `capture_cancel` and the capture result (state, reason, counts, paths) appended | 3.4.0 |
 | 19 | `passes` and `pass[10]` (each pass's overrides of the Model tab's values: `overrides` bits and their values) appended | 3.6.0 |
 | 20 | `network` (which extracted network the layer runs) and the control mask's rules (`mask_sky`, `mask_sky_margin`, `mask_dark*`, `mask_motion*`) appended | 3.7.0 |
-| 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512) | 3.8.0 |
+| 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended; then the colour of the edit (`edit_saturation`, `edit_contrast`, `edit_detail`, `edit_gamut_guard`, `edit_dither`, `edit_lut_strength`, `edit_lut_adapt`, `edit_lut_seq`) and `pass_colour[10]` (override bits `EDIT_SATURATION` 128, `EDIT_CONTRAST` 256, `EDIT_DETAIL` 512); then `placement`, `pass_placement[10]` (override bit `PLACEMENT` 1024), `hud_detect`, `hud_region_count` and `hud_region[8]` | 3.8.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.
@@ -247,8 +255,10 @@ one precondition:
 - **DLSS Ray Reconstruction must not be running** (PRE_UPSCALER_DESIGN.md, "DLSS Ray
   Reconstruction"). Its input is the noisy ray-traced frame. While one of its kernels (`rr2_*`, `cuda_dldn_engine_swin_*`, `cuda_dldn_engine_hkpn_*`)
   launched within the last 64 launch-bearing submits, nothing is identified; a buffer launching
-  one is never the hold point or evidence, whatever its shape; and the post path runs the model
-  after the upscaler at once. Logged on each change: `DLSS Ray Reconstruction runs (...)` and
+  one is never the hold point or evidence, whatever its shape. The model then runs right after
+  DLSS's output kernel (the hold after DLSS, NATIVE_BACKEND.md, "Where the model runs") where DLSS's
+  output is learnt and the placement allows it, else the post path runs it after the upscaler at
+  once. Logged on each change: `DLSS Ray Reconstruction runs (...)` and
   `DLSS Ray Reconstruction stopped`. Super Resolution needs no kernel name (Crimson Desert's is
   `rrlite_*`, GTA V's `hiluma_engine_input*`).
 
@@ -292,7 +302,9 @@ one precondition:
   1500 bytes, for the first 16 changes of the set per device).
 - While any device of the process holds, the post-upscaler compose stays off on every device
   (`preupscale::post_off_by_any_device`), so a game whose DLSS runs on a device without the
-  swapchain does not get the model twice.
+  swapchain does not get the model twice; unless every pass is placed at present
+  (`preupscale::post_serves`: the `present` placement, or Ray Reconstruction without a hold after
+  DLSS), when the holds stand down and the post path serves.
 
 The submit on which the inputs are (re)identified is not held: their layouts are not known yet.
 The next one is.

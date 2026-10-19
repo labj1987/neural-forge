@@ -785,6 +785,8 @@ impl ShmClient {
         // A fresh mapping holds the defaults: the saved settings (config.ini's `set_*`) go on it here,
         // since no other process (the GUI may not be running) does it before the game's first frame.
         if let Some(hdr) = self.header() {
+            // Where the network runs is read at record time, outside the hold's state.
+            crate::preupscale::placement::watch(hdr);
             if neural_forge_protocol::persist::apply_saved(hdr) {
                 crate::log!("[shm] applied the saved settings from {}", neural_forge_protocol::persist::config_file());
             }

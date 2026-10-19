@@ -16,7 +16,11 @@ pub fn usage() {
         "usage: neural-forge-cli shmctl <status|set|toggle|capture|dump-cache|reset>\n\n\
          \x20 status              print every setting and live status field (only looks:\n\
          \x20                     it creates and changes nothing)\n\
-         \x20 set <name> <value>  set one setting (float fields take a decimal value)\n\
+         \x20 set <name> <value>  set one setting (float fields take a decimal value;\n\
+         \x20                     placement and pass<N>_placement take auto, before,\n\
+         \x20                     upscaled or present; hud_regions takes\n\
+         \x20                     \"x,y,w,h[,keep|soften[,strength]];...\" in 0-1 of the\n\
+         \x20                     frame, or \"\" for none)\n\
          \x20 toggle <name>       flip an on/off (0/1) setting\n\
          \x20 capture [--frames N] [--view V]\n\
          \x20                     save the next presented frame (or the next N, at most\n\
@@ -55,6 +59,35 @@ fn store(header: &ShmHeader, name: &str, bits: u32) -> bool {
 }
 
 fn cmd_set(header: &ShmHeader, name: &str, value: &str) -> bool {
+    if name == neural_forge_protocol::persist::HUD_REGIONS {
+        return match neural_forge_protocol::HudRegion::parse_list(value) {
+            Ok(regions) => {
+                header.set_hud_regions(&regions);
+                println!("{name}={}", neural_forge_protocol::HudRegion::list_text(&header.hud_settings().regions));
+                true
+            }
+            Err(e) => {
+                eprintln!("shmctl set: {name}: {e}");
+                false
+            }
+        };
+    }
+    // A placement by name (`enums::placement`).
+    let named;
+    let value = if name == "placement" || (name.starts_with("pass") && name.ends_with("_placement")) {
+        match neural_forge_protocol::enums::placement::parse(value) {
+            Some(v) => {
+                named = v.to_string();
+                named.as_str()
+            }
+            None => {
+                eprintln!("shmctl set: {name} takes one of {}, got {value:?}", neural_forge_protocol::enums::placement::NAMES.join(", "));
+                return false;
+            }
+        }
+    } else {
+        value
+    };
     let Some((is_float, _)) = resolve(header, name) else {
         eprintln!("shmctl set: unknown setting {name:?}");
         return false;
@@ -374,6 +407,24 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_takes_placements_by_name_and_hud_regions_as_text() {
+        let header = ShmHeader::default();
+        header.init_defaults();
+        assert!(cmd_set(&header, "placement", "upscaled"));
+        assert_eq!(header.placement.load(Ordering::Relaxed), neural_forge_protocol::enums::placement::UPSCALED);
+        assert!(cmd_set(&header, "pass2_placement", "present"));
+        assert_eq!(header.pass_placement[1].load(Ordering::Relaxed), neural_forge_protocol::enums::placement::PRESENT);
+        assert!(cmd_set(&header, "placement", "0"));
+        assert!(!cmd_set(&header, "placement", "sideways"));
+        assert!(cmd_set(&header, "hud_regions", "0.1,0.8,0.3,0.2;0.7,0,0.3,0.1,soften,0.4"));
+        assert_eq!(header.hud_settings().regions.len(), 2);
+        assert!(!cmd_set(&header, "hud_regions", "0.1,0.8"));
+        assert_eq!(header.hud_settings().regions.len(), 2, "a list that does not parse changes nothing");
+        assert!(cmd_set(&header, "hud_regions", ""));
+        assert!(header.hud_settings().regions.is_empty());
+    }
 
     #[test]
     fn resolve_finds_a_persisted_setting() {

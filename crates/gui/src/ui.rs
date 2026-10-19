@@ -441,6 +441,8 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         0.05,
         set_feedback,
     ));
+    let (placement, set_placement) = bind_u32(&shm, Some("placement"), |h| &h.placement);
+    model_group.add(&placement_row(placement, set_placement));
     let (scale, set_scale) = bind_float(&shm, Some("preupscale_scale"), |h| &h.preupscale_scale_bits);
     model_group.add(&scale_row(
         "Model resolution",
@@ -714,6 +716,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let model_page = adw::PreferencesPage::new();
     model_page.add(&model_group);
     model_page.add(&build_colour_group(&shm, &toasts));
+    model_page.add(&build_hud_group(&shm));
     view_stack.add_titled_with_icon(&model_page, Some("model"), "Model", "applications-graphics-symbolic");
 
     // Model resolution and model-every-Nth-frame apply after the upscaler only: shown while a game runs
@@ -999,6 +1002,169 @@ fn build_colour_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mappi
     group
 }
 
+/// The placements' names in the menus (`enums::placement`, by value) and what each does.
+const PLACEMENTS: [(&str, &str); 4] = [
+    ("Auto", "Before the upscaler; after DLSS while Ray Reconstruction runs; on the finished frame where neither works"),
+    ("Before the upscaler", "On DLSS's input at the render size, fastest (with Ray Reconstruction: on the finished frame)"),
+    ("After DLSS", "On DLSS's output at the output size, before the game's HUD; where the game allows it, else as Auto"),
+    ("Finished frame", "On the presented frame with the HUD; the HUD settings below keep the edit off it"),
+];
+
+/// [`PLACEMENTS`]' names alone (the per-pass dialog's menu).
+const PLACEMENT_NAMES: [&str; 4] = [PLACEMENTS[0].0, PLACEMENTS[1].0, PLACEMENTS[2].0, PLACEMENTS[3].0];
+
+/// The Placement menu: where the model runs in the frame. Its subtitle says what the choice does.
+fn placement_row(selected: u32, setter: impl Fn(u32) + 'static) -> adw::ComboRow {
+    let names: Vec<&str> = PLACEMENTS.iter().map(|&(n, _)| n).collect();
+    let row = combo_row("Placement", &names, selected, setter);
+    let describe = |row: &adw::ComboRow| row.set_subtitle(PLACEMENTS.get(row.selected() as usize).map_or("", |&(_, d)| d));
+    describe(&row);
+    row.connect_selected_notify(describe);
+    row
+}
+
+/// The HUD on the finished frame (the Placement "Finished frame", or where the model runs there anyway): the
+/// detection and the user's regions, a list of rectangles in percent of the frame.
+fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>) -> adw::PreferencesGroup {
+    use neural_forge_protocol::{enums::hud_mode, HudRegion, MAX_HUD_REGIONS};
+    use std::rc::Rc;
+    let group = adw::PreferencesGroup::new();
+    group.set_title("HUD on the finished frame");
+    group.set_description(Some(
+        "Only where the model runs on the presented frame, HUD included. Before the upscaler and after DLSS the HUD is not drawn yet",
+    ));
+    let (v, set) = bind_bool(shm, Some("hud_detect"), |h| &h.hud_detect);
+    group.add(&switch_row("Find the HUD", "Keep the edit off what stays still and sharp while the picture moves (text, icons, the minimap)", v, set));
+    let list = gtk4::ListBox::new();
+    list.set_selection_mode(gtk4::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    let add = gtk4::Button::with_label("Add region");
+    add.set_halign(gtk4::Align::Start);
+    add.set_margin_top(6);
+    let holder = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
+    holder.append(&list);
+    holder.append(&add);
+    let regions_row = adw::ActionRow::new();
+    regions_row.set_title("HUD regions");
+    regions_row.set_subtitle("Rectangles in percent of the frame (left, top, width, height): Keep has no edit inside, Soften scales it by the strength");
+    group.add(&regions_row);
+    group.add(&holder);
+    // Writes the regions to the header as one unit and saves them (`set_hud_regions` in config.ini).
+    let write = {
+        let shm = std::sync::Arc::clone(shm);
+        Rc::new(move |regions: &[HudRegion]| {
+            shm.header().set_hud_regions(regions);
+            crate::shm::persist_settings_later(&shm, &[neural_forge_protocol::persist::HUD_REGIONS]);
+        })
+    };
+    // The list's rows, rebuilt from the header (after an add or a removal, and when something else changed it).
+    type Rebuild = Rc<dyn Fn()>;
+    let rebuild: Rc<std::cell::RefCell<Option<Rebuild>>> = Rc::new(std::cell::RefCell::new(None));
+    let shown: Rc<std::cell::RefCell<Vec<HudRegion>>> = Rc::new(std::cell::RefCell::new(Vec::new()));
+    {
+        let (shm, list, write, rebuild_ref, shown, add) = (std::sync::Arc::clone(shm), list.clone(), Rc::clone(&write), Rc::clone(&rebuild), Rc::clone(&shown), add.clone());
+        let f: Rebuild = Rc::new(move || {
+            while let Some(child) = list.first_child() {
+                list.remove(&child);
+            }
+            let regions = shm.header().hud_settings().regions;
+            *shown.borrow_mut() = regions.clone();
+            add.set_sensitive(regions.len() < MAX_HUD_REGIONS);
+            for (k, r) in regions.iter().enumerate() {
+                let row = adw::ActionRow::new();
+                row.set_title(&format!("Region {}", k + 1));
+                let edit = {
+                    let (shm, write, shown) = (std::sync::Arc::clone(&shm), Rc::clone(&write), Rc::clone(&shown));
+                    Rc::new(move |change: &dyn Fn(&mut HudRegion)| {
+                        if refreshing() {
+                            return;
+                        }
+                        let mut regions = shm.header().hud_settings().regions;
+                        if let Some(r) = regions.get_mut(k) {
+                            change(r);
+                        }
+                        write(&regions);
+                        *shown.borrow_mut() = shm.header().hud_settings().regions;
+                    })
+                };
+                let spin = |value: f32, tip: &str, set: fn(&mut HudRegion, f32)| {
+                    let b = gtk4::SpinButton::with_range(0.0, 100.0, 0.5);
+                    b.set_digits(1);
+                    b.set_value(f64::from(value) * 100.0);
+                    b.set_valign(gtk4::Align::Center);
+                    b.set_tooltip_text(Some(tip));
+                    let edit = Rc::clone(&edit);
+                    b.connect_value_changed(move |b| {
+                        let v = (b.value() / 100.0) as f32;
+                        edit(&move |r: &mut HudRegion| set(r, v));
+                    });
+                    row.add_suffix(&b);
+                };
+                spin(r.x, "Left, percent of the width", |r, v| r.x = v);
+                spin(r.y, "Top, percent of the height", |r, v| r.y = v);
+                spin(r.w, "Width, percent", |r, v| r.w = v);
+                spin(r.h, "Height, percent", |r, v| r.h = v);
+                let mode = gtk4::DropDown::from_strings(&["Keep", "Soften"]);
+                mode.set_selected(if r.mode == hud_mode::SOFTEN { 1 } else { 0 });
+                mode.set_valign(gtk4::Align::Center);
+                {
+                    let edit = Rc::clone(&edit);
+                    mode.connect_selected_notify(move |m| {
+                        let soften = m.selected() == 1;
+                        edit(&move |r: &mut HudRegion| r.mode = if soften { hud_mode::SOFTEN } else { hud_mode::KEEP });
+                    });
+                }
+                row.add_suffix(&mode);
+                spin(r.strength, "Soften: how much of the edit stays, percent", |r, v| r.strength = v);
+                let remove = gtk4::Button::from_icon_name("list-remove-symbolic");
+                remove.set_valign(gtk4::Align::Center);
+                remove.set_tooltip_text(Some("Remove this region"));
+                {
+                    let (shm, write, rebuild) = (std::sync::Arc::clone(&shm), Rc::clone(&write), Rc::clone(&rebuild_ref));
+                    remove.connect_clicked(move |_| {
+                        let mut regions = shm.header().hud_settings().regions;
+                        if k < regions.len() {
+                            regions.remove(k);
+                        }
+                        write(&regions);
+                        if let Some(f) = rebuild.borrow().clone() {
+                            f();
+                        }
+                    });
+                }
+                row.add_suffix(&remove);
+                list.append(&row);
+            }
+        });
+        *rebuild.borrow_mut() = Some(f);
+    }
+    {
+        let (shm, write, rebuild) = (std::sync::Arc::clone(shm), Rc::clone(&write), Rc::clone(&rebuild));
+        add.connect_clicked(move |_| {
+            let mut regions = shm.header().hud_settings().regions;
+            // A strip along the bottom edge, where many games put their HUD; edited from there.
+            regions.push(HudRegion { x: 0.0, y: 0.88, w: 0.3, h: 0.12, mode: hud_mode::KEEP, strength: HudRegion::DEFAULT_STRENGTH });
+            write(&regions);
+            if let Some(f) = rebuild.borrow().clone() {
+                f();
+            }
+        });
+    }
+    if let Some(f) = rebuild.borrow().clone() {
+        f();
+    }
+    // Follows changes made elsewhere (shmctl, a profile, Reset); not its own edits (`shown` has those).
+    let shm = std::sync::Arc::clone(shm);
+    register_refresher(move || {
+        if shm.header().hud_settings().regions != *shown.borrow() {
+            if let Some(f) = rebuild.borrow().clone() {
+                f();
+            }
+        }
+    });
+    group
+}
+
 /// One field of the per-pass dialog.
 struct PassField {
     title: &'static str,
@@ -1036,6 +1202,7 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
         PassField { title: "Edit saturation", field: "edit_saturation", bit: po::EDIT_SATURATION, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].saturation_bits },
         PassField { title: "Edit contrast", field: "edit_contrast", bit: po::EDIT_CONTRAST, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].contrast_bits },
         PassField { title: "Edit detail", field: "edit_detail", bit: po::EDIT_DETAIL, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass_colour[k].detail_bits },
+        PassField { title: "Placement", field: "placement", bit: po::PLACEMENT, kind: PassFieldKind::Choice(&PLACEMENT_NAMES), get: |h, k| &h.pass_placement[k] },
     ];
     let max = neural_forge_protocol::MAX_PASSES;
 
@@ -1045,7 +1212,8 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     let pick = adw::PreferencesGroup::new();
     pick.set_description(Some(
         "Each pass of the model can override any Model-tab value with its own. A pass that overrides nothing \
-         follows the Model tab. Only the passes the Passes setting runs are used.",
+         follows the Model tab. Only the passes the Passes setting runs are used. Passes run in order: a pass \
+         placed earlier in the frame than the pass before it runs where that one does.",
     ));
     let pass_adj = gtk4::Adjustment::new(1.0, 1.0, max as f64, 1.0, 1.0, 0.0);
     let pass_row = adw::SpinRow::new(Some(&pass_adj), 1.0, 0);

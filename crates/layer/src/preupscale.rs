@@ -103,6 +103,7 @@ pub(crate) mod inline;
 pub(crate) mod native;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native_post;
+pub(crate) mod placement;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod post_flow;
 #[cfg(target_arch = "x86_64")]
@@ -154,13 +155,19 @@ pub(crate) fn native_on(loader: Option<&NativeLoader>) -> bool {
 #[allow(clippy::too_many_arguments, clippy::needless_return)]
 pub(crate) unsafe fn run_native(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut Resources, target: &Target,
-    loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient, arm: Option<cache_dump::Arm>, hold: u64,
+    loader: &NativeLoader, jitter: Option<[f32; 2]>, chain_ok: bool, shm: &ShmClient, arm: Option<cache_dump::Arm>, hold: u64, at: placement::Hold,
     submit: &mut dyn FnMut(Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
     {
         // The Passes setting and each pass's settings (the Model tab's with that pass's overrides).
-        let mut passes = shm.pass_tunings().map_or_else(native::Passes::default, native::Passes::from);
+        let all = shm.pass_tunings().map_or_else(native::Passes::default, native::Passes::from);
+        // This stage's passes ([`placement`]), and the sizes the network is built for: both holds' of the frame,
+        // so that the holds before the upscaler and after DLSS ask for the same build.
+        let Some(mut passes) = native::stage_passes(&all, at) else {
+            return HoldResult { native: true, miss: Some("no pass runs at this hold's stage"), ..Default::default() };
+        };
+        let sizes = native::frame_sizes(&all, at, (target.width, target.height));
         // The control mask's rules (the hold adds what it knows of the depth).
         passes.mask = shm.mask_settings().map_or_else(native::Mask::default, native::Mask::from);
         // The edit cache's interval (its own, not `model_interval`: that is the after-the-upscaler
@@ -174,10 +181,10 @@ pub(crate) unsafe fn run_native(
         let choice = shm.network_choice().unwrap_or(neural_forge_protocol::enums::network::FULL);
         // The colour of the edit's look-up table (read from config.ini's `edit_lut` in the background).
         let lut = colour::current(&passes.colour);
-        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, passes, arm, ask, choice, lut.as_ref(), submit) };
+        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, passes, &sizes, arm, ask, choice, lut.as_ref(), submit) };
     }
     #[cfg(not(target_arch = "x86_64"))]
-    let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, hold, submit);
+    let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, hold, at, submit);
     #[cfg(not(target_arch = "x86_64"))]
     match *loader {}
 }
@@ -1152,39 +1159,20 @@ pub(crate) struct DlssOutput {
 /// Submitted DLSS buffers in a row naming the same output kernel and image before it is taken.
 const OUTPUT_SETTLE: u32 = 8;
 
-/// Where the model runs relative to DLSS's output (`NEURAL_FORGE_AFTER_DLSS`): `rr` (the default) holds
-/// right after DLSS's output kernel while Ray Reconstruction runs, whose input is the noisy frame (the
-/// model sees the denoised, upscaled frame there, before the game's post-processing and HUD, with DLSS's
-/// motion vectors for its history); `always` does so for Super Resolution too (instead of before it);
-/// `off` never (Ray Reconstruction then leaves the model to the after-the-upscaler path, as before 3.8).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum AfterDlss {
-    Off,
-    RayReconstruction,
-    Always,
-}
-
-pub(crate) fn after_dlss() -> AfterDlss {
-    static AT: LazyLock<AfterDlss> = LazyLock::new(|| match neural_forge_protocol::env::var("NEURAL_FORGE_AFTER_DLSS").as_deref() {
-        None | Some("rr") => AfterDlss::RayReconstruction,
-        Some("always") => AfterDlss::Always,
-        Some("off" | "0") => AfterDlss::Off,
-        Some(other) => {
-            crate::log!("[preupscale] NEURAL_FORGE_AFTER_DLSS={other:?} is not one of rr, always, off; rr");
-            AfterDlss::RayReconstruction
-        }
-    });
-    *AT
-}
+/// Holds after DLSS's output that could not be had in a row before the output counts as not learnable
+/// ([`Tracker::after_missed`]).
+const AFTER_MISSES: u32 = 8;
 
 /// Per-device tracking state. Every hook that feeds it only does map operations under the lock.
 #[derive(Default)]
 pub(crate) struct Tracker {
     /// DLSS's output kernel and image, learned from submitted buffers ([`DlssOutput`]).
     dlss_output: Option<DlssOutput>,
-    /// The launch just recorded is DLSS's output kernel naming its output, and the model runs after DLSS
-    /// ([`after_dlss`]): the hold goes right after it (taken by [`TrackerHandle::launch`]).
-    after_at: Option<(vk::CommandBuffer, DlssOutput)>,
+    /// The launch just recorded is DLSS's output kernel naming its output, and passes run after DLSS
+    /// ([`placement`]): the hold goes right after it, for those passes (taken by [`Tracking::launch_with_after`]).
+    after_at: Option<(vk::CommandBuffer, DlssOutput, placement::Plan)>,
+    /// Holds after DLSS's output missed in a row, and for which output ([`Self::after_missed`]).
+    after_misses: (Option<DlssOutput>, u32),
     output_streak: Option<(DlssOutput, u32)>,
     images: HashMap<vk::Image, ImageDesc>,
     views: HashMap<vk::ImageView, vk::Image>,
@@ -1516,6 +1504,8 @@ pub(crate) struct InlinePoint {
     pub depth_input: Option<Aux>,
     pub identification: u64,
     pub hazard: Hazard,
+    /// The stage this hold runs at and which passes ([`placement::Hold`]).
+    pub hold: placement::Hold,
 }
 
 impl InlinePoint {
@@ -1792,13 +1782,10 @@ impl Tracker {
             }
         }
         if let Some(o) = self.dlss_output.filter(|o| o.function == function && named.contains(&o.image)) {
-            let wanted = match after_dlss() {
-                AfterDlss::Off => false,
-                AfterDlss::RayReconstruction => o.rr || self.rr_running(),
-                AfterDlss::Always => true,
-            };
-            if wanted {
-                self.after_at = Some((command_buffer, o));
+            let frame = self.frame();
+            let plan = placement::current(placement::Frame { rr: o.rr || frame.rr, ..frame });
+            if plan.has(placement::Stage::Upscaled) {
+                self.after_at = Some((command_buffer, o, plan));
             }
         }
         let refs = self.launch.entry(command_buffer).or_default();
@@ -2080,7 +2067,7 @@ impl Tracker {
                 && layout.is_some_and(|l| depth_copy_layout(d.format, l));
             Aux { image, format: d.format, layout, readable }
         });
-        Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, mvec_extent, depth_input, identification: self.generation, hazard })
+        Some(InlinePoint { colour, desc, layout, exposure_input, mvec_input, mvec_extent, depth_input, identification: self.generation, hazard, hold: placement::Hold::ALL_BEFORE })
     }
 
     /// A hold inside DLSS's buffer was recorded at a point of identification `identification`.
@@ -2093,14 +2080,61 @@ impl Tracker {
         self.inline_at.take()
     }
 
-    /// The hold right after DLSS's output kernel just recorded into `cb` ([`after_dlss`]): on DLSS's output
+    /// What this device's frames offer the placements ([`placement::Frame`]): Ray Reconstruction running, and
+    /// DLSS's output learnt. The hook before the upscaler is taken as there: where DLSS's input is not
+    /// identified nothing is held anyway.
+    pub(crate) fn frame(&self) -> placement::Frame {
+        let refused = self.after_misses.0.is_some() && self.after_misses.0 == self.dlss_output && self.after_misses.1 >= AFTER_MISSES;
+        placement::Frame { rr: self.rr_running(), output: self.dlss_output.is_some() && !refused, hook: true }
+    }
+
+    /// DLSS's output size, once its output is learnt.
+    fn output_extent(&self) -> (u32, u32) {
+        self.dlss_output.and_then(|o| self.images.get(&o.image)).map_or((0, 0), |d| (d.width, d.height))
+    }
+
+    /// The hold right after DLSS's output kernel just recorded into `cb` ([`placement`]): on DLSS's output
     /// image (RGBA16F or R11G11B10, transferable, in a layout known here), with DLSS's motion vectors of
     /// the same buffer at the render size (resampled up to the output's; [`InlinePoint::mvec_scale`] is
     /// then output over render pixels) and no depth copy (the depth is at the render size), the exposure
     /// measured from the frame.
     pub(crate) fn after_point(&mut self) -> Option<InlinePoint> {
-        let (cb, o) = self.after_at.take()?;
+        let (cb, o, plan) = self.after_at.take()?;
+        let point = self.after_point_at(cb, o, &plan);
+        if point.is_none() {
+            self.after_missed();
+        }
+        point
+    }
+
+    /// A hold after DLSS's output could not be had (the point, or recording it): after [`AFTER_MISSES`] in a
+    /// row its output counts as not learnable ([`Self::frame`]), so its passes go where `auto` would, for as
+    /// long as DLSS keeps that output (logged once).
+    pub(crate) fn after_missed(&mut self) {
+        let Some(o) = self.dlss_output else { return };
+        match &mut self.after_misses {
+            (seen, n) if *seen == Some(o) => *n += 1,
+            m => *m = (Some(o), 1),
+        }
+        if self.after_misses.1 == AFTER_MISSES {
+            crate::log!(
+                "[placement] no hold after DLSS's output {} could be had in {AFTER_MISSES} tries in a row (its format, usage or layout, or the buffer it is recorded in); the passes placed there run where auto runs them",
+                hex(o.image)
+            );
+            crate::logging::flush();
+        }
+    }
+
+    /// A hold after DLSS's output was recorded: the count of misses starts over.
+    pub(crate) fn after_recorded(&mut self) {
+        if self.after_misses.1 < AFTER_MISSES {
+            self.after_misses = (None, 0);
+        }
+    }
+
+    fn after_point_at(&self, cb: vk::CommandBuffer, o: DlssOutput, plan: &placement::Plan) -> Option<InlinePoint> {
         let desc = *self.images.get(&o.image)?;
+        let render = self.images.get(&o.input).map_or((0, 0), |d| (d.width, d.height));
         let copyable = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
         if !OUTPUT_FORMATS.contains(&desc.format) || !desc.plain || !desc.usage.contains(copyable) {
             return None;
@@ -2139,6 +2173,7 @@ impl Tracker {
             // Its own identification: the output image's handle with the top bit set (never an input's).
             identification: o.image.as_raw() | (1 << 63),
             hazard: Hazard::NotSplittable,
+            hold: placement::Hold::of(plan, placement::Stage::Upscaled, render, (desc.width, desc.height)),
         })
     }
 
@@ -3130,6 +3165,24 @@ impl Tracking {
 
     /// The camera jitter (x, y, render pixels) `cb`'s DLSS input launch was given, if read: for the
     /// hold inside DLSS's buffer, whose job is made at the submit.
+    /// A hold after DLSS's output was recorded ([`Tracker::after_recorded`]).
+    pub(crate) fn after_recorded(&self) {
+        self.lock().after_recorded();
+    }
+
+    /// A hold after DLSS's output could not be recorded ([`Tracker::after_missed`]).
+    pub(crate) fn after_missed(&self) {
+        self.lock().after_missed();
+    }
+
+    /// The split hold's plan ([`placement`]): `None` when no pass runs before the upscaler (the frame goes
+    /// to DLSS untouched), else the hold for the passes that do, with DLSS's render size `render`.
+    pub(crate) fn split_hold(&self, render: (u32, u32)) -> Option<placement::Hold> {
+        let t = self.lock();
+        let plan = placement::current(t.frame());
+        plan.has(placement::Stage::Before).then(|| placement::Hold::of(&plan, placement::Stage::Before, render, t.output_extent()))
+    }
+
     pub(crate) fn jitter_px_of(&self, cb: vk::CommandBuffer) -> Option<[f32; 2]> {
         let v = self.lock().launch.get(&cb).and_then(|r| r.jitter)?;
         Some([f32::from_bits(v as u32), f32::from_bits((v >> 32) as u32)])
@@ -3183,7 +3236,13 @@ impl Tracking {
 
     fn before_point(t: &mut Tracker) -> Option<InlinePoint> {
         let (cb, colour) = t.take_inline_at()?;
-        let point = t.inline_point(cb, colour);
+        // No pass runs before the upscaler (they run after DLSS or at present): no hold here.
+        let plan = placement::current(t.frame());
+        if !plan.has(placement::Stage::Before) {
+            return None;
+        }
+        let output = t.output_extent();
+        let point = t.inline_point(cb, colour).map(|p| InlinePoint { hold: placement::Hold::of(&plan, placement::Stage::Before, (p.desc.width, p.desc.height), output), ..p });
         if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) {
             let own = t.pending.get(&cb).is_some_and(|p| p.iter().any(|s| s.image == colour)) || t.attached.get(&cb).is_some_and(|a| a.iter().any(|(i, _)| *i == colour));
             if !own && !t.committed.contains_key(&colour) {
@@ -5199,7 +5258,12 @@ fn median(values: &[f32]) -> f32 {
 /// the same lock).
 #[derive(Default)]
 pub(crate) struct Session {
+    /// The resources of the holds before the upscaler (at DLSS's input size).
     pub(crate) res: Option<Resources>,
+    /// The resources of the hold after DLSS's output (at the output size, [`placement::Stage::Upscaled`]): its
+    /// own network pass, histories, scene-cut detector and control mask, beside the holds before the upscaler
+    /// in the same frame.
+    pub(crate) res_after: Option<Resources>,
     stats: Stats,
     last_hold: Option<Instant>,
     /// The last hold ran the native backend (for `native_running`).
@@ -5372,7 +5436,7 @@ impl Session {
     /// ([`post_off`]).
     pub(crate) fn suppresses_post(&self) -> bool {
         let now = Instant::now();
-        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, now) && !rr_needs_post(now)
+        mode() == Mode::Model && post_off(self.engaged, self.last_dlss, now) && !post_serves(now)
     }
 
     /// How many launch-bearing submits with DLSS's inputs identified reached the hold point
@@ -5460,9 +5524,12 @@ impl Session {
     /// use them), so the next hold builds new ones and the after-the-upscaler path is not kept waiting
     /// on them. On a lost device they stay, and nothing holds there again.
     pub(crate) fn recover_unfenced(&mut self, device: &ash::Device) {
-        if self.res.as_ref().is_some_and(|r| r.unfenced) && !crate::device_lost(device.handle()) {
+        for res in [&mut self.res, &mut self.res_after] {
+            if !res.as_ref().is_some_and(|r| r.unfenced) || crate::device_lost(device.handle()) {
+                continue;
+            }
             crate::log!("[preupscale] hold resources without a fence for their last work are left behind (leaked) and built again");
-            if let Some(old) = self.res.take() {
+            if let Some(old) = res.take() {
                 std::mem::forget(old);
             }
             // What they went to the queue with may still read slot 0, which the after-the-upscaler
@@ -5481,37 +5548,71 @@ impl Session {
     /// Waits for the layer's own pending work (bounded). `true` when none is left.
     pub(crate) fn drain(&mut self, device: &ash::Device) -> bool {
         let mut gpu = None;
-        self.res.as_mut().is_none_or(|r| r.wait_idle(device, &mut gpu))
+        let before = self.res.as_mut().is_none_or(|r| r.wait_idle(device, &mut gpu));
+        let after = self.res_after.as_mut().is_none_or(|r| r.wait_idle(device, &mut gpu));
+        before && after
+    }
+
+    /// The resources of the holds at `stage`: [`Self::res`] before the upscaler, [`Self::res_after`] after
+    /// DLSS's output.
+    fn res_slot(&mut self, stage: placement::Stage) -> &mut Option<Resources> {
+        match stage {
+            placement::Stage::Upscaled => &mut self.res_after,
+            _ => &mut self.res,
+        }
+    }
+
+    /// Whether any of the holds' resources exist.
+    pub(crate) fn has_res(&self) -> bool {
+        self.res.is_some() || self.res_after.is_some()
     }
 
     /// # Safety
     /// The device must be idle (teardown).
     pub(crate) unsafe fn destroy(&mut self, device: &ash::Device) {
-        if let Some(res) = self.res.take() {
+        for res in [self.res.take(), self.res_after.take()].into_iter().flatten() {
             // SAFETY: forwarded.
             unsafe { res.destroy(device) };
         }
     }
 
-    /// Makes sure `res` is built for this extent and queue family, draining and rebuilding the old
-    /// one only when nothing of it is pending. `false` when there is nothing usable.
+    /// Makes sure the resources of the holds at `stage` ([`Self::res_slot`]) are built for this extent and queue
+    /// family, draining and rebuilding the old ones only when nothing of them is pending. `false` when there is
+    /// nothing usable.
     ///
     /// # Safety
     /// As [`Resources::build`].
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn ensure(
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
-        width: u32, height: u32, shm: &ShmClient, import: bool,
+        width: u32, height: u32, shm: &ShmClient, import: bool, stage: placement::Stage,
     ) -> bool {
         self.recover_unfenced(device);
+        // Taken out while it is looked at (the cache dump's state is the session's).
+        let mut slot = self.res_slot(stage).take();
+        // SAFETY: forwarded.
+        let ok = unsafe { self.ensure_in(&mut slot, device, instance, physical_device, queue_family, width, height, shm, import) };
+        *self.res_slot(stage) = slot;
+        ok
+    }
+
+    /// [`Self::ensure`] on one stage's resources, `res`.
+    ///
+    /// # Safety
+    /// As [`Resources::build`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn ensure_in(
+        &mut self, res: &mut Option<Resources>, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
+        width: u32, height: u32, shm: &ShmClient, import: bool,
+    ) -> bool {
         // A staged set serves either way; an imported one only where imports are wanted.
-        if self.res.as_ref().is_some_and(|r| r.matches(queue_family, width, height) && (import || !r.imported())) {
+        if res.as_ref().is_some_and(|r| r.matches(queue_family, width, height) && (import || !r.imported())) {
             return true;
         }
-        if let Some(mut old) = self.res.take() {
+        if let Some(mut old) = res.take() {
             let mut gpu = None;
             if !old.wait_idle(device, &mut gpu) {
-                self.res = Some(old);
+                *res = Some(old);
                 return false;
             }
             if old.cache_pending() {
@@ -5521,8 +5622,8 @@ impl Session {
             unsafe { old.destroy(device) };
         }
         // SAFETY: forwarded.
-        self.res = unsafe { Resources::build(device, instance, physical_device, queue_family, width, height, shm, import) };
-        match &self.res {
+        *res = unsafe { Resources::build(device, instance, physical_device, queue_family, width, height, shm, import) };
+        match res {
             Some(r) => {
                 let (pw, ph) = padded(width, height);
                 crate::log!(
@@ -5817,7 +5918,7 @@ impl Session {
     /// went idle). What still holds the loader (the hold's resources) is dropped with it.
     pub(crate) fn close_native(&mut self) {
         #[cfg(target_arch = "x86_64")]
-        if let Some(res) = self.res.as_mut() {
+        for res in [self.res.as_mut(), self.res_after.as_mut()].into_iter().flatten() {
             res.pre_loader = None;
         }
         drop(self.native.take());
@@ -5911,25 +6012,34 @@ static NATIVE_POST_OFF_UNTIL: Mutex<Option<Instant>> = Mutex::new(None);
 /// own [`Session::suppresses_post`]; it matters when DLSS runs on another device than the swapchain
 /// (only ever set in model mode).
 pub(crate) fn post_off_by_any_device(now: Instant) -> bool {
-    (lock(&POST_OFF_UNTIL).values().any(|&until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !rr_needs_post(now)
+    (lock(&POST_OFF_UNTIL).values().any(|&until| now < until) || lock(&NATIVE_POST_OFF_UNTIL).is_some_and(|until| now < until)) && !post_serves(now)
 }
 
 /// When a device of the process last saw DLSS Ray Reconstruction running ([`Tracker::rr_running`]).
 static RAY_RECONSTRUCTION_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// When a hold was last recorded right after DLSS's output kernel ([`after_dlss`]).
+/// When a hold was last recorded right after DLSS's output kernel ([`placement`]).
 static AFTER_DLSS_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
-/// A hold was recorded after DLSS's output kernel: the model runs there, so Ray Reconstruction does not
-/// hand it to the after-the-upscaler path ([`rr_needs_post`]).
+/// A hold was recorded after DLSS's output kernel: passes run there, so the after-the-upscaler path does not
+/// take them ([`post_serves`]).
 pub(crate) fn note_after_dlss() {
     *lock(&AFTER_DLSS_AT) = Some(Instant::now());
 }
 
-/// Ray Reconstruction runs and the model does not run after DLSS's output: the after-the-upscaler path
-/// takes it.
-pub(crate) fn rr_needs_post(now: Instant) -> bool {
-    ray_reconstruction_running(now) && !lock(&AFTER_DLSS_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK)
+/// Whether the after-the-upscaler path serves the frames while a device holds them ([`placement`]): every
+/// pass of the plan runs at present. The plan here takes the hold after DLSS as available only while such
+/// holds are being recorded (within [`RAY_RECONSTRUCTION_HAND_BACK`]), so a game whose hold after DLSS
+/// cannot be recorded keeps the post path, as Ray Reconstruction did before the placements.
+pub(crate) fn post_serves(now: Instant) -> bool {
+    post_serves_for(placement::settings(), ray_reconstruction_running(now), lock(&AFTER_DLSS_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK))
+}
+
+/// [`post_serves`] for the passes' `settings` (count, placements), Ray Reconstruction running (`rr`) and holds
+/// after DLSS recorded lately (`after`).
+fn post_serves_for((count, settings): (usize, [u32; neural_forge_protocol::MAX_PASSES]), rr: bool, after: bool) -> bool {
+    // Not logged here: the recording side ([`Tracker::frame`]) logs the plan the holds follow.
+    placement::Plan::of(count, &settings, placement::Frame { rr, output: after, hook: true }).all_present()
 }
 
 /// How long after Ray Reconstruction's last launch-bearing submit the post path keeps running in its
@@ -7059,6 +7169,7 @@ mod tests {
             depth_input: None,
             identification: 1,
             hazard: Hazard::MemoryBarrier,
+            hold: placement::Hold::ALL_BEFORE,
         };
         assert_eq!(point((1708, 964)).mvec_scale(), [1.0, 1.0]);
         assert_eq!(point((2560, 1440)).mvec_scale(), [1708.0 / 2560.0, 964.0 / 1440.0]);
@@ -8557,6 +8668,61 @@ mod tests {
         t
     }
 
+    /// The post path serves a held game's frames only where every pass runs at present: `present`; `auto` and
+    /// `before` while Ray Reconstruction runs and no hold after DLSS is being recorded (3.7.0's hand-off);
+    /// `upscaled` only when, without its hold, it would fall back to the post path too.
+    #[test]
+    fn the_post_path_serves_only_frames_whose_passes_all_run_at_present() {
+        use neural_forge_protocol::enums::placement::*;
+        let one = |p: u32| (1, [p; neural_forge_protocol::MAX_PASSES]);
+        // (setting, rr, after recorded) -> serves
+        for (setting, rr, after, serves) in [
+            (AUTO, false, false, false),
+            (AUTO, true, false, true),
+            (AUTO, true, true, false),
+            (BEFORE, false, false, false),
+            (BEFORE, true, true, true),
+            (UPSCALED, false, false, false),
+            (UPSCALED, false, true, false),
+            (UPSCALED, true, false, true),
+            (UPSCALED, true, true, false),
+            (PRESENT, false, false, true),
+            (PRESENT, true, true, true),
+        ] {
+            assert_eq!(post_serves_for(one(setting), rr, after), serves, "{} rr {rr} after {after}", NAMES[setting as usize]);
+        }
+        // Pass 2 at present behind pass 1 before the upscaler: it moves into the holds, the post path stays off.
+        let mut s = [BEFORE; neural_forge_protocol::MAX_PASSES];
+        s[1] = PRESENT;
+        assert!(!post_serves_for((2, s), false, false));
+    }
+
+    /// A hold after DLSS's output that cannot be had (its point or its recording) eight times in a row makes
+    /// the output count as not learnable, so the passes placed there go where `auto` runs them; a hold recorded
+    /// before that starts the count over.
+    #[test]
+    fn a_hold_after_dlss_that_keeps_missing_gives_its_passes_back() {
+        let mut t = Tracker::default();
+        assert!(!t.frame().output, "no output learnt");
+        let o = DlssOutput { function: vk::CuFunctionNVX::from_raw(9), image: img(0x400), input: img(0x100), depth: img(0x200), mvec: img(0x300), rr: true };
+        t.dlss_output = Some(o);
+        assert!(t.frame().output);
+        for _ in 0..AFTER_MISSES - 1 {
+            t.after_missed();
+        }
+        t.after_recorded();
+        for _ in 0..AFTER_MISSES - 1 {
+            t.after_missed();
+        }
+        assert!(t.frame().output, "a recorded hold started the count over");
+        t.after_missed();
+        assert!(!t.frame().output, "{AFTER_MISSES} misses in a row");
+        t.after_recorded();
+        assert!(!t.frame().output, "for as long as DLSS keeps that output");
+        t.dlss_output = Some(DlssOutput { image: img(0x410), ..o });
+        assert!(t.frame().output, "another output is tried again");
+    }
+
     /// DLSS Ray Reconstruction (Crimson Desert with it on): its first encoder names the colour input,
     /// depth and motion vectors (SR's whole shape) and its guide buffers. Nothing is identified and no
     /// buffer is held, the line says why once, and the post path is handed the model at once. Without
@@ -8838,11 +9004,11 @@ mod tests {
         let shm = scratch_shm("unfenced");
         let mut session = Session::default();
         // SAFETY: a fresh device; nothing of the resources is ever submitted.
-        assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false) });
+        assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false, placement::Stage::Before) });
         session.res.as_mut().unwrap().unfenced = true;
         assert!(session.res.as_ref().unwrap().pending());
         // SAFETY: as above.
-        assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false) }, "built again");
+        assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false, placement::Stage::Before) }, "built again");
         assert!(!session.res.as_ref().unwrap().pending(), "fresh resources");
         // SAFETY: nothing submitted.
         unsafe { session.destroy(d) };
@@ -9272,6 +9438,7 @@ mod tests {
                 depth_input: None,
                 identification: 1,
                 hazard: Hazard::MemoryBarrier,
+                hold: placement::Hold::ALL_BEFORE,
             };
             assert!(inline.record(cb, point));
             d.end_command_buffer(cb).unwrap();

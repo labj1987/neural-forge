@@ -20,6 +20,10 @@
 //!   was copied, so the copy back changes nothing. The GPU never waits longer than the hold's own
 //!   bounds.
 //!
+//! The hold right after DLSS's output kernel (the passes placed after DLSS, [`super::placement`]) is recorded
+//! the same way, behind that launch, in its own slot: a buffer can carry both, and their jobs run one after
+//! the other in the order the GPU reaches them.
+//!
 //! A buffer the split can take (GTA V's) gets nothing recorded: [`super::Tracker::inline_point`]
 //! only answers where the split would be refused. Nor does a secondary command buffer (only submitted
 //! primaries become jobs, so its hold would never be released), one from a pool of another queue
@@ -106,7 +110,9 @@ pub(crate) struct Job {
 #[derive(Default)]
 struct Slots {
     slots: Vec<Slot>,
-    by_cb: HashMap<vk::CommandBuffer, usize>,
+    /// The slots each buffer holds, in the order its holds were recorded (the GPU reaches them in that order):
+    /// one before the upscaler and one after DLSS's output at most ([`super::placement`]).
+    by_cb: HashMap<vk::CommandBuffer, Vec<usize>>,
     simultaneous: HashSet<vk::CommandBuffer>,
     /// The pool each of the device's command buffers was allocated from: resetting or destroying a
     /// pool ends every one of its buffers' pending state, so their slots are free again.
@@ -269,14 +275,22 @@ impl Inline {
         }
     }
 
-    /// Whether `cb` carries a hold (the split path leaves it alone).
+    /// Whether `cb` carries a hold.
+    #[cfg(test)]
     pub(crate) fn owns(&self, cb: vk::CommandBuffer) -> bool {
         lock(&self.slots).by_cb.contains_key(&cb)
     }
 
+    /// Whether `cb` carries a hold before the upscaler (the split path then leaves it alone; one carrying only
+    /// the hold after DLSS's output is still split in front of).
+    pub(crate) fn owns_before(&self, cb: vk::CommandBuffer) -> bool {
+        let s = lock(&self.slots);
+        s.by_cb.get(&cb).is_some_and(|slots| slots.iter().any(|&i| s.slots[i].point.is_some_and(|p| p.hold.stage == super::placement::Stage::Before)))
+    }
+
     /// Whether the model is switched off (F11, the GUI, `shmctl set enabled 0`), as far as known: before
     /// the device's state opened the shared memory nothing is known, and the hold is recorded.
-    fn model_switched_off(&self) -> bool {
+    pub(crate) fn model_switched_off(&self) -> bool {
         let header = self.switch.load(Ordering::Acquire);
         // SAFETY: a header [`watch_switch`] stored: mapped for the life of the process.
         !header.is_null() && unsafe { !((*header).neural_enabled() && (*header).apply_model.load(Ordering::Relaxed) != 0) }
@@ -312,7 +326,9 @@ impl Inline {
                 return false;
             }
         }
-        if s.by_cb.contains_key(&cb) {
+        // One hold per stage in a buffer: a second launch at the same point (re-recorded launches, a second
+        // output kernel) adds none.
+        if s.by_cb.get(&cb).is_some_and(|slots| slots.iter().any(|&i| s.slots[i].point.is_some_and(|p| p.hold.stage == point.hold.stage))) {
             return false;
         }
         let extent = (point.desc.width, point.desc.height);
@@ -361,7 +377,9 @@ impl Inline {
             }
         };
         if let Some(old) = s.slots[index].owner.take() {
-            s.by_cb.remove(&old);
+            if let Some(slots) = s.by_cb.get_mut(&old) {
+                slots.retain(|&i| i != index);
+            }
         }
         if s.slots[index].extent != extent {
             // SAFETY: the slot is not owned by any buffer that could still be pending (its buffer was
@@ -421,10 +439,14 @@ impl Inline {
         slot.owner = Some(cb);
         slot.recorded = Some(now);
         slot.submits = 0;
-        s.by_cb.insert(cb, index);
+        s.by_cb.entry(cb).or_default().push(index);
         drop(s);
         self.say_once(format!(
-            "holding inside DLSS's command buffer, right before its first launch that reads the colour input ({:?} in {:?}{}; why not the split: {:?}; motion vectors {})",
+            "holding inside DLSS's command buffer, {} ({:?} in {:?}{}; why not the split: {:?}; motion vectors {})",
+            match point.hold.stage {
+                super::placement::Stage::Upscaled => format!("right after its output kernel, on its {}x{} output (passes {}-{})", extent.0, extent.1, point.hold.upscaled.0 + 1, point.hold.upscaled.1),
+                _ => "right before its first launch that reads the colour input".to_string(),
+            },
             point.desc.format,
             point.layout,
             if convert { ", blitted to and from RGBA16F" } else { "" },
@@ -445,24 +467,27 @@ impl Inline {
         let mut s = lock(&self.slots);
         let mut jobs = Vec::new();
         for cb in cbs {
-            let Some(&i) = s.by_cb.get(&cb) else { continue };
-            let slot = &mut s.slots[i];
-            slot.submits += 1;
-            if let Some(point) = slot.point {
-                // A queue the layer never saw (`vkGetDeviceQueue*`) counts as another family: the
-                // worker then only releases.
-                jobs.push(Job {
-                    image: slot.image,
-                    exposure: point.exposure_input,
-                    point,
-                    family: family.unwrap_or(u32::MAX),
-                    side_family: self.side_family,
-                    cb,
-                    jitter: None,
-                    depth: slot.depth_copied.map(|f| (slot.depth, f)),
-                    captured: slot.captured,
-                    release: slot.release,
-                });
+            let Some(held) = s.by_cb.get(&cb).cloned() else { continue };
+            // In the order recorded: the worker runs them one after another, as the GPU reaches them.
+            for i in held {
+                let slot = &mut s.slots[i];
+                slot.submits += 1;
+                if let Some(point) = slot.point {
+                    // A queue the layer never saw (`vkGetDeviceQueue*`) counts as another family: the
+                    // worker then only releases.
+                    jobs.push(Job {
+                        image: slot.image,
+                        exposure: point.exposure_input,
+                        point,
+                        family: family.unwrap_or(u32::MAX),
+                        side_family: self.side_family,
+                        cb,
+                        jitter: None,
+                        depth: slot.depth_copied.map(|f| (slot.depth, f)),
+                        captured: slot.captured,
+                        release: slot.release,
+                    });
+                }
             }
         }
         jobs
@@ -686,7 +711,7 @@ impl Inline {
 }
 
 fn release(s: &mut Slots, cb: vk::CommandBuffer) {
-    if let Some(i) = s.by_cb.remove(&cb) {
+    for i in s.by_cb.remove(&cb).unwrap_or_default() {
         let slot = &mut s.slots[i];
         slot.owner = None;
         slot.point = None;
@@ -971,6 +996,7 @@ mod tests {
             depth_input: None,
             identification: 0,
             hazard: Hazard::MemoryBarrier,
+            hold: crate::preupscale::placement::Hold::ALL_BEFORE,
         };
         let cb = |raw: u64| <vk::CommandBuffer as vk::Handle>::from_raw(raw);
         let pool_of = |raw: u64| <vk::CommandPool as vk::Handle>::from_raw(raw);
@@ -1031,6 +1057,7 @@ mod tests {
             depth_input: None,
             identification: 0,
             hazard: Hazard::MemoryBarrier,
+            hold: crate::preupscale::placement::Hold::ALL_BEFORE,
         };
         // SAFETY: test-only setup on a live device; every handle is destroyed at the end. The buffers
         // are never submitted, so the null colour input is never read.
@@ -1153,6 +1180,7 @@ mod tests {
                 depth_input: None,
                 identification: 0,
                 hazard: Hazard::MemoryBarrier,
+                hold: crate::preupscale::placement::Hold::ALL_BEFORE,
             };
             assert!(inline.record(cb, point));
             assert!(inline.owns(cb));
@@ -1181,7 +1209,7 @@ mod tests {
                 let expected = [0x3c00u16, 0x3800, 0x3400, 0x3c00]; // 1.0, 0.5, 0.25, 1.0 as f16
                 assert!(texels.as_chunks::<4>().0.iter().all(|t| *t == expected), "the colour input changed across a hold that wrote nothing");
                 let slots = inline.slots.lock().unwrap();
-                let slot = &slots.slots[slots.by_cb[&cb]];
+                let slot = &slots.slots[slots.by_cb[&cb][0]];
                 assert_eq!(device.get_event_status(slot.captured), Ok(false), "captured reset by the buffer");
                 assert_eq!(device.get_event_status(slot.release), Ok(false), "release reset by the buffer");
                 drop(slots);
@@ -1356,6 +1384,7 @@ mod mvec_tests {
                 depth_input: None,
                 identification: 0,
                 hazard: Hazard::MemoryBarrier,
+                hold: crate::preupscale::placement::Hold::ALL_BEFORE,
             };
             assert!(inline.record(cb, point));
             device.end_command_buffer(cb).unwrap();
@@ -1486,6 +1515,7 @@ mod convert_tests {
                         depth_input: None,
                         identification: 0,
                         hazard: Hazard::NotSplittable,
+                        hold: crate::preupscale::placement::Hold::ALL_BEFORE,
                     };
                     assert!(inline.record(cb, point));
                 }

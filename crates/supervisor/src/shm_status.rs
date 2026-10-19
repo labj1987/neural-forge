@@ -98,6 +98,8 @@ pub fn status_text(header: &ShmHeader) -> String {
             line(format_args!("{name}={bits}"));
         }
     }
+    // The one setting that is text.
+    line(format_args!("{}={}", neural_forge_protocol::persist::HUD_REGIONS, neural_forge_protocol::HudRegion::list_text(&header.hud_settings().regions)));
     s
 }
 
@@ -146,7 +148,8 @@ mod tests {
         assert!(lines.contains(&"intensity=1"), "{text}");
         assert!(lines.contains(&"skin_structure=-1"), "{text}");
         let settings_at = lines.iter().position(|l| l.starts_with("# settings")).expect("a settings section");
-        assert_eq!(lines.len() - settings_at - 1, header.persisted_settings().len());
+        assert_eq!(lines.len() - settings_at - 1, header.persisted_settings().len() + 1, "and hud_regions");
+        assert!(lines.contains(&"hud_regions="), "{text}");
         assert!(text.ends_with('\n'));
     }
 }

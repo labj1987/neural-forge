@@ -1812,7 +1812,9 @@ DLSS Ray Reconstruction is the denoiser and upscaler in one: its colour input is
 ray-traced frame, read with guide buffers. Running the model on it would show the model an
 un-denoised frame and write its answer into what Ray Reconstruction denoises: wrong whatever the
 format. So the model never runs before Ray Reconstruction. While it runs, nothing is identified or
-held, and the model runs after the upscaler, on the finished frame.
+held before it; the model runs right after DLSS's output kernel on the denoised, upscaled frame where
+DLSS's output is learnt and the placement allows it, else after the upscaler, on the finished frame
+(NATIVE_BACKEND.md, "Where the model runs").
 
 ### What tells Ray Reconstruction apart (Crimson Desert, 2026-10-09)
 

@@ -1082,6 +1082,163 @@ once).
 Not measured in a game yet: what the controls cost on the RTX 5070 (the low-pass and the steps are two
 full-frame dispatches per pass that has a step) and how they look.
 
+## Where the model runs (3.8.0, 2026-10-19)
+
+The network can run at three stages of a frame (`preupscale::placement`), in the frame's order:
+
+| Stage | Where | Size | Picture |
+|---|---|---|---|
+| Before the upscaler | the hold inside DLSS's command buffer, or the split in front of it (Phase 4b, PRE_UPSCALER_DESIGN.md) | DLSS's input (render) size | the scene in HDR, no HUD |
+| After DLSS | the hold right after DLSS's output kernel, inside DLSS's command buffer | the output size | DLSS's upscaled (and with Ray Reconstruction denoised) frame, before the game's post-processing and HUD |
+| At present | the after-the-upscaler path (2.1), `native_post` | the presented size | the 8-bit proxy of the finished frame, HUD included |
+
+**The setting.** `placement` (Model tab, Placement; `shmctl set placement auto|before|upscaled|present`) picks
+the stage, and a pass can have its own (`pass<N>_placement` with override bit `PLACEMENT`, 1024, the per-pass
+dialog's Placement). Each pass's setting resolves for what the frame offers (`placement::stage_of`): Ray
+Reconstruction running, DLSS's output learnt, and DLSS's input identified (the hook before the upscaler):
+
+| Setting | Super Resolution, output learnt | Super Resolution, no output | Ray Reconstruction, output learnt | Ray Reconstruction, no output | No hook (no DLSS, no NVX) |
+|---|---|---|---|---|---|
+| `auto` (default) | before | before | after DLSS | at present | at present |
+| `before` | before | before | at present | at present | at present |
+| `upscaled` | after DLSS | before (as `auto`, logged) | after DLSS | at present (as `auto`, logged) | at present |
+| `present` | at present | at present | at present | at present | at present |
+
+`auto` is the default and keeps every game where it was: before the upscaler, after DLSS while Ray
+Reconstruction runs (whose input is the noisy frame, never held), at present where neither hold exists.
+`before` with Ray Reconstruction is 3.7.0's behaviour: its frames go to the after-the-upscaler path. DLSS's
+output is learnt when eight submitted DLSS buffers in a row name the same output kernel and image ("DLSS's
+output:" in the log); it counts as not learnable once eight holds after it in a row could not be had (its
+format, usage or layout, a buffer that cannot carry a hold), logged once, for as long as DLSS keeps that
+output, so `upscaled` then runs where `auto` would instead of not at all.
+
+**Per pass.** Passes run in order, and each pass whose placement resolves to a stage runs there
+(`placement::Plan`). Two rules keep the plan sound, each move logged once (`[placement]`):
+
+- A pass never runs at an earlier stage than the pass before it: it moves to that pass's stage (pass 2
+  `before` after pass 1 `upscaled` runs after DLSS).
+- The present stage does not share a frame with the holds: passes at present after held passes move to the
+  last hold's stage (after DLSS where the output is learnt, else before the upscaler). A pass 1 at present
+  takes every pass with it. The two paths cannot run one frame together: the network is built for one set of
+  sizes at a time and the after-the-upscaler path takes it only once no hold has used it for a second
+  (`Loader::claim_post`, `PATH_SWITCH_MS`), and its 8-bit proxy is made after the held frame is presented,
+  so a mixed frame would have the paths take the network from each other every frame.
+
+So a frame runs one contiguous group of passes before the upscaler and the next after DLSS, or every pass
+at present. Each stage's group is a `Passes` of its own (`Passes::stage`): its pass 1 is the frame's first
+pass at that stage, with that pass's settings, model resolution and colour; pass feedback acts within the
+group; the look-up table grades only the stack's last pass. Each hold carries its stage and both groups'
+ranges from the moment it is recorded (`placement::Hold`, in `InlinePoint::hold`; the split hold takes its
+plan at the submit, `Tracking::split_hold`), so the two holds of one buffer always split the passes the
+same way.
+
+**Two holds in one buffer.** A command buffer can carry the hold before the upscaler and the hold after
+DLSS's output (`inline::Slots::by_cb` holds a list): each has its own staging slot and events, the jobs
+are handed to the worker in the order recorded, and the worker runs them one after the other, waiting for
+each hold's work before it releases the buffer, which is the order the GPU reaches them. A buffer carrying
+only the hold after DLSS is still split in front of where the split applies (GTA V), and the split's work
+on the game's queue is done before DLSS's buffer reaches the event the hold after DLSS waits for. The hold
+after DLSS records the next layer's launch first, then the hold behind it. Its jitter is zero: DLSS's output
+is not jittered (the edit cache keeps its interval there).
+
+**Each stage has its own resources** (`Session::res` before the upscaler, `Session::res_after` after
+DLSS): the HDR encode, the native pass with each pass's history, the edit cache, the scene-cut detector and
+the control mask, each at its stage's size, so the two groups never share a history or a cut decision.
+
+**Sizes.** The hold after DLSS's native pass is built at the output size, and the model resolution
+(`preupscale_scale`, `pass<N>_scale`) applies there too, as a scale of the output size. Both holds of a frame
+ask the network for the same set of sizes (`native::frame_sizes`: the group before the upscaler's sizes at
+the render size, then the group after DLSS's at the output size, each once), so neither rebuilds it for the
+other: one build of several sizes (`nf_native_build_sizes`), whose graphs share the weights, kernels and
+split-K scratch and run one after another on one queue. With every pass before the upscaler the set is the
+one size it always was. Each size adds its own activations (about 364 bytes a field texel): at 1440p a pass
+after DLSS at Full is about 1.3 GB, with a group before the upscaler at DLSS Quality another 0.6 GB.
+
+**After DLSS there is no depth at the output size** (`after_point` gives none): the control mask's sky rule
+is dropped there (`Mask::for_frame` drops it without a depth copy), so `mask_sky` keeps no sky after DLSS;
+the dark and motion rules work (the motion vectors are resampled to the output size), the edit cache runs
+without its depth tests, and the scene-cut detector is the stage's own. The stage runs before the game's HUD,
+so it needs no HUD handling.
+
+**The after-the-upscaler path** serves a held game's frames only while every pass of the plan runs at
+present (`post_serves`): `present`, or `auto`/`before`/`upscaled` resolving there (Ray Reconstruction without
+a hold after DLSS recorded within a second, which is 3.7.0's hand-off). Then the holds stand down (no hold is
+recorded or split, the frames go to DLSS untouched) and the post path runs as in any game without DLSS.
+
+Tests on lavapipe: `each_placement_resolves_to_its_stage_for_what_the_frame_offers` (the table above),
+`passes_split_into_contiguous_groups_in_the_frames_order` (the two rules),
+`each_stage_records_only_its_own_passes` (two passes, before and after DLSS: each stage's pass runs alone
+with its own intensity at its own size, and both holds ask for the same two sizes),
+`the_post_path_serves_only_frames_whose_passes_all_run_at_present`,
+`a_hold_after_dlss_that_keeps_missing_gives_its_passes_back`, and the settings' own.
+
+To measure in a game: Crimson Desert with Ray Reconstruction on at `auto` (the hold after DLSS; 118 fps shown
+against 36 for the post path when first measured) and at `upscaled`/`before` split across two passes;
+Super Resolution games at `upscaled` (the network at the output size costs about the output's pixel count
+over the render's more) and at `present`.
+
+## The HUD at present (3.8.0, 2026-10-19)
+
+The presented frame carries the game's HUD, which the network's edit smears (text and icons gain the
+network's texture and lose their edges). Two things keep the edit off it on the after-the-upscaler path
+(`native_post`, `native_post_hud.comp`); the stages before the upscaler and after DLSS run before the HUD is
+drawn and need neither.
+
+**Regions** (`hud_regions` in `config.ini`, `set_hud_regions=x,y,w,h[,keep|soften[,strength]];...` in 0-1 of
+the frame; the Model tab's HUD group; `shmctl set hud_regions "..."`): up to eight rectangles, each `keep` (no
+edit inside) or `soften` (the edit times its strength, 0-1, default 0.5). Outside a rectangle the edit comes
+back linearly over a feather of `height / 360` pixels (4 at 1440 lines, at least 2), so there is no seam.
+The header holds them as numbers (`hud_region_count`, `hud_region[8]`); `config.ini` holds the text, the one
+setting that is not a number (`persist::HUD_REGIONS`).
+
+**Detection** (`hud_detect`, on by default): per pixel, a confidence (0-1) kept from frame to frame. On a
+frame where the scene moves as a whole (at least 30% of the frame's 8-pixel thumbnail cells changed by 4 of
+255 or more since the last frame, measured on the CPU from the proxy the request carries), a pixel whose
+colour changed by 2/255 or less (largest channel) against the previous frame's proxy and whose neighbourhood
+(nine taps two pixels apart) spans 0.15 of luma or more gains 1/16; every other pixel loses 1/4. Above 0.5 a
+pixel is HUD, and the edit is kept off it and fades back over two pixels around it (1, 2/3, 1/3). On a still
+frame nothing is dispatched: every confidence holds, so a still scene (a paused game, a menu) never grows a
+mask, and a HUD found while moving stays found. The previous proxy is the history's own copy while the
+history is on (`NEURAL_FORGE_POST_MOTION`), else the HUD's, copied at the end of each frame.
+
+**Why on by default.** A new confidence starts at 0 for every pixel (the buffer is zeroed on its first
+frame), and nine moving frames in a row are the least that make a pixel HUD, so the first frames after it is
+made detect nothing, and where nothing is detected the frame is exactly what it was without the detection
+(the scale is 1 everywhere and the composite takes its old path; `the_shipped_frame_stays_bit_for_bit` runs
+with it on). Static, sharp, while the scene moves is the HUD's signature; the scene itself moves with the
+camera.
+
+**How it is applied.** Before the passes, phase 0 (the detection, on moving frames), phases 1 and 2 (the
+scale of the edit per pixel: the detection's, feathered by the distance to the nearest confident pixel, and
+each region's, the smallest) write a float a pixel. The
+last pass's composite moves its answer back toward the frame's own proxy by that scale, after the colour of
+the edit and the dither, so the whole stack's edit is scaled and a `keep` pixel is the frame's texel exactly.
+With the history on, the preprocess also rejects the history wherever the scale is below 1 (as the per-pixel
+change rule does), so HUD text that changes never ghosts.
+
+**Cost.** Three dispatches of 8x8 groups over the frame, (2560 / 8) x (1440 / 8) = 57,600 groups each at
+1440p: phase 0 (the detection, only on moving frames) reads nine proxy texels two pixels apart, the previous
+texel and the confidence and writes the confidence; phase 1 (only with the detection on) reads five
+confidences along the row and writes a distance; phase 2 reads five distances down the column and the
+regions and writes the scale. The 5x5 feather in one pass (25 taps) cost five times as much on lavapipe, and
+a shared-memory tile of the taps more still there, so the distance is found in two passes. The buffers are
+4 bytes a pixel each (confidence, distance, scale, and the own previous proxy without the history: 59 MB at
+1440p). Measured on lavapipe (CPU) at 2560x1440, median of seven: phase 0 8.9 ms, phase 1 4.1 ms, phase 2
+7.0 ms (two regions), against 8.8 ms for one pass's composite there; on the RTX 5070 each is a few tens of
+megabytes of memory traffic, about 0.05 to 0.1 ms (an estimate, not measured).
+
+Tests on lavapipe: `hud_regions_keep_the_edit_off_or_scale_it_and_leave_the_rest` (the frame's texel exactly
+inside a keep rectangle, half the edit within a 1/255 step in a soften one at 0.5, the answer without regions
+bit for bit outside the feather, no history under a region), and
+`the_hud_detection_finds_static_text_over_a_moving_scene_and_not_in_a_still_one` (a block of 2-pixel cells over
+a scene that changes everywhere: nothing for nine frames, then no edit on the block and the scene bit for bit as
+without the detection; twenty still frames grow nothing).
+
+To measure in a game: GTA V at `present` (or a game without DLSS) with the HUD on screen while driving and
+while standing: whether the minimap, the weapon wheel and the money text are found while moving and stay
+clean, what a first-person weapon model or a third-person character that stays in place does (it can be found
+as HUD while the camera turns), and what the detection costs on the RTX 5070.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

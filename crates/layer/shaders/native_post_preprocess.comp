@@ -8,8 +8,10 @@
 // previous output at the pixel's previous position, centred as before the upscaler: at the same pixel (mode
 // 1, zero motion) or where the GPU's optical flow says the pixel was (mode 2, with native_preprocess.comp's
 // five-tap Catmull-Rom filter), rejected (the proxy, blend weight 0) where the frame changed there by more
-// than the threshold since the previous frame or the previous position is off screen. The reprojected value
-// and whether it was kept go to the composite (`Reproj`), which blends toward it.
+// than the threshold since the previous frame or the previous position is off screen, and (p.more.z set) where
+// the HUD's scale of the edit is below 1 (docs/NATIVE_BACKEND.md, "The HUD at present": HUD text that changes
+// never ghosts). The reprojected value and whether it was kept go to the composite (`Reproj`), which blends
+// toward it.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 // The pass's input: one packed RGBA8 (or BGRA8) texel per pixel, rows of the valid width (the frame's proxy,
@@ -29,12 +31,14 @@ layout(set = 0, binding = 6, std430) readonly buffer Previous { uint texel[]; } 
 // The optical flow (mode 2): one vector per grid cell (p.frame.w pixels square), rows of ceil(width / grid),
 // two signed 16-bit S10.5 values (x low, y high: pixels x 32) from where the pixel is to where it was.
 layout(set = 0, binding = 7, std430) readonly buffer Flow { uint v[]; } u_flow;
+// The HUD's scale of the edit per pixel (native_post_hud.comp; read only with p.more.z).
+layout(set = 0, binding = 9, std430) readonly buffer Hud { float s[]; } u_hud;
 
 layout(push_constant) uniform Params {
   uvec4 dims;      // field width, field height, valid width, valid height
   uvec4 frame;     // seed, BGRA (1) or RGBA (0), history mode (0 none, 1 zero motion, 2 optical flow), flow grid
   vec4 control;    // style, local tone, local structure, skin structure (< 0: follow structure)
-  vec4 more;       // auto mask (> 0 on), rejection threshold (0-1), unused x2
+  vec4 more;       // auto mask (> 0 on), rejection threshold (0-1), reject under the HUD (> 0 on), unused
 } p;
 
 float roundF16(float value) {
@@ -169,6 +173,7 @@ vec3 previousFrame(vec2 position) {
 // history there).
 vec4 previous(uvec2 xy) {
   vec2 valid = vec2(p.dims.zw);
+  if (p.more.z > 0.0 && u_hud.s[xy.y * p.dims.z + xy.x] < 1.0) return vec4(0.0);
   vec2 position = vec2(xy) + 0.5;
   if (p.frame.z == 2u) position += flowAt(xy);
   if (any(lessThan(position, vec2(0.0))) || any(greaterThanEqual(position, valid))) return vec4(0.0);

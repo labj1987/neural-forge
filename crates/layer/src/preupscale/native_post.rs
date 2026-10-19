@@ -21,6 +21,11 @@
 //! on a cut and the other reset rules, with the seed counting frames since the reset. It never runs the
 //! network while the pre-upscaler path uses it, nor the other way round
 //! ([`super::native::Loader::claim_post`]).
+//!
+//! The presented frame carries the game's HUD (docs/NATIVE_BACKEND.md, "The HUD at present"): the user's
+//! regions (`hud_regions`) and the detection (`hud_detect`, on by default) give each pixel a scale of the edit
+//! (`native_post_hud.comp`, [`Hud`]), which the last pass's composite applies and the preprocess's history
+//! rejection honours.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
@@ -39,6 +44,7 @@ use crate::shm::ShmView;
 const PREPROCESS_SPV: &[u8] = include_bytes!("../../shaders/native_post_preprocess.spv");
 const COMPOSITE_SPV: &[u8] = include_bytes!("../../shaders/native_post_composite.spv");
 const FEEDBACK_SPV: &[u8] = include_bytes!("../../shaders/native_post_feedback.spv");
+const HUD_SPV: &[u8] = include_bytes!("../../shaders/native_post_hud.spv");
 
 /// The model server's smallest frame (`ngx::MIN_FEATURE_DIM`): smaller ones are echoed.
 const MIN_DIM: u32 = 64;
@@ -48,8 +54,9 @@ const MIN_DIM: u32 = 64;
 const SETS: usize = 2 * neural_forge_protocol::MAX_PASSES + 2;
 
 /// The set layout's bindings (the shaders': 0 input, 1 features or head, 2 answer, 3 the pass's history,
-/// 4 the reprojected history, 5 the frame's proxy, 6 the previous frame's, 7 the optical flow).
-const BINDINGS: u32 = 9;
+/// 4 the reprojected history, 5 the frame's proxy, 6 the previous frame's, 7 the optical flow, 8 the look-up
+/// table, 9 the HUD's scale of the edit).
+const BINDINGS: u32 = 10;
 
 #[repr(C)]
 #[derive(Clone, Copy, Default)]
@@ -71,6 +78,8 @@ struct CompositePush {
     colour_flags: [u32; 4],
     lut_scale: [f32; 4],
     lut_offset: [f32; 4],
+    /// The HUD: x 1 applies its scale of the edit (the last pass).
+    hud: [f32; 4],
 }
 
 impl CompositePush {
@@ -220,6 +229,9 @@ struct Gpu {
     feedback: Option<(vk::PipelineLayout, vk::Pipeline)>,
     /// The colour of the edit's look-up table (binding 8 of the composite's sets), the last pass's.
     lut: Option<PostLut>,
+    /// The HUD's pipeline and its one set (`native_post_hud.comp`), built the first time the HUD is wanted
+    /// (`None` inside after a failed build: the frames run without it, logged once).
+    hud: Option<Option<HudPipeline>>,
     command_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -257,6 +269,8 @@ struct Bound {
     flow: bool,
     /// The look-up table's buffer (null: none).
     lut: vk::Buffer,
+    /// The HUD's scale buffer (null: none).
+    hud: vk::Buffer,
 }
 
 /// The optical flow's state on the server's device.
@@ -308,6 +322,9 @@ impl SlotBuffers {
             if let Some(s) = self.scratch {
                 s.destroy(device);
             }
+            if let Some(h) = self.hud {
+                h.destroy(device);
+            }
             if let Some(h) = self.hist {
                 h.previous.destroy(device);
                 h.reproj.destroy(device);
@@ -334,6 +351,8 @@ struct SlotBuffers {
     scratch: Option<OwnBuffer>,
     /// The history's (`zero` and `flow`), built on the first frame with one.
     hist: Option<HistBuffers>,
+    /// The HUD's ([`Hud`]), built on the first frame that wants it.
+    hud: Option<HudBuffers>,
 }
 
 /// One slot's history buffers, for its frame size.
@@ -430,6 +449,7 @@ impl Gpu {
             sets: [vk::DescriptorSet::null(); SETS],
             feedback: None,
             lut: None,
+            hud: None,
             command_pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -467,6 +487,9 @@ impl Gpu {
             }
             if let Some(l) = self.lut.take() {
                 l.buffer.destroy(device);
+            }
+            if let Some(Some(h)) = self.hud.take() {
+                h.destroy(device);
             }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
@@ -572,6 +595,8 @@ fn process(
     // The colour of the edit, and its look-up table (read from config.ini's `edit_lut` in the background).
     let colour = tunings.colour;
     let lut = super::colour::current(&colour);
+    // The HUD's regions and detection (the presented frame carries the game's HUD).
+    let hud = hdr.hud_settings();
     // The claim is released whatever happens after it (a claim held while the network is not built at
     // this size would keep the pre-upscaler path off it for good), except after a frame that did not
     // finish in time: its work may still use the network, so the claim stays until its fence signals
@@ -581,7 +606,7 @@ fn process(
         // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
         let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
             // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
-            unsafe { evaluate(device, instance, physical, import, Some(loader), (view.regions(slot).0, view.regions(slot).1, view.capacity()), gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes, feedback, &colour, lut.as_ref()) }
+            unsafe { evaluate(device, instance, physical, import, Some(loader), (view.regions(slot).0, view.regions(slot).1, view.capacity()), gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes, feedback, &colour, lut.as_ref(), &hud) }
         });
         if gpu.stalled {
             loader.post_stalled(device, gpu.fence);
@@ -674,7 +699,7 @@ unsafe fn upload_lut(device: &ash::Device, instance: &ash::Instance, physical: v
 unsafe fn evaluate(
     device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: Option<&Loader>, regions: (*mut u8, *mut u8, usize), gpu: &mut Gpu, slot: Slot,
     built: &Built, width: u32, height: u32, bgra: bool, passes: &[Conditioning], feedback: f32, colour: &neural_forge_protocol::ColourSettings,
-    lut: Option<&Arc<super::colour::Lut>>,
+    lut: Option<&Arc<super::colour::Lut>>, hud: &neural_forge_protocol::HudSettings,
 ) -> bool {
     let s = slot.index();
     let bytes = u64::from(width) * u64::from(height) * 4;
@@ -701,7 +726,7 @@ unsafe fn evaluate(
                 return false;
             }
         };
-        gpu.slots[s] = Some(SlotBuffers { width, height, proxy, answer, scratch: None, hist: None });
+        gpu.slots[s] = Some(SlotBuffers { width, height, proxy, answer, scratch: None, hist: None, hud: None });
     }
     let more = passes.len() > 1;
     if more && gpu.slots[s].as_ref().is_some_and(|b| b.scratch.is_none()) {
@@ -739,6 +764,36 @@ unsafe fn evaluate(
     if history && !unsafe { ensure_history(device, instance, physical, gpu, s, width, height, passes.len()) } {
         return false;
     }
+    // The HUD (module docs): its buffers, and whether the scene moves as a whole since the last frame (the
+    // detection runs only then; a still frame holds every confidence).
+    // SAFETY: nothing of the slot's is pending.
+    let hud_on = (hud.detect || !hud.regions.is_empty()) && (unsafe { ensure_hud(device, instance, physical, gpu, s, width, height) } || {
+        note_hud_off();
+        false
+    });
+    let hud_moving = match gpu.slots[s].as_mut().and_then(|b| b.hud.as_mut()) {
+        Some(h) if hud_on && hud.detect => {
+            // SAFETY: the proxy region holds the frame's `bytes`, written before the request was posted.
+            let thumb = post_history::thumbnail(unsafe { std::slice::from_raw_parts(proxy_region, bytes as usize) }, width, height);
+            // The previous proxy is the history's while it keeps one, else the HUD's own: a switch has none yet.
+            let moving = h.from_history == history && h.thumb.as_deref().is_some_and(|last| Hud::moving(last, &thumb));
+            h.thumb = Some(thumb);
+            h.from_history = history;
+            let words = Hud::region_words(&hud.regions, width, height);
+            // SAFETY: host-coherent, sized for every region; not in use (contract).
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), h.regions.ptr, words.len() * 16) };
+            moving
+        }
+        Some(h) => {
+            // Without the detection its thumbnails are not kept: when it is switched on, its first frame holds.
+            h.thumb = None;
+            let words = Hud::region_words(&hud.regions, width, height);
+            // SAFETY: as above.
+            unsafe { std::ptr::copy_nonoverlapping(words.as_ptr().cast::<u8>(), h.regions.ptr, words.len() * 16) };
+            false
+        }
+        None => false,
+    };
     // SAFETY: nothing of `gpu`'s is pending (contract).
     unsafe { upload_lut(device, instance, physical, gpu, lut.filter(|_| colour.lut_strength > 0.0)) };
     let lut = gpu.lut.as_ref().filter(|_| colour.lut_strength > 0.0).map(|l| &*l.lut);
@@ -776,7 +831,20 @@ unsafe fn evaluate(
     let f = built.frame;
     let scratch = b.scratch.as_ref().map(|o| o.buffer);
     let flow_buffer = hist.and_then(|h| h.flow.as_ref()).map(|x| x.buffer);
-    let key = Bound { slot: s, width, height, generation: built.generation, scratch: scratch.is_some(), passes: passes.len(), history: hist.map_or(0, |h| h.passes.len()), flow: flow_buffer.is_some(), lut: lut_buffer };
+    let hud_buffers = b.hud.as_ref().filter(|_| hud_on);
+    let hud_buffer = hud_buffers.map_or(vk::Buffer::null(), |h| h.scale.buffer);
+    let key = Bound {
+        slot: s,
+        width,
+        height,
+        generation: built.generation,
+        scratch: scratch.is_some(),
+        passes: passes.len(),
+        history: hist.map_or(0, |h| h.passes.len()),
+        flow: flow_buffer.is_some(),
+        lut: lut_buffer,
+        hud: hud_buffer,
+    };
     if gpu.bound != Some(key) {
         let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
         let proxy_i = info(b.proxy.buffer);
@@ -789,6 +857,8 @@ unsafe fn evaluate(
         let flow_i = or_proxy(flow_buffer);
         // The look-up table, or the proxy as a stand-in until there is one (nothing reads it then).
         let lut_i = or_proxy(Some(lut_buffer).filter(|l| *l != vk::Buffer::null()));
+        // The HUD's scale of the edit, or the proxy as a stand-in (nothing reads it without the HUD).
+        let hud_i = or_proxy(Some(hud_buffer).filter(|h| *h != vk::Buffer::null()));
         let history_i: Vec<[vk::DescriptorBufferInfo; 1]> = (0..passes.len()).map(|k| or_proxy(hist.and_then(|h| h.passes.get(k)).map(|o| o.buffer))).collect();
         let w = |set, n, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
         let mut writes = Vec::new();
@@ -796,8 +866,8 @@ unsafe fn evaluate(
             // Every pass after the first reads the previous pass's answer from the scratch.
             let input = if k == 0 { &proxy_i } else { &scratch_i };
             let (pre, post) = (gpu.sets[2 * k], gpu.sets[2 * k + 1]);
-            writes.extend([w(pre, 0, input), w(pre, 1, &feat_i), w(pre, 3, history_k), w(pre, 4, &reproj_i), w(pre, 5, &proxy_i), w(pre, 6, &previous_i), w(pre, 7, &flow_i)]);
-            writes.extend([w(post, 0, input), w(post, 1, &head_i), w(post, 2, &ans_i), w(post, 3, history_k), w(post, 4, &reproj_i), w(post, 8, &lut_i)]);
+            writes.extend([w(pre, 0, input), w(pre, 1, &feat_i), w(pre, 3, history_k), w(pre, 4, &reproj_i), w(pre, 5, &proxy_i), w(pre, 6, &previous_i), w(pre, 7, &flow_i), w(pre, 9, &hud_i)]);
+            writes.extend([w(post, 0, input), w(post, 1, &head_i), w(post, 2, &ans_i), w(post, 3, history_k), w(post, 4, &reproj_i), w(post, 5, &proxy_i), w(post, 8, &lut_i), w(post, 9, &hud_i)]);
         }
         if scratch.is_some() {
             // Pass feedback: from the frame (pass 2) and from the scratch in place (after), into the scratch.
@@ -818,6 +888,30 @@ unsafe fn evaluate(
         // SAFETY: the buffer was sized for the field; not in use.
         unsafe { std::ptr::copy_nonoverlapping(field.as_ptr().cast::<u8>(), out.ptr, field.len() * 4) };
     }
+    // The HUD's set: this frame's proxy, the previous one (the history's, or the HUD's own), the confidence, the
+    // scale and the regions.
+    let hud_rec = match (hud_buffers, gpu.hud.as_ref().and_then(Option::as_ref)) {
+        (Some(h), Some(pipe)) => {
+            let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
+            let previous = hist.map_or(h.previous.buffer, |x| x.previous.buffer);
+            let infos = [info(b.proxy.buffer), info(previous), info(h.confidence.buffer), info(h.scale.buffer), info(h.regions.buffer), info(h.near.buffer)];
+            let writes: Vec<vk::WriteDescriptorSet> = infos
+                .iter()
+                .enumerate()
+                .map(|(n, i)| vk::WriteDescriptorSet::builder().dst_set(pipe.set).dst_binding(n as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build())
+                .collect();
+            // SAFETY: the set is not in use (every frame waits for its own work); the buffers are live.
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+            let push = HudPush {
+                dims: [width, height, 0, hud.regions.len() as u32],
+                flags: [u32::from(hud.detect), 0, 0, 0],
+                detect: [Hud::STILL, Hud::SHARP, Hud::RISE, Hud::FALL],
+                shape: [Hud::THRESHOLD, 0.0, Hud::region_feather(height), 0.0],
+            };
+            Some((pipe.layout, pipe.pipeline, pipe.set, push, h.fresh, h.confidence.buffer, (hist.is_none() && hud.detect).then_some(h.previous.buffer)))
+        }
+        _ => None,
+    };
     let blend_scale = f.blend_scale;
     let reject = gpu.reject;
     let push = |c: &Conditioning, (has, seed): (bool, u32)| {
@@ -825,7 +919,7 @@ unsafe fn evaluate(
             dims: [f.field_width, f.field_height, width, height],
             frame: [seed, u32::from(bgra), if has { mode.shader_mode() } else { 0 }, if history { grid } else { 0 }],
             control: [c.style as f32, c.local_tone, c.local_structure, c.skin_structure],
-            more: [if c.auto_mask { 1.0 } else { 0.0 }, if history { reject } else { 0.0 }, 0.0, 0.0],
+            more: [if c.auto_mask { 1.0 } else { 0.0 }, if history { reject } else { 0.0 }, if history && hud_rec.is_some() { 1.0 } else { 0.0 }, 0.0],
         };
         let post = CompositePush {
             dims: pre.dims,
@@ -847,6 +941,30 @@ unsafe fn evaluate(
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+            if let Some((layout, pipeline, set, push, fresh, confidence, _)) = hud_rec {
+                // The HUD's scale of the edit, before every pass (the preprocess and the last composite read it).
+                if fresh {
+                    // A new confidence starts at 0 everywhere: nothing is HUD before the detection saw it.
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
+                    device.cmd_fill_buffer(cmd, confidence, 0, vk::WHOLE_SIZE, 0);
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                }
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[set], &[]);
+                let groups = (width.div_ceil(8), height.div_ceil(8));
+                if hud_moving {
+                    device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<HudPush>()));
+                    device.cmd_dispatch(cmd, groups.0, groups.1, 1);
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ), &[], &[]);
+                }
+                // Phase 1 (the detection's rows) with the detection on, then phase 2 (the scale).
+                for phase in if push.flags[0] != 0 { 1..3 } else { 2..3 } {
+                    let at = HudPush { dims: [push.dims[0], push.dims[1], phase, push.dims[3]], ..push };
+                    device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&at).cast::<u8>(), std::mem::size_of::<HudPush>()));
+                    device.cmd_dispatch(cmd, groups.0, groups.1, 1);
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                }
+            }
             if let (Some(session), Some(out)) = (session, flow_buffer) {
                 if flow_frame {
                     // The frame waits for the flow's semaphore at the transfer stage.
@@ -862,7 +980,7 @@ unsafe fn evaluate(
             }
             for (k, c) in passes.iter().enumerate() {
                 let (pre, post) = push(c, decision.passes[k]);
-                let post = post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true));
+                let post = CompositePush { hud: [if hud_rec.is_some() && k + 1 == runs { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0], ..post.with_colour(super::colour::PassColour::of(colour, k, k + 1 == runs, lut, true)) };
                 // Every pass after the first reads the previous one's answer: copied into `scratch`, after the
                 // composite wrote it and before this pass's shaders read it (and the next composite rewrites it).
                 if k > 0 {
@@ -903,6 +1021,12 @@ unsafe fn evaluate(
                 // The frame's proxy is the next frame's previous one, copied once every pass read this one.
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
                 device.cmd_copy_buffer(cmd, b.proxy.buffer, h.previous.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
+                last |= vk::PipelineStageFlags::TRANSFER;
+            }
+            if let Some((.., Some(previous))) = hud_rec {
+                // The HUD's own previous proxy (no history keeps one), for the next frame's detection.
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
+                device.cmd_copy_buffer(cmd, b.proxy.buffer, previous, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
                 last |= vk::PipelineStageFlags::TRANSFER;
             }
             device.cmd_pipeline_barrier(cmd, last, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::HOST_READ), &[], &[]);
@@ -954,6 +1078,12 @@ unsafe fn evaluate(
     if b.answer.staged {
         // SAFETY: both hold `bytes`; the work that wrote the staging buffer completed.
         unsafe { std::ptr::copy_nonoverlapping(b.answer.ptr, answer_region, bytes as usize) };
+    }
+    if hud_rec.is_some() {
+        // The confidence was zeroed by this frame's work, which completed.
+        if let Some(h) = gpu.slots[s].as_mut().and_then(|b| b.hud.as_mut()) {
+            h.fresh = false;
+        }
     }
     true
 }
@@ -1086,6 +1216,200 @@ unsafe fn ensure_history(device: &ash::Device, instance: &ash::Instance, physica
     true
 }
 
+/// The HUD at present (docs/NATIVE_BACKEND.md, "The HUD at present"; `native_post_hud.comp`): the detection's
+/// constants. A pixel counts as still at a largest channel change of [`Hud::STILL`] or less, as sharp where nine
+/// taps two pixels apart span [`Hud::SHARP`] of luma; its confidence rises by [`Hud::RISE`] on a moving frame
+/// where it is both and falls by [`Hud::FALL`] where it is not, and above [`Hud::THRESHOLD`] it is HUD, the edit
+/// kept off it and fading back over the two pixels around it (the shader's two passes of five taps). A frame
+/// moves when at least [`Hud::MOVING_SHARE`] of its thumbnail cells changed by [`Hud::MOVING_LEVEL`] or more.
+pub(crate) struct Hud;
+
+impl Hud {
+    pub(crate) const STILL: f32 = 2.0 / 255.0;
+    pub(crate) const SHARP: f32 = 0.15;
+    pub(crate) const RISE: f32 = 1.0 / 16.0;
+    pub(crate) const FALL: f32 = 1.0 / 4.0;
+    /// Nine moving frames in a row before a pixel is HUD: a new confidence detects nothing for eight.
+    pub(crate) const THRESHOLD: f32 = 0.5;
+    pub(crate) const MOVING_LEVEL: u8 = 4;
+    pub(crate) const MOVING_SHARE: f32 = 0.3;
+
+    /// A region's feather in pixels at an output `height`: 4 at 1440 lines, at least 2.
+    pub(crate) fn region_feather(height: u32) -> f32 {
+        (height as f32 / 360.0).round().max(2.0)
+    }
+
+    /// Whether the scene moves as a whole between the thumbnails `last` and `now` ([`post_history::thumbnail`]):
+    /// enough of its cells changed. Still (or not comparable) holds every confidence.
+    pub(crate) fn moving(last: &[u8], now: &[u8]) -> bool {
+        if last.len() != now.len() || now.is_empty() {
+            return false;
+        }
+        let changed = last.iter().zip(now).filter(|(a, b)| a.abs_diff(**b) >= Self::MOVING_LEVEL).count();
+        changed as f32 >= Self::MOVING_SHARE * now.len() as f32
+    }
+
+    /// The regions as the shader reads them: per region its rectangle in pixels and (mode, strength, 0, 0).
+    fn region_words(regions: &[neural_forge_protocol::HudRegion], width: u32, height: u32) -> Vec<[f32; 4]> {
+        let (w, h) = (width as f32, height as f32);
+        regions.iter().flat_map(|r| [[r.x * w, r.y * h, (r.x + r.w) * w, (r.y + r.h) * h], [r.mode as f32, r.strength, 0.0, 0.0]]).collect()
+    }
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct HudPush {
+    dims: [u32; 4],
+    flags: [u32; 4],
+    detect: [f32; 4],
+    shape: [f32; 4],
+}
+
+/// [`Gpu::hud`]: `native_post_hud.comp`'s layout, pipeline and its one set.
+struct HudPipeline {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+}
+
+impl HudPipeline {
+    /// # Safety
+    /// `device` is live.
+    unsafe fn build(device: &ash::Device) -> Option<Self> {
+        let mut h = Self { set_layout: vk::DescriptorSetLayout::null(), layout: vk::PipelineLayout::null(), pipeline: vk::Pipeline::null(), pool: vk::DescriptorPool::null(), set: vk::DescriptorSet::null() };
+        // SAFETY: valid create infos; on a failure what was made is destroyed (null handles are ignored).
+        let built = unsafe {
+            (|| {
+                let binding = |n: u32| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build();
+                let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..6).map(binding).collect();
+                h.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
+                let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<HudPush>() as u32).build();
+                h.layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&[h.set_layout]).push_constant_ranges(&[push]), None).ok()?;
+                h.pipeline = super::hdr::compute_pipeline(device, h.layout, HUD_SPV)?;
+                let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 6 }];
+                h.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None).ok()?;
+                h.set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(h.pool).set_layouts(&[h.set_layout])).ok()?[0];
+                Some(())
+            })()
+        };
+        match built {
+            Some(()) => Some(h),
+            None => {
+                // SAFETY: nothing of it was used.
+                unsafe { h.destroy(device) };
+                None
+            }
+        }
+    }
+
+    /// # Safety
+    /// Nothing of it is pending.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded (null handles are ignored).
+        unsafe {
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_pool(self.pool, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
+}
+
+/// One slot's HUD buffers, for its frame size.
+struct HudBuffers {
+    /// Per pixel, f32: the detection's confidence (0-1), kept from frame to frame.
+    confidence: OwnBuffer,
+    /// Per pixel, f32: the scale of the edit (1 untouched), written every frame.
+    scale: OwnBuffer,
+    /// Per pixel, f32: the detection's distance along the row to a confident pixel (the shader's phase 1).
+    near: OwnBuffer,
+    /// The previous frame's proxy while the history keeps none (the history's own otherwise), copied at the end
+    /// of each frame.
+    previous: OwnBuffer,
+    /// The regions as the shader reads them ([`Hud::region_words`]).
+    regions: HostBuffer,
+    /// The confidence is undefined until the next frame zeroes it.
+    fresh: bool,
+    /// The last frame's thumbnail ([`Hud::moving`]), and whether its previous proxy was the history's.
+    thumb: Option<Vec<u8>>,
+    from_history: bool,
+}
+
+impl HudBuffers {
+    /// # Safety
+    /// Nothing of it is pending.
+    unsafe fn destroy(self, device: &ash::Device) {
+        // SAFETY: forwarded.
+        unsafe {
+            self.confidence.destroy(device);
+            self.scale.destroy(device);
+            self.near.destroy(device);
+            self.previous.destroy(device);
+            self.regions.destroy(device);
+        }
+    }
+}
+
+/// Builds slot `s`'s HUD buffers for this size (and the pipeline, once) as far as they are missing. `false`
+/// when something could not be made: the frame then runs without the HUD (logged once).
+///
+/// # Safety
+/// Nothing of the slot's is pending.
+unsafe fn ensure_hud(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, gpu: &mut Gpu, s: usize, width: u32, height: u32) -> bool {
+    if gpu.hud.is_none() {
+        // SAFETY: `device` is live.
+        gpu.hud = Some(unsafe { HudPipeline::build(device) });
+    }
+    if !matches!(gpu.hud, Some(Some(_))) {
+        return false;
+    }
+    let Some(b) = gpu.slots[s].as_mut() else { return false };
+    if b.hud.is_some() {
+        return true;
+    }
+    let pixels = u64::from(width) * u64::from(height);
+    let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+    // SAFETY: `device` is live; whatever was made is destroyed again if anything fails.
+    let made = unsafe {
+        (
+            OwnBuffer::new(device, instance, physical, pixels * 4, storage | vk::BufferUsageFlags::TRANSFER_DST),
+            OwnBuffer::new(device, instance, physical, pixels * 4, storage),
+            OwnBuffer::new(device, instance, physical, pixels * 4, storage),
+            OwnBuffer::new(device, instance, physical, pixels * 4, storage | vk::BufferUsageFlags::TRANSFER_DST),
+            super::own_host_buffer_with(device, instance, physical, (neural_forge_protocol::MAX_HUD_REGIONS * 32) as u64, storage),
+        )
+    };
+    match made {
+        (Some(confidence), Some(scale), Some(near), Some(previous), Some(regions)) => {
+            b.hud = Some(HudBuffers { confidence, scale, near, previous, regions, fresh: true, thumb: None, from_history: false });
+            gpu.bound = None;
+            true
+        }
+        (confidence, scale, near, previous, regions) => {
+            // SAFETY: never used.
+            unsafe {
+                for o in [confidence, scale, near, previous].into_iter().flatten() {
+                    o.destroy(device);
+                }
+                if let Some(r) = regions {
+                    r.destroy(device);
+                }
+            }
+            false
+        }
+    }
+}
+
+/// Logs (once per process) that the HUD's buffers or pipeline could not be built.
+fn note_hud_off() {
+    static SAID: AtomicBool = AtomicBool::new(false);
+    if !SAID.swap(true, Ordering::Relaxed) {
+        crate::log!("[native] after the upscaler: the HUD's buffers or pipeline could not be built; frames run without the HUD regions and detection");
+    }
+}
+
 /// Logs (once per process) why `flow` runs as `zero`.
 fn note_flow_off(why: &str) {
     static SAID: AtomicBool = AtomicBool::new(false);
@@ -1157,7 +1481,8 @@ mod tests {
             let (pi, hi, ai, li, si) = (info(proxy.buffer), info(head.buffer), info(answer.buffer), info(lut.buffer), info(history.buffer));
             let w = |n, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(gpu.sets[1]).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
             // No history (frame.z and .w 0): its two bindings point at a buffer nothing reads.
-            device.update_descriptor_sets(&[w(0, &pi), w(1, &hi), w(2, &ai), w(3, &si), w(4, &si), w(8, &li)], &[]);
+            // Nor the frame's proxy and the HUD's scale (no HUD: p.hud.x 0).
+            device.update_descriptor_sets(&[w(0, &pi), w(1, &hi), w(2, &ai), w(3, &si), w(4, &si), w(5, &pi), w(8, &li), w(9, &si)], &[]);
             let fill = |proxy_of: &dyn Fn(u32, u32, u32) -> u8, edit: &dyn Fn(u32, u32, u32) -> f32| {
                 let p: Vec<u8> = (0..H).flat_map(|y| (0..W).flat_map(move |x| [proxy_of(x, y, 0), proxy_of(x, y, 1), proxy_of(x, y, 2), 255])).collect();
                 std::ptr::copy_nonoverlapping(p.as_ptr(), proxy.ptr, p.len());
@@ -1256,6 +1581,8 @@ mod tests {
         built: Built,
         proxy: Vec<u8>,
         answer: Vec<u8>,
+        /// The HUD settings the frames run with (the shipped default: the detection on, no region).
+        hud: neural_forge_protocol::HudSettings,
         /// Keeps the Vulkan library loaded (dropped last).
         _entry: ash::Entry,
     }
@@ -1290,7 +1617,8 @@ mod tests {
                 };
                 let built = Built { width: W, height: H, frame, graph, graph_own: graph, generation: 1, network: neural_forge_protocol::enums::network::FULL };
                 let bytes = (W * H * 4) as usize;
-                Some(Self { device, instance, physical, gpu, features, head, graph_pool, built, proxy: vec![0; bytes], answer: vec![0; bytes], _entry: entry })
+                let hud = neural_forge_protocol::HudSettings { detect: true, regions: Vec::new() };
+                Some(Self { device, instance, physical, gpu, features, head, graph_pool, built, proxy: vec![0; bytes], answer: vec![0; bytes], hud, _entry: entry })
             }
         }
 
@@ -1308,7 +1636,7 @@ mod tests {
             }
             let regions = (self.proxy.as_mut_ptr(), self.answer.as_mut_ptr(), self.proxy.len());
             // SAFETY: the regions live as long as the rig; nothing of the rig's is pending.
-            let ok = unsafe { evaluate(&self.device, &self.instance, self.physical, false, None, regions, &mut self.gpu, Slot::Primary, &self.built, W, H, false, passes, 1.0, &neural_forge_protocol::ColourSettings::DEFAULT, None) };
+            let ok = unsafe { evaluate(&self.device, &self.instance, self.physical, false, None, regions, &mut self.gpu, Slot::Primary, &self.built, W, H, false, passes, 1.0, &neural_forge_protocol::ColourSettings::DEFAULT, None, &self.hud) };
             assert!(ok, "the frame was answered");
             self.answer.as_chunks::<4>().0.iter().map(|&c| u32::from_le_bytes(c)).collect()
         }
@@ -1669,6 +1997,145 @@ mod tests {
         let (flow, unavailable) = run(Motion::Flow);
         assert!(unavailable, "no flow device");
         assert_eq!(flow, run(Motion::Zero).0);
+    }
+
+    /// The HUD settings of a test: the detection and the regions (normalised to the test frame).
+    fn hud(detect: bool, regions: &[(u32, u32, u32, u32, u32, f32)]) -> neural_forge_protocol::HudSettings {
+        let regions = regions
+            .iter()
+            .map(|&(x, y, w, h, mode, strength)| neural_forge_protocol::HudRegion { x: x as f32 / W as f32, y: y as f32 / H as f32, w: w as f32 / W as f32, h: h as f32 / H as f32, mode, strength })
+            .collect();
+        neural_forge_protocol::HudSettings { detect, regions }
+    }
+
+    /// How far pixel (x, y)'s centre lies outside the rectangle (pixels, Chebyshev; 0 inside), as the shader
+    /// measures it.
+    fn outside(x: u32, y: u32, (x0, y0, w, h): (u32, u32, u32, u32)) -> f32 {
+        let (cx, cy) = (x as f32 + 0.5, y as f32 + 0.5);
+        let dx = (x0 as f32 - cx).max(cx - (x0 + w) as f32).max(0.0);
+        let dy = (y0 as f32 - cy).max(cy - (y0 + h) as f32).max(0.0);
+        dx.max(dy)
+    }
+
+    /// HUD regions at present: inside a `keep` rectangle the answer is the frame's own texel exactly (no edit),
+    /// inside a `soften` one the edit is scaled by its strength, and outside the feather the answer is the one
+    /// without regions bit for bit; with history the rejected history leaves no trace of the previous frame's
+    /// edit under the region.
+    #[test]
+    fn hud_regions_keep_the_edit_off_or_scale_it_and_leave_the_rest() {
+        let Some(mut rig) = Rig::new() else { return };
+        let one = [Conditioning::default()];
+        let p = picture(0);
+        rig.write_head(head_pattern(1.0));
+        rig.hud = hud(false, &[]);
+        let plain = rig.frame(&p, &one);
+        let keep = (8, 6, 8, 6);
+        let soften = (26, 12, 8, 8);
+        rig.hud = hud(false, &[(keep.0, keep.1, keep.2, keep.3, neural_forge_protocol::enums::hud_mode::KEEP, 0.0), (soften.0, soften.1, soften.2, soften.3, neural_forge_protocol::enums::hud_mode::SOFTEN, 0.5)]);
+        let a = rig.frame(&p, &one);
+        let feather = Hud::region_feather(H);
+        let (mut edited, mut kept, mut softened) = (0, 0, 0);
+        for y in 0..H {
+            for x in 0..W {
+                let i = (y * W + x) as usize;
+                let (dk, ds) = (outside(x, y, keep), outside(x, y, soften));
+                if dk == 0.0 {
+                    assert_eq!(a[i], p[i], "({x}, {y}) inside the keep region: the frame's texel");
+                    kept += 1;
+                    edited += usize::from(plain[i] != p[i]);
+                } else if ds == 0.0 {
+                    for c in 0..3 {
+                        let (f, e) = (channel(p[i], c), channel(plain[i], c));
+                        let want = f + 0.5 * (e - f);
+                        assert!((channel(a[i], c) - want).abs() <= 1.0 / 255.0, "({x}, {y}) channel {c} softened: {} against {want}", channel(a[i], c));
+                    }
+                    softened += usize::from(plain[i] != p[i]);
+                } else if dk >= feather && ds >= feather {
+                    assert_eq!(a[i], plain[i], "({x}, {y}) outside the feather: unchanged");
+                }
+            }
+        }
+        assert_eq!(kept, 48);
+        assert!(edited > 24 && softened > 32, "the test's edit reaches into both regions ({edited}, {softened})");
+        // With a history the region's pixels never blend toward a history (rejected): the frame after one with
+        // another edit answers there as a first frame does.
+        let Some(mut hist) = Rig::with(Motion::Zero) else { return };
+        hist.hud = rig.hud.clone();
+        hist.write_head(head_pattern(-1.0));
+        hist.frame(&p, &one);
+        hist.write_head(head_pattern(1.0));
+        hist.frame(&p, &one);
+        for (x, y) in [(10, 8), (12, 9)] {
+            let l = hist.lanes(x, y);
+            assert_eq!(l[7..10], l[4..7], "({x}, {y}): no history under the region");
+        }
+        let l = hist.lanes(2, 20);
+        assert_ne!(l[7..10], l[4..7], "a history outside it");
+    }
+
+    /// A 12x6 block of 2-pixel black and white cells (the HUD's text) over `background`.
+    fn with_text(background: &[u32]) -> Vec<u32> {
+        background
+            .iter()
+            .enumerate()
+            .map(|(i, &t)| {
+                let (x, y) = (i as u32 % W, i as u32 / W);
+                if (14..26).contains(&x) && (2..8).contains(&y) {
+                    let on = (x / 2 + y / 2) % 2 == 0;
+                    (if on { 0x00ff_ffff } else { 0 }) | (t & 0xff00_0000)
+                } else {
+                    t
+                }
+            })
+            .collect()
+    }
+
+    /// The HUD detection: a static, sharp block over a scene that changes everywhere is found after nine
+    /// moving frames (none before: a new confidence detects nothing for eight), and from then on gets no edit,
+    /// while the scene is answered bit for bit as without the detection. A fully still sequence (sharp edges
+    /// everywhere, nothing moving) grows no mask.
+    #[test]
+    fn the_hud_detection_finds_static_text_over_a_moving_scene_and_not_in_a_still_one() {
+        let Some(mut rig) = Rig::new() else { return };
+        let Some(mut off) = Rig::new() else { return };
+        let one = [Conditioning::default()];
+        for r in [&mut rig, &mut off] {
+            r.write_head(head_pattern(1.0));
+        }
+        rig.hud = hud(true, &[]);
+        off.hud = hud(false, &[]);
+        // Inside the block, away from its edge (the detection needs sharp taps two pixels apart).
+        let inner: Vec<(u32, u32)> = (16..24).flat_map(|x| (4..6).map(move |y| (x, y))).collect();
+        let far = |x: u32, y: u32| !(11..29).contains(&x) || !(0..11).contains(&y);
+        for k in 0..12u32 {
+            let p = with_text(&picture(k));
+            let a = rig.frame(&p, &one);
+            let b = off.frame(&p, &one);
+            for y in 0..H {
+                for x in 0..W {
+                    if far(x, y) {
+                        assert_eq!(a[(y * W + x) as usize], b[(y * W + x) as usize], "frame {k}: ({x}, {y}) is scene, answered as without the detection");
+                    }
+                }
+            }
+            let held = inner.iter().filter(|&&(x, y)| a[(y * W + x) as usize] == p[(y * W + x) as usize]).count();
+            let edited = inner.iter().filter(|&&(x, y)| b[(y * W + x) as usize] != p[(y * W + x) as usize]).count();
+            if k < 9 {
+                assert_eq!(a, b, "frame {k}: nothing is HUD yet");
+            } else {
+                assert_eq!(held, inner.len(), "frame {k}: the text gets no edit");
+                assert!(edited > inner.len() / 2, "frame {k}: the test's edit reaches the text ({edited})");
+            }
+        }
+        // Still: the same picture over and over.
+        let Some(mut still) = Rig::new() else { return };
+        still.write_head(head_pattern(1.0));
+        still.hud = hud(true, &[]);
+        let p = with_text(&picture(3));
+        let b = off.frame(&p, &one);
+        for k in 0..20 {
+            assert_eq!(still.frame(&p, &one), b, "still frame {k}: no mask grows");
+        }
     }
 
     /// One server answers at a time; once it ends, another can take over.

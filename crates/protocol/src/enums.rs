@@ -144,7 +144,38 @@ pub mod pass_override {
     pub const EDIT_SATURATION: u32 = 128;
     pub const EDIT_CONTRAST: u32 = 256;
     pub const EDIT_DETAIL: u32 = 512;
-    pub const ALL: u32 = 1023;
+    /// The pass's own placement (`pass<N>_placement`, [`super::placement`]) instead of `placement`.
+    pub const PLACEMENT: u32 = 1024;
+    pub const ALL: u32 = 2047;
+}
+
+/// Where the network runs in the frame (`placement`, and a pass's own `pass<N>_placement`):
+/// docs/NATIVE_BACKEND.md, "Where the model runs".
+pub mod placement {
+    /// Before the upscaler; after DLSS while Ray Reconstruction runs; at present where neither hook exists.
+    pub const AUTO: u32 = 0;
+    /// Before the upscaler (Ray Reconstruction's frames: at present).
+    pub const BEFORE: u32 = 1;
+    /// After DLSS's output, before the game's HUD, always.
+    pub const UPSCALED: u32 = 2;
+    /// At present, on the presented frame with its HUD, always.
+    pub const PRESENT: u32 = 3;
+    pub const COUNT: u32 = 4;
+    /// The names `shmctl` and `config.ini` comments use, by value.
+    pub const NAMES: [&str; 4] = ["auto", "before", "upscaled", "present"];
+
+    /// The value `name` names (`NAMES`), or a number below [`COUNT`].
+    pub fn parse(name: &str) -> Option<u32> {
+        NAMES.iter().position(|n| *n == name).map(|i| i as u32).or_else(|| name.parse().ok().filter(|v| *v < COUNT))
+    }
+}
+
+/// How a HUD region (`hud_regions`) treats the edit inside it.
+pub mod hud_mode {
+    /// No edit inside the region (a feathered edge outside it).
+    pub const KEEP: u32 = 0;
+    /// The edit scaled by the region's strength inside it.
+    pub const SOFTEN: u32 = 1;
 }
 
 /// The model resolution presets before the upscaler (`preupscale_scale`, `pass<N>_scale`): the network's

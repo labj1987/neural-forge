@@ -60,7 +60,8 @@ extracted (a DLL without the small one), the other one runs.
 Each network's answer for an input frame is bit-exact with NGX's own
 ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), 0.6 and "The small network").
 
-The model runs in one of two places. The layer picks the place for each game by itself:
+The model runs in one of three places. With the Model tab's **Placement** at **Auto** (the default) the
+layer picks the place for each game by itself:
 
 - **Before the upscaler**, when the game uses DLSS Super Resolution (at Quality, Balanced,
   Performance or DLAA). The layer recognises the frame the game hands to
@@ -70,13 +71,18 @@ The model runs in one of two places. The layer picks the place for each game by 
   jitter for its history, and writes the answer back before DLSS upscales it. DLSS then upscales the
   enhanced frame. The model works on fewer pixels and gets the input it was made for. Games that
   record their frame in DLSS's own command buffer (Crimson Desert) are held inside that buffer.
-  With DLSS Ray Reconstruction on, the model runs after the upscaler instead: Ray Reconstruction's
-  input is the noisy ray-traced frame before its denoising, which is not a frame the model can
-  improve. Switching Ray Reconstruction on or off in a game moves the model within a few frames.
-- **After the upscaler**, for everything else: native resolution, games without DLSS, and
+- **After DLSS**, when the game runs DLSS Ray Reconstruction: Ray Reconstruction's input is the noisy
+  ray-traced frame before its denoising, which is not a frame the model can improve, so the model runs
+  right after DLSS instead, on its denoised, upscaled frame at the output resolution, before the game's
+  post-processing and HUD, with DLSS's motion vectors for its history. Where DLSS's output cannot be
+  held there, the model runs on the finished frame. Switching Ray Reconstruction on or off in a game
+  moves the model within a few frames.
+- **On the finished frame**, for everything else: native resolution, games without DLSS, and
   devices without NVIDIA's `VK_NVX_image_view_handle`. The finished 8-bit
   frame is captured at present, answered by the network and composited back onto the same frame
-  before it is shown. It has no history (no motion vectors there).
+  before it is shown. It has no history by default (no motion vectors there). The frame has the
+  game's HUD in it: the layer finds the HUD and keeps the model's change off it (see
+  [Usage](#usage)).
 
 The game's own **DLSS Frame Generation** works with the model before the upscaler. Generated
 frames are built from enhanced frames, and the model runs once per real frame.
@@ -117,14 +123,14 @@ ran with no missed frames and no GPU fault.
 | Game | Engine, API | DLSS used | Where the model runs |
 |---|---|---|---|
 | GTA V Enhanced | RAGE, DX12 | Super Resolution, Frame Generation 4x | Before the upscaler |
-| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | After the upscaler with Ray Reconstruction on; before it, inside DLSS's buffer, with it off |
+| Crimson Desert | BlackSpace, DX12 | Ray Reconstruction, dynamic Frame Generation | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off |
 | GTA San Andreas - The Definitive Edition | Unreal Engine 4 | Super Resolution | Before the upscaler |
 | God of War (2018) | Santa Monica Studio, DX11 | Super Resolution | Before the upscaler |
 | Marvel's Spider-Man Remastered | Insomniac, DX12 | Super Resolution, Frame Generation | Before the upscaler |
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Before the upscaler |
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | Before the upscaler, inside DLSS's buffer |
 | Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler, inside DLSS's buffer |
-| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction | After the upscaler with Ray Reconstruction on; before it with it off |
+| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction | Before the upscaler with Ray Reconstruction off; with it on, after DLSS where its output can be held, else on the finished frame (not tested at this placement yet) |
 
 Setup notes for these games:
 
@@ -260,7 +266,7 @@ this version re-creates the shared memory.
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution (before the upscaler) and per-pass settings, model every Nth frame (after the upscaler only), the toggle key, and the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table. |
+| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution (before the upscaler) and per-pass settings, model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -319,6 +325,30 @@ changed the picture: its strength (0, off) grows with the size of the change and
 full at**, so a pixel the model left alone keeps its colour. At their defaults the picture is exactly the
 model's.
 
+**Placement** (Model tab) sets where the model runs in the frame: **Auto** (the default; see
+[How it works](#how-it-works)), **Before the upscaler** (with Ray Reconstruction on, the finished frame, as
+before), **After DLSS** (on DLSS's output, before the game's HUD and post-processing, at the output
+resolution, so it costs more than before the upscaler; where a game's DLSS output cannot be held, it runs
+where Auto would) or **Finished frame** (on the presented frame, HUD included; DLSS gets its input
+untouched). Model resolution applies after DLSS too, as a share of the output size. Each pass can have its
+own placement in the per-pass settings, so pass 1 can run before the upscaler and pass 2 after DLSS, each
+with its own settings and history. Passes run in the frame's order: a pass placed earlier than the pass
+before it runs where that one does, and passes on the finished frame after passes held in the game's frame
+run after DLSS instead (the model serves one of the two at a time); the log says when a placement is moved.
+`neural-forge-cli shmctl set placement auto|before|upscaled|present` (and `pass2_placement`, ...) does the
+same from a terminal.
+
+**HUD on the finished frame** (Model tab): where the model runs on the finished frame, the game's HUD is in
+the picture. **Find the HUD** (on) keeps the model's change off what stays still and sharp while the
+picture moves: text, icons, the minimap. It needs a few seconds of movement to find them, and a still
+scene (a menu, a paused game) never adds to what it found. **HUD regions** are up to eight rectangles in
+percent of the frame: **Keep** has no change inside, **Soften** keeps the change's strength (a share) inside;
+the change comes back over a few pixels around each one. With a history after the upscaler, the history is
+not used under the HUD either, so changing HUD text leaves no trail. They are saved as `set_hud_regions` in
+`config.ini` and can be set with `neural-forge-cli shmctl set hud_regions "0,0.88,0.3,0.12;0.7,0,0.3,0.1,soften,0.5"`
+(left, top, width, height in 0-1, then `keep` or `soften` and the strength). Before the upscaler and after
+DLSS the HUD is not drawn yet, so neither setting applies there.
+
 ![Per-pass settings: the pass to edit, and an override switch with its value for intensity, local tone, local structure, skin structure, style and auto mask](screenshots/passes.png)
 
 Settings are live: the GUI and the running layer share them through shared memory.
@@ -357,6 +387,9 @@ takes is withdrawn after 5 seconds.
   for an `Xid` line before blaming Neural Forge.
   [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-09-16) has the diagnosis and the
   workarounds other users report.
+- **Finding the HUD can take a part of the scene for HUD** when it stays in place on screen while the
+  camera moves, such as a first-person weapon or a character the camera follows closely: the model's change
+  is then kept off it too. Switch **Find the HUD** off, or use regions, where that shows.
 - **Not carried over from upstream DLSS5VKLayer:** see
   [docs/UPSTREAM_PARITY.md](docs/UPSTREAM_PARITY.md).
 

@@ -27,6 +27,22 @@ first shipped them; their phase is kept as a subheading.
   `neural-forge-cli shmctl lut FILE` (`none` removes it), and raise its strength. It grades the last pass's
   result where the model changed the picture, more where it changed more ("Look-up table full at" sets how
   much change gets the full strength); a pixel the model left alone keeps its colour.
+- **With DLSS Ray Reconstruction on, the model now runs right after DLSS**, on its denoised, upscaled
+  frame and before the game's HUD, instead of on the finished frame: in Crimson Desert about 118 frames a
+  second shown against 36. Where a game's DLSS output cannot be held there, the model runs on the finished
+  frame as before.
+- **Placement** (Model tab): choose where the model runs. **Auto** (the default) keeps every game where it
+  was; **Before the upscaler**, **After DLSS** (on DLSS's output, before the HUD, at the output resolution)
+  and **Finished frame** (on the presented frame) choose one place. Each pass can have its own placement in
+  the per-pass settings, so one pass can run before the upscaler and the next after DLSS; the log says when a
+  placement cannot be followed and where the pass runs instead. `neural-forge-cli shmctl set placement`
+  takes `auto`, `before`, `upscaled` or `present`.
+- **The HUD on the finished frame** (Model tab): when the model runs on the presented frame, it now finds
+  the game's HUD (text, icons, the minimap: what stays still and sharp while the picture moves) and keeps
+  its change off it, so HUD text is no longer smeared (**Find the HUD**, on by default; it needs a few
+  seconds of movement). **HUD regions** add up to eight rectangles of your own where the change is kept off
+  or softened; `neural-forge-cli shmctl set hud_regions` sets them from a terminal. Nothing changes where
+  no HUD is found.
 
 ## 3.7.0 — 2026-10-19
 

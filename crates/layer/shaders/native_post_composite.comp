@@ -17,6 +17,11 @@
 // offset in (-0.5, 0.5) of the 8-bit step, so a level is the neighbour above or below it, never further.
 // The history is stored before any of this: it stays the network's answer. With no bit set the answer is
 // computed exactly as before.
+//
+// The HUD (docs/NATIVE_BACKEND.md, "The HUD at present"; p.hud.x set on the last pass): where
+// native_post_hud.comp's scale is below 1, the answer is moved back toward the frame's own proxy by it (0: the
+// frame's texel exactly), after every step above, so the whole stack's edit is what is scaled. Where it is 1
+// nothing changes.
 layout(local_size_x = 8, local_size_y = 8) in;
 
 layout(set = 0, binding = 0, std430) readonly buffer Proxy { uint texel[]; } u_proxy;
@@ -27,8 +32,12 @@ layout(set = 0, binding = 2, std430) writeonly buffer Answer { uint texel[]; } u
 layout(set = 0, binding = 3, std430) writeonly buffer History { uvec2 texel[]; } u_history;
 // native_post_preprocess.comp's reprojected history: as History, the second half of .y 1 where it is kept.
 layout(set = 0, binding = 4, std430) readonly buffer Reproj { uvec2 texel[]; } u_reproj;
+// The frame's proxy (the first pass's input; read only with p.hud.x).
+layout(set = 0, binding = 5, std430) readonly buffer Frame { uint texel[]; } u_frame;
 // The look-up table: size^3 RGB entries, red fastest (read only with bit 4).
 layout(set = 0, binding = 8, std430) readonly buffer Lut { vec4 entry[]; } u_lut;
+// The HUD's scale of the edit per pixel (native_post_hud.comp; read only with p.hud.x).
+layout(set = 0, binding = 9, std430) readonly buffer Hud { float s[]; } u_hud;
 
 layout(push_constant) uniform Params {
   uvec4 dims;      // field width, field height, valid width, valid height
@@ -38,6 +47,7 @@ layout(push_constant) uniform Params {
   uvec4 colour_flags; // 1 a step runs, 2 gamut guard, 4 look-up table, 8 detail, 16 dither; table size; unused x2
   vec4 lut_scale;  // per channel (size - 1) / (domain max - min); strength
   vec4 lut_offset; // per channel -domain min x scale; adapt
+  vec4 hud;        // apply the HUD's scale (1, the last pass), unused x3
 } p;
 
 const uint STEP = 1u;
@@ -258,6 +268,14 @@ void main() {
   uint flags = p.colour_flags.x;
   if ((flags & STEP) != 0u) published = colourOf(id, proxy, published);
   if ((flags & DITHER) != 0u) published = published + vec3(bayer(id) / 255.0);
+  if (p.hud.x != 0.0) {
+    float s = u_hud.s[at];
+    if (s < 1.0) {
+      vec4 f = unpackUnorm4x8(u_frame.texel[at]);
+      vec3 frame = bgra ? f.bgr : f.rgb;
+      published = frame + s * (published - frame);
+    }
+  }
   vec3 out3 = bgra ? published.bgr : published;
   u_answer.texel[at] = packUnorm4x8(vec4(out3, texel.a));
 }

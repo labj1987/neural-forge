@@ -73,12 +73,14 @@ pub struct PassTunings {
     pub scales: [f32; crate::MAX_PASSES],
     /// The colour of each pass's edit and the stack's colour controls.
     pub colour: ColourSettings,
+    /// Each pass's placement ([`ShmHeader::placements`]).
+    pub placements: [u32; crate::MAX_PASSES],
 }
 
 impl PassTunings {
     /// One pass with `tuning`, at full size.
     pub fn single(tuning: Tuning) -> Self {
-        Self { count: 1, tunings: [tuning; crate::MAX_PASSES], feedback: 1.0, scales: [1.0; crate::MAX_PASSES], colour: ColourSettings::DEFAULT }
+        Self { count: 1, tunings: [tuning; crate::MAX_PASSES], feedback: 1.0, scales: [1.0; crate::MAX_PASSES], colour: ColourSettings::DEFAULT, placements: [crate::enums::placement::AUTO; crate::MAX_PASSES] }
     }
 
     pub fn passes(&self) -> &[Tuning] {
@@ -549,6 +551,117 @@ pub struct ShmHeader {
     pub edit_lut_seq: AtomicU32,
     /// Each pass's own colour values ([`PassColour`]), used where its `overrides` say so.
     pub pass_colour: [PassColour; crate::MAX_PASSES],
+    /// Where the network runs in the frame ([`crate::enums::placement`]; docs/NATIVE_BACKEND.md, "Where the
+    /// model runs"): `auto` (0, the default) before the upscaler, after DLSS while Ray Reconstruction runs and
+    /// at present where neither hook exists; `before`, `upscaled` (after DLSS's output, before the HUD) and
+    /// `present` (on the presented frame) where the game allows it.
+    pub placement: AtomicU32,
+    /// Each pass's own placement (`pass<N>_placement`), used where its `overrides` has
+    /// [`crate::enums::pass_override::PLACEMENT`]. Default `auto`.
+    pub pass_placement: [AtomicU32; crate::MAX_PASSES],
+    /// 1 (the default): at present, find the HUD (pixels that stay put and sharp while the scene moves) and
+    /// keep the edit off it ([`HudSettings`]).
+    pub hud_detect: AtomicU32,
+    /// How many of [`Self::hud_region`] are in use (0 to [`MAX_HUD_REGIONS`]). With them, `hud_regions` in
+    /// `config.ini` (`x,y,w,h[,keep|soften[,strength]]` separated by `;`); not a numeric setting.
+    pub hud_region_count: AtomicU32,
+    /// The user's HUD regions at present, in the output's 0-1 coordinates ([`HudRegion`]).
+    pub hud_region: [HudRegionWords; MAX_HUD_REGIONS],
+}
+
+/// The most HUD regions (`hud_regions`).
+pub const MAX_HUD_REGIONS: usize = 8;
+
+/// One HUD region as the header holds it ([`HudRegion`]): f32 bits of its left, top, width and height (0-1 of
+/// the output), its mode ([`crate::enums::hud_mode`]) and f32 bits of its soften strength.
+#[repr(C)]
+#[derive(Default)]
+pub struct HudRegionWords {
+    pub x_bits: AtomicU32,
+    pub y_bits: AtomicU32,
+    pub w_bits: AtomicU32,
+    pub h_bits: AtomicU32,
+    pub mode: AtomicU32,
+    pub strength_bits: AtomicU32,
+}
+
+/// A HUD region at present: a rectangle in the output's 0-1 coordinates where the network's edit is kept off
+/// (`keep`: none inside, fading in over a few pixels outside) or scaled by `strength` (`soften`, 0-1).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HudRegion {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+    pub mode: u32,
+    pub strength: f32,
+}
+
+impl HudRegion {
+    /// A soften region's strength when its text names none.
+    pub const DEFAULT_STRENGTH: f32 = 0.5;
+
+    /// Within the frame: left and top in 0-1, width and height to its edges, the strength in 0-1. `None` for a
+    /// value that is not a number, an unknown mode or an empty rectangle.
+    pub fn clamped(self) -> Option<Self> {
+        if ![self.x, self.y, self.w, self.h, self.strength].iter().all(|v| v.is_finite()) || self.mode > crate::enums::hud_mode::SOFTEN {
+            return None;
+        }
+        let x = self.x.clamp(0.0, 1.0);
+        let y = self.y.clamp(0.0, 1.0);
+        let w = self.w.clamp(0.0, 1.0 - x);
+        let h = self.h.clamp(0.0, 1.0 - y);
+        (w > 0.0 && h > 0.0).then_some(Self { x, y, w, h, mode: self.mode, strength: self.strength.clamp(0.0, 1.0) })
+    }
+
+    /// `x,y,w,h` (keep), `x,y,w,h,keep`, `x,y,w,h,soften` or `x,y,w,h,soften,strength`.
+    pub fn parse(text: &str) -> Option<Self> {
+        let f: Vec<&str> = text.split(',').map(str::trim).collect();
+        let n = |i: usize| f.get(i).and_then(|v| v.parse::<f32>().ok());
+        let (x, y, w, h) = (n(0)?, n(1)?, n(2)?, n(3)?);
+        let (mode, strength) = match (f.get(4).copied(), f.len()) {
+            (None, 4) | (Some("keep"), 5) => (crate::enums::hud_mode::KEEP, 0.0),
+            (Some("soften"), 5) => (crate::enums::hud_mode::SOFTEN, Self::DEFAULT_STRENGTH),
+            (Some("soften"), 6) => (crate::enums::hud_mode::SOFTEN, n(5)?),
+            _ => return None,
+        };
+        Self { x, y, w, h, mode, strength }.clamped()
+    }
+
+    /// Regions separated by `;` (empty text: none). `Err` names the first one that does not parse, or says
+    /// there are more than [`MAX_HUD_REGIONS`].
+    pub fn parse_list(text: &str) -> Result<Vec<Self>, String> {
+        let regions: Vec<Self> = text
+            .split(';')
+            .map(str::trim)
+            .filter(|r| !r.is_empty())
+            .map(|r| Self::parse(r).ok_or_else(|| format!("{r:?} is not x,y,w,h[,keep|soften[,strength]] inside the frame")))
+            .collect::<Result<_, _>>()?;
+        if regions.len() > MAX_HUD_REGIONS {
+            return Err(format!("at most {MAX_HUD_REGIONS} regions, got {}", regions.len()));
+        }
+        Ok(regions)
+    }
+
+    /// The text [`Self::parse`] reads back.
+    pub fn text(&self) -> String {
+        match self.mode {
+            crate::enums::hud_mode::SOFTEN => format!("{},{},{},{},soften,{}", self.x, self.y, self.w, self.h, self.strength),
+            _ => format!("{},{},{},{},keep", self.x, self.y, self.w, self.h),
+        }
+    }
+
+    /// [`Self::text`] of each, separated by `;`.
+    pub fn list_text(regions: &[Self]) -> String {
+        regions.iter().map(Self::text).collect::<Vec<_>>().join(";")
+    }
+}
+
+/// The HUD settings at present ([`ShmHeader::hud_settings`]).
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct HudSettings {
+    pub detect: bool,
+    pub regions: Vec<HudRegion>,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -573,7 +686,12 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2280, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2524, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, placement) == 2280, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_placement) == 2284, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, hud_detect) == 2324, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, hud_region_count) == 2328, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, hud_region) == 2332, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_saturation_bits) == 2128, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, edit_lut_seq) == 2156, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_colour) == 2160, "layout changed -- bump SHM_VERSION");
@@ -618,7 +736,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 164] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 176] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -657,70 +775,70 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 164] = [
     // How many times the network runs over one frame (`resolved_passes`).
     ("passes", 1.0, 10.0),
     // Each pass's overrides (`enums::pass_override` bits) and its own values for them.
-    ("pass1_overrides", 0.0, 1023.0),
+    ("pass1_overrides", 0.0, 2047.0),
     ("pass1_intensity", 0.0, 4.0),
     ("pass1_local_tone", 0.0, 4.0),
     ("pass1_local_structure", 0.0, 4.0),
     ("pass1_skin_structure", -1.0, 4.0),
     ("pass1_style", 0.0, 2.0),
     ("pass1_auto_mask", 0.0, 1.0),
-    ("pass2_overrides", 0.0, 1023.0),
+    ("pass2_overrides", 0.0, 2047.0),
     ("pass2_intensity", 0.0, 4.0),
     ("pass2_local_tone", 0.0, 4.0),
     ("pass2_local_structure", 0.0, 4.0),
     ("pass2_skin_structure", -1.0, 4.0),
     ("pass2_style", 0.0, 2.0),
     ("pass2_auto_mask", 0.0, 1.0),
-    ("pass3_overrides", 0.0, 1023.0),
+    ("pass3_overrides", 0.0, 2047.0),
     ("pass3_intensity", 0.0, 4.0),
     ("pass3_local_tone", 0.0, 4.0),
     ("pass3_local_structure", 0.0, 4.0),
     ("pass3_skin_structure", -1.0, 4.0),
     ("pass3_style", 0.0, 2.0),
     ("pass3_auto_mask", 0.0, 1.0),
-    ("pass4_overrides", 0.0, 1023.0),
+    ("pass4_overrides", 0.0, 2047.0),
     ("pass4_intensity", 0.0, 4.0),
     ("pass4_local_tone", 0.0, 4.0),
     ("pass4_local_structure", 0.0, 4.0),
     ("pass4_skin_structure", -1.0, 4.0),
     ("pass4_style", 0.0, 2.0),
     ("pass4_auto_mask", 0.0, 1.0),
-    ("pass5_overrides", 0.0, 1023.0),
+    ("pass5_overrides", 0.0, 2047.0),
     ("pass5_intensity", 0.0, 4.0),
     ("pass5_local_tone", 0.0, 4.0),
     ("pass5_local_structure", 0.0, 4.0),
     ("pass5_skin_structure", -1.0, 4.0),
     ("pass5_style", 0.0, 2.0),
     ("pass5_auto_mask", 0.0, 1.0),
-    ("pass6_overrides", 0.0, 1023.0),
+    ("pass6_overrides", 0.0, 2047.0),
     ("pass6_intensity", 0.0, 4.0),
     ("pass6_local_tone", 0.0, 4.0),
     ("pass6_local_structure", 0.0, 4.0),
     ("pass6_skin_structure", -1.0, 4.0),
     ("pass6_style", 0.0, 2.0),
     ("pass6_auto_mask", 0.0, 1.0),
-    ("pass7_overrides", 0.0, 1023.0),
+    ("pass7_overrides", 0.0, 2047.0),
     ("pass7_intensity", 0.0, 4.0),
     ("pass7_local_tone", 0.0, 4.0),
     ("pass7_local_structure", 0.0, 4.0),
     ("pass7_skin_structure", -1.0, 4.0),
     ("pass7_style", 0.0, 2.0),
     ("pass7_auto_mask", 0.0, 1.0),
-    ("pass8_overrides", 0.0, 1023.0),
+    ("pass8_overrides", 0.0, 2047.0),
     ("pass8_intensity", 0.0, 4.0),
     ("pass8_local_tone", 0.0, 4.0),
     ("pass8_local_structure", 0.0, 4.0),
     ("pass8_skin_structure", -1.0, 4.0),
     ("pass8_style", 0.0, 2.0),
     ("pass8_auto_mask", 0.0, 1.0),
-    ("pass9_overrides", 0.0, 1023.0),
+    ("pass9_overrides", 0.0, 2047.0),
     ("pass9_intensity", 0.0, 4.0),
     ("pass9_local_tone", 0.0, 4.0),
     ("pass9_local_structure", 0.0, 4.0),
     ("pass9_skin_structure", -1.0, 4.0),
     ("pass9_style", 0.0, 2.0),
     ("pass9_auto_mask", 0.0, 1.0),
-    ("pass10_overrides", 0.0, 1023.0),
+    ("pass10_overrides", 0.0, 2047.0),
     ("pass10_intensity", 0.0, 4.0),
     ("pass10_local_tone", 0.0, 4.0),
     ("pass10_local_structure", 0.0, 4.0),
@@ -793,6 +911,20 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 164] = [
     ("pass10_edit_saturation", 0.0, 4.0),
     ("pass10_edit_contrast", 0.0, 4.0),
     ("pass10_edit_detail", 0.0, 4.0),
+    // Where the network runs (`enums::placement`), and each pass's own.
+    ("placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass1_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass2_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass3_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass4_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass5_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass6_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass7_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass8_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass9_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    ("pass10_placement", 0.0, (crate::enums::placement::COUNT - 1) as f32),
+    // The HUD at present: its detection.
+    ("hud_detect", 0.0, 1.0),
 ];
 
 /// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
@@ -899,6 +1031,12 @@ impl ShmHeader {
         for p in &self.pass_colour {
             p.reset_to_defaults();
         }
+        self.placement.store(crate::enums::placement::AUTO, Ordering::Relaxed);
+        for p in &self.pass_placement {
+            p.store(crate::enums::placement::AUTO, Ordering::Relaxed);
+        }
+        self.hud_detect.store(1, Ordering::Relaxed);
+        self.store_hud_regions(&[]);
 
         self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
@@ -984,7 +1122,7 @@ impl ShmHeader {
         let defaults = ShmHeader::default();
         defaults.init_defaults();
         let settings: Vec<(&str, u32)> = defaults.persisted_settings().into_iter().map(|(name, _, bits)| (name, bits)).collect();
-        self.write_settings(&settings);
+        self.write_settings_and_hud(&settings, Some(&[]));
     }
 
     /// Writes several settings as one unit (`persisted_settings` names, raw bits, each clamped as
@@ -994,6 +1132,17 @@ impl ShmHeader {
     /// non-zero once anything has written: that is how "not yet configured" (0) is read. Returns
     /// whether every name was a setting.
     pub fn write_settings(&self, settings: &[(&str, u32)]) -> bool {
+        self.write_settings_and_hud(settings, None)
+    }
+
+    /// The HUD regions at present (`hud_regions`), written as one unit like [`Self::write_settings`]
+    /// (each clamped by [`HudRegion::clamped`], one that is not dropped, at most [`MAX_HUD_REGIONS`]).
+    pub fn set_hud_regions(&self, regions: &[HudRegion]) {
+        self.write_settings_and_hud(&[], Some(regions));
+    }
+
+    /// [`Self::write_settings`] and, with `regions`, the HUD regions, in one unit.
+    pub fn write_settings_and_hud(&self, settings: &[(&str, u32)], regions: Option<&[HudRegion]>) -> bool {
         // Entering is a compare-and-swap from an even value to the next odd one, so two writers
         // (the GUI and the CLI) take turns. One left odd by a writer that died mid-write is taken
         // over once it has stayed on that value for STUCK_FOR: the next odd value is ours.
@@ -1019,6 +1168,9 @@ impl ShmHeader {
         let mut all = true;
         for (name, bits) in settings {
             all &= self.apply_persisted_setting(name, *bits);
+        }
+        if let Some(regions) = regions {
+            self.store_hud_regions(regions);
         }
         // Only if this writer still owns the section: one taken over as dead while it was merely slow
         // must not move the sequence back under the writer that took over (that one finishes it).
@@ -1077,7 +1229,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 164] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 176] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -1245,6 +1397,18 @@ impl ShmHeader {
             ("pass10_edit_saturation", true, self.pass_colour[9].saturation_bits.load(Ordering::Relaxed)),
             ("pass10_edit_contrast", true, self.pass_colour[9].contrast_bits.load(Ordering::Relaxed)),
             ("pass10_edit_detail", true, self.pass_colour[9].detail_bits.load(Ordering::Relaxed)),
+            ("placement", false, self.placement.load(Ordering::Relaxed)),
+            ("pass1_placement", false, self.pass_placement[0].load(Ordering::Relaxed)),
+            ("pass2_placement", false, self.pass_placement[1].load(Ordering::Relaxed)),
+            ("pass3_placement", false, self.pass_placement[2].load(Ordering::Relaxed)),
+            ("pass4_placement", false, self.pass_placement[3].load(Ordering::Relaxed)),
+            ("pass5_placement", false, self.pass_placement[4].load(Ordering::Relaxed)),
+            ("pass6_placement", false, self.pass_placement[5].load(Ordering::Relaxed)),
+            ("pass7_placement", false, self.pass_placement[6].load(Ordering::Relaxed)),
+            ("pass8_placement", false, self.pass_placement[7].load(Ordering::Relaxed)),
+            ("pass9_placement", false, self.pass_placement[8].load(Ordering::Relaxed)),
+            ("pass10_placement", false, self.pass_placement[9].load(Ordering::Relaxed)),
+            ("hud_detect", false, self.hud_detect.load(Ordering::Relaxed)),
         ]
     }
 
@@ -1432,6 +1596,18 @@ impl ShmHeader {
             "pass10_edit_saturation" => &self.pass_colour[9].saturation_bits,
             "pass10_edit_contrast" => &self.pass_colour[9].contrast_bits,
             "pass10_edit_detail" => &self.pass_colour[9].detail_bits,
+            "placement" => &self.placement,
+            "pass1_placement" => &self.pass_placement[0],
+            "pass2_placement" => &self.pass_placement[1],
+            "pass3_placement" => &self.pass_placement[2],
+            "pass4_placement" => &self.pass_placement[3],
+            "pass5_placement" => &self.pass_placement[4],
+            "pass6_placement" => &self.pass_placement[5],
+            "pass7_placement" => &self.pass_placement[6],
+            "pass8_placement" => &self.pass_placement[7],
+            "pass9_placement" => &self.pass_placement[8],
+            "pass10_placement" => &self.pass_placement[9],
+            "hud_detect" => &self.hud_detect,
             _ => return false,
         };
         field.store(bits, Ordering::Relaxed);
@@ -1468,7 +1644,7 @@ impl ShmHeader {
                     *s = resolved_scale(self.pass_scale_bits[k].load(Ordering::Relaxed));
                 }
             }
-            PassTunings { count: self.resolved_passes() as usize, tunings, feedback, scales, colour: self.colour_now() }
+            PassTunings { count: self.resolved_passes() as usize, tunings, feedback, scales, colour: self.colour_now(), placements: self.placements_now() }
         })
     }
 
@@ -1499,6 +1675,54 @@ impl ShmHeader {
             lut_adapt: f(&self.edit_lut_adapt_bits, "edit_lut_adapt", 0.05),
             lut_seq: self.edit_lut_seq.load(Ordering::Relaxed),
         }
+    }
+
+    /// Stores the HUD regions as they stand (inside a write section, or on a header nobody reads yet).
+    fn store_hud_regions(&self, regions: &[HudRegion]) {
+        let kept: Vec<HudRegion> = regions.iter().filter_map(|r| r.clamped()).take(MAX_HUD_REGIONS).collect();
+        for (k, w) in self.hud_region.iter().enumerate() {
+            let r = kept.get(k).copied().unwrap_or(HudRegion { x: 0.0, y: 0.0, w: 0.0, h: 0.0, mode: crate::enums::hud_mode::KEEP, strength: HudRegion::DEFAULT_STRENGTH });
+            w.x_bits.store(r.x.to_bits(), Ordering::Relaxed);
+            w.y_bits.store(r.y.to_bits(), Ordering::Relaxed);
+            w.w_bits.store(r.w.to_bits(), Ordering::Relaxed);
+            w.h_bits.store(r.h.to_bits(), Ordering::Relaxed);
+            w.mode.store(r.mode, Ordering::Relaxed);
+            w.strength_bits.store(r.strength.to_bits(), Ordering::Relaxed);
+        }
+        self.hud_region_count.store(kept.len() as u32, Ordering::Relaxed);
+    }
+
+    /// The HUD settings at present: the detection switch and the regions in use (each clamped; one that is not
+    /// a valid rectangle is left out), read as one unit like [`Self::global_tuning`].
+    pub fn hud_settings(&self) -> HudSettings {
+        self.read_settings(|| {
+            let n = (self.hud_region_count.load(Ordering::Relaxed) as usize).min(MAX_HUD_REGIONS);
+            let f = |a: &AtomicU32| f32::from_bits(a.load(Ordering::Relaxed));
+            let regions = self.hud_region[..n]
+                .iter()
+                .filter_map(|w| HudRegion { x: f(&w.x_bits), y: f(&w.y_bits), w: f(&w.w_bits), h: f(&w.h_bits), mode: w.mode.load(Ordering::Relaxed), strength: f(&w.strength_bits) }.clamped())
+                .collect();
+            HudSettings { detect: self.hud_detect.load(Ordering::Relaxed) != 0, regions }
+        })
+    }
+
+    /// The pass count and each pass's placement ([`crate::enums::placement`]: `placement`, or the pass's own
+    /// where its `overrides` has [`crate::enums::pass_override::PLACEMENT`]; a value out of range is `auto`),
+    /// read as one unit like [`Self::pass_tunings`].
+    pub fn placements(&self) -> (usize, [u32; crate::MAX_PASSES]) {
+        self.read_settings(|| (self.resolved_passes() as usize, self.placements_now()))
+    }
+
+    fn placements_now(&self) -> [u32; crate::MAX_PASSES] {
+        let valid = |v: u32| if v < crate::enums::placement::COUNT { v } else { crate::enums::placement::AUTO };
+        let global = valid(self.placement.load(Ordering::Relaxed));
+        std::array::from_fn(|k| {
+            if self.pass[k].overrides.load(Ordering::Relaxed) & crate::enums::pass_override::PLACEMENT != 0 {
+                valid(self.pass_placement[k].load(Ordering::Relaxed))
+            } else {
+                global
+            }
+        })
     }
 
     /// The Network setting ([`crate::enums::network`]); a value out of range is the full network.
@@ -1968,7 +2192,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, edit_saturation_bits), std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4);
         assert_eq!(std::mem::size_of::<PassColour>(), 12);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour), std::mem::offset_of!(ShmHeader, edit_lut_seq) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12, std::mem::offset_of!(ShmHeader, placement));
         assert_eq!(crate::SHM_VERSION, 21);
         let h = ShmHeader::default();
         h.edit_lut_seq.store(9, Ordering::Relaxed);
@@ -2055,7 +2279,52 @@ mod tests {
         assert_eq!(h.pass_tunings().tunings[9].intensity, 0.5);
         assert!(!h.apply_persisted_setting("pass11_intensity", 0), "there is no eleventh pass");
         assert!(h.apply_persisted_setting("pass1_overrides", 4095));
-        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "clamped to the ten fields");
+        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "clamped to the eleven fields");
+    }
+
+    #[test]
+    fn the_placement_and_the_hud_are_appended_after_the_colour_of_the_edit() {
+        use crate::enums::{pass_override, placement};
+        assert_eq!(std::mem::offset_of!(ShmHeader, placement), std::mem::offset_of!(ShmHeader, pass_colour) + crate::MAX_PASSES * 12);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_placement), std::mem::offset_of!(ShmHeader, placement) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, hud_detect), std::mem::offset_of!(ShmHeader, pass_placement) + crate::MAX_PASSES * 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, hud_region_count), std::mem::offset_of!(ShmHeader, hud_detect) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, hud_region), std::mem::offset_of!(ShmHeader, hud_region_count) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, hud_region) + MAX_HUD_REGIONS * 24, std::mem::size_of::<ShmHeader>());
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.placements(), (1, [placement::AUTO; crate::MAX_PASSES]), "auto for every pass by default");
+        assert!(h.write_settings(&[("passes", 3), ("placement", placement::BEFORE), ("pass2_placement", placement::UPSCALED), ("pass3_placement", placement::PRESENT), ("pass2_overrides", pass_override::PLACEMENT)]));
+        let (count, p) = h.placements();
+        assert_eq!((count, &p[..3]), (3, &[placement::BEFORE, placement::UPSCALED, placement::BEFORE][..]), "pass 3 does not override its placement");
+        assert_eq!(h.pass_tunings().placements, p);
+        assert!(h.apply_persisted_setting("placement", 9));
+        assert_eq!(h.placement.load(Ordering::Relaxed), placement::PRESENT, "clamped to the last placement");
+        assert_eq!(placement::parse("upscaled"), Some(placement::UPSCALED));
+        assert_eq!(placement::parse("2"), Some(placement::UPSCALED));
+        assert_eq!(placement::parse("later"), None);
+    }
+
+    #[test]
+    fn hud_regions_parse_clamp_and_print() {
+        use crate::enums::hud_mode;
+        let r = HudRegion::parse_list("0.1,0.2,0.3,0.4;0.5,0.5,0.9,0.9,soften; 0,0,1,0.1,soften,0.25 ;0.2,0.2,0.1,0.1,keep").unwrap();
+        assert_eq!(r[0], HudRegion { x: 0.1, y: 0.2, w: 0.3, h: 0.4, mode: hud_mode::KEEP, strength: 0.0 });
+        assert_eq!(r[1], HudRegion { x: 0.5, y: 0.5, w: 0.5, h: 0.5, mode: hud_mode::SOFTEN, strength: HudRegion::DEFAULT_STRENGTH }, "clamped to the frame");
+        assert_eq!(r[2].strength, 0.25);
+        assert_eq!(r[3].mode, hud_mode::KEEP);
+        assert_eq!(HudRegion::parse_list("").unwrap(), vec![]);
+        for bad in ["0.1,0.2,0.3", "0.1,0.2,0.3,0.4,blur", "0.1,0.2,0,0.4", "nan,0,1,1", "0.1,0.2,0.3,0.4,keep,0.5"] {
+            assert!(HudRegion::parse_list(bad).is_err(), "{bad}");
+        }
+        assert!(HudRegion::parse_list(&["0,0,0.1,0.1"; MAX_HUD_REGIONS + 1].join(";")).is_err());
+        assert_eq!(HudRegion::parse_list(&HudRegion::list_text(&r)).unwrap(), r, "the text reads back");
+        let h = ShmHeader::default();
+        h.init_defaults();
+        h.set_hud_regions(&r);
+        assert_eq!(h.hud_settings(), HudSettings { detect: true, regions: r });
+        h.hud_region_count.store(99, Ordering::Relaxed);
+        assert_eq!(h.hud_settings().regions.len(), 4, "at most the regions held: the empty slots are left out");
     }
 
     #[test]

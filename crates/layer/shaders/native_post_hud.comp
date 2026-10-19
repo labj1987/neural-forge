@@ -1,0 +1,104 @@
+#version 450
+// The HUD at present (docs/NATIVE_BACKEND.md, "The HUD at present"): the presented frame carries the game's
+// HUD, which the network's edit would smear. Two phases over the 8-bit proxy, one invocation a pixel:
+//
+// Phase 0, the detection (dispatched only on frames where the scene moves as a whole, which the layer tells
+// from two frames' thumbnails; on a still frame nothing is dispatched and every confidence holds): a pixel
+// whose colour stayed within the static level of the previous frame's proxy while the scene moved, and whose
+// neighbourhood (nine taps two pixels apart) spans at least the contrast level of luma, gains confidence;
+// any other pixel loses it faster. Confidence starts at 0 for every pixel, so the first frames after it was
+// made detect nothing (eight rises reach the threshold, not above it).
+//
+// Phases 1 and 2, the scale of the edit per pixel (1: untouched): 0 at a confident pixel (above the threshold),
+// rising by a third a pixel of distance (Chebyshev) to 1 at three, the distance found in two passes of five taps
+// (phase 1 along the row into `Near`, phase 2 down the column; only with the detection on); and for each user
+// region
+// (pixels), its inside value (0 keep, the strength soften) at and inside the rectangle, rising
+// linearly to 1 over the region feather outside it. The smallest of all wins. The composite of the last pass
+// moves the answer back toward the frame by it, and the preprocess rejects the history where it is below 1.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The frame's proxy and the previous frame's (RGBA8 or BGRA8: only differences and luma of the three colour
+// channels are read, and the order does not change them).
+layout(set = 0, binding = 0, std430) readonly buffer Frame { uint texel[]; } u_frame;
+layout(set = 0, binding = 1, std430) readonly buffer Previous { uint texel[]; } u_previous;
+// Per pixel: the detection's confidence (0-1), kept from frame to frame.
+layout(set = 0, binding = 2, std430) buffer Confidence { float c[]; } u_confidence;
+// Per pixel: the scale of the edit, written by phase 2.
+layout(set = 0, binding = 3, std430) writeonly buffer Scale { float s[]; } u_scale;
+// Per region: (left, top, right, bottom) in pixels, then (mode: 0 keep, 1 soften; strength; unused x2).
+layout(set = 0, binding = 4, std430) readonly buffer Regions { vec4 r[]; } u_regions;
+// Per pixel: phase 1's distance along the row to the nearest confident pixel (0-2, 3 for none within two).
+layout(set = 0, binding = 5, std430) buffer Near { float d[]; } u_near;
+
+layout(push_constant) uniform Params {
+  uvec4 dims;     // width, height, phase (0 detect, 1 rows, 2 scale), region count
+  uvec4 flags;    // detection on (1), unused x3
+  vec4 detect;    // static level (0-1, largest channel), contrast level (luma), rise, fall
+  vec4 shape;     // confidence threshold, unused, region feather (pixels), unused
+} p;
+
+const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
+
+vec3 rgb(uint texel) { return unpackUnorm4x8(texel).rgb; }
+
+uint at(ivec2 q) {
+  ivec2 c = clamp(q, ivec2(0), ivec2(p.dims.xy) - 1);
+  return uint(c.y) * p.dims.x + uint(c.x);
+}
+
+void detect(ivec2 id) {
+  uint i = at(id);
+  vec3 change = abs(rgb(u_frame.texel[i]) - rgb(u_previous.texel[i]));
+  bool still = max(change.r, max(change.g, change.b)) <= p.detect.x;
+  float lo = 1.0;
+  float hi = 0.0;
+  for (int dy = -2; dy <= 2; dy += 2) {
+    for (int dx = -2; dx <= 2; dx += 2) {
+      float l = dot(rgb(u_frame.texel[at(id + ivec2(dx, dy))]), LUMA);
+      lo = min(lo, l);
+      hi = max(hi, l);
+    }
+  }
+  bool sharp = hi - lo >= p.detect.y;
+  float c = u_confidence.c[i];
+  u_confidence.c[i] = still && sharp ? min(1.0, c + p.detect.z) : max(0.0, c - p.detect.w);
+}
+
+void rows(ivec2 id) {
+  float d = 3.0;
+  for (int dx = -2; dx <= 2; dx++) {
+    if (u_confidence.c[at(id + ivec2(dx, 0))] > p.shape.x) d = min(d, float(abs(dx)));
+  }
+  u_near.d[at(id)] = d;
+}
+
+void scale(ivec2 id) {
+  float s = 1.0;
+  if (p.flags.x != 0u) {
+    // The Chebyshev distance to the nearest confident pixel within two: the column's nearest row distance.
+    float d = 3.0;
+    for (int dy = -2; dy <= 2; dy++) d = min(d, max(float(abs(dy)), u_near.d[at(id + ivec2(0, dy))]));
+    s = d / 3.0;
+  }
+  vec2 c = vec2(id) + 0.5;
+  float feather = max(p.shape.z, 1.0);
+  for (uint k = 0u; k < p.dims.w; k++) {
+    vec4 rect = u_regions.r[2u * k];
+    vec4 mode = u_regions.r[2u * k + 1u];
+    float inside = mode.x > 0.5 ? mode.y : 0.0;
+    vec2 out2 = max(max(rect.xy - c, c - rect.zw), vec2(0.0));
+    float d = max(out2.x, out2.y);
+    float v = d >= feather ? 1.0 : inside + (1.0 - inside) * (d / feather);
+    s = min(s, v);
+  }
+  u_scale.s[uint(id.y) * p.dims.x + uint(id.x)] = s;
+}
+
+void main() {
+  ivec2 id = ivec2(gl_GlobalInvocationID.xy);
+  if (id.x >= int(p.dims.x) || id.y >= int(p.dims.y)) return;
+  if (p.dims.z == 0u) detect(id);
+  else if (p.dims.z == 1u) rows(id);
+  else scale(id);
+}

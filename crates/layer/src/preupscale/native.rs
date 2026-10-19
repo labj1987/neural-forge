@@ -893,6 +893,62 @@ impl Default for Passes {
     }
 }
 
+impl Passes {
+    /// Passes `first..end` as a stage runs them ([`super::placement`]): its pass 1 is pass `first + 1`, with
+    /// that pass's settings, model resolution and colour. The look-up table stays the stack's last pass's: a
+    /// stage that does not run it has none.
+    pub(crate) fn stage(&self, first: usize, end: usize) -> Self {
+        let max = neural_forge_protocol::MAX_PASSES;
+        let mut out = *self;
+        out.count = end.min(self.count).saturating_sub(first).max(1);
+        for k in 0..max {
+            let from = (first + k).min(max - 1);
+            out.each[k] = self.each[from];
+            out.scales[k] = self.scales[from];
+            out.colour.each[k] = self.colour.each[from];
+        }
+        if end < self.count {
+            out.colour.lut_strength = 0.0;
+        }
+        out
+    }
+}
+
+/// The passes the hold `at` runs ([`Passes::stage`]); `None` when none of the frame's passes is at its stage.
+pub(crate) fn stage_passes(all: &Passes, at: super::placement::Hold) -> Option<Passes> {
+    let (first, end) = at.passes();
+    let end = end.min(all.count);
+    (first < end).then(|| all.stage(first, end))
+}
+
+/// The sizes the network is built for in a frame whose hold `at` runs at `own` (its colour image's size): the
+/// passes before the upscaler at the render size, then those after DLSS at the output size, each size once
+/// (both holds of a frame ask for the same set: another set would build the network again). With only the
+/// holds before the upscaler this is [`graph_sizes`] of the render size, as it always was.
+pub(crate) fn frame_sizes(all: &Passes, at: super::placement::Hold, own: (u32, u32)) -> Vec<(u32, u32)> {
+    use super::placement::Stage;
+    let (render, output) = match at.stage {
+        Stage::Upscaled => (at.render, own),
+        _ => (own, at.output),
+    };
+    let mut sizes = Vec::new();
+    for (stage, extent) in [(Stage::Before, render), (Stage::Upscaled, output)] {
+        let Some(p) = stage_passes(all, super::placement::Hold { stage, ..at }) else { continue };
+        if extent.0 == 0 || extent.1 == 0 {
+            continue;
+        }
+        for size in graph_sizes(&pass_extents(extent.0, extent.1, &p.scales), p.count) {
+            if !sizes.contains(&size) {
+                sizes.push(size);
+            }
+        }
+    }
+    if sizes.is_empty() {
+        sizes = graph_sizes(&pass_extents(own.0, own.1, &all.scales), all.count);
+    }
+    sizes
+}
+
 impl From<neural_forge_protocol::PassTunings> for Passes {
     fn from(t: neural_forge_protocol::PassTunings) -> Self {
         let mut each = [Conditioning::default(); neural_forge_protocol::MAX_PASSES];
@@ -2837,7 +2893,7 @@ pub(crate) struct CacheAsk {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_native_hold(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut super::Resources, target: &Target,
-    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, passes: Passes, arm: Option<super::cache_dump::Arm>, ask: CacheAsk, choice: u32,
+    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, passes: Passes, sizes: &[(u32, u32)], arm: Option<super::cache_dump::Arm>, ask: CacheAsk, choice: u32,
     lut: Option<&Arc<super::colour::Lut>>, submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> super::HoldResult {
     let mut result = super::HoldResult { native: true, ..Default::default() };
@@ -2888,14 +2944,18 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("the network's counter chain timed out; it is being rebuilt with barriers");
         return result;
     }
-    // The model resolution (`preupscale_scale`, `pass<N>_scale`): each pass slot's extent, and the sizes the
-    // network is built for (one at a model resolution of 1: the render extent, as always).
+    // The model resolution (`preupscale_scale`, `pass<N>_scale`): each pass slot's extent. The sizes the
+    // network is built for are the frame's (`frame_sizes`: one at a model resolution of 1 with every pass
+    // before the upscaler, the render extent, as always), this hold's among them.
     let extents = pass_extents(target.width, target.height, &passes.scales);
-    let sizes = graph_sizes(&extents, passes.count);
+    let Some(own) = sizes.iter().position(|s| *s == extents[0]) else {
+        result.miss = Some("the network's sizes do not include this hold's");
+        return result;
+    };
     // The Network setting (`choice`): a switch frees the current build here (this hold's previous work
     // was waited for above, the other path's is kept off by `claim_pre`), and the frames go to DLSS
     // untouched until the chosen network is built. So does another set of sizes.
-    let Some(builts) = loader.ready_sizes(&sizes, choice) else {
+    let Some(builts) = loader.ready_sizes(sizes, choice) else {
         if let Some(n) = res.native.as_mut() {
             n.gap.skipped();
         }
@@ -2903,7 +2963,7 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     };
     // Pass 1's: its network, its generation and its input features (where the edit cache's buffers live).
-    let built = builts[0];
+    let built = builts[own];
     // Counter chaining faulted the GPU from the hold inside DLSS's buffer (Black Myth: Wukong, 3 runs
     // of 4: Xid 13 then 32 within seconds; none of 2 with barriers): that hold rebuilds the network
     // with barriers between its launches, for the rest of the process (`fall_back_to_barriers`).
@@ -5029,5 +5089,69 @@ mod tests {
             device.destroy_command_pool(graph_pool, None);
             device.destroy_command_pool(pool, None);
         }
+    }
+
+    /// The per-pass split: two passes, one placed before the upscaler and one after DLSS. Each stage's hold
+    /// runs its own pass only, with that pass's own settings (pass 1's intensity before the upscaler, pass 2's
+    /// after DLSS) and no later pass recorded, and both holds ask the network for the same two sizes (render and
+    /// output), so neither rebuilds it for the other. The look-up table stays with the stack's last pass.
+    #[test]
+    fn each_stage_records_only_its_own_passes() {
+        use super::super::placement::{Frame, Hold, Plan, Stage};
+        use neural_forge_protocol::enums::placement::{BEFORE, UPSCALED};
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let (render, output) = ((SW, SH), (2 * SW, 2 * SH));
+        let mut all = Passes::one(Conditioning::default());
+        all.count = 2;
+        all.each[0].intensity = 0.25;
+        all.each[1].intensity = 0.75;
+        all.colour.lut_strength = 0.5;
+        let mut settings = [BEFORE; neural_forge_protocol::MAX_PASSES];
+        settings[1] = UPSCALED;
+        let plan = Plan::of(2, &settings, Frame { rr: false, output: true, hook: true });
+        let before = Hold::of(&plan, Stage::Before, render, output);
+        let after = Hold::of(&plan, Stage::Upscaled, render, output);
+        assert_eq!(frame_sizes(&all, before, render), vec![render, output], "both holds' sizes, the render size first");
+        assert_eq!(frame_sizes(&all, after, output), frame_sizes(&all, before, render), "the same set from either hold");
+        assert_eq!(frame_sizes(&all, Hold::ALL_BEFORE, render), vec![render], "every pass before the upscaler: one size, as always");
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let (graph_pool, graph) = empty_graph(device, family);
+            let stands = [Stand::new(device, instance, physical, render, (FW, FH), graph, 3), Stand::new(device, instance, physical, output, (2 * FW, 2 * FH), graph, 3)];
+            let graphs = [stands[0].graph(), stands[1].graph()];
+            for (hold, extent, intensity, lut) in [(before, render, 0.25, 0.0), (after, output, 0.75, 0.5)] {
+                let passes = stage_passes(&all, hold).expect("the stage has a pass");
+                assert_eq!((passes.count, passes.each[0].intensity, passes.colour.lut_strength), (1, intensity, lut), "{:?}", hold.stage);
+                let (pw, ph) = super::super::padded(extent.0, extent.1);
+                let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+                let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+                let extents = pass_extents(extent.0, extent.1, &passes.scales);
+                let mut pass = NativePass::build_at(device, instance, physical, family, extent.0, extent.1, extents, false).unwrap();
+                assert!(pass.ensure_lanes(device, instance, physical, passes.count));
+                assert!(pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None));
+                let (cmds, later) = pass.frame_graphs(&graphs, false, None, [1.0, 1.0], &passes);
+                assert!(cmds[1].is_some() && later.is_empty(), "{:?}: one pass, no later one", hold.stage);
+                assert!(pass.more.is_none(), "{:?}: no later pass's buffers", hold.stage);
+                let p = &*pass.params[0].ptr.cast::<Params>();
+                assert_eq!(p.motion[3], intensity, "{:?}: its own pass's intensity", hold.stage);
+                assert_eq!(p.dims[2..], [extent.0, extent.1], "{:?}: at its own size", hold.stage);
+                pass.destroy(device);
+                encoded.destroy(device);
+                exposure.destroy(device);
+            }
+            for st in &stands {
+                st.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+        }
+        // A stage with none of the frame's passes runs nothing.
+        let mut settings = [BEFORE; neural_forge_protocol::MAX_PASSES];
+        settings[0] = UPSCALED;
+        let plan = Plan::of(2, &settings, Frame { rr: false, output: true, hook: true });
+        assert!(stage_passes(&all, Hold::of(&plan, Stage::Before, render, output)).is_none());
     }
 }

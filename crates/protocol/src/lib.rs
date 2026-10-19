@@ -47,7 +47,7 @@ mod slot;
 #[cfg(unix)]
 pub mod state_log;
 
-pub use header::{load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, MaskSettings, PassColour, PassControl, PassTunings, ShmHeader, Tuning, SETTING_BOUNDS};
+pub use header::{load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings, MaskSettings, PassColour, PassControl, PassTunings, ShmHeader, Tuning, MAX_HUD_REGIONS, SETTING_BOUNDS};
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
 

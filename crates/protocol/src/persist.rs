@@ -7,11 +7,17 @@ use std::collections::BTreeMap;
 
 use crate::ShmHeader;
 
+/// The one setting that is text, not a number: the HUD regions at present (`set_hud_regions=x,y,w,h;...`,
+/// [`crate::HudRegion::parse_list`]).
+pub const HUD_REGIONS: &str = "hud_regions";
+
 /// Every persisted setting's current value, as `set_<name>` -> string, ready to
-/// merge into whatever else `config.ini` is about to write out.
+/// merge into whatever else `config.ini` is about to write out (the HUD regions as their text).
 pub fn snapshot(header: &ShmHeader) -> BTreeMap<String, String> {
     let fmt = |is_float: bool, bits: u32| if is_float { f32::from_bits(bits).to_string() } else { bits.to_string() };
-    header.persisted_settings().into_iter().map(|(name, is_float, bits)| (format!("set_{name}"), fmt(is_float, bits))).collect()
+    let mut all: BTreeMap<String, String> = header.persisted_settings().into_iter().map(|(name, is_float, bits)| (format!("set_{name}"), fmt(is_float, bits))).collect();
+    all.insert(format!("set_{HUD_REGIONS}"), crate::HudRegion::list_text(&header.hud_settings().regions));
+    all
 }
 
 /// `config.ini`: `$XDG_CONFIG_HOME/neural-forge/config.ini`, or `~/.config/neural-forge/config.ini`.
@@ -58,8 +64,10 @@ pub fn apply(header: &ShmHeader, raw: &BTreeMap<String, String>) {
             settings.push((name, bits));
         }
     }
+    // A HUD region list that does not parse is left as it is, like any value that does not.
+    let regions = raw.get(&format!("set_{HUD_REGIONS}")).and_then(|t| crate::HudRegion::parse_list(t).ok());
     // One unit: a profile is never seen half applied, and `tuning_seq` marks the header configured.
-    header.write_settings(&settings);
+    header.write_settings_and_hud(&settings, regions.as_deref());
 }
 
 #[cfg(all(test, unix))]
@@ -110,6 +118,29 @@ mod tests {
 
         std::fs::remove_file(&path).ok();
         std::fs::remove_dir(std::path::Path::new(&path).parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn the_hud_regions_round_trip_as_text_and_reset_to_none() {
+        let h = crate::ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(snapshot(&h).get("set_hud_regions").map(String::as_str), Some(""), "no region by default");
+        let raw = BTreeMap::from([("set_hud_regions".to_string(), "0.02,0.85,0.25,0.12; 0.7,0.02,0.28,0.1,soften,0.3".to_string())]);
+        apply(&h, &raw);
+        let regions = h.hud_settings().regions;
+        assert_eq!(regions.len(), 2);
+        assert_eq!(regions[1], crate::HudRegion { x: 0.7, y: 0.02, w: 0.28, h: 0.1, mode: crate::enums::hud_mode::SOFTEN, strength: 0.3 });
+        let snap = snapshot(&h);
+        assert_eq!(snap["set_hud_regions"], "0.02,0.85,0.25,0.12,keep;0.7,0.02,0.28,0.1,soften,0.3");
+        h.init_defaults();
+        apply(&h, &snap);
+        assert_eq!(h.hud_settings().regions, regions, "the text reads back the same regions");
+        // A list that does not parse leaves the regions as they are.
+        apply(&h, &BTreeMap::from([("set_hud_regions".to_string(), "0.1,0.1,nope".to_string())]));
+        assert_eq!(h.hud_settings().regions, regions);
+        h.reset_persisted_settings();
+        assert!(h.hud_settings().regions.is_empty(), "a reset clears them");
+        assert!(h.hud_settings().detect, "detection is on by default");
     }
 
     #[test]
