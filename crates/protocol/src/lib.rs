@@ -46,7 +46,7 @@ mod slot;
 #[cfg(unix)]
 pub mod state_log;
 
-pub use header::{load64, pass_setting, setting_bounds, store64, PassControl, PassTunings, ShmHeader, Tuning, SETTING_BOUNDS};
+pub use header::{load64, pass_setting, setting_bounds, store64, MaskSettings, PassControl, PassTunings, ShmHeader, Tuning, SETTING_BOUNDS};
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
 
@@ -71,11 +71,12 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// counts, the last cached hold's rejected share and the cache passes' GPU time; v18 makes
 /// `capture_request` carry a request id and appends the capture result (`capture`): what became of
 /// each request, why, and where its files are); v19 appends the network's pass count and each pass's
-/// overrides of the Model tab's values (`passes`, `pass`)).
+/// overrides of the Model tab's values (`passes`, `pass`); v20 the control mask's rules (`mask_*`: keep the
+/// game's sky, and the optional dark and motion rules)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 19;
+pub const SHM_VERSION: u32 = 20;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;

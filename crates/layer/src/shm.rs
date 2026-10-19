@@ -469,6 +469,12 @@ impl ShmClient {
         (!self.header.is_null() && self.regions.iter().all(|r| !r.is_null())).then_some(ShmView { header: self.header, regions: self.regions, leased: self.leased })
     }
 
+    /// The control mask's rules.
+    #[cfg(target_arch = "x86_64")]
+    pub fn mask_settings(&self) -> Option<neural_forge_protocol::MaskSettings> {
+        self.header().map(|hdr| hdr.mask_settings())
+    }
+
     /// The Passes setting and each pass's settings (the Model tab's with its overrides).
     #[cfg(target_arch = "x86_64")]
     pub fn pass_tunings(&self) -> Option<neural_forge_protocol::PassTunings> {

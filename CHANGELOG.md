@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.7.0 — 2026-10-19
+
+- **The game's sky stays as it is.** Before the upscaler, Neural Forge no longer edits the sky (found from
+  the game's depth), so it stays clean and steady. "Keep the game's sky" on the Model tab turns it off.
+- **More mask rules** (Model tab): the model's edit can fade out in dark areas or in fast motion, each with
+  its own brightness or motion and how much intensity and structure to keep. Both are off by default.
+
 ## 3.6.0 — 2026-10-19
 
 - **Passes.** The Model tab has a Passes setting: the model can run up to 10 times over each frame,

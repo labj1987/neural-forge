@@ -84,7 +84,7 @@ The consumers' column gives where they agree or differ.
 | `DLSSNR.MVecScaleX`, `DLSSNR.MVecScaleY` | f32 | the motion scale for the flow's units | E | each has its own units |
 | `DLSSNR.DepthInverted` | i32 | 0 (depth cleared to 1.0, far) | E | DLSS5VKLayer 1; the game-hosted ones follow the game |
 | `DLSSNR.Reset` | i32 | see "History reset" | C (1) and E | all |
-| `DLSSNR.ControlMask` | pointer | **never** | | null everywhere |
+| `DLSSNR.ControlMask` | pointer | **never** | | null everywhere; the native backend implements its semantics itself (3.7.0, NATIVE_BACKEND.md "The control mask") |
 | `DLSSNR.UI`, `DLSSNR.UIAlpha` | pointer | **never** | | null everywhere |
 | `DLSSNR.Backbuffer` | pointer | **never** | | null, except the AMD project, which binds its output |
 | `DLSSNR.BidirectionalDistortionField` | pointer | **never** | | null (DLSS5VKLayer only, explicitly) |

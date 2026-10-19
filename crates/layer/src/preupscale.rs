@@ -152,7 +152,9 @@ pub(crate) unsafe fn run_native(
     #[cfg(target_arch = "x86_64")]
     {
         // The Passes setting and each pass's settings (the Model tab's with that pass's overrides).
-        let passes = shm.pass_tunings().map_or_else(native::Passes::default, native::Passes::from);
+        let mut passes = shm.pass_tunings().map_or_else(native::Passes::default, native::Passes::from);
+        // The control mask's rules (the hold adds what it knows of the depth).
+        passes.mask = shm.mask_settings().map_or_else(native::Mask::default, native::Mask::from);
         // The edit cache's interval (its own, not `model_interval`: that is the after-the-upscaler
         // path's), and the debug view of its rejection mask.
         let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
