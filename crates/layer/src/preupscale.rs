@@ -102,6 +102,10 @@ pub(crate) mod native;
 #[cfg(target_arch = "x86_64")]
 pub(crate) mod native_post;
 #[cfg(target_arch = "x86_64")]
+pub(crate) mod post_flow;
+#[cfg(target_arch = "x86_64")]
+pub(crate) mod post_history;
+#[cfg(target_arch = "x86_64")]
 pub(crate) mod scene_cut;
 
 /// The native backend's per-device network ([`native::Loader`]); the native crate builds for x86_64 only.
