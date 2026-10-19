@@ -110,3 +110,15 @@ pub mod proxy_format {
     }
 }
 
+
+/// The bits of a pass's `overrides` setting (`pass<N>_overrides`): each names a Model-tab value the
+/// pass takes from its own field instead. A pass with none follows the Model tab.
+pub mod pass_override {
+    pub const INTENSITY: u32 = 1;
+    pub const LOCAL_TONE: u32 = 2;
+    pub const LOCAL_STRUCTURE: u32 = 4;
+    pub const SKIN_STRUCTURE: u32 = 8;
+    pub const STYLE: u32 = 16;
+    pub const AUTO_MASK: u32 = 32;
+    pub const ALL: u32 = 63;
+}

@@ -119,7 +119,7 @@ if [ -n "$new" ] && [ "$new" != "$before" ]; then
   ts=${new##*/Benchmark-}; ts=${ts%.txt}; cp "$new" "$out/benchmark.txt"
   for f in "$DOCS"/FrameTimes-Pass*-$ts.txt; do cp "$f" "$out/${f##*/FrameTimes-}"; done
 fi
-sed -n 's/.*\[series\] capturing the next [0-9]* presents into //p' "$out/launch.log" | while read -r d; do
+sed -n 's/.*\[capture\] capturing the next [0-9]* presents into //p' "$out/launch.log" | while read -r d; do
   [ -d "$d" ] && mv "$d" "$out/"
 done
 ls "$out"

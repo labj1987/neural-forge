@@ -469,10 +469,10 @@ impl ShmClient {
         (!self.header.is_null() && self.regions.iter().all(|r| !r.is_null())).then_some(ShmView { header: self.header, regions: self.regions, leased: self.leased })
     }
 
-    /// The Model tab's settings without per-pass overrides (the native backend's).
+    /// The Passes setting and each pass's settings (the Model tab's with its overrides).
     #[cfg(target_arch = "x86_64")]
-    pub fn global_tuning(&self) -> Option<neural_forge_protocol::Tuning> {
-        self.header().map(|hdr| hdr.global_tuning())
+    pub fn pass_tunings(&self) -> Option<neural_forge_protocol::PassTunings> {
+        self.header().map(|hdr| hdr.pass_tunings())
     }
 
     /// The layer's status line for the GUI (the native backend's state, or why it is not running).

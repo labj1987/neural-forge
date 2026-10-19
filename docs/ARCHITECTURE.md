@@ -158,6 +158,7 @@ be private.
 | 16 | `device_lost_at` (Unix seconds of the session's `VK_ERROR_DEVICE_LOST`, 0 when none) | 3.2.0 |
 | 17 | `preupscale_dump_request`; the edit cache's `cache_refresh_holds`, `cache_cached_holds`, `cache_rejected`, `cache_gpu_ms_bits` | 3.3.0 |
 | 18 | `capture_request` carries a request id; `capture_next_id`, `capture_cancel` and the capture result (state, reason, counts, paths) appended | 3.4.0 |
+| 19 | `passes` and `pass[10]` (each pass's overrides of the Model tab's values: `overrides` bits and their values) appended | 3.6.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
 the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18.

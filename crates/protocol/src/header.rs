@@ -2,6 +2,69 @@ use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::{Slot, HEADER_BYTES, NAME_BYTES, REASON_BYTES, SHM_MAGIC, SHM_VERSION};
 
+/// One pass's overrides of the Model tab's values: `overrides` ([`crate::enums::pass_override`] bits)
+/// names the fields the pass takes from here; the rest follow the Model tab.
+#[repr(C)]
+#[derive(Default)]
+pub struct PassControl {
+    pub overrides: AtomicU32,
+    pub intensity_bits: AtomicU32,
+    pub local_tone_bits: AtomicU32,
+    pub local_structure_bits: AtomicU32,
+    pub skin_structure_bits: AtomicU32,
+    pub style: AtomicU32,
+    pub auto_mask: AtomicU32,
+}
+
+impl PassControl {
+    /// No overrides, and the Model tab's defaults in every field, so an override switched on later
+    /// starts from what the Model tab does by default.
+    pub fn reset_to_defaults(&self) {
+        self.overrides.store(0, Ordering::Relaxed);
+        self.intensity_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.local_tone_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.local_structure_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.skin_structure_bits.store((-1.0f32).to_bits(), Ordering::Relaxed);
+        self.style.store(0, Ordering::Relaxed);
+        self.auto_mask.store(1, Ordering::Relaxed);
+    }
+
+    /// `global` with this pass's overrides applied.
+    pub fn apply(&self, global: Tuning) -> Tuning {
+        use crate::enums::pass_override::*;
+        let mask = self.overrides.load(Ordering::Relaxed);
+        let f = |bit: u32, a: &AtomicU32, g: f32| if mask & bit != 0 { f32::from_bits(a.load(Ordering::Relaxed)) } else { g };
+        let u = |bit: u32, a: &AtomicU32, g: u32| if mask & bit != 0 { a.load(Ordering::Relaxed) } else { g };
+        Tuning {
+            intensity: f(INTENSITY, &self.intensity_bits, global.intensity),
+            local_tone: f(LOCAL_TONE, &self.local_tone_bits, global.local_tone),
+            local_structure: f(LOCAL_STRUCTURE, &self.local_structure_bits, global.local_structure),
+            skin_structure: f(SKIN_STRUCTURE, &self.skin_structure_bits, global.skin_structure),
+            style: u(STYLE, &self.style, global.style),
+            auto_mask: u(AUTO_MASK, &self.auto_mask, global.auto_mask),
+        }
+    }
+}
+
+/// The network's passes as one frame runs them: how many, and each one's settings (the Model tab's
+/// with that pass's overrides). Entries past `count` are the Model tab's.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PassTunings {
+    pub count: usize,
+    pub tunings: [Tuning; crate::MAX_PASSES],
+}
+
+impl PassTunings {
+    /// One pass with `tuning`.
+    pub fn single(tuning: Tuning) -> Self {
+        Self { count: 1, tunings: [tuning; crate::MAX_PASSES] }
+    }
+
+    pub fn passes(&self) -> &[Tuning] {
+        &self.tunings[..self.count]
+    }
+}
+
 /// The model's settings (the Model tab's), read out of the header as plain values.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Tuning {
@@ -302,6 +365,13 @@ pub struct ShmHeader {
     /// guarded by its own sequence number like the free-text fields. Written by the layer only.
     pub capture_result_seq: AtomicU32,
     capture_result: [AtomicU32; crate::capture::RESULT_WORDS],
+
+    // --- v19 -----------------------------------------------------------------------------
+    /// How many times the network runs over one frame (1 to [`crate::MAX_PASSES`]): each pass after the
+    /// first takes the previous pass's picture as its colour input. Default 1.
+    pub passes: AtomicU32,
+    /// Each pass's overrides of the Model tab's values ([`PassControl`]), pass 1 first.
+    pub pass: [PassControl; crate::MAX_PASSES],
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -326,7 +396,9 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 1748, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2032, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, passes) == 1748, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 1752, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_next_id) == 688, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_cancel) == 692, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_result_seq) == 696, "layout changed -- bump SHM_VERSION");
@@ -360,7 +432,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 33] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 104] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -396,7 +468,87 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 33] = [
     ("apply_model", 0.0, 1.0),
     ("debug_view", 0.0, 6.0),
     ("debug_scale", 0.1, 10.0),
+    // How many times the network runs over one frame (`resolved_passes`).
+    ("passes", 1.0, 10.0),
+    // Each pass's overrides (`enums::pass_override` bits) and its own values for them.
+    ("pass1_overrides", 0.0, 63.0),
+    ("pass1_intensity", 0.0, 4.0),
+    ("pass1_local_tone", 0.0, 4.0),
+    ("pass1_local_structure", 0.0, 4.0),
+    ("pass1_skin_structure", -1.0, 4.0),
+    ("pass1_style", 0.0, 2.0),
+    ("pass1_auto_mask", 0.0, 1.0),
+    ("pass2_overrides", 0.0, 63.0),
+    ("pass2_intensity", 0.0, 4.0),
+    ("pass2_local_tone", 0.0, 4.0),
+    ("pass2_local_structure", 0.0, 4.0),
+    ("pass2_skin_structure", -1.0, 4.0),
+    ("pass2_style", 0.0, 2.0),
+    ("pass2_auto_mask", 0.0, 1.0),
+    ("pass3_overrides", 0.0, 63.0),
+    ("pass3_intensity", 0.0, 4.0),
+    ("pass3_local_tone", 0.0, 4.0),
+    ("pass3_local_structure", 0.0, 4.0),
+    ("pass3_skin_structure", -1.0, 4.0),
+    ("pass3_style", 0.0, 2.0),
+    ("pass3_auto_mask", 0.0, 1.0),
+    ("pass4_overrides", 0.0, 63.0),
+    ("pass4_intensity", 0.0, 4.0),
+    ("pass4_local_tone", 0.0, 4.0),
+    ("pass4_local_structure", 0.0, 4.0),
+    ("pass4_skin_structure", -1.0, 4.0),
+    ("pass4_style", 0.0, 2.0),
+    ("pass4_auto_mask", 0.0, 1.0),
+    ("pass5_overrides", 0.0, 63.0),
+    ("pass5_intensity", 0.0, 4.0),
+    ("pass5_local_tone", 0.0, 4.0),
+    ("pass5_local_structure", 0.0, 4.0),
+    ("pass5_skin_structure", -1.0, 4.0),
+    ("pass5_style", 0.0, 2.0),
+    ("pass5_auto_mask", 0.0, 1.0),
+    ("pass6_overrides", 0.0, 63.0),
+    ("pass6_intensity", 0.0, 4.0),
+    ("pass6_local_tone", 0.0, 4.0),
+    ("pass6_local_structure", 0.0, 4.0),
+    ("pass6_skin_structure", -1.0, 4.0),
+    ("pass6_style", 0.0, 2.0),
+    ("pass6_auto_mask", 0.0, 1.0),
+    ("pass7_overrides", 0.0, 63.0),
+    ("pass7_intensity", 0.0, 4.0),
+    ("pass7_local_tone", 0.0, 4.0),
+    ("pass7_local_structure", 0.0, 4.0),
+    ("pass7_skin_structure", -1.0, 4.0),
+    ("pass7_style", 0.0, 2.0),
+    ("pass7_auto_mask", 0.0, 1.0),
+    ("pass8_overrides", 0.0, 63.0),
+    ("pass8_intensity", 0.0, 4.0),
+    ("pass8_local_tone", 0.0, 4.0),
+    ("pass8_local_structure", 0.0, 4.0),
+    ("pass8_skin_structure", -1.0, 4.0),
+    ("pass8_style", 0.0, 2.0),
+    ("pass8_auto_mask", 0.0, 1.0),
+    ("pass9_overrides", 0.0, 63.0),
+    ("pass9_intensity", 0.0, 4.0),
+    ("pass9_local_tone", 0.0, 4.0),
+    ("pass9_local_structure", 0.0, 4.0),
+    ("pass9_skin_structure", -1.0, 4.0),
+    ("pass9_style", 0.0, 2.0),
+    ("pass9_auto_mask", 0.0, 1.0),
+    ("pass10_overrides", 0.0, 63.0),
+    ("pass10_intensity", 0.0, 4.0),
+    ("pass10_local_tone", 0.0, 4.0),
+    ("pass10_local_structure", 0.0, 4.0),
+    ("pass10_skin_structure", -1.0, 4.0),
+    ("pass10_style", 0.0, 2.0),
+    ("pass10_auto_mask", 0.0, 1.0),
 ];
+
+/// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
+/// `local_structure`, `skin_structure`, `style`, `auto_mask`): `pass<N>_<field>`.
+pub fn pass_setting(pass: usize, field: &str) -> Option<&'static str> {
+    let name = format!("pass{}_{field}", pass + 1);
+    SETTING_BOUNDS.iter().map(|&(n, ..)| n).find(|n| *n == name)
+}
 
 /// `(min, max)` for a persisted setting, from [`SETTING_BOUNDS`].
 pub fn setting_bounds(name: &str) -> Option<(f32, f32)> {
@@ -457,6 +609,10 @@ impl ShmHeader {
         self.colour_trust_bits.store(2.0f32.to_bits(), Ordering::Relaxed);
         self.ratio_smooth_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
         self.model_interval.store(1, Ordering::Relaxed);
+        self.passes.store(1, Ordering::Relaxed);
+        for p in &self.pass {
+            p.reset_to_defaults();
+        }
 
         self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
@@ -634,7 +790,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 33] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 104] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -671,6 +827,77 @@ impl ShmHeader {
             ("apply_model", false, self.apply_model.load(Ordering::Relaxed)),
             ("debug_view", false, self.debug_view.load(Ordering::Relaxed)),
             ("debug_scale", true, self.debug_scale_bits.load(Ordering::Relaxed)),
+            ("passes", false, self.passes.load(Ordering::Relaxed)),
+            ("pass1_overrides", false, self.pass[0].overrides.load(Ordering::Relaxed)),
+            ("pass1_intensity", true, self.pass[0].intensity_bits.load(Ordering::Relaxed)),
+            ("pass1_local_tone", true, self.pass[0].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass1_local_structure", true, self.pass[0].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass1_skin_structure", true, self.pass[0].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass1_style", false, self.pass[0].style.load(Ordering::Relaxed)),
+            ("pass1_auto_mask", false, self.pass[0].auto_mask.load(Ordering::Relaxed)),
+            ("pass2_overrides", false, self.pass[1].overrides.load(Ordering::Relaxed)),
+            ("pass2_intensity", true, self.pass[1].intensity_bits.load(Ordering::Relaxed)),
+            ("pass2_local_tone", true, self.pass[1].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass2_local_structure", true, self.pass[1].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass2_skin_structure", true, self.pass[1].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass2_style", false, self.pass[1].style.load(Ordering::Relaxed)),
+            ("pass2_auto_mask", false, self.pass[1].auto_mask.load(Ordering::Relaxed)),
+            ("pass3_overrides", false, self.pass[2].overrides.load(Ordering::Relaxed)),
+            ("pass3_intensity", true, self.pass[2].intensity_bits.load(Ordering::Relaxed)),
+            ("pass3_local_tone", true, self.pass[2].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass3_local_structure", true, self.pass[2].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass3_skin_structure", true, self.pass[2].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass3_style", false, self.pass[2].style.load(Ordering::Relaxed)),
+            ("pass3_auto_mask", false, self.pass[2].auto_mask.load(Ordering::Relaxed)),
+            ("pass4_overrides", false, self.pass[3].overrides.load(Ordering::Relaxed)),
+            ("pass4_intensity", true, self.pass[3].intensity_bits.load(Ordering::Relaxed)),
+            ("pass4_local_tone", true, self.pass[3].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass4_local_structure", true, self.pass[3].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass4_skin_structure", true, self.pass[3].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass4_style", false, self.pass[3].style.load(Ordering::Relaxed)),
+            ("pass4_auto_mask", false, self.pass[3].auto_mask.load(Ordering::Relaxed)),
+            ("pass5_overrides", false, self.pass[4].overrides.load(Ordering::Relaxed)),
+            ("pass5_intensity", true, self.pass[4].intensity_bits.load(Ordering::Relaxed)),
+            ("pass5_local_tone", true, self.pass[4].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass5_local_structure", true, self.pass[4].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass5_skin_structure", true, self.pass[4].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass5_style", false, self.pass[4].style.load(Ordering::Relaxed)),
+            ("pass5_auto_mask", false, self.pass[4].auto_mask.load(Ordering::Relaxed)),
+            ("pass6_overrides", false, self.pass[5].overrides.load(Ordering::Relaxed)),
+            ("pass6_intensity", true, self.pass[5].intensity_bits.load(Ordering::Relaxed)),
+            ("pass6_local_tone", true, self.pass[5].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass6_local_structure", true, self.pass[5].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass6_skin_structure", true, self.pass[5].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass6_style", false, self.pass[5].style.load(Ordering::Relaxed)),
+            ("pass6_auto_mask", false, self.pass[5].auto_mask.load(Ordering::Relaxed)),
+            ("pass7_overrides", false, self.pass[6].overrides.load(Ordering::Relaxed)),
+            ("pass7_intensity", true, self.pass[6].intensity_bits.load(Ordering::Relaxed)),
+            ("pass7_local_tone", true, self.pass[6].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass7_local_structure", true, self.pass[6].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass7_skin_structure", true, self.pass[6].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass7_style", false, self.pass[6].style.load(Ordering::Relaxed)),
+            ("pass7_auto_mask", false, self.pass[6].auto_mask.load(Ordering::Relaxed)),
+            ("pass8_overrides", false, self.pass[7].overrides.load(Ordering::Relaxed)),
+            ("pass8_intensity", true, self.pass[7].intensity_bits.load(Ordering::Relaxed)),
+            ("pass8_local_tone", true, self.pass[7].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass8_local_structure", true, self.pass[7].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass8_skin_structure", true, self.pass[7].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass8_style", false, self.pass[7].style.load(Ordering::Relaxed)),
+            ("pass8_auto_mask", false, self.pass[7].auto_mask.load(Ordering::Relaxed)),
+            ("pass9_overrides", false, self.pass[8].overrides.load(Ordering::Relaxed)),
+            ("pass9_intensity", true, self.pass[8].intensity_bits.load(Ordering::Relaxed)),
+            ("pass9_local_tone", true, self.pass[8].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass9_local_structure", true, self.pass[8].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass9_skin_structure", true, self.pass[8].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass9_style", false, self.pass[8].style.load(Ordering::Relaxed)),
+            ("pass9_auto_mask", false, self.pass[8].auto_mask.load(Ordering::Relaxed)),
+            ("pass10_overrides", false, self.pass[9].overrides.load(Ordering::Relaxed)),
+            ("pass10_intensity", true, self.pass[9].intensity_bits.load(Ordering::Relaxed)),
+            ("pass10_local_tone", true, self.pass[9].local_tone_bits.load(Ordering::Relaxed)),
+            ("pass10_local_structure", true, self.pass[9].local_structure_bits.load(Ordering::Relaxed)),
+            ("pass10_skin_structure", true, self.pass[9].skin_structure_bits.load(Ordering::Relaxed)),
+            ("pass10_style", false, self.pass[9].style.load(Ordering::Relaxed)),
+            ("pass10_auto_mask", false, self.pass[9].auto_mask.load(Ordering::Relaxed)),
         ]
     }
 
@@ -727,6 +954,77 @@ impl ShmHeader {
             "apply_model" => &self.apply_model,
             "debug_view" => &self.debug_view,
             "debug_scale" => &self.debug_scale_bits,
+            "passes" => &self.passes,
+            "pass1_overrides" => &self.pass[0].overrides,
+            "pass1_intensity" => &self.pass[0].intensity_bits,
+            "pass1_local_tone" => &self.pass[0].local_tone_bits,
+            "pass1_local_structure" => &self.pass[0].local_structure_bits,
+            "pass1_skin_structure" => &self.pass[0].skin_structure_bits,
+            "pass1_style" => &self.pass[0].style,
+            "pass1_auto_mask" => &self.pass[0].auto_mask,
+            "pass2_overrides" => &self.pass[1].overrides,
+            "pass2_intensity" => &self.pass[1].intensity_bits,
+            "pass2_local_tone" => &self.pass[1].local_tone_bits,
+            "pass2_local_structure" => &self.pass[1].local_structure_bits,
+            "pass2_skin_structure" => &self.pass[1].skin_structure_bits,
+            "pass2_style" => &self.pass[1].style,
+            "pass2_auto_mask" => &self.pass[1].auto_mask,
+            "pass3_overrides" => &self.pass[2].overrides,
+            "pass3_intensity" => &self.pass[2].intensity_bits,
+            "pass3_local_tone" => &self.pass[2].local_tone_bits,
+            "pass3_local_structure" => &self.pass[2].local_structure_bits,
+            "pass3_skin_structure" => &self.pass[2].skin_structure_bits,
+            "pass3_style" => &self.pass[2].style,
+            "pass3_auto_mask" => &self.pass[2].auto_mask,
+            "pass4_overrides" => &self.pass[3].overrides,
+            "pass4_intensity" => &self.pass[3].intensity_bits,
+            "pass4_local_tone" => &self.pass[3].local_tone_bits,
+            "pass4_local_structure" => &self.pass[3].local_structure_bits,
+            "pass4_skin_structure" => &self.pass[3].skin_structure_bits,
+            "pass4_style" => &self.pass[3].style,
+            "pass4_auto_mask" => &self.pass[3].auto_mask,
+            "pass5_overrides" => &self.pass[4].overrides,
+            "pass5_intensity" => &self.pass[4].intensity_bits,
+            "pass5_local_tone" => &self.pass[4].local_tone_bits,
+            "pass5_local_structure" => &self.pass[4].local_structure_bits,
+            "pass5_skin_structure" => &self.pass[4].skin_structure_bits,
+            "pass5_style" => &self.pass[4].style,
+            "pass5_auto_mask" => &self.pass[4].auto_mask,
+            "pass6_overrides" => &self.pass[5].overrides,
+            "pass6_intensity" => &self.pass[5].intensity_bits,
+            "pass6_local_tone" => &self.pass[5].local_tone_bits,
+            "pass6_local_structure" => &self.pass[5].local_structure_bits,
+            "pass6_skin_structure" => &self.pass[5].skin_structure_bits,
+            "pass6_style" => &self.pass[5].style,
+            "pass6_auto_mask" => &self.pass[5].auto_mask,
+            "pass7_overrides" => &self.pass[6].overrides,
+            "pass7_intensity" => &self.pass[6].intensity_bits,
+            "pass7_local_tone" => &self.pass[6].local_tone_bits,
+            "pass7_local_structure" => &self.pass[6].local_structure_bits,
+            "pass7_skin_structure" => &self.pass[6].skin_structure_bits,
+            "pass7_style" => &self.pass[6].style,
+            "pass7_auto_mask" => &self.pass[6].auto_mask,
+            "pass8_overrides" => &self.pass[7].overrides,
+            "pass8_intensity" => &self.pass[7].intensity_bits,
+            "pass8_local_tone" => &self.pass[7].local_tone_bits,
+            "pass8_local_structure" => &self.pass[7].local_structure_bits,
+            "pass8_skin_structure" => &self.pass[7].skin_structure_bits,
+            "pass8_style" => &self.pass[7].style,
+            "pass8_auto_mask" => &self.pass[7].auto_mask,
+            "pass9_overrides" => &self.pass[8].overrides,
+            "pass9_intensity" => &self.pass[8].intensity_bits,
+            "pass9_local_tone" => &self.pass[8].local_tone_bits,
+            "pass9_local_structure" => &self.pass[8].local_structure_bits,
+            "pass9_skin_structure" => &self.pass[8].skin_structure_bits,
+            "pass9_style" => &self.pass[8].style,
+            "pass9_auto_mask" => &self.pass[8].auto_mask,
+            "pass10_overrides" => &self.pass[9].overrides,
+            "pass10_intensity" => &self.pass[9].intensity_bits,
+            "pass10_local_tone" => &self.pass[9].local_tone_bits,
+            "pass10_local_structure" => &self.pass[9].local_structure_bits,
+            "pass10_skin_structure" => &self.pass[9].skin_structure_bits,
+            "pass10_style" => &self.pass[9].style,
+            "pass10_auto_mask" => &self.pass[9].auto_mask,
             _ => return false,
         };
         field.store(bits, Ordering::Relaxed);
@@ -742,14 +1040,41 @@ impl ShmHeader {
     /// whole, before or after. A writer that died mid-write (the sequence left on one odd value) is
     /// recognised after a few thousand looks and the values are read as they stand.
     pub fn global_tuning(&self) -> Tuning {
-        let read = || Tuning {
+        self.read_settings(|| self.global_tuning_now())
+    }
+
+    /// The pass count ([`Self::resolved_passes`]) and each pass's settings, read as one unit under
+    /// `tuning_seq` like [`Self::global_tuning`].
+    pub fn pass_tunings(&self) -> PassTunings {
+        self.read_settings(|| {
+            let global = self.global_tuning_now();
+            let mut tunings = [global; crate::MAX_PASSES];
+            for (t, p) in tunings.iter_mut().zip(&self.pass) {
+                *t = p.apply(global);
+            }
+            PassTunings { count: self.resolved_passes() as usize, tunings }
+        })
+    }
+
+    /// The Passes setting, clamped to 1 to [`crate::MAX_PASSES`].
+    pub fn resolved_passes(&self) -> u32 {
+        self.passes.load(Ordering::Relaxed).clamp(1, crate::MAX_PASSES as u32)
+    }
+
+    fn global_tuning_now(&self) -> Tuning {
+        Tuning {
             intensity: f32::from_bits(self.intensity_bits.load(Ordering::Relaxed)),
             local_tone: f32::from_bits(self.local_tone_bits.load(Ordering::Relaxed)),
             local_structure: f32::from_bits(self.local_structure_bits.load(Ordering::Relaxed)),
             skin_structure: f32::from_bits(self.skin_structure_bits.load(Ordering::Relaxed)),
             style: self.style.load(Ordering::Relaxed),
             auto_mask: self.auto_mask.load(Ordering::Relaxed),
-        };
+        }
+    }
+
+    /// `read` under `tuning_seq` ([`Self::write_settings`]): a preset or profile being written is seen
+    /// whole, before or after.
+    fn read_settings<T>(&self, read: impl Fn() -> T) -> T {
         // A live writer moves the sequence on within microseconds; one that stays on the same odd
         // value for STUCK_FOR has died mid-write. That value is remembered (per process), so later
         // reads do not wait for it again; the next write takes it over.
@@ -1116,14 +1441,81 @@ mod tests {
     }
 
     #[test]
+    fn the_passes_are_appended_after_the_capture_result() {
+        // v19 appends the pass count and the per-pass overrides: every earlier field keeps its offset.
+        assert_eq!(std::mem::offset_of!(ShmHeader, passes), std::mem::offset_of!(ShmHeader, capture_result) + crate::capture::RESULT_WORDS * 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass), std::mem::offset_of!(ShmHeader, passes) + 4);
+        assert_eq!(std::mem::size_of::<PassControl>(), 28);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 19);
+    }
+
+    #[test]
+    fn one_pass_following_the_model_tab_is_the_default() {
+        let h = ShmHeader::default();
+        h.passes.store(7, Ordering::Relaxed);
+        h.pass[3].overrides.store(crate::enums::pass_override::ALL, Ordering::Relaxed);
+        h.pass[3].intensity_bits.store(0.25f32.to_bits(), Ordering::Relaxed);
+        h.init_defaults();
+        let t = h.pass_tunings();
+        assert_eq!(t.count, 1);
+        assert_eq!(t.passes(), &[h.global_tuning()]);
+        assert!(t.tunings.iter().all(|p| *p == h.global_tuning()), "no pass overrides anything");
+    }
+
+    #[test]
+    fn a_pass_takes_only_the_values_it_overrides() {
+        use crate::enums::pass_override::*;
+        let h = ShmHeader::default();
+        h.init_defaults();
+        h.intensity_bits.store(0.8f32.to_bits(), Ordering::Relaxed);
+        h.local_tone_bits.store(1.5f32.to_bits(), Ordering::Relaxed);
+        h.passes.store(3, Ordering::Relaxed);
+        let p = &h.pass[1];
+        p.intensity_bits.store(0.3f32.to_bits(), Ordering::Relaxed);
+        p.local_tone_bits.store(0.1f32.to_bits(), Ordering::Relaxed);
+        p.style.store(2, Ordering::Relaxed);
+        p.overrides.store(INTENSITY | STYLE, Ordering::Relaxed);
+        let t = h.pass_tunings();
+        assert_eq!(t.count, 3);
+        assert_eq!(t.tunings[0], h.global_tuning());
+        assert_eq!(t.tunings[1], Tuning { intensity: 0.3, style: 2, ..h.global_tuning() }, "local tone is not overridden");
+        assert_eq!(t.tunings[2], h.global_tuning());
+    }
+
+    #[test]
+    fn the_pass_count_is_clamped_to_one_to_max_passes() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        for (stored, resolved) in [(0, 1), (1, 1), (10, 10), (11, 10), (u32::MAX, 10)] {
+            h.passes.store(stored, Ordering::Relaxed);
+            assert_eq!(h.resolved_passes(), resolved, "{stored}");
+        }
+        assert_eq!(crate::setting_bounds("passes"), Some((1.0, crate::MAX_PASSES as f32)));
+        assert!(h.apply_persisted_setting("passes", 40));
+        assert_eq!(h.passes.load(Ordering::Relaxed), 10);
+    }
+
+    #[test]
+    fn every_pass_setting_is_persisted_by_name() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert!(h.write_settings(&[("pass10_overrides", 1), ("pass10_intensity", 0.5f32.to_bits()), ("passes", 10)]));
+        assert_eq!(h.pass[9].overrides.load(Ordering::Relaxed), 1);
+        assert_eq!(h.pass_tunings().tunings[9].intensity, 0.5);
+        assert!(!h.apply_persisted_setting("pass11_intensity", 0), "there is no eleventh pass");
+        assert!(h.apply_persisted_setting("pass1_overrides", 255));
+        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "clamped to the six fields");
+    }
+
+    #[test]
     fn the_capture_result_is_appended_after_the_cache_status() {
         // v18 appends the capture request ids and the result block: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, capture_next_id), std::mem::offset_of!(ShmHeader, cache_gpu_ms_bits) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, capture_cancel), std::mem::offset_of!(ShmHeader, capture_next_id) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, capture_result_seq), std::mem::offset_of!(ShmHeader, capture_cancel) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, capture_result), std::mem::offset_of!(ShmHeader, capture_result_seq) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, capture_result) + crate::capture::RESULT_WORDS * 4, std::mem::size_of::<ShmHeader>());
-        assert_eq!(crate::SHM_VERSION, 18);
+        assert_eq!(std::mem::offset_of!(ShmHeader, passes), std::mem::offset_of!(ShmHeader, capture_result) + crate::capture::RESULT_WORDS * 4);
         let h = ShmHeader::default();
         h.capture_cancel.store(3, Ordering::Relaxed);
         h.set_capture_result_words(&[7; crate::capture::RESULT_WORDS]);

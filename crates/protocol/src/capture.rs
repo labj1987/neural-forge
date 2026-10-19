@@ -196,9 +196,11 @@ pub fn take(hdr: &ShmHeader, accept: impl Fn(&Request) -> bool) -> Option<Reques
     hdr.capture_request.compare_exchange(word, 0, Ordering::AcqRel, Ordering::Relaxed).ok().map(|_| request)
 }
 
-/// Whether the requester asked for capture `id` to stop.
+/// Whether the requester asked for capture `id` to stop. Id 0 is a capture the layer started on its
+/// own (`NEURAL_FORGE_CAPTURE_AT`, never handed out by [`request`]): nothing can name it, and
+/// `capture_cancel`'s 0 means "none", so it is never cancelled.
 pub fn cancel_requested(hdr: &ShmHeader, id: u32) -> bool {
-    hdr.capture_cancel.load(Ordering::Acquire) == id
+    id != 0 && hdr.capture_cancel.load(Ordering::Acquire) == id
 }
 
 /// What became of one request, as the layer publishes it.
@@ -396,5 +398,16 @@ mod tests {
             assert_eq!(known, !(8..=9).contains(&code), "{code}");
         }
         assert_eq!(reason::describe(reason::NONE), None);
+    }
+
+    #[test]
+    fn a_capture_the_layer_started_itself_is_never_cancelled() {
+        // `NEURAL_FORGE_CAPTURE_AT`'s series carries id 0, and `capture_cancel`'s 0 means "none".
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert!(!cancel_requested(&h, 0), "a fresh header cancels nothing");
+        h.capture_cancel.store(5, Ordering::Relaxed);
+        assert!(cancel_requested(&h, 5));
+        assert!(!cancel_requested(&h, 0));
     }
 }

@@ -17,7 +17,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab: the Neural rendering switch, style, strength presets, intensity, local tone, local and skin structure, auto mask and the toggle key](screenshots/settings.png) | ![Setup tab: the model present (the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: layer state, the Model placement line, the model, the settings reset and profiles, and the Diagnosis group with Diagnose and Save report](screenshots/status.png) |
+| ![Model tab: the Neural rendering switch, style, strength presets, intensity, local tone, local and skin structure, auto mask and passes](screenshots/settings.png) | ![Setup tab: the model present (the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: layer state, the Model placement line, the model, the settings reset and profiles, and the Diagnosis group with Diagnose and Save report](screenshots/status.png) |
 
 The screenshots show default settings with no game running.
 
@@ -254,7 +254,7 @@ this version re-creates the shared memory.
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, model every Nth frame (after the upscaler only), and the toggle key. |
+| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes and per-pass settings, model every Nth frame (after the upscaler only), and the toggle key. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -265,6 +265,23 @@ frame while it moves; the frame in between reuses its last result, moved with th
 checked against depth and colour (the edit cache). The model's answer is written straight back (there is no
 composition step), so "Model every Nth frame" and the Composition tab only change the after-the-upscaler
 path. The Model tab's tuning and the switch apply to both.
+
+**Passes** (1 to 10, default 1) runs the model that many times over each frame, before or after the
+upscaler: every pass after the first works on the previous pass's picture. Each pass costs about as much
+GPU time as the first, and the effect builds up with every pass. In GTA V Enhanced at 1440p with frame
+generation 4x (real frames per second, pass 4 of the built-in benchmark):
+
+| Network | 1 pass | 2 passes | 3 passes |
+|---|---|---|---|
+| Small | 74.3 | 64.0 | 58.1 |
+| Full | 65.6 | 51.2 | |
+
+Two passes of the small network cost about as much as one pass of the full network, and look
+over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
+blend toward each other's pictures over time. **Per-pass settings** (Edit…) let each pass use its own
+intensity, local tone, local structure, skin structure, style or auto mask instead of the Model tab's.
+
+![Per-pass settings: the pass to edit, and an override switch with its value for intensity, local tone, local structure, skin structure, style and auto mask](screenshots/passes.png)
 
 Settings are live: the GUI and the running layer share them through shared memory.
 `neural-forge-cli shmctl status|set|toggle|capture` does the same from a terminal. The Debug tab's

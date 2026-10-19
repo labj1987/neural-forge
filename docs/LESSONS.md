@@ -1082,6 +1082,64 @@ looked like 0.5 ms of the network's 6.6.
   benchmark and the play checks were not run. Worth revisiting only if a network change keeps padded
   tokens out of the bottleneck (then the bound reaches the encoder and the 0.5 ms ceiling is real).
 
+## October 19: passes again, natively (3.6.0)
+
+Alex asked for a pass count like other apps offer (up to 10), whatever the measurements say about its use.
+A one-off test on 2026-10-18 (a throwaway branch) ran the small network twice per frame; 3.6.0 ships it
+as a setting with per-pass overrides, before and after the upscaler.
+
+- **The edit cache keeps its edit in the network's input-feature buffer** (`cache::ScratchLayout`). The
+  first test build ran pass 2 after the write-back, whose preprocess overwrote the edit pass 1 had just
+  captured: cached holds then read garbage (rejected 100% of pixels in the cache status, against 3-5%
+  normally). Every pass must run before the write-back, and the write-back must be the only thing that
+  captures the edit. The shipped order is `C`, `N`, (`X` or `Y`, `N`) per later pass, `R`, `W`.
+- **Anchor on the original frame.** Before the upscaler the encoded capture is saved before the first
+  copy of an answer over it and put back after the last pass, so the write-back's clamped-highlight rule
+  and the edit cache compare the last answer with the game's own frame. After the upscaler the shared
+  proxy is never overwritten (later passes read a scratch copy), so the composition compares the whole
+  chain with the original. `pan` after the upscaler: the edit is 191% of one pass's at 2 passes and 273%
+  at 3 (agreement.py, ncc 0.96 / 0.93), so it grows instead of fading.
+- **Each pass needs its own history** (an idea from y4my4my4m/OptiScaler_DLSSNR_Multipass_MFG's notes,
+  GPL-3.0, ideas only). With one shared history pass 1 blends toward the previous frame's multi-pass
+  picture, which compounds frame after frame. Each later pass has its own pair of history images, built
+  when the pass count first reaches it (about 20 MB per pass at 1486x836), and reads it only when it ran
+  on the previous network frame. The history flag stays shared, so every reset (F11, a loading screen, a
+  resolution change) resets every pass. The GPU test fails with the shared history.
+- **Counter chaining across passes** is the same as across frames: each pass executes the whole recorded
+  graph, with barriers between passes. `pan`, 2 passes, chaining against barriers: 60 of 60 frames
+  bit-identical.
+- **Memory** grows only by the later passes' history and parameter buffers: peak VRAM in GTA 1440p FG 4x
+  was 9998 MiB at 1 pass, 10010-10072 at 2 and 10026 at 3 (the full network: 9986-10043 at 1, 10268 at 2).
+- **The brightness guard** (Max ratio, after the upscaler) applies once to the final composition, so it
+  caps the whole chain's edit. It is left as the user sets it rather than scaled with the pass count.
+- **Not done:** per-pass ViT reuse and pass feedback (the RenoDX handoff's item 4 adds the latter).
+
+Measured (mods off, FG 4x, three runs where the difference is small, pass 4 real fps): small 74.3 / 64.0
+/ 58.1 at 1 / 2 / 3 passes, full 65.6 / 51.2 at 1 / 2. Two small passes and one full pass cost the same
+within the 3 fps spread; two small passes look over-processed (2026-10-18 screenshots: gritty stone,
+blotchy windows, streaky roads), one full pass does not.
+
+### The after-the-upscaler path answered only the first game session (fixed in 3.6.0)
+
+Found while testing passes with `pan`: on a channel a previous session had used, the after-the-upscaler
+model never answered (3.5.3 too). The layer posts its first request in the present that starts the
+native model server; the server's loop started from the current `seq_req`, so a request posted a moment
+before the thread started was taken as seen and never served. On a fresh channel the layer gave up on it
+(no heartbeat yet) and posted again; on a used one the header still showed the previous session's server
+running, and the layer waited on the lost request for good. The server now starts from `seq_resp`
+(`native_post::first_seen`): three sessions in a row all composed. `NEURAL_FORGE_PREUPSCALE=off` runs in
+GTA after a first session showed nothing for the same reason.
+
+### 4K with the small network (2026-10-19, Alex's go-ahead for this test)
+
+One run of GTA at 3840x2160@144 VRR, FG 4x, Preset C, small network, one pass, texture quality one step
+down (High to Normal) for the run only: 35.6 real / 142.4 shown fps, the network 7.47 ms at DLSS's
+2228x1253 input (6.6 ms in the two runs where GTA did not engage frame generation, about its cost outside
+a game at that size), peak VRAM 11863 of 12227 MiB, no miss, no Xid, no out-of-memory. The full network's
+19 ms in game against 10.7 ms idle (3.4.1) is not seen with the small one: it fits, and slows by about
+15% under frame generation's memory pressure without collapsing. Two passes at 4K were not run: there is
+no memory left for them.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

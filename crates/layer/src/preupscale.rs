@@ -151,8 +151,8 @@ pub(crate) unsafe fn run_native(
 ) -> HoldResult {
     #[cfg(target_arch = "x86_64")]
     {
-        // The Model tab's settings.
-        let conditioning = shm.global_tuning().map_or_else(native::Conditioning::default, native::Conditioning::from);
+        // The Passes setting and each pass's settings (the Model tab's with that pass's overrides).
+        let passes = shm.pass_tunings().map_or_else(native::Passes::default, native::Passes::from);
         // The edit cache's interval (its own, not `model_interval`: that is the after-the-upscaler
         // path's), and the debug view of its rejection mask.
         let ask = native::CacheAsk { hold, interval: cache::interval(), debug_mask: shm.debug_view() == CACHE_DEBUG_VIEW };
@@ -160,7 +160,7 @@ pub(crate) unsafe fn run_native(
         // after-the-upscaler path keeps off the network.
         res.pre_loader = Some(loader.clone());
         // SAFETY: forwarded.
-        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, conditioning, arm, ask, submit) };
+        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, passes, arm, ask, submit) };
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, hold, submit);

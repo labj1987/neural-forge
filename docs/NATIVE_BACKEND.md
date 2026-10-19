@@ -484,14 +484,14 @@ setting: bit-exact, or within one half-float step where the native side applies 
 | Auto mask | `DLSSNR.UseAutoMask` | lanes 12-14 (off: structure, -1, -1) | off: bit-exact |
 | Preset | `DLSSNR.Hint.Render.Preset` | none | preset 1 gives NGX's preset-0 answer byte for byte: it does nothing on 310.8.0, with either backend. **Removed (SHM v12); the helper always sends 0.** |
 | Sharpness | `Sharpness`, which the 310.8 feature never reads (DLSSNR_PARAMETERS.md) | none | No effect on either backend. **Removed (SHM v12).** |
-| Passes, per-pass settings | the helper chains one NGX feature per pass | none: the network runs once per frame with the Model tab's values; per-pass overrides are ignored | **The maintainer (2026-10-07): not wanted on native.** The GUI shows Passes, Per-pass settings and Unlock pass limit only while a game runs on the helper (`native_running`, SHM v13). |
+| Passes, per-pass settings | the helper chained one NGX feature per pass | the network runs `passes` times per network frame (1 to 10, SHM v19), each pass after the first on the previous pass's answer and with its own parameters (the Model tab's values with that pass's overrides) | Back in 3.6.0 at the maintainer's request (2026-10-19), after 3.0.0 removed them with the helper. Before the upscaler (`native::MorePasses`) the answer is copied over the encoded capture between passes, and the capture put back for the write-back; after it (`native_post`) each pass reads the previous answer from a scratch buffer. Each later pass has its own history (`MorePasses::history`, built when the pass count first reaches it; a pass reads it only if it ran on the previous frame). GTA V Enhanced, 1440p, FG 4x, mods off: small 74.3 / 64.0 / 58.1 real fps at 1 / 2 / 3 passes, full 65.6 / 51.2 at 1 / 2 (HARDWARE_VALIDATION.md, 2026-10-19). |
 | Motion: estimate motion vectors, units, quality | the helper's optical flow feeds NGX's `MVec` | none: DLSS's own motion vectors and jitter | **The maintainer (2026-10-07): helper only.** The Motion tab is shown only while a game runs on the helper. |
 
 Every other Model and Composition control (model interval, working scale, detail strength, colour
 strength, highlight guard, white point, transfer mode, compare, debug) belongs to the after-the-upscaler
 composition, which is unchanged, and has no network-side meaning.
 
-The native hold reads the Model tab's settings from the header every frame (`ShmClient::global_tuning`, no per-pass overrides),
+The native hold reads the Model tab's settings and every pass's overrides from the header every frame (`ShmClient::pass_tunings`),
 with the helper's clamps, so a change applies at the next frame (the helper rebuilt its feature after a
 settle delay instead).
 
@@ -572,8 +572,9 @@ matrix as too long once the answer was clear; what was measured:
   scene).
 - **Games held inside DLSS's command buffer** (Crimson Desert, Cyberpunk 2077): native since Phase 4b.
 - **32-bit**: not possible as built (no `VK_NV_cuda_kernel_launch` in a 32-bit process).
-- **Passes, the motion controls**: helper only, hidden in the GUI while native runs (SHM v13). Preset and
-  sharpness did nothing on either backend and are removed (SHM v12).
+- **The motion controls**: helper only, hidden in the GUI while native runs (SHM v13). Preset and
+  sharpness did nothing on either backend and are removed (SHM v12). Passes and per-pass settings run
+  natively since 3.6.0.
 - The layer grew to 8.9 MB and needs glibc 2.38.
 
 ### Recommendation

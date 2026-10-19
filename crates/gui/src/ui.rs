@@ -389,6 +389,28 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     let (auto_mask, set_auto_mask) = bind_bool(&shm, Some("auto_mask"), |h| &h.auto_mask);
     model_group.add(&switch_row("Auto mask", "Automatic skin/detail masking", auto_mask, set_auto_mask));
 
+    let (passes, set_passes) = bind_u32(&shm, Some("passes"), |h| &h.passes);
+    model_group.add(&spin_row(
+        "Passes",
+        "How many times the model runs over each frame. Every pass after the first works on the previous pass's picture and costs the model's time again",
+        passes as f32,
+        "passes",
+        1.0,
+        move |v| set_passes(v as u32),
+    ));
+    let pass_row = adw::ActionRow::new();
+    pass_row.set_title("Per-pass settings");
+    pass_row.set_subtitle("Give individual passes their own values");
+    let pass_button = gtk4::Button::with_label("Edit…");
+    pass_button.set_valign(gtk4::Align::Center);
+    pass_row.add_suffix(&pass_button);
+    pass_row.set_activatable_widget(Some(&pass_button));
+    {
+        let shm = std::sync::Arc::clone(&shm);
+        pass_button.connect_clicked(move |b| open_pass_dialog(&shm, b.upcast_ref()));
+    }
+    model_group.add(&pass_row);
+
     let (interval, set_interval) = bind_u32(&shm, Some("model_interval"), |h| &h.model_interval);
     let interval_row = spin_row(
         "Model every Nth frame",
@@ -690,10 +712,16 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     toasts.set_child(Some(&toolbar_view));
 
     // Developer aid: `NEURAL_FORGE_GUI_OPEN=<tab id>` (model/composition/debug/status/setup) selects
-    // that tab at startup, so it can be screenshotted where synthetic input cannot reliably reach a
-    // page navigated to after the window opens.
-    if let Some(tab @ ("model" | "composition" | "debug" | "status" | "setup")) = neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
-        view_stack.set_visible_child_name(tab);
+    // that tab at startup, and `NEURAL_FORGE_GUI_OPEN=passes` opens the per-pass dialog, so either can be
+    // screenshotted where synthetic input cannot reliably reach a page navigated to after the window opens.
+    match neural_forge_protocol::env::var("NEURAL_FORGE_GUI_OPEN").as_deref() {
+        Some("passes") => {
+            let shm = std::sync::Arc::clone(&shm);
+            let view = view_stack.clone();
+            glib::timeout_add_local_once(std::time::Duration::from_millis(500), move || open_pass_dialog(&shm, view.upcast_ref()));
+        }
+        Some(tab @ ("model" | "composition" | "debug" | "status" | "setup")) => view_stack.set_visible_child_name(tab),
+        _ => {}
     }
 
     // Follow the header: a change made with `shmctl`, a loaded profile, Reset or another
@@ -777,6 +805,164 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     }
 
     window.present();
+}
+
+/// One field of the per-pass dialog.
+struct PassField {
+    title: &'static str,
+    /// The setting's name after `pass<N>_`.
+    field: &'static str,
+    bit: u32,
+    kind: PassFieldKind,
+    get: fn(&neural_forge_protocol::PassControl) -> &std::sync::atomic::AtomicU32,
+}
+
+enum PassFieldKind {
+    Float { step: f64 },
+    Choice(&'static [&'static str]),
+    Toggle,
+}
+
+/// Per-pass overrides: each pass can replace any of the Model tab's values with its own; a pass that
+/// overrides nothing follows the Model tab. Saved as `set_pass<N>_*` like any other setting, and
+/// written as one unit (`write_settings`) so the layer never reads half of a change.
+fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, parent: &gtk4::Widget) {
+    use neural_forge_protocol::enums::pass_override as po;
+    use std::cell::Cell;
+    use std::rc::Rc;
+    const FIELDS: &[PassField] = &[
+        PassField { title: "Intensity", field: "intensity", bit: po::INTENSITY, kind: PassFieldKind::Float { step: 0.05 }, get: |p| &p.intensity_bits },
+        PassField { title: "Local tone", field: "local_tone", bit: po::LOCAL_TONE, kind: PassFieldKind::Float { step: 0.05 }, get: |p| &p.local_tone_bits },
+        PassField { title: "Local structure", field: "local_structure", bit: po::LOCAL_STRUCTURE, kind: PassFieldKind::Float { step: 0.05 }, get: |p| &p.local_structure_bits },
+        PassField { title: "Skin structure", field: "skin_structure", bit: po::SKIN_STRUCTURE, kind: PassFieldKind::Float { step: 0.05 }, get: |p| &p.skin_structure_bits },
+        PassField { title: "Style", field: "style", bit: po::STYLE, kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]), get: |p| &p.style },
+        PassField { title: "Auto mask", field: "auto_mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |p| &p.auto_mask },
+    ];
+    let max = neural_forge_protocol::MAX_PASSES;
+
+    let dialog = adw::PreferencesDialog::new();
+    dialog.set_title("Per-pass settings");
+    let page = adw::PreferencesPage::new();
+    let pick = adw::PreferencesGroup::new();
+    pick.set_description(Some(
+        "Each pass of the model can override any Model-tab value with its own. A pass that overrides nothing \
+         follows the Model tab. Only the passes the Passes setting runs are used.",
+    ));
+    let pass_adj = gtk4::Adjustment::new(1.0, 1.0, max as f64, 1.0, 1.0, 0.0);
+    let pass_row = adw::SpinRow::new(Some(&pass_adj), 1.0, 0);
+    pass_row.set_title("Pass");
+    pick.add(&pass_row);
+    page.add(&pick);
+    let fields_group = adw::PreferencesGroup::new();
+    page.add(&fields_group);
+
+    let loading = Rc::new(Cell::new(false));
+    let current_pass = move |adj: &gtk4::Adjustment| (adj.value() as usize).saturating_sub(1).min(max - 1);
+    // Writes settings of the pass shown, as one unit, and saves them.
+    let write = {
+        let shm = std::sync::Arc::clone(shm);
+        move |settings: &[(&'static str, u32)]| {
+            if shm.header().write_settings(settings) {
+                let names: Vec<&'static str> = settings.iter().map(|&(n, _)| n).collect();
+                crate::shm::persist_settings_later(&shm, &names);
+            }
+        }
+    };
+    let write = Rc::new(write);
+    let mut reloads: Vec<Box<dyn Fn(usize)>> = Vec::new();
+
+    for field in FIELDS {
+        let expander = adw::ExpanderRow::new();
+        expander.set_title(field.title);
+        expander.set_subtitle("Override for this pass");
+        expander.set_show_enable_switch(true);
+        let set_value = {
+            let pass_adj = pass_adj.clone();
+            let loading = Rc::clone(&loading);
+            let write = Rc::clone(&write);
+            let name = field.field;
+            Rc::new(move |bits: u32| {
+                if loading.get() {
+                    return;
+                }
+                if let Some(setting) = neural_forge_protocol::pass_setting(current_pass(&pass_adj), name) {
+                    write(&[(setting, bits)]);
+                }
+            })
+        };
+        let set_widget: Box<dyn Fn(u32)> = match &field.kind {
+            PassFieldKind::Float { step } => {
+                let (lower, upper) = neural_forge_protocol::setting_bounds(field.field).unwrap_or_else(|| panic!("{} has no bounds", field.field));
+                let adj = gtk4::Adjustment::new(0.0, f64::from(lower), f64::from(upper), *step, step * 10.0, 0.0);
+                let row = adw::SpinRow::new(Some(&adj), *step, 2);
+                row.set_title("Value");
+                let w = Rc::clone(&set_value);
+                adj.connect_value_changed(move |a| w((a.value() as f32).to_bits()));
+                expander.add_row(&row);
+                Box::new(move |bits| adj.set_value(f64::from(f32::from_bits(bits))))
+            }
+            PassFieldKind::Choice(options) => {
+                let row = adw::ComboRow::new();
+                row.set_title("Value");
+                row.set_model(Some(&gtk4::StringList::new(options)));
+                let w = Rc::clone(&set_value);
+                row.connect_selected_notify(move |r| w(r.selected()));
+                expander.add_row(&row);
+                let last = options.len() as u32 - 1;
+                Box::new(move |bits| row.set_selected(bits.min(last)))
+            }
+            PassFieldKind::Toggle => {
+                let row = adw::SwitchRow::new();
+                row.set_title("On");
+                let w = Rc::clone(&set_value);
+                row.connect_active_notify(move |r| w(u32::from(r.is_active())));
+                expander.add_row(&row);
+                Box::new(move |bits| row.set_active(bits != 0))
+            }
+        };
+        {
+            let shm = std::sync::Arc::clone(shm);
+            let pass_adj = pass_adj.clone();
+            let loading = Rc::clone(&loading);
+            let write = Rc::clone(&write);
+            let bit = field.bit;
+            expander.connect_enable_expansion_notify(move |e| {
+                if loading.get() {
+                    return;
+                }
+                let pass = current_pass(&pass_adj);
+                let mask = shm.header().pass[pass].overrides.load(Ordering::Relaxed);
+                let mask = if e.enables_expansion() { mask | bit } else { mask & !bit };
+                if let Some(setting) = neural_forge_protocol::pass_setting(pass, "overrides") {
+                    write(&[(setting, mask)]);
+                }
+            });
+        }
+        fields_group.add(&expander);
+        let shm = std::sync::Arc::clone(shm);
+        let get = field.get;
+        let bit = field.bit;
+        reloads.push(Box::new(move |pass| {
+            let p = &shm.header().pass[pass];
+            expander.set_enable_expansion(p.overrides.load(Ordering::Relaxed) & bit != 0);
+            set_widget(get(p).load(Ordering::Relaxed));
+        }));
+    }
+
+    let reload = {
+        let loading = Rc::clone(&loading);
+        let reloads = Rc::new(reloads);
+        move |pass: usize| {
+            loading.set(true);
+            reloads.iter().for_each(|r| r(pass));
+            loading.set(false);
+        }
+    };
+    reload(0);
+    pass_adj.connect_value_changed(move |a| reload(current_pass(a)));
+
+    dialog.add(&page);
+    dialog.present(Some(parent));
 }
 
 fn profile_names() -> Vec<String> {

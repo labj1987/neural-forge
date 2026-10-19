@@ -9,6 +9,10 @@
 //! echoed (failing open). Then `answered_w/h`, `seq_eval`, `server_busy_us` and `seq_resp` are published in that
 //! order, and the heartbeat keeps the layer's `server_alive` true.
 //!
+//! With more than one pass (the Passes setting) the frame runs through the network again for each, every pass
+//! after the first reading the previous pass's answer (copied into the slot's `scratch`) where the first reads
+//! the frame; each pass has its own settings (the Model tab's with that pass's overrides).
+//!
 //! There are no motion vectors after the upscaler: every frame runs without history, with a fixed seed (a
 //! seed that changed every frame, with nothing blending frames, would shimmer). It never runs the network
 //! while the pre-upscaler path uses it, nor the other way round ([`super::native::Loader::claim_post`]).
@@ -21,7 +25,7 @@ use ash::vk;
 use neural_forge_protocol::enums::proxy_format;
 use neural_forge_protocol::Slot;
 
-use super::native::{Built, Conditioning, Loader, Setup};
+use super::native::{Built, Conditioning, Loader, OwnBuffer, Setup};
 use super::{region_buffer, HostBuffer};
 use crate::shm::ShmView;
 
@@ -174,16 +178,33 @@ struct Gpu {
     layouts: [vk::PipelineLayout; 2],
     pipelines: [vk::Pipeline; 2],
     pool: vk::DescriptorPool,
-    sets: [vk::DescriptorSet; 2],
+    /// The preprocess's and the composite's sets reading the frame (0, 1), and the same reading `scratch`
+    /// (2, 3: every pass after the first).
+    sets: [vk::DescriptorSet; 4],
     command_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
     /// Per slot: the proxy and answer buffers over the shared-memory regions, for one frame size.
     slots: [Option<SlotBuffers>; 2],
-    /// What the sets point at: the slot, its buffers' size, and the build.
-    bound: Option<(usize, u32, u32, u64)>,
+    /// What the sets point at: the slot, its buffers' size, the build, and whether sets 2 and 3 are bound.
+    bound: Option<(usize, u32, u32, u64, bool)>,
     /// A wait that timed out: the buffers it used may still be in use, so they are never touched again.
     stalled: bool,
+}
+
+impl SlotBuffers {
+    /// # Safety
+    /// Nothing of it is pending.
+    unsafe fn destroy(self, device: &ash::Device) {
+        // SAFETY: forwarded.
+        unsafe {
+            self.proxy.destroy(device);
+            self.answer.destroy(device);
+            if let Some(s) = self.scratch {
+                s.destroy(device);
+            }
+        }
+    }
 }
 
 struct SlotBuffers {
@@ -191,6 +212,8 @@ struct SlotBuffers {
     height: u32,
     proxy: HostBuffer,
     answer: HostBuffer,
+    /// The previous pass's answer, for the next pass to read (built on the first frame with two or more).
+    scratch: Option<OwnBuffer>,
 }
 
 impl Gpu {
@@ -230,13 +253,13 @@ impl Gpu {
             g.gpu.pipelines[0] = super::hdr::compute_pipeline(device, g.gpu.layouts[0], PREPROCESS_SPV)?;
             step(5)?;
             g.gpu.pipelines[1] = super::hdr::compute_pipeline(device, g.gpu.layouts[1], COMPOSITE_SPV)?;
-            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 6 }];
+            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 12 }];
             step(6)?;
-            g.gpu.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(2).pool_sizes(&sizes), None).ok()?;
-            let set_layouts = [set_layout, set_layout];
+            g.gpu.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(4).pool_sizes(&sizes), None).ok()?;
+            let set_layouts = [set_layout; 4];
             step(7)?;
             let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(g.gpu.pool).set_layouts(&set_layouts)).ok()?;
-            g.gpu.sets = [sets[0], sets[1]];
+            g.gpu.sets = [sets[0], sets[1], sets[2], sets[3]];
             step(8)?;
             g.gpu.command_pool = device
                 .create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(setup.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
@@ -265,7 +288,7 @@ impl Gpu {
             layouts: [vk::PipelineLayout::null(); 2],
             pipelines: [vk::Pipeline::null(); 2],
             pool: vk::DescriptorPool::null(),
-            sets: [vk::DescriptorSet::null(); 2],
+            sets: [vk::DescriptorSet::null(); 4],
             command_pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -284,8 +307,7 @@ impl Gpu {
         // SAFETY: forwarded.
         unsafe {
             for s in self.slots.iter_mut().filter_map(Option::take) {
-                s.proxy.destroy(device);
-                s.answer.destroy(device);
+                s.destroy(device);
             }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
@@ -316,10 +338,21 @@ impl Drop for Partial<'_> {
     }
 }
 
+/// The request each slot's server starts out having seen: the last one answered (`seq_resp`), so a request
+/// posted before it started is served.
+fn first_seen(hdr: &neural_forge_protocol::ShmHeader) -> [u32; Slot::COUNT] {
+    Slot::ALL.map(|s| hdr.seq_resp_slot(s).load(Ordering::Acquire))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn serve(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: &Loader, view: ShmView, quit: &AtomicBool, gpu: &mut Gpu) {
     let hdr = view.header();
-    let mut last = Slot::ALL.map(|s| hdr.seq_req_slot(s).load(Ordering::Acquire));
+    // A request the layer posted before this thread started (it posts in the present that starts the
+    // server) is still unanswered: `seq_resp` behind `seq_req`. Starting from `seq_resp` serves it.
+    // Starting from `seq_req` lost it, and a layer whose channel still showed the previous session's
+    // server running waited on it for good: after the first game on a channel, the after-the-upscaler
+    // path never answered again.
+    let mut last = first_seen(hdr);
     let mut frames: u64 = 0;
     let mut last_request = Instant::now();
     while !quit.load(Ordering::Relaxed) && !gpu.stalled {
@@ -370,7 +403,8 @@ fn process(
         && height >= MIN_DIM
         && hdr.neural_enabled()
         && hdr.apply_model.load(Ordering::Relaxed) != 0;
-    let conditioning = Conditioning::from(hdr.global_tuning());
+    let tunings = hdr.pass_tunings();
+    let passes: Vec<Conditioning> = tunings.passes().iter().map(|&t| Conditioning::from(t)).collect();
     // The claim is released whatever happens after it (a claim held while the network is not built at
     // this size would keep the pre-upscaler path off it for good), except after a frame that did not
     // finish in time: its work may still use the network, so the claim stays until its fence signals
@@ -378,7 +412,7 @@ fn process(
     let evaluated = wanted && loader.claim_post() && {
         let ok = loader.ready(width, height).is_some_and(|built| {
             // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
-            unsafe { evaluate(device, instance, physical, import, loader, view, gpu, slot, &built, width, height, format == proxy_format::BGRA8, conditioning) }
+            unsafe { evaluate(device, instance, physical, import, loader, view, gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes) }
         });
         if gpu.stalled {
             loader.post_stalled(device, gpu.fence);
@@ -421,14 +455,15 @@ fn process(
     neural_forge_protocol::store64(&hdr.server_frames_lo, &hdr.server_frames_hi, *frames);
 }
 
-/// One frame through the network. `false` (and the caller echoes) on anything short of a written answer.
+/// One frame through the network, once per entry of `passes` (each pass's settings, at least one). `false`
+/// (and the caller echoes) on anything short of a written answer.
 ///
 /// # Safety
 /// The regions are live; nothing of `gpu`'s is pending.
 #[allow(clippy::too_many_arguments)]
 unsafe fn evaluate(
     device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: &Loader, view: ShmView, gpu: &mut Gpu, slot: Slot, built: &Built,
-    width: u32, height: u32, bgra: bool, c: Conditioning,
+    width: u32, height: u32, bgra: bool, passes: &[Conditioning],
 ) -> bool {
     let s = slot.index();
     let bytes = u64::from(width) * u64::from(height) * 4;
@@ -436,10 +471,7 @@ unsafe fn evaluate(
     if gpu.slots[s].as_ref().is_none_or(|b| (b.width, b.height) != (width, height)) {
         if let Some(old) = gpu.slots[s].take() {
             // SAFETY: nothing pending (every request waits for its own work).
-            unsafe {
-                old.proxy.destroy(device);
-                old.answer.destroy(device);
-            }
+            unsafe { old.destroy(device) };
             gpu.bound = None;
         }
         // SAFETY: the regions are mapped for the process's life with room for `bytes`.
@@ -461,36 +493,58 @@ unsafe fn evaluate(
                 return false;
             }
         };
-        gpu.slots[s] = Some(SlotBuffers { width, height, proxy, answer });
+        gpu.slots[s] = Some(SlotBuffers { width, height, proxy, answer, scratch: None });
+    }
+    let more = passes.len() > 1;
+    if more && gpu.slots[s].as_ref().is_some_and(|b| b.scratch.is_none()) {
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST;
+        // SAFETY: `device` is live.
+        let Some(scratch) = (unsafe { OwnBuffer::new(device, instance, physical, bytes, usage) }) else { return false };
+        if let Some(b) = gpu.slots[s].as_mut() {
+            b.scratch = Some(scratch);
+        }
+        gpu.bound = None;
     }
     let Some(b) = gpu.slots[s].as_ref() else { return false };
+    if passes.is_empty() {
+        return false;
+    }
     let f = built.frame;
-    if gpu.bound != Some((s, width, height, built.generation)) {
+    let scratch = b.scratch.as_ref().map(|o| o.buffer);
+    let key = (s, width, height, built.generation, scratch.is_some());
+    if gpu.bound != Some(key) {
         let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
         let (proxy_i, feat_i, head_i, ans_i) = (info(b.proxy.buffer), info(f.features), info(f.head), info(b.answer.buffer));
+        let scratch_i = info(scratch.unwrap_or(b.proxy.buffer));
         let w = |set, n, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
-        let writes = [
+        let mut writes = vec![
             w(gpu.sets[0], 0, &proxy_i),
             w(gpu.sets[0], 1, &feat_i),
             w(gpu.sets[1], 0, &proxy_i),
             w(gpu.sets[1], 1, &head_i),
             w(gpu.sets[1], 2, &ans_i),
         ];
+        if scratch.is_some() {
+            writes.extend([w(gpu.sets[2], 0, &scratch_i), w(gpu.sets[2], 1, &feat_i), w(gpu.sets[3], 0, &scratch_i), w(gpu.sets[3], 1, &head_i), w(gpu.sets[3], 2, &ans_i)]);
+        }
         // SAFETY: the sets are not in use; every buffer is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
-        gpu.bound = Some((s, width, height, built.generation));
+        gpu.bound = Some(key);
     }
     if b.proxy.staged {
         // SAFETY: both hold `bytes`; the staging buffer is host-coherent and not in use.
         unsafe { std::ptr::copy_nonoverlapping(proxy_region, b.proxy.ptr, bytes as usize) };
     }
-    let pre = PreprocessPush {
-        dims: [f.field_width, f.field_height, width, height],
-        frame: [0, u32::from(bgra), 0, 0],
-        control: [c.style as f32, c.local_tone, c.local_structure, c.skin_structure],
-        more: [if c.auto_mask { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+    let push = |c: &Conditioning| {
+        let pre = PreprocessPush {
+            dims: [f.field_width, f.field_height, width, height],
+            frame: [0, u32::from(bgra), 0, 0],
+            control: [c.style as f32, c.local_tone, c.local_structure, c.skin_structure],
+            more: [if c.auto_mask { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+        };
+        let post = CompositePush { dims: pre.dims, frame: pre.frame, control: [c.style as f32, c.local_tone, c.intensity, 0.0] };
+        (pre, post)
     };
-    let post = CompositePush { dims: pre.dims, frame: pre.frame, control: [c.style as f32, c.local_tone, c.intensity, 0.0] };
     let barrier = |src: vk::AccessFlags, dst: vk::AccessFlags| [vk::MemoryBarrier::builder().src_access_mask(src).dst_access_mask(dst).build()];
     let cmd = gpu.cmd;
     // SAFETY: the layer's own buffer, not pending; every handle is live.
@@ -499,17 +553,31 @@ unsafe fn evaluate(
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[0]);
-            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[0], 0, &[gpu.sets[0]], &[]);
-            device.cmd_push_constants(cmd, gpu.layouts[0], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&pre).cast::<u8>(), std::mem::size_of::<PreprocessPush>()));
-            device.cmd_dispatch(cmd, f.field_width.div_ceil(8), f.field_height.div_ceil(8), 1);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
-            device.cmd_execute_commands(cmd, &[built.graph_own]);
-            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ), &[], &[]);
-            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[1]);
-            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[1], 0, &[gpu.sets[1]], &[]);
-            device.cmd_push_constants(cmd, gpu.layouts[1], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&post).cast::<u8>(), std::mem::size_of::<CompositePush>()));
-            device.cmd_dispatch(cmd, width.div_ceil(8), height.div_ceil(8), 1);
+            for (k, c) in passes.iter().enumerate() {
+                let (pre, post) = push(c);
+                // Every pass after the first reads the previous one's answer: copied into `scratch`, after the
+                // composite wrote it and before this pass's shaders read it (and the next composite rewrites it).
+                let (pre_set, post_set) = if k == 0 {
+                    (gpu.sets[0], gpu.sets[1])
+                } else {
+                    let Some(scratch) = scratch else { return Err(vk::Result::ERROR_INITIALIZATION_FAILED) };
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
+                    device.cmd_copy_buffer(cmd, b.answer.buffer, scratch, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
+                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                    (gpu.sets[2], gpu.sets[3])
+                };
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[0]);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[0], 0, &[pre_set], &[]);
+                device.cmd_push_constants(cmd, gpu.layouts[0], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&pre).cast::<u8>(), std::mem::size_of::<PreprocessPush>()));
+                device.cmd_dispatch(cmd, f.field_width.div_ceil(8), f.field_height.div_ceil(8), 1);
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                device.cmd_execute_commands(cmd, &[built.graph_own]);
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ), &[], &[]);
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[1]);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[1], 0, &[post_set], &[]);
+                device.cmd_push_constants(cmd, gpu.layouts[1], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&post).cast::<u8>(), std::mem::size_of::<CompositePush>()));
+                device.cmd_dispatch(cmd, width.div_ceil(8), height.div_ceil(8), 1);
+            }
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::HOST_READ), &[], &[]);
             device.end_command_buffer(cmd)
         })()
@@ -580,6 +648,20 @@ mod tests {
         // SAFETY: nothing of it was submitted.
         unsafe { gpu.destroy(&device) };
         unsafe { device.destroy_device(None) };
+    }
+
+    /// The layer posts its first request in the present that starts the server: one still unanswered when
+    /// the server starts is served, whatever the previous session left in the channel.
+    #[test]
+    fn a_request_posted_before_the_server_started_is_served() {
+        let hdr = neural_forge_protocol::ShmHeader::default();
+        hdr.init_defaults();
+        // The previous session answered request 7; this session's layer posted 8 before the server started.
+        hdr.seq_resp_slot(Slot::Primary).store(7, Ordering::Relaxed);
+        hdr.seq_req_slot(Slot::Primary).store(8, Ordering::Relaxed);
+        let seen = first_seen(&hdr);
+        assert_ne!(seen[Slot::Primary.index()], hdr.seq_req_slot(Slot::Primary).load(Ordering::Relaxed), "request 8 is still to serve");
+        assert_eq!(seen[Slot::Secondary.index()], hdr.seq_req_slot(Slot::Secondary).load(Ordering::Relaxed), "an answered slot has nothing to serve");
     }
 
     /// One server answers at a time; once it ends, another can take over.

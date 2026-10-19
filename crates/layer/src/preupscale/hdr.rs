@@ -569,7 +569,7 @@ impl HdrPass {
                 .ok()?
                 .first()
                 .copied()?;
-            p.encoded = Some(OwnImage::new(device, instance, physical_device, padded_width, padded_height, vk::ImageUsageFlags::TRANSFER_SRC)?);
+            p.encoded = Some(OwnImage::new(device, instance, physical_device, padded_width, padded_height, vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)?);
             p.answer = Some(OwnImage::new(device, instance, physical_device, padded_width, padded_height, vk::ImageUsageFlags::TRANSFER_DST)?);
             p.exposure = Some(super::own_host_buffer_with(
                 device,
@@ -610,6 +610,25 @@ impl HdrPass {
             auto: None,
         };
         Some(pass)
+    }
+
+    /// The encoded picture (the network's later passes copy the previous answer into it).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn encoded_image(&self) -> vk::Image {
+        self.encoded.image
+    }
+
+    /// The padded extent as one tightly packed buffer-image copy (the answer buffer's layout).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn padded_region(&self) -> vk::BufferImageCopy {
+        vk::BufferImageCopy {
+            buffer_offset: 0,
+            buffer_row_length: self.padded_width,
+            buffer_image_height: 0,
+            image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 },
+            image_offset: vk::Offset3D::default(),
+            image_extent: vk::Extent3D { width: self.padded_width, height: self.padded_height, depth: 1 },
+        }
     }
 
     /// The encoded picture's view (padded extent, `GENERAL` after the capture's opening barrier).

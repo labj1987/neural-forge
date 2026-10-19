@@ -4,6 +4,25 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.6.0 — 2026-10-19
+
+- **Passes.** The Model tab has a Passes setting: the model can run up to 10 times over each frame,
+  every pass after the first working on the previous pass's picture, before or after the upscaler. Each
+  extra pass costs about as much GPU time as the first, and the effect builds up with every pass: in GTA V
+  Enhanced at 1440p with frame generation, two passes of the small network cost about 14% of the real
+  frame rate, about as much as one pass of the full network, and look over-processed. One pass stays the
+  default.
+- **Per-pass settings.** Per-pass settings (Model tab, Edit…) let each pass use its own intensity,
+  local tone, local structure, skin structure, style or auto mask instead of the Model tab's. Passes and
+  their settings are saved with your other settings and in profiles.
+- **The model after the upscaler works in every game session again.** Where the model runs after the
+  upscaler (games with Ray Reconstruction on, or without DLSS), only the first game after the computer
+  started got the effect; later games showed the frame untouched.
+- Timed captures with `NEURAL_FORGE_CAPTURE_AT` work again. Every one of them stopped before its
+  first frame.
+- After updating, close any game that is running with Neural Forge before opening the app: this version
+  changes the settings the app and the game share.
+
 ## 3.5.3 — 2026-10-17
 
 - **Extracting with an older DLL works the first time.** With no model yet, the Setup tab's Extract

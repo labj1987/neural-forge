@@ -1327,3 +1327,21 @@ against x2.08 / x2.18 with the network on every frame; flicker 1.18 / 1.10% agai
 (GTA San Andreas DE, Crimson Desert, Hogwarts Legacy): attached, the effect shown, the toggle key off and on, no
 miss, fence timeout or Xid. Every phase's numbers, and what was tried and dropped, are in LESSONS.md, "3.3 edit
 cache: what was tried".
+
+
+## 2026-10-19: passes (3.6.0)
+
+GTA V Enhanced built-in benchmark, 2560x1440@288 VRR, desktop HDR as set, DLSS FG 4x with Preset C, script
+mods off, Neural Forge settings as found (edit cache on), pass 4 (about 117 s). Runs where GTA did not
+engage frame generation were repeated.
+
+| Network | Passes | Real fps (runs) | Shown fps | Network ms per network frame | Peak VRAM MiB |
+|---|---|---|---|---|---|
+| small | 1 | 74.3 | 299.3 | 3.7 | 9998 |
+| small | 2 | 64.0 (63.1 / 64.1 / 64.7) | 253.6-260.6 | 7.5 | 10010-10072 |
+| small | 3 | 58.1 | 233.0 | 10.3 | 10026 |
+| full | 1 | 65.6 (66.0 / 65.1 / 65.7) | 262.5-265.0 | 6.8 | 9986-10043 |
+| full | 2 | 51.2 | 205.3 | | 10268 |
+
+After the upscaler (`pan`, 2492x1370, no history): the model server's time 9.4 / 18.9 / 28.2 ms at 1 / 2 /
+3 passes; 2 passes with counter chaining and with barriers gave 60 of 60 identical frames.
