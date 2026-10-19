@@ -6,43 +6,44 @@ first shipped them; their phase is kept as a subheading.
 
 ## 3.8.0 — 2026-10-19
 
-- **Model resolution before the upscaler** (Model tab): run the model at **Full** size (the default,
-  unchanged), or at **Quality**, **Balanced**, **Performance** or **Ultra Performance** (66.7%, 58%, 50% or
-  33.3% of DLSS's input size) for less GPU time and memory. Below Full the model works on a downscaled copy
-  of the frame and its change is brought back to full size along the frame's own edges; it adds less detail
-  of its own than at Full.
-- **Model resolution per pass**: with more than one pass, each pass can run at its own model resolution
-  (Per-pass settings), working on the previous pass's full-size picture.
-- Changing the model resolution starts the model's history afresh and shows a moment of untouched frames
-  while the model is prepared for the new size.
-- **Colour of the model's change** (Model tab, Colour group): controls that act on what the model changes,
-  not on the frame, before and after the upscaler. **Saturation**, **contrast** and **detail of the change**
-  (0 to 4, default 1) scale how much the model changes colour, how much it brightens or darkens, and its fine
-  detail against its broad change. They apply to every pass; the per-pass settings can give a pass its own.
+- **With DLSS Ray Reconstruction on, the model now runs right after DLSS**, on its denoised, upscaled frame
+  and before the game's HUD, instead of on the finished frame. In Crimson Desert (Ray Reconstruction and
+  frame generation on, 1440p) that is 120 frames a second shown with the model at Full instead of 36, against
+  183 with the model off. Where a game's DLSS output cannot be held there, the model runs on the finished
+  frame as before.
+- **Placement** (Model tab): choose where the model runs. **Auto** (the default) picks the place for each
+  game as above; **Before the upscaler**, **After DLSS** (on DLSS's output, before the HUD, at the output
+  resolution) and **Finished frame** (on the presented frame) choose one place. Each pass can have its own
+  placement in the per-pass settings, so one pass can run before the upscaler and the next after DLSS; the
+  log says when a placement cannot be followed and where the pass runs instead. `neural-forge-cli shmctl set
+  placement` takes `auto`, `before`, `upscaled` or `present`.
+- **Model resolution** (Model tab): run the model at **Full** size (the default, unchanged) or at
+  **Quality**, **Balanced**, **Performance** or **Ultra Performance** (66.7%, 58%, 50% or 33.3%) for less GPU
+  time and memory; each pass can have its own. Below Full the model works on a smaller copy of the frame and
+  its change is brought back to full size along the frame's own edges. Before the upscaler, where the model
+  sees only DLSS's input (1486x836 in GTA V at 1440p), the smaller sizes keep little of the detail the model
+  adds. After DLSS, on the full 2560x1440 output (the Ray Reconstruction case), Performance keeps most of it:
+  in Crimson Desert 143 frames a second shown at Quality, 153 at Performance and 161 at Ultra Performance.
+  Changing it shows a moment of untouched frames while the model is prepared for the new size.
+- **Colour of the model's change** (Model tab, Colour group): **saturation**, **contrast** and **detail of
+  the change** (0 to 4, default 1) scale how much the model changes colour, how much it brightens or darkens,
+  and its fine detail against its broad change, without touching the frame's own colours. They apply to
+  every pass; the per-pass settings can give a pass its own.
 - **Gamut guard** (on by default): when a stronger change would push a colour past what the frame can hold,
-  the change is shortened instead of one channel clipping, so the hue stays. It only acts when you raise the
-  controls above: at their defaults the picture is exactly as before.
-- **Dither** (off by default): breaks up banding in smooth gradients after the upscaler.
+  the change is shortened instead of one channel clipping, so the hue stays. At the colour controls'
+  defaults the picture is exactly as before.
+- **Dither** (off by default) breaks up banding in smooth gradients after the upscaler.
 - **Look-up table**: choose a 3D `.cube` file (17 to 65 points) in the Colour group, or with
   `neural-forge-cli shmctl lut FILE` (`none` removes it), and raise its strength. It grades the last pass's
   result where the model changed the picture, more where it changed more ("Look-up table full at" sets how
   much change gets the full strength); a pixel the model left alone keeps its colour.
-- **With DLSS Ray Reconstruction on, the model now runs right after DLSS**, on its denoised, upscaled
-  frame and before the game's HUD, instead of on the finished frame: in Crimson Desert about 118 frames a
-  second shown against 36. Where a game's DLSS output cannot be held there, the model runs on the finished
-  frame as before.
-- **Placement** (Model tab): choose where the model runs. **Auto** (the default) keeps every game where it
-  was; **Before the upscaler**, **After DLSS** (on DLSS's output, before the HUD, at the output resolution)
-  and **Finished frame** (on the presented frame) choose one place. Each pass can have its own placement in
-  the per-pass settings, so one pass can run before the upscaler and the next after DLSS; the log says when a
-  placement cannot be followed and where the pass runs instead. `neural-forge-cli shmctl set placement`
-  takes `auto`, `before`, `upscaled` or `present`.
 - **The HUD on the finished frame** (Model tab): when the model runs on the presented frame, it now finds
   the game's HUD (text, icons, the minimap: what stays still and sharp while the picture moves) and keeps
   its change off it, so HUD text is no longer smeared (**Find the HUD**, on by default; it needs a few
   seconds of movement). **HUD regions** add up to eight rectangles of your own where the change is kept off
-  or softened; `neural-forge-cli shmctl set hud_regions` sets them from a terminal. Nothing changes where
-  no HUD is found.
+  or softened; `neural-forge-cli shmctl set hud_regions` sets them from a terminal.
+- Close any game running with Neural Forge before opening the updated app: this version changes the
+  settings the app and the game share.
 
 ## 3.7.0 — 2026-10-19
 

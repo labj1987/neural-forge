@@ -1181,6 +1181,25 @@ pass feedback. Measured in GTA V Enhanced at 1440p, FG 4x, Preset C, mods off, p
   again (20% "flicker"). The numbers above put a 9-frame window 40 presented frames (settled) and 8 frames
   (just after) after each series' own cut instead, with bench-iq.py's flicker and detail functions.
 
+## October 19: placement, model resolution and history after the upscaler (3.8.0)
+
+- **A history after the upscaler does not steady the edit.** Measured with `pan` (2492x1370, 60 frames;
+  the edit's change between frames over its size): none 0.314, the previous output at the same pixel 0.355,
+  reprojected by the GPU's optical flow 0.324 while panning at 6 px/frame; 0.249 against 0.296 on a still
+  frame. Blending toward the network's own previous answer makes it change more, and the flow only brings
+  it back near none for 2.4 ms more. It stays an env-var testing aid with `none` the default
+  (NATIVE_BACKEND.md, "History after the upscaler").
+- **A lower model resolution before the upscaler still loses the detail.** Rebuilt in 3.8.0 with the edit
+  enlarged along the frame's edges, it measured in GTA V at 1440p (DLSS's input 1486x836) x1.01, x0.97 and
+  x1.10 added detail on the facade box at Quality, Performance and Ultra Performance against x1.28-1.32 at
+  Full, for 9-13% more real fps. The 3.3 lesson holds at 1440p too: a model on DLSS's input has few pixels
+  to spare. After DLSS, on the 2560x1440 output (Ray Reconstruction), Performance keeps most of the detail
+  at 150-153 fps shown against 118-120 at Full, so the setting is worth having there; Full stays the default.
+- **A changed shared-memory layout needs a new version or a fresh file.** Two development builds with the
+  same version but different layouts read the colour settings as 0, which zeroed the edit and made a
+  measurement look like the model had no effect. Measure only on a freshly created shared memory after a
+  layout change.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

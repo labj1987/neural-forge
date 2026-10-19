@@ -17,7 +17,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab: the Neural rendering switch, style, strength presets, intensity, local tone, local and skin structure, auto mask and passes](screenshots/settings.png) | ![Setup tab: the model present (the full and the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: layer state, the Model placement line, the model, the settings reset and profiles, and the Diagnosis group with Diagnose and Save report](screenshots/status.png) |
+| ![Model tab, scrolled to the middle: Placement (Auto), Model resolution (Full), Per-pass settings, Keep the game's sky, More mask rules, the toggle key, and the start of the Colour group with saturation and contrast of the change; above are the switch, style, strength and passes, below the rest of the Colour group and the HUD on the finished frame](screenshots/settings.png) | ![Setup tab: the model present (the full and the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: telemetry (model, game, frame rate and the graph of the hold's and the layer's time), then the layer state, the Model placement line and the model (the full and the small network of build 310.9.16.0)](screenshots/status.png) |
 
 The screenshots show default settings with no game running.
 
@@ -84,8 +84,8 @@ layer picks the place for each game by itself:
   game's HUD in it: the layer finds the HUD and keeps the model's change off it (see
   [Usage](#usage)).
 
-The game's own **DLSS Frame Generation** works with the model before the upscaler. Generated
-frames are built from enhanced frames, and the model runs once per real frame.
+The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
+Generated frames are built from enhanced frames, and the model runs once per real frame.
 
 `NEURAL_FORGE_PREUPSCALE=off` in the launch options switches back to the after-the-upscaler path
 everywhere. Use it to compare the two, or to roll back if something looks wrong.
@@ -93,6 +93,8 @@ everywhere. Use it to compare the two, or to roll back if something looks wrong.
 How it works, step by step: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
 ## Measured results
+
+### GTA V Enhanced, before the upscaler
 
 GTA V Enhanced's built-in benchmark on the test machine: RTX 5070 (12 GB), 2560x1440, DLSS Balanced,
 DLSS Frame Generation 4x, ray tracing on, script mods off, pass 4 (about 117 s), three runs each (the
@@ -107,6 +109,42 @@ too. Measured 2026-10-19 with the default settings (keep the game's sky on, one 
 
 The network runs on every frame while the camera is still and on every second frame while it moves (the
 edit cache carries it between), so about half the frames pay its time in this benchmark.
+
+**Model resolution** before the upscaler, in the same game with frame generation off (DLSS's input
+1486x836; added detail measured on a fixed patch of a building's facade, against the model off):
+
+| Model resolution | Real fps | Network GPU time | Added detail |
+|---|---|---|---|
+| Off | 90.3 | - | x1.00 |
+| Full | 77.1 | 6.05 ms | x1.28-1.32 |
+| Quality | 84.4 | 3.20 ms | x1.01 |
+| Performance | 85.2 | 3.04 ms | x0.97-0.98 |
+| Ultra Performance | 86.8 | 2.65 ms | x1.10 |
+
+At DLSS's input size the smaller model resolutions keep little of the detail the model adds: before the
+upscaler, use Full.
+
+### Crimson Desert, after DLSS (Ray Reconstruction)
+
+Crimson Desert with DLSS Ray Reconstruction and frame generation on, 2560x1440, placement Auto: the model
+runs after DLSS on its 2560x1440 output. Shown fps counts the generated frames; network GPU time is per frame
+the model runs on. No missed frames and no GPU fault in any run.
+
+| Network, model resolution | Shown fps | Network GPU time |
+|---|---|---|
+| Model off | 183 | - |
+| Full network, Full | 118-120 | 15.8 ms |
+| Small network, Full | 140 | 9.2 ms |
+| Full network, Quality | 143 | 8.3 ms |
+| Full network, Performance | 150-153 | 5.4 ms |
+| Full network, Ultra Performance | 161 | 3.8 ms |
+| Full network on the finished frame (Placement: Finished frame) | 36 | - |
+
+At the output size, Performance keeps most of the detail the model adds at Full. With Ray Reconstruction
+off, the same game runs 133 fps shown with the model after DLSS (Placement: After DLSS) and 41 on the
+finished frame.
+
+### The network on its own
 
 The network's time per frame on its own (`dlss5vk bench`, 1707x960, the DLSS input of GTA V at DLSS
 Quality): full 7.03 ms, small 3.81 ms. In the game it also waits for the game's own GPU work. Games
@@ -130,7 +168,7 @@ ran with no missed frames and no GPU fault.
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Before the upscaler |
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | Before the upscaler, inside DLSS's buffer |
 | Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler, inside DLSS's buffer |
-| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction | Before the upscaler with Ray Reconstruction off; with it on, after DLSS where its output can be held, else on the finished frame (not tested at this placement yet) |
+| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Frame Generation | Before the upscaler (with its Ray Reconstruction setting on, the game ran Super Resolution on the test machine) |
 
 Setup notes for these games:
 
@@ -238,7 +276,8 @@ stay; Neural Forge does not touch its files.
    next to it before every change (`localconfig.vdf.neural-forge.bak`, and the first state found as
    `localconfig.vdf.neural-forge.orig`).
 3. In the game, use DLSS Super Resolution (Quality, Balanced or Performance) to get the model
-   before the upscaler. Turn on the game's own DLSS Frame Generation if you want it.
+   before the upscaler; with DLSS Ray Reconstruction on, the model runs after DLSS. Turn on the game's
+   own DLSS Frame Generation if you want it.
 4. Start the game. The layer waits until the game has rendered steadily for 5 seconds, and stays
    out of the way on loading screens.
 
@@ -266,7 +305,7 @@ this version re-creates the shared memory.
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution (before the upscaler) and per-pass settings, model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
+| Model | The Neural rendering switch, the placement (where the model runs in the frame), the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution and per-pass settings, model every Nth frame (after the upscaler only), the toggle key, the Colour group: saturation, contrast and detail of the model's change, gamut guard, dither and a look-up table, and the HUD group: finding the HUD and HUD regions on the finished frame. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -299,16 +338,19 @@ generation 4x (real frames per second, pass 4 of the built-in benchmark):
 Two passes of the small network cost about as much as one pass of the full network, and look
 over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
 blend toward each other's pictures over time. **Per-pass settings** (Edit…) let each pass use its own
-intensity, local tone, local structure, skin structure, style, auto mask, model resolution or colour of the change
-instead of the Model tab's.
+intensity, local tone, local structure, skin structure, style, auto mask, model resolution, colour of the
+change or placement instead of the Model tab's.
 **Pass feedback** (0 to 1, default 1) sets how much of a pass's picture the next pass works on; lower
 values keep more of the pass's own input, so the passes add less to each other.
 
-**Model resolution** (Model tab, before the upscaler) sets the size the model runs at, as a share of
-DLSS's input size: **Full** (the default), **Quality** (66.7%), **Balanced** (58%), **Performance** (50%)
-or **Ultra Performance** (33.3%). Below Full the model works on a downscaled copy of the frame and its
-change is brought back to full size, following the frame's own edges, so the frame keeps its own detail;
-the model costs less GPU time and memory but adds less detail of its own. Full is the frame exactly as
+**Model resolution** (Model tab) sets the size the model runs at, as a share of the frame it works on
+(DLSS's input before the upscaler, DLSS's output after it): **Full** (the default), **Quality** (66.7%),
+**Balanced** (58%), **Performance** (50%) or **Ultra Performance** (33.3%). Below Full the model works on a
+downscaled copy of the frame and its change is brought back to full size, following the frame's own edges,
+so the frame keeps its own detail; the model costs less GPU time and memory but adds less detail of its own.
+Before the upscaler the frame is already small (1486x836 in GTA V at 1440p) and the smaller sizes keep
+little of the model's detail; after DLSS, on the full output (with Ray Reconstruction), Performance keeps
+most of it for about 30 fps more (see [Measured results](#measured-results)). Full is the frame exactly as
 without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
 on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
 and shows a moment of untouched frames while the model is prepared for the new size.
@@ -326,8 +368,8 @@ full at**, so a pixel the model left alone keeps its colour. At their defaults t
 model's.
 
 **Placement** (Model tab) sets where the model runs in the frame: **Auto** (the default; see
-[How it works](#how-it-works)), **Before the upscaler** (with Ray Reconstruction on, the finished frame, as
-before), **After DLSS** (on DLSS's output, before the game's HUD and post-processing, at the output
+[How it works](#how-it-works)), **Before the upscaler** (with Ray Reconstruction on, the finished
+frame), **After DLSS** (on DLSS's output, before the game's HUD and post-processing, at the output
 resolution, so it costs more than before the upscaler; where a game's DLSS output cannot be held, it runs
 where Auto would) or **Finished frame** (on the presented frame, HUD included; DLSS gets its input
 untouched). Model resolution applies after DLSS too, as a share of the output size. Each pass can have its
@@ -349,7 +391,7 @@ not used under the HUD either, so changing HUD text leaves no trail. They are sa
 (left, top, width, height in 0-1, then `keep` or `soften` and the strength). Before the upscaler and after
 DLSS the HUD is not drawn yet, so neither setting applies there.
 
-![Per-pass settings: the pass to edit, and an override switch with its value for intensity, local tone, local structure, skin structure, style and auto mask](screenshots/passes.png)
+![Per-pass settings, scrolled to the end: an override switch for each of local tone, local structure, skin structure, style, auto mask, model resolution, edit saturation, edit contrast, edit detail and placement, each off](screenshots/passes.png)
 
 Settings are live: the GUI and the running layer share them through shared memory.
 `neural-forge-cli shmctl status|set|toggle|capture` does the same from a terminal. The Debug tab's
@@ -387,6 +429,10 @@ takes is withdrawn after 5 seconds.
   for an `Xid` line before blaming Neural Forge.
   [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-09-16) has the diagnosis and the
   workarounds other users report.
+- **The model after DLSS is tested in one game.** Crimson Desert with Ray Reconstruction ran it with no
+  missed frames; Hogwarts Legacy ran Super Resolution on the test machine even with its Ray Reconstruction
+  setting on. Where a game's DLSS output cannot be held, the model runs on the finished frame, at a much
+  lower frame rate (36 against 120 fps shown in Crimson Desert).
 - **Finding the HUD can take a part of the scene for HUD** when it stays in place on screen while the
   camera moves, such as a first-person weapon or a character the camera follows closely: the model's change
   is then kept off it too. Switch **Find the HUD** off, or use regions, where that shows.
@@ -425,7 +471,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_INLINE=off` | layer | Testing aid: never hold inside DLSS's command buffer. |
 | `NEURAL_FORGE_NATIVE_CHAIN=0`, `NEURAL_FORGE_NATIVE_INLINE_CHAIN=1` | layer | Testing aids: barriers between the network's launches instead of counter chaining (before the upscaler), or counter chaining inside DLSS's buffer (where barriers are the default). |
 | `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1` | layer | Testing aid: record everything but the network's launches. |
-| `NEURAL_FORGE_POST_MOTION=none\|zero\|flow`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | Testing aids: after the upscaler, give the model a history: its previous output at the same pixel (`zero`) or where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; `zero` elsewhere), not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and dropped on a scene cut. Default `none`: no history. |
+| `NEURAL_FORGE_POST_MOTION=none\|zero\|flow`, `NEURAL_FORGE_POST_HISTORY_REJECT=0.12` | layer | Testing aids: after the upscaler, give the model a history: its previous output at the same pixel (`zero`) or where the GPU's optical flow says the pixel was (`flow`, on GPUs with `VK_NV_optical_flow`; `zero` elsewhere), not used where a pixel changed by more than the threshold (0 to 1, default 0.12) since the previous frame, and dropped on a scene cut. Default `none`: no history (measured, neither is steadier than none). |
 | `NEURAL_FORGE_FAIL_CREATE=N[@K]`, `NEURAL_FORGE_NATIVE_FAIL=chain` | layer | Testing aids: let K network builds through, then fail the next N; or report one counter-chain timeout. |
 | `NEURAL_FORGE_GUI_OPEN=<tab>` | GUI | Testing aid: open a tab (`model`, `composition`, `debug`, `status`, `setup`) at start, for screenshots. |
 | `NEURAL_FORGE_BENCH=1`, `NEURAL_FORGE_REQUIRE_VULKAN=1` | layer tests | Testing aids: run the hot-path GPU benchmark; fail instead of skipping when no Vulkan device exists. |

@@ -1372,3 +1372,72 @@ settled, 0.845% just after):
 
 Pass feedback (small network): NATIVE_BACKEND.md, "Pass feedback". Scene cuts: 3 per run, all at the
 long pass's scripted cuts. A live network switch mid-run: rebuilt in 1.2-1.5 s, no miss, no Xid.
+
+
+## 2026-10-19: 3.8.0 (placement, model resolution, colour, HUD, Ray Reconstruction)
+
+RTX 5070, 2560x1440@288 VRR, desktop HDR as set, Proton.
+
+**Native rig tests** (`NEURAL_FORGE_NATIVE_RIG`): 7 of 7 pass on the RTX 5070, among them
+`two_sizes_built_together_each_give_the_head_of_their_size_alone` (two model resolutions built as one set
+give each size's answer as a build of that size alone does).
+
+**Crimson Desert, Ray Reconstruction on, frame generation on, 1440p, placement auto.** The hold after
+DLSS's output, behind `rr2_downsample_kernel_static_hdr_no_transparency` (with Ray Reconstruction off:
+`rrlite_downsample_kernel_static_hdr`). Network and hold times are per hold:
+
+| Model | Shown fps | Network ms | Hold ms | Holds/s |
+|---|---|---|---|---|
+| Off | 183.2 | | | |
+| Old after-the-upscaler path (placement present / 3.7.0) | 35.9 | | | |
+| Full | 118.1 / 119.6 | 15.8 | 18.5 | 20.3 |
+| Full, small network | 139.9 | 9.17 | 11.7 | 23.6 |
+| Quality 0.667 | 143.4 | 8.25 | 10.9 | 23.3 |
+| Performance 0.5 | 153.3 / 150.3 | 5.42 | 8.0-8.5 | 25.0-25.5 |
+| Ultra Performance 0.333 | 160.9 | 3.79 | 6.35 | 27.0 |
+
+No misses, no Xid, no timeouts in any run.
+
+**Crimson Desert, Ray Reconstruction off:**
+
+- `placement upscaled` (Super Resolution, the hold after DLSS): 133.3 shown fps, 22.2 holds/s, network
+  15.85 ms, no misses.
+- `placement present`: 41.2 shown fps, every frame composited. The HUD detection kept the minimap ring,
+  the compass and the text untouched (checked by eye on a capture).
+
+**GTA V Enhanced, frame generation off** (DLSS's input 1486x836; the facade box,
+`~/scratch/harness/facade.py`'s method: windows 10 and 14 frames after the still shot's cut):
+
+| Build / model | Real fps | Facade added detail |
+|---|---|---|
+| 3.7.0 Full | 76.6 | x1.24-1.26 |
+| 3.8.0 Full | 77.1 | x1.28-1.32 |
+| Quality 0.667 | 84.4 | x1.01 |
+| Performance 0.5 | 85.2 | x0.97-0.98 |
+| Ultra Performance 0.333 | 86.8 | x1.10 |
+| Model off | 90.3 | x1.00 |
+
+Before the upscaler the reduced sizes keep little of the added detail. The frame-generation-on runs mostly
+did not engage frame generation (GTA's benchmark-launch quirk) and were not repeated; their real fps with
+frame generation off: Full 76.0, Quality 81.6, Performance 82.0, Ultra Performance 82.9, the network 6.05 /
+3.20 / 3.04 / 2.65 ms.
+
+**Hogwarts Legacy:** with Ray Reconstruction set on in its settings, the game ran DLSS Super Resolution
+(`hiluma` kernels only) on this setup, so the hold after DLSS was not exercised there. The hold before the
+upscaler ran with no misses or Xid: 193.5 shown fps, frame generation on.
+
+**History after the upscaler** (`pan`, 2492x1370, a 60-frame series; the edit's mean change between frames
+over its mean size, motion-compensated; lower is steadier):
+
+| Case | `none` | `zero` | `flow` |
+|---|---|---|---|
+| 6 px/frame | 0.314 | 0.355 | 0.324 |
+| Still | 0.249 | 0.296 | |
+
+The model server takes 17.1 / 17.5 / 19.5 ms (`none` / `zero` / `flow`). The optical flow ran on the RTX 5070
+(queue 0 of family 5, 623x343 vectors) with no fault. Neither history is steadier than none, so it stays
+off by default, a testing aid.
+
+**A measuring pitfall:** two development builds with the same shared-memory version but different layouts
+left the colour settings at 0, which zeroes the edit; after a layout change only a freshly created shared
+memory gives valid numbers.

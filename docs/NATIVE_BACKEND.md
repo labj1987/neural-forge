@@ -891,8 +891,8 @@ default.
 ## History after the upscaler (selectable, 2026-10-19)
 
 Without a history every frame after the upscaler is a first frame, which costs temporal stability
-(shimmer). `NEURAL_FORGE_POST_MOTION` selects one, for measurement (read once, logged once; `none` stays the
-default until it is measured in game):
+(shimmer). `NEURAL_FORGE_POST_MOTION` selects one, for measurement (read once, logged once). `none` stays the
+default: measured, neither history is steadier than none ("Measured" below), so it is a testing aid:
 
 | Value | History |
 |---|---|
@@ -933,11 +933,9 @@ transfer stage, copies the vectors into a host-visible buffer the preprocess rea
 grid cells' centres) and is waited for by the server thread, as every frame is. A submit of the flow's that
 fails gives it up (both queues drain; `zero` from then on). The entry points are resolved by hand and checked.
 
-**Not tested on the GPU it is for**: lavapipe has no optical flow, so the tests feed the same shader path a
-synthetic flow field (`the_flow_reprojects_the_history`: a 3-pixel pan with the matching flow reads the first
+**Tests**: lavapipe has no optical flow, so the tests feed the same shader path a synthetic flow field (`the_flow_reprojects_the_history`: a 3-pixel pan with the matching flow reads the first
 frame's output 3 pixels back) and check the fallback (`flow_without_the_extension_runs_as_zero_motion`). The
-flow's direction (input to reference) is the extension's documented meaning; a game run should confirm it
-(the wrong sign would reject most moving pixels, visible as no history while panning).
+flow's direction (input to reference) is the extension's documented meaning.
 
 **The GPU work it adds** (per slot, at W x H; nothing with `none`):
 
@@ -946,6 +944,21 @@ flow's direction (input to reference) is the extension's documented meaning; a g
 | Buffers | previous proxy 4 B/px, reprojected history 8 B/px, one history per pass 8 B/px (1440p, one pass: 74 MB) | two input images 4 B/px, the flow image and its host-visible copy 4 B per 4x4 cell (1440p: 30 MB + 2 x 0.9 MB) |
 | Per pass | the preprocess reads 8 B (history) + 8 B (two proxies) and writes 8 B per pixel; the composite reads and writes 8 B per pixel; same dispatches as before | the preprocess's history read is the five-tap filter (up to 20 texel reads) and four flow reads |
 | Per frame | one buffer copy of the proxy (4 B/px); the cut thumbnail on the CPU (1/64 of the pixels) | one buffer-to-image copy of the proxy, the optical flow at the proxy's size, one image-to-buffer copy of the vectors, two more submits and their semaphores |
+
+**Measured** (RTX 5070, 2026-10-19; `pan` at 2492x1370, a 60-frame series each; the number is the edit's mean
+change between frames over its mean size, motion-compensated, so lower is steadier):
+
+| Case | `none` | `zero` | `flow` |
+|---|---|---|---|
+| Pan, 6 px/frame | 0.314 | 0.355 | 0.324 |
+| Still | 0.249 | 0.296 | |
+
+The model server took 17.1 ms with `none`, 17.5 with `zero` and 19.5 with `flow`. The optical flow ran on the
+RTX 5070 (queue 0 of family 5, 623x343 vectors for the 4x4 grid) with no fault, and the reprojection follows
+the pan (`flow` is close to `none` while moving, where `zero` is worse). Neither history makes the edit
+steadier than none, even on a still frame, where `zero` is the exact previous output: the network's answer
+blended toward its own previous answer changes more from frame to frame, not less. The default stays `none`
+and both histories stay a testing aid.
 
 ## Model resolution before the upscaler (3.8.0, 2026-10-19)
 
@@ -1013,9 +1026,20 @@ bilinear gives the pixel next to the edge half the other side's). The rig test
 `two_sizes_built_together_each_give_the_head_of_their_size_alone` (`NEURAL_FORGE_NATIVE_RIG`, an NVIDIA
 GPU) checks two sizes built together against one built alone.
 
-Not measured yet. To measure in GTA V Enhanced at 1440p (frame generation on, as found): real fps for each
-preset, and bench-iq's added detail and flicker on a static box (the still shot's facade, as in LESSONS.md;
-the whole-scene number moves with what the game spawns), Full against each preset.
+**Measured** (RTX 5070, 1440p, 2026-10-19; HARDWARE_VALIDATION.md, "3.8.0"):
+
+- **Before the upscaler, GTA V Enhanced** (frame generation off; DLSS's input 1486x836; the added detail on
+  the still shot's facade box, windows 10 and 14 frames after its cut, against the model off): Full 77.1
+  real fps and x1.28-1.32 (3.7.0: 76.6, x1.24-1.26), Quality 84.4 and x1.01, Performance 85.2 and
+  x0.97-0.98, Ultra Performance 86.8 and x1.10; the model off 90.3. The network 6.05 / 3.20 / 3.04 / 2.65 ms.
+  At DLSS's small input the reduced sizes keep little of the added detail, as the 3.3 attempt found at 4K.
+- **After DLSS, Crimson Desert with Ray Reconstruction** (frame generation on, the model at the 2560x1440
+  output): shown fps Full 118-120, Quality 143.4, Performance 150-153, Ultra Performance 160.9 against 183.2
+  with the model off; the network 15.8 / 8.25 / 5.42 / 3.79 ms. At the output size Performance runs the
+  network at 1280x720, close to what Full runs at before the upscaler in GTA, and keeps most of the added
+  detail.
+
+Full stays the default.
 
 ## The colour of the edit (3.8.0, 2026-10-19)
 
@@ -1175,10 +1199,12 @@ with its own intensity at its own size, and both holds ask for the same two size
 `the_post_path_serves_only_frames_whose_passes_all_run_at_present`,
 `a_hold_after_dlss_that_keeps_missing_gives_its_passes_back`, and the settings' own.
 
-To measure in a game: Crimson Desert with Ray Reconstruction on at `auto` (the hold after DLSS; 118 fps shown
-against 36 for the post path when first measured) and at `upscaled`/`before` split across two passes;
-Super Resolution games at `upscaled` (the network at the output size costs about the output's pixel count
-over the render's more) and at `present`.
+Measured in Crimson Desert (RTX 5070, 1440p, frame generation on; HARDWARE_VALIDATION.md, "3.8.0"): with
+Ray Reconstruction on at `auto` (the hold after DLSS) 118-120 fps shown with the full network, 140 with the
+small one, against 36 on the after-the-upscaler path and 183 with the model off, with no misses; with it off
+at `upscaled` (Super Resolution, the network at the output size) 133 fps, and at `present` 41. Not measured:
+two passes split across the two holds. Hogwarts Legacy ran Super Resolution with its Ray Reconstruction
+setting on, so it did not exercise the hold after DLSS.
 
 ## The HUD at present (3.8.0, 2026-10-19)
 
@@ -1237,8 +1263,9 @@ bit for bit outside the feather, no history under a region), and
 a scene that changes everywhere: nothing for nine frames, then no edit on the block and the scene bit for bit as
 without the detection; twenty still frames grow nothing).
 
-To measure in a game: GTA V at `present` (or a game without DLSS) with the HUD on screen while driving and
-while standing: whether the minimap, the weapon wheel and the money text are found while moving and stay
+Measured in Crimson Desert at `present` (2026-10-19): the detection kept the minimap ring, the compass and
+the HUD text untouched (by eye on a capture). Still to see: GTA V at `present` with the HUD on screen while
+driving and while standing: whether the minimap, the weapon wheel and the money text are found while moving and stay
 clean, what a first-person weapon model or a third-person character that stays in place does (it can be found
 as HUD while the camera turns), and what the detection costs on the RTX 5070.
 
