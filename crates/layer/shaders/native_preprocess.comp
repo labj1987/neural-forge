@@ -43,7 +43,9 @@ layout(set = 0, binding = 4, std140) uniform Params {
 // extent. Read only while p.mask.x names a rule.
 layout(set = 0, binding = 10, std430) readonly buffer Mask { uint m[]; } u_mask;
 // [0], [1]: whether the frame of that parity was encoded with a usable exposure (written by the composite).
-layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; } u_state;
+// cut: 1 when this frame's capture is a scene cut (preupscale_scene_cut.comp, written in the capture before
+// this frame): no history, as on a reset.
+layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; uint cut; } u_state;
 
 float roundF16(float value) {
   uint bits = floatBitsToUint(value);
@@ -92,9 +94,9 @@ vec2 previousPosition(uvec2 xy) {
 }
 
 // The previous frame showed this pixel: its previous position is inside the frame, the CPU has a
-// history for this frame and the previous frame's exposure was usable.
+// history for this frame, this frame is not a scene cut and the previous frame's exposure was usable.
 bool hasHistory(uvec2 xy) {
-  if (p.frame.z == 0u || u_state.ok[1u - p.frame.w] == 0u) return false;
+  if (p.frame.z == 0u || u_state.cut != 0u || u_state.ok[1u - p.frame.w] == 0u) return false;
   vec2 at = previousPosition(xy);
   vec2 valid = vec2(p.dims.zw);
   return all(greaterThanEqual(at, vec2(0.0))) && all(lessThan(at, valid));
@@ -147,7 +149,8 @@ void main() {
   // A no-op on every valid frame.
   proxy = clamp(mix(proxy, vec3(0.0), isnan(proxy)), 0.0, 1.0);
   vec3 centered = centre(proxy);
-  vec3 noise = gaussian3(id.x, id.y, p.frame.y);
+  // A scene cut starts afresh: the seed of a frame without history.
+  vec3 noise = gaussian3(id.x, id.y, u_state.cut != 0u ? 0u : p.frame.y);
   uint base = (id.y * p.dims.x + id.x) * 4u;
   u_features.features[base + 0u] = vec4(noise, 1.0);
   vec3 history = centered;

@@ -5,7 +5,8 @@
 //! wait between them and none for them:
 //!
 //! - `C`, the capture (`super::record_capture`): the exposure texel, the HDR encode into the encoded
-//!   image, and a copy of DLSS's motion vectors into [`NativePass`]'s motion buffer;
+//!   image, a copy of DLSS's motion vectors into [`NativePass`]'s motion buffer, and the scene-cut
+//!   detector (`super::scene_cut`), whose decision the frame shaders read from the state buffer;
 //! - `N[parity]`, recorded once per build ([`NativePass::record`]): `native_preprocess.comp` (the
 //!   network's 16 input lanes from the encoded proxy and the reprojected history), the network's
 //!   recorded graph (a secondary from `neural-forge-native`), and `native_composite.comp` (the
@@ -1253,6 +1254,18 @@ impl NativePass {
         (self.width, self.height) == (width, height)
     }
 
+    /// The frame shaders' state buffer (binding 5: `ok[2]`, then `cut`, which the scene-cut detector writes
+    /// in the capture).
+    pub(crate) fn state_buffer(&self) -> vk::Buffer {
+        self.state.buffer
+    }
+
+    /// The last network frame was a scene cut, which its shaders ran without history (seed 0): the next
+    /// frame's seed counts on from there, as after a reset on the CPU.
+    pub(crate) fn restart_seed(&mut self) {
+        self.seed = 0;
+    }
+
     pub(crate) fn answer(&self) -> vk::Buffer {
         self.answer.buffer
     }
@@ -2036,7 +2049,8 @@ impl PassRetry {
     }
 }
 
-/// The retry state of a device's native hold: the HDR pass, its auto-exposure, the native pass.
+/// The retry state of a device's native hold: the HDR pass, its auto-exposure, the native pass, the depth
+/// copy, the edit cache and the scene-cut detector.
 #[derive(Debug, Default)]
 pub(crate) struct Retries {
     pub(crate) hdr: PassRetry,
@@ -2044,6 +2058,7 @@ pub(crate) struct Retries {
     pub(crate) pass: PassRetry,
     pub(crate) depth: PassRetry,
     pub(crate) edit: PassRetry,
+    pub(crate) scene: PassRetry,
 }
 
 /// `NEURAL_FORGE_NATIVE_FAIL=chain`: reports one counter-chain timeout at the 300th network frame, to
@@ -2098,7 +2113,36 @@ pub(crate) fn note_reset(stale: Option<Stale>) {
         Some(Stale::Skipped) => crate::log!("[native] resetting the history (frames went to DLSS untouched since the last one)"),
         Some(Stale::Idle(gap)) => crate::log!("[native] resetting the history ({} ms since the last frame)", gap.as_millis()),
         Some(Stale::FormatChanged) => crate::log!("[native] resetting the history (another extent or identification)"),
+        Some(Stale::SceneCut(mean)) => crate::log!(
+            "[native] resetting the history (scene cut: the picture's luma changed by {mean} of 255 on average, threshold {})",
+            super::scene_cut::threshold()
+        ),
         None => {}
+    }
+}
+
+/// The CPU's side of a scene-cut reading ([`super::scene_cut::effect`]), at the hold after the one it was
+/// taken on. `true` when it counts a reset (the GPU's, logged here); a latched cut is counted when the next
+/// network frame consumes it (`HistoryGap::begin`).
+pub(crate) fn apply_scene_cut(effect: super::scene_cut::Effect, native: Option<&mut NativePass>, edit: Option<&mut super::cache::State>) -> bool {
+    match effect {
+        super::scene_cut::Effect::ResetOnGpu(mean) => {
+            note_reset(Some(Stale::SceneCut(mean)));
+            if let Some(n) = native {
+                n.restart_seed();
+            }
+            true
+        }
+        super::scene_cut::Effect::Latch(mean) => {
+            if let Some(n) = native {
+                n.gap.scene_cut(mean);
+            }
+            if let Some(e) = edit {
+                e.drop_edit();
+            }
+            false
+        }
+        super::scene_cut::Effect::None => false,
     }
 }
 
@@ -2157,6 +2201,13 @@ pub(crate) unsafe fn run_native_hold(
     if let Some(c) = res.edit.as_mut() {
         result.cache_gpu_ms = c.take_gpu_ms(device);
         result.cache_rejected = c.after_fence().rejected;
+    }
+    // The previous hold's scene-cut reading (finished: waited above): a network frame the GPU started
+    // afresh is logged and counted, and the CPU's seed restarts with it; a cut on a cached hold resets
+    // the next network frame, and the edit cache refreshes rather than carry an edit across it.
+    if let Some((reading, recorded)) = res.scene.as_mut().and_then(super::scene_cut::ScenePass::take) {
+        let effect = super::scene_cut::effect(reading, recorded);
+        result.scene_cut = apply_scene_cut(effect, res.native.as_mut(), res.edit.as_mut().map(|e| &mut e.state));
     }
     // An armed hold's readbacks (finished: waited above), before anything clears the exposure.
     result.cache_frame = res.take_cache_frame();
@@ -2260,6 +2311,7 @@ pub(crate) unsafe fn run_native_hold(
     debug_assert_eq!((res.width, res.height), (target.width, target.height));
     debug_assert!(res.native.as_ref().is_none_or(|n| n.matches(target.width, target.height)));
     debug_assert!(res.edit.as_ref().is_none_or(|c| c.matches(target.width, target.height)));
+    debug_assert!(res.scene.as_ref().is_none_or(|s| s.matches(target.width, target.height)));
     let mut native = match res.native.take() {
         Some(n) => n,
         None => {
@@ -2324,6 +2376,24 @@ pub(crate) unsafe fn run_native_hold(
         res.native = Some(native);
         result.miss = Some("the edit cache's passes could not be built");
         return result;
+    }
+    // The scene-cut detector, unless switched off (`NEURAL_FORGE_SCENE_CUT=off`). Without it (a failed
+    // build, tried again on the retry schedule) the history resets on the other rules only.
+    let threshold = super::scene_cut::threshold();
+    if threshold > 0 && res.scene.is_none() {
+        res.scene = res.native_retry.scene.build((target.width, target.height), now, || {
+            // SAFETY: `device` is live.
+            let built = unsafe { super::scene_cut::ScenePass::build(device, instance, physical_device, target.width, target.height) };
+            if built.is_none() {
+                crate::log!("[native] the scene-cut detector could not be built; the history resets on the other rules only");
+            }
+            built
+        });
+    }
+    if let (Some(s), Some(hdr_ref)) = (res.scene.as_mut().filter(|_| threshold > 0), res.hdr.as_ref()) {
+        // SAFETY: nothing of the detector is pending (`wait_idle` above); the encoded view and the native
+        // pass's state buffer are live.
+        unsafe { s.bind(device, hdr_ref.encoded_view(), native.state_buffer()) };
     }
     native.gap.note_format(format_of(target));
     // A frame of another network than the history's (the Network setting switched) resets the history
@@ -2404,6 +2474,17 @@ pub(crate) unsafe fn run_native_hold(
     let motion = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_motion(device, cmd, push_ref, acc) };
     let capture_edit = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_capture(device, cmd, push_ref) };
     let apply = |cmd: vk::CommandBuffer| unsafe { edit.expect("the cache runs").record_apply(device, cmd, push_ref) };
+    // After the encode in the capture: the scene-cut detector, then the cache's motion pass.
+    let scene = res.scene.as_ref().filter(|_| threshold > 0);
+    let after_encode = |cmd: vk::CommandBuffer| {
+        if let Some(s) = scene {
+            // SAFETY: recording the capture, after the encode; bound above.
+            unsafe { s.record(device, cmd, threshold) };
+        }
+        if run_motion {
+            motion(cmd);
+        }
+    };
     // SAFETY: the capture buffer is idle; the colour view was bound above. The encode stays in the HDR
     // pass's image: the network reads it there (no copy into slot 0's proxy, the after-the-upscaler
     // path's).
@@ -2418,7 +2499,7 @@ pub(crate) unsafe fn run_native_hold(
             mvec.map(|_| native.mvec.buffer),
             depth_copy,
             cache.map(|c| c.colour),
-            run_motion.then_some(&motion as &dyn Fn(vk::CommandBuffer)),
+            (scene.is_some() || run_motion).then_some(&after_encode as &dyn Fn(vk::CommandBuffer)),
         )
     };
     if recorded.is_err() {
@@ -2460,6 +2541,7 @@ pub(crate) unsafe fn run_native_hold(
         let stale = native.gap.begin(Instant::now());
         if native.frames > 0 {
             note_reset(stale);
+            result.scene_cut = matches!(stale, Some(Stale::SceneCut(_)));
         }
         let history = native.frames > 0 && stale.is_none() && mvec.is_some();
         let (cmds, later) = native.frame_passes(&built, history, jitter, target.mvec_scale, &passes);
@@ -2483,6 +2565,9 @@ pub(crate) unsafe fn run_native_hold(
         }
     }
     result.waits_consumed = true;
+    if let Some(s) = res.scene.as_mut().filter(|_| threshold > 0) {
+        s.submitted(super::scene_cut::Recorded { network: !cached, history });
+    }
     res.game_exposure_read = (source == super::ExposureSource::Game).then_some(target.identification);
     // From here on something of this hold is on the queue: a failure fences what went (so the next
     // hold waits for it before it records any of those buffers again), and the network's history and
@@ -3364,6 +3449,209 @@ mod tests {
             }
             device.destroy_command_pool(graph_pool, None);
             device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// A frame whose capture the scene-cut detector marked (the state buffer's `cut` word) runs every pass
+    /// exactly as a frame without history does (the same lanes, seed 0, no blend, the same answer), and with
+    /// the seed restarted after it (`restart_seed`, what the next hold does on the reading) the next frame is
+    /// bit for bit the one after a reset. Without the mark the frame blends toward its history.
+    #[test]
+    fn a_scene_cut_frame_runs_every_pass_as_a_reset_and_the_next_frame_follows_it() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(W, H);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.end_command_buffer(graph).unwrap();
+            let built = Built {
+                width: W,
+                height: H,
+                frame: nn::Frame {
+                    field_width: FW,
+                    field_height: FH,
+                    features: features.buffer,
+                    features_bytes: u64::from(FW * FH) * 64,
+                    head: head.buffer,
+                    head_bytes: u64::from(FW * FH) * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation: 1,
+                network: network::FULL,
+            };
+            let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, buffer_row_length: pw, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
+            fx.one_shot(|cmd| {
+                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
+                device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+            let mut passes = Passes::one(Conditioning::default());
+            passes.count = 2;
+            passes.each[1].intensity = 0.5;
+            let answer_of = |pass: &NativePass| -> Vec<u16> {
+                let answer = pass.answer();
+                fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }]));
+                std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).to_vec()
+            };
+            let lanes = || -> Vec<u32> { std::slice::from_raw_parts(features.ptr.cast::<u32>(), (FW * FH * 16) as usize).to_vec() };
+            // One network frame of both passes: `history` the CPU's flag, `cut` the detector's word.
+            let frame = |pass: &mut NativePass, n: u32, history: bool, cut: bool| -> (Vec<u16>, Vec<u32>, u32) {
+                let h: Vec<f32> = (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, n), residual(x, y, 1, n), residual(x, y, 2, n), 10.0])).collect();
+                std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
+                pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
+                let (cmds, later) = pass.frame_passes(&built, history, None, [1.0, 1.0], &passes);
+                assert_eq!(later.len(), 1, "one later pass");
+                let seed = (*pass.params[((pass.frames - 1) & 1) as usize].ptr.cast::<Params>()).frame[1];
+                let copies = pass.more.as_ref().unwrap().copies;
+                let state = pass.state_buffer();
+                let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+                // The initialisation clears the state; the capture writes the cut word after it, before the frame.
+                let init_cmd = pass.commands[2];
+                let (init, rest): (Vec<vk::CommandBuffer>, Vec<vk::CommandBuffer>) = order.iter().copied().partition(|&c| c == init_cmd);
+                if !init.is_empty() {
+                    device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&init).build()], vk::Fence::null()).unwrap();
+                    device.queue_wait_idle(gpu.4).unwrap();
+                }
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, state, 8, 4, u32::from(cut)));
+                device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&rest).build()], vk::Fence::null()).unwrap();
+                device.queue_wait_idle(gpu.4).unwrap();
+                for cmd in order {
+                    pass.submitted(cmd);
+                }
+                if let Some(m) = pass.more.as_mut() {
+                    m.fresh[0] = false;
+                }
+                (answer_of(pass), lanes(), seed)
+            };
+            let build = || {
+                let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+                assert!(pass.ensure_more(device, instance, physical, family, 2), "the later passes build");
+                assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                pass
+            };
+
+            // The reference: frame 2 without history (a reset on the CPU), frame 3 with it.
+            let mut reset = build();
+            frame(&mut reset, 0, false, false);
+            let (ra2, rl2, rs2) = frame(&mut reset, 1, false, false);
+            let (ra3, rl3, rs3) = frame(&mut reset, 2, true, false);
+            assert_eq!((rs2, rs3), (0, 1), "a reset's seeds");
+            // Frame 2 cut: the CPU kept the history (seed 1), the detector marked the frame.
+            let mut cut = build();
+            frame(&mut cut, 0, false, false);
+            let (ca2, cl2, cs2) = frame(&mut cut, 1, true, true);
+            assert_eq!(cs2, 1, "the CPU's parameters kept the history");
+            assert_eq!(cl2, rl2, "every lane of the last pass (noise seed 0, no history) as on a reset");
+            assert_eq!(ca2, ra2, "the answer of both passes as on a reset");
+            cut.restart_seed();
+            let (ca3, cl3, cs3) = frame(&mut cut, 2, true, false);
+            assert_eq!(cs3, 1, "the seed restarts after the cut");
+            assert_eq!(cl3, rl3, "the frame after the cut is the frame after a reset");
+            assert_eq!(ca3, ra3);
+            // Without the mark the same frame 2 keeps its history: the test tells the two apart.
+            let mut kept = build();
+            frame(&mut kept, 0, false, false);
+            let (ka2, _, _) = frame(&mut kept, 1, true, false);
+            assert_ne!(ka2, ra2, "with history the answer blends toward it");
+
+            for p in [&reset, &cut, &kept] {
+                p.destroy(device);
+            }
+            encoded.destroy(device);
+            for b in [&exposure, &features, &head, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+
+    /// The next hold's side of a reading: a cut the GPU reset restarts the seed and is counted; a cut on a
+    /// cached hold resets the next network frame (its parameters' history off, counted then) and makes the
+    /// edit cache refresh instead of carrying its edit on; no cut changes nothing.
+    #[test]
+    fn a_reading_restarts_the_seed_or_resets_the_next_network_frame_and_refreshes_the_cache() {
+        use super::super::cache::{Hold, Kind, State};
+        use super::super::scene_cut::Effect;
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let hold = |n: u64| Hold { interval: 2, hold: n, jitter: Some([0.0; 2]), mvec: true, depth: true, history_ok: true, armed: false, debug_mask: false, generation: 1 };
+        // A cache that just refreshed: its next hold is cached.
+        let refreshed = || {
+            let mut s = State::default();
+            let h = hold(1);
+            let p = s.plan(&h);
+            assert_eq!(p.kind, Kind::Refresh);
+            s.went_through(&h, &p);
+            s
+        };
+        let built = Built {
+            width: W,
+            height: H,
+            frame: nn::Frame { field_width: FW, field_height: FH, features: vk::Buffer::null(), features_bytes: 0, head: vk::Buffer::null(), head_bytes: 0, blend_scale: 0.5, chained: 0 },
+            graph: vk::CommandBuffer::null(),
+            graph_own: vk::CommandBuffer::null(),
+            generation: 1,
+            network: network::FULL,
+        };
+        let seed = |pass: &NativePass| unsafe { (*pass.params[((pass.frames - 1) & 1) as usize].ptr.cast::<Params>()).frame[1] };
+        // SAFETY: a fresh device; the pass is never submitted.
+        unsafe {
+            let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
+            let t0 = Instant::now();
+            for _ in 0..3 {
+                pass.gap.begin(t0);
+                pass.frame_passes(&built, true, None, [1.0, 1.0], &Passes::default());
+            }
+            assert_eq!(seed(&pass), 3);
+            let mut cache = refreshed();
+            // No cut: nothing changes.
+            assert!(!apply_scene_cut(Effect::None, Some(&mut pass), Some(&mut cache)));
+            assert_eq!(pass.gap.pending(t0), None);
+            assert_eq!(cache.plan(&hold(2)).kind, Kind::Cached, "the cache carries its edit");
+            // The GPU reset the last network frame: counted, and the next frame's seed is a reset's next.
+            assert!(apply_scene_cut(Effect::ResetOnGpu(80), Some(&mut pass), None));
+            assert_eq!(pass.gap.pending(t0), None, "the reset already happened");
+            pass.frame_passes(&built, true, None, [1.0, 1.0], &Passes::default());
+            assert_eq!(seed(&pass), 1, "the seed counts on from the cut frame's 0");
+            // A cut on a cached hold: the next network frame resets, the cache refreshes.
+            let mut cache = refreshed();
+            assert!(!apply_scene_cut(Effect::Latch(90), Some(&mut pass), Some(&mut cache)), "counted when it is consumed");
+            assert_eq!(cache.plan(&hold(2)).kind, Kind::Refresh, "the cache refreshes across the cut");
+            let stale = pass.gap.begin(t0);
+            assert_eq!(stale, Some(Stale::SceneCut(90)));
+            // run_native_hold's rule for the frame's history flag.
+            assert!(!(pass.frames > 0 && stale.is_none()), "the next network frame has no history");
+            pass.frame_passes(&built, false, None, [1.0, 1.0], &Passes::default());
+            assert_eq!((*pass.params[((pass.frames - 1) & 1) as usize].ptr.cast::<Params>()).frame[2], 0, "its parameters' history flag is off");
+            assert_eq!(pass.gap.begin(t0), None, "once");
+            pass.destroy(device);
         }
     }
 }

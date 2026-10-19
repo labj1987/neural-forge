@@ -89,6 +89,7 @@ pub fn status_text(header: &ShmHeader) -> String {
         f64::from(header.cache_rejected.load(Ordering::Relaxed)) / 100.0,
         f32::from_bits(header.cache_gpu_ms_bits.load(Ordering::Relaxed))
     ));
+    line(format_args!("scene_cuts={}", header.scene_cuts.load(Ordering::Relaxed)));
     line(format_args!("# settings (neural_forge_protocol::ShmHeader::persisted_settings)"));
     for (name, is_float, bits) in header.persisted_settings() {
         if is_float {
@@ -132,6 +133,7 @@ mod tests {
         header.cache_cached_holds.store(29, Ordering::Relaxed);
         header.cache_rejected.store(1234, Ordering::Relaxed);
         header.cache_gpu_ms_bits.store(0.25f32.to_bits(), Ordering::Relaxed);
+        header.scene_cuts.store(3, Ordering::Relaxed);
         let text = status_text(&header);
         let lines: Vec<&str> = text.lines().collect();
         assert_eq!(lines[0], "# live status");
@@ -140,6 +142,7 @@ mod tests {
         assert!(lines.contains(&"capture_path=/c/1-composited.png"), "{text}");
         assert!(lines.contains(&"preupscale_dump_request=16"), "{text}");
         assert!(lines.contains(&"edit_cache: refresh_holds=30 cached_holds=29 rejected=12.34% gpu_ms=0.250"), "{text}");
+        assert!(lines.contains(&"scene_cuts=3"), "{text}");
         assert!(lines.contains(&"intensity=1"), "{text}");
         assert!(lines.contains(&"skin_structure=-1"), "{text}");
         let settings_at = lines.iter().position(|l| l.starts_with("# settings")).expect("a settings section");

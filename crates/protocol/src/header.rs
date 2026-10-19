@@ -433,6 +433,10 @@ pub struct ShmHeader {
     /// f32 bits: how much of a pass's answer becomes the next pass's input, 0 to 1 (the rest is the pass's
     /// own input). 1 (the default) is the answer itself.
     pub pass_feedback_bits: AtomicU32,
+    /// Times the layer reset the network's history before the upscaler because the picture changed as a
+    /// whole (a scene cut: the mean luma difference of two frames' thumbnails at or above the
+    /// threshold), counted since the layer opened the channel.
+    pub scene_cuts: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -457,8 +461,9 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2080, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2084, "the header layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) == 2076, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, scene_cuts) == 2080, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, network) == 2032, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, mask_sky) == 2036, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, passes) == 1748, "layout changed -- bump SHM_VERSION");
@@ -735,6 +740,7 @@ impl ShmHeader {
         for f in [&self.cache_refresh_holds, &self.cache_cached_holds, &self.cache_rejected, &self.cache_gpu_ms_bits] {
             f.store(0, Ordering::Relaxed);
         }
+        self.scene_cuts.store(0, Ordering::Relaxed);
         self.capture_next_id.store(0, Ordering::Relaxed);
         self.capture_cancel.store(0, Ordering::Relaxed);
         self.set_capture_result_words(&[0; crate::capture::RESULT_WORDS]);
@@ -1590,7 +1596,7 @@ mod tests {
         // v20 appends the mask's rules: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::offset_of!(ShmHeader, pass_feedback_bits));
-        assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::offset_of!(ShmHeader, scene_cuts));
         assert_eq!(crate::SHM_VERSION, 20);
         let h = ShmHeader::default();
         h.init_defaults();
@@ -1619,6 +1625,18 @@ mod tests {
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::FULL, "the full network is the default");
+    }
+
+    #[test]
+    fn the_scene_cut_counter_is_appended_after_the_passes() {
+        // v20's last word: every earlier field keeps its offset, and the counter sits last.
+        assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts), std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 20);
+        let h = ShmHeader::default();
+        h.scene_cuts.store(5, Ordering::Relaxed);
+        h.init_defaults();
+        assert_eq!(h.scene_cuts.load(Ordering::Relaxed), 0, "a fresh session has seen no cut");
     }
 
     #[test]

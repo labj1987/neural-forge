@@ -70,7 +70,7 @@ present hook and its model server thread. Layout (`crates/protocol/src/lib.rs`):
 
 | Offset | Size | Content |
 |---|---|---|
-| 0 | 64 KiB (`HEADER_BYTES`) | `ShmHeader` (2076 bytes used) |
+| 0 | 64 KiB (`HEADER_BYTES`) | `ShmHeader` (2084 bytes used) |
 | 64 KiB | `MAX_FRAME` | slot 0 proxy: the frame the layer captured |
 | + `MAX_FRAME` | `MAX_FRAME` | slot 0 answer: the model's output |
 | + 2 `MAX_FRAME` | `MAX_FRAME` | slot 1 proxy |
@@ -316,7 +316,7 @@ sequenceDiagram
     G->>L: vkQueueSubmit (batch containing the DLSS buffer)
     L->>L: wait (bounded) for the previous hold's W fence
     L->>Q: head: game buffers before the DLSS buffer (wait semaphores)
-    L->>Q: C: barrier, copy exposure, encode colour -> RGBA16F, copy motion vectors
+    L->>Q: C: barrier, copy exposure, encode colour -> RGBA16F, copy motion vectors, scene-cut thumbnail
     L->>Q: N: preprocess, the network's recorded graph, composite (history, jitter)
     L->>Q: W: decode over the colour input, barrier
     L->>Q: tail: DLSS buffer onward (signal semaphores, fence)
@@ -335,14 +335,18 @@ sequenceDiagram
    exposure image, measure it from the colour input: the auto-exposure, 4.6); the encode compute
    shader reads the colour input through a storage view and writes the layer's padded `RGBA16F`
    image; DLSS's motion vectors are copied beside it for the history. An odd width or height is
-   padded by repeating the last column or row.
+   padded by repeating the last column or row. After the encode the scene-cut detector
+   (`preupscale/scene_cut.rs`) takes a luma thumbnail of the encoded image (every 8th pixel on each
+   axis) and compares it with the previous hold's; a mean absolute difference of 40 of 255 or more
+   marks the frame as a cut in the native pass's state buffer.
 3. **The network** (`N`, `preupscale/native.rs`): `native_preprocess.comp` builds the network's input
    lanes from the encoded frame, the previous answer reprojected with the motion vectors and the
    camera jitter (read from DLSS's input-kernel parameters), and the Model tab's settings; the graph
    recorded for this extent runs the network; `native_composite.comp` applies the style operator and
    intensity and keeps the answer as the next frame's history. The history is reset after a frame
-   that went to DLSS untouched, after 500 ms without a frame, on another extent, or after a frame
-   whose exposure was unusable.
+   that went to DLSS untouched, after 500 ms without a frame, on another extent, after a frame
+   whose exposure was unusable, or on a scene cut (the frame `C` marked; read by both shaders on the
+   same frame, for every pass; a cut on a cached hold resets the next network frame instead).
 4. **Write back and decode** (`W`): the decode shader inverts the encode and writes the colour input
    in place, cropping the padding, keeping the original pixel (all three channels, so no hue turns)
    where the encoded input's peak channel was clamped and keeping the original alpha; a closing
@@ -569,7 +573,7 @@ directly as 3.2.0's did; the picture is bit for bit 3.2.0's (the test
 - **When a hold is cached** (`cache::State::plan`): within the regime's interval after a refresh that stored
   an edit, the very next DLSS submit after the previous hold (any frame that went to DLSS untouched
   breaks it), the network's history still good (`HistoryGap::pending`: no skip, no other extent, under
-  500 ms), jitter, vectors, the same depth presence as the refresh, no cache dump armed. A hold that
+  500 ms, no scene cut on the hold before: such a cut also drops the stored edit), jitter, vectors, the same depth presence as the refresh, no cache dump armed. A hold that
   misses for any reason takes the stored edit with it. Cached holds keep the network's history as it
   is (parity, seed, `last_jitter`), call `claim_pre` and set `evaluated` like a refresh, and
   `HistoryGap::touch` so the 500 ms rule counts from the last hold, not the last network frame.

@@ -361,7 +361,17 @@ and composite bit for bit; ATTRIBUTION.md).
   used by both: a reset after a frame that went to DLSS untouched, after 500 ms without a frame, or
   on another extent or identification. Plus per pixel: no history where the previous position is
   outside the frame, and none after a frame whose exposure was unusable (a GPU flag the composite
-  writes).
+  writes). Since 3.7.0 also on a scene cut (`preupscale::scene_cut`, `Stale::SceneCut`): the 1.x
+  helper's detector (an 8-pixel-step luma thumbnail of the encoded capture, a mean absolute difference
+  of 40 of 255 from the previous hold's) on the GPU, two dispatches in `C` after the encode, whether
+  motion vectors are on or not. Its decision is the state buffer's third word (`cut`, beside `ok[2]`),
+  which both frame shaders read as no history on that same frame, so every pass (`MorePasses` too) starts
+  afresh with seed 0. The host reads the 16-byte result at the next hold, after the wait it does anyway:
+  a cut on a network frame logs `[native] resetting the history (scene cut: ...)`, is counted (SHM v20
+  `scene_cuts`) and restarts the CPU's seed (`restart_seed`) so the next frame's is 1, as after a reset;
+  a cut on a cached hold (no network ran on it) marks `HistoryGap::scene_cut`, so the next network frame
+  resets (and is logged and counted then), and drops the edit cache's stored edit so that frame
+  refreshes. `NEURAL_FORGE_SCENE_CUT=off|<threshold>` is the test override.
 - **Motion vectors** (measured on consecutive GTA V frames, `NEURAL_FORGE_PREUPSCALE_DUMP_FRAMES`):
   DLSS's are in render pixels, y down, current to previous (`prev = x + mv`, scale +1 on both axes
   by a 7x7 search). They exclude the camera jitter: the warp error falls a further 20% with a global

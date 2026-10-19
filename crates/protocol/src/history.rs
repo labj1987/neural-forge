@@ -26,11 +26,14 @@ pub struct HistoryGap<F = ()> {
     /// last evaluate.
     format: Option<F>,
     format_changed: bool,
+    /// A scene cut seen on a frame the network did not run on (the layer's edit cache carried the last
+    /// answer to it), with its mean luma difference: the next evaluate starts afresh.
+    cut: Option<u32>,
 }
 
 impl<F> Default for HistoryGap<F> {
     fn default() -> Self {
-        Self { last: None, broken: false, format: None, format_changed: false }
+        Self { last: None, broken: false, format: None, format_changed: false, cut: None }
     }
 }
 
@@ -46,6 +49,10 @@ pub enum Stale {
     /// The slot's input format changed (the model server: between 8-bit and RGBA16F; the layer: another
     /// extent or another identification of DLSS's inputs): the history describes another picture.
     FormatChanged,
+    /// The picture changed as a whole since the previous frame (the layer's scene-cut detector,
+    /// `preupscale::scene_cut`): the mean absolute difference of the two frames' luma thumbnails, on
+    /// 0-255. The history describes a scene no longer on screen.
+    SceneCut(u32),
 }
 
 impl<F: Copy + PartialEq> HistoryGap<F> {
@@ -57,6 +64,13 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
     /// A request on this slot that did not reach the model.
     pub fn skipped(&mut self) {
         self.broken = true;
+    }
+
+    /// A scene cut on a frame the history was kept through without an evaluate (the layer's cached
+    /// holds), `mean` its luma difference: the next [`Self::begin`] reports [`Stale::SceneCut`]. A cut on
+    /// a frame that evaluates is reset on the GPU for that frame and never comes here.
+    pub fn scene_cut(&mut self, mean: u32) {
+        self.cut = Some(mean);
     }
 
     /// Every request on this slot, with its proxy's format class (before deciding whether it
@@ -76,6 +90,7 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
             None => None,
             Some(_) if self.format_changed => Some(Stale::FormatChanged),
             Some(_) if self.broken => Some(Stale::Skipped),
+            Some(_) if self.cut.is_some() => self.cut.map(Stale::SceneCut),
             Some(t) => {
                 let gap = now.saturating_duration_since(t);
                 (gap > Self::MAX_GAP).then_some(Stale::Idle(gap))
@@ -99,6 +114,7 @@ impl<F: Copy + PartialEq> HistoryGap<F> {
         let stale = self.pending(now);
         self.broken = false;
         self.format_changed = false;
+        self.cut = None;
         self.last = Some(now);
         stale
     }
@@ -138,6 +154,28 @@ mod tests {
         assert_eq!(g.pending(t), Some(Stale::Skipped));
         assert_eq!(g.begin(t), Some(Stale::Skipped));
         assert_eq!(g.pending(t), None);
+    }
+
+    #[test]
+    fn a_scene_cut_resets_the_next_evaluate_once() {
+        let mut g: HistoryGap = HistoryGap::default();
+        let t0 = Instant::now();
+        g.begin(t0);
+        // A cached frame saw the cut: the evaluate after it starts afresh, and only that one.
+        g.scene_cut(87);
+        g.touch(t0 + Duration::from_millis(16));
+        assert_eq!(g.pending(t0 + Duration::from_millis(16)), Some(Stale::SceneCut(87)), "pending does not consume it");
+        assert_eq!(g.begin(t0 + Duration::from_millis(32)), Some(Stale::SceneCut(87)));
+        assert_eq!(g.begin(t0 + Duration::from_millis(48)), None);
+        // With a skip as well it is one reset, reported as the skip.
+        g.scene_cut(60);
+        g.skipped();
+        assert_eq!(g.begin(t0 + Duration::from_millis(64)), Some(Stale::Skipped));
+        assert_eq!(g.begin(t0 + Duration::from_millis(80)), None);
+        // Before the first evaluate a new feature resets on its own.
+        let mut h: HistoryGap = HistoryGap::default();
+        h.scene_cut(90);
+        assert_eq!(h.begin(t0), None);
     }
 
     #[test]

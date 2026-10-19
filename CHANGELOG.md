@@ -24,6 +24,10 @@ first shipped them; their phase is kept as a subheading.
   the game's depth), so it stays clean and steady. "Keep the game's sky" on the Model tab turns it off.
 - **More mask rules** (Model tab): the model's edit can fade out in dark areas or in fast motion, each with
   its own brightness or motion and how much intensity and structure to keep. Both are off by default.
+- **Scene cuts start the model afresh.** Before the upscaler, when the picture changes completely from
+  one frame to the next (a cut in a cutscene, a respawn, a camera switch), the model no longer blends
+  the previous scene into the first frames of the new one. The Debug tab counts these frames under
+  Scene cuts.
 
 ## 3.6.0 — 2026-10-19
 

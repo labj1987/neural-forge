@@ -38,7 +38,7 @@ layout(set = 0, binding = 4, std140) uniform Params {
 // The control mask (native_mask.comp): r scales the intensity blend per pixel. Read only while p.mask.x
 // names a rule.
 layout(set = 0, binding = 10, std430) readonly buffer Mask { uint m[]; } u_mask;
-layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; } u_state;
+layout(set = 0, binding = 5, std430) buffer State { uint ok[2]; uint cut; } u_state;
 // The exposure texel the encode used (R16_SFLOAT in the low 16 bits).
 layout(set = 0, binding = 6, std430) readonly buffer Exposure { uint bits; } u_exposure;
 // The next frame's history, valid extent.
@@ -132,7 +132,7 @@ vec2 previousPosition(uvec2 xy) {
 }
 
 bool hasHistory(uvec2 xy) {
-  if (p.frame.z == 0u || u_state.ok[1u - p.frame.w] == 0u) return false;
+  if (p.frame.z == 0u || u_state.cut != 0u || u_state.ok[1u - p.frame.w] == 0u) return false;
   vec2 at = previousPosition(xy);
   vec2 valid = vec2(p.dims.zw);
   return all(greaterThanEqual(at, vec2(0.0))) && all(lessThan(at, valid));
