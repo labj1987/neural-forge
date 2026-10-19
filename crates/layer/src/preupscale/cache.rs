@@ -655,6 +655,11 @@ impl CachePass {
         (self.width, self.height) == (width, height)
     }
 
+    /// The bytes its buffers take above interval 1 ([`ScratchLayout::total`]).
+    pub(crate) fn scratch_bytes(&self) -> u64 {
+        self.layout.total
+    }
+
     /// Chains holds above interval 1: `false` when the network's input features (`scratch_bytes`)
     /// cannot hold the [`ScratchLayout`] (the hold then runs at interval 1).
     pub(crate) fn chain(&mut self, scratch_bytes: u64) -> bool {

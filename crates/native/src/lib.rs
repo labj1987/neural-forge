@@ -46,9 +46,13 @@ mod ffi {
         pub fn nf_native_device_restore(state: *mut c_void);
         pub fn nf_native_open(open: *const Open, stalled: *mut u32, err: *mut c_char, len: usize) -> *mut c_void;
         pub fn nf_native_build(n: *mut c_void, width: u32, height: u32, err: *mut c_char, len: usize) -> u32;
+        pub fn nf_native_build_sizes(n: *mut c_void, sizes: *const u32, count: u32, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_frame(n: *const c_void, frame: *mut super::Frame) -> u32;
+        pub fn nf_native_frame_at(n: *const c_void, slot: u32, frame: *mut super::Frame) -> u32;
         pub fn nf_native_graph_commands(n: *const c_void) -> vk::CommandBuffer;
         pub fn nf_native_graph_commands_own(n: *const c_void) -> vk::CommandBuffer;
+        pub fn nf_native_graph_commands_at(n: *const c_void, slot: u32) -> vk::CommandBuffer;
+        pub fn nf_native_graph_commands_own_at(n: *const c_void, slot: u32) -> vk::CommandBuffer;
         pub fn nf_native_record_graph(n: *mut c_void, primary: vk::CommandBuffer, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_chain_timeouts(n: *const c_void, at: *mut c_char, len: usize) -> u32;
         pub fn nf_native_reset_chain_timeouts(n: *mut c_void);
@@ -261,6 +265,41 @@ impl Network {
         self.frame().ok_or_else(|| "built, but no frame".to_string())
     }
 
+    /// [`Self::build`] for several frame sizes at once: one graph each (slot `i` for `sizes[i]`, slot 0 what
+    /// [`Self::frame`] and [`Self::graph_commands`] return), sharing the weights and the kernels, run one after
+    /// another (never at the same time). The frames in `sizes`' order.
+    ///
+    /// # Safety
+    /// As [`Self::build`].
+    pub unsafe fn build_sizes(&mut self, sizes: &[(u32, u32)]) -> Result<Vec<Frame>, String> {
+        let mut err = [0 as c_char; MESSAGE];
+        let flat: Vec<u32> = sizes.iter().flat_map(|&(w, h)| [w, h]).collect();
+        // SAFETY: `raw` is live; `flat` holds `sizes.len()` pairs; nothing of the previous build is pending.
+        if unsafe { ffi::nf_native_build_sizes(self.raw, flat.as_ptr(), sizes.len() as u32, err.as_mut_ptr(), MESSAGE) } != 1 {
+            return Err(message(&err));
+        }
+        (0..sizes.len() as u32).map(|i| self.frame_at(i).ok_or_else(|| "built, but no frame".to_string())).collect()
+    }
+
+    /// Slot `slot`'s frame ([`Self::build_sizes`]).
+    pub fn frame_at(&self, slot: u32) -> Option<Frame> {
+        let mut frame = Frame::default();
+        // SAFETY: `raw` is live; `frame` is a valid out-pointer.
+        (unsafe { ffi::nf_native_frame_at(self.raw, slot, &mut frame) } == 1).then_some(frame)
+    }
+
+    /// Slot `slot`'s recorded graph ([`Self::graph_commands`] for slot 0).
+    pub fn graph_commands_at(&self, slot: u32) -> vk::CommandBuffer {
+        // SAFETY: `raw` is live.
+        unsafe { ffi::nf_native_graph_commands_at(self.raw, slot) }
+    }
+
+    /// Slot `slot`'s recording for the network's own queue family ([`Self::graph_commands_own`] for slot 0).
+    pub fn graph_commands_own_at(&self, slot: u32) -> vk::CommandBuffer {
+        // SAFETY: `raw` is live.
+        unsafe { ffi::nf_native_graph_commands_own_at(self.raw, slot) }
+    }
+
     pub fn frame(&self) -> Option<Frame> {
         let mut frame = Frame::default();
         // SAFETY: `raw` is live; `frame` is a valid out-pointer.
@@ -351,8 +390,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_2() {
-        assert_eq!(abi_version(), 2);
+    fn abi_version_is_3() {
+        assert_eq!(abi_version(), 3);
     }
 
     #[test]

@@ -864,7 +864,8 @@ only lowering a value:
 With no rule on, the mask pass writes nothing and no shader reads it: the frame is bit for bit as without the
 mask (`the_control_mask_keeps_the_sky_lowers_structure_and_changes_nothing_when_all_ones` also checks an
 all-ones mask against none). Every pass of a multi-pass frame reads the same mask, built from the original
-frame.
+frame, unless the passes run at different model resolutions: then the first pass at each resolution builds
+that resolution's mask from its own input ("Model resolution before the upscaler").
 
 ## Pass feedback (3.7.0, 2026-10-19)
 
@@ -945,6 +946,76 @@ flow's direction (input to reference) is the extension's documented meaning; a g
 | Buffers | previous proxy 4 B/px, reprojected history 8 B/px, one history per pass 8 B/px (1440p, one pass: 74 MB) | two input images 4 B/px, the flow image and its host-visible copy 4 B per 4x4 cell (1440p: 30 MB + 2 x 0.9 MB) |
 | Per pass | the preprocess reads 8 B (history) + 8 B (two proxies) and writes 8 B per pixel; the composite reads and writes 8 B per pixel; same dispatches as before | the preprocess's history read is the five-tap filter (up to 20 texel reads) and four flow reads |
 | Per frame | one buffer copy of the proxy (4 B/px); the cut thumbnail on the CPU (1/64 of the pixels) | one buffer-to-image copy of the proxy, the optical flow at the proxy's size, one image-to-buffer copy of the vectors, two more submits and their semaphores |
+
+## Model resolution before the upscaler (3.8.0, 2026-10-19)
+
+The Model tab's **Model resolution** (`preupscale_scale`) sets the size the network runs at before the
+upscaler, as a scale of DLSS's input size: **Full** 1 (the default), **Quality** 0.667, **Balanced** 0.58,
+**Performance** 0.5, **Ultra Performance** 0.333 (`enums::model_scale`; `shmctl set` takes any value from
+0.25 to 1). Each pass can override it (`pass<N>_scale` with the `SCALE` override bit, the per-pass dialog's
+Model resolution). Each side is rounded and kept at 8 texels or more (`native::model_extent`).
+
+**Full is the frame as it was, bit for bit.** At 1 nothing of the following is built or recorded: one
+graph at the render extent, the same `N` buffers, the same parameters
+(`at_full_model_resolution_the_frame_is_bit_for_bit_as_before` runs two passes and three frames against a
+pass built the old way). The default is not lowered: the 3.3 attempt at a reduced resolution before the
+upscaler kept 12% (75%) to 28% (50%) of the added detail on a static facade at 4K and showed soft diagonal
+streaks on flat lit surfaces at 50% (LESSONS.md, "3.3 edit cache: reduced model resolution before the
+upscaler (built, removed)"), and lowering it by default needs the picture not to suffer. Below Full the
+setting is the user's choice of speed over detail.
+
+A pass below the render extent runs inside its own `N` buffer, around the network:
+
+- **Reduce** (`native_reduce.comp`, first): the pass's input at its extent, each texel the area (box)
+  average of the render pixels it covers, taken in the encoded domain the network reads (the encode's
+  picture, or the previous pass's answer), so the picture keeps its look and only loses pixels. The
+  motion (the accumulated field, or DLSS's packed vectors with the edit cache off) and the depth copy (as
+  f32 device depth) are taken at the render pixel under each texel's centre.
+- **The network** at that extent, with its own history images there. The vectors keep their units; the
+  pass's parameters scale the vectors' scale, the jitter's step and the control mask's motion threshold by
+  the extent's ratio to the render extent, so the history reprojects in the pass's own pixels.
+- **Enlarge** (`native_enlarge.comp`, last): the network's **edit**, its answer minus its input at its
+  extent in the encoded domain, is brought to the render extent by a joint bilateral upsample guided by the
+  full-resolution input, and added to that input: each render pixel takes the four texels around it, each
+  by its bilinear weight times `exp(-|guide - input|^2 / 0.08^2)` over the three encoded channels
+  (`GUIDE_SIGMA`, upstream's JBU sigma), never below 1e-6 of the bilinear weight. The full-resolution
+  frame's own detail is kept as it is; only the change is enlarged, and an edge in the frame keeps each
+  side's edit. The result is written to the answer buffer at the render extent, where the write-back
+  decodes it and the next pass reads it as before.
+
+Everything after the passes is at the render extent: the decode and its clamped-highlight rule, the edit
+cache (which captures the full-size edit, so its cached holds are unchanged; its buffers live in pass 1's
+input features when they fit, else in a buffer of the native pass's own of the same layout, 56 bytes a
+render pixel), the copies between passes and pass feedback, a cache dump. The control mask is built at each
+extent by the first pass there. The scene-cut word is shared by every pass.
+
+**Per pass**: every pass downsamples its own input, the previous pass's full-size answer, to its own
+extent, and enlarges its edit back; passes at the same extent share one graph and one lane (input,
+motion, depth, mask and answer buffers at that extent). `each_pass_runs_at_its_own_model_resolution`
+checks pass 1 at full size and pass 2 at half: pass 2's input lanes are the 2x2 means of pass 1's answer.
+
+**The network for several sizes**: the loader builds one graph per distinct extent the passes run at, pass
+1's first, together (`nn::Network::build_sizes`, `nf_native_build_sizes`: a warm-up each, the largest
+first so the split-K scratch is sized for it, then every recording in descriptor pool 1). The graphs share
+the weights and kernels and run one after another, never at once. Every build of a set carries one
+generation. VRAM goes with the field: the network's activations are about 364 bytes a field texel, so a
+pass at 0.5 needs about a quarter of Full's, and each further size adds its own. Build time is one warm-up
+per size.
+
+**Changing it**: a change of any pass's model resolution builds the native pass again (its extents are
+fixed for its life, `take_other_extents`), so every history starts afresh at its new extent, the edit cache
+refreshes, and the loader builds the new set of sizes while the frames go to DLSS untouched (a moment, as
+for a switch of the network). `another_model_resolution_starts_the_history_afresh` checks it.
+`at_half_model_resolution_the_edit_comes_back_at_full_size_without_crossing_an_edge` checks the reduce
+(the network's input is the area average) and the enlarge (a constant edit comes back with its own
+magnitude on every pixel; opposite edits on either side of a hard edge stay on their sides, where plain
+bilinear gives the pixel next to the edge half the other side's). The rig test
+`two_sizes_built_together_each_give_the_head_of_their_size_alone` (`NEURAL_FORGE_NATIVE_RIG`, an NVIDIA
+GPU) checks two sizes built together against one built alone.
+
+Not measured yet. To measure in GTA V Enhanced at 1440p (frame generation on, as found): real fps for each
+preset, and bench-iq's added detail and flicker on a static box (the still shot's facade, as in LESSONS.md;
+the whole-scene number moves with what the game spawns), Full against each preset.
 
 ## Decided before Phase 1
 

@@ -1,0 +1,72 @@
+#version 450
+// Model resolution before the upscaler (docs/NATIVE_BACKEND.md, "Model resolution before the upscaler"): the
+// last dispatch of a pass that runs the network below the render extent. It brings the network's change back
+// to the render extent, not a blurred picture: the pass's edit (its answer minus its input, both at its
+// extent, in the encoded domain) is enlarged by a joint bilateral upsample guided by the full-resolution
+// input, then added to that input. Each render pixel takes the four texels of the pass around it, each by its
+// bilinear weight times exp(-|guide - input|^2 / sigma^2) (the full-resolution pixel's encoded colour against
+// the texel's, all three channels; upstream's JBU sigma 0.08), so an edge in the frame keeps each side's own
+// edit; a weight never falls below 1e-6 of its bilinear one, so a pixel unlike all four takes their nearest
+// in colour rather than nothing. The result is the answer at the render extent (packed half4 rows of the
+// padded width, the padding repeating the edge), which the write-back decodes and the next pass reads, as a
+// pass at the render extent writes it.
+//
+// The descriptor set layout and Params are native_preprocess.comp's (field for field, append only).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+// The pass's input at its extent (padded), GENERAL.
+layout(set = 0, binding = 0, rgba16f) uniform readonly image2D u_small;
+layout(set = 0, binding = 4, std140) uniform Params {
+  uvec4 dims;        // field width, field height, the pass's width, height
+  uvec4 frame;       // the pass's padded width, seed, history valid (CPU), parity
+  vec4 motion;
+  vec4 control;
+  vec4 more;
+  uvec4 mask;
+  vec4 sky;
+  vec4 dark;
+  vec4 moving;
+  uvec4 full;        // the render extent (width, height), its padded width, the depth copy's kind
+  vec4 ratio;        // the pass's extent over the render extent (x, y), the guide sigma, unused
+} p;
+// The pass's answer (native_composite.comp's, rows of the pass's padded width).
+layout(set = 0, binding = 8, std430) readonly buffer Answer { uvec2 texel[]; } u_answer;
+// The render extent's input (padded), GENERAL: the guide and what the edit is added to.
+layout(set = 0, binding = 12, rgba16f) uniform readonly image2D u_full;
+// The answer at the render extent: RGBA16F rows of its padded width, as packed half4.
+layout(set = 0, binding = 15, std430) writeonly buffer FullAnswer { uvec2 texel[]; } u_full_answer;
+
+vec3 sane(vec3 c) {
+  return clamp(mix(c, vec3(0.0), isnan(c)), 0.0, 1.0);
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  uvec2 size = p.full.xy;
+  uvec2 padded = uvec2(p.full.z, size.y + (size.y & 1u));
+  if (any(greaterThanEqual(id, padded))) return;
+  uvec2 xy = min(id, size - 1u);
+  ivec2 extent = ivec2(p.dims.zw);
+  vec3 guide = sane(imageLoad(u_full, ivec2(xy)).rgb);
+  vec2 at = (vec2(xy) + 0.5) * p.ratio.xy - 0.5;
+  vec2 base = floor(at);
+  vec2 f = at - base;
+  float inv = 1.0 / (p.ratio.z * p.ratio.z);
+  vec3 sum = vec3(0.0);
+  float wsum = 0.0;
+  for (int j = 0; j < 4; j++) {
+    ivec2 offset = ivec2(j & 1, j >> 1);
+    ivec2 t = clamp(ivec2(base) + offset, ivec2(0), extent - 1);
+    float wb = (offset.x == 1 ? f.x : 1.0 - f.x) * (offset.y == 1 ? f.y : 1.0 - f.y);
+    vec3 low = sane(imageLoad(u_small, t).rgb);
+    uvec2 packed = u_answer.texel[uint(t.y) * p.frame.x + uint(t.x)];
+    vec3 answer = vec3(unpackHalf2x16(packed.x), unpackHalf2x16(packed.y).x);
+    vec3 d = guide - low;
+    float w = wb * max(exp(-dot(d, d) * inv), 1e-6);
+    sum += (answer - low) * w;
+    wsum += w;
+  }
+  vec3 edit = wsum > 0.0 ? sum / wsum : vec3(0.0);
+  vec3 published = clamp(guide + edit, 0.0, 1.0);
+  u_full_answer.texel[id.y * p.full.z + id.x] = uvec2(packHalf2x16(published.rg), packHalf2x16(vec2(published.b, 1.0)));
+}

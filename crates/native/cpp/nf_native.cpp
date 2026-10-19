@@ -258,17 +258,25 @@ void* copyChain(Extension& x, const void* chain, const void** tail) {
 
 // ---- The network -----------------------------------------------------------------------------
 
+// One frame size's graph: its activations, the layer's input features and the two recordings.
+struct NfSlot {
+  nr::Geometry geometry{};
+  std::unique_ptr<nr::Graph> graph;
+  nr::Activation* features = nullptr;
+  VkCommandBuffer secondary = VK_NULL_HANDLE;
+  VkCommandBuffer ownSecondary = VK_NULL_HANDLE;
+};
+
 struct NfNative {
   std::unique_ptr<vk::Context> context;
   std::unique_ptr<nr::Model> model;
   std::unique_ptr<nr::Kernels> kernels;
-  std::unique_ptr<nr::Graph> graph;
-  nr::Geometry geometry{};
-  nr::Activation* features = nullptr;
+  // The graphs of the sizes built together (nf_native_build_sizes), in the order asked for. They share the
+  // weights, the kernels and the split-K scratch (sized by the largest, built first), and run one after
+  // another on one queue, never at the same time (each opens and closes with compute barriers).
+  std::vector<NfSlot> slots;
   VkCommandPool secondaryPool = VK_NULL_HANDLE;
-  VkCommandBuffer secondary = VK_NULL_HANDLE;
   VkCommandPool ownPool = VK_NULL_HANDLE;
-  VkCommandBuffer ownSecondary = VK_NULL_HANDLE;
   float blendScale = 1.0f;
   uint64_t rawLoaded = 0;
   uint64_t fenceTimeoutNs = 5'000'000'000ull;
@@ -277,49 +285,62 @@ struct NfNative {
 
   void dropGraph() {
     if (stalled()) {
-      // The GPU may still run the graph: its command buffers and activations are leaked, not freed.
-      secondary = ownSecondary = VK_NULL_HANDLE;
-      (void)graph.release();
-      features = nullptr;
+      // The GPU may still run the graphs: their command buffers and activations are leaked, not freed.
+      for (NfSlot& slot : slots) (void)slot.graph.release();
+      slots.clear();
       return;
     }
-    if (secondary) vkFreeCommandBuffers(context->device(), secondaryPool, 1, &secondary);
-    secondary = VK_NULL_HANDLE;
-    if (ownSecondary) vkFreeCommandBuffers(context->device(), ownPool, 1, &ownSecondary);
-    ownSecondary = VK_NULL_HANDLE;
-    graph.reset();
-    features = nullptr;
-    // Nothing recorded holds the split-K scratch's address now: the next build sizes it for its own graph
+    for (NfSlot& slot : slots) {
+      if (slot.secondary) vkFreeCommandBuffers(context->device(), secondaryPool, 1, &slot.secondary);
+      if (slot.ownSecondary) vkFreeCommandBuffers(context->device(), ownPool, 1, &slot.ownSecondary);
+      slot.graph.reset();
+    }
+    slots.clear();
+    // Nothing recorded holds the split-K scratch's address now: the next build sizes it for its own graphs
     // (a larger frame needs more than the first build's).
     if (kernels) kernels->releaseScratch();
   }
 
-  // Build (or rebuild) the graph for `geometry`: a warm-up run on the layer's queue, then the
-  // secondary recording.
-  void build(uint32_t width, uint32_t height) {
+  // Build (or rebuild) the graphs for `sizes` (pairs of valid width and height, `count` of them): each a
+  // warm-up run on the layer's queue, then the secondary recordings of all of them. The largest is built
+  // first: the split-K scratch is sized by the first recording that needs it, and the smaller graphs' fit
+  // in it.
+  void build(const uint32_t* sizes, uint32_t count) {
     dropGraph();
-    geometry = nr::Geometry::fromValid(width, height);
-    graph = std::make_unique<nr::Graph>(*context, *model, *kernels, geometry, nr::Graph::Options{});
-    features = graph->allocate("input features", geometry.fullWidth * geometry.fullHeight, 16, nr::Format::F32);
-    context->fillZero(features->buffer);
-    // The first recording uploads the weights' re-laid matrices (each its own bounded submit) and
-    // its run makes the driver compile every PTX module.
-    context->resetDescriptorPool(0);
-    VkCommandBuffer warm = context->beginCommands();
-    graph->record(warm, *features);
-    context->endAndSubmit(warm, true);
-    const nr::Kernels::ChainTimeouts timeouts = kernels->chainTimeouts();
-    if (timeouts.waits) throw std::runtime_error("the warm-up run's counter chain timed out at " + timeouts.counter);
-    // The warm-up built every matrix the graph uses and has completed: the records' raw buffers now keep only the
-    // bytes the kernels read through them (OpenDLSS-NR patch 0008). The recordings below use those.
-    model->compactAux();
-    // The frame recordings (one per queue family they run on): descriptor pool 1 stays reserved for them.
+    if (count == 0) throw std::runtime_error("no frame size to build the network for");
+    slots.resize(count);
+    std::vector<uint32_t> order(count);
+    for (uint32_t i = 0; i < count; ++i) order[i] = i;
+    auto area = [&](uint32_t i) { return uint64_t(sizes[2 * i]) * sizes[2 * i + 1]; };
+    std::stable_sort(order.begin(), order.end(), [&](uint32_t a, uint32_t b) { return area(a) > area(b); });
+    for (uint32_t i : order) {
+      NfSlot& slot = slots[i];
+      slot.geometry = nr::Geometry::fromValid(sizes[2 * i], sizes[2 * i + 1]);
+      slot.graph = std::make_unique<nr::Graph>(*context, *model, *kernels, slot.geometry, nr::Graph::Options{});
+      slot.features = slot.graph->allocate("input features", slot.geometry.fullWidth * slot.geometry.fullHeight, 16, nr::Format::F32);
+      context->fillZero(slot.features->buffer);
+      // The first recording uploads the weights' re-laid matrices (each its own bounded submit) and
+      // its run makes the driver compile every PTX module.
+      context->resetDescriptorPool(0);
+      VkCommandBuffer warm = context->beginCommands();
+      slot.graph->record(warm, *slot.features);
+      context->endAndSubmit(warm, true);
+      const nr::Kernels::ChainTimeouts timeouts = kernels->chainTimeouts();
+      if (timeouts.waits) throw std::runtime_error("the warm-up run's counter chain timed out at " + timeouts.counter);
+      // The warm-up built every matrix the graph uses and has completed: the records' raw buffers now keep only the
+      // bytes the kernels read through them (OpenDLSS-NR patch 0008). The recordings below use those.
+      model->compactAux();
+    }
+    // The frame recordings (one per queue family they run on), every size's: descriptor pool 1 stays reserved
+    // for them.
     context->resetDescriptorPool(1);
-    secondary = recordSecondary(secondaryPool);
-    ownSecondary = recordSecondary(ownPool);
+    for (NfSlot& slot : slots) {
+      slot.secondary = recordSecondary(secondaryPool, slot);
+      slot.ownSecondary = recordSecondary(ownPool, slot);
+    }
   }
 
-  VkCommandBuffer recordSecondary(VkCommandPool pool) {
+  VkCommandBuffer recordSecondary(VkCommandPool pool, NfSlot& slot) {
     VkCommandBuffer commands = VK_NULL_HANDLE;
     VkCommandBufferAllocateInfo allocate{VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
     allocate.commandPool = pool;
@@ -333,7 +354,7 @@ struct NfNative {
     begin.pInheritanceInfo = &inheritance;
     VK_CHECK(vkBeginCommandBuffer(commands, &begin));
     context->computeBarrier(commands);
-    graph->record(commands, *features);
+    slot.graph->record(commands, *slot.features);
     context->computeBarrier(commands);
     VK_CHECK(vkEndCommandBuffer(commands));
     return commands;
@@ -342,7 +363,7 @@ struct NfNative {
 
 extern "C" {
 
-uint32_t nf_native_abi_version(void) { return 2; }
+uint32_t nf_native_abi_version(void) { return 3; }
 
 uint32_t nf_native_asset_count(const char* kind) {
   try {
@@ -508,12 +529,17 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
 }
 
 uint32_t nf_native_build(NfNative* n, uint32_t valid_width, uint32_t valid_height, char* err, size_t err_len) {
+  const uint32_t size[2] = {valid_width, valid_height};
+  return nf_native_build_sizes(n, size, 1, err, err_len);
+}
+
+uint32_t nf_native_build_sizes(NfNative* n, const uint32_t* sizes, uint32_t count, char* err, size_t err_len) {
   if (n->stalled()) {
     say(err, err_len, "the network's queue stalled earlier; it takes no more work");
     return 0;
   }
   try {
-    n->build(valid_width, valid_height);
+    n->build(sizes, count);
     return 1;
   } catch (const std::exception& e) {
     say(err, err_len, e.what());
@@ -527,16 +553,20 @@ uint32_t nf_native_build(NfNative* n, uint32_t valid_width, uint32_t valid_heigh
   return 0;
 }
 
-uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame) {
-  if (!n->graph || !n->secondary) return 0;
-  frame->field_width = n->geometry.fullWidth;
-  frame->field_height = n->geometry.fullHeight;
-  frame->features = n->features->buffer.buffer;
-  frame->features_bytes = n->features->buffer.size;
-  frame->head = n->graph->head().buffer.buffer;
-  frame->head_bytes = n->graph->head().buffer.size;
+uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame) { return nf_native_frame_at(n, 0, frame); }
+
+uint32_t nf_native_frame_at(const NfNative* n, uint32_t slot, NfNativeFrame* frame) {
+  if (slot >= n->slots.size()) return 0;
+  const NfSlot& s = n->slots[slot];
+  if (!s.graph || !s.secondary) return 0;
+  frame->field_width = s.geometry.fullWidth;
+  frame->field_height = s.geometry.fullHeight;
+  frame->features = s.features->buffer.buffer;
+  frame->features_bytes = s.features->buffer.size;
+  frame->head = s.graph->head().buffer.buffer;
+  frame->head_bytes = s.graph->head().buffer.size;
   frame->blend_scale = n->blendScale;
-  frame->chained = n->graph->chained() ? 1 : 0;
+  frame->chained = s.graph->chained() ? 1 : 0;
   return 1;
 }
 
@@ -548,14 +578,23 @@ void nf_native_weight_bytes(const NfNative* n, uint64_t* raw_loaded, uint64_t* r
   *matrices = n->model->matrixBytes();
 }
 
-VkCommandBuffer nf_native_graph_commands(const NfNative* n) { return n->secondary; }
+VkCommandBuffer nf_native_graph_commands(const NfNative* n) { return nf_native_graph_commands_at(n, 0); }
 
-VkCommandBuffer nf_native_graph_commands_own(const NfNative* n) { return n->ownSecondary; }
+VkCommandBuffer nf_native_graph_commands_own(const NfNative* n) { return nf_native_graph_commands_own_at(n, 0); }
+
+VkCommandBuffer nf_native_graph_commands_at(const NfNative* n, uint32_t slot) {
+  return slot < n->slots.size() ? n->slots[slot].secondary : VK_NULL_HANDLE;
+}
+
+VkCommandBuffer nf_native_graph_commands_own_at(const NfNative* n, uint32_t slot) {
+  return slot < n->slots.size() ? n->slots[slot].ownSecondary : VK_NULL_HANDLE;
+}
 
 uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err, size_t err_len) {
   try {
+    if (n->slots.empty() || !n->slots[0].graph) throw std::runtime_error("the network is not built");
     n->context->resetDescriptorPool(0);
-    n->graph->record(primary, *n->features);
+    n->slots[0].graph->record(primary, *n->slots[0].features);
     return 1;
   } catch (const std::exception& e) {
     say(err, err_len, e.what());

@@ -46,7 +46,7 @@ mod slot;
 #[cfg(unix)]
 pub mod state_log;
 
-pub use header::{load64, pass_setting, setting_bounds, store64, MaskSettings, PassControl, PassTunings, ShmHeader, Tuning, SETTING_BOUNDS};
+pub use header::{load64, pass_setting, resolved_scale, setting_bounds, store64, MaskSettings, PassControl, PassTunings, ShmHeader, Tuning, SETTING_BOUNDS};
 pub use path::{isolated_path, shm_default_path, shm_runtime_dir};
 pub use slot::{next_request, Slot};
 
@@ -74,11 +74,12 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// overrides of the Model tab's values (`passes`, `pass`); v20 appends `network`, which of the two
 /// extracted networks the layer runs, the control mask's rules (`mask_*`: keep the game's sky, and the
 /// optional dark and motion rules), `pass_feedback`, and `scene_cuts`, the count of history resets for a
-/// scene cut before the upscaler).
+/// scene cut before the upscaler); v21 appends the model resolution before the upscaler
+/// (`preupscale_scale`) and each pass's own (`pass_scale`, used with the `SCALE` override bit)).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
-pub const SHM_VERSION: u32 = 20;
+pub const SHM_VERSION: u32 = 21;
 
 pub const MAX_W: u32 = 7680;
 pub const MAX_H: u32 = 4320;

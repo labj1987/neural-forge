@@ -1,0 +1,88 @@
+#version 450
+// Model resolution before the upscaler (docs/NATIVE_BACKEND.md, "Model resolution before the upscaler"): the
+// first dispatch of a pass that runs the network below the render extent. It writes the pass's input at its
+// extent from the render extent's: each texel of the encoded picture the area (box) average of the render
+// pixels it covers, in the encoded domain the network reads (so the picture keeps its look: the same
+// encode, only fewer pixels), the padding repeating the last column and row as the encode's does; the
+// motion (the accumulated field's f32 x and y, or DLSS's packed halves with MOTION_HALF) and the depth copy
+// (as f32 device depth, whatever the game's format) at the render pixel under each texel's centre, for the
+// pass's history and its control mask. The vectors keep their units: the pass's parameters carry the scale
+// to its pixels (`preupscale::native::NativePass::frame_graphs`).
+//
+// The descriptor set layout and Params are native_preprocess.comp's (field for field, append only).
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(constant_id = 0) const bool MOTION_HALF = false;
+// The pass's input at its extent (padded), GENERAL; native_preprocess.comp reads it.
+layout(set = 0, binding = 0, rgba16f) uniform writeonly image2D u_small;
+// The motion at the pass's extent, in the render extent's format.
+layout(set = 0, binding = 2, std430) writeonly buffer Motion { uint mv[]; } u_motion;
+layout(set = 0, binding = 4, std140) uniform Params {
+  uvec4 dims;        // field width, field height, the pass's width, height
+  uvec4 frame;       // the pass's padded width, seed, history valid (CPU), parity
+  vec4 motion;
+  vec4 control;
+  vec4 more;
+  uvec4 mask;
+  vec4 sky;
+  vec4 dark;
+  vec4 moving;
+  uvec4 full;        // the render extent (width, height), its padded width, the depth copy's kind (0 none)
+  vec4 ratio;        // the pass's extent over the render extent (x, y), the enlarge's guide sigma, unused
+} p;
+// The depth at the pass's extent: f32 device depth bits (native_mask.comp reads it as kind 1).
+layout(set = 0, binding = 11, std430) writeonly buffer Depth { uint raw[]; } u_depth;
+// The render extent's encoded picture (padded), GENERAL: the capture's encode, or the previous pass's answer.
+layout(set = 0, binding = 12, rgba16f) uniform readonly image2D u_full;
+layout(set = 0, binding = 13, std430) readonly buffer FullMotion { uint mv[]; } u_full_motion;
+// DLSS's depth as the capture copied it (`native::DepthCopy`), raw texels as p.full.w says.
+layout(set = 0, binding = 14, std430) readonly buffer FullDepth { uint raw[]; } u_full_depth;
+
+// One texel of the depth copy as f32 device depth (native_mask.comp's device_depth).
+float device_depth(uint i) {
+  if (p.full.w == 3u) {
+    uint word = u_full_depth.raw[i >> 1u];
+    return float((i & 1u) == 0u ? word & 0xffffu : word >> 16u) / 65535.0;
+  }
+  uint raw = u_full_depth.raw[i];
+  return p.full.w == 2u ? float(raw & 0x00ffffffu) / 16777215.0 : uintBitsToFloat(raw);
+}
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  uvec2 extent = p.dims.zw;
+  uvec2 padded = uvec2(p.frame.x, extent.y + (extent.y & 1u));
+  if (any(greaterThanEqual(id, padded))) return;
+  uvec2 m = min(id, extent - 1u);
+  uvec2 size = p.full.xy;
+  // Render pixels per texel of the pass.
+  vec2 ratio = vec2(size) / vec2(extent);
+  vec2 lo = vec2(m) * ratio;
+  vec2 hi = lo + ratio;
+  vec3 sum = vec3(0.0);
+  float wsum = 0.0;
+  for (int y = int(floor(lo.y)); float(y) < hi.y; y++) {
+    float wy = min(hi.y, float(y + 1)) - max(lo.y, float(y));
+    for (int x = int(floor(lo.x)); float(x) < hi.x; x++) {
+      float w = wy * (min(hi.x, float(x + 1)) - max(lo.x, float(x)));
+      if (w <= 0.0) continue;
+      vec3 c = imageLoad(u_full, min(ivec2(x, y), ivec2(size) - 1)).rgb;
+      // As the preprocess reads its proxy: a NaN is 0, everything within [0, 1].
+      c = clamp(mix(c, vec3(0.0), isnan(c)), 0.0, 1.0);
+      sum += c * w;
+      wsum += w;
+    }
+  }
+  imageStore(u_small, ivec2(id), vec4(sum / max(wsum, 1e-6), 1.0));
+  if (any(greaterThanEqual(id, extent))) return;
+  uvec2 src = min(uvec2((vec2(m) + 0.5) * ratio), size - 1u);
+  uint from = src.y * size.x + src.x;
+  uint to = m.y * extent.x + m.x;
+  if (MOTION_HALF) {
+    u_motion.mv[to] = u_full_motion.mv[from];
+  } else {
+    u_motion.mv[2u * to] = u_full_motion.mv[2u * from];
+    u_motion.mv[2u * to + 1u] = u_full_motion.mv[2u * from + 1u];
+  }
+  if (p.full.w != 0u) u_depth.raw[to] = floatBitsToUint(device_depth(from));
+}

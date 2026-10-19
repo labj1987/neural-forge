@@ -14,7 +14,7 @@
 //! the harness's threads run them one after another.
 
 use ash::vk;
-use neural_forge_native::{device_extend, device_supported, Network, OpenInfo};
+use neural_forge_native::{device_extend, device_supported, Frame, Network, OpenInfo};
 use std::path::PathBuf;
 
 const WIDTH: u32 = 1486;
@@ -153,6 +153,98 @@ fn a_larger_build_after_a_smaller_one_on_one_network() {
         d.destroy_fence(fence, None);
         d.destroy_command_pool(pool, None);
         drop(net);
+        d.destroy_device(None);
+        g.instance.destroy_instance(None);
+    }
+}
+
+/// Two frame sizes built together (per-pass model resolution before the upscaler): both graphs run one
+/// after the other in one submit, and the smaller one's head is the head of the same size built alone,
+/// on the same features.
+#[test]
+fn two_sizes_built_together_each_give_the_head_of_their_size_alone() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let model = model_dir();
+    let g = gpu();
+    let open = OpenInfo {
+        gipa: g._entry.static_fn().get_instance_proc_addr,
+        instance: g.instance.handle(),
+        physical: g.physical,
+        device: g.device.handle(),
+        queue_family: g.compute,
+        queue_index: 0,
+        frame_family: g.family,
+        model_dir: &model,
+        chain: std::env::var("NEURAL_FORGE_NATIVE_CHAIN").map_or(true, |v| v != "0"),
+        fence_timeout_ms: 5000,
+        init_dispatchable: None,
+    };
+    // SAFETY: the device was made with device_extend; the compute queue is the network's alone.
+    let mut net = unsafe { Network::open(&open) }.expect("open");
+    let d = &g.device;
+    // Runs `graphs` (each with its features filled with a fixed pattern first) in one submit and returns each
+    // head as read back.
+    let run = |net: &Network, frames: &[(Frame, vk::CommandBuffer)]| -> Vec<Vec<f32>> {
+        // SAFETY: live device and handles; the submit completes before anything is read or destroyed.
+        unsafe {
+            let queue = d.get_device_queue(g.family, 0);
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.family), None).unwrap();
+            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+            let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            let mut staging = Vec::new();
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            for (frame, graph) in frames {
+                let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+                let (src, src_mem, src_ptr) = g.host_buffer(frame.features_bytes, usage);
+                let values: Vec<f32> = (0..frame.features_bytes / 4).map(|i| ((i * 2654435761 % 1000) as f32 / 1000.0 - 0.5) * 0.25).collect();
+                std::ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), src_ptr, values.len() * 4);
+                let (dst, dst_mem, dst_ptr) = g.host_buffer(frame.head_bytes, usage);
+                let all = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+                d.cmd_copy_buffer(cmd, src, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: frame.features_bytes }]);
+                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[all], &[], &[]);
+                d.cmd_execute_commands(cmd, &[*graph]);
+                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[all], &[], &[]);
+                d.cmd_copy_buffer(cmd, frame.head, dst, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: frame.head_bytes }]);
+                staging.push((src, src_mem, dst, dst_mem, dst_ptr, frame.head_bytes));
+            }
+            d.end_command_buffer(cmd).unwrap();
+            d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+            d.wait_for_fences(&[fence], true, 10_000_000_000).expect("the graphs complete");
+            assert_eq!(net.chain_timeouts().0, 0);
+            let heads = staging
+                .iter()
+                .map(|&(src, src_mem, dst, dst_mem, ptr, bytes)| {
+                    let head = std::slice::from_raw_parts(ptr.cast::<f32>(), (bytes / 4) as usize).to_vec();
+                    d.destroy_buffer(src, None);
+                    d.free_memory(src_mem, None);
+                    d.destroy_buffer(dst, None);
+                    d.free_memory(dst_mem, None);
+                    head
+                })
+                .collect();
+            d.destroy_fence(fence, None);
+            d.destroy_command_pool(pool, None);
+            heads
+        }
+    };
+    // SAFETY: nothing of a previous build exists.
+    let both = unsafe { net.build_sizes(&[(960, 540), (480, 270)]) }.expect("the two sizes build together");
+    assert!(both[0].field_width >= 960 && both[1].field_width >= 480 && both[1].field_width < both[0].field_width);
+    let together = run(&net, &[(both[0], net.graph_commands_at(0)), (both[1], net.graph_commands_at(1))]);
+    assert!(together.iter().flatten().all(|v| v.is_finite()), "finite heads");
+    // SAFETY: the two graphs' submit completed.
+    let alone = unsafe { net.build(480, 270) }.expect("the small size alone");
+    let single = run(&net, &[(alone, net.graph_commands())]);
+    let worst = together[1].iter().zip(&single[0]).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+    eprintln!("480x270 built with 960x540 against alone: largest difference {worst}");
+    assert!(worst <= 1e-3, "the smaller graph built beside the larger one gives its own size's head: {worst}");
+    drop(net);
+    // SAFETY: the network is closed; nothing is pending.
+    unsafe {
         d.destroy_device(None);
         g.instance.destroy_instance(None);
     }
