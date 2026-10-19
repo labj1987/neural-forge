@@ -1,0 +1,22 @@
+#version 450
+// Pass feedback after the upscaler (docs/NATIVE_BACKEND.md, "Pass feedback"): the next pass's input is the
+// previous pass's input (the frame for pass 2, the scratch after) moved toward its answer by p.feedback, into
+// the scratch the next pass reads: out = input + feedback x (answer - input), per 8-bit channel; alpha is the
+// input's. At 1 the server copies the answer instead (`native_post::evaluate`).
+layout(local_size_x = 64) in;
+
+layout(set = 0, binding = 0, std430) readonly buffer Input { uint texel[]; } u_input;
+layout(set = 0, binding = 1, std430) readonly buffer Answer { uint texel[]; } u_answer;
+layout(set = 0, binding = 2, std430) writeonly buffer Out { uint texel[]; } u_out;
+layout(push_constant) uniform Push {
+  uint count;    // texels
+  float feedback;
+} p;
+
+void main() {
+  uint i = gl_GlobalInvocationID.x;
+  if (i >= p.count) return;
+  vec4 a = unpackUnorm4x8(u_input.texel[i]);
+  vec4 b = unpackUnorm4x8(u_answer.texel[i]);
+  u_out.texel[i] = packUnorm4x8(vec4(mix(a.rgb, b.rgb, p.feedback), a.a));
+}

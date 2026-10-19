@@ -1,0 +1,24 @@
+#version 450
+// Pass feedback before the upscaler (docs/NATIVE_BACKEND.md, "Pass feedback"): between two passes, the next
+// pass's colour input is the previous pass's input moved toward its answer by p.feedback, in place in the
+// encoded image the network reads (padded extent): input = input + feedback x (answer - input). At 1 the hold
+// copies the answer instead (`NativePass::record_copies`), so this never runs there.
+layout(local_size_x = 8, local_size_y = 8) in;
+
+layout(set = 0, binding = 0, rgba16f) uniform image2D u_encoded;
+// The pass's answer, padded RGBA16F tightly packed (native_composite.comp's).
+layout(set = 0, binding = 1, std430) readonly buffer Answer { uvec2 texel[]; } u_answer;
+layout(push_constant) uniform Push {
+  uint width;    // padded
+  uint height;   // padded
+  float feedback;
+} p;
+
+void main() {
+  uvec2 id = gl_GlobalInvocationID.xy;
+  if (id.x >= p.width || id.y >= p.height) return;
+  vec4 input_ = imageLoad(u_encoded, ivec2(id));
+  uvec2 t = u_answer.texel[id.y * p.width + id.x];
+  vec4 answer = vec4(unpackHalf2x16(t.x), unpackHalf2x16(t.y));
+  imageStore(u_encoded, ivec2(id), vec4(mix(input_.rgb, answer.rgb, p.feedback), input_.a));
+}

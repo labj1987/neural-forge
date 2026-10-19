@@ -31,6 +31,7 @@ use crate::shm::ShmView;
 
 const PREPROCESS_SPV: &[u8] = include_bytes!("../../shaders/native_post_preprocess.spv");
 const COMPOSITE_SPV: &[u8] = include_bytes!("../../shaders/native_post_composite.spv");
+const FEEDBACK_SPV: &[u8] = include_bytes!("../../shaders/native_post_feedback.spv");
 
 /// The model server's smallest frame (`ngx::MIN_FEATURE_DIM`): smaller ones are echoed.
 const MIN_DIM: u32 = 64;
@@ -179,8 +180,11 @@ struct Gpu {
     pipelines: [vk::Pipeline; 2],
     pool: vk::DescriptorPool,
     /// The preprocess's and the composite's sets reading the frame (0, 1), and the same reading `scratch`
-    /// (2, 3: every pass after the first).
-    sets: [vk::DescriptorSet; 4],
+    /// (2, 3: every pass after the first); pass feedback's from the frame and from the scratch (4, 5).
+    sets: [vk::DescriptorSet; 6],
+    /// Pass feedback below 1 (`native_post_feedback.comp`): its pipeline layout and pipeline, built the first
+    /// time it is.
+    feedback: Option<(vk::PipelineLayout, vk::Pipeline)>,
     command_pool: vk::CommandPool,
     cmd: vk::CommandBuffer,
     fence: vk::Fence,
@@ -253,13 +257,13 @@ impl Gpu {
             g.gpu.pipelines[0] = super::hdr::compute_pipeline(device, g.gpu.layouts[0], PREPROCESS_SPV)?;
             step(5)?;
             g.gpu.pipelines[1] = super::hdr::compute_pipeline(device, g.gpu.layouts[1], COMPOSITE_SPV)?;
-            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 12 }];
+            let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 18 }];
             step(6)?;
-            g.gpu.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(4).pool_sizes(&sizes), None).ok()?;
-            let set_layouts = [set_layout; 4];
+            g.gpu.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(6).pool_sizes(&sizes), None).ok()?;
+            let set_layouts = [set_layout; 6];
             step(7)?;
             let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(g.gpu.pool).set_layouts(&set_layouts)).ok()?;
-            g.gpu.sets = [sets[0], sets[1], sets[2], sets[3]];
+            g.gpu.sets = [sets[0], sets[1], sets[2], sets[3], sets[4], sets[5]];
             step(8)?;
             g.gpu.command_pool = device
                 .create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(setup.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
@@ -288,7 +292,8 @@ impl Gpu {
             layouts: [vk::PipelineLayout::null(); 2],
             pipelines: [vk::Pipeline::null(); 2],
             pool: vk::DescriptorPool::null(),
-            sets: [vk::DescriptorSet::null(); 4],
+            sets: [vk::DescriptorSet::null(); 6],
+            feedback: None,
             command_pool: vk::CommandPool::null(),
             cmd: vk::CommandBuffer::null(),
             fence: vk::Fence::null(),
@@ -308,6 +313,10 @@ impl Gpu {
         unsafe {
             for s in self.slots.iter_mut().filter_map(Option::take) {
                 s.destroy(device);
+            }
+            if let Some((layout, pipeline)) = self.feedback.take() {
+                device.destroy_pipeline(pipeline, None);
+                device.destroy_pipeline_layout(layout, None);
             }
             device.destroy_fence(self.fence, None);
             device.destroy_command_pool(self.command_pool, None);
@@ -405,6 +414,7 @@ fn process(
         && hdr.apply_model.load(Ordering::Relaxed) != 0;
     let tunings = hdr.pass_tunings();
     let passes: Vec<Conditioning> = tunings.passes().iter().map(|&t| Conditioning::from(t)).collect();
+    let feedback = tunings.feedback;
     // The claim is released whatever happens after it (a claim held while the network is not built at
     // this size would keep the pre-upscaler path off it for good), except after a frame that did not
     // finish in time: its work may still use the network, so the claim stays until its fence signals
@@ -414,7 +424,7 @@ fn process(
         // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
         let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
             // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
-            unsafe { evaluate(device, instance, physical, import, loader, view, gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes) }
+            unsafe { evaluate(device, instance, physical, import, loader, view, gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes, feedback) }
         });
         if gpu.stalled {
             loader.post_stalled(device, gpu.fence);
@@ -465,7 +475,7 @@ fn process(
 #[allow(clippy::too_many_arguments)]
 unsafe fn evaluate(
     device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, import: bool, loader: &Loader, view: ShmView, gpu: &mut Gpu, slot: Slot, built: &Built,
-    width: u32, height: u32, bgra: bool, passes: &[Conditioning],
+    width: u32, height: u32, bgra: bool, passes: &[Conditioning], feedback: f32,
 ) -> bool {
     let s = slot.index();
     let bytes = u64::from(width) * u64::from(height) * 4;
@@ -507,6 +517,24 @@ unsafe fn evaluate(
         }
         gpu.bound = None;
     }
+    let blend = feedback < 1.0 && passes.len() > 1;
+    if blend && gpu.feedback.is_none() {
+        let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(8).build();
+        // SAFETY: valid create infos; the layout is destroyed again if the pipeline fails.
+        let built = unsafe {
+            device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&[gpu.set_layout]).push_constant_ranges(&[push]), None).ok().and_then(|layout| {
+                match super::hdr::compute_pipeline(device, layout, FEEDBACK_SPV) {
+                    Some(pipeline) => Some((layout, pipeline)),
+                    None => {
+                        device.destroy_pipeline_layout(layout, None);
+                        None
+                    }
+                }
+            })
+        };
+        let Some(built) = built else { return false };
+        gpu.feedback = Some(built);
+    }
     let Some(b) = gpu.slots[s].as_ref() else { return false };
     if passes.is_empty() {
         return false;
@@ -528,6 +556,9 @@ unsafe fn evaluate(
         ];
         if scratch.is_some() {
             writes.extend([w(gpu.sets[2], 0, &scratch_i), w(gpu.sets[2], 1, &feat_i), w(gpu.sets[3], 0, &scratch_i), w(gpu.sets[3], 1, &head_i), w(gpu.sets[3], 2, &ans_i)]);
+            // Pass feedback: from the frame (pass 2) and from the scratch in place (after), into the scratch.
+            writes.extend([w(gpu.sets[4], 0, &proxy_i), w(gpu.sets[4], 1, &ans_i), w(gpu.sets[4], 2, &scratch_i)]);
+            writes.extend([w(gpu.sets[5], 0, &scratch_i), w(gpu.sets[5], 1, &ans_i), w(gpu.sets[5], 2, &scratch_i)]);
         }
         // SAFETY: the sets are not in use; every buffer is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -563,9 +594,23 @@ unsafe fn evaluate(
                     (gpu.sets[0], gpu.sets[1])
                 } else {
                     let Some(scratch) = scratch else { return Err(vk::Result::ERROR_INITIALIZATION_FAILED) };
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
-                    device.cmd_copy_buffer(cmd, b.answer.buffer, scratch, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
-                    device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                    match gpu.feedback.filter(|_| blend) {
+                        // Feedback below 1: the scratch is the pass's input moved toward its answer.
+                        Some((layout, pipeline)) => {
+                            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                            let push: [u32; 2] = [width * height, feedback.to_bits()];
+                            device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, pipeline);
+                            device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, layout, 0, &[if k == 1 { gpu.sets[4] } else { gpu.sets[5] }], &[]);
+                            device.cmd_push_constants(cmd, layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(push.as_ptr().cast::<u8>(), 8));
+                            device.cmd_dispatch(cmd, (width * height).div_ceil(64), 1, 1);
+                            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                        }
+                        None => {
+                            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::SHADER_READ, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE), &[], &[]);
+                            device.cmd_copy_buffer(cmd, b.answer.buffer, scratch, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: bytes }]);
+                            device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
+                        }
+                    }
                     (gpu.sets[2], gpu.sets[3])
                 };
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[0]);

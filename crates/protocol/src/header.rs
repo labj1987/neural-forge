@@ -52,12 +52,14 @@ impl PassControl {
 pub struct PassTunings {
     pub count: usize,
     pub tunings: [Tuning; crate::MAX_PASSES],
+    /// How much of a pass's answer becomes the next pass's input (0 to 1; 1 is the answer itself).
+    pub feedback: f32,
 }
 
 impl PassTunings {
     /// One pass with `tuning`.
     pub fn single(tuning: Tuning) -> Self {
-        Self { count: 1, tunings: [tuning; crate::MAX_PASSES] }
+        Self { count: 1, tunings: [tuning; crate::MAX_PASSES], feedback: 1.0 }
     }
 
     pub fn passes(&self) -> &[Tuning] {
@@ -428,6 +430,9 @@ pub struct ShmHeader {
     pub mask_motion_threshold_bits: AtomicU32,
     pub mask_motion_intensity_bits: AtomicU32,
     pub mask_motion_structure_bits: AtomicU32,
+    /// f32 bits: how much of a pass's answer becomes the next pass's input, 0 to 1 (the rest is the pass's
+    /// own input). 1 (the default) is the answer itself.
+    pub pass_feedback_bits: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -452,7 +457,8 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2076, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2080, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) == 2076, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, network) == 2032, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, mask_sky) == 2036, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, passes) == 1748, "layout changed -- bump SHM_VERSION");
@@ -490,7 +496,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 115] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 116] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -612,6 +618,8 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 115] = [
     ("mask_motion_threshold", 0.5, 256.0),
     ("mask_motion_intensity", 0.0, 1.0),
     ("mask_motion_structure", 0.0, 1.0),
+    // How much of a pass's answer becomes the next pass's input.
+    ("pass_feedback", 0.0, 1.0),
 ];
 
 /// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
@@ -695,6 +703,7 @@ impl ShmHeader {
         self.mask_motion_threshold_bits.store(16.0f32.to_bits(), Ordering::Relaxed);
         self.mask_motion_intensity_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
         self.mask_motion_structure_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+        self.pass_feedback_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
 
         self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
@@ -872,7 +881,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 115] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 116] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -991,6 +1000,7 @@ impl ShmHeader {
             ("mask_motion_threshold", true, self.mask_motion_threshold_bits.load(Ordering::Relaxed)),
             ("mask_motion_intensity", true, self.mask_motion_intensity_bits.load(Ordering::Relaxed)),
             ("mask_motion_structure", true, self.mask_motion_structure_bits.load(Ordering::Relaxed)),
+            ("pass_feedback", true, self.pass_feedback_bits.load(Ordering::Relaxed)),
         ]
     }
 
@@ -1129,6 +1139,7 @@ impl ShmHeader {
             "mask_motion_threshold" => &self.mask_motion_threshold_bits,
             "mask_motion_intensity" => &self.mask_motion_intensity_bits,
             "mask_motion_structure" => &self.mask_motion_structure_bits,
+            "pass_feedback" => &self.pass_feedback_bits,
             _ => return false,
         };
         field.store(bits, Ordering::Relaxed);
@@ -1156,7 +1167,9 @@ impl ShmHeader {
             for (t, p) in tunings.iter_mut().zip(&self.pass) {
                 *t = p.apply(global);
             }
-            PassTunings { count: self.resolved_passes() as usize, tunings }
+            let feedback = f32::from_bits(self.pass_feedback_bits.load(Ordering::Relaxed));
+            let feedback = if feedback.is_finite() { feedback.clamp(0.0, 1.0) } else { 1.0 };
+            PassTunings { count: self.resolved_passes() as usize, tunings, feedback }
         })
     }
 
@@ -1576,7 +1589,8 @@ mod tests {
     fn the_control_mask_is_appended_after_the_passes() {
         // v20 appends the mask's rules: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::offset_of!(ShmHeader, pass_feedback_bits));
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::size_of::<ShmHeader>());
         assert_eq!(crate::SHM_VERSION, 20);
         let h = ShmHeader::default();
         h.init_defaults();
@@ -1616,6 +1630,7 @@ mod tests {
         h.init_defaults();
         let t = h.pass_tunings();
         assert_eq!(t.count, 1);
+        assert_eq!(t.feedback, 1.0, "the next pass takes the answer itself by default");
         assert_eq!(t.passes(), &[h.global_tuning()]);
         assert!(t.tunings.iter().all(|p| *p == h.global_tuning()), "no pass overrides anything");
     }

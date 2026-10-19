@@ -398,6 +398,15 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         1.0,
         move |v| set_passes(v as u32),
     ));
+    let (feedback, set_feedback) = bind_float(&shm, Some("pass_feedback"), |h| &h.pass_feedback_bits);
+    model_group.add(&spin_row(
+        "Pass feedback",
+        "How much of a pass's picture the next pass works on: 1 is that picture, lower keeps more of the pass's own input",
+        feedback,
+        "pass_feedback",
+        0.05,
+        set_feedback,
+    ));
     let pass_row = adw::ActionRow::new();
     pass_row.set_title("Per-pass settings");
     pass_row.set_subtitle("Give individual passes their own values");

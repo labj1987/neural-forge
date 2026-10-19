@@ -50,6 +50,7 @@ use super::{own_host_buffer_with, HostBuffer, Target};
 const PREPROCESS_SPV: &[u8] = include_bytes!("../../shaders/native_preprocess.spv");
 const COMPOSITE_SPV: &[u8] = include_bytes!("../../shaders/native_composite.spv");
 const MASK_SPV: &[u8] = include_bytes!("../../shaders/native_mask.spv");
+const FEEDBACK_SPV: &[u8] = include_bytes!("../../shaders/native_feedback.spv");
 
 /// `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`: the frames record everything but the network's launches.
 fn skip_graph() -> bool {
@@ -758,11 +759,13 @@ pub(crate) struct Passes {
     pub each: [Conditioning; neural_forge_protocol::MAX_PASSES],
     /// The control mask, for every pass (built once, before the first).
     pub mask: Mask,
+    /// How much of a pass's answer becomes the next pass's input (1: the answer itself).
+    pub feedback: f32,
 }
 
 impl Passes {
     pub(crate) fn one(c: Conditioning) -> Self {
-        Self { count: 1, each: [c; neural_forge_protocol::MAX_PASSES], mask: Mask::default() }
+        Self { count: 1, each: [c; neural_forge_protocol::MAX_PASSES], mask: Mask::default(), feedback: 1.0 }
     }
 }
 
@@ -778,7 +781,7 @@ impl From<neural_forge_protocol::PassTunings> for Passes {
         for (c, &tuning) in each.iter_mut().zip(t.tunings.iter()) {
             *c = Conditioning::from(tuning);
         }
-        Self { count: t.count.clamp(1, neural_forge_protocol::MAX_PASSES), each, mask: Mask::default() }
+        Self { count: t.count.clamp(1, neural_forge_protocol::MAX_PASSES), each, mask: Mask::default(), feedback: t.feedback }
     }
 }
 
@@ -801,10 +804,81 @@ pub(crate) struct MorePasses {
     /// when that was the frame before.
     last_run: Vec<Option<u64>>,
     copies: [vk::CommandBuffer; 3],
+    /// Pass feedback below 1 (`native_feedback.comp`), built the first time it is.
+    feedback: Option<Feedback>,
     saved: OwnBuffer,
     timer: Option<crate::gpu_timer::GpuTimer>,
     /// The [`Built::generation`] `commands` were recorded for.
     recorded: Option<u64>,
+}
+
+/// [`MorePasses::feedback`]: the blend's pipeline and its one set (the encoded image, the answer).
+struct Feedback {
+    set_layout: vk::DescriptorSetLayout,
+    layout: vk::PipelineLayout,
+    pipeline: vk::Pipeline,
+    pool: vk::DescriptorPool,
+    set: vk::DescriptorSet,
+}
+
+/// `native_feedback.comp`'s push constants.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FeedbackPush {
+    width: u32,
+    height: u32,
+    feedback: f32,
+}
+
+impl Feedback {
+    /// # Safety
+    /// `device` is live.
+    unsafe fn build(device: &ash::Device) -> Option<Self> {
+        let b = |n: u32, ty| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build();
+        let bindings = [b(0, vk::DescriptorType::STORAGE_IMAGE), b(1, vk::DescriptorType::STORAGE_BUFFER)];
+        // SAFETY: valid create infos; each object is destroyed below on a later failure.
+        unsafe {
+            let set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
+            let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<FeedbackPush>() as u32).build();
+            let Ok(layout) = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&[set_layout]).push_constant_ranges(&[push]), None) else {
+                device.destroy_descriptor_set_layout(set_layout, None);
+                return None;
+            };
+            let undo = |pipeline: Option<vk::Pipeline>, pool: Option<vk::DescriptorPool>| {
+                if let Some(p) = pool {
+                    device.destroy_descriptor_pool(p, None);
+                }
+                if let Some(p) = pipeline {
+                    device.destroy_pipeline(p, None);
+                }
+                device.destroy_pipeline_layout(layout, None);
+                device.destroy_descriptor_set_layout(set_layout, None);
+                None
+            };
+            let Some(pipeline) = hdr::compute_pipeline(device, layout, FEEDBACK_SPV) else { return undo(None, None) };
+            let sizes = [
+                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 1 },
+                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 },
+            ];
+            let Ok(pool) = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None) else { return undo(Some(pipeline), None) };
+            let Ok(sets) = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(&[set_layout])) else {
+                return undo(Some(pipeline), Some(pool));
+            };
+            Some(Self { set_layout, layout, pipeline, pool, set: sets[0] })
+        }
+    }
+
+    /// # Safety
+    /// Nothing submitted uses it.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded; the set goes with the pool.
+        unsafe {
+            device.destroy_descriptor_pool(self.pool, None);
+            device.destroy_pipeline(self.pipeline, None);
+            device.destroy_pipeline_layout(self.layout, None);
+            device.destroy_descriptor_set_layout(self.set_layout, None);
+        }
+    }
 }
 
 /// The passes [`MorePasses`] holds.
@@ -1445,6 +1519,7 @@ impl NativePass {
             sets: sets.chunks(2).map(|s| [s[0], s[1]]).collect(),
             commands: cmds[..2 * MORE].chunks(2).map(|c| [c[0], c[1]]).collect(),
             history: (0..MORE).map(|_| None).collect(),
+            feedback: None,
             fresh: vec![false; MORE],
             last_run: vec![None; MORE],
             copies: [cmds[2 * MORE], cmds[2 * MORE + 1], cmds[2 * MORE + 2]],
@@ -1460,8 +1535,47 @@ impl NativePass {
     ///
     /// # Safety
     /// [`MorePasses`] is built and none of its copies is pending.
-    unsafe fn record_copies(&self, device: &ash::Device, encoded: vk::Image, region: vk::BufferImageCopy, count: usize) -> ash::prelude::VkResult<()> {
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn record_copies(
+        &mut self, device: &ash::Device, encoded: vk::Image, encoded_view: vk::ImageView, region: vk::BufferImageCopy, count: usize, feedback: f32,
+    ) -> ash::prelude::VkResult<()> {
+        // Feedback below 1 blends the answer into the input (`native_feedback.comp`) where 1 copies it.
+        let blend = feedback < 1.0;
+        if blend && self.more.as_ref().is_some_and(|m| m.feedback.is_none()) {
+            // SAFETY: `device` is live.
+            let built = unsafe { Feedback::build(device) };
+            let Some(f) = built else { return Err(vk::Result::ERROR_INITIALIZATION_FAILED) };
+            if let Some(m) = self.more.as_mut() {
+                m.feedback = Some(f);
+            }
+        }
         let Some(m) = &self.more else { return Ok(()) };
+        let fb = m.feedback.as_ref().filter(|_| blend);
+        if let Some(f) = fb {
+            let image = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: encoded_view, image_layout: vk::ImageLayout::GENERAL }];
+            let answer = [vk::DescriptorBufferInfo { buffer: self.answer.buffer, offset: 0, range: vk::WHOLE_SIZE }];
+            let writes = [
+                vk::WriteDescriptorSet::builder().dst_set(f.set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&image).build(),
+                vk::WriteDescriptorSet::builder().dst_set(f.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&answer).build(),
+            ];
+            // SAFETY: the set is not in use (none of the copies is pending).
+            unsafe { device.update_descriptor_sets(&writes, &[]) };
+        }
+        let push = FeedbackPush { width: region.image_extent.width, height: region.image_extent.height, feedback };
+        let tc = vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER;
+        // The blend in place of a copy of the answer over the input: a barrier from what came before in the
+        // buffer (the save's read of the input), the dispatch.
+        let mix = |cmd: vk::CommandBuffer, f: &Feedback| {
+            let before = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
+            // SAFETY: recording; the set is bound to this hold's image and answer.
+            unsafe {
+                device.cmd_pipeline_barrier(cmd, tc, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[before], &[], &[]);
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, f.pipeline);
+                device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, f.layout, 0, &[f.set], &[]);
+                device.cmd_push_constants(cmd, f.layout, vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<FeedbackPush>()));
+                device.cmd_dispatch(cmd, push.width.div_ceil(8), push.height.div_ceil(8), 1);
+            }
+        };
         // The history of a pass about to run for the first time, out of `UNDEFINED` (its frame does not read
         // it: `last_run` is unset).
         let to_general: Vec<vk::ImageMemoryBarrier> = (0..count.saturating_sub(1).min(MORE))
@@ -1481,16 +1595,19 @@ impl NativePass {
             })
             .collect();
         let t = vk::PipelineStageFlags::TRANSFER;
-        let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).build();
+        let open = vk::MemoryBarrier::builder()
+            .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
+            .build();
         let mid = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).build();
-        let close = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+        let close = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
         let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         // SAFETY: forwarded; every handle is live.
         unsafe {
             for (i, &cmd) in m.copies.iter().enumerate() {
                 device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
                 device.begin_command_buffer(cmd, &begin)?;
-                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, t, vk::DependencyFlags::empty(), &[open], &[], &[]);
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, tc, vk::DependencyFlags::empty(), &[open], &[], &[]);
                 match i {
                     0 => {
                         if !to_general.is_empty() {
@@ -1500,13 +1617,21 @@ impl NativePass {
                             timer.record_start(device, cmd);
                         }
                         device.cmd_copy_image_to_buffer(cmd, encoded, vk::ImageLayout::GENERAL, m.saved.buffer, &[region]);
-                        device.cmd_pipeline_barrier(cmd, t, t, vk::DependencyFlags::empty(), &[mid], &[], &[]);
-                        device.cmd_copy_buffer_to_image(cmd, self.answer.buffer, encoded, vk::ImageLayout::GENERAL, &[region]);
+                        match fb {
+                            Some(f) => mix(cmd, f),
+                            None => {
+                                device.cmd_pipeline_barrier(cmd, t, t, vk::DependencyFlags::empty(), &[mid], &[], &[]);
+                                device.cmd_copy_buffer_to_image(cmd, self.answer.buffer, encoded, vk::ImageLayout::GENERAL, &[region]);
+                            }
+                        }
                     }
-                    1 => device.cmd_copy_buffer_to_image(cmd, self.answer.buffer, encoded, vk::ImageLayout::GENERAL, &[region]),
+                    1 => match fb {
+                        Some(f) => mix(cmd, f),
+                        None => device.cmd_copy_buffer_to_image(cmd, self.answer.buffer, encoded, vk::ImageLayout::GENERAL, &[region]),
+                    },
                     _ => device.cmd_copy_buffer_to_image(cmd, m.saved.buffer, encoded, vk::ImageLayout::GENERAL, &[region]),
                 }
-                device.cmd_pipeline_barrier(cmd, t, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &[]);
+                device.cmd_pipeline_barrier(cmd, tc, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[close], &[], &[]);
                 if i == 2 {
                     if let Some(timer) = &m.timer {
                         timer.record_end(device, cmd);
@@ -1753,6 +1878,9 @@ impl NativePass {
                     destroyed(1);
                 }
                 m.saved.destroy(device);
+                if let Some(f) = &m.feedback {
+                    f.destroy(device);
+                }
                 device.destroy_descriptor_pool(m.pool, None);
                 destroyed(2 + 2 * MORE as isize + isize::from(m.timer.is_some()));
             }
@@ -2304,7 +2432,7 @@ pub(crate) unsafe fn run_native_hold(
         let pass = res.hdr.as_ref().expect("built above");
         // SAFETY: built above and not pending (the hold waited for the previous one's fence, which
         // comes after them); the encoded image is in GENERAL.
-        if unsafe { native.record_copies(device, pass.encoded_image(), pass.padded_region(), passes.count) }.is_err() {
+        if unsafe { native.record_copies(device, pass.encoded_image(), pass.encoded_view(), pass.padded_region(), passes.count, passes.feedback) }.is_err() {
             res.native = Some(native);
             result.miss = Some("recording the copies between the network's passes failed");
             return result;
@@ -3040,7 +3168,7 @@ mod tests {
             let mut pass = NativePass::build(device, instance, physical, family, W, H, false).expect("the native pass builds");
             assert!(pass.ensure_more(device, instance, physical, family, 2), "the later passes build");
             assert!(pass.record(device, instance, physical, &built, graph, encoded.view, exposure.buffer, None));
-            pass.record_copies(device, encoded.image, region, 2).unwrap();
+            pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
             fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
             let h: Vec<f32> = (0..FH).flat_map(|y| (0..FW).flat_map(move |x| [residual(x, y, 0, 0), residual(x, y, 1, 0), residual(x, y, 2, 0), 10.0])).collect();
             std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), head.ptr, h.len() * 4);
@@ -3089,6 +3217,23 @@ mod tests {
             fx.submit(&mut pass, cmds);
             assert_ne!(a1(5, 3, 0), a2[((3 * pw + 5) * 4) as usize], "the test tells the two answers apart");
             assert_eq!(lane(5, 3, 7), centre(a1(5, 3, 0)), "pass 1's history is its own answer");
+
+            // Frame 3, two passes without history at a pass feedback of 0.5: pass 2's colour input is halfway
+            // from the frame to pass 1's answer (on the encoded image's half grid).
+            pass.record_copies(device, encoded.image, encoded.view, region, 2, 0.5).unwrap();
+            let (cmds, later) = pass.frame_passes(&built, false, None, [1.0, 1.0], &passes);
+            let copies = pass.more.as_ref().unwrap().copies;
+            let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+            device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&order).build()], vk::Fence::null()).unwrap();
+            device.queue_wait_idle(gpu.4).unwrap();
+            for cmd in order {
+                pass.submitted(cmd);
+            }
+            for c in 0..3u32 {
+                let (x, y) = (5u32, 3u32);
+                let input = f16(half(f16(half(proxy(x, y, c))) + 0.5 * (a1(x, y, c) - f16(half(proxy(x, y, c))))));
+                assert!((lane(x, y, 4 + c as usize) - centre(input)).abs() <= 2f32.powi(-12), "pass 2's input at feedback 0.5, channel {c}: {} against {}", lane(x, y, 4 + c as usize), centre(input));
+            }
 
             pass.destroy(device);
             encoded.destroy(device);

@@ -73,7 +73,7 @@ pub const SHM_MAGIC: u32 = u32::from_le_bytes(*b"NFR1");
 /// each request, why, and where its files are); v19 appends the network's pass count and each pass's
 /// overrides of the Model tab's values (`passes`, `pass`); v20 appends `network`, which of the two
 /// extracted networks the layer runs, and the control mask's rules (`mask_*`: keep the game's sky, and the
-/// optional dark and motion rules)).
+/// optional dark and motion rules), and `pass_feedback`).
 /// The header layout version. A mismatch (matching magic, different version) means
 /// another process in the chain is out of date; the GUI/CLI side refuses such a header
 /// untouched (`mapping::OpenError::WrongVersion`) rather than half-read or reinitialize it.
