@@ -40,6 +40,7 @@ use std::time::Instant;
 use ash::vk;
 use ash::vk::Handle;
 use neural_forge_native as nn;
+use neural_forge_protocol::enums::network;
 use neural_forge_protocol::history::{HistoryGap, Stale};
 use neural_forge_protocol::rebuild::{BuildRetry, FailInject, Step};
 
@@ -60,14 +61,38 @@ fn chain_wanted() -> bool {
     neural_forge_protocol::env::var("NEURAL_FORGE_NATIVE_CHAIN").is_none_or(|v| v != "0")
 }
 
-/// `extract-model`'s output: `$XDG_DATA_HOME/neural-forge/model`.
+/// `extract-model`'s output: `$XDG_DATA_HOME/neural-forge/model`, one directory per network in it.
 pub(crate) fn model_dir() -> PathBuf {
     crate::dump::captures_dir().with_file_name("model")
 }
 
-/// Whether the model directory is there at all (the hash check is the loader's).
-pub(crate) fn model_present() -> bool {
-    model_dir().join("manifest.json").is_file()
+/// The directory of `network` (`neural_forge_protocol::enums::network`) under the model directory.
+fn network_dir(network: u32) -> PathBuf {
+    model_dir().join(network::name(network))
+}
+
+/// Whether a network's directory is there at all (the hash check is the loader's).
+fn network_present(network: u32) -> bool {
+    network_dir(network).join("manifest.json").is_file()
+}
+
+/// The network to load for the Network setting `chosen`: the chosen one when it is extracted, else
+/// the other one when that is (a DLL without the small network extracts only the full one), else
+/// `None`. `present` says whether a network is extracted.
+fn network_to_load(chosen: u32, present: impl Fn(u32) -> bool) -> Option<u32> {
+    let other = if chosen == network::SMALL { network::FULL } else { network::SMALL };
+    [chosen, other].into_iter().find(|&n| present(n))
+}
+
+/// The history holds the answers of the network that ran last: a frame of another one (the Network
+/// setting switched) starts it afresh, as a frame after a skipped one does. `history_of` is the network
+/// the history came from, updated to `network`. Returns whether the network changed.
+fn note_network(gap: &mut HistoryGap<(u32, u32)>, history_of: &mut Option<u32>, network: u32) -> bool {
+    let changed = history_of.replace(network).is_some_and(|n| n != network);
+    if changed {
+        gap.skipped();
+    }
+    changed
 }
 
 /// "full network, build 310.8.0.0, verified": the manifest's `network`, `source.build` and
@@ -113,6 +138,9 @@ pub(crate) struct Built {
     pub graph_own: vk::CommandBuffer,
     /// Changes with every build: [`NativePass`] re-records its buffers when it does.
     pub generation: u64,
+    /// The network it runs (`neural_forge_protocol::enums::network`): the one the Network setting
+    /// chose, or the other when that one is not extracted.
+    pub network: u32,
 }
 
 #[derive(Default)]
@@ -133,6 +161,48 @@ struct LoaderState {
     /// A wait on the network's queue timed out ([`nn::Network::stalled`]): the network is dead on this
     /// device and never opened or built again.
     dead: bool,
+    /// The Network setting the holds last asked for ([`Loader::ready`]); 0, the full network, until then.
+    choice: u32,
+    /// The setting the open network was opened for, and the network it runs (the chosen one, or the
+    /// other when that is not extracted).
+    opened_for: Option<u32>,
+    running: u32,
+    /// The graph was switched to barriers ([`Loader::fall_back`]): a network opened after a switch of
+    /// the Network setting is switched too.
+    barriers: bool,
+}
+
+impl LoaderState {
+    /// Whether the loader thread has work: the network is not open yet, the graph is to fall back to
+    /// barriers, the network open is not the one the setting chooses, or a size is wanted that is not
+    /// built.
+    fn wants_work(&self) -> bool {
+        !self.dead && (!self.opened || self.fall_back || self.switching() || (self.wanted.is_some() && self.wanted != self.built.map(|b| (b.width, b.height))))
+    }
+
+    /// The network was last opened for another Network setting than the holds' now: it is closed (when
+    /// open) and the chosen one opened.
+    fn switching(&self) -> bool {
+        self.opened_for.is_some_and(|f| f != self.choice)
+    }
+
+    /// The build the holds may use for `size` and the Network setting `choice`, after noting what they
+    /// want (the caller wakes the loader thread when this returns `true` in its second field).
+    fn want(&mut self, size: (u32, u32), choice: u32) -> (Option<Built>, bool) {
+        let mut wake = false;
+        if self.choice != choice {
+            self.choice = choice;
+            wake = true;
+        }
+        if let Some(b) = self.built.filter(|b| (b.width, b.height) == size && self.opened_for == Some(choice)) {
+            return (Some(b), wake);
+        }
+        if self.wanted != Some(size) {
+            self.wanted = Some(size);
+            wake = true;
+        }
+        (None, wake)
+    }
 }
 
 /// The network on one device, opened and built off the game's threads. Nothing is loaded until the
@@ -312,11 +382,17 @@ impl Loader {
         *self.worker.lock().unwrap() = worker;
     }
 
-    fn open(device: vk::Device, setup: Setup) -> Result<nn::Network, nn::OpenError> {
-        let dir = model_dir();
-        if !model_present() {
-            return Err(nn::OpenError { message: format!("no model at {}: extract it in the Setup tab (neural-forge-cli extract-model)", dir.display()), stalled: false });
+    /// Opens the network the Network setting `choice` names ([`network_to_load`]); returns it with
+    /// which network it is.
+    fn open(device: vk::Device, setup: Setup, choice: u32) -> Result<(nn::Network, u32), nn::OpenError> {
+        let Some(running) = network_to_load(choice, network_present) else {
+            let message = format!("no model at {}: extract it in the Setup tab (neural-forge-cli extract-model)", network_dir(choice).display());
+            return Err(nn::OpenError { message, stalled: false });
+        };
+        if running != choice {
+            crate::log!("[native] the {} network is chosen but not extracted (the DLL has none); running the {} network", network::name(choice), network::name(running));
         }
+        let dir = network_dir(running);
         let open = nn::OpenInfo {
             gipa: setup.gipa,
             instance: setup.instance,
@@ -337,7 +413,7 @@ impl Loader {
             .map_err(|why| nn::OpenError { message: format!("the model at {} could not be loaded: {}", dir.display(), why.message), stalled: why.stalled })?;
         crate::log!("[native] model loaded and verified from {} in {} ms (chaining {})", dir.display(), t.elapsed().as_millis(), if chain_wanted() { "on" } else { "off" });
         crate::log!("[native] model source: {}", model_source(&std::fs::read_to_string(dir.join("manifest.json")).unwrap_or_default()));
-        Ok(network)
+        Ok((network, running))
     }
 
     fn work(shared: &(Mutex<LoaderState>, Condvar), device: vk::Device, setup: Setup) {
@@ -351,13 +427,13 @@ impl Loader {
         }
         let mut state = lock.lock().unwrap();
         loop {
-            // Work is wanted when the network is not open yet, a size is wanted that is not built, or
-            // the graph is to fall back to barriers; it is due when the retry schedule says so.
-            let wanted = |s: &LoaderState| !s.dead && (!s.opened || s.fall_back || (s.wanted.is_some() && s.wanted != s.built.map(|b| (b.width, b.height))));
+            // Work is wanted when the network is not open yet, another network is chosen, a size is
+            // wanted that is not built, or the graph is to fall back to barriers
+            // ([`LoaderState::wants_work`]); it is due when the retry schedule says so.
             if state.quit {
                 return;
             }
-            if !wanted(&state) {
+            if !state.wants_work() {
                 state = wake.wait(state).unwrap();
                 continue;
             }
@@ -366,23 +442,37 @@ impl Loader {
                 state = wake.wait_timeout(state, d).unwrap().0;
                 continue;
             }
+            let switching = state.switching();
             let mut network = state.network.take();
-            let fall_back = std::mem::take(&mut state.fall_back);
+            let fall_back = std::mem::take(&mut state.fall_back) || (switching && state.barriers);
             let size = state.wanted.or(state.built.map(|b| (b.width, b.height)));
+            let choice = state.choice;
             state.built = None;
             drop(state);
             if step == Step::ReinitThenBuild && network.take().is_some() {
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
+            }
+            // Another network chosen: this one is closed and the chosen one opened (and built for the
+            // size wanted). SAFETY of the close: nothing of it is pending, as for a rebuild below (a hold
+            // asks for another network only in `ready`, after the frames that used this one were drained,
+            // and neither path takes the network while the other's work may run).
+            if switching && network.take().is_some() {
+                crate::log!("[native] the {} network is chosen: closing the open one and loading it", network::name(choice));
             }
             let t = Instant::now();
             let vram_before = vram.as_ref().map(crate::vram::reading);
             let mut open_stalled = false;
             let mut opened = None;
             let mut switched = false;
+            let mut loaded = None;
             let result = match network.take() {
                 Some(n) => Ok(n),
-                None => Self::open(device, setup)
-                    .inspect(|_| opened = Some((t.elapsed(), vram.as_ref().map(crate::vram::reading))))
+                None => Self::open(device, setup, choice)
+                    .map(|(n, running)| {
+                        opened = Some((t.elapsed(), vram.as_ref().map(crate::vram::reading)));
+                        loaded = Some(running);
+                        n
+                    })
                     .map_err(|e| {
                         open_stalled = e.stalled;
                         e.message
@@ -431,6 +521,11 @@ impl Loader {
             let mut lines = Vec::new();
             state = lock.lock().unwrap();
             state.opened = true;
+            if let Some(running) = loaded {
+                // The network now open (kept below whether its build succeeds) is the one for `choice`.
+                state.opened_for = Some(choice);
+                state.running = running;
+            }
             if let (Some((took, after)), Ok((n, _))) = (opened, &result) {
                 let weights = n.weight_bytes();
                 lines.push(format!(
@@ -445,9 +540,11 @@ impl Loader {
             }
             match result {
                 Ok((n, built)) => {
+                    state.barriers |= switched;
                     if let Some((w, h, frame)) = built {
                         state.generation += 1;
-                        state.built = Some(Built { width: w, height: h, frame, graph: n.graph_commands(), graph_own: n.graph_commands_own(), generation: state.generation });
+                        let network = state.running;
+                        state.built = Some(Built { width: w, height: h, frame, graph: n.graph_commands(), graph_own: n.graph_commands_own(), generation: state.generation, network });
                         lines.push(format!(
                             "[native] network {}built for {w}x{h} (field {}x{}, chained {}) in {} ms{}",
                             if fall_back { "re" } else { "" },
@@ -502,19 +599,18 @@ impl Loader {
         }
     }
 
-    /// The network built for `width` x `height`, or `None` (and the build is asked for) while it is not.
-    pub(crate) fn ready(&self, width: u32, height: u32) -> Option<Built> {
+    /// The network the Network setting `choice` names (`neural_forge_protocol::enums::network`), built
+    /// for `width` x `height`, or `None` (and the build, or the other network, is asked for) while it
+    /// is not. Called only once the caller's frames that used the network have completed: another
+    /// size or network asked for here frees the current build.
+    pub(crate) fn ready(&self, width: u32, height: u32, choice: u32) -> Option<Built> {
         self.spawn();
         let (lock, wake) = &*self.shared;
-        let mut state = lock.lock().unwrap();
-        if let Some(b) = state.built.filter(|b| (b.width, b.height) == (width, height)) {
-            return Some(b);
-        }
-        if state.wanted != Some((width, height)) {
-            state.wanted = Some((width, height));
+        let (built, woken) = lock.lock().unwrap().want((width, height), choice);
+        if woken {
             wake.notify_all();
         }
-        None
+        built
     }
 
     /// Why the network is not usable right now, if a load or build failed.
@@ -829,6 +925,8 @@ pub(crate) struct NativePass {
     seed: u32,
     last_jitter: Option<[f32; 2]>,
     pub(crate) gap: HistoryGap<(u32, u32)>,
+    /// The network whose answers the history holds ([`Built::network`]), once one has run.
+    history_network: Option<u32>,
     /// Passes 2 and on, built on the first frame with more than one.
     more: Option<MorePasses>,
 }
@@ -1007,6 +1105,7 @@ impl NativePass {
                 last_jitter: None,
                 more: None,
                 gap: HistoryGap::default(),
+                history_network: None,
             })
         }
     }
@@ -1763,7 +1862,7 @@ pub(crate) struct CacheAsk {
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn run_native_hold(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, res: &mut super::Resources, target: &Target,
-    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, passes: Passes, arm: Option<super::cache_dump::Arm>, ask: CacheAsk,
+    loader: &Loader, jitter: Option<[f32; 2]>, chain_ok: bool, passes: Passes, arm: Option<super::cache_dump::Arm>, ask: CacheAsk, choice: u32,
     submit: &mut dyn FnMut(super::Which, vk::CommandBuffer, vk::Fence) -> ash::prelude::VkResult<()>,
 ) -> super::HoldResult {
     let mut result = super::HoldResult { native: true, ..Default::default() };
@@ -1807,7 +1906,10 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("the network's counter chain timed out; it is being rebuilt with barriers");
         return result;
     }
-    let Some(built) = loader.ready(target.width, target.height) else {
+    // The Network setting (`choice`): a switch frees the current build here (this hold's previous work
+    // was waited for above, the other path's is kept off by `claim_pre`), and the frames go to DLSS
+    // untouched until the chosen network is built.
+    let Some(built) = loader.ready(target.width, target.height, choice) else {
         if let Some(n) = res.native.as_mut() {
             n.gap.skipped();
         }
@@ -1941,6 +2043,11 @@ pub(crate) unsafe fn run_native_hold(
         return result;
     }
     native.gap.note_format(format_of(target));
+    // A frame of another network than the history's (the Network setting switched) resets the history
+    // (`frame_passes` below then runs with no history: seed 0, no blend toward it, in every pass).
+    if note_network(&mut native.gap, &mut native.history_network, built.network) {
+        crate::log!("[native] resetting the history (the {} network runs from here)", network::name(built.network));
+    }
     let history_ok = native.frames > 0 && native.gap.pending(Instant::now()).is_none();
     // The cache's plan for this hold (a refresh at interval 1 with the cache off).
     let mut cache_hold = None;
@@ -2229,6 +2336,84 @@ mod tests {
         loader.release_post();
     }
 
+    fn built(size: (u32, u32), generation: u64, network: u32) -> Built {
+        let graph = vk::CommandBuffer::null();
+        Built { width: size.0, height: size.1, frame: nn::Frame::default(), graph, graph_own: graph, generation, network }
+    }
+
+    /// The loader's side of a switch of the Network setting: the build of the network open is not
+    /// handed out for another choice, the loader thread is woken and has work (closing it and opening
+    /// the chosen one), and once that is built it is served.
+    #[test]
+    fn another_network_chosen_is_not_served_the_open_one_and_wakes_the_loader() {
+        let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
+        s.built = Some(built((64, 32), 1, network::FULL));
+        s.wanted = Some((64, 32));
+        assert!(!s.wants_work(), "the full network is built for the size wanted");
+        let (b, wake) = s.want((64, 32), network::FULL);
+        assert_eq!((b.map(|b| b.generation), wake), (Some(1), false), "the default choice gets the open network");
+        let (b, wake) = s.want((64, 32), network::SMALL);
+        assert!(b.is_none() && wake, "the small network is chosen: the full one's build is not used, the loader is woken");
+        assert!(s.switching() && s.wants_work(), "the loader closes the full network and opens the small one");
+        // Asked again before the loader got to it: still nothing, and no second wake.
+        assert!(!s.want((64, 32), network::SMALL).1);
+        // The loader opened and built the small network (what `work` stores).
+        s.opened_for = Some(network::SMALL);
+        s.running = network::SMALL;
+        s.built = Some(built((64, 32), 2, network::SMALL));
+        assert!(!s.switching() && !s.wants_work());
+        let (b, wake) = s.want((64, 32), network::SMALL);
+        assert_eq!((b.map(|b| (b.generation, b.network)), wake), (Some((2, network::SMALL)), false));
+        // The small network chosen, not extracted, the full one running in its place: no switch.
+        s.running = network::FULL;
+        assert!(!s.switching());
+        // Back to the full network: the open one is not served until it is reopened.
+        assert!(s.want((64, 32), network::FULL).0.is_none());
+        assert!(s.switching() && s.wants_work());
+        // A dead network is never switched.
+        s.dead = true;
+        assert!(!s.wants_work());
+    }
+
+    /// The chosen network loads when it is extracted; when it is not, the other one does, and with
+    /// neither nothing does.
+    #[test]
+    fn the_chosen_network_loads_and_the_other_only_when_it_is_missing() {
+        let both = |_| true;
+        assert_eq!(network_to_load(network::FULL, both), Some(network::FULL));
+        assert_eq!(network_to_load(network::SMALL, both), Some(network::SMALL));
+        let only_full = |n| n == network::FULL;
+        assert_eq!(network_to_load(network::SMALL, only_full), Some(network::FULL), "a DLL without the small network");
+        assert_eq!(network_to_load(network::FULL, only_full), Some(network::FULL));
+        let only_small = |n| n == network::SMALL;
+        assert_eq!(network_to_load(network::FULL, only_small), Some(network::SMALL));
+        assert_eq!(network_to_load(network::FULL, |_| false), None);
+        // The directories are the setting's names for the networks under the model directory.
+        assert_eq!(network_dir(network::FULL).file_name().unwrap(), "full");
+        assert_eq!(network_dir(network::SMALL).file_name().unwrap(), "small");
+        assert_eq!(network_dir(network::SMALL).parent(), Some(model_dir().as_path()));
+    }
+
+    /// A frame of another network than the one whose answers the history holds starts the history
+    /// afresh; frames of the same network keep it.
+    #[test]
+    fn switching_the_network_resets_the_history() {
+        let t0 = Instant::now();
+        let mut gap: HistoryGap<(u32, u32)> = HistoryGap::default();
+        let mut of = None;
+        let frame = |gap: &mut HistoryGap<(u32, u32)>, of: &mut Option<u32>, network: u32, at: u64| {
+            gap.note_format((64, 32));
+            let changed = note_network(gap, of, network);
+            (changed, gap.begin(t0 + std::time::Duration::from_millis(at)))
+        };
+        assert_eq!(frame(&mut gap, &mut of, network::FULL, 0), (false, None), "the first frame");
+        assert_eq!(frame(&mut gap, &mut of, network::FULL, 16), (false, None), "the same network keeps its history");
+        assert_eq!(frame(&mut gap, &mut of, network::SMALL, 33), (true, Some(Stale::Skipped)), "a switch resets it");
+        assert_eq!(frame(&mut gap, &mut of, network::SMALL, 50), (false, None));
+        assert_eq!(frame(&mut gap, &mut of, network::FULL, 66), (true, Some(Stale::Skipped)), "and so does the way back");
+        assert_eq!(of, Some(network::FULL));
+    }
+
     #[test]
     fn a_failure_is_new_once_per_reason_until_it_clears() {
         let mut last = None;
@@ -2339,7 +2524,7 @@ mod tests {
             device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
             device.end_command_buffer(graph).unwrap();
             let frame = nn::Frame { field_width: FW, field_height: FH, features: features.buffer, features_bytes: u64::from(FW * FH) * 64, head: head.buffer, head_bytes: u64::from(FW * FH) * 16, blend_scale: 0.5, chained: 0 };
-            let built = Built { width: W, height: H, frame, graph, graph_own: graph, generation: 1 };
+            let built = Built { width: W, height: H, frame, graph, graph_own: graph, generation: 1, network: network::FULL };
             let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
             std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
@@ -2543,6 +2728,7 @@ mod tests {
                 graph,
                 graph_own: graph,
                 generation: 1,
+                network: network::FULL,
             };
             // The proxy into the encoded image (padded; the composite reads the valid part).
             let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
@@ -2685,6 +2871,7 @@ mod tests {
                 graph,
                 graph_own: graph,
                 generation: 1,
+                network: network::FULL,
             };
             let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
             std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);

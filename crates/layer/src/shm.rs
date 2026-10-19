@@ -475,6 +475,12 @@ impl ShmClient {
         self.header().map(|hdr| hdr.pass_tunings())
     }
 
+    /// The Network setting (`neural_forge_protocol::enums::network`): which extracted network runs.
+    #[cfg(target_arch = "x86_64")]
+    pub fn network_choice(&self) -> Option<u32> {
+        self.header().map(neural_forge_protocol::ShmHeader::network_choice)
+    }
+
     /// The layer's status line for the GUI (the native backend's state, or why it is not running).
     #[cfg(target_arch = "x86_64")]
     pub fn set_layer_reason(&self, reason: &str) {

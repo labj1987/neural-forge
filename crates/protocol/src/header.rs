@@ -372,6 +372,12 @@ pub struct ShmHeader {
     pub passes: AtomicU32,
     /// Each pass's overrides of the Model tab's values ([`PassControl`]), pass 1 first.
     pub pass: [PassControl; crate::MAX_PASSES],
+
+    // --- v20 -----------------------------------------------------------------------------
+    /// Which extracted network the layer runs ([`crate::enums::network`]): the full one (0, the
+    /// default) or the small one. The layer switches a running game over at its next frame
+    /// (`preupscale::native::Loader::ready`).
+    pub network: AtomicU32,
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -396,7 +402,8 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2032, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2036, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, network) == 2032, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, passes) == 1748, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass) == 1752, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, capture_next_id) == 688, "layout changed -- bump SHM_VERSION");
@@ -432,7 +439,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 104] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 105] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -541,6 +548,8 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 104] = [
     ("pass10_skin_structure", -1.0, 4.0),
     ("pass10_style", 0.0, 2.0),
     ("pass10_auto_mask", 0.0, 1.0),
+    // `enums::network`: 0 the full network, 1 the small one.
+    ("network", 0.0, (crate::enums::network::COUNT - 1) as f32),
 ];
 
 /// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
@@ -613,6 +622,7 @@ impl ShmHeader {
         for p in &self.pass {
             p.reset_to_defaults();
         }
+        self.network.store(crate::enums::network::FULL, Ordering::Relaxed);
 
         self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
@@ -790,7 +800,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 104] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 105] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -898,6 +908,7 @@ impl ShmHeader {
             ("pass10_skin_structure", true, self.pass[9].skin_structure_bits.load(Ordering::Relaxed)),
             ("pass10_style", false, self.pass[9].style.load(Ordering::Relaxed)),
             ("pass10_auto_mask", false, self.pass[9].auto_mask.load(Ordering::Relaxed)),
+            ("network", false, self.network.load(Ordering::Relaxed)),
         ]
     }
 
@@ -1025,6 +1036,7 @@ impl ShmHeader {
             "pass10_skin_structure" => &self.pass[9].skin_structure_bits,
             "pass10_style" => &self.pass[9].style,
             "pass10_auto_mask" => &self.pass[9].auto_mask,
+            "network" => &self.network,
             _ => return false,
         };
         field.store(bits, Ordering::Relaxed);
@@ -1054,6 +1066,12 @@ impl ShmHeader {
             }
             PassTunings { count: self.resolved_passes() as usize, tunings }
         })
+    }
+
+    /// The Network setting ([`crate::enums::network`]); a value out of range is the full network.
+    pub fn network_choice(&self) -> u32 {
+        let v = self.network.load(Ordering::Relaxed);
+        if v < crate::enums::network::COUNT { v } else { crate::enums::network::FULL }
     }
 
     /// The Passes setting, clamped to 1 to [`crate::MAX_PASSES`].
@@ -1446,8 +1464,18 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, passes), std::mem::offset_of!(ShmHeader, capture_result) + crate::capture::RESULT_WORDS * 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, pass), std::mem::offset_of!(ShmHeader, passes) + 4);
         assert_eq!(std::mem::size_of::<PassControl>(), 28);
-        assert_eq!(std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28, std::mem::size_of::<ShmHeader>());
-        assert_eq!(crate::SHM_VERSION, 19);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28, std::mem::offset_of!(ShmHeader, network));
+    }
+
+    #[test]
+    fn the_network_is_appended_after_the_passes() {
+        // v20 appends the Network setting: every earlier field keeps its offset.
+        assert_eq!(std::mem::offset_of!(ShmHeader, network), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
+        assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 20);
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::FULL, "the full network is the default");
     }
 
     #[test]
@@ -1660,4 +1688,20 @@ mod tests {
         assert_eq!(h.layer_reason().len(), REASON_BYTES - 1);
     }
 
+    #[test]
+    fn the_network_setting_defaults_to_the_full_network_and_clamps() {
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert_eq!(h.network_choice(), crate::enums::network::FULL);
+        assert!(h.write_settings(&[("network", crate::enums::network::SMALL)]));
+        assert_eq!(h.network_choice(), crate::enums::network::SMALL);
+        // A stored value past the range (clamped by every writer) still reads as a network.
+        assert!(h.write_settings(&[("network", 7)]));
+        assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::SMALL, "the write clamps");
+        h.network.store(7, Ordering::Relaxed);
+        assert_eq!(h.network_choice(), crate::enums::network::FULL);
+        h.reset_persisted_settings();
+        assert_eq!(h.network_choice(), crate::enums::network::FULL, "Reset goes back to the full network");
+        assert_eq!((crate::enums::network::name(0), crate::enums::network::name(1)), ("full", "small"));
+    }
 }

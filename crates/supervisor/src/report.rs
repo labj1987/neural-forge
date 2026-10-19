@@ -3,8 +3,8 @@
 //! nothing is opened in a browser or uploaded, the user attaches the file themselves.
 //!
 //! Members: `summary.txt` (version, GPU, driver, compute capability, kernel, session type, the
-//! game's Proton tool, the doctor's findings), `config.ini`, `model/manifest.json` (never the
-//! weights), the layer's state-dir logs (`layer.log`, `layer.log.1`), the kernel's Xid lines, the
+//! game's Proton tool, the doctor's findings), `config.ini`, each extracted network's
+//! `model/<network>/manifest.json` (never the weights), the layer's state-dir logs (`layer.log`, `layer.log.1`), the kernel's Xid lines, the
 //! live channel's status (`neural-forge-cli shmctl status`'s text) and the newest capture pair.
 //! Logs keep their last [`LOG_CAP`] bytes.
 //!
@@ -34,7 +34,7 @@ pub struct Sources {
     pub home: PathBuf,
     /// `$XDG_CONFIG_HOME` itself (holds `user-dirs.dirs` and `neural-forge/config.ini`).
     pub config_home: PathBuf,
-    /// The model directory (`manifest.json` is read from it, nothing else).
+    /// The model directory (each network's `manifest.json` is read from it, nothing else).
     pub model_dir: PathBuf,
     /// Neural Forge's state directory (`layer.log`, `layer.log.1`).
     pub state_dir: PathBuf,
@@ -376,14 +376,18 @@ pub fn summary(sources: &Sources, inputs: &Inputs, created: u64) -> String {
 /// Every member of the report, redacted, in the order they are written.
 pub fn collect(sources: &Sources, inputs: &Inputs, redactor: &Redactor, created: u64) -> Vec<Member> {
     let mut members = vec![Member { name: "summary.txt".into(), data: summary(sources, inputs, created).into_bytes(), text: true }];
+    let manifest = |network: crate::model::Network| {
+        (format!("model/{}/manifest.json", network.name()), crate::model::network_dir(&sources.model_dir, network).join("manifest.json"))
+    };
     for (name, path) in [
-        ("config.ini", sources.config_home.join("neural-forge/config.ini")),
-        ("model/manifest.json", sources.model_dir.join("manifest.json")),
-        ("layer.log", sources.state_dir.join("layer.log")),
-        ("layer.log.1", sources.state_dir.join("layer.log.1")),
+        ("config.ini".to_string(), sources.config_home.join("neural-forge/config.ini")),
+        manifest(crate::model::Network::Full),
+        manifest(crate::model::Network::Small),
+        ("layer.log".to_string(), sources.state_dir.join("layer.log")),
+        ("layer.log.1".to_string(), sources.state_dir.join("layer.log.1")),
     ] {
         if let Some(data) = log_tail(&path, LOG_CAP) {
-            members.push(Member { name: name.into(), data, text: true });
+            members.push(Member { name, data, text: true });
         }
     }
     if let Some(xid) = inputs.xid_lines {
@@ -658,8 +662,9 @@ mod tests {
         let s = sources(root);
         let home = s.home.display().to_string();
         write(&s.config_home.join("neural-forge/config.ini"), format!("binaries={home}/.local/share/neural-forge/binaries\nset_intensity=1\n"));
-        write(&s.model_dir.join("manifest.json"), format!("{{\"source\": {{\"dll\": \"{home}/Games/nvngx_dlssnr.dll\"}}}}\n"));
-        write(&s.model_dir.join("model/vit.e4m3"), b"weights");
+        write(&s.model_dir.join("full/manifest.json"), format!("{{\"source\": {{\"dll\": \"{home}/Games/nvngx_dlssnr.dll\"}}}}\n"));
+        write(&s.model_dir.join("full/model/vit.e4m3"), b"weights");
+        write(&s.model_dir.join("small/manifest.json"), "{\"network\": \"small\"}\n");
         write(&s.state_dir.join("layer.log"), format!("[neural-forge-layer] loaded from {home}/.local/lib\nuser alex started, alexa did not\n"));
         write(&s.proc_root.join("sys/kernel/osrelease"), "6.17.0-5-generic\n");
         s
@@ -714,7 +719,8 @@ mod tests {
             [
                 "summary.txt",
                 "config.ini",
-                "model/manifest.json",
+                "model/full/manifest.json",
+                "model/small/manifest.json",
                 "layer.log",
                 "layer.log.1",
                 "xid.txt",
@@ -739,7 +745,8 @@ mod tests {
         assert!(get("summary.txt").contains("session type: wayland\n"));
         assert!(get("summary.txt").contains("[warn] the model in ~/.local/share is old\n"));
         assert!(get("config.ini").starts_with("binaries=~/.local/share/neural-forge/binaries\n"));
-        assert!(get("model/manifest.json").contains("\"~/Games/nvngx_dlssnr.dll\""));
+        assert!(get("model/full/manifest.json").contains("\"~/Games/nvngx_dlssnr.dll\""));
+        assert_eq!(get("model/small/manifest.json"), "{\"network\": \"small\"}\n");
         assert_eq!(get("layer.log"), "[neural-forge-layer] loaded from ~/.local/lib\nuser <user> started, alexa did not\n");
         assert_eq!(get("xid.txt"), "NVRM: Xid 79 for <user>");
         assert_eq!(get("channel-status.txt"), "# live status\nlayer_reason=model at ~/x\n");
@@ -752,7 +759,7 @@ mod tests {
         match std::process::Command::new("python3").args(["-I", "-c", check]).arg(&path).output() {
             Ok(out) => {
                 assert!(out.status.success(), "python3 zipfile: {}", String::from_utf8_lossy(&out.stderr));
-                assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "9");
+                assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "10");
             }
             Err(_) => eprintln!("no python3: skipping the zipfile check"),
         }

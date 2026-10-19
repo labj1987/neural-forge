@@ -338,26 +338,46 @@ fn check_ngx_dll(roots: &Roots) -> Finding {
     }
 }
 
+/// The model directory: every extracted network intact, and the one the Network setting chooses
+/// (`set_network` in `config.ini`, the full network when unset) among them.
 fn check_model(roots: &Roots) -> Finding {
+    use crate::model::{self, Network};
     let dir = roots.model_dir.display().to_string();
     let extract = "Extract it in the Setup tab, or run `neural-forge-cli extract-model DIR` with the folder that holds nvngx_dlssnr.dll.";
-    match crate::model::check_installed(&roots.model_dir) {
-        Ok(build) => {
-            let note = if crate::model::installed_verified(&roots.model_dir) == Some(false) { ", not verified against NVIDIA's runtime" } else { "" };
-            let network = crate::model::installed_network_text(&roots.model_dir);
-            Finding::new("model", Severity::Ok, format!("the model is extracted and intact ({network}, build {build}{note})"), dir, None)
-        }
-        Err(why) if crate::model::installed(&roots.model_dir).is_none() => {
-            Finding::new("model", Severity::Failure, "the model is not extracted: the network has nothing to load", why, Some(extract.into()))
-        }
-        Err(why) => Finding::new(
-            "model",
-            Severity::Failure,
-            "the extracted model is damaged: the network cannot load it",
-            format!("{dir}: {why}"),
-            Some(format!("Extract it again. {extract}")),
-        ),
+    let installed = model::installed_all(&roots.model_dir);
+    if installed.is_empty() {
+        let why = format!("no network's manifest in {dir} (full/manifest.json or small/manifest.json)");
+        return Finding::new("model", Severity::Failure, "the model is not extracted: the network has nothing to load", why, Some(extract.into()));
     }
+    for i in &installed {
+        if let Err(why) = model::check_installed(&model::network_dir(&roots.model_dir, i.network), i.network) {
+            return Finding::new(
+                "model",
+                Severity::Failure,
+                format!("the extracted {} is damaged: the network cannot load it", i.network),
+                format!("{dir}: {why}"),
+                Some(format!("Extract it again. {extract}")),
+            );
+        }
+    }
+    let text = installed.iter().map(ToString::to_string).collect::<Vec<_>>().join("; ");
+    let cfg = crate::Config::load_from(&roots.config_file.to_string_lossy());
+    let chosen = cfg.settings.get("set_network").and_then(|v| v.trim().parse::<u32>().ok()).map_or(Network::Full, Network::from_setting);
+    if !installed.iter().any(|i| i.network == chosen) {
+        let runs = installed[0].network;
+        return Finding::new(
+            "model",
+            Severity::Warning,
+            format!("the {chosen} is chosen but not extracted: the {runs} runs instead"),
+            format!("{dir}: {text}"),
+            Some(if chosen == Network::Small {
+                "Your nvngx_dlssnr.dll has no small network (build 310.9.16 carries one): choose the full network in the Setup tab, or extract from a DLL that has it.".into()
+            } else {
+                format!("Extract the model again. {extract}")
+            }),
+        );
+    }
+    Finding::new("model", Severity::Ok, format!("the model is extracted and intact ({text}; the {chosen} is chosen)"), dir, None)
 }
 
 /// Whether each user dir is writable, or could be created: the nearest existing ancestor is a
@@ -1224,19 +1244,34 @@ mod tests {
         write(&f.roots.config_file, "");
         let bytes = [1u8; 16];
         let tensors = [crate::model::Tensor { name: "block0.layer0.layer".into(), block: 0, layer: 0, parameter: "layer".into(), bytes: &bytes }];
-        for (rel, data) in crate::model::build_model(&tensors, crate::model::Network::Full, [310, 8, 0, 0], "00").unwrap() {
-            std::fs::create_dir_all(f.roots.model_dir.join(&rel).parent().unwrap()).unwrap();
-            std::fs::write(f.roots.model_dir.join(&rel), data).unwrap();
-        }
+        let put = |network| {
+            let dir = crate::model::network_dir(&f.roots.model_dir, network);
+            for (rel, data) in crate::model::build_model(&tensors, network, [310, 9, 16, 0], "00").unwrap() {
+                std::fs::create_dir_all(dir.join(&rel).parent().unwrap()).unwrap();
+                std::fs::write(dir.join(&rel), data).unwrap();
+            }
+        };
+        put(crate::model::Network::Full);
         write(&f.roots.binaries_dir.join("nvngx_dlssnr.dll"), "");
         let v = run(&f.roots);
         assert_eq!(one(&v, "config").severity, Severity::Ok);
-        assert_eq!(one(&v, "model").summary, "the model is extracted and intact (full network, build 310.8.0.0)");
-        // A stage file that no longer matches the manifest: damaged, not OK.
-        let first = std::fs::read_dir(f.roots.model_dir.join("model")).unwrap().flatten().map(|e| e.path()).find(|p| std::fs::metadata(p).unwrap().len() > 0).unwrap();
-        std::fs::write(&first, [9u8; 16]).unwrap();
-        assert!(one(&run(&f.roots), "model").summary.contains("damaged"));
+        assert_eq!(one(&v, "model").summary, "the model is extracted and intact (full network, build 310.9.16.0; the full network is chosen)");
         assert_eq!(one(&v, "nvngx-dll").severity, Severity::Ok);
+        // The small network chosen but not extracted: the full one runs, and the doctor says so.
+        write(&f.roots.config_file, "set_network=1\n");
+        let m = one(&run(&f.roots), "model").clone();
+        assert_eq!((m.severity, m.summary.as_str()), (Severity::Warning, "the small network is chosen but not extracted: the full network runs instead"));
+        put(crate::model::Network::Small);
+        assert_eq!(
+            one(&run(&f.roots), "model").summary,
+            "the model is extracted and intact (full network, build 310.9.16.0; small network, build 310.9.16.0; the small network is chosen)"
+        );
+        // A stage file that no longer matches the manifest: damaged, not OK.
+        let stages = crate::model::network_dir(&f.roots.model_dir, crate::model::Network::Small).join("model");
+        let first = std::fs::read_dir(stages).unwrap().flatten().map(|e| e.path()).find(|p| std::fs::metadata(p).unwrap().len() > 0).unwrap();
+        std::fs::write(&first, [9u8; 16]).unwrap();
+        let m = one(&run(&f.roots), "model").clone();
+        assert_eq!((m.severity, m.summary.as_str()), (Severity::Failure, "the extracted small network is damaged: the network cannot load it"));
     }
 
     #[test]

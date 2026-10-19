@@ -16,6 +16,23 @@ pub mod preupscale_state {
     pub const HOLDING: u32 = 2;
 }
 
+/// Which of the networks `extract-model` writes the layer runs (`ShmHeader::network`, the Network
+/// row of the Setup tab). Each has its own directory under the model directory
+/// (`$XDG_DATA_HOME/neural-forge/model/<name>`).
+pub mod network {
+    /// `WEIGHTS_HT`, the network every build of the DLL carries: the default.
+    pub const FULL: u32 = 0;
+    /// `WEIGHTS_CC_SMALL_FP8` (build 310.9.16 on): faster, with a subtler effect.
+    pub const SMALL: u32 = 1;
+    pub const COUNT: u32 = 2;
+
+    /// The network's directory name under the model directory, and its name on the command line.
+    /// A value out of range is the full network.
+    pub fn name(network: u32) -> &'static str {
+        if network == SMALL { "small" } else { "full" }
+    }
+}
+
 /// Where the white point comes from: the slider, or the calibration grid measured off
 /// the untouched copy of the frame.
 pub mod white_point_source {

@@ -4,8 +4,8 @@
 //! between the two), and the head compared byte for byte.
 //!
 //! Runs only with `NEURAL_FORGE_NATIVE_RIG=<dump dir>` (holding `features.f32` and `head.f32` of a
-//! 1486x836 frame); `NEURAL_FORGE_NATIVE_MODEL` overrides the model directory (default: the user data
-//! dir's `neural-forge/model`). The same variable runs the rebuild test (a small build, then a large one
+//! 1486x836 frame); `NEURAL_FORGE_NATIVE_MODEL` overrides the model directory (default: the full
+//! network's directory in the user data dir, `neural-forge/model/full`). The same variable runs the rebuild test (a small build, then a large one
 //! on the same network), the fallback to barriers and the device-creation test. With
 //! `NEURAL_FORGE_NATIVE_HEADS=<dir>` too, the heads at every size the layer builds are compared with a
 //! saved run there (or saved, the first time): run once on a known-good build, then on the change.
@@ -98,7 +98,7 @@ impl Gpu {
 fn model_dir() -> PathBuf {
     std::env::var_os("NEURAL_FORGE_NATIVE_MODEL")
         .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/neural-forge/model"))
+        .unwrap_or_else(|| PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/neural-forge/model/full"))
 }
 
 /// A build after a smaller one on the same network: the kernels outlive the graph, and their split-K

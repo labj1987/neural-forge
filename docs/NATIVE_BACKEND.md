@@ -161,7 +161,10 @@ bytes (140.84 MiB) in total.
 holds the DLL or is the DLL). It walks the records refusing any surprise in their framing (a total
 that disagrees, a kind other than 1, differing record lengths, a tensor overrunning its record, a
 name outside the pattern), checks the network's shape (below), and writes `paths::data_dir()/model`:
-`manifest.json` plus `model/<stage>.e4m3`, each file through a temporary name and a rename. Eleven
+`manifest.json` plus `model/<stage>.e4m3`, each file through a temporary name and a rename. (Since 3.7.0
+that layout is one network's directory, `model/full` or `model/small`: `extract-model` writes every
+network the DLL carries, the whole model directory replaced as one, and the `network` setting picks the
+one the layer loads; "The small network" below.) Eleven
 stages by resolution: `encoder32` (blocks 0-4), `encoder64` (5-8), `encoder128` (9-14),
 `encoder256` (15-22), `encoder512` (23-30), `vit` (31-38), `decoder512` (39-47), `decoder256`
 (48-55), `decoder128` (56-61), `decoder64` (62-65), `decoder32` (66-70); tensors 16-byte aligned
@@ -757,6 +760,15 @@ decoder stages continue from 2. That rule is upstream's, found for the full netw
 the graph's assumption, checked only by the picture below. The extractor (`model.rs`) takes `Network::Full`
 or `Network::Small` (`extract-model DIR --network small`, the Setup tab's Network row) and records it in the
 manifest (`network`); `nf_native.cpp` reads `blend_scale` from the last block.
+
+**Both networks, chosen live (3.7.0).** `extract-model` (and the Setup tab's Extract button) writes every
+network the DLL carries into its own directory, `model/full` and `model/small` (`model::extract_all`;
+`--network` writes one and leaves the other). The `network` setting (SHM v20, `enums::network`, the
+Setup tab's Network row, persisted like the other settings) chooses which one the layer loads, the full
+one by default; when the chosen one is not extracted the other is loaded and the log says so. A change
+reaches the running game at its next hold: `Loader::ready` hands out no build of another network, the
+loader thread closes the open network and opens the chosen one (drained first, as for a
+re-initialisation), and the first frame of the new network starts the history afresh (`note_network`).
 
 **Checks** (`dlss5vk` built from the pinned commit with the same change, the 0.6 fixtures, RTX 5070):
 

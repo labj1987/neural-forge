@@ -640,7 +640,7 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     // and (like AdwPreferencesGroup::title) are Pango markup, so no bare "&" either.
     view_stack.add_titled_with_icon(&debug_page, Some("debug"), "Debug", "edit-find-symbolic");
 
-    let setup_page = build_setup_page(&toasts);
+    let setup_page = build_setup_page(&shm, &toasts);
 
     let status_page = adw::PreferencesPage::new();
     status_page.add(&build_telemetry_group(&shm));
@@ -1059,22 +1059,35 @@ fn build_launch_option_group() -> (adw::PreferencesGroup, impl Fn(&SteamScan)) {
     (group, fill)
 }
 
-/// The model's row text: present with the network and build it came from (and whether that is
-/// verified), or missing.
+/// The model's row text: present with each extracted network and the build it came from (and
+/// whether that is verified), or missing.
 fn model_status() -> (String, bool) {
-    let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
-    let network = neural_forge_supervisor::model::installed_network_text(&dir);
-    match neural_forge_supervisor::model::installed(&dir) {
-        Some(build) if neural_forge_supervisor::model::installed_verified(&dir) == Some(false) => {
-            (format!("present: the {network} of build {build}, not verified against NVIDIA's runtime"), true)
-        }
-        Some(build) => (format!("present: the {network} of build {build}"), true),
+    let root = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+    match neural_forge_supervisor::model::installed_text(&root) {
+        Some(networks) => (format!("present: {networks}"), true),
         None => ("missing: extract it from nvngx_dlssnr.dll below".to_string(), false),
     }
 }
 
-/// The Network row's choices, in [`Network::ALL`]'s order.
-const NETWORK_CHOICES: [&str; 2] = ["Full", "Small"];
+/// The Network row's choices, in [`Network::ALL`]'s order (the Network setting's values).
+const NETWORK_CHOICES: [&str; 2] = ["Full network", "Small network"];
+
+/// The Network row's subtitle for `network`: what it gives, and what runs instead when it is not
+/// extracted (the layer runs the other network then).
+fn network_subtitle(network: Network) -> String {
+    let what = match network {
+        Network::Full => "Stronger shading and depth. The default",
+        Network::Small => "Faster, with a subtler effect",
+    };
+    let root = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+    let installed = neural_forge_supervisor::model::installed_all(&root);
+    match installed.iter().find(|i| i.network != network) {
+        Some(other) if !installed.iter().any(|i| i.network == network) => {
+            format!("{what}. Not extracted from your DLL, so the {} runs", other.network)
+        }
+        _ => format!("{what}. A running game switches at once"),
+    }
+}
 
 /// The model group's rows an extraction reads and updates.
 #[derive(Clone)]
@@ -1082,57 +1095,29 @@ struct ModelRows {
     toasts: adw::ToastOverlay,
     status_row: adw::ActionRow,
     icon: gtk4::Image,
-    network_row: adw::ComboRow,
     button: gtk4::Button,
-    /// Extractions still running: the Network row and the button stay insensitive until none is.
-    running: std::rc::Rc<std::cell::Cell<u32>>,
-    /// The Network row is being set to the installed model, not chosen by the user.
-    syncing: std::rc::Rc<std::cell::Cell<bool>>,
-    /// The user picked a network on the row (otherwise the first Extract takes the default).
-    picked: std::rc::Rc<std::cell::Cell<bool>>,
 }
 
-impl ModelRows {
-    fn chosen(&self) -> Network {
-        Network::ALL.get(self.network_row.selected() as usize).copied().unwrap_or(Network::Full)
-    }
-
-    /// Puts the Network row on the installed model's network, when there is one.
-    fn sync_network_row(&self) {
-        let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
-        if let Some(installed) = neural_forge_supervisor::model::installed_network(&dir) {
-            self.syncing.set(true);
-            self.network_row.set_selected(Network::ALL.iter().position(|n| *n == installed).unwrap_or(0) as u32);
-            self.syncing.set(false);
-        }
-    }
-}
-
-/// Extracts `network` (`None`: the default, [`neural_forge_supervisor::model::extract_default`])
-/// from the DLL at `path` into the model directory, says how it went in a toast and brings the
-/// status and Network rows up to date. The Network row and the button are insensitive meanwhile.
-async fn extract_model(path: std::path::PathBuf, network: Option<Network>, rows: ModelRows) {
-    rows.running.set(rows.running.get() + 1);
-    rows.network_row.set_sensitive(false);
+/// Extracts every network the DLL at `path` carries into the model directory
+/// ([`neural_forge_supervisor::model::extract_all`]), says how it went in a toast and brings the
+/// status rows up to date. The button is insensitive meanwhile.
+async fn extract_model(path: std::path::PathBuf, rows: ModelRows) {
     rows.button.set_sensitive(false);
-    let out = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
-    let result = gio::spawn_blocking(move || match network {
-        Some(network) => neural_forge_supervisor::model::extract(&path, &out, network),
-        None => neural_forge_supervisor::model::extract_default(&path, &out),
-    })
-    .await;
+    let root = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
+    let result = gio::spawn_blocking(move || neural_forge_supervisor::model::extract_all(&path, &root)).await;
     let toasts = &rows.toasts;
     match result {
-        Ok(Ok(done)) => {
-            let unverified = if done.verified { "" } else { " (not verified against NVIDIA's runtime)" };
-            if let Some(why) = &done.fallback {
-                eprintln!("neural-forge: {why}");
+        Ok(Ok(all)) => {
+            let networks: Vec<String> = all
+                .networks
+                .iter()
+                .map(|done| format!("the {} of build {}{}", done.network, done.build, if done.verified { "" } else { " (not verified against NVIDIA's runtime)" }))
+                .collect();
+            for (network, why) in &all.refused {
+                eprintln!("neural-forge: the DLL's {network} was not extracted: {why}");
             }
-            let fallback = if done.fallback.is_some() { " -- the small network was refused, see the log" } else { "" };
-            toasts.add_toast(toast(&format!(
-                "Extracted the {} of build {}{unverified}{fallback} -- restart the game to use it",
-                done.network, done.build
-            )))
+            let refused = if all.refused.is_empty() { "" } else { " -- a network of the DLL was refused, see the log" };
+            toasts.add_toast(toast(&format!("Extracted {}{refused} -- restart the game to use it", networks.join(" and "))))
         }
         // The report is too long for a toast: its summary line there, all of it in the log.
         Ok(Err(neural_forge_supervisor::model::ModelError::Shape(report))) => {
@@ -1146,18 +1131,13 @@ async fn extract_model(path: std::path::PathBuf, network: Option<Network>, rows:
     let (text, present) = model_status();
     rows.status_row.set_subtitle(&text);
     rows.icon.set_icon_name(Some(if present { "object-select-symbolic" } else { "dialog-warning-symbolic" }));
-    // A refused choice goes back to what is installed, so the row never shows a network that isn't.
-    rows.sync_network_row();
-    rows.running.set(rows.running.get() - 1);
-    if rows.running.get() == 0 {
-        rows.network_row.set_sensitive(true);
-        rows.button.set_sensitive(true);
-    }
+    rows.button.set_sensitive(true);
     model_changed();
 }
 
-/// The native backend's one setup step: point at NVIDIA's DLL once and extract the model from it.
-fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
+/// The native backend's one setup step: point at NVIDIA's DLL once and extract the model from it;
+/// and which of its networks runs (the Network setting, live).
+fn build_model_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     let group = adw::PreferencesGroup::new();
     group.set_title("Neural rendering model");
     group.set_description(Some(
@@ -1171,60 +1151,30 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
     status_row.add_prefix(&icon);
     group.add(&status_row);
 
-    // Which network to extract. Changing it re-extracts from the DLL `import-binaries` keeps, when
-    // there is one; otherwise it applies to the next Extract.
-    let network_row = adw::ComboRow::new();
-    network_row.set_title("Network");
-    network_row.set_subtitle("Small, the default: 31 blocks instead of 71, about half the GPU time (build 310.9.16 of the DLL; older builds have only Full)");
-    network_row.set_model(Some(&gtk4::StringList::new(&NETWORK_CHOICES)));
-    // Before any model is extracted the row shows the default, the small network.
-    network_row.set_selected(Network::ALL.iter().position(|n| *n == Network::Small).unwrap_or(0) as u32);
+    // Which network runs: a persisted setting, so a running game switches over at its next frame.
+    let (network, set_network) = bind_u32(shm, Some("network"), |h| &h.network);
+    let network_row = combo_row("Network", &NETWORK_CHOICES, network, set_network);
+    let subtitle = |row: &adw::ComboRow| row.set_subtitle(&network_subtitle(Network::from_setting(row.selected())));
+    subtitle(&network_row);
+    network_row.connect_selected_notify(subtitle);
+    {
+        let network_row = network_row.clone();
+        on_model_changed(move || subtitle(&network_row));
+    }
     group.add(&network_row);
 
     let extract_row = adw::ActionRow::new();
     extract_row.set_title("Extract from DLL");
-    extract_row.set_subtitle("Choose nvngx_dlssnr.dll; the model is written to Neural Forge's data folder");
+    extract_row.set_subtitle("Choose nvngx_dlssnr.dll; every network it has is written to Neural Forge's data folder");
     let button = gtk4::Button::with_label("Extract…");
     button.set_valign(gtk4::Align::Center);
     extract_row.add_suffix(&button);
     extract_row.set_activatable_widget(Some(&button));
     group.add(&extract_row);
 
-    let rows = ModelRows {
-        toasts: toasts.clone(),
-        status_row,
-        icon,
-        network_row: network_row.clone(),
-        button: button.clone(),
-        running: Default::default(),
-        syncing: Default::default(),
-        picked: Default::default(),
-    };
-    rows.sync_network_row();
-
-    {
-        let rows = rows.clone();
-        network_row.connect_selected_notify(move |_| {
-            if rows.syncing.get() {
-                return;
-            }
-            rows.picked.set(true);
-            let network = rows.chosen();
-            let dll = std::path::PathBuf::from(neural_forge_supervisor::paths::binaries_dir()).join(neural_forge_supervisor::model::DLL_NAME);
-            let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
-            if !dll.is_file() || neural_forge_supervisor::model::installed_network(&dir) == Some(network) {
-                return;
-            }
-            glib::spawn_future_local(extract_model(dll, Some(network), rows.clone()));
-        });
-    }
-
+    let rows = ModelRows { toasts: toasts.clone(), status_row, icon, button: button.clone() };
     button.connect_clicked(move |button| {
         let rows = rows.clone();
-        // The row's network once a model is installed or the user picked one; the default (the
-        // small network, else the full one) for a first extraction.
-        let dir = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
-        let network = (rows.picked.get() || neural_forge_supervisor::model::installed_network(&dir).is_some()).then(|| rows.chosen());
         let parent = button.root().and_downcast::<gtk4::Window>();
         let dialog = gtk4::FileDialog::builder().title("Select nvngx_dlssnr.dll").build();
         dialog.open(parent.as_ref(), None::<&gio::Cancellable>, move |result| {
@@ -1233,7 +1183,7 @@ fn build_model_group(toasts: &adw::ToastOverlay) -> adw::PreferencesGroup {
                 rows.toasts.add_toast(toast("That file has no local path -- choose a file on this computer"));
                 return;
             };
-            glib::spawn_future_local(extract_model(path, network, rows));
+            glib::spawn_future_local(extract_model(path, rows));
         });
     });
     group
@@ -1539,9 +1489,9 @@ fn switch_usable(game: &neural_forge_supervisor::steam::Game, target: &str, on: 
     !steam_running && (on || (game.unsupported().is_none() && !target.is_empty()))
 }
 
-fn build_setup_page(toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
+fn build_setup_page(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>, toasts: &adw::ToastOverlay) -> adw::PreferencesPage {
     let page = adw::PreferencesPage::new();
-    page.add(&build_model_group(toasts));
+    page.add(&build_model_group(shm, toasts));
     let refresh = gtk4::Button::from_icon_name("view-refresh-symbolic");
     refresh.set_tooltip_text(Some("Look for games again"));
     refresh.add_css_class("flat");

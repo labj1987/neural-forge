@@ -220,29 +220,12 @@ fn cmd_config() -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The extracted model's build, if one is installed.
-fn model_build() -> Option<String> {
-    neural_forge_supervisor::model::installed(std::path::Path::new(&neural_forge_supervisor::model::model_dir()))
-}
-
-/// ", not verified against NVIDIA's runtime" when the installed model came from such a build.
-fn unverified_note() -> &'static str {
-    let dir = neural_forge_supervisor::model::model_dir();
-    match neural_forge_supervisor::model::installed_verified(std::path::Path::new(&dir)) {
-        Some(false) => ", not verified against NVIDIA's runtime",
-        _ => "",
-    }
-}
-
 fn cmd_status() -> ExitCode {
     println!("config: {}", paths::config_file());
     println!("channel: {}", neural_forge_supervisor::channel_path(&Config::load()));
-    match model_build() {
-        Some(build) => {
-            let dir = neural_forge_supervisor::model::model_dir();
-            let network = neural_forge_supervisor::model::installed_network_text(std::path::Path::new(&dir));
-            println!("model: {network}, build {build}{} in {dir}", unverified_note())
-        }
+    let dir = neural_forge_supervisor::model::model_dir();
+    match neural_forge_supervisor::model::installed_text(std::path::Path::new(&dir)) {
+        Some(networks) => println!("model: {networks} in {dir}"),
         None => println!("model: not extracted (see `neural-forge-cli extract-model DIR`)"),
     }
     println!("state: {}", paths::state_dir());
@@ -325,41 +308,36 @@ fn cmd_import_binaries(dir: &str) -> ExitCode {
 }
 
 fn cmd_extract_model(source: &str, network: Option<Network>) -> ExitCode {
-    let out = neural_forge_supervisor::model::model_dir();
-    let (source, out) = (std::path::Path::new(source), std::path::Path::new(&out));
+    use neural_forge_supervisor::model;
+    let root = model::model_dir();
+    let (source, root) = (std::path::Path::new(source), std::path::Path::new(&root));
     let result = match network {
-        Some(network) => neural_forge_supervisor::model::extract(source, out, network),
-        None => neural_forge_supervisor::model::extract_default(source, out),
+        Some(network) => model::extract(source, root, network).map(|done| model::ExtractedAll { networks: vec![done], refused: Vec::new() }),
+        None => model::extract_all(source, root),
     };
     match result {
-        Ok(done) => {
-            println!(
-                "extracted the {} of build {} ({} tensors, {} bytes) to {}",
-                done.network,
-                done.build,
-                done.tensors,
-                done.bytes,
-                done.dir.display()
-            );
-            if let Some(why) = &done.fallback {
-                println!("The default is the small network, but {why}.");
+        Ok(all) => {
+            for done in &all.networks {
+                println!("extracted the {} of build {} ({} tensors, {} bytes) to {}", done.network, done.build, done.tensors, done.bytes, done.dir.display());
+                if !done.verified {
+                    let verified: Vec<String> = model::VERIFIED.iter().filter(|(n, _)| *n == done.network).map(|(_, v)| format!("{}.{}.{}", v[0], v[1], v[2])).collect();
+                    println!(
+                        "The {} of build {} has not been compared with NVIDIA's runtime (verified builds: {}).",
+                        done.network,
+                        done.build,
+                        verified.join(", ")
+                    );
+                }
             }
-            if !done.verified {
-                let verified: Vec<String> = neural_forge_supervisor::model::VERIFIED
-                    .iter()
-                    .filter(|(n, _)| *n == done.network)
-                    .map(|(_, v)| format!("{}.{}.{}", v[0], v[1], v[2]))
-                    .collect();
-                println!(
-                    "The {} of build {} has not been compared with NVIDIA's runtime (verified builds: {}).",
-                    done.network,
-                    done.build,
-                    verified.join(", ")
-                );
+            for (network, why) in &all.refused {
+                println!("The DLL's {network} was not extracted: {why}");
+            }
+            if all.networks.iter().all(|d| d.network != Network::Full) && network.is_none() {
+                println!("The full network, the default, is not extracted: the layer runs the small one.");
             }
             ExitCode::SUCCESS
         }
-        Err(neural_forge_supervisor::model::ModelError::Shape(report)) => {
+        Err(model::ModelError::Shape(report)) => {
             eprintln!("extract-model refused the DLL:\n{report}");
             ExitCode::FAILURE
         }
@@ -507,7 +485,7 @@ enum Command {
     Doctor,
     Config,
     ImportBinaries(String),
-    /// `network` None is the default ([`neural_forge_supervisor::model::extract_default`]).
+    /// `network` None extracts every network the DLL carries ([`neural_forge_supervisor::model::extract_all`]).
     ExtractModel { source: String, network: Option<Network> },
     Install(String),
     Uninstall { purge: bool },
@@ -654,7 +632,7 @@ fn command_usage(command: &str) -> Option<&'static str> {
         "doctor" => "usage: neural-forge-cli doctor\n  say why neural rendering is or is not running (the install, GPU, driver, kernel log and the\n  last game session), worst first; exits 1 only on a failure",
         "config" => "usage: neural-forge-cli config\n  print the effective config",
         "import-binaries" => "usage: neural-forge-cli import-binaries DIR\n  copy NVIDIA's nvngx_dlssnr.dll from DIR into the user data dir",
-        "extract-model" => "usage: neural-forge-cli extract-model DIR [--network full|small]\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL). small (the\n  default when the DLL has it) is the 31-block network build 310.9.16 added, about half the GPU\n  time; full is the 71-block network every build carries, and the default for builds without the\n  small one. The game uses the new model when it next starts",
+        "extract-model" => "usage: neural-forge-cli extract-model DIR [--network full|small]\n  write the model directory from nvngx_dlssnr.dll (DIR holds it, or is the DLL): every network\n  the DLL carries, replacing what was extracted before. Build 310.9.16 carries two: full, the\n  71-block network every build has (stronger shading and depth), and small, 31 blocks (faster,\n  subtler); older builds have only full. --network extracts only that one and leaves the other\n  as it is. Which one runs is the Network setting (the Setup tab, `shmctl set network 0|1`; full\n  by default); a game already running switches to a newly chosen one at once, and picks up a\n  newly extracted model when it next starts",
         "install" => "usage: neural-forge-cli install --appdir DIR\n  install an extracted AppImage AppDir into persistent user storage",
         "uninstall" => {
             "usage: neural-forge-cli uninstall [--purge]\n  remove unchanged tracked installed files; --purge also removes config, data\n  (the DLL, the model), state and /tmp/neural-forge-$UID"

@@ -4,6 +4,23 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.7.0 — 2026-10-19
+
+- **Choose the network in the Setup tab, while a game runs.** Extracting the model now writes both
+  networks the DLL has (build 310.9.16 carries a full and a small one; older builds only the full one),
+  and the Setup tab's Network row chooses which one runs: **Full network**, the default, with stronger
+  shading and depth, or **Small network**, faster with a subtler effect. A running game switches at once:
+  a moment of untouched frames while the other network loads, then the new one. The choice is saved
+  with your other settings and in profiles; when the chosen network is not extracted, the other one runs
+  and the Setup tab and `neural-forge-cli doctor` say so.
+- **The full network is the default again**, also for a DLL that carries the small one.
+- `neural-forge-cli extract-model DIR` extracts every network the DLL has; `--network full|small`
+  extracts only that one and leaves the other as it is.
+- After updating, extract the model again (Setup tab, Extract from DLL): the networks are now kept in
+  their own folders, and the layer does not read a model extracted by an earlier version. Close any game
+  running with Neural Forge before opening the app: this version changes the settings the app and the
+  game share.
+
 ## 3.6.0 — 2026-10-19
 
 - **Passes.** The Model tab has a Passes setting: the model can run up to 10 times over each frame,

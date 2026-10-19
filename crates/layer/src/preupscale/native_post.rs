@@ -410,7 +410,9 @@ fn process(
     // finish in time: its work may still use the network, so the claim stays until its fence signals
     // (`Loader::post_stalled`, checked by the pre-upscaler path's claim).
     let evaluated = wanted && loader.claim_post() && {
-        let ok = loader.ready(width, height).is_some_and(|built| {
+        // The Network setting: a switch frees the current build here, once this path's previous frame
+        // was waited for (`evaluate` waits for each) and the other path is kept off by the claim.
+        let ok = loader.ready(width, height, hdr.network_choice()).is_some_and(|built| {
             // SAFETY: the regions are mapped for the process's life; this thread owns the slot's request now.
             unsafe { evaluate(device, instance, physical, import, loader, view, gpu, slot, &built, width, height, format == proxy_format::BGRA8, &passes) }
         });

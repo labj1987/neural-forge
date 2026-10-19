@@ -160,7 +160,9 @@ pub(crate) unsafe fn run_native(
         // after-the-upscaler path keeps off the network.
         res.pre_loader = Some(loader.clone());
         // SAFETY: forwarded.
-        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, passes, arm, ask, submit) };
+        // The Network setting: which extracted network runs (a switch takes effect at this hold).
+        let choice = shm.network_choice().unwrap_or(neural_forge_protocol::enums::network::FULL);
+        return unsafe { native::run_native_hold(device, instance, physical_device, res, target, loader, jitter, chain_ok, passes, arm, ask, choice, submit) };
     }
     #[cfg(not(target_arch = "x86_64"))]
     let _ = (device, instance, physical_device, res, target, jitter, chain_ok, shm, arm, hold, submit);

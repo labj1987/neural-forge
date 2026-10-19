@@ -1,6 +1,8 @@
 //! The model directory the native backend loads: NVIDIA's packed E4M3 weights, taken from the
 //! user's own `nvngx_dlssnr.dll` and written in the layout OpenDLSS-NR's `nr::Model` reads
-//! (`manifest.json` plus eleven stage files under `model/`, its docs/weights.md).
+//! (`manifest.json` plus eleven stage files under `model/`, its docs/weights.md), one such directory
+//! per network under the model directory: `model/full/` and, from a build that carries it,
+//! `model/small/` ([`network_dir`]). The Network setting picks which one the layer runs.
 //!
 //! A network's weights are one `RT_RCDATA` resource: `WEIGHTS_HT` for the full network (71 blocks),
 //! and since build 310.9.16 also `WEIGHTS_CC_SMALL_FP8` for a small one (31 blocks of the same
@@ -78,7 +80,7 @@ const STAGES_SMALL: [(&str, u32, u32); 11] = [
 pub enum Network {
     /// `WEIGHTS_HT`, 71 blocks: the network every build carries.
     Full,
-    /// `WEIGHTS_CC_SMALL_FP8`, 31 blocks: about half the GPU time of the full one.
+    /// `WEIGHTS_CC_SMALL_FP8`, 31 blocks: about half the GPU time of the full one, a subtler effect.
     Small,
 }
 
@@ -95,6 +97,19 @@ impl Network {
 
     pub fn parse(name: &str) -> Option<Network> {
         Network::ALL.into_iter().find(|n| n.name() == name)
+    }
+
+    /// Its value of the Network setting (`neural_forge_protocol::enums::network`).
+    pub fn setting(self) -> u32 {
+        match self {
+            Network::Full => neural_forge_protocol::enums::network::FULL,
+            Network::Small => neural_forge_protocol::enums::network::SMALL,
+        }
+    }
+
+    /// The network a Network setting value names (out of range: the full one, as the layer reads it).
+    pub fn from_setting(value: u32) -> Network {
+        if value == neural_forge_protocol::enums::network::SMALL { Network::Small } else { Network::Full }
     }
 
     /// The DLL resource holding its weights.
@@ -160,9 +175,16 @@ fn w_err(m: impl Into<String>) -> ModelError {
     ModelError::Weights(m.into())
 }
 
-/// `paths::data_dir()/model`, the directory the layer loads.
+/// `paths::data_dir()/model`, the model directory: one directory per extracted network in it
+/// ([`network_dir`]), the one the Network setting names is what the layer loads.
 pub fn model_dir() -> String {
     format!("{}/model", crate::paths::data_dir())
+}
+
+/// `root/full` or `root/small`: one network's directory under the model directory `root`, in the
+/// layout `nr::Model` reads (`manifest.json` plus the stage files under `model/`).
+pub fn network_dir(root: &Path, network: Network) -> PathBuf {
+    root.join(network.name())
 }
 
 fn u16_at(b: &[u8], at: usize) -> Option<u16> {
@@ -475,18 +497,22 @@ fn read_manifest(dir: &Path) -> Option<serde_json::Value> {
     serde_json::from_str(&std::fs::read_to_string(dir.join("manifest.json")).ok()?).ok()
 }
 
-/// The build of the DLL the installed model directory came from (the manifest's `source.build`),
-/// or `None` when there is no readable manifest there.
+/// The build of the DLL a network's directory ([`network_dir`]) came from (the manifest's
+/// `source.build`), or `None` when there is no readable manifest there.
 pub fn installed(dir: &Path) -> Option<String> {
     read_manifest(dir)?["source"]["build"].as_str().map(str::to_string)
 }
 
-/// Checks the installed model's stage files against its manifest: each stage's file is there with
-/// the manifest's length and SHA-256. `Ok(build)` when all are, else what is wrong.
-pub fn check_installed(dir: &Path) -> Result<String, String> {
+/// Checks a network's directory ([`network_dir`]) against its manifest: the manifest names
+/// `network`, and each stage's file is there with the manifest's length and SHA-256. `Ok(build)`
+/// when all are, else what is wrong.
+pub fn check_installed(dir: &Path, network: Network) -> Result<String, String> {
     let manifest = read_manifest(dir).ok_or_else(|| format!("no readable manifest.json in {}", dir.display()))?;
     let build = manifest["source"]["build"].as_str().ok_or("the manifest names no source build")?.to_string();
-    manifest_network(&manifest).map_err(|name| format!("the manifest names a network this version does not know: {name}"))?;
+    let named = manifest_network(&manifest).map_err(|name| format!("the manifest names a network this version does not know: {name}"))?;
+    if named != network {
+        return Err(format!("the manifest is the {named}'s, in the {network}'s directory"));
+    }
     let stages = manifest["stages"].as_array().filter(|s| !s.is_empty()).ok_or("the manifest lists no stages")?;
     for stage in stages {
         let (Some(file), Some(len), Some(sha)) = (stage["file"].as_str(), stage["packedByteLength"].as_u64(), stage["sha256"].as_str()) else {
@@ -507,34 +533,65 @@ pub fn check_installed(dir: &Path) -> Result<String, String> {
     Ok(build)
 }
 
-/// The manifest's `network`: the full one when it has none (written before 3.5.0, from the full
-/// network), `Err(name)` for a name this version does not know.
+/// The manifest's `network`, `Err(name)` for none or a name this version does not know.
 fn manifest_network(manifest: &serde_json::Value) -> Result<Network, String> {
     match &manifest["network"] {
-        serde_json::Value::Null => Ok(Network::Full),
         serde_json::Value::String(name) => Network::parse(name).ok_or_else(|| format!("{name:?}")),
         other => Err(other.to_string()),
     }
 }
 
-/// Which network the installed model is (the manifest's `network`), or `None` when there is no
-/// readable manifest or it names a network this version does not know ([`check_installed`] says
-/// which). A manifest without the field was written before 3.5.0, from the full network.
+/// Which network a directory's manifest says it holds, or `None` when there is no readable
+/// manifest or it names none this version knows ([`check_installed`] says which).
 pub fn installed_network(dir: &Path) -> Option<Network> {
     manifest_network(&read_manifest(dir)?).ok()
 }
 
-/// [`installed_network`] for a line of text: "full network", "small network", or "unknown network"
-/// for a manifest naming one this version does not know.
-pub fn installed_network_text(dir: &Path) -> String {
-    installed_network(dir).map_or_else(|| "unknown network".to_string(), |n| n.to_string())
-}
-
-/// Whether the installed model is a network and build in [`VERIFIED`] (the manifest's
+/// Whether the network in `dir` is a network and build in [`VERIFIED`] (the manifest's
 /// `source.verified`), or `None` when there is no readable manifest. A manifest without the field
 /// is unverified.
 pub fn installed_verified(dir: &Path) -> Option<bool> {
     Some(read_manifest(dir)?["source"]["verified"].as_bool().unwrap_or(false))
+}
+
+/// One extracted network, as the status lines show it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Installed {
+    pub network: Network,
+    pub build: String,
+    pub verified: bool,
+}
+
+impl fmt::Display for Installed {
+    /// "full network, build 310.9.16.0", with ", not verified against NVIDIA's runtime" for a build
+    /// not in [`VERIFIED`].
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}, build {}{}", self.network, self.build, if self.verified { "" } else { ", not verified against NVIDIA's runtime" })
+    }
+}
+
+/// The networks extracted under the model directory `root`, in [`Network::ALL`]'s order: each whose
+/// directory has a readable manifest naming it (whether its files are intact is
+/// [`check_installed`]'s question).
+pub fn installed_all(root: &Path) -> Vec<Installed> {
+    Network::ALL
+        .into_iter()
+        .filter_map(|network| {
+            let dir = network_dir(root, network);
+            (installed_network(&dir) == Some(network)).then(|| Installed {
+                network,
+                build: installed(&dir).unwrap_or_default(),
+                verified: installed_verified(&dir) == Some(true),
+            })
+        })
+        .collect()
+}
+
+/// [`installed_all`] as one line: "full network, build 310.9.16.0; small network, build
+/// 310.9.16.0", or `None` when no network is extracted.
+pub fn installed_text(root: &Path) -> Option<String> {
+    let all = installed_all(root);
+    (!all.is_empty()).then(|| all.iter().map(Installed::to_string).collect::<Vec<_>>().join("; "))
 }
 
 #[derive(Debug)]
@@ -546,74 +603,122 @@ pub struct Extracted {
     pub verified: bool,
     pub tensors: usize,
     pub bytes: usize,
-    /// Why the default went to the full network although the DLL carries a small one
-    /// ([`extract_default`]); `None` otherwise.
-    pub fallback: Option<String>,
 }
 
-/// `source` is the DLL or a directory holding it; `network` is which of its networks to write.
-/// Replaces `out` as a whole ([`replace_tree`]), so a model directory is never half old and half new.
-/// Any build is taken whose records hold the tensors the graph implements for that network
-/// ([`check_shape`]); nothing is written otherwise.
-pub fn extract(source: &Path, out: &Path, network: Network) -> Result<Extracted, ModelError> {
-    extract_shaped(source, out, network, network.expected())
+/// What [`extract_all`] wrote.
+#[derive(Debug)]
+pub struct ExtractedAll {
+    /// Every network written, in [`Network::ALL`]'s order.
+    pub networks: Vec<Extracted>,
+    /// The networks the DLL carries that were not written, with the first line of why: a network
+    /// whose records this version cannot read or whose shape the graph does not implement.
+    pub refused: Vec<(Network, String)>,
 }
 
-/// [`extract`] with the default network: the small one when the DLL carries it (build 310.9.16),
-/// the full one otherwise. A small network the graph does not implement (a later build that
-/// changed it) falls back to the full one, and [`Extracted::fallback`] says why.
-pub fn extract_default(source: &Path, out: &Path) -> Result<Extracted, ModelError> {
-    extract_with(source, out, None, &|network| network.expected())
+/// `source` is the DLL or a directory holding it. Writes `network`'s directory under the model
+/// directory `root` ([`network_dir`]) and leaves the other network's as it is. The directory is
+/// replaced as a whole ([`replace_tree`]), so it is never half old and half new. Any build is taken
+/// whose records hold the tensors the graph implements for that network ([`check_shape`]); nothing
+/// is written otherwise.
+pub fn extract(source: &Path, root: &Path, network: Network) -> Result<Extracted, ModelError> {
+    extract_shaped(source, root, network, network.expected())
 }
 
-fn extract_shaped(source: &Path, out: &Path, network: Network, expected: &[(&str, u64)]) -> Result<Extracted, ModelError> {
-    extract_with(source, out, Some(network), &|_| expected)
+/// Writes every network the DLL carries under the model directory `root`: both of build 310.9.16
+/// (the full network and the small one), only the full one of a build without the small one. The
+/// model directory is replaced as a whole, so a network the DLL does not carry is gone afterwards.
+/// A network the graph does not implement (a later build that changed it) is left out and
+/// [`ExtractedAll::refused`] says why; only when no network can be written is that an error (the
+/// full network's).
+pub fn extract_all(source: &Path, root: &Path) -> Result<ExtractedAll, ModelError> {
+    extract_all_with(source, root, &|network| network.expected())
 }
 
-/// `network` None picks the default ([`extract_default`]); `expected` gives each network's table.
-fn extract_with<'t>(source: &Path, out: &Path, network: Option<Network>, expected: &dyn Fn(Network) -> &'t [(&'t str, u64)]) -> Result<Extracted, ModelError> {
-    let dll = if source.is_dir() { source.join(DLL_NAME) } else { source.to_path_buf() };
-    let image = std::fs::read(&dll).map_err(|e| ModelError::Io(dll.clone(), e))?;
-    let resources = Resources::parse(&image)?;
+fn extract_shaped(source: &Path, root: &Path, network: Network, expected: &[(&str, u64)]) -> Result<Extracted, ModelError> {
+    let dll = Dll::read(source)?;
+    let resources = Resources::parse(&dll.image)?;
     let version = file_version(&resources).ok_or_else(|| pe_err("no version resource"))?;
-    let shaped = |network: Network| -> Result<Vec<Tensor<'_>>, ModelError> {
-        let resource = network.resource();
-        let blob = resources.get(RT_RCDATA, Key::Name(resource)).ok_or_else(|| {
-            w_err(format!(
-                "build {}.{}.{}.{} has no {network} (no RCDATA resource named {resource})",
-                version[0], version[1], version[2], version[3]
-            ))
-        })?;
-        let tensors = parse_weights(blob)?;
-        check_shape(&tensors, expected(network))?;
-        Ok(tensors)
-    };
-    let (network, tensors, fallback) = match network {
-        Some(network) => (network, shaped(network)?, None),
-        None if resources.get(RT_RCDATA, Key::Name(Network::Small.resource())).is_some() => match shaped(Network::Small) {
-            Ok(tensors) => (Network::Small, tensors, None),
-            // Records this version cannot read, or a different network: the full one may still be the graph's.
-            Err(small @ (ModelError::Weights(_) | ModelError::Shape(_))) => {
-                let tensors = shaped(Network::Full)?;
-                let why = small.to_string();
-                let why = why.lines().next().unwrap_or_default();
-                (Network::Full, tensors, Some(format!("the small network was refused ({why}), so the full one was extracted")))
+    let tensors = shaped(&resources, version, network, expected)?;
+    let dir = network_dir(root, network);
+    let files = build_model(&tensors, network, version, &dll.sha256())?;
+    replace_tree(&dir, &files)?;
+    Ok(extracted(dir, network, version, &tensors))
+}
+
+/// [`extract_all`] with `expected` giving each network's table.
+fn extract_all_with<'t>(source: &Path, root: &Path, expected: &dyn Fn(Network) -> &'t [(&'t str, u64)]) -> Result<ExtractedAll, ModelError> {
+    let dll = Dll::read(source)?;
+    let resources = Resources::parse(&dll.image)?;
+    let version = file_version(&resources).ok_or_else(|| pe_err("no version resource"))?;
+    let sha256 = dll.sha256();
+    let mut files = Vec::new();
+    let mut networks = Vec::new();
+    let mut refused = Vec::new();
+    let mut first_error = None;
+    for network in Network::ALL {
+        // The small network is optional: a build without its resource has nothing to refuse.
+        if network == Network::Small && resources.get(RT_RCDATA, Key::Name(network.resource())).is_none() {
+            continue;
+        }
+        match shaped(&resources, version, network, expected(network)) {
+            Ok(tensors) => {
+                for (relative, bytes) in build_model(&tensors, network, version, &sha256)? {
+                    files.push((format!("{}/{relative}", network.name()), bytes));
+                }
+                networks.push(extracted(network_dir(root, network), network, version, &tensors));
+            }
+            // Records this version cannot read, or a different network: the other may still be the graph's.
+            Err(e @ (ModelError::Weights(_) | ModelError::Shape(_))) => {
+                refused.push((network, e.to_string().lines().next().unwrap_or_default().to_string()));
+                first_error.get_or_insert(e);
             }
             Err(e) => return Err(e),
-        },
-        None => (Network::Full, shaped(Network::Full)?, None),
-    };
-    let files = build_model(&tensors, network, version, &sha256_hex(&image))?;
-    replace_tree(out, &files)?;
-    Ok(Extracted {
-        dir: out.to_path_buf(),
+        }
+    }
+    if networks.is_empty() {
+        return Err(first_error.unwrap_or_else(|| w_err("the DLL carries no network")));
+    }
+    replace_tree(root, &files)?;
+    Ok(ExtractedAll { networks, refused })
+}
+
+/// The DLL's bytes, from the DLL itself or a directory holding it.
+struct Dll {
+    image: Vec<u8>,
+}
+
+impl Dll {
+    fn read(source: &Path) -> Result<Self, ModelError> {
+        let dll = if source.is_dir() { source.join(DLL_NAME) } else { source.to_path_buf() };
+        let image = std::fs::read(&dll).map_err(|e| ModelError::Io(dll.clone(), e))?;
+        Ok(Dll { image })
+    }
+
+    fn sha256(&self) -> String {
+        sha256_hex(&self.image)
+    }
+}
+
+/// `network`'s records from the DLL, checked against `expected` ([`check_shape`]).
+fn shaped<'a>(resources: &Resources<'a>, version: [u16; 4], network: Network, expected: &[(&str, u64)]) -> Result<Vec<Tensor<'a>>, ModelError> {
+    let resource = network.resource();
+    let blob = resources.get(RT_RCDATA, Key::Name(resource)).ok_or_else(|| {
+        w_err(format!("build {}.{}.{}.{} has no {network} (no RCDATA resource named {resource})", version[0], version[1], version[2], version[3]))
+    })?;
+    let tensors = parse_weights(blob)?;
+    check_shape(&tensors, expected)?;
+    Ok(tensors)
+}
+
+fn extracted(dir: PathBuf, network: Network, version: [u16; 4], tensors: &[Tensor]) -> Extracted {
+    Extracted {
+        dir,
         network,
         build: format!("{}.{}.{}", version[0], version[1], version[2]),
         verified: is_verified(network, version),
         tensors: tensors.len(),
         bytes: tensors.iter().map(|t| t.bytes.len()).sum(),
-        fallback,
-    })
+    }
 }
 
 /// Makes `out` hold exactly `files` (relative path, content): the whole tree is built in a sibling
@@ -992,14 +1097,20 @@ mod tests {
         }
     }
 
+    /// The small network as the fixtures carry it: one 20-to-50-byte tensor per block, 31 blocks.
+    fn small_shape() -> Vec<(String, u64)> {
+        (0..31).map(|b| (format!("block{b}.layer0.layer"), 20 + b as u64)).collect()
+    }
+
     #[test]
     fn extracts_the_small_network_of_another_build_unverified() {
         let dir = scratch("small");
-        let small: Vec<(String, u64)> = (0..31).map(|b| (format!("block{b}.layer0.layer"), 20 + b as u64)).collect();
+        let small = small_shape();
         std::fs::write(dir.join(DLL_NAME), dll_with("WEIGHTS_CC_SMALL_FP8", &blob_of(&small), [310, 8, 0, 0])).unwrap();
-        let out = dir.join("model");
-        let done = extract_shaped(&dir, &out, Network::Small, &table(&small)).unwrap();
-        assert_eq!((done.network, done.verified, done.tensors), (Network::Small, false, 31));
+        let root = dir.join("model");
+        let done = extract_shaped(&dir, &root, Network::Small, &table(&small)).unwrap();
+        let out = network_dir(&root, Network::Small);
+        assert_eq!((done.network, done.verified, done.tensors, &done.dir), (Network::Small, false, 31, &out));
         assert_eq!(installed_network(&out), Some(Network::Small));
         assert_eq!(installed_verified(&out), Some(false));
         let manifest = read_manifest(&out).unwrap();
@@ -1008,38 +1119,67 @@ mod tests {
         // Blocks 9-10 are the small network's encoder 512 stage.
         let stage = |block: u64| manifest["tensors"].as_array().unwrap().iter().find(|t| t["block"] == block).unwrap()["stage"].clone();
         assert_eq!((stage(10), stage(11), stage(30)), ("encoder512".into(), "vit".into(), "decoder32".into()));
-        assert_eq!(check_installed(&out), Ok("310.8.0.0".to_string()));
+        assert_eq!(check_installed(&out, Network::Small), Ok("310.8.0.0".to_string()));
+        assert!(check_installed(&out, Network::Full).unwrap_err().contains("the manifest is the small network's, in the full network's directory"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn extracts_the_small_network_of_310_9_16_verified() {
         let dir = scratch("small-verified");
-        let small: Vec<(String, u64)> = (0..31).map(|b| (format!("block{b}.layer0.layer"), 20 + b as u64)).collect();
+        let small = small_shape();
         std::fs::write(dir.join(DLL_NAME), dll_with("WEIGHTS_CC_SMALL_FP8", &blob_of(&small), [310, 9, 16, 0])).unwrap();
-        let out = dir.join("model");
-        let done = extract_shaped(&dir, &out, Network::Small, &table(&small)).unwrap();
+        let root = dir.join("model");
+        let done = extract_shaped(&dir, &root, Network::Small, &table(&small)).unwrap();
         assert_eq!((done.network, done.build.as_str(), done.verified), (Network::Small, "310.9.16", true));
-        assert_eq!(installed_verified(&out), Some(true));
+        assert_eq!(installed_verified(&network_dir(&root, Network::Small)), Some(true));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn the_default_is_the_small_network_when_the_dll_has_it_and_the_full_one_otherwise() {
-        let dir = scratch("default");
-        let small: Vec<(String, u64)> = (0..31).map(|b| (format!("block{b}.layer0.layer"), 20 + b as u64)).collect();
-        let (small_table, full_shape) = (table(&small), shape());
-        let full_table = table(&full_shape);
+    fn both_networks_are_extracted_when_the_dll_has_both_and_only_the_full_one_otherwise() {
+        let dir = scratch("all");
+        let (small, full) = (small_shape(), shape());
+        let (small_table, full_table) = (table(&small), table(&full));
         let expected = |network| if network == Network::Small { &small_table[..] } else { &full_table[..] };
-        let out = dir.join("model");
-        std::fs::write(dir.join(DLL_NAME), dll_with("WEIGHTS_CC_SMALL_FP8", &blob_of(&small), [310, 9, 16, 0])).unwrap();
-        assert_eq!(extract_with(&dir, &out, None, &expected).unwrap().network, Network::Small);
-        assert_eq!(installed_network(&out), Some(Network::Small));
-        std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 8, 0, 0])).unwrap();
-        let done = extract_with(&dir, &out, None, &expected).unwrap();
-        // No small network to refuse: nothing to explain.
-        assert_eq!((done.network, done.fallback), (Network::Full, None));
-        assert_eq!(installed_network(&out), Some(Network::Full));
+        let root = dir.join("model");
+        let (full_blob, small_blob) = (weights(), blob_of(&small));
+        std::fs::write(dir.join(DLL_NAME), dll_of(&[("WEIGHTS_HT", &full_blob), ("WEIGHTS_CC_SMALL_FP8", &small_blob)], [310, 9, 16, 0])).unwrap();
+        let done = extract_all_with(&dir, &root, &expected).unwrap();
+        assert_eq!(done.networks.iter().map(|e| e.network).collect::<Vec<_>>(), Network::ALL);
+        assert!(done.refused.is_empty());
+        for network in Network::ALL {
+            assert_eq!(check_installed(&network_dir(&root, network), network), Ok("310.9.16.0".to_string()), "{network}");
+        }
+        assert_eq!(installed_all(&root).iter().map(|i| (i.network, i.verified)).collect::<Vec<_>>(), [(Network::Full, true), (Network::Small, true)]);
+        assert_eq!(installed_text(&root).unwrap(), "full network, build 310.9.16.0; small network, build 310.9.16.0");
+        // A build with only the full network: the full one, and the small one extracted before is gone.
+        std::fs::write(dir.join(DLL_NAME), dll(&full_blob, [310, 8, 0, 0])).unwrap();
+        let done = extract_all_with(&dir, &root, &expected).unwrap();
+        assert_eq!(done.networks.iter().map(|e| e.network).collect::<Vec<_>>(), [Network::Full]);
+        assert!(done.refused.is_empty(), "no small network to refuse: nothing to explain");
+        assert_eq!(installed_all(&root).iter().map(|i| i.network).collect::<Vec<_>>(), [Network::Full]);
+        assert!(!network_dir(&root, Network::Small).exists());
+        let mut names: Vec<_> = std::fs::read_dir(&root).unwrap().map(|e| e.unwrap().file_name().into_string().unwrap()).collect();
+        names.sort();
+        assert_eq!(names, ["full"], "the model directory holds one directory per network and nothing else");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn extracting_one_network_leaves_the_other_alone() {
+        let dir = scratch("one");
+        let (small, full) = (small_shape(), shape());
+        let (small_table, full_table) = (table(&small), table(&full));
+        let expected = |network| if network == Network::Small { &small_table[..] } else { &full_table[..] };
+        let root = dir.join("model");
+        let (full_blob, small_blob) = (weights(), blob_of(&small));
+        std::fs::write(dir.join(DLL_NAME), dll_of(&[("WEIGHTS_HT", &full_blob), ("WEIGHTS_CC_SMALL_FP8", &small_blob)], [310, 9, 16, 0])).unwrap();
+        extract_all_with(&dir, &root, &expected).unwrap();
+        std::fs::write(dir.join(DLL_NAME), dll(&full_blob, [310, 9, 1, 0])).unwrap();
+        extract_shaped(&dir, &root, Network::Full, &full_table).unwrap();
+        assert_eq!(installed(&network_dir(&root, Network::Full)).as_deref(), Some("310.9.1.0"));
+        assert_eq!(installed(&network_dir(&root, Network::Small)).as_deref(), Some("310.9.16.0"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1055,51 +1195,61 @@ mod tests {
     }
 
     #[test]
-    fn the_default_takes_the_full_network_when_the_small_one_is_refused() {
-        let dir = scratch("default-fallback");
-        let small: Vec<(String, u64)> = (0..31).map(|b| (format!("block{b}.layer0.layer"), 20 + b as u64)).collect();
-        let (small_table, full_shape) = (table(&small), shape());
-        let full_table = table(&full_shape);
+    fn a_refused_network_leaves_the_other_one_extracted() {
+        let dir = scratch("refused");
+        let (small, full) = (small_shape(), shape());
+        let (small_table, full_table) = (table(&small), table(&full));
         let expected = |network| if network == Network::Small { &small_table[..] } else { &full_table[..] };
-        let out = dir.join("model");
+        let root = dir.join("model");
         let full_blob = weights();
-        // Both networks, the small one as the graph has it: the small one, nothing to explain.
-        let small_blob = blob_of(&small);
-        std::fs::write(dir.join(DLL_NAME), dll_of(&[("WEIGHTS_HT", &full_blob), ("WEIGHTS_CC_SMALL_FP8", &small_blob)], [310, 9, 16, 0])).unwrap();
-        let done = extract_with(&dir, &out, None, &expected).unwrap();
-        assert_eq!((done.network, done.fallback), (Network::Small, None));
-        // A later build whose small network lost a block: the full one, and why.
+        // A later build whose small network lost a block: the full one, and why the small one is not there.
         let changed_blob = blob_of(&small[..30]);
         std::fs::write(dir.join(DLL_NAME), dll_of(&[("WEIGHTS_HT", &full_blob), ("WEIGHTS_CC_SMALL_FP8", &changed_blob)], [310, 9, 20, 0])).unwrap();
-        let done = extract_with(&dir, &out, None, &expected).unwrap();
-        assert_eq!(done.network, Network::Full);
-        let why = done.fallback.unwrap();
-        assert!(why.starts_with("the small network was refused (nvngx_dlssnr.dll holds 30 tensors in 30 blocks (0-29)"), "{why}");
-        assert!(why.ends_with("so the full one was extracted"), "{why}");
-        assert_eq!(installed_network(&out), Some(Network::Full));
-        // Asked for by name, the small network is not swapped for the full one.
-        assert!(matches!(extract_with(&dir, &out, Some(Network::Small), &expected), Err(ModelError::Shape(_))));
+        let done = extract_all_with(&dir, &root, &expected).unwrap();
+        assert_eq!(done.networks.iter().map(|e| e.network).collect::<Vec<_>>(), [Network::Full]);
+        let [(network, why)] = &done.refused[..] else { panic!("{:?}", done.refused) };
+        assert_eq!(*network, Network::Small);
+        assert!(why.starts_with("nvngx_dlssnr.dll holds 30 tensors in 30 blocks (0-29)"), "{why}");
+        assert_eq!(installed_all(&root).iter().map(|i| i.network).collect::<Vec<_>>(), [Network::Full]);
+        // Asked for by name, the small network is refused, and the full one is not touched.
+        assert!(matches!(extract_shaped(&dir, &root, Network::Small, &small_table), Err(ModelError::Shape(_))));
+        assert!(check_installed(&network_dir(&root, Network::Full), Network::Full).is_ok());
+        // The other way round: a full network the graph does not implement, the small one as it has it.
+        let small_blob = blob_of(&small);
+        std::fs::write(dir.join(DLL_NAME), dll_of(&[("WEIGHTS_HT", &blob_of(&full[1..])), ("WEIGHTS_CC_SMALL_FP8", &small_blob)], [310, 9, 20, 0])).unwrap();
+        let done = extract_all_with(&dir, &root, &expected).unwrap();
+        assert_eq!(done.networks.iter().map(|e| e.network).collect::<Vec<_>>(), [Network::Small]);
+        assert_eq!(done.refused.iter().map(|r| r.0).collect::<Vec<_>>(), [Network::Full]);
+        // Neither: the full network's report, and the model directory as it was.
+        std::fs::write(dir.join(DLL_NAME), dll_of(&[("WEIGHTS_HT", &blob_of(&full[1..])), ("WEIGHTS_CC_SMALL_FP8", &changed_blob)], [310, 9, 20, 0])).unwrap();
+        let err = extract_all_with(&dir, &root, &expected).unwrap_err();
+        assert!(err.to_string().contains("the graph expects 153 tensors"), "{err}");
+        assert_eq!(installed_all(&root).iter().map(|i| i.network).collect::<Vec<_>>(), [Network::Small]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
     fn extractions_into_one_directory_at_the_same_time_each_land_whole() {
         let dir = scratch("concurrent");
-        let small: Vec<(String, u64)> = (0..31).map(|b| (format!("block{b}.layer0.layer"), 20 + b as u64)).collect();
-        let (small_table, full_shape) = (table(&small), shape());
-        let full_table = table(&full_shape);
+        let (small, full) = (small_shape(), shape());
+        let (small_table, full_table) = (table(&small), table(&full));
         let (full_blob, small_blob) = (weights(), blob_of(&small));
         std::fs::write(dir.join(DLL_NAME), dll_of(&[("WEIGHTS_HT", &full_blob), ("WEIGHTS_CC_SMALL_FP8", &small_blob)], [310, 9, 16, 0])).unwrap();
-        let out = dir.join("model");
-        // The GUI's Network row and its Extract button can each start one while another writes.
+        let root = dir.join("model");
+        // The GUI's Extract button can start one while another writes; the CLI can write one network.
         std::thread::scope(|s| {
-            let runs: Vec<_> = (0..8)
+            let runs: Vec<_> = (0..9)
                 .map(|i| {
-                    let network = Network::ALL[i % 2];
-                    let (dir, out, small_table, full_table) = (&dir, &out, &small_table, &full_table);
+                    let (dir, root, small_table, full_table) = (&dir, &root, &small_table, &full_table);
                     s.spawn(move || {
                         let expected = |n| if n == Network::Small { &small_table[..] } else { &full_table[..] };
-                        extract_with(dir, out, Some(network), &expected).map(|_| ())
+                        match i % 3 {
+                            0 => extract_all_with(dir, root, &expected).map(|_| ()),
+                            k => {
+                                let network = Network::ALL[k - 1];
+                                extract_shaped(dir, root, network, expected(network)).map(|_| ())
+                            }
+                        }
                     })
                 })
                 .collect();
@@ -1107,32 +1257,45 @@ mod tests {
                 run.join().unwrap().unwrap();
             }
         });
-        assert!(check_installed(&out).is_ok(), "{:?}", check_installed(&out));
-        let leftovers: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with('.')).collect();
-        assert!(leftovers.is_empty(), "{leftovers:?}");
+        for network in installed_all(&root).iter().map(|i| i.network) {
+            let dir = network_dir(&root, network);
+            assert!(check_installed(&dir, network).is_ok(), "{:?}", check_installed(&dir, network));
+        }
+        assert!(!installed_all(&root).is_empty());
+        for d in [&dir, &root] {
+            let leftovers: Vec<_> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with('.')).collect();
+            assert!(leftovers.is_empty(), "{leftovers:?}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn a_manifest_naming_an_unknown_network_is_not_taken_for_the_full_one() {
+    fn a_manifest_naming_an_unknown_network_or_none_is_no_network() {
         let dir = scratch("manifest-unknown-network");
         std::fs::write(dir.join("manifest.json"), r#"{"source": {"build": "310.9.20.0"}, "network": "tiny", "stages": []}"#).unwrap();
         assert_eq!(installed_network(&dir), None);
-        assert_eq!(installed_network_text(&dir), "unknown network");
-        assert_eq!(check_installed(&dir), Err("the manifest names a network this version does not know: \"tiny\"".to_string()));
+        assert_eq!(check_installed(&dir, Network::Full), Err("the manifest names a network this version does not know: \"tiny\"".to_string()));
+        std::fs::write(dir.join("manifest.json"), r#"{"source": {"build": "310.8.0.0"}, "stages": []}"#).unwrap();
+        assert_eq!(installed_network(&dir), None);
+        assert!(check_installed(&dir, Network::Full).is_err());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
-    fn network_names_round_trip_and_an_old_manifest_is_the_full_network() {
+    fn network_names_and_settings_round_trip() {
         for network in Network::ALL {
             assert_eq!(Network::parse(network.name()), Some(network));
+            assert_eq!(Network::from_setting(network.setting()), network);
+            // The layer finds a network's directory by the setting's own name for it.
+            assert_eq!(neural_forge_protocol::enums::network::name(network.setting()), network.name());
         }
         assert_eq!(Network::parse("tiny"), None);
-        let dir = scratch("manifest-no-network");
-        std::fs::write(dir.join("manifest.json"), r#"{"source": {"build": "310.8.0.0"}}"#).unwrap();
-        assert_eq!(installed_network(&dir), Some(Network::Full));
-        assert_eq!(installed_network(&dir.join("nowhere")), None);
+        assert_eq!(Network::from_setting(9), Network::Full);
+        assert_eq!(Network::from_setting(0), Network::Full, "the setting's default is the full network");
+        let dir = scratch("network-dir");
+        assert_eq!(network_dir(&dir, Network::Small), dir.join("small"));
+        assert!(installed_all(&dir.join("nowhere")).is_empty());
+        assert_eq!(installed_text(&dir.join("nowhere")), None);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1187,14 +1350,14 @@ mod tests {
             std::fs::create_dir_all(dir.join(rel).parent().unwrap()).unwrap();
             std::fs::write(dir.join(rel), data).unwrap();
         }
-        assert_eq!(check_installed(&dir), Ok("310.8.0.0".to_string()));
+        assert_eq!(check_installed(&dir, Network::Full), Ok("310.8.0.0".to_string()));
         let (first, _) = files.iter().find(|(p, d)| p.starts_with("model/") && !d.is_empty()).unwrap();
         std::fs::write(dir.join(first), [0u8; 32]).unwrap();
-        assert!(check_installed(&dir).unwrap_err().contains("SHA-256"));
+        assert!(check_installed(&dir, Network::Full).unwrap_err().contains("SHA-256"));
         std::fs::write(dir.join(first), [0u8; 3]).unwrap();
-        assert!(check_installed(&dir).unwrap_err().contains("bytes"));
+        assert!(check_installed(&dir, Network::Full).unwrap_err().contains("bytes"));
         std::fs::remove_file(dir.join(first)).unwrap();
-        assert!(check_installed(&dir).is_err());
+        assert!(check_installed(&dir, Network::Full).is_err());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1202,15 +1365,17 @@ mod tests {
     fn extracts_a_verified_build() {
         let dir = scratch("verified");
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 8, 0, 3])).unwrap();
-        let out = dir.join("model");
-        let done = extract_shaped(&dir, &out, Network::Full, &table(&shape())).unwrap();
+        let root = dir.join("model");
+        let done = extract_shaped(&dir, &root, Network::Full, &table(&shape())).unwrap();
         assert_eq!((done.build.as_str(), done.verified, done.tensors), ("310.8.0", true, TENSOR_COUNT));
+        let out = network_dir(&root, Network::Full);
         assert_eq!(installed_network(&out), Some(Network::Full));
         assert!(out.join("manifest.json").is_file() && out.join("model/vit.e4m3").is_file());
         assert_eq!(installed(&out).as_deref(), Some("310.8.0.3"));
         assert_eq!(installed_verified(&out), Some(true));
         assert_eq!((installed(&dir.join("nowhere")), installed_verified(&dir.join("nowhere"))), (None, None));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 2, "only the DLL and the model directory");
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1, "only the full network's directory");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1218,11 +1383,13 @@ mod tests {
     fn extracts_another_build_with_the_same_network_unverified() {
         let dir = scratch("unverified");
         std::fs::write(dir.join(DLL_NAME), dll(&weights(), [310, 9, 1, 0])).unwrap();
-        let out = dir.join("model");
-        let done = extract_shaped(&dir, &out, Network::Full, &table(&shape())).unwrap();
+        let root = dir.join("model");
+        let done = extract_shaped(&dir, &root, Network::Full, &table(&shape())).unwrap();
         assert_eq!((done.build.as_str(), done.verified), ("310.9.1", false));
+        let out = network_dir(&root, Network::Full);
         assert_eq!(installed(&out).as_deref(), Some("310.9.1.0"));
         assert_eq!(installed_verified(&out), Some(false));
+        assert_eq!(installed_text(&root).unwrap(), "full network, build 310.9.1.0, not verified against NVIDIA's runtime");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

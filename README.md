@@ -44,13 +44,18 @@ A residential street: 215 fps shown with the effect, 276 without.
 
 The network runs inside the game's process, in the Vulkan layer, on the game's GPU. NVIDIA's DLL is
 not loaded at run time: the layer reads the model's weights from the folder `extract-model` wrote
-(see [Install](#install)). Two networks come in NVIDIA's DLL, and you choose one:
+(see [Install](#install)). Two networks come in NVIDIA's DLL; both are extracted, and the Setup
+tab's **Network** row chooses which one runs:
 
-- **Small** (31 blocks, the same kinds of blocks with fewer of each), in build 310.9.16, and the
-  default when the DLL has it. It takes about half the GPU time of the full one and changes the
-  picture a little less. It is what NVIDIA's own runtime runs from build 310.9.16 at its default
-  preset.
-- **Full** (71 blocks), in every build of the DLL, and the default for builds without the small one.
+- **Full network** (71 blocks), in every build of the DLL, and the default. Its shading and depth are
+  stronger.
+- **Small network** (31 blocks, the same kinds of blocks with fewer of each), in build 310.9.16. It
+  takes about half the GPU time of the full one and changes the picture less. It is what NVIDIA's own
+  runtime runs from build 310.9.16 at its default preset.
+
+A game that is running switches to the chosen network at once: its next frames go to DLSS untouched
+while the network loads, and the network's history starts afresh. When the chosen network is not
+extracted (a DLL without the small one), the other one runs.
 
 Each network's answer for an input frame is bit-exact with NGX's own
 ([docs/NATIVE_BACKEND.md](docs/NATIVE_BACKEND.md), 0.6 and "The small network").
@@ -180,23 +185,20 @@ NVIDIA's SDK), with the Setup tab's **Extract from DLL** button or with:
 neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll
 ```
 
-That writes the small network when the DLL has it (build 310.9.16), and the full one otherwise. To
-choose, pick **Small** or **Full** in the Setup tab's **Network** row (it re-extracts from the
-imported DLL), or run:
+That writes every network the DLL has: both from build 310.9.16, only the full one from an older
+build. `--network full` or `--network small` extracts only that one and leaves the other as it is.
+Which one runs is the Setup tab's **Network** row (or `neural-forge-cli shmctl set network 0` for the
+full network, `1` for the small one); the full network is the default.
 
-```bash
-neural-forge-cli extract-model /path/to/nvngx_dlssnr.dll --network full
-```
-
-The weights are written to `~/.local/share/neural-forge/model` (141 MB full, 114 MB small), with
-hashes the layer checks when it loads them. The DLL is not needed after that. Restart the game
-afterwards.
+The weights are written to `~/.local/share/neural-forge/model/full` (141 MB) and `model/small`
+(114 MB), with hashes the layer checks when it loads them. The DLL is not needed after that. Restart
+the game after extracting.
 
 The verified networks are the small and full ones of build 310.9.16 and the full one of build
 310.8.0: their output was compared bit for bit with NVIDIA's runtime. Other builds with the same
 networks are marked "not verified against NVIDIA's runtime". A DLL with a network Neural Forge does not implement is refused
-with a report of what differs. When only the small network differs and you didn't choose one, the full network is
-extracted instead, and you're told why.
+with a report of what differs. When only one of the DLL's two networks differs, the other one is
+extracted, and you're told why.
 
 Nothing needs root: everything lives under `~/.config/neural-forge`, `~/.local/share/neural-forge`,
 `~/.local/state/neural-forge` and `/tmp/neural-forge-$UID/`. An upstream DLSS5VKLayer install can
@@ -258,7 +260,7 @@ this version re-creates the shared memory.
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
-| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), the network (Full or Small), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another, and the launch option to copy by hand for a game you pick. |
+| Setup | The model (present, or extract it from `nvngx_dlssnr.dll`), which network runs (Full network, the default, or Small network; a running game switches at once), your installed Steam games with a Neural Forge switch each, the executable it targets and an edit button to choose another, and the launch option to copy by hand for a game you pick. |
 
 Before the upscaler the network runs on every frame while the camera is still and on every second
 frame while it moves; the frame in between reuses its last result, moved with the game's motion and
