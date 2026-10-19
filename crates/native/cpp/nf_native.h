@@ -74,6 +74,13 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
 // previous build's secondary must not be pending.
 uint32_t nf_native_build(NfNative* n, uint32_t valid_width, uint32_t valid_height, char* err, size_t err_len);
 
+// nf_native_build for `count` frame sizes at once (`sizes`: valid width, height pairs): one graph each, slot i
+// for sizes[i] (slot 0 is what nf_native_frame and nf_native_graph_commands return). Each is warmed up as
+// nf_native_build's (the largest first), then all are recorded. The graphs share the weights and the kernels'
+// scratch, and run one after another on one queue, never at the same time. Any previous build's secondaries must
+// not be pending. Slow (one warm-up per size).
+uint32_t nf_native_build_sizes(NfNative* n, const uint32_t* sizes, uint32_t count, char* err, size_t err_len);
+
 typedef struct NfNativeFrame {
   uint32_t field_width, field_height;   // the padded field the network runs on
   VkBuffer features;                    // f32 [field_height][field_width][16], written by the layer
@@ -85,6 +92,8 @@ typedef struct NfNativeFrame {
 } NfNativeFrame;
 
 uint32_t nf_native_frame(const NfNative* n, NfNativeFrame* frame);
+// Slot `slot`'s frame (nf_native_build_sizes); 0 past the last slot.
+uint32_t nf_native_frame_at(const NfNative* n, uint32_t slot, NfNativeFrame* frame);
 
 // The recorded graph: a secondary command buffer (simultaneous use, no render pass) of `frame_family`,
 // reading `features` and writing `head`. It opens and closes with compute barriers only; the caller
@@ -95,6 +104,9 @@ VkCommandBuffer nf_native_graph_commands(const NfNative* n);
 // family): for work the layer submits on a queue of that family (the after-the-upscaler path). Both
 // recordings share the activations: they must never run at the same time.
 VkCommandBuffer nf_native_graph_commands_own(const NfNative* n);
+// Slot `slot`'s recordings (nf_native_build_sizes); null past the last slot.
+VkCommandBuffer nf_native_graph_commands_at(const NfNative* n, uint32_t slot);
+VkCommandBuffer nf_native_graph_commands_own_at(const NfNative* n, uint32_t slot);
 
 // Records the graph straight into `primary` (descriptor pool 0, which the warm-up also uses). For
 // measurements beside the secondary; the frame path uses nf_native_graph_commands.

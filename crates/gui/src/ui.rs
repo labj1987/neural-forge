@@ -186,6 +186,40 @@ fn combo_row(title: &str, options: &[&str], selected: u32, setter: impl Fn(u32) 
     row
 }
 
+/// A model resolution menu (`enums::model_scale::PRESETS`, then "Custom" for a value set elsewhere, e.g. with
+/// `shmctl`): choosing a preset writes its scale. Follows the header like the other rows.
+fn scale_row(title: &str, subtitle: &str, value: f32, setter: impl Fn(f32) + 'static) -> adw::ComboRow {
+    use neural_forge_protocol::enums::model_scale::{preset_of, PRESETS};
+    let mut names: Vec<&str> = PRESETS.iter().map(|&(n, _)| n).collect();
+    names.push("Custom");
+    let custom = PRESETS.len() as u32;
+    let index = move |v: f32| preset_of(v).map_or(custom, |i| i as u32);
+    let row = adw::ComboRow::new();
+    row.set_title(title);
+    row.set_subtitle(subtitle);
+    row.set_model(Some(&gtk4::StringList::new(&names)));
+    row.set_selected(index(value));
+    row.connect_selected_notify(move |row| {
+        if let Some(&(_, scale)) = PRESETS.get(row.selected() as usize) {
+            if !refreshing() {
+                setter(scale);
+            }
+        }
+    });
+    if let Some((_, read)) = crate::shm::take_pending_reader() {
+        let row = row.downgrade();
+        register_refresher(move || {
+            if let Some(row) = row.upgrade() {
+                let v = index(f32::from_bits(read()));
+                if row.selected() != v {
+                    row.set_selected(v);
+                }
+            }
+        });
+    }
+    row
+}
+
 /// The strength preset menu: choosing a preset writes its four values to the header as one unit
 /// (`Knobs::write`, so the layer never sees half of a preset) and saves them; the four rows follow
 /// the header. It shows the preset the header matches, else "Custom".
@@ -406,6 +440,13 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
         "pass_feedback",
         0.05,
         set_feedback,
+    ));
+    let (scale, set_scale) = bind_float(&shm, Some("preupscale_scale"), |h| &h.preupscale_scale_bits);
+    model_group.add(&scale_row(
+        "Model resolution",
+        "The size the model runs at before the upscaler, of DLSS's input size. Full gives the most detail; the others are faster, and the model's edit is brought back to full size",
+        scale,
+        set_scale,
     ));
     let pass_row = adw::ActionRow::new();
     pass_row.set_title("Per-pass settings");
@@ -875,13 +916,16 @@ struct PassField {
     field: &'static str,
     bit: u32,
     kind: PassFieldKind,
-    get: fn(&neural_forge_protocol::PassControl) -> &std::sync::atomic::AtomicU32,
+    /// The pass's field (pass 0 is pass 1).
+    get: fn(&neural_forge_protocol::ShmHeader, usize) -> &std::sync::atomic::AtomicU32,
 }
 
 enum PassFieldKind {
     Float { step: f64 },
     Choice(&'static [&'static str]),
     Toggle,
+    /// A model resolution preset (`enums::model_scale::PRESETS`), stored as its scale.
+    Scale,
 }
 
 /// Per-pass overrides: each pass can replace any of the Model tab's values with its own; a pass that
@@ -892,12 +936,13 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
     use std::cell::Cell;
     use std::rc::Rc;
     const FIELDS: &[PassField] = &[
-        PassField { title: "Intensity", field: "intensity", bit: po::INTENSITY, kind: PassFieldKind::Float { step: 0.05 }, get: |p| &p.intensity_bits },
-        PassField { title: "Local tone", field: "local_tone", bit: po::LOCAL_TONE, kind: PassFieldKind::Float { step: 0.05 }, get: |p| &p.local_tone_bits },
-        PassField { title: "Local structure", field: "local_structure", bit: po::LOCAL_STRUCTURE, kind: PassFieldKind::Float { step: 0.05 }, get: |p| &p.local_structure_bits },
-        PassField { title: "Skin structure", field: "skin_structure", bit: po::SKIN_STRUCTURE, kind: PassFieldKind::Float { step: 0.05 }, get: |p| &p.skin_structure_bits },
-        PassField { title: "Style", field: "style", bit: po::STYLE, kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]), get: |p| &p.style },
-        PassField { title: "Auto mask", field: "auto_mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |p| &p.auto_mask },
+        PassField { title: "Intensity", field: "intensity", bit: po::INTENSITY, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].intensity_bits },
+        PassField { title: "Local tone", field: "local_tone", bit: po::LOCAL_TONE, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].local_tone_bits },
+        PassField { title: "Local structure", field: "local_structure", bit: po::LOCAL_STRUCTURE, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].local_structure_bits },
+        PassField { title: "Skin structure", field: "skin_structure", bit: po::SKIN_STRUCTURE, kind: PassFieldKind::Float { step: 0.05 }, get: |h, k| &h.pass[k].skin_structure_bits },
+        PassField { title: "Style", field: "style", bit: po::STYLE, kind: PassFieldKind::Choice(&["Default", "Natural", "Cinematic"]), get: |h, k| &h.pass[k].style },
+        PassField { title: "Auto mask", field: "auto_mask", bit: po::AUTO_MASK, kind: PassFieldKind::Toggle, get: |h, k| &h.pass[k].auto_mask },
+        PassField { title: "Model resolution", field: "scale", bit: po::SCALE, kind: PassFieldKind::Scale, get: |h, k| &h.pass_scale_bits[k] },
     ];
     let max = neural_forge_protocol::MAX_PASSES;
 
@@ -980,6 +1025,24 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
                 expander.add_row(&row);
                 Box::new(move |bits| row.set_active(bits != 0))
             }
+            PassFieldKind::Scale => {
+                use neural_forge_protocol::enums::model_scale::{preset_of, PRESETS};
+                let mut names: Vec<&str> = PRESETS.iter().map(|&(n, _)| n).collect();
+                names.push("Custom");
+                let custom = PRESETS.len() as u32;
+                let row = adw::ComboRow::new();
+                row.set_title("Value");
+                row.set_subtitle("Of DLSS's input size; this pass works on the previous pass's full-size picture");
+                row.set_model(Some(&gtk4::StringList::new(&names)));
+                let w = Rc::clone(&set_value);
+                row.connect_selected_notify(move |r| {
+                    if let Some(&(_, scale)) = PRESETS.get(r.selected() as usize) {
+                        w(scale.to_bits());
+                    }
+                });
+                expander.add_row(&row);
+                Box::new(move |bits| row.set_selected(preset_of(f32::from_bits(bits)).map_or(custom, |i| i as u32)))
+            }
         };
         {
             let shm = std::sync::Arc::clone(shm);
@@ -1004,9 +1067,9 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
         let get = field.get;
         let bit = field.bit;
         reloads.push(Box::new(move |pass| {
-            let p = &shm.header().pass[pass];
-            expander.set_enable_expansion(p.overrides.load(Ordering::Relaxed) & bit != 0);
-            set_widget(get(p).load(Ordering::Relaxed));
+            let h = shm.header();
+            expander.set_enable_expansion(h.pass[pass].overrides.load(Ordering::Relaxed) & bit != 0);
+            set_widget(get(h, pass).load(Ordering::Relaxed));
         }));
     }
 

@@ -54,12 +54,15 @@ pub struct PassTunings {
     pub tunings: [Tuning; crate::MAX_PASSES],
     /// How much of a pass's answer becomes the next pass's input (0 to 1; 1 is the answer itself).
     pub feedback: f32,
+    /// Each pass's model resolution before the upscaler, a scale of DLSS's input size
+    /// (`preupscale_scale`, or the pass's own `pass<N>_scale` where it overrides it); 1 is full size.
+    pub scales: [f32; crate::MAX_PASSES],
 }
 
 impl PassTunings {
-    /// One pass with `tuning`.
+    /// One pass with `tuning`, at full size.
     pub fn single(tuning: Tuning) -> Self {
-        Self { count: 1, tunings: [tuning; crate::MAX_PASSES], feedback: 1.0 }
+        Self { count: 1, tunings: [tuning; crate::MAX_PASSES], feedback: 1.0, scales: [1.0; crate::MAX_PASSES] }
     }
 
     pub fn passes(&self) -> &[Tuning] {
@@ -437,6 +440,17 @@ pub struct ShmHeader {
     /// whole (a scene cut: the mean luma difference of two frames' thumbnails at or above the
     /// threshold), counted since the layer opened the channel.
     pub scene_cuts: AtomicU32,
+
+    // --- v21 -----------------------------------------------------------------------------
+    /// f32 bits: the model resolution before the upscaler, a scale of DLSS's input size
+    /// ([`crate::enums::model_scale`]: Full 1, Quality 0.667, Balanced 0.58, Performance 0.5, Ultra
+    /// Performance 0.333). Below 1 the network runs on a downscaled picture and its edit is brought back to
+    /// full size (`preupscale::native`, docs/NATIVE_BACKEND.md, "Model resolution before the upscaler").
+    /// Default 1: the network at DLSS's input size, as before.
+    pub preupscale_scale_bits: AtomicU32,
+    /// f32 bits: each pass's own model resolution (`pass<N>_scale`), used where the pass's `overrides` has
+    /// [`crate::enums::pass_override::SCALE`]. Default 1.
+    pub pass_scale_bits: [AtomicU32; crate::MAX_PASSES],
 }
 
 // Every field is an atomic, so `ShmHeader` is `Sync` without an `unsafe impl`: another
@@ -461,7 +475,9 @@ const _: () = assert!(std::mem::size_of::<ShmHeader>() <= HEADER_BYTES, "ShmHead
 // reads its neighbor's value — which is not a crash, it is a status display quietly
 // reporting a nonsensical number for a flag that is 0 or 1. If any of these fire, the
 // layout changed: bump `SHM_VERSION` in the same commit, then update these numbers.
-const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2084, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::size_of::<ShmHeader>() == 2128, "the header layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits) == 2084, "layout changed -- bump SHM_VERSION");
+const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_scale_bits) == 2088, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) == 2076, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, scene_cuts) == 2080, "layout changed -- bump SHM_VERSION");
 const _: () = assert!(std::mem::offset_of!(ShmHeader, network) == 2032, "layout changed -- bump SHM_VERSION");
@@ -501,7 +517,7 @@ const _: () = assert!(REASON_BYTES.is_multiple_of(4) && NAME_BYTES.is_multiple_o
 /// setting's own units (an enum or flag takes whole numbers). The one place a setting's range is
 /// decided: [`ShmHeader::apply_persisted_setting`] clamps to it, `shmctl set` refuses values
 /// outside it and the GUI's rows take their bounds from it.
-pub const SETTING_BOUNDS: [(&str, f32, f32); 116] = [
+pub const SETTING_BOUNDS: [(&str, f32, f32); 127] = [
     ("white_point", 0.01, 10000.0),
     ("white_point_scale", 0.01, 100.0),
     ("white_point_trim", 0.01, 100.0),
@@ -540,70 +556,70 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 116] = [
     // How many times the network runs over one frame (`resolved_passes`).
     ("passes", 1.0, 10.0),
     // Each pass's overrides (`enums::pass_override` bits) and its own values for them.
-    ("pass1_overrides", 0.0, 63.0),
+    ("pass1_overrides", 0.0, 127.0),
     ("pass1_intensity", 0.0, 4.0),
     ("pass1_local_tone", 0.0, 4.0),
     ("pass1_local_structure", 0.0, 4.0),
     ("pass1_skin_structure", -1.0, 4.0),
     ("pass1_style", 0.0, 2.0),
     ("pass1_auto_mask", 0.0, 1.0),
-    ("pass2_overrides", 0.0, 63.0),
+    ("pass2_overrides", 0.0, 127.0),
     ("pass2_intensity", 0.0, 4.0),
     ("pass2_local_tone", 0.0, 4.0),
     ("pass2_local_structure", 0.0, 4.0),
     ("pass2_skin_structure", -1.0, 4.0),
     ("pass2_style", 0.0, 2.0),
     ("pass2_auto_mask", 0.0, 1.0),
-    ("pass3_overrides", 0.0, 63.0),
+    ("pass3_overrides", 0.0, 127.0),
     ("pass3_intensity", 0.0, 4.0),
     ("pass3_local_tone", 0.0, 4.0),
     ("pass3_local_structure", 0.0, 4.0),
     ("pass3_skin_structure", -1.0, 4.0),
     ("pass3_style", 0.0, 2.0),
     ("pass3_auto_mask", 0.0, 1.0),
-    ("pass4_overrides", 0.0, 63.0),
+    ("pass4_overrides", 0.0, 127.0),
     ("pass4_intensity", 0.0, 4.0),
     ("pass4_local_tone", 0.0, 4.0),
     ("pass4_local_structure", 0.0, 4.0),
     ("pass4_skin_structure", -1.0, 4.0),
     ("pass4_style", 0.0, 2.0),
     ("pass4_auto_mask", 0.0, 1.0),
-    ("pass5_overrides", 0.0, 63.0),
+    ("pass5_overrides", 0.0, 127.0),
     ("pass5_intensity", 0.0, 4.0),
     ("pass5_local_tone", 0.0, 4.0),
     ("pass5_local_structure", 0.0, 4.0),
     ("pass5_skin_structure", -1.0, 4.0),
     ("pass5_style", 0.0, 2.0),
     ("pass5_auto_mask", 0.0, 1.0),
-    ("pass6_overrides", 0.0, 63.0),
+    ("pass6_overrides", 0.0, 127.0),
     ("pass6_intensity", 0.0, 4.0),
     ("pass6_local_tone", 0.0, 4.0),
     ("pass6_local_structure", 0.0, 4.0),
     ("pass6_skin_structure", -1.0, 4.0),
     ("pass6_style", 0.0, 2.0),
     ("pass6_auto_mask", 0.0, 1.0),
-    ("pass7_overrides", 0.0, 63.0),
+    ("pass7_overrides", 0.0, 127.0),
     ("pass7_intensity", 0.0, 4.0),
     ("pass7_local_tone", 0.0, 4.0),
     ("pass7_local_structure", 0.0, 4.0),
     ("pass7_skin_structure", -1.0, 4.0),
     ("pass7_style", 0.0, 2.0),
     ("pass7_auto_mask", 0.0, 1.0),
-    ("pass8_overrides", 0.0, 63.0),
+    ("pass8_overrides", 0.0, 127.0),
     ("pass8_intensity", 0.0, 4.0),
     ("pass8_local_tone", 0.0, 4.0),
     ("pass8_local_structure", 0.0, 4.0),
     ("pass8_skin_structure", -1.0, 4.0),
     ("pass8_style", 0.0, 2.0),
     ("pass8_auto_mask", 0.0, 1.0),
-    ("pass9_overrides", 0.0, 63.0),
+    ("pass9_overrides", 0.0, 127.0),
     ("pass9_intensity", 0.0, 4.0),
     ("pass9_local_tone", 0.0, 4.0),
     ("pass9_local_structure", 0.0, 4.0),
     ("pass9_skin_structure", -1.0, 4.0),
     ("pass9_style", 0.0, 2.0),
     ("pass9_auto_mask", 0.0, 1.0),
-    ("pass10_overrides", 0.0, 63.0),
+    ("pass10_overrides", 0.0, 127.0),
     ("pass10_intensity", 0.0, 4.0),
     ("pass10_local_tone", 0.0, 4.0),
     ("pass10_local_structure", 0.0, 4.0),
@@ -625,13 +641,32 @@ pub const SETTING_BOUNDS: [(&str, f32, f32); 116] = [
     ("mask_motion_structure", 0.0, 1.0),
     // How much of a pass's answer becomes the next pass's input.
     ("pass_feedback", 0.0, 1.0),
+    // The model resolution before the upscaler (`enums::model_scale`), and each pass's own.
+    ("preupscale_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass1_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass2_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass3_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass4_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass5_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass6_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass7_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass8_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass9_scale", crate::enums::model_scale::MIN, 1.0),
+    ("pass10_scale", crate::enums::model_scale::MIN, 1.0),
 ];
 
 /// The persisted name of pass `pass`'s (0 is pass 1) `field` (`overrides`, `intensity`, `local_tone`,
-/// `local_structure`, `skin_structure`, `style`, `auto_mask`): `pass<N>_<field>`.
+/// `local_structure`, `skin_structure`, `style`, `auto_mask`, `scale`): `pass<N>_<field>`.
 pub fn pass_setting(pass: usize, field: &str) -> Option<&'static str> {
     let name = format!("pass{}_{field}", pass + 1);
     SETTING_BOUNDS.iter().map(|&(n, ..)| n).find(|n| *n == name)
+}
+
+/// A model resolution setting's bits as the scale the layer uses: within
+/// [`crate::enums::model_scale::MIN`] and 1, and 1 for anything that is not a number.
+pub fn resolved_scale(bits: u32) -> f32 {
+    let s = f32::from_bits(bits);
+    if s.is_finite() { s.clamp(crate::enums::model_scale::MIN, 1.0) } else { 1.0 }
 }
 
 /// `(min, max)` for a persisted setting, from [`SETTING_BOUNDS`].
@@ -709,6 +744,10 @@ impl ShmHeader {
         self.mask_motion_intensity_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
         self.mask_motion_structure_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
         self.pass_feedback_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        self.preupscale_scale_bits.store(1.0f32.to_bits(), Ordering::Relaxed);
+        for s in &self.pass_scale_bits {
+            s.store(1.0f32.to_bits(), Ordering::Relaxed);
+        }
 
         self.server_state.store(crate::enums::server_state::STOPPED, Ordering::Relaxed);
         self.model_up.store(0, Ordering::Relaxed);
@@ -887,7 +926,7 @@ impl ShmHeader {
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
     /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
     /// tunable needs to survive a restart -- this is the one list that decides it.
-    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 116] {
+    pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 127] {
         [
             ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
             ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
@@ -1007,6 +1046,17 @@ impl ShmHeader {
             ("mask_motion_intensity", true, self.mask_motion_intensity_bits.load(Ordering::Relaxed)),
             ("mask_motion_structure", true, self.mask_motion_structure_bits.load(Ordering::Relaxed)),
             ("pass_feedback", true, self.pass_feedback_bits.load(Ordering::Relaxed)),
+            ("preupscale_scale", true, self.preupscale_scale_bits.load(Ordering::Relaxed)),
+            ("pass1_scale", true, self.pass_scale_bits[0].load(Ordering::Relaxed)),
+            ("pass2_scale", true, self.pass_scale_bits[1].load(Ordering::Relaxed)),
+            ("pass3_scale", true, self.pass_scale_bits[2].load(Ordering::Relaxed)),
+            ("pass4_scale", true, self.pass_scale_bits[3].load(Ordering::Relaxed)),
+            ("pass5_scale", true, self.pass_scale_bits[4].load(Ordering::Relaxed)),
+            ("pass6_scale", true, self.pass_scale_bits[5].load(Ordering::Relaxed)),
+            ("pass7_scale", true, self.pass_scale_bits[6].load(Ordering::Relaxed)),
+            ("pass8_scale", true, self.pass_scale_bits[7].load(Ordering::Relaxed)),
+            ("pass9_scale", true, self.pass_scale_bits[8].load(Ordering::Relaxed)),
+            ("pass10_scale", true, self.pass_scale_bits[9].load(Ordering::Relaxed)),
         ]
     }
 
@@ -1146,6 +1196,17 @@ impl ShmHeader {
             "mask_motion_intensity" => &self.mask_motion_intensity_bits,
             "mask_motion_structure" => &self.mask_motion_structure_bits,
             "pass_feedback" => &self.pass_feedback_bits,
+            "preupscale_scale" => &self.preupscale_scale_bits,
+            "pass1_scale" => &self.pass_scale_bits[0],
+            "pass2_scale" => &self.pass_scale_bits[1],
+            "pass3_scale" => &self.pass_scale_bits[2],
+            "pass4_scale" => &self.pass_scale_bits[3],
+            "pass5_scale" => &self.pass_scale_bits[4],
+            "pass6_scale" => &self.pass_scale_bits[5],
+            "pass7_scale" => &self.pass_scale_bits[6],
+            "pass8_scale" => &self.pass_scale_bits[7],
+            "pass9_scale" => &self.pass_scale_bits[8],
+            "pass10_scale" => &self.pass_scale_bits[9],
             _ => return false,
         };
         field.store(bits, Ordering::Relaxed);
@@ -1175,7 +1236,14 @@ impl ShmHeader {
             }
             let feedback = f32::from_bits(self.pass_feedback_bits.load(Ordering::Relaxed));
             let feedback = if feedback.is_finite() { feedback.clamp(0.0, 1.0) } else { 1.0 };
-            PassTunings { count: self.resolved_passes() as usize, tunings, feedback }
+            let global_scale = resolved_scale(self.preupscale_scale_bits.load(Ordering::Relaxed));
+            let mut scales = [global_scale; crate::MAX_PASSES];
+            for (k, s) in scales.iter_mut().enumerate() {
+                if self.pass[k].overrides.load(Ordering::Relaxed) & crate::enums::pass_override::SCALE != 0 {
+                    *s = resolved_scale(self.pass_scale_bits[k].load(Ordering::Relaxed));
+                }
+            }
+            PassTunings { count: self.resolved_passes() as usize, tunings, feedback, scales }
         })
     }
 
@@ -1597,7 +1665,7 @@ mod tests {
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_sky), std::mem::offset_of!(ShmHeader, network) + 4);
         assert_eq!(std::mem::offset_of!(ShmHeader, mask_motion_structure_bits) + 4, std::mem::offset_of!(ShmHeader, pass_feedback_bits));
         assert_eq!(std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4, std::mem::offset_of!(ShmHeader, scene_cuts));
-        assert_eq!(crate::SHM_VERSION, 20);
+        assert_eq!(crate::SHM_VERSION, 21);
         let h = ShmHeader::default();
         h.init_defaults();
         let m = h.mask_settings();
@@ -1621,7 +1689,7 @@ mod tests {
         // v20 appends the Network setting: every earlier field keeps its offset.
         assert_eq!(std::mem::offset_of!(ShmHeader, network), std::mem::offset_of!(ShmHeader, pass) + crate::MAX_PASSES * 28);
         assert_eq!(std::mem::offset_of!(ShmHeader, network) + 4, std::mem::offset_of!(ShmHeader, mask_sky));
-        assert_eq!(crate::SHM_VERSION, 20);
+        assert_eq!(crate::SHM_VERSION, 21);
         let h = ShmHeader::default();
         h.init_defaults();
         assert_eq!(h.network.load(Ordering::Relaxed), crate::enums::network::FULL, "the full network is the default");
@@ -1629,10 +1697,10 @@ mod tests {
 
     #[test]
     fn the_scene_cut_counter_is_appended_after_the_passes() {
-        // v20's last word: every earlier field keeps its offset, and the counter sits last.
+        // v20's last word: every earlier field keeps its offset, and v21's fields follow it.
         assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts), std::mem::offset_of!(ShmHeader, pass_feedback_bits) + 4);
-        assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::size_of::<ShmHeader>());
-        assert_eq!(crate::SHM_VERSION, 20);
+        assert_eq!(std::mem::offset_of!(ShmHeader, scene_cuts) + 4, std::mem::offset_of!(ShmHeader, preupscale_scale_bits));
+        assert_eq!(crate::SHM_VERSION, 21);
         let h = ShmHeader::default();
         h.scene_cuts.store(5, Ordering::Relaxed);
         h.init_defaults();
@@ -1695,7 +1763,42 @@ mod tests {
         assert_eq!(h.pass_tunings().tunings[9].intensity, 0.5);
         assert!(!h.apply_persisted_setting("pass11_intensity", 0), "there is no eleventh pass");
         assert!(h.apply_persisted_setting("pass1_overrides", 255));
-        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "clamped to the six fields");
+        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "clamped to the seven fields");
+    }
+
+    #[test]
+    fn the_model_resolution_is_appended_last_and_full_size_by_default() {
+        // v21 appends the model resolution and each pass's own: every earlier field keeps its offset.
+        assert_eq!(std::mem::offset_of!(ShmHeader, preupscale_scale_bits), std::mem::offset_of!(ShmHeader, scene_cuts) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits), std::mem::offset_of!(ShmHeader, preupscale_scale_bits) + 4);
+        assert_eq!(std::mem::offset_of!(ShmHeader, pass_scale_bits) + crate::MAX_PASSES * 4, std::mem::size_of::<ShmHeader>());
+        assert_eq!(crate::SHM_VERSION, 21);
+        let h = ShmHeader::default();
+        h.preupscale_scale_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+        h.pass_scale_bits[2].store(0.5f32.to_bits(), Ordering::Relaxed);
+        h.init_defaults();
+        let t = h.pass_tunings();
+        assert_eq!(t.scales, [1.0; crate::MAX_PASSES], "every pass at full size by default");
+        assert_eq!(f32::from_bits(h.pass_scale_bits[2].load(Ordering::Relaxed)), 1.0);
+    }
+
+    #[test]
+    fn a_pass_takes_its_own_model_resolution_only_when_it_overrides_it() {
+        use crate::enums::pass_override::SCALE;
+        let h = ShmHeader::default();
+        h.init_defaults();
+        assert!(h.write_settings(&[("preupscale_scale", 0.667f32.to_bits()), ("pass2_scale", 0.5f32.to_bits()), ("pass3_scale", 0.333f32.to_bits())]));
+        assert!(h.write_settings(&[("pass2_overrides", SCALE), ("passes", 3)]));
+        let t = h.pass_tunings();
+        assert_eq!(t.scales[0], 0.667, "pass 1 follows the setting");
+        assert_eq!(t.scales[1], 0.5, "pass 2 overrides it");
+        assert_eq!(t.scales[2], 0.667, "pass 3 has a value of its own but does not override");
+        assert!(h.write_settings(&[("preupscale_scale", 0.01f32.to_bits())]));
+        assert_eq!(h.pass_tunings().scales[0], crate::enums::model_scale::MIN, "clamped to its range");
+        h.preupscale_scale_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        assert_eq!(h.pass_tunings().scales[0], 1.0, "not a number is full size");
+        assert_eq!(crate::enums::model_scale::preset_of(0.58), Some(2));
+        assert_eq!(crate::enums::model_scale::preset_of(0.7), None);
     }
 
     #[test]

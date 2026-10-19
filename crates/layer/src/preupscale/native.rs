@@ -52,6 +52,8 @@ const PREPROCESS_SPV: &[u8] = include_bytes!("../../shaders/native_preprocess.sp
 const COMPOSITE_SPV: &[u8] = include_bytes!("../../shaders/native_composite.spv");
 const MASK_SPV: &[u8] = include_bytes!("../../shaders/native_mask.spv");
 const FEEDBACK_SPV: &[u8] = include_bytes!("../../shaders/native_feedback.spv");
+const REDUCE_SPV: &[u8] = include_bytes!("../../shaders/native_reduce.spv");
+const ENLARGE_SPV: &[u8] = include_bytes!("../../shaders/native_enlarge.spv");
 
 /// `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`: the frames record everything but the network's launches.
 fn skip_graph() -> bool {
@@ -153,9 +155,11 @@ struct LoaderState {
     network: Option<nn::Network>,
     /// Why the network is not usable right now (the Status tab shows it); cleared by a success.
     failed: Option<String>,
-    built: Option<Built>,
-    /// The size the holds want; the worker builds it.
-    wanted: Option<(u32, u32)>,
+    /// The graphs built, one per size (empty: none); one build makes them all (`nn::Network::build_sizes`).
+    built: Vec<Built>,
+    /// The sizes the holds want, in their order (the first pass's first: a model resolution per pass asks
+    /// for several); the worker builds them.
+    wanted: Option<Vec<(u32, u32)>>,
     fall_back: bool,
     quit: bool,
     generation: u64,
@@ -180,7 +184,12 @@ impl LoaderState {
     /// barriers, the network open is not the one the setting chooses, or a size is wanted that is not
     /// built.
     fn wants_work(&self) -> bool {
-        !self.dead && (!self.opened || self.fall_back || self.switching() || (self.wanted.is_some() && self.wanted != self.built.map(|b| (b.width, b.height))))
+        !self.dead && (!self.opened || self.fall_back || self.switching() || self.wanted.as_ref().is_some_and(|w| *w != self.built_sizes()))
+    }
+
+    /// The sizes of what is built, in their order.
+    fn built_sizes(&self) -> Vec<(u32, u32)> {
+        self.built.iter().map(|b| (b.width, b.height)).collect()
     }
 
     /// The network was last opened for another Network setting than the holds' now: it is closed (when
@@ -191,17 +200,25 @@ impl LoaderState {
 
     /// The build the holds may use for `size` and the Network setting `choice`, after noting what they
     /// want (the caller wakes the loader thread when this returns `true` in its second field).
+    #[cfg(test)]
     fn want(&mut self, size: (u32, u32), choice: u32) -> (Option<Built>, bool) {
+        let (built, wake) = self.want_sizes(&[size], choice);
+        (built.map(|b| b[0]), wake)
+    }
+
+    /// [`Self::want`] for several sizes at once (one graph each, built together): the builds in `sizes`'
+    /// order once exactly those are built.
+    fn want_sizes(&mut self, sizes: &[(u32, u32)], choice: u32) -> (Option<Vec<Built>>, bool) {
         let mut wake = false;
         if self.choice != choice {
             self.choice = choice;
             wake = true;
         }
-        if let Some(b) = self.built.filter(|b| (b.width, b.height) == size && self.opened_for == Some(choice)) {
-            return (Some(b), wake);
+        if self.opened_for == Some(choice) && !self.built.is_empty() && self.built_sizes() == sizes {
+            return (Some(self.built.clone()), wake);
         }
-        if self.wanted != Some(size) {
-            self.wanted = Some(size);
+        if self.wanted.as_deref() != Some(sizes) {
+            self.wanted = Some(sizes.to_vec());
             wake = true;
         }
         (None, wake)
@@ -265,6 +282,14 @@ fn epoch_ms() -> u64 {
 
 /// How long after one path last used the network the other may.
 const PATH_SWITCH_MS: u64 = 1000;
+
+/// The next [`Built::generation`] (process-wide).
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// `1485x836`, or `1485x836 and 743x418` for a build of several sizes.
+fn sizes_text(sizes: &[(u32, u32)]) -> String {
+    sizes.iter().map(|(w, h)| format!("{w}x{h}")).collect::<Vec<_>>().join(" and ")
+}
 
 unsafe extern "C" fn init_dispatchable(_user: *mut std::ffi::c_void, device: vk::Device, object: *mut std::ffi::c_void) {
     // SAFETY: a dispatchable object of `device` the network just got from below the loader.
@@ -448,9 +473,9 @@ impl Loader {
             let switching = state.switching();
             let mut network = state.network.take();
             let fall_back = std::mem::take(&mut state.fall_back) || (switching && state.barriers);
-            let size = state.wanted.or(state.built.map(|b| (b.width, b.height)));
+            let sizes = state.wanted.clone().or_else(|| (!state.built.is_empty()).then(|| state.built_sizes()));
             let choice = state.choice;
-            state.built = None;
+            state.built = Vec::new();
             drop(state);
             if step == Step::ReinitThenBuild && network.take().is_some() {
                 crate::log!("[native] {} failed attempts in a row: closing the network and loading it again", retry.streak());
@@ -490,22 +515,27 @@ impl Loader {
                     unsafe { n.fall_back_to_barriers() };
                     switched = true;
                 }
-                match size {
+                match sizes {
                     None => Ok((n, None)),
                     Some(_) if inject.as_mut().is_some_and(FailInject::should_fail) => {
                         network = Some(n);
                         Err(format!("{} asked this build to fail", FailInject::ENV))
                     }
-                    Some((w, h)) => {
+                    Some(sizes) => {
                         // SAFETY: nothing of the previous build is pending: a wanted size or a fallback is
                         // only asked for once the holds stopped using it (`ready` returns another size's
                         // build to no hold; `fall_back` is called after the frames that used it were
                         // drained; neither path takes the network while the other's work may run).
-                        match unsafe { n.build(w, h) } {
-                            Ok(frame) => Ok((n, Some((w, h, frame)))),
+                        // One size is the single build it always was.
+                        let made = match sizes.as_slice() {
+                            &[(w, h)] => unsafe { n.build(w, h) }.map(|f| vec![f]),
+                            _ => unsafe { n.build_sizes(&sizes) },
+                        };
+                        match made {
+                            Ok(frames) => Ok((n, Some(sizes.iter().zip(frames).map(|(&(w, h), f)| (w, h, f)).collect::<Vec<_>>()))),
                             Err(why) => {
                                 network = Some(n);
-                                Err(format!("building the network for {w}x{h} failed: {why}"))
+                                Err(format!("building the network for {} failed: {why}", sizes_text(&sizes)))
                             }
                         }
                     }
@@ -544,16 +574,33 @@ impl Loader {
             match result {
                 Ok((n, built)) => {
                     state.barriers |= switched;
-                    if let Some((w, h, frame)) = built {
-                        state.generation += 1;
+                    if let Some(built) = built {
+                        // Unique in the process: a hold's buffers recorded for one build are never taken
+                        // for another's.
+                        state.generation = NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                         let network = state.running;
-                        state.built = Some(Built { width: w, height: h, frame, graph: n.graph_commands(), graph_own: n.graph_commands_own(), generation: state.generation, network });
+                        let generation = state.generation;
+                        state.built = built
+                            .iter()
+                            .enumerate()
+                            .map(|(i, &(w, h, frame))| Built {
+                                width: w,
+                                height: h,
+                                frame,
+                                graph: n.graph_commands_at(i as u32),
+                                graph_own: n.graph_commands_own_at(i as u32),
+                                generation,
+                                network,
+                            })
+                            .collect();
+                        let fields: Vec<String> = built.iter().map(|(_, _, f)| format!("{}x{}", f.field_width, f.field_height)).collect();
+                        let sizes: Vec<(u32, u32)> = built.iter().map(|&(w, h, _)| (w, h)).collect();
                         lines.push(format!(
-                            "[native] network {}built for {w}x{h} (field {}x{}, chained {}) in {} ms{}",
+                            "[native] network {}built for {} (field {}, chained {}) in {} ms{}",
                             if fall_back { "re" } else { "" },
-                            frame.field_width,
-                            frame.field_height,
-                            frame.chained != 0,
+                            sizes_text(&sizes),
+                            fields.join(" and "),
+                            built.iter().any(|(_, _, f)| f.chained != 0),
                             t.elapsed().as_millis(),
                             match (vram_before, vram_after) {
                                 (Some((before, _)), Some((after, budget))) => format!(" (vram {before} -> {after} of {budget} MiB)"),
@@ -607,9 +654,16 @@ impl Loader {
     /// is not. Called only once the caller's frames that used the network have completed: another
     /// size or network asked for here frees the current build.
     pub(crate) fn ready(&self, width: u32, height: u32, choice: u32) -> Option<Built> {
+        self.ready_sizes(&[(width, height)], choice).map(|b| b[0])
+    }
+
+    /// [`Self::ready`] for several sizes (a model resolution per pass): one graph each, built together, in
+    /// `sizes`' order; `None` until exactly those are built. Asking for another set frees every graph of the
+    /// current one (the same rule as [`Self::ready`]'s).
+    pub(crate) fn ready_sizes(&self, sizes: &[(u32, u32)], choice: u32) -> Option<Vec<Built>> {
         self.spawn();
         let (lock, wake) = &*self.shared;
-        let (built, woken) = lock.lock().unwrap().want((width, height), choice);
+        let (built, woken) = lock.lock().unwrap().want_sizes(sizes, choice);
         if woken {
             wake.notify_all();
         }
@@ -634,7 +688,7 @@ impl Loader {
         let (lock, wake) = &*self.shared;
         let mut state = lock.lock().unwrap();
         state.fall_back = true;
-        state.built = None;
+        state.built = Vec::new();
         wake.notify_all();
     }
 }
@@ -678,6 +732,57 @@ pub(crate) struct Params {
     sky: [f32; 4],
     dark: [f32; 4],
     moving: [f32; 4],
+    /// A pass below the render extent (`native_reduce.comp`, `native_enlarge.comp`): the render extent, its
+    /// padded width, and the kind of the depth the capture copied (`cache::depth_kind`).
+    full: [u32; 4],
+    /// The pass's extent over the render extent (x, y), the enlarge's guide sigma, unused.
+    ratio: [f32; 4],
+}
+
+/// The model resolution's guide sigma (`native_enlarge.comp`), in the encoded picture's units: how far a
+/// low-resolution texel's colour may be from the full-resolution pixel's before its edit stops counting
+/// there (upstream's joint bilateral sigma, 0.08, on all three channels).
+pub(crate) const GUIDE_SIGMA: f32 = 0.08;
+
+/// The network's extent for a render extent at the model resolution `scale` (`preupscale_scale`,
+/// `pass<N>_scale`): each side rounded, at least 8 texels (or the side itself), at most the side. A scale of
+/// 1 or more, or one that is not a number, is the render extent itself.
+pub(crate) fn model_extent(width: u32, height: u32, scale: f32) -> (u32, u32) {
+    if scale.is_nan() || scale >= 1.0 {
+        return (width, height);
+    }
+    let s = scale.max(neural_forge_protocol::enums::model_scale::MIN);
+    let side = |n: u32| ((n as f32 * s).round() as u32).clamp(n.min(8), n);
+    (side(width), side(height))
+}
+
+/// Every pass slot's extent for a render extent and the passes' scales ([`model_extent`]).
+pub(crate) fn pass_extents(width: u32, height: u32, scales: &[f32; neural_forge_protocol::MAX_PASSES]) -> [(u32, u32); neural_forge_protocol::MAX_PASSES] {
+    scales.map(|s| model_extent(width, height, s))
+}
+
+/// The distinct extents the first `count` passes run at, pass 1's first: the sizes the network is built for.
+pub(crate) fn graph_sizes(extents: &[(u32, u32)], count: usize) -> Vec<(u32, u32)> {
+    let mut sizes: Vec<(u32, u32)> = Vec::new();
+    for &e in extents.iter().take(count.max(1)) {
+        if !sizes.contains(&e) {
+            sizes.push(e);
+        }
+    }
+    sizes
+}
+
+/// One extent's network as a frame runs it: its build and its recording for the hold's queue family.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Graph {
+    pub built: Built,
+    pub graph: vk::CommandBuffer,
+}
+
+impl Graph {
+    fn of(graphs: &[Graph], extent: (u32, u32)) -> Option<&Graph> {
+        graphs.iter().find(|g| (g.built.width, g.built.height) == extent)
+    }
 }
 
 /// The control mask's rules for one frame (`native_mask.comp`): bit 1 keeps the sky, 2 the dark rule, 4
@@ -762,11 +867,13 @@ pub(crate) struct Passes {
     pub mask: Mask,
     /// How much of a pass's answer becomes the next pass's input (1: the answer itself).
     pub feedback: f32,
+    /// Each pass's model resolution, a scale of the render extent (1: the network at it).
+    pub scales: [f32; neural_forge_protocol::MAX_PASSES],
 }
 
 impl Passes {
     pub(crate) fn one(c: Conditioning) -> Self {
-        Self { count: 1, each: [c; neural_forge_protocol::MAX_PASSES], mask: Mask::default(), feedback: 1.0 }
+        Self { count: 1, each: [c; neural_forge_protocol::MAX_PASSES], mask: Mask::default(), feedback: 1.0, scales: [1.0; neural_forge_protocol::MAX_PASSES] }
     }
 }
 
@@ -782,7 +889,7 @@ impl From<neural_forge_protocol::PassTunings> for Passes {
         for (c, &tuning) in each.iter_mut().zip(t.tunings.iter()) {
             *c = Conditioning::from(tuning);
         }
-        Self { count: t.count.clamp(1, neural_forge_protocol::MAX_PASSES), each, mask: Mask::default(), feedback: t.feedback }
+        Self { count: t.count.clamp(1, neural_forge_protocol::MAX_PASSES), each, mask: Mask::default(), feedback: t.feedback, scales: t.scales }
     }
 }
 
@@ -811,6 +918,9 @@ pub(crate) struct MorePasses {
     timer: Option<crate::gpu_timer::GpuTimer>,
     /// The [`Built::generation`] `commands` were recorded for.
     recorded: Option<u64>,
+    /// Per later pass, the generation its `commands` were recorded for (a pass whose extent has no graph in
+    /// that build is not recorded and does not run).
+    recorded_pass: Vec<Option<u64>>,
 }
 
 /// [`MorePasses::feedback`]: the blend's pipeline and its one set (the encoded image, the answer).
@@ -884,6 +994,9 @@ impl Feedback {
 
 /// The passes [`MorePasses`] holds.
 const MORE: usize = neural_forge_protocol::MAX_PASSES - 1;
+/// The storage images and storage buffers one frame set binds.
+const IMAGES_PER_SET: u32 = 3;
+const BUFFERS_PER_SET: u32 = 11;
 
 /// A device-local buffer of the layer's own.
 pub(crate) struct OwnBuffer {
@@ -1008,10 +1121,27 @@ pub(crate) fn depth_source(target: &Target) -> Option<vk::Format> {
 
 /// The layer's side of the native frame for one extent: the two frame shaders, the history images,
 /// DLSS's motion vectors' copy, the answer buffer, and the two recorded `N` buffers.
+///
+/// With a model resolution below 1 (`preupscale_scale`, `pass<N>_scale`) a pass runs at a smaller extent
+/// ([`Self::extents`]): its `N` buffer opens with `native_reduce.comp` (the encoded picture, the motion and
+/// the depth at that extent, into its [`Lane`]), runs the network there with its own history, and closes
+/// with `native_enlarge.comp`, which brings its edit back to the render extent in the answer buffer. Every
+/// pass's answer, and everything after the passes, is at the render extent.
 pub(crate) struct NativePass {
+    /// The render extent.
     width: u32,
     height: u32,
     padded_width: u32,
+    /// Each pass slot's extent (the render extent at a model resolution of 1), fixed for the pass's life: a
+    /// change builds another pass (and so starts every history afresh).
+    extents: [(u32, u32); neural_forge_protocol::MAX_PASSES],
+    /// The resources of each extent below the render extent a pass ran at, built on first use.
+    lanes: Vec<Lane>,
+    /// `native_reduce.comp` and `native_enlarge.comp`, built with the first lane.
+    resize: Option<[vk::Pipeline; 2]>,
+    /// The edit cache's buffers where pass 1's network input features cannot hold them (pass 1 below the
+    /// render extent), and their size.
+    cache_scratch: Option<(OwnBuffer, u64)>,
     set_layout: vk::DescriptorSetLayout,
     pipeline_layout: vk::PipelineLayout,
     preprocess: vk::Pipeline,
@@ -1059,6 +1189,64 @@ pub(crate) struct NativePass {
     mask_depth: vk::Buffer,
 }
 
+/// One extent below the render extent ([`NativePass::extents`]): what its passes read and write there.
+struct Lane {
+    width: u32,
+    height: u32,
+    /// The network's input at this extent (padded), written by `native_reduce.comp` from the render
+    /// extent's encoded image every pass that runs here.
+    encoded: OwnImage,
+    /// The motion (as the render extent's: f32 x and y, or DLSS's packed halves with `MOTION_HALF`), the
+    /// depth (f32 device depth) and the control mask at this extent, and the network's answer (padded).
+    motion: OwnBuffer,
+    depth: OwnBuffer,
+    mask: OwnBuffer,
+    answer: OwnBuffer,
+}
+
+impl Lane {
+    /// # Safety
+    /// `device` is live.
+    unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32) -> Option<Self> {
+        let (pw, ph) = super::padded(width, height);
+        let texels = u64::from(width) * u64::from(height);
+        let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+        // SAFETY: forwarded; each is destroyed below if another fails.
+        unsafe {
+            let encoded = OwnImage::new(device, instance, physical_device, pw, ph, vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST);
+            let motion = OwnBuffer::new(device, instance, physical_device, texels * 8, usage);
+            let depth = OwnBuffer::new(device, instance, physical_device, texels * 4, usage);
+            let mask = OwnBuffer::new(device, instance, physical_device, texels * 4, usage);
+            let answer = OwnBuffer::new(device, instance, physical_device, u64::from(pw) * u64::from(ph) * 8, usage);
+            match (encoded, motion, depth, mask, answer) {
+                (Some(encoded), Some(motion), Some(depth), Some(mask), Some(answer)) => Some(made(Self { width, height, encoded, motion, depth, mask, answer })),
+                (e, m, d, k, a) => {
+                    if let Some(e) = e {
+                        e.destroy(device);
+                    }
+                    for b in [m, d, k, a].into_iter().flatten() {
+                        b.destroy(device);
+                    }
+                    None
+                }
+            }
+        }
+    }
+
+    /// # Safety
+    /// Nothing submitted may still use it.
+    unsafe fn destroy(&self, device: &ash::Device) {
+        // SAFETY: forwarded.
+        unsafe {
+            self.encoded.destroy(device);
+            for b in [&self.motion, &self.depth, &self.mask, &self.answer] {
+                b.destroy(device);
+            }
+        }
+        destroyed(1);
+    }
+}
+
 /// [`NativePass::mask`].
 struct MaskPass {
     pipeline: vk::Pipeline,
@@ -1075,6 +1263,7 @@ impl NativePass {
     ///
     /// # Safety
     /// `device` is live; `family` is the queue family the frames are submitted on.
+    #[cfg(test)]
     pub(crate) unsafe fn build(
         device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32, motion_half: bool,
     ) -> Option<Self> {
@@ -1082,15 +1271,53 @@ impl NativePass {
         unsafe { Self::build_failing_at(device, instance, physical_device, family, width, height, None, motion_half) }
     }
 
+    /// [`Self::build`] with each pass slot at its own extent (`extents`, [`pass_extents`]): pass 1's history
+    /// at its extent; the rest is built as each pass first runs.
+    ///
+    /// # Safety
+    /// As [`Self::build`].
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build_at(
+        device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32,
+        extents: [(u32, u32); neural_forge_protocol::MAX_PASSES], motion_half: bool,
+    ) -> Option<Self> {
+        // SAFETY: forwarded.
+        let pass = unsafe { Self::build_inner(device, instance, physical_device, family, width, height, extents, None, motion_half) };
+        if let Some(p) = pass.as_ref().filter(|p| p.extents[0] != (width, height)) {
+            crate::log!(
+                "[native] model resolution: pass 1 runs the network at {}x{} of the render extent {width}x{height} ({:.0}%)",
+                p.extents[0].0,
+                p.extents[0].1,
+                100.0 * f64::from(p.extents[0].0) / f64::from(width)
+            );
+        }
+        pass
+    }
+
     /// [`Self::build`], failing on purpose at creation step `fail_at` (`0..BUILD_STEPS`) when given.
     /// Built piece by piece; [`PassPartial`] destroys whatever exists on an early return.
     ///
     /// # Safety
     /// As [`Self::build`].
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     unsafe fn build_failing_at(
         device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32, fail_at: Option<usize>,
         motion_half: bool,
+    ) -> Option<Self> {
+        let extents = [(width, height); neural_forge_protocol::MAX_PASSES];
+        // SAFETY: forwarded.
+        unsafe { Self::build_inner(device, instance, physical_device, family, width, height, extents, fail_at, motion_half) }
+    }
+
+    /// [`Self::build_failing_at`] with each pass slot's extent.
+    ///
+    /// # Safety
+    /// As [`Self::build`].
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn build_inner(
+        device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32,
+        extents: [(u32, u32); neural_forge_protocol::MAX_PASSES], fail_at: Option<usize>, motion_half: bool,
     ) -> Option<Self> {
         let (padded_width, padded_height) = super::padded(width, height);
         let binding = |n: u32, ty: vk::DescriptorType| {
@@ -1110,6 +1337,12 @@ impl NativePass {
             // The control mask, and the depth copy it reads (`native_mask.comp`).
             binding(10, vk::DescriptorType::STORAGE_BUFFER),
             binding(11, vk::DescriptorType::STORAGE_BUFFER),
+            // At the render extent, for a pass below it (`native_reduce.comp`, `native_enlarge.comp`): the
+            // encoded image, the motion, the depth copy and the answer.
+            binding(12, vk::DescriptorType::STORAGE_IMAGE),
+            binding(13, vk::DescriptorType::STORAGE_BUFFER),
+            binding(14, vk::DescriptorType::STORAGE_BUFFER),
+            binding(15, vk::DescriptorType::STORAGE_BUFFER),
         ];
         let mut steps = 0usize;
         // `Some` unless this creation step is the one to fail.
@@ -1150,9 +1383,9 @@ impl NativePass {
                     .ok()?,
             );
             let sizes = [
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 4 },
+                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 2 * IMAGES_PER_SET },
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 2 },
-                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 16 },
+                vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 * BUFFERS_PER_SET },
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 2 },
             ];
             step()?;
@@ -1163,7 +1396,8 @@ impl NativePass {
             let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(p.pool).set_layouts(&layouts)).ok()?;
             for _ in 0..2 {
                 step()?;
-                p.history.push(made(OwnImage::new(device, instance, physical_device, width, height, vk::ImageUsageFlags::SAMPLED)?));
+                // Pass 1's history, at its extent.
+                p.history.push(made(OwnImage::new(device, instance, physical_device, extents[0].0, extents[0].1, vk::ImageUsageFlags::SAMPLED)?));
             }
             let texels = u64::from(width) * u64::from(height);
             step()?;
@@ -1218,6 +1452,10 @@ impl NativePass {
                 width,
                 height,
                 padded_width,
+                extents,
+                lanes: Vec::new(),
+                resize: None,
+                cache_scratch: None,
                 set_layout: std::mem::take(&mut p.set_layout),
                 pipeline_layout: std::mem::take(&mut p.pipeline_layout),
                 preprocess: std::mem::take(&mut p.preprocess),
@@ -1254,6 +1492,86 @@ impl NativePass {
         (self.width, self.height) == (width, height)
     }
 
+    /// Built for the render extent `width` x `height` with every pass slot at `extents`.
+    pub(crate) fn matches_at(&self, width: u32, height: u32, extents: &[(u32, u32); neural_forge_protocol::MAX_PASSES]) -> bool {
+        self.matches(width, height) && self.extents == *extents
+    }
+
+    /// The edit cache's buffers: pass 1's network input features when they can hold `bytes` (as at a model
+    /// resolution of 1), else a buffer of the pass's own, built on first use. `None` when it cannot be.
+    ///
+    /// # Safety
+    /// `device` is live; nothing of the pass is pending.
+    pub(crate) unsafe fn cache_scratch(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, features: (vk::Buffer, u64), bytes: u64) -> Option<(vk::Buffer, u64)> {
+        if features.1 >= bytes {
+            return Some(features);
+        }
+        if self.cache_scratch.as_ref().is_none_or(|(_, n)| *n < bytes) {
+            if let Some((old, _)) = self.cache_scratch.take() {
+                // SAFETY: idle (the caller's contract).
+                unsafe { old.destroy(device) };
+                destroyed(1);
+            }
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+            // SAFETY: forwarded.
+            self.cache_scratch = unsafe { OwnBuffer::new(device, instance, physical_device, bytes, usage) }.map(|b| (made(b), bytes));
+        }
+        self.cache_scratch.as_ref().map(|(b, n)| (b.buffer, *n))
+    }
+
+    /// Builds the [`Lane`] of every extent below the render extent the first `count` passes run at, and the
+    /// two pipelines they use. `false` when something could not be built (the frame then misses). Nothing to
+    /// do at a model resolution of 1.
+    ///
+    /// # Safety
+    /// `device` is live; nothing of this pass is pending.
+    pub(crate) unsafe fn ensure_lanes(&mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, count: usize) -> bool {
+        let render = (self.width, self.height);
+        let wanted: Vec<(u32, u32)> = graph_sizes(&self.extents, count).into_iter().filter(|&e| e != render).collect();
+        if wanted.is_empty() {
+            return true;
+        }
+        if self.resize.is_none() {
+            let half = u32::from(self.motion_half).to_le_bytes();
+            let entry = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
+            let spec = vk::SpecializationInfo::builder().map_entries(&entry).data(&half).build();
+            // SAFETY: `device` is live; the layout is this pass's.
+            let reduce = unsafe { hdr::compute_pipeline_with(device, self.pipeline_layout, REDUCE_SPV, Some(&spec)) };
+            // SAFETY: as above.
+            let enlarge = unsafe { hdr::compute_pipeline_with(device, self.pipeline_layout, ENLARGE_SPV, Some(&spec)) };
+            match (reduce, enlarge) {
+                (Some(r), Some(e)) => self.resize = Some([made(r), made(e)]),
+                (r, e) => {
+                    // SAFETY: never used.
+                    unsafe {
+                        for p in [r, e].into_iter().flatten() {
+                            device.destroy_pipeline(p, None);
+                        }
+                    }
+                    return false;
+                }
+            }
+        }
+        for e in wanted {
+            if self.lane(e).is_some() {
+                continue;
+            }
+            // SAFETY: forwarded.
+            let Some(lane) = (unsafe { Lane::build(device, instance, physical_device, e.0, e.1) }) else { return false };
+            self.lanes.push(lane);
+            // Every set is written again with the lane's resources.
+            self.recorded = None;
+            if let Some(m) = self.more.as_mut() {
+                m.recorded = None;
+            }
+        }
+        true
+    }
+
+    fn lane(&self, extent: (u32, u32)) -> Option<&Lane> {
+        self.lanes.iter().find(|l| (l.width, l.height) == extent)
+    }
+
     /// The frame shaders' state buffer (binding 5: `ok[2]`, then `cut`, which the scene-cut detector writes
     /// in the capture).
     pub(crate) fn state_buffer(&self) -> vk::Buffer {
@@ -1276,18 +1594,36 @@ impl NativePass {
     /// # Safety
     /// `device` is live; `encoded` and `exposure` are the HDR pass's (live for as long as this pass).
     /// `graph` is `built`'s graph recorded for this pass's queue family.
+    #[cfg(test)]
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn record(
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, built: &Built, graph: vk::CommandBuffer, encoded: vk::ImageView,
         exposure: vk::Buffer, depth: Option<vk::Buffer>,
     ) -> bool {
+        // SAFETY: forwarded.
+        unsafe { self.record_graphs(device, instance, physical_device, &[Graph { built: *built, graph }], encoded, exposure, depth) }
+    }
+
+    /// [`Self::record`] with the network built for each extent the passes run at (`graphs`, one build: one
+    /// generation). Pass 1's extent must be among them; a later pass whose extent is not is not recorded (and
+    /// does not run).
+    ///
+    /// # Safety
+    /// As [`Self::record`]; every graph is recorded for this pass's queue family.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn record_graphs(
+        &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, graphs: &[Graph], encoded: vk::ImageView, exposure: vk::Buffer,
+        depth: Option<vk::Buffer>,
+    ) -> bool {
+        let Some(first) = Graph::of(graphs, self.extents[0]) else { return false };
+        let generation = first.built.generation;
         // SAFETY: forwarded; nothing of this pass is pending.
         if !unsafe { self.ensure_mask(device, instance, physical_device) } {
             return false;
         }
         let depth = depth.unwrap_or_else(|| self.mask.as_ref().map_or(vk::Buffer::null(), |m| m.no_depth.buffer));
-        let more_done = self.more.as_ref().is_none_or(|m| m.recorded == Some(built.generation));
-        if self.recorded == Some(built.generation) && more_done && self.mask_depth == depth {
+        let more_done = self.more.as_ref().is_none_or(|m| m.recorded == Some(generation));
+        if self.recorded == Some(generation) && more_done && self.mask_depth == depth {
             return true;
         }
         if self.mask_depth != depth {
@@ -1297,33 +1633,52 @@ impl NativePass {
                 m.recorded = None;
             }
         }
+        // Pass 1 below the render extent needs its lane (`ensure_lanes`).
+        let render = (self.width, self.height);
+        if self.extents[0] != render && (self.lane(self.extents[0]).is_none() || self.resize.is_none()) {
+            return false;
+        }
         for p in 0..2 {
             // SAFETY: forwarded; the sets are not in use.
-            unsafe { self.write_set(device, self.sets[p], p, self.params[p].buffer, &self.history, built, encoded, exposure) };
+            unsafe { self.write_set(device, self.sets[p], p, self.params[p].buffer, &self.history, &first.built, self.extents[0], encoded, exposure) };
         }
         let ok = (0..2).all(|p| {
             // SAFETY: forwarded from this function's contract.
-            unsafe { self.record_frame(device, self.commands[p], self.sets[p], self.timers[p].as_ref(), built, graph, true) }.is_ok()
+            unsafe { self.record_frame(device, self.commands[p], self.sets[p], self.timers[p].as_ref(), first, self.extents[0], true) }.is_ok()
         });
         // SAFETY: as above.
         let ok = ok && unsafe { self.record_init(device) }.is_ok();
+        let mut recorded_pass = vec![None; MORE];
         let more_ok = match &self.more {
             None => true,
             Some(m) => (0..MORE).all(|k| {
                 let Some(history) = &m.history[k] else { return true };
-                (0..2).all(|p| {
+                let extent = self.extents[k + 1];
+                // A pass whose extent has no graph in this build, or no lane yet, is not recorded.
+                let Some(g) = Graph::of(graphs, extent) else { return true };
+                if extent != render && self.lane(extent).is_none() {
+                    return true;
+                }
+                // The control mask is built by the first pass at each extent.
+                let mask = !self.extents[..=k].contains(&extent);
+                let ok = (0..2).all(|p| {
                     // SAFETY: as above: nothing of this pass is pending.
                     unsafe {
-                        self.write_set(device, m.sets[k][p], p, m.params[k][p].buffer, history, built, encoded, exposure);
-                        self.record_frame(device, m.commands[k][p], m.sets[k][p], None, built, graph, false)
+                        self.write_set(device, m.sets[k][p], p, m.params[k][p].buffer, history, &g.built, extent, encoded, exposure);
+                        self.record_frame(device, m.commands[k][p], m.sets[k][p], None, g, extent, mask)
                     }
                     .is_ok()
-                })
+                });
+                if ok {
+                    recorded_pass[k] = Some(generation);
+                }
+                ok
             }),
         };
-        self.recorded = ok.then_some(built.generation);
+        self.recorded = ok.then_some(generation);
         if let Some(m) = self.more.as_mut() {
-            m.recorded = more_ok.then_some(built.generation);
+            m.recorded = more_ok.then_some(generation);
+            m.recorded_pass = recorded_pass;
         }
         ok && more_ok
     }
@@ -1372,27 +1727,33 @@ impl NativePass {
     ///
     /// # Safety
     /// As [`Self::record`]; `set` is not in use.
+    /// `extent` is the pass's: below the render extent it reads and writes its [`Lane`]'s resources, and the
+    /// render extent's are bound beside them (bindings 12 to 15) for the reduce and the enlarge.
     #[allow(clippy::too_many_arguments)]
     unsafe fn write_set(
-        &self, device: &ash::Device, set: vk::DescriptorSet, p: usize, params: vk::Buffer, history: &[OwnImage; 2], built: &Built, encoded: vk::ImageView,
-        exposure: vk::Buffer,
+        &self, device: &ash::Device, set: vk::DescriptorSet, p: usize, params: vk::Buffer, history: &[OwnImage; 2], built: &Built, extent: (u32, u32),
+        encoded: vk::ImageView, exposure: vk::Buffer,
     ) {
         let f = built.frame;
         let general = |view| [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }];
-        let enc = general(encoded);
+        let lane = self.lane(extent).filter(|_| extent != (self.width, self.height));
+        let full_motion = if self.motion_half { self.mvec.buffer } else { self.acc.buffer };
+        let enc = general(lane.map_or(encoded, |l| l.encoded.view));
+        let full_enc = general(encoded);
         let next = general(history[1 - p].view);
         let prev = [vk::DescriptorImageInfo { sampler: self.sampler, image_view: history[p].view, image_layout: vk::ImageLayout::GENERAL }];
         let buf = |buffer, range| [vk::DescriptorBufferInfo { buffer, offset: 0, range }];
-        let mask = self.mask.as_ref().map_or(vk::Buffer::null(), |m| m.buffer.buffer);
-        let (mask_buf, depth_buf) = (buf(mask, vk::WHOLE_SIZE), buf(self.mask_depth, vk::WHOLE_SIZE));
+        let mask = lane.map_or_else(|| self.mask.as_ref().map_or(vk::Buffer::null(), |m| m.buffer.buffer), |l| l.mask.buffer);
+        let (mask_buf, depth_buf) = (buf(mask, vk::WHOLE_SIZE), buf(lane.map_or(self.mask_depth, |l| l.depth.buffer), vk::WHOLE_SIZE));
+        let (full_motion_buf, full_depth_buf, full_answer_buf) = (buf(full_motion, vk::WHOLE_SIZE), buf(self.mask_depth, vk::WHOLE_SIZE), buf(self.answer.buffer, vk::WHOLE_SIZE));
         let (mv, feat, head, params, state, expo, ans) = (
-            buf(if self.motion_half { self.mvec.buffer } else { self.acc.buffer }, vk::WHOLE_SIZE),
+            buf(lane.map_or(full_motion, |l| l.motion.buffer), vk::WHOLE_SIZE),
             buf(f.features, vk::WHOLE_SIZE),
             buf(f.head, vk::WHOLE_SIZE),
             buf(params, PARAMS_BYTES),
             buf(self.state.buffer, vk::WHOLE_SIZE),
             buf(exposure, 4),
-            buf(self.answer.buffer, vk::WHOLE_SIZE),
+            buf(lane.map_or(self.answer.buffer, |l| l.answer.buffer), vk::WHOLE_SIZE),
         );
         let w = |binding, ty| vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(binding).descriptor_type(ty);
         let writes = [
@@ -1408,6 +1769,10 @@ impl NativePass {
             w(9, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&head).build(),
             w(10, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&mask_buf).build(),
             w(11, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&depth_buf).build(),
+            w(12, vk::DescriptorType::STORAGE_IMAGE).image_info(&full_enc).build(),
+            w(13, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_motion_buf).build(),
+            w(14, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_depth_buf).build(),
+            w(15, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_answer_buf).build(),
         ];
         // SAFETY: the set is not in use (contract); every handle is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -1423,12 +1788,14 @@ impl NativePass {
         if !unsafe { self.ensure_more_base(device, instance, physical_device, family) } {
             return false;
         }
-        let (width, height) = (self.width, self.height);
+        let extents = self.extents;
         let Some(m) = self.more.as_mut() else { return false };
         for k in 0..count.saturating_sub(1).min(MORE) {
             if m.history[k].is_some() {
                 continue;
             }
+            // Pass k + 2's history, at its extent.
+            let (width, height) = extents[k + 1];
             // SAFETY: `device` is live.
             let a = unsafe { OwnImage::new(device, instance, physical_device, width, height, vk::ImageUsageFlags::SAMPLED) };
             // SAFETY: as above.
@@ -1466,9 +1833,9 @@ impl NativePass {
             return true;
         }
         let sizes = [
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 4 * MORE as u32 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 2 * IMAGES_PER_SET * MORE as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::COMBINED_IMAGE_SAMPLER, descriptor_count: 2 * MORE as u32 },
-            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 16 * MORE as u32 },
+            vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 * BUFFERS_PER_SET * MORE as u32 },
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 2 * MORE as u32 },
         ];
         // SAFETY: valid create info.
@@ -1539,6 +1906,7 @@ impl NativePass {
             saved,
             timer,
             recorded: None,
+            recorded_pass: vec![None; MORE],
         });
         true
     }
@@ -1660,10 +2028,13 @@ impl NativePass {
     /// As [`Self::record`].
     #[allow(clippy::too_many_arguments)]
     unsafe fn record_frame(
-        &self, device: &ash::Device, cmd: vk::CommandBuffer, set: vk::DescriptorSet, timer: Option<&crate::gpu_timer::GpuTimer>, built: &Built, graph: vk::CommandBuffer,
+        &self, device: &ash::Device, cmd: vk::CommandBuffer, set: vk::DescriptorSet, timer: Option<&crate::gpu_timer::GpuTimer>, g: &Graph, extent: (u32, u32),
         mask: bool,
     ) -> ash::prelude::VkResult<()> {
-        let f = built.frame;
+        let (f, graph) = (g.built.frame, g.graph);
+        let (width, height) = extent;
+        // Below the render extent: the reduce first, the enlarge last (`ensure_lanes` built them).
+        let resize = self.lane(extent).filter(|_| extent != (self.width, self.height)).zip(self.resize);
         let compute = |src: vk::AccessFlags, dst: vk::AccessFlags| vk::MemoryBarrier::builder().src_access_mask(src).dst_access_mask(dst).build();
         // SAFETY: the layer's own buffer, not pending (forwarded); every handle is live.
         unsafe {
@@ -1684,10 +2055,37 @@ impl NativePass {
                 &[],
             );
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[set], &[]);
-            // Pass 1 builds the control mask every pass reads (it writes nothing while no rule is on).
+            if let Some((lane, [reduce, _])) = resize {
+                // The network's input, motion and depth at this extent, from the render extent's (the lane's
+                // encoded image is rewritten whole: from UNDEFINED).
+                let to_general = vk::ImageMemoryBarrier::builder()
+                    .old_layout(vk::ImageLayout::UNDEFINED)
+                    .new_layout(vk::ImageLayout::GENERAL)
+                    .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
+                    .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
+                    .image(lane.encoded.image)
+                    .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
+                    .build();
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, reduce);
+                let (pw, ph) = super::padded(width, height);
+                device.cmd_dispatch(cmd, pw.div_ceil(8), ph.div_ceil(8), 1);
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[compute(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)],
+                    &[],
+                    &[],
+                );
+            }
+            // The first pass at each extent builds the control mask the passes there read (it writes nothing
+            // while no rule is on).
             if let Some(m) = self.mask.as_ref().filter(|_| mask) {
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, m.pipeline);
-                device.cmd_dispatch(cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+                device.cmd_dispatch(cmd, width.div_ceil(8), height.div_ceil(8), 1);
                 device.cmd_pipeline_barrier(
                     cmd,
                     vk::PipelineStageFlags::COMPUTE_SHADER,
@@ -1727,7 +2125,22 @@ impl NativePass {
             // The graph's secondary may have bound its own pipeline layout and sets: bind again.
             device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, self.pipeline_layout, 0, &[set], &[]);
             device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, self.composite);
-            device.cmd_dispatch(cmd, self.width.div_ceil(8), self.height.div_ceil(8), 1);
+            device.cmd_dispatch(cmd, width.div_ceil(8), height.div_ceil(8), 1);
+            if let Some((_, [_, enlarge])) = resize {
+                // The edit back to the render extent, into the answer buffer `W` and the next pass read.
+                device.cmd_pipeline_barrier(
+                    cmd,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::PipelineStageFlags::COMPUTE_SHADER,
+                    vk::DependencyFlags::empty(),
+                    &[compute(vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)],
+                    &[],
+                    &[],
+                );
+                device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, enlarge);
+                let (pw, ph) = super::padded(self.width, self.height);
+                device.cmd_dispatch(cmd, pw.div_ceil(8), ph.div_ceil(8), 1);
+            }
             // The answer to `W`'s copy, the history to the next frame's samplers.
             device.cmd_pipeline_barrier(
                 cmd,
@@ -1803,8 +2216,19 @@ impl NativePass {
 
     /// [`Self::frame`] for `passes`: also writes each later pass's parameters (when [`MorePasses`] is
     /// built) and returns its `N[parity]` buffers, pass 2 first, to submit after pass 1's.
+    #[cfg(test)]
     pub(crate) fn frame_passes(
         &mut self, built: &Built, history: bool, jitter: Option<[f32; 2]>, mvec_scale: [f32; 2], passes: &Passes,
+    ) -> ([Option<vk::CommandBuffer>; 2], Vec<vk::CommandBuffer>) {
+        let graph = [Graph { built: *built, graph: vk::CommandBuffer::null() }];
+        self.frame_graphs(&graph, history, jitter, mvec_scale, passes)
+    }
+
+    /// [`Self::frame_passes`] with the network built for each extent the passes run at (`graphs`, as given
+    /// to [`Self::record_graphs`]). A pass below the render extent gets its motion vectors' scale, the
+    /// jitter's step and the control mask's motion threshold in its own pixels.
+    pub(crate) fn frame_graphs(
+        &mut self, graphs: &[Graph], history: bool, jitter: Option<[f32; 2]>, mvec_scale: [f32; 2], passes: &Passes,
     ) -> ([Option<vk::CommandBuffer>; 2], Vec<vk::CommandBuffer>) {
         let p = (self.frames & 1) as usize;
         self.seed = if history { self.seed.wrapping_add(1) } else { 0 };
@@ -1813,35 +2237,50 @@ impl NativePass {
             _ => [0.0, 0.0],
         };
         self.last_jitter = jitter;
-        let f = built.frame;
+        let render = (self.width, self.height);
+        let generation = Graph::of(graphs, self.extents[0]).map(|g| g.built.generation);
         // A pass without history (pass 2 on whose previous frame it did not run) starts afresh: seed 0, no
         // jitter step, no blend toward its history.
-        let params = |c: &Conditioning, history: bool| Params {
-            dims: [f.field_width, f.field_height, self.width, self.height],
-            frame: [self.padded_width, if history { self.seed } else { 0 }, u32::from(history), p as u32],
-            motion: [if history { delta[0] } else { 0.0 }, if history { delta[1] } else { 0.0 }, f.blend_scale, c.intensity],
-            control: [c.style as f32, c.local_tone, c.local_structure, c.skin_structure],
-            more: [if c.auto_mask { 1.0 } else { 0.0 }, mvec_scale[0], mvec_scale[1], 0.0],
-            mask: [passes.mask.rules, passes.mask.depth_kind, u32::from(passes.mask.reversed), 0],
-            sky: [passes.mask.sky_margin, 0.0, 0.0, 0.0],
-            dark: [passes.mask.dark[0], passes.mask.dark[1], passes.mask.dark[2], 0.0],
-            moving: [passes.mask.motion[0], passes.mask.motion[1], passes.mask.motion[2], 0.0],
+        let params = |c: &Conditioning, history: bool, extent: (u32, u32)| {
+            let f = Graph::of(graphs, extent).map_or_else(nn::Frame::default, |g| g.built.frame);
+            let (width, height) = extent;
+            let scaled = extent != render;
+            // Model pixels per render pixel.
+            let k = [width as f32 / render.0 as f32, height as f32 / render.1 as f32];
+            let (delta, mvec_scale) = if scaled { ([delta[0] * k[0], delta[1] * k[1]], [mvec_scale[0] * k[0], mvec_scale[1] * k[1]]) } else { (delta, mvec_scale) };
+            let threshold = if scaled { passes.mask.motion[0] * 0.5 * (k[0] + k[1]) } else { passes.mask.motion[0] };
+            // A lane's depth is f32 device depth (`native_reduce.comp` converts the copy).
+            let depth_kind = if scaled && passes.mask.depth_kind != 0 { 1 } else { passes.mask.depth_kind };
+            Params {
+                dims: [f.field_width, f.field_height, width, height],
+                frame: [super::padded(width, height).0, if history { self.seed } else { 0 }, u32::from(history), p as u32],
+                motion: [if history { delta[0] } else { 0.0 }, if history { delta[1] } else { 0.0 }, f.blend_scale, c.intensity],
+                control: [c.style as f32, c.local_tone, c.local_structure, c.skin_structure],
+                more: [if c.auto_mask { 1.0 } else { 0.0 }, mvec_scale[0], mvec_scale[1], 0.0],
+                mask: [passes.mask.rules, depth_kind, u32::from(passes.mask.reversed), 0],
+                sky: [passes.mask.sky_margin, 0.0, 0.0, 0.0],
+                dark: [passes.mask.dark[0], passes.mask.dark[1], passes.mask.dark[2], 0.0],
+                moving: [threshold, passes.mask.motion[1], passes.mask.motion[2], 0.0],
+                full: [render.0, render.1, self.padded_width, passes.mask.depth_kind],
+                ratio: [k[0], k[1], GUIDE_SIGMA, 0.0],
+            }
         };
         let write = |buffer: &HostBuffer, params: Params| {
             // SAFETY: host-coherent and mapped for PARAMS_BYTES; parity `p`'s previous use (two frames
             // ago) completed: the hold waits for the previous hold's work before it records anything.
             unsafe { std::ptr::copy_nonoverlapping(std::ptr::from_ref(&params).cast::<u8>(), buffer.ptr, PARAMS_BYTES as usize) };
         };
-        write(&self.params[p], params(&passes.each[0], history));
+        write(&self.params[p], params(&passes.each[0], history, self.extents[0]));
         let mut later = Vec::new();
         let frame = self.frames;
-        if let Some(m) = self.more.as_mut().filter(|m| m.recorded == Some(built.generation)) {
-            for k in 1..passes.count.min(neural_forge_protocol::MAX_PASSES) {
-                if m.history[k - 1].is_none() {
+        let extents = self.extents;
+        if let Some(m) = self.more.as_mut().filter(|m| generation.is_some() && m.recorded == generation) {
+            for (k, &extent) in extents.iter().enumerate().take(passes.count.min(neural_forge_protocol::MAX_PASSES)).skip(1) {
+                if m.history[k - 1].is_none() || m.recorded_pass[k - 1] != generation {
                     break;
                 }
                 let own = history && frame > 0 && m.last_run[k - 1] == Some(frame - 1);
-                write(&m.params[k - 1][p], params(&passes.each[k], own));
+                write(&m.params[k - 1][p], params(&passes.each[k], own, extent));
                 m.last_run[k - 1] = Some(frame);
                 later.push(m.commands[k - 1][p]);
             }
@@ -1877,6 +2316,17 @@ impl NativePass {
                 m.buffer.destroy(device);
                 m.no_depth.destroy(device);
                 destroyed(3);
+            }
+            for lane in &self.lanes {
+                lane.destroy(device);
+            }
+            for p in self.resize.iter().flatten() {
+                device.destroy_pipeline(*p, None);
+                destroyed(1);
+            }
+            if let Some((b, _)) = &self.cache_scratch {
+                b.destroy(device);
+                destroyed(1);
             }
             if let Some(m) = &self.more {
                 // The command buffers go with the pass's pool.
@@ -2154,6 +2604,17 @@ pub(crate) fn format_of(target: &Target) -> (u32, u32) {
 }
 
 
+/// The native pass when it was built for other pass extents than `extents` (another model resolution),
+/// taken out of `native` for the caller to destroy; `None` (and `native` as it was) when it matches or there
+/// is none.
+pub(crate) fn take_other_extents(native: &mut Option<NativePass>, width: u32, height: u32, extents: &[(u32, u32); neural_forge_protocol::MAX_PASSES]) -> Option<NativePass> {
+    if native.as_ref().is_some_and(|n| !n.matches_at(width, height, extents)) {
+        native.take()
+    } else {
+        None
+    }
+}
+
 /// The motion vectors the capture copies into the native pass this frame, by the capture's own rule
 /// (`super::capture_reads`): readable, in a layout a copy can read from. The history is only enabled
 /// with them; one in `UNDEFINED` is not copied, and the history would reproject with stale vectors.
@@ -2235,20 +2696,26 @@ pub(crate) unsafe fn run_native_hold(
         result.miss = Some("the network's counter chain timed out; it is being rebuilt with barriers");
         return result;
     }
+    // The model resolution (`preupscale_scale`, `pass<N>_scale`): each pass slot's extent, and the sizes the
+    // network is built for (one at a model resolution of 1: the render extent, as always).
+    let extents = pass_extents(target.width, target.height, &passes.scales);
+    let sizes = graph_sizes(&extents, passes.count);
     // The Network setting (`choice`): a switch frees the current build here (this hold's previous work
     // was waited for above, the other path's is kept off by `claim_pre`), and the frames go to DLSS
-    // untouched until the chosen network is built.
-    let Some(built) = loader.ready(target.width, target.height, choice) else {
+    // untouched until the chosen network is built. So does another set of sizes.
+    let Some(builts) = loader.ready_sizes(&sizes, choice) else {
         if let Some(n) = res.native.as_mut() {
             n.gap.skipped();
         }
         result.miss = Some(if loader.failed().is_some() { "the native network could not be loaded or built" } else { "the native network is still loading" });
         return result;
     };
+    // Pass 1's: its network, its generation and its input features (where the edit cache's buffers live).
+    let built = builts[0];
     // Counter chaining faulted the GPU from the hold inside DLSS's buffer (Black Myth: Wukong, 3 runs
     // of 4: Xid 13 then 32 within seconds; none of 2 with barriers): that hold rebuilds the network
     // with barriers between its launches, for the rest of the process (`fall_back_to_barriers`).
-    if !chain_ok && built.frame.chained != 0 {
+    if !chain_ok && builts.iter().any(|b| b.frame.chained != 0) {
         crate::log!("[native] the hold inside DLSS's buffer runs the network with barriers between its launches, not counter chaining; rebuilding it");
         crate::logging::flush();
         loader.fall_back();
@@ -2293,10 +2760,10 @@ pub(crate) unsafe fn run_native_hold(
     // The graph for the queue the frames go to: the game's graphics family (the split hold) or the
     // network's own compute family (the hold inside DLSS's buffer, on the layer's side queue).
     let setup = loader.setup();
-    let graph = if res.queue_family == setup.frame_family {
-        built.graph
+    let graphs: Vec<Graph> = if res.queue_family == setup.frame_family {
+        builts.iter().map(|&b| Graph { built: b, graph: b.graph }).collect()
     } else if res.queue_family == setup.family {
-        built.graph_own
+        builts.iter().map(|&b| Graph { built: b, graph: b.graph_own }).collect()
     } else {
         result.miss = Some("the hold's queue family is not one the network was recorded for");
         return result;
@@ -2312,13 +2779,23 @@ pub(crate) unsafe fn run_native_hold(
     debug_assert!(res.native.as_ref().is_none_or(|n| n.matches(target.width, target.height)));
     debug_assert!(res.edit.as_ref().is_none_or(|c| c.matches(target.width, target.height)));
     debug_assert!(res.scene.as_ref().is_none_or(|s| s.matches(target.width, target.height)));
+    // Another model resolution: the pass is built again (every history starts afresh, at its new extent),
+    // and the edit cache refreshes rather than carry an edit through the old pass's motion.
+    if let Some(old) = take_other_extents(&mut res.native, target.width, target.height, &extents) {
+        crate::log!("[native] resetting the history (the model resolution changed)");
+        // SAFETY: idle (`wait_idle` above).
+        unsafe { old.destroy(device) };
+        if let Some(e) = res.edit.as_mut() {
+            e.state.drop_edit();
+        }
+    }
     let mut native = match res.native.take() {
         Some(n) => n,
         None => {
             let family = res.queue_family;
             // SAFETY: `device` is live; `family` is the frames' family.
             let built = res.native_retry.pass.build((target.width, target.height), now, || unsafe {
-                NativePass::build(device, instance, physical_device, family, target.width, target.height, !cache_on)
+                NativePass::build_at(device, instance, physical_device, family, target.width, target.height, extents, !cache_on)
             });
             match built {
                 Some(n) => n,
@@ -2335,6 +2812,13 @@ pub(crate) unsafe fn run_native_hold(
         // SAFETY: `device` is live; `family` is the pass's; nothing of it is pending.
         unsafe { native.ensure_more(device, instance, physical_device, family, passes.count) }
     };
+    // Below a model resolution of 1: the passes' resources at their extents.
+    // SAFETY: as above.
+    if !unsafe { native.ensure_lanes(device, instance, physical_device, passes.count) } {
+        res.native = Some(native);
+        result.miss = Some("the model resolution's buffers could not be built");
+        return result;
+    }
     // The history needs DLSS's motion vectors copied this frame.
     let mvec = copied_mvec(target.mvec);
     // DLSS's depth, wherever it can be read, into the layer's own buffer: for the edit cache only.
@@ -2353,7 +2837,7 @@ pub(crate) unsafe fn run_native_hold(
     passes.mask = passes.mask.for_frame(depth.map_or(0, super::cache::depth_kind), res.edit.as_ref().and_then(|e| e.state.reverse_z()));
     let depth_buffer = depth.and(res.depth.as_ref()).map(DepthCopy::buffer);
     // SAFETY: nothing of the pass is pending (`wait_idle` above); the HDR pass outlives it in `res`.
-    if !unsafe { native.record(device, instance, physical_device, &built, graph, encoded, exposure, depth_buffer) } {
+    if !unsafe { native.record_graphs(device, instance, physical_device, &graphs, encoded, exposure, depth_buffer) } {
         res.native = Some(native);
         result.miss = Some("recording the native frame failed");
         return result;
@@ -2407,9 +2891,18 @@ pub(crate) unsafe fn run_native_hold(
     let mut plan = None;
     let mut push = None;
     let mut chained = false;
+    // Above interval 1 the cache's buffers are in the network's input features (`cache::ScratchLayout`), or
+    // with pass 1 below the render extent (whose features are too small) in a buffer of the pass's own.
+    let scratch = match res.edit.as_ref().filter(|_| cache_on) {
+        Some(edit) => {
+            let bytes = edit.scratch_bytes();
+            // SAFETY: `device` is live; nothing of the pass is pending (`wait_idle` above).
+            unsafe { native.cache_scratch(device, instance, physical_device, (built.frame.features, built.frame.features_bytes), bytes) }.unwrap_or((built.frame.features, built.frame.features_bytes))
+        }
+        None => (built.frame.features, built.frame.features_bytes),
+    };
     if let Some(edit) = res.edit.as_mut().filter(|_| cache_on) {
-        // Above interval 1 the cache's buffers are in the network's input features (`cache::ScratchLayout`).
-        chained = edit.chain(built.frame.features_bytes);
+        chained = edit.chain(scratch.1);
         if !chained {
             edit.unchain();
         }
@@ -2434,7 +2927,7 @@ pub(crate) unsafe fn run_native_hold(
             depth: depth.and(res.depth.as_ref()).map(DepthCopy::buffer),
             mvec: native.mvec.buffer,
             acc: native.acc.buffer,
-            scratch: (built.frame.features, built.frame.features_bytes),
+            scratch,
         };
         // SAFETY: nothing of the pass is pending; every handle is live.
         unsafe { edit.bind(device, &bindings) };
@@ -2544,7 +3037,7 @@ pub(crate) unsafe fn run_native_hold(
             result.scene_cut = matches!(stale, Some(Stale::SceneCut(_)));
         }
         let history = native.frames > 0 && stale.is_none() && mvec.is_some();
-        let (cmds, later) = native.frame_passes(&built, history, jitter, target.mvec_scale, &passes);
+        let (cmds, later) = native.frame_graphs(&graphs, history, jitter, target.mvec_scale, &passes);
         (history, cmds, if more { later } else { Vec::new() })
     };
     res.native = Some(native);
@@ -2715,8 +3208,8 @@ mod tests {
     #[test]
     fn another_network_chosen_is_not_served_the_open_one_and_wakes_the_loader() {
         let mut s = LoaderState { opened: true, opened_for: Some(network::FULL), running: network::FULL, ..Default::default() };
-        s.built = Some(built((64, 32), 1, network::FULL));
-        s.wanted = Some((64, 32));
+        s.built = vec![built((64, 32), 1, network::FULL)];
+        s.wanted = Some(vec![(64, 32)]);
         assert!(!s.wants_work(), "the full network is built for the size wanted");
         let (b, wake) = s.want((64, 32), network::FULL);
         assert_eq!((b.map(|b| b.generation), wake), (Some(1), false), "the default choice gets the open network");
@@ -2728,7 +3221,7 @@ mod tests {
         // The loader opened and built the small network (what `work` stores).
         s.opened_for = Some(network::SMALL);
         s.running = network::SMALL;
-        s.built = Some(built((64, 32), 2, network::SMALL));
+        s.built = vec![built((64, 32), 2, network::SMALL)];
         assert!(!s.switching() && !s.wants_work());
         let (b, wake) = s.want((64, 32), network::SMALL);
         assert_eq!((b.map(|b| (b.generation, b.network)), wake), (Some((2, network::SMALL)), false));
@@ -3652,6 +4145,463 @@ mod tests {
             assert_eq!((*pass.params[((pass.frames - 1) & 1) as usize].ptr.cast::<Params>()).frame[2], 0, "its parameters' history flag is off");
             assert_eq!(pass.gap.begin(t0), None, "once");
             pass.destroy(device);
+        }
+    }
+
+    /// The render extent of the model resolution tests (half of it is above the 8-texel floor).
+    const SW: u32 = 20;
+    const SH: u32 = 16;
+
+    /// A network stand-in for one extent: host-visible features and head, the given field.
+    struct Stand {
+        built: Built,
+        features: HostBuffer,
+        head: HostBuffer,
+    }
+
+    impl Stand {
+        /// # Safety
+        /// `device` is live; `graph` is an empty secondary of it.
+        unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, extent: (u32, u32), field: (u32, u32), graph: vk::CommandBuffer, generation: u64) -> Self {
+            let texels = u64::from(field.0 * field.1);
+            let features = own_host_buffer_with(device, instance, physical, texels * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let head = own_host_buffer_with(device, instance, physical, texels * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            let built = Built {
+                width: extent.0,
+                height: extent.1,
+                frame: nn::Frame {
+                    field_width: field.0,
+                    field_height: field.1,
+                    features: features.buffer,
+                    features_bytes: texels * 64,
+                    head: head.buffer,
+                    head_bytes: texels * 16,
+                    blend_scale: 0.5,
+                    chained: 0,
+                },
+                graph,
+                graph_own: graph,
+                generation,
+                network: network::FULL,
+            };
+            Self { built, features, head }
+        }
+
+        /// The head: `residual(x, y, c)` in every field texel, logit 10.
+        fn write_head(&self, residual: impl Fn(u32, u32, u32) -> f32) {
+            let (fw, fh) = (self.built.frame.field_width, self.built.frame.field_height);
+            let h: Vec<f32> = (0..fh).flat_map(|y| (0..fw).flat_map(|x| [residual(x, y, 0), residual(x, y, 1), residual(x, y, 2), 10.0]).collect::<Vec<_>>()).collect();
+            // SAFETY: mapped for the whole field.
+            unsafe { std::ptr::copy_nonoverlapping(h.as_ptr().cast::<u8>(), self.head.ptr, h.len() * 4) };
+        }
+
+        /// Input lane `i` of field texel (x, y).
+        fn lane(&self, x: u32, y: u32, i: usize) -> f32 {
+            // SAFETY: mapped for the whole field; the frame that wrote it completed.
+            unsafe { *self.features.ptr.cast::<f32>().add(((y * self.built.frame.field_width + x) * 16) as usize + i) }
+        }
+
+        fn graph(&self) -> Graph {
+            Graph { built: self.built, graph: self.built.graph }
+        }
+
+        /// # Safety
+        /// Nothing pending uses them.
+        unsafe fn destroy(&self, device: &ash::Device) {
+            // SAFETY: forwarded.
+            unsafe {
+                self.features.destroy(device);
+                self.head.destroy(device);
+            }
+        }
+    }
+
+    /// An empty secondary (the graph's place) and its pool.
+    ///
+    /// # Safety
+    /// `device` is live.
+    unsafe fn empty_graph(device: &ash::Device, family: u32) -> (vk::CommandPool, vk::CommandBuffer) {
+        // SAFETY: forwarded; valid create infos.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let inheritance = vk::CommandBufferInheritanceInfo::default();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.end_command_buffer(graph).unwrap();
+            (pool, graph)
+        }
+    }
+
+    /// `texels` (RGBA16F rows of the padded width) into `image`, left in GENERAL.
+    fn upload_encoded(fx: &Fixture, staging: &HostBuffer, image: &OwnImage, pw: u32, ph: u32, texels: &[u16]) {
+        let d = &fx.gpu.3;
+        // SAFETY: the staging buffer is mapped for the texels; the image is the test's.
+        unsafe {
+            std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
+            fx.one_shot(|cmd| {
+                let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(image.image).subresource_range(range).build();
+                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
+                let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
+                d.cmd_copy_buffer_to_image(cmd, staging.buffer, image.image, vk::ImageLayout::GENERAL, &[region]);
+            });
+        }
+    }
+
+    /// The answer buffer (RGBA16F rows of the padded width), as f32.
+    fn read_answer(fx: &Fixture, staging: &HostBuffer, answer: vk::Buffer, pw: u32, ph: u32) -> Vec<f32> {
+        let d = &fx.gpu.3;
+        // SAFETY: as `upload_encoded`.
+        unsafe {
+            fx.one_shot(|cmd| d.cmd_copy_buffer(cmd, answer, staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }]));
+            std::slice::from_raw_parts(staging.ptr.cast::<u16>(), (pw * ph * 4) as usize).iter().map(|&h| f16(h)).collect()
+        }
+    }
+
+    #[test]
+    fn the_model_extent_follows_the_scale_and_full_size_is_the_render_extent() {
+        for s in [1.0, 1.5, f32::NAN, f32::INFINITY] {
+            assert_eq!(model_extent(1485, 836, s), (1485, 836), "scale {s}");
+        }
+        assert_eq!(model_extent(1485, 836, 0.5), (743, 418));
+        assert_eq!(model_extent(1485, 836, 0.667), (990, 558));
+        assert_eq!(model_extent(1485, 836, 0.333), (495, 278));
+        assert_eq!(model_extent(1485, 836, 0.1), (371, 209), "at least the setting's lowest scale");
+        assert_eq!(model_extent(12, 6, 0.25), (8, 6), "at least 8 texels, never more than the side");
+        // At 1 every pass is at the render extent and the network is built for that one size, as before.
+        let full = pass_extents(SW, SH, &[1.0; neural_forge_protocol::MAX_PASSES]);
+        assert!(full.iter().all(|&e| e == (SW, SH)));
+        assert_eq!(graph_sizes(&full, 3), vec![(SW, SH)]);
+        let mut scales = [1.0; neural_forge_protocol::MAX_PASSES];
+        scales[1] = 0.5;
+        scales[2] = 0.5;
+        scales[4] = 0.333;
+        let mixed = pass_extents(SW, SH, &scales);
+        assert_eq!(graph_sizes(&mixed, 3), vec![(SW, SH), (10, 8)], "pass 1's first, each size once");
+        assert_eq!(graph_sizes(&mixed, 5), vec![(SW, SH), (10, 8), (8, 8)], "never below 8 texels");
+        assert_eq!(graph_sizes(&mixed, 1), vec![(SW, SH)], "only the passes that run");
+    }
+
+    /// A model resolution of 1 is the native frame as it was, bit for bit: a pass built for every slot at the
+    /// render extent (what the hold builds at the default) gives the same input lanes and answers as one built
+    /// the old way, over two passes and frames with history.
+    #[test]
+    fn at_full_model_resolution_the_frame_is_bit_for_bit_as_before() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(SW, SH);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+            let (graph_pool, graph) = empty_graph(device, family);
+            let net = Stand::new(device, instance, physical, (SW, SH), (FW, FH), graph, 1);
+            let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, buffer_row_length: pw, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
+            let extents = pass_extents(SW, SH, &[1.0; neural_forge_protocol::MAX_PASSES]);
+            let mut old = NativePass::build(device, instance, physical, family, SW, SH, false).unwrap();
+            let mut new = NativePass::build_at(device, instance, physical, family, SW, SH, extents, false).unwrap();
+            let mut passes = Passes::one(Conditioning::default());
+            passes.count = 2;
+            passes.each[1].intensity = 0.5;
+            let mut results = Vec::new();
+            for (k, pass) in [&mut old, &mut new].into_iter().enumerate() {
+                assert!(pass.ensure_more(device, instance, physical, family, 2));
+                assert!(pass.ensure_lanes(device, instance, physical, 2), "nothing to build at full size");
+                assert!(pass.lanes.is_empty() && pass.resize.is_none(), "no lane or resize pipeline at full size");
+                let graphs = [net.graph()];
+                assert!(if k == 0 { pass.record(device, instance, physical, &net.built, graph, encoded.view, exposure.buffer, None) } else { pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None) });
+                pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
+                fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                let mut frames = Vec::new();
+                for frame in 0..3u32 {
+                    upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
+                    net.write_head(|x, y, c| residual(x, y, c, frame));
+                    let (cmds, later) = if k == 0 { pass.frame_passes(&net.built, frame > 0, Some([0.25, -0.25]), [1.0, 1.0], &passes) } else { pass.frame_graphs(&graphs, frame > 0, Some([0.25, -0.25]), [1.0, 1.0], &passes) };
+                    let copies = pass.more.as_ref().unwrap().copies;
+                    let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+                    device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&order).build()], vk::Fence::null()).unwrap();
+                    device.queue_wait_idle(gpu.4).unwrap();
+                    for cmd in order {
+                        pass.submitted(cmd);
+                    }
+                    let lanes: Vec<u32> = (0..FW * FH * 16).map(|i| (*net.features.ptr.cast::<f32>().add(i as usize)).to_bits()).collect();
+                    frames.push((lanes, read_answer(&fx, &staging, pass.answer(), pw, ph).iter().map(|v| v.to_bits()).collect::<Vec<u32>>()));
+                }
+                results.push(frames);
+            }
+            for (frame, (a, b)) in results[0].iter().zip(&results[1]).enumerate() {
+                assert!(a.0 == b.0, "frame {frame}: the network's input lanes differ");
+                assert!(a.1 == b.1, "frame {frame}: the answer differs");
+            }
+            for pass in [&old, &new] {
+                pass.destroy(device);
+            }
+            net.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// At half the model resolution: the network's input is the area average of the encoded frame at half
+    /// its size, and its edit comes back at full size: a constant residual (a constant edit) is added to every
+    /// full-resolution pixel with its own magnitude; an edit of opposite sign on either side of a hard edge in
+    /// the frame stays on its side up to the edge, where a plain bilinear enlargement would mix the two over
+    /// the pixels next to it.
+    #[test]
+    fn at_half_model_resolution_the_edit_comes_back_at_full_size_without_crossing_an_edge() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let mut scales = [1.0; neural_forge_protocol::MAX_PASSES];
+        scales[0] = 0.5;
+        let extents = pass_extents(SW, SH, &scales);
+        let (mw, mh) = extents[0];
+        assert_eq!((mw, mh), (10, 8));
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(SW, SH);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+            let (graph_pool, graph) = empty_graph(device, family);
+            let net = Stand::new(device, instance, physical, (mw, mh), (16, 8), graph, 1);
+            // The frame: dark on the left half, bright on the right (a hard edge between columns 9 and 10, on a
+            // texel boundary of the half-size picture), a fine texture on each side.
+            let frame = |x: u32, y: u32, c: u32| -> f32 { (if x < SW / 2 { 0.25 } else { 0.75 }) + ((x + 2 * y + c) % 4) as f32 / 256.0 };
+            let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(frame(x.min(SW - 1), y.min(SH - 1), 0)), half(frame(x.min(SW - 1), y.min(SH - 1), 1)), half(frame(x.min(SW - 1), y.min(SH - 1), 2)), half(1.0)])).collect();
+            upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
+            let mut pass = NativePass::build_at(device, instance, physical, family, SW, SH, extents, false).unwrap();
+            assert!(!pass.record_graphs(device, instance, physical, &[net.graph()], encoded.view, exposure.buffer, None), "pass 1's lane is needed first");
+            assert!(pass.ensure_lanes(device, instance, physical, 1));
+            let graphs = [net.graph()];
+            assert!(pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None));
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            // The CPU's picture of the network's input: each texel the mean of its 2x2 render pixels.
+            let small = |x: u32, y: u32, c: u32| (0..4).map(|k| f16(half(frame(2 * x + k % 2, 2 * y + k / 2, c)))).sum::<f32>() / 4.0;
+            // The full-size answer as an edit of the frame.
+            let run = |pass: &mut NativePass, edit: &dyn Fn(u32) -> f32| -> Vec<f32> {
+                // A residual of 4e is an edit of e (the composite's residual / 4).
+                net.write_head(|x, _, _| 4.0 * edit(x));
+                let (cmds, _) = pass.frame_graphs(&graphs, false, None, [1.0, 1.0], &Passes::default());
+                fx.submit(pass, cmds);
+                let a = read_answer(&fx, &staging, pass.answer(), pw, ph);
+                (0..SH).flat_map(|y| (0..SW).flat_map(move |x| (0..3).map(move |c| (x, y, c)))).map(|(x, y, c)| a[((y * pw + x) * 4 + c) as usize] - f16(half(frame(x, y, c)))).collect()
+            };
+            // A constant edit of 0.1.
+            let e = run(&mut pass, &|_| 0.1);
+            for x in 0..mw {
+                for c in 0..3 {
+                    let got = net.lane(x, 2, 4 + c as usize);
+                    let want = (small(x, 2, c) - 0.5) * 0.125;
+                    assert!((got - want).abs() < 2e-4, "the network's input at ({x}, 2) channel {c}: {got} against the area average's {want}");
+                }
+            }
+            for (i, v) in e.iter().enumerate() {
+                assert!((v - 0.1).abs() < 2e-3, "pixel {} channel {}: an edit of {v}, not 0.1", i / 3 % SW as usize, i % 3);
+            }
+            // +0.1 on the left half of the network's texels, -0.1 on the right: every pixel takes its own side's.
+            let e = run(&mut pass, &|x| if x < mw / 2 { 0.1 } else { -0.1 });
+            for y in 0..SH {
+                for x in 0..SW {
+                    let want = if x < SW / 2 { 0.1 } else { -0.1 };
+                    for c in 0..3 {
+                        let got = e[((y * SW + x) * 3 + c) as usize];
+                        assert!((got - want).abs() < 4e-3, "pixel ({x}, {y}) channel {c}: an edit of {got}, its side's is {want}");
+                    }
+                }
+            }
+            pass.destroy(device);
+            net.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+            assert_eq!(LIVE.with(std::cell::Cell::get), 0, "everything the pass made is destroyed");
+        }
+    }
+
+    /// Another model resolution builds the pass again: the hold's rule takes the old pass out (to destroy), and
+    /// the new one's first frame runs without history (its lanes 7-9 are the frame, not the previous answer),
+    /// while the same resolution keeps the pass and its history.
+    #[test]
+    fn another_model_resolution_starts_the_history_afresh() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(SW, SH);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+            let (graph_pool, graph) = empty_graph(device, family);
+            let full = Stand::new(device, instance, physical, (SW, SH), (FW, FH), graph, 1);
+            let half_net = Stand::new(device, instance, physical, (10, 8), (16, 8), graph, 2);
+            let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
+            let at = |s: f32| {
+                let mut scales = [1.0; neural_forge_protocol::MAX_PASSES];
+                scales[0] = s;
+                pass_extents(SW, SH, &scales)
+            };
+            // The hold's frame: the pass for these extents (the old one taken out when it is for others), its
+            // history flag by the hold's rule (a pass that ran a frame before).
+            let mut slot: Option<NativePass> = None;
+            let hold = |slot: &mut Option<NativePass>, scale: f32, net: &Stand, frame: u32| {
+                let extents = at(scale);
+                if let Some(old) = take_other_extents(slot, SW, SH, &extents) {
+                    old.destroy(device);
+                }
+                let mut pass = slot.take().unwrap_or_else(|| NativePass::build_at(device, instance, physical, family, SW, SH, extents, false).unwrap());
+                assert!(pass.ensure_lanes(device, instance, physical, 1));
+                assert!(pass.record_graphs(device, instance, physical, &[net.graph()], encoded.view, exposure.buffer, None));
+                if pass.frames == 0 {
+                    fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+                }
+                net.write_head(|x, y, c| residual(x, y, c, frame));
+                let history = pass.frames > 0;
+                let (cmds, _) = pass.frame_graphs(&[net.graph()], history, None, [1.0, 1.0], &Passes::default());
+                fx.submit(&mut pass, cmds);
+                *slot = Some(pass);
+                history
+            };
+            assert!(!hold(&mut slot, 1.0, &full, 0), "the first frame has no history");
+            assert!(hold(&mut slot, 1.0, &full, 1), "the same model resolution keeps the pass and its history");
+            assert_eq!(full.lane(5, 3, 7), centre(neural(5, 3, 0, 0)), "lanes 7-9 hold the previous answer");
+            assert!(!hold(&mut slot, 0.5, &half_net, 2), "another model resolution: a new pass, no history");
+            assert_eq!(slot.as_ref().unwrap().extents[0], (10, 8));
+            let input = half_net.lane(2, 1, 4);
+            assert_eq!(half_net.lane(2, 1, 7), input, "lanes 7-9 are the frame itself: the history started afresh");
+            assert!(hold(&mut slot, 0.5, &half_net, 3), "and is kept at that resolution");
+            assert!(!hold(&mut slot, 1.0, &full, 4), "back to full size: afresh again");
+            slot.take().unwrap().destroy(device);
+            full.destroy(device);
+            half_net.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// Two passes at their own model resolutions (pass 1 at full size, pass 2 at half): each runs at its own
+    /// extent with its own network build: pass 1's input lanes are the frame at full size, pass 2's the area
+    /// average of pass 1's full-size answer at half size, and pass 2's history is at half size. With pass 2's
+    /// edit zero the answer is pass 1's.
+    #[test]
+    fn each_pass_runs_at_its_own_model_resolution() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        let mut scales = [1.0; neural_forge_protocol::MAX_PASSES];
+        scales[1] = 0.5;
+        let extents = pass_extents(SW, SH, &scales);
+        assert_eq!(graph_sizes(&extents, 2), vec![(SW, SH), (10, 8)]);
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let fx = Fixture { gpu: gpu.clone(), pool };
+            let (pw, ph) = super::super::padded(SW, SH);
+            let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
+            let exposure = own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
+            std::ptr::copy_nonoverlapping(0x3c00u32.to_le_bytes().as_ptr(), exposure.ptr, 4);
+            let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
+            let (graph_pool, graph) = empty_graph(device, family);
+            // One build of two sizes: one generation.
+            let first = Stand::new(device, instance, physical, (SW, SH), (FW, FH), graph, 7);
+            let second = Stand::new(device, instance, physical, (10, 8), (16, 8), graph, 7);
+            let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| [half(proxy(x, y, 0)), half(proxy(x, y, 1)), half(proxy(x, y, 2)), half(1.0)])).collect();
+            upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
+            let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, buffer_row_length: pw, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
+            let mut pass = NativePass::build_at(device, instance, physical, family, SW, SH, extents, false).unwrap();
+            assert!(pass.ensure_more(device, instance, physical, family, 2));
+            assert!(pass.ensure_lanes(device, instance, physical, 2));
+            assert_eq!(pass.lanes.len(), 1, "one lane, pass 2's");
+            let graphs = [first.graph(), second.graph()];
+            assert!(pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None));
+            pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            first.write_head(|x, y, c| residual(x, y, c, 0));
+            second.write_head(|_, _, _| 0.0);
+            let mut passes = Passes::one(Conditioning::default());
+            passes.count = 2;
+            passes.scales = scales;
+            let (cmds, later) = pass.frame_graphs(&graphs, false, None, [1.0, 1.0], &passes);
+            assert_eq!(later.len(), 1, "pass 2 runs");
+            let copies = pass.more.as_ref().unwrap().copies;
+            let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
+            device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&order).build()], vk::Fence::null()).unwrap();
+            device.queue_wait_idle(gpu.4).unwrap();
+            for cmd in order {
+                pass.submitted(cmd);
+            }
+            // Pass 1 at full size: its lanes are the frame.
+            for c in 0..3 {
+                assert_eq!(first.lane(5, 3, 4 + c as usize), centre(proxy(5, 3, c)), "pass 1's input, channel {c}");
+            }
+            // Pass 2 at half size: its lanes are the 2x2 means of pass 1's answer.
+            let a1 = |x: u32, y: u32, c: u32| neural(x, y, c, 0);
+            for (x, y) in [(0, 0), (2, 1), (9, 5)] {
+                for c in 0..3 {
+                    let mean = (0..4).map(|k| a1(2 * x + k % 2, 2 * y + k / 2, c)).sum::<f32>() / 4.0;
+                    let got = second.lane(x, y, 4 + c as usize);
+                    assert!((got - (mean - 0.5) * 0.125).abs() < 2e-4, "pass 2's input at ({x}, {y}) channel {c}: {got} against {}", (mean - 0.5) * 0.125);
+                }
+            }
+            let m = pass.more.as_ref().unwrap();
+            assert_eq!(m.recorded_pass[0], Some(7));
+            assert!(m.history[0].is_some() && pass.extents[1] == (10, 8), "pass 2's history is at its extent");
+            // Pass 2's params: its extent and field, the vectors' scale at its size.
+            let p2 = &*m.params[0][0].ptr.cast::<Params>();
+            assert_eq!(p2.dims, [16, 8, 10, 8]);
+            assert_eq!(p2.full[..3], [SW, SH, pw]);
+            // Its edit is zero: the answer is pass 1's, at full size.
+            let a = read_answer(&fx, &staging, pass.answer(), pw, ph);
+            for y in 0..SH {
+                for x in 0..SW {
+                    for c in 0..3 {
+                        let got = a[((y * pw + x) * 4 + c) as usize];
+                        assert!((got - a1(x, y, c)).abs() < 2e-3, "({x}, {y}) channel {c}: {got} against pass 1's {}", a1(x, y, c));
+                    }
+                }
+            }
+            pass.destroy(device);
+            first.destroy(device);
+            second.destroy(device);
+            encoded.destroy(device);
+            for b in [&exposure, &staging] {
+                b.destroy(device);
+            }
+            device.destroy_command_pool(graph_pool, None);
+            device.destroy_command_pool(pool, None);
         }
     }
 }

@@ -260,7 +260,7 @@ this version re-creates the shared memory.
 
 | Tab | What it has |
 |---|---|
-| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes and per-pass settings, model every Nth frame (after the upscaler only), and the toggle key. |
+| Model | The Neural rendering switch, the model's style, strength presets (Light, Moderate, Reference, Overdrive), intensity, local tone, local structure, skin structure, auto mask, passes, pass feedback, model resolution (before the upscaler) and per-pass settings, model every Nth frame (after the upscaler only), and the toggle key. |
 | Composition | How the model's answer is blended back on the after-the-upscaler path: detail and colour strength, highlight guard, model resolution, the reversible proxy mode, transfer mode, colour trust, ratio smoothing, ghost guard, apply model edit, hold frame, and the white point. |
 | Debug | Compare views (side by side or wipe, split, zoom, swap), debug views (original/proxy, raw answer, amplified diff, colour trust, the composite before colour trust, and what the edit cache rejected before the upscaler), the edit cache at work (frames with and without the network, the share it rejected, its cost), the scene cuts the model started afresh on, and captures: take one (the next frame as before/after PNGs, with what happened) and open the captures folder. |
 | Status | Telemetry (the hold's and the layer's time), layer state, **Model placement** (before the upscaler with DLSS's render size and missed frames, waiting for DLSS Super Resolution, or after the upscaler), the model, reset and profiles, and **Diagnosis**: Diagnose (the same checks as `neural-forge-cli doctor`) and Save report. |
@@ -293,9 +293,19 @@ generation 4x (real frames per second, pass 4 of the built-in benchmark):
 Two passes of the small network cost about as much as one pass of the full network, and look
 over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
 blend toward each other's pictures over time. **Per-pass settings** (Edit…) let each pass use its own
-intensity, local tone, local structure, skin structure, style or auto mask instead of the Model tab's.
+intensity, local tone, local structure, skin structure, style, auto mask or model resolution instead of the
+Model tab's.
 **Pass feedback** (0 to 1, default 1) sets how much of a pass's picture the next pass works on; lower
 values keep more of the pass's own input, so the passes add less to each other.
+
+**Model resolution** (Model tab, before the upscaler) sets the size the model runs at, as a share of
+DLSS's input size: **Full** (the default), **Quality** (66.7%), **Balanced** (58%), **Performance** (50%)
+or **Ultra Performance** (33.3%). Below Full the model works on a downscaled copy of the frame and its
+change is brought back to full size, following the frame's own edges, so the frame keeps its own detail;
+the model costs less GPU time and memory but adds less detail of its own. Full is the frame exactly as
+without the setting. Each pass can have its own model resolution in the per-pass settings: a pass works
+on the previous pass's full-size picture at its own size. Changing it starts the model's history afresh
+and shows a moment of untouched frames while the model is prepared for the new size.
 
 ![Per-pass settings: the pass to edit, and an override switch with its value for intensity, local tone, local structure, skin structure, style and auto mask](screenshots/passes.png)
 

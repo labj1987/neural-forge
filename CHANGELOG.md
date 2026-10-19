@@ -4,6 +4,18 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.0 — 2026-10-19
+
+- **Model resolution before the upscaler** (Model tab): run the model at **Full** size (the default,
+  unchanged), or at **Quality**, **Balanced**, **Performance** or **Ultra Performance** (66.7%, 58%, 50% or
+  33.3% of DLSS's input size) for less GPU time and memory. Below Full the model works on a downscaled copy
+  of the frame and its change is brought back to full size along the frame's own edges; it adds less detail
+  of its own than at Full.
+- **Model resolution per pass**: with more than one pass, each pass can run at its own model resolution
+  (Per-pass settings), working on the previous pass's full-size picture.
+- Changing the model resolution starts the model's history afresh and shows a moment of untouched frames
+  while the model is prepared for the new size.
+
 ## 3.7.0 — 2026-10-19
 
 - **Choose the network in the Setup tab, while a game runs.** Extracting the model now writes both

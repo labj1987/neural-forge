@@ -70,7 +70,7 @@ present hook and its model server thread. Layout (`crates/protocol/src/lib.rs`):
 
 | Offset | Size | Content |
 |---|---|---|
-| 0 | 64 KiB (`HEADER_BYTES`) | `ShmHeader` (2084 bytes used) |
+| 0 | 64 KiB (`HEADER_BYTES`) | `ShmHeader` (2128 bytes used) |
 | 64 KiB | `MAX_FRAME` | slot 0 proxy: the frame the layer captured |
 | + `MAX_FRAME` | `MAX_FRAME` | slot 0 answer: the model's output |
 | + 2 `MAX_FRAME` | `MAX_FRAME` | slot 1 proxy |
@@ -97,7 +97,9 @@ Offsets are pinned by compile-time asserts; any change bumps `SHM_VERSION`. Grou
   `global_tuning` never reads half of one; 0 means nothing has configured the header yet.
 - **Model settings:** `enabled`, `style`, `auto_mask`, intensity, local tone, local structure,
   skin structure, `model_interval` (v6), `passes` and `pass[10]` (v19), `network` (v20,
-  `enums::network`: 0 the full network, 1 the small one).
+  `enums::network`: 0 the full network, 1 the small one), `preupscale_scale` and `pass_scale[10]` (v21:
+  the model resolution before the upscaler, a scale of DLSS's input size, and each pass's own, used where
+  its `overrides` has `pass_override::SCALE`; NATIVE_BACKEND.md, "Model resolution before the upscaler").
 - **Composition settings (after-the-upscaler path):** transfer and colour strength, max ratio,
   transfer mode, white point fields, `working_scale`, compare and debug views, `reversible_mode`,
   `apply_model`, `hold_frame`, `ghost_guard` (v4), colour trust and ratio smoothing (v5).
@@ -164,9 +166,10 @@ be private.
 | 18 | `capture_request` carries a request id; `capture_next_id`, `capture_cancel` and the capture result (state, reason, counts, paths) appended | 3.4.0 |
 | 19 | `passes` and `pass[10]` (each pass's overrides of the Model tab's values: `overrides` bits and their values) appended | 3.6.0 |
 | 20 | `network` (which extracted network the layer runs) and the control mask's rules (`mask_sky`, `mask_sky_margin`, `mask_dark*`, `mask_motion*`) appended | 3.7.0 |
+| 21 | `preupscale_scale` (the model resolution before the upscaler) and `pass_scale[10]` (each pass's own, with the new `SCALE` override bit) appended | 3.8.0 |
 
 Sources: `SHM_VERSION`'s doc comment, CHANGELOG.md, git log. Versions 9-11 all landed during
-the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20.
+the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.4.0 ships 18, 3.6.0 ships 19, 3.7.0 ships 20, 3.8.0 ships 21.
 
 ## 3. Which path a frame takes
 
@@ -589,7 +592,10 @@ directly as 3.2.0's did; the picture is bit for bit 3.2.0's (the test
   first two once the apply has read them) live within it. The fingerprint is read from the frame
   where it is needed, the refresh's depth from the depth again. Edits are kept as three 16-bit
   fixed-point stops (+-2.5, steps of 7.6e-5 stop: the shaders stay within 8e-5 stop of the replay
-  tool, measured; the shader-against-tool test's tolerance is 1e-3). A hold checks the features' size, and a rebuilt network (new features) drops the edit. The
+  tool, measured; the shader-against-tool test's tolerance is 1e-3). A hold checks the features' size, and a rebuilt network (new features) drops the edit.
+  With pass 1 below the render extent (a model resolution below Full) its features are too small: the
+  native pass then holds a buffer of the layout's size of its own (`NativePass::cache_scratch`). The
+  cache always works on the full-size answer (the enlarged edit). The
   cache had 146 bytes a render pixel of its own before (408 MB at 2228x1253; LESSONS.md, "3.3 edit
   cache: what was tried"). Reversed-Z is decided once per extent, when 3 holds in a row with
   conclusive depth counts agree (texels at 0 and 1, else the top and bottom quarters' sums, 64-bit);
@@ -724,6 +730,11 @@ by `build.rs`), `crates/layer/src/preupscale/native.rs` (the loader, the per-dev
   closed one is pending). A barrier fallback made before carries over to the new network. The first
   frame of the new network starts the history afresh (`note_network`: seed 0, no blend toward the
   history, in every pass), and the edit cache refreshes on the new build's generation.
+- **Several sizes**: with a model resolution per pass (NATIVE_BACKEND.md, "Model resolution before the
+  upscaler") the hold asks `Loader::ready_sizes` for every extent its passes run at, pass 1's first. One
+  build makes a graph for each (`nf_native_build_sizes`: one warm-up each, the largest first so the
+  split-K scratch is sized for it, then all recordings), sharing the weights and kernels; all carry one
+  generation. Another set of sizes rebuilds them all, like another extent.
 - The network's Vulkan calls go through the next layer's entry points, so they never pass through
   this layer.
 

@@ -137,5 +137,22 @@ pub mod pass_override {
     pub const SKIN_STRUCTURE: u32 = 8;
     pub const STYLE: u32 = 16;
     pub const AUTO_MASK: u32 = 32;
-    pub const ALL: u32 = 63;
+    /// The pass's own model resolution before the upscaler (`pass<N>_scale`) instead of
+    /// `preupscale_scale`.
+    pub const SCALE: u32 = 64;
+    pub const ALL: u32 = 127;
+}
+
+/// The model resolution presets before the upscaler (`preupscale_scale`, `pass<N>_scale`): the network's
+/// scale of DLSS's input size, by name. Full runs it at that size (the default); the others are DLSS's own
+/// ratios, the network on a downscaled picture whose edit is brought back to full size.
+pub mod model_scale {
+    pub const PRESETS: [(&str, f32); 5] = [("Full", 1.0), ("Quality", 0.667), ("Balanced", 0.58), ("Performance", 0.5), ("Ultra Performance", 0.333)];
+    /// The lowest scale a setting may hold.
+    pub const MIN: f32 = 0.25;
+
+    /// The preset `scale` is (within 0.001), as an index into [`PRESETS`].
+    pub fn preset_of(scale: f32) -> Option<usize> {
+        PRESETS.iter().position(|&(_, s)| (s - scale).abs() < 0.001)
+    }
 }
