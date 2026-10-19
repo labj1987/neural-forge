@@ -16,18 +16,21 @@ first shipped them; their phase is kept as a subheading.
 - **The full network is the default again**, also for a DLL that carries the small one.
 - `neural-forge-cli extract-model DIR` extracts every network the DLL has; `--network full|small`
   extracts only that one and leaves the other as it is.
-- After updating, extract the model again (Setup tab, Extract from DLL): the networks are now kept in
-  their own folders, and the layer does not read a model extracted by an earlier version. Close any game
-  running with Neural Forge before opening the app: this version changes the settings the app and the
-  game share.
 - **The game's sky stays as it is.** Before the upscaler, Neural Forge no longer edits the sky (found from
   the game's depth), so it stays clean and steady. "Keep the game's sky" on the Model tab turns it off.
 - **More mask rules** (Model tab): the model's edit can fade out in dark areas or in fast motion, each with
   its own brightness or motion and how much intensity and structure to keep. Both are off by default.
+- **Pass feedback** (Model tab): with more than one pass, how much of a pass's picture the next pass works
+  on. Lower values keep more of each pass's own input, so extra passes add less: three passes at 0.5 look
+  about like two at 1. The default, 1, is the pass's picture itself.
 - **Scene cuts start the model afresh.** Before the upscaler, when the picture changes completely from
   one frame to the next (a cut in a cutscene, a respawn, a camera switch), the model no longer blends
   the previous scene into the first frames of the new one. The Debug tab counts these frames under
   Scene cuts.
+- After updating, extract the model again (Setup tab, Extract from DLL): the networks are now kept in
+  their own folders, and the layer does not read a model extracted by an earlier version. Close any game
+  running with Neural Forge before opening the app: this version changes the settings the app and the
+  game share.
 
 ## 3.6.0 — 2026-10-19
 

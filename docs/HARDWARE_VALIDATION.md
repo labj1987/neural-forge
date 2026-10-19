@@ -1345,3 +1345,30 @@ engage frame generation were repeated.
 
 After the upscaler (`pan`, 2492x1370, no history): the model server's time 9.4 / 18.9 / 28.2 ms at 1 / 2 /
 3 passes; 2 passes with counter chaining and with barriers gave 60 of 60 identical frames.
+
+
+## 2026-10-19: 3.7.0 (network choice, control mask, scene cuts, pass feedback)
+
+GTA V Enhanced built-in benchmark, 2560x1440@288 VRR, desktop HDR as set, DLSS Balanced, FG 4x with Preset C,
+script mods off, pass 4. Defaults unless named (keep the sky on, one pass, feedback 1).
+
+| Configuration | Real fps | Shown fps | Network ms | Peak VRAM MiB |
+|---|---|---|---|---|
+| full (3 runs) | 65.2 (65.3 / 65.4 / 65.1) | 262.4 | 6.89 | 10017-10042 |
+| small (3 runs) | 73.4 (72.7 / 73.7 / 73.8) | 295.4 | 3.90 | 10001-10082 |
+| full, sky off | 65.2 | 261.9 | 6.81 | 9993 |
+| small, sky off | 73.9 | 296.6 | 3.82 | 10047 |
+
+Still-shot captures (220 frames from 69.5 s after the long pass's start; a 9-frame window 40 presented
+frames after each series' cut, and 8 after it), flicker and added detail against the effect off (0.931%
+settled, 0.845% just after):
+
+| Capture | Settled | Just after the cut |
+|---|---|---|
+| full | 0.750%, x1.53 | 1.070%, x1.23 |
+| full, sky off | 1.500%, x1.27 | 1.053%, x1.33 |
+| full, scene-cut reset off | 2.285%, x1.21 | 1.166%, x1.18 |
+| small | 1.267%, x1.32 | 1.000%, x1.22 |
+
+Pass feedback (small network): NATIVE_BACKEND.md, "Pass feedback". Scene cuts: 3 per run, all at the
+long pass's scripted cuts. A live network switch mid-run: rebuilt in 1.2-1.5 s, no miss, no Xid.

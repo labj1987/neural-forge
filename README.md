@@ -17,7 +17,7 @@ Repository: [labj1987/neural-forge](https://github.com/labj1987/neural-forge).
 
 | Model settings | Setup | Status |
 |---|---|---|
-| ![Model tab: the Neural rendering switch, style, strength presets, intensity, local tone, local and skin structure, auto mask and passes](screenshots/settings.png) | ![Setup tab: the model present (the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: layer state, the Model placement line, the model, the settings reset and profiles, and the Diagnosis group with Diagnose and Save report](screenshots/status.png) |
+| ![Model tab: the Neural rendering switch, style, strength presets, intensity, local tone, local and skin structure, auto mask and passes](screenshots/settings.png) | ![Setup tab: the model present (the full and the small network of build 310.9.16.0), the Network choice, the Steam games with their switches, the executables they target and an edit button each, and the launch option NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_TARGET_EXE=PlayGTAV.exe,GTA5_Enhanced.exe %command% for Grand Theft Auto V Enhanced](screenshots/setup.png) | ![Status tab: layer state, the Model placement line, the model, the settings reset and profiles, and the Diagnosis group with Diagnose and Save report](screenshots/status.png) |
 
 The screenshots show default settings with no game running.
 
@@ -89,14 +89,18 @@ How it works, step by step: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 ## Measured results
 
 GTA V Enhanced's built-in benchmark on the test machine: RTX 5070 (12 GB), 2560x1440, DLSS Balanced,
-DLSS Frame Generation 4x, ray tracing on, script mods off, one run each, pass 4 (about 117 s). Real
-fps is the game's own frames; shown fps counts the generated ones too. Measured 2026-10-16.
+DLSS Frame Generation 4x, ray tracing on, script mods off, pass 4 (about 117 s), three runs each (the
+off row: one run, 2026-10-16). Real fps is the game's own frames; shown fps counts the generated ones
+too. Measured 2026-10-19 with the default settings (keep the game's sky on, one pass).
 
-| Model | Real fps | Shown fps | Network time per frame | Weights in video memory |
+| Model | Real fps | Shown fps | Network GPU time on the frames it runs | Weights in video memory |
 |---|---|---|---|---|
 | Off (Neural Forge not loaded) | 76.8 | 309.0 | - | - |
-| Full network | 56.8 | 228.1 | 16.0 ms | 140 MB |
-| Small network | 63.7 | 256.2 | 9.95 ms | 108 MB |
+| Full network | 65.2 | 262.4 | 6.9 ms | 140 MB |
+| Small network | 73.4 | 295.4 | 3.9 ms | 108 MB |
+
+The network runs on every frame while the camera is still and on every second frame while it moves (the
+edit cache carries it between), so about half the frames pay its time in this benchmark.
 
 The network's time per frame on its own (`dlss5vk bench`, 1707x960, the DLSS input of GTA V at DLSS
 Quality): full 7.03 ms, small 3.81 ms. In the game it also waits for the game's own GPU work. Games
@@ -290,6 +294,8 @@ Two passes of the small network cost about as much as one pass of the full netwo
 over-processed: grittier stone and noisier roads. Each pass keeps its own history, so the passes do not
 blend toward each other's pictures over time. **Per-pass settings** (Edit…) let each pass use its own
 intensity, local tone, local structure, skin structure, style or auto mask instead of the Model tab's.
+**Pass feedback** (0 to 1, default 1) sets how much of a pass's picture the next pass works on; lower
+values keep more of the pass's own input, so the passes add less to each other.
 
 ![Per-pass settings: the pass to edit, and an override switch with its value for intensity, local tone, local structure, skin structure, style and auto mask](screenshots/passes.png)
 
@@ -311,10 +317,11 @@ takes is withdrawn after 5 seconds.
 - **The game's DLSS Frame Generation does not always switch on.** In the benchmark runs the game
   generated frames in some launches and not in others with the same settings, with or without
   Neural Forge. The fps counter shows which happened.
-- **4K is not tested.** The network needs about 1.5 GB of video memory at that size, and on a 12 GB
-  card 4K with frame generation and the model on sits at the memory limit: its frame rate changes
-  from run to run. A network build that fails is retried on a schedule, and frames go to DLSS
-  untouched meanwhile.
+- **4K is at the memory limit on a 12 GB card.** One run of GTA V Enhanced at 3840x2160 with frame
+  generation 4x and the small network (texture quality one step down) ran steadily at 35.6 real fps
+  with the video memory at 11.9 of 12.2 GB; the full network there has collapsed to a few fps at the
+  limit. A network build that fails is retried on a schedule, and frames go to DLSS untouched
+  meanwhile.
 - **Unreal Engine 5 games are only partly tested.** Lords of the Fallen ran in game with frame
   generation, and Remnant II at its character select screen with frame generation, with no GPU fault
   in those measurements. The Black Myth: Wukong Benchmark Tool faulted the GPU

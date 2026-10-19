@@ -865,6 +865,27 @@ mask (`the_control_mask_keeps_the_sky_lowers_structure_and_changes_nothing_when_
 all-ones mask against none). Every pass of a multi-pass frame reads the same mask, built from the original
 frame.
 
+## Pass feedback (3.7.0, 2026-10-19)
+
+`pass_feedback` (0 to 1, default 1) sets the next pass's colour input to the previous pass's input moved
+toward its answer: input + feedback x (answer - input), the idea of janblade/OptiScaler-F5-DLSSNR-Multipass's
+`DlssNr.PassFeedback` (v0.1.18 notes, ideas only). At 1 the copy between passes stays as it was (bit for
+bit); below 1 `native_feedback.comp` blends in place in the encoded image before the upscaler (`X`, `Y`), and
+`native_post_feedback.comp` into the scratch after it (from the frame for pass 2, in place after).
+
+GTA V Enhanced, 1440p, FG 4x, the small network, the still shot after its cut (one run each; flicker and
+added detail with bench-iq.py's functions on a window placed 40 presented frames after each series' own cut,
+against the effect off at 0.931%):
+
+| Passes | Feedback 1.0 | 0.7 | 0.5 | 0.3 |
+|---|---|---|---|---|
+| 2 | 0.78%, x2.05 | 0.77%, x1.92 | 0.80%, x1.87 | 1.50%, x1.37 |
+| 3 | 0.92%, x2.51 | 1.01%, x2.12 | 0.89%, x1.97 | 0.67%, x1.90 |
+
+(One pass: 1.27%, x1.32.) Lower feedback lowers the added detail steadily (the over-processing of extra
+passes); flicker does not move beyond the run-to-run noise. No value is clearly better, so 1 stays the
+default.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

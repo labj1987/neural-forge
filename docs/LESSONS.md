@@ -1140,6 +1140,47 @@ a game at that size), peak VRAM 11863 of 12227 MiB, no miss, no Xid, no out-of-m
 15% under frame generation's memory pressure without collapsing. Two passes at 4K were not run: there is
 no memory left for them.
 
+## October 19: the RenoDX handoff (3.7.0)
+
+Users comparing NVIDIA's full and small networks found the small one much weaker (barely darkened crevices,
+moved shadows, changed faces, sharpening, a "deep fried" moment after cuts). 3.7.0 makes the network a live
+choice with the full one as the default, adds a scene-cut reset, a per-pixel control mask with a sky rule and
+pass feedback. Measured in GTA V Enhanced at 1440p, FG 4x, Preset C, mods off, pass 4.
+
+- **The network choice.** Full 65.2 real / 262.4 shown fps (65.3, 65.4, 65.1), the network 6.89 ms on the
+  frames it runs; small 73.4 / 295.4 (72.7, 73.7, 73.8), 3.90 ms. Same as 3.6.0 within the spread (65.6 and
+  74.3). A live switch in a running benchmark (full to small 30 s into the long pass, back 30 s later): each
+  network built in 1.2-1.5 s, the history reset on each switch, no miss (the frames during the load go to
+  DLSS untouched), no Xid. On the still shot the full network flickers less and adds more detail than the
+  small one (0.75% against 1.27%, x1.53 against x1.32; one run each).
+- **The control mask** (NATIVE_BACKEND.md, "The control mask"): 0.08 ms per network frame for the sky rule
+  (6.89 against 6.81 ms full, 3.90 against 3.82 small), fps unchanged (65.2 against 65.2, 73.4 against 73.9).
+  GTA V Enhanced is reversed-Z (the edit cache's verdict: about 17% of texels at exactly 0). On the still
+  shot the sky rule halves the settled flicker (0.75% against 1.50%). The sky keeps its own blue there
+  (without the rule the network greys it), but it is not identical to the effect off: a patch of open sky
+  read 137/150/161 against 121/136/154 off and 142/150/158 without the rule. The mask leaves those pixels as
+  they were (bit for bit in the GPU test), so what remains is the game's own response to the rest of the
+  edited frame (its exposure) and DLSS's temporal blend near edges, not an edit of the sky.
+- **Scene cuts.** Three resets in every benchmark run, all in the long free-roam pass at its scripted camera
+  cuts (luma changes 52-68 of 255 against the threshold of 40), none in the other passes or on loading
+  screens (no false positives seen in 15 runs). On the still shot after its cut, the full network with the
+  reset against without it (`NEURAL_FORGE_SCENE_CUT=off`): 1.07% against 1.17% flicker just after the cut,
+  0.75% against 2.29% once the shot has settled: without it the previous scene's history blends in.
+- **Pass feedback**: lower values lower the added detail steadily, flicker does not move beyond noise; 1
+  stays the default (NATIVE_BACKEND.md, "Pass feedback").
+- **Bottleneck reuse (handoff item 5): not built.** The ViT bottleneck recomputed every other frame saves
+  at most about a tenth of the network's time (the reference's figure). With the edit cache the network runs
+  on about half the frames already, so the gain per frame is at most 0.19 ms of a 13.6 ms small-network
+  frame (1.4%) and 0.34 ms of 15.3 ms for the full one (2.3%), both under the 3% the handoff set, and it
+  needs a change to OpenDLSS-NR's graph. Measured network times from this table; the per-launch profile
+  (October 16, above) puts the encoder and the ViT together at 3.35 of the full network's 6.11 ms at
+  1486x836.
+- **bench-iq.py's settle lands after the still shot when the capture slows the game.** The series capture
+  reads every presented frame back, which slows the game, so GTA's still shot (about a second) holds fewer
+  rendered frames than the 30 the default settle skips at FG 4x, and the window measured the camera moving
+  again (20% "flicker"). The numbers above put a 9-frame window 40 presented frames (settled) and 8 frames
+  (just after) after each series' own cut instead, with bench-iq.py's flicker and detail functions.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
