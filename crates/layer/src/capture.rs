@@ -2785,9 +2785,7 @@ mod tests {
     fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32, bool)> {
         // SAFETY: same reasoning as `test_device`.
         let entry = unsafe { ash::Entry::load() }.ok()?;
-        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
-        let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
-        let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
+        let (instance, surface) = crate::composition::gpu::test_instance(&entry)?;
         let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
         let supported = unsafe { instance.enumerate_device_extension_properties(physical_device) }.is_ok_and(|extensions| {
             extensions.iter().any(|extension| {
@@ -2797,11 +2795,8 @@ mod tests {
         });
         let queue_family = 0;
         let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
-        let extension_names = [EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()];
-        let mut device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
-        if supported {
-            device_create_info = device_create_info.enabled_extension_names(&extension_names);
-        }
+        let extension_names = crate::composition::gpu::test_device_extensions(&instance, physical_device, surface, if supported { &[EXTERNAL_MEMORY_HOST_EXTENSION] } else { &[] });
+        let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         Some((entry, instance, physical_device, device, queue, queue_family, supported))

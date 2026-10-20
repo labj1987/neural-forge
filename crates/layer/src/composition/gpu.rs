@@ -1472,21 +1472,51 @@ pub(crate) fn test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDe
 fn open_test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
     // SAFETY: same reasoning as `examples/smoke.rs`'s identical call.
     let entry = unsafe { ash::Entry::load() }.ok()?;
-    let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
-    let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
-    // SAFETY: `create_info` is valid.
-    let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
+    let (instance, surface) = test_instance(&entry)?;
     // SAFETY: `instance` was just created and outlives every use of `physical_device`.
     let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
     let queue_family = 0;
     let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
-    let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
+    let extension_names = test_device_extensions(&instance, physical_device, surface, &[]);
+    let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
     // SAFETY: `device_create_info` is valid; every physical device has a family 0
     // (the Vulkan spec guarantees at least one queue family).
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
     // SAFETY: `device`/family/index 0 match what `device_create_info` just requested.
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
     Some((entry, instance, physical_device, device, queue, queue_family))
+}
+
+/// A Vulkan 1.3 instance for a test device, with `VK_KHR_surface` when the loader offers it (the
+/// `bool`), which `VK_KHR_swapchain` on the device needs ([`test_device_extensions`]).
+#[cfg(test)]
+pub(crate) fn test_instance(entry: &ash::Entry) -> Option<(ash::Instance, bool)> {
+    let surface_name = ash::extensions::khr::Surface::name();
+    let surface = entry
+        .enumerate_instance_extension_properties(None)
+        // SAFETY: each name is a NUL-terminated array.
+        .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == surface_name));
+    let names = [surface_name.as_ptr()];
+    let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
+    let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info).enabled_extension_names(if surface { &names } else { &[] });
+    // SAFETY: `create_info` is valid.
+    let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
+    Some((instance, surface))
+}
+
+/// The extensions a test device is created with: `extra` (each one the caller found offered) and
+/// `VK_KHR_swapchain` when the device offers it and the instance has `VK_KHR_surface` (`surface`;
+/// lavapipe has both). The capture and composition paths move images to and from `PRESENT_SRC_KHR`,
+/// a layout that exists only with that extension enabled, as it is on every device the layer sees a
+/// present on.
+#[cfg(test)]
+pub(crate) fn test_device_extensions(instance: &ash::Instance, physical_device: vk::PhysicalDevice, surface: bool, extra: &[&'static std::ffi::CStr]) -> Vec<*const std::ffi::c_char> {
+    let swapchain = ash::extensions::khr::Swapchain::name();
+    // SAFETY: `physical_device` is the instance's own; each name is a NUL-terminated array.
+    let offered = surface
+        && unsafe { instance.enumerate_device_extension_properties(physical_device) }
+            .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == swapchain));
+    extra.iter().copied().chain(offered.then_some(swapchain)).map(std::ffi::CStr::as_ptr).collect()
 }
 
 /// [`test_device`] with two queues in family 0 (the second one the layer's side queue, as for the
@@ -1498,8 +1528,7 @@ fn open_test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, 
 pub(crate) fn test_device_two_queues() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, vk::Queue, u32, bool)> {
     // SAFETY: same reasoning as `test_device`.
     let entry = unsafe { ash::Entry::load() }.ok()?;
-    let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
-    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder().application_info(&app_info), None) }.ok()?;
+    let (instance, surface) = test_instance(&entry)?;
     let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
     let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
     if families.first()?.queue_count < 2 {
@@ -1508,12 +1537,9 @@ pub(crate) fn test_device_two_queues() -> Option<(ash::Entry, ash::Instance, vk:
     let import = neural_forge_protocol::env::var("NEURAL_FORGE_TEST_IMPORT").as_deref() != Some("0")
         && unsafe { instance.enumerate_device_extension_properties(physical_device) }
         .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == crate::EXTERNAL_MEMORY_HOST_EXTENSION));
-    let names = [crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()];
+    let names = test_device_extensions(&instance, physical_device, surface, if import { &[crate::EXTERNAL_MEMORY_HOST_EXTENSION] } else { &[] });
     let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0, 1.0]).build()];
-    let mut info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info);
-    if import {
-        info = info.enabled_extension_names(&names);
-    }
+    let info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&names);
     let device = unsafe { instance.create_device(physical_device, &info, None) }.ok()?;
     let (q0, q1) = unsafe { (device.get_device_queue(0, 0), device.get_device_queue(0, 1)) };
     use std::io::Write;
@@ -1527,9 +1553,7 @@ pub(crate) fn test_device_two_queues() -> Option<(ash::Entry, ash::Instance, vk:
 pub(crate) fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
     // SAFETY: same reasoning as `test_device`.
     let entry = unsafe { ash::Entry::load() }.ok()?;
-    let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
-    let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info);
-    let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
+    let (instance, surface) = test_instance(&entry)?;
     let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
     let supported = unsafe { instance.enumerate_device_extension_properties(physical_device) }.is_ok_and(|extensions| {
         extensions.iter().any(|e| unsafe { std::ffi::CStr::from_ptr(e.extension_name.as_ptr()) } == crate::EXTERNAL_MEMORY_HOST_EXTENSION)
@@ -1540,7 +1564,7 @@ pub(crate) fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash
     }
     let queue_family = 0;
     let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
-    let extension_names = [crate::EXTERNAL_MEMORY_HOST_EXTENSION.as_ptr()];
+    let extension_names = test_device_extensions(&instance, physical_device, surface, &[crate::EXTERNAL_MEMORY_HOST_EXTENSION]);
     let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
