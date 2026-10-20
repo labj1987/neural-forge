@@ -680,6 +680,8 @@ void nf_native_fall_back_to_barriers(NfNative* n) {
   }
 }
 
+void nf_native_forget_fall_back(void) { g_fellBack.store(false); }
+
 void nf_native_close(NfNative* n) {
   if (!n) return;
   try {

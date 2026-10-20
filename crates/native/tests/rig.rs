@@ -403,6 +403,8 @@ fn the_fallback_to_barriers_builds_once_without_chaining() {
         assert_eq!(rebuilt.chained, 0, "recorded with barriers");
         assert!(rebuilt.field_width >= 800 && rebuilt.field_height >= 448, "at the size asked for, not the old one");
         drop(net);
+        // The fall back is process-wide: the tests after this one in the process chain again.
+        neural_forge_native::forget_fall_back();
         g.device.destroy_device(None);
         g.instance.destroy_instance(None);
     }

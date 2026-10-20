@@ -58,6 +58,7 @@ mod ffi {
         pub fn nf_native_chain_timeouts(n: *const c_void, at: *mut c_char, len: usize) -> u32;
         pub fn nf_native_reset_chain_timeouts(n: *mut c_void);
         pub fn nf_native_fall_back_to_barriers(n: *mut c_void);
+        pub fn nf_native_forget_fall_back();
         pub fn nf_native_stalled(n: *const c_void) -> u32;
         pub fn nf_native_weight_bytes(n: *const c_void, raw_loaded: *mut u64, raw: *mut u64, matrices: *mut u64);
         pub fn nf_native_close(n: *mut c_void);
@@ -399,6 +400,13 @@ impl Network {
         // SAFETY: `raw` is live; nothing of the previous build is pending (this function's contract).
         unsafe { ffi::nf_native_fall_back_to_barriers(self.raw) }
     }
+}
+
+/// Forgets a [`Network::fall_back_to_barriers`] for networks opened from now on (the live one keeps what it
+/// has): for a test of the fall back that shares its process with tests that chain.
+pub fn forget_fall_back() {
+    // SAFETY: only an atomic store.
+    unsafe { ffi::nf_native_forget_fall_back() }
 }
 
 impl Drop for Network {

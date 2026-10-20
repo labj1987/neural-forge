@@ -133,6 +133,10 @@ void nf_native_reset_chain_timeouts(NfNative* n);
 // next nf_native_build records it with barriers. The previous secondary must not be pending. Cheap.
 void nf_native_fall_back_to_barriers(NfNative* n);
 
+// Forgets a fall back to barriers for networks opened from now on (the live one keeps what it has): for a
+// test of the fall back that shares its process with other tests.
+void nf_native_forget_fall_back(void);
+
 // 1 once a bounded wait on the network's queue timed out: its work may still be running, so the network
 // takes no more work (every later build fails) and destroys nothing (close leaks what it made). The
 // caller treats the network as dead for this device.
