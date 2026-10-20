@@ -1455,7 +1455,7 @@ impl NeuralForgeDeviceInfo {
     /// synchronized for its `vkQueueSubmit*`.
     fn inline_prologue(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) {
         let Some(inline) = &self.inline else { return };
-        let inits = inline.prologue(cbs);
+        let inits = inline.prologue(queue, cbs);
         if inits.is_empty() {
             return;
         }

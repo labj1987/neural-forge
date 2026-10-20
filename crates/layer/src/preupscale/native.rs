@@ -1292,7 +1292,9 @@ impl DepthCopy {
         let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
         // SAFETY: forwarded.
         let buffer = unsafe { OwnBuffer::new(device, instance, physical_device, u64::from(width) * u64::from(height) * 4, usage) }?;
-        Some(Self { buffer, valid: None, timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).filter(|_| timed) })
+        // Only made when kept: a timer has no destructor, and one dropped leaks its query pool.
+        let timer = if timed { crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family) } else { None };
+        Some(Self { buffer, valid: None, timer })
     }
 
     pub(crate) fn buffer(&self) -> vk::Buffer {
@@ -1694,7 +1696,8 @@ impl NativePass {
             let cmds = crate::loader_data::allocate_commands(device, &alloc).ok()?;
             debug_assert_eq!(steps, BUILD_STEPS);
             // Optional (`None` where timestamps are not supported): nothing fails from here on.
-            let timer = || crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).filter(|_| timed).map(made);
+            // Only made when kept (inside DLSS's buffer the hold times its slot): a timer has no destructor.
+            let timer = || if timed { crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).map(made) } else { None };
             let timers = [timer(), timer()];
             let take_buffer = |b: &mut Option<OwnBuffer>| b.take().expect("built above");
             let (mvec, acc, answer, state) = (take_buffer(&mut p.mvec), take_buffer(&mut p.acc), take_buffer(&mut p.answer), take_buffer(&mut p.state));
@@ -2268,7 +2271,8 @@ impl NativePass {
         let Ok(cmds) = (unsafe { crate::loader_data::allocate_commands(device, &alloc) }) else {
             return fail(params, Some(saved));
         };
-        let timer = crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).filter(|_| self.timed);
+        // Only made when kept: a timer has no destructor.
+        let timer = if self.timed { crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family) } else { None };
         made(());
         made(());
         for _ in 0..2 * MORE + usize::from(timer.is_some()) {
@@ -3271,6 +3275,17 @@ pub(crate) fn note_reset(stale: Option<Stale>) {
     }
 }
 
+/// A network frame's history reset `stale` ([`HistoryGap::begin`]) after the pass's first frame (`frames`
+/// before it): logged, and a scene cut it consumes counted in `scene_cut`, or-ed with a cut the GPU already
+/// reset on the last network frame ([`apply_scene_cut`], read earlier in the same hold), which a network
+/// frame without a latched cut must not take back.
+fn note_network_reset(frames: u64, stale: Option<Stale>, scene_cut: &mut bool) {
+    if frames > 0 {
+        note_reset(stale);
+        *scene_cut |= matches!(stale, Some(Stale::SceneCut(_)));
+    }
+}
+
 /// The CPU's side of a scene-cut reading ([`super::scene_cut::effect`]), at the hold after the one it was
 /// taken on. `true` when it counts a reset (the GPU's, logged here); a latched cut is counted when the next
 /// network frame consumes it (`HistoryGap::begin`).
@@ -3506,7 +3521,8 @@ pub(crate) unsafe fn run_native_hold(
         // The staging image is the layer's own and stays: bound once.
         // SAFETY: nothing that may run uses the set unless it is unchanged; the colour input is a live
         // RGBA16F storage image.
-        if !unsafe { pass.bind_colour_once(device, target.colour) } {
+        let staging = ctx.as_ref().map_or(0, |c| c.staging.id);
+        if !unsafe { pass.bind_colour_once(device, target.colour, staging) } {
             result.miss = Some(frozen.blocked().map_or("a storage view of the colour input could not be created", |_| WAITING));
             return result;
         }
@@ -3654,7 +3670,7 @@ pub(crate) unsafe fn run_native_hold(
     if let (Some(s), Some(hdr_ref)) = (res.scene.as_mut().filter(|_| threshold > 0), res.hdr.as_ref()) {
         // SAFETY: nothing of the detector is pending (`wait_idle` above), or its set is not written now; the
         // encoded view and the native pass's state buffer are live.
-        unsafe { s.bind(device, hdr_ref.encoded_view(), native.state_buffer()) };
+        unsafe { s.bind(device, hdr_ref.encoded_view(), native.state_buffer(), [hdr_ref.id(), native.id()]) };
     }
     native.gap.note_format(format_of(target));
     // A frame of another network than the history's (the Network setting switched) resets the history
@@ -3816,10 +3832,7 @@ pub(crate) unsafe fn run_native_hold(
             (false, None)
         } else {
             let stale = native.gap.begin(hold_now());
-            if native.frames > 0 {
-                note_reset(stale);
-                result.scene_cut |= matches!(stale, Some(Stale::SceneCut(_)));
-            }
+            note_network_reset(native.frames, stale, &mut result.scene_cut);
             let history = native.frames > 0 && stale.is_none() && mvec.is_some();
             (history, Some(native.frame_plan(&graphs, history, jitter, target.mvec_scale, &passes)))
         };
@@ -4030,10 +4043,7 @@ pub(crate) unsafe fn run_native_hold(
         (false, [None, None], Vec::new())
     } else {
         let stale = native.gap.begin(hold_now());
-        if native.frames > 0 {
-            note_reset(stale);
-            result.scene_cut = matches!(stale, Some(Stale::SceneCut(_)));
-        }
+        note_network_reset(native.frames, stale, &mut result.scene_cut);
         let history = native.frames > 0 && stale.is_none() && mvec.is_some();
         let (cmds, later) = native.frame_graphs(&graphs, history, jitter, target.mvec_scale, &passes);
         (history, cmds, if more { later } else { Vec::new() })
@@ -4171,6 +4181,33 @@ pub(crate) unsafe fn run_native_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resources built untimed (inside DLSS's buffer the hold times its slot) make no GPU timer at all: a timer
+    /// has no destructor, so one made and dropped left its query pool behind, past `vkDestroyDevice` (which the
+    /// validation layer reports here, at the end of the test).
+    #[test]
+    fn untimed_resources_make_no_query_pool() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        // SAFETY: a fresh device; nothing is submitted; everything is destroyed before the device.
+        unsafe {
+            let extents = pass_extents(W, H, &[1.0; neural_forge_protocol::MAX_PASSES]);
+            let mut pass = NativePass::build_at(device, instance, physical, family, W, H, extents, false, false).expect("the pass builds");
+            assert!(pass.timers.iter().all(Option::is_none), "the frames untimed");
+            assert!(pass.ensure_more(device, instance, physical, family, 2), "the later passes build");
+            assert!(pass.more.as_ref().is_some_and(|m| m.timer.is_none()), "the later passes untimed");
+            let depth = DepthCopy::build(device, instance, physical, family, W, H, false).expect("the depth copy builds");
+            assert!(depth.timer.is_none(), "the depth copy untimed");
+            let cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H, false).expect("the edit cache builds");
+            cache.destroy(device);
+            depth.destroy(device);
+            pass.destroy(device);
+            device.destroy_device(None);
+        }
+    }
 
     /// A failed hold whose work no fence covers keeps the after-the-upscaler path off the network for
     /// as long as a frame may run; nothing else does.
@@ -5171,6 +5208,24 @@ mod tests {
             }
             device.destroy_command_pool(graph_pool, None);
             device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// A cut the GPU reset on the last network frame (read at the start of the hold) stays counted through a
+    /// network frame that consumes no latched cut, as inside DLSS's buffer: the split hold overwrote it, so
+    /// the session's count missed every such cut with the edit cache off or the camera still.
+    #[test]
+    fn a_cut_the_gpu_reset_stays_counted_through_the_next_network_frame() {
+        for (frames, stale, before, after) in [
+            (3, None, true, true),
+            (3, Some(Stale::Idle(std::time::Duration::from_secs(1))), true, true),
+            (3, Some(Stale::SceneCut(60)), false, true),
+            (3, None, false, false),
+            (0, Some(Stale::SceneCut(60)), false, false),
+        ] {
+            let mut cut = before;
+            note_network_reset(frames, stale, &mut cut);
+            assert_eq!(cut, after, "frames {frames}, {stale:?}, counted before: {before}");
         }
     }
 

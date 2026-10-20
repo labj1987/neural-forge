@@ -101,9 +101,11 @@ struct Store {
     loading: bool,
     lut: Option<Arc<Lut>>,
     generation: u64,
+    /// The `edit_lut_seq` whose loader thread could not be started, logged.
+    failed: Option<u32>,
 }
 
-static STORE: Mutex<Store> = Mutex::new(Store { seen: None, loading: false, lut: None, generation: 0 });
+static STORE: Mutex<Store> = Mutex::new(Store { seen: None, loading: false, lut: None, generation: 0, failed: None });
 
 /// The table to use: `None` while the strength is 0 (nothing is read) or no file is named or it could not
 /// be read. A new `seq` starts reading the file again in the background.
@@ -112,43 +114,78 @@ pub(crate) fn current(s: &ColourSettings) -> Option<Arc<Lut>> {
         return None;
     }
     let mut store = STORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    if store.seen != Some(s.lut_seq) && !store.loading {
-        store.seen = Some(s.lut_seq);
-        store.loading = true;
-        let started = std::thread::Builder::new().name("nf-colour-lut".into()).spawn(|| {
-            let config = neural_forge_protocol::persist::read_config(&neural_forge_protocol::persist::config_file());
-            let path = config.get(neural_forge_protocol::cube::CONFIG_KEY).cloned().unwrap_or_default();
-            let cube = if path.is_empty() {
-                crate::log!("[colour] no look-up table named (edit_lut in config.ini)");
-                None
-            } else {
-                match neural_forge_protocol::cube::load(&path) {
-                    Ok(c) => {
-                        crate::log!("[colour] look-up table {path}: {} points a side", c.size);
-                        Some(c)
-                    }
-                    Err(e) => {
-                        crate::log!("[colour] the look-up table could not be read: {e}");
-                        None
-                    }
-                }
-            };
-            let mut store = STORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-            store.generation += 1;
-            let generation = store.generation;
-            store.lut = cube.map(|cube| Arc::new(Lut { generation, cube }));
+    request(&mut store, s.lut_seq, || std::thread::Builder::new().name("nf-colour-lut".into()).spawn(load).map(drop));
+    store.lut.clone()
+}
+
+/// Starts reading the table for `seq` with `spawn` unless it was read for it or is being read. `seq` counts
+/// as read only once the reading started: a thread that could not be started is tried again at the next call
+/// (logged once for the seq), where taking it as read kept the previous table until `seq` moved on.
+fn request(store: &mut Store, seq: u32, spawn: impl FnOnce() -> std::io::Result<()>) {
+    if store.seen == Some(seq) || store.loading {
+        return;
+    }
+    store.loading = true;
+    match spawn() {
+        Ok(()) => store.seen = Some(seq),
+        Err(e) => {
             store.loading = false;
-        });
-        if started.is_err() {
-            store.loading = false;
+            if store.failed.replace(seq) != Some(seq) {
+                crate::log!("[colour] the look-up table's loader thread could not be started ({e}); tried again at the next frame");
+            }
         }
     }
-    store.lut.clone()
+}
+
+/// The loader thread: reads the file `edit_lut` names into [`STORE`].
+fn load() {
+    let config = neural_forge_protocol::persist::read_config(&neural_forge_protocol::persist::config_file());
+    let path = config.get(neural_forge_protocol::cube::CONFIG_KEY).cloned().unwrap_or_default();
+    let cube = if path.is_empty() {
+        crate::log!("[colour] no look-up table named (edit_lut in config.ini)");
+        None
+    } else {
+        match neural_forge_protocol::cube::load(&path) {
+            Ok(c) => {
+                crate::log!("[colour] look-up table {path}: {} points a side", c.size);
+                Some(c)
+            }
+            Err(e) => {
+                crate::log!("[colour] the look-up table could not be read: {e}");
+                None
+            }
+        }
+    };
+    let mut store = STORE.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    store.generation += 1;
+    let generation = store.generation;
+    store.lut = cube.map(|cube| Arc::new(Lut { generation, cube }));
+    store.loading = false;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A loader thread that could not be started leaves the seq unread: the next call starts one, where the
+    /// table chosen was otherwise never loaded until the seq moved on. One reading at a time, once per seq.
+    #[test]
+    fn a_seq_counts_as_read_only_once_its_loader_started() {
+        let mut store = Store::default();
+        request(&mut store, 4, || Err(std::io::Error::other("no more threads")));
+        assert_eq!((store.seen, store.loading), (None, false), "not started: still to read");
+        let mut started = 0;
+        request(&mut store, 4, || {
+            started += 1;
+            Ok(())
+        });
+        assert_eq!((started, store.seen, store.loading), (1, Some(4), true), "started at the next call");
+        request(&mut store, 5, || unreachable!("one reading at a time"));
+        store.loading = false;
+        request(&mut store, 4, || unreachable!("read for this seq already"));
+        request(&mut store, 5, || Ok(()));
+        assert_eq!(store.seen, Some(5), "a new seq reads again");
+    }
 
     #[test]
     fn a_neutral_pass_has_nothing_to_do_and_each_value_turns_on_its_step() {
