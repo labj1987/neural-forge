@@ -1944,4 +1944,47 @@ mod tests {
             assert_eq!(bits(&a.4), bits(&b.4), "hold {}: the picture written back differs", a.0);
         }
     }
+
+    /// The edit cache's write-backs stay within the finite half range at a low exposure. The refresh's
+    /// capture takes the decode's rule: at 5e-5 a fully clipped answer (1.0) decodes past 65504, and as
+    /// +Inf it would read as no light (`to_v`) and store a darkening edit for the cached holds; it stores
+    /// the brightening one (+1.5 stops, the luma limit). A cached hold of the same picture at half the
+    /// exposure (twice the scene value, the same in v) carries that edit onto 40000, past the half range:
+    /// it stores 65504, not +Inf. (Lavapipe's float-to-half conversion rounds toward zero, so it lands on
+    /// 65504 there anyway: this pins what every driver must give, NVIDIA's round-to-nearest one included.)
+    #[test]
+    fn the_cache_writes_back_finite_halves_at_a_low_exposure() {
+        let (w, h) = (8u32, 8u32);
+        let Some(rig) = Rig::new(w, h) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let n = (w * h) as usize;
+        let half = crate::preupscale::tests::f32_to_f16;
+        let grey = |v: f32| -> Vec<u8> { (0..n).flat_map(|_| [v, v, v, 1.0]).flat_map(|c| half(c).to_le_bytes()).collect() };
+        let exposure = |e: f32| Rig::write(&rig.exposure, &u32::from(half(e)).to_le_bytes());
+        Rig::write(&rig.depth, &vec![0u8; n * 4]);
+        Rig::write(&rig.mvec, &vec![0u8; n * 4]);
+        let d = &rig.gpu.3;
+        let push = rig.pass.push(F_CHAINED | F_FRESH | F_KEEP_CLAMPED, 0, [1.0, 1.0], 3.0);
+        // The refresh hold: the answer clipped at 1.0 over a grey of 20000 (v = 1/3).
+        exposure(5e-5);
+        rig.upload_image(rig.colour.image, &grey(20000.0));
+        rig.upload_image(rig.answer.image, &grey(1.0));
+        // SAFETY (all): recording into the test's buffer; bound in `Rig::new`.
+        rig.one_shot(|cmd| unsafe { rig.pass.record_motion(d, cmd, &push, rig.acc.buffer) });
+        rig.one_shot(|cmd| unsafe { rig.pass.record_capture(d, cmd, &push) });
+        let (edit, _) = rig.read_edits(|l| l.src_edit);
+        let limit = rig.pass.tuning.max_luma_edit;
+        assert!(edit.iter().all(|e| (e - limit).abs() < 1e-3), "the refresh stores the brightening edit (+{limit} stops), got {:?}", &edit[..3]);
+        // The cached hold.
+        exposure(2.5e-5);
+        rig.upload_image(rig.colour.image, &grey(40000.0));
+        rig.one_shot(|cmd| unsafe { rig.pass.record_motion(d, cmd, &push, rig.acc.buffer) });
+        rig.one_shot(|cmd| unsafe { rig.pass.record_apply(d, cmd, &push) });
+        let colour = rig.read_colour();
+        for (i, px) in colour.as_chunks::<4>().0.iter().enumerate() {
+            assert_eq!(&px[..3], &[65504.0; 3], "the cached hold at texel {i} stores the largest finite half");
+        }
+    }
 }

@@ -123,6 +123,7 @@ const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float KNEE = 0.75;
 const float K = 5.770780;
 const float CLAMPED = 0.999;
+const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
 
 uint index_of(uvec2 xy) { return xy.y * p.size.x + xy.x; }
 

@@ -4679,6 +4679,30 @@ mod tests {
             assert_ne!(neural(6, 4, 0, 2), neural(7, 7, 0, 2), "the test tells the scaled position from the unscaled one");
             assert_eq!(lanes(5, 3)[7], centre(neural(6, 4, 0, 2)), "history lane from the previous answer where the scaled vector points");
 
+            // Frame 5: a NaN head at (5, 3), residual and logit, on a frame with history (no motion again): clamp()
+            // of a NaN is undefined, so the composite reads it as 0. The answer there is 0 and the history the
+            // next frame reads is 0, not NaN (which would reach the network's input lanes, frame after frame).
+            // Lavapipe's clamp() happens to return 0 for a NaN too; the shader no longer relies on it.
+            fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
+            write_head(4, 10.0);
+            let nan_at = ((3 * FW + 5) * 4) as usize;
+            for k in 0..4 {
+                *head.ptr.cast::<f32>().add(nan_at + k) = f32::NAN;
+            }
+            let cmds = pass.frame(&built, true, None, [1.0, 1.0], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            let a5 = read_answer();
+            for c in 0..3 {
+                assert_eq!(a5[((3 * pw + 5) * 4 + c) as usize].to_bits(), 0, "a NaN head answers 0 in channel {c}");
+            }
+            write_head(5, 10.0);
+            let cmds = pass.frame(&built, true, None, [1.0, 1.0], Conditioning::default());
+            fx.submit(&mut pass, cmds);
+            let l = lanes(5, 3);
+            for c in 0..3 {
+                assert_eq!(l[7 + c].to_bits(), centre(0.0).to_bits(), "the history lane {c} after a NaN head is 0, centred");
+            }
+
             pass.destroy(device);
             encoded.destroy(device);
             for b in [&exposure, &features, &head, &staging] {

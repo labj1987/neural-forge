@@ -11,8 +11,8 @@
 //
 // The colour of the edit (docs/NATIVE_BACKEND.md, "The colour of the edit"; native_colour.comp's steps on the
 // 8-bit proxy's own values): with p.colour_flags.x bit 1 the change e = published - proxy is reshaped
-// (detail against its 3x3 binomial low-pass, from the neighbours' answers worked out here; saturation and
-// contrast around its BT.709 luma; the look-up table on the last pass, scaled by the edit's size; the gamut
+// (detail against its 3x3 binomial low-pass, from the neighbours' answers worked out here, once per group;
+// saturation and contrast around its BT.709 luma; the look-up table on the last pass, scaled by the edit's size; the gamut
 // guard shortening it along itself to stay in 0-1). Bit 16 dithers the quantisation: an 8x8 ordered
 // offset in (-0.5, 0.5) of the 8-bit step, so a level is the neighbour above or below it, never further.
 // The history is stored before any of this: it stays the network's answer. With no bit set the answer is
@@ -131,26 +131,41 @@ vec3 nrStyle(vec3 neural, float style, float tone) {
   return clamp(nrRgb(vec3(again.x, clamp(exp2(log2(again.y)), 0.0, 1.0), again.z)), vec3(0.0), vec3(1.0));
 }
 
-// The answer at `xy` before quantisation, and the proxy there (main's arithmetic, history blend included, for
-// the detail step's neighbours).
-vec3 publishedAt(uvec2 xy, out vec3 proxy) {
+// clamp() of a NaN is undefined (FClamp): a NaN the network's head gives reads as 0, so it never reaches
+// the history (and through it the next frame's input lanes) or the 8-bit answer's pack.
+float saturateOrZero(float x) {
+  return isnan(x) ? 0.0 : clamp(x, 0.0, 1.0);
+}
+
+vec3 saturateOrZero(vec3 x) {
+  return vec3(saturateOrZero(x.r), saturateOrZero(x.g), saturateOrZero(x.b));
+}
+
+// The network's answer at `xy` with the history blend, truncated to the half grid (this pass's next
+// history), and the proxy there.
+vec3 historyAt(uvec2 xy, out vec3 proxy) {
   uint at = xy.y * p.dims.z + xy.x;
   vec4 texel = unpackUnorm4x8(u_proxy.texel[at]);
   proxy = p.frame.y != 0u ? texel.bgr : texel.rgb;
   uint feature = (xy.y * p.dims.x + xy.x) * 4u;
   vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);
-  vec3 neural = clamp(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5, vec3(0.0), vec3(1.0));
+  vec3 neural = saturateOrZero(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5);
   if (p.frame.z != 0u) {
     uvec2 r = u_reproj.texel[at];
     vec2 last = unpackHalf2x16(r.y);
     if (last.y > 0.0) {
       float scale = clamp(p.control.w, 0.0, 1.0);
-      float weight = clamp((1.0 / (1.0 + exp2(u_head.head[feature + 3u] * uintBitsToFloat(0xbfb8aa3bu)))) * scale, 0.0, 1.0);
+      float weight = saturateOrZero((1.0 / (1.0 + exp2(u_head.head[feature + 3u] * uintBitsToFloat(0xbfb8aa3bu)))) * scale);
       vec3 hist = vec3(unpackHalf2x16(r.x), last.x);
       neural = fma(vec3(weight), hist - neural, neural);
     }
   }
-  vec3 history = vec3(truncateHalf(neural.r), truncateHalf(neural.g), truncateHalf(neural.b));
+  return vec3(truncateHalf(neural.r), truncateHalf(neural.g), truncateHalf(neural.b));
+}
+
+// The style operator on the history, then the intensity blend toward it from the proxy: the answer before
+// quantisation.
+vec3 publish(vec3 history, vec3 proxy) {
   float style = p.control.x;
   float intensity = p.control.z;
   vec3 styled = style != 0.0 ? nrStyle(history, style, p.control.y) : history;
@@ -159,6 +174,23 @@ vec3 publishedAt(uvec2 xy, out vec3 proxy) {
     for (int c = 0; c < 3; c++) published[c] = truncateHalf(clamp(fma(intensity, styled[c] - proxy[c], proxy[c]), 0.0, 1.0));
   }
   return published;
+}
+
+// The detail step's neighbours: the change (answer - proxy) of every pixel of this group's 8x8 tile and
+// the ring of one around it (the frame's edge repeated), worked out once per group instead of nine times
+// per pixel. The same arithmetic as the pixel's own, so the low-pass is what it was per pixel, bit for bit.
+const uint TILE = 10u;
+shared vec3 s_change[TILE * TILE];
+
+void loadTile() {
+  ivec2 origin = ivec2(gl_WorkGroupID.xy * 8u) - 1;
+  for (uint k = gl_LocalInvocationIndex; k < TILE * TILE; k += 64u) {
+    uvec2 q = uvec2(clamp(origin + ivec2(int(k % TILE), int(k / TILE)), ivec2(0), ivec2(p.dims.zw) - 1));
+    vec3 qp;
+    vec3 qa = publish(historyAt(q, qp), qp);
+    s_change[k] = qa - qp;
+  }
+  barrier();
 }
 
 vec3 lutEntry(uint r, uint g, uint b) {
@@ -194,19 +226,17 @@ float bayer(uvec2 xy) {
 }
 
 // The colour steps on one pixel (native_colour.comp's, on the 8-bit proxy's values).
-vec3 colourOf(uvec2 id, vec3 proxy, vec3 published) {
+vec3 colourOf(vec3 proxy, vec3 published) {
   uint flags = p.colour_flags.x;
   vec3 e = published - proxy;
   vec3 r = published;
   bool changed = false;
   if ((flags & DETAIL) != 0u) {
     vec3 low = vec3(0.0);
+    ivec2 local = ivec2(gl_LocalInvocationID.xy) + 1;
     for (int dy = -1; dy <= 1; dy++) {
       for (int dx = -1; dx <= 1; dx++) {
-        uvec2 q = uvec2(clamp(ivec2(id) + ivec2(dx, dy), ivec2(0), ivec2(p.dims.zw) - 1));
-        vec3 qp;
-        vec3 qa = publishedAt(q, qp);
-        low += float((2 - abs(dx)) * (2 - abs(dy))) * (qa - qp);
+        low += float((2 - abs(dx)) * (2 - abs(dy))) * s_change[uint(local.y + dy) * TILE + uint(local.x + dx)];
       }
     }
     low *= 1.0 / 16.0;
@@ -238,35 +268,18 @@ vec3 colourOf(uvec2 id, vec3 proxy, vec3 published) {
 
 void main() {
   uvec2 id = gl_GlobalInvocationID.xy;
+  uint flags = p.colour_flags.x;
+  // The tile before any invocation returns: barrier() needs the whole group (the flags are uniform).
+  if ((flags & STEP) != 0u && (flags & DETAIL) != 0u) loadTile();
   if (id.x >= p.dims.z || id.y >= p.dims.w) return;
   uint at = id.y * p.dims.z + id.x;
   vec4 texel = unpackUnorm4x8(u_proxy.texel[at]);
   bool bgra = p.frame.y != 0u;
-  vec3 proxy = bgra ? texel.bgr : texel.rgb;
-  uint feature = (id.y * p.dims.x + id.x) * 4u;
-  vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);
-  vec3 neural = clamp(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5, vec3(0.0), vec3(1.0));
-  if (p.frame.z != 0u) {
-    uvec2 r = u_reproj.texel[at];
-    vec2 last = unpackHalf2x16(r.y);
-    if (last.y > 0.0) {
-      float scale = clamp(p.control.w, 0.0, 1.0);
-      float weight = clamp((1.0 / (1.0 + exp2(u_head.head[feature + 3u] * uintBitsToFloat(0xbfb8aa3bu)))) * scale, 0.0, 1.0);
-      vec3 hist = vec3(unpackHalf2x16(r.x), last.x);
-      neural = fma(vec3(weight), hist - neural, neural);
-    }
-  }
-  vec3 history = vec3(truncateHalf(neural.r), truncateHalf(neural.g), truncateHalf(neural.b));
+  vec3 proxy;
+  vec3 history = historyAt(id, proxy);
   if (p.frame.w != 0u) u_history.texel[at] = uvec2(packHalf2x16(history.rg), packHalf2x16(vec2(history.b, 1.0)));
-  float style = p.control.x;
-  float intensity = p.control.z;
-  vec3 styled = style != 0.0 ? nrStyle(history, style, p.control.y) : history;
-  vec3 published = history;
-  if (style != 0.0 || intensity != 1.0) {
-    for (int c = 0; c < 3; c++) published[c] = truncateHalf(clamp(fma(intensity, styled[c] - proxy[c], proxy[c]), 0.0, 1.0));
-  }
-  uint flags = p.colour_flags.x;
-  if ((flags & STEP) != 0u) published = colourOf(id, proxy, published);
+  vec3 published = publish(history, proxy);
+  if ((flags & STEP) != 0u) published = colourOf(proxy, published);
   if ((flags & DITHER) != 0u) published = published + vec3(bayer(id) / 255.0);
   if (p.hud.x != 0.0) {
     float s = u_hud.s[at];

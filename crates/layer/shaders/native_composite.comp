@@ -130,6 +130,16 @@ bool exposure_ok(float e) {
   return e > 1e-6 && e < 65504.0;
 }
 
+// clamp() of a NaN is undefined (FClamp): a NaN the network's head gives reads as 0, as the decode reads
+// one, so it never reaches the history (and through it the next frame's input lanes).
+float saturateOrZero(float x) {
+  return isnan(x) ? 0.0 : clamp(x, 0.0, 1.0);
+}
+
+vec3 saturateOrZero(vec3 x) {
+  return vec3(saturateOrZero(x.r), saturateOrZero(x.g), saturateOrZero(x.b));
+}
+
 vec2 previousPosition(uvec2 xy) {
   uint at = xy.y * p.dims.z + xy.x;
   vec2 motion = MOTION_HALF ? unpackHalf2x16(u_motion.mv[at]) : vec2(uintBitsToFloat(u_motion.mv[2u * at]), uintBitsToFloat(u_motion.mv[2u * at + 1u]));
@@ -179,12 +189,12 @@ void main() {
   vec3 proxy = imageLoad(u_encoded, ivec2(id)).rgb;
   uint feature = (id.y * p.dims.x + id.x) * 4u;
   vec3 h = vec3(u_head.head[feature], u_head.head[feature + 1u], u_head.head[feature + 2u]);
-  vec3 neural = clamp(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5, vec3(0.0), vec3(1.0));
+  vec3 neural = saturateOrZero(fma(h, vec3(0.03125), fma(proxy, vec3(0.125), vec3(-0.0625))) * 8.0 + 0.5);
   // Without a history (a reset, the previous frame unusable, or a pixel whose previous position was off
   // screen) the blend weight is 0.
   if (hasHistory(id)) {
     float scale = clamp(p.motion.z, 0.0, 1.0);
-    float weight = clamp((1.0 / (1.0 + exp2(u_head.head[feature + 3u] * uintBitsToFloat(0xbfb8aa3bu)))) * scale, 0.0, 1.0);
+    float weight = saturateOrZero((1.0 / (1.0 + exp2(u_head.head[feature + 3u] * uintBitsToFloat(0xbfb8aa3bu)))) * scale);
     vec3 hist = historySample(id);
     neural = fma(vec3(weight), hist - neural, neural);
   }

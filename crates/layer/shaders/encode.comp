@@ -8,7 +8,7 @@
 // `swapchain -> frame -> ENCODE -> proxy (+ the untouched keep)`. Until this existed, this project skipped the encode entirely and handed the model a
 // bit-identical copy of the frame. Two consequences, both measured live:
 //
-//   * The ratio transfer (`compose.comp`'s mode 0, upstream's own resolve) degenerates
+//   * The ratio transfer (`compose.comp`'s mode 2, upstream's own resolve) degenerates
 //     when `proxy == original` -- its rescale target collapses to the frame itself and
 //     the model's answer is discarded. That is what pushed this project onto an
 //     additive path with a per-pixel motion mask, and that mask re-derives from noisy
