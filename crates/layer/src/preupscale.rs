@@ -1166,6 +1166,12 @@ pub(crate) enum Hazard {
     /// queue family, the inside hold's on the side queue's) and with them the native network's
     /// pipelines and history (2026-10-09).
     HeldInside,
+    /// The launch buffer, or a buffer before it in the submit, was recorded (at least in part) before
+    /// the current identification ([`Tracker::recorded_watched`]): barriers it holds on the inputs
+    /// were never seen. A D3D12 command list executed again without being re-recorded, or one recorded
+    /// ahead of the submit that identified the inputs, may carry a transition or a same-layout barrier
+    /// before DLSS's launch.
+    RecordedBefore,
 }
 
 impl Hazard {
@@ -1179,6 +1185,7 @@ impl Hazard {
             Self::SuspendedRendering => "the DLSS launch buffer resumes dynamic rendering suspended in the buffer before it; not holding (nothing may be submitted between the two), frames go to DLSS untouched",
             Self::NotSplittable => "the colour input is not an RGBA16F image in GENERAL; only the hold inside DLSS's buffer takes it",
             Self::HeldInside => "this identification's holds run inside DLSS's buffer; every buffer is held there, so the hold keeps one set of resources and the network its history",
+            Self::RecordedBefore => "the DLSS launch buffer, or a buffer before it in the submit, was recorded before DLSS's inputs were identified, so its barriers on them were not seen; not holding it (buffers recorded since are held)",
         }
     }
 }
@@ -1355,6 +1362,14 @@ pub(crate) struct Tracker {
     /// Watched images attached in `vkCmdBeginRendering`, per command buffer, with their layout
     /// ([`Self::attachments`]).
     attached: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::ImageLayout)>>,
+    /// Command buffers whose whole recording so far happened under the current identification: begun
+    /// while these inputs were watched ([`Self::begin`]), with every secondary executed into them so far
+    /// the same. Only for these are [`Self::pending`], [`Self::global_sync`] and [`Self::attached`]
+    /// everything recorded on the watched images: the device hooks record barriers only while inputs
+    /// are watched, and a new identification drops what was recorded ([`Self::refresh`], which empties
+    /// this set too). A buffer recorded before (a re-submitted one, or one recorded ahead on another
+    /// thread) may carry barriers on the inputs that were never seen ([`Hazard::RecordedBefore`]).
+    recorded_watched: HashSet<vk::CommandBuffer>,
     /// Diagnostics: barriers seen on the identified colour input, the last one's new layout, and
     /// whether the in-buffer hold's "layout unknown" line was logged.
     colour_barriers: u64,
@@ -1444,7 +1459,8 @@ impl Scan {
     /// Whether the colour input can be taken to be in `GENERAL` at this submit: its last committed
     /// barrier left it there, or no barrier on it was seen since it was watched. Never on the
     /// submit that (re)identified the inputs ([`Self::identified_now`]): that one goes to DLSS
-    /// untouched, and the next is held with known layouts.
+    /// untouched. A later submit whose launch buffer, or a buffer before it, was recorded before the
+    /// identification is refused by its [`Self::hazard`] ([`Hazard::RecordedBefore`]).
     pub(crate) fn colour_in_general(&self) -> bool {
         !self.identified_now && self.colour_layout.is_none_or(|l| l == vk::ImageLayout::GENERAL)
     }
@@ -2084,7 +2100,8 @@ impl Tracker {
     /// gets nothing.
     pub(crate) fn inline_point(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Option<InlinePoint> {
         let inputs = self.inputs?;
-        if self.identified {
+        // Begun before this identification: the layouts its earlier commands left are not known.
+        if self.identified || !self.recorded_watched.contains(&cb) {
             return None;
         }
         let desc = *self.images.get(&colour)?;
@@ -2292,11 +2309,21 @@ impl Tracker {
 
     /// Whether any command buffer carries a launch, recorded barriers or other synchronization.
     fn armed(&self) -> bool {
-        !self.launch.is_empty() || !self.pending.is_empty() || !self.global_sync.is_empty() || !self.rendering.is_empty() || !self.attached.is_empty()
+        !self.launch.is_empty()
+            || !self.pending.is_empty()
+            || !self.global_sync.is_empty()
+            || !self.rendering.is_empty()
+            || !self.attached.is_empty()
+            || !self.recorded_watched.is_empty()
     }
 
+    /// `vkBeginCommandBuffer` (or a reset): the earlier recording is gone, and the new one is seen
+    /// whole from here on when inputs are watched ([`Self::recorded_watched`]).
     pub(crate) fn begin(&mut self, command_buffer: vk::CommandBuffer) {
         self.free(&[command_buffer]);
+        if self.inputs.is_some() {
+            self.recorded_watched.insert(command_buffer);
+        }
     }
 
     pub(crate) fn free(&mut self, command_buffers: &[vk::CommandBuffer]) {
@@ -2306,6 +2333,7 @@ impl Tracker {
             self.global_sync.remove(cb);
             self.rendering.remove(cb);
             self.attached.remove(cb);
+            self.recorded_watched.remove(cb);
         }
     }
 
@@ -2344,6 +2372,10 @@ impl Tracker {
     /// `vkCmdExecuteCommands`: each secondary's recording continues the primary's, in order.
     pub(crate) fn execute(&mut self, primary: vk::CommandBuffer, secondaries: &[vk::CommandBuffer]) {
         for secondary in secondaries {
+            // A secondary recorded (in part) before the identification makes the primary so too.
+            if !self.recorded_watched.contains(secondary) {
+                self.recorded_watched.remove(&primary);
+            }
             // Where the secondary's recording starts in the primary's.
             let base = Before {
                 barriers: self.pending.get(&primary).map_or(0, Vec::len),
@@ -2569,6 +2601,7 @@ impl Tracker {
             self.committed.clear();
             self.owners.clear();
             self.pending.clear();
+            self.recorded_watched.clear();
             self.identified = true;
             self.generation += 1;
         } else if let (Some(new), Some(old)) = (inputs, self.inputs) {
@@ -3009,8 +3042,14 @@ impl Tracker {
         let mut any_foreign = false;
         let mut held_kind = None;
         let mut held_target: Option<(vk::Image, bool)> = None;
+        // A buffer up to and including the launch buffer was recorded (in part) before the current
+        // identification ([`Self::recorded_watched`]): what it recorded on the inputs is not known.
+        let mut recorded_before = false;
         for (bi, cbs) in batches.iter().enumerate() {
             for (ci, &cb) in cbs.iter().enumerate() {
+                if found.is_none() && !self.recorded_watched.contains(&cb) {
+                    recorded_before = true;
+                }
                 let colour = self.inputs.map(|i| i.colour.0);
                 // A buffer that launches DLSS Ray Reconstruction is never the hold point: forwarded.
                 let kind = self.launch.get(&cb).map(|r| if r.rr.is_empty() { r.kind(colour) } else { LaunchKind::Foreign });
@@ -3057,7 +3096,8 @@ impl Tracker {
                         evaluation: self.evaluations,
                         identified_now: self.identified,
                         identification: self.generation,
-                        hazard,
+                        // Before the barrier rules: those read only what was recorded while watched.
+                        hazard: if recorded_before { Some(Hazard::RecordedBefore) } else { hazard },
                         dump_hazard,
                         depth_hazard,
                         colour_owner,
@@ -3370,7 +3410,7 @@ impl Tracking {
         }
         let output = t.output_extent();
         let point = t.inline_point(cb, colour).map(|p| InlinePoint { hold: placement::Hold::of(&plan, placement::Stage::Before, (p.desc.width, p.desc.height), output), ..p });
-        if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) {
+        if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) && t.recorded_watched.contains(&cb) {
             let own = t.pending.get(&cb).is_some_and(|p| p.iter().any(|s| s.image == colour)) || t.attached.get(&cb).is_some_and(|a| a.iter().any(|(i, _)| *i == colour));
             if !own && !t.committed.contains_key(&colour) {
                 t.said_layout_miss = true;
@@ -3400,10 +3440,11 @@ impl Tracking {
         self.lock().forget_function(function);
     }
 
-    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording. Nothing to do (no lock)
-    /// while nothing is armed.
+    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording, and while inputs are watched
+    /// notes that the new one is seen whole ([`Tracker::recorded_watched`]). Nothing to do (no lock)
+    /// while nothing is armed or watched: a buffer begun then is not in that set, and none of it is.
     pub(crate) fn begin(&self, command_buffer: vk::CommandBuffer) {
-        if self.armed() {
+        if self.armed() || self.watching() {
             let mut t = self.lock();
             t.begin(command_buffer);
             self.rearm(&t);
@@ -7284,8 +7325,11 @@ mod tests {
 
     /// The submit that (re)identifies the inputs is not held: barriers recorded before the images
     /// were watched were never seen (the device hooks only record them while watching), and a new
-    /// identification drops what was committed, so "no layout" there is not "GENERAL". The next
-    /// launch-bearing submit, with no barrier seen while watched, is.
+    /// identification drops what was committed, so "no layout" there is not "GENERAL". Nor is a later
+    /// submit whose launch buffer, or a buffer before it, was recorded before the identification
+    /// (submitted again without being recorded again, recorded ahead on another thread, or carrying
+    /// such a secondary): its barriers on the inputs were not seen either. A launch buffer recorded
+    /// since, with no barrier seen while watched, is held.
     #[test]
     fn the_submit_that_identifies_the_inputs_is_not_held() {
         let t = Tracking::default();
@@ -7306,24 +7350,60 @@ mod tests {
             }
             tr.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
         };
+        let record = |c: vk::CommandBuffer| {
+            t.begin(c);
+            t.launch(c, vk::CuFunctionNVX::null(), None);
+        };
         register(0x1000);
-        t.launch(cb(1), vk::CuFunctionNVX::null(), None);
+        record(cb(1));
         let first = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(first.inputs.is_some() && first.identified_now && first.colour_layout.is_none());
         assert!(!first.colour_in_general(), "identified on this submit: nothing known, not held");
+        // The same buffer again, not recorded again: whatever it holds on the inputs was not seen.
+        let resubmitted = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
+        assert!(!resubmitted.identified_now && resubmitted.colour_in_general());
+        assert_eq!(resubmitted.hazard, Some(Hazard::RecordedBefore), "recorded before the identification: not held");
+        record(cb(1));
         let second = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(!second.identified_now && second.colour_layout.is_none());
-        assert!(second.colour_in_general(), "watched for a submit and no barrier seen: GENERAL");
-        // A re-identification (DLSS's inputs re-created) starts over.
+        assert!(second.colour_in_general() && second.hazard.is_none(), "recorded while watched, no barrier seen: GENERAL, held");
+        // A buffer before the launch buffer in the submit, recorded before the identification: its
+        // barriers are what the launch buffer starts from.
+        assert_eq!(t.submit_ok(&[vec![cb(3)], vec![cb(1)]]).expect("launch-bearing").hazard, Some(Hazard::RecordedBefore));
+        t.begin(cb(3));
+        assert_eq!(t.submit_ok(&[vec![cb(3)], vec![cb(1)]]).expect("launch-bearing").hazard, None);
+        assert_eq!(t.submit_ok(&[vec![cb(1), cb(7)]]).expect("launch-bearing").hazard, None, "one after the launch buffer does not matter");
+        // A secondary recorded before the identification makes its primary so.
+        t.begin(cb(4));
+        t.execute(cb(4), &[cb(5)]);
+        t.launch(cb(4), vk::CuFunctionNVX::null(), None);
+        assert_eq!(t.submit_ok(&[vec![cb(4)]]).expect("launch-bearing").hazard, Some(Hazard::RecordedBefore));
+        t.begin(cb(5));
+        record(cb(4));
+        t.execute(cb(4), &[cb(5)]);
+        assert_eq!(t.submit_ok(&[vec![cb(4)]]).expect("launch-bearing").hazard, None);
+        // A re-identification (DLSS's inputs re-created) starts over: a buffer recorded under the old
+        // one was recorded before this one (only its barriers on the old inputs were kept).
         t.lock().forget_image(vk::Image::from_raw(0x1000));
         register(0x5000);
         let again = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert_eq!(again.inputs.map(|i| i.colour.0), Some(vk::Image::from_raw(0x5000)));
         assert!(again.identified_now && !again.colour_in_general());
-        assert!(t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing").colour_in_general());
+        let stale = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
+        assert!(stale.colour_in_general() && stale.hazard == Some(Hazard::RecordedBefore), "recorded under the old identification: not held");
+        record(cb(1));
+        let held = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
+        assert!(held.colour_in_general() && held.hazard.is_none());
         // A barrier out of GENERAL still refuses the hold.
+        t.begin(cb(2));
         t.barriers(cb(2), [ImageSync::to(vk::Image::from_raw(0x5000), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)].into_iter(), None);
         assert!(!t.submit_ok(&[vec![cb(2), cb(1)]]).expect("launch-bearing").colour_in_general());
+        // Nothing is left watched-recorded once nothing is identified, so nothing stays armed for it.
+        t.lock().forget_image(vk::Image::from_raw(0x5000));
+        t.lock().forget_image(vk::Image::from_raw(0x5100));
+        t.lock().launch_submits += SR_RECENT;
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        assert!(t.lock().inputs.is_none() && t.lock().recorded_watched.is_empty());
     }
 
     /// On a device with NVX but no DLSS nothing is ever armed, so the per-command-buffer and
@@ -7416,7 +7496,8 @@ mod tests {
 
     /// A tracker with GTA's three inputs identified (colour 0x100, depth 0x200, motion vectors
     /// 0x300; registration keys `image + 0x1000`) and one launch-bearing submit behind it, so the
-    /// next is not the identifying one.
+    /// next is not the identifying one. Buffers `cb(1)` to `cb(HELD_BEGUN)` were begun since: their
+    /// whole recording is seen ([`Tracker::recorded_watched`]).
     fn held_tracker() -> (Tracker, Vec<u8>) {
         held_tracker_with(vk::ImageUsageFlags::STORAGE)
     }
@@ -7442,8 +7523,14 @@ mod tests {
         t.launch(cb(900), Some(&params));
         assert!(t.submit_ok(&[vec![cb(900)]]).is_some_and(|s| s.identified_now));
         t.free(&[cb(900)]);
+        for k in 1..=HELD_BEGUN {
+            t.begin(cb(k));
+        }
         (t, params)
     }
+
+    /// The buffers [`held_tracker`] begins after its identification.
+    const HELD_BEGUN: u64 = 16;
 
     fn colour() -> vk::Image {
         vk::Image::from_raw(0x100)
@@ -7538,6 +7625,25 @@ mod tests {
         assert_eq!(input_launch(&other, &[colour, r32, mvec]), None);
         // No motion vectors: not an input launch.
         assert_eq!(input_launch(&images, &[colour, r32]), None);
+    }
+
+    /// No hold goes inside a buffer begun before the identification: the layout its earlier commands
+    /// left the colour input in, and the synchronization before the launch, were not seen. Begun again
+    /// since, the same recording gets its hold.
+    #[test]
+    fn no_hold_goes_inside_a_buffer_begun_before_the_identification() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        let early = cb(HELD_BEGUN + 1);
+        t.global(early, Hazard::MemoryBarrier);
+        t.launch(early, Some(&params));
+        assert_eq!(t.take_inline_at(), Some((early, colour())));
+        assert!(t.inline_point(early, colour()).is_none(), "recorded (in part) before the identification");
+        t.begin(early);
+        t.global(early, Hazard::MemoryBarrier);
+        t.launch(early, Some(&params));
+        assert_eq!(t.take_inline_at(), Some((early, colour())));
+        assert_eq!(t.inline_point(early, colour()).map(|p| p.hazard), Some(Hazard::MemoryBarrier), "begun since: held inside");
     }
 
     /// The hold goes inside DLSS's buffer exactly where the split is refused: Crimson Desert's and
