@@ -48,7 +48,8 @@ disagree, the more recent measurement wins.
   documented pipeline, the history reset rule, and the GTA script-mod finding.
 - [DLSS_KERNEL_CATALOGUE.md](DLSS_KERNEL_CATALOGUE.md): DLSS's kernel names and input-kernel parameter
   layouts for every DLSS version on the test machine (2.2.11 to 310.9.1), which kernels are SR, FG and
-  Ray Reconstruction, and what the layer could stop guessing.
+  Ray Reconstruction, and what the layer could stop guessing; DLSS-NR's own PTX kernels in build 310.9.16
+  against 310.8.0, what changed and whether OpenDLSS-NR has it, and the register caps measured.
 - [DLL_FINDINGS_AUDIT.md](DLL_FINDINGS_AUDIT.md): 2.0.10 and the native backend checked against a
   static analysis of `nvngx_dlssnr.dll` 310.8, item by item, with the recommended changes and the
   runtime tests that would settle what the code cannot.
