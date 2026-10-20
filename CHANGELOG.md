@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.3 — 2026-10-20
+
+- Games that recreate their swapchain (changing resolution, toggling fullscreen or HDR, alt-tabbing) no
+  longer leave a few Vulkan semaphores behind each time: they are freed once the GPU is done with them.
+- Native Vulkan programs with a Vulkan 1.0 device (vkcube) get a valid device: the zero-copy capture's
+  extension is added only where its dependency is there.
+
 ## 3.8.2 — 2026-10-20
 
 A review of the whole code base, and its fixes.
