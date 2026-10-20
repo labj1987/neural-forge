@@ -1303,7 +1303,7 @@ impl GpuCompose {
         }
         // SAFETY: the caller hands over `ShmClient`'s answer region, mapped for the life of the
         // process and aligned/sized as `import_host_buffer` requires.
-        match unsafe { crate::capture::import_host_buffer(device, instance, physical_device, host_ptr, bytes) } {
+        match unsafe { crate::capture::import_host_buffer(device, instance, physical_device, host_ptr, bytes, vk::BufferUsageFlags::empty()) } {
             Some((buffer, memory)) => {
                 self.zc.answer_import = Some(AnswerImport { buffer, memory, ptr: host_ptr, bytes });
                 static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);

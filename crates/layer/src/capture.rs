@@ -2584,7 +2584,7 @@ unsafe fn build_imported_capture_buffer(
     };
 
     // SAFETY: forwarded from this function's own contract.
-    let Some((buffer, memory)) = (unsafe { import_host_buffer(device, instance, physical_device, host_ptr, bytes) }) else {
+    let Some((buffer, memory)) = (unsafe { import_host_buffer(device, instance, physical_device, host_ptr, bytes, vk::BufferUsageFlags::empty()) }) else {
         // SAFETY: neither `fence` nor `pool` owns any other resource yet.
         unsafe {
             device.destroy_fence(fence, None);
@@ -2617,6 +2617,7 @@ pub(crate) unsafe fn import_host_buffer(
     physical_device: vk::PhysicalDevice,
     host_ptr: *mut u8,
     bytes: vk::DeviceSize,
+    usage: vk::BufferUsageFlags,
 ) -> Option<(vk::Buffer, vk::DeviceMemory)> {
     // Imported host memory has its own compatibility query -- separate from (and not
     // necessarily the same memory-type set as) `build_capture_buffer`'s own
@@ -2660,7 +2661,7 @@ pub(crate) unsafe fn import_host_buffer(
     let mut external_info = vk::ExternalMemoryBufferCreateInfo::builder().handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
     let buf_info = vk::BufferCreateInfo::builder()
         .size(bytes)
-        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
+        .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
         .push_next(&mut external_info);
     // SAFETY: `buf_info` is valid.

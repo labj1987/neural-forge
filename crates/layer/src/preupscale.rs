@@ -3979,26 +3979,28 @@ fn own_host_buffer_with(device: &ash::Device, instance: &ash::Instance, physical
 }
 
 /// Imports `bytes` (rounded up to the driver's alignment) of the SHM region at `region` when it can,
-/// else allocates a staged buffer of `bytes`.
+/// else allocates a staged buffer of `bytes`; either way usable for copies and for `usage` (the
+/// after-the-upscaler path binds its regions as storage buffers).
 ///
 /// # Safety
 /// `region` must be valid for `capacity` bytes for the life of the result.
+#[allow(clippy::too_many_arguments)]
 unsafe fn region_buffer(
     device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, import: bool,
-    region: *mut u8, capacity: usize, bytes: u64,
+    region: *mut u8, capacity: usize, bytes: u64, usage: vk::BufferUsageFlags,
 ) -> Option<HostBuffer> {
     if import {
         if let Some(alignment) = crate::capture::min_imported_host_pointer_alignment(instance, physical_device) {
             let rounded = bytes.div_ceil(alignment) * alignment;
             if (region as u64).is_multiple_of(alignment) && rounded <= capacity as u64 {
                 // SAFETY: `region` is valid for `capacity >= rounded` bytes and aligned.
-                if let Some((buffer, memory)) = unsafe { crate::capture::import_host_buffer(device, instance, physical_device, region, rounded) } {
+                if let Some((buffer, memory)) = unsafe { crate::capture::import_host_buffer(device, instance, physical_device, region, rounded, usage) } {
                     return Some(HostBuffer { buffer, memory, ptr: region, staged: false });
                 }
             }
         }
     }
-    own_host_buffer(device, instance, physical_device, bytes)
+    own_host_buffer_with(device, instance, physical_device, bytes, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | usage)
 }
 
 /// Everything one device's holds use. Built for one extent and queue family; rebuilt (after
@@ -4076,7 +4078,7 @@ impl Resources {
             return None;
         }
         // SAFETY: the region is mapped for the life of the process.
-        let proxy = unsafe { region_buffer(device, instance, physical_device, import, proxy_region, proxy_capacity, bytes) }?;
+        let proxy = unsafe { region_buffer(device, instance, physical_device, import, proxy_region, proxy_capacity, bytes, vk::BufferUsageFlags::empty()) }?;
         let cleanup = |pool: Option<vk::CommandPool>, fences: &[vk::Fence]| {
             // SAFETY: none of these was ever submitted.
             unsafe {

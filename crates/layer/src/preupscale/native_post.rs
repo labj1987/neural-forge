@@ -718,7 +718,8 @@ unsafe fn evaluate(
         }
         // SAFETY: the regions are mapped for the process's life with room for `bytes`.
         let buffers = unsafe {
-            (region_buffer(device, instance, physical, import, proxy_region, capacity, bytes), region_buffer(device, instance, physical, import, answer_region, capacity, bytes))
+            let storage = vk::BufferUsageFlags::STORAGE_BUFFER;
+            (region_buffer(device, instance, physical, import, proxy_region, capacity, bytes, storage), region_buffer(device, instance, physical, import, answer_region, capacity, bytes, storage))
         };
         let (proxy, answer) = match buffers {
             (Some(proxy), Some(answer)) => (proxy, answer),
