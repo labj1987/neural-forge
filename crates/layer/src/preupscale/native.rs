@@ -306,6 +306,30 @@ impl InFlight {
     }
 }
 
+/// The holds' clock for the history's gap rule (`HistoryGap::MAX_GAP`): the time now, or in a test the
+/// rig's stopped clock ([`stop_clock`]), so that how long the test machine takes between two holds does not
+/// decide whether the second one has the first one's history.
+fn hold_now() -> Instant {
+    #[cfg(test)]
+    if let Some(t) = STOPPED_CLOCK.get() {
+        return t;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    static STOPPED_CLOCK: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+/// Tests: stops [`hold_now`] on this thread, for the rest of the test: its holds follow one another with no
+/// gap, however long the machine takes between them (a CI runner took over `HistoryGap::MAX_GAP` between two
+/// holds now and then, and the cached hold became a refresh).
+#[cfg(test)]
+pub(crate) fn stop_clock() {
+    STOPPED_CLOCK.set(Some(Instant::now()));
+}
+
 /// Milliseconds since the first call in this process (a monotonic stamp for [`Loader`]'s claims).
 fn epoch_ms() -> u64 {
     static START: std::sync::LazyLock<Instant> = std::sync::LazyLock::new(Instant::now);
@@ -3638,7 +3662,7 @@ pub(crate) unsafe fn run_native_hold(
     if note_network(&mut native.gap, &mut native.history_network, built.network) {
         crate::log!("[native] resetting the history (the {} network runs from here)", network::name(built.network));
     }
-    let history_ok = native.frames > 0 && native.gap.pending(Instant::now()).is_none();
+    let history_ok = native.frames > 0 && native.gap.pending(hold_now()).is_none();
     // The cache's plan for this hold (a refresh at interval 1 with the cache off).
     let mut cache_hold = None;
     let mut plan = None;
@@ -3791,7 +3815,7 @@ pub(crate) unsafe fn run_native_hold(
         let (history, frame_plan) = if cached {
             (false, None)
         } else {
-            let stale = native.gap.begin(Instant::now());
+            let stale = native.gap.begin(hold_now());
             if native.frames > 0 {
                 note_reset(stale);
                 result.scene_cut |= matches!(stale, Some(Stale::SceneCut(_)));
@@ -3925,7 +3949,7 @@ pub(crate) unsafe fn run_native_hold(
         if cached {
             // The 500 ms rule counts from this hold, not the last network frame.
             if let Some(n) = res.native.as_mut() {
-                n.gap.touch(Instant::now());
+                n.gap.touch(hold_now());
             }
         }
         if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {
@@ -4005,7 +4029,7 @@ pub(crate) unsafe fn run_native_hold(
     let (history, frame_cmds, later) = if cached {
         (false, [None, None], Vec::new())
     } else {
-        let stale = native.gap.begin(Instant::now());
+        let stale = native.gap.begin(hold_now());
         if native.frames > 0 {
             note_reset(stale);
             result.scene_cut = matches!(stale, Some(Stale::SceneCut(_)));
@@ -4115,7 +4139,7 @@ pub(crate) unsafe fn run_native_hold(
     if cached {
         // The 500 ms rule counts from this hold, not the last network frame.
         if let Some(n) = res.native.as_mut() {
-            n.gap.touch(Instant::now());
+            n.gap.touch(hold_now());
         }
     }
     if let (Some(edit), Some(h), Some(p)) = (res.edit.as_mut(), cache_hold.as_ref(), plan.as_ref()) {

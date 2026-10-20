@@ -53,6 +53,13 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` (CI's step shows the settings); a test device
   enables what the code under test needs (`composition::gpu::test_device_extensions`), destroys what
   it created before the device, and records over real images, never stand-in handles.
+- Leave lavapipe's vector width and CPU features at their defaults. With `LP_NATIVE_VECTOR_WIDTH=128` on an
+  AVX CPU, Mesa 26.0.8's llvmpipe crashes in its own JIT code in every test that runs the native frame (a
+  32-byte aligned store to a 16-byte aligned slot of its stack), and Mesa 25.2.8's does with 128 and
+  `GALLIUM_OVERRIDE_CPU_CAPS=sse4.1` (a jump into non-executable memory). The same shaders pass at the
+  defaults (also under GPU-assisted validation), and each Mesa passes the setting the other crashes with.
+- Tests must not depend on how fast the machine runs them: the hold's history gap
+  (`HistoryGap::MAX_GAP`, 500 ms) reads `native::hold_now`, which the inline test rig stops.
 - Run `python3 scripts/check_namespace.py`, `python3 scripts/test_install.py`,
   and `bash scripts/smoke-test.sh` for namespace, installation and Vulkan checks.
 - Shaders: `python3 scripts/check_shaders.py --update` rebuilds the committed SPIR-V with the pinned

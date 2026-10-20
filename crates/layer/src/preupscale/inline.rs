@@ -1327,6 +1327,8 @@ mod tests {
                 inline.pool_created(pool, family);
                 // As after the device's first hold point: every buffer the tests begin is noted.
                 inline.restore.activate();
+                // The holds' history follows the hold numbers the tests give, not the machine's speed.
+                native::stop_clock();
                 let mut rig = Self {
                     _entry: entry,
                     instance,
