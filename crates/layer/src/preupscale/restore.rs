@@ -90,8 +90,10 @@ impl Binding {
         }
     }
 
-    /// Descriptor sets bound the classic way (pushed ones included): what descriptor-buffer offsets invalidate,
-    /// and the other way round.
+    /// Descriptor sets bound with `vkCmdBindDescriptorSets`: what descriptor-buffer offsets invalidate, and the
+    /// other way round. Pushed sets are neither kind: a push-descriptor set is used beside either
+    /// (VK_EXT_descriptor_buffer takes pushes with descriptor buffers), so neither drops it, and it drops
+    /// neither; only a call binding its set number again replaces it.
     fn classic(&self) -> bool {
         matches!(self, Binding::Sets { .. })
     }
@@ -1012,8 +1014,16 @@ mod tests {
         assert_eq!(s.bindings.len(), 2);
         s.bind(Binding::Push { layout: layout(3), set: 2, writes: vec![] });
         assert_eq!(s.bindings.len(), 3, "a push leaves descriptor-buffer offsets alone");
+        s.bind(Binding::Offsets { layout: layout(2), first: 0, indices: vec![0], offsets: vec![512] });
+        assert_eq!(s.bindings.len(), 3, "offsets for set 0 replace set 0's and leave the push of set 2");
         s.bind(Binding::Sets { layout: layout(1), first: 0, sets: vec![set(15)], dynamic: vec![] });
         assert_eq!(s.bindings.iter().filter(|(_, b)| b.buffer()).count(), 0, "descriptor sets invalidate the offsets");
+        assert!(s.bindings.iter().any(|(_, b)| matches!(b, Binding::Push { set: 2, .. })), "and leave the push");
+        s.bind(Binding::PushTemplate { template: vk::DescriptorUpdateTemplate::from_raw(4), layout: layout(2), set: 3, data: vec![] });
+        s.bind(Binding::Offsets { layout: layout(2), first: 0, indices: vec![0], offsets: vec![0] });
+        assert_eq!(s.bindings.iter().filter(|(_, b)| matches!(b, Binding::Push { .. } | Binding::PushTemplate { .. })).count(), 2, "offsets leave both pushes");
+        s.bind(Binding::Sets { layout: layout(1), first: 2, sets: vec![set(16)], dynamic: vec![] });
+        assert!(!s.bindings.iter().any(|(_, b)| matches!(b, Binding::Push { .. })), "binding set 2 again replaces its push");
     }
 
     #[test]
