@@ -585,7 +585,9 @@ the write-back inverts, on the GPU, in the layer's own two submissions (`preupsc
   padded answer image `UNDEFINED -> GENERAL`); copy the answer region (model) or the proxy region
   (roundtrip) into the answer image; `TRANSFER -> COMPUTE_SHADER`; the **decode** dispatch over the
   real extent (the padding is cropped): `y = sRGB EOTF(answer)`, `y = min(y, 1 - 1e-4)`, at or above
-  0.75 `v = 0.75 - ln(1 - (y - 0.75) / 0.25) / 5.770780`, `scene' = v * W / e`; where the encoded
+  0.75 `v = 0.75 - ln(1 - (y - 0.75) / 0.25) / 5.770780`, `scene' = min(v * W / e, 65504)` (the largest
+  finite half: below an exposure of about 2.1 W / 65504 the inverse reaches past it, and an infinity in DLSS's
+  colour input spreads through its history); where the encoded
   input of that channel (read from the encoded image the capture wrote) was >= 0.999 the original
   scene value is kept; alpha is always the original. It reads and writes the colour input in place
   (each invocation its own pixel only); then `COMPUTE_SHADER/SHADER_WRITE ->

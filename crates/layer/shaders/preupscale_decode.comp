@@ -5,7 +5,8 @@
 //
 // Per channel: y = sRGB EOTF(clamp(answer, 0, 1)) (a NaN answer as 0), clamped to <= 1 - 1e-4; at or
 // above 0.75 the shoulder's inverse v = 0.75 - ln(1 - (y - 0.75) / 0.25) / K, else v = y; scene' = v
-// * paper_white / e. Where the encoded input's peak channel was >= 0.999 (a blown highlight: sky,
+// * paper_white / e, at most 65504 (the largest finite half: at a low exposure the shoulder's inverse
+// reaches past it, and an infinity in DLSS's colour input spreads through its history). Where the encoded input's peak channel was >= 0.999 (a blown highlight: sky,
 // sun; the inverse cannot bring it back) and flags bit 0 is set, the original pixel is kept, all
 // three channels: keeping only the clamped one beside the model's other two would turn its hue.
 // Alpha is always the original. With an unusable exposure value nothing is written.
@@ -38,6 +39,7 @@ const float KNEE = 0.75;
 const float K = 5.770780;
 const float CLAMPED = 0.999;
 const uint KEEP_CLAMPED = 1u;
+const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
 
 bool exposure_ok(float e) {
   return e > 1e-6 && e < 65504.0;
@@ -54,9 +56,9 @@ float shoulder_inverse(float y) {
   return y >= KNEE ? KNEE - log(1.0 - (y - KNEE) / 0.25) / K : y;
 }
 
-// model domain -> scene-linear.
+// model domain -> scene-linear, within the finite half range the colour input stores.
 float decode(float answer, float inv_scale) {
-  return shoulder_inverse(srgb_eotf(answer)) * inv_scale;
+  return min(shoulder_inverse(srgb_eotf(answer)) * inv_scale, HALF_MAX);
 }
 
 void main() {

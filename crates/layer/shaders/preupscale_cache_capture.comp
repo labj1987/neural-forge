@@ -121,6 +121,7 @@ const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float KNEE = 0.75;
 const float K = 5.770780;
 const float CLAMPED = 0.999;
+const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
 
 uint index_of(uvec2 xy) { return xy.y * p.size.x + xy.x; }
 
@@ -234,7 +235,7 @@ float shoulder_inverse(float y) {
 }
 
 float decode(float answer, float inv_scale) {
-  return shoulder_inverse(srgb_eotf(answer)) * inv_scale;
+  return min(shoulder_inverse(srgb_eotf(answer)) * inv_scale, HALF_MAX);
 }
 
 // The value an RGBA16F store keeps.

@@ -55,11 +55,11 @@ layout(push_constant) uniform Params {
   // every composited frame -- see `swapchain::is_bgr_order`'s doc comment (Rust
   // side) for the full story.
   uint bgr_order;
-  // 1: guarded-additive, used by the async held-answer path when the proxy is NOT
-  // encoded -- see the comment
-  // 2: the encoded-proxy ratio transfer, used whenever the capture leg ran the
-  // encode (the normal path on hardware that supports it)
-  // where it's read, below, for why that path needs a different formula.
+  // 2: the encoded-proxy ratio transfer, used whenever the capture leg ran the encode
+  // (the normal path on hardware that supports it). Every other value (1 is what the Rust
+  // side passes) is the guarded-additive formula the async held-answer path uses when the
+  // proxy is NOT encoded -- see the comment where `mode` is read, below, for why that path
+  // needs a different formula.
   uint mode;
   // Mode 2 only. 0 = off (the ratio is taken per pixel, as before), 1 = full guard: where the
   // frame has moved since the one the model answered, the relighting ratio comes from the
@@ -672,6 +672,13 @@ void main() {
     // exact inverse of its curve and the white divide. Nothing of the frame is kept. (Only on an
     // encoded proxy: an unencoded one was never put through the curve.)
     result = DecodeAnswer(model_answer) * max(params.white_point, 1e-4);
+    // The 8-bit output holds 0-1: a triple above it is scaled down by its peak channel (one
+    // scalar, so hue is kept), as the soft knee does, instead of SrgbEncode clipping channels one
+    // by one, which turns the hue.
+    float peak = max(result.r, max(result.g, result.b));
+    if (peak > 1.0) {
+      result /= peak;
+    }
   }
 
   // Debug views (neural_forge_protocol::ShmHeader::debug_view): 1 the frame, 2 the model's answer,

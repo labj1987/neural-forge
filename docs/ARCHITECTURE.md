@@ -421,7 +421,7 @@ input = sRGB_OETF(y),  alpha = 1
 y      = min(sRGB_EOTF(answer), 1 - 1e-4)            a NaN answer as 0
 v      = y                                         y < 0.75
          0.75 - ln(1 - (y - 0.75) / 0.25) / 5.770780        above
-scene' = v * W / e     (the original pixel kept where the encoded peak channel was >= 0.999; alpha kept)
+scene' = min(v * W / e, 65504)     (the original pixel kept where the encoded peak channel was >= 0.999; alpha kept)
 ```
 
 The shoulder and sRGB step follow OpenDLSS-NR's documented proxy; the exposure multiply, the

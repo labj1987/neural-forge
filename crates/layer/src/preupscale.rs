@@ -10191,6 +10191,86 @@ mod tests {
         finish(&gpu, res, &[(image, memory), (zero, zero_mem)]);
     }
 
+    /// The write-back stays within the finite half range. At an exposure of 5e-5 (a sunlit physically based
+    /// game's) the shoulder's inverse of a fully clipped answer (1.0), and of one just below the top (0.985),
+    /// lies past 65504: it stores 65504, never +Inf, which DLSS would spread through its history. A mid-range
+    /// answer decodes as the CPU reference says, and the pixel whose encode clamped (an infinite channel) keeps
+    /// the original. With an unusable exposure (0) the encode of that infinite channel is 0, as every other
+    /// value, not the NaN of +Inf x 0, and nothing is written back. (Lavapipe's float-to-half conversion
+    /// rounds toward zero, so an overflow lands on 65504 there anyway, and its clamp() returns 0 for a NaN:
+    /// this pins the result every driver must give, NVIDIA's round-to-nearest one included.)
+    #[test]
+    fn the_decode_stores_finite_halves_at_a_low_exposure_and_an_infinity_encodes_to_0_without_one() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("preupscale half-range test: no Vulkan device, skipping");
+            return;
+        };
+        let (w, h) = (2u32, 2u32);
+        let (pw, ph) = padded(w, h);
+        let d = &gpu.device;
+        let (image, memory) = gpu.image(w, h);
+        let scene = frame(w, h, |x, y| if (x, y) == (1, 1) { [f32::INFINITY, 1.0, 1.0] } else { [1.0, 2.0, 3.0] });
+        let white = hdr::DEFAULT_PAPER_WHITE;
+        let answers = [1.0f32, 0.985, 0.5];
+        let answer: Vec<u16> = (0..pw * ph).flat_map(|_| [f32_to_f16(answers[0]), f32_to_f16(answers[1]), f32_to_f16(answers[2]), 0x3c00]).collect();
+        let source = own_host_buffer_with(d, &gpu.instance, gpu.physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC).unwrap();
+        unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr().cast::<u8>(), source.ptr, answer.len() * 2) };
+        let mut pass = unsafe { hdr::HdrPass::build(d, &gpu.instance, gpu.physical, w, h) }.expect("the HDR pass builds");
+        assert!(unsafe { pass.bind_colour(d, image) });
+        // One hold's encode and decode at exposure `e`: the frame after it and the encoded picture.
+        let hold = |e: f32| {
+            gpu.upload(image, w, h, &scene);
+            gpu.one_shot(|cmd| unsafe {
+                d.cmd_fill_buffer(cmd, pass.exposure_buffer(), 0, 4, u32::from(f32_to_f16(e)));
+                let open = [pass.encoded_to_general(), pass.answer_to_general()];
+                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &open);
+                pass.record_encode(d, cmd, None, white);
+                let encoded = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
+                d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[encoded], &[], &[]);
+                pass.record_decode(d, cmd, source.buffer, white, None);
+            });
+            (gpu.read(image, w, h), gpu.read(pass.encoded_image(), pw, ph))
+        };
+
+        let (after, _) = hold(5e-5);
+        let e = f16_to_f32(f32_to_f16(5e-5));
+        for y in 0..h {
+            for x in 0..w {
+                for (c, &a) in answers.iter().enumerate() {
+                    let got = half_at(&after, w, x, y, c);
+                    if (x, y) == (1, 1) {
+                        assert_eq!(got, half_at(&scene, w, x, y, c), "the clamped pixel keeps the original, channel {c}");
+                        continue;
+                    }
+                    let want = hdr_ref::decode(f16_to_f32(f32_to_f16(a)), e, white);
+                    if want > 65504.0 {
+                        assert_eq!(got, 0x7bff, "answer {} at {x},{y} (the inverse {want}) stores the largest finite half", a);
+                    } else {
+                        let got = f64::from(f16_to_f32(got));
+                        assert!((got - want).abs() <= 2e-3 * want, "answer {} at {x},{y}: {got}, the CPU reference says {want}", a);
+                    }
+                }
+            }
+        }
+        assert!(hdr_ref::decode(f16_to_f32(f32_to_f16(0.985)), e, white) > 65504.0, "the test reaches past the half range below the top too");
+
+        let (after, encoded) = hold(0.0);
+        assert_eq!(after, scene, "nothing is written back without a usable exposure");
+        for y in 0..ph {
+            for x in 0..pw {
+                for c in 0..3 {
+                    assert_eq!(half_at(&encoded, pw, x, y, c), 0, "an unusable exposure encodes {x},{y} channel {c} as 0");
+                }
+            }
+        }
+        unsafe {
+            pass.destroy(d);
+            source.destroy(d);
+            d.destroy_image(image, None);
+            d.free_memory(memory, None);
+        }
+    }
+
     // ---- Auto-exposure: the CPU reference on synthetic frames, and the GPU pass against it. ----
 
     /// A tightly packed RGBA16F frame from a per-texel colour.

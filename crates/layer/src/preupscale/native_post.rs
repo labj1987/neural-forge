@@ -1538,6 +1538,14 @@ mod tests {
             }
             assert!((0..W).any(|x| (0..3).map(|c| i32::from(at(&plain, x, 0, c)) - i32::from(proxy_of(x, 0, c))).collect::<Vec<_>>().windows(2).any(|w| (w[0] - w[1]).abs() > 2)), "the test's edit has chroma");
 
+            // The detail step's 3x3 low-pass of the change, across the 8x8 groups' edges and the frame's: bit for
+            // bit what the shader gave when it worked out all nine neighbours per pixel (pinned from it).
+            use super::super::colour::DETAIL;
+            let digest = |a: &[u8]| a.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x0000_0100_0000_01b3));
+            let detailed: Vec<u64> = [0.0f32, 0.5, 2.0].iter().map(|&d| digest(&run(PassColour { colour: [1.0, 1.0, d, 0.0], ..flags(STEP | GUARD | DETAIL) }))).collect();
+            assert_eq!(detailed, DETAIL_PINNED, "the detail step moved");
+            assert_ne!(detailed[0], digest(&plain), "detail 0 changes the answer");
+
             // The dither on a flat area whose answer lies a third of a step above level 100.
             fill(&|_, _, _| 100, &|_, _, _| 0.34 / 255.0);
             let level = |v: u8| f32::from(v);
@@ -1591,6 +1599,10 @@ mod tests {
             device.destroy_device(None);
         }
     }
+
+    /// [`the_colour_of_the_edit_after_the_upscaler_reshapes_and_dithers_the_8_bit_answer`]'s detail digests (detail
+    /// 0, 0.5 and 2), from the shader before the low-pass read its neighbours from the group's tile.
+    const DETAIL_PINNED: [u64; 3] = [0x7eba_f3c3_00ce_9395, 0xb4cd_8291_8580_3b3d, 0xa980_19b8_4ead_d587];
 
     /// The layer posts its first request in the present that starts the server: one still unanswered when
     /// the server starts is served, whatever the previous session left in the channel.
@@ -1848,6 +1860,29 @@ mod tests {
                 let centred = (channel(t, c) - 0.5) * 0.125;
                 assert!((l[7 + c] - centred).abs() <= 0.125 / 255.0 + 0.001, "lane {} at ({x}, {y})", 7 + c);
             }
+        }
+    }
+
+    /// A NaN head (residual and logit) at one pixel, with a history kept (`NEURAL_FORGE_POST_MOTION=zero`): clamp()
+    /// of a NaN is undefined, so the composite reads it as 0. The answer there is 0 (alpha kept) and the history
+    /// the next frame reads is 0, not NaN, which would reach the network's input lanes frame after frame.
+    /// (Lavapipe's clamp() happens to return 0 for a NaN too; the shader no longer relies on it.)
+    #[test]
+    fn a_nan_head_answers_0_and_never_reaches_the_history() {
+        let Some(mut rig) = Rig::with(Motion::Zero) else { return };
+        let one = [Conditioning::default()];
+        let p = picture(0);
+        let pattern = head_pattern(1.0);
+        rig.write_head(|x, y| if (x, y) == (5, 3) { [f32::NAN; 4] } else { pattern(x, y) });
+        let first = rig.frame(&p, &one);
+        let at = (3 * W + 5) as usize;
+        assert_eq!(first[at] & 0x00ff_ffff, 0, "a NaN head answers 0");
+        assert_eq!(first[at] >> 24, p[at] >> 24, "alpha comes back as it was");
+        rig.write_head(head_pattern(-1.0));
+        let _ = rig.frame(&p, &one);
+        let l = rig.lanes(5, 3);
+        for c in 0..3 {
+            assert!((l[7 + c] - (0.0 - 0.5) * 0.125).abs() <= 0.001, "history lane {} after a NaN head: {}", 7 + c, l[7 + c]);
         }
     }
 

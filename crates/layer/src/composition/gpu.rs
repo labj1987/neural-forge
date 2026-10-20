@@ -78,9 +78,9 @@ struct PushConstants {
     /// Matches `compose.comp`'s own `params.bgr_order` field exactly (same offset,
     /// same 4-byte size as the `f32`s above it -- no padding to worry about).
     bgr_order: u32,
-    /// Matches `compose.comp`'s own `params.mode`: 0 selects the classic ratio-transfer
-    /// (`UpgradeToneMap`), 1 selects the guarded-additive formula the async
-    /// held-answer path needs instead -- see that shader's own doc comment on why.
+    /// Matches `compose.comp`'s own `params.mode`: 2 selects the ratio transfer on the encoded
+    /// proxy (`UpgradeToneMap`), 1 (or any other value) the guarded-additive formula the async
+    /// held-answer path needs when the proxy is not encoded -- see that shader's own doc comment on why.
     mode: u32,
     /// Matches `compose.comp`'s `params.ghost_guard` (mode 2 only).
     ghost_guard: f32,
@@ -1977,6 +1977,30 @@ mod tests {
             assert!((i32::from(out[centre]) - 200).abs() <= 3, "replace mode {replace}: the answer comes back whole ({})", out[centre]);
             let guarded = compose_once(w, h, &frame, &frame, &answer, ComposeParams { reversible_mode: composed, ..base }).unwrap();
             assert!(guarded[centre] < 100, "composition mode {composed} holds the same answer to the guard ({})", guarded[centre]);
+        }
+    }
+
+    /// A replace mode's answer above white comes back with its hue: the triple is scaled down by its peak
+    /// channel, where clipping each channel at 1 would turn it. An answer at the top of the curve in red
+    /// (255), with green and blue below it, decodes above 1 in red and green (the inverse diverges at the
+    /// top); scaled by the peak it keeps the answer's own ratios, here its bytes, where the clip gave
+    /// yellow-white.
+    #[test]
+    fn a_replace_modes_highlight_keeps_its_hue() {
+        use neural_forge_protocol::enums::reversible_mode;
+        let (w, h) = (16u32, 16u32);
+        let frame: Vec<u8> = (0..w * h).flat_map(|_| [60u8, 60, 60, 255]).collect();
+        let hue = [255u8, 160, 60];
+        let answer: Vec<u8> = (0..w * h).flat_map(|_| [hue[0], hue[1], hue[2], 255]).collect();
+        let base = ComposeParams { colour_strength: 0.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Compare::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: true, reversible_mode: 0 };
+        let centre = ((8 * w + 8) * 4) as usize;
+        for replace in [reversible_mode::NEUTWO_REPLACE, reversible_mode::HYBRID_REPLACE] {
+            let Some(out) = compose_once(w, h, &frame, &frame, &answer, ComposeParams { reversible_mode: replace, ..base }) else {
+                eprintln!("replace mode hue test: no Vulkan device, skipping");
+                return;
+            };
+            let got = [out[centre], out[centre + 1], out[centre + 2]];
+            assert!(got.iter().zip(hue).all(|(&g, a)| (i32::from(g) - i32::from(a)).abs() <= 1), "replace mode {replace}: {got:?}, the answer's hue is {hue:?}");
         }
     }
 

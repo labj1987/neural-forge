@@ -121,6 +121,7 @@ const vec3 LUMA = vec3(0.2126, 0.7152, 0.0722);
 const float KNEE = 0.75;
 const float K = 5.770780;
 const float CLAMPED = 0.999;
+const float HALF_MAX = 65504.0; // the largest finite half: the most a write-back stores
 
 uint index_of(uvec2 xy) { return xy.y * p.size.x + xy.x; }
 
@@ -276,7 +277,7 @@ void guided_coefficients(uvec2 xy, out vec3 a, out vec3 b) {
 // the pixel has moved since the refresh (sat(staleness / 2)), clamped; multiplied onto this hold's
 // frame in v and written over DLSS's colour input
 // with the decode's rules (the padding is never reached, the original kept where the encode clamped,
-// alpha kept, nothing written with an unusable exposure or without a stored edit).
+// at most 65504 elsewhere, alpha kept, nothing written with an unusable exposure or without a stored edit).
 void main() {
   uvec2 xy = gl_GlobalInvocationID.xy;
   if (any(greaterThanEqual(xy, p.size))) return;
@@ -334,14 +335,14 @@ void main() {
     vec2 acc = u_acc.v[i];
     bool lost = isnan(acc.x) || isnan(acc.y);
     uint mask = spare_of(shown_packed);
-    result = vec3(1.0 - float(mask & 0xffu) / 255.0, float(mask >> 8u) / 255.0, lost ? 1.0 : 0.0) * 0.5 * inv_scale;
+    result = min(vec3(1.0 - float(mask & 0xffu) / 255.0, float(mask >> 8u) / 255.0, lost ? 1.0 : 0.0) * 0.5 * inv_scale, vec3(HALF_MAX));
   } else {
     vec3 v = to_v(original.rgb, scale);
     vec3 v_out = max((max(v, vec3(0.0)) + p.eps_v) * exp2(edit) - p.eps_v, vec3(0.0));
     vec3 encoded = imageLoad(u_encoded, at).rgb;
     bool keep = (p.flags & F_KEEP_CLAMPED) != 0u;
     // The decode's rule: the whole pixel kept where the encoded peak channel clamped.
-    result = keep && max(encoded.r, max(encoded.g, encoded.b)) >= CLAMPED ? original.rgb : v_out * inv_scale;
+    result = keep && max(encoded.r, max(encoded.g, encoded.b)) >= CLAMPED ? original.rgb : min(v_out * inv_scale, vec3(HALF_MAX));
   }
   imageStore(u_colour, at, vec4(result, original.a));
 }

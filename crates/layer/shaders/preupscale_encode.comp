@@ -51,10 +51,11 @@ float srgb_oetf(float c) {
   return c <= 0.0031308 ? 12.92 * c : 1.055 * pow(c, 1.0 / 2.4) - 0.055;
 }
 
-// scene-linear -> model domain. NaN and negatives are 0; +Inf ends on the shoulder's top (1.0).
+// scene-linear -> model domain. NaN and negatives are 0; +Inf ends on the shoulder's top (1.0). With an
+// unusable exposure (scale 0) every value is 0: +Inf * 0 would be a NaN, and clamp() of one is undefined.
 float encode(float scene, float scale) {
   float x = scene >= 0.0 ? scene : 0.0;
-  return srgb_oetf(shoulder(x * scale));
+  return srgb_oetf(shoulder(scale > 0.0 ? x * scale : 0.0));
 }
 
 void main() {
