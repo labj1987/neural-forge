@@ -1413,6 +1413,12 @@ impl GpuCompose {
         self.present_semaphores.retire(images);
     }
 
+    /// The semaphores the presents of composed frames wait on: the present path notes each wait
+    /// ([`crate::present_sync::PresentSemaphores::note`]) and frees retired ones once it is complete.
+    pub fn present_semaphores_mut(&mut self) -> &mut crate::present_sync::PresentSemaphores {
+        &mut self.present_semaphores
+    }
+
     /// # Safety
     /// Must only be called at device-destruction time, with no submitted work
     /// referencing these handles still in flight.

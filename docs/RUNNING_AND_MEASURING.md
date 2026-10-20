@@ -59,7 +59,8 @@ own CLI into scratch XDG directories and run through the Vulkan loader
   no `[preupscale]` line and that the probe stays off unless asked.
 - GPU tests run on lavapipe, in CI and locally with `VK_DRIVER_FILES` as above. Without it, on a
   machine with an NVIDIA GPU, they run on the real device, in parallel, and can run out of memory. `NEURAL_FORGE_REQUIRE_VULKAN=1` makes a test fail instead of
-  skipping when no Vulkan device exists.
+  skipping when no Vulkan device exists. The present-fence test on a real swapchain runs only with
+  `NEURAL_FORGE_TEST_DISPLAY` naming an X server (start an Xvfb, e.g. `Xvfb :97`, never the desktop's).
 - Tests never touch real XDG directories: point `XDG_*_HOME` at a scratch directory when running
   the CLI or `install` by hand.
 

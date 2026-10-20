@@ -677,6 +677,32 @@ An answer is never applied to a later frame, which is what removed the ghosting
 through a wait-only batch ahead of the layer's work, and the real present waits on the layer's
 semaphore.
 
+**Present semaphores** (`present_sync.rs`). The relay's semaphores and the composition's are one
+per swapchain image. Those of a destroyed swapchain are freed once the last wait on them is known
+complete, which needs a fence:
+
+- On a device with `swapchainMaintenance1` enabled, the layer chains a present fence of its own
+  (`VkSwapchainPresentFenceInfoKHR`: its fence for the swapchain it worked on, none for the others)
+  to each present it adds semaphores to.
+- When the application chains present fences of its own (DXVK and vkd3d-proton do), they stay its
+  own. Instead, one more fenced batch on the present's queue waits on the layer's semaphores and
+  signals the application's wait semaphores again (the relay consumed them), and the present goes
+  out exactly as the application made it.
+- The fences are looked at, never waited on, at each present and when a swapchain is destroyed; a
+  signalled one is reset and reused.
+- Without the feature, and for a present the application fenced but gave no wait semaphores (nothing
+  was relayed), the semaphores are kept until the device is destroyed: Vulkan has no earlier point at
+  which a present's wait on them is known to be complete.
+
+The layer enables `swapchainMaintenance1` itself (`swapchain_maintenance.rs`): at `vkCreateDevice`, on
+an NVIDIA device that offers it and an application that did not enable it, `VK_KHR_swapchain_maintenance1`
+(else the EXT) and the feature; at `vkCreateInstance`, for an instance that enables `VK_KHR_surface`
+and neither surface maintenance extension, what that depends on (`VK_KHR_surface_maintenance1`,
+`VK_EXT_surface_maintenance1`, `VK_KHR_get_surface_capabilities2`). The loader passes each driver only
+the instance extensions it offers, and a driver that offers the device extension offers what it
+depends on. A request refused with the additions is made again without them. The log says what was
+added (`[present]` lines) and, when a swapchain is destroyed, how many semaphores were freed.
+
 **Model every Nth frame** (`model_interval`, default 1): on the presents between model runs, the
 last answer is composed onto the current frame without waiting. Used before 2.0 to stop
 frame-generated frames from each waiting for an answer.
