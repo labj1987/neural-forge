@@ -4337,8 +4337,10 @@ impl Resources {
             fence_cmd: cmds[2],
             capture_fence: fences[0],
             writeback_fence: fences[1],
-            capture_timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family).filter(|_| !inline),
-            writeback_timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family).filter(|_| !inline),
+            // Only the split's resources are timed: an inline set creates no query pool at all (a
+            // `GpuTimer` has no `Drop`, so one made and dropped would leak its pool).
+            capture_timer: (!inline).then(|| crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family)).flatten(),
+            writeback_timer: (!inline).then(|| crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family)).flatten(),
             proxy,
             proxy_region,
             dump: None,
@@ -9467,6 +9469,31 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The resources of a hold recorded into DLSS's buffer are never timed, and create no timestamp
+    /// pool to drop: a `GpuTimer` has no `Drop`, so one made and discarded leaks its `VkQueryPool`, which
+    /// the validation layer reports when the device is destroyed. The split's resources are timed.
+    #[test]
+    fn inline_hold_resources_create_no_timer_pools() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let d = &gpu.device;
+        // SAFETY: a live device; nothing of the resources is ever submitted.
+        let inline = unsafe { Resources::build_inline(d, &gpu.instance, gpu.physical, gpu.family, 16, 8) }.expect("inline resources");
+        assert!(inline.inline && inline.capture_timer.is_none() && inline.writeback_timer.is_none());
+        let shm = scratch_shm("timers");
+        // SAFETY: as above.
+        let split = unsafe { Resources::build(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false) }.expect("split resources");
+        let timestamps = unsafe { gpu.instance.get_physical_device_queue_family_properties(gpu.physical) }[gpu.family as usize].timestamp_valid_bits > 0;
+        assert_eq!((split.capture_timer.is_some(), split.writeback_timer.is_some()), (timestamps, timestamps));
+        // SAFETY: nothing submitted.
+        unsafe {
+            inline.destroy(d);
+            split.destroy(d);
+        }
     }
 
     /// Resources a failed submit left without a fence are let go of (leaked) on a live device, so the
