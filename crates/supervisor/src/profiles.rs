@@ -14,11 +14,33 @@ pub fn profiles_file() -> String {
     format!("{}/profiles.ini", paths::config_dir())
 }
 
+/// Every saved profile, for listing and loading: none when there is no `profiles.ini` or it cannot
+/// be read, and a byte that is not UTF-8 reads as U+FFFD. [`save_profile`] and [`delete_profile`]
+/// read it strictly instead: a file there that cannot be read stops them.
 pub fn load_all() -> BTreeMap<String, ProfileSettings> {
-    let Ok(text) = std::fs::read_to_string(profiles_file()) else {
-        return BTreeMap::new();
+    match std::fs::read(profiles_file()) {
+        Ok(bytes) => parse(&String::from_utf8_lossy(&bytes)),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// The profiles to rewrite `profiles.ini` from: none only when there is no file. A file that cannot
+/// be read, or is not UTF-8 (a name or value that would be rewritten with U+FFFD in it), is an error,
+/// so a save or delete never replaces it with fewer profiles than it holds.
+fn load_for_update() -> std::io::Result<BTreeMap<String, ProfileSettings>> {
+    let file = profiles_file();
+    let bytes = match std::fs::read(&file) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) => return Err(std::io::Error::new(e.kind(), format!("{file} cannot be read ({e}); not replacing it, which would lose the profiles it holds"))),
     };
-    parse(&text)
+    match String::from_utf8(bytes) {
+        Ok(text) => Ok(parse(&text)),
+        Err(e) => Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{file} is not UTF-8 (byte {}); not replacing it, which would change the profiles it holds: fix that line by hand", e.utf8_error().valid_up_to()),
+        )),
+    }
 }
 
 fn parse(text: &str) -> BTreeMap<String, ProfileSettings> {
@@ -77,14 +99,14 @@ pub fn save_profile(name: &str, settings: ProfileSettings) -> std::io::Result<()
     if let Some(why) = invalid_name(name) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, why));
     }
-    let mut all = load_all();
+    let mut all = load_for_update()?;
     all.insert(name.to_string(), settings);
     save_all(&all)
 }
 
 /// Returns `true` if `name` existed and was removed.
 pub fn delete_profile(name: &str) -> std::io::Result<bool> {
-    let mut all = load_all();
+    let mut all = load_for_update()?;
     let existed = all.remove(name).is_some();
     if existed {
         save_all(&all)?;
@@ -195,5 +217,25 @@ mod tests {
     fn load_all_with_no_file_is_empty() {
         let _scratch = ScratchConfigHome::new("empty");
         assert!(load_all().is_empty());
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_or_is_not_utf8_is_never_rewritten() {
+        let scratch = ScratchConfigHome::new("unreadable");
+        let file = std::path::PathBuf::from(profiles_file());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let held = b"[Caf\xe9]\nset_style=1\n[Day]\nset_style=2\n";
+        std::fs::write(&file, held).unwrap();
+        assert_eq!(save_profile("Night", ProfileSettings::new()).unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+        assert!(delete_profile("Day").is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), held, "the file is left as it was");
+        let listed: Vec<String> = load_all().into_keys().collect();
+        assert_eq!(listed, ["Caf\u{fffd}", "Day"], "listing still shows every profile");
+        // A file that exists but cannot be read at all: a directory where it goes.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(save_profile("Night", ProfileSettings::new()).is_err());
+        assert!(file.is_dir());
+        drop(scratch);
     }
 }

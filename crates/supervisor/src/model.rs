@@ -725,7 +725,8 @@ fn extracted(dir: PathBuf, network: Network, version: [u16; 4], tensors: &[Tenso
 /// temporary directory and synced, then swapped in by rename, so a reader sees the old directory or
 /// the new one and never a mix. The temporary directory is removed on any error, leaving `out` as
 /// it was. One call at a time in a process: the temporary directories are named by the process, and
-/// the GUI can start a second extraction while one is still writing.
+/// the GUI can start a second extraction while one is still writing. What a process that died left
+/// behind is cleaned up first ([`recover_leftovers`]).
 fn replace_tree(out: &Path, files: &[(String, Vec<u8>)]) -> Result<(), ModelError> {
     static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
     let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -748,6 +749,7 @@ fn replace_tree(out: &Path, files: &[(String, Vec<u8>)]) -> Result<(), ModelErro
             std::fs::remove_dir_all(leftover).map_err(io(leftover))?;
         }
     }
+    recover_leftovers(parent, &name, out)?;
 
     let build = || -> Result<(), ModelError> {
         let mut dirs = vec![staging.clone()];
@@ -791,6 +793,63 @@ fn replace_tree(out: &Path, files: &[(String, Vec<u8>)]) -> Result<(), ModelErro
         let _ = std::fs::remove_dir_all(&previous);
     }
     Ok(())
+}
+
+/// Cleans up after [`replace_tree`] runs of processes that are gone (killed, crashed): their
+/// `.<name>.partial-<pid>` staging directories are removed, and when `out` is missing because the
+/// run died between moving it aside and moving the new tree in, its `.<name>.previous-<pid>` is
+/// put back (the newest, if several), so the layer finds the model again; the rest are removed.
+/// A live process's directories are left alone: it may still be writing them.
+fn recover_leftovers(parent: &Path, name: &str, out: &Path) -> Result<(), ModelError> {
+    let io = |path: &Path| {
+        let path = path.to_path_buf();
+        move |e| ModelError::Io(path, e)
+    };
+    let (partial, previous) = (format!(".{name}.partial-"), format!(".{name}.previous-"));
+    let alive = |pid: &str| pid.parse::<u32>().is_ok_and(|pid| pid == std::process::id() || Path::new("/proc").join(pid.to_string()).exists());
+    let Ok(entries) = std::fs::read_dir(parent) else { return Ok(()) };
+    let mut stale_partial = Vec::new();
+    let mut stale_previous = Vec::new();
+    for entry in entries.flatten() {
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else { continue };
+        if !entry.file_type().is_ok_and(|t| t.is_dir()) {
+            continue;
+        }
+        if file_name.strip_prefix(&partial).is_some_and(|pid| !alive(pid)) {
+            stale_partial.push(entry.path());
+        } else if file_name.strip_prefix(&previous).is_some_and(|pid| !alive(pid)) {
+            let modified = entry.metadata().and_then(|m| m.modified()).unwrap_or(std::time::UNIX_EPOCH);
+            stale_previous.push((modified, entry.path()));
+        }
+    }
+    for dir in stale_partial {
+        std::fs::remove_dir_all(&dir).map_err(io(&dir))?;
+    }
+    stale_previous.sort();
+    if !out.exists() {
+        if let Some((_, newest)) = stale_previous.pop() {
+            std::fs::rename(&newest, out).map_err(io(out))?;
+        }
+    }
+    for (_, dir) in stale_previous {
+        std::fs::remove_dir_all(&dir).map_err(io(&dir))?;
+    }
+    Ok(())
+}
+
+/// Imports NVIDIA's `nvngx_dlssnr.dll` from `source_dir` into `dest_dir`: the file is read and
+/// checked to be a 64-bit DLL with a version (what [`extract`] reads), then written whole by rename
+/// (`paths::write_atomic`), so a failed or interrupted import leaves the DLL imported before as it
+/// was. Returns where it went and the DLL's build.
+pub fn import_dll(source_dir: &Path, dest_dir: &Path) -> Result<(PathBuf, String), ModelError> {
+    let from = source_dir.join(DLL_NAME);
+    let image = std::fs::read(&from).map_err(|e| ModelError::Io(from.clone(), e))?;
+    let resources = Resources::parse(&image)?;
+    let version = file_version(&resources).ok_or_else(|| pe_err("no version resource"))?;
+    let dest = dest_dir.join(DLL_NAME);
+    crate::paths::write_atomic(&dest, &image, 0o644).map_err(|e| ModelError::Io(dest.clone(), e))?;
+    Ok((dest, format!("{}.{}.{}.{}", version[0], version[1], version[2], version[3])))
 }
 
 #[cfg(test)]
@@ -966,11 +1025,64 @@ mod tests {
         image
     }
 
-    fn scratch(tag: &str) -> PathBuf {
-        let d = std::env::temp_dir().join(format!("neural-forge-model-test-{tag}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&d);
-        std::fs::create_dir_all(&d).unwrap();
-        d
+    fn scratch(tag: &str) -> crate::paths::tests::ScratchDir {
+        crate::paths::tests::ScratchDir::new(&format!("model-test-{tag}"))
+    }
+
+    /// A process id no process has: above the kernel's largest.
+    const DEAD_PID: u32 = 4_194_305;
+
+    #[test]
+    fn a_killed_runs_leftovers_are_restored_or_removed() {
+        let dir = scratch("leftovers");
+        let out = dir.join("model");
+        // Killed between moving the old model aside and moving the new one in: no `model`, the old
+        // one in `.model.previous-<pid>`, and the staging tree beside it.
+        let previous = dir.join(format!(".model.previous-{DEAD_PID}"));
+        std::fs::create_dir_all(previous.join("full")).unwrap();
+        std::fs::write(previous.join("full/weights.bin"), "old").unwrap();
+        std::fs::create_dir_all(dir.join(format!(".model.partial-{DEAD_PID}"))).unwrap();
+        // An older leftover of another dead run, and a live process's staging dir (this one's parent's).
+        let older = dir.join(format!(".model.previous-{}", DEAD_PID + 1));
+        std::fs::create_dir_all(&older).unwrap();
+        let t = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::open(&older).unwrap().set_modified(t).unwrap();
+        let live = dir.join(format!(".model.partial-{}", std::os::unix::process::parent_id()));
+        std::fs::create_dir_all(&live).unwrap();
+        recover_leftovers(&dir, "model", &out).unwrap();
+        assert_eq!(std::fs::read_to_string(out.join("full/weights.bin")).unwrap(), "old", "the model is back");
+        let mut left: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        left.sort();
+        assert_eq!(left, [live.file_name().unwrap().to_string_lossy().into_owned(), "model".to_string()]);
+        // With `model` in place, a dead run's previous copy is only removed.
+        std::fs::create_dir_all(&previous).unwrap();
+        replace_tree(&out, &[("full/weights.bin".to_string(), b"new".to_vec())]).unwrap();
+        assert_eq!(std::fs::read_to_string(out.join("full/weights.bin")).unwrap(), "new");
+        assert!(!previous.exists() && live.exists());
+    }
+
+    #[test]
+    fn importing_the_dll_checks_it_and_never_truncates_the_one_there() {
+        let dir = scratch("import");
+        let (src, dest) = (dir.join("src"), dir.join("binaries"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dest).unwrap();
+        let good = dll(&weights(), [310, 9, 16, 0]);
+        std::fs::write(src.join(DLL_NAME), &good).unwrap();
+        let (to, build) = import_dll(&src, &dest).unwrap();
+        assert_eq!((to.clone(), build.as_str()), (dest.join(DLL_NAME), "310.9.16.0"));
+        assert_eq!(std::fs::read(&to).unwrap(), good);
+        // Not a DLL: refused, and the one imported before stays whole.
+        std::fs::write(src.join(DLL_NAME), "not a dll").unwrap();
+        assert!(matches!(import_dll(&src, &dest), Err(ModelError::Pe(_))));
+        assert_eq!(std::fs::read(&to).unwrap(), good);
+        // Replaced by rename: a reader holding the old file keeps its content.
+        let inode = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+        let before = inode(&to);
+        std::fs::write(src.join(DLL_NAME), dll(&weights(), [310, 9, 17, 0])).unwrap();
+        assert_eq!(import_dll(&src, &dest).unwrap().1, "310.9.17.0");
+        assert_ne!(inode(&to), before);
+        assert!(matches!(import_dll(&dir.join("missing"), &dest), Err(ModelError::Io(..))));
     }
 
     #[test]
@@ -1262,7 +1374,7 @@ mod tests {
             assert!(check_installed(&dir, network).is_ok(), "{:?}", check_installed(&dir, network));
         }
         assert!(!installed_all(&root).is_empty());
-        for d in [&dir, &root] {
+        for d in [&*dir, root.as_path()] {
             let leftovers: Vec<_> = std::fs::read_dir(d).unwrap().flatten().map(|e| e.file_name()).filter(|n| n.to_string_lossy().starts_with('.')).collect();
             assert!(leftovers.is_empty(), "{leftovers:?}");
         }

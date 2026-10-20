@@ -124,6 +124,54 @@ pub(crate) mod tests {
     // duration, restoring the prior value (or removing it) before releasing.
     pub(crate) static XDG_DATA_HOME_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// A fresh directory under the system temp dir, removed when dropped: also when the test using
+    /// it fails, which a `remove_dir_all` at the end of the test never reaches.
+    pub(crate) struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        pub(crate) fn new(tag: &str) -> Self {
+            static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let dir = std::env::temp_dir().join(format!("neural-forge-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            Self(dir)
+        }
+    }
+
+    impl std::ops::Deref for ScratchDir {
+        type Target = std::path::Path;
+        fn deref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl AsRef<std::path::Path> for ScratchDir {
+        fn as_ref(&self) -> &std::path::Path {
+            &self.0
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn a_scratch_dir_is_removed_when_its_test_fails() {
+        let path = std::sync::Mutex::new(std::path::PathBuf::new());
+        let failed = std::panic::catch_unwind(|| {
+            let dir = ScratchDir::new("scratch-guard");
+            std::fs::write(dir.join("f"), "x").unwrap();
+            *path.lock().unwrap() = dir.to_path_buf();
+            panic!("the test fails");
+        });
+        assert!(failed.is_err());
+        let path = path.into_inner().unwrap();
+        assert!(!path.as_os_str().is_empty() && !path.exists(), "{} was left behind", path.display());
+    }
+
     #[test]
     fn write_atomic_leaves_no_staging_file_when_the_rename_fails() {
         let dir = std::env::temp_dir().join(format!("neural-forge-write-atomic-{}", std::process::id()));
