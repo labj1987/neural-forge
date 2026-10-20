@@ -246,6 +246,10 @@ struct Gpu {
     reject: f32,
     /// Per slot: the history's reset rules and seeds.
     history: [SlotHistory; 2],
+    /// The tests' clock for the history's gap rule: each frame 16 ms after the last, however slow the
+    /// test's device is.
+    #[cfg(test)]
+    clock: Option<Instant>,
     /// The optical flow (`flow`), set up on its first frame.
     flow: FlowState,
     /// What `create_device` added (the optical-flow queue).
@@ -459,6 +463,8 @@ impl Gpu {
             motion: Motion::None,
             reject: post_history::REJECT,
             history: [SlotHistory::default(), SlotHistory::default()],
+            #[cfg(test)]
+            clock: None,
             flow: FlowState::Off,
             setup,
             #[cfg(test)]
@@ -819,7 +825,11 @@ unsafe fn evaluate(
     let decision = if history {
         // SAFETY: the proxy region holds the frame's `bytes`, written before the request was posted.
         let thumb = post_history::thumbnail(unsafe { std::slice::from_raw_parts(proxy_region, bytes as usize) }, width, height);
-        let d = gpu.history[s].begin(Instant::now(), thumb, super::scene_cut::threshold(), (built.network, built.generation), passes.len());
+        #[cfg(not(test))]
+        let now = Instant::now();
+        #[cfg(test)]
+        let now = *gpu.clock.insert(gpu.clock.map_or_else(Instant::now, |t| t + Duration::from_millis(16)));
+        let d = gpu.history[s].begin(now, thumb, super::scene_cut::threshold(), (built.network, built.generation), passes.len());
         if let Some(reset) = d.reset {
             post_history::note_reset(reset);
         }
