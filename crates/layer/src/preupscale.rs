@@ -3723,6 +3723,19 @@ pub(crate) fn plan<B: SplitBatch>(mut batches: Vec<B>, batch: usize, index: usiz
 /// accepted (`VK_SUCCESS`), in submission order: `head`'s once it was submitted, `tail`'s once it
 /// was. Tracked state advances from those only ([`Tracker::commit_submitted`]): after a failed
 /// `head` nothing is reported, after a failed `tail` only `head`'s buffers are.
+///
+/// A failed `tail` comes after work of the call went to the queue: `head`, and the hold's own
+/// submissions, which may have consumed the launch batch's waits and written the colour input. The
+/// application's `vkQueueSubmit` is all or nothing: on `VK_ERROR_OUT_OF_HOST_MEMORY` or
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY` it takes nothing to have executed and no semaphore to have been
+/// waited on, and may submit the same buffers again. The specification's answer for an
+/// implementation that cannot keep that promise is `VK_ERROR_DEVICE_LOST` ("If vkQueueSubmit fails
+/// in such a way that the implementation is unable to make that guarantee, the implementation must
+/// return VK_ERROR_DEVICE_LOST"). A failed submission changes nothing ("the state and contents of
+/// any resources or synchronization primitives ... is unaffected"), so the tail is first submitted
+/// once more (an out-of-memory error can be transient); only when that fails too is the call
+/// reported as `VK_ERROR_DEVICE_LOST`. A tail that failed with `VK_ERROR_DEVICE_LOST` is returned
+/// as it is.
 pub(crate) fn submit_around<B: SplitBatch>(
     mut plan: Plan<B>, fence: vk::Fence, submit: &dyn Fn(&[B], vk::Fence) -> vk::Result, hold: impl FnOnce(&[B::Wait]) -> bool,
     accepted: &mut dyn FnMut(Vec<vk::CommandBuffer>),
@@ -3738,7 +3751,26 @@ pub(crate) fn submit_around<B: SplitBatch>(
     if !hold(&plan.capture_waits) {
         plan.restore_waits();
     }
-    let result = submit(&plan.tail, fence);
+    let mut result = submit(&plan.tail, fence);
+    if result != vk::Result::SUCCESS && result != vk::Result::ERROR_DEVICE_LOST {
+        let first = result;
+        result = submit(&plan.tail, fence);
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::log!(
+                "[preupscale] the held submit's last part (DLSS's buffer onward) failed with {first:?} after its earlier parts went to the queue; submitted again: {}",
+                if result == vk::Result::SUCCESS {
+                    "accepted".to_string()
+                } else {
+                    format!("{result:?}, reported to the application as VK_ERROR_DEVICE_LOST (the call can no longer be undone)")
+                }
+            );
+            crate::logging::flush();
+        }
+        if result != vk::Result::SUCCESS {
+            result = vk::Result::ERROR_DEVICE_LOST;
+        }
+    }
     if result == vk::Result::SUCCESS {
         accepted(buffers(&plan.tail));
     }
@@ -6832,6 +6864,41 @@ mod tests {
         assert!(!reported, "a refused head reports nothing as accepted");
     }
 
+    /// A tail refused after the head and the hold went to the queue is never reported as an
+    /// out-of-memory error, which tells the application that nothing of its call ran: it is
+    /// submitted once more, and reported as `VK_ERROR_DEVICE_LOST` (what the specification asks of
+    /// a submit that cannot be undone) only when that fails too. `VK_ERROR_DEVICE_LOST` itself is
+    /// not retried.
+    #[test]
+    fn a_tail_refused_after_the_head_ran_is_retried_once_then_reported_as_device_lost() {
+        let batches = vec![batch1(&[(1, None)], &[10], &[(2, None)]), batch1(&[(3, Some(5))], &[20], &[(4, Some(6))])];
+        let game_fence = vk::Fence::from_raw(0xf);
+        // The tail's submissions fail with `tail_results` in turn; the head always succeeds.
+        let run = |tail_results: &[vk::Result]| {
+            let tail_calls = std::cell::Cell::new(0usize);
+            let submit = |b: &[Batch1], _: vk::Fence| {
+                if b.iter().any(|b| b.cbs.contains(&cb(20))) {
+                    let k = tail_calls.get();
+                    tail_calls.set(k + 1);
+                    tail_results.get(k).copied().unwrap_or(vk::Result::SUCCESS)
+                } else {
+                    vk::Result::SUCCESS
+                }
+            };
+            let mut accepted: Vec<Vec<vk::CommandBuffer>> = Vec::new();
+            let result = submit_around(plan(batches.clone(), 1, 0), game_fence, &submit, |_| true, &mut |part| accepted.push(part));
+            (result, tail_calls.get(), accepted)
+        };
+        let oom = vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+        assert_eq!(run(&[oom]), (vk::Result::SUCCESS, 2, vec![vec![cb(10)], vec![cb(20)]]), "a transient failure: submitted again and accepted");
+        assert_eq!(
+            run(&[oom, vk::Result::ERROR_OUT_OF_HOST_MEMORY]),
+            (vk::Result::ERROR_DEVICE_LOST, 2, vec![vec![cb(10)]]),
+            "refused twice: the head ran, so the call is lost, not out of memory"
+        );
+        assert_eq!(run(&[vk::Result::ERROR_DEVICE_LOST]), (vk::Result::ERROR_DEVICE_LOST, 1, vec![vec![cb(10)]]), "a lost device is not retried");
+    }
+
     fn sem2(raw: u64, value: u64) -> vk::SemaphoreSubmitInfo {
         vk::SemaphoreSubmitInfo { semaphore: sem(raw), value, stage_mask: vk::PipelineStageFlags2::COMPUTE_SHADER, ..Default::default() }
     }
@@ -8058,13 +8125,13 @@ mod tests {
         let scan = t.scan(&cbs).expect("launch-bearing");
         assert_eq!((scan.index, scan.colour_layout), (1, Some(GENERAL)));
         assert!(t.committed.is_empty(), "a scan commits nothing");
-        // Submits `plan`'s parts, failing the call numbered `fail`; returns the result.
-        let run = |t: &mut Tracker, fail: usize| {
+        // Submits `plan`'s parts, failing the calls numbered in `fail`; returns the result.
+        let run = |t: &mut Tracker, fail: &[usize]| {
             let scan = t.scan(&cbs).expect("launch-bearing");
             let calls = std::cell::Cell::new(0);
             let submit = |_: &[Batch1], _: vk::Fence| {
                 calls.set(calls.get() + 1);
-                if calls.get() == fail { vk::Result::ERROR_OUT_OF_DEVICE_MEMORY } else { vk::Result::SUCCESS }
+                if fail.contains(&calls.get()) { vk::Result::ERROR_OUT_OF_DEVICE_MEMORY } else { vk::Result::SUCCESS }
             };
             let mut accepted = Vec::new();
             let result = submit_around(plan(batches.clone(), scan.batch, scan.index), vk::Fence::null(), &submit, |_| false, &mut |part| accepted.extend(part));
@@ -8073,15 +8140,20 @@ mod tests {
         };
         // The head is refused: nothing executed, nothing tracked.
         let mut t = fixture();
-        assert_eq!(run(&mut t, 1), vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert_eq!(run(&mut t, &[1]), vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
         assert!(t.committed.is_empty());
-        // The head is accepted, the tail refused: the head's barrier only.
+        // The head is accepted, the tail refused twice (the second time is its retry): the head's
+        // barrier only, and the call reported lost (its head cannot be taken back).
         let mut t = fixture();
-        assert_eq!(run(&mut t, 2), vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert_eq!(run(&mut t, &[2, 3]), vk::Result::ERROR_DEVICE_LOST);
         assert_eq!(t.committed.get(&colour()), Some(&GENERAL), "the launch buffer and what follows never ran");
+        // The tail refused once: accepted when submitted again, the last buffer's layout.
+        let mut t = fixture();
+        assert_eq!(run(&mut t, &[2]), vk::Result::SUCCESS);
+        assert_eq!(t.committed.get(&colour()), Some(&transfer));
         // Both accepted: the last buffer's layout.
         let mut t = fixture();
-        assert_eq!(run(&mut t, 0), vk::Result::SUCCESS);
+        assert_eq!(run(&mut t, &[]), vk::Result::SUCCESS);
         assert_eq!(t.committed.get(&colour()), Some(&transfer));
         // An unsplit call that fails is never committed by its caller: the state stays put, and
         // the next scan still reads the last accepted layout.

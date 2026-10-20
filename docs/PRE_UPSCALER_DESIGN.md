@@ -374,7 +374,11 @@ from the committed state plus the barriers of the buffers ahead of it in the sam
 nothing. State advances in `commit_submitted`, which is only ever given command buffers of a
 submission the next layer accepted: for a split call the head's once it was submitted and the tail's
 once it was (`submit_around`), so a refused head leaves the state as it was and a refused tail adds
-only the head. For that the layer issues every `vkQueueSubmit`/`vkQueueSubmit2` to the next layer
+only the head. A refused tail comes after the head and the hold went to the queue, which the
+application's all-or-nothing `vkQueueSubmit` cannot express: an out-of-memory result tells it that
+nothing ran and no semaphore was waited on. The tail is submitted once more (a refused submission
+changes nothing); refused again, the call is reported as `VK_ERROR_DEVICE_LOST`, what the
+specification requires of a submit that failed in a way it cannot undo. For that the layer issues every `vkQueueSubmit`/`vkQueueSubmit2` to the next layer
 itself (the framework's own forwarding gives a hook no result), and the render tap's source layouts
 (`TapTracker`) follow the same rule.
 
