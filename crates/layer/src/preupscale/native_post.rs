@@ -682,6 +682,9 @@ unsafe fn upload_lut(device: &ash::Device, instance: &ash::Instance, physical: v
             return;
         };
         gpu.lut = Some(PostLut { buffer, entries: entries.len(), lut: Arc::clone(l) });
+        // The sets name the table by its handle, and a destroyed buffer's handle comes back for the next one
+        // made: written again whatever handle the new buffer has.
+        gpu.bound = None;
     }
     if let Some(g) = gpu.lut.as_mut() {
         // SAFETY: host-coherent, mapped and sized for `entries`; not in use (contract).
@@ -1554,6 +1557,36 @@ mod tests {
             for b in [&proxy, &head, &answer, &lut, &history] {
                 b.destroy(&device);
             }
+            gpu.destroy(&device);
+            device.destroy_device(None);
+        }
+    }
+
+    /// A table of another size gets a new buffer, and the sets name the table by its handle: a destroyed
+    /// buffer's handle comes back for the next one made, so the sets are written again whatever handle the new
+    /// buffer got (bound to the freed buffer, the composite read the larger table past its end). Another table
+    /// of the same size goes into the same buffer, and the sets stay as they are.
+    #[test]
+    fn a_table_of_another_size_binds_the_sets_again() {
+        let Some((_entry, instance, physical, device, _queue, family)) = crate::composition::gpu::test_device() else { return };
+        unsafe extern "system" fn gipa(_: vk::Instance, _: *const std::ffi::c_char) -> vk::PFN_vkVoidFunction {
+            None
+        }
+        let setup = Setup { gipa, instance: vk::Instance::null(), physical, frame_family: family, family, index: 0, post_index: 0, properties2: crate::vram::Properties2::None, flow: None };
+        let table = |generation: u64, size: usize| Arc::new(super::super::colour::Lut { generation, cube: neural_forge_protocol::cube::Cube::identity(size) });
+        // SAFETY: a live test device whose queue 0 of `family` exists; nothing is submitted.
+        unsafe {
+            let mut gpu = Gpu::new(&device, setup).expect("builds");
+            upload_lut(&device, &instance, physical, &mut gpu, Some(&table(1, 3)));
+            let first = gpu.lut.as_ref().map(|l| l.buffer.buffer).expect("a buffer for the table");
+            let key = Bound { slot: 0, width: 4, height: 4, generation: 1, scratch: false, passes: 1, history: 0, flow: false, lut: first, hud: vk::Buffer::null() };
+            gpu.bound = Some(key);
+            upload_lut(&device, &instance, physical, &mut gpu, Some(&table(2, 3)));
+            assert_eq!(gpu.lut.as_ref().map(|l| l.buffer.buffer), Some(first), "the same size: the same buffer");
+            assert_eq!(gpu.bound, Some(key), "and the sets stay as they are");
+            upload_lut(&device, &instance, physical, &mut gpu, Some(&table(3, 5)));
+            assert_eq!(gpu.lut.as_ref().map(|l| l.entries), Some(125), "a new buffer for 5 points a side");
+            assert_eq!(gpu.bound, None, "the sets are written again, whatever handle the new buffer has");
             gpu.destroy(&device);
             device.destroy_device(None);
         }
