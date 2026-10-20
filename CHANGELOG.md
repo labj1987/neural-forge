@@ -13,6 +13,11 @@ first shipped them; their phase is kept as a subheading.
   handles it; the game's device no longer gets an extra queue from Neural Forge either. Right after you
   change a model setting in such a game, a frame or two go to the upscaler without the model while the
   frames the game had already prepared finish.
+- **Hogwarts Legacy with Ray Reconstruction**: the model now runs right after DLSS there too, before the
+  HUD, as in Crimson Desert: 137 frames a second shown instead of 25 on the finished frame. Its Ray
+  Reconstruction writes to two images in turn, which kept Neural Forge from finding DLSS's output.
+- A little faster: the full network takes about 0.2 ms less per frame, the small one about 0.06 ms
+  (1486x836 on an RTX 5070), with the same picture to the bit.
 - Fixes a Vulkan validity error with the model on the finished frame (after the upscaler).
 
 ## 3.8.0 — 2026-10-19

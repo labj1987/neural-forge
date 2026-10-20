@@ -1441,3 +1441,30 @@ off by default, a testing aid.
 **A measuring pitfall:** two development builds with the same shared-memory version but different layouts
 left the colour settings at 0, which zeroes the edit; after a layout change only a freshly created shared
 memory gives valid numbers.
+
+
+## 2026-10-20: 3.8.1 (the hold recorded into DLSS's buffer, Hogwarts Legacy's Ray Reconstruction)
+
+RTX 5070, 2560x1440@288 VRR, desktop HDR as set, frame generation on as found.
+
+- **Validity:** the layer's test suite under the Khronos validation layer (1.4.341, lavapipe) reports nothing,
+  without any filter; before 3.8.1 it reported 921 messages, among them the hold's host-set event
+  (VUID-vkSetEvent-event-09543) and the after-the-upscaler path's storage-buffer usage (00331).
+- **Crimson Desert, the hold inside DLSS's buffer, now recorded into it:** Ray Reconstruction on, after
+  DLSS, Full: 122.5 shown fps (120 on 3.8.0), 20.4 holds/s, network 15.8 ms; Ray Reconstruction off, before
+  the upscaler: 175.6 shown fps, 29.3 holds/s, network 6.8 ms. Recording the hold costs 0.6-0.7 ms of CPU on
+  the game's render thread. Every hold recorded ran; no miss, no Xid.
+- **Hogwarts Legacy:** Ray Reconstruction off, before the upscaler: 189.8 shown fps, 47.4 holds/s (193.5 and
+  48.5 on 3.8.0). Ray Reconstruction on (switched on in its menu), after DLSS: 136-137 shown fps, 33.6-34.4
+  holds/s, network 15.2 ms, against 24.8 on the finished frame before; no Xid.
+- **GTA V Enhanced (the split hold, unchanged):** 64.4 / 64.8 / 65.0 real fps, frame generation 4x, network
+  about 6.7 ms; 3.8.0 the same night 65.0. A development build of 3.8.1 hung the GPU there (Xid 109, CTX
+  SWITCH TIMEOUT, 4 of 4 runs): the edit cache's descriptor set was skipped when its handles were unchanged,
+  and a new view of the colour input reused a destroyed view's handle; fixed before release.
+- **Crimson Desert with the game's HDR on** (Proton-GE, Wayland, HDR10 swapchain), Ray Reconstruction on,
+  after DLSS (3.8.0): 19.6 holds/s against 19.5 in SDR, the same network time; the model's change on DLSS's
+  output was the same size in both (median 20% and 17% of the pixel, relative).
+- **Model resolution after DLSS** (Crimson Desert, Ray Reconstruction on): Quality 145.8 shown fps with the
+  same edge detail as Full (23.9 / 23.9 on a fixed crop), Ultra Performance 159.4 and a little softer (23.2).
+- **Native network, 1486x836, idle GPU** (back-to-back graph time, median of 40): full 5.41 ms (5.60 before
+  the 64-register cap on the 128-channel FFN kernels), small 2.90 ms (2.96); heads bit-exact.

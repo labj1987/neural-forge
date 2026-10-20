@@ -133,16 +133,21 @@ the model runs on. No missed frames and no GPU fault in any run.
 | Network, model resolution | Shown fps | Network GPU time |
 |---|---|---|
 | Model off | 183 | - |
-| Full network, Full | 118-120 | 15.8 ms |
+| Full network, Full | 120-122 | 15.8 ms |
 | Small network, Full | 140 | 9.2 ms |
 | Full network, Quality | 143 | 8.3 ms |
 | Full network, Performance | 150-153 | 5.4 ms |
 | Full network, Ultra Performance | 161 | 3.8 ms |
 | Full network on the finished frame (Placement: Finished frame) | 36 | - |
 
-At the output size, Performance keeps most of the detail the model adds at Full. With Ray Reconstruction
-off, the same game runs 133 fps shown with the model after DLSS (Placement: After DLSS) and 41 on the
-finished frame.
+At the output size, Quality keeps the detail the model adds at Full and Performance most of it; Ultra
+Performance is a little softer. With Ray Reconstruction off, the same game runs 176 fps shown with the
+model before the upscaler (Auto), 133 with it after DLSS (Placement: After DLSS) and 41 on the finished
+frame. With the game's HDR on (Proton-GE, Wayland) the model after DLSS runs as in SDR: the same holds per
+second and the same size of change.
+
+Hogwarts Legacy with Ray Reconstruction (switched on in its menu) and frame generation 4x, Full: 137 fps
+shown with the model after DLSS (25 on the finished frame), 15.2 ms network GPU time.
 
 ### The network on its own
 
@@ -168,7 +173,7 @@ ran with no missed frames and no GPU fault.
 | Shadow Warrior 3: Definitive Edition | Unreal Engine 4, DX12 | Super Resolution | Before the upscaler |
 | Lords of the Fallen (2023) | Unreal Engine 5, DX12 | Super Resolution, Frame Generation (launch option `-DLSSFG`) | Before the upscaler, inside DLSS's buffer |
 | Remnant II | Unreal Engine 5, DX12 | Super Resolution, Frame Generation | Before the upscaler, inside DLSS's buffer |
-| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Frame Generation | Before the upscaler (with its Ray Reconstruction setting on, the game ran Super Resolution on the test machine) |
+| Hogwarts Legacy | Unreal Engine 4, DX12 | Super Resolution, Ray Reconstruction, Frame Generation | After DLSS with Ray Reconstruction on; before the upscaler, inside DLSS's buffer, with it off |
 
 Setup notes for these games:
 
@@ -429,10 +434,11 @@ takes is withdrawn after 5 seconds.
   for an `Xid` line before blaming Neural Forge.
   [docs/HARDWARE_VALIDATION.md](docs/HARDWARE_VALIDATION.md) (2026-09-16) has the diagnosis and the
   workarounds other users report.
-- **The model after DLSS is tested in one game.** Crimson Desert with Ray Reconstruction ran it with no
-  missed frames; Hogwarts Legacy ran Super Resolution on the test machine even with its Ray Reconstruction
-  setting on. Where a game's DLSS output cannot be held, the model runs on the finished frame, at a much
-  lower frame rate (36 against 120 fps shown in Crimson Desert).
+- **The model after DLSS is tested in two games** (Crimson Desert and Hogwarts Legacy, with Ray
+  Reconstruction). Where a game's DLSS output cannot be held, the model runs on the finished frame, at a
+  much lower frame rate (36 against 120 fps shown in Crimson Desert).
+- **Hogwarts Legacy turns Ray Reconstruction back off** when it is set in its settings file rather than in
+  its menu: switch it on in the game's Display options.
 - **Finding the HUD can take a part of the scene for HUD** when it stays in place on screen while the
   camera moves, such as a first-person weapon or a character the camera follows closely: the model's change
   is then kept off it too. Switch **Find the HUD** off, or use regions, where that shows.
