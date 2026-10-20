@@ -180,7 +180,8 @@ fn copy_is_live(path: &str) -> bool {
 /// present untouched, submit nothing, log nothing more. Another device of the process (a second
 /// GPU, or a device the game created after the loss) is not affected.
 static LOST_DEVICES: Mutex<Vec<vk::Device>> = Mutex::new(Vec::new());
-/// Whether any device was lost: what the per-present and per-submit checks read first, a relaxed load.
+/// Whether any device in [`LOST_DEVICES`] is still alive: what the per-present and per-submit checks
+/// read first, a relaxed load. Cleared when the last lost device is destroyed.
 static ANY_DEVICE_LOST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether `device` reported `VK_ERROR_DEVICE_LOST`.
@@ -188,15 +189,23 @@ pub(crate) fn device_lost(device: vk::Device) -> bool {
     ANY_DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed) && LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner()).contains(&device)
 }
 
-/// Whether any device of this process was lost (the channel's session record, `device_lost_at`).
+/// Whether a device of this process is lost now (the channel's session record, `device_lost_at`). A
+/// game that recovered by destroying the lost device and creating another is no longer reported.
 pub(crate) fn any_device_lost() -> bool {
     ANY_DEVICE_LOST.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// A destroyed device's handle may be reused by the next one: it starts unlatched.
+/// A destroyed device's handle may be reused by the next one: it starts unlatched. With the last
+/// lost device gone, the process has none lost any more.
 pub(crate) fn forget_lost_device(device: vk::Device) {
     if any_device_lost() {
-        LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner()).retain(|&d| d != device);
+        let mut lost = LOST_DEVICES.lock().unwrap_or_else(|e| e.into_inner());
+        lost.retain(|&d| d != device);
+        // Under the lock: `note_vk` adds a device under it before raising the flag, so a loss
+        // reported meanwhile always ends with the flag up.
+        if lost.is_empty() {
+            ANY_DEVICE_LOST.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 }
 
@@ -218,7 +227,8 @@ pub(crate) fn note_vk<T>(device: vk::Device, result: ash::prelude::VkResult<T>) 
             crate::logging::flush();
         }
         if first_of_process {
-            // Once, with the first loss: the channel's `device_lost_at` and the state log say it without a log.
+            // Once per loss while no other device is lost: the channel's `device_lost_at` and the state
+            // log say it without a log.
             crate::shm::note_device_lost();
             crate::event!(neural_forge_protocol::state_log::DEVICE_LOST, "VK_ERROR_DEVICE_LOST; the layer is inert from here on");
         }
@@ -1051,8 +1061,12 @@ mod duplicate_copy_tests {
 mod device_lost_tests {
     use super::*;
 
+    /// Held by the tests that latch devices lost: the latch is process-wide.
+    static LOST_STATE: Mutex<()> = Mutex::new(());
+
     #[test]
     fn note_vk_passes_results_through_and_latches_only_the_lost_device() {
+        let _state = LOST_STATE.lock().unwrap_or_else(|e| e.into_inner());
         use ash::vk::Handle;
         // Handles no other test uses; the latch is process-wide state.
         let (lost, other) = (vk::Device::from_raw(0xdead_0001), vk::Device::from_raw(0xdead_0002));
@@ -1065,6 +1079,21 @@ mod device_lost_tests {
         assert!(any_device_lost());
         forget_lost_device(lost);
         assert!(!device_lost(lost), "a destroyed device's handle starts unlatched");
+        assert!(!any_device_lost(), "with the lost device destroyed the process has none lost");
+    }
+
+    /// The process counts as having a lost device until the last lost one is destroyed.
+    #[test]
+    fn the_process_is_lost_until_its_last_lost_device_is_destroyed() {
+        let _state = LOST_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        use ash::vk::Handle;
+        let (a, b) = (vk::Device::from_raw(0xdead_0011), vk::Device::from_raw(0xdead_0012));
+        let _ = note_vk::<()>(a, Err(vk::Result::ERROR_DEVICE_LOST));
+        let _ = note_vk::<()>(b, Err(vk::Result::ERROR_DEVICE_LOST));
+        forget_lost_device(a);
+        assert!(any_device_lost() && device_lost(b), "b is still lost");
+        forget_lost_device(b);
+        assert!(!any_device_lost());
     }
 
     #[test]
