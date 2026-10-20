@@ -800,6 +800,36 @@ pub(crate) fn input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::
     })
 }
 
+/// DLSS Ray Reconstruction's first launch read for its colour input and motion vectors when it does not
+/// read as SR's input form ([`input_launch`]): the colour input is a [`colour_candidate`] it names that was
+/// identified as DLSS's colour input before (`known`), else its only one usable as a colour attachment; the
+/// motion vectors the [`MVEC_FORMATS`] image nearest its extent; the depth a depth-like image at the motion
+/// vectors' extent, or none (the hold after DLSS reads no depth).
+fn rr_input_launch(images: &HashMap<vk::Image, ImageDesc>, named: &[vk::Image], known: &[vk::Image]) -> Option<InputLaunch> {
+    let desc = |i: &vk::Image| images.get(i).copied();
+    let candidates: Vec<vk::Image> = named.iter().copied().filter(|i| desc(i).is_some_and(|d| colour_candidate(&d))).collect();
+    let colour = candidates.iter().copied().find(|i| known.contains(i)).or_else(|| {
+        let attachments: Vec<vk::Image> = candidates.iter().copied().filter(|i| desc(i).is_some_and(|d| d.usage.contains(vk::ImageUsageFlags::COLOR_ATTACHMENT))).collect();
+        match attachments[..] {
+            [one] => Some(one),
+            _ => None,
+        }
+    })?;
+    let cd = desc(&colour)?;
+    let mvec = named
+        .iter()
+        .copied()
+        .filter(|i| desc(i).is_some_and(|d| d.plain && MVEC_FORMATS.contains(&d.format)))
+        .min_by_key(|i| desc(i).map_or(u64::MAX, |d| u64::from(d.width.abs_diff(cd.width)) + u64::from(d.height.abs_diff(cd.height))))?;
+    let md = desc(&mvec)?;
+    let depth = named
+        .iter()
+        .copied()
+        .find(|i| desc(i).is_some_and(|d| d.plain && (DEPTH_FORMATS.contains(&d.format) || DEPTH_AS_COLOUR.contains(&d.format)) && (d.width, d.height) == (md.width, md.height)))
+        .unwrap_or(vk::Image::null());
+    Some(InputLaunch::Inputs { colour, depth, mvec })
+}
+
 /// `NEURAL_FORGE_PREUPSCALE_PICK=N` (diagnostics only): when an input launch names several colour
 /// candidates at the depth's extent, take the Nth in parameter order (from 0) instead of the first.
 /// With `NEURAL_FORGE_PREUPSCALE=dump` it shows which candidate is the game's frame; an N past the
@@ -1794,13 +1824,20 @@ impl Tracker {
                 }
             }
         }
+        probe_rr(command_buffer, self.functions.get(&function).map(|(_, n)| n.as_str()), &named, &self.images);
         // DLSS's output: after the buffer's input launch, a launch naming a colour candidate larger than
         // the input (the upscaled frame); the last such launch of the buffer is its output kernel.
         if let Some(InputLaunch::Inputs { colour, .. }) = self.launch.get(&command_buffer).and_then(|r| r.input.clone()) {
             let input = self.images.get(&colour).map(|d| (d.width, d.height));
-            let out = named.iter().copied().find(|i| {
-                *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && input.is_some_and(|(w, h)| d.width > w && d.height > h))
-            });
+            let larger: Vec<vk::Image> = named
+                .iter()
+                .copied()
+                .filter(|i| *i != colour && self.images.get(i).is_some_and(|d| colour_candidate(d) && input.is_some_and(|(w, h)| d.width > w && d.height > h)))
+                .collect();
+            // Several (Hogwarts Legacy's Ray Reconstruction names an internal 3416x1922 image beside its
+            // 2560x1440 output): the one at the swapchain's extent, else the first.
+            let swapchain = self.swapchain_extent();
+            let out = larger.iter().copied().find(|i| self.images.get(i).is_some_and(|d| Some((d.width, d.height)) == swapchain)).or(larger.first().copied());
             if let Some(out) = out {
                 self.launch.entry(command_buffer).or_default().output = Some((function, out));
             }
@@ -1812,6 +1849,8 @@ impl Tracker {
                 self.after_at = Some((command_buffer, o, plan));
             }
         }
+        // The colour inputs identified so far (Ray Reconstruction's first launch, [`rr_input_launch`]).
+        let known: Vec<vk::Image> = self.named.iter().map(|n| n.colour).collect();
         let refs = self.launch.entry(command_buffer).or_default();
         // Whether this launch is the buffer's first one read as an input launch.
         let mut fresh_input = false;
@@ -1826,8 +1865,19 @@ impl Tracker {
         } else if refs.input.is_none() {
             fresh_input = true;
             refs.input = input_launch(&self.images, &named);
+            // DLSS Ray Reconstruction's first launch may not read as SR's input form (Hogwarts Legacy's
+            // `cuda_dldn_engine_swin_enc0_kernel` names two R32_SFLOAT depth-like images, and its colour
+            // input is not at their extent): taken from the colour input and motion vectors it names, so
+            // its output can be learnt; as Ray Reconstruction's it is never evidence nor a hold point.
+            if kernel == Some(Kernel::RayReconstruction) && !matches!(refs.input, Some(InputLaunch::Inputs { .. })) {
+                if let Some(rr) = rr_input_launch(&self.images, &named, &known) {
+                    refs.input = Some(rr);
+                }
+            }
             if let Some(InputLaunch::Inputs { mvec, .. }) = refs.input {
-                self.current_mvec = Some(mvec);
+                if kernel != Some(Kernel::RayReconstruction) {
+                    self.current_mvec = Some(mvec);
+                }
             }
             if refs.input.is_some() {
                 refs.input_sr = kernel.map(|k| k == Kernel::SrInput);
@@ -5570,6 +5620,28 @@ fn probe_kernel(name: &str, bytes: &[u8]) {
     crate::log!("[probe-kernel] {name} {}", words.join(" "));
 }
 
+/// `NEURAL_FORGE_PROBE_RR=<a,b,...>`: the kernel and the registered images it names (size, format, usage) of
+/// every launch whose kernel name contains one of the comma-separated parts (`1`: every launch), for the
+/// first 4000 such launches: how a DLSS engine spreads its inputs and output over its launches.
+fn probe_rr(cb: vk::CommandBuffer, name: Option<&str>, named: &[vk::Image], images: &HashMap<vk::Image, ImageDesc>) {
+    static PARTS: LazyLock<Option<Vec<String>>> =
+        LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_PROBE_RR").filter(|v| !v.is_empty()).map(|v| v.split(',').map(str::to_string).collect()));
+    static COUNT: AtomicU64 = AtomicU64::new(0);
+    let Some(parts) = PARTS.as_deref() else { return };
+    let wanted = parts.iter().any(|p| p == "1" || name.is_some_and(|n| n.contains(p.as_str())));
+    if !wanted || COUNT.fetch_add(1, Ordering::Relaxed) >= 4000 {
+        return;
+    }
+    let list: Vec<String> = named
+        .iter()
+        .map(|i| match images.get(i) {
+            Some(d) => format!("{} {}x{} {:?} {}", hex(*i), d.width, d.height, d.format, usage_short(d.usage)),
+            None => format!("{} unregistered", hex(*i)),
+        })
+        .collect();
+    crate::log!("[probe-rr] {} {} [{}]", hex(cb), name.unwrap_or("unnamed"), list.join("; "));
+}
+
 /// `NEURAL_FORGE_PREUPSCALE_DUMP_HAZARD=ignore`: dump even when DLSS's launch buffer synchronizes
 /// the depth or motion vectors before its launch ([`Scan::dump_hazard`]). Diagnostic only: those
 /// images may then be read before the game finished them, which consecutive dumps show.
@@ -8175,6 +8247,44 @@ mod tests {
 
     fn identification_lines(lines: &[String]) -> Vec<&String> {
         lines.iter().filter(|l| l.starts_with("colour input:") || l.starts_with("no DLSS input")).collect()
+    }
+
+    /// Hogwarts Legacy's DLSS Ray Reconstruction (310.0's `cuda_dldn_engine_*`, from `NEURAL_FORGE_PROBE_RR`,
+    /// 2026-10-19): its first launch names the colour input (1708x964) with motion vectors and two R32_SFLOAT
+    /// depth-like images at 1708x961, and its output kernel names an internal 3416x1922 image before the
+    /// 2560x1440 output. DLSS's output is learnt as the swapchain-size one, after the input launch read from
+    /// the colour input and motion vectors; the buffer is never evidence.
+    #[test]
+    fn hogwarts_ray_reconstruction_output_is_learnt_at_the_swapchain_extent() {
+        let rgba = vk::Format::R16G16B16A16_SFLOAT;
+        let copy = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let storage = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::SAMPLED | copy;
+        let set = set_of(&[
+            (0x100, desc(1708, 964, rgba, storage | vk::ImageUsageFlags::COLOR_ATTACHMENT)),
+            (0x200, desc(1708, 961, vk::Format::R32_SFLOAT, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | copy)),
+            (0x210, desc(1708, 961, vk::Format::R32_SFLOAT, vk::ImageUsageFlags::SAMPLED | vk::ImageUsageFlags::COLOR_ATTACHMENT | copy)),
+            (0x300, desc(1708, 961, vk::Format::R16G16_SFLOAT, storage)),
+            (0x500, desc(3416, 1922, rgba, storage)),
+            (0x420, desc(2560, 1440, rgba, storage)),
+        ]);
+        let mut t = tracker_with(&set, Some((2560, 1440)));
+        let (enc0, out) = (vk::CuFunctionNVX::from_raw(0x9001), vk::CuFunctionNVX::from_raw(0x9002));
+        t.record_function(enc0, "cuda_dldn_engine_swin_enc0_kernel");
+        t.record_function(out, "cuda_dldn_engine_multiscale_downsample_kernel");
+        let mut lines = Vec::new();
+        for _ in 0..OUTPUT_SETTLE {
+            t.launch_kernel(cb(1), enc0, Some(&param_block(&[h(0x100), h(0x300), h(0x200), h(0x210)])));
+            t.launch_kernel(cb(1), out, Some(&param_block(&[h(0x500), h(0x420)])));
+            assert_eq!(t.launch[&cb(1)].input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
+            assert!(t.launch[&cb(1)].input_rr);
+            assert_eq!(t.launch[&cb(1)].output, Some((out, img(0x420))), "the swapchain-size image, not the internal 3416x1922 one");
+            lines.extend(submit(&mut t, &[vec![cb(1)]]).1);
+            t.launch.remove(&cb(1));
+        }
+        let o = t.dlss_output.expect("DLSS's output is learnt");
+        assert_eq!((o.image, o.input, o.mvec, o.rr), (img(0x420), img(0x100), img(0x300), true));
+        assert!(t.named.is_empty(), "Ray Reconstruction's buffer is never evidence: {:?}", t.named);
+        assert!(lines.iter().any(|l| l.starts_with("DLSS's output: image 0x420 (2560x1440")), "{lines:#?}");
     }
 
     /// (a) GTA V with DLSS Frame Generation: SR's buffer (input kernel naming colour, depth and
