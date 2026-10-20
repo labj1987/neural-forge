@@ -338,8 +338,9 @@ pub(crate) fn mode() -> Mode {
                 std::process::id()
             );
             if mode == Mode::Model {
-                // `NEURAL_FORGE_EDIT_CACHE`, read (and logged when off) with the mode.
-                let _ = cache::interval();
+                // `NEURAL_FORGE_EDIT_CACHE`, read (and logged when off) with the mode, where the
+                // edit cache is built at all (`edit_cache_on`).
+                let _ = edit_cache_on();
             }
             crate::logging::flush();
         }
@@ -1165,6 +1166,12 @@ pub(crate) enum Hazard {
     /// queue family, the inside hold's on the side queue's) and with them the native network's
     /// pipelines and history (2026-10-09).
     HeldInside,
+    /// The launch buffer, or a buffer before it in the submit, was recorded (at least in part) before
+    /// the current identification ([`Tracker::recorded_watched`]): barriers it holds on the inputs
+    /// were never seen. A D3D12 command list executed again without being re-recorded, or one recorded
+    /// ahead of the submit that identified the inputs, may carry a transition or a same-layout barrier
+    /// before DLSS's launch.
+    RecordedBefore,
 }
 
 impl Hazard {
@@ -1178,6 +1185,7 @@ impl Hazard {
             Self::SuspendedRendering => "the DLSS launch buffer resumes dynamic rendering suspended in the buffer before it; not holding (nothing may be submitted between the two), frames go to DLSS untouched",
             Self::NotSplittable => "the colour input is not an RGBA16F image in GENERAL; only the hold inside DLSS's buffer takes it",
             Self::HeldInside => "this identification's holds run inside DLSS's buffer; every buffer is held there, so the hold keeps one set of resources and the network its history",
+            Self::RecordedBefore => "the DLSS launch buffer, or a buffer before it in the submit, was recorded before DLSS's inputs were identified, so its barriers on them were not seen; not holding it (buffers recorded since are held)",
         }
     }
 }
@@ -1354,6 +1362,14 @@ pub(crate) struct Tracker {
     /// Watched images attached in `vkCmdBeginRendering`, per command buffer, with their layout
     /// ([`Self::attachments`]).
     attached: HashMap<vk::CommandBuffer, Vec<(vk::Image, vk::ImageLayout)>>,
+    /// Command buffers whose whole recording so far happened under the current identification: begun
+    /// while these inputs were watched ([`Self::begin`]), with every secondary executed into them so far
+    /// the same. Only for these are [`Self::pending`], [`Self::global_sync`] and [`Self::attached`]
+    /// everything recorded on the watched images: the device hooks record barriers only while inputs
+    /// are watched, and a new identification drops what was recorded ([`Self::refresh`], which empties
+    /// this set too). A buffer recorded before (a re-submitted one, or one recorded ahead on another
+    /// thread) may carry barriers on the inputs that were never seen ([`Hazard::RecordedBefore`]).
+    recorded_watched: HashSet<vk::CommandBuffer>,
     /// Diagnostics: barriers seen on the identified colour input, the last one's new layout, and
     /// whether the in-buffer hold's "layout unknown" line was logged.
     colour_barriers: u64,
@@ -1443,7 +1459,8 @@ impl Scan {
     /// Whether the colour input can be taken to be in `GENERAL` at this submit: its last committed
     /// barrier left it there, or no barrier on it was seen since it was watched. Never on the
     /// submit that (re)identified the inputs ([`Self::identified_now`]): that one goes to DLSS
-    /// untouched, and the next is held with known layouts.
+    /// untouched. A later submit whose launch buffer, or a buffer before it, was recorded before the
+    /// identification is refused by its [`Self::hazard`] ([`Hazard::RecordedBefore`]).
     pub(crate) fn colour_in_general(&self) -> bool {
         !self.identified_now && self.colour_layout.is_none_or(|l| l == vk::ImageLayout::GENERAL)
     }
@@ -2083,7 +2100,8 @@ impl Tracker {
     /// gets nothing.
     pub(crate) fn inline_point(&self, cb: vk::CommandBuffer, colour: vk::Image) -> Option<InlinePoint> {
         let inputs = self.inputs?;
-        if self.identified {
+        // Begun before this identification: the layouts its earlier commands left are not known.
+        if self.identified || !self.recorded_watched.contains(&cb) {
             return None;
         }
         let desc = *self.images.get(&colour)?;
@@ -2291,11 +2309,21 @@ impl Tracker {
 
     /// Whether any command buffer carries a launch, recorded barriers or other synchronization.
     fn armed(&self) -> bool {
-        !self.launch.is_empty() || !self.pending.is_empty() || !self.global_sync.is_empty() || !self.rendering.is_empty() || !self.attached.is_empty()
+        !self.launch.is_empty()
+            || !self.pending.is_empty()
+            || !self.global_sync.is_empty()
+            || !self.rendering.is_empty()
+            || !self.attached.is_empty()
+            || !self.recorded_watched.is_empty()
     }
 
+    /// `vkBeginCommandBuffer` (or a reset): the earlier recording is gone, and the new one is seen
+    /// whole from here on when inputs are watched ([`Self::recorded_watched`]).
     pub(crate) fn begin(&mut self, command_buffer: vk::CommandBuffer) {
         self.free(&[command_buffer]);
+        if self.inputs.is_some() {
+            self.recorded_watched.insert(command_buffer);
+        }
     }
 
     pub(crate) fn free(&mut self, command_buffers: &[vk::CommandBuffer]) {
@@ -2305,6 +2333,7 @@ impl Tracker {
             self.global_sync.remove(cb);
             self.rendering.remove(cb);
             self.attached.remove(cb);
+            self.recorded_watched.remove(cb);
         }
     }
 
@@ -2343,6 +2372,10 @@ impl Tracker {
     /// `vkCmdExecuteCommands`: each secondary's recording continues the primary's, in order.
     pub(crate) fn execute(&mut self, primary: vk::CommandBuffer, secondaries: &[vk::CommandBuffer]) {
         for secondary in secondaries {
+            // A secondary recorded (in part) before the identification makes the primary so too.
+            if !self.recorded_watched.contains(secondary) {
+                self.recorded_watched.remove(&primary);
+            }
             // Where the secondary's recording starts in the primary's.
             let base = Before {
                 barriers: self.pending.get(&primary).map_or(0, Vec::len),
@@ -2365,8 +2398,17 @@ impl Tracker {
                         refs.rr.push(f);
                     }
                 }
+                // The jitter of the first launch carrying one, in recording order.
+                if refs.jitter.is_none() {
+                    refs.jitter = c.jitter;
+                }
                 if c.input.is_some() && c.input == refs.input {
                     refs.output_pair |= c.output_pair;
+                    // The secondary's output kernel follows the input launch it was found after, and
+                    // comes after whatever the primary recorded so far: the last one.
+                    if c.output.is_some() {
+                        refs.output = c.output;
+                    }
                 }
                 for image in c.images {
                     if !refs.images.contains(&image) {
@@ -2381,6 +2423,9 @@ impl Tracker {
             }
             if let Some(hazard) = self.global_sync.get(secondary).copied() {
                 self.global(primary, hazard);
+            }
+            if let Some(inherited) = self.attached.get(secondary).filter(|a| !a.is_empty()).cloned() {
+                self.attached.entry(primary).or_default().extend(inherited);
             }
             if let Some(c) = self.rendering.get(secondary).copied() {
                 let r = self.rendering.entry(primary).or_default();
@@ -2556,6 +2601,7 @@ impl Tracker {
             self.committed.clear();
             self.owners.clear();
             self.pending.clear();
+            self.recorded_watched.clear();
             self.identified = true;
             self.generation += 1;
         } else if let (Some(new), Some(old)) = (inputs, self.inputs) {
@@ -2996,8 +3042,14 @@ impl Tracker {
         let mut any_foreign = false;
         let mut held_kind = None;
         let mut held_target: Option<(vk::Image, bool)> = None;
+        // A buffer up to and including the launch buffer was recorded (in part) before the current
+        // identification ([`Self::recorded_watched`]): what it recorded on the inputs is not known.
+        let mut recorded_before = false;
         for (bi, cbs) in batches.iter().enumerate() {
             for (ci, &cb) in cbs.iter().enumerate() {
+                if found.is_none() && !self.recorded_watched.contains(&cb) {
+                    recorded_before = true;
+                }
                 let colour = self.inputs.map(|i| i.colour.0);
                 // A buffer that launches DLSS Ray Reconstruction is never the hold point: forwarded.
                 let kind = self.launch.get(&cb).map(|r| if r.rr.is_empty() { r.kind(colour) } else { LaunchKind::Foreign });
@@ -3044,7 +3096,8 @@ impl Tracker {
                         evaluation: self.evaluations,
                         identified_now: self.identified,
                         identification: self.generation,
-                        hazard,
+                        // Before the barrier rules: those read only what was recorded while watched.
+                        hazard: if recorded_before { Some(Hazard::RecordedBefore) } else { hazard },
                         dump_hazard,
                         depth_hazard,
                         colour_owner,
@@ -3357,7 +3410,7 @@ impl Tracking {
         }
         let output = t.output_extent();
         let point = t.inline_point(cb, colour).map(|p| InlinePoint { hold: placement::Hold::of(&plan, placement::Stage::Before, (p.desc.width, p.desc.height), output), ..p });
-        if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) {
+        if point.is_none() && !t.said_layout_miss && t.images.contains_key(&colour) && t.recorded_watched.contains(&cb) {
             let own = t.pending.get(&cb).is_some_and(|p| p.iter().any(|s| s.image == colour)) || t.attached.get(&cb).is_some_and(|a| a.iter().any(|(i, _)| *i == colour));
             if !own && !t.committed.contains_key(&colour) {
                 t.said_layout_miss = true;
@@ -3387,10 +3440,11 @@ impl Tracking {
         self.lock().forget_function(function);
     }
 
-    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording. Nothing to do (no lock)
-    /// while nothing is armed.
+    /// `vkBeginCommandBuffer`: forgets the buffer's earlier recording, and while inputs are watched
+    /// notes that the new one is seen whole ([`Tracker::recorded_watched`]). Nothing to do (no lock)
+    /// while nothing is armed or watched: a buffer begun then is not in that set, and none of it is.
     pub(crate) fn begin(&self, command_buffer: vk::CommandBuffer) {
-        if self.armed() {
+        if self.armed() || self.watching() {
             let mut t = self.lock();
             t.begin(command_buffer);
             self.rearm(&t);
@@ -3710,6 +3764,19 @@ pub(crate) fn plan<B: SplitBatch>(mut batches: Vec<B>, batch: usize, index: usiz
 /// accepted (`VK_SUCCESS`), in submission order: `head`'s once it was submitted, `tail`'s once it
 /// was. Tracked state advances from those only ([`Tracker::commit_submitted`]): after a failed
 /// `head` nothing is reported, after a failed `tail` only `head`'s buffers are.
+///
+/// A failed `tail` comes after work of the call went to the queue: `head`, and the hold's own
+/// submissions, which may have consumed the launch batch's waits and written the colour input. The
+/// application's `vkQueueSubmit` is all or nothing: on `VK_ERROR_OUT_OF_HOST_MEMORY` or
+/// `VK_ERROR_OUT_OF_DEVICE_MEMORY` it takes nothing to have executed and no semaphore to have been
+/// waited on, and may submit the same buffers again. The specification's answer for an
+/// implementation that cannot keep that promise is `VK_ERROR_DEVICE_LOST` ("If vkQueueSubmit fails
+/// in such a way that the implementation is unable to make that guarantee, the implementation must
+/// return VK_ERROR_DEVICE_LOST"). A failed submission changes nothing ("the state and contents of
+/// any resources or synchronization primitives ... is unaffected"), so the tail is first submitted
+/// once more (an out-of-memory error can be transient); only when that fails too is the call
+/// reported as `VK_ERROR_DEVICE_LOST`. A tail that failed with `VK_ERROR_DEVICE_LOST` is returned
+/// as it is.
 pub(crate) fn submit_around<B: SplitBatch>(
     mut plan: Plan<B>, fence: vk::Fence, submit: &dyn Fn(&[B], vk::Fence) -> vk::Result, hold: impl FnOnce(&[B::Wait]) -> bool,
     accepted: &mut dyn FnMut(Vec<vk::CommandBuffer>),
@@ -3725,7 +3792,26 @@ pub(crate) fn submit_around<B: SplitBatch>(
     if !hold(&plan.capture_waits) {
         plan.restore_waits();
     }
-    let result = submit(&plan.tail, fence);
+    let mut result = submit(&plan.tail, fence);
+    if result != vk::Result::SUCCESS && result != vk::Result::ERROR_DEVICE_LOST {
+        let first = result;
+        result = submit(&plan.tail, fence);
+        static SAID: AtomicU64 = AtomicU64::new(0);
+        if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+            crate::log!(
+                "[preupscale] the held submit's last part (DLSS's buffer onward) failed with {first:?} after its earlier parts went to the queue; submitted again: {}",
+                if result == vk::Result::SUCCESS {
+                    "accepted".to_string()
+                } else {
+                    format!("{result:?}, reported to the application as VK_ERROR_DEVICE_LOST (the call can no longer be undone)")
+                }
+            );
+            crate::logging::flush();
+        }
+        if result != vk::Result::SUCCESS {
+            result = vk::Result::ERROR_DEVICE_LOST;
+        }
+    }
     if result == vk::Result::SUCCESS {
         accepted(buffers(&plan.tail));
     }
@@ -4336,8 +4422,10 @@ impl Resources {
             fence_cmd: cmds[2],
             capture_fence: fences[0],
             writeback_fence: fences[1],
-            capture_timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family).filter(|_| !inline),
-            writeback_timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family).filter(|_| !inline),
+            // Only the split's resources are timed: an inline set creates no query pool at all (a
+            // `GpuTimer` has no `Drop`, so one made and dropped would leak its pool).
+            capture_timer: (!inline).then(|| crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family)).flatten(),
+            writeback_timer: (!inline).then(|| crate::gpu_timer::GpuTimer::new(device, instance, physical_device, queue_family)).flatten(),
             proxy,
             proxy_region,
             dump: None,
@@ -5816,21 +5904,21 @@ impl Session {
     /// Hold resources that a failed submit left without a fence ([`Resources::fence_submitted`]) are
     /// let go of on a device that is not lost: leaked, not destroyed (what went to the queue may still
     /// use them), so the next hold builds new ones and the after-the-upscaler path is not kept waiting
-    /// on them. On a lost device they stay, and nothing holds there again.
+    /// on them. On a lost device they stay, and nothing holds there again. Only the split hold's
+    /// [`Self::res`] has fences: the holds recorded into DLSS's buffers ([`Self::res_inline`],
+    /// [`Self::res_after`]) have no work of their own.
     pub(crate) fn recover_unfenced(&mut self, device: &ash::Device) {
-        for res in [&mut self.res, &mut self.res_after] {
-            if !res.as_ref().is_some_and(|r| r.unfenced) || crate::device_lost(device.handle()) {
-                continue;
-            }
-            crate::log!("[preupscale] hold resources without a fence for their last work are left behind (leaked) and built again");
-            if let Some(old) = res.take() {
-                std::mem::forget(old);
-            }
-            // What they went to the queue with may still read slot 0, which the after-the-upscaler
-            // path writes: it keeps off as long as any wait of the layer's is bounded (on the native
-            // path the network's loader holds it off the same way, `Loader::pre_unfenced`).
-            self.post_held_off_until = Some(Instant::now() + crate::FENCE_WAIT_TIMEOUT);
+        if !self.res.as_ref().is_some_and(|r| r.unfenced) || crate::device_lost(device.handle()) {
+            return;
         }
+        crate::log!("[preupscale] hold resources without a fence for their last work are left behind (leaked) and built again");
+        if let Some(old) = self.res.take() {
+            std::mem::forget(old);
+        }
+        // What they went to the queue with may still read slot 0, which the after-the-upscaler
+        // path writes: it keeps off as long as any wait of the layer's is bounded (on the native
+        // path the network's loader holds it off the same way, `Loader::pre_unfenced`).
+        self.post_held_off_until = Some(Instant::now() + crate::FENCE_WAIT_TIMEOUT);
     }
 
     /// Whether the after-the-upscaler path must leave slot 0 alone this present (see
@@ -5844,14 +5932,6 @@ impl Session {
     pub(crate) fn drain(&mut self, device: &ash::Device) -> bool {
         let mut gpu = None;
         self.res.as_mut().is_none_or(|r| r.wait_idle(device, &mut gpu))
-    }
-
-    /// The resources of the split holds at `stage` ([`Self::res`]; [`Self::res_after`] after DLSS's output).
-    fn res_slot(&mut self, stage: placement::Stage) -> &mut Option<Resources> {
-        match stage {
-            placement::Stage::Upscaled => &mut self.res_after,
-            _ => &mut self.res,
-        }
     }
 
     /// The resources of the holds recorded into DLSS's buffer at `stage`: [`Self::res_inline`] before the
@@ -5956,9 +6036,12 @@ impl Session {
         }
     }
 
-    /// Makes sure the resources of the holds at `stage` ([`Self::res_slot`]) are built for this extent and queue
-    /// family, draining and rebuilding the old ones only when nothing of them is pending. `false` when there is
-    /// nothing usable.
+    /// Makes sure the split hold's resources ([`Self::res`]) are built for this extent and queue family,
+    /// draining and rebuilding the old ones only when nothing of them is pending. `false` when there is
+    /// nothing usable, and for any `stage` but [`placement::Stage::Before`]: the split holds run only before
+    /// the upscaler. After DLSS's output the hold is recorded into DLSS's buffer, with
+    /// [`Self::res_after`]'s fence-less resources, which [`Self::ensure_inline`] destroys without a wait and
+    /// [`Self::drain`] never waits for; fenced resources there could be destroyed while still pending.
     ///
     /// # Safety
     /// As [`Resources::build`].
@@ -5967,16 +6050,19 @@ impl Session {
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
         width: u32, height: u32, shm: &ShmClient, import: bool, stage: placement::Stage,
     ) -> bool {
+        if stage != placement::Stage::Before {
+            return false;
+        }
         self.recover_unfenced(device);
         // Taken out while it is looked at (the cache dump's state is the session's).
-        let mut slot = self.res_slot(stage).take();
+        let mut slot = self.res.take();
         // SAFETY: forwarded.
         let ok = unsafe { self.ensure_in(&mut slot, device, instance, physical_device, queue_family, width, height, shm, import) };
-        *self.res_slot(stage) = slot;
+        self.res = slot;
         ok
     }
 
-    /// [`Self::ensure`] on one stage's resources, `res`.
+    /// [`Self::ensure`] on the split hold's resources, `res`.
     ///
     /// # Safety
     /// As [`Resources::build`].
@@ -6817,6 +6903,41 @@ mod tests {
         assert!(!reported, "a refused head reports nothing as accepted");
     }
 
+    /// A tail refused after the head and the hold went to the queue is never reported as an
+    /// out-of-memory error, which tells the application that nothing of its call ran: it is
+    /// submitted once more, and reported as `VK_ERROR_DEVICE_LOST` (what the specification asks of
+    /// a submit that cannot be undone) only when that fails too. `VK_ERROR_DEVICE_LOST` itself is
+    /// not retried.
+    #[test]
+    fn a_tail_refused_after_the_head_ran_is_retried_once_then_reported_as_device_lost() {
+        let batches = vec![batch1(&[(1, None)], &[10], &[(2, None)]), batch1(&[(3, Some(5))], &[20], &[(4, Some(6))])];
+        let game_fence = vk::Fence::from_raw(0xf);
+        // The tail's submissions fail with `tail_results` in turn; the head always succeeds.
+        let run = |tail_results: &[vk::Result]| {
+            let tail_calls = std::cell::Cell::new(0usize);
+            let submit = |b: &[Batch1], _: vk::Fence| {
+                if b.iter().any(|b| b.cbs.contains(&cb(20))) {
+                    let k = tail_calls.get();
+                    tail_calls.set(k + 1);
+                    tail_results.get(k).copied().unwrap_or(vk::Result::SUCCESS)
+                } else {
+                    vk::Result::SUCCESS
+                }
+            };
+            let mut accepted: Vec<Vec<vk::CommandBuffer>> = Vec::new();
+            let result = submit_around(plan(batches.clone(), 1, 0), game_fence, &submit, |_| true, &mut |part| accepted.push(part));
+            (result, tail_calls.get(), accepted)
+        };
+        let oom = vk::Result::ERROR_OUT_OF_DEVICE_MEMORY;
+        assert_eq!(run(&[oom]), (vk::Result::SUCCESS, 2, vec![vec![cb(10)], vec![cb(20)]]), "a transient failure: submitted again and accepted");
+        assert_eq!(
+            run(&[oom, vk::Result::ERROR_OUT_OF_HOST_MEMORY]),
+            (vk::Result::ERROR_DEVICE_LOST, 2, vec![vec![cb(10)]]),
+            "refused twice: the head ran, so the call is lost, not out of memory"
+        );
+        assert_eq!(run(&[vk::Result::ERROR_DEVICE_LOST]), (vk::Result::ERROR_DEVICE_LOST, 1, vec![vec![cb(10)]]), "a lost device is not retried");
+    }
+
     fn sem2(raw: u64, value: u64) -> vk::SemaphoreSubmitInfo {
         vk::SemaphoreSubmitInfo { semaphore: sem(raw), value, stage_mask: vk::PipelineStageFlags2::COMPUTE_SHADER, ..Default::default() }
     }
@@ -7204,8 +7325,11 @@ mod tests {
 
     /// The submit that (re)identifies the inputs is not held: barriers recorded before the images
     /// were watched were never seen (the device hooks only record them while watching), and a new
-    /// identification drops what was committed, so "no layout" there is not "GENERAL". The next
-    /// launch-bearing submit, with no barrier seen while watched, is.
+    /// identification drops what was committed, so "no layout" there is not "GENERAL". Nor is a later
+    /// submit whose launch buffer, or a buffer before it, was recorded before the identification
+    /// (submitted again without being recorded again, recorded ahead on another thread, or carrying
+    /// such a secondary): its barriers on the inputs were not seen either. A launch buffer recorded
+    /// since, with no barrier seen while watched, is held.
     #[test]
     fn the_submit_that_identifies_the_inputs_is_not_held() {
         let t = Tracking::default();
@@ -7226,24 +7350,60 @@ mod tests {
             }
             tr.swapchain(vk::SwapchainKHR::from_raw(9), Some((2560, 1440)));
         };
+        let record = |c: vk::CommandBuffer| {
+            t.begin(c);
+            t.launch(c, vk::CuFunctionNVX::null(), None);
+        };
         register(0x1000);
-        t.launch(cb(1), vk::CuFunctionNVX::null(), None);
+        record(cb(1));
         let first = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(first.inputs.is_some() && first.identified_now && first.colour_layout.is_none());
         assert!(!first.colour_in_general(), "identified on this submit: nothing known, not held");
+        // The same buffer again, not recorded again: whatever it holds on the inputs was not seen.
+        let resubmitted = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
+        assert!(!resubmitted.identified_now && resubmitted.colour_in_general());
+        assert_eq!(resubmitted.hazard, Some(Hazard::RecordedBefore), "recorded before the identification: not held");
+        record(cb(1));
         let second = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert!(!second.identified_now && second.colour_layout.is_none());
-        assert!(second.colour_in_general(), "watched for a submit and no barrier seen: GENERAL");
-        // A re-identification (DLSS's inputs re-created) starts over.
+        assert!(second.colour_in_general() && second.hazard.is_none(), "recorded while watched, no barrier seen: GENERAL, held");
+        // A buffer before the launch buffer in the submit, recorded before the identification: its
+        // barriers are what the launch buffer starts from.
+        assert_eq!(t.submit_ok(&[vec![cb(3)], vec![cb(1)]]).expect("launch-bearing").hazard, Some(Hazard::RecordedBefore));
+        t.begin(cb(3));
+        assert_eq!(t.submit_ok(&[vec![cb(3)], vec![cb(1)]]).expect("launch-bearing").hazard, None);
+        assert_eq!(t.submit_ok(&[vec![cb(1), cb(7)]]).expect("launch-bearing").hazard, None, "one after the launch buffer does not matter");
+        // A secondary recorded before the identification makes its primary so.
+        t.begin(cb(4));
+        t.execute(cb(4), &[cb(5)]);
+        t.launch(cb(4), vk::CuFunctionNVX::null(), None);
+        assert_eq!(t.submit_ok(&[vec![cb(4)]]).expect("launch-bearing").hazard, Some(Hazard::RecordedBefore));
+        t.begin(cb(5));
+        record(cb(4));
+        t.execute(cb(4), &[cb(5)]);
+        assert_eq!(t.submit_ok(&[vec![cb(4)]]).expect("launch-bearing").hazard, None);
+        // A re-identification (DLSS's inputs re-created) starts over: a buffer recorded under the old
+        // one was recorded before this one (only its barriers on the old inputs were kept).
         t.lock().forget_image(vk::Image::from_raw(0x1000));
         register(0x5000);
         let again = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
         assert_eq!(again.inputs.map(|i| i.colour.0), Some(vk::Image::from_raw(0x5000)));
         assert!(again.identified_now && !again.colour_in_general());
-        assert!(t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing").colour_in_general());
+        let stale = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
+        assert!(stale.colour_in_general() && stale.hazard == Some(Hazard::RecordedBefore), "recorded under the old identification: not held");
+        record(cb(1));
+        let held = t.submit_ok(&[vec![cb(1)]]).expect("launch-bearing");
+        assert!(held.colour_in_general() && held.hazard.is_none());
         // A barrier out of GENERAL still refuses the hold.
+        t.begin(cb(2));
         t.barriers(cb(2), [ImageSync::to(vk::Image::from_raw(0x5000), vk::ImageLayout::SHADER_READ_ONLY_OPTIMAL)].into_iter(), None);
         assert!(!t.submit_ok(&[vec![cb(2), cb(1)]]).expect("launch-bearing").colour_in_general());
+        // Nothing is left watched-recorded once nothing is identified, so nothing stays armed for it.
+        t.lock().forget_image(vk::Image::from_raw(0x5000));
+        t.lock().forget_image(vk::Image::from_raw(0x5100));
+        t.lock().launch_submits += SR_RECENT;
+        let _ = t.submit_ok(&[vec![cb(1)]]);
+        assert!(t.lock().inputs.is_none() && t.lock().recorded_watched.is_empty());
     }
 
     /// On a device with NVX but no DLSS nothing is ever armed, so the per-command-buffer and
@@ -7336,7 +7496,8 @@ mod tests {
 
     /// A tracker with GTA's three inputs identified (colour 0x100, depth 0x200, motion vectors
     /// 0x300; registration keys `image + 0x1000`) and one launch-bearing submit behind it, so the
-    /// next is not the identifying one.
+    /// next is not the identifying one. Buffers `cb(1)` to `cb(HELD_BEGUN)` were begun since: their
+    /// whole recording is seen ([`Tracker::recorded_watched`]).
     fn held_tracker() -> (Tracker, Vec<u8>) {
         held_tracker_with(vk::ImageUsageFlags::STORAGE)
     }
@@ -7362,8 +7523,14 @@ mod tests {
         t.launch(cb(900), Some(&params));
         assert!(t.submit_ok(&[vec![cb(900)]]).is_some_and(|s| s.identified_now));
         t.free(&[cb(900)]);
+        for k in 1..=HELD_BEGUN {
+            t.begin(cb(k));
+        }
         (t, params)
     }
+
+    /// The buffers [`held_tracker`] begins after its identification.
+    const HELD_BEGUN: u64 = 16;
 
     fn colour() -> vk::Image {
         vk::Image::from_raw(0x100)
@@ -7458,6 +7625,25 @@ mod tests {
         assert_eq!(input_launch(&other, &[colour, r32, mvec]), None);
         // No motion vectors: not an input launch.
         assert_eq!(input_launch(&images, &[colour, r32]), None);
+    }
+
+    /// No hold goes inside a buffer begun before the identification: the layout its earlier commands
+    /// left the colour input in, and the synchronization before the launch, were not seen. Begun again
+    /// since, the same recording gets its hold.
+    #[test]
+    fn no_hold_goes_inside_a_buffer_begun_before_the_identification() {
+        let copyable = vk::ImageUsageFlags::STORAGE | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        let (mut t, params) = held_tracker_with(copyable);
+        let early = cb(HELD_BEGUN + 1);
+        t.global(early, Hazard::MemoryBarrier);
+        t.launch(early, Some(&params));
+        assert_eq!(t.take_inline_at(), Some((early, colour())));
+        assert!(t.inline_point(early, colour()).is_none(), "recorded (in part) before the identification");
+        t.begin(early);
+        t.global(early, Hazard::MemoryBarrier);
+        t.launch(early, Some(&params));
+        assert_eq!(t.take_inline_at(), Some((early, colour())));
+        assert_eq!(t.inline_point(early, colour()).map(|p| p.hazard), Some(Hazard::MemoryBarrier), "begun since: held inside");
     }
 
     /// The hold goes inside DLSS's buffer exactly where the split is refused: Crimson Desert's and
@@ -8043,13 +8229,13 @@ mod tests {
         let scan = t.scan(&cbs).expect("launch-bearing");
         assert_eq!((scan.index, scan.colour_layout), (1, Some(GENERAL)));
         assert!(t.committed.is_empty(), "a scan commits nothing");
-        // Submits `plan`'s parts, failing the call numbered `fail`; returns the result.
-        let run = |t: &mut Tracker, fail: usize| {
+        // Submits `plan`'s parts, failing the calls numbered in `fail`; returns the result.
+        let run = |t: &mut Tracker, fail: &[usize]| {
             let scan = t.scan(&cbs).expect("launch-bearing");
             let calls = std::cell::Cell::new(0);
             let submit = |_: &[Batch1], _: vk::Fence| {
                 calls.set(calls.get() + 1);
-                if calls.get() == fail { vk::Result::ERROR_OUT_OF_DEVICE_MEMORY } else { vk::Result::SUCCESS }
+                if fail.contains(&calls.get()) { vk::Result::ERROR_OUT_OF_DEVICE_MEMORY } else { vk::Result::SUCCESS }
             };
             let mut accepted = Vec::new();
             let result = submit_around(plan(batches.clone(), scan.batch, scan.index), vk::Fence::null(), &submit, |_| false, &mut |part| accepted.extend(part));
@@ -8058,15 +8244,20 @@ mod tests {
         };
         // The head is refused: nothing executed, nothing tracked.
         let mut t = fixture();
-        assert_eq!(run(&mut t, 1), vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert_eq!(run(&mut t, &[1]), vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
         assert!(t.committed.is_empty());
-        // The head is accepted, the tail refused: the head's barrier only.
+        // The head is accepted, the tail refused twice (the second time is its retry): the head's
+        // barrier only, and the call reported lost (its head cannot be taken back).
         let mut t = fixture();
-        assert_eq!(run(&mut t, 2), vk::Result::ERROR_OUT_OF_DEVICE_MEMORY);
+        assert_eq!(run(&mut t, &[2, 3]), vk::Result::ERROR_DEVICE_LOST);
         assert_eq!(t.committed.get(&colour()), Some(&GENERAL), "the launch buffer and what follows never ran");
+        // The tail refused once: accepted when submitted again, the last buffer's layout.
+        let mut t = fixture();
+        assert_eq!(run(&mut t, &[2]), vk::Result::SUCCESS);
+        assert_eq!(t.committed.get(&colour()), Some(&transfer));
         // Both accepted: the last buffer's layout.
         let mut t = fixture();
-        assert_eq!(run(&mut t, 0), vk::Result::SUCCESS);
+        assert_eq!(run(&mut t, &[]), vk::Result::SUCCESS);
         assert_eq!(t.committed.get(&colour()), Some(&transfer));
         // An unsplit call that fails is never committed by its caller: the state stays put, and
         // the next scan still reads the last accepted layout.
@@ -8412,6 +8603,41 @@ mod tests {
         }
         assert_eq!((t.named.len(), t.inputs.map(|i| i.rule)), (1, Some(Rule::Params)));
         assert_eq!((t.colour_submits, t.foreign_submits), (30, 60));
+    }
+
+    /// DLSS's launches recorded into a secondary that is executed into the submitted primary: the
+    /// primary carries the secondary's camera jitter, DLSS's output kernel and image, and the colour
+    /// input's attachment layout, beside its input launch. Before, only the input launch carried
+    /// over: the hold ran without jitter, DLSS's output was never learnt, and the layout the
+    /// secondary's rendering left never reached the committed state.
+    #[test]
+    fn a_secondarys_jitter_output_and_attachment_layouts_carry_over_to_its_primary() {
+        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
+        assert!(t.refresh().is_some(), "identified by size");
+        let (input, output) = (vk::CuFunctionNVX::from_raw(0x9001), vk::CuFunctionNVX::from_raw(0x9002));
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        t.record_function(output, "hiluma_engine_output_kernel");
+        // Word 3 of a 310.x SR input kernel's parameters is the jitter (x low, y high).
+        let jitter = u64::from((-0.25f32).to_bits()) | (u64::from(0.1667f32.to_bits()) << 32);
+        let (primary, secondary) = (cb(1), cb(11));
+        t.begin(primary);
+        t.begin(secondary);
+        t.attachments(secondary, &[(vk::ImageView::from_raw(0x101), vk::ImageLayout::GENERAL)]);
+        t.launch_kernel(secondary, input, Some(&param_block(&[h(0x100), jitter, h(0x200), h(0x300)])));
+        t.launch_kernel(secondary, output, Some(&param_block(&[h(0x100), h(0x400)])));
+        assert_eq!((t.launch[&secondary].jitter, t.launch[&secondary].output), (Some(jitter), Some((output, img(0x400)))));
+        t.execute(primary, &[secondary]);
+        let refs = &t.launch[&primary];
+        assert_eq!(refs.input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
+        assert_eq!(refs.jitter, Some(jitter), "the secondary's jitter");
+        assert_eq!(refs.output, Some((output, img(0x400))), "the secondary's output kernel and image");
+        assert_eq!(t.attached.get(&primary), Some(&vec![(img(0x100), vk::ImageLayout::GENERAL)]), "the secondary's attachment layout");
+        for n in 0..OUTPUT_SETTLE {
+            let scan = submit(&mut t, &[vec![primary]]).0.expect("launch-bearing");
+            assert_eq!(scan.jitter_px(), Some([-0.25, 0.1667]), "submit {n}");
+            assert_eq!(t.committed.get(&img(0x100)), Some(&vk::ImageLayout::GENERAL), "submit {n}: committed from the primary");
+        }
+        assert_eq!(t.dlss_output.map(|o| (o.function, o.image, o.input)), Some((output, img(0x400), img(0x100))), "DLSS's output is learnt from the primary");
     }
 
     /// The DLAA set (Resident Evil Requiem: `UpscalingQuality_DLSS=MaxQuality`, FG on): DLSS's colour
@@ -9350,6 +9576,15 @@ mod tests {
     }
 
     impl Gpu {
+        /// Whether a 2D optimal-tiling `format` image with `usage` can be created here.
+        fn supports(&self, format: vk::Format, usage: vk::ImageUsageFlags) -> bool {
+            // SAFETY: a plain property query on this instance's physical device.
+            unsafe {
+                self.instance.get_physical_device_image_format_properties(self.physical, format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL, usage, vk::ImageCreateFlags::empty())
+            }
+            .is_ok()
+        }
+
         fn open(import: bool) -> Option<Self> {
             let (entry, instance, physical, device, queue, family) = if import {
                 crate::composition::gpu::test_device_with_external_memory_host()?
@@ -9468,6 +9703,31 @@ mod tests {
         out
     }
 
+    /// The resources of a hold recorded into DLSS's buffer are never timed, and create no timestamp
+    /// pool to drop: a `GpuTimer` has no `Drop`, so one made and discarded leaks its `VkQueryPool`, which
+    /// the validation layer reports when the device is destroyed. The split's resources are timed.
+    #[test]
+    fn inline_hold_resources_create_no_timer_pools() {
+        let Some(gpu) = Gpu::open(false) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let d = &gpu.device;
+        // SAFETY: a live device; nothing of the resources is ever submitted.
+        let inline = unsafe { Resources::build_inline(d, &gpu.instance, gpu.physical, gpu.family, 16, 8) }.expect("inline resources");
+        assert!(inline.inline && inline.capture_timer.is_none() && inline.writeback_timer.is_none());
+        let shm = scratch_shm("timers");
+        // SAFETY: as above.
+        let split = unsafe { Resources::build(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false) }.expect("split resources");
+        let timestamps = unsafe { gpu.instance.get_physical_device_queue_family_properties(gpu.physical) }[gpu.family as usize].timestamp_valid_bits > 0;
+        assert_eq!((split.capture_timer.is_some(), split.writeback_timer.is_some()), (timestamps, timestamps));
+        // SAFETY: nothing submitted.
+        unsafe {
+            inline.destroy(d);
+            split.destroy(d);
+        }
+    }
+
     /// Resources a failed submit left without a fence are let go of (leaked) on a live device, so the
     /// next hold builds new ones and the after-the-upscaler path does not wait on them for good.
     #[test]
@@ -9490,6 +9750,11 @@ mod tests {
         // SAFETY: as above.
         assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false, placement::Stage::Before) }, "built again");
         assert!(!session.res.as_ref().unwrap().pending(), "fresh resources");
+        // The split holds run before the upscaler only: no fenced resources are ever built into the
+        // slot of the hold after DLSS's output, which `ensure_inline` destroys without a wait.
+        // SAFETY: as above.
+        assert!(!unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 32, 16, &shm, false, placement::Stage::Upscaled) });
+        assert!(session.res_after.is_none() && session.res.as_ref().unwrap().matches(gpu.family, 16, 8), "nothing built, the split's left alone");
         // SAFETY: nothing submitted.
         unsafe {
             session.destroy(d);
@@ -9497,16 +9762,42 @@ mod tests {
         }
     }
 
-    fn scratch_shm(tag: &str) -> ShmClient {
+    /// A channel over a scratch file, which goes (with its directory) when the test is done with it.
+    struct ScratchShm {
+        shm: ShmClient,
+        dir: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for ScratchShm {
+        type Target = ShmClient;
+        fn deref(&self) -> &ShmClient {
+            &self.shm
+        }
+    }
+
+    impl std::ops::DerefMut for ScratchShm {
+        fn deref_mut(&mut self) -> &mut ShmClient {
+            &mut self.shm
+        }
+    }
+
+    impl Drop for ScratchShm {
+        fn drop(&mut self) {
+            // The mapping stays valid without its file.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn scratch_shm(tag: &str) -> ScratchShm {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .unwrap()
-            .join(format!("target/test-scratch/preupscale-{}-{tag}-{}/shm.bin", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+            .join(format!("target/test-scratch/preupscale-{}-{tag}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let mut shm = ShmClient::default();
-        assert!(shm.test_open_at(&path.display().to_string()));
-        shm
+        assert!(shm.test_open_at(&dir.join("shm.bin").display().to_string()));
+        ScratchShm { shm, dir }
     }
 
     // ---- The hand-back window. ----
@@ -10247,6 +10538,12 @@ mod tests {
             eprintln!("preupscale depth copy test: no Vulkan device, skipping");
             return;
         };
+        // Asked before anything is created, so a skip leaves nothing behind for the device's destruction.
+        let depth_usage = vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        if !gpu.supports(vk::Format::D32_SFLOAT_S8_UINT, depth_usage) {
+            eprintln!("preupscale depth copy test: no D32_SFLOAT_S8_UINT image here, skipping");
+            return;
+        }
         let d = &gpu.device;
         let (w, h) = (5u32, 3u32);
         let (image, memory) = gpu.image(w, h);
@@ -10261,12 +10558,9 @@ mod tests {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .usage(depth_usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let Ok(depth) = (unsafe { d.create_image(&info, None) }) else {
-            eprintln!("preupscale depth copy test: no D32_SFLOAT_S8_UINT image here, skipping");
-            return;
-        };
+        let depth = unsafe { d.create_image(&info, None) }.expect("a D32_SFLOAT_S8_UINT image, which the device supports");
         let reqs = unsafe { d.get_image_memory_requirements(depth) };
         let props = unsafe { gpu.instance.get_physical_device_memory_properties(gpu.physical) };
         let index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
@@ -10361,6 +10655,12 @@ mod tests {
             eprintln!("preupscale dump test: no Vulkan device, skipping");
             return;
         };
+        // Asked before anything is created, so a skip leaves nothing behind for the device's destruction.
+        let depth_format = vk::Format::D32_SFLOAT_S8_UINT;
+        if !gpu.supports(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST) {
+            eprintln!("preupscale dump test: no D32_SFLOAT_S8_UINT image here, skipping");
+            return;
+        }
         let d = &gpu.device;
         let (w, h) = (5u32, 3u32);
         let (image, memory) = gpu.image(w, h);
@@ -10388,11 +10688,7 @@ mod tests {
         let make = |format: vk::Format, usage: vk::ImageUsageFlags| make_sized(format, usage, (w, h));
         let (exp32, exp32_mem) = make_sized(vk::Format::R32G32B32A32_SFLOAT, vk::ImageUsageFlags::STORAGE, (1, 1)).expect("1x1 RGBA32F image");
         let (exp16, exp16_mem) = make_sized(vk::Format::R16_SFLOAT, vk::ImageUsageFlags::SAMPLED, (1, 1)).expect("1x1 R16F image");
-        let depth_format = vk::Format::D32_SFLOAT_S8_UINT;
-        let Some((depth, depth_mem)) = make(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT) else {
-            eprintln!("preupscale dump test: no D32_SFLOAT_S8_UINT image here, skipping");
-            return;
-        };
+        let (depth, depth_mem) = make(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT).expect("a D32_SFLOAT_S8_UINT image, which the device supports");
         let (mvec, mvec_mem) = make(vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT).expect("RG16F image");
         let ds_range = aux_range(depth_format);
         let colour_range = aux_range(vk::Format::R16G16_SFLOAT);

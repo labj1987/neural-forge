@@ -365,6 +365,16 @@ Not split, each with its own once-per-session log line:
   halves, with the layer's submits in between.
 - **Dynamic rendering suspended across the split point**: the launch buffer resumes
   (`VK_RENDERING_RESUMING_BIT`) a render pass instance suspended in the buffer before it.
+- **A buffer recorded before the inputs were identified** (`Hazard::RecordedBefore`): the launch
+  buffer, a buffer ahead of it in the same call, or a secondary executed into one of them was begun
+  before the current identification (`Tracker::recorded_watched`). Barriers are recorded only while
+  inputs are watched, and a new identification drops what was recorded, so what such a buffer does
+  to the inputs is not known: a D3D12 command list executed again without being recorded again, or
+  one recorded ahead on another thread while the submit that identified the inputs went out, can
+  carry a transition or a same-layout barrier before DLSS's launch. Before, only the identifying
+  submit itself was skipped, and such a buffer was then held as if it had no barrier. GTA V Enhanced
+  records every buffer again before submitting it (docs/PRE_UPSCALER_PROBE.md), so only the buffers
+  recorded before an identification are affected. No hold is recorded inside such a buffer either.
 
 Not detected (the layer does not see them): a write to an input through a descriptor in the launch
 buffer before the launch with no barrier after it, and render pass attachments.
@@ -374,7 +384,11 @@ from the committed state plus the barriers of the buffers ahead of it in the sam
 nothing. State advances in `commit_submitted`, which is only ever given command buffers of a
 submission the next layer accepted: for a split call the head's once it was submitted and the tail's
 once it was (`submit_around`), so a refused head leaves the state as it was and a refused tail adds
-only the head. For that the layer issues every `vkQueueSubmit`/`vkQueueSubmit2` to the next layer
+only the head. A refused tail comes after the head and the hold went to the queue, which the
+application's all-or-nothing `vkQueueSubmit` cannot express: an out-of-memory result tells it that
+nothing ran and no semaphore was waited on. The tail is submitted once more (a refused submission
+changes nothing); refused again, the call is reported as `VK_ERROR_DEVICE_LOST`, what the
+specification requires of a submit that failed in a way it cannot undo. For that the layer issues every `vkQueueSubmit`/`vkQueueSubmit2` to the next layer
 itself (the framework's own forwarding gives a hook no result), and the render tap's source layouts
 (`TapTracker`) follow the same rule.
 
@@ -1672,7 +1686,7 @@ What changed (`Tracker::switch_by_evidence`, `Tracker::retarget`):
   candidate (an input launch naming the colour input resets the count; launches with no input
   launch, such as FG's, do not count), the colour input switches to it, logged once per switch:
   `colour input switched to 0x... (DLSS's input kernel reads it; the size rule had picked 0x...)`.
-  It is an ordinary re-identification: layouts dropped, that one submit not held, the
+  It is an ordinary re-identification: layouts dropped, that submit (and buffers recorded before it) not held, the
   identification line repeated with `identified by the input kernel's parameters`. The switch is
   kept (it takes precedence over the settled pick) while its image is one of the size rule's
   candidates and registered.
