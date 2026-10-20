@@ -65,6 +65,9 @@ struct InstanceContext {
     surface_caps: Option<vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>,
     /// Which `vkGetPhysicalDeviceMemoryProperties2` the application's instance may call (the VRAM log).
     properties2: vram::Properties2,
+    /// The application's `VkApplicationInfo::api_version` (0 without one): the network needs 1.3
+    /// (`neural_forge_native::device_extend`).
+    api_version: u32,
 }
 
 /// The owning instance of each physical device a device is being created on, so
@@ -673,7 +676,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                         with.p_queue_create_infos = queues.as_ptr();
                         // SAFETY: the next layer's gipa for this instance; `with` and everything it
                         // points to outlive the extension, which outlives the call.
-                        match unsafe { neural_forge_native::device_extend(gipa, instance.instance.handle(), physical_device, &with) } {
+                        match unsafe { neural_forge_native::device_extend(gipa, instance.instance.handle(), instance.api_version, physical_device, &with) } {
                             Err(why) => {
                                 log!("[native] the device cannot run the network: {why}; native backend off on this device");
                                 note_native_unavailable(&why);
@@ -876,7 +879,9 @@ impl Layer for NeuralForgeLayer {
             next_get_instance_proc_addr(instance.handle(), c"vkGetPhysicalDeviceSurfaceCapabilitiesKHR".as_ptr())
                 .map(|p| std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR>(p))
         };
-        NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance, surface_caps, properties2: vram::Properties2::of(create_info) }) }
+        // SAFETY: the application's create info, valid for the call; its application info is null or valid.
+        let api_version = unsafe { create_info.p_application_info.as_ref() }.map_or(0, |app| app.api_version);
+        NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance, surface_caps, properties2: vram::Properties2::of(create_info), api_version }) }
     }
 
     fn create_device_info(
@@ -999,7 +1004,7 @@ mod instance_table_tests {
             eprintln!("instance table test: no Vulkan ICD, skipping");
             return;
         };
-        let hooks = |instance: &Arc<ash::Instance>| NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None }) };
+        let hooks = |instance: &Arc<ash::Instance>| NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None, api_version: 0 }) };
         // Stand-in handles: the table is keyed by whatever the framework hands over.
         let (real_gpu, probe_gpu) = (vk::PhysicalDevice::from_raw(0x5100), vk::PhysicalDevice::from_raw(0x5200));
         let real_hooks = hooks(&real);
@@ -1213,7 +1218,7 @@ mod device_link_tests {
         let priorities = [1.0];
         let queue = vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities).build();
         let info = vk::DeviceCreateInfo::builder().queue_create_infos(std::slice::from_ref(&queue)).build();
-        let hooks = NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None }) };
+        let hooks = NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None, api_version: 0 }) };
         let mut p_device = std::mem::MaybeUninit::uninit();
         CALLED.set(0);
         let result = hooks.create_device(physical, &info, &link, None, &mut p_device);

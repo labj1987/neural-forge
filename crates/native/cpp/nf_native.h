@@ -18,24 +18,31 @@ extern "C" {
 
 uint32_t nf_native_abi_version(void);
 uint32_t nf_native_asset_count(const char* kind);
+// The hold slots nf_native_record_graph_at serves (`hold` 0 up to this, exclusive).
+uint32_t nf_native_hold_slots(void);
 
 // ---- Device creation -------------------------------------------------------------------------
 
-// Whether `physical` can run the network: every extension and feature the kernels need. On 0,
+// Whether `physical` can run the network: every extension and feature the kernels need, and an instance
+// created for Vulkan 1.3 or later (`instance_api_version`: the application's VkApplicationInfo.apiVersion,
+// 0 when it gave none, which is 1.0). The kernels are SPIR-V 1.6 and the glue calls Vulkan 1.3's core
+// commands, which a device made from an older instance does not have whatever the GPU supports. On 0,
 // `missing` names the first missing one.
-uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
-                                    char* missing, size_t missing_len);
+uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, uint32_t instance_api_version,
+                                    VkPhysicalDevice physical, char* missing, size_t missing_len);
 
 // Extends `in` (the create info about to go to the next layer's vkCreateDevice) with the network's
 // extensions and features, writing the result to `out`. `in` and its chain are only read: `out`'s chain
 // is a copy of the application's (each structure's size from the Vulkan registry, the loader's own
 // link and callback nodes included; from the first structure this build does not know on, the rest stays
 // the application's, linked as it is and never written) with the flags set in the copies, and the structures the
-// application has none of prepended, all in memory owned by `*state`. Fails when the application
-// enables VK_EXT_buffer_device_address (it excludes the core feature the kernels need). `out`, its
+// application has none of prepended, all in memory owned by `*state`. Fails where
+// nf_native_device_supported does (an instance older than 1.3 says so as is; a missing device requirement
+// as "the device lacks <it>"), and when the application enables VK_EXT_buffer_device_address (it excludes the core feature the kernels need). `out`, its
 // extension list and its chain stay valid until nf_native_device_restore(*state), which frees them
 // and must be called once vkCreateDevice has returned, whatever it returned.
-uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
+uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, uint32_t instance_api_version,
+                                 VkPhysicalDevice physical,
                                  const VkDeviceCreateInfo* in, VkDeviceCreateInfo* out, void** state, char* err,
                                  size_t err_len);
 void nf_native_device_restore(void* state);
@@ -71,7 +78,11 @@ NfNative* nf_native_open(const NfNativeOpen* open, uint32_t* stalled, char* err,
 // The graph for a `valid_width` x `valid_height` frame: allocates the activations, runs it once on
 // the layer's queue (the driver compiles the PTX then, and the weights' device copies are made),
 // then records it into the secondary command buffer nf_native_graph_commands returns. Slow. Any
-// previous build's secondary must not be pending.
+// previous build's secondary must not be pending. Invalid sizes (none, or a zero width or height) fail
+// before anything is dropped: the previous build stays as it was. Counter-chain timeouts left from frames
+// of the previous build (unread by nf_native_chain_timeouts), or a warm-up's own, switch the network to
+// barriers as nf_native_fall_back_to_barriers does, and the build records with them (`chained` 0); every
+// warm-up starts from a count of 0.
 uint32_t nf_native_build(NfNative* n, uint32_t valid_width, uint32_t valid_height, char* err, size_t err_len);
 
 // nf_native_build for `count` frame sizes at once (`sizes`: valid width, height pairs): one graph each, slot i
@@ -108,8 +119,10 @@ VkCommandBuffer nf_native_graph_commands_own(const NfNative* n);
 VkCommandBuffer nf_native_graph_commands_at(const NfNative* n, uint32_t slot);
 VkCommandBuffer nf_native_graph_commands_own_at(const NfNative* n, uint32_t slot);
 
-// Records the graph straight into `primary` (descriptor pool 0, which the warm-up also uses). For
-// measurements beside the secondary; the frame path uses nf_native_graph_commands.
+// Records the graph straight into `primary`, a primary command buffer of `frame_family` the caller is
+// recording on this thread (descriptor pool 0, which the warm-up also uses, reset first: no buffer
+// recorded by an earlier call may still be pending). For measurements beside the secondary; the frame path
+// uses nf_native_graph_commands.
 uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err, size_t err_len);
 
 // Records slot `slot`'s graph (nf_native_build_sizes) straight into `primary`, a primary command buffer of
@@ -137,6 +150,10 @@ void nf_native_fall_back_to_barriers(NfNative* n);
 // test of the fall back that shares its process with other tests.
 void nf_native_forget_fall_back(void);
 
+// For tests of the watchdog: as if a counter wait gave up, in the graph's last frame (`in_warm_up` 0: the
+// count nf_native_chain_timeouts reads) or in the next build's first warm-up (1). Cleared as a real one is.
+void nf_native_fake_chain_timeout(NfNative* n, uint32_t in_warm_up);
+
 // 1 once a bounded wait on the network's queue timed out: its work may still be running, so the network
 // takes no more work (every later build fails) and destroys nothing (close leaks what it made). The
 // caller treats the network as dead for this device.
@@ -146,7 +163,8 @@ uint32_t nf_native_stalled(const NfNative* n);
 // vectors the kernels read through them), and the matrices built from the records.
 void nf_native_weight_bytes(const NfNative* n, uint64_t* raw_loaded, uint64_t* raw, uint64_t* matrices);
 
-// Destroys everything this side made. Nothing of it may be pending.
+// Destroys everything this side made. Nothing of it may be pending: no submitted work that executes a
+// recording (nf_native_graph_commands*, nf_native_record_graph*) may still run.
 void nf_native_close(NfNative* n);
 
 #ifdef __cplusplus
