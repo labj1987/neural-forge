@@ -4,7 +4,7 @@
 //! there because it's entangled with that crate's request/response round-trip state
 //! machine, which the GUI/CLI have no reason to duplicate or depend on).
 //!
-//! Linux-only.
+//! Linux only (the crate is; see its docs).
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
 use std::sync::atomic::Ordering;
@@ -124,7 +124,12 @@ pub fn channel_file(fd: BorrowedFd<'_>) -> Option<ChannelFile> {
 /// layer), so two processes finding the same new file cannot both initialise it (the header has a
 /// single writer per field), nor can one read a header another is still writing. The lock is the
 /// file's own, separate from the ownership lease (`<channel>.owner`), and held only for those steps.
+/// A read-only look ([`open_existing`]) takes it shared.
 pub fn with_init_lock<R>(fd: BorrowedFd<'_>, f: impl FnOnce() -> R) -> R {
+    with_lock(fd, libc::LOCK_EX, f)
+}
+
+fn with_lock<R>(fd: BorrowedFd<'_>, operation: i32, f: impl FnOnce() -> R) -> R {
     struct Unlock(i32);
     impl Drop for Unlock {
         fn drop(&mut self) {
@@ -134,9 +139,19 @@ pub fn with_init_lock<R>(fd: BorrowedFd<'_>, f: impl FnOnce() -> R) -> R {
     }
     // SAFETY: plain call on an open descriptor. Interrupted waits are retried; any other failure
     // (no flock support) proceeds unlocked, as before.
-    while unsafe { libc::flock(fd.as_raw_fd(), libc::LOCK_EX) } != 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {}
+    while unsafe { libc::flock(fd.as_raw_fd(), operation) } != 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {}
     let _unlock = Unlock(fd.as_raw_fd());
     f()
+}
+
+/// The `version` word of the header at the start of the file `fd`, read without mapping it; `None`
+/// when the file is too short to hold it or cannot be read.
+fn header_version(fd: BorrowedFd<'_>) -> Option<u32> {
+    let at = std::mem::offset_of!(ShmHeader, version);
+    let mut word = [0u8; 4];
+    // SAFETY: the destination is 4 writable bytes; `pread` moves no file offset.
+    let n = unsafe { libc::pread(fd.as_raw_fd(), word.as_mut_ptr().cast(), word.len(), at as libc::off_t) };
+    (n == word.len() as isize).then(|| u32::from_ne_bytes(word))
 }
 
 /// A read-only look at an existing channel, for diagnostics (`doctor`, the report, `shmctl
@@ -151,7 +166,15 @@ pub fn open_existing(path: &str) -> Result<Option<Mapping>, OpenError> {
         return Ok(None);
     }
     let fd = crate::private_dir::open_private_file(path, libc::O_RDONLY, 0).ok_or(OpenError::Unavailable)?;
-    match channel_file(fd.as_fd()) {
+    // Shared under the init lock: a process initialising the file (which withdraws the magic while it
+    // writes the header) finishes first, so a channel being created is not read as a foreign file.
+    let header = with_lock(fd.as_fd(), libc::LOCK_SH, || look(fd.as_fd()))?;
+    Ok(header.map(|header| Mapping { _fd: fd, header, freshly_created: false }))
+}
+
+/// [`open_existing`]'s steps under the shared init lock: classify, map privately, check the version.
+fn look(fd: BorrowedFd<'_>) -> Result<Option<*mut ShmHeader>, OpenError> {
+    match channel_file(fd) {
         Some(ChannelFile::Ours) => {}
         Some(ChannelFile::New | ChannelFile::Blank) => return Ok(None),
         Some(ChannelFile::Foreign) => return Err(OpenError::Foreign),
@@ -178,7 +201,7 @@ pub fn open_existing(path: &str) -> Result<Option<Mapping>, OpenError> {
         unsafe { libc::munmap(map, HEADER_BYTES) };
         return Err(OpenError::WrongVersion { found });
     }
-    Ok(Some(Mapping { _fd: fd, header, freshly_created: false }))
+    Ok(Some(header))
 }
 
 /// Opens the mapping at `$NEURAL_FORGE_SHM` (or the default runtime path), creating it if
@@ -214,9 +237,15 @@ pub fn open_path(path: &str) -> Result<Mapping, OpenError> {
 
 /// [`open_path`]'s steps under the file's init lock: classify, size, map, initialise or check.
 fn open_locked(fd: BorrowedFd<'_>) -> Result<(*mut ShmHeader, bool), OpenError> {
-    // Before the file is sized or written: is it one of ours, or new?
+    // Before the file is sized or written: is it one of ours (at this build's version), or new?
     match channel_file(fd) {
-        Some(ChannelFile::New | ChannelFile::Ours | ChannelFile::Blank) => {}
+        Some(ChannelFile::New | ChannelFile::Blank) => {}
+        Some(ChannelFile::Ours) => match header_version(fd) {
+            Some(SHM_VERSION) => {}
+            // Another build's layout (a shorter one, for an older build) is left at its length.
+            Some(found) => return Err(OpenError::WrongVersion { found }),
+            None => return Err(OpenError::Unavailable),
+        },
         Some(ChannelFile::Foreign) => return Err(OpenError::Foreign),
         None => return Err(OpenError::Unavailable),
     }
@@ -342,6 +371,73 @@ mod tests {
         assert_eq!(word(std::mem::offset_of!(ShmHeader, version)), SHM_VERSION + 1);
         assert_eq!(word(std::mem::offset_of!(ShmHeader, seq_req)), 77);
         assert_eq!(word(std::mem::offset_of!(ShmHeader, intensity_bits)), 0.25f32.to_bits());
+        cleanup(&path);
+    }
+
+    /// A look never maps a file too short to hold a header (a load past its end would be SIGBUS),
+    /// even one that starts with the magic.
+    #[test]
+    fn a_look_refuses_a_file_too_short_for_a_header() {
+        let path = scratch_path();
+        assert!(crate::private_dir::ensure_private_parent_dir(&path));
+        std::fs::write(&path, SHM_MAGIC.to_ne_bytes()).unwrap();
+        assert_eq!(open_existing(&path).err(), Some(OpenError::Unavailable));
+        std::fs::write(&path, b"").unwrap();
+        assert!(open_existing(&path).unwrap().is_none(), "an empty file is a channel not made yet");
+        cleanup(&path);
+    }
+
+    /// A header of ours at another version, in a file shorter than this build's mapping (an older
+    /// build's layout): refused before anything is sized, so the file keeps its length.
+    #[test]
+    fn a_shorter_file_at_another_version_is_not_grown() {
+        let path = scratch_path();
+        assert!(crate::private_dir::ensure_private_parent_dir(&path));
+        let mut bytes = vec![0u8; HEADER_BYTES];
+        bytes[..4].copy_from_slice(&SHM_MAGIC.to_ne_bytes());
+        let at = std::mem::offset_of!(ShmHeader, version);
+        bytes[at..at + 4].copy_from_slice(&(SHM_VERSION - 1).to_ne_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        assert_eq!(open_path(&path).err(), Some(OpenError::WrongVersion { found: SHM_VERSION - 1 }));
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), HEADER_BYTES as u64, "the file's length is unchanged");
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        cleanup(&path);
+    }
+
+    /// A look at the channel while another process is initialising it (the magic withdrawn, the header
+    /// half written) waits for it, and sees the finished channel, not a foreign file.
+    #[test]
+    fn a_look_during_initialisation_waits_for_it() {
+        use std::os::fd::AsFd;
+        let path = scratch_path();
+        assert!(crate::private_dir::ensure_private_parent_dir(&path));
+        let file = std::fs::File::options().read(true).write(true).create(true).truncate(false).open(&path).unwrap();
+        file.set_len(shm_total_bytes() as u64).unwrap();
+        let initialised = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let look = with_init_lock(file.as_fd(), || {
+            // Mid-initialisation: the file has its length, some of the header is written, no magic.
+            std::os::unix::fs::FileExt::write_all_at(&file, &1u32.to_ne_bytes(), 100).unwrap();
+            assert_eq!(channel_file(file.as_fd()), Some(ChannelFile::Foreign), "what a look without the lock would see");
+            let (path, done) = (path.clone(), initialised.clone());
+            let look = std::thread::spawn(move || {
+                let found = open_existing(&path).map(|m| m.map(|m| m.header().is_valid()));
+                (found, done.load(Ordering::Acquire))
+            });
+            std::thread::sleep(std::time::Duration::from_millis(20));
+            // SAFETY: the file is `shm_total_bytes()` long; this test's own mapping, unmapped below.
+            let map = unsafe { libc::mmap(std::ptr::null_mut(), HEADER_BYTES, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, file.as_raw_fd(), 0) };
+            assert_ne!(map, libc::MAP_FAILED);
+            // SAFETY: just mapped, large enough for the header; nothing derived from it outlives it.
+            unsafe {
+                (*map.cast::<ShmHeader>()).init_defaults();
+                libc::munmap(map, HEADER_BYTES);
+            }
+            initialised.store(true, Ordering::Release);
+            look
+        });
+        let (found, after) = look.join().unwrap();
+        assert_eq!(found, Ok(Some(true)), "a valid channel, not a foreign file");
+        assert!(after, "the look waited for the initialisation");
         cleanup(&path);
     }
 
