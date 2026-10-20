@@ -471,6 +471,16 @@ pub(crate) fn requests_extension(create_info: &vk::DeviceCreateInfo, name: &CStr
 /// Checks and clears whether `device` is one [`NeuralForgeInstanceHooks::create_device`]
 /// created with [`EXTERNAL_MEMORY_HOST_EXTENSION`] enabled (added by the hook, or already
 /// requested by the application).
+/// Whether [`EXTERNAL_MEMORY_HOST_EXTENSION`] may be added to a device: its dependency,
+/// VK_KHR_external_memory, is core from Vulkan 1.1 (the effective version is the lower of the
+/// application's instance `api_version`, where 0 means 1.0, and the device's), or the application enables
+/// it itself.
+fn external_memory_host_allowed(instance_api_version: u32, device_api_version: u32, app_enables_external_memory: bool) -> bool {
+    let instance = if instance_api_version == 0 { vk::API_VERSION_1_0 } else { instance_api_version };
+    let effective = instance.min(device_api_version);
+    app_enables_external_memory || (vk::api_version_major(effective), vk::api_version_minor(effective)) >= (1, 1)
+}
+
 pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
     EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().as_mut().is_some_and(|set| set.remove(&device))
 }
@@ -929,6 +939,15 @@ impl NeuralForgeInstanceHooks {
                     name == EXTERNAL_MEMORY_HOST_EXTENSION
                 })
             });
+        // VK_EXT_external_memory_host requires VK_KHR_external_memory, core in Vulkan 1.1: below that
+        // effective version (the lower of the application's instance version, 0 meaning 1.0, and the
+        // device's) it may only be added beside an application that enables VK_KHR_external_memory itself
+        // (VUID-vkCreateDevice-ppEnabledExtensionNames-01387; vkcube's 1.0 device).
+        let supported = supported && {
+            // SAFETY: `physical_device` belongs to this instance.
+            let device_version = unsafe { instance.instance.get_physical_device_properties(physical_device) }.api_version;
+            external_memory_host_allowed(instance.api_version, device_version, requests_extension(create_info, c"VK_KHR_external_memory"))
+        };
         if !supported {
             #[cfg(target_arch = "x86_64")]
             let unhandled = !native && !handled;
@@ -1147,6 +1166,19 @@ mod requests_extension_tests {
         assert!(!requests_extension(&without, EXTERNAL_MEMORY_HOST_EXTENSION));
         // Zero extensions with a null list, as `vkcube` passes it.
         assert!(!requests_extension(&vk::DeviceCreateInfo::default(), EXTERNAL_MEMORY_HOST_EXTENSION));
+    }
+
+    /// External memory host only where its dependency VK_KHR_external_memory is there: Vulkan 1.1 on both
+    /// the instance and the device, or the application enabling it.
+    #[test]
+    fn external_memory_host_needs_vulkan_1_1_or_the_applications_external_memory() {
+        let (v10, v11, v13) = (vk::API_VERSION_1_0, vk::API_VERSION_1_1, vk::API_VERSION_1_3);
+        assert!(!external_memory_host_allowed(0, v13, false), "no application info: a 1.0 instance");
+        assert!(!external_memory_host_allowed(v10, v13, false));
+        assert!(!external_memory_host_allowed(v13, v10, false), "a 1.0 device");
+        assert!(external_memory_host_allowed(v11, v13, false));
+        assert!(external_memory_host_allowed(v13, v13, false), "Proton's DXVK and vkd3d-proton");
+        assert!(external_memory_host_allowed(v10, v10, true), "the application enables VK_KHR_external_memory");
     }
 }
 
