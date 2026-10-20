@@ -19,11 +19,13 @@ A run with a presented-frame series (NEURAL_FORGE_CAPTURE_AT=<resume>:<ms>:<fram
 flicker beside the fps, and its added detail against --baseline, a model-off run of the same moment
 (scripts/bench-iq.py, which this loads from beside itself; --host sends it along).
 
-Each run also gets its pass-4 frame-generation multiplier (displayed / real). GTA decides at each
-loading screen whether to run DLSS Frame Generation, and in benchmark launches it often does not,
-with or without Neural Forge (docs/RUNNING_AND_MEASURING.md). --fg is for runs with frame
-generation on in GTA's settings: a run under FG_ENGAGED is reported as "frame generation did not
-engage", is left out of --mean, and the exit status is 1, so the run is repeated.
+Each run also gets its pass-4 frame-generation multiplier (displayed / real). In about half of
+benchmark launches GTA turns DLSS Frame Generation off at a scene change in passes 1-3 and leaves it
+off for pass 4: Streamline reports eDLSSGStatusFailReflexNotDetectedAtRuntime, with or without
+Neural Forge, launched by Steam or by gta-bench.sh (docs/LESSONS.md, October 20). --fg is for runs
+with frame generation on in GTA's settings: a run under FG_ENGAGED is reported as "frame generation
+did not engage", is left out of --mean, and the exit status is 1. Such a run is kept and compared
+only with other runs without frame generation, not repeated.
 
 Reads $NF_BENCH_DIR (default ~/nf-spike/gta) on the machine it runs on; --host runs it on
 the rig over ssh.
@@ -195,7 +197,8 @@ def main(argv):
     results = [(label, r) for label, r in ((label, report(label, base, baseline)) for label in labels) if r]
     missed = [label for label, r in results if want_fg and not engaged(r[3])]
     for label in missed:
-        print(f"{label}: frame generation did not engage (displayed / real under {FG_ENGAGED}x); run it again")
+        print(f"{label}: frame generation did not engage (displayed / real under {FG_ENGAGED}x); GTA turned it "
+              "off itself, so compare this run only with runs without frame generation")
     results = [r for label, r in results if label not in missed]
     if mean and results:
         avg = lambda xs: sum(xs) / len(xs) if xs else None

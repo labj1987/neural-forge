@@ -1041,6 +1041,11 @@ never reaches it), so no generated frame is made. Either it never starts, or it 
 
 The cause inside GTA is not known. `scripts/bench-report.py --fg` now names a run where frame
 generation did not engage and leaves it out, so a frame-generation number is always an engaged one.
+
+**Update 2026-10-20:** Streamline's log names it: `eDLSSGStatusFailReflexNotDetectedAtRuntime` at a
+scene change in passes 1-3, when DLSS-G runs on before GTA has turned Reflex back on after a loading
+screen. Launches through Steam with the maintainer's launch options lose it the same way (LESSONS.md,
+"October 20").
 With logging on, 2 of 3 engaged: 49.5 / 49.6 real, 198.5 / 198.6 shown, every frame held.
 
 ## 2026-10-05 -- 2.0.4: the hold inside DLSS's command buffer

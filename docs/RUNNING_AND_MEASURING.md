@@ -94,8 +94,26 @@ Proton that Steam uses, with only the environment given (Steam's launch options 
 `-benchmark -benchmarkIterations 1 -benchmarkFrameTimes`. It exits by itself.
 
 ```text
-gta-bench.sh [--host HOST] [--set key=value]... <label> <VK layers above MangoHud> [env...]
+gta-bench.sh [--host HOST] [--tries N] [--set key=value]... <label> <VK layers above MangoHud> [env...]
+gta-bench.sh --self-test
 ```
+
+A launch that ends without a result is classified and launched again, up to `--tries` launches
+(default 3). Each failed launch's files go to `<label>/attempt-K/` and every launch has a line in
+`<label>/attempts`:
+
+- **early exit**: the runner reads the crash dumps GTA wrote during the launch and says when it was GTA's
+  hang watchdog (below), and copies any `Xid` line of the kernel log (a GPU hang);
+- **stopped presenting**: MangoHud's per-frame log stopped growing for 15 s while the game runs. The runner
+  saves every game thread's state and kernel wait channel (`stalled-threads.txt`) and ends the launch after
+  90 s (GTA's own watchdog ends it at 60 s);
+- **did not start**: no game process 120 s after the launch;
+- **stuck**: the game running with no result after `NF_BENCH_STUCK_S` (default 480 s; a run takes
+  260-280 s). With Neural Forge in the launch it saves the frame the game shows first
+  (`stuck-capture.txt` names the PNG).
+
+The runner refuses to start while a GTA process is running, and after each launch kills the Wine
+processes of GTA's prefix that the launch started.
 
 Effect off (no Neural Forge layer), then on, both with GTA's script mods off:
 
@@ -139,21 +157,29 @@ model ran before the upscaler. `scripts/bench-report.py --self-test` checks its 
 - **Model resolution is never left lowered.** `--set working_scale=0.66` sets it with
   `neural-forge-cli shmctl set` for one run and restores the previous value afterwards, printing
   `shmctl status` both times. Any live setting works the same way (`--set model_interval=2`).
-- **Early exit at "Game Init".** GTA sometimes crashes at `GTA5_Enhanced.exe+0x12c6eb` during
-  start-up, with or without Neural Forge. The runner says "launch exited early" and writes no
-  `benchmark.txt`. Run it again straight away.
+- **An early exit is GTA's hang watchdog, not a start-up crash.** A dump at
+  `GTA5_Enhanced.exe+0x12c6eb` (or, during the benchmark, at a stage handler such as `+0x951c50` or
+  `+0xcfab00`) is written by a thread of GTA's that ends the game once its update loop has not moved
+  for 60 s. The update loop is almost always waiting on a D3D12 fence: GPU work that never completed.
+  So look for the hang: an `Xid` in `journalctl -k` (the runner copies it to `attempt-K/kernel.txt`),
+  a layer change in the GPU path, or `kernel.split_lock_mitigate=1` (keep it at 0). The runner
+  relaunches by itself (docs/LESSONS.md, October 20).
 - **Test as it is played: frame generation on.** Release checks run with GTA's `settings.xml` as
   the maintainer has it (`FrameGenType` 1, `dlssFrameGenMode` 0/1/2 = 2x/3x/4x). Frame-generation-off runs
   are comparisons only; 2.0.2 passed them and failed with frame generation on.
 - **Automated runs check that the model is applied; frame generation is checked in real play.** One
   run per game per change, with GTA's settings as the maintainer has them: every DLSS frame held
   (`holds_per_s` equal to the real frame rate), model answers written back (0 misses, no echoes), no
-  `not holding` refusal, no `fence wait timed out`, no Xid. GTA decides at each loading screen whether
-  to run DLSS Frame Generation and in benchmark launches it often does not, with or without Neural
-  Forge (2026-10-05: about half of the launches; not window focus, VRAM, Reflex or Neural Forge, see
-  HARDWARE_VALIDATION.md), so a run is never repeated for it. `bench-report.py` gives each run's
-  multiplier, and `--fg` names a run where it did not engage and leaves it out of `--mean`. Whether
-  frame generation works and how the game feels is the maintainer's check, playing.
+  `not holding` refusal, no `fence wait timed out`, no Xid. In some benchmark launches GTA turns DLSS
+  Frame Generation off itself at a scene change in passes 1-3 (105-125 s after the launch) and leaves it
+  off for pass 4: Streamline reports `eDLSSGStatusFailReflexNotDetectedAtRuntime` because GTA had Reflex
+  off for its loading screen and DLSS-G presented more than 100 frames before Reflex was back. It happens
+  with and without Neural Forge, and in launches through Steam with the maintainer's own launch options
+  as much as through this runner (docs/LESSONS.md, October 20), so a run is never repeated for it. The
+  runner prints "frame generation stopped at about N s" when it sees the displayed rate fall to a third
+  of its best for 20 s (written to `<label>/fg`); `bench-report.py` gives each run's multiplier, and
+  `--fg` names a run where it did not engage and leaves it out of `--mean`. Whether frame generation
+  works and how the game feels is the maintainer's check, playing.
 
 **4K runs.** GTA renders at the desktop's size under Proton, so switch the host's desktop to
 3840x2160 at scale 1.0 first, temporarily, with GNOME's `gdctl set` (not persistent), and set
@@ -206,7 +232,9 @@ flicker difference under 10% is noise. Added detail between two model-off runs: 
 series and its stillest window, for choosing another moment.
 
 Results land in `$NF_BENCH_DIR/<label>` on the host (default `~/nf-spike/gta`): GTA's Benchmark
-and FrameTimes files, MangoHud's CSV, `nvidia-smi` samples, and `launch.log` with the layer's lines.
+and FrameTimes files, MangoHud's CSV, `nvidia-smi` samples, `launch.log` with the layer's lines,
+`attempts` (one line per launch), `fg` when frame generation stopped, and `attempt-K/` for each
+launch that gave no result.
 
 ## 4. Where the edit lands: the pan reproducer and agreement
 

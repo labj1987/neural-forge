@@ -422,6 +422,10 @@ Every early exit during the 2.0 runs was an access violation at `GTA5_Enhanced.e
 going back to January, before Neural Forge. It is the game's own; relaunching after a few minutes
 works (HARDWARE_VALIDATION.md, "2.0.0").
 
+**Corrected 2026-10-20:** it is not a crash at start-up but GTA's hang watchdog, which ends the game
+when its update loop has not moved for 60 s, nearly always because a D3D12 fence it waits on never
+completes ("October 20", below).
+
 ## October 11: the edit cache (3.3)
 
 ### 3.3 edit cache: what was tried
@@ -1200,6 +1204,97 @@ pass feedback. Measured in GTA V Enhanced at 1440p, FG 4x, Preset C, mods off, p
   measurement look like the model had no effect. Measure only on a freshly created shared memory after a
   layout change.
 
+## October 20: why the unattended GTA benchmark was unreliable
+
+Over 2026-10-19 and the morning of 2026-10-20 the agents' `gta-bench.sh` launches (120 of them, counted from
+Steam's own "Adding process / Removing process" journal lines, which every launch produces) gave 108
+results, 8 early exits, 2 launches stuck for the runner's full 20 minutes, and 2 launches that lasted under
+70 s with no dump; and frame generation often missing. Each was traced on the rig (3.8.5, 1440p, frame
+generation 4x and Preset C as Alex has it), with GTA's crash dumps, the kernel log, MangoHud's per-frame
+logs, Streamline's own log and the game's memory read while it ran.
+
+### The "+0x12c6eb crash" is GTA's hang watchdog
+
+- **What:** every early exit left a dump at `GTA5_Enhanced.exe+0x12c6eb` or, during the benchmark, at
+  `+0x951c50` or `+0xcfab00`. It was read as a start-up crash (October 2, below).
+- **Found:** the executable is encrypted on disk, so the code was read from the running game
+  (`/proc/<pid>/mem`). The faulting thread is a watchdog: once a second it compares a
+  QueryPerformanceCounter stamp that the game's update loop writes (the function at `+0x12c8c0`, called from
+  three places) with the one it saw before. When the stamp has not moved for 60 checks (the dword at
+  `0x14286b710` is 60) it calls the handler of the current stage, a function that writes a code to address 0
+  (`mov qword [0], 0x21e` at `+0x951c50`, `0x2ef` at `+0xcfab00`), or with no handler set writes to address 0
+  itself (`mov dword [0], 0` at `+0x12c6eb`). The address names the stage, not a fault. Of the 110 dumps in
+  the prefix (since January) 93 are the watchdog, and in 84 of those GTA's update thread waits at `+0x1e7c12a`,
+  a loop of `ID3D12Fence::SetEventOnCompletion` (vtable slot 9) and 50 ms `WaitForSingleObject`: GPU work it
+  submitted never completed.
+- **The two clusters:** 2026-10-19 23:40-00:11, 5 exits in 8 launches, 4 of them with
+  `Xid 109 (CTX SWITCH TIMEOUT)` 58 s before the dump: the hold-in-buffer development build writing through a
+  destroyed view, already fixed by fd03e9b in 3.8.1 ("GTA V hang"). 2026-10-20 08:47-09:13, 3 exits in
+  7 launches, no Xid, during an A/B of `kernel.split_lock_mitigate` on the 3.8.3/3.8.4 development builds:
+  over that morning, launches with the mitigation on ended without a result 3 times in 7 (two watchdog exits
+  and the stuck launch at 11:10), with it off 2 times in 24. GTA takes split-lock traps all the time (its own
+  threads, Bink audio, Wine's dsound mixer; `journalctl -k`), and the mitigation makes each one sleep. The
+  sysctl stays 0.
+- **Not reproduced on 3.8.5 with the mitigation off:** none of the 34 organic launches of this
+  investigation (Neural Forge on and off, the runner and Steam) stalled, exited early or got stuck.
+- **Fix in the runner:** it reads the dumps a failed launch wrote and names the watchdog and its stage, copies
+  `Xid` lines from the kernel log, notices a game that stopped presenting (MangoHud's per-frame log stops
+  growing) and saves each game thread's state and wait channel, and launches again (`--tries`, default 3).
+  Tested by stopping the game (SIGSTOP at 150 s: "stopped presenting at 168 s", relaunched, result) and by
+  faulting it (below).
+
+### The launches that never reached the benchmark
+
+- **What:** two launches (07:06 and 11:10) ran the full 20 minutes with the game presenting and no
+  benchmark. Their logs had been deleted, so the screen they showed is not known.
+- **Reproduced:** a fault in one of GTA's threads during loading (SIGSEGV into the game at 120 s after
+  the launch) is caught by GTA's own handler, which writes a dump (`0x80000003` at `+0x13b35e`) and keeps
+  presenting a black screen with the loading spinner, at 50 fps, for good. The update loop keeps running, so
+  the watchdog never fires. Faulted the same way in another launch, the game stopped presenting instead.
+- **Fix in the runner:** a launch with the game running and no result after `NF_BENCH_STUCK_S` (480 s; a run
+  takes 260-280 s) is ended and launched again; with Neural Forge in the launch the frame on screen is saved
+  first. A launch where the game never appears within 120 s is retried the same way.
+
+### Frame generation that stops in the benchmark
+
+- **What:** with frame generation 4x in `settings.xml`, pass 4 ran at 1.0x in about half of the launches.
+- **Found:** with Streamline's log on (registry `HKLM\Software\NVIDIA Corporation\Global\Streamline`,
+  `LogLevel` 2, `LogPath`, for the test only), every launch that lost frame generation logged one line, at
+  105-121 s, a scene change in passes 1-3, and none of the others did:
+  `eDLSSGStatusFailReflexNotDetectedAtRuntime - sl.reflex must be enabled and active 6339 != 9414`.
+  Frame generation came back for a moment at the next one or two scene changes and was off for pass 4.
+  In `sl.dlss_g.dll` (`dlfgPresent.cpp`, `updateStatus`) the check runs on each present once DLSS-G has
+  presented 100 frames: `sl.param.latency.frame` must equal `sl.param.reserved.frame`, the frame being
+  presented. `sl.reflex.dll` sets the first on each PresentStart marker, and only while its Reflex mode is not
+  Off. GTA turns Reflex off for its loading screens (the 2026-10-05 `SetSleepMode` sequence), so the check
+  fails when DLSS-G is past its 100 frames before GTA has turned Reflex back on. In every failing launch the
+  two frame numbers were about 3,000 apart (3,014-3,086), the frames presented with Reflex off. Which comes
+  first is GTA's own timing.
+- **Counts:** the runner kept frame generation in 9 of 15 launches with Neural Forge and in 4 of 11 without without; launched through Steam
+  (`steam -applaunch 3240220` with the benchmark arguments, so Alex's launch options, the Steam overlay and
+  the script mods) 3 of 4, the fourth with the same Streamline line. The runner's `env -i` environment is not
+  the cause: the launch Alex uses fails the same way.
+- **Tried, no help:** `DXVK_NVAPI_VKREFLEX=1` (dxvk-nvapi's Vulkan Reflex layer instead of vkd3d-proton's own
+  `VK_NV_low_latency2` path; the layer loaded) lost it in 1 of 3 launches. dxvk-nvapi has no option that keeps
+  Reflex on (its options: `DXVK_NVAPI_DRIVER_VERSION`, `_GPU_ARCH`, `_ALLOW_OTHER_DRIVERS`,
+  `_DISABLE_ENTRYPOINTS`, `_VKREFLEX`, `_FAKE_VKREFLEX`, `_DRS_*`, logging), and none could: the check reads
+  sl.reflex's own mode, which only GTA's `slReflexSetOptions` sets, and Streamline's production DLLs read no
+  `sl.interposer.json` ("in development builds" only, their own message). The `SetSleepMode (Disabled)` /
+  `(Enabled/2000us)` pairs at each scene change are in the launch log with `DXVK_NVAPI_LOG_LEVEL=info`.
+- **Ruled out:** Neural Forge (above); the dlss-presetc timer, which replaces a DLL only when its hash
+  differs and has not replaced GTA's since 2026-10-13 (its journal: 339 runs that changed nothing since
+  2026-10-18); and, from 2026-10-05, window focus, VRAM and dynamic multi frame generation.
+- **What the runner does:** frame generation is not retried (Alex, 2026-10-19). With frame generation on in
+  `settings.xml` the runner prints "frame generation stopped at about N s" when the displayed rate falls to a
+  third of its best for 20 s, about 125 s into the launch (the rule matched bench-report on all 26 runs
+  checked), and `bench-report.py --fg` flags the run.
+
+### The 20-minute wait
+
+The runner waited up to 20 minutes for a result whatever happened, and a cancelled call left GTA running
+beside the next one. It now ends a launch at 480 s, refuses to start while a GTA process is running, and kills
+the Wine processes of GTA's prefix that the launch started.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,
@@ -1244,6 +1339,10 @@ pass feedback. Measured in GTA V Enhanced at 1440p, FG 4x, Preset C, mods off, p
   layers and unit tests did not.
 - **Validation layers before any synchronization change**, and never reapply the reverted fence
   changes of 0.1.33-0.1.34.
-- **Check `journalctl -k` for `Xid`** before blaming the layer for a GPU hang, and check for GTA's
-  own `+0x12c6eb` crash before blaming it for an early exit.
+- **Check `journalctl -k` for `Xid`** before blaming the layer for a GPU hang. A GTA dump at `+0x12c6eb`
+  (or `+0x951c50`, `+0xcfab00`) is its hang watchdog: the update loop stalled for 60 s, so look for what
+  the GPU never finished, not for a crash.
+- **Read the game's own logs before deciding a failure is random.** Steam's journal lines give every
+  launch's lifetime, GTA's dumps say where the game waited, and Streamline writes why frame generation
+  turned off when its registry log switch is set.
 - **Every silent no-op logs its reason once.**
