@@ -54,6 +54,10 @@ REC709 = (0.2126, 0.7152, 0.0722)
 # The darkest non-black 8-bit sRGB code, linear: black pixels count as this in the geometric mean.
 DARKEST = 1 / 255 / 12.92
 
+# The layer's line for a series capture (crates/layer/src/series.rs; gta-bench.sh reads the same). The
+# directory is the rest of the line, spaces included.
+SERIES_LOG = re.compile(r"\[capture\] capturing the next \d+ presents into (.+?)[ \t\r]*$", re.M)
+
 
 def np():
     import numpy
@@ -70,7 +74,8 @@ def series_dir(run):
         return run
     log = os.path.join(run, "launch.log")
     if os.path.exists(log):
-        m = re.findall(r"\[series\] capturing the next \d+ presents into (\S+)", open(log, errors="replace").read())
+        with open(log, errors="replace") as f:
+            m = SERIES_LOG.findall(f.read())
         if m and os.path.isdir(m[-1]):
             return m[-1]
     return None
@@ -364,6 +369,23 @@ def _self_test():
     assert anchor(changes(still + [black, black] + long_shot), WINDOW, 2) == (WINDOW + settle(2), True)
     pan = [n.roll(base, 3 * i, 1) for i in range(4)]
     assert anchor(changes(pan + still)) == (0, False), "a camera that stops is not a cut"
+    # A run whose series was not moved into it is found through its launch log, spaces included.
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        run = os.path.join(tmp, "run")
+        series = os.path.join(tmp, "elsewhere dir", "series-123")
+        os.makedirs(run)
+        os.makedirs(series)
+        assert series_dir(run) is None, "no series, no log"
+        with open(os.path.join(run, "launch.log"), "w") as f:
+            f.write("[neural-forge-layer] [capture] capturing the next 40 presents into /nonexistent/series-1\n")
+            f.write(f"[neural-forge-layer] [capture] capturing the next 40 presents into {series}\n")
+            f.write("[neural-forge-layer] [present] 60.0 fps\n")
+        assert series_dir(run) == series, series_dir(run)
+        moved = os.path.join(run, "series-456")
+        os.makedirs(moved)
+        assert series_dir(run) == moved, "the moved series wins over the log"
     print("bench-iq self-test ok")
 
 

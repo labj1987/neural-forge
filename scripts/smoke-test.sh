@@ -13,12 +13,22 @@ if [[ -z "$SO_PATH" ]]; then
     SO_PATH="${CARGO_TARGET_DIR:-$(pwd)/target}/debug/libneural_forge_layer.so"
 fi
 test -f "$SO_PATH"
+# Absolute: the loader resolves a relative library_path against the manifest's directory (the scratch
+# dir below), not this one, and CARGO_TARGET_DIR may be relative.
+SO_PATH="$(realpath "$SO_PATH")"
 
 SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 
-sed "s#\./libneural_forge_layer\.so#$SO_PATH#" data/neural_forge_layer.json \
-    > "$SCRATCH/neural_forge_layer.json"
+# Written as JSON, so any character the path holds stays the path.
+python3 - "$SO_PATH" data/neural_forge_layer.json "$SCRATCH/neural_forge_layer.json" <<'PY'
+import json, sys
+so, src, dst = sys.argv[1:]
+manifest = json.load(open(src))
+assert manifest["layer"]["library_path"] == "./libneural_forge_layer.so", manifest["layer"]["library_path"]
+manifest["layer"]["library_path"] = so
+json.dump(manifest, open(dst, "w"), indent=2)
+PY
 
 # VK_LAYER_PATH only makes the loader consider a manifest for *explicit* enabling --
 # it does not add it to the implicit_layer.d search path, so an implicit-type layer

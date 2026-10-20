@@ -11,7 +11,26 @@ label=$1; appid=$2; pat=$3; boot=$4; shift 4
 case $label in ''|.|..|*/*) echo "error: label must be a plain name (no '/', not empty)" >&2; exit 2;; esac
 uid=$(id -u)
 out=$HOME/nf-spike/runs/$label; mkdir -p "$out"; C=$HOME/.local/share/neural-forge/bin/neural-forge-cli
-pad(){ timeout 5 sh -c 'echo "$1" > /tmp/nf-pad.fifo' sh "$1" || echo "warning: controller step $1 failed" >&2; sleep 1; }
+# Controller steps go to the pad helper (~/nf-spike/pad/nf-pad.py) through its FIFO. Never written
+# unless it is a FIFO: a redirect to a missing one would create a plain file, every step would
+# "succeed" at once with no input reaching the game, and the run would measure a menu. A step that
+# cannot be delivered (no FIFO, or no reader within 5 s) ends the run.
+PAD=/tmp/nf-pad.fifo
+pad(){
+    timeout 5 sh -c '[ -p "$2" ] && echo "$1" > "$2"' sh "$1" "$PAD" ||
+        { echo "error: controller step $1 was not delivered (is the pad helper running?)" >&2; exit 1; }
+    sleep 1
+}
+needs_pad=0
+for s in "$@"; do case $s in W*) ;; *) needs_pad=1;; esac; done
+if [ $needs_pad = 1 ] && [ ! -p "$PAD" ]; then
+    if [ -e "$PAD" ]; then
+        echo "error: $PAD is not a FIFO (a stray file?); remove it and start the pad helper" >&2
+    else
+        echo "error: $PAD does not exist: start the pad helper (~/nf-spike/pad/nf-pad.py) first" >&2
+    fi
+    exit 1
+fi
 start=$(date "+%F %T"); echo "$start" > "$out/start"
 
 # Ends the game however this script ends (a failed step under set -e included): `pgrep -f` also

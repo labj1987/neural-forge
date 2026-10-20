@@ -7,7 +7,8 @@ are pinned by SHA and updated by Dependabot; Cargo crates by Dependabot.) Each i
 upstream's newest release, tag or commit through the GitHub API ($GITHUB_TOKEN raises its rate limit).
 
   check_pins.py               print a Markdown report; exit 0 when every pin is current, 10 when one
-                              is behind, 1 when upstream could not be asked
+                              is behind, 1 when upstream could not be asked or named no version
+                              to compare with (a pin that cannot be checked is never current)
   check_pins.py --self-test   check the pin parsing and version comparison offline
 
 .github/workflows/pin-check.yml runs it weekly and keeps one issue up to date with the report.
@@ -79,12 +80,13 @@ def latest(kind, repo):
     return newest([t["name"] for t in tags if t["name"].startswith(prefix)])
 
 
-def behind(kind, pinned, upstream):
+def state(kind, pinned, upstream):
+    """behind, current, or unknown when upstream gave nothing to compare with."""
     if upstream is None:
-        return False
+        return "unknown"
     if kind == "commit":
-        return pinned != upstream
-    return version_key(upstream) > version_key(pinned)
+        return "behind" if pinned != upstream else "current"
+    return "behind" if version_key(upstream) > version_key(pinned) else "current"
 
 
 def report(rows):
@@ -96,9 +98,10 @@ def report(rows):
         "| Pin | Pinned | Upstream | |",
         "|---|---|---|---|",
     ]
-    for name, pinned, upstream, old in rows:
+    shown = {"behind": "**behind**", "current": "current", "unknown": "**unknown**"}
+    for name, pinned, upstream, st in rows:
         short = lambda v: v[:12] if v and re.fullmatch(r"[0-9a-f]{40}", v) else (v or "?")
-        lines.append(f"| {name} | {short(pinned)} | {short(upstream)} | {'**behind**' if old else 'current'} |")
+        lines.append(f"| {name} | {short(pinned)} | {short(upstream)} | {shown[st]} |")
     return "\n".join(lines) + "\n"
 
 
@@ -109,11 +112,24 @@ def self_test():
     assert version_key("vulkan-sdk-1.4.357.0") < version_key("vulkan-sdk-1.4.360.0")
     assert newest(["v1.4.363", "v1.4.370", "v1.4.99", "v1.5.0-rc1", "continuous"]) == "v1.4.370"
     assert newest(["continuous"]) is None
-    assert behind("release", "1.96.0", "1.97.0") and not behind("release", "1.96.0", "1.96.0")
-    assert behind("commit", "a" * 40, "b" * 40) and not behind("commit", "a" * 40, None)
-    text = report([("x", "1.0", "1.1", True), ("y", "c" * 40, "c" * 40, False)])
+    assert state("release", "1.96.0", "1.97.0") == "behind" and state("release", "1.96.0", "1.96.0") == "current"
+    assert state("commit", "a" * 40, "b" * 40) == "behind" and state("commit", "a" * 40, "a" * 40) == "current"
+    # Upstream that names no version (only `continuous` or -rc tags) is not a current pin.
+    assert state("commit", "a" * 40, None) == "unknown" and state("release", "1.96.0", None) == "unknown"
+    text = report([("x", "1.0", "1.1", "behind"), ("y", "c" * 40, "c" * 40, "current"), ("z", "2.0", None, "unknown")])
     assert "| x | 1.0 | 1.1 | **behind** |" in text and "| y | cccccccccccc | cccccccccccc | current |" in text
+    assert "| z | 2.0 | ? | **unknown** |" in text
+    assert exit_status([("x", "1.0", "1.1", "behind")], []) == BEHIND
+    assert exit_status([("y", "1.0", "1.0", "current")], []) == 0
+    assert exit_status([("x", "1.0", "1.1", "behind"), ("z", "2.0", None, "unknown")], ["z: no version"]) == 1
     print("check_pins self-test ok")
+
+
+def exit_status(rows, failed):
+    """1 when any pin could not be checked (never reported as current), else BEHIND or 0."""
+    if failed or any(r[3] == "unknown" for r in rows):
+        return 1
+    return BEHIND if any(r[3] == "behind" for r in rows) else 0
 
 
 def main():
@@ -123,15 +139,16 @@ def main():
     for name, pinned, kind, repo in pins(read("scripts/fetch-native-tools.sh"), read("build-appimage.sh"), read("rust-toolchain.toml")):
         try:
             upstream = latest(kind, repo)
+            if upstream is None:
+                failed.append(f"{name}: upstream {repo} names no plain {kind.split(':')[0]} to compare with")
         except Exception as e:  # network, rate limit: reported, not guessed
             failed.append(f"{name}: {e}")
             upstream = None
-        rows.append((name, pinned, upstream, behind(kind, pinned, upstream)))
+        rows.append((name, pinned, upstream, state(kind, pinned, upstream)))
     print(report(rows), end="")
     if failed:
-        print("\nCould not ask upstream: " + "; ".join(failed))
-        sys.exit(1)
-    sys.exit(BEHIND if any(r[3] for r in rows) else 0)
+        print("\nCould not check upstream: " + "; ".join(failed))
+    sys.exit(exit_status(rows, failed))
 
 
 main()

@@ -17,35 +17,39 @@ APPIMAGE="neural-forge-$VERSION-x86_64.AppImage"
 
 echo "==> building $APPIMAGE"
 BUILD_LOG="$(mktemp)"
-trap 'rm -f "$BUILD_LOG"' EXIT
+# The local build only exists to be copied; releases come from CI, so it is removed however this ends.
+trap 'rm -rf "$BUILD_LOG" "$APPIMAGE" "$APPIMAGE.zsync" build-appimage' EXIT
 bash build-appimage.sh >"$BUILD_LOG" 2>&1 || { tail -20 "$BUILD_LOG"; exit 1; }
 
 echo "==> copying to $HOST"
 scp -q "$APPIMAGE" "$HOST:/tmp/nf-deploy.AppImage"
-# The local build only exists to be copied; releases come from CI, so don't let builds pile up here.
-rm -rf "$APPIMAGE" "$APPIMAGE.zsync" build-appimage
 ssh "$HOST" "VERSION=$VERSION bash -s" <<'REMOTE'
 set -eo pipefail
+  # A version-specific extraction directory, so nothing else's squashfs-root in /tmp is
+  # touched or reused. Removed with the copied AppImage however the script ends.
+  X=/tmp/nf-deploy-$VERSION
+  trap 'rm -rf "$X" /tmp/nf-deploy.AppImage' EXIT
   mkdir -p ~/AppImages
   cp /tmp/nf-deploy.AppImage ~/AppImages/neural-forge.appimage.new && chmod +x ~/AppImages/neural-forge.appimage.new
   mv -f ~/AppImages/neural-forge.appimage.new ~/AppImages/neural-forge.appimage
-  # A version-specific extraction directory, so nothing else's squashfs-root in /tmp is
-  # touched or reused.
-  X=/tmp/nf-deploy-$VERSION
   rm -rf "$X" && mkdir -p "$X"
   (cd "$X" && ~/AppImages/neural-forge.appimage --appimage-extract >/dev/null)
   "$X/squashfs-root/usr/bin/neural-forge-cli" install --appdir "$X/squashfs-root" | tail -1
-  I=~/.local/share/neural-forge; S=$X/squashfs-root/usr
+  # Where the CLI installs: $XDG_DATA_HOME/neural-forge, ~/.local/share when it is unset.
+  D="${XDG_DATA_HOME:-$HOME/.local/share}"
+  I=$D/neural-forge; S=$X/squashfs-root/usr
   ok=1
   for f in lib/neural-forge/libneural_forge_layer.so bin/neural-forge bin/neural-forge-cli; do
-    a=$(sha256sum "$I/$f" | cut -d" " -f1); b=$(sha256sum "$S/$f" | cut -d" " -f1)
-    if [ "$a" = "$b" ]; then echo "  $f  ${a:0:12}  installed == AppImage"; else echo "  $f MISMATCH"; ok=0; fi
+    a=$(sha256sum "$I/$f" 2>/dev/null | cut -d" " -f1) || a=""
+    b=$(sha256sum "$S/$f" | cut -d" " -f1)
+    if [ -z "$a" ]; then echo "  $f MISSING from $I"; ok=0
+    elif [ "$a" = "$b" ]; then echo "  $f  ${a:0:12}  installed == AppImage"
+    else echo "  $f MISMATCH"; ok=0; fi
   done
-  rm -rf "$X" /tmp/nf-deploy.AppImage
   # Keep the menu entry's version metadata (written when the AppImage was integrated) in step.
-  E=~/.local/share/applications/neural-forge.desktop
+  E=$D/applications/neural-forge.desktop
   [ -f "$E" ] && sed -i "s/^X-AppImage-Version=.*/X-AppImage-Version=$VERSION/" "$E"
-  update-desktop-database ~/.local/share/applications 2>/dev/null || true
+  update-desktop-database "$D/applications" 2>/dev/null || true
   [ $ok = 1 ]
 REMOTE
 echo "==> deployed and verified"

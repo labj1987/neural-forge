@@ -8,7 +8,9 @@ import tempfile
 import unittest
 
 SCRIPT = Path(__file__).with_name('install.py')
-CLI = Path(os.environ.get('NEURAL_FORGE_CLI', Path(__file__).resolve().parent.parent / 'target/debug/neural-forge-cli'))
+ROOT = Path(__file__).resolve().parent.parent
+# The debug CLI where cargo builds it from the repo root (a relative CARGO_TARGET_DIR is relative to that).
+CLI = Path(os.environ.get('NEURAL_FORGE_CLI', ROOT / os.environ.get('CARGO_TARGET_DIR', 'target') / 'debug/neural-forge-cli'))
 def scratch_env(root, data):
     # Every XDG home lives in the scratch dir, so the CLI never sees the real ones. The unique uid names a
     # runtime dir that cannot belong to a real session.
@@ -19,7 +21,7 @@ class InstallTests(unittest.TestCase):
     def setUpClass(cls):
         # The tests drive the real CLI: build the debug one when it is the default and missing.
         if 'NEURAL_FORGE_CLI' not in os.environ and not CLI.is_file():
-            subprocess.run(['cargo', 'build', '--locked', '-p', 'neural-forge-cli'], cwd=CLI.parents[2], check=True)
+            subprocess.run(['cargo', 'build', '--locked', '-p', 'neural-forge-cli'], cwd=ROOT, check=True)
 
     def test_coexistence_and_owned_removal(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -27,8 +27,9 @@ def notes(changelog: str, version: str) -> str:
 
 def unwrap(text: str) -> str:
     """Joins the changelog's hard-wrapped lines: GitHub shows every newline of a release's text as a
-    line break. A list item's continuation lines (indented) and a paragraph's lines become one line;
-    blank lines, list items and code fences stay as they are."""
+    line break. A list item's continuation lines (indented), a paragraph's lines and a quote's lines
+    become one line; blank lines, headings (nothing is joined onto one), list items, tables and code
+    fences stay as they are."""
     out = []
     fenced = False
     for line in text.splitlines():
@@ -37,8 +38,13 @@ def unwrap(text: str) -> str:
             fenced = not fenced
             out.append(line)
             continue
-        joinable = out and out[-1].strip() and not fenced and not out[-1].strip().startswith("```")
-        starts_block = not stripped or stripped.startswith(("- ", "* ", "#", "|")) or re.match(r"\d+\. ", stripped)
+        previous = out[-1].strip() if out else ""
+        joinable = previous and not fenced and not previous.startswith(("```", "#", "|"))
+        if joinable and previous.startswith(">") and stripped.startswith(">"):
+            # The next line of the same quote.
+            out[-1] = out[-1].rstrip() + " " + stripped[1:].strip()
+            continue
+        starts_block = not stripped or stripped.startswith(("- ", "* ", "+ ", "> ", "#", "|")) or stripped == ">" or re.match(r"\d+\. ", stripped)
         if joinable and stripped and not starts_block:
             out[-1] = out[-1].rstrip() + " " + stripped
         else:
@@ -50,6 +56,11 @@ def _self_test():
     text = "# T\n\n## Unreleased\n\n- x\n\n## 1.2.3 — 2026-10-05\n\nIntro.\n\n- **A.** one\n  two\n\n## 1.2.2 — 2026-10-01\n\n- old\n"
     assert notes(text, "1.2.3") == "Intro.\n\n- **A.** one two", notes(text, "1.2.3")
     assert unwrap("a\nb\n\n- x\n  y\n- z\n```\nk\nl\n```") == "a b\n\n- x y\n- z\n```\nk\nl\n```"
+    # Nothing is joined onto a heading or a table row; quotes and `+` items are blocks of their own.
+    assert unwrap("### Fixed\nThe layer\nno longer") == "### Fixed\nThe layer no longer"
+    assert unwrap("| a |\nb") == "| a |\nb"
+    assert unwrap("text\n> quoted\n> more\nlazy") == "text\n> quoted more lazy"
+    assert unwrap("text\n+ item\n  on\n+ next") == "text\n+ item on\n+ next"
     assert notes(text, "1.2.2") == "- old"
     assert notes(text, "1.2") == ""
     print("release_notes self-test ok")
