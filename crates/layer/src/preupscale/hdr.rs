@@ -528,6 +528,10 @@ pub(crate) struct HdrPass {
     colour_view: Option<vk::ImageView>,
     /// The image `colour_view` views.
     colour_image: Option<vk::Image>,
+    /// How many views [`Self::bind_colour`] made: what tells this hold's view from the last one's when their
+    /// handles are equal (a destroyed view's handle comes back for the next one made, which may view another
+    /// image under a reused handle too, as at GTA V Enhanced's loading screens).
+    colour_bindings: u64,
     /// The auto-exposure, built on the first hold without a readable exposure image.
     auto: Option<AutoExposure>,
 }
@@ -613,6 +617,7 @@ impl HdrPass {
             exposure,
             colour_view: None,
             colour_image: None,
+            colour_bindings: 0,
             auto: None,
         };
         Some(pass)
@@ -647,6 +652,13 @@ impl HdrPass {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn colour_view(&self) -> Option<vk::ImageView> {
         self.colour_view
+    }
+
+    /// Which view [`Self::bind_colour`] made [`Self::colour_view`] as (a count, one more for every view made,
+    /// whatever its handle).
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn colour_binding(&self) -> u64 {
+        self.colour_bindings
     }
 
     /// The answer image's view (padded extent, `GENERAL` after the write-back's opening barrier).
@@ -772,6 +784,7 @@ impl HdrPass {
         };
         self.colour_view = Some(view);
         self.colour_image = Some(colour);
+        self.colour_bindings += 1;
         // SAFETY: the sets are not in use (contract).
         unsafe {
             bind_view(device, self.set, view);

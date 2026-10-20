@@ -311,6 +311,11 @@ pub(crate) struct Bindings {
     pub acc: vk::Buffer,
     /// The network's input features and their size in bytes ([`ScratchLayout`]).
     pub scratch: (vk::Buffer, u64),
+    /// Which objects the handles above name: the HDR pass's view of the colour input
+    /// (`hdr::HdrPass::colour_binding`), the network frame's pass (`native::NativePass::id`: `mvec`, `acc`) and
+    /// the network's build (`native::Built::generation`: the input features). A destroyed object's handle comes
+    /// back for the next one made, so equal handles alone do not say the set still points at the right objects.
+    pub made: [u64; 3],
 }
 
 /// A hold of the cache: what the network does on it.
@@ -589,8 +594,8 @@ pub(crate) struct CachePass {
     /// GPU timestamps around the passes in the capture and in the write-back (before, or in place
     /// of, the decode). None inside DLSS's buffer (the hold times its slot).
     timers: [Option<crate::gpu_timer::GpuTimer>; 2],
-    /// What the set points at ([`Self::bind`]) and whether it was chained: written again only when that
-    /// changes.
+    /// What the set points at ([`Self::bind`], with [`Bindings::made`]) and whether it was chained: written again
+    /// only when that changes.
     bound: Option<(Bindings, bool)>,
     pub(crate) state: State,
     pub(crate) tuning: Tuning,
@@ -1347,6 +1352,43 @@ mod tests {
         assert_eq!((c[STAT_STILL], c[STAT_MOTION_N]), (0, 0), "nothing counted for the cadence");
     }
 
+    /// A handle the last bind named comes back for another object once that one is destroyed (the split hold
+    /// makes a view of the colour input every hold, and a destroyed view's handle is the next one's): the set
+    /// is written again when what the handles name changed ([`Bindings::made`]), and only then. Bound to a
+    /// destroyed view, the cache's passes wrote wherever its descriptor pointed (GTA V Enhanced, 2026-10-20:
+    /// Xid 109 after a loading screen, 4 runs of 4).
+    #[test]
+    fn the_set_is_written_again_for_other_objects_under_the_same_handles() {
+        let Some(mut rig) = Rig::new(16, 8) else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let device = rig.gpu.3.clone();
+        let first = rig.pass.bound.expect("bound by the rig").0;
+        // SAFETY: the rig's own pass, idle; every handle is live.
+        unsafe { rig.pass.bind(&device, &first) };
+        assert_eq!(rig.pass.bound.map(|(b, _)| b.made), Some([0; 3]), "the same objects: nothing to write");
+        for (k, made) in [[1, 0, 0], [1, 1, 0], [1, 1, 1]].into_iter().enumerate() {
+            let again = Bindings { made, ..first };
+            // SAFETY: as above.
+            unsafe { rig.pass.bind(&device, &again) };
+            assert_eq!(rig.pass.bound.map(|(b, _)| b.made), Some(made), "another object behind the same handles ({k}): written again");
+        }
+        // HdrPass::bind_colour counts every view it makes, whatever handle the driver gives it.
+        let (instance, physical) = (rig.gpu.1.clone(), rig.gpu.2);
+        // SAFETY: a fresh pass on the rig's device; the colour image is a live RGBA16F image with storage use.
+        unsafe {
+            let mut hdr = super::super::hdr::HdrPass::build(&device, &instance, physical, rig.w, rig.h).expect("the HDR pass builds");
+            let mut seen = Vec::new();
+            for _ in 0..3 {
+                assert!(hdr.bind_colour(&device, rig.colour.image));
+                seen.push(hdr.colour_binding());
+            }
+            assert_eq!(seen, [1, 2, 3], "one more for every view made");
+            hdr.destroy(&device);
+        }
+    }
+
     /// The test's GPU objects around a [`CachePass`].
     pub(crate) struct Rig {
         pub gpu: (ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32),
@@ -1427,6 +1469,7 @@ mod tests {
                         mvec: rig.mvec.buffer,
                         acc: rig.acc.buffer,
                         scratch: (rig.scratch.buffer, scratch_bytes),
+                        made: [0; 3],
                     },
                 );
                 Some(rig)

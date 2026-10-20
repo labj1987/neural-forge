@@ -482,7 +482,11 @@ change any of them (a descriptor set written again, the look-up table, a pass re
 model resolution, the resources rebuilt for another extent) records nothing (`may_rewrite`, `Frozen`;
 "waiting for the holds recorded in DLSS's buffers ..."), and the change is made at the first hold
 recorded once they are done, normally a frame or two later. Every bind skips a write that changes
-nothing. The network's build is kept the same way: while any hold may run, the loader does not rebuild
+nothing, judged by the objects the handles name as well as the handles (`cache::Bindings::made`,
+`HoldGuard`'s pass id): a destroyed object's handle comes back for the next one made. The split hold
+makes a view of the colour input every hold, often under the last one's handle; skipped on the handle
+alone, the edit cache's set kept a destroyed view, and GTA V Enhanced hung after a loading screen
+(Xid 109, 4 runs of 4; none of 3 once it was written again). The network's build is kept the same way: while any hold may run, the loader does not rebuild
 it (another size or network, the fallback to barriers) and the after-the-upscaler path does not take it
 (`Loader::holds`). The resources of the holds inside DLSS's buffer are their own (`Session::res_inline`
 before the upscaler, `res_after` after DLSS's output): no fences, no timers of the passes', the guard.

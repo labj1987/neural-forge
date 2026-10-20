@@ -2943,7 +2943,9 @@ pub(crate) struct HoldGuard {
     set: vk::DescriptorSet,
     /// Stands in for the counters while the edit cache is off.
     no_stats: OwnBuffer,
-    bound: Option<(vk::Buffer, vk::Buffer)>,
+    /// What the set points at, with the native pass whose state buffer it is ([`NativePass::id`]): a rebuilt
+    /// pass's buffer may come back under the old one's handle.
+    bound: Option<(vk::Buffer, vk::Buffer, u64)>,
 }
 
 const GUARD_SPV: &[u8] = include_bytes!("../../shaders/preupscale_hold_guard.spv");
@@ -2984,14 +2986,14 @@ impl HoldGuard {
         }
     }
 
-    /// Points the set at the native pass's `state` buffer and the edit cache's counters `stats` (when they
-    /// changed). `false` when it cannot be written now ([`super::may_rewrite`]).
+    /// Points the set at the `state` buffer of native pass `pass` ([`NativePass::id`]) and the edit cache's
+    /// counters `stats` (when they changed). `false` when it cannot be written now ([`super::may_rewrite`]).
     ///
     /// # Safety
     /// Both buffers are live; nothing that may run uses the set unless it is unchanged.
-    pub(crate) unsafe fn bind(&mut self, device: &ash::Device, state: vk::Buffer, stats: Option<vk::Buffer>) -> bool {
+    pub(crate) unsafe fn bind(&mut self, device: &ash::Device, state: vk::Buffer, pass: u64, stats: Option<vk::Buffer>) -> bool {
         let stats = stats.unwrap_or(self.no_stats.buffer);
-        if self.bound == Some((state, stats)) {
+        if self.bound == Some((state, stats, pass)) {
             return true;
         }
         if !super::may_rewrite("the hold guard's descriptor set") {
@@ -3002,7 +3004,7 @@ impl HoldGuard {
         let w = |n: u32, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(self.set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
         // SAFETY: the contract.
         unsafe { device.update_descriptor_sets(&[w(0, &a), w(1, &b)], &[]) };
-        self.bound = Some((state, stats));
+        self.bound = Some((state, stats, pass));
         true
     }
 
@@ -3679,6 +3681,9 @@ pub(crate) unsafe fn run_native_hold(
             mvec: native.mvec.buffer,
             acc: native.acc.buffer,
             scratch,
+            // The split hold makes a view of the colour input every hold (`HdrPass::bind_colour`): the set is
+            // written every hold, as the view's handle often comes back for the next one.
+            made: [hdr_ref.colour_binding(), native.id(), built.generation],
         };
         // SAFETY: nothing of the pass is pending, or its set is not written now; every handle is live.
         unsafe { edit.bind(device, &bindings) };
@@ -3734,7 +3739,7 @@ pub(crate) unsafe fn run_native_hold(
         }
         let stats = res.edit.as_ref().filter(|_| cache_on).map(super::cache::CachePass::stats_buffer);
         // SAFETY: both buffers are live; the set is not written while a hold that bound it may run.
-        let bound = res.guard.as_mut().is_some_and(|g| unsafe { g.bind(device, native.state_buffer(), stats) });
+        let bound = res.guard.as_mut().is_some_and(|g| unsafe { g.bind(device, native.state_buffer(), native.id(), stats) });
         if !bound && frozen.blocked().is_none() {
             res.native = Some(native);
             result.miss = Some("the hold guard could not be built");
@@ -4372,7 +4377,7 @@ mod tests {
             let mut cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H, true).unwrap();
             cache.bind(
                 device,
-                &super::super::cache::Bindings { colour: encoded.view, encoded: encoded.view, answer: encoded.view, exposure: exposure.buffer, depth: None, mvec: new.mvec.buffer, acc: new.acc.buffer, scratch: (vk::Buffer::null(), 0) },
+                &super::super::cache::Bindings { colour: encoded.view, encoded: encoded.view, answer: encoded.view, exposure: exposure.buffer, depth: None, mvec: new.mvec.buffer, acc: new.acc.buffer, scratch: (vk::Buffer::null(), 0), made: [0; 3] },
             );
             let answer_of = |pass: &NativePass| -> Vec<u16> {
                 fx.one_shot(|cmd| device.cmd_copy_buffer(cmd, pass.answer(), staging.buffer, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: u64::from(pw * ph) * 8 }]));
