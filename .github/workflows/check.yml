@@ -2,7 +2,8 @@ name: Build and check
 
 # The one build and check every change gets: ci.yml runs it on pushes and pull requests to main,
 # release.yml on a version tag (and then publishes what it built). Everything a release ships is
-# exercised before it is tagged: the tests (GPU ones on lavapipe), clippy, every script's self-test,
+# exercised before it is tagged: the tests (GPU ones on lavapipe, and again under the Vulkan
+# validation layer), clippy, every script's self-test,
 # the AppImage itself, its glibc baseline, and its installed layer through the Vulkan loader.
 on:
   workflow_call:
@@ -69,13 +70,14 @@ jobs:
 
       # libgtk-4-dev/libadwaita-1-dev for the gui crate; a software Vulkan ICD (lavapipe) so the
       # layer's real-device tests run (NEURAL_FORGE_REQUIRE_VULKAN makes that an assertion);
+      # vulkan-validationlayers (Ubuntu's Khronos validation layer) to run them under it;
       # spirv-tools for check_shaders.py's validation; zsync and desktop-file-utils for the
       # AppImage; numpy and Pillow for the scripts' self-tests.
       - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-4-dev libadwaita-1-dev pkg-config \
-            libvulkan1 mesa-vulkan-drivers vulkan-tools spirv-tools \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools vulkan-validationlayers spirv-tools \
             zsync desktop-file-utils patch python3-numpy python3-pil
 
       # Only lavapipe, never whatever other ICD the runner image happens to carry.
@@ -103,6 +105,46 @@ jobs:
           ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-native.log || true)"
           echo "GPU tests that ran: $ran" | tee -a "$GITHUB_STEP_SUMMARY"
           test "$ran" -gt 0
+
+      # The layer's GPU tests (the only crate with tests that run on lavapipe) again, under the Khronos
+      # validation layer, which must report nothing. Its settings come from a settings file, which
+      # every version reads (Ubuntu 24.04's 1.3.275 ignores the VK_KHRONOS_VALIDATION_* variables):
+      # errors and warnings, every one (no per-message limit), and the information-level status line
+      # it prints into each instance, which shows it was loaded at all (the loader skips a
+      # VK_INSTANCE_LAYERS entry it cannot find, and the run would pass with nothing checked).
+      # The layer writes its messages to stdout itself, past libtest's capture, so the log holds
+      # every one; the step fails on any "Validation Error" or "Validation Warning" line, after
+      # printing them all (aborting on the first error would hide the rest and lose the test's
+      # output).
+      - name: cargo test under the Vulkan validation layer
+        env:
+          VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
+          # TEMPORARY: the one known violation, being fixed: the hold inside DLSS's command buffer
+          # waits on an event the host sets after the buffer is submitted (docs/PRE_UPSCALER_DESIGN.md,
+          # "Not valid Vulkan: the release set from the host"). Remove this filter with the redesign.
+          VK_LAYER_MESSAGE_ID_FILTER: VUID-vkSetEvent-event-09543
+        run: |
+          settings="$RUNNER_TEMP/vk_layer_settings.txt"
+          printf '%s\n' \
+            'khronos_validation.report_flags = error,warn,info' \
+            'khronos_validation.debug_action = VK_DBG_LAYER_ACTION_LOG_MSG' \
+            'khronos_validation.enable_message_limit = false' > "$settings"
+          export VK_LAYER_SETTINGS_PATH="$settings"
+          cargo test --locked --release -p neural-forge-layer 2>&1 | tee test-validation.log
+          ran="$(grep -c '\[neural-forge-gpu-test\] device acquired' test-validation.log || true)"
+          loaded="$(grep -c 'CreateInstance-status-message' test-validation.log || true)"
+          reported="$(grep -cE 'Validation (Error|Warning|Performance Warning)' test-validation.log || true)"
+          echo "Under the validation layer: $ran GPU tests, the layer in $loaded instances, $reported messages" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$ran" -gt 0
+          if [ "$loaded" -lt "$ran" ]; then
+              echo "error: the validation layer was loaded into $loaded instances for $ran GPU tests" >&2
+              exit 1
+          fi
+          if [ "$reported" -ne 0 ]; then
+              grep -E -A4 'Validation (Error|Warning|Performance Warning)' test-validation.log >&2
+              echo "error: the validation layer reported $reported errors or warnings" >&2
+              exit 1
+          fi
 
       - name: Clippy (warnings are errors)
         run: cargo clippy --locked --workspace --all-targets -- -D warnings

@@ -40,15 +40,19 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   exactly) that `crates/native` builds with into `tools/native/`; the build is offline after that.
   OpenDLSS-NR is not vendored: change it through a patch there (UPSTREAM.md lists each with its reason).
 - CI (`.github/workflows/check.yml`, run by ci.yml on every push and pull request and by release.yml
-  on a tag) runs the tests, clippy, every script's self-test, the shader check, the AppImage build and
-  its installed-layer smoke test. A new script with a self-test is added there. The weekly pin check
+  on a tag) runs the tests, the layer's tests again under the Khronos validation layer (which must
+  report nothing; one known violation is filtered until it is fixed), clippy, every script's
+  self-test, the shader check, the AppImage build and its installed-layer smoke test. A new script with a self-test is added there. The weekly pin check
   (`scripts/check_pins.py`, pin-check.yml) keeps one issue about pins behind upstream; it must never
   comment or open more than that one (each notification is an email).
 - `cargo test` and `cargo build --release` build every crate (x86_64 Linux only; there is no
   Windows helper and no 32-bit layer since 3.0).
 - `bash build-appimage.sh` packages Neural Forge.
 - The layer's GPU tests run on lavapipe: set `VK_DRIVER_FILES` to the `lvp_icd*.json` manifests, as
-  CI does. On a machine with an NVIDIA GPU, never run them without it.
+  CI does. On a machine with an NVIDIA GPU, never run them without it. Under validation:
+  `VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation` (CI's step shows the settings); a test device
+  enables what the code under test needs (`composition::gpu::test_device_extensions`), destroys what
+  it created before the device, and records over real images, never stand-in handles.
 - Run `python3 scripts/check_namespace.py`, `python3 scripts/test_install.py`,
   and `bash scripts/smoke-test.sh` for namespace, installation and Vulkan checks.
 - Shaders: `python3 scripts/check_shaders.py --update` rebuilds the committed SPIR-V with the pinned

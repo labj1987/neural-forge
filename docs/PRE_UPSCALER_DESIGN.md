@@ -464,9 +464,14 @@ also copies DLSS's RG16F motion vectors into a slot image of their own beside th
 `TRANSFER_SRC_OPTIMAL` and back when they are in a sampled or attachment layout); the camera jitter is
 read from the input launch's parameters at the submit (NATIVE_BACKEND.md, "Phase 4b"). Each job keeps
 the post path off before the worker takes the device's state (`keep_post_off`): the post path would
-otherwise hold that state while its frame waits on the GPU, which waits at this hold. Each job keeps
-the post path off before the worker takes the device's state (`keep_post_off`): the post path would
 otherwise hold that state while its frame waits on the GPU, which waits at this hold.
+
+**Not valid Vulkan: the release set from the host.** The buffer's `vkCmdWaitEvents(release)` waits
+from the host stage on an event the worker sets with `vkSetEvent` after the buffer was submitted. The
+specification requires an event a command buffer waits on from the host to be set before that buffer
+is submitted, and forbids setting an event a pending command buffer waits on
+(`VUID-vkSetEvent-event-09543`). The validation layer reports it in the hold's GPU tests; it is the
+one violation CI's validation run filters, and only until the hold is replaced by a valid design.
 
 ### The HDR encode and decode (model, roundtrip)
 
