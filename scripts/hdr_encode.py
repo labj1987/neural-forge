@@ -421,7 +421,7 @@ def main():
     def exposure_args(sp):
         sp.add_argument("--convention", choices=("mul", "div"), default="mul", help="scene * e (mul) or scene / e (div)")
         sp.add_argument("--exposure-image", type=int, default=0, help="which read exposure.json image (default 0)")
-        sp.add_argument("--exposure", type=float, help="override: the scale itself")
+        sp.add_argument("--exposure", type=float, help="override: the exposure value (still divided by --white; --convention is ignored)")
         sp.add_argument("--white", type=float, default=DEFAULT_PAPER_WHITE,
                         help=f"paper white in exposed units: the scale is divided by it (default {DEFAULT_PAPER_WHITE:g}, the layer's)")
         sp.add_argument("--no-keep-clamped", dest="keep_clamped", action="store_false",

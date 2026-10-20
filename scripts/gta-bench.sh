@@ -64,18 +64,31 @@ status_of() { shmctl status | sed -n "s/^$1=//p"; }
 out=${NF_BENCH_DIR:-$HOME/nf-spike/gta}/$label; rm -rf "$out"; mkdir -p "$out"
 
 restore=()
+# Puts every --set back and checks it took: a value left changed (the CLI can no longer open the
+# channel, say) is an error and fails the run, whatever its result.
 put_back() {
+    local kv k want got failed=0
     for kv in "${restore[@]}"; do
-        k=${kv%%=*}
-        shmctl set "$k" "${kv#*=}" >/dev/null
-        echo "restored $k=$(status_of "$k")"
+        k=${kv%%=*}; want=${kv#*=}
+        shmctl set "$k" "$want" >/dev/null 2>&1 || true
+        got=$(status_of "$k")
+        if [ "$got" = "$want" ]; then
+            echo "restored $k=$got"
+        else
+            echo "error: $k is ${got:-unreadable} after the run, not the previous $want: set it back by hand" >&2
+            failed=1
+        fi
     done
+    [ $failed = 0 ] || exit 1
 }
 # Installed before the first set, so a failed later --set still puts back the earlier ones.
 trap put_back EXIT
 for kv in "${sets[@]}"; do
     k=${kv%%=*}
-    restore+=("$k=$(status_of "$k")")
+    old=$(status_of "$k")
+    # Without the value it has now it could not be put back.
+    [ -n "$old" ] || { echo "error: shmctl status shows no $k; not changing it" >&2; exit 1; }
+    restore+=("$k=$old")
     shmctl set "$k" "${kv#*=}" >/dev/null || { echo "shmctl set $kv failed" >&2; exit 1; }
     echo "set $k=$(status_of "$k")" | tee -a "$out/settings"
 done

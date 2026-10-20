@@ -32,8 +32,9 @@ jobs:
         with:
           persist-credentials: false
 
-      # A network or API failure is retried, then reported in the run's summary and ends the run
-      # without failing it: a failed scheduled run emails, and nothing has changed.
+      # A network or API failure, or an upstream that names no version to compare with, is retried,
+      # then reported in the run's summary and ends the run without failing it (a failed scheduled
+      # run emails) and without touching the issue: a pin that could not be checked is not current.
       - name: Compare the pins with upstream
         id: check
         env:
@@ -48,12 +49,12 @@ jobs:
             case $status in
               0) state=current; break ;;
               10) state=behind; break ;;
-              *) echo "attempt $attempt: upstream could not be asked" >&2; sleep 60 ;;
+              *) echo "attempt $attempt: upstream could not be checked" >&2; sleep 60 ;;
             esac
           done
           cat report.md
           if [ "$state" = unknown ]; then
-            { echo "Upstream could not be asked three times; nothing was changed this week."; echo; cat report.md; } >> "$GITHUB_STEP_SUMMARY"
+            { echo "Upstream could not be checked three times; nothing was changed this week."; echo; cat report.md; } >> "$GITHUB_STEP_SUMMARY"
           fi
           echo "state=$state" >> "$GITHUB_OUTPUT"
 

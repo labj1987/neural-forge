@@ -346,8 +346,12 @@ def guided_fast(I: np.ndarray, P: np.ndarray, eps: float) -> np.ndarray:
 
 def run_cadence(dump: cc.Dump, frames: Frames, cad: Cadence, p: cc.Params):
     """Holds phase.. with the model on every interval-th (adaptive: the regime's interval, decided by
-    the holds before): yields (hold, since, shown edit, frame). A hold without a usable exposure
-    restarts the run (the next hold refreshes)."""
+    the holds before). Yields `(t, since, refresh, shown, dst, step)`: the hold's index in the dump;
+    the holds since the last refresh (0 on a refresh); whether the model ran on it (True) or the cache
+    carried the edit (False); the edit shown, float32 H x W x 3; the hold's frame (`frames[t]`); and
+    where each of its pixels was on the hold before (`step_position`, pixel units, H x W x 2; None
+    when the previous usable hold is not the one just before). A hold without a usable exposure restarts the run (the next hold refreshes)
+    and yields nothing."""
     regime = Regime(cad) if cad.adaptive else None
     src = acc = prev = stale = None
     since = 0

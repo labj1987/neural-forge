@@ -8,7 +8,28 @@
 # OpenDLSS-NR, the same patches), so it is safe to run on every build, and a filled tools/native/ builds
 # offline. scripts/check_pins.py reads the pins below.
 #   bash scripts/fetch-native-tools.sh            (NEURAL_FORGE_NATIVE_TOOLS=<dir> to unpack elsewhere)
+#   bash scripts/fetch-native-tools.sh --self-test
 set -euo pipefail
+
+# True when patch's output reports a hunk that applied only with an offset or fuzz. Only its hunk lines
+# are read: a patched file's path (`patching file src/offset_table.cpp`) says nothing about how it applied.
+drifted() {
+  grep -qE '^Hunk #[0-9]+ succeeded at [0-9]+ (with fuzz|\(offset)' <<<"$1"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+  drifted 'patching file src/kernels.cpp' && { echo "self-test: a clean patch counted as drifted" >&2; exit 1; }
+  drifted $'patching file src/offset_table.cpp\npatching file shaders/fuzz.comp' &&
+    { echo "self-test: a path with offset or fuzz in it counted as drifted" >&2; exit 1; }
+  drifted $'patching file src/a.cpp\nHunk #2 succeeded at 120 (offset 3 lines).' ||
+    { echo "self-test: an offset hunk passed" >&2; exit 1; }
+  drifted $'patching file src/a.cpp\nHunk #1 succeeded at 7 with fuzz 1.' ||
+    { echo "self-test: a fuzzed hunk passed" >&2; exit 1; }
+  drifted $'patching file src/a.cpp\nHunk #3 succeeded at 40 with fuzz 2 (offset -1 lines).' ||
+    { echo "self-test: a fuzzed and offset hunk passed" >&2; exit 1; }
+  echo "fetch-native-tools self-test ok"
+  exit 0
+fi
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TOOLS="${NEURAL_FORGE_NATIVE_TOOLS:-$ROOT/tools/native}"
@@ -59,7 +80,7 @@ prepare_opendlss() {
       echo "$out" >&2
       exit 1
     }
-    if grep -q 'offset\|fuzz' <<<"$out"; then
+    if drifted "$out"; then
       echo "OpenDLSS-NR: $(basename "$patch") applies only with an offset or fuzz:" >&2
       echo "$out" >&2
       exit 1

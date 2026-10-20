@@ -6,17 +6,19 @@
 /.cache/
 *.AppImage
 *.AppImage.zsync
+# What an extracted AppImage unpacks into (CI's check, deploys, releases)
+/squashfs-root/
 
 # NVIDIA weights written by extract-model: never committed
 /model/
 *.e4m3
 
 # Native backend toolchain (scripts/fetch-native-tools.sh)
-/tools/
 /tools
 __pycache__/
 
 # Benchmark and test output
 /bench-out/
 test-native.log
+test-validation.log
 release-notes.md

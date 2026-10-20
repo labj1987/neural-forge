@@ -1,21 +1,46 @@
 #!/usr/bin/env python3
-"""Check activation, desktop, packaging and private API namespace boundaries."""
+"""Check activation, desktop, packaging and private API namespace boundaries.
+
+Every check runs (none is an `assert`, so `python3 -O` checks the same), and each failure is reported
+with what was expected; the script exits 1 after listing them all.
+"""
 import json
 from pathlib import Path
 import re
+import sys
 import xml.etree.ElementTree as ET
+
 root = Path(__file__).resolve().parents[1]
-manifest = json.loads((root / 'data/neural_forge_layer.json').read_text())['layer']
-assert manifest['enable_environment'] == {'NEURAL_FORGE_ENABLE': '1'}
-assert manifest['disable_environment'] == {'NEURAL_FORGE_DISABLE': '1'}
-assert manifest['name'] == 'VK_LAYER_neuralforge_neural'
-assert manifest['name'] in (root / 'crates/layer/src/lib.rs').read_text()
-assert manifest['library_path'] == './libneural_forge_layer.so'
+failures = []
+
+
+def check(ok, message):
+    if not ok:
+        failures.append(message)
+
+
+def text(rel):
+    return (root / rel).read_text()
+
+
+manifest = json.loads(text('data/neural_forge_layer.json'))['layer']
+check(manifest.get('enable_environment') == {'NEURAL_FORGE_ENABLE': '1'},
+      f"data/neural_forge_layer.json: enable_environment is {manifest.get('enable_environment')!r}, not NEURAL_FORGE_ENABLE=1")
+check(manifest.get('disable_environment') == {'NEURAL_FORGE_DISABLE': '1'},
+      f"data/neural_forge_layer.json: disable_environment is {manifest.get('disable_environment')!r}, not NEURAL_FORGE_DISABLE=1")
+check(manifest.get('name') == 'VK_LAYER_neuralforge_neural',
+      f"data/neural_forge_layer.json: the layer is named {manifest.get('name')!r}, not VK_LAYER_neuralforge_neural")
+check(str(manifest.get('name')) in text('crates/layer/src/lib.rs'),
+      f"crates/layer/src/lib.rs does not name the manifest's layer {manifest.get('name')!r}")
+check(manifest.get('library_path') == './libneural_forge_layer.so',
+      f"data/neural_forge_layer.json: library_path is {manifest.get('library_path')!r}, not ./libneural_forge_layer.so")
 identity = 'io.github.labj1987.NeuralForge'
 meta = ET.parse(root / f'data/{identity}.appdata.xml').getroot()
-assert meta.find('id').text == identity
-assert meta.find('launchable').text == f'{identity}.desktop'
-assert '\nExec=neural-forge\n' in (root / f'data/{identity}.desktop').read_text()
+for tag, want in (('id', identity), ('launchable', f'{identity}.desktop')):
+    found = meta.find(tag)
+    got = found.text if found is not None else None
+    check(got == want, f"data/{identity}.appdata.xml: <{tag}> is {got!r}, not {want!r}")
+check('\nExec=neural-forge\n' in text(f'data/{identity}.desktop'), f"data/{identity}.desktop has no Exec=neural-forge line")
 # The pre-0.1.77 spelling (`NEURALFORGE_*`, `neuralforge` paths) is gone everywhere: Rust sources, scripts,
 # data files and the packaging script. Only the two frozen identifiers (and one history file name) keep the old spelling.
 # The history file keeps its name (it records the project before the rename).
@@ -33,12 +58,20 @@ for path in scanned:
         continue  # binary data
     for frozen in FROZEN:
         code = code.replace(frozen, '')
-    assert not re.search(r'neuralforge|NEURALFORGE', code), path
+    rel = path.relative_to(root)
+    old = re.search(r'neuralforge|NEURALFORGE', code)
+    check(not old, f"{rel}: the old spelling {old.group(0) if old else ''!r} (use neural-forge / NEURAL_FORGE_)")
     if path.suffix == '.rs':
-        assert not re.search(r'(?:var|var_os|set_var)\("(?:DLSSNR_|VKLayer_DLSS5)', code), path
-        assert 'NEURALFORGE.Color' not in code, path
-assert (root / 'README.md').read_text().startswith('# Neural Forge\n')
-assert '`dlssnr` is a from-scratch' not in (root / 'ATTRIBUTION.md').read_text()
-assert '|labj1987|neural-forge|latest|' in (root / 'build-appimage.sh').read_text()
-assert 'https://github.com/labj1987/neural-forge' in (root / 'README.md').read_text()
+        env = re.search(r'(?:var|var_os|set_var)\("(?:DLSSNR_|VKLayer_DLSS5)\w*', code)
+        check(not env, f"{rel}: reads an old or upstream environment variable ({env.group(0) if env else ''})")
+        check('NEURALFORGE.Color' not in code, f"{rel}: the old NEURALFORGE.Color name")
+check(text('README.md').startswith('# Neural Forge\n'), "README.md does not start with the '# Neural Forge' heading")
+check('`dlssnr` is a from-scratch' not in text('ATTRIBUTION.md'), "ATTRIBUTION.md still describes the project as dlssnr")
+check('|labj1987|neural-forge|latest|' in text('build-appimage.sh'), "build-appimage.sh's update information does not name labj1987/neural-forge")
+check('https://github.com/labj1987/neural-forge' in text('README.md'), "README.md does not link https://github.com/labj1987/neural-forge")
+if failures:
+    for message in failures:
+        print(f"error: {message}", file=sys.stderr)
+    print(f"Namespace contract: {len(failures)} failures", file=sys.stderr)
+    sys.exit(1)
 print('Namespace contract: OK')

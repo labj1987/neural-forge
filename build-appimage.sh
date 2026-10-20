@@ -24,8 +24,18 @@ echo "==> Building $NAME $VERSION AppImage"
 # ── Build dependencies ────────────────────────────────────────────────
 SUDO=""
 if [[ "$(id -u)" -ne 0 ]]; then SUDO="sudo"; fi
-if ! pkg-config --exists gtk4 2>/dev/null || ! command -v g++ >/dev/null 2>&1 || ! command -v patch >/dev/null 2>&1; then
-    echo "==> Installing build dependencies"
+# Every tool the build runs (here, in scripts/fetch-native-tools.sh, the crates' build scripts and the
+# Python generators), so a missing one is installed before the long release build, not found after it.
+missing_deps() {
+    local tool
+    for tool in g++ curl patch python3 pkg-config desktop-file-validate zsyncmake; do
+        command -v "$tool" >/dev/null 2>&1 || { echo "$tool"; return 0; }
+    done
+    pkg-config --exists gtk4 libadwaita-1 2>/dev/null || { echo "gtk4/libadwaita-1"; return 0; }
+    return 1
+}
+if missing="$(missing_deps)"; then
+    echo "==> Installing build dependencies ($missing is missing)"
     # Tolerate an unrelated third-party repo (e.g. a runner image's preinstalled
     # Google Chrome source) failing to refresh -- apt falls back to its cached index
     # for that repo and still refreshes everything else; only `apt-get install`
@@ -34,7 +44,11 @@ if ! pkg-config --exists gtk4 2>/dev/null || ! command -v g++ >/dev/null 2>&1 ||
     # g++ brings the static libstdc++ that crates/native links; curl, patch and python3 are what
     # scripts/fetch-native-tools.sh and the crate's build script run.
     $SUDO apt-get install -y -qq g++ curl patch python3 libgtk-4-dev libadwaita-1-dev \
-        pkg-config wget desktop-file-utils zsync
+        pkg-config desktop-file-utils zsync
+    if missing="$(missing_deps)"; then
+        echo "error: $missing is still missing after installing the build dependencies" >&2
+        exit 1
+    fi
 fi
 # Rust from rustup, at the version rust-toolchain.toml pins (the distribution's cargo is too old for
 # Cargo.lock and the code): rustup reads the file and installs that toolchain on first use.
@@ -113,7 +127,7 @@ mkdir -p "$TOOL_DIR"
 TOOL="$TOOL_DIR/appimagetool-$APPIMAGETOOL_VERSION"
 if [[ ! -f "$TOOL" ]] || ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --status; then
     echo "==> Downloading appimagetool $APPIMAGETOOL_VERSION"
-    wget -q -O "$TOOL" \
+    curl -fsSL --retry 3 -o "$TOOL" \
         "https://github.com/AppImage/appimagetool/releases/download/$APPIMAGETOOL_VERSION/appimagetool-x86_64.AppImage"
     if ! echo "$APPIMAGETOOL_SHA256  $TOOL" | sha256sum -c --status; then
         echo "error: appimagetool $APPIMAGETOOL_VERSION does not match the pinned checksum" >&2
@@ -132,7 +146,7 @@ RUNTIME_SHA256="2fca8b443c92510f1483a883f60061ad09b46b978b2631c807cd873a47ec260d
 RUNTIME="$TOOL_DIR/runtime-x86_64-$RUNTIME_VERSION"
 if [[ ! -f "$RUNTIME" ]] || ! echo "$RUNTIME_SHA256  $RUNTIME" | sha256sum -c --status; then
     echo "==> Downloading type2-runtime $RUNTIME_VERSION"
-    wget -q -O "$RUNTIME" \
+    curl -fsSL --retry 3 -o "$RUNTIME" \
         "https://github.com/AppImage/type2-runtime/releases/download/$RUNTIME_VERSION/runtime-x86_64"
     if ! echo "$RUNTIME_SHA256  $RUNTIME" | sha256sum -c --status; then
         echo "error: type2-runtime $RUNTIME_VERSION does not match the pinned checksum" >&2
@@ -144,11 +158,26 @@ fi
 echo "==> Packing AppImage"
 OUT="neural-forge-$VERSION-$ARCH.AppImage"
 
+# Reproducible packing: the same commit packs to the same bytes (and the same .zsync), so a published
+# release can be checked against a local rebuild. Every file in the AppDir gets the commit's time and
+# umask-independent permissions, and SOURCE_DATE_EPOCH gives appimagetool's mksquashfs the same
+# filesystem time (appimagetool also packs every file root-owned).
+SOURCE_DATE_EPOCH="${SOURCE_DATE_EPOCH:-$(git log -1 --format=%ct 2>/dev/null || true)}"
+if [[ -z "$SOURCE_DATE_EPOCH" ]]; then
+    echo "error: no git commit to take the AppImage's timestamps from; set SOURCE_DATE_EPOCH" >&2
+    exit 1
+fi
+export SOURCE_DATE_EPOCH
+chmod -R u+rwX,go+rX,go-w "$APPDIR"
+find "$APPDIR" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
+
 # Use the canonical renamed repository for release updates.
 UPDATE_INFORMATION="gh-releases-zsync|labj1987|neural-forge|latest|neural-forge-*-x86_64.AppImage.zsync"
 VERSION="$VERSION" ARCH="$ARCH" "$TOOL" --appimage-extract-and-run \
     --runtime-file "$RUNTIME" -u "$UPDATE_INFORMATION" "$APPDIR" "$OUT"
 
+# The .zsync records the AppImage's mtime (its MTime: header): the commit's too, so it is reproducible.
+touch -d "@$SOURCE_DATE_EPOCH" "$OUT"
 echo "==> Done: $OUT"
 ls -lh "$OUT"
 

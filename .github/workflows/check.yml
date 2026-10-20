@@ -33,6 +33,9 @@ jobs:
       NEURAL_FORGE_REQUIRE_VULKAN: "1"
       # Makes a missing or failing zsyncmake fatal in build-appimage.sh.
       CI: "true"
+      # Every build here starts the workspace's crates from nothing (see the Cargo cache below), so
+      # incremental state would only be written, never reused.
+      CARGO_INCREMENTAL: "0"
     steps:
       # Actions are pinned to full commit SHAs (a tag can be moved); Dependabot proposes the
       # updates (.github/dependabot.yml). The trailing comment is the release the SHA is.
@@ -88,8 +91,40 @@ jobs:
           echo "VK_DRIVER_FILES=$icds" >> "$GITHUB_ENV"
           echo "VK_DRIVER_FILES=$icds"
 
+      # Cargo's downloads and the third-party crates' build output, so a run does not download and
+      # compile the whole dependency graph again. Only what cannot go stale is kept. The key is the
+      # exact lockfile, manifests (profiles, features), toolchain, runner image and the system packages
+      # the -sys crates' build scripts and the C/C++ builds read, with no fallback to an older key:
+      # any change is a cold build, never a partial restore. And the workspace's own crates are
+      # removed before the cache is saved (the last steps), so every run compiles and tests this
+      # checkout's code from scratch, its build scripts included (crates/native's reads tools/native).
+      # A release builds everything from nothing and leaves the cache alone.
+      - name: Cargo cache key
+        if: ${{ !inputs.release }}
+        id: cargo-key
+        run: |
+          sys="$( { echo "${ImageOS:-} ${ImageVersion:-}"; rustc -vV
+                    dpkg-query -W -f '${Package}=${Version}\n' gcc g++ binutils libc6-dev pkg-config \
+                      libgtk-4-dev libadwaita-1-dev libglib2.0-dev libvulkan1; } | sha256sum | cut -c1-16)"
+          echo "key=cargo-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'crates/*/Cargo.toml', 'rust-toolchain.toml') }}-$sys" >> "$GITHUB_OUTPUT"
+
+      - name: Restore the Cargo cache
+        if: ${{ !inputs.release }}
+        id: cargo-cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cargo-key.outputs.key }}
+
       # The pinned glslang, Vulkan-Headers, volk and OpenDLSS-NR (with its patches applied) that
       # crates/native builds with, cached by their pins and patches: the build itself is offline.
+      # The key covers everything that decides the tree (the pins, what is kept of OpenDLSS-NR and the
+      # patches are all in the script or the patch files), and the script re-checks each tool's stamp
+      # (its archive's and the patches' SHA-256) and fetches again on a mismatch.
       - name: Cache the native backend's sources and tools
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
@@ -162,6 +197,7 @@ jobs:
           python3 scripts/test_cache_replay.py
           python3 scripts/gen_third_party_crates.py --self-test
           python3 scripts/check_pins.py --self-test
+          bash scripts/fetch-native-tools.sh --self-test
 
       - name: Shader sources match committed SPIR-V
         run: python3 scripts/check_shaders.py
@@ -241,3 +277,33 @@ jobs:
             neural-forge-*-x86_64.AppImage.zsync
             release-notes.md
           if-no-files-found: error
+
+      # Only a run that found no cache under its key and passed everything saves one, and without
+      # the workspace's own crates (see the restore step): the downloads and the dependencies'
+      # build output are all that is kept.
+      - name: Drop the workspace's own build output from the Cargo cache
+        if: success() && !inputs.release && steps.cargo-cache.outputs.cache-hit != 'true'
+        run: |
+          packages="$(cargo metadata --locked --no-deps --format-version 1 |
+            python3 -c 'import json, sys; print(" ".join(p["name"] for p in json.load(sys.stdin)["packages"]))')"
+          test -n "$packages"
+          for package in $packages; do
+              cargo clean --locked -p "$package"
+              cargo clean --locked --release -p "$package"
+          done
+          rm -rf target/debug/incremental target/release/incremental
+          if find target -maxdepth 3 \( -name 'libneural_forge*' -o -name 'neural-forge*' -o -name 'neural_forge*' \) | grep .; then
+              echo "error: the workspace's build output is still in target/" >&2
+              exit 1
+          fi
+
+      - name: Save the Cargo cache
+        if: success() && !inputs.release && steps.cargo-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: ${{ steps.cargo-key.outputs.key }}
