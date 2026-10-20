@@ -1120,6 +1120,18 @@ mod post_path_idle_tests {
     }
 }
 
+/// Whether `reason` is reported for the first time in `seen` (and records it). For the "present
+/// skipped" lines that are logged once per distinct reason: remembering only the last reason would
+/// log (and flush, on the present thread) on every present whose reason alternates between two.
+fn first_report<T: PartialEq>(seen: &Mutex<Vec<T>>, reason: T) -> bool {
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&reason) {
+        return false;
+    }
+    seen.push(reason);
+    true
+}
+
 unsafe fn relay_app_waits(
     device: &ash::Device,
     queue: vk::Queue,
@@ -2266,10 +2278,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         self.log_launch_queues(queue, buffers());
         self.inline_prologue(queue, buffers());
         let Some(next) = self.next_queue_submit2 else {
-            // Not resolvable below this layer (the application could not be calling it): the
-            // framework forwards, and the result stays unseen.
-            self.inline_submitted(queue, buffers());
-            self.commit_submitted(buffers());
+            // Neither `vkQueueSubmit2` nor its KHR alias resolves below this layer, so no valid
+            // application calls it. The framework forwards it and the result stays unseen, so
+            // nothing is committed: the tracking only ever advances for a submission seen accepted.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!("[layer] vkQueueSubmit2 called on a device that does not resolve it below the layer; its submissions are not tracked");
+                crate::logging::flush();
+            }
             return LayerResult::Unhandled;
         };
         if let Some(tracking) = self.preupscale.as_ref().filter(|t| t.armed()) {
@@ -3042,12 +3058,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     //
                     // Logged once per distinct reason so it identifies the state
                     // without joining the per-barrier spam.
-                    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-                    let reason = match tap {
-                        None => 0u32,
-                        Some((_, layout)) => layout.as_raw().unsigned_abs().wrapping_add(1),
-                    };
-                    if REPORTED.swap(reason, std::sync::atomic::Ordering::Relaxed) != reason {
+                    static REPORTED: Mutex<Vec<Option<vk::ImageLayout>>> = Mutex::new(Vec::new());
+                    if first_report(&REPORTED, tap.map(|(_, layout)| layout)) {
                         match tap {
                             None => crate::log!(
                                 "[layer] present skipped: swapchain is pass_through and this image has no tracked render source \
@@ -3067,10 +3079,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // swapchain's extent out of it and read its bytes as the swapchain's format:
                     // unless both are known to match, that is an out-of-bounds copy or misread
                     // pixels. Logged once per distinct reason.
-                    static REPORTED_TAP: Mutex<&str> = Mutex::new("");
-                    let mut said = REPORTED_TAP.lock().unwrap();
-                    if *said != reason {
-                        *said = reason;
+                    static REPORTED_TAP: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+                    if first_report(&REPORTED_TAP, reason) {
                         crate::log!("[layer] present skipped: swapchain is pass_through and {reason} -- this frame is untouched");
                         crate::logging::flush();
                     }
@@ -3398,6 +3408,19 @@ mod tap_source_lifetime_tests {
 
     fn image(raw: u64) -> vk::Image {
         vk::Image::from_raw(raw)
+    }
+
+    /// Each "present skipped" reason is reported once, also when two of them alternate from present to
+    /// present (remembering only the last one logged and flushed on every present).
+    #[test]
+    fn a_skip_reason_is_reported_once_even_when_reasons_alternate() {
+        let seen: Mutex<Vec<Option<vk::ImageLayout>>> = Mutex::new(Vec::new());
+        let reports: Vec<bool> = [None, Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL), None, Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL), None]
+            .into_iter()
+            .map(|reason| first_report(&seen, reason))
+            .collect();
+        assert_eq!(reports, [true, true, false, false, false]);
+        assert!(first_report(&seen, Some(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)), "a new reason is still reported");
     }
 
     /// A pool reset or destroyed takes its buffers' recorded tap-source layouts with it; another
