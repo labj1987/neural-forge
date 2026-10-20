@@ -777,8 +777,22 @@ impl ShmClient {
         let path = neural_forge_protocol::env::var("NEURAL_FORGE_SHM")
             .filter(|s| !s.is_empty())
             .unwrap_or_else(shm_default_path);
-        if !neural_forge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) || !crate::ownership::claim(&path) { return false; }
+        // A mapping refused once is refused for good: no claim for a channel this client can never use.
+        if self.map_refused || !neural_forge_protocol::isolated_path(&path) || !ensure_private_parent_dir(&path) {
+            return false;
+        }
+        // The lease comes first: opening may initialise the header, and only the lease holder may
+        // write the channel.
+        let had_lease = crate::ownership::held();
+        if !crate::ownership::claim(&path) {
+            return false;
+        }
         if !self.open_at(&path) {
+            // Taken for this client only (no other client of this process was using it): a lease
+            // held over a channel nobody here can map would keep the process that can from it.
+            if !had_lease {
+                crate::ownership::release("the channel could not be mapped");
+            }
             return false;
         }
         self.leased = true;
