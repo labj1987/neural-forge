@@ -2006,7 +2006,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     fn free_command_buffers(
         &self, command_pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer],
     ) -> LayerResult<()> {
-        crate::probe_ngx::on_free_command_buffers(command_buffers);
+        crate::probe_ngx::on_free_command_buffers(command_pool, command_buffers);
         if let Some(t) = &self.preupscale {
             t.free(command_buffers);
         }
