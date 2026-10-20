@@ -112,6 +112,17 @@ VkCommandBuffer nf_native_graph_commands_own_at(const NfNative* n, uint32_t slot
 // measurements beside the secondary; the frame path uses nf_native_graph_commands.
 uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err, size_t err_len);
 
+// Records slot `slot`'s graph (nf_native_build_sizes) straight into `primary`, a primary command buffer of
+// `frame_family` the caller is recording (the application's: the hold inside DLSS's command buffer), between
+// two compute barriers. Its descriptor sets come from hold slot `hold`'s own pool (0..15, made on first use),
+// which this call resets first: the caller guarantees that no command buffer recorded with that hold slot
+// may still be submitted or pending. The recording reads the build's activations, so the build must not be
+// dropped (a rebuild, nf_native_fall_back_to_barriers, nf_native_close) while any such buffer may still be
+// submitted. Binds compute pipelines and descriptor sets and pushes constants: the caller restores its own
+// state after it. On failure (0) part of the graph may be recorded.
+uint32_t nf_native_record_graph_at(NfNative* n, uint32_t slot, uint32_t hold, VkCommandBuffer primary, char* err,
+                                   size_t err_len);
+
 // Counter-chain waits that gave up since the last reset (the watchdog). Read only once a frame that
 // executed the graph has completed. `where` names the first stuck counter.
 uint32_t nf_native_chain_timeouts(const NfNative* n, char* where, size_t where_len);

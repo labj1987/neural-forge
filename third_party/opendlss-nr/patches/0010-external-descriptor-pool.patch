@@ -1,0 +1,13 @@
+diff --git a/src/vk_context.h b/src/vk_context.h
+--- a/src/vk_context.h
++++ b/src/vk_context.h
+@@ -135,6 +135,9 @@
+                               const VkDeviceSize ranges[kGenericBindings] = nullptr);
+   void resetDescriptorPool();              // advance to the next pool and reset it
+   void resetDescriptorPool(uint32_t slot); // reset and use a specific pool (the caller's frame-in-flight slot)
++  // Allocate from `pool` (the caller's own, made for the generic layout) until the next call; returns the pool used
++  // before. For recordings whose sets must outlive both of this context's pools.
++  VkDescriptorPool useDescriptorPool(VkDescriptorPool pool) { VkDescriptorPool previous = descriptorPool_; descriptorPool_ = pool; return previous; }
+ 
+   // Commands --------------------------------------------------------------------
+   VkCommandBuffer beginCommands();

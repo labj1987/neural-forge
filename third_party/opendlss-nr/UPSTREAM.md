@@ -98,3 +98,10 @@ Each one is a patch in `patches/`, relative to the source's root (`patch -p1`), 
    comes from it, as do the boundary capture names and `referenceBoundaryNames` (parity fixtures only; a member
    now, since the list depends on the network). The full network's output is unchanged: bit-exact against NGX's
    answer on fixture d1w (docs/NATIVE_BACKEND.md, 0.6).
+10. `patches/0010-external-descriptor-pool.patch`: `vk::Context::useDescriptorPool(pool)` (`src/vk_context.h`)
+   makes the context allocate its descriptor sets from a pool of the caller's until the next call, and returns
+   the pool it used before. The context has two pools of its own, reset in rotation, so the sets of a graph
+   recorded twice in a row would be freed while the first recording may still run. neural-forge-native records
+   the graph straight into the game's command buffer for the hold inside DLSS's buffer
+   (`nf_native_record_graph_at`), several of which can be recorded before any runs: each recording takes its sets
+   from a pool of the layer's hold slot, reset only when that slot records again.

@@ -54,6 +54,7 @@ mod ffi {
         pub fn nf_native_graph_commands_at(n: *const c_void, slot: u32) -> vk::CommandBuffer;
         pub fn nf_native_graph_commands_own_at(n: *const c_void, slot: u32) -> vk::CommandBuffer;
         pub fn nf_native_record_graph(n: *mut c_void, primary: vk::CommandBuffer, err: *mut c_char, len: usize) -> u32;
+        pub fn nf_native_record_graph_at(n: *mut c_void, slot: u32, hold: u32, primary: vk::CommandBuffer, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_chain_timeouts(n: *const c_void, at: *mut c_char, len: usize) -> u32;
         pub fn nf_native_reset_chain_timeouts(n: *mut c_void);
         pub fn nf_native_fall_back_to_barriers(n: *mut c_void);
@@ -64,6 +65,9 @@ mod ffi {
 }
 
 const MESSAGE: usize = 512;
+
+/// The hold slots [`Network::record_graph_at`] serves (`kHoldPools` in nf_native.cpp).
+pub const HOLD_SLOTS: u32 = 16;
 
 /// Sets the loader's dispatch pointer on a dispatchable object the network got from below the loader.
 pub type InitDispatchable = unsafe extern "C" fn(user: *mut c_void, device: vk::Device, object: *mut c_void);
@@ -330,6 +334,25 @@ impl Network {
         }
     }
 
+    /// Records slot `slot`'s graph ([`Self::build_sizes`]) straight into `primary`, a primary command buffer of
+    /// `frame_family` being recorded (the application's: the hold inside DLSS's command buffer), between two
+    /// compute barriers, with descriptor sets from hold slot `hold`'s own pool (`0..HOLD_SLOTS`), which this
+    /// resets first. Binds compute pipelines and descriptor sets and pushes constants: the caller restores its
+    /// own state afterwards. On an error part of the graph may be recorded.
+    ///
+    /// # Safety
+    /// `primary` is recording on this thread. No command buffer recorded with hold slot `hold` may still be
+    /// submitted or pending, and none recorded with this build may be, when the build is dropped (a rebuild,
+    /// [`Self::fall_back_to_barriers`], drop).
+    pub unsafe fn record_graph_at(&mut self, slot: u32, hold: u32, primary: vk::CommandBuffer) -> Result<(), String> {
+        let mut err = [0 as c_char; MESSAGE];
+        // SAFETY: `raw` is live; `primary` is recording (contract).
+        match unsafe { ffi::nf_native_record_graph_at(self.raw, slot, hold, primary, err.as_mut_ptr(), MESSAGE) } {
+            1 => Ok(()),
+            _ => Err(message(&err)),
+        }
+    }
+
     /// A bounded wait on the network's queue timed out: its work may still run on the GPU, so the
     /// network takes no more work (every build fails) and leaks what it made when dropped instead of
     /// destroying it. Dead for this device.
@@ -390,8 +413,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn abi_version_is_3() {
-        assert_eq!(abi_version(), 3);
+    fn abi_version_is_4() {
+        assert_eq!(abi_version(), 4);
     }
 
     #[test]

@@ -258,6 +258,11 @@ void* copyChain(Extension& x, const void* chain, const void** tail) {
 
 // ---- The network -----------------------------------------------------------------------------
 
+// Hold slots nf_native_record_graph_at serves (the layer's slots per device), and the descriptor sets each
+// slot's pool holds: as many as the context's own pools, from which the warm-up recorded the same graph.
+constexpr uint32_t kHoldPools = 16;
+constexpr uint32_t kHoldSets = 8192;
+
 // One frame size's graph: its activations, the layer's input features and the two recordings.
 struct NfSlot {
   nr::Geometry geometry{};
@@ -277,6 +282,10 @@ struct NfNative {
   std::vector<NfSlot> slots;
   VkCommandPool secondaryPool = VK_NULL_HANDLE;
   VkCommandPool ownPool = VK_NULL_HANDLE;
+  // The descriptor pools of the recordings into the application's command buffers
+  // (nf_native_record_graph_at), one per hold slot, made on first use: a slot's sets stay valid while the
+  // buffer recorded with them may still be submitted, and are reset only when that slot records again.
+  std::vector<VkDescriptorPool> holdPools;
   float blendScale = 1.0f;
   uint64_t rawLoaded = 0;
   uint64_t fenceTimeoutNs = 5'000'000'000ull;
@@ -363,7 +372,7 @@ struct NfNative {
 
 extern "C" {
 
-uint32_t nf_native_abi_version(void) { return 3; }
+uint32_t nf_native_abi_version(void) { return 4; }
 
 uint32_t nf_native_asset_count(const char* kind) {
   try {
@@ -605,6 +614,48 @@ uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err,
   }
 }
 
+uint32_t nf_native_record_graph_at(NfNative* n, uint32_t slot, uint32_t hold, VkCommandBuffer primary, char* err,
+                                   size_t err_len) {
+  if (n->stalled()) {
+    say(err, err_len, "the network's queue stalled earlier; it takes no more work");
+    return 0;
+  }
+  try {
+    if (slot >= n->slots.size() || !n->slots[slot].graph) throw std::runtime_error("the network is not built for that size");
+    if (hold >= kHoldPools) throw std::runtime_error("no such hold slot");
+    if (n->holdPools.size() <= hold) n->holdPools.resize(hold + 1, VK_NULL_HANDLE);
+    VkDescriptorPool& pool = n->holdPools[hold];
+    if (!pool) {
+      // As the context's own pools: the warm-up recorded this graph's sets into one of those.
+      VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kHoldSets * vk::kGenericBindings};
+      VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+      info.maxSets = kHoldSets;
+      info.poolSizeCount = 1;
+      info.pPoolSizes = &size;
+      VK_CHECK(vkCreateDescriptorPool(n->context->device(), &info, nullptr, &pool));
+    } else {
+      VK_CHECK(vkResetDescriptorPool(n->context->device(), pool, 0));
+    }
+    // The context allocates the recording's sets from the hold's pool; its own pool is put back whatever
+    // happens.
+    struct Restore {
+      vk::Context& context;
+      VkDescriptorPool previous;
+      ~Restore() { context.useDescriptorPool(previous); }
+    } restore{*n->context, n->context->useDescriptorPool(pool)};
+    n->context->computeBarrier(primary);
+    n->slots[slot].graph->record(primary, *n->slots[slot].features);
+    n->context->computeBarrier(primary);
+    return 1;
+  } catch (const std::exception& e) {
+    say(err, err_len, e.what());
+    return 0;
+  } catch (...) {
+    say(err, err_len, "an unknown C++ exception");
+    return 0;
+  }
+}
+
 uint32_t nf_native_chain_timeouts(const NfNative* n, char* where, size_t where_len) {
   try {
     const nr::Kernels::ChainTimeouts timeouts = n->kernels->chainTimeouts();
@@ -636,6 +687,8 @@ void nf_native_close(NfNative* n) {
     if (!n->stalled()) {
       if (n->secondaryPool) vkDestroyCommandPool(n->context->device(), n->secondaryPool, nullptr);
       if (n->ownPool) vkDestroyCommandPool(n->context->device(), n->ownPool, nullptr);
+      for (VkDescriptorPool pool : n->holdPools)
+        if (pool) vkDestroyDescriptorPool(n->context->device(), pool, nullptr);
     }
     n->kernels.reset();
     n->model.reset();
