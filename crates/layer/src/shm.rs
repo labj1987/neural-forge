@@ -137,6 +137,13 @@ impl ShmView {
     }
 }
 
+/// Flips the shared `enabled` switch in one atomic step: the GUI, the CLI and another device's
+/// client write the same word, and a separate load and store would lose a write landing between
+/// them (or turn a press into a double toggle).
+fn toggle_enabled(hdr: &neural_forge_protocol::ShmHeader) {
+    let _ = hdr.enabled.try_update(Ordering::Relaxed, Ordering::Relaxed, |enabled| Some(u32::from(enabled == 0)));
+}
+
 /// The header of the channel this process opened (the lease lets one game hold it), for the one
 /// write that has no `ShmClient` at hand: `note_vk`'s device-lost latch ([`note_device_lost`]).
 static CHANNEL: std::sync::atomic::AtomicPtr<neural_forge_protocol::ShmHeader> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
@@ -205,9 +212,37 @@ struct Mapped {
     /// Bytes of each slot's proxy and answer regions known to be backed by the file
     /// (`posix_fallocate`), so writing them can never fault (`ShmClient::reserve`).
     reserved: [u64; Slot::COUNT],
+    /// Per slot: the size backing last failed for and when. A size at least as large is not tried
+    /// again before [`RESERVE_RETRY`]: on a full tmpfs each attempt allocates pages up to the limit
+    /// and gives them back, on the game's present thread.
+    refused: [Option<(u64, Instant)>; Slot::COUNT],
 }
 
+/// How long a size the file could not be backed for is left before it is tried again.
+const RESERVE_RETRY: Duration = Duration::from_secs(5);
+
 static MAPPINGS: std::sync::Mutex<Vec<Mapped>> = std::sync::Mutex::new(Vec::new());
+
+/// `posix_fallocate` on the channel file: 0, or the error.
+fn fallocate(fd: &OwnedFd, offset: libc::off_t, len: libc::off_t) -> i32 {
+    #[cfg(test)]
+    {
+        TEST_FALLOCATE_CALLS.with(|c| c.set(c.get() + 1));
+        if let Some(err) = TEST_FALLOCATE_ERROR.with(std::cell::Cell::get) {
+            return err;
+        }
+    }
+    // SAFETY: a plain call on an open file; the range is inside the channel's layout.
+    unsafe { libc::posix_fallocate(fd.as_raw_fd(), offset, len) }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`fallocate`] fail with this error on this thread (a full tmpfs: `ENOSPC`).
+    static TEST_FALLOCATE_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    /// How many times [`fallocate`] was called on this thread.
+    static TEST_FALLOCATE_CALLS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 
 fn state_session(hdr: &neural_forge_protocol::ShmHeader, lost: bool, cannot_run: Option<&str>) {
     hdr.device_lost_at.store(if lost { unix_now() } else { 0 }, Ordering::Relaxed);
@@ -387,8 +422,7 @@ impl ShmClient {
             return;
         }
         if poller.pressed(key) {
-            let enabled = hdr.enabled.load(Ordering::Relaxed);
-            hdr.enabled.store((enabled == 0) as u32, Ordering::Relaxed);
+            toggle_enabled(hdr);
         }
     }
 
@@ -706,19 +740,23 @@ impl ShmClient {
             return true;
         };
         if mapped.reserved[slot.index()] < bytes {
+            if mapped.refused[slot.index()].is_some_and(|(size, at)| bytes >= size && at.elapsed() < RESERVE_RETRY) {
+                return false;
+            }
             for region in [Region::proxy(slot), Region::answer(slot)] {
-                // SAFETY: a plain call on the open channel file; the range is inside it.
-                let err = unsafe { libc::posix_fallocate(mapped.fd.as_raw_fd(), region.offset() as libc::off_t, bytes as libc::off_t) };
+                let err = fallocate(&mapped.fd, region.offset() as libc::off_t, bytes as libc::off_t);
                 if err != 0 {
                     static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
                     if !SAID.swap(true, Ordering::Relaxed) {
                         crate::log!("[shm] cannot back {bytes} bytes of {} (error {err}, is /tmp full?): frames of this size are not sent", mapped.path);
                         crate::logging::flush();
                     }
+                    mapped.refused[slot.index()] = Some((bytes, Instant::now()));
                     return false;
                 }
             }
             mapped.reserved[slot.index()] = bytes;
+            mapped.refused[slot.index()] = None;
         }
         self.reserved[slot.index()] = mapped.reserved[slot.index()];
         true
@@ -831,7 +869,7 @@ impl ShmClient {
             None => match map_channel(path) {
                 Ok((base, fd)) => {
                     let raw_fd = fd.as_raw_fd();
-                    mappings.push(Mapped { path: path.to_owned(), base: base as usize, fd, reserved: [0; Slot::COUNT] });
+                    mappings.push(Mapped { path: path.to_owned(), base: base as usize, fd, reserved: [0; Slot::COUNT], refused: [None; Slot::COUNT] });
                     (base, raw_fd)
                 }
                 Err(refused) => {
@@ -1220,6 +1258,56 @@ mod tests {
         // SAFETY: the proxy region is mapped and backed for its first bytes.
         assert_eq!(unsafe { *a.regions[0] }, 0, "nothing written past the backing");
         assert_eq!(header_of(&a).seq_req.load(Ordering::Relaxed), before);
+    }
+
+    /// A size the file could not be backed for is not tried again on every present (each attempt
+    /// on a full tmpfs allocates and gives back pages up to the limit), only after
+    /// [`RESERVE_RETRY`] or for a smaller frame; and once backing works again the frame goes out.
+    #[test]
+    fn a_size_that_cannot_be_backed_is_not_retried_every_present() {
+        let path = scratch_path();
+        let mut client = ShmClient::default();
+        assert!(client.open_at(&path));
+        let rgba = neural_forge_protocol::enums::proxy_format::RGBA8;
+        let calls = || TEST_FALLOCATE_CALLS.with(std::cell::Cell::get);
+        TEST_FALLOCATE_ERROR.with(|e| e.set(Some(libc::ENOSPC)));
+        let before = calls();
+        client.set_frame_info(Slot::Secondary, 640, 480, rgba);
+        assert!(!client.frame_backed[1], "a frame the file cannot back is not sent");
+        assert_eq!(calls() - before, 1, "the first attempt failed at the proxy region");
+        for _ in 0..10 {
+            client.set_frame_info(Slot::Secondary, 640, 480, rgba);
+            client.set_frame_info(Slot::Secondary, 800, 600, rgba);
+        }
+        assert!(!client.frame_backed[1]);
+        assert_eq!(calls() - before, 1, "neither that size nor a larger one is tried again at once");
+        client.set_frame_info(Slot::Secondary, 320, 240, rgba);
+        assert_eq!(calls() - before, 2, "a smaller frame may fit and is tried");
+        // The retry interval passed: tried again, and with space back the frame is backed.
+        TEST_FALLOCATE_ERROR.with(|e| e.set(None));
+        {
+            let mut mappings = MAPPINGS.lock().unwrap();
+            let mapped = mappings.iter_mut().find(|m| m.path == path).unwrap();
+            let (size, at) = mapped.refused[1].unwrap();
+            mapped.refused[1] = Some((size, at - RESERVE_RETRY));
+        }
+        client.set_frame_info(Slot::Secondary, 640, 480, rgba);
+        assert!(client.frame_backed[1], "backed once the space is there");
+        assert!(MAPPINGS.lock().unwrap().iter().find(|m| m.path == path).unwrap().refused[1].is_none());
+    }
+
+    /// The hotkey's toggle flips the switch, and a value only the GUI writes is still read as on/off.
+    #[test]
+    fn the_toggle_flips_the_shared_switch() {
+        let header = neural_forge_protocol::ShmHeader::default();
+        header.enabled.store(1, Ordering::Relaxed);
+        toggle_enabled(&header);
+        assert_eq!(header.enabled.load(Ordering::Relaxed), 0);
+        toggle_enabled(&header);
+        assert_eq!(header.enabled.load(Ordering::Relaxed), 1);
+        header.enabled.store(5, Ordering::Relaxed);
+        toggle_enabled(&header);
+        assert_eq!(header.enabled.load(Ordering::Relaxed), 0, "any non-zero value is on");
     }
 
     #[test]
