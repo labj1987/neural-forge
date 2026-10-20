@@ -4804,12 +4804,13 @@ mod tests {
                 assert!(pass.lanes.is_empty() && pass.resize.is_none(), "no lane or resize pipeline at full size");
                 let graphs = [net.graph()];
                 assert!(if k == 0 { pass.record(device, instance, physical, &net.built, graph, encoded.view, exposure.buffer, None) } else { pass.record_graphs(device, instance, physical, &graphs, encoded.view, exposure.buffer, None) });
-                pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
                 fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, pass.acc.buffer, 0, vk::WHOLE_SIZE, 0));
                 let mut frames = Vec::new();
                 for frame in 0..3u32 {
                     upload_encoded(&fx, &staging, &encoded, pw, ph, &texels);
                     net.write_head(|x, y, c| residual(x, y, c, frame));
+                    // Recorded for each frame, as each hold does: they are one-time-submit buffers.
+                    pass.record_copies(device, encoded.image, encoded.view, region, 2, 1.0).unwrap();
                     let (cmds, later) = if k == 0 { pass.frame_passes(&net.built, frame > 0, Some([0.25, -0.25]), [1.0, 1.0], &passes) } else { pass.frame_graphs(&graphs, frame > 0, Some([0.25, -0.25]), [1.0, 1.0], &passes) };
                     let copies = pass.more.as_ref().unwrap().copies;
                     let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
@@ -4817,6 +4818,10 @@ mod tests {
                     device.queue_wait_idle(gpu.4).unwrap();
                     for cmd in order {
                         pass.submitted(cmd);
+                    }
+                    // The submit took the later pass's new history to GENERAL (the hold clears it the same way).
+                    if let Some(m) = pass.more.as_mut() {
+                        m.fresh[0] = false;
                     }
                     let lanes: Vec<u32> = (0..FW * FH * 16).map(|i| (*net.features.ptr.cast::<f32>().add(i as usize)).to_bits()).collect();
                     frames.push((lanes, read_answer(&fx, &staging, pass.answer(), pw, ph).iter().map(|v| v.to_bits()).collect::<Vec<u32>>()));
