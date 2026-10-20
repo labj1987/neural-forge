@@ -5863,21 +5863,21 @@ impl Session {
     /// Hold resources that a failed submit left without a fence ([`Resources::fence_submitted`]) are
     /// let go of on a device that is not lost: leaked, not destroyed (what went to the queue may still
     /// use them), so the next hold builds new ones and the after-the-upscaler path is not kept waiting
-    /// on them. On a lost device they stay, and nothing holds there again.
+    /// on them. On a lost device they stay, and nothing holds there again. Only the split hold's
+    /// [`Self::res`] has fences: the holds recorded into DLSS's buffers ([`Self::res_inline`],
+    /// [`Self::res_after`]) have no work of their own.
     pub(crate) fn recover_unfenced(&mut self, device: &ash::Device) {
-        for res in [&mut self.res, &mut self.res_after] {
-            if !res.as_ref().is_some_and(|r| r.unfenced) || crate::device_lost(device.handle()) {
-                continue;
-            }
-            crate::log!("[preupscale] hold resources without a fence for their last work are left behind (leaked) and built again");
-            if let Some(old) = res.take() {
-                std::mem::forget(old);
-            }
-            // What they went to the queue with may still read slot 0, which the after-the-upscaler
-            // path writes: it keeps off as long as any wait of the layer's is bounded (on the native
-            // path the network's loader holds it off the same way, `Loader::pre_unfenced`).
-            self.post_held_off_until = Some(Instant::now() + crate::FENCE_WAIT_TIMEOUT);
+        if !self.res.as_ref().is_some_and(|r| r.unfenced) || crate::device_lost(device.handle()) {
+            return;
         }
+        crate::log!("[preupscale] hold resources without a fence for their last work are left behind (leaked) and built again");
+        if let Some(old) = self.res.take() {
+            std::mem::forget(old);
+        }
+        // What they went to the queue with may still read slot 0, which the after-the-upscaler
+        // path writes: it keeps off as long as any wait of the layer's is bounded (on the native
+        // path the network's loader holds it off the same way, `Loader::pre_unfenced`).
+        self.post_held_off_until = Some(Instant::now() + crate::FENCE_WAIT_TIMEOUT);
     }
 
     /// Whether the after-the-upscaler path must leave slot 0 alone this present (see
@@ -5891,14 +5891,6 @@ impl Session {
     pub(crate) fn drain(&mut self, device: &ash::Device) -> bool {
         let mut gpu = None;
         self.res.as_mut().is_none_or(|r| r.wait_idle(device, &mut gpu))
-    }
-
-    /// The resources of the split holds at `stage` ([`Self::res`]; [`Self::res_after`] after DLSS's output).
-    fn res_slot(&mut self, stage: placement::Stage) -> &mut Option<Resources> {
-        match stage {
-            placement::Stage::Upscaled => &mut self.res_after,
-            _ => &mut self.res,
-        }
     }
 
     /// The resources of the holds recorded into DLSS's buffer at `stage`: [`Self::res_inline`] before the
@@ -6003,9 +5995,12 @@ impl Session {
         }
     }
 
-    /// Makes sure the resources of the holds at `stage` ([`Self::res_slot`]) are built for this extent and queue
-    /// family, draining and rebuilding the old ones only when nothing of them is pending. `false` when there is
-    /// nothing usable.
+    /// Makes sure the split hold's resources ([`Self::res`]) are built for this extent and queue family,
+    /// draining and rebuilding the old ones only when nothing of them is pending. `false` when there is
+    /// nothing usable, and for any `stage` but [`placement::Stage::Before`]: the split holds run only before
+    /// the upscaler. After DLSS's output the hold is recorded into DLSS's buffer, with
+    /// [`Self::res_after`]'s fence-less resources, which [`Self::ensure_inline`] destroys without a wait and
+    /// [`Self::drain`] never waits for; fenced resources there could be destroyed while still pending.
     ///
     /// # Safety
     /// As [`Resources::build`].
@@ -6014,16 +6009,19 @@ impl Session {
         &mut self, device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32,
         width: u32, height: u32, shm: &ShmClient, import: bool, stage: placement::Stage,
     ) -> bool {
+        if stage != placement::Stage::Before {
+            return false;
+        }
         self.recover_unfenced(device);
         // Taken out while it is looked at (the cache dump's state is the session's).
-        let mut slot = self.res_slot(stage).take();
+        let mut slot = self.res.take();
         // SAFETY: forwarded.
         let ok = unsafe { self.ensure_in(&mut slot, device, instance, physical_device, queue_family, width, height, shm, import) };
-        *self.res_slot(stage) = slot;
+        self.res = slot;
         ok
     }
 
-    /// [`Self::ensure`] on one stage's resources, `res`.
+    /// [`Self::ensure`] on the split hold's resources, `res`.
     ///
     /// # Safety
     /// As [`Resources::build`].
@@ -9637,6 +9635,11 @@ mod tests {
         // SAFETY: as above.
         assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false, placement::Stage::Before) }, "built again");
         assert!(!session.res.as_ref().unwrap().pending(), "fresh resources");
+        // The split holds run before the upscaler only: no fenced resources are ever built into the
+        // slot of the hold after DLSS's output, which `ensure_inline` destroys without a wait.
+        // SAFETY: as above.
+        assert!(!unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 32, 16, &shm, false, placement::Stage::Upscaled) });
+        assert!(session.res_after.is_none() && session.res.as_ref().unwrap().matches(gpu.family, 16, 8), "nothing built, the split's left alone");
         // SAFETY: nothing submitted.
         unsafe {
             session.destroy(d);
