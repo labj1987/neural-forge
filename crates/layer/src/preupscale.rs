@@ -2366,8 +2366,17 @@ impl Tracker {
                         refs.rr.push(f);
                     }
                 }
+                // The jitter of the first launch carrying one, in recording order.
+                if refs.jitter.is_none() {
+                    refs.jitter = c.jitter;
+                }
                 if c.input.is_some() && c.input == refs.input {
                     refs.output_pair |= c.output_pair;
+                    // The secondary's output kernel follows the input launch it was found after, and
+                    // comes after whatever the primary recorded so far: the last one.
+                    if c.output.is_some() {
+                        refs.output = c.output;
+                    }
                 }
                 for image in c.images {
                     if !refs.images.contains(&image) {
@@ -2382,6 +2391,9 @@ impl Tracker {
             }
             if let Some(hazard) = self.global_sync.get(secondary).copied() {
                 self.global(primary, hazard);
+            }
+            if let Some(inherited) = self.attached.get(secondary).filter(|a| !a.is_empty()).cloned() {
+                self.attached.entry(primary).or_default().extend(inherited);
             }
             if let Some(c) = self.rendering.get(secondary).copied() {
                 let r = self.rendering.entry(primary).or_default();
@@ -8415,6 +8427,41 @@ mod tests {
         }
         assert_eq!((t.named.len(), t.inputs.map(|i| i.rule)), (1, Some(Rule::Params)));
         assert_eq!((t.colour_submits, t.foreign_submits), (30, 60));
+    }
+
+    /// DLSS's launches recorded into a secondary that is executed into the submitted primary: the
+    /// primary carries the secondary's camera jitter, DLSS's output kernel and image, and the colour
+    /// input's attachment layout, beside its input launch. Before, only the input launch carried
+    /// over: the hold ran without jitter, DLSS's output was never learnt, and the layout the
+    /// secondary's rendering left never reached the committed state.
+    #[test]
+    fn a_secondarys_jitter_output_and_attachment_layouts_carry_over_to_its_primary() {
+        let mut t = tracker_with(&gta_registered(), Some((2560, 1440)));
+        assert!(t.refresh().is_some(), "identified by size");
+        let (input, output) = (vk::CuFunctionNVX::from_raw(0x9001), vk::CuFunctionNVX::from_raw(0x9002));
+        t.record_function(input, "hiluma_engine_input_depthinv_mvlo_hdr_v2_rel");
+        t.record_function(output, "hiluma_engine_output_kernel");
+        // Word 3 of a 310.x SR input kernel's parameters is the jitter (x low, y high).
+        let jitter = u64::from((-0.25f32).to_bits()) | (u64::from(0.1667f32.to_bits()) << 32);
+        let (primary, secondary) = (cb(1), cb(11));
+        t.begin(primary);
+        t.begin(secondary);
+        t.attachments(secondary, &[(vk::ImageView::from_raw(0x101), vk::ImageLayout::GENERAL)]);
+        t.launch_kernel(secondary, input, Some(&param_block(&[h(0x100), jitter, h(0x200), h(0x300)])));
+        t.launch_kernel(secondary, output, Some(&param_block(&[h(0x100), h(0x400)])));
+        assert_eq!((t.launch[&secondary].jitter, t.launch[&secondary].output), (Some(jitter), Some((output, img(0x400)))));
+        t.execute(primary, &[secondary]);
+        let refs = &t.launch[&primary];
+        assert_eq!(refs.input, Some(InputLaunch::Inputs { colour: img(0x100), depth: img(0x200), mvec: img(0x300) }));
+        assert_eq!(refs.jitter, Some(jitter), "the secondary's jitter");
+        assert_eq!(refs.output, Some((output, img(0x400))), "the secondary's output kernel and image");
+        assert_eq!(t.attached.get(&primary), Some(&vec![(img(0x100), vk::ImageLayout::GENERAL)]), "the secondary's attachment layout");
+        for n in 0..OUTPUT_SETTLE {
+            let scan = submit(&mut t, &[vec![primary]]).0.expect("launch-bearing");
+            assert_eq!(scan.jitter_px(), Some([-0.25, 0.1667]), "submit {n}");
+            assert_eq!(t.committed.get(&img(0x100)), Some(&vk::ImageLayout::GENERAL), "submit {n}: committed from the primary");
+        }
+        assert_eq!(t.dlss_output.map(|o| (o.function, o.image, o.input)), Some((output, img(0x400), img(0x100))), "DLSS's output is learnt from the primary");
     }
 
     /// The DLAA set (Resident Evil Requiem: `UpscalingQuality_DLSS=MaxQuality`, FG on): DLSS's colour
