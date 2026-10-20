@@ -9068,11 +9068,18 @@ mod tests {
         assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false, placement::Stage::Before) });
         session.res.as_mut().unwrap().unfenced = true;
         assert!(session.res.as_ref().unwrap().pending());
+        // The resources the layer lets go of: kept here so the test can destroy them before the device
+        // (the layer forgets its own copy, `recover_unfenced`, so this one is the only one dropped).
+        // SAFETY: a bitwise copy of a value that is `mem::forget`-ten, never dropped, below.
+        let left_behind = unsafe { std::ptr::read(session.res.as_ref().unwrap()) };
         // SAFETY: as above.
         assert!(unsafe { session.ensure(d, &gpu.instance, gpu.physical, gpu.family, 16, 8, &shm, false, placement::Stage::Before) }, "built again");
         assert!(!session.res.as_ref().unwrap().pending(), "fresh resources");
         // SAFETY: nothing submitted.
-        unsafe { session.destroy(d) };
+        unsafe {
+            session.destroy(d);
+            left_behind.destroy(d);
+        }
     }
 
     fn scratch_shm(tag: &str) -> ShmClient {

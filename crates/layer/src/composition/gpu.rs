@@ -1643,6 +1643,7 @@ mod tests {
         let out = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
         unsafe {
             device.destroy_fence(fence, None);
+            target.destroy(&device);
             gpu.destroy(&device);
             device.destroy_command_pool(pool, None);
             device.destroy_device(None);
@@ -2037,6 +2038,7 @@ mod tests {
             let out = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
             unsafe {
                 device.destroy_fence(fence, None);
+                target.destroy(&device);
                 gpu.destroy(&device);
             }
             out
@@ -2137,6 +2139,7 @@ mod tests {
             let out = read_back_image(&device, &mem_props, queue, pool, target.image, width, height);
             unsafe {
                 device.destroy_fence(fence, None);
+                target.destroy(&device);
                 gpu.destroy(&device);
             }
             out
