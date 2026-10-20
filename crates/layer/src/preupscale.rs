@@ -9470,6 +9470,15 @@ mod tests {
     }
 
     impl Gpu {
+        /// Whether a 2D optimal-tiling `format` image with `usage` can be created here.
+        fn supports(&self, format: vk::Format, usage: vk::ImageUsageFlags) -> bool {
+            // SAFETY: a plain property query on this instance's physical device.
+            unsafe {
+                self.instance.get_physical_device_image_format_properties(self.physical, format, vk::ImageType::TYPE_2D, vk::ImageTiling::OPTIMAL, usage, vk::ImageCreateFlags::empty())
+            }
+            .is_ok()
+        }
+
         fn open(import: bool) -> Option<Self> {
             let (entry, instance, physical, device, queue, family) = if import {
                 crate::composition::gpu::test_device_with_external_memory_host()?
@@ -9647,16 +9656,42 @@ mod tests {
         }
     }
 
-    fn scratch_shm(tag: &str) -> ShmClient {
+    /// A channel over a scratch file, which goes (with its directory) when the test is done with it.
+    struct ScratchShm {
+        shm: ShmClient,
+        dir: std::path::PathBuf,
+    }
+
+    impl std::ops::Deref for ScratchShm {
+        type Target = ShmClient;
+        fn deref(&self) -> &ShmClient {
+            &self.shm
+        }
+    }
+
+    impl std::ops::DerefMut for ScratchShm {
+        fn deref_mut(&mut self) -> &mut ShmClient {
+            &mut self.shm
+        }
+    }
+
+    impl Drop for ScratchShm {
+        fn drop(&mut self) {
+            // The mapping stays valid without its file.
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    fn scratch_shm(tag: &str) -> ScratchShm {
         static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .ancestors()
             .nth(2)
             .unwrap()
-            .join(format!("target/test-scratch/preupscale-{}-{tag}-{}/shm.bin", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
+            .join(format!("target/test-scratch/preupscale-{}-{tag}-{}", std::process::id(), N.fetch_add(1, Ordering::Relaxed)));
         let mut shm = ShmClient::default();
-        assert!(shm.test_open_at(&path.display().to_string()));
-        shm
+        assert!(shm.test_open_at(&dir.join("shm.bin").display().to_string()));
+        ScratchShm { shm, dir }
     }
 
     // ---- The hand-back window. ----
@@ -10397,6 +10432,12 @@ mod tests {
             eprintln!("preupscale depth copy test: no Vulkan device, skipping");
             return;
         };
+        // Asked before anything is created, so a skip leaves nothing behind for the device's destruction.
+        let depth_usage = vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST;
+        if !gpu.supports(vk::Format::D32_SFLOAT_S8_UINT, depth_usage) {
+            eprintln!("preupscale depth copy test: no D32_SFLOAT_S8_UINT image here, skipping");
+            return;
+        }
         let d = &gpu.device;
         let (w, h) = (5u32, 3u32);
         let (image, memory) = gpu.image(w, h);
@@ -10411,12 +10452,9 @@ mod tests {
             .array_layers(1)
             .samples(vk::SampleCountFlags::TYPE_1)
             .tiling(vk::ImageTiling::OPTIMAL)
-            .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+            .usage(depth_usage)
             .initial_layout(vk::ImageLayout::UNDEFINED);
-        let Ok(depth) = (unsafe { d.create_image(&info, None) }) else {
-            eprintln!("preupscale depth copy test: no D32_SFLOAT_S8_UINT image here, skipping");
-            return;
-        };
+        let depth = unsafe { d.create_image(&info, None) }.expect("a D32_SFLOAT_S8_UINT image, which the device supports");
         let reqs = unsafe { d.get_image_memory_requirements(depth) };
         let props = unsafe { gpu.instance.get_physical_device_memory_properties(gpu.physical) };
         let index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
@@ -10511,6 +10549,12 @@ mod tests {
             eprintln!("preupscale dump test: no Vulkan device, skipping");
             return;
         };
+        // Asked before anything is created, so a skip leaves nothing behind for the device's destruction.
+        let depth_format = vk::Format::D32_SFLOAT_S8_UINT;
+        if !gpu.supports(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST) {
+            eprintln!("preupscale dump test: no D32_SFLOAT_S8_UINT image here, skipping");
+            return;
+        }
         let d = &gpu.device;
         let (w, h) = (5u32, 3u32);
         let (image, memory) = gpu.image(w, h);
@@ -10538,11 +10582,7 @@ mod tests {
         let make = |format: vk::Format, usage: vk::ImageUsageFlags| make_sized(format, usage, (w, h));
         let (exp32, exp32_mem) = make_sized(vk::Format::R32G32B32A32_SFLOAT, vk::ImageUsageFlags::STORAGE, (1, 1)).expect("1x1 RGBA32F image");
         let (exp16, exp16_mem) = make_sized(vk::Format::R16_SFLOAT, vk::ImageUsageFlags::SAMPLED, (1, 1)).expect("1x1 R16F image");
-        let depth_format = vk::Format::D32_SFLOAT_S8_UINT;
-        let Some((depth, depth_mem)) = make(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT) else {
-            eprintln!("preupscale dump test: no D32_SFLOAT_S8_UINT image here, skipping");
-            return;
-        };
+        let (depth, depth_mem) = make(depth_format, vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT).expect("a D32_SFLOAT_S8_UINT image, which the device supports");
         let (mvec, mvec_mem) = make(vk::Format::R16G16_SFLOAT, vk::ImageUsageFlags::COLOR_ATTACHMENT).expect("RG16F image");
         let ds_range = aux_range(depth_format);
         let colour_range = aux_range(vk::Format::R16G16_SFLOAT);
