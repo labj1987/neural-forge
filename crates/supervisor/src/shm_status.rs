@@ -59,7 +59,9 @@ pub fn status_text(header: &ShmHeader) -> String {
         match preupscale {
             OFF => "off",
             WAITING => "waiting for DLSS input",
-            HOLDING => "holding",
+            HOLDING => "holding before the upscaler",
+            HOLDING_AFTER => "holding after DLSS",
+            HOLDING_BOTH => "holding before the upscaler and after DLSS",
             _ => "unknown",
         }
     }));

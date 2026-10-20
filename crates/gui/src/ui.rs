@@ -2549,11 +2549,13 @@ fn finding_row(finding: &neural_forge_supervisor::doctor::Finding) -> adw::Actio
 /// (`neural_forge_protocol::enums::preupscale_state`). `layer_active`: the layer's heartbeat is
 /// fresh; otherwise the fields are a closed game's leftovers.
 fn preupscale_label(layer_active: bool, state: u32, width: u32, height: u32, misses: u32) -> String {
-    use neural_forge_protocol::enums::preupscale_state::{HOLDING, WAITING};
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH, WAITING};
     let missed = if misses == 0 { String::new() } else { format!(", {misses} frame{} missed", if misses == 1 { "" } else { "s" }) };
     match state {
         _ if !layer_active => "no game running".to_string(),
         HOLDING => format!("before the upscaler: holding DLSS's {width}x{height} input{missed}"),
+        HOLDING_AFTER => format!("after DLSS, before the HUD: holding DLSS's {width}x{height} output{missed}"),
+        HOLDING_BOTH => format!("before the upscaler and after DLSS, before the HUD{missed}"),
         WAITING => format!("after the upscaler: waiting for DLSS Super Resolution{missed}"),
         _ => "after the upscaler".to_string(),
     }
@@ -2598,6 +2600,8 @@ mod preupscale_label_tests {
         assert_eq!(preupscale_label(true, 2, 1485, 836, 0), "before the upscaler: holding DLSS's 1485x836 input");
         assert_eq!(preupscale_label(true, 2, 1485, 836, 1), "before the upscaler: holding DLSS's 1485x836 input, 1 frame missed");
         assert_eq!(preupscale_label(true, 1, 1485, 836, 85), "after the upscaler: waiting for DLSS Super Resolution, 85 frames missed");
+        assert_eq!(preupscale_label(true, 3, 2560, 1440, 0), "after DLSS, before the HUD: holding DLSS's 2560x1440 output");
+        assert_eq!(preupscale_label(true, 4, 2560, 1440, 2), "before the upscaler and after DLSS, before the HUD, 2 frames missed");
     }
 }
 

@@ -5814,7 +5814,7 @@ impl Session {
             shm.publish_cache(s.refresh_holds, s.cached_holds, s.last_rejected, gpu);
             shm.publish_scene_cuts(s.scene_cuts);
         }
-        shm.publish_preupscale_state(if holding { neural_forge_protocol::enums::preupscale_state::HOLDING } else { neural_forge_protocol::enums::preupscale_state::WAITING }, self.last_hold_native, extent.0, extent.1);
+        shm.publish_preupscale_state(hold_state(holding), self.last_hold_native, extent.0, extent.1);
         if held && s.holds.is_multiple_of(SUMMARY_EVERY) {
             let (pw, ph) = padded(extent.0, extent.1);
             // The window's rate: frames the model ran on before the upscaler (the post path's
@@ -5991,7 +5991,7 @@ impl Session {
     /// The header state for a present: holding when a hold happened within [`RECENT`].
     pub(crate) fn publish_status(&self, shm: &ShmClient, extent: Option<(u32, u32)>) {
         let (w, h) = extent.unwrap_or((0, 0));
-        shm.publish_preupscale_state(if self.holding() { neural_forge_protocol::enums::preupscale_state::HOLDING } else { neural_forge_protocol::enums::preupscale_state::WAITING }, self.last_hold_native, w, h);
+        shm.publish_preupscale_state(hold_state(self.holding()), self.last_hold_native, w, h);
     }
 }
 
@@ -6047,6 +6047,30 @@ static AFTER_DLSS_AT: Mutex<Option<Instant>> = Mutex::new(None);
 /// take them ([`post_serves`]).
 pub(crate) fn note_after_dlss() {
     *lock(&AFTER_DLSS_AT) = Some(Instant::now());
+}
+
+/// The header's `preupscale_state` for a device that is `holding` or not: where its holds are, from the
+/// passes' placements and whether holds after DLSS are being recorded (within
+/// [`RAY_RECONSTRUCTION_HAND_BACK`]).
+fn hold_state(holding: bool) -> u32 {
+    if !holding {
+        return neural_forge_protocol::enums::preupscale_state::WAITING;
+    }
+    let now = Instant::now();
+    let after = lock(&AFTER_DLSS_AT).is_some_and(|at| now.saturating_duration_since(at) < RAY_RECONSTRUCTION_HAND_BACK);
+    let (count, settings) = placement::settings();
+    let plan = placement::Plan::of(count, &settings, placement::Frame { rr: ray_reconstruction_running(now), output: after, hook: true });
+    hold_state_of(plan.has(placement::Stage::Before), after && plan.has(placement::Stage::Upscaled))
+}
+
+/// [`hold_state`] for a device holding with passes `before` the upscaler and/or `after` DLSS.
+fn hold_state_of(before: bool, after: bool) -> u32 {
+    use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH};
+    match (before, after) {
+        (true, true) => HOLDING_BOTH,
+        (false, true) => HOLDING_AFTER,
+        _ => HOLDING,
+    }
 }
 
 /// Whether the after-the-upscaler path serves the frames while a device holds them ([`placement`]): every
@@ -8722,6 +8746,15 @@ mod tests {
     /// A hold after DLSS's output that is refused (its point or its recording) eight times in a row makes the
     /// output count as not learnable for [`AFTER_RETRY`], so the passes placed there go where `auto` runs them
     /// meanwhile; then it is tried again. A hold recorded starts the count over and ends a refusal.
+    #[test]
+    fn the_hold_state_says_where_the_holds_are() {
+        use neural_forge_protocol::enums::preupscale_state::{HOLDING, HOLDING_AFTER, HOLDING_BOTH};
+        assert_eq!(hold_state_of(true, false), HOLDING);
+        assert_eq!(hold_state_of(false, true), HOLDING_AFTER);
+        assert_eq!(hold_state_of(true, true), HOLDING_BOTH);
+        assert_eq!(hold_state_of(false, false), HOLDING, "a hold the plan does not explain stays before the upscaler");
+    }
+
     #[test]
     fn a_hold_after_dlss_that_keeps_missing_gives_its_passes_back_for_a_while() {
         let mut t = Tracker::default();

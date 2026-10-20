@@ -14,6 +14,11 @@ pub mod preupscale_state {
     pub const WAITING: u32 = 1;
     /// Holding DLSS's input: the model runs before the upscaler.
     pub const HOLDING: u32 = 2;
+    /// Holding DLSS's output: the model runs after DLSS, before the HUD (the `upscaled` placement, or
+    /// `auto` with Ray Reconstruction).
+    pub const HOLDING_AFTER: u32 = 3;
+    /// Holding both: some passes run before the upscaler and the rest after DLSS.
+    pub const HOLDING_BOTH: u32 = 4;
 }
 
 /// Which of the networks `extract-model` writes the layer runs (`ShmHeader::network`, the Network
