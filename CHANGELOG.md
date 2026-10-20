@@ -4,6 +4,17 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.1 — 2026-10-20
+
+- **Games that render their frame inside DLSS's own work** (Crimson Desert, Cyberpunk 2077, Black Myth:
+  Wukong, some of Hogwarts Legacy's frames): the model now runs inside that work, where DLSS reads its
+  frame, instead of pausing it while the model ran on a queue of Neural Forge's own and the CPU let it
+  go on. That way of working was not allowed by the Vulkan specification and depended on how a driver
+  handles it; the game's device no longer gets an extra queue from Neural Forge either. Right after you
+  change a model setting in such a game, a frame or two go to the upscaler without the model while the
+  frames the game had already prepared finish.
+- Fixes a Vulkan validity error with the model on the finished frame (after the upscaler).
+
 ## 3.8.0 — 2026-10-19
 
 - **With DLSS Ray Reconstruction on, the model now runs right after DLSS**, on its denoised, upscaled frame

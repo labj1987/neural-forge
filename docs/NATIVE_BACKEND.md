@@ -342,7 +342,12 @@ missing requirement.
   previous hold's `W` fence (which covers `C` and `N`, submitted before it on the same queue).
 - **One network frame in flight**: activations, chain counters and the status word are single
   instances; frames on one queue in submission order never overlap, and the previous hold's work is
-  complete before parameters for the same parity are written.
+  complete before parameters for the same parity are written. Inside DLSS's command buffer (3.8.1) the
+  hold is recorded into that buffer instead, the parameters with it (`vkCmdUpdateBuffer`), so buffers
+  recorded ahead each carry their own; the network's graph is recorded straight into the buffer with
+  descriptor sets from that buffer's slot (`nf_native_record_graph_at`), and the build is not rebuilt
+  while a buffer recorded with it may still run (PRE_UPSCALER_DESIGN.md, "The hold inside DLSS's
+  command buffer").
 - **The network's functions** are loaded through the next layer's `vkGetInstanceProcAddr`, so its calls
   never pass through this layer; its queue and command buffers get the loader's dispatch pointer
   (`loader_data::initialize_object`).
@@ -609,6 +614,11 @@ need the helper, so whether Phase 5 removes it is still his call. Then: "port th
 should work on the native backend when everything is said and done" (Phase 4b).
 
 ## Phase 4b: the hold inside DLSS's command buffer
+
+> Since 3.8.1 the hold inside DLSS's buffer no longer waits on an event the host sets, and no longer
+> runs on a queue of the layer's: the whole hold, the network's graph included, is recorded into DLSS's
+> buffer as it is recorded, on the game's graphics family (PRE_UPSCALER_DESIGN.md, "The hold inside
+> DLSS's command buffer"). What follows is the 3.0 design it replaced, kept for its measurements.
 
 Games that render their frame in DLSS's own command buffer (Crimson Desert, Cyberpunk 2077, Black Myth:
 Wukong) are held inside that buffer (PRE_UPSCALER_DESIGN.md, "Inside DLSS's command buffer"): the buffer

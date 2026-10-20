@@ -380,16 +380,25 @@ pre-upscaler path while a timed-out after-the-upscaler frame's is). The native h
 the layer's image: nothing is copied into slot 0, the after-the-upscaler path's.
 
 **Inside DLSS's command buffer** (`preupscale/inline.rs`). Some games record their frame and DLSS
-in one command buffer (Crimson Desert), so there is no submit to split. There the layer records into
-DLSS's buffer, at the input kernel's launch, a copy of the colour input (and the motion vectors) to
-a staging image and a wait on an event; at the submit its worker thread runs the same `C`/`N`/`W` on
-the layer's own compute queue, then sets the event, and DLSS continues on the enhanced input. The
-network's launches there are separated by barriers instead of counter chaining (chaining faulted the
-GPU in Black Myth: Wukong; NATIVE_BACKEND.md, Phase 4b). Nothing is recorded into a secondary
-command buffer (only submitted primaries become jobs), into a buffer of a pool of another queue
-family than DLSS's graphics one (`vkCreateCommandPool` tells the family), or while the model is
-switched off; a slot is free again only once its buffer is re-recorded, reset or freed or its pool
-reset or destroyed.
+in one command buffer (Crimson Desert), so there is no submit to split. There the layer records the
+whole hold into DLSS's buffer as it is recorded, at the input kernel's launch (or right after DLSS's
+output kernel for the passes placed after DLSS): the colour input (and its motion vectors, exposure and
+depth) copied to staging images, the same `C`/`N`/`W` as the split hold with the network's graph
+recorded straight into the buffer, the staging image copied back, and the application's compute
+state (pipeline, descriptor sets or descriptor-buffer offsets, push constants) bound again
+(`preupscale/restore.rs`), since vkd3d-proton does not bind it again itself. Nothing waits on the host
+and nothing runs on another queue; DLSS continues on the enhanced input in the same buffer. Per-hold
+data the split hold writes from the host is written in the buffer; a guard dispatch checks on the GPU
+that the hold recorded before ran right before, and otherwise drops the history and the edit cache's
+stored edit, so buffers recorded ahead, recorded again or never submitted cost a history, never a wrong
+frame; nothing those holds use is rewritten or rebuilt while one may still run. The network's launches
+there are separated by barriers instead of counter chaining (chaining faulted the GPU in Black Myth:
+Wukong; NATIVE_BACKEND.md, Phase 4b). Nothing is recorded into a secondary command buffer, into a buffer
+of a pool of another queue family than DLSS's graphics one (`vkCreateCommandPool` tells the family),
+into one recorded for simultaneous use or whose compute state cannot be put back, or while the model is
+switched off; a slot is free again (and its hold's timestamps and counters read) only once its buffer is
+re-recorded, reset or freed or its pool reset or destroyed. PRE_UPSCALER_DESIGN.md, "The hold inside
+DLSS's command buffer", has the details.
 
 ### 4.6 The HDR encode and decode
 
@@ -474,8 +483,8 @@ a barrier on both says where they are, and the split hold copies only from the l
 alternates two depth images frame by frame and copies the frame's one into a ring of three that
 DLSS reads, inside the launch buffer: the identified image held the previous frame's depth on every
 other hold, and the ring's image is written after the hold. The split hold copies the chosen
-image's depth aspect; the hold inside DLSS's buffer copies it into a slot buffer there (in a layout
-`depth_copy_layout` takes) and `C` on the side queue copies that over. The texels stay raw, tagged
+image's depth aspect; the hold inside DLSS's buffer copies it into its staging buffer there (in a
+layout `depth_copy_layout` takes) and its `C`, in the same buffer, copies that over. The texels stay raw, tagged
 with the game's format: 4 bytes (D32, D24 with its top byte, depth handed over as R32), or 2 for D16.
 A barrier on that image in front of the launch that may follow a write (a layout transition, an
 ownership transfer, a write in its source access; `Scan::depth_hazard`) leaves that hold without
@@ -495,7 +504,8 @@ file `dump-cache` next to the channel (`/tmp/neural-forge-$UID/dump-cache`, hold
 armed hold only adds copies: the colour input before the model in `C`, and in `W` after the decode
 the colour input (the answer written back), the motion vectors and the depth copy, into host
 readbacks built for the dump and freed after it. They are read once the hold's `W` fence was waited
-on (the next hold on the split path, right after the worker's wait inside DLSS's buffer). A hold
+on (the next hold on the split path; inside DLSS's buffer, once that buffer is released after it ran,
+from readbacks of the slot's own). A hold
 that misses, or a DLSS frame between two armed holds that went unheld, ends the dump there. At most 8
 holds wait for the writer; a hold waits up to 2 s for it beyond that, then the dump ends. With the
 edit cache off a dump has no depth.
@@ -733,8 +743,8 @@ by `build.rs`), `crates/layer/src/preupscale/native.rs` (the loader, the per-dev
   the PTX, and the graph's recording for the frame's extent (0.73-1.15 s at 1485x836), on a loader
   thread and the layer's compute queue, never the game's graphics queue (a graphics-family queue
   faulted the game's channel).
-- **Every frame** runs on the game's queue inside its DLSS submit (4.5), or on the layer's compute
-  queue (inside DLSS's buffer, and the model server).
+- **Every frame** runs on the game's queue inside its DLSS submit (4.5), inside DLSS's own command
+  buffer (recorded into it), or on the layer's compute queue (the after-the-upscaler path).
 - **Which network**: the one the `network` setting chooses (`model/full` or `model/small` under the
   model directory); when it is not extracted, the other one, with a log line saying so.
 - **Switching the network**: a hold (or a post-path request) passes the setting to `Loader::ready`,

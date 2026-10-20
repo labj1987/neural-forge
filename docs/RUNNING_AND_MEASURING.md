@@ -327,22 +327,19 @@ Set in the game's launch environment (for `gta-bench.sh`, as extra arguments):
   (the graph is rebuilt with barriers, the history reset).
 - `NEURAL_FORGE_NATIVE_SKIP_GRAPH=1`: record everything but the network's launches.
 
-### The hold inside DLSS's command buffer (2.0.4)
+### The hold inside DLSS's command buffer (2.0.4; recorded into it since 3.8.1)
 
-Where DLSS's buffer renders its own input (Crimson Desert, Cyberpunk 2077) the hold runs inside the
-buffer, with its work on a queue the layer adds in a compute-only family (PRE_UPSCALER_DESIGN.md,
-"The hold inside DLSS's command buffer"). Its lines: `hold inside DLSS's command buffer available:
-side queue in family N, DLSS's in M` per device, then `holding inside DLSS's command buffer ...` once;
-the 300-hold summaries are the ordinary ones. `NEURAL_FORGE_INLINE=off` turns it off;
-`NEURAL_FORGE_INLINE=release` records it but releases every hold at once without running it (to tell
-a fault in the recorded commands from one in the side queue's work).
-
-`crates/layer/examples/queue_wait_probe.rs` measures, natively, whether each candidate queue finishes
-work while queue (0, 0) waits on a host-set event. The two-queue GPU test
-(`a_hold_inside_the_buffer_runs_on_the_side_queue_and_writes_back_through_the_staging_image`) skips on
-a device with one queue (lavapipe); on the test machine run the release test binary with
-`NEURAL_FORGE_TEST_IMPORT=0` (with host-memory imports in that process, later device allocations
-fail there).
+Where DLSS's buffer renders its own input (Crimson Desert, Cyberpunk 2077) the whole hold is recorded
+into that buffer as the game records it (PRE_UPSCALER_DESIGN.md, "The hold inside DLSS's command
+buffer"). Its lines: `hold inside DLSS's command buffer available: recorded into it, on family N` per
+device, `noting the application's compute state from here on ...` at the first hold point (that
+buffer, begun before, is not held), then `holding inside DLSS's command buffer ...` once; every 5 s `inside DLSS's buffer, last
+5.0 s: held N, ran M, ...` (holds recorded, holds whose buffers ran, and each reason a hold point got
+none, such as `waiting for the holds recorded in DLSS's buffers ...` while a change waits for the
+buffers recorded before it); the 300-hold summaries are the ordinary ones, with `hold_ms` the CPU time
+of recording the hold on the game's thread and the GPU times read back from each buffer once it ran.
+A buffer whose compute state the layer cannot put back is not held (`a DLSS buffer is not held inside:
+its compute state cannot be put back ...`, once). `NEURAL_FORGE_INLINE=off` turns it off.
 
 ## 6. Reading the logs
 

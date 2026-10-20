@@ -119,10 +119,6 @@ jobs:
       - name: cargo test under the Vulkan validation layer
         env:
           VK_INSTANCE_LAYERS: VK_LAYER_KHRONOS_validation
-          # TEMPORARY: the one known violation, being fixed: the hold inside DLSS's command buffer
-          # waits on an event the host sets after the buffer is submitted (docs/PRE_UPSCALER_DESIGN.md,
-          # "Not valid Vulkan: the release set from the host"). Remove this filter with the redesign.
-          VK_LAYER_MESSAGE_ID_FILTER: VUID-vkSetEvent-event-09543
         run: |
           settings="$RUNNER_TEMP/vk_layer_settings.txt"
           printf '%s\n' \

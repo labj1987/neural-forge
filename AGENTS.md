@@ -41,7 +41,7 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   OpenDLSS-NR is not vendored: change it through a patch there (UPSTREAM.md lists each with its reason).
 - CI (`.github/workflows/check.yml`, run by ci.yml on every push and pull request and by release.yml
   on a tag) runs the tests, the layer's tests again under the Khronos validation layer (which must
-  report nothing; one known violation is filtered until it is fixed), clippy, every script's
+  report nothing, with nothing filtered), clippy, every script's
   self-test, the shader check, the AppImage build and its installed-layer smoke test. A new script with a self-test is added there. The weekly pin check
   (`scripts/check_pins.py`, pin-check.yml) keeps one issue about pins behind upstream; it must never
   comment or open more than that one (each notification is an email).
@@ -136,7 +136,8 @@ DLSS's registered colour input, holds the game's DLSS submit, runs the network o
 render-resolution frame (every frame while the camera is still, every second frame in motion with the
 edit cache carrying it between; with DLSS's motion vectors and the jitter for the history) and
 writes the answer back before DLSS runs. Games that record their frame in DLSS's own command buffer
-are held inside it (`preupscale/inline.rs`, on the layer's side compute queue). The colour input is
+are held inside it: the whole hold is recorded into that buffer, and the application's compute state
+is bound again after it (`preupscale/inline.rs`, `preupscale/restore.rs`). The colour input is
 what DLSS's own input kernel's parameters name with depth and motion vectors (which also finds DLAA's
 output-size input), with the older size rule as the fallback (docs/PRE_UPSCALER_DESIGN.md,
 "Identification by the input kernel's parameters (DLAA)"). DLSS Ray

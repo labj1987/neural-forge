@@ -1061,7 +1061,7 @@ write barriers before its first launch and is refused the same way.
 | Hold recorded, released at once, no work on the side queue (`NEURAL_FORGE_INLINE=release`) | no Xid: the recorded copies, events and wait are fine |
 | Family 2 (compute only), staged, exposure copied in the buffer | **every frame held, 0 misses, no Xid, no fence timeout** |
 
-A native probe (`examples/queue_wait_probe.rs`, RTX 5070) shows a second queue of family 0 and a
+A native probe (`examples/queue_wait_probe.rs`, removed in 3.8.1 with the side queue, RTX 5070) shows a second queue of family 0 and a
 family-2 queue both finish work in 0.1-0.2 ms while queue (0,0) waits on a host event; the fault
 needs the game's buffer (CUDA launches in flight) on the parked queue. The two-queue GPU test
 (`a_hold_inside_the_buffer_runs_on_the_side_queue_and_writes_back_through_the_staging_image`) passes on

@@ -378,7 +378,7 @@ only the head. For that the layer issues every `vkQueueSubmit`/`vkQueueSubmit2` 
 itself (the framework's own forwarding gives a hook no result), and the render tap's source layouts
 (`TapTracker`) follow the same rule.
 
-### The hold inside DLSS's command buffer (2.0.4)
+### The hold inside DLSS's command buffer (2.0.4; recorded into it since 3.8.1)
 
 **Why.** The split above runs the model in front of DLSS's launch buffer, which is only correct when
 the buffer does nothing to the colour input before DLSS reads it. The NGX probe on 2026-10-05:
@@ -392,55 +392,124 @@ the buffer does nothing to the colour input before DLSS reads it. The NGX probe 
   it (`global memory barrier with a write in its source access before its launch`).
 - Cyberpunk 2077: 2 dispatches and 6 write barriers before the first launch; refused the same way.
 
-**How.** At record time, in `vkCmdCuLaunchKernelNVX`, when the launch is the buffer's first to name a
-colour candidate and the split would be refused there (`Tracker::inline_point`), the layer records
-into the application's buffer, right before that launch:
+**How (3.8.1).** At record time, in `vkCmdCuLaunchKernelNVX`, when the launch is the buffer's first to
+name a colour candidate and the split would be refused there (`Tracker::inline_point`), the layer
+records the whole hold into the application's buffer, right before that launch (and the hold after
+DLSS's output, `placement`, right after DLSS's output kernel). Nothing of it waits on the host and
+nothing runs on another queue: the hold is part of DLSS's buffer, and the GPU runs it when it gets
+there, in the buffer's order. In the buffer, in order (`preupscale/inline.rs`, `native::run_native_hold`
+with `Sink::Buffer`):
 
-1. a barrier (everything written so far, to transfer; the staging image `UNDEFINED -> GENERAL`),
-2. a copy of the colour input (`GENERAL`) into a layer-owned staging image of its size,
-3. a barrier publishing the copy, then `vkCmdSetEvent(captured)`,
-4. `vkCmdWaitEvents(release)` from the host stage, with a memory barrier from host and memory writes,
-5. the copy of the staging image back over the colour input, a barrier to everything after,
-6. `vkCmdResetEvent` of both events.
+1. the copies in (`inline::record_copy_in`): a barrier from everything written before, the colour input
+   copied (an R11G11B10 one blitted) into the stage's RGBA16F staging image, and beside it DLSS's 1x1
+   exposure input, its motion vectors (blitted down, `NEAREST`, where they are at the output's extent)
+   and its depth aspect, each read in place or moved to a transfer layout and back;
+2. a timestamp, the hold guard (below), and what the split hold writes from the host before it
+   submits, written in the buffer instead (`vkCmdFillBuffer`, `vkCmdUpdateBuffer`): the exposure buffer
+   cleared, the edit cache's counters cleared, the auto-exposure's state reset for a new
+   identification, and each pass's parameters (`native::Params`: the seed, the history flag, the
+   parity, the jitter's step, the conditioning);
+3. the capture `C` as the split hold records it (`record_capture`, into the buffer): the depth copy,
+   the exposure copy or the auto-exposure, the HDR encode, the scene-cut detector, the edit cache's
+   motion pass; a timestamp;
+4. on a network frame, `N` for each pass (`NativePass::record_frame_inline`): the reduce below the
+   render extent, the control mask, the preprocess, the network itself, the composite, the enlarge,
+   the colour of the edit, and with more than one pass the copies between them (`X`, `Y`, `R`); a
+   timestamp. The network is recorded straight into the buffer
+   (`nf_native_record_graph_at`, the build's graph for that size with descriptor sets from the slot's
+   own pool), not executed as the split hold's secondary: `vkCmdExecuteCommands` leaves every state of
+   the primary undefined, graphics included;
+5. the write-back `W` (`record_writeback`, or `record_cached_writeback` on a cached hold), decoding into
+   the staging image;
+6. the counters, the scene cut's result, the exposure and the auto-exposure's state copied into the
+   slot's readback buffer, and a barrier to the host;
+7. a timestamp, and the copy back (`inline::record_copy_back`): the staging image over the colour input,
+   in its layout, then a barrier to everything after it: DLSS's launch first;
+8. the application's compute state bound again (`preupscale/restore.rs`, below).
 
-Only copies, barriers and event commands: nothing binds pipelines, descriptors or push constants,
-so the application's (vkd3d-proton's) cached command-buffer state stays valid. The colour input must
-be RGBA16F with `TRANSFER_SRC | TRANSFER_DST`, in `GENERAL` there, and no render pass instance may
-be suspended at that point; otherwise nothing is recorded. A buffer recorded with
-`SIMULTANEOUS_USE` gets nothing (one execution at a time per staging slot).
+Everything that can fail (building the resources and pipelines, the network not ready, a descriptor
+set that would have to change, below) is decided before the first command: a hold that cannot run
+records nothing, and the frame goes to DLSS untouched. Only the network's own recording can fail
+half way (`nf_native_record_graph_at` throws); then the write-back is not recorded, the staging image
+goes back as it was copied, and the history and the stored edit start afresh.
 
-At the submit, each accepted submission's buffers that carry a hold become jobs for the device's
-worker thread, in order. The worker waits (bounded by `FRAME_CAPTURE_WAIT`) for `captured`, then runs
-the ordinary hold, `run_hold`, with the staging image as the colour input, on the layer's own queue,
-waits for the write-back, and sets `release`. It always sets `release`: a hold that did not run,
-missed its budget or failed leaves the staging image as the buffer copied it, so the copy back
-changes nothing and DLSS gets the frame untouched. The device state is only try-locked (20 ms): a
-present that holds it may itself be waiting on the GPU, which is waiting on the hold.
+**The application's state (`restore.rs`).** The hold's dispatches bind the layer's compute pipelines
+and descriptor sets and push its constants; vkd3d-proton caches what it bound and does not bind it
+again before its next dispatch. So, per command buffer from `vkBeginCommandBuffer` on, the layer notes
+what the application binds for compute and binds it again after the hold, in the order the
+application did (which reproduces what a later call disturbed): the compute pipeline or compute
+shader object (`vkCmdBindShadersEXT`), the compute bind point's descriptor sets with their dynamic
+offsets, push descriptors (deep copied; the template form with the template's data, sized from its
+`vkCreateDescriptorUpdateTemplate`), descriptor-buffer offsets and embedded samplers (descriptor sets
+and descriptor-buffer offsets invalidate each other, so a call of one kind drops the other's), the
+descriptor buffers `vkCmdBindDescriptorBuffersEXT` bound last (kept bound across descriptor sets by the
+specification, unbound by them in the validation layer's model, so bound again before the offsets that
+use them), and every push that includes the compute stage, with its own layout (values are per stage;
+a later push covering an earlier one's stages and bytes replaces it). The `2` forms of these commands
+(VK_KHR_maintenance6) and the core 1.4 names the pinned framework does not know are wrapped through
+`vkGetDeviceProcAddr`. Graphics state is not touched: the hold records no draw, binds nothing to the
+graphics bind point and sets no dynamic state. `vkCmdExecuteCommands` makes everything undefined, so
+tracking starts over. Nothing is noted until the device first reaches a hold point inside DLSS's buffer
+(GTA V's buffers, which the split takes, never do, so its binds cost a flag test), and only buffers begun
+after that are held in. A buffer whose state cannot be repeated (a structure in a chain the layer does
+not copy, a push without a layout, conditional rendering active at the hold) is not held.
 
-**The layer's queue.** `vkCreateDevice` gets one more queue in a compute family without graphics
-(NVIDIA's family 2): the application's request for that family is extended by one when it has a queue
-to spare and is a plain one, or a one-queue request is added. A creation with it that the driver
-refuses is repeated without (then nothing is held inside buffers). The queue gets the loader's
-dispatch data (`loader_data::initialize_queue`). Not the game's graphics family: there, the hold's
-compute work while DLSS's buffer waited faulted the game's channel (Xid 69, class `cec0`, offset
-`1b0c`, Crimson Desert, 2026-10-05; with the hold recorded but released at once there was none, and a
-native probe with a plain parked buffer showed no fault, so it takes the game's buffer in flight).
-The staging image and a 1x1 copy of DLSS's exposure input (made in the buffer beside the colour copy,
-when the exposure input is readable in `GENERAL` or `TRANSFER_SRC_OPTIMAL`) are created with
-`CONCURRENT` sharing across the game's graphics family and the layer's; the layer's queue never
-touches the game's images. The hold's buffers are staged, never imported from the shared memory (with
-imports, no capture finished in Crimson Desert). A buffer submitted on a queue of another family than
-the game's graphics family is only released.
+**Several buffers ahead.** DLSS's buffers can be recorded before the first of them runs, recorded
+again or never submitted. What the CPU decides per hold is decided when it is recorded, in recording
+order, as the split hold decides it in submission order: the network frame's parity, the seed, the
+history flag, the jitter's step, the edit cache's plan (refresh or cached). Per-hold data the split
+hold writes from the host is recorded into the buffer (step 2), so a buffer recorded ahead carries
+its own and a later recording cannot overwrite it before it runs. Whether the plan still holds when
+the buffer runs is checked on the GPU, not guessed on the CPU: the hold guard
+(`preupscale_hold_guard.comp`, step 2) compares the sequence number of the last hold that ran on these
+resources (`last`, the native pass's state buffer's fourth word) with this hold's minus one. When the
+hold before this one in recording order did not run right before it (the first hold, a buffer recorded
+again or never submitted, buffers run out of their recorded order), it clears what this hold would
+carry from the holds before: the network's history (both frames' `ok` flags: the frame shaders then
+run without history, as after a reset) and the edit cache's stored edit (`STAT_EDIT_STORED`, which a
+refresh's capture sets and a cached hold's apply requires; without it the cached hold writes nothing).
+That costs the history for a frame, never a frame built on a history, an edit or a motion chain that
+did not run. The alternative, copying the history back into one image at the end of every hold so no
+parity is needed, would cost a copy every frame and still not cover the edit cache's chain or the seed.
+The native pass's initialisation (its state cleared, its history images to `GENERAL`) is not recorded
+into the buffers: it is submitted once, on the same queue, in front of the first submission that
+carries a hold of that pass (`Inline::prologue`), where submission order is the order it runs in.
 
-**Slots.** Up to 8 staging images with their event pairs, one per buffer recorded with a hold and not
-yet re-recorded (`vkBeginCommandBuffer` and `vkFreeCommandBuffers` free them; a slot unsubmitted for
-10 s is taken back). Teardown stops the worker first (jobs left are released at once), joins it,
-waits the device idle and frees the slots, before the device's other resources.
+**Nothing they use changes while they may run.** A recorded buffer keeps the descriptor sets it bound
+and the buffers it reads: writing such a set invalidates the buffer, and destroying a buffer it reads
+is invalid. While holds recorded with a stage's resources may still run, a hold whose recording would
+change any of them (a descriptor set written again, the look-up table, a pass rebuilt for another
+model resolution, the resources rebuilt for another extent) records nothing (`may_rewrite`, `Frozen`;
+"waiting for the holds recorded in DLSS's buffers ..."), and the change is made at the first hold
+recorded once they are done, normally a frame or two later. Every bind skips a write that changes
+nothing. The network's build is kept the same way: while any hold may run, the loader does not rebuild
+it (another size or network, the fallback to barriers) and the after-the-upscaler path does not take it
+(`Loader::holds`). The resources of the holds inside DLSS's buffer are their own (`Session::res_inline`
+before the upscaler, `res_after` after DLSS's output): no fences, no timers of the passes', the guard.
+
+**Slots.** Up to 8 per device, one per buffer recorded with a hold whose hold may still run. A slot is
+free again only once its buffer cannot run unchanged any more: re-recorded (`vkBeginCommandBuffer`),
+reset, freed, or its pool reset or destroyed (each reaches the layer, and Vulkan forbids each while the
+buffer is pending; never by time). Each slot has a timestamp pool (4 queries), a 256-byte host-visible
+readback buffer, the network's descriptor pool for this buffer (`nf_native_record_graph_at`'s hold
+slot), and a cache dump's readbacks when an armed hold was recorded into it. When the slot is freed and
+its buffer was submitted, its hold has run: its readings are taken then (`Inline::release`, `Harvest`)
+and applied at the next hold (`Session::harvest`): the GPU times (capture, network, write-back), the edit
+cache's counters (its regime, the depth's convention, a refresh whose exposure was unusable), the
+scene cut, the game's exposure for the exposure checks, the auto-exposure's state, a cache dump's frame.
+The staging images are per stage, built for the colour input's extent, and built again for another one
+only once no hold of the stage may run. Teardown waits for the device to go idle, then frees the slots
+and staging images, before the device's other resources.
+
+**Queues.** DLSS's buffers with a hold run on the game's graphics queue, one after another, sharing
+the stage's resources. A buffer of a pool of another family is not held; and once buffers with a
+hold are submitted on two different queues, no more holds are recorded (logged once): their work
+would overlap.
 
 **Other formats and layouts (2.0.6).** The colour input may be RGBA16F or `B10G11R11_UFLOAT` (Unreal
 Engine 5 hands DLSS a sampled R11G11B10 image), in `GENERAL`, `SHADER_READ_ONLY_OPTIMAL`,
 `COLOR_ATTACHMENT_OPTIMAL` or a transfer layout, known from the buffer's barriers or the committed
-state. Outside `GENERAL` it is moved to `TRANSFER_SRC_OPTIMAL` for the capture, to
+state. Outside `GENERAL` it is moved to `TRANSFER_SRC_OPTIMAL` for the copy in, to
 `TRANSFER_DST_OPTIMAL` for the copy back and back to its layout; an R11G11B10 input is blitted
 (`NEAREST`, same extent) to the RGBA16F staging image and back, when the device can blit both
 formats. Such inputs are held here even with nothing in the buffer before the launch
@@ -450,28 +519,31 @@ formats. Such inputs are held here even with nothing in the buffer before the la
 identification (`Tracker::inline_recorded`), a buffer the split could take is held inside too
 (`Hazard::HeldInside`). Hogwarts Legacy refuses the split for some of its DLSS buffers (a memory or
 same-layout barrier before the launch) and not others; holding the rest at the split alternated the
-two holds frame by frame, and each switch drained and rebuilt the hold's resources (the split's on
-DLSS's queue family, the hold inside's on the side queue's), and with them the native network's
-pipelines and history: 114 rebuilds in a minute at the title screen, 2 with the rule (2026-10-09).
-A new identification starts over, so GTA V's buffers, which the split always takes, never get one.
+two holds frame by frame, and each switch drained and rebuilt the hold's resources, and with them the
+native network's pipelines and history: 114 rebuilds in a minute at the title screen, 2 with the rule
+(2026-10-09). A new identification starts over, so GTA V's buffers, which the split always takes,
+never get one.
 
-`NEURAL_FORGE_INLINE=off` turns it off (no queue is added either). A `dump` taken here has the colour
-input and the exposure only.
+**Modes.** Only model mode holds inside DLSS's buffer: the diagnostic modes (`dump`, `identity`,
+`roundtrip`) read the capture on the host or wait for it, which a recorded hold cannot. The network's
+launches are separated by barriers there, never counter chaining (chaining faulted the GPU in Black
+Myth: Wukong; NATIVE_BACKEND.md, Phase 4b). The camera jitter is read from the input launch's
+parameters as the hold is recorded; DLSS's output, which the hold after it works on, is not jittered.
+`NEURAL_FORGE_INLINE=off` turns it off.
 
-**Native backend.** With the native backend the worker runs `run_native` instead of `run_hold`, on the
-same side queue, with the network's graph recorded for that queue's family. For its history the buffer
-also copies DLSS's RG16F motion vectors into a slot image of their own beside the colour input (moved to
-`TRANSFER_SRC_OPTIMAL` and back when they are in a sampled or attachment layout); the camera jitter is
-read from the input launch's parameters at the submit (NATIVE_BACKEND.md, "Phase 4b"). Each job keeps
-the post path off before the worker takes the device's state (`keep_post_off`): the post path would
-otherwise hold that state while its frame waits on the GPU, which waits at this hold.
+**Cost.** The game's recording thread now records the hold: the layer's own commands and the
+network's graph (`Graph::record`, a few hundred launches and the descriptor sets of its Vulkan
+dispatches), measured as the `hold_ms` of the summary line (before 3.8.1 that was the worker's wall
+time, GPU included). The GPU work is the split hold's, plus the copies in and back and the guard.
 
-**Not valid Vulkan: the release set from the host.** The buffer's `vkCmdWaitEvents(release)` waits
-from the host stage on an event the worker sets with `vkSetEvent` after the buffer was submitted. The
-specification requires an event a command buffer waits on from the host to be set before that buffer
-is submitted, and forbids setting an event a pending command buffer waits on
-(`VUID-vkSetEvent-event-09543`). The validation layer reports it in the hold's GPU tests; it is the
-one violation CI's validation run filters, and only until the hold is replaced by a valid design.
+**Valid Vulkan.** Until 3.8.1 the buffer copied the colour input out, set an event, and waited on a
+second event from the host stage, which a worker thread set with `vkSetEvent` after running the hold
+on a queue of the layer's own. The specification requires an event a command buffer waits on from the
+host to be set before that buffer is submitted, and forbids setting an event a pending command buffer
+waits on (`VUID-vkSetEvent-event-09543`); events cannot be set from another queue either. Recording the
+hold into the buffer needs neither the events nor the queue: the extra queue `vkCreateDevice` got for
+it is gone (the network's loader keeps its own two, which are separate), and the hold's GPU tests run
+under the validation layer with nothing to report and nothing filtered.
 
 ### The HDR encode and decode (model, roundtrip)
 
