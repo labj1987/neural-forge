@@ -4,6 +4,12 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.4 — 2026-10-20
+
+- `neural-forge-cli doctor` no longer reports a program that creates an older Vulkan instance as a GPU
+  that cannot run the network (with advice to update the driver): it names the program in a warning.
+  Games under Proton are not affected.
+
 ## 3.8.3 — 2026-10-20
 
 - Games that recreate their swapchain (changing resolution, toggling fullscreen or HDR, alt-tabbing) no

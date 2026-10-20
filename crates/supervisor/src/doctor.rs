@@ -847,6 +847,19 @@ fn check_cannot_run(hdr: Option<&neural_forge_protocol::ShmHeader>, session: Opt
     if let Some(e) = logged {
         evidence.push(format!("state log: {}", event_line(e)));
     }
+    // The application's own Vulkan version, not the GPU: that program ran without the model, and no
+    // driver changes it (Proton's DXVK and vkd3d-proton ask for Vulkan 1.3).
+    if first.starts_with(INSTANCE_TOO_OLD) {
+        let program = logged.map(|e| e.process.clone()).filter(|p| !p.is_empty());
+        let who = program.unwrap_or_else(|| "the last program".to_string());
+        return vec![Finding::new(
+            "device-requirements",
+            Severity::Warning,
+            format!("{who} ran without the model: {first}"),
+            evidence.join("\n"),
+            Some("Nothing to fix in Neural Forge or the driver: that program creates its Vulkan instance for an older version. Games under Proton ask for Vulkan 1.3 and are not affected.".into()),
+        )];
+    }
     vec![Finding::new(
         "device-requirements",
         Severity::Failure,
@@ -855,6 +868,10 @@ fn check_cannot_run(hdr: Option<&neural_forge_protocol::ShmHeader>, session: Opt
         Some(format!("Update the NVIDIA driver (the network needs {first}); on an RTX 20 or 30-series card no driver adds it.")),
     )]
 }
+
+/// The start of the native backend's reason when the application's instance asks for a Vulkan version
+/// below the network's (nf_native_device_supported).
+const INSTANCE_TOO_OLD: &str = "the application's instance asks for Vulkan";
 
 /// The native backend's own status line when it says the network is not running.
 fn check_native_status(hdr: &neural_forge_protocol::ShmHeader) -> Vec<Finding> {
@@ -1597,6 +1614,15 @@ mod tests {
         assert!(check_cannot_run(Some(hdr), None).is_empty());
         let session: Vec<_> = [event(1, 7, state_log::NATIVE_UNAVAILABLE, "device cannot run the network: shaderInt64")].iter().filter_map(|l| state_log::parse_line(l)).collect();
         assert_eq!(check_cannot_run(None, Some(&session))[0].summary, "the GPU cannot run the network: it lacks shaderInt64");
+        // The application's instance version is that program's, not the GPU's: a warning naming it, no driver advice.
+        let old: Vec<_> = [event(1, 7, state_log::NATIVE_UNAVAILABLE, "device cannot run the network: the application's instance asks for Vulkan 1.1; the network needs an instance for Vulkan 1.3")]
+            .iter()
+            .filter_map(|l| state_log::parse_line(l))
+            .collect();
+        let v = check_cannot_run(None, Some(&old));
+        assert_eq!(v[0].severity, Severity::Warning);
+        assert!(v[0].summary.ends_with("ran without the model: the application's instance asks for Vulkan 1.1; the network needs an instance for Vulkan 1.3"), "{}", v[0].summary);
+        assert!(!v[0].fix.as_deref().unwrap_or("").contains("Update the NVIDIA driver"), "{:?}", v[0].fix);
     }
 
     #[test]

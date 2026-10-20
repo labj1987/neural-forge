@@ -571,7 +571,7 @@ impl Gpu {
             std::process::exit(1)
         });
         let app_name = c"neural-forge-pan";
-        let app_info = vk::ApplicationInfo::builder().application_name(app_name).api_version(vk::API_VERSION_1_1);
+        let app_info = vk::ApplicationInfo::builder().application_name(app_name).api_version(vk::API_VERSION_1_3);
         let extensions = [khr::Surface::name().as_ptr(), khr::XcbSurface::name().as_ptr()];
         let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info).enabled_extension_names(&extensions);
         let instance = check(unsafe { entry.create_instance(&create_info, None) }, "vkCreateInstance");
