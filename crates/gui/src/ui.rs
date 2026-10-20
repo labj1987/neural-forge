@@ -110,8 +110,8 @@ fn spin_row_scaled(title: &str, subtitle: &str, value: f32, setting: &str, step:
     let (lower, upper) = neural_forge_protocol::setting_bounds(setting).unwrap_or_else(|| panic!("{setting} has no bounds"));
     let (lower, upper) = (f64::from(lower) * scale, f64::from(upper) * scale);
     let adjustment = gtk4::Adjustment::new(f64::from(value) * scale, lower, upper, step, step * 10.0, 0.0);
-    let digits = if step >= 1.0 { 0 } else if step >= 0.1 { 1 } else { 2 };
-    let row = adw::SpinRow::new(Some(&adjustment), step, digits);
+    let row = adw::SpinRow::new(Some(&adjustment), step, 0);
+    keep_spin_precision(&row, &adjustment, step);
     row.set_title(title);
     row.set_subtitle(subtitle);
     adjustment.connect_value_changed(move |adj| {
@@ -134,6 +134,50 @@ fn spin_row_scaled(title: &str, subtitle: &str, value: f32, setting: &str, step:
         });
     }
     row
+}
+
+/// GtkSpinButton parses its text again on Enter and when it loses the focus. A value with more
+/// decimals than the row shows would come back rounded and be written to the header and config.ini
+/// though nobody edited it. So the row shows the value's own decimals (`spin_digits`), and text that
+/// still shows the current value keeps it exactly (`kept_spin_value`).
+fn keep_spin_precision(row: &adw::SpinRow, adjustment: &gtk4::Adjustment, step: f64) {
+    row.set_digits(spin_digits(step, adjustment.value()));
+    {
+        let adjustment = adjustment.clone();
+        row.connect_input(move |row| kept_spin_value(&row.text(), adjustment.value(), row.digits()).map(Ok));
+    }
+    let row = row.downgrade();
+    adjustment.connect_value_changed(move |adj| {
+        if let Some(row) = row.upgrade() {
+            row.set_digits(spin_digits(step, adj.value()));
+        }
+    });
+}
+
+/// The decimals a spin row shows: as many as its step has, and more (up to 3) while the value has
+/// them, so a value set off the step by shmctl, a profile or config.ini (16.5 on a step-1 row, 0.004
+/// on a step-0.01 one) is shown as it is.
+fn spin_digits(step: f64, value: f64) -> u32 {
+    decimals(step).max(decimals(value))
+}
+
+/// The fewest decimals (0 to 3) that write `x` exactly, 3 when it has more.
+fn decimals(x: f64) -> u32 {
+    (0..3)
+        .find(|&d| {
+            let shifted = x * 10f64.powi(d as i32);
+            (shifted - shifted.round()).abs() <= 1e-6 * shifted.abs().max(1.0)
+        })
+        .unwrap_or(3)
+}
+
+/// The value a spin row keeps when GTK re-reads its `text`: the current `value` while the text still
+/// shows it at `digits` decimals (either decimal mark), so precision the row does not show survives
+/// a focus change; `None` lets GTK parse an edited text as usual.
+fn kept_spin_value(text: &str, value: f64, digits: u32) -> Option<f64> {
+    let typed: f64 = text.trim().replace(',', ".").parse().ok()?;
+    let d = digits as usize;
+    (format!("{typed:.d$}") == format!("{value:.d$}")).then_some(value)
 }
 
 fn switch_row(title: &str, subtitle: &str, active: bool, setter: impl Fn(bool) + 'static) -> adw::SwitchRow {
@@ -520,8 +564,16 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     comp_group.add(&spin_row("Highlight guard", "The most the pass may brighten or darken a pixel by (x)", max_ratio, "max_ratio", 0.1, set_max_ratio));
 
     let (working_scale, set_working_scale) = bind_float(&shm, Some("working_scale"), |h| &h.working_scale_bits);
-    let scale_row = spin_row_scaled("Model resolution", "Percent of the frame the model works at; lower is faster and softer", working_scale, "working_scale", 5.0, 100.0, set_working_scale);
-    comp_group.add(&scale_row);
+    let working_scale_row = spin_row_scaled(
+        "Model resolution after the upscaler",
+        "Percent of the frame the model works at; lower is faster and softer",
+        working_scale,
+        "working_scale",
+        5.0,
+        100.0,
+        set_working_scale,
+    );
+    comp_group.add(&working_scale_row);
 
 
     let (reversible, set_reversible) = bind_u32(&shm, Some("reversible_mode"), |h| &h.reversible_mode);
@@ -724,12 +776,12 @@ pub fn build_ui(app: &adw::Application, install_error: Option<String>) {
     {
         let shm = std::sync::Arc::clone(&shm);
         let live = Liveness::default();
-        let scale_row = scale_row.clone();
+        let working_scale_row = working_scale_row.clone();
         every(&interval_row, SECOND, move |interval_row| {
             let hdr = shm.header();
             let after_upscaler = live.alive(hdr) && hdr.native_running.load(Ordering::Relaxed) == 0;
             interval_row.set_visible(after_upscaler);
-            scale_row.set_visible(after_upscaler);
+            working_scale_row.set_visible(after_upscaler);
         });
     }
 
@@ -1089,12 +1141,15 @@ fn build_hud_group(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping>
                 };
                 let spin = |value: f32, tip: &str, set: fn(&mut HudRegion, f32)| {
                     let b = gtk4::SpinButton::with_range(0.0, 100.0, 0.5);
-                    b.set_digits(1);
                     b.set_value(f64::from(value) * 100.0);
+                    // As `keep_spin_precision` does for the spin rows.
+                    b.set_digits(spin_digits(0.5, b.value()));
+                    b.connect_input(|b| kept_spin_value(&b.text(), b.value(), b.digits()).map(Ok));
                     b.set_valign(gtk4::Align::Center);
                     b.set_tooltip_text(Some(tip));
                     let edit = Rc::clone(&edit);
                     b.connect_value_changed(move |b| {
+                        b.set_digits(spin_digits(0.5, b.value()));
                         let v = (b.value() / 100.0) as f32;
                         edit(&move |r: &mut HudRegion| set(r, v));
                     });
@@ -1261,7 +1316,8 @@ fn open_pass_dialog(shm: &std::sync::Arc<neural_forge_protocol::mapping::Mapping
             PassFieldKind::Float { step } => {
                 let (lower, upper) = neural_forge_protocol::setting_bounds(field.field).unwrap_or_else(|| panic!("{} has no bounds", field.field));
                 let adj = gtk4::Adjustment::new(0.0, f64::from(lower), f64::from(upper), *step, step * 10.0, 0.0);
-                let row = adw::SpinRow::new(Some(&adj), *step, 2);
+                let row = adw::SpinRow::new(Some(&adj), *step, 0);
+                keep_spin_precision(&row, &adj, *step);
                 row.set_title("Value");
                 let w = Rc::clone(&set_value);
                 adj.connect_value_changed(move |a| w((a.value() as f32).to_bits()));
@@ -2586,6 +2642,38 @@ fn build_error_window(app: &adw::Application, error: &neural_forge_protocol::map
     let status = adw::StatusPage::builder().icon_name("dialog-error-symbolic").title(title).description(description).build();
     let window = adw::ApplicationWindow::builder().application(app).title("Neural Forge").content(&status).build();
     window.present();
+}
+
+#[cfg(test)]
+mod spin_precision_tests {
+    use super::{decimals, kept_spin_value, spin_digits};
+
+    #[test]
+    fn a_row_shows_the_decimals_its_step_and_value_have() {
+        assert_eq!(spin_digits(1.0, 16.0), 0);
+        assert_eq!(spin_digits(5.0, f64::from(0.66f32) * 100.0), 0);
+        assert_eq!(spin_digits(1.0, 16.5), 1);
+        assert_eq!(spin_digits(0.1, 1.25), 2);
+        assert_eq!(spin_digits(0.05, 0.8), 2);
+        assert_eq!(spin_digits(0.01, f64::from(0.004f32)), 3);
+        assert_eq!(spin_digits(0.01, f64::from(0.001f32)), 3);
+        assert_eq!(decimals(f64::from(0.1f32)), 1);
+        assert_eq!(decimals(1.0 / 3.0), 3, "capped");
+    }
+
+    #[test]
+    fn re_reading_the_shown_text_keeps_the_value() {
+        // Text that shows the value: the value, with the decimals the row does not show.
+        assert_eq!(kept_spin_value("17", 16.6, 0), Some(16.6));
+        assert_eq!(kept_spin_value("1.3", 1.26, 1), Some(1.26));
+        assert_eq!(kept_spin_value(" 0.00 ", 0.004, 2), Some(0.004));
+        assert_eq!(kept_spin_value("1,3", 1.26, 1), Some(1.26), "a comma decimal mark");
+        // Edited text is GTK's to parse.
+        assert_eq!(kept_spin_value("18", 16.6, 0), None);
+        assert_eq!(kept_spin_value("1.2", 1.26, 1), None);
+        assert_eq!(kept_spin_value("", 1.0, 1), None);
+        assert_eq!(kept_spin_value("abc", 1.0, 1), None);
+    }
 }
 
 #[cfg(test)]
