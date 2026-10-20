@@ -993,6 +993,35 @@ mod tests {
         pub(super) static FAIL_IMAGES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     }
 
+    /// A real RGBA16F colour input of `w`x`h` for a hold recorded into a real buffer: the recorded
+    /// copies name it, so a stand-in handle would record a copy of a null image. The caller destroys
+    /// both handles.
+    ///
+    /// # Safety
+    /// `device` is `physical_device`'s and live.
+    unsafe fn colour_input(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, (w, h): (u32, u32)) -> (vk::Image, vk::DeviceMemory) {
+        let info = vk::ImageCreateInfo::builder()
+            .image_type(vk::ImageType::TYPE_2D)
+            .format(vk::Format::R16G16B16A16_SFLOAT)
+            .extent(vk::Extent3D { width: w, height: h, depth: 1 })
+            .mip_levels(1)
+            .array_layers(1)
+            .samples(vk::SampleCountFlags::TYPE_1)
+            .tiling(vk::ImageTiling::OPTIMAL)
+            .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE)
+            .initial_layout(vk::ImageLayout::UNDEFINED);
+        // SAFETY: valid create and allocate infos on a live device (contract).
+        unsafe {
+            let image = device.create_image(&info, None).unwrap();
+            let reqs = device.get_image_memory_requirements(image);
+            let props = instance.get_physical_device_memory_properties(physical_device);
+            let index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
+            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None).unwrap();
+            device.bind_image_memory(image, memory, 0).unwrap();
+            (image, memory)
+        }
+    }
+
     /// Only a primary of a pool of DLSS's graphics family is held inside, and nothing while the model
     /// is switched off: a secondary's hold would never be released (only submitted primaries become
     /// jobs), another family's queue may not take the copies and blits and its job only releases, and
@@ -1004,8 +1033,10 @@ mod tests {
         let hold: HoldFn = Box::new(|_job, _queue| {});
         let inline = Inline::start(device.clone(), &instance, physical_device, vk::Queue::null(), family, family, hold).expect("worker");
         let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE;
+        // SAFETY: test-only, on a live device; destroyed at the end.
+        let (colour, colour_memory) = unsafe { colour_input(&device, &instance, physical_device, (16, 8)) };
         let point = InlinePoint {
-            colour: vk::Image::null(),
+            colour,
             desc: ImageDesc { width: 16, height: 8, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true },
             layout: vk::ImageLayout::GENERAL,
             exposure_input: None,
@@ -1055,6 +1086,8 @@ mod tests {
             inline.switch.store(std::ptr::null_mut(), Ordering::Release);
             destroy(device.handle());
             device.destroy_command_pool(real_pool, None);
+            device.destroy_image(colour, None);
+            device.free_memory(colour_memory, None);
         }
     }
 
@@ -1067,8 +1100,11 @@ mod tests {
         let hold: HoldFn = Box::new(|_job, _queue| {});
         let inline = Inline::start(device.clone(), &instance, physical_device, vk::Queue::null(), family, family, hold).expect("worker");
         let usage = vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::STORAGE;
+        // SAFETY: test-only, on a live device; destroyed at the end.
+        let colours = [(32, 16), (48, 24)].map(|extent| (extent, unsafe { colour_input(&device, &instance, physical_device, extent) }));
+        let colour_of = |extent| colours.iter().find(|(e, _)| *e == extent).unwrap().1 .0;
         let point = |w, h| InlinePoint {
-            colour: vk::Image::null(),
+            colour: colour_of((w, h)),
             desc: ImageDesc { width: w, height: h, format: vk::Format::R16G16B16A16_SFLOAT, usage, plain: true },
             layout: vk::ImageLayout::GENERAL,
             exposure_input: None,
@@ -1080,9 +1116,11 @@ mod tests {
             hold: crate::preupscale::placement::Hold::ALL_BEFORE,
         };
         // SAFETY: test-only setup on a live device; every handle is destroyed at the end. The buffers
-        // are never submitted, so the null colour input is never read.
+        // are never submitted.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            // Each buffer is recorded more than once.
+            let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let pool = device.create_command_pool(&pool_info, None).unwrap();
             let cbs = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(3)).unwrap();
             inline.pool_created(pool, family);
             inline.allocated(pool, vk::CommandBufferLevel::PRIMARY, &cbs);
@@ -1113,6 +1151,10 @@ mod tests {
             inline.begin(cbs[1], begin.flags);
             destroy(device.handle());
             device.destroy_command_pool(pool, None);
+            for (_, (image, memory)) in colours {
+                device.destroy_image(image, None);
+                device.free_memory(memory, None);
+            }
         }
     }
 
@@ -1165,7 +1207,9 @@ mod tests {
             });
             let inline = Inline::start(device.clone(), &instance, physical_device, vk::Queue::null(), family, family, hold).expect("worker");
 
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            // The buffer is recorded again at the end.
+            let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let pool = device.create_command_pool(&pool_info, None).unwrap();
             let cb = device
                 .allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1))
                 .unwrap()[0];
@@ -1350,7 +1394,9 @@ mod mvec_tests {
 
             let hold: HoldFn = Box::new(|_job, _queue| {});
             let inline = Inline::start(device.clone(), &instance, physical_device, vk::Queue::null(), family, family, hold).expect("worker");
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            // `read` is recorded once per image read back.
+            let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let pool = device.create_command_pool(&pool_info, None).unwrap();
             let cbs = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(2)).unwrap();
             inline.pool_created(pool, family);
             inline.allocated(pool, vk::CommandBufferLevel::PRIMARY, &cbs);
