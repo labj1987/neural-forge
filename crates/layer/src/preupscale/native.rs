@@ -3275,6 +3275,17 @@ pub(crate) fn note_reset(stale: Option<Stale>) {
     }
 }
 
+/// A network frame's history reset `stale` ([`HistoryGap::begin`]) after the pass's first frame (`frames`
+/// before it): logged, and a scene cut it consumes counted in `scene_cut`, or-ed with a cut the GPU already
+/// reset on the last network frame ([`apply_scene_cut`], read earlier in the same hold), which a network
+/// frame without a latched cut must not take back.
+fn note_network_reset(frames: u64, stale: Option<Stale>, scene_cut: &mut bool) {
+    if frames > 0 {
+        note_reset(stale);
+        *scene_cut |= matches!(stale, Some(Stale::SceneCut(_)));
+    }
+}
+
 /// The CPU's side of a scene-cut reading ([`super::scene_cut::effect`]), at the hold after the one it was
 /// taken on. `true` when it counts a reset (the GPU's, logged here); a latched cut is counted when the next
 /// network frame consumes it (`HistoryGap::begin`).
@@ -3821,10 +3832,7 @@ pub(crate) unsafe fn run_native_hold(
             (false, None)
         } else {
             let stale = native.gap.begin(hold_now());
-            if native.frames > 0 {
-                note_reset(stale);
-                result.scene_cut |= matches!(stale, Some(Stale::SceneCut(_)));
-            }
+            note_network_reset(native.frames, stale, &mut result.scene_cut);
             let history = native.frames > 0 && stale.is_none() && mvec.is_some();
             (history, Some(native.frame_plan(&graphs, history, jitter, target.mvec_scale, &passes)))
         };
@@ -4035,10 +4043,7 @@ pub(crate) unsafe fn run_native_hold(
         (false, [None, None], Vec::new())
     } else {
         let stale = native.gap.begin(hold_now());
-        if native.frames > 0 {
-            note_reset(stale);
-            result.scene_cut = matches!(stale, Some(Stale::SceneCut(_)));
-        }
+        note_network_reset(native.frames, stale, &mut result.scene_cut);
         let history = native.frames > 0 && stale.is_none() && mvec.is_some();
         let (cmds, later) = native.frame_graphs(&graphs, history, jitter, target.mvec_scale, &passes);
         (history, cmds, if more { later } else { Vec::new() })
@@ -5203,6 +5208,24 @@ mod tests {
             }
             device.destroy_command_pool(graph_pool, None);
             device.destroy_command_pool(pool, None);
+        }
+    }
+
+    /// A cut the GPU reset on the last network frame (read at the start of the hold) stays counted through a
+    /// network frame that consumes no latched cut, as inside DLSS's buffer: the split hold overwrote it, so
+    /// the session's count missed every such cut with the edit cache off or the camera still.
+    #[test]
+    fn a_cut_the_gpu_reset_stays_counted_through_the_next_network_frame() {
+        for (frames, stale, before, after) in [
+            (3, None, true, true),
+            (3, Some(Stale::Idle(std::time::Duration::from_secs(1))), true, true),
+            (3, Some(Stale::SceneCut(60)), false, true),
+            (3, None, false, false),
+            (0, Some(Stale::SceneCut(60)), false, false),
+        ] {
+            let mut cut = before;
+            note_network_reset(frames, stale, &mut cut);
+            assert_eq!(cut, after, "frames {frames}, {stale:?}, counted before: {before}");
         }
     }
 
