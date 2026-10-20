@@ -31,7 +31,10 @@ pub fn config_file() -> String {
 /// Every `key=value` line of the config file at `path` (blank lines and `#` comments skipped); empty
 /// when it cannot be read.
 pub fn read_config(path: &str) -> BTreeMap<String, String> {
-    let Ok(text) = std::fs::read_to_string(path) else { return BTreeMap::new() };
+    // Read as bytes: one line that is not UTF-8 (a path in another encoding) costs that line's text
+    // (read with U+FFFD), not every saved setting.
+    let Ok(bytes) = std::fs::read(path) else { return BTreeMap::new() };
+    let text = String::from_utf8_lossy(&bytes);
     text.lines()
         .map(str::trim)
         .filter(|l| !l.is_empty() && !l.starts_with('#'))
@@ -86,6 +89,19 @@ fn parse(header: &ShmHeader, raw: &BTreeMap<String, String>) -> (Vec<(&'static s
 
 #[cfg(test)]
 mod tests {
+    /// A line that is not UTF-8 costs only its own text: the other saved settings are still read.
+    #[test]
+    fn a_line_that_is_not_utf8_keeps_the_other_settings() {
+        let dir = std::env::temp_dir().join(format!("neural-forge-persist-lossy-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("config.ini");
+        std::fs::write(&file, b"binaries=/home/x/caf\xe9\nset_intensity=0.5\n").unwrap();
+        let read = read_config(&file.to_string_lossy());
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(read.get("set_intensity").map(String::as_str), Some("0.5"));
+        assert_eq!(read.get("binaries").map(String::as_str), Some("/home/x/caf\u{fffd}"));
+    }
+
     use super::*;
     use crate::mapping;
 
