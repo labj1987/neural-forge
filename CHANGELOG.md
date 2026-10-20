@@ -4,6 +4,46 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.2 — 2026-10-20
+
+A review of the whole code base, and its fixes.
+
+- **Bright sunlit scenes** in games with physically based lighting (a very low exposure) could put broken
+  pixels into DLSS's input, which DLSS then carried as blotches for several frames. The model's result now
+  always stays a valid HDR value, also in frames carried by the edit cache.
+- **After changing the model resolution** the scene-cut detection could write into freed GPU memory (a
+  possible GPU fault) and stop resetting the history at scene cuts. Fixed, along with two more places where
+  a new GPU object under an old one's handle kept the old one's bindings: the colour input's copy inside
+  DLSS's buffer after its size changed back and forth, and the look-up table after switching to a `.cube`
+  of another size (after the upscaler).
+- A broken value from the network can no longer feed itself into the following frames.
+- **Settings and profiles:** a `config.ini` or `profiles.ini` holding a byte that is not UTF-8, or that
+  cannot be read for a moment, is no longer wiped by the next change, profile save or `enable`; the game
+  also keeps the other saved settings. Tabbing through the settings no longer rounds a value that has more
+  decimals than its row showed.
+- **Launch options:** `NEURAL_FORGE_ENABLE=1` after a wrapper such as `gamemoderun` no longer counts as on
+  (the game did not start); `enable` puts it in front. `ENABLE=1 ENABLE=0` reads as off.
+- **Crashes:** a deeply nested or damaged Steam file no longer crashes the app or `neural-forge-cli`, and the
+  toggle key no longer crashes a game that recreates its Vulkan device when its X connection breaks.
+- **Colours:** a red/blue swap that could stick after a game switched to a same-size swapchain with the
+  other channel order is fixed, and the replace modes keep a bright light's colour.
+- **The native network:** a counter-chain timeout no longer keeps the network off for the rest of the
+  session (the next build runs without chaining instead); a game whose Vulkan instance is older than 1.3
+  gets a clear reason instead of a possible crash; the hold inside DLSS's buffer uses much smaller
+  descriptor pools, and GPU timer pools no longer pile up with each rebuild.
+- **Holds:** no hold runs on a DLSS buffer recorded before its inputs were identified; a held frame whose
+  submit runs short of memory is retried rather than handed back to the game as failed after part of it
+  ran; holds in a game that submits DLSS on two queues no longer overlap; games that record DLSS into
+  secondary command buffers get the camera jitter and the hold after DLSS.
+- **Smaller fixes:** a full `/tmp` no longer stutters every frame; the toggle key and the app no longer lose
+  each other's on/off change; the Status tab no longer shows "device lost" after a game recovered; a newly
+  chosen `.cube` is applied even if its loader could not start once; an `edit_lut` that names a device, a
+  pipe or a huge file is refused; `install --appdir` refuses an AppDir with symlinks and uninstall never
+  deletes through a symlinked data folder; an interrupted model extraction no longer leaves the model
+  missing; `import-binaries` checks the file is a DLL and never truncates the one already imported.
+- The Composition tab's resolution setting is now called **Model resolution after the upscaler**, and its
+  detail step costs much less GPU time with the same picture.
+
 ## 3.8.1 — 2026-10-20
 
 - **Games that render their frame inside DLSS's own work** (Crimson Desert, Cyberpunk 2077, Black Myth:
