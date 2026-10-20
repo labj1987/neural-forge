@@ -10,6 +10,10 @@ pub const CONFIG_KEY: &str = "edit_lut";
 pub const MIN_SIZE: usize = 2;
 pub const MAX_SIZE: usize = 65;
 
+/// The largest file [`load`] reads: a 65-point table is about 275,000 lines of three numbers, a few
+/// MB even with long numbers and comments.
+pub const MAX_FILE_BYTES: u64 = 64 << 20;
+
 /// A parsed 3D table: `size`^3 RGB entries, red fastest, then green, then blue (the format's order), for
 /// inputs from `domain_min` to `domain_max` per channel.
 #[derive(Clone, Debug, PartialEq)]
@@ -29,9 +33,19 @@ impl Cube {
         Self { size: n, domain_min: [0.0; 3], domain_max: [1.0; 3], table }
     }
 
-    /// The table's value at `rgb` by trilinear interpolation (the shaders' lookup, on the CPU).
+    /// The table's value at `rgb` by trilinear interpolation (the shaders' lookup, on the CPU). A
+    /// table that is not one [`parse`] would give (fewer than [`MIN_SIZE`] points a side, not `size`^3
+    /// entries, an empty or non-finite domain) leaves `rgb` as it is.
     pub fn sample(&self, rgb: [f32; 3]) -> [f32; 3] {
         let n = self.size;
+        let whole = n >= MIN_SIZE && n.checked_pow(3) == Some(self.table.len());
+        let spans_ok = (0..3).all(|c| {
+            let span = self.domain_max[c] - self.domain_min[c];
+            span.is_finite() && span > 0.0
+        });
+        if !whole || !spans_ok {
+            return rgb;
+        }
         let mut base = [0usize; 3];
         let mut frac = [0f32; 3];
         for c in 0..3 {
@@ -110,9 +124,24 @@ pub fn parse(text: &str) -> Result<Cube, String> {
     Ok(Cube { size, domain_min, domain_max, table })
 }
 
-/// Reads and parses the file at `path`.
+/// Reads and parses the file at `path`: a regular file of at most [`MAX_FILE_BYTES`]. Anything else
+/// (a device, a FIFO, a directory, a file far larger than any table) is refused without reading it
+/// whole or waiting on it.
 pub fn load(path: &str) -> Result<Cube, String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+    use std::io::Read;
+    use std::os::unix::fs::OpenOptionsExt;
+    // Non-blocking, so opening a FIFO does not wait for a writer; a regular file reads the same.
+    let file = std::fs::File::options().read(true).custom_flags(libc::O_NONBLOCK).open(path).map_err(|e| format!("{path}: {e}"))?;
+    let meta = file.metadata().map_err(|e| format!("{path}: {e}"))?;
+    if !meta.is_file() {
+        return Err(format!("{path}: not a regular file"));
+    }
+    let mut bytes = Vec::new();
+    file.take(MAX_FILE_BYTES + 1).read_to_end(&mut bytes).map_err(|e| format!("{path}: {e}"))?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(format!("{path}: larger than {} MiB, too large for a table", MAX_FILE_BYTES >> 20));
+    }
+    let text = String::from_utf8(bytes).map_err(|e| format!("{path}: {e}"))?;
     parse(&text).map_err(|e| format!("{path}: {e}"))
 }
 
@@ -152,6 +181,44 @@ mod tests {
         t.push_str("DOMAIN_MIN 1 0 0\nDOMAIN_MAX 1 1 1\n");
         assert!(parse(&t).unwrap_err().contains("DOMAIN"));
         assert!(parse("LUT_3D_SIZE 2\n0 0 nan\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n0 0 0\n").is_err());
+    }
+
+    /// A table built by hand that `parse` would refuse: sampling it never indexes out of the table.
+    #[test]
+    fn a_table_parse_would_refuse_samples_to_its_input() {
+        let rgb = [0.25, 0.5, 0.75];
+        let one = Cube { size: 1, domain_min: [0.0; 3], domain_max: [1.0; 3], table: vec![[0.0; 3]] };
+        assert_eq!(one.sample(rgb), rgb);
+        let mut short = Cube::identity(17);
+        short.table.truncate(100);
+        assert_eq!(short.sample(rgb), rgb);
+        let mut flat = Cube::identity(2);
+        flat.domain_max = [0.0; 3];
+        assert_eq!(flat.sample(rgb), rgb);
+        flat.domain_max = [f32::NAN; 3];
+        assert_eq!(flat.sample(rgb), rgb);
+    }
+
+    #[test]
+    fn load_takes_only_a_regular_file_of_a_tables_size() {
+        let dir = std::env::temp_dir().join(format!("neural-forge-cube-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("ok.cube");
+        std::fs::write(&ok, text(&Cube::identity(2))).unwrap();
+        assert_eq!(load(&ok.to_string_lossy()).unwrap().size, 2);
+        // A device that never ends, a FIFO nothing writes to, a directory: refused, not read.
+        assert!(load("/dev/zero").unwrap_err().contains("not a regular file"));
+        let fifo = dir.join("fifo.cube");
+        let c = std::ffi::CString::new(fifo.to_string_lossy().as_bytes()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(load(&fifo.to_string_lossy()).unwrap_err().contains("not a regular file"));
+        assert!(load(&dir.to_string_lossy()).unwrap_err().contains("not a regular file"));
+        // A sparse file past the limit: refused after reading the limit, not the whole of it.
+        let big = dir.join("big.cube");
+        std::fs::File::create(&big).unwrap().set_len(MAX_FILE_BYTES + 1).unwrap();
+        assert!(load(&big.to_string_lossy()).unwrap_err().contains("too large"));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
