@@ -140,13 +140,19 @@ fn now_ms() -> u64 {
 
 /// Whether this process holds the channel's lease now. Released when it stops presenting
 /// ([`LEASE_IDLE`]); a process that does not hold it must not read or write the channel.
+///
+/// Sequentially consistent, as [`note_present`]'s store and the watchdog's pair are: a present
+/// notes itself before it first asks this, and the watchdog withdraws `HELD` before it looks at the
+/// last present a second time, so either the present sees the lease gone (and leaves the channel
+/// alone) or the watchdog sees the present (and keeps the lease). Never both missed.
 pub fn held() -> bool {
-    HELD.load(Ordering::Acquire)
+    HELD.load(Ordering::SeqCst)
 }
 
-/// Called on every present of this process: the lease follows presenting.
+/// Called on every present of this process, before the present touches the channel: the lease
+/// follows presenting.
 pub fn note_present() {
-    LAST_PRESENT_MS.store(now_ms(), Ordering::Relaxed);
+    LAST_PRESENT_MS.store(now_ms(), Ordering::SeqCst);
 }
 
 /// Takes (or keeps) the lease on `shm_path`'s channel. Cheap while held; a process that does not hold
@@ -171,7 +177,7 @@ pub fn claim(shm_path: &str) -> bool {
             // A claim counts as presenting: the claim happens on a present (or a submit around one).
             note_present();
             GENERATION.fetch_add(1, Ordering::AcqRel);
-            HELD.store(true, Ordering::Release);
+            HELD.store(true, Ordering::SeqCst);
             start_watchdog();
             true
         }
@@ -198,18 +204,47 @@ fn start_watchdog() {
 }
 
 /// The watchdog's step: lets the lease go when the last present is more than `idle` ago.
+///
+/// Check, withdraw, check again: a present that noted itself after the first look but before
+/// `HELD` went false may already be using the channel, so the second look (after the withdrawal,
+/// see [`held`]) keeps the lease for it. The kernel lock is only let go after that.
 fn release_if_idle(now: u64, idle: std::time::Duration) -> bool {
-    if !held() || now.saturating_sub(LAST_PRESENT_MS.load(Ordering::Relaxed)) < idle.as_millis() as u64 {
+    let idle_ms = idle.as_millis() as u64;
+    let quiet = || now.saturating_sub(LAST_PRESENT_MS.load(Ordering::SeqCst)) >= idle_ms;
+    if !held() || !quiet() {
         return false;
     }
     let mut lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
-    HELD.store(false, Ordering::Release);
+    HELD.store(false, Ordering::SeqCst);
+    #[cfg(test)]
+    if let Some(present) = *TEST_PRESENT_DURING_RELEASE.lock().unwrap_or_else(|e| e.into_inner()) {
+        present();
+    }
+    if !quiet() {
+        HELD.store(true, Ordering::SeqCst);
+        return false;
+    }
     if let Some(l) = lease.take() {
         crate::log!("[ownership] pid {} has not presented for {} s; released {}", std::process::id(), idle.as_secs(), l.path);
         crate::logging::flush();
     }
     true
 }
+
+/// Gives the lease up at once: this process claimed it but cannot use the channel (its mapping
+/// failed), and must not keep the process that can from claiming it.
+pub fn release(why: &str) {
+    let mut lease = LEASE.lock().unwrap_or_else(|e| e.into_inner());
+    HELD.store(false, Ordering::SeqCst);
+    if let Some(l) = lease.take() {
+        crate::log!("[ownership] pid {} released {} ({why})", std::process::id(), l.path);
+        crate::logging::flush();
+    }
+}
+
+/// Runs between the watchdog's withdrawal of `HELD` and its second look: a present landing there.
+#[cfg(test)]
+static TEST_PRESENT_DURING_RELEASE: Mutex<Option<fn()>> = Mutex::new(None);
 
 #[cfg(test)]
 mod tests {
@@ -292,6 +327,45 @@ mod tests {
         // The kernel lock went with it: another process (here another open) can take the channel.
         assert!(acquire(path.to_str().unwrap()).is_ok());
         assert!(!release_if_idle(99_000, idle), "nothing left to release");
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// A present that lands while the watchdog is letting the lease go keeps it: it may already be
+    /// writing the channel.
+    #[test]
+    fn a_present_during_the_release_keeps_the_lease() {
+        let _serial = LEASE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("neural-forge-race-test-{}", std::process::id()));
+        let file = acquire(path.to_str().unwrap()).unwrap();
+        *LEASE.lock().unwrap() = Some(Lease { path: "test".into(), _file: file });
+        HELD.store(true, Ordering::SeqCst);
+        LAST_PRESENT_MS.store(1_000, Ordering::SeqCst);
+        fn present() {
+            LAST_PRESENT_MS.store(20_000, Ordering::SeqCst);
+        }
+        *TEST_PRESENT_DURING_RELEASE.lock().unwrap() = Some(present);
+        let idle = std::time::Duration::from_secs(10);
+        let released = release_if_idle(20_000, idle);
+        *TEST_PRESENT_DURING_RELEASE.lock().unwrap() = None;
+        assert!(!released, "the present that came in between keeps the lease");
+        assert!(held() && LEASE.lock().unwrap().is_some());
+        assert!(acquire(path.to_str().unwrap()).is_err(), "and the kernel lock with it");
+        assert!(release_if_idle(30_000, idle), "released once presents really stop");
+        assert!(!held());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    /// An explicit release drops the lease and its kernel lock at once.
+    #[test]
+    fn release_lets_the_channel_go_at_once() {
+        let _serial = LEASE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join(format!("neural-forge-release-test-{}", std::process::id()));
+        let file = acquire(path.to_str().unwrap()).unwrap();
+        *LEASE.lock().unwrap() = Some(Lease { path: "test".into(), _file: file });
+        HELD.store(true, Ordering::SeqCst);
+        release("test");
+        assert!(!held() && LEASE.lock().unwrap().is_none());
+        assert!(acquire(path.to_str().unwrap()).is_ok(), "another process can take the channel");
         std::fs::remove_file(path).unwrap();
     }
 

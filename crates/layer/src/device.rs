@@ -730,7 +730,8 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     if let Some((device, state, hold)) = owned {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
-        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || hold.preupscale.has_res() || hold.preupscale.native.is_some() {
+        let mut idle = true;
+        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || state.series.has_stranded() || hold.preupscale.has_res() || hold.preupscale.native.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     // Idle: nothing uses the network any more.
@@ -749,6 +750,7 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                     unsafe { hold.preupscale.destroy(&device); }
                 }
                 Err(error) => {
+                    idle = false;
                     crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources (the network is left open)", error);
                     // Its buffers may still be in use: leaked rather than closed.
                     if let Some(loader) = hold.preupscale.native.take() {
@@ -757,9 +759,10 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                 }
             }
         }
-        // SAFETY: a series never leaves GPU work pending once a present returns (it waits on
-        // its own fences), so no idle wait is needed; this also finishes writing its files.
-        unsafe { state.series.destroy(&device); }
+        // SAFETY: a series leaves no GPU work pending once a present returns (it waits on its own
+        // fences) except a stalled readback's, which the idle wait above covered when `idle`; this
+        // also finishes writing its files.
+        unsafe { state.series.destroy(&device, idle); }
         state.swapchains.clear();
         let mut primary = PRIMARY.lock().unwrap();
         if primary.as_ref().is_some_and(|p| p.device == handle) { *primary = None; }
@@ -978,6 +981,7 @@ unsafe fn capture_untouched(
     relay_semaphores: &mut crate::present_sync::PresentSemaphores,
     present_info: &vk::PresentInfoKHR,
     relay_semaphore: &mut Option<vk::Semaphore>,
+    series_wait: &mut Option<vk::Semaphore>,
     why: u32,
 ) {
     if !readable || !series.running() {
@@ -998,7 +1002,9 @@ unsafe fn capture_untouched(
     // SAFETY: per this function's contract; the relay (if any) is the only submission so far.
     unsafe {
         series.before(device, instance, physical_device, queue, queue_family, image, width, height);
-        series.after(device, queue, image, width, height, bgr_order, None, why);
+        if let crate::series::PresentWait::Instead(semaphore) = series.after(device, queue, image, width, height, bgr_order, None, why) {
+            *series_wait = Some(semaphore);
+        }
     }
 }
 
@@ -1112,6 +1118,18 @@ mod post_path_idle_tests {
         assert!(!post_path_idle(Some(true), true, true, false), "a capture or series is asked for");
         assert!(!post_path_idle(Some(true), true, false, true), "a series is running");
     }
+}
+
+/// Whether `reason` is reported for the first time in `seen` (and records it). For the "present
+/// skipped" lines that are logged once per distinct reason: remembering only the last reason would
+/// log (and flush, on the present thread) on every present whose reason alternates between two.
+fn first_report<T: PartialEq>(seen: &Mutex<Vec<T>>, reason: T) -> bool {
+    let mut seen = seen.lock().unwrap_or_else(|e| e.into_inner());
+    if seen.contains(&reason) {
+        return false;
+    }
+    seen.push(reason);
+    true
 }
 
 unsafe fn relay_app_waits(
@@ -1988,7 +2006,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     fn free_command_buffers(
         &self, command_pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer],
     ) -> LayerResult<()> {
-        crate::probe_ngx::on_free_command_buffers(command_buffers);
+        crate::probe_ngx::on_free_command_buffers(command_pool, command_buffers);
         if let Some(t) = &self.preupscale {
             t.free(command_buffers);
         }
@@ -2260,10 +2278,14 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         self.log_launch_queues(queue, buffers());
         self.inline_prologue(queue, buffers());
         let Some(next) = self.next_queue_submit2 else {
-            // Not resolvable below this layer (the application could not be calling it): the
-            // framework forwards, and the result stays unseen.
-            self.inline_submitted(queue, buffers());
-            self.commit_submitted(buffers());
+            // Neither `vkQueueSubmit2` nor its KHR alias resolves below this layer, so no valid
+            // application calls it. The framework forwards it and the result stays unseen, so
+            // nothing is committed: the tracking only ever advances for a submission seen accepted.
+            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                crate::log!("[layer] vkQueueSubmit2 called on a device that does not resolve it below the layer; its submissions are not tracked");
+                crate::logging::flush();
+            }
             return LayerResult::Unhandled;
         };
         if let Some(tracking) = self.preupscale.as_ref().filter(|t| t.armed()) {
@@ -2908,6 +2930,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let mut relay_semaphore: Option<vk::Semaphore> = None;
         // Set when a frame series' readback consumed `wait_semaphore` (see `crate::series`).
         let mut series_composed = false;
+        // Set when a series readback was not seen complete: the present waits on this, signalled after
+        // it (`crate::series::PresentWait::Instead`).
+        let mut series_wait: Option<vk::Semaphore> = None;
         if crate::layer_enabled() {
             // The channel's lease follows presenting (`ownership`): an atomic store.
             crate::ownership::note_present();
@@ -3033,12 +3058,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     //
                     // Logged once per distinct reason so it identifies the state
                     // without joining the per-barrier spam.
-                    static REPORTED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
-                    let reason = match tap {
-                        None => 0u32,
-                        Some((_, layout)) => layout.as_raw().unsigned_abs().wrapping_add(1),
-                    };
-                    if REPORTED.swap(reason, std::sync::atomic::Ordering::Relaxed) != reason {
+                    static REPORTED: Mutex<Vec<Option<vk::ImageLayout>>> = Mutex::new(Vec::new());
+                    if first_report(&REPORTED, tap.map(|(_, layout)| layout)) {
                         match tap {
                             None => crate::log!(
                                 "[layer] present skipped: swapchain is pass_through and this image has no tracked render source \
@@ -3058,10 +3079,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // swapchain's extent out of it and read its bytes as the swapchain's format:
                     // unless both are known to match, that is an out-of-bounds copy or misread
                     // pixels. Logged once per distinct reason.
-                    static REPORTED_TAP: Mutex<&str> = Mutex::new("");
-                    let mut said = REPORTED_TAP.lock().unwrap();
-                    if *said != reason {
-                        *said = reason;
+                    static REPORTED_TAP: Mutex<Vec<&str>> = Mutex::new(Vec::new());
+                    if first_report(&REPORTED_TAP, reason) {
                         crate::log!("[layer] present skipped: swapchain is pass_through and {reason} -- this frame is untouched");
                         crate::logging::flush();
                     }
@@ -3155,7 +3174,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             unsafe {
                                 capture_untouched(
                                     &self.device, instance, self.physical_device, queue, queue_family, image, (width, height, bgr_order), readable,
-                                    series, relay_semaphores, present_info, &mut relay_semaphore, neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
+                                    series, relay_semaphores, present_info, &mut relay_semaphore, &mut series_wait, neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
                                 );
                             }
                         }
@@ -3188,7 +3207,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         unsafe {
                             capture_untouched(
                                 &self.device, instance, self.physical_device, queue, queue_family, image, (width, height, bgr_order), readable,
-                                series, relay_semaphores, present_info, &mut relay_semaphore, neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
+                                series, relay_semaphores, present_info, &mut relay_semaphore, &mut series_wait, neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
                             );
                         }
                     }
@@ -3313,9 +3332,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     if observing {
                         // SAFETY: same present, same queue, right after `before`. When the readback
                         // waited on the composition's semaphore, the present must not wait on it too.
-                        if unsafe { series.after(&self.device, queue, image, width, height, bgr_order, wait_semaphore, capture::untouched_reason()) } && wait_semaphore.is_some() {
-                            wait_semaphore = None;
-                            series_composed = true;
+                        match unsafe { series.after(&self.device, queue, image, width, height, bgr_order, wait_semaphore, capture::untouched_reason()) } {
+                            crate::series::PresentWait::Unchanged => {}
+                            crate::series::PresentWait::Consumed => series_composed |= wait_semaphore.take().is_some(),
+                            crate::series::PresentWait::Instead(semaphore) => {
+                                series_composed |= wait_semaphore.take().is_some();
+                                series_wait = Some(semaphore);
+                            }
                         }
                     }
                     if capture::take_setup_failure() {
@@ -3340,12 +3363,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
 
         // SAFETY: `present_info` is valid for the duration of this call; `next_present`
         // was resolved from the next layer/driver's own proc-addr table.
-        let result = if relay_semaphore.is_some() || wait_semaphore.is_some() {
+        let result = if relay_semaphore.is_some() || wait_semaphore.is_some() || series_wait.is_some() {
             // Never drop a dependency the application had: either its own wait
             // semaphores go through unchanged (the layer did no relay), or the relay
             // batch already waited on them and its semaphore stands in for them.
             // `capture::run`'s own compute work is an *additional* dependency.
-            let mut combined: Vec<vk::Semaphore> = Vec::with_capacity(present_info.wait_semaphore_count as usize + 2);
+            let mut combined: Vec<vk::Semaphore> = Vec::with_capacity(present_info.wait_semaphore_count as usize + 3);
             match relay_semaphore {
                 Some(relay) => combined.push(relay),
                 None if present_info.wait_semaphore_count > 0 && !present_info.p_wait_semaphores.is_null() => {
@@ -3358,9 +3381,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 }
                 None => {}
             }
-            if let Some(sem) = wait_semaphore {
-                combined.push(sem);
-            }
+            combined.extend(wait_semaphore);
+            combined.extend(series_wait);
             // Copies every other field (`p_next`, `swapchain_count`, `p_swapchains`,
             // `p_image_indices`, `p_results`) unchanged from the app's own
             // `present_info` -- only the wait-semaphore list is actually different.
@@ -3386,6 +3408,19 @@ mod tap_source_lifetime_tests {
 
     fn image(raw: u64) -> vk::Image {
         vk::Image::from_raw(raw)
+    }
+
+    /// Each "present skipped" reason is reported once, also when two of them alternate from present to
+    /// present (remembering only the last one logged and flushed on every present).
+    #[test]
+    fn a_skip_reason_is_reported_once_even_when_reasons_alternate() {
+        let seen: Mutex<Vec<Option<vk::ImageLayout>>> = Mutex::new(Vec::new());
+        let reports: Vec<bool> = [None, Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL), None, Some(vk::ImageLayout::TRANSFER_SRC_OPTIMAL), None]
+            .into_iter()
+            .map(|reason| first_report(&seen, reason))
+            .collect();
+        assert_eq!(reports, [true, true, false, false, false]);
+        assert!(first_report(&seen, Some(vk::ImageLayout::COLOR_ATTACHMENT_OPTIMAL)), "a new reason is still reported");
     }
 
     /// A pool reset or destroyed takes its buffers' recorded tap-source layouts with it; another

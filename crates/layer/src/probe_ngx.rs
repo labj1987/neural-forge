@@ -364,6 +364,17 @@ impl State {
         self.pools.entry(pool).or_default().extend(command_buffers.iter().copied());
     }
 
+    /// `vkFreeCommandBuffers`: the buffers leave `pool` as well, so a handle the driver reuses for a
+    /// buffer of another pool is not dropped with this pool's next reset.
+    fn free_from(&mut self, pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer]) {
+        if let Some(members) = self.pools.get_mut(&pool) {
+            for cb in command_buffers {
+                members.remove(cb);
+            }
+        }
+        self.free(command_buffers);
+    }
+
     /// A pool reset (`destroyed`: destroyed) resets (frees) every buffer of it.
     fn reset_pool(&mut self, pool: vk::CommandPool, destroyed: bool) {
         let members: Vec<vk::CommandBuffer> = if destroyed { self.pools.remove(&pool).map(|m| m.into_iter().collect()).unwrap_or_default() } else { self.pools.get(&pool).map(|m| m.iter().copied().collect()).unwrap_or_default() };
@@ -889,9 +900,9 @@ pub(crate) fn on_reset_command_pool(pool: vk::CommandPool, destroyed: bool) {
     }
 }
 
-pub(crate) fn on_free_command_buffers(command_buffers: &[vk::CommandBuffer]) {
+pub(crate) fn on_free_command_buffers(pool: vk::CommandPool, command_buffers: &[vk::CommandBuffer]) {
     if enabled() {
-        state().free(command_buffers);
+        state().free_from(pool, command_buffers);
     }
 }
 
@@ -1186,5 +1197,24 @@ mod tests {
         assert!(!s.recordings.contains_key(&cb));
         s.reset_pool(pool, true);
         assert!(s.pools.is_empty());
+    }
+
+    /// A freed buffer leaves its pool: when the driver hands its handle out again from another
+    /// pool, resetting the first pool keeps the new buffer's recording.
+    #[test]
+    fn a_freed_buffers_handle_reused_by_another_pool_survives_the_first_pools_reset() {
+        let mut s = State::default();
+        let (first, second, cb) = (vk::CommandPool::from_raw(30), vk::CommandPool::from_raw(31), vk::CommandBuffer::from_raw(40));
+        s.allocated(first, &[cb]);
+        s.free_from(first, &[cb]);
+        assert!(s.pools[&first].is_empty(), "freed: no longer the first pool's");
+        s.allocated(second, &[cb]);
+        s.begin(cb, vk::CommandBufferUsageFlags::empty());
+        s.reset_pool(first, false);
+        assert!(s.recordings.contains_key(&cb), "the second pool's buffer keeps its recording");
+        s.reset_pool(first, true);
+        assert!(s.recordings.contains_key(&cb));
+        s.reset_pool(second, false);
+        assert!(!s.recordings.contains_key(&cb), "its own pool's reset drops it");
     }
 }
