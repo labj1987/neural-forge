@@ -21,7 +21,11 @@ use std::sync::Mutex;
 const MIN_PYTHON: (u32, u32) = (3, 10);
 
 /// One PTX generator run: the script in `scripts/ptx`, its arguments, and the output's file stem, which takes
-/// the place of `@` in the arguments. Same invocations, in the same order, as upstream's build_shaders.ps1.
+/// the place of `@` in the arguments. Same invocations, in the same order, as upstream's build_shaders.ps1, except
+/// one register cap: the 128-channel FFN kernels are capped at 64 registers (upstream: none), so two of their
+/// 512-thread workgroups fit on an SM instead of one (88 and 84 registers); bit-exact, and 0.20 ms (full
+/// network) and 0.06 ms (small) faster at 1486x836 on the RTX 5070 (docs/DLSS_KERNEL_CATALOGUE.md,
+/// "Register caps").
 fn ptx_invocations() -> Vec<(&'static str, String, Vec<String>)> {
     let mut v = Vec::new();
     let mut add = |script: &'static str, stem: String, args: &[&str]| {
@@ -38,7 +42,7 @@ fn ptx_invocations() -> Vec<(&'static str, String, Vec<String>)> {
             add("gemm2_e4m3.py", format!("gemm2_e4m3_K{k}_f{f}"), &[k, f, "@"]);
         }
     }
-    for [c, r, x] in [["64", "4", "0"], ["128", "4", "0"], ["256", "3", "80"], ["256", "4", "64"]] {
+    for [c, r, x] in [["64", "4", "0"], ["128", "4", "64"], ["256", "3", "80"], ["256", "4", "64"]] {
         add("ffn_e4m3.py", format!("ffn_e4m3_C{c}_R{r}"), &[c, r, "@", x]);
         add("ffn_e4m3.py", format!("ffn_e4m3_C{c}_R{r}_proj"), &[c, r, "@", x, "1"]);
     }

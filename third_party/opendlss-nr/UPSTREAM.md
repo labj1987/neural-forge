@@ -27,7 +27,8 @@ patches onto it, and regenerate `crates/supervisor/src/model_shape.rs` if the ne
   (`runVerify`). `src/reference.*` stays: `ref::siluTable()` feeds `Kernels::setSiluTable`.
 - `demo/`, `ports/`, `docs/`, `third_party/` (Filament patch), and the PowerShell/Node build scripts
   (`scripts/*.ps1`, `scripts/*.mjs`, `scripts/*.py` outside `scripts/ptx/`). `build.rs` reproduces
-  `scripts/build_shaders.ps1`: the same glslang flags and the same PTX generator invocations.
+  `scripts/build_shaders.ps1`: the same glslang flags and the same PTX generator invocations, except that the
+  128-channel FFN kernels (`ffn_e4m3_C128_R4`, `_proj`) are generated with a 64-register cap (`build.rs` says why).
 
 ## Local changes
 
