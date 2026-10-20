@@ -16,9 +16,10 @@
 //!
 //! Both backends see presses whatever has the focus, so a press acts only while the game has it:
 //! the window the X server (XWayland) names active (`_NET_ACTIVE_WINDOW`) belongs to this process
-//! ([`Focus`]). Where that cannot be told (no X server, or one without EWMH, as inside gamescope) a
-//! press is ignored unless `NEURAL_FORGE_HOTKEY_GLOBAL=1` asks for the key to act whatever has the
-//! focus. Only presses of the watched key are kept; every other key code read is dropped at once.
+//! ([`Focus`]). Where that cannot be told (no X server, or one without EWMH, as inside gamescope,
+//! whose nested server holds only the game) a press acts; `NEURAL_FORGE_HOTKEY_GLOBAL=1` makes it act
+//! even while another client is known to have the focus. Only presses of the watched key are kept;
+//! every other key code read is dropped at once.
 //!
 //! Neither links X11: libX11/libXi are `dlopen`ed only when the evdev backend is unavailable, so
 //! a Vulkan process on a machine with no X at all is unaffected.
@@ -286,6 +287,8 @@ struct X11 {
     x11: *mut c_void,
     xi: *mut c_void,
     display: *mut c_void,
+    /// This connection's entry in [`X11_DISPLAYS`] and [`X11_DEAD`].
+    slot: usize,
     opcode: c_int,
     close_display: unsafe extern "C" fn(*mut c_void) -> c_int,
     pending: unsafe extern "C" fn(*mut c_void) -> c_int,
@@ -343,7 +346,7 @@ impl X11 {
                 let close_display = sym(x11, "XCloseDisplay")?;
                 // Needed to survive the connection's death (libX11 1.7 and later): without it, Xlib's
                 // I/O error path ends the process, so the backend is not used at all.
-                let set_io_error_handler: unsafe extern "C" fn(Option<IoErrorHandler>) -> Option<IoErrorHandler> = sym(x11, "XSetIOErrorHandler")?;
+                let set_io_error_handler: SetIoErrorHandler = sym(x11, "XSetIOErrorHandler")?;
                 let set_io_error_exit_handler: unsafe extern "C" fn(*mut c_void, Option<IoErrorExitHandler>, *mut c_void) =
                     sym(x11, "XSetIOErrorExitHandler")?;
                 let pending = sym(x11, "XPending")?;
@@ -355,28 +358,37 @@ impl X11 {
                 if display.is_null() {
                     return None;
                 }
-                // The I/O error handler is process-wide (the game's own Xlib use, Wine's, shares it):
-                // ours acts on this connection only and hands every other one to the handler that was
-                // there. The exit handler is this connection's own; returning from it keeps the
-                // process alive.
-                X11_DISPLAY.store(display, Ordering::Release);
-                let previous = set_io_error_handler(Some(io_error));
-                PREVIOUS_IO_ERROR.store(previous.map_or(0, |f| f as usize), Ordering::Release);
-                set_io_error_exit_handler(display, Some(io_error_exit), std::ptr::null_mut());
-                let fail = |display| {
-                    // The connection was opened above; give it back on every failure path.
+                let fail = |display, slot: Option<usize>| {
+                    // The connection was opened above; give it back on every failure path, then its
+                    // entry (after the close, so an error the close itself hits is still ours).
                     let close: unsafe extern "C" fn(*mut c_void) -> c_int = close_display;
                     close(display);
+                    if let Some(slot) = slot {
+                        release_display(slot);
+                    }
                     None::<()>
                 };
+                // The I/O error handler is process-wide (the game's own Xlib use, Wine's, shares it):
+                // ours acts on the layer's own connections only and hands every other one to the
+                // handler that was there. It is installed once per process. The exit handler is this
+                // connection's own; returning from it keeps the process alive.
+                let Some(slot) = register_display(display) else {
+                    fail(display, None);
+                    return None;
+                };
+                if !install_io_error_handler(set_io_error_handler) {
+                    fail(display, Some(slot));
+                    return None;
+                }
+                set_io_error_exit_handler(display, Some(io_error_exit), slot as *mut c_void);
                 let (mut opcode, mut event, mut error) = (0, 0, 0);
                 if query_extension(display, c"XInputExtension".as_ptr(), &mut opcode, &mut event, &mut error) == 0 {
-                    fail(display);
+                    fail(display, Some(slot));
                     return None;
                 }
                 let (mut major, mut minor) = (2, 2);
                 if query_version(display, &mut major, &mut minor) != 0 {
-                    fail(display);
+                    fail(display, Some(slot));
                     return None;
                 }
                 // Raw key presses on the root window: delivered whatever has focus, which is the
@@ -386,14 +398,14 @@ impl X11 {
                 let mut em = XiEventMask { deviceid: XI_ALL_MASTER_DEVICES, mask_len: mask.len() as c_int, mask: mask.as_mut_ptr() };
                 select_events(display, default_root(display), &mut em, 1);
                 flush(display);
-                Some((display, opcode, close_display, pending, next_event, get_event_data, free_event_data))
+                Some((display, slot, opcode, close_display, pending, next_event, get_event_data, free_event_data))
             })()
         };
-        let Some((display, opcode, close_display, pending, next_event, get_event_data, free_event_data)) = resolved else {
+        let Some((display, slot, opcode, close_display, pending, next_event, get_event_data, free_event_data)) = resolved else {
             close_libs(x11, xi);
             return None;
         };
-        Some(X11 { x11, xi, display, opcode, close_display, pending, next_event, get_event_data, free_event_data })
+        Some(X11 { x11, xi, display, slot, opcode, close_display, pending, next_event, get_event_data, free_event_data })
     }
 
     /// Raw key presses are already edges, so no held state is tracked. An X keycode is the evdev
@@ -401,7 +413,8 @@ impl X11 {
     /// Presses of `key` since the last poll; none once the connection died.
     fn poll(&mut self, key: u32) -> u32 {
         let mut presses = 0;
-        if X11_DEAD.load(Ordering::Acquire) {
+        let dead = &X11_DEAD[self.slot];
+        if dead.load(Ordering::Acquire) {
             return 0;
         }
         // SAFETY: `display` is live until Drop; the event/cookie structs match Xlib's layout for
@@ -424,7 +437,7 @@ impl X11 {
                     }
                 }
                 (self.free_event_data)(self.display, cookie);
-                if X11_DEAD.load(Ordering::Acquire) {
+                if dead.load(Ordering::Acquire) {
                     break;
                 }
             }
@@ -438,12 +451,18 @@ impl Drop for X11 {
         // SAFETY: the connection is closed exactly once, before the libraries that own the
         // code doing so are unloaded.
         // A connection Xlib reported an I/O error on is unusable: it (and the libraries its code is
-        // in, which the error path may still reference) is left as it is.
-        if X11_DEAD.load(Ordering::Acquire) {
+        // in, which the error path may still reference) is left as it is, and keeps its entry so a
+        // late error on it is still recognised as ours.
+        if X11_DEAD[self.slot].load(Ordering::Acquire) {
             return;
         }
         unsafe {
             (self.close_display)(self.display);
+        }
+        // After the close: nothing names the closed connection as the layer's any more, so a new
+        // one Xlib hands out at the same address is not mistaken for it.
+        release_display(self.slot);
+        unsafe {
             libc::dlclose(self.xi);
             libc::dlclose(self.x11);
         }
@@ -452,19 +471,74 @@ impl Drop for X11 {
 
 type IoErrorHandler = unsafe extern "C" fn(*mut c_void) -> c_int;
 type IoErrorExitHandler = unsafe extern "C" fn(*mut c_void, *mut c_void);
+type SetIoErrorHandler = unsafe extern "C" fn(Option<IoErrorHandler>) -> Option<IoErrorHandler>;
 
-/// The layer's own X connection, the handler that was installed before ours, and whether our
-/// connection died.
-static X11_DISPLAY: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
+/// How many of the layer's own X connections can be open at once: one per device's poller.
+const X11_SLOTS: usize = 4;
+/// The layer's own X connections (null: a free entry), whether Xlib reported an I/O error on each,
+/// and the handler that was installed before ours. An entry whose connection died stays taken.
+static X11_DISPLAYS: [AtomicPtr<c_void>; X11_SLOTS] = [const { AtomicPtr::new(std::ptr::null_mut()) }; X11_SLOTS];
+static X11_DEAD: [AtomicBool; X11_SLOTS] = [const { AtomicBool::new(false) }; X11_SLOTS];
 static PREVIOUS_IO_ERROR: AtomicUsize = AtomicUsize::new(0);
-static X11_DEAD: AtomicBool = AtomicBool::new(false);
 
-/// Xlib's I/O error handler: our connection is marked dead (Xlib then calls its exit handler,
-/// [`io_error_exit`], which returns); any other connection goes to the handler installed before.
+/// Records `display` as one of the layer's own connections: its entry, `None` when all are taken.
+fn register_display(display: *mut c_void) -> Option<usize> {
+    X11_DISPLAYS.iter().position(|entry| entry.compare_exchange(std::ptr::null_mut(), display, Ordering::AcqRel, Ordering::Acquire).is_ok())
+}
+
+/// Frees the entry of a connection that was closed without an I/O error.
+fn release_display(slot: usize) {
+    X11_DEAD[slot].store(false, Ordering::Release);
+    X11_DISPLAYS[slot].store(std::ptr::null_mut(), Ordering::Release);
+}
+
+/// Installs [`io_error`] as Xlib's I/O error handler, once per process. The handler is
+/// process-wide: a second `XSetIOErrorHandler` would hand back our own handler as the one before,
+/// and [`io_error`] would then forward every other connection's error to itself until the stack
+/// overflowed. The code the handler lives in is pinned first (`RTLD_NODELETE` on libX11 and on the
+/// layer's own object): the Vulkan loader unloads a layer with the last instance, and Xlib would
+/// then call into unmapped memory. `false` when they cannot be pinned (the X11 backend is then not
+/// used, since Xlib's default handler ends the process on the connection's death).
+fn install_io_error_handler(set: SetIoErrorHandler) -> bool {
+    static INSTALLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *INSTALLED.get_or_init(|| {
+        if !pin_handler_code() {
+            crate::log!("[hotkey] could not pin the X I/O error handler's code; not using XInput2");
+            return false;
+        }
+        // SAFETY: `set` is libX11's `XSetIOErrorHandler`; `io_error` has the handler's signature.
+        chain_previous(unsafe { set(Some(io_error)) });
+        true
+    })
+}
+
+/// Keeps `previous` as the handler other connections' errors go to. Never our own: that would
+/// forward to itself forever.
+fn chain_previous(previous: Option<IoErrorHandler>) {
+    let previous = previous.map_or(0, |f| f as usize);
+    if previous != io_error as IoErrorHandler as usize {
+        PREVIOUS_IO_ERROR.store(previous, Ordering::Release);
+    }
+}
+
+/// Makes libX11 and the layer's own object stay loaded for the life of the process.
+fn pin_handler_code() -> bool {
+    // SAFETY: `RTLD_NOLOAD` only looks up an object already loaded; the reference it takes is kept
+    // on purpose, and `RTLD_NODELETE` keeps the object mapped past every `dlclose`.
+    let pin = |name: &CStr| unsafe { !libc::dlopen(name.as_ptr(), libc::RTLD_LAZY | libc::RTLD_NOLOAD | libc::RTLD_NODELETE).is_null() };
+    let Some(layer) = crate::layer_object_path().and_then(|p| CString::new(p).ok()) else { return false };
+    pin(c"libX11.so.6") && pin(&layer)
+}
+
+/// Xlib's I/O error handler: one of the layer's own connections is marked dead (Xlib then calls
+/// its exit handler, [`io_error_exit`], which returns); any other connection goes to the handler
+/// installed before.
 unsafe extern "C" fn io_error(display: *mut c_void) -> c_int {
-    if display == X11_DISPLAY.load(Ordering::Acquire) {
-        X11_DEAD.store(true, Ordering::Release);
-        return 0;
+    if !display.is_null() {
+        if let Some(slot) = X11_DISPLAYS.iter().position(|entry| entry.load(Ordering::Acquire) == display) {
+            X11_DEAD[slot].store(true, Ordering::Release);
+            return 0;
+        }
     }
     match PREVIOUS_IO_ERROR.load(Ordering::Acquire) {
         0 => 0,
@@ -473,8 +547,11 @@ unsafe extern "C" fn io_error(display: *mut c_void) -> c_int {
     }
 }
 
-unsafe extern "C" fn io_error_exit(_display: *mut c_void, _data: *mut c_void) {
-    X11_DEAD.store(true, Ordering::Release);
+/// The exit handler of one of the layer's connections; `data` is its entry.
+unsafe extern "C" fn io_error_exit(_display: *mut c_void, data: *mut c_void) {
+    if let Some(dead) = X11_DEAD.get(data as usize) {
+        dead.store(true, Ordering::Release);
+    }
 }
 
 // ---- whether the game has the keyboard focus ----------------------------------------------------
@@ -826,7 +903,7 @@ mod tests {
         p.pending = 1;
         p.pending_key = 87;
         p.last_poll = Some(Instant::now());
-        // No X server to ask about the focus here: the press is consumed, and acts only when global.
+        // No X server to ask about the focus here: the press is consumed, and acts (unknown focus).
         p.focus = Some(None);
         assert!(!p.pressed(88), "another key's press is never one of these");
         assert_eq!(p.pending, 1);
@@ -835,31 +912,71 @@ mod tests {
         assert!(!p.pressed(87));
     }
 
-    /// An I/O error on the layer's own X connection marks it dead and never reaches the game's
-    /// handler; one on any other connection goes to the handler that was installed before.
+    /// Serializes the tests that use the process-wide X connection table and handler chain.
+    static X11_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// An I/O error on one of the layer's own X connections marks that one dead and never reaches
+    /// the game's handler; one on any other connection goes to the handler that was installed before.
     #[test]
     fn io_errors_on_other_connections_go_to_the_previous_handler() {
+        let _state = X11_STATE.lock().unwrap_or_else(|e| e.into_inner());
         static SEEN: AtomicUsize = AtomicUsize::new(0);
         unsafe extern "C" fn previous(display: *mut c_void) -> c_int {
             SEEN.store(display as usize, Ordering::SeqCst);
             7
         }
-        let ours = 0x1000 as *mut c_void;
-        X11_DISPLAY.store(ours, Ordering::SeqCst);
+        let (first, second) = (0x1000 as *mut c_void, 0x1800 as *mut c_void);
+        let a = register_display(first).expect("a free entry");
+        let b = register_display(second).expect("a second device's poller has its own entry");
         PREVIOUS_IO_ERROR.store(previous as *const () as usize, Ordering::SeqCst);
         assert_eq!(unsafe { io_error(0x2000 as *mut c_void) }, 7);
         assert_eq!(SEEN.load(Ordering::SeqCst), 0x2000);
-        assert!(!X11_DEAD.load(Ordering::SeqCst));
-        assert_eq!(unsafe { io_error(ours) }, 0);
-        assert!(X11_DEAD.load(Ordering::SeqCst), "our connection is marked dead");
-        assert_eq!(SEEN.load(Ordering::SeqCst), 0x2000, "the game's handler never sees it");
-        X11_DEAD.store(false, Ordering::SeqCst);
-        X11_DISPLAY.store(std::ptr::null_mut(), Ordering::SeqCst);
+        assert!(!X11_DEAD[a].load(Ordering::SeqCst) && !X11_DEAD[b].load(Ordering::SeqCst));
+        assert_eq!(unsafe { io_error(first) }, 0);
+        assert!(X11_DEAD[a].load(Ordering::SeqCst), "our connection is marked dead");
+        assert!(!X11_DEAD[b].load(Ordering::SeqCst), "the other one of ours lives on");
+        assert_eq!(unsafe { io_error(second) }, 0, "the second connection is ours too");
+        assert_eq!(SEEN.load(Ordering::SeqCst), 0x2000, "the game's handler never sees either");
+        unsafe { io_error_exit(second, b as *mut c_void) };
+        assert!(X11_DEAD[b].load(Ordering::SeqCst), "the exit handler marks its own entry");
+        release_display(a);
+        release_display(b);
+        assert_eq!(unsafe { io_error(first) }, 7, "a released connection is no longer the layer's");
         PREVIOUS_IO_ERROR.store(0, Ordering::SeqCst);
     }
 
+    /// Our own handler is never kept as the one before it: a second `XSetIOErrorHandler` returns it,
+    /// and chaining to it made an error on any other connection recurse until the stack overflowed.
+    #[test]
+    fn our_own_handler_is_never_chained_to_itself() {
+        let _state = X11_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        unsafe extern "C" fn wine(_display: *mut c_void) -> c_int {
+            3
+        }
+        chain_previous(Some(wine));
+        chain_previous(Some(io_error));
+        assert_eq!(PREVIOUS_IO_ERROR.load(Ordering::SeqCst), wine as *const () as usize, "the handler from before ours is kept");
+        assert_eq!(unsafe { io_error(0x2000 as *mut c_void) }, 3, "another connection's error reaches it, once");
+        chain_previous(None);
+        assert_eq!(unsafe { io_error(0x2000 as *mut c_void) }, 0, "with none before ours the error simply returns");
+        PREVIOUS_IO_ERROR.store(0, Ordering::SeqCst);
+    }
+
+    /// All entries taken: a further connection is refused, not mistaken for another's.
+    #[test]
+    fn the_connection_table_refuses_a_connection_past_its_size() {
+        let _state = X11_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let taken: Vec<usize> = (1..=X11_SLOTS).map(|i| register_display((0x4000 + i * 0x100) as *mut c_void).expect("free")).collect();
+        assert_eq!(register_display(0x9000 as *mut c_void), None);
+        for slot in taken {
+            release_display(slot);
+        }
+        let again = register_display(0x9000 as *mut c_void).expect("released entries are reused");
+        release_display(again);
+    }
+
     /// A press acts with the game focused; never with another window focused unless global was asked
-    /// for; and where focus cannot be told only when global was asked for.
+    /// for; and where focus cannot be told, always.
     #[test]
     fn a_press_acts_only_with_the_game_focused_unless_global() {
         assert!(press_acts(Some(true), false));
