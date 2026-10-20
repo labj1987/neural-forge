@@ -88,7 +88,8 @@ mod tests {
     fn channel_path_prefers_config_then_environment_then_default() {
         let _guard = crate::paths::tests::XDG_DATA_HOME_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let prev = std::env::var("NEURAL_FORGE_SHM").ok();
-        let mut cfg = Config { shm: "/tmp/neural-forge-x/configured.bin".into(), ..Config::default() };
+        let mut cfg = Config::default();
+        cfg.shm = "/tmp/neural-forge-x/configured.bin".into();
         std::env::set_var("NEURAL_FORGE_SHM", "/tmp/neural-forge-x/env.bin");
         assert_eq!(channel_path(&cfg), "/tmp/neural-forge-x/configured.bin");
         cfg.shm.clear();

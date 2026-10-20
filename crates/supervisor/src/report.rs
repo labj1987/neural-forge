@@ -599,11 +599,10 @@ pub mod zip {
 mod tests {
     use super::*;
 
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("neural-forge-report-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// Removed when the test ends, passed or failed (a failed run left
+    /// `/tmp/neural-forge-report-full-<pid>` behind before).
+    fn scratch(name: &str) -> crate::paths::tests::ScratchDir {
+        crate::paths::tests::ScratchDir::new(&format!("report-{name}"))
     }
 
     fn sources(root: &Path) -> Sources {

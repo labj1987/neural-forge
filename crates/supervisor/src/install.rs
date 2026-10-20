@@ -28,6 +28,8 @@ pub enum InstallError {
     Json(serde_json::Error),
     InvalidManifest(String),
     RefusedSymlink(PathBuf),
+    /// A symlink in the AppDir's files: following it could copy a tree from anywhere (or loop).
+    RefusedSourceSymlink(PathBuf),
     RefusedUnowned(PathBuf),
     CorruptRecord(CorruptRecord),
 }
@@ -65,6 +67,7 @@ impl std::fmt::Display for InstallError {
             Self::Json(e) => write!(f, "{e}"),
             Self::InvalidManifest(msg) => write!(f, "{msg}"),
             Self::RefusedSymlink(path) => write!(f, "refusing symlink destination: {}", path.display()),
+            Self::RefusedSourceSymlink(path) => write!(f, "refusing a symlink in the AppDir: {}", path.display()),
             Self::RefusedUnowned(path) => write!(f, "refusing to overwrite unowned or changed file: {}", path.display()),
             Self::CorruptRecord(e) => write!(f, "{e}"),
         }
@@ -111,16 +114,44 @@ fn record_path() -> PathBuf {
     PathBuf::from(paths::data_dir()).join("installation.json")
 }
 
+/// Why the install record could not be used.
+#[derive(Debug)]
+enum RecordError {
+    /// It is there but could not be read (permissions, an I/O error): it may be fine, so nothing
+    /// may act as if there were none.
+    Unreadable(std::io::Error),
+    /// It was read and is not a record.
+    Corrupt(CorruptRecord),
+}
+
+impl From<RecordError> for InstallError {
+    fn from(e: RecordError) -> Self {
+        match e {
+            RecordError::Unreadable(e) => InstallError::Io(e),
+            RecordError::Corrupt(e) => InstallError::CorruptRecord(e),
+        }
+    }
+}
+
+impl From<RecordError> for std::io::Error {
+    fn from(e: RecordError) -> Self {
+        match e {
+            RecordError::Unreadable(e) => e,
+            RecordError::Corrupt(e) => e.into(),
+        }
+    }
+}
+
 /// The install record: empty when there is none yet, an error when one is there but cannot be
 /// read (silently starting from an empty record would refuse every installed file as unowned).
-fn load_record() -> Result<BTreeMap<String, String>, CorruptRecord> {
+fn load_record() -> Result<BTreeMap<String, String>, RecordError> {
     let path = record_path();
-    let text = match std::fs::read_to_string(&path) {
-        Ok(text) => text,
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
-        Err(e) => return Err(CorruptRecord { path, reason: e.to_string() }),
+        Err(e) => return Err(RecordError::Unreadable(std::io::Error::new(e.kind(), format!("the install record {} cannot be read: {e}", path.display())))),
     };
-    serde_json::from_str(&text).map_err(|e| CorruptRecord { path, reason: e.to_string() })
+    serde_json::from_slice(&bytes).map_err(|e| RecordError::Corrupt(CorruptRecord { path, reason: e.to_string() }))
 }
 
 /// The installed layer manifest, the one file the Vulkan loader finds on its own.
@@ -149,15 +180,24 @@ fn save_record(record: &BTreeMap<String, String>) -> std::io::Result<()> {
     write_atomic(&record_path(), text.as_bytes(), 0o644)
 }
 
-fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
+/// Every regular file under `dir` (none when it is not a directory). A symlink anywhere below it is
+/// refused, not followed: a link to a directory elsewhere would copy that tree into the install and
+/// record it as owned, and a link loop would recurse until the stack overflows.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<(), InstallError> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(m) if m.is_symlink() => return Err(InstallError::RefusedSourceSymlink(dir.to_path_buf())),
+        Ok(m) if m.is_dir() => {}
+        _ => return Ok(()),
     }
     for entry in std::fs::read_dir(dir)? {
-        let path = entry?.path();
-        if path.is_dir() {
+        let entry = entry?;
+        let kind = entry.file_type()?;
+        let path = entry.path();
+        if kind.is_symlink() {
+            return Err(InstallError::RefusedSourceSymlink(path));
+        } else if kind.is_dir() {
             collect_files(&path, out)?;
-        } else if path.is_file() {
+        } else if kind.is_file() {
             out.push(path);
         }
     }
@@ -171,7 +211,7 @@ fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) -> std::io::Result<()> {
 /// `install.py` makes.
 pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     let root = PathBuf::from(paths::data_dir());
-    let (old, foreign) = owned_record(load_record().map_err(InstallError::CorruptRecord)?);
+    let (old, foreign) = owned_record(load_record()?);
     let usr = appdir.join("usr");
 
     let mut files: BTreeMap<PathBuf, Vec<u8>> = BTreeMap::new();
@@ -263,7 +303,7 @@ pub fn install(appdir: &Path) -> Result<InstallReport, InstallError> {
     let stale: Vec<(String, String)> = old.iter().filter(|(name, _)| !current.contains(*name)).map(|(n, d)| (n.clone(), d.clone())).collect();
     for (name, recorded) in stale {
         let path = PathBuf::from(&name);
-        if path.is_file() && !path.is_symlink() && digest_file(&path).ok().as_ref() == Some(&recorded) {
+        if removable(&path) && digest_file(&path).ok().as_ref() == Some(&recorded) {
             std::fs::remove_file(&path)?;
         }
         record.remove(&name);
@@ -286,9 +326,16 @@ fn symlink_below_data_home(path: &Path) -> Option<PathBuf> {
     path.ancestors().take_while(|a| *a != data_home && a.starts_with(&data_home)).find(|a| a.is_symlink()).map(Path::to_path_buf)
 }
 
-/// Whether the file at `path` is a layer manifest naming this project's layer.
+/// Whether the file at `path` may be removed: a regular file, not a symlink, with no symlink
+/// between it and the XDG data home ([`symlink_below_data_home`], the check every write makes): a
+/// symlinked `neural-forge`, `lib` or `vulkan` directory would send the removal somewhere else.
+fn removable(path: &Path) -> bool {
+    path.is_file() && !path.is_symlink() && symlink_below_data_home(path).is_none()
+}
+
+/// Whether the file at `path` is a layer manifest naming this project's layer, and [`removable`].
 fn is_our_manifest(path: &Path) -> bool {
-    !path.is_symlink()
+    removable(path)
         && std::fs::read_to_string(path)
             .ok()
             .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -305,13 +352,13 @@ fn remove_known_install() -> std::io::Result<()> {
     }
     let root = PathBuf::from(paths::data_dir());
     for file in [root.join("bin/neural-forge"), root.join("bin/neural-forge-cli")] {
-        if file.is_file() && !file.is_symlink() {
+        if removable(&file) {
             std::fs::remove_file(&file)?;
             remove_empty_parents(&file);
         }
     }
     let lib = root.join("lib/neural-forge");
-    if lib.is_dir() && !lib.is_symlink() {
+    if lib.is_dir() && symlink_below_data_home(&lib).is_none() {
         std::fs::remove_dir_all(&lib)?;
         remove_empty_parents(&lib.join("x"));
     }
@@ -333,14 +380,17 @@ fn prune_empty_dirs(dir: &Path, stop: &Path) {
 /// own record (a file the user or another program has since changed is left alone,
 /// reported as preserved rather than silently deleted), then clears the record. The layer
 /// manifest goes first, so no game loads a layer whose files are half gone. A record entry
-/// outside the directories this installer owns is skipped: neither removed nor reported. Without
-/// a record, or with one that cannot be read, what an install puts in place is removed by its
-/// location ([`remove_known_install`]): the layer manifest (when it names this layer), the
-/// binaries and the layer's library directory.
+/// outside the directories this installer owns is skipped: neither removed nor reported, and so is
+/// one reached through a symlinked directory ([`removable`]), reported as preserved. Without a
+/// record, or with one that is not a record (corrupt), what an install puts in place is removed by
+/// its location ([`remove_known_install`]): the layer manifest (when it names this layer), the
+/// binaries and the layer's library directory. A record that is there but cannot be read (an I/O
+/// error, permissions) is an error: nothing is removed, and the record is kept.
 pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
     let record = match load_record() {
         Ok(record) if !record.is_empty() => record,
-        _ => {
+        Err(e @ RecordError::Unreadable(_)) => return Err(e.into()),
+        Ok(_) | Err(RecordError::Corrupt(_)) => {
             remove_known_install()?;
             let record = record_path();
             if record.exists() {
@@ -355,7 +405,7 @@ pub fn uninstall() -> std::io::Result<Vec<PathBuf>> {
     let ordered = old.get_key_value(&manifest).into_iter().chain(old.iter().filter(|(name, _)| **name != manifest));
     for (name, expected) in ordered {
         let path = PathBuf::from(name);
-        let matches = path.is_file() && !path.is_symlink() && digest_file(&path).ok().as_ref() == Some(expected);
+        let matches = removable(&path) && digest_file(&path).ok().as_ref() == Some(expected);
         if matches {
             std::fs::remove_file(&path)?;
             remove_empty_parents(&path);
@@ -393,7 +443,7 @@ fn remove_empty_parents(path: &Path) {
 pub fn purge() -> std::io::Result<Vec<PathBuf>> {
     let preserved = uninstall()?;
     for path in &preserved {
-        if path.is_file() {
+        if removable(path) {
             let _ = std::fs::remove_file(path);
             remove_empty_parents(path);
         }
@@ -822,5 +872,83 @@ mod tests {
 
         let err = install(&appdir).expect_err("a manifest with the wrong layer name must be rejected");
         assert!(matches!(err, InstallError::InvalidManifest(_)), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn a_record_that_cannot_be_read_stops_uninstall_and_is_kept() {
+        let scratch = ScratchDataHome::new("unreadable-record");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+        let lib_dir = PathBuf::from(paths::data_dir()).join("lib/neural-forge");
+        let theirs = lib_dir.join("notes.txt");
+        std::fs::write(&theirs, "the user's").unwrap();
+        // A record that exists but cannot be read: a directory where it goes (EISDIR, as EIO or EACCES would be).
+        let record = record_path();
+        std::fs::rename(&record, scratch.dir.join("record.json")).unwrap();
+        std::fs::create_dir(&record).unwrap();
+        let err = uninstall().expect_err("an unreadable record is not a missing one");
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        assert!(record.is_dir() && theirs.is_file() && manifest_path().is_file(), "nothing may be removed");
+        assert!(PathBuf::from(paths::data_dir()).join("bin/neural-forge").is_file());
+        assert!(purge().is_err());
+        assert!(theirs.is_file() && manifest_path().is_file());
+        assert!(matches!(install(&appdir), Err(InstallError::Io(_))), "install says the record cannot be read");
+    }
+
+    #[test]
+    fn removal_never_goes_through_a_symlinked_directory() {
+        let scratch = ScratchDataHome::new("symlinked-removal");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        install(&appdir).unwrap();
+        // The user moves the data dir to another disk and links it back: the files there match the record.
+        let root = PathBuf::from(paths::data_dir());
+        let moved = scratch.dir.join("other-disk/neural-forge");
+        std::fs::create_dir_all(moved.parent().unwrap()).unwrap();
+        std::fs::rename(&root, &moved).unwrap();
+        std::os::unix::fs::symlink(&moved, &root).unwrap();
+        let preserved = uninstall().unwrap();
+        for file in ["bin/neural-forge", "bin/neural-forge-cli", "lib/neural-forge/libneural_forge_layer.so"] {
+            assert!(moved.join(file).is_file(), "{file} was removed through the symlink");
+            assert!(preserved.contains(&root.join(file)), "{file} is reported as preserved: {preserved:?}");
+        }
+        // Without a record, removal by location does not follow it either.
+        assert!(uninstall().unwrap().is_empty());
+        assert!(moved.join("bin/neural-forge").is_file() && moved.join("lib/neural-forge").is_dir());
+        // A stale file of an older version under a symlinked directory stays too.
+        std::fs::remove_file(&root).unwrap();
+        std::fs::rename(&moved, &root).unwrap();
+        install(&appdir).unwrap();
+        let old_moved = scratch.dir.join("other-disk/old-dir");
+        std::fs::create_dir_all(&old_moved).unwrap();
+        std::fs::write(old_moved.join("old.so"), "old").unwrap();
+        std::os::unix::fs::symlink(&old_moved, root.join("old-dir")).unwrap();
+        let mut record = load_record().unwrap();
+        record.insert(root.join("old-dir/old.so").to_string_lossy().into_owned(), digest(b"old"));
+        save_record(&record).unwrap();
+        install(&appdir).unwrap();
+        assert!(old_moved.join("old.so").is_file(), "the stale file was removed through the symlink");
+        assert!(!load_record().unwrap().contains_key(&root.join("old-dir/old.so").to_string_lossy().into_owned()), "but no longer tracked");
+    }
+
+    #[test]
+    fn a_symlink_in_the_appdir_is_refused_not_followed() {
+        let scratch = ScratchDataHome::new("appdir-symlink");
+        let appdir = scratch.dir.join("AppDir");
+        write_fixture_appdir(&appdir);
+        let lib = appdir.join("usr/lib/neural-forge");
+        // A loop: following it recursed until the stack overflowed.
+        std::os::unix::fs::symlink(&lib, lib.join("loop")).unwrap();
+        assert!(matches!(install(&appdir), Err(InstallError::RefusedSourceSymlink(p)) if p == lib.join("loop")));
+        std::fs::remove_file(lib.join("loop")).unwrap();
+        // A link to a directory elsewhere: its tree would be copied in and recorded as ours.
+        let elsewhere = scratch.dir.join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        std::fs::write(elsewhere.join("secret"), "x").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, lib.join("more")).unwrap();
+        assert!(matches!(install(&appdir), Err(InstallError::RefusedSourceSymlink(_))));
+        assert!(!PathBuf::from(paths::data_dir()).join("lib/neural-forge/more").exists(), "nothing is written");
+        assert!(!manifest_path().exists());
     }
 }

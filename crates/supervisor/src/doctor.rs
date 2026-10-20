@@ -1036,7 +1036,7 @@ fn check_target_excluded(roots: &Roots, events: &[state_log::Event]) -> Vec<Find
     if neural_forge_protocol::processes::launcher_like(name) || neural_forge_protocol::processes::game_helper(name) {
         return Vec::new();
     }
-    if events.iter().any(|e| e.kind == state_log::ATTACH && e.time + SESSION_SECS >= newest.time) {
+    if events.iter().any(|e| e.kind == state_log::ATTACH && e.time.saturating_add(SESSION_SECS) >= newest.time) {
         return Vec::new();
     }
     let missed = [newest];
@@ -1056,7 +1056,7 @@ fn check_target_excluded(roots: &Roots, events: &[state_log::Event]) -> Vec<Find
                 CHECK,
                 Severity::Warning,
                 format!("the game ran but its target excluded {exe}, so Neural Forge stayed off in it"),
-                format!("{} {}", utc(e.time), event_line(e)),
+                event_line(e),
                 Some(fix),
             )
         })
@@ -1512,6 +1512,7 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].summary.contains("excluded eso64.exe"), "{}", v[0].summary);
         assert!(v[0].fix.as_deref().unwrap().contains("neural-forge-cli enable 306130 --target-exe eso64.exe"), "{:?}", v[0].fix);
+        assert_eq!(v[0].evidence.matches(" UTC").count(), 1, "the time once: {}", v[0].evidence);
         // A process engaged in the same session (the target's own) or later: nothing to say.
         let attach = event(200, 8, "attach", "engaged");
         let events: Vec<state_log::Event> = format!("{excluded}{attach}").lines().filter_map(state_log::parse_line).collect();
@@ -1526,6 +1527,12 @@ mod tests {
         // A launcher that made a swapchain is never the advice.
         let launcher = event(100, 7, "target-excluded", "x").replace("\tGame.exe\t", "\tBethesda.net_Launcher.exe\t");
         let events: Vec<state_log::Event> = launcher.lines().filter_map(state_log::parse_line).collect();
+        assert!(check_target_excluded(&f.roots, &events).is_empty());
+        // A damaged line's time near the end of u64: no overflow (a panic in a debug build), and an
+        // attach logged at that time still counts as later.
+        let far = event(u64::MAX - 1, 8, "attach", "engaged");
+        let events: Vec<state_log::Event> = format!("{excluded}{far}").lines().filter_map(state_log::parse_line).collect();
+        assert_eq!(events.len(), 2, "{far}");
         assert!(check_target_excluded(&f.roots, &events).is_empty());
     }
 

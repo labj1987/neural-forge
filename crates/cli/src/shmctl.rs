@@ -11,9 +11,16 @@
 use neural_forge_protocol::ShmHeader;
 use std::sync::atomic::Ordering;
 
+/// Every subcommand, in the order the usage lists them.
+const SUBCOMMANDS: [&str; 7] = ["status", "set", "toggle", "capture", "dump-cache", "reset", "lut"];
+
 pub fn usage() {
-    eprintln!(
-        "usage: neural-forge-cli shmctl <status|set|toggle|capture|dump-cache|reset>\n\n\
+    eprintln!("{}", usage_text());
+}
+
+fn usage_text() -> String {
+    format!(
+        "usage: neural-forge-cli shmctl <{}>\n\n\
          \x20 status              print every setting and live status field (only looks:\n\
          \x20                     it creates and changes nothing)\n\
          \x20 set <name> <value>  set one setting (float fields take a decimal value;\n\
@@ -39,10 +46,11 @@ pub fn usage() {
          \x20                     again; edit_lut_strength above 0 turns it on\n\n\
          Opens config.ini's shm= channel, else $NEURAL_FORGE_SHM, else the default under\n\
          /tmp/neural-forge-$UID -- the same one the layer uses.",
+        SUBCOMMANDS.join("|"),
         max_frames = neural_forge_protocol::capture::MAX_FRAMES,
         view_min = debug_view_bounds().0,
         view_max = debug_view_bounds().1,
-    );
+    )
 }
 
 /// Shared by `set`/`toggle`: resolves `name` against the persisted settings, returning whether it's
@@ -407,6 +415,23 @@ pub fn run(args: &[String]) -> std::process::ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_usage_header_lists_every_subcommand_and_each_is_described() {
+        let text = usage_text();
+        let header = text.lines().next().unwrap();
+        for sub in SUBCOMMANDS {
+            assert!(header.contains(sub), "{sub} missing from {header:?}");
+            assert!(text.lines().any(|l| l.trim_start().starts_with(&format!("{sub} ")) || l.trim() == sub), "{sub} is not described");
+            let args: Vec<String> = match sub {
+                "set" => vec![sub.into(), "intensity".into(), "1".into()],
+                "toggle" | "lut" => vec![sub.into(), "x".into()],
+                _ => vec![sub.into()],
+            };
+            assert_eq!(check_args(&args), Ok(()), "{sub}");
+        }
+        assert_eq!(header, "usage: neural-forge-cli shmctl <status|set|toggle|capture|dump-cache|reset|lut>");
+    }
 
     #[test]
     fn set_takes_placements_by_name_and_hud_regions_as_text() {

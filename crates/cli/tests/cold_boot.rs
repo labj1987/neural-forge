@@ -10,6 +10,8 @@ fn cli(scratch: &Path, args: &[&str]) -> (bool, String) {
         .env("XDG_CONFIG_HOME", scratch.join("config"))
         .env("XDG_DATA_HOME", scratch.join("data"))
         .env("XDG_STATE_HOME", scratch.join("state"))
+        // The home too: `doctor` finds Steam (its libraries, launch options, app cache) under it.
+        .env("HOME", scratch.join("home"))
         .env("NEURAL_FORGE_SHM", scratch.join("shm.bin"))
         .output()
         .expect("run neural-forge-cli");
@@ -18,7 +20,15 @@ fn cli(scratch: &Path, args: &[&str]) -> (bool, String) {
 
 #[test]
 fn shmctl_on_a_cold_boot_starts_from_the_saved_settings_and_saves_its_change() {
-    let scratch = std::env::temp_dir().join(format!("neural-forge-cli-cold-boot-{}", std::process::id()));
+    /// Removed when the test ends, passed or failed.
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let guard = Scratch(std::env::temp_dir().join(format!("neural-forge-cli-cold-boot-{}", std::process::id())));
+    let scratch = guard.0.clone();
     let config: PathBuf = scratch.join("config/neural-forge/config.ini");
     std::fs::create_dir_all(config.parent().unwrap()).unwrap();
     // The channel's directory must be private, as the real runtime directory is.
@@ -46,6 +56,5 @@ fn shmctl_on_a_cold_boot_starts_from_the_saved_settings_and_saves_its_change() {
     assert!(ok, "{out}");
     let (_, status) = cli(&scratch, &["shmctl", "status"]);
     assert!(status.lines().any(|l| l == "intensity=3") && status.lines().any(|l| l == "local_tone=2.5"), "{status}");
-
-    std::fs::remove_dir_all(&scratch).ok();
+    drop(guard);
 }

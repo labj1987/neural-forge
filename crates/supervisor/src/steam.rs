@@ -159,6 +159,11 @@ pub fn games(roots: &[Root]) -> Vec<Game> {
                 let Some(tree) = std::fs::read(&manifest).ok().and_then(|t| vdf::parse(&t).ok()) else { continue };
                 let field = |key: &str| tree.string_at(&["AppState", key]).map(str::to_string);
                 let (Some(appid), Some(name), Some(installdir)) = (field("appid"), field("name"), field("installdir")) else { continue };
+                // A folder inside `steamapps/common`: an absolute path or `..` would point the
+                // searches of the game's folder anywhere (`/` walks the whole filesystem).
+                if !relative_inside(&installdir) {
+                    continue;
+                }
                 if is_tool(&appid, &name) || copies.iter().any(|(g, _)| g.appid == appid && g.library == library) {
                     continue;
                 }
@@ -341,6 +346,10 @@ impl TargetFinder {
         for launch in launches.iter().filter(|l| (l.for_os("windows") || l.for_os("linux")) && l.for_branch(&game.branch)) {
             let rel = launch.executable.replace('\\', "/");
             let rel = rel.trim_start_matches("./");
+            // Inside the game's folder only, as `installdir` is.
+            if !relative_inside(rel) {
+                continue;
+            }
             let path = dir.join(rel);
             let name = rel.rsplit('/').next().unwrap_or(rel);
             let beside = path.parent().map(Path::to_path_buf).unwrap_or_else(|| dir.clone());
@@ -392,6 +401,14 @@ impl TargetFinder {
         }
         out
     }
+}
+
+/// Whether `path` is a relative path that stays inside the folder it is joined to: not empty, not
+/// absolute, without `..`.
+fn relative_inside(path: &str) -> bool {
+    use std::path::Component;
+    let path = Path::new(path);
+    path.components().next().is_some() && path.components().all(|c| matches!(c, Component::Normal(_) | Component::CurDir)) && path.components().any(|c| matches!(c, Component::Normal(_)))
 }
 
 fn file_name(path: &str) -> &str {
@@ -909,6 +926,22 @@ mod tests {
         assert_eq!(games[0].installdir, "Grand Theft Auto V Enhanced");
         // The same root listed twice still gives each game once.
         assert_eq!(super::games(&[roots[0].clone(), roots[0].clone()]).len(), 3);
+    }
+
+    #[test]
+    fn an_install_folder_or_launch_entry_outside_the_library_is_ignored() {
+        let home = Scratch::new("traversal");
+        let root = home.0.join("Steam");
+        let manifest_with = |appid: &str, installdir: &str| format!("\"AppState\"\n{{\n\t\"appid\"\t\t\"{appid}\"\n\t\"name\"\t\t\"Game {appid}\"\n\t\"installdir\"\t\t{}\n}}\n", vdf::quote(installdir));
+        for (appid, installdir) in [("1", "/"), ("2", ".."), ("3", "../../.."), ("4", "a/../../b"), ("5", ""), ("6", "Real Game"), ("7", "sub/dir")] {
+            write(&root.join(format!("steamapps/appmanifest_{appid}.acf")), &manifest_with(appid, installdir));
+        }
+        let games = games(&[Root { path: root.clone(), flatpak: false }]);
+        assert_eq!(games.iter().map(|g| g.installdir.as_str()).collect::<Vec<_>>(), ["Real Game", "sub/dir"]);
+        assert!(relative_inside("bin/x.exe") && relative_inside("./x.exe"));
+        for bad in ["/x.exe", "../x.exe", "bin/../../x.exe", "", "."] {
+            assert!(!relative_inside(bad), "{bad:?}");
+        }
     }
 
     #[test]

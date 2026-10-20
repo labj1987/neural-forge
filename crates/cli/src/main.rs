@@ -11,8 +11,11 @@ use neural_forge_supervisor::model::Network;
 use neural_forge_supervisor::{paths, Config};
 
 fn usage() {
-    eprintln!(
-        "usage: neural-forge-cli <command>\n\n\
+    eprintln!("{}", usage_text());
+}
+
+fn usage_text() -> &'static str {
+    "usage: neural-forge-cli <command>\n\n\
          commands:\n\
          \x20 init                 create the default config\n\
          \x20 status               show the config, channel and model\n\
@@ -22,8 +25,8 @@ fn usage() {
          \x20 import-binaries DIR  copy NVIDIA's nvngx_dlssnr.dll into the user data dir\n\
          \x20 extract-model DIR [--network full|small]\n\
          \x20                     write the model directory from nvngx_dlssnr.dll\n\
-         \x20                     (DIR holds it, or is the DLL) into the user data dir;\n\
-         \x20                     default: small when the DLL has it (build 310.9.16), else full\n\
+         \x20                     (DIR holds it, or is the DLL) into the user data dir:\n\
+         \x20                     every network the DLL carries, or only the one named\n\
          \x20 install --appdir DIR install an extracted AppImage AppDir into\n\
          \x20                     persistent user storage (see scripts/install.py --\n\
          \x20                     same operation, same record, either tool works)\n\
@@ -47,7 +50,6 @@ fn usage() {
          \x20                     and host names redacted; it lists your installed Steam\n\
          \x20                     games and their library folders); ID: the game's Steam\n\
          \x20                     app id, for its Proton version"
-    );
 }
 
 fn profile_usage() {
@@ -186,7 +188,9 @@ fn cmd_report(appid: Option<&str>) -> ExitCode {
 fn default_config() -> Config {
     // `shm` stays unset: the channel then follows $NEURAL_FORGE_SHM or the default (see
     // `neural_forge_supervisor::channel_path`) rather than pinning today's default for good.
-    Config { binaries: paths::binaries_dir(), ..Config::default() }
+    let mut cfg = Config::default();
+    cfg.binaries = paths::binaries_dir();
+    cfg
 }
 
 fn cmd_init() -> ExitCode {
@@ -282,29 +286,29 @@ fn cmd_uninstall(purge: bool) -> ExitCode {
 }
 
 fn cmd_import_binaries(dir: &str) -> ExitCode {
+    use neural_forge_supervisor::model;
     let src = std::path::Path::new(dir);
     if !src.is_dir() {
         eprintln!("not a directory: {dir}");
         return ExitCode::FAILURE;
     }
-    let dest = paths::binaries_dir();
-    if let Err(e) = std::fs::create_dir_all(&dest) {
-        eprintln!("failed to create {dest}: {e}");
-        return ExitCode::FAILURE;
-    }
     // Only `nvngx_dlssnr.dll`: the model's weights are extracted from it (`extract-model`).
-    let name = "nvngx_dlssnr.dll";
-    let from = src.join(name);
-    if !from.is_file() {
+    let name = model::DLL_NAME;
+    if !src.join(name).is_file() {
         eprintln!("no {name} in {dir}: nothing imported");
         return ExitCode::FAILURE;
     }
-    if let Err(e) = std::fs::copy(&from, std::path::Path::new(&dest).join(name)) {
-        eprintln!("failed to copy {name}: {e}");
-        return ExitCode::FAILURE;
+    let dest = paths::binaries_dir();
+    match model::import_dll(src, std::path::Path::new(&dest)) {
+        Ok((_, build)) => {
+            println!("imported {name} (build {build}) to {dest}");
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("failed to import {name}: {e}");
+            ExitCode::FAILURE
+        }
     }
-    println!("imported {name} to {dest}");
-    ExitCode::SUCCESS
 }
 
 fn cmd_extract_model(source: &str, network: Option<Network>) -> ExitCode {
@@ -699,6 +703,14 @@ mod tests {
 
     fn parse_str(line: &str) -> Result<Command, UsageError> {
         parse(&line.split_whitespace().map(String::from).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn the_overview_says_what_extract_model_writes_as_its_own_help_does() {
+        let overview = usage_text();
+        assert!(!overview.contains("default: small"), "extract-model has no choice of default: it writes every network");
+        assert!(overview.contains("every network the DLL carries"), "{overview}");
+        assert!(command_usage("extract-model").unwrap().contains("every network\n  the DLL carries"));
     }
 
     #[test]

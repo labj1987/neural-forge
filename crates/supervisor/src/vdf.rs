@@ -241,9 +241,14 @@ fn take_condition(tokens: &[Token], pos: &mut usize) -> Option<String> {
     }
 }
 
+/// How deep blocks may nest. Steam's own files nest a handful deep (`localconfig.vdf`'s launch
+/// options sit six blocks down); a damaged or hostile file nested further is refused, where recursing would
+/// overflow the stack and abort the process (`appinfo`'s binary tree has the same bound).
+pub const MAX_DEPTH: usize = 64;
+
 /// Parses entries up to the matching `}` (or the end, at the top level); returns the block and the
-/// closing brace's offset.
-fn parse_block(tokens: &[Token], pos: &mut usize, top: bool) -> Result<(SpannedBlock, usize), Error> {
+/// closing brace's offset. `depth` is how many blocks enclose this one.
+fn parse_block(tokens: &[Token], pos: &mut usize, top: bool, depth: usize) -> Result<(SpannedBlock, usize), Error> {
     let mut out = SpannedBlock::default();
     loop {
         let Some(token) = tokens.get(*pos) else {
@@ -264,9 +269,12 @@ fn parse_block(tokens: &[Token], pos: &mut usize, top: bool) -> Result<(SpannedB
                 *pos += 1;
                 SpannedValue::Str { span: span.clone(), value: value.clone() }
             }
-            Some(Token { kind: Kind::Open, .. }) => {
+            Some(Token { kind: Kind::Open, span }) => {
+                if depth >= MAX_DEPTH {
+                    return err(format!("blocks nested more than {MAX_DEPTH} deep at byte {}", span.start));
+                }
                 *pos += 1;
-                let (inner, close) = parse_block(tokens, pos, false)?;
+                let (inner, close) = parse_block(tokens, pos, false, depth + 1)?;
                 SpannedValue::Block { inner, close }
             }
             _ => return err(format!("key {key:?} at byte {} has no value", key_span.start)),
@@ -281,7 +289,7 @@ fn parse_block(tokens: &[Token], pos: &mut usize, top: bool) -> Result<(SpannedB
 fn parse_spanned(text: &[u8]) -> Result<SpannedBlock, Error> {
     let tokens = tokenize(text)?;
     let mut pos = 0;
-    Ok(parse_block(&tokens, &mut pos, true)?.0)
+    Ok(parse_block(&tokens, &mut pos, true, 0)?.0)
 }
 
 pub fn parse(text: &[u8]) -> Result<Block, Error> {
@@ -592,5 +600,18 @@ mod tests {
         let at = text.windows(4).position(|w| w == b"\"\"\n\t").unwrap();
         text.splice(at..at + 2, b"\"NEURAL_FORGE_ENABLE=1 %command%\"".iter().copied());
         assert_eq!(out, text);
+    }
+
+    #[test]
+    fn nesting_past_the_limit_is_an_error_not_a_stack_overflow() {
+        let nested = |levels: usize| format!("{}\"k\" \"v\"{}", "\"a\" { ".repeat(levels), " }".repeat(levels));
+        let tree = parse(nested(MAX_DEPTH).as_bytes()).unwrap();
+        assert_eq!(tree.string_at(&vec!["a"; MAX_DEPTH].into_iter().chain(["k"]).collect::<Vec<_>>()), Some("v"));
+        let e = parse(nested(MAX_DEPTH + 1).as_bytes()).unwrap_err();
+        assert!(e.0.contains("nested more than 64 deep"), "{e}");
+        // Far deeper than any stack holds: refused all the same, and editing refuses it too.
+        let deep = nested(200_000);
+        assert!(parse(deep.as_bytes()).is_err());
+        assert!(set_string(deep.as_bytes(), &["a", "a", "x"], "1").is_err());
     }
 }
