@@ -140,8 +140,9 @@ pub(crate) struct ScenePass {
     partial: OwnBuffer,
     /// Host-visible: compared, cut, sum, samples (the shader's `Result`).
     result: HostBuffer,
-    /// The encoded view and state buffer the set points at.
-    bound: Option<(vk::ImageView, vk::Buffer)>,
+    /// The encoded view and state buffer the set points at, with the passes they are of ([`Self::bind`]'s
+    /// `made`): a rebuilt pass's view or buffer may come back under the old one's handle.
+    bound: Option<(vk::ImageView, vk::Buffer, [u64; 2])>,
     /// A submitted hold wrote the thumbnail: the next one compares with it.
     have: bool,
     /// The last submitted hold whose result is still to be read.
@@ -255,12 +256,16 @@ impl ScenePass {
     }
 
     /// Points the set at this hold's encoded capture and the native pass's state buffer (when they
-    /// changed).
+    /// changed). `made` says which objects the handles name: the HDR pass whose view `encoded` is
+    /// (`hdr::HdrPass::id`) and the native pass whose buffer `state` is (`native::NativePass::id`). The
+    /// detector outlives the native pass (rebuilt for another model resolution), and a destroyed buffer's
+    /// handle comes back for the next one made, so equal handles alone do not say the set still points at
+    /// the right buffer.
     ///
     /// # Safety
     /// Nothing of this pass is pending; both handles are live.
-    pub(crate) unsafe fn bind(&mut self, device: &ash::Device, encoded: vk::ImageView, state: vk::Buffer) {
-        if self.bound == Some((encoded, state)) {
+    pub(crate) unsafe fn bind(&mut self, device: &ash::Device, encoded: vk::ImageView, state: vk::Buffer, made: [u64; 2]) {
+        if self.bound == Some((encoded, state, made)) {
             return;
         }
         // Not while a hold recorded into DLSS's buffer with the set may run (the hold then misses).
@@ -280,7 +285,7 @@ impl ScenePass {
         ];
         // SAFETY: the set is not in use (contract); every handle is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
-        self.bound = Some((encoded, state));
+        self.bound = Some((encoded, state, made));
     }
 
     /// Records the thumbnail and the decision into the capture, after the encode: compared with the
@@ -407,6 +412,74 @@ mod tests {
         }
     }
 
+    /// The detector outlives the native pass whose state buffer it writes the cut into (rebuilt for another
+    /// model resolution), and a destroyed buffer's handle comes back for the next one made: the set is written
+    /// again when the passes behind the same handles changed (`made`), and only then. The test points the set
+    /// at another buffer behind `bind`'s back, as a set left on a destroyed buffer whose handle the new one got:
+    /// the same passes leave it there, another native or HDR pass puts it back on the buffer named.
+    #[test]
+    fn the_set_is_written_again_for_another_pass_under_the_same_handles() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, queue, family) = (&gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
+        const W: u32 = 16;
+        const H: u32 = 8;
+        // SAFETY: a fresh device; every object below is used on its queue only and waited for.
+        unsafe {
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+            let one_shot = |record: &dyn Fn(vk::CommandBuffer)| {
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
+                record(cmd);
+                device.end_command_buffer(cmd).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], vk::Fence::null()).unwrap();
+                device.queue_wait_idle(queue).unwrap();
+            };
+            let encoded = OwnImage::new(device, instance, physical, W, H, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
+            let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
+            one_shot(&|cmd| {
+                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
+                device.cmd_clear_color_image(cmd, encoded.image, vk::ImageLayout::GENERAL, &vk::ClearColorValue { float32: [0.5; 4] }, &[range]);
+            });
+            let [state, elsewhere] = [(); 2].map(|()| own_host_buffer_with(device, instance, physical, 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap());
+            let mut pass = ScenePass::build(device, instance, physical, W, H).expect("the scene-cut pass builds");
+            // The state word each hold writes (`cut`), set beforehand in both buffers: which one the hold wrote.
+            let written = |pass: &mut ScenePass| -> [bool; 2] {
+                for b in [&state, &elsewhere] {
+                    std::ptr::write(b.ptr.cast::<u32>().add(2), 7);
+                }
+                one_shot(&|cmd| pass.record(device, cmd, THRESHOLD));
+                pass.submitted(Recorded { network: true, history: true });
+                let _ = pass.take();
+                [&state, &elsewhere].map(|b| *b.ptr.cast::<u32>().add(2) != 7)
+            };
+            pass.bind(device, encoded.view, state.buffer, [1, 1]);
+            assert_eq!(written(&mut pass), [true, false], "bound to the state buffer");
+            let set = pass.set;
+            let stale = || {
+                let info = [vk::DescriptorBufferInfo { buffer: elsewhere.buffer, offset: 0, range: vk::WHOLE_SIZE }];
+                let w = vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(4).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&info).build();
+                device.update_descriptor_sets(&[w], &[]);
+            };
+            stale();
+            pass.bind(device, encoded.view, state.buffer, [1, 1]);
+            assert_eq!(written(&mut pass), [false, true], "the same handles of the same passes: the set is not written");
+            for made in [[1, 2], [2, 2]] {
+                stale();
+                pass.bind(device, encoded.view, state.buffer, made);
+                assert_eq!(written(&mut pass), [true, false], "another pass ({made:?}) behind the same handles: the set is written again");
+            }
+            pass.destroy(device);
+            encoded.destroy(device);
+            state.destroy(device);
+            elsewhere.destroy(device);
+            device.destroy_command_pool(pool, None);
+        }
+    }
+
     /// The 1.x helper's `luma_thumbnail_rgba16f` and `is_scene_cut`, on the CPU: the shader's reference.
     fn cpu_thumbnail(frame: &[[f32; 3]], width: u32, height: u32) -> Vec<u32> {
         let q = |v: f32| if v.is_nan() { 0 } else { (v.clamp(0.0, 1.0) * 255.0 + 0.5) as u32 };
@@ -469,7 +542,7 @@ mod tests {
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
             });
             let mut pass = ScenePass::build(device, instance, physical, W, H).expect("the scene-cut pass builds");
-            pass.bind(device, encoded.view, state.buffer);
+            pass.bind(device, encoded.view, state.buffer, [1, 1]);
             // The frame's valid part (the padding stays whatever it is: never sampled).
             let upload = |frame: &[[f32; 3]]| {
                 let texels: Vec<u16> = (0..ph).flat_map(|y| (0..pw).flat_map(move |x| {

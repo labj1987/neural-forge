@@ -504,6 +504,9 @@ unsafe fn colour_view(device: &ash::Device, image: vk::Image) -> Option<vk::Imag
     unsafe { device.create_image_view(&info, None) }.ok()
 }
 
+/// The next [`HdrPass::id`].
+static NEXT_PASS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 /// The encode and decode pipelines and what they work on, for one extent.
 pub(crate) struct HdrPass {
     width: u32,
@@ -528,10 +531,16 @@ pub(crate) struct HdrPass {
     colour_view: Option<vk::ImageView>,
     /// The image `colour_view` views.
     colour_image: Option<vk::Image>,
+    /// Which image that is when [`Self::bind_colour_once`] bound it (the hold inside DLSS's buffer: its
+    /// staging image's `inline::Staging::id`): the staging images are built again for another extent, and a
+    /// destroyed image's handle comes back for the next one made.
+    colour_made: Option<u64>,
     /// How many views [`Self::bind_colour`] made: what tells this hold's view from the last one's when their
     /// handles are equal (a destroyed view's handle comes back for the next one made, which may view another
     /// image under a reused handle too, as at GTA V Enhanced's loading screens).
     colour_bindings: u64,
+    /// Which pass this is ([`Self::id`]).
+    id: u64,
     /// The auto-exposure, built on the first hold without a readable exposure image.
     auto: Option<AutoExposure>,
 }
@@ -617,7 +626,9 @@ impl HdrPass {
             exposure,
             colour_view: None,
             colour_image: None,
+            colour_made: None,
             colour_bindings: 0,
+            id: NEXT_PASS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             auto: None,
         };
         Some(pass)
@@ -659,6 +670,13 @@ impl HdrPass {
     #[cfg(target_arch = "x86_64")]
     pub(crate) fn colour_binding(&self) -> u64 {
         self.colour_bindings
+    }
+
+    /// Which pass this is: a number no other pass of the process has, so what binds the pass's images and
+    /// buffers tells it from a pass destroyed before it, whose handles the driver may give this one.
+    #[cfg(target_arch = "x86_64")]
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 
     /// The answer image's view (padded extent, `GENERAL` after the write-back's opening barrier).
@@ -725,19 +743,25 @@ impl HdrPass {
     pub(crate) const EXPOSURE_BYTES: u64 = EXPOSURE_BYTES;
 
     /// Points binding 0 at a view of `colour` once (the hold inside DLSS's buffer: its staging image, which
-    /// the layer owns and keeps): `true` when it is, or already was.
+    /// the layer owns and keeps until another extent's replace it), `made` saying which image it is
+    /// (`inline::Staging::id`): `true` when it is, or already was. Equal handles alone do not say the view is
+    /// of the same image: the destroyed images' handles come back for the next ones made.
     ///
     /// # Safety
-    /// As [`Self::bind_colour`], unless `colour` is the image already bound.
-    pub(crate) unsafe fn bind_colour_once(&mut self, device: &ash::Device, colour: vk::Image) -> bool {
-        if self.colour_image == Some(colour) && self.colour_view.is_some() {
+    /// As [`Self::bind_colour`], unless `colour` is the image already bound under the same `made`.
+    pub(crate) unsafe fn bind_colour_once(&mut self, device: &ash::Device, colour: vk::Image, made: u64) -> bool {
+        if self.colour_image == Some(colour) && self.colour_made == Some(made) && self.colour_view.is_some() {
             return true;
         }
         if !super::may_rewrite("the HDR pass's descriptor set") {
             return false;
         }
         // SAFETY: forwarded.
-        unsafe { self.bind_colour(device, colour) }
+        let bound = unsafe { self.bind_colour(device, colour) };
+        if bound {
+            self.colour_made = Some(made);
+        }
+        bound
     }
 
     /// Starts the auto-exposure's adaptation afresh when `identification` differs from the one it
@@ -774,6 +798,7 @@ impl HdrPass {
     /// Nothing submitted may still use the set or the previous view (the hold's `wait_idle` passed);
     /// `colour` is a live plain 2D RGBA16F storage image of `device`.
     pub(crate) unsafe fn bind_colour(&mut self, device: &ash::Device, colour: vk::Image) -> bool {
+        self.colour_made = None;
         if let Some(old) = self.colour_view.take() {
             // SAFETY: nothing pending uses it (contract).
             unsafe { device.destroy_image_view(old, None) };

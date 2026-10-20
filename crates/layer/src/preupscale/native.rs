@@ -3506,7 +3506,8 @@ pub(crate) unsafe fn run_native_hold(
         // The staging image is the layer's own and stays: bound once.
         // SAFETY: nothing that may run uses the set unless it is unchanged; the colour input is a live
         // RGBA16F storage image.
-        if !unsafe { pass.bind_colour_once(device, target.colour) } {
+        let staging = ctx.as_ref().map_or(0, |c| c.staging.id);
+        if !unsafe { pass.bind_colour_once(device, target.colour, staging) } {
             result.miss = Some(frozen.blocked().map_or("a storage view of the colour input could not be created", |_| WAITING));
             return result;
         }
@@ -3654,7 +3655,7 @@ pub(crate) unsafe fn run_native_hold(
     if let (Some(s), Some(hdr_ref)) = (res.scene.as_mut().filter(|_| threshold > 0), res.hdr.as_ref()) {
         // SAFETY: nothing of the detector is pending (`wait_idle` above), or its set is not written now; the
         // encoded view and the native pass's state buffer are live.
-        unsafe { s.bind(device, hdr_ref.encoded_view(), native.state_buffer()) };
+        unsafe { s.bind(device, hdr_ref.encoded_view(), native.state_buffer(), [hdr_ref.id(), native.id()]) };
     }
     native.gap.note_format(format_of(target));
     // A frame of another network than the history's (the Network setting switched) resets the history

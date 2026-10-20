@@ -32,7 +32,7 @@
 //! be restored, or any while the model is switched off (F11).
 
 use std::collections::{HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Instant;
 
@@ -82,7 +82,14 @@ pub(crate) struct Staging {
     mvec_memory: vk::DeviceMemory,
     pub depth: vk::Buffer,
     depth_memory: vk::DeviceMemory,
+    /// Which images these are: a number no other staging images of the process have. The images are built
+    /// again for another extent, and a destroyed image's handle comes back for the next one made, so what
+    /// keeps a view of the colour image (`hdr::HdrPass::bind_colour_once`) tells them apart by this.
+    pub id: u64,
 }
+
+/// The next [`Staging::id`].
+static NEXT_STAGING: AtomicU64 = AtomicU64::new(1);
 
 /// One slot: the buffer it belongs to and what its hold left to read back.
 struct Slot {
@@ -880,6 +887,7 @@ impl Inline {
                     mvec_memory: m.1,
                     depth: dp.0,
                     depth_memory: dp.1,
+                    id: NEXT_STAGING.fetch_add(1, Ordering::Relaxed),
                 }),
                 (c, e, m, dp) => {
                     for (image, memory) in [c, e, m].into_iter().flatten() {

@@ -1385,6 +1385,16 @@ mod tests {
                 seen.push(hdr.colour_binding());
             }
             assert_eq!(seen, [1, 2, 3], "one more for every view made");
+            // Inside DLSS's buffer the view of the staging image is made once, and again for other staging
+            // images (built for another extent) even under the same handle: the destroyed image's view
+            // otherwise stayed bound.
+            let once = |hdr: &mut super::super::hdr::HdrPass, made: u64| {
+                assert!(hdr.bind_colour_once(&device, rig.colour.image, made));
+                hdr.colour_binding()
+            };
+            assert_eq!(once(&mut hdr, 7), 4, "after a split hold's view: one of its own");
+            assert_eq!(once(&mut hdr, 7), 4, "the same staging images: the view is kept");
+            assert_eq!(once(&mut hdr, 8), 5, "other staging images under the same handle: a view of them");
             hdr.destroy(&device);
         }
     }
