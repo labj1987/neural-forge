@@ -1,5 +1,6 @@
-# The compiler every build uses: local, CI and release. Keep the version in step with the
-# toolchain steps in .github/workflows/ci.yml and release.yml (both check it).
+# The compiler every build uses: local, CI and release. Keep the version in step with
+# .github/workflows/check.yml (which ci.yml and release.yml both run): its Rust toolchain step's
+# `toolchain:` and the check after it that compares the two.
 [toolchain]
 channel = "1.99.0"
 components = ["clippy"]
