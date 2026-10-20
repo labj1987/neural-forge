@@ -25,6 +25,9 @@
 //! compatible with, and never attaches to, a mapping left behind by any other DLSS
 //! neural-rendering project. `SHM_MAGIC` exists specifically so a stale mapping from
 //! anything else is always rejected and reinitialized rather than half-read.
+//!
+//! Linux only, like the rest of the workspace (the mapping, its directory, the state log and the
+//! runtime path all go through `libc`), so nothing here is gated on the target.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -33,18 +36,15 @@ pub mod capture;
 pub mod cube;
 pub mod enums;
 mod header;
-#[cfg(unix)]
 pub mod mapping;
 pub mod env;
 pub mod history;
 pub mod rebuild;
 mod path;
 pub mod persist;
-#[cfg(unix)]
 pub mod private_dir;
 pub mod processes;
 mod slot;
-#[cfg(unix)]
 pub mod state_log;
 
 pub use header::{load64, pass_setting, resolved_scale, setting_bounds, store64, ColourSettings, EditColour, HudRegion, HudRegionWords, HudSettings, MaskSettings, PassColour, PassControl, PassTunings, ShmHeader, Tuning, MAX_HUD_REGIONS, SETTING_BOUNDS};

@@ -99,13 +99,15 @@ pub fn parse_line(line: &str) -> Option<Event> {
 /// that are not UTF-8 (a line torn by a crash mid-character) spoil only their own line.
 pub fn read_dir_events(dir: &Path) -> std::io::Result<Vec<Event>> {
     let read = |name: &str| std::fs::read(dir.join(name)).map(|b| String::from_utf8_lossy(&b).into_owned());
-    let mut text = read(ROTATED_NAME).unwrap_or_default();
-    match read(FILE_NAME) {
-        Ok(current) => text.push_str(&current),
-        Err(e) if text.is_empty() => return Err(e),
-        Err(_) => {}
-    }
-    Ok(text.lines().filter_map(parse_line).collect())
+    // Each file parsed on its own: a torn last line of the rotated file (a crash mid-write) must not
+    // join the current file's first line into one that parses as neither.
+    let rotated = read(ROTATED_NAME).unwrap_or_default();
+    let current = match read(FILE_NAME) {
+        Ok(current) => current,
+        Err(e) if rotated.is_empty() => return Err(e),
+        Err(_) => String::new(),
+    };
+    Ok(rotated.lines().chain(current.lines()).filter_map(parse_line).collect())
 }
 
 /// Appends `line` to the file at `path`, rotating it to [`ROTATED_NAME`] first when it has reached
@@ -177,6 +179,17 @@ mod tests {
         let events = read_dir_events(&dir).unwrap();
         assert_eq!(events.len(), 3);
         assert_eq!(events[0].message, "ok");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_torn_last_line_of_the_rotated_file_keeps_the_current_files_first() {
+        let dir = scratch("torn");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(ROTATED_NAME), b"1\t2\tg.exe\tattach\tok\n4\t2\tg.exe\tnative-fa").unwrap();
+        std::fs::write(dir.join(FILE_NAME), b"5\t2\tg.exe\tdevice-lost\tat submit\n").unwrap();
+        let events = read_dir_events(&dir).unwrap();
+        assert_eq!(events.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(), [ATTACH, DEVICE_LOST]);
         std::fs::remove_dir_all(&dir).ok();
     }
 

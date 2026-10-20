@@ -9,5 +9,5 @@ description = "Shared-memory channel between the Neural Forge layer, GUI and CLI
 [lib]
 name = "neural_forge_protocol"
 
-[target.'cfg(unix)'.dependencies]
+[dependencies]
 libc = "0.2"
