@@ -730,7 +730,8 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     if let Some((device, state, hold)) = owned {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
-        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || hold.preupscale.has_res() || hold.preupscale.native.is_some() {
+        let mut idle = true;
+        if state.capture_pipeline.is_some() || state.direct_capture.iter().any(Option::is_some) || state.gpu_compose.is_some() || !state.relay_semaphores.is_empty() || state.series.has_stranded() || hold.preupscale.has_res() || hold.preupscale.native.is_some() {
             match unsafe { device.device_wait_idle() } {
                 Ok(()) | Err(vk::Result::ERROR_DEVICE_LOST) => {
                     // Idle: nothing uses the network any more.
@@ -749,6 +750,7 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                     unsafe { hold.preupscale.destroy(&device); }
                 }
                 Err(error) => {
+                    idle = false;
                     crate::log!("[layer] teardown wait failed: {:?}; cannot safely free pending resources (the network is left open)", error);
                     // Its buffers may still be in use: leaked rather than closed.
                     if let Some(loader) = hold.preupscale.native.take() {
@@ -757,9 +759,10 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
                 }
             }
         }
-        // SAFETY: a series never leaves GPU work pending once a present returns (it waits on
-        // its own fences), so no idle wait is needed; this also finishes writing its files.
-        unsafe { state.series.destroy(&device); }
+        // SAFETY: a series leaves no GPU work pending once a present returns (it waits on its own
+        // fences) except a stalled readback's, which the idle wait above covered when `idle`; this
+        // also finishes writing its files.
+        unsafe { state.series.destroy(&device, idle); }
         state.swapchains.clear();
         let mut primary = PRIMARY.lock().unwrap();
         if primary.as_ref().is_some_and(|p| p.device == handle) { *primary = None; }
@@ -978,6 +981,7 @@ unsafe fn capture_untouched(
     relay_semaphores: &mut crate::present_sync::PresentSemaphores,
     present_info: &vk::PresentInfoKHR,
     relay_semaphore: &mut Option<vk::Semaphore>,
+    series_wait: &mut Option<vk::Semaphore>,
     why: u32,
 ) {
     if !readable || !series.running() {
@@ -998,7 +1002,9 @@ unsafe fn capture_untouched(
     // SAFETY: per this function's contract; the relay (if any) is the only submission so far.
     unsafe {
         series.before(device, instance, physical_device, queue, queue_family, image, width, height);
-        series.after(device, queue, image, width, height, bgr_order, None, why);
+        if let crate::series::PresentWait::Instead(semaphore) = series.after(device, queue, image, width, height, bgr_order, None, why) {
+            *series_wait = Some(semaphore);
+        }
     }
 }
 
@@ -2908,6 +2914,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         let mut relay_semaphore: Option<vk::Semaphore> = None;
         // Set when a frame series' readback consumed `wait_semaphore` (see `crate::series`).
         let mut series_composed = false;
+        // Set when a series readback was not seen complete: the present waits on this, signalled after
+        // it (`crate::series::PresentWait::Instead`).
+        let mut series_wait: Option<vk::Semaphore> = None;
         if crate::layer_enabled() {
             // The channel's lease follows presenting (`ownership`): an atomic store.
             crate::ownership::note_present();
@@ -3155,7 +3164,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             unsafe {
                                 capture_untouched(
                                     &self.device, instance, self.physical_device, queue, queue_family, image, (width, height, bgr_order), readable,
-                                    series, relay_semaphores, present_info, &mut relay_semaphore, neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
+                                    series, relay_semaphores, present_info, &mut relay_semaphore, &mut series_wait, neural_forge_protocol::capture::reason::BEFORE_UPSCALER,
                                 );
                             }
                         }
@@ -3188,7 +3197,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                         unsafe {
                             capture_untouched(
                                 &self.device, instance, self.physical_device, queue, queue_family, image, (width, height, bgr_order), readable,
-                                series, relay_semaphores, present_info, &mut relay_semaphore, neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
+                                series, relay_semaphores, present_info, &mut relay_semaphore, &mut series_wait, neural_forge_protocol::capture::reason::MODEL_UNAVAILABLE,
                             );
                         }
                     }
@@ -3313,9 +3322,13 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     if observing {
                         // SAFETY: same present, same queue, right after `before`. When the readback
                         // waited on the composition's semaphore, the present must not wait on it too.
-                        if unsafe { series.after(&self.device, queue, image, width, height, bgr_order, wait_semaphore, capture::untouched_reason()) } && wait_semaphore.is_some() {
-                            wait_semaphore = None;
-                            series_composed = true;
+                        match unsafe { series.after(&self.device, queue, image, width, height, bgr_order, wait_semaphore, capture::untouched_reason()) } {
+                            crate::series::PresentWait::Unchanged => {}
+                            crate::series::PresentWait::Consumed => series_composed |= wait_semaphore.take().is_some(),
+                            crate::series::PresentWait::Instead(semaphore) => {
+                                series_composed |= wait_semaphore.take().is_some();
+                                series_wait = Some(semaphore);
+                            }
                         }
                     }
                     if capture::take_setup_failure() {
@@ -3340,12 +3353,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
 
         // SAFETY: `present_info` is valid for the duration of this call; `next_present`
         // was resolved from the next layer/driver's own proc-addr table.
-        let result = if relay_semaphore.is_some() || wait_semaphore.is_some() {
+        let result = if relay_semaphore.is_some() || wait_semaphore.is_some() || series_wait.is_some() {
             // Never drop a dependency the application had: either its own wait
             // semaphores go through unchanged (the layer did no relay), or the relay
             // batch already waited on them and its semaphore stands in for them.
             // `capture::run`'s own compute work is an *additional* dependency.
-            let mut combined: Vec<vk::Semaphore> = Vec::with_capacity(present_info.wait_semaphore_count as usize + 2);
+            let mut combined: Vec<vk::Semaphore> = Vec::with_capacity(present_info.wait_semaphore_count as usize + 3);
             match relay_semaphore {
                 Some(relay) => combined.push(relay),
                 None if present_info.wait_semaphore_count > 0 && !present_info.p_wait_semaphores.is_null() => {
@@ -3358,9 +3371,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                 }
                 None => {}
             }
-            if let Some(sem) = wait_semaphore {
-                combined.push(sem);
-            }
+            combined.extend(wait_semaphore);
+            combined.extend(series_wait);
             // Copies every other field (`p_next`, `swapchain_count`, `p_swapchains`,
             // `p_image_indices`, `p_results`) unchanged from the app's own
             // `present_info` -- only the wait-semaphore list is actually different.

@@ -27,9 +27,33 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 
-/// What the writers hold at most (queued pairs) before the present thread waits on them.
+/// What the writers hold at most before the present thread waits on them: the pairs queued for
+/// them, the pair each is writing and the copy its encoder makes of one image ([`writer_budget`]).
 const BACKLOG_BYTES: usize = 512 << 20;
 const WRITERS: usize = 4;
+
+/// How many writers a capture of `len`-byte images starts and how many pairs may queue for them,
+/// within [`BACKLOG_BYTES`]: a writer holds its pair (`2 * len`) and the encoder's opaque copy of
+/// one image (`len`), a queued pair `2 * len`. At least one writer, and a queue of 0 (each pair
+/// handed straight to a writer) when the writers alone fill the budget.
+fn writer_budget(len: usize, frames: u32) -> (usize, usize) {
+    let len = len.max(1);
+    let writers = WRITERS.min(frames.max(1) as usize).min(BACKLOG_BYTES / (3 * len)).max(1);
+    (writers, BACKLOG_BYTES.saturating_sub(writers * 3 * len) / (2 * len))
+}
+
+/// What the real present waits on after [`Series::after`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentWait {
+    /// What it would have: nothing of the present's was consumed.
+    Unchanged,
+    /// The readback waited on the composition's semaphore and was seen complete: the present must
+    /// not wait on that semaphore again (a binary semaphore is consumed by one wait).
+    Consumed,
+    /// A readback was not seen complete (its bounded wait failed): the present waits on this, signalled
+    /// once everything the layer submitted for it has run, in place of the composition's semaphore.
+    Instead(vk::Semaphore),
+}
 
 struct Job {
     seq: u32,
@@ -217,6 +241,11 @@ struct Active {
 pub struct Series {
     active: Option<Active>,
     resources: Option<Resources>,
+    /// Readback resources whose fence was not seen signalled, and the semaphores presents waited on
+    /// in their place ([`PresentWait::Instead`]): never reused, freed only at device teardown once
+    /// the device is idle.
+    stranded: Vec<Resources>,
+    stranded_semaphores: Vec<vk::Semaphore>,
     /// Writers of finished captures still writing: waited for (bounded) only at device teardown.
     draining: Vec<std::thread::JoinHandle<()>>,
 }
@@ -371,9 +400,8 @@ impl Series {
     /// Reads `image` back as this present's composited result, waiting on `compose_done` (the
     /// semaphore `capture::run` returned, if any) first, and hands the pair to the writers.
     /// `untouched`: when `compose_done` is `None`, why the effect did not compose this frame (a
-    /// [`reason`] code; [`reason::NONE`] when unknown). Returns `true` when `compose_done` was
-    /// waited on here, so the real present must no longer wait on it (a binary semaphore is
-    /// consumed by one wait).
+    /// [`reason`] code; [`reason::NONE`] when unknown). Returns what the real present waits on
+    /// ([`PresentWait`]).
     ///
     /// # Safety
     /// Same as [`Self::before`], called once after it for the same present.
@@ -388,24 +416,42 @@ impl Series {
         bgr_order: bool,
         compose_done: Option<vk::Semaphore>,
         untouched: u32,
-    ) -> bool {
-        let Some(active) = self.active.as_mut() else { return false };
-        let Some(r) = self.resources.as_ref() else { return false };
+    ) -> PresentWait {
+        let Some(active) = self.active.as_mut() else { return PresentWait::Unchanged };
+        let Some(r) = self.resources.as_ref() else { return PresentWait::Unchanged };
         if !active.original_pending {
-            return false;
+            return PresentWait::Unchanged;
         }
         active.original_pending = false;
         // SAFETY: per this function's contract.
         let submitted = unsafe { submit_copy(device, queue, &r.composited, image, width, height, compose_done) };
+        let consumed = if submitted { PresentWait::Consumed } else { PresentWait::Unchanged };
         let original_done = unsafe { wait_and_reset(device, &r.original) };
         let composited_done = submitted && unsafe { wait_and_reset(device, &r.composited) };
         if !(original_done && composited_done) {
             crate::log!("[capture] readback failed on frame {}; capture abandoned", active.seq);
             self.finish(Close::Failed(reason::READBACK_FAILED));
-            // A fence that never signalled leaves its resources in an unknown state: they are
-            // leaked rather than freed under the GPU or reused with a pending fence.
-            self.resources = None;
-            return submitted;
+            // A fence that never signalled leaves its resources in an unknown state: they are kept
+            // aside rather than freed under the GPU or reused with a pending fence.
+            self.stranded.extend(self.resources.take());
+            // A copy still in flight reads the image and puts it back in `PRESENT_SRC_KHR` only when it
+            // runs: the present must not go before it. With `compose_done` still unconsumed (the second
+            // copy was never submitted) the present's wait on it already orders it after the first.
+            let in_flight = !original_done || (submitted && !composited_done);
+            if !in_flight || (!submitted && compose_done.is_some()) {
+                return consumed;
+            }
+            // SAFETY: per this function's contract.
+            return match unsafe { signal_after_submitted(device, queue) } {
+                Some(semaphore) => {
+                    self.stranded_semaphores.push(semaphore);
+                    PresentWait::Instead(semaphore)
+                }
+                None => {
+                    crate::log!("[capture] could not order the present after the stalled readback");
+                    consumed
+                }
+            };
         }
         let len = (u64::from(width) * u64::from(height) * 4) as usize;
         // SAFETY: both fences are signalled, the buffers are `len` bytes and stay mapped.
@@ -433,11 +479,11 @@ impl Series {
                 None => {
                     crate::log!("[capture] could not start a writer thread; capture abandoned");
                     self.finish(Close::Failed(reason::WRITE_FAILED));
-                    return submitted;
+                    return consumed;
                 }
             }
         }
-        let Some(active) = self.active.as_mut() else { return submitted };
+        let Some(active) = self.active.as_mut() else { return consumed };
         active.report.update(|p| {
             p.queued += 1;
             if composed {
@@ -456,7 +502,7 @@ impl Series {
         if active.remaining == 0 {
             self.finish(Close::Complete);
         }
-        submitted
+        consumed
     }
 
     /// Ends the running capture on the present thread. Never waits for its files: the writers drain
@@ -473,10 +519,19 @@ impl Series {
         crate::logging::flush();
     }
 
+    /// Whether a stalled readback's resources wait for the device's idle wait at teardown.
+    pub fn has_stranded(&self) -> bool {
+        !self.stranded.is_empty() || !self.stranded_semaphores.is_empty()
+    }
+
+    /// `idle`: the device was waited idle (or is lost), so the stranded readbacks and the semaphores
+    /// presents waited on in their place may go too; otherwise they are leaked.
+    ///
     /// # Safety
-    /// Nothing submitted through this series may still be pending (it never is after
-    /// [`Self::after`] returns).
-    pub unsafe fn destroy(&mut self, device: &ash::Device) {
+    /// Nothing submitted through this series may still be pending apart from the stranded
+    /// readbacks (nothing else is after [`Self::after`] returns), and with `idle` not those either,
+    /// nor any present waiting on a stranded semaphore.
+    pub unsafe fn destroy(&mut self, device: &ash::Device, idle: bool) {
         if self.active.is_some() {
             self.finish(Close::Failed(reason::GAME_ENDED));
         }
@@ -493,6 +548,20 @@ impl Series {
         }
         self.draining.clear();
         unsafe { destroy_resources(self.resources.take(), device) };
+        if idle {
+            for stranded in self.stranded.drain(..) {
+                // SAFETY: the device is idle: nothing of these is pending.
+                unsafe { destroy_resources(Some(stranded), device) };
+            }
+            for semaphore in self.stranded_semaphores.drain(..) {
+                // SAFETY: as above, and the presents that waited on it are done with the swapchains.
+                unsafe { device.destroy_semaphore(semaphore, None) };
+            }
+        } else if self.has_stranded() {
+            crate::log!("[capture] the device was not idle at teardown: the stalled readback's resources are leaked");
+            self.stranded.clear();
+            self.stranded_semaphores.clear();
+        }
     }
 }
 
@@ -524,12 +593,12 @@ fn create_target(base: &Path, frames: u32) -> std::io::Result<Target> {
 
 /// Starts the capture's writers (at most one per frame): `None` when not one thread could be started.
 fn spawn_writers(target: &Target, report: &Arc<Report>, len: usize, frames: u32) -> Option<(mpsc::SyncSender<Job>, Vec<std::thread::JoinHandle<()>>)> {
-    let bound = (BACKLOG_BYTES / (2 * len.max(1))).max(1);
+    let (writers_wanted, bound) = writer_budget(len, frames);
     let (sender, receiver) = mpsc::sync_channel::<Job>(bound);
     let receiver = Arc::new(Mutex::new(receiver));
     let fast = matches!(target, Target::Series { .. });
     let mut writers = Vec::new();
-    for i in 0..WRITERS.min(frames.max(1) as usize) {
+    for i in 0..writers_wanted {
         let receiver = receiver.clone();
         let target = target.clone();
         let report = report.clone();
@@ -721,11 +790,42 @@ unsafe fn submit_copy(device: &ash::Device, queue: vk::Queue, r: &Readback, imag
     }
 }
 
-/// Waits (bounded) for `r`'s submission, then resets its fence for the next one.
+/// Waits (bounded, [`crate::FENCE_WAIT_TIMEOUT`]) for `r`'s submission, then resets its fence for the
+/// next one. Through [`crate::note_fence_wait`], like every bounded wait of the layer: a timeout
+/// leaves its trail, and a lost device latches the layer inert on it.
 unsafe fn wait_and_reset(device: &ash::Device, r: &Readback) -> bool {
+    #[cfg(test)]
+    if TEST_READBACK_STALLS.with(std::cell::Cell::get) {
+        return false;
+    }
     unsafe {
-        let ok = device.wait_for_fences(&[r.fence], true, 5_000_000_000).is_ok();
-        ok && device.reset_fences(&[r.fence]).is_ok()
+        let wait = device.wait_for_fences(&[r.fence], true, crate::FENCE_WAIT_TIMEOUT.as_nanos() as u64);
+        crate::note_fence_wait(device.handle(), wait, "series readback").is_ok() && crate::note_vk(device.handle(), device.reset_fences(&[r.fence])).is_ok()
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Makes [`wait_and_reset`] report a stalled readback on this thread.
+    static TEST_READBACK_STALLS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// An empty batch on `queue` signalling a new semaphore: its signal's first synchronization scope
+/// is everything submitted to `queue` before it, so a wait on it orders the present after the
+/// layer's stalled readback. `None` when it cannot be made.
+///
+/// # Safety
+/// `queue` is externally synchronized for the call.
+unsafe fn signal_after_submitted(device: &ash::Device, queue: vk::Queue) -> Option<vk::Semaphore> {
+    // SAFETY: plain creation and a submit that references only the new semaphore.
+    unsafe {
+        let semaphore = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()?;
+        let submit = vk::SubmitInfo::builder().signal_semaphores(std::slice::from_ref(&semaphore)).build();
+        if crate::note_vk(device.handle(), device.queue_submit(queue, &[submit], vk::Fence::null())).is_err() {
+            device.destroy_semaphore(semaphore, None);
+            return None;
+        }
+        Some(semaphore)
     }
 }
 
@@ -883,6 +983,93 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    /// The writers' budget covers what each writer holds as well as the queue, so a 4K series stays
+    /// within `BACKLOG_BYTES`; a frame too large for even four writers gets fewer, and a queue of 0.
+    #[test]
+    fn the_writers_and_their_queue_stay_within_the_backlog() {
+        for (width, height) in [(1280usize, 720usize), (2560, 1440), (3840, 2160), (7680, 4320)] {
+            let len = width * height * 4;
+            let (writers, bound) = writer_budget(len, 600);
+            assert!(writers >= 1);
+            if 3 * len <= BACKLOG_BYTES {
+                assert!(writers * 3 * len + bound * 2 * len <= BACKLOG_BYTES, "{width}x{height}: {writers} writers, {bound} queued");
+            } else {
+                assert_eq!((writers, bound), (1, 0), "{width}x{height}: one writer, nothing queued");
+            }
+        }
+        assert_eq!(writer_budget(3840 * 2160 * 4, 600), (4, 2));
+        assert_eq!(writer_budget(7680 * 4320 * 4, 600), (1, 0));
+        assert_eq!(writer_budget(64, 1).0, 1, "a one-shot needs one writer");
+    }
+
+    /// A readback whose bounded wait fails ends the capture, and the present it belonged to waits on
+    /// a semaphore signalled after the stalled copy (which consumed the composition's semaphore)
+    /// instead of going out ahead of it. The stranded resources go at teardown.
+    #[test]
+    fn a_stalled_readback_orders_the_present_after_it() {
+        let Some((_entry, instance, physical_device, device, queue, family)) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device; skipping");
+            return;
+        };
+        let (width, height) = (16u32, 8u32);
+        let base = scratch("stall");
+        let header = Box::new(neural_forge_protocol::ShmHeader::default());
+        let shm = crate::shm::ShmClient::test_over_header(&header);
+        unsafe {
+            let info = vk::ImageCreateInfo::builder()
+                .image_type(vk::ImageType::TYPE_2D)
+                .format(vk::Format::B8G8R8A8_UNORM)
+                .extent(vk::Extent3D { width, height, depth: 1 })
+                .mip_levels(1)
+                .array_layers(1)
+                .samples(vk::SampleCountFlags::TYPE_1)
+                .tiling(vk::ImageTiling::OPTIMAL)
+                .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
+                .initial_layout(vk::ImageLayout::UNDEFINED);
+            let image = device.create_image(&info, None).unwrap();
+            let reqs = device.get_image_memory_requirements(image);
+            let props = instance.get_physical_device_memory_properties(physical_device);
+            let type_index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
+            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None).unwrap();
+            device.bind_image_memory(image, memory, 0).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            clear(&device, queue, pool, image, vk::ImageLayout::UNDEFINED, [0.5, 0.0, 0.0, 1.0]);
+
+            let mut series = Series::default();
+            series.start(request(21, 3), &base, shm.channel(), false);
+            series.before(&device, &instance, physical_device, queue, family, image, width, height);
+            // The composition's semaphore, as `capture::run` returns it.
+            let compose_done = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
+            let signal = vk::SubmitInfo::builder().signal_semaphores(std::slice::from_ref(&compose_done)).build();
+            device.queue_submit(queue, &[signal], vk::Fence::null()).unwrap();
+            TEST_READBACK_STALLS.with(|s| s.set(true));
+            let wait = series.after(&device, queue, image, width, height, true, Some(compose_done), reason::NONE);
+            TEST_READBACK_STALLS.with(|s| s.set(false));
+            let PresentWait::Instead(present_wait) = wait else { panic!("the present must wait on the stalled readback: {wait:?}") };
+            assert!(!series.running(), "the capture ends");
+            assert_eq!(finished(&header, 21).reason, reason::READBACK_FAILED);
+            assert!(series.has_stranded());
+            // The present's wait, standing in for `vkQueuePresentKHR`'s.
+            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            let stage = [vk::PipelineStageFlags::ALL_COMMANDS];
+            let present = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&present_wait)).wait_dst_stage_mask(&stage).build();
+            device.queue_submit(queue, &[present], fence).unwrap();
+            device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
+            device.destroy_fence(fence, None);
+
+            device.queue_wait_idle(queue).unwrap();
+            series.destroy(&device, true);
+            assert!(!series.has_stranded(), "freed once the device is idle");
+            device.destroy_semaphore(compose_done, None);
+            device.destroy_command_pool(pool, None);
+            device.destroy_image(image, None);
+            device.free_memory(memory, None);
+            device.destroy_device(None);
+            instance.destroy_instance(None);
+        }
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
     /// A series of three presents where something (standing in for the composition) rewrites
     /// the image between `before` and `after`: each pair must hold the frame as it was before
     /// and after that write, the files must be named by sequence, and the series must end by
@@ -968,7 +1155,7 @@ mod tests {
             let o = finished(&header, 13);
             assert_eq!((o.state, o.done), (state::CANCELLED, 2));
 
-            series.destroy(&device);
+            series.destroy(&device, true);
             device.queue_wait_idle(queue).unwrap();
             device.destroy_command_pool(pool, None);
             device.destroy_image(image, None);
