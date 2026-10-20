@@ -661,7 +661,8 @@ impl CachePass {
                 layout: ScratchLayout::new(width, height),
                 scratch: vk::Buffer::null(),
                 said_small: false,
-                timers: [(); 2].map(|()| crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).filter(|_| timed)),
+                // Only made when kept: a timer has no destructor, and one dropped leaks its query pool.
+                timers: [(); 2].map(|()| if timed { crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family) } else { None }),
                 bound: None,
                 state: State::default(),
                 tuning: Tuning::default(),

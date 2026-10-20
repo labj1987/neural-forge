@@ -1292,7 +1292,9 @@ impl DepthCopy {
         let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER;
         // SAFETY: forwarded.
         let buffer = unsafe { OwnBuffer::new(device, instance, physical_device, u64::from(width) * u64::from(height) * 4, usage) }?;
-        Some(Self { buffer, valid: None, timer: crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).filter(|_| timed) })
+        // Only made when kept: a timer has no destructor, and one dropped leaks its query pool.
+        let timer = if timed { crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family) } else { None };
+        Some(Self { buffer, valid: None, timer })
     }
 
     pub(crate) fn buffer(&self) -> vk::Buffer {
@@ -1694,7 +1696,8 @@ impl NativePass {
             let cmds = crate::loader_data::allocate_commands(device, &alloc).ok()?;
             debug_assert_eq!(steps, BUILD_STEPS);
             // Optional (`None` where timestamps are not supported): nothing fails from here on.
-            let timer = || crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).filter(|_| timed).map(made);
+            // Only made when kept (inside DLSS's buffer the hold times its slot): a timer has no destructor.
+            let timer = || if timed { crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).map(made) } else { None };
             let timers = [timer(), timer()];
             let take_buffer = |b: &mut Option<OwnBuffer>| b.take().expect("built above");
             let (mvec, acc, answer, state) = (take_buffer(&mut p.mvec), take_buffer(&mut p.acc), take_buffer(&mut p.answer), take_buffer(&mut p.state));
@@ -2268,7 +2271,8 @@ impl NativePass {
         let Ok(cmds) = (unsafe { crate::loader_data::allocate_commands(device, &alloc) }) else {
             return fail(params, Some(saved));
         };
-        let timer = crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).filter(|_| self.timed);
+        // Only made when kept: a timer has no destructor.
+        let timer = if self.timed { crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family) } else { None };
         made(());
         made(());
         for _ in 0..2 * MORE + usize::from(timer.is_some()) {
@@ -4172,6 +4176,33 @@ pub(crate) unsafe fn run_native_hold(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Resources built untimed (inside DLSS's buffer the hold times its slot) make no GPU timer at all: a timer
+    /// has no destructor, so one made and dropped left its query pool behind, past `vkDestroyDevice` (which the
+    /// validation layer reports here, at the end of the test).
+    #[test]
+    fn untimed_resources_make_no_query_pool() {
+        let Some(gpu) = crate::composition::gpu::test_device() else {
+            eprintln!("no Vulkan device: skipped");
+            return;
+        };
+        let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
+        // SAFETY: a fresh device; nothing is submitted; everything is destroyed before the device.
+        unsafe {
+            let extents = pass_extents(W, H, &[1.0; neural_forge_protocol::MAX_PASSES]);
+            let mut pass = NativePass::build_at(device, instance, physical, family, W, H, extents, false, false).expect("the pass builds");
+            assert!(pass.timers.iter().all(Option::is_none), "the frames untimed");
+            assert!(pass.ensure_more(device, instance, physical, family, 2), "the later passes build");
+            assert!(pass.more.as_ref().is_some_and(|m| m.timer.is_none()), "the later passes untimed");
+            let depth = DepthCopy::build(device, instance, physical, family, W, H, false).expect("the depth copy builds");
+            assert!(depth.timer.is_none(), "the depth copy untimed");
+            let cache = super::super::cache::CachePass::build(device, instance, physical, family, W, H, false).expect("the edit cache builds");
+            cache.destroy(device);
+            depth.destroy(device);
+            pass.destroy(device);
+            device.destroy_device(None);
+        }
+    }
 
     /// A failed hold whose work no fence covers keeps the after-the-upscaler path off the network for
     /// as long as a frame may run; nothing else does.
