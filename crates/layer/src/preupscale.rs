@@ -338,8 +338,9 @@ pub(crate) fn mode() -> Mode {
                 std::process::id()
             );
             if mode == Mode::Model {
-                // `NEURAL_FORGE_EDIT_CACHE`, read (and logged when off) with the mode.
-                let _ = cache::interval();
+                // `NEURAL_FORGE_EDIT_CACHE`, read (and logged when off) with the mode, where the
+                // edit cache is built at all (`edit_cache_on`).
+                let _ = edit_cache_on();
             }
             crate::logging::flush();
         }
