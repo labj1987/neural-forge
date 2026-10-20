@@ -321,7 +321,11 @@ added: `VK_NV_cuda_kernel_launch`, `VK_KHR_cooperative_matrix`, `VK_NV_cooperati
 upstream enables (pipeline executable properties, shader clock, SM built-ins) are not: no kernel
 uses them. robustBufferAccess is left as the game asked. A device that lacks a requirement, or a
 request the driver refuses, is created exactly as the game asked, and the log names the first
-missing requirement.
+missing requirement. An instance the application created for Vulkan 1.2 or older (its
+`VkApplicationInfo::apiVersion`, which the layer keeps from `vkCreateInstance`) is refused the same
+way: a device's API version is the lower of its instance's and the GPU's, and below 1.3 neither the
+kernels' SPIR-V 1.6 nor the 1.3 core commands the vendored code calls are there (DXVK and
+vkd3d-proton create 1.3 instances).
 
 ### 1.3 The game's device, and which queue does what
 
@@ -412,6 +416,7 @@ A/B runs only; Phase 5 deletes it.
 | Network not ready | first frames | frames to DLSS untouched ("the native network is still loading"), one frame in the first run |
 | Build fails | `NEURAL_FORGE_FAIL_CREATE=3` | retried after 0.5, 1, 2 s (the helper's schedule, now shared), the 4th attempt closed and reopened the network, built, "up again after 3 failed attempt(s)"; frames untouched meanwhile; no Xid |
 | Chain watchdog | `NEURAL_FORGE_NATIVE_FAIL=chain` | the timeout read at the next hold, the graph rebuilt with barriers in 56 ms (`chained false`), the history reset, frames untouched for that time; no Xid |
+| Chain watchdog before a rebuild | rig: `a_chain_timeout_left_from_the_frames_does_not_fail_the_next_builds`, `a_warm_up_chain_timeout_falls_back_to_barriers` | a count the frames left that no hold read before a rebuild for another size, or a warm-up's own, switches that build to barriers (`chained 0`); each warm-up starts from a count of 0, so the count never fails a later build |
 | Model missing | model directory moved aside for a run | frames untouched all run; status "native network not running: no model at …: extract it in the Setup tab (neural-forge-cli extract-model)"; retried 0.5, 1, 2 s, then every 30 s; directory put back |
 | Hash mismatch | not run in game: `load_check` refuses a stage whose digest differs (0.4), and the loader logs and retries like a missing model | |
 

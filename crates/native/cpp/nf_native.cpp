@@ -165,7 +165,19 @@ bool has(const std::vector<std::string>& names, const char* name) {
   return std::find(names.begin(), names.end(), name) != names.end();
 }
 
-// The first missing requirement, or empty when the device has them all.
+// Why an instance created for `api` (the application's VkApplicationInfo.apiVersion; 0 is 1.0) cannot run
+// the network, or empty. A device's API version is the lower of its instance's and the GPU's: below 1.3
+// the kernels' SPIR-V 1.6 is not allowed and Vulkan 1.3's core commands, which the vendored code calls by
+// those names (vkCmdPipelineBarrier2, vkGetBufferDeviceAddress, ...), are not there, extensions or not.
+std::string instanceRequirement(uint32_t api) {
+  if (api == 0) api = VK_API_VERSION_1_0;
+  const uint32_t major = VK_API_VERSION_MAJOR(api), minor = VK_API_VERSION_MINOR(api);
+  if (major > 1 || (major == 1 && minor >= 3)) return "";
+  return "the application's instance asks for Vulkan " + std::to_string(major) + "." + std::to_string(minor) +
+         "; the network needs an instance for Vulkan 1.3";
+}
+
+// The first missing requirement of the device, or empty when it has them all.
 std::string missingRequirement(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical) {
   InstanceFns fns(gipa, instance);
   if (!fns.features2) return "vkGetPhysicalDeviceFeatures2 (or its KHR name)";
@@ -258,10 +270,22 @@ void* copyChain(Extension& x, const void* chain, const void** tail) {
 
 // ---- The network -----------------------------------------------------------------------------
 
-// Hold slots nf_native_record_graph_at serves (the layer's slots per device), and the descriptor sets each
-// slot's pool holds: as many as the context's own pools, from which the warm-up recorded the same graph.
+// Why nf_native_build_sizes cannot build for `sizes`, or empty: checked before anything is dropped.
+static std::string invalidSizes(const uint32_t* sizes, uint32_t count) {
+  if (count == 0 || !sizes) return "no frame size to build the network for";
+  for (uint32_t i = 0; i < count; ++i)
+    if (sizes[2 * i] == 0 || sizes[2 * i + 1] == 0)
+      return "no network for a " + std::to_string(sizes[2 * i]) + "x" + std::to_string(sizes[2 * i + 1]) + " frame";
+  return "";
+}
+
+// Hold slots nf_native_record_graph_at serves (nf_native_hold_slots; the layer's slots per device).
 constexpr uint32_t kHoldPools = 16;
-constexpr uint32_t kHoldSets = 8192;
+
+// A warm-up whose counter chain timed out: the build falls back to barriers and runs again.
+struct WarmUpChainTimeout : std::runtime_error {
+  using std::runtime_error::runtime_error;
+};
 
 // One frame size's graph: its activations, the layer's input features and the two recordings.
 struct NfSlot {
@@ -270,6 +294,9 @@ struct NfSlot {
   nr::Activation* features = nullptr;
   VkCommandBuffer secondary = VK_NULL_HANDLE;
   VkCommandBuffer ownSecondary = VK_NULL_HANDLE;
+  // The descriptor sets one recording of the graph allocates at most: its dispatches, counted at the
+  // warm-up's recording (PTX launches are counted too and take none).
+  uint32_t sets = 0;
 };
 
 struct NfNative {
@@ -286,11 +313,41 @@ struct NfNative {
   // (nf_native_record_graph_at), one per hold slot, made on first use: a slot's sets stay valid while the
   // buffer recorded with them may still be submitted, and are reset only when that slot records again.
   std::vector<VkDescriptorPool> holdPools;
+  std::vector<uint32_t> holdPoolSets;   // the sets each of those pools was made for
+  // nf_native_fake_chain_timeout's: waits added to the watchdog's count, and one for the next warm-up.
+  uint32_t fakeTimeouts = 0;
+  bool fakeWarmUpTimeout = false;
   float blendScale = 1.0f;
   uint64_t rawLoaded = 0;
   uint64_t fenceTimeoutNs = 5'000'000'000ull;
 
   bool stalled() const { return context && context->stalled(); }
+
+  // The watchdog's count (nf_native_chain_timeouts) and its reset.
+  nr::Kernels::ChainTimeouts timeouts() const {
+    nr::Kernels::ChainTimeouts t = kernels->chainTimeouts();
+    if (fakeTimeouts && !t.waits) t.counter = "a faked timeout";
+    t.waits += fakeTimeouts;
+    return t;
+  }
+  void resetTimeouts() {
+    kernels->resetChainTimeouts();
+    fakeTimeouts = 0;
+  }
+
+  // Barriers between every launch from now on, for this network and every one opened later in the process.
+  void fallBack() {
+    g_fellBack.store(true);
+    nr::Kernels::setChainEnabled(false);
+    resetTimeouts();
+  }
+
+  // The most descriptor sets a recording of any built slot allocates.
+  uint32_t holdSets() const {
+    uint32_t most = 0;
+    for (const NfSlot& slot : slots) most = std::max(most, slot.sets);
+    return most;
+  }
 
   void dropGraph() {
     if (stalled()) {
@@ -313,10 +370,28 @@ struct NfNative {
   // Build (or rebuild) the graphs for `sizes` (pairs of valid width and height, `count` of them): each a
   // warm-up run on the layer's queue, then the secondary recordings of all of them. The largest is built
   // first: the split-K scratch is sized by the first recording that needs it, and the smaller graphs' fit
-  // in it.
+  // in it. The sizes are valid (invalidSizes).
   void build(const uint32_t* sizes, uint32_t count) {
     dropGraph();
-    if (count == 0) throw std::runtime_error("no frame size to build the network for");
+    // A count the frames of the graph just dropped left (the caller drained them, but reads the count only at
+    // its next hold, which a rebuild for another size can come before): counter chaining gave up on this
+    // device, so the build falls back as the caller would. Never left standing: a stale count would fail
+    // every warm-up from now on.
+    if (timeouts().waits) {
+      if (nr::Kernels::chainEnabled()) fallBack();
+      resetTimeouts();
+    }
+    try {
+      buildGraphs(sizes, count);
+    } catch (const WarmUpChainTimeout&) {
+      // The warm-up waited on the GPU, which runs nothing of the network now.
+      dropGraph();
+      fallBack();
+      buildGraphs(sizes, count);
+    }
+  }
+
+  void buildGraphs(const uint32_t* sizes, uint32_t count) {
     slots.resize(count);
     std::vector<uint32_t> order(count);
     for (uint32_t i = 0; i < count; ++i) order[i] = i;
@@ -333,9 +408,20 @@ struct NfNative {
       context->resetDescriptorPool(0);
       VkCommandBuffer warm = context->beginCommands();
       slot.graph->record(warm, *slot.features);
+      slot.sets = kernels->dispatchCount();
+      // This warm-up's count alone: nothing else of the network runs (the previous warm-up was waited on, and
+      // the caller drained every frame of the previous build).
+      resetTimeouts();
+      if (fakeWarmUpTimeout) {
+        fakeWarmUpTimeout = false;
+        fakeTimeouts = 1;
+      }
       context->endAndSubmit(warm, true);
-      const nr::Kernels::ChainTimeouts timeouts = kernels->chainTimeouts();
-      if (timeouts.waits) throw std::runtime_error("the warm-up run's counter chain timed out at " + timeouts.counter);
+      const nr::Kernels::ChainTimeouts t = timeouts();
+      if (t.waits) {
+        if (slot.graph->chained()) throw WarmUpChainTimeout("the warm-up run's counter chain timed out at " + t.counter);
+        throw std::runtime_error("the warm-up run (with barriers) reports a counter-chain timeout at " + t.counter);
+      }
       // The warm-up built every matrix the graph uses and has completed: the records' raw buffers now keep only the
       // bytes the kernels read through them (OpenDLSS-NR patch 0008). The recordings below use those.
       model->compactAux();
@@ -372,7 +458,9 @@ struct NfNative {
 
 extern "C" {
 
-uint32_t nf_native_abi_version(void) { return 4; }
+uint32_t nf_native_abi_version(void) { return 5; }
+
+uint32_t nf_native_hold_slots(void) { return kHoldPools; }
 
 uint32_t nf_native_asset_count(const char* kind) {
   try {
@@ -382,10 +470,11 @@ uint32_t nf_native_asset_count(const char* kind) {
   }
 }
 
-uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
-                                    char* missing, size_t missing_len) {
+uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, uint32_t instance_api_version,
+                                    VkPhysicalDevice physical, char* missing, size_t missing_len) {
   try {
-    const std::string first = missingRequirement(gipa, instance, physical);
+    std::string first = instanceRequirement(instance_api_version);
+    if (first.empty()) first = missingRequirement(gipa, instance, physical);
     say(missing, missing_len, first);
     return first.empty() ? 1 : 0;
   } catch (const std::exception& e) {
@@ -397,12 +486,17 @@ uint32_t nf_native_device_supported(PFN_vkGetInstanceProcAddr gipa, VkInstance i
   }
 }
 
-uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, VkPhysicalDevice physical,
-                                 const VkDeviceCreateInfo* in, VkDeviceCreateInfo* out, void** state, char* err,
-                                 size_t err_len) {
+uint32_t nf_native_device_extend(PFN_vkGetInstanceProcAddr gipa, VkInstance instance, uint32_t instance_api_version,
+                                 VkPhysicalDevice physical, const VkDeviceCreateInfo* in, VkDeviceCreateInfo* out,
+                                 void** state, char* err, size_t err_len) {
   *out = *in;
   *state = nullptr;
   try {
+    const std::string old = instanceRequirement(instance_api_version);
+    if (!old.empty()) {
+      say(err, err_len, old);
+      return 0;
+    }
     const std::string first = missingRequirement(gipa, instance, physical);
     if (!first.empty()) {
       say(err, err_len, "the device lacks " + first);
@@ -547,6 +641,11 @@ uint32_t nf_native_build_sizes(NfNative* n, const uint32_t* sizes, uint32_t coun
     say(err, err_len, "the network's queue stalled earlier; it takes no more work");
     return 0;
   }
+  // Refused with the current build kept: nothing of it needs to be drained for a call that does nothing.
+  if (const std::string invalid = invalidSizes(sizes, count); !invalid.empty()) {
+    say(err, err_len, invalid);
+    return 0;
+  }
   try {
     n->build(sizes, count);
     return 1;
@@ -600,6 +699,10 @@ VkCommandBuffer nf_native_graph_commands_own_at(const NfNative* n, uint32_t slot
 }
 
 uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err, size_t err_len) {
+  if (n->stalled()) {
+    say(err, err_len, "the network's queue stalled earlier; it takes no more work");
+    return 0;
+  }
   try {
     if (n->slots.empty() || !n->slots[0].graph) throw std::runtime_error("the network is not built");
     n->context->resetDescriptorPool(0);
@@ -623,16 +726,26 @@ uint32_t nf_native_record_graph_at(NfNative* n, uint32_t slot, uint32_t hold, Vk
   try {
     if (slot >= n->slots.size() || !n->slots[slot].graph) throw std::runtime_error("the network is not built for that size");
     if (hold >= kHoldPools) throw std::runtime_error("no such hold slot");
-    if (n->holdPools.size() <= hold) n->holdPools.resize(hold + 1, VK_NULL_HANDLE);
+    if (n->holdPools.size() <= hold) {
+      n->holdPools.resize(hold + 1, VK_NULL_HANDLE);
+      n->holdPoolSets.resize(hold + 1, 0);
+    }
     VkDescriptorPool& pool = n->holdPools[hold];
+    // Sized for one recording of the largest graph built (its dispatches, counted at its warm-up), and made
+    // again when a later build needs more: nothing recorded with this hold slot is pending (the contract).
+    const uint32_t sets = std::max(1u, n->holdSets());
+    if (pool && n->holdPoolSets[hold] < sets) {
+      vkDestroyDescriptorPool(n->context->device(), pool, nullptr);
+      pool = VK_NULL_HANDLE;
+    }
     if (!pool) {
-      // As the context's own pools: the warm-up recorded this graph's sets into one of those.
-      VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, kHoldSets * vk::kGenericBindings};
+      VkDescriptorPoolSize size{VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, sets * vk::kGenericBindings};
       VkDescriptorPoolCreateInfo info{VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
-      info.maxSets = kHoldSets;
+      info.maxSets = sets;
       info.poolSizeCount = 1;
       info.pPoolSizes = &size;
       VK_CHECK(vkCreateDescriptorPool(n->context->device(), &info, nullptr, &pool));
+      n->holdPoolSets[hold] = sets;
     } else {
       VK_CHECK(vkResetDescriptorPool(n->context->device(), pool, 0));
     }
@@ -658,7 +771,7 @@ uint32_t nf_native_record_graph_at(NfNative* n, uint32_t slot, uint32_t hold, Vk
 
 uint32_t nf_native_chain_timeouts(const NfNative* n, char* where, size_t where_len) {
   try {
-    const nr::Kernels::ChainTimeouts timeouts = n->kernels->chainTimeouts();
+    const nr::Kernels::ChainTimeouts timeouts = n->timeouts();
     say(where, where_len, timeouts.counter);
     return timeouts.waits;
   } catch (...) {
@@ -667,13 +780,11 @@ uint32_t nf_native_chain_timeouts(const NfNative* n, char* where, size_t where_l
   }
 }
 
-void nf_native_reset_chain_timeouts(NfNative* n) { n->kernels->resetChainTimeouts(); }
+void nf_native_reset_chain_timeouts(NfNative* n) { n->resetTimeouts(); }
 
 void nf_native_fall_back_to_barriers(NfNative* n) {
-  g_fellBack.store(true);
-  nr::Kernels::setChainEnabled(false);
   try {
-    n->kernels->resetChainTimeouts();
+    n->fallBack();
     // The chained recording is of no more use; the next nf_native_build records the graph with barriers.
     n->dropGraph();
   } catch (...) {
@@ -681,6 +792,13 @@ void nf_native_fall_back_to_barriers(NfNative* n) {
 }
 
 void nf_native_forget_fall_back(void) { g_fellBack.store(false); }
+
+void nf_native_fake_chain_timeout(NfNative* n, uint32_t in_warm_up) {
+  if (in_warm_up)
+    n->fakeWarmUpTimeout = true;
+  else
+    ++n->fakeTimeouts;
+}
 
 void nf_native_close(NfNative* n) {
   if (!n) return;
