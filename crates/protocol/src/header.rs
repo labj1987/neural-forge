@@ -29,7 +29,8 @@ impl PassControl {
         self.auto_mask.store(1, Ordering::Relaxed);
     }
 
-    /// `global` with this pass's overrides applied.
+    /// `global` with this pass's overrides applied, each strength within its range (a value that is
+    /// not a number is the default).
     pub fn apply(&self, global: Tuning) -> Tuning {
         use crate::enums::pass_override::*;
         let mask = self.overrides.load(Ordering::Relaxed);
@@ -43,6 +44,7 @@ impl PassControl {
             style: u(STYLE, &self.style, global.style),
             auto_mask: u(AUTO_MASK, &self.auto_mask, global.auto_mask),
         }
+        .validated()
     }
 }
 
@@ -206,6 +208,59 @@ impl Default for Tuning {
             auto_mask: 1,
         }
     }
+}
+
+impl Tuning {
+    /// The four strengths as the network may take them: within their ranges in [`SETTING_BOUNDS`]
+    /// (a pass's own have the same ranges), and the default for one that is not a number. The header
+    /// is written by other processes, and not every store goes through
+    /// [`ShmHeader::apply_persisted_setting`], so a value read from it is not trusted.
+    fn validated(self) -> Self {
+        const INTENSITY: (f32, f32) = bounds_of("intensity");
+        const LOCAL_TONE: (f32, f32) = bounds_of("local_tone");
+        const LOCAL_STRUCTURE: (f32, f32) = bounds_of("local_structure");
+        const SKIN_STRUCTURE: (f32, f32) = bounds_of("skin_structure");
+        let d = Tuning::default();
+        let f = |v: f32, (lo, hi): (f32, f32), default: f32| if v.is_finite() { v.clamp(lo, hi) } else { default };
+        Tuning {
+            intensity: f(self.intensity, INTENSITY, d.intensity),
+            local_tone: f(self.local_tone, LOCAL_TONE, d.local_tone),
+            local_structure: f(self.local_structure, LOCAL_STRUCTURE, d.local_structure),
+            skin_structure: f(self.skin_structure, SKIN_STRUCTURE, d.skin_structure),
+            ..self
+        }
+    }
+}
+
+/// How a persisted setting's bits are taken ([`ShmHeader::setting_slots`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Kind {
+    /// An `f32`'s bits, clamped to its range.
+    Float,
+    /// A whole number, clamped to its range.
+    Whole,
+    /// A pass's override mask ([`crate::enums::pass_override`]): only the bits that name an override.
+    Bits,
+}
+
+/// [`setting_bounds`] at compile time, for a name that must be a setting (a build error otherwise).
+const fn bounds_of(name: &str) -> (f32, f32) {
+    let mut i = 0;
+    while i < SETTING_BOUNDS.len() {
+        let (n, min, max) = SETTING_BOUNDS[i];
+        if n.len() == name.len() {
+            let (a, b) = (n.as_bytes(), name.as_bytes());
+            let mut k = 0;
+            while k < a.len() && a[k] == b[k] {
+                k += 1;
+            }
+            if k == a.len() {
+                return (min, max);
+            }
+        }
+        i += 1;
+    }
+    panic!("not a setting")
 }
 
 /// The shared-memory header. See the crate-level docs for the mapping this sits at the
@@ -965,6 +1020,7 @@ impl ShmHeader {
         self.server_heartbeat.store(0, Ordering::Relaxed);
         self.control_seq.store(0, Ordering::Relaxed);
         self.tuning_seq.store(0, Ordering::Relaxed);
+        self.forget_dead_writer();
 
         self.enabled.store(1, Ordering::Relaxed);
         self.style.store(0, Ordering::Relaxed);
@@ -1071,6 +1127,8 @@ impl ShmHeader {
         self.scene_cuts.store(0, Ordering::Relaxed);
         self.capture_next_id.store(0, Ordering::Relaxed);
         self.capture_cancel.store(0, Ordering::Relaxed);
+        // From 0, so a sequence another layout (or a writer that died) left odd is not waited for.
+        self.capture_result_seq.store(0, Ordering::Relaxed);
         self.set_capture_result_words(&[0; crate::capture::RESULT_WORDS]);
         self.layer_measured_white_bits.store(0, Ordering::Relaxed);
         self.layer_heartbeat.store(0, Ordering::Relaxed);
@@ -1128,9 +1186,9 @@ impl ShmHeader {
     /// Writes several settings as one unit (`persisted_settings` names, raw bits, each clamped as
     /// [`Self::apply_persisted_setting`] does) and bumps `control_seq` once. `tuning_seq` is their
     /// sequence lock: odd while the values change, even again after, so [`Self::global_tuning`]
-    /// never reads half of a preset or a profile. It only grows (by two per write), and stays
-    /// non-zero once anything has written: that is how "not yet configured" (0) is read. Returns
-    /// whether every name was a setting.
+    /// never reads half of a preset or a profile ([`write_unit`]). It only grows (by two per write,
+    /// more when a writer is taken over), and stays non-zero once anything has written: that is how
+    /// "not yet configured" (0) is read. Returns whether every name was a setting.
     pub fn write_settings(&self, settings: &[(&str, u32)]) -> bool {
         self.write_settings_and_hud(settings, None)
     }
@@ -1143,46 +1201,39 @@ impl ShmHeader {
 
     /// [`Self::write_settings`] and, with `regions`, the HUD regions, in one unit.
     pub fn write_settings_and_hud(&self, settings: &[(&str, u32)], regions: Option<&[HudRegion]>) -> bool {
-        // Entering is a compare-and-swap from an even value to the next odd one, so two writers
-        // (the GUI and the CLI) take turns. One left odd by a writer that died mid-write is taken
-        // over once it has stayed on that value for STUCK_FOR: the next odd value is ours.
-        let mut stuck: Option<(u32, std::time::Instant)> = None;
-        let odd = loop {
-            let seq = self.tuning_seq.load(Ordering::Relaxed);
-            let next = if seq & 1 == 0 {
-                seq.wrapping_add(1)
-            } else if stuck.is_some_and(|(v, at)| v == seq && at.elapsed() >= STUCK_FOR) {
-                seq.wrapping_add(2)
-            } else {
-                if stuck.is_none_or(|(v, _)| v != seq) {
-                    stuck = Some((seq, std::time::Instant::now()));
-                }
-                std::thread::yield_now();
-                continue;
-            };
-            if self.tuning_seq.compare_exchange_weak(seq, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
-                break next;
-            }
-        };
-        std::sync::atomic::fence(Ordering::Release);
-        let mut all = true;
-        for (name, bits) in settings {
-            all &= self.apply_persisted_setting(name, *bits);
-        }
-        if let Some(regions) = regions {
-            self.store_hud_regions(regions);
-        }
-        // Only if this writer still owns the section: one taken over as dead while it was merely slow
-        // must not move the sequence back under the writer that took over (that one finishes it).
-        self.finish_settings_write(odd);
-        self.control_seq.fetch_add(1, Ordering::Relaxed);
-        all
+        self.write_settings_unit(settings, regions, Entry::Any).is_some_and(|all| all)
     }
 
-    /// Ends the write section entered at `odd`, only if this writer still owns it: one taken over as
-    /// dead while it was merely slow must not move the sequence back under the writer that took over.
-    fn finish_settings_write(&self, odd: u32) {
-        let _ = self.tuning_seq.compare_exchange(odd, odd.wrapping_add(1).max(2), Ordering::Release, Ordering::Relaxed);
+    /// [`Self::write_settings_and_hud`] only when nothing has written settings since the header was
+    /// initialised (`tuning_seq` still 0), decided as the write section is entered, so a write that
+    /// gets in first is never overwritten by these (the saved settings, `persist::apply_saved`).
+    /// Returns whether they were written.
+    pub fn write_settings_if_unconfigured(&self, settings: &[(&str, u32)], regions: Option<&[HudRegion]>) -> bool {
+        self.write_settings_unit(settings, regions, Entry::First).is_some()
+    }
+
+    /// The settings' and regions' stores, made one unit under `tuning_seq` ([`write_unit`]); `None`
+    /// when `entry` skipped them, else whether every name was a setting. Each name is resolved to its
+    /// field and value before the section is entered, so the section holds only the stores the
+    /// readers wait for.
+    fn write_settings_unit(&self, settings: &[(&str, u32)], regions: Option<&[HudRegion]>, entry: Entry) -> Option<bool> {
+        let slots = self.setting_slots();
+        let mut all = true;
+        let mut stores: Vec<(&AtomicU32, u32)> = Vec::with_capacity(settings.len() + regions.map_or(0, |_| MAX_HUD_REGIONS * 6 + 1));
+        for &(name, bits) in settings {
+            match Self::resolve_setting(&slots, name, bits) {
+                Some(store) => stores.push(store),
+                None => all = false,
+            }
+        }
+        if let Some(regions) = regions {
+            stores.extend(self.hud_region_stores(regions));
+        }
+        if !write_unit(&self.tuning_seq, entry, stores.len(), |i| stores[i].0.store(stores[i].1, Ordering::Relaxed)) {
+            return None;
+        }
+        self.control_seq.fetch_add(1, Ordering::Relaxed);
+        Some(all)
     }
 
     /// Whether this mapping is one of ours and laid out the way this build expects.
@@ -1224,392 +1275,234 @@ impl ShmHeader {
         }
     }
 
-    /// Every setting a user can change from the GUI, as `("name", current bits)`
-    /// pairs -- what [`crate::persist::snapshot`]/[`crate::persist::apply`] round-trip
+    /// Every setting a user can change from the GUI, as `("name", is_float, current bits)`
+    /// triples -- what [`crate::persist::snapshot`]/[`crate::persist::apply`] round-trip
     /// through `config.ini` so tuning survives a reboot (the SHM mapping itself lives
-    /// under `/tmp` and does not). Add here, not just to the GUI, whenever a new
-    /// tunable needs to survive a restart -- this is the one list that decides it.
+    /// under `/tmp` and does not). Add to [`Self::setting_slots`] (and [`SETTING_BOUNDS`]), not just
+    /// to the GUI, whenever a new tunable needs to survive a restart -- that is the one list that
+    /// decides it.
     pub fn persisted_settings(&self) -> [(&'static str, bool, u32); 176] {
+        self.setting_slots().map(|(name, kind, field)| (name, kind == Kind::Float, field.load(Ordering::Relaxed)))
+    }
+
+    /// Every persisted setting's name, kind and field, in [`SETTING_BOUNDS`]'s order (a test holds
+    /// the two lists to the same names at the same places). Only addresses: nothing is loaded.
+    fn setting_slots(&self) -> [(&'static str, Kind, &AtomicU32); 176] {
         [
-            ("white_point", true, self.white_point_bits.load(Ordering::Relaxed)),
-            ("white_point_scale", true, self.white_point_scale_bits.load(Ordering::Relaxed)),
-            ("white_point_trim", true, self.white_point_trim_bits.load(Ordering::Relaxed)),
-            ("white_point_source", false, self.white_point_source.load(Ordering::Relaxed)),
-            ("toggle_key", false, self.toggle_key.load(Ordering::Relaxed)),
-            ("enabled", false, self.enabled.load(Ordering::Relaxed)),
-            ("style", false, self.style.load(Ordering::Relaxed)),
-            ("intensity", true, self.intensity_bits.load(Ordering::Relaxed)),
-            ("local_tone", true, self.local_tone_bits.load(Ordering::Relaxed)),
-            ("local_structure", true, self.local_structure_bits.load(Ordering::Relaxed)),
-            ("skin_structure", true, self.skin_structure_bits.load(Ordering::Relaxed)),
-            ("auto_mask", false, self.auto_mask.load(Ordering::Relaxed)),
-            ("composition_bypass", false, self.composition_bypass.load(Ordering::Relaxed)),
-            ("transfer_strength", true, self.transfer_strength_bits.load(Ordering::Relaxed)),
-            ("colour_strength", true, self.colour_strength_bits.load(Ordering::Relaxed)),
-            ("max_ratio", true, self.max_ratio_bits.load(Ordering::Relaxed)),
-            ("working_scale", true, self.working_scale_bits.load(Ordering::Relaxed)),
-            ("reversible_mode", false, self.reversible_mode.load(Ordering::Relaxed)),
-            ("hdr_mode", false, self.hdr_mode.load(Ordering::Relaxed)),
+            ("white_point", Kind::Float, &self.white_point_bits),
+            ("white_point_scale", Kind::Float, &self.white_point_scale_bits),
+            ("white_point_trim", Kind::Float, &self.white_point_trim_bits),
+            ("white_point_source", Kind::Whole, &self.white_point_source),
+            ("toggle_key", Kind::Whole, &self.toggle_key),
+            ("enabled", Kind::Whole, &self.enabled),
+            ("style", Kind::Whole, &self.style),
+            ("intensity", Kind::Float, &self.intensity_bits),
+            ("local_tone", Kind::Float, &self.local_tone_bits),
+            ("local_structure", Kind::Float, &self.local_structure_bits),
+            ("skin_structure", Kind::Float, &self.skin_structure_bits),
+            ("auto_mask", Kind::Whole, &self.auto_mask),
+            ("composition_bypass", Kind::Whole, &self.composition_bypass),
+            ("transfer_strength", Kind::Float, &self.transfer_strength_bits),
+            ("colour_strength", Kind::Float, &self.colour_strength_bits),
+            ("max_ratio", Kind::Float, &self.max_ratio_bits),
+            ("working_scale", Kind::Float, &self.working_scale_bits),
+            ("reversible_mode", Kind::Whole, &self.reversible_mode),
+            ("hdr_mode", Kind::Whole, &self.hdr_mode),
             // Added 2026-09-10 alongside the GUI rows that expose them -- see this
             // function's own doc comment on why both have to change together.
-            ("transfer", false, self.transfer.load(Ordering::Relaxed)),
-            ("compare_mode", false, self.compare_mode.load(Ordering::Relaxed)),
-            ("compare_split", true, self.compare_split_bits.load(Ordering::Relaxed)),
-            ("compare_zoom", true, self.compare_zoom_bits.load(Ordering::Relaxed)),
-            ("compare_swap", false, self.compare_swap.load(Ordering::Relaxed)),
-            ("colour_mode", false, self.colour_mode.load(Ordering::Relaxed)),
-            ("hold_frame", false, self.hold_frame.load(Ordering::Relaxed)),
-            ("ghost_guard", true, self.ghost_guard_bits.load(Ordering::Relaxed)),
-            ("colour_trust", true, self.colour_trust_bits.load(Ordering::Relaxed)),
-            ("ratio_smooth", true, self.ratio_smooth_bits.load(Ordering::Relaxed)),
-            ("model_interval", false, self.model_interval.load(Ordering::Relaxed)),
-            ("apply_model", false, self.apply_model.load(Ordering::Relaxed)),
-            ("debug_view", false, self.debug_view.load(Ordering::Relaxed)),
-            ("debug_scale", true, self.debug_scale_bits.load(Ordering::Relaxed)),
-            ("passes", false, self.passes.load(Ordering::Relaxed)),
-            ("pass1_overrides", false, self.pass[0].overrides.load(Ordering::Relaxed)),
-            ("pass1_intensity", true, self.pass[0].intensity_bits.load(Ordering::Relaxed)),
-            ("pass1_local_tone", true, self.pass[0].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass1_local_structure", true, self.pass[0].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass1_skin_structure", true, self.pass[0].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass1_style", false, self.pass[0].style.load(Ordering::Relaxed)),
-            ("pass1_auto_mask", false, self.pass[0].auto_mask.load(Ordering::Relaxed)),
-            ("pass2_overrides", false, self.pass[1].overrides.load(Ordering::Relaxed)),
-            ("pass2_intensity", true, self.pass[1].intensity_bits.load(Ordering::Relaxed)),
-            ("pass2_local_tone", true, self.pass[1].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass2_local_structure", true, self.pass[1].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass2_skin_structure", true, self.pass[1].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass2_style", false, self.pass[1].style.load(Ordering::Relaxed)),
-            ("pass2_auto_mask", false, self.pass[1].auto_mask.load(Ordering::Relaxed)),
-            ("pass3_overrides", false, self.pass[2].overrides.load(Ordering::Relaxed)),
-            ("pass3_intensity", true, self.pass[2].intensity_bits.load(Ordering::Relaxed)),
-            ("pass3_local_tone", true, self.pass[2].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass3_local_structure", true, self.pass[2].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass3_skin_structure", true, self.pass[2].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass3_style", false, self.pass[2].style.load(Ordering::Relaxed)),
-            ("pass3_auto_mask", false, self.pass[2].auto_mask.load(Ordering::Relaxed)),
-            ("pass4_overrides", false, self.pass[3].overrides.load(Ordering::Relaxed)),
-            ("pass4_intensity", true, self.pass[3].intensity_bits.load(Ordering::Relaxed)),
-            ("pass4_local_tone", true, self.pass[3].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass4_local_structure", true, self.pass[3].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass4_skin_structure", true, self.pass[3].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass4_style", false, self.pass[3].style.load(Ordering::Relaxed)),
-            ("pass4_auto_mask", false, self.pass[3].auto_mask.load(Ordering::Relaxed)),
-            ("pass5_overrides", false, self.pass[4].overrides.load(Ordering::Relaxed)),
-            ("pass5_intensity", true, self.pass[4].intensity_bits.load(Ordering::Relaxed)),
-            ("pass5_local_tone", true, self.pass[4].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass5_local_structure", true, self.pass[4].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass5_skin_structure", true, self.pass[4].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass5_style", false, self.pass[4].style.load(Ordering::Relaxed)),
-            ("pass5_auto_mask", false, self.pass[4].auto_mask.load(Ordering::Relaxed)),
-            ("pass6_overrides", false, self.pass[5].overrides.load(Ordering::Relaxed)),
-            ("pass6_intensity", true, self.pass[5].intensity_bits.load(Ordering::Relaxed)),
-            ("pass6_local_tone", true, self.pass[5].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass6_local_structure", true, self.pass[5].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass6_skin_structure", true, self.pass[5].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass6_style", false, self.pass[5].style.load(Ordering::Relaxed)),
-            ("pass6_auto_mask", false, self.pass[5].auto_mask.load(Ordering::Relaxed)),
-            ("pass7_overrides", false, self.pass[6].overrides.load(Ordering::Relaxed)),
-            ("pass7_intensity", true, self.pass[6].intensity_bits.load(Ordering::Relaxed)),
-            ("pass7_local_tone", true, self.pass[6].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass7_local_structure", true, self.pass[6].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass7_skin_structure", true, self.pass[6].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass7_style", false, self.pass[6].style.load(Ordering::Relaxed)),
-            ("pass7_auto_mask", false, self.pass[6].auto_mask.load(Ordering::Relaxed)),
-            ("pass8_overrides", false, self.pass[7].overrides.load(Ordering::Relaxed)),
-            ("pass8_intensity", true, self.pass[7].intensity_bits.load(Ordering::Relaxed)),
-            ("pass8_local_tone", true, self.pass[7].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass8_local_structure", true, self.pass[7].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass8_skin_structure", true, self.pass[7].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass8_style", false, self.pass[7].style.load(Ordering::Relaxed)),
-            ("pass8_auto_mask", false, self.pass[7].auto_mask.load(Ordering::Relaxed)),
-            ("pass9_overrides", false, self.pass[8].overrides.load(Ordering::Relaxed)),
-            ("pass9_intensity", true, self.pass[8].intensity_bits.load(Ordering::Relaxed)),
-            ("pass9_local_tone", true, self.pass[8].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass9_local_structure", true, self.pass[8].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass9_skin_structure", true, self.pass[8].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass9_style", false, self.pass[8].style.load(Ordering::Relaxed)),
-            ("pass9_auto_mask", false, self.pass[8].auto_mask.load(Ordering::Relaxed)),
-            ("pass10_overrides", false, self.pass[9].overrides.load(Ordering::Relaxed)),
-            ("pass10_intensity", true, self.pass[9].intensity_bits.load(Ordering::Relaxed)),
-            ("pass10_local_tone", true, self.pass[9].local_tone_bits.load(Ordering::Relaxed)),
-            ("pass10_local_structure", true, self.pass[9].local_structure_bits.load(Ordering::Relaxed)),
-            ("pass10_skin_structure", true, self.pass[9].skin_structure_bits.load(Ordering::Relaxed)),
-            ("pass10_style", false, self.pass[9].style.load(Ordering::Relaxed)),
-            ("pass10_auto_mask", false, self.pass[9].auto_mask.load(Ordering::Relaxed)),
-            ("network", false, self.network.load(Ordering::Relaxed)),
-            ("mask_sky", false, self.mask_sky.load(Ordering::Relaxed)),
-            ("mask_sky_margin", true, self.mask_sky_margin_bits.load(Ordering::Relaxed)),
-            ("mask_dark", false, self.mask_dark.load(Ordering::Relaxed)),
-            ("mask_dark_threshold", true, self.mask_dark_threshold_bits.load(Ordering::Relaxed)),
-            ("mask_dark_intensity", true, self.mask_dark_intensity_bits.load(Ordering::Relaxed)),
-            ("mask_dark_structure", true, self.mask_dark_structure_bits.load(Ordering::Relaxed)),
-            ("mask_motion", false, self.mask_motion.load(Ordering::Relaxed)),
-            ("mask_motion_threshold", true, self.mask_motion_threshold_bits.load(Ordering::Relaxed)),
-            ("mask_motion_intensity", true, self.mask_motion_intensity_bits.load(Ordering::Relaxed)),
-            ("mask_motion_structure", true, self.mask_motion_structure_bits.load(Ordering::Relaxed)),
-            ("pass_feedback", true, self.pass_feedback_bits.load(Ordering::Relaxed)),
-            ("preupscale_scale", true, self.preupscale_scale_bits.load(Ordering::Relaxed)),
-            ("pass1_scale", true, self.pass_scale_bits[0].load(Ordering::Relaxed)),
-            ("pass2_scale", true, self.pass_scale_bits[1].load(Ordering::Relaxed)),
-            ("pass3_scale", true, self.pass_scale_bits[2].load(Ordering::Relaxed)),
-            ("pass4_scale", true, self.pass_scale_bits[3].load(Ordering::Relaxed)),
-            ("pass5_scale", true, self.pass_scale_bits[4].load(Ordering::Relaxed)),
-            ("pass6_scale", true, self.pass_scale_bits[5].load(Ordering::Relaxed)),
-            ("pass7_scale", true, self.pass_scale_bits[6].load(Ordering::Relaxed)),
-            ("pass8_scale", true, self.pass_scale_bits[7].load(Ordering::Relaxed)),
-            ("pass9_scale", true, self.pass_scale_bits[8].load(Ordering::Relaxed)),
-            ("pass10_scale", true, self.pass_scale_bits[9].load(Ordering::Relaxed)),
-            ("edit_saturation", true, self.edit_saturation_bits.load(Ordering::Relaxed)),
-            ("edit_contrast", true, self.edit_contrast_bits.load(Ordering::Relaxed)),
-            ("edit_detail", true, self.edit_detail_bits.load(Ordering::Relaxed)),
-            ("edit_gamut_guard", false, self.edit_gamut_guard.load(Ordering::Relaxed)),
-            ("edit_dither", false, self.edit_dither.load(Ordering::Relaxed)),
-            ("edit_lut_strength", true, self.edit_lut_strength_bits.load(Ordering::Relaxed)),
-            ("edit_lut_adapt", true, self.edit_lut_adapt_bits.load(Ordering::Relaxed)),
-            ("pass1_edit_saturation", true, self.pass_colour[0].saturation_bits.load(Ordering::Relaxed)),
-            ("pass1_edit_contrast", true, self.pass_colour[0].contrast_bits.load(Ordering::Relaxed)),
-            ("pass1_edit_detail", true, self.pass_colour[0].detail_bits.load(Ordering::Relaxed)),
-            ("pass2_edit_saturation", true, self.pass_colour[1].saturation_bits.load(Ordering::Relaxed)),
-            ("pass2_edit_contrast", true, self.pass_colour[1].contrast_bits.load(Ordering::Relaxed)),
-            ("pass2_edit_detail", true, self.pass_colour[1].detail_bits.load(Ordering::Relaxed)),
-            ("pass3_edit_saturation", true, self.pass_colour[2].saturation_bits.load(Ordering::Relaxed)),
-            ("pass3_edit_contrast", true, self.pass_colour[2].contrast_bits.load(Ordering::Relaxed)),
-            ("pass3_edit_detail", true, self.pass_colour[2].detail_bits.load(Ordering::Relaxed)),
-            ("pass4_edit_saturation", true, self.pass_colour[3].saturation_bits.load(Ordering::Relaxed)),
-            ("pass4_edit_contrast", true, self.pass_colour[3].contrast_bits.load(Ordering::Relaxed)),
-            ("pass4_edit_detail", true, self.pass_colour[3].detail_bits.load(Ordering::Relaxed)),
-            ("pass5_edit_saturation", true, self.pass_colour[4].saturation_bits.load(Ordering::Relaxed)),
-            ("pass5_edit_contrast", true, self.pass_colour[4].contrast_bits.load(Ordering::Relaxed)),
-            ("pass5_edit_detail", true, self.pass_colour[4].detail_bits.load(Ordering::Relaxed)),
-            ("pass6_edit_saturation", true, self.pass_colour[5].saturation_bits.load(Ordering::Relaxed)),
-            ("pass6_edit_contrast", true, self.pass_colour[5].contrast_bits.load(Ordering::Relaxed)),
-            ("pass6_edit_detail", true, self.pass_colour[5].detail_bits.load(Ordering::Relaxed)),
-            ("pass7_edit_saturation", true, self.pass_colour[6].saturation_bits.load(Ordering::Relaxed)),
-            ("pass7_edit_contrast", true, self.pass_colour[6].contrast_bits.load(Ordering::Relaxed)),
-            ("pass7_edit_detail", true, self.pass_colour[6].detail_bits.load(Ordering::Relaxed)),
-            ("pass8_edit_saturation", true, self.pass_colour[7].saturation_bits.load(Ordering::Relaxed)),
-            ("pass8_edit_contrast", true, self.pass_colour[7].contrast_bits.load(Ordering::Relaxed)),
-            ("pass8_edit_detail", true, self.pass_colour[7].detail_bits.load(Ordering::Relaxed)),
-            ("pass9_edit_saturation", true, self.pass_colour[8].saturation_bits.load(Ordering::Relaxed)),
-            ("pass9_edit_contrast", true, self.pass_colour[8].contrast_bits.load(Ordering::Relaxed)),
-            ("pass9_edit_detail", true, self.pass_colour[8].detail_bits.load(Ordering::Relaxed)),
-            ("pass10_edit_saturation", true, self.pass_colour[9].saturation_bits.load(Ordering::Relaxed)),
-            ("pass10_edit_contrast", true, self.pass_colour[9].contrast_bits.load(Ordering::Relaxed)),
-            ("pass10_edit_detail", true, self.pass_colour[9].detail_bits.load(Ordering::Relaxed)),
-            ("placement", false, self.placement.load(Ordering::Relaxed)),
-            ("pass1_placement", false, self.pass_placement[0].load(Ordering::Relaxed)),
-            ("pass2_placement", false, self.pass_placement[1].load(Ordering::Relaxed)),
-            ("pass3_placement", false, self.pass_placement[2].load(Ordering::Relaxed)),
-            ("pass4_placement", false, self.pass_placement[3].load(Ordering::Relaxed)),
-            ("pass5_placement", false, self.pass_placement[4].load(Ordering::Relaxed)),
-            ("pass6_placement", false, self.pass_placement[5].load(Ordering::Relaxed)),
-            ("pass7_placement", false, self.pass_placement[6].load(Ordering::Relaxed)),
-            ("pass8_placement", false, self.pass_placement[7].load(Ordering::Relaxed)),
-            ("pass9_placement", false, self.pass_placement[8].load(Ordering::Relaxed)),
-            ("pass10_placement", false, self.pass_placement[9].load(Ordering::Relaxed)),
-            ("hud_detect", false, self.hud_detect.load(Ordering::Relaxed)),
+            ("transfer", Kind::Whole, &self.transfer),
+            ("compare_mode", Kind::Whole, &self.compare_mode),
+            ("compare_split", Kind::Float, &self.compare_split_bits),
+            ("compare_zoom", Kind::Float, &self.compare_zoom_bits),
+            ("compare_swap", Kind::Whole, &self.compare_swap),
+            ("colour_mode", Kind::Whole, &self.colour_mode),
+            ("hold_frame", Kind::Whole, &self.hold_frame),
+            ("ghost_guard", Kind::Float, &self.ghost_guard_bits),
+            ("colour_trust", Kind::Float, &self.colour_trust_bits),
+            ("ratio_smooth", Kind::Float, &self.ratio_smooth_bits),
+            ("model_interval", Kind::Whole, &self.model_interval),
+            ("apply_model", Kind::Whole, &self.apply_model),
+            ("debug_view", Kind::Whole, &self.debug_view),
+            ("debug_scale", Kind::Float, &self.debug_scale_bits),
+            ("passes", Kind::Whole, &self.passes),
+            ("pass1_overrides", Kind::Bits, &self.pass[0].overrides),
+            ("pass1_intensity", Kind::Float, &self.pass[0].intensity_bits),
+            ("pass1_local_tone", Kind::Float, &self.pass[0].local_tone_bits),
+            ("pass1_local_structure", Kind::Float, &self.pass[0].local_structure_bits),
+            ("pass1_skin_structure", Kind::Float, &self.pass[0].skin_structure_bits),
+            ("pass1_style", Kind::Whole, &self.pass[0].style),
+            ("pass1_auto_mask", Kind::Whole, &self.pass[0].auto_mask),
+            ("pass2_overrides", Kind::Bits, &self.pass[1].overrides),
+            ("pass2_intensity", Kind::Float, &self.pass[1].intensity_bits),
+            ("pass2_local_tone", Kind::Float, &self.pass[1].local_tone_bits),
+            ("pass2_local_structure", Kind::Float, &self.pass[1].local_structure_bits),
+            ("pass2_skin_structure", Kind::Float, &self.pass[1].skin_structure_bits),
+            ("pass2_style", Kind::Whole, &self.pass[1].style),
+            ("pass2_auto_mask", Kind::Whole, &self.pass[1].auto_mask),
+            ("pass3_overrides", Kind::Bits, &self.pass[2].overrides),
+            ("pass3_intensity", Kind::Float, &self.pass[2].intensity_bits),
+            ("pass3_local_tone", Kind::Float, &self.pass[2].local_tone_bits),
+            ("pass3_local_structure", Kind::Float, &self.pass[2].local_structure_bits),
+            ("pass3_skin_structure", Kind::Float, &self.pass[2].skin_structure_bits),
+            ("pass3_style", Kind::Whole, &self.pass[2].style),
+            ("pass3_auto_mask", Kind::Whole, &self.pass[2].auto_mask),
+            ("pass4_overrides", Kind::Bits, &self.pass[3].overrides),
+            ("pass4_intensity", Kind::Float, &self.pass[3].intensity_bits),
+            ("pass4_local_tone", Kind::Float, &self.pass[3].local_tone_bits),
+            ("pass4_local_structure", Kind::Float, &self.pass[3].local_structure_bits),
+            ("pass4_skin_structure", Kind::Float, &self.pass[3].skin_structure_bits),
+            ("pass4_style", Kind::Whole, &self.pass[3].style),
+            ("pass4_auto_mask", Kind::Whole, &self.pass[3].auto_mask),
+            ("pass5_overrides", Kind::Bits, &self.pass[4].overrides),
+            ("pass5_intensity", Kind::Float, &self.pass[4].intensity_bits),
+            ("pass5_local_tone", Kind::Float, &self.pass[4].local_tone_bits),
+            ("pass5_local_structure", Kind::Float, &self.pass[4].local_structure_bits),
+            ("pass5_skin_structure", Kind::Float, &self.pass[4].skin_structure_bits),
+            ("pass5_style", Kind::Whole, &self.pass[4].style),
+            ("pass5_auto_mask", Kind::Whole, &self.pass[4].auto_mask),
+            ("pass6_overrides", Kind::Bits, &self.pass[5].overrides),
+            ("pass6_intensity", Kind::Float, &self.pass[5].intensity_bits),
+            ("pass6_local_tone", Kind::Float, &self.pass[5].local_tone_bits),
+            ("pass6_local_structure", Kind::Float, &self.pass[5].local_structure_bits),
+            ("pass6_skin_structure", Kind::Float, &self.pass[5].skin_structure_bits),
+            ("pass6_style", Kind::Whole, &self.pass[5].style),
+            ("pass6_auto_mask", Kind::Whole, &self.pass[5].auto_mask),
+            ("pass7_overrides", Kind::Bits, &self.pass[6].overrides),
+            ("pass7_intensity", Kind::Float, &self.pass[6].intensity_bits),
+            ("pass7_local_tone", Kind::Float, &self.pass[6].local_tone_bits),
+            ("pass7_local_structure", Kind::Float, &self.pass[6].local_structure_bits),
+            ("pass7_skin_structure", Kind::Float, &self.pass[6].skin_structure_bits),
+            ("pass7_style", Kind::Whole, &self.pass[6].style),
+            ("pass7_auto_mask", Kind::Whole, &self.pass[6].auto_mask),
+            ("pass8_overrides", Kind::Bits, &self.pass[7].overrides),
+            ("pass8_intensity", Kind::Float, &self.pass[7].intensity_bits),
+            ("pass8_local_tone", Kind::Float, &self.pass[7].local_tone_bits),
+            ("pass8_local_structure", Kind::Float, &self.pass[7].local_structure_bits),
+            ("pass8_skin_structure", Kind::Float, &self.pass[7].skin_structure_bits),
+            ("pass8_style", Kind::Whole, &self.pass[7].style),
+            ("pass8_auto_mask", Kind::Whole, &self.pass[7].auto_mask),
+            ("pass9_overrides", Kind::Bits, &self.pass[8].overrides),
+            ("pass9_intensity", Kind::Float, &self.pass[8].intensity_bits),
+            ("pass9_local_tone", Kind::Float, &self.pass[8].local_tone_bits),
+            ("pass9_local_structure", Kind::Float, &self.pass[8].local_structure_bits),
+            ("pass9_skin_structure", Kind::Float, &self.pass[8].skin_structure_bits),
+            ("pass9_style", Kind::Whole, &self.pass[8].style),
+            ("pass9_auto_mask", Kind::Whole, &self.pass[8].auto_mask),
+            ("pass10_overrides", Kind::Bits, &self.pass[9].overrides),
+            ("pass10_intensity", Kind::Float, &self.pass[9].intensity_bits),
+            ("pass10_local_tone", Kind::Float, &self.pass[9].local_tone_bits),
+            ("pass10_local_structure", Kind::Float, &self.pass[9].local_structure_bits),
+            ("pass10_skin_structure", Kind::Float, &self.pass[9].skin_structure_bits),
+            ("pass10_style", Kind::Whole, &self.pass[9].style),
+            ("pass10_auto_mask", Kind::Whole, &self.pass[9].auto_mask),
+            ("network", Kind::Whole, &self.network),
+            ("mask_sky", Kind::Whole, &self.mask_sky),
+            ("mask_sky_margin", Kind::Float, &self.mask_sky_margin_bits),
+            ("mask_dark", Kind::Whole, &self.mask_dark),
+            ("mask_dark_threshold", Kind::Float, &self.mask_dark_threshold_bits),
+            ("mask_dark_intensity", Kind::Float, &self.mask_dark_intensity_bits),
+            ("mask_dark_structure", Kind::Float, &self.mask_dark_structure_bits),
+            ("mask_motion", Kind::Whole, &self.mask_motion),
+            ("mask_motion_threshold", Kind::Float, &self.mask_motion_threshold_bits),
+            ("mask_motion_intensity", Kind::Float, &self.mask_motion_intensity_bits),
+            ("mask_motion_structure", Kind::Float, &self.mask_motion_structure_bits),
+            ("pass_feedback", Kind::Float, &self.pass_feedback_bits),
+            ("preupscale_scale", Kind::Float, &self.preupscale_scale_bits),
+            ("pass1_scale", Kind::Float, &self.pass_scale_bits[0]),
+            ("pass2_scale", Kind::Float, &self.pass_scale_bits[1]),
+            ("pass3_scale", Kind::Float, &self.pass_scale_bits[2]),
+            ("pass4_scale", Kind::Float, &self.pass_scale_bits[3]),
+            ("pass5_scale", Kind::Float, &self.pass_scale_bits[4]),
+            ("pass6_scale", Kind::Float, &self.pass_scale_bits[5]),
+            ("pass7_scale", Kind::Float, &self.pass_scale_bits[6]),
+            ("pass8_scale", Kind::Float, &self.pass_scale_bits[7]),
+            ("pass9_scale", Kind::Float, &self.pass_scale_bits[8]),
+            ("pass10_scale", Kind::Float, &self.pass_scale_bits[9]),
+            ("edit_saturation", Kind::Float, &self.edit_saturation_bits),
+            ("edit_contrast", Kind::Float, &self.edit_contrast_bits),
+            ("edit_detail", Kind::Float, &self.edit_detail_bits),
+            ("edit_gamut_guard", Kind::Whole, &self.edit_gamut_guard),
+            ("edit_dither", Kind::Whole, &self.edit_dither),
+            ("edit_lut_strength", Kind::Float, &self.edit_lut_strength_bits),
+            ("edit_lut_adapt", Kind::Float, &self.edit_lut_adapt_bits),
+            ("pass1_edit_saturation", Kind::Float, &self.pass_colour[0].saturation_bits),
+            ("pass1_edit_contrast", Kind::Float, &self.pass_colour[0].contrast_bits),
+            ("pass1_edit_detail", Kind::Float, &self.pass_colour[0].detail_bits),
+            ("pass2_edit_saturation", Kind::Float, &self.pass_colour[1].saturation_bits),
+            ("pass2_edit_contrast", Kind::Float, &self.pass_colour[1].contrast_bits),
+            ("pass2_edit_detail", Kind::Float, &self.pass_colour[1].detail_bits),
+            ("pass3_edit_saturation", Kind::Float, &self.pass_colour[2].saturation_bits),
+            ("pass3_edit_contrast", Kind::Float, &self.pass_colour[2].contrast_bits),
+            ("pass3_edit_detail", Kind::Float, &self.pass_colour[2].detail_bits),
+            ("pass4_edit_saturation", Kind::Float, &self.pass_colour[3].saturation_bits),
+            ("pass4_edit_contrast", Kind::Float, &self.pass_colour[3].contrast_bits),
+            ("pass4_edit_detail", Kind::Float, &self.pass_colour[3].detail_bits),
+            ("pass5_edit_saturation", Kind::Float, &self.pass_colour[4].saturation_bits),
+            ("pass5_edit_contrast", Kind::Float, &self.pass_colour[4].contrast_bits),
+            ("pass5_edit_detail", Kind::Float, &self.pass_colour[4].detail_bits),
+            ("pass6_edit_saturation", Kind::Float, &self.pass_colour[5].saturation_bits),
+            ("pass6_edit_contrast", Kind::Float, &self.pass_colour[5].contrast_bits),
+            ("pass6_edit_detail", Kind::Float, &self.pass_colour[5].detail_bits),
+            ("pass7_edit_saturation", Kind::Float, &self.pass_colour[6].saturation_bits),
+            ("pass7_edit_contrast", Kind::Float, &self.pass_colour[6].contrast_bits),
+            ("pass7_edit_detail", Kind::Float, &self.pass_colour[6].detail_bits),
+            ("pass8_edit_saturation", Kind::Float, &self.pass_colour[7].saturation_bits),
+            ("pass8_edit_contrast", Kind::Float, &self.pass_colour[7].contrast_bits),
+            ("pass8_edit_detail", Kind::Float, &self.pass_colour[7].detail_bits),
+            ("pass9_edit_saturation", Kind::Float, &self.pass_colour[8].saturation_bits),
+            ("pass9_edit_contrast", Kind::Float, &self.pass_colour[8].contrast_bits),
+            ("pass9_edit_detail", Kind::Float, &self.pass_colour[8].detail_bits),
+            ("pass10_edit_saturation", Kind::Float, &self.pass_colour[9].saturation_bits),
+            ("pass10_edit_contrast", Kind::Float, &self.pass_colour[9].contrast_bits),
+            ("pass10_edit_detail", Kind::Float, &self.pass_colour[9].detail_bits),
+            ("placement", Kind::Whole, &self.placement),
+            ("pass1_placement", Kind::Whole, &self.pass_placement[0]),
+            ("pass2_placement", Kind::Whole, &self.pass_placement[1]),
+            ("pass3_placement", Kind::Whole, &self.pass_placement[2]),
+            ("pass4_placement", Kind::Whole, &self.pass_placement[3]),
+            ("pass5_placement", Kind::Whole, &self.pass_placement[4]),
+            ("pass6_placement", Kind::Whole, &self.pass_placement[5]),
+            ("pass7_placement", Kind::Whole, &self.pass_placement[6]),
+            ("pass8_placement", Kind::Whole, &self.pass_placement[7]),
+            ("pass9_placement", Kind::Whole, &self.pass_placement[8]),
+            ("pass10_placement", Kind::Whole, &self.pass_placement[9]),
+            ("hud_detect", Kind::Whole, &self.hud_detect),
         ]
+    }
+
+    /// The field persisted setting `name` lives in and the bits to store there for `bits`: a float
+    /// clamped to the setting's range in [`SETTING_BOUNDS`] (`None` for one that is not finite), a
+    /// whole number clamped to it, and an override mask with the bits that name no override cleared.
+    /// `None` for a name that is no setting.
+    fn resolve_setting<'a>(slots: &[(&'static str, Kind, &'a AtomicU32); 176], name: &str, bits: u32) -> Option<(&'a AtomicU32, u32)> {
+        let at = SETTING_BOUNDS.iter().position(|(n, ..)| *n == name)?;
+        let (_, min, max) = SETTING_BOUNDS[at];
+        let (slot_name, kind, field) = slots[at];
+        debug_assert_eq!(slot_name, name);
+        let bits = match kind {
+            Kind::Float => {
+                let v = f32::from_bits(bits);
+                if !v.is_finite() {
+                    return None;
+                }
+                v.clamp(min, max).to_bits()
+            }
+            Kind::Whole => bits.clamp(min as u32, max as u32),
+            // A bit this build has no override for (a hand edit, or a later build's) is dropped, not
+            // read as "every override".
+            Kind::Bits => bits & crate::enums::pass_override::ALL,
+        };
+        Some((field, bits))
     }
 
     /// Stores one persisted setting back by name (as looked up in a `config.ini`
     /// `set_<name>=<value>` line) -- `bits` is already the right representation
     /// (`f32::to_bits()` for the float-valued ones, per [`Self::persisted_settings`]'s
-    /// second field). A non-finite float is rejected and anything else is clamped to the
-    /// setting's range in [`SETTING_BOUNDS`]. Returns whether a value was stored.
+    /// second field). A non-finite float is rejected, an override mask keeps only the override bits
+    /// and anything else is clamped to the setting's range in [`SETTING_BOUNDS`]. Returns whether a
+    /// value was stored.
     pub fn apply_persisted_setting(&self, name: &str, bits: u32) -> bool {
-        let Some((min, max)) = setting_bounds(name) else { return false };
-        let Some(is_float) = self.persisted_settings().iter().find(|(n, ..)| *n == name).map(|&(_, f, _)| f) else {
-            return false;
-        };
-        let bits = if is_float {
-            let v = f32::from_bits(bits);
-            if !v.is_finite() {
-                return false;
-            }
-            v.clamp(min, max).to_bits()
-        } else {
-            bits.clamp(min as u32, max as u32)
-        };
-        let field = match name {
-            "white_point" => &self.white_point_bits,
-            "white_point_scale" => &self.white_point_scale_bits,
-            "white_point_trim" => &self.white_point_trim_bits,
-            "white_point_source" => &self.white_point_source,
-            "toggle_key" => &self.toggle_key,
-            "enabled" => &self.enabled,
-            "style" => &self.style,
-            "intensity" => &self.intensity_bits,
-            "local_tone" => &self.local_tone_bits,
-            "local_structure" => &self.local_structure_bits,
-            "skin_structure" => &self.skin_structure_bits,
-            "auto_mask" => &self.auto_mask,
-            "composition_bypass" => &self.composition_bypass,
-            "transfer_strength" => &self.transfer_strength_bits,
-            "colour_strength" => &self.colour_strength_bits,
-            "max_ratio" => &self.max_ratio_bits,
-            "working_scale" => &self.working_scale_bits,
-            "reversible_mode" => &self.reversible_mode,
-            "hdr_mode" => &self.hdr_mode,
-            "transfer" => &self.transfer,
-            "compare_mode" => &self.compare_mode,
-            "compare_split" => &self.compare_split_bits,
-            "compare_zoom" => &self.compare_zoom_bits,
-            "compare_swap" => &self.compare_swap,
-            "colour_mode" => &self.colour_mode,
-            "hold_frame" => &self.hold_frame,
-            "ghost_guard" => &self.ghost_guard_bits,
-            "colour_trust" => &self.colour_trust_bits,
-            "ratio_smooth" => &self.ratio_smooth_bits,
-            "model_interval" => &self.model_interval,
-            "apply_model" => &self.apply_model,
-            "debug_view" => &self.debug_view,
-            "debug_scale" => &self.debug_scale_bits,
-            "passes" => &self.passes,
-            "pass1_overrides" => &self.pass[0].overrides,
-            "pass1_intensity" => &self.pass[0].intensity_bits,
-            "pass1_local_tone" => &self.pass[0].local_tone_bits,
-            "pass1_local_structure" => &self.pass[0].local_structure_bits,
-            "pass1_skin_structure" => &self.pass[0].skin_structure_bits,
-            "pass1_style" => &self.pass[0].style,
-            "pass1_auto_mask" => &self.pass[0].auto_mask,
-            "pass2_overrides" => &self.pass[1].overrides,
-            "pass2_intensity" => &self.pass[1].intensity_bits,
-            "pass2_local_tone" => &self.pass[1].local_tone_bits,
-            "pass2_local_structure" => &self.pass[1].local_structure_bits,
-            "pass2_skin_structure" => &self.pass[1].skin_structure_bits,
-            "pass2_style" => &self.pass[1].style,
-            "pass2_auto_mask" => &self.pass[1].auto_mask,
-            "pass3_overrides" => &self.pass[2].overrides,
-            "pass3_intensity" => &self.pass[2].intensity_bits,
-            "pass3_local_tone" => &self.pass[2].local_tone_bits,
-            "pass3_local_structure" => &self.pass[2].local_structure_bits,
-            "pass3_skin_structure" => &self.pass[2].skin_structure_bits,
-            "pass3_style" => &self.pass[2].style,
-            "pass3_auto_mask" => &self.pass[2].auto_mask,
-            "pass4_overrides" => &self.pass[3].overrides,
-            "pass4_intensity" => &self.pass[3].intensity_bits,
-            "pass4_local_tone" => &self.pass[3].local_tone_bits,
-            "pass4_local_structure" => &self.pass[3].local_structure_bits,
-            "pass4_skin_structure" => &self.pass[3].skin_structure_bits,
-            "pass4_style" => &self.pass[3].style,
-            "pass4_auto_mask" => &self.pass[3].auto_mask,
-            "pass5_overrides" => &self.pass[4].overrides,
-            "pass5_intensity" => &self.pass[4].intensity_bits,
-            "pass5_local_tone" => &self.pass[4].local_tone_bits,
-            "pass5_local_structure" => &self.pass[4].local_structure_bits,
-            "pass5_skin_structure" => &self.pass[4].skin_structure_bits,
-            "pass5_style" => &self.pass[4].style,
-            "pass5_auto_mask" => &self.pass[4].auto_mask,
-            "pass6_overrides" => &self.pass[5].overrides,
-            "pass6_intensity" => &self.pass[5].intensity_bits,
-            "pass6_local_tone" => &self.pass[5].local_tone_bits,
-            "pass6_local_structure" => &self.pass[5].local_structure_bits,
-            "pass6_skin_structure" => &self.pass[5].skin_structure_bits,
-            "pass6_style" => &self.pass[5].style,
-            "pass6_auto_mask" => &self.pass[5].auto_mask,
-            "pass7_overrides" => &self.pass[6].overrides,
-            "pass7_intensity" => &self.pass[6].intensity_bits,
-            "pass7_local_tone" => &self.pass[6].local_tone_bits,
-            "pass7_local_structure" => &self.pass[6].local_structure_bits,
-            "pass7_skin_structure" => &self.pass[6].skin_structure_bits,
-            "pass7_style" => &self.pass[6].style,
-            "pass7_auto_mask" => &self.pass[6].auto_mask,
-            "pass8_overrides" => &self.pass[7].overrides,
-            "pass8_intensity" => &self.pass[7].intensity_bits,
-            "pass8_local_tone" => &self.pass[7].local_tone_bits,
-            "pass8_local_structure" => &self.pass[7].local_structure_bits,
-            "pass8_skin_structure" => &self.pass[7].skin_structure_bits,
-            "pass8_style" => &self.pass[7].style,
-            "pass8_auto_mask" => &self.pass[7].auto_mask,
-            "pass9_overrides" => &self.pass[8].overrides,
-            "pass9_intensity" => &self.pass[8].intensity_bits,
-            "pass9_local_tone" => &self.pass[8].local_tone_bits,
-            "pass9_local_structure" => &self.pass[8].local_structure_bits,
-            "pass9_skin_structure" => &self.pass[8].skin_structure_bits,
-            "pass9_style" => &self.pass[8].style,
-            "pass9_auto_mask" => &self.pass[8].auto_mask,
-            "pass10_overrides" => &self.pass[9].overrides,
-            "pass10_intensity" => &self.pass[9].intensity_bits,
-            "pass10_local_tone" => &self.pass[9].local_tone_bits,
-            "pass10_local_structure" => &self.pass[9].local_structure_bits,
-            "pass10_skin_structure" => &self.pass[9].skin_structure_bits,
-            "pass10_style" => &self.pass[9].style,
-            "pass10_auto_mask" => &self.pass[9].auto_mask,
-            "network" => &self.network,
-            "mask_sky" => &self.mask_sky,
-            "mask_sky_margin" => &self.mask_sky_margin_bits,
-            "mask_dark" => &self.mask_dark,
-            "mask_dark_threshold" => &self.mask_dark_threshold_bits,
-            "mask_dark_intensity" => &self.mask_dark_intensity_bits,
-            "mask_dark_structure" => &self.mask_dark_structure_bits,
-            "mask_motion" => &self.mask_motion,
-            "mask_motion_threshold" => &self.mask_motion_threshold_bits,
-            "mask_motion_intensity" => &self.mask_motion_intensity_bits,
-            "mask_motion_structure" => &self.mask_motion_structure_bits,
-            "pass_feedback" => &self.pass_feedback_bits,
-            "preupscale_scale" => &self.preupscale_scale_bits,
-            "pass1_scale" => &self.pass_scale_bits[0],
-            "pass2_scale" => &self.pass_scale_bits[1],
-            "pass3_scale" => &self.pass_scale_bits[2],
-            "pass4_scale" => &self.pass_scale_bits[3],
-            "pass5_scale" => &self.pass_scale_bits[4],
-            "pass6_scale" => &self.pass_scale_bits[5],
-            "pass7_scale" => &self.pass_scale_bits[6],
-            "pass8_scale" => &self.pass_scale_bits[7],
-            "pass9_scale" => &self.pass_scale_bits[8],
-            "pass10_scale" => &self.pass_scale_bits[9],
-            "edit_saturation" => &self.edit_saturation_bits,
-            "edit_contrast" => &self.edit_contrast_bits,
-            "edit_detail" => &self.edit_detail_bits,
-            "edit_gamut_guard" => &self.edit_gamut_guard,
-            "edit_dither" => &self.edit_dither,
-            "edit_lut_strength" => &self.edit_lut_strength_bits,
-            "edit_lut_adapt" => &self.edit_lut_adapt_bits,
-            "pass1_edit_saturation" => &self.pass_colour[0].saturation_bits,
-            "pass1_edit_contrast" => &self.pass_colour[0].contrast_bits,
-            "pass1_edit_detail" => &self.pass_colour[0].detail_bits,
-            "pass2_edit_saturation" => &self.pass_colour[1].saturation_bits,
-            "pass2_edit_contrast" => &self.pass_colour[1].contrast_bits,
-            "pass2_edit_detail" => &self.pass_colour[1].detail_bits,
-            "pass3_edit_saturation" => &self.pass_colour[2].saturation_bits,
-            "pass3_edit_contrast" => &self.pass_colour[2].contrast_bits,
-            "pass3_edit_detail" => &self.pass_colour[2].detail_bits,
-            "pass4_edit_saturation" => &self.pass_colour[3].saturation_bits,
-            "pass4_edit_contrast" => &self.pass_colour[3].contrast_bits,
-            "pass4_edit_detail" => &self.pass_colour[3].detail_bits,
-            "pass5_edit_saturation" => &self.pass_colour[4].saturation_bits,
-            "pass5_edit_contrast" => &self.pass_colour[4].contrast_bits,
-            "pass5_edit_detail" => &self.pass_colour[4].detail_bits,
-            "pass6_edit_saturation" => &self.pass_colour[5].saturation_bits,
-            "pass6_edit_contrast" => &self.pass_colour[5].contrast_bits,
-            "pass6_edit_detail" => &self.pass_colour[5].detail_bits,
-            "pass7_edit_saturation" => &self.pass_colour[6].saturation_bits,
-            "pass7_edit_contrast" => &self.pass_colour[6].contrast_bits,
-            "pass7_edit_detail" => &self.pass_colour[6].detail_bits,
-            "pass8_edit_saturation" => &self.pass_colour[7].saturation_bits,
-            "pass8_edit_contrast" => &self.pass_colour[7].contrast_bits,
-            "pass8_edit_detail" => &self.pass_colour[7].detail_bits,
-            "pass9_edit_saturation" => &self.pass_colour[8].saturation_bits,
-            "pass9_edit_contrast" => &self.pass_colour[8].contrast_bits,
-            "pass9_edit_detail" => &self.pass_colour[8].detail_bits,
-            "pass10_edit_saturation" => &self.pass_colour[9].saturation_bits,
-            "pass10_edit_contrast" => &self.pass_colour[9].contrast_bits,
-            "pass10_edit_detail" => &self.pass_colour[9].detail_bits,
-            "placement" => &self.placement,
-            "pass1_placement" => &self.pass_placement[0],
-            "pass2_placement" => &self.pass_placement[1],
-            "pass3_placement" => &self.pass_placement[2],
-            "pass4_placement" => &self.pass_placement[3],
-            "pass5_placement" => &self.pass_placement[4],
-            "pass6_placement" => &self.pass_placement[5],
-            "pass7_placement" => &self.pass_placement[6],
-            "pass8_placement" => &self.pass_placement[7],
-            "pass9_placement" => &self.pass_placement[8],
-            "pass10_placement" => &self.pass_placement[9],
-            "hud_detect" => &self.hud_detect,
-            _ => return false,
-        };
+        let Some((field, bits)) = Self::resolve_setting(&self.setting_slots(), name, bits) else { return false };
         field.store(bits, Ordering::Relaxed);
         true
     }
@@ -1677,19 +1570,24 @@ impl ShmHeader {
         }
     }
 
-    /// Stores the HUD regions as they stand (inside a write section, or on a header nobody reads yet).
+    /// Stores the HUD regions as they stand (on a header nobody reads yet: [`Self::init_defaults`]).
     fn store_hud_regions(&self, regions: &[HudRegion]) {
+        for (field, bits) in self.hud_region_stores(regions) {
+            field.store(bits, Ordering::Relaxed);
+        }
+    }
+
+    /// The stores that put `regions` in the header (each clamped, one that is not dropped, at most
+    /// [`MAX_HUD_REGIONS`]; the slots past them emptied), the count last.
+    fn hud_region_stores(&self, regions: &[HudRegion]) -> Vec<(&AtomicU32, u32)> {
         let kept: Vec<HudRegion> = regions.iter().filter_map(|r| r.clamped()).take(MAX_HUD_REGIONS).collect();
+        let mut stores = Vec::with_capacity(MAX_HUD_REGIONS * 6 + 1);
         for (k, w) in self.hud_region.iter().enumerate() {
             let r = kept.get(k).copied().unwrap_or(HudRegion { x: 0.0, y: 0.0, w: 0.0, h: 0.0, mode: crate::enums::hud_mode::KEEP, strength: HudRegion::DEFAULT_STRENGTH });
-            w.x_bits.store(r.x.to_bits(), Ordering::Relaxed);
-            w.y_bits.store(r.y.to_bits(), Ordering::Relaxed);
-            w.w_bits.store(r.w.to_bits(), Ordering::Relaxed);
-            w.h_bits.store(r.h.to_bits(), Ordering::Relaxed);
-            w.mode.store(r.mode, Ordering::Relaxed);
-            w.strength_bits.store(r.strength.to_bits(), Ordering::Relaxed);
+            stores.extend([(&w.x_bits, r.x.to_bits()), (&w.y_bits, r.y.to_bits()), (&w.w_bits, r.w.to_bits()), (&w.h_bits, r.h.to_bits()), (&w.mode, r.mode), (&w.strength_bits, r.strength.to_bits())]);
         }
-        self.hud_region_count.store(kept.len() as u32, Ordering::Relaxed);
+        stores.push((&self.hud_region_count, kept.len() as u32));
+        stores
     }
 
     /// The HUD settings at present: the detection switch and the regions in use (each clamped; one that is not
@@ -1767,18 +1665,19 @@ impl ShmHeader {
             style: self.style.load(Ordering::Relaxed),
             auto_mask: self.auto_mask.load(Ordering::Relaxed),
         }
+        .validated()
     }
 
     /// `read` under `tuning_seq` ([`Self::write_settings`]): a preset or profile being written is seen
     /// whole, before or after.
     fn read_settings<T>(&self, read: impl Fn() -> T) -> T {
         // A live writer moves the sequence on within microseconds; one that stays on the same odd
-        // value for STUCK_FOR has died mid-write. That value is remembered (per process), so later
-        // reads do not wait for it again; the next write takes it over.
+        // value for STUCK_FOR has died mid-write. That value is remembered (per process and header),
+        // so later reads do not wait for it again; the next write takes it over.
         let mut stuck: Option<(u32, std::time::Instant)> = None;
         loop {
             let before = self.tuning_seq.load(Ordering::Acquire);
-            if before & 1 == 1 && DEAD_TUNING_SEQ.load(Ordering::Relaxed) == before {
+            if self.dead_writer_at(before) {
                 return read();
             }
             if before & 1 == 0 {
@@ -1789,7 +1688,7 @@ impl ShmHeader {
                 }
             } else if let Some((value, at)) = stuck.filter(|(v, _)| *v == before) {
                 if at.elapsed() >= STUCK_FOR {
-                    DEAD_TUNING_SEQ.store(value, Ordering::Relaxed);
+                    self.note_dead_writer(value);
                     return read();
                 }
                 std::thread::yield_now();
@@ -1813,9 +1712,51 @@ impl ShmHeader {
     pub fn game_name(&self) -> String {
         load_seq_guarded(&self.game_name_seq, &self.game_name)
     }
-    /// The capture result's raw words, written as one unit (`crate::capture::publish`).
+    /// The capture result's raw words, written as one unit (`crate::capture::publish`) under
+    /// `capture_result_seq`, which writers enter one at a time ([`write_unit`]): any number of
+    /// processes and threads may publish.
     pub(crate) fn set_capture_result_words(&self, words: &[u32; crate::capture::RESULT_WORDS]) {
-        store_words_seq_guarded(&self.capture_result_seq, &self.capture_result, words);
+        write_unit(&self.capture_result_seq, Entry::Any, words.len(), |i| self.capture_result[i].store(words[i], Ordering::Relaxed));
+    }
+
+    /// Whether `seq` is the odd `tuning_seq` this process found left on this header by a writer that
+    /// died. Seeing the sequence anywhere else (taken over, re-initialised) forgets the record, so a
+    /// live writer passing through the same value later is waited for again.
+    fn dead_writer_at(&self, seq: u32) -> bool {
+        if !ANY_DEAD_WRITER.load(Ordering::Relaxed) {
+            return false;
+        }
+        let me = std::ptr::from_ref(self) as usize;
+        let mut dead = DEAD_WRITERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut found = false;
+        dead.retain(|&(at, value)| {
+            if at != me {
+                return true;
+            }
+            found = value == seq;
+            found
+        });
+        ANY_DEAD_WRITER.store(!dead.is_empty(), Ordering::Relaxed);
+        found
+    }
+
+    /// Records `seq` as left on this header by a writer that died ([`Self::dead_writer_at`]).
+    fn note_dead_writer(&self, seq: u32) {
+        let me = std::ptr::from_ref(self) as usize;
+        let mut dead = DEAD_WRITERS.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        dead.retain(|&(at, _)| at != me);
+        if dead.len() >= MAX_DEAD_WRITERS {
+            dead.remove(0);
+        }
+        dead.push((me, seq));
+        ANY_DEAD_WRITER.store(true, Ordering::Relaxed);
+    }
+
+    /// Forgets a dead writer recorded on this header: it is being initialised.
+    fn forget_dead_writer(&self) {
+        if ANY_DEAD_WRITER.load(Ordering::Relaxed) {
+            self.dead_writer_at(0);
+        }
     }
     /// The capture result's raw words as one consistent snapshot, `None` while a write keeps
     /// changing them (`crate::capture::result`).
@@ -1828,8 +1769,101 @@ impl ShmHeader {
 /// writer moves it on within microseconds, a preempted one within a scheduler slice or two).
 const STUCK_FOR: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// The odd `tuning_seq` this process found left by a dead writer: reads skip the wait for it.
-static DEAD_TUNING_SEQ: AtomicU32 = AtomicU32::new(0);
+/// The odd `tuning_seq` values this process found left by a dead writer, each with the header's
+/// address: reads of that header skip the wait while its sequence stays on that value. A few headers'
+/// worth (a process maps one channel; tests make many).
+static DEAD_WRITERS: std::sync::Mutex<Vec<(usize, u32)>> = std::sync::Mutex::new(Vec::new());
+const MAX_DEAD_WRITERS: usize = 8;
+/// Whether [`DEAD_WRITERS`] holds anything: the read path's only cost while it does not.
+static ANY_DEAD_WRITER: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How a writer enters a sequence lock's write section ([`write_unit`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Entry {
+    /// From any even value, after the writer before has finished; an odd value that stays put for
+    /// [`STUCK_FOR`] is a writer that died, and is taken over.
+    Any,
+    /// Only from 0, the value nothing has written since the header was initialised: the write is
+    /// skipped once anything else has entered (`persist::apply_saved`).
+    First,
+}
+
+/// Enters `seq`'s write section from an even value, taking over an odd one left for [`STUCK_FOR`]
+/// by a writer that died. Returns the odd value this writer owns.
+fn enter_write(seq: &AtomicU32) -> u32 {
+    let mut stuck: Option<(u32, std::time::Instant)> = None;
+    loop {
+        let s = seq.load(Ordering::Relaxed);
+        let next = if s & 1 == 0 {
+            s.wrapping_add(1)
+        } else if stuck.is_some_and(|(v, at)| v == s && at.elapsed() >= STUCK_FOR) {
+            s.wrapping_add(2)
+        } else {
+            if stuck.is_none_or(|(v, _)| v != s) {
+                stuck = Some((s, std::time::Instant::now()));
+            }
+            std::thread::yield_now();
+            continue;
+        };
+        if seq.compare_exchange_weak(s, next, Ordering::Acquire, Ordering::Relaxed).is_ok() {
+            return next;
+        }
+    }
+}
+
+/// Ends the write section entered at `odd`, only if this writer still owns it: one taken over as
+/// dead while it was merely slow must not move the sequence back under the writer that took over.
+/// Returns whether it still owned it.
+fn finish_write(seq: &AtomicU32, odd: u32) -> bool {
+    seq.compare_exchange(odd, odd.wrapping_add(1).max(2), Ordering::Release, Ordering::Relaxed).is_ok()
+}
+
+/// Makes `count` stores (`store(i)` for each `i`) one unit under the sequence lock `seq`: odd while
+/// they change, even again after, so a reader that sees the same even value before and after its
+/// loads read none of them half done. Writers enter one at a time (a compare-and-swap from even to
+/// odd). Returns whether the stores were made: always for [`Entry::Any`], and for [`Entry::First`]
+/// only when nothing had entered before.
+///
+/// A writer taken over as dead while it was merely slow (stopped, or starved of CPU for
+/// [`STUCK_FOR`] inside its section) checks before every store that the section is still its own,
+/// so it stops at the first one after the takeover. It then makes all of its stores again in a
+/// section of its own, after the writer that took over: the result is the two writes one after the
+/// other, never a mix of them under an even sequence. What is left is one store at most, the one
+/// already on its way when the takeover landed, which a reader may see under the other writer's even
+/// value until the rewrite (microseconds later) moves the sequence on. A writer that owned the whole
+/// header could close that too, but it needs a word naming the writer (and a way to tell it is alive
+/// across the game's container), which this layout does not have.
+fn write_unit(seq: &AtomicU32, entry: Entry, count: usize, store: impl Fn(usize)) -> bool {
+    let mut entry = entry;
+    loop {
+        let odd = match entry {
+            Entry::Any => enter_write(seq),
+            Entry::First => {
+                if seq.compare_exchange(0, 1, Ordering::Acquire, Ordering::Relaxed).is_err() {
+                    return false;
+                }
+                1
+            }
+        };
+        // Orders the odd value before the stores below for a reader that pairs it with an acquire
+        // fence.
+        std::sync::atomic::fence(Ordering::Release);
+        let mut owned = true;
+        for i in 0..count {
+            if seq.load(Ordering::Relaxed) != odd {
+                owned = false;
+                break;
+            }
+            store(i);
+        }
+        if finish_write(seq, odd) && owned {
+            return true;
+        }
+        // Taken over: the whole unit again, after the writer that took over. A first write has
+        // already started applying, so it finishes like any other.
+        entry = Entry::Any;
+    }
+}
 
 /// Reads a lo/hi `AtomicU32` pair as one `u64` frame counter.
 ///
@@ -1888,17 +1922,6 @@ fn store_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], s:
             }
         }
         word.store(u32::from_le_bytes(chunk), Ordering::Relaxed);
-    }
-    seq.store(odd.wrapping_add(1), Ordering::Release);
-}
-
-/// [`store_seq_guarded`] for a block of plain words.
-fn store_words_seq_guarded<const W: usize>(seq: &AtomicU32, words: &[AtomicU32; W], values: &[u32; W]) {
-    let odd = seq.load(Ordering::Relaxed) | 1;
-    seq.store(odd, Ordering::Relaxed);
-    std::sync::atomic::fence(Ordering::Release);
-    for (word, &value) in words.iter().zip(values) {
-        word.store(value, Ordering::Relaxed);
     }
     seq.store(odd.wrapping_add(1), Ordering::Release);
 }
@@ -2063,7 +2086,7 @@ mod tests {
         let dead = h.tuning_seq.load(Ordering::Relaxed) | 1;
         h.tuning_seq.store(dead, Ordering::Relaxed);
         let _ = h.global_tuning();
-        assert_eq!(DEAD_TUNING_SEQ.load(Ordering::Relaxed), dead);
+        assert!(h.dead_writer_at(dead));
         let _ = h.global_tuning();
         assert!(h.write_settings(&[("intensity", 0.75f32.to_bits())]));
         assert_eq!(h.tuning_seq.load(Ordering::Relaxed), dead + 3);
@@ -2077,11 +2100,62 @@ mod tests {
         // A slow writer holds 5; another found it dead and took over with 7, then finished at 8.
         h.tuning_seq.store(8, Ordering::Relaxed);
         // The slow writer finishing now must leave 8 alone (its own end would be 6).
-        h.finish_settings_write(5);
+        assert!(!finish_write(&h.tuning_seq, 5));
         assert_eq!(h.tuning_seq.load(Ordering::Relaxed), 8);
         // And a write started after it still works from 8.
         assert!(h.write_settings(&[("intensity", 1.5f32.to_bits())]));
         assert_eq!(h.tuning_seq.load(Ordering::Relaxed), 10);
+    }
+
+    /// A writer taken over while it was merely slow stops storing at once, and writes its whole unit
+    /// again after the writer that took over: no store of it lands under an even sequence, and the end
+    /// is the two writes one after the other.
+    #[test]
+    fn a_slow_writer_taken_over_writes_again_whole() {
+        let seq = AtomicU32::new(4);
+        let words: [AtomicU32; 4] = Default::default();
+        let stalled = std::sync::atomic::AtomicBool::new(false);
+        let under_even = AtomicU32::new(0);
+        write_unit(&seq, Entry::Any, words.len(), |i| {
+            if seq.load(Ordering::Relaxed) & 1 == 0 {
+                under_even.fetch_add(1, Ordering::Relaxed);
+            }
+            words[i].store(10 + i as u32, Ordering::Relaxed);
+            if i == 1 && !stalled.swap(true, Ordering::Relaxed) {
+                // Stalled half way: another writer finds the section stuck, takes it over and finishes.
+                write_unit(&seq, Entry::Any, words.len(), |k| words[k].store(20 + k as u32, Ordering::Relaxed));
+                assert_eq!(seq.load(Ordering::Relaxed) & 1, 0, "the writer that took over finished");
+            }
+        });
+        assert_eq!(under_even.load(Ordering::Relaxed), 0, "no store under an even sequence");
+        assert_eq!(words.each_ref().map(|w| w.load(Ordering::Relaxed)), [10, 11, 12, 13], "the slow write, whole, after the other");
+        assert_eq!(seq.load(Ordering::Relaxed) & 1, 0);
+        // A first write that finds anything entered before it skips its stores.
+        assert!(!write_unit(&seq, Entry::First, 1, |_| panic!("not stored")));
+        let fresh = AtomicU32::new(0);
+        assert!(write_unit(&fresh, Entry::First, 0, |_| {}));
+        assert_eq!(fresh.load(Ordering::Relaxed), 2);
+    }
+
+    /// A dead writer's value is remembered for its own header only, and only while the sequence stays
+    /// on it: after a re-initialisation a live writer passing the same value is waited for again.
+    #[test]
+    fn a_dead_writer_is_remembered_per_header_until_the_sequence_moves() {
+        let (a, b) = (ShmHeader::default(), ShmHeader::default());
+        a.init_defaults();
+        b.init_defaults();
+        a.tuning_seq.store(7, Ordering::Relaxed);
+        let _ = a.global_tuning();
+        assert!(a.dead_writer_at(7), "found dead after the wait");
+        assert!(!b.dead_writer_at(7), "another header's writer at the same value is not dead");
+        a.init_defaults();
+        a.tuning_seq.store(7, Ordering::Relaxed);
+        assert!(!a.dead_writer_at(7), "re-initialised: forgotten");
+        a.tuning_seq.store(9, Ordering::Relaxed);
+        let _ = a.global_tuning();
+        assert!(a.dead_writer_at(9));
+        assert!(!a.dead_writer_at(10), "seen elsewhere: forgotten");
+        assert!(!a.dead_writer_at(9));
     }
 
     #[test]
@@ -2279,7 +2353,54 @@ mod tests {
         assert_eq!(h.pass_tunings().tunings[9].intensity, 0.5);
         assert!(!h.apply_persisted_setting("pass11_intensity", 0), "there is no eleventh pass");
         assert!(h.apply_persisted_setting("pass1_overrides", 4095));
-        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "clamped to the eleven fields");
+        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::ALL, "the eleven fields' bits");
+        // A bit no override has (a hand edit, a later build's) is dropped; it does not switch every
+        // override on.
+        assert!(h.write_settings(&[("pass1_overrides", 2048 | crate::enums::pass_override::INTENSITY)]));
+        assert_eq!(h.pass[0].overrides.load(Ordering::Relaxed), crate::enums::pass_override::INTENSITY);
+    }
+
+    #[test]
+    fn the_setting_table_matches_the_bounds_and_a_pass_has_the_model_tabs_ranges() {
+        let h = ShmHeader::default();
+        for ((name, ..), (bound, ..)) in h.setting_slots().iter().zip(SETTING_BOUNDS.iter()) {
+            assert_eq!(name, bound, "the two lists name the same setting at the same place");
+        }
+        for field in ["intensity", "local_tone", "local_structure", "skin_structure"] {
+            for pass in 0..crate::MAX_PASSES {
+                assert_eq!(setting_bounds(pass_setting(pass, field).unwrap()), setting_bounds(field), "{field}, pass {}", pass + 1);
+            }
+        }
+    }
+
+    /// The header is written by other processes, and not only through `apply_persisted_setting`:
+    /// a strength that is not a number never reaches the network, and one out of range is clamped.
+    #[test]
+    fn a_strength_that_is_not_a_number_is_read_as_its_default() {
+        use crate::enums::pass_override::*;
+        let h = ShmHeader::default();
+        h.init_defaults();
+        for field in [&h.intensity_bits, &h.local_tone_bits, &h.local_structure_bits, &h.skin_structure_bits] {
+            field.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        }
+        assert_eq!(h.global_tuning(), Tuning::default());
+        h.intensity_bits.store(f32::INFINITY.to_bits(), Ordering::Relaxed);
+        h.local_tone_bits.store(9.0f32.to_bits(), Ordering::Relaxed);
+        h.skin_structure_bits.store((-5.0f32).to_bits(), Ordering::Relaxed);
+        let t = h.global_tuning();
+        assert_eq!((t.intensity, t.local_tone, t.skin_structure), (1.0, 4.0, -1.0));
+        // A pass's own values, where it overrides them.
+        h.init_defaults();
+        h.passes.store(2, Ordering::Relaxed);
+        let p = &h.pass[1];
+        p.overrides.store(INTENSITY | LOCAL_TONE | LOCAL_STRUCTURE | SKIN_STRUCTURE, Ordering::Relaxed);
+        p.intensity_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        p.local_tone_bits.store(f32::NEG_INFINITY.to_bits(), Ordering::Relaxed);
+        p.local_structure_bits.store(0.5f32.to_bits(), Ordering::Relaxed);
+        p.skin_structure_bits.store(f32::NAN.to_bits(), Ordering::Relaxed);
+        let pass = h.pass_tunings().tunings[1];
+        assert_eq!(pass, Tuning { local_structure: 0.5, ..Tuning::default() });
+        assert!(h.pass_tunings().passes().iter().all(|t| t.intensity.is_finite() && t.skin_structure.is_finite()));
     }
 
     #[test]

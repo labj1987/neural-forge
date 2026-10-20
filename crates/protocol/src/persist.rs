@@ -44,18 +44,33 @@ pub fn read_config(path: &str) -> BTreeMap<String, String> {
 /// initialised (`tuning_seq` still 0): the layer does this when it finds a fresh mapping, since no
 /// other process is running to do it. Returns whether it applied them.
 pub fn apply_saved(header: &ShmHeader) -> bool {
+    // Not configured yet is decided again as the write is entered ([`apply_if_unconfigured`]); this
+    // only spares reading the file when it is plainly too late.
     if header.tuning_seq.load(std::sync::atomic::Ordering::Relaxed) != 0 {
         return false;
     }
-    apply(header, &read_config(&config_file()));
-    header.control_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    true
+    apply_if_unconfigured(header, &read_config(&config_file()))
+}
+
+/// [`apply`], only if nothing has written settings to `header` since it was initialised: decided as
+/// the write section is entered, so a write that got in first (the GUI's, while a game's layer reads
+/// `config.ini`) is never overwritten by the saved values. Returns whether they were applied.
+pub fn apply_if_unconfigured(header: &ShmHeader, raw: &BTreeMap<String, String>) -> bool {
+    let (settings, regions) = parse(header, raw);
+    header.write_settings_if_unconfigured(&settings, regions.as_deref())
 }
 
 /// Applies whichever `set_<name>` keys `raw` has onto `header` -- silently skips a
 /// key it doesn't recognize (an older/newer build's config.ini) or a value that
 /// doesn't parse, rather than failing the whole load over one bad line.
 pub fn apply(header: &ShmHeader, raw: &BTreeMap<String, String>) {
+    let (settings, regions) = parse(header, raw);
+    // One unit: a profile is never seen half applied, and `tuning_seq` marks the header configured.
+    header.write_settings_and_hud(&settings, regions.as_deref());
+}
+
+/// The settings `raw` names, as `(name, bits)`, and its HUD region list if it has one that parses.
+fn parse(header: &ShmHeader, raw: &BTreeMap<String, String>) -> (Vec<(&'static str, u32)>, Option<Vec<crate::HudRegion>>) {
     let mut settings = Vec::new();
     for (name, is_float, _) in header.persisted_settings() {
         let Some(value) = raw.get(&format!("set_{name}")) else { continue };
@@ -66,11 +81,10 @@ pub fn apply(header: &ShmHeader, raw: &BTreeMap<String, String>) {
     }
     // A HUD region list that does not parse is left as it is, like any value that does not.
     let regions = raw.get(&format!("set_{HUD_REGIONS}")).and_then(|t| crate::HudRegion::parse_list(t).ok());
-    // One unit: a profile is never seen half applied, and `tuning_seq` marks the header configured.
-    header.write_settings_and_hud(&settings, regions.as_deref());
+    (settings, regions)
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::mapping;
@@ -181,6 +195,34 @@ mod tests {
         assert_eq!(h.style.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert!(!h.apply_persisted_setting("intensity", f32::NAN.to_bits()));
         assert!(!h.apply_persisted_setting("not_a_setting", 0));
+    }
+
+    /// The saved settings and a live write racing on a fresh header (a game's layer applying
+    /// `config.ini` while the GUI writes the user's change): whichever enters first, the live write is
+    /// what stays.
+    #[test]
+    fn the_saved_settings_never_overwrite_a_write_that_got_in_first() {
+        let saved = BTreeMap::from([("set_intensity".to_string(), "2.0".to_string()), ("set_local_tone".to_string(), "2.0".to_string())]);
+        let h = crate::ShmHeader::default();
+        let intensity = || f32::from_bits(h.intensity_bits.load(std::sync::atomic::Ordering::Relaxed));
+        let (mut saved_first, mut live_first) = (0, 0);
+        for _ in 0..2000 {
+            h.init_defaults();
+            let go = std::sync::Barrier::new(2);
+            let applied = std::thread::scope(|s| {
+                s.spawn(|| {
+                    go.wait();
+                    h.write_settings(&[("intensity", 0.5f32.to_bits())]);
+                });
+                go.wait();
+                apply_if_unconfigured(&h, &saved)
+            });
+            assert_eq!(intensity(), 0.5, "the live write was overwritten by the saved settings");
+            if applied { saved_first += 1 } else { live_first += 1 }
+            assert_eq!(f32::from_bits(h.local_tone_bits.load(std::sync::atomic::Ordering::Relaxed)), if applied { 2.0 } else { 1.0 }, "applied whole or not at all");
+        }
+        assert!(saved_first + live_first == 2000);
+        assert!(!apply_if_unconfigured(&h, &saved), "configured: not applied again");
     }
 
     #[test]

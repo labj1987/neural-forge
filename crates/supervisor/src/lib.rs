@@ -42,16 +42,11 @@ pub fn open_channel(cfg: &Config) -> Result<neural_forge_protocol::mapping::Mapp
 /// layer applies the saved settings itself then (`neural_forge_protocol::persist::apply_saved`),
 /// and the GUI and CLI call this right after opening the channel for the same reason, so a
 /// command run on a cold boot acts on the saved settings, not the defaults. `init_defaults`
-/// leaves `tuning_seq` at 0 and `persist::apply` bumps it, which is what "not yet applied" is
+/// leaves `tuning_seq` at 0 and any settings write bumps it, which is what "not yet applied" is
 /// read from. Returns whether it applied them.
 pub fn apply_saved_settings(cfg: &Config, mapping: &neural_forge_protocol::mapping::Mapping) -> bool {
-    let hdr = mapping.header();
-    if hdr.tuning_seq.load(std::sync::atomic::Ordering::Relaxed) != 0 {
-        return false;
-    }
-    neural_forge_protocol::persist::apply(hdr, &cfg.settings);
-    hdr.control_seq.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    true
+    // Decided as the write is entered, so a game's layer writing first is never overwritten.
+    neural_forge_protocol::persist::apply_if_unconfigured(mapping.header(), &cfg.settings)
 }
 
 /// Writes the live header's settings to `config.ini`, so a change made on the channel also

@@ -248,7 +248,9 @@ impl Outcome {
     }
 }
 
-/// Publishes `outcome` (the layer, which writes it from one place at a time).
+/// Publishes `outcome` as one unit. Writers take turns on the result block's sequence lock, so any
+/// number may publish at once (a capture's writer threads, a new game's [`reset_session`], another
+/// process's layer still finishing its capture): a reader sees one whole outcome or another.
 pub fn publish(hdr: &ShmHeader, outcome: &Outcome) {
     let mut words = [0u32; RESULT_WORDS];
     words[..6].copy_from_slice(&[outcome.id, outcome.state, outcome.reason, outcome.done, outcome.total, outcome.composed]);
@@ -389,6 +391,34 @@ mod tests {
         publish(&h, &written);
         reset_session(&h);
         assert_eq!(result(&h), Some(written));
+    }
+
+    /// Two publishers at once (a game's capture writer finishing while the next game's layer resets the
+    /// session): every outcome read is one of the two, whole, and each publish took its own turn.
+    #[test]
+    fn publishers_take_turns_and_a_reader_never_sees_a_mix() {
+        let h = ShmHeader::default();
+        let a = Outcome { id: 1, state: state::WRITTEN, reason: reason::NONE, done: 2, total: 2, composed: 2, paths: "a".repeat(PATH_BYTES - 1) };
+        let b = Outcome { id: 2, state: state::FAILED, reason: reason::GAME_ENDED, done: 5, total: 9, composed: 1, paths: "b".repeat(PATH_BYTES / 2) };
+        publish(&h, &a);
+        let start = h.capture_result_seq.load(Ordering::Relaxed);
+        const EACH: u32 = 3000;
+        std::thread::scope(|s| {
+            for outcome in [&a, &b] {
+                let h = &h;
+                s.spawn(move || {
+                    for _ in 0..EACH {
+                        publish(h, outcome);
+                    }
+                });
+            }
+            for _ in 0..20_000 {
+                if let Some(read) = result(&h) {
+                    assert!(read == a || read == b, "a torn outcome: id {} state {} paths {} bytes", read.id, read.state, read.paths.len());
+                }
+            }
+        });
+        assert_eq!(h.capture_result_seq.load(Ordering::Relaxed), start + 2 * 2 * EACH, "every publish took its own turn");
     }
 
     #[test]
