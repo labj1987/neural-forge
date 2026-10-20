@@ -93,6 +93,13 @@ pub(crate) struct AutoState {
     pub samples: u32,
 }
 
+impl AutoState {
+    /// The state from its five words as the resolve writes them.
+    pub(crate) fn from_words(raw: [u32; 5]) -> Self {
+        AutoState { log2_e: f32::from_bits(raw[0]), valid: raw[1] != 0, target_log2_e: f32::from_bits(raw[2]), mean_log2: f32::from_bits(raw[3]), samples: raw[4] }
+    }
+}
+
 /// The CPU reference of `preupscale_exposure.comp` on a tightly packed RGBA16F frame (`texels`,
 /// `width` x `height`), in the shader's f32 arithmetic: the samples (even x and y), the histogram,
 /// the trimmed log-average, the target and the adaptation from `previous` (the state's log2 e when
@@ -404,7 +411,9 @@ impl AutoExposure {
                     .first()
                     .copied()?;
                 histogram = Some(DeviceBuffer::new(device, instance, physical_device, HISTOGRAM_BYTES)?);
-                state = Some(super::own_host_buffer_with(device, instance, physical_device, STATE_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER)?);
+                // TRANSFER: inside DLSS's buffer the hold resets it and copies it out for the host itself.
+                let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
+                state = Some(super::own_host_buffer_with(device, instance, physical_device, STATE_BYTES, usage)?);
                 Some(set)
             })()
         };
@@ -439,13 +448,7 @@ impl AutoExposure {
         // SAFETY: the mapping covers STATE_BYTES and is host-coherent; the capture's fence was
         // waited on and its closing barrier made the shader's writes available to the host.
         let raw = unsafe { std::ptr::read_volatile(self.state.ptr.cast::<[u32; 5]>()) };
-        AutoState {
-            log2_e: f32::from_bits(raw[0]),
-            valid: raw[1] != 0,
-            target_log2_e: f32::from_bits(raw[2]),
-            mean_log2: f32::from_bits(raw[3]),
-            samples: raw[4],
-        }
+        AutoState::from_words(raw)
     }
 
     /// # Safety
@@ -523,6 +526,8 @@ pub(crate) struct HdrPass {
     /// (after the previous hold's work drained), so a destroyed and re-created image with a reused
     /// handle is never reached through a stale view.
     colour_view: Option<vk::ImageView>,
+    /// The image `colour_view` views.
+    colour_image: Option<vk::Image>,
     /// The auto-exposure, built on the first hold without a readable exposure image.
     auto: Option<AutoExposure>,
 }
@@ -576,7 +581,7 @@ impl HdrPass {
                 instance,
                 physical_device,
                 EXPOSURE_BYTES,
-                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::STORAGE_BUFFER,
+                vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::STORAGE_BUFFER,
             )?);
         }
         let (encoded, answer, exposure) = (p.encoded.take()?, p.answer.take()?, p.exposure.take()?);
@@ -607,6 +612,7 @@ impl HdrPass {
             answer,
             exposure,
             colour_view: None,
+            colour_image: None,
             auto: None,
         };
         Some(pass)
@@ -686,6 +692,42 @@ impl HdrPass {
         self.auto.is_some()
     }
 
+    /// Whether the auto-exposure's adaptation starts afresh for `identification` (a new colour input), noting
+    /// that it does: the hold inside DLSS's buffer clears its state there ([`Self::auto_state_buffer`]).
+    pub(crate) fn auto_reset_due(&mut self, identification: u64) -> bool {
+        match self.auto.as_mut().filter(|a| a.identification != Some(identification)) {
+            Some(auto) => {
+                auto.identification = Some(identification);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The auto-exposure's state buffer and its size, once built.
+    pub(crate) fn auto_state_buffer(&self) -> Option<(vk::Buffer, u64)> {
+        self.auto.as_ref().map(|a| (a.state.buffer, STATE_BYTES))
+    }
+
+    /// Bytes of the exposure buffer the encode reads.
+    pub(crate) const EXPOSURE_BYTES: u64 = EXPOSURE_BYTES;
+
+    /// Points binding 0 at a view of `colour` once (the hold inside DLSS's buffer: its staging image, which
+    /// the layer owns and keeps): `true` when it is, or already was.
+    ///
+    /// # Safety
+    /// As [`Self::bind_colour`], unless `colour` is the image already bound.
+    pub(crate) unsafe fn bind_colour_once(&mut self, device: &ash::Device, colour: vk::Image) -> bool {
+        if self.colour_image == Some(colour) && self.colour_view.is_some() {
+            return true;
+        }
+        if !super::may_rewrite("the HDR pass's descriptor set") {
+            return false;
+        }
+        // SAFETY: forwarded.
+        unsafe { self.bind_colour(device, colour) }
+    }
+
     /// Starts the auto-exposure's adaptation afresh when `identification` differs from the one it
     /// adapted for (a new colour input: the first frame takes its target directly).
     pub(crate) fn auto_for(&mut self, identification: u64) {
@@ -729,6 +771,7 @@ impl HdrPass {
             return false;
         };
         self.colour_view = Some(view);
+        self.colour_image = Some(colour);
         // SAFETY: the sets are not in use (contract).
         unsafe {
             bind_view(device, self.set, view);

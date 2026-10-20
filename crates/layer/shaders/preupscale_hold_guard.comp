@@ -1,0 +1,33 @@
+#version 450
+// The hold inside DLSS's command buffer (preupscale::inline): the first dispatch of every hold recorded
+// there. Several of DLSS's buffers can be recorded before the first runs, and a recorded one can be
+// recorded again or never submitted, so the CPU, which plans each hold as it records it, assumes that the
+// hold recorded before this one is the one that runs right before it. This checks that on the GPU: the
+// sequence number of the last hold that ran (`last`, written here) must be this hold's minus one. Where it
+// is not (the first hold, a hold that never ran, holds run out of the order they were recorded in, or the
+// initialisation run again), nothing carried from the holds before is used: the network's history is not
+// (both frames' `ok` flags cleared, as for a reset) and the edit cache applies no stored edit
+// (STAT_EDIT_STORED cleared) until its next refresh.
+layout(local_size_x = 1) in;
+
+// The native pass's state buffer (preupscale::native::NativePass::state): the frame shaders read `ok` and
+// `cut`; `last` is this shader's alone.
+layout(set = 0, binding = 0, std430) buffer State { uint ok[2]; uint cut; uint last; } u_state;
+// The edit cache's counters (preupscale::cache), or a stand-in while the cache is off.
+layout(set = 0, binding = 1, std430) buffer Stats { uint v[16]; } u_stats;
+
+layout(push_constant) uniform Push {
+  uint seq;   // this hold's sequence number (1, 2, ... in recording order)
+} p;
+
+const uint STAT_EDIT_STORED = 14u;
+
+void main() {
+  bool follows = u_state.last != 0u && u_state.last + 1u == p.seq;
+  if (!follows) {
+    u_state.ok[0] = 0u;
+    u_state.ok[1] = 0u;
+    u_stats.v[STAT_EDIT_STORED] = 0u;
+  }
+  u_state.last = p.seq;
+}

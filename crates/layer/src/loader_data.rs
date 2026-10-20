@@ -59,8 +59,8 @@ unsafe fn initialize(device: vk::Device, object: *mut c_void) -> VkResult<()> {
 }
 
 /// Sets the loader's dispatch data on a queue the layer got from the next layer's
-/// `vkGetDeviceQueue` (its own side queue): queues the application gets are set by the loader's
-/// trampoline, this one never passes through it.
+/// `vkGetDeviceQueue` (one of its own: the after-the-upscaler path's, the optical flow's): queues the
+/// application gets are set by the loader's trampoline, this one never passes through it.
 ///
 /// # Safety
 /// `queue` is a live queue of `device`, obtained below the loader trampoline.

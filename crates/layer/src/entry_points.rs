@@ -26,6 +26,13 @@ impl EntryPoints {
     pub unsafe extern "system" fn get_device_proc_addr(device: vk::Device, name: *const c_char) -> vk::PFN_vkVoidFunction {
         let original = unsafe { Framework::get_device_proc_addr(device, name) };
         let original = unsafe { Self::intercept_probe(device, name, original, crate::probe_ngx::enabled() || crate::preupscale::active()) };
+        // The binding commands newer than the framework, wrapped where the hold inside DLSS's buffer tracks
+        // the application's compute state (`preupscale::restore`).
+        let original = if original.is_some() && device != vk::Device::null() && crate::preupscale::active() {
+            unsafe { crate::preupscale::restore::intercept(device, CStr::from_ptr(name).to_bytes(), original) }
+        } else {
+            original
+        };
         unsafe { Self::intercept(name, original) }
     }
     /// `vkGetImageViewHandle64NVX` is newer than the pinned ash and `vulkan-layer`, so the

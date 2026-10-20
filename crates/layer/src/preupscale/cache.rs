@@ -82,7 +82,13 @@ const STAT_MOTION_N: usize = 11;
 /// larger frame sums past 2^32).
 const STAT_TOP_SUM_HI: usize = 12;
 const STAT_BOTTOM_SUM_HI: usize = 13;
-const STAT_WORDS: usize = 16;
+/// 1 while the last refresh's edit is stored and the holds since followed it without a gap (the shaders'
+/// `STAT_EDIT_STORED`): written by the refresh's capture, cleared by the hold guard inside DLSS's buffer
+/// (`preupscale_hold_guard.comp`), never with the counters ([`CLEARED_BYTES`]).
+pub(crate) const STAT_EDIT_STORED: usize = 14;
+/// The counters' bytes a hold clears: every word before [`STAT_EDIT_STORED`].
+pub(crate) const CLEARED_BYTES: u64 = STAT_EDIT_STORED as u64 * 4;
+pub(crate) const STAT_WORDS: usize = 16;
 const STAT_BYTES: u64 = STAT_WORDS as u64 * 4;
 
 /// The interval while the camera moves: the network on every second hold. 3 trails further (p99.5
@@ -290,7 +296,7 @@ impl ScratchLayout {
 }
 
 /// What a hold binds: the frame's images and buffers, which change from hold to hold.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Bindings {
     /// DLSS's colour input (the HDR pass's view of it, GENERAL).
     pub colour: vk::ImageView,
@@ -581,8 +587,11 @@ pub(crate) struct CachePass {
     /// The network's input features were too small for the layout (logged once).
     said_small: bool,
     /// GPU timestamps around the passes in the capture and in the write-back (before, or in place
-    /// of, the decode).
+    /// of, the decode). None inside DLSS's buffer (the hold times its slot).
     timers: [Option<crate::gpu_timer::GpuTimer>; 2],
+    /// What the set points at ([`Self::bind`]) and whether it was chained: written again only when that
+    /// changes.
+    bound: Option<(Bindings, bool)>,
     pub(crate) state: State,
     pub(crate) tuning: Tuning,
 }
@@ -602,7 +611,8 @@ const BINDINGS: u32 = 21;
 impl CachePass {
     /// # Safety
     /// `device` is live; `family` is the queue family the holds are submitted on.
-    pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32) -> Option<Self> {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, family: u32, width: u32, height: u32, timed: bool) -> Option<Self> {
         let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..BINDINGS)
             .map(|n| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(binding_type(n)).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build())
             .collect();
@@ -624,7 +634,9 @@ impl CachePass {
             ];
             p.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None).ok()?;
             let set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(p.pool).set_layouts(std::slice::from_ref(&p.set_layout))).ok()?[0];
-            p.stats = Some(super::own_host_buffer_with(device, instance, physical_device, STAT_BYTES, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)?);
+            // TRANSFER: inside DLSS's buffer the hold clears them and copies them out for the host itself.
+            let usage = vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST | vk::BufferUsageFlags::TRANSFER_SRC;
+            p.stats = Some(super::own_host_buffer_with(device, instance, physical_device, STAT_BYTES, usage)?);
             p.dummy = Some(OwnBuffer::new(device, instance, physical_device, 256, vk::BufferUsageFlags::STORAGE_BUFFER)?);
             let stats = p.stats.take()?;
             let dummy = p.dummy.take()?;
@@ -644,7 +656,8 @@ impl CachePass {
                 layout: ScratchLayout::new(width, height),
                 scratch: vk::Buffer::null(),
                 said_small: false,
-                timers: [crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family), crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family)],
+                timers: [(); 2].map(|()| crate::gpu_timer::GpuTimer::new(device, instance, physical_device, family).filter(|_| timed)),
+                bound: None,
                 state: State::default(),
                 tuning: Tuning::default(),
             })
@@ -688,6 +701,14 @@ impl CachePass {
     /// # Safety
     /// Nothing of the pass is pending; every handle is live.
     pub(crate) unsafe fn bind(&mut self, device: &ash::Device, b: &Bindings) {
+        if self.bound == Some((*b, self.chained)) {
+            return;
+        }
+        // Not while a hold recorded into DLSS's buffer with the set may run (the hold then misses).
+        if !super::may_rewrite("the edit cache's descriptor set") {
+            return;
+        }
+        self.bound = Some((*b, self.chained));
         let dummy = self.dummy.buffer;
         // The scratch only above interval 1 and with room for the layout.
         let scratch = (self.chained && b.scratch.1 >= self.layout.total).then_some(b.scratch.0);
@@ -915,10 +936,16 @@ impl CachePass {
         out
     }
 
-    /// Clears the counters before a hold's passes are submitted.
+    /// Clears the counters before a hold's passes are submitted ([`CLEARED_BYTES`]).
     pub(crate) fn clear_counters(&self) {
         // SAFETY: as `counters`; nothing pending writes them (after the hold's wait).
-        unsafe { std::ptr::write_bytes(self.stats.ptr, 0, STAT_BYTES as usize) };
+        unsafe { std::ptr::write_bytes(self.stats.ptr, 0, CLEARED_BYTES as usize) };
+    }
+
+    /// The counters' buffer: the hold inside DLSS's buffer clears it there ([`CLEARED_BYTES`]) and copies it
+    /// out for the host, and the hold guard clears [`STAT_EDIT_STORED`] in it.
+    pub(crate) fn stats_buffer(&self) -> vk::Buffer {
+        self.stats.buffer
     }
 
     /// Reads what the last submitted hold's passes counted (its fence was waited on): the stored
@@ -926,11 +953,17 @@ impl CachePass {
     /// the motion's counts go to the [`Regime`], and the depth's convention is decided once.
     pub(crate) fn after_fence(&mut self) -> Outcome {
         let Some(kind) = self.state.pending.take() else { return Outcome::default() };
-        let decided = self.state.reverse_z.is_some();
         let c = self.counters();
+        self.after_counters(kind, &c)
+    }
+
+    /// [`Self::after_fence`] for counters `c` of a hold planned as `kind` (inside DLSS's buffer, read back
+    /// once its buffer ran).
+    pub(crate) fn after_counters(&mut self, kind: Kind, c: &[u32; STAT_WORDS]) -> Outcome {
+        let decided = self.state.reverse_z.is_some();
         let mut out = Outcome::default();
         self.state.regime.observe(c[STAT_STILL], c[STAT_MOTION_N]);
-        if !decided && self.state.vote_reverse_z(infer_reverse_z(&c)) {
+        if !decided && self.state.vote_reverse_z(infer_reverse_z(c)) {
             let rev = self.state.reverse_z == Some(true);
             crate::log!(
                 "[preupscale] edit cache: depth is {} ({REVERSE_Z_HOLDS} holds agreeing; the last: {} of {} texels at 0, {} at 1)",
@@ -1345,7 +1378,7 @@ mod tests {
             unsafe {
                 let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
                 let usage = vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC;
-                let mut pass = CachePass::build(device, instance, physical, family, w, h).expect("the cache pass builds");
+                let mut pass = CachePass::build(device, instance, physical, family, w, h, true).expect("the cache pass builds");
                 let scratch_bytes = ScratchLayout::new(w, h).total;
                 assert!(pass.chain(scratch_bytes));
                 let mut rig = Self {

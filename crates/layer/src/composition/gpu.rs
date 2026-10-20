@@ -1519,32 +1519,40 @@ pub(crate) fn test_device_extensions(instance: &ash::Instance, physical_device: 
     extra.iter().copied().chain(offered.then_some(swapchain)).map(std::ffi::CStr::as_ptr).collect()
 }
 
-/// [`test_device`] with two queues in family 0 (the second one the layer's side queue, as for the
-/// hold inside DLSS's command buffer) and `VK_EXT_external_memory_host` when the device has it.
-/// `None` without a Vulkan device or when family 0 has a single queue (lavapipe); the tests that
-/// need it skip then.
+/// [`test_device`] with `VK_EXT_descriptor_buffer` and buffer device addresses enabled (the binding model
+/// vkd3d-proton uses on NVIDIA): `None` when there is no Vulkan device or it lacks either (the tests that
+/// need it skip then).
 #[cfg(test)]
-#[allow(clippy::type_complexity)]
-pub(crate) fn test_device_two_queues() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, vk::Queue, u32, bool)> {
+pub(crate) fn test_device_with_descriptor_buffer() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, ash::Device, vk::Queue, u32)> {
     // SAFETY: same reasoning as `test_device`.
     let entry = unsafe { ash::Entry::load() }.ok()?;
     let (instance, surface) = test_instance(&entry)?;
     let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
-    let families = unsafe { instance.get_physical_device_queue_family_properties(physical_device) };
-    if families.first()?.queue_count < 2 {
+    let name = ash::extensions::ext::DescriptorBuffer::name();
+    let offered = unsafe { instance.enumerate_device_extension_properties(physical_device) }
+        .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == name));
+    let mut db = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
+    let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
+    let mut features = vk::PhysicalDeviceFeatures2::builder().push_next(&mut db).push_next(&mut v12).build();
+    // SAFETY: a plain query into a valid chain.
+    unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
+    if !offered || db.descriptor_buffer == 0 || v12.buffer_device_address == 0 {
+        // SAFETY: nothing was made from it.
+        unsafe { instance.destroy_instance(None) };
         return None;
     }
-    let import = neural_forge_protocol::env::var("NEURAL_FORGE_TEST_IMPORT").as_deref() != Some("0")
-        && unsafe { instance.enumerate_device_extension_properties(physical_device) }
-        .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == crate::EXTERNAL_MEMORY_HOST_EXTENSION));
-    let names = test_device_extensions(&instance, physical_device, surface, if import { &[crate::EXTERNAL_MEMORY_HOST_EXTENSION] } else { &[] });
-    let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0, 1.0]).build()];
-    let info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&names);
+    let mut db = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::builder().descriptor_buffer(true).build();
+    let mut v12 = vk::PhysicalDeviceVulkan12Features::builder().buffer_device_address(true).build();
+    let names = test_device_extensions(&instance, physical_device, surface, &[name]);
+    let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
+    let info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&names).push_next(&mut db).push_next(&mut v12);
+    // SAFETY: a valid create info whose features the device has.
     let device = unsafe { instance.create_device(physical_device, &info, None) }.ok()?;
-    let (q0, q1) = unsafe { (device.get_device_queue(0, 0), device.get_device_queue(0, 1)) };
+    // SAFETY: family 0, index 0, as requested.
+    let queue = unsafe { device.get_device_queue(0, 0) };
     use std::io::Write;
     let _ = std::io::stderr().write_all(b"[neural-forge-gpu-test] device acquired\n");
-    Some((entry, instance, physical_device, device, q0, q1, 0, import))
+    Some((entry, instance, physical_device, device, queue, 0))
 }
 
 /// [`test_device`] with `VK_EXT_external_memory_host` enabled -- `None` when there is no

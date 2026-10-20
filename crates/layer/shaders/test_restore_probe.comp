@@ -1,0 +1,16 @@
+#version 450
+// Tests only (preupscale::inline, preupscale::restore): the application's own compute dispatch after a hold
+// recorded into its command buffer, made without binding anything again. It writes what it finds bound:
+// its push constants and a word of the buffer its set (or descriptor buffer) points at, and a marker that it
+// ran at all.
+layout(local_size_x = 1) in;
+layout(set = 0, binding = 0, std430) readonly buffer In { uint v; } u_in;
+layout(set = 0, binding = 1, std430) buffer Out { uint r[4]; } u_out;
+layout(push_constant) uniform Push { uint a; uint b; } p;
+
+void main() {
+  u_out.r[0] = p.a;
+  u_out.r[1] = u_in.v;
+  u_out.r[2] = p.b;
+  u_out.r[3] = 0x600dbeefu;
+}

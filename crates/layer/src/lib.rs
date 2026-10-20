@@ -384,20 +384,6 @@ pub(crate) fn take_external_memory_host_enabled(device: vk::Device) -> bool {
     EXTERNAL_MEMORY_HOST_DEVICES.lock().unwrap().as_mut().is_some_and(|set| set.remove(&device))
 }
 
-/// Devices created with the layer's own extra queue (the hold inside DLSS's command buffer,
-/// `preupscale::inline`): its family and index, and the game's graphics family. Taken once by
-/// `NeuralForgeDeviceInfo::new`, like [`EXTERNAL_MEMORY_HOST_DEVICES`].
-static SIDE_QUEUES: Mutex<Option<HashMap<vk::Device, SideQueue>>> = Mutex::new(None);
-
-/// Where the layer's own queue is.
-#[derive(Clone, Copy, Debug)]
-pub(crate) struct SideQueue {
-    pub family: u32,
-    pub index: u32,
-    /// The first family the application requests with graphics and compute: where DLSS runs.
-    pub app_family: u32,
-}
-
 /// Devices created with the native backend's additions (`preupscale::native`): its extensions and
 /// features, and one more queue in the game's graphics family for the network's loading. Taken once by
 /// `NeuralForgeDeviceInfo::new`.
@@ -410,15 +396,10 @@ pub(crate) fn take_native(device: vk::Device) -> Option<preupscale::native::Setu
     NATIVE_DEVICES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
 }
 
-/// Checks and clears the side queue [`NeuralForgeInstanceHooks::create_device`] added to `device`.
-pub(crate) fn take_side_queue(device: vk::Device) -> Option<SideQueue> {
-    SIDE_QUEUES.lock().unwrap().as_mut().and_then(|map| map.remove(&device))
-}
-
 /// The application's queue requests `infos` with `n` more queues for the layer, in a compute family without
 /// graphics (NVIDIA's family 2): queues of the game's own graphics family share its GPU context, and the
-/// layer's work there faulted the channel (Xid 69 in Crimson Desert with the hold inside DLSS's buffer,
-/// 2026-10-05; Xid 69 and Xid 32 in GTA V with the network's uploads, 2026-10-07). Every such family is
+/// layer's work there faulted the channel (Xid 69 in Crimson Desert with work on a queue of the layer's
+/// beside DLSS's buffer, 2026-10-05; Xid 69 and Xid 32 in GTA V with the network's uploads, 2026-10-07). Every such family is
 /// considered, in order, and the first with room for `n` more is taken: the application's request for it is
 /// extended when it is a plain one (no flags), or a request for `n` queues is added.
 struct ExtraQueues {
@@ -430,12 +411,6 @@ struct ExtraQueues {
     infos: Vec<vk::DeviceQueueCreateInfo>,
     /// Backs the extended `pQueuePriorities`.
     _priorities: Vec<f32>,
-}
-
-impl ExtraQueues {
-    fn side_queue(&self) -> SideQueue {
-        SideQueue { family: self.family, index: self.index, app_family: self.app_family }
-    }
 }
 
 fn extra_queues(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQueueCreateInfo], n: u32) -> Option<ExtraQueues> {
@@ -610,8 +585,7 @@ impl Drop for NeuralForgeInstanceHooks {
 impl InstanceHooks for NeuralForgeInstanceHooks {
     /// In a process the layer is on in and the target filter admits, adds what the layer needs to
     /// the game's own `vkCreateDevice` call: [`EXTERNAL_MEMORY_HOST_EXTENSION`] when the physical
-    /// device advertises it, the side queue for the hold inside DLSS's command buffer, and the
-    /// native backend's extensions, features and queues. Every other case returns
+    /// device advertises it, and the native backend's extensions, features and queues. Every other case returns
     /// [`LayerResult::Unhandled`], which hands the *unmodified* call straight to the framework's
     /// own default `create_device` path -- identical to this hook not existing at all. It never
     /// makes a request that would otherwise have succeeded start failing: an addition the driver
@@ -670,10 +644,6 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         let next_create_device = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| unsafe {
             call_next_create_device(next_create_device, link.as_ref(), physical_device, info, allocator_ptr, p_device)
         };
-        // The hold inside DLSS's command buffer needs a queue of the layer's own beside the game's
-        // (`preupscale::inline`): one more in a compute family without graphics ([`extra_queues`]), on
-        // an NVIDIA device with the pre-upscaler path on. A request with it that the driver refuses is
-        // made again without.
         // SAFETY: `physical_device` belongs to this instance.
         let nvidia = unsafe { instance.instance.get_physical_device_properties(physical_device) }.vendor_id == 0x10DE;
         if !create_info.p_queue_create_infos.is_null() {
@@ -685,8 +655,6 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             log!("[queues] the application asks for {}", asked.join(", "));
         }
         let (app_queues, families) = queue_requests(&instance.instance, physical_device, create_info);
-        // The hold inside DLSS's buffer: one queue of the layer's own.
-        let side = (nvidia && preupscale::active() && preupscale::inline::enabled()).then(|| extra_queues(&families, app_queues, 1)).flatten();
         // The native backend: the network's extensions and features and a loading queue of its own.
         // A request with them that the driver refuses is made again without (frames then go to DLSS
         // untouched in native mode, and the log says why).
@@ -696,9 +664,8 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             #[cfg(target_arch = "x86_64")]
             if native {
                 let gipa = layer_device_link.pfnNextGetInstanceProcAddr;
-                // Two more (the network's loading, and the after-the-upscaler path's frames), on top of the side queue.
-                let base = side.as_ref().map_or(app_queues, |sq| &sq.infos[..]);
-                match extra_queues(&families, base, 2) {
+                // Two more: the network's loading, and the after-the-upscaler path's frames.
+                match extra_queues(&families, app_queues, 2) {
                     None => log!("[native] no compute queue to spare for the network's loading; native backend off on this device"),
                     Some(ExtraQueues { app_family: frame_family, family, index, infos: queues, .. }) => {
                         let mut with = *info;
@@ -745,9 +712,6 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                                 if result == vk::Result::SUCCESS {
                                     // SAFETY: written by the successful call.
                                     let device = unsafe { p_device.assume_init() };
-                                    if let Some(sq) = &side {
-                                        SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.side_queue());
-                                    }
                                     let setup = preupscale::native::Setup {
                                         gipa,
                                         instance: instance.instance.handle(),
@@ -769,20 +733,6 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
                     }
                 }
             }
-            if let Some(sq) = &side {
-                let mut with = *info;
-                with.queue_create_info_count = sq.infos.len() as u32;
-                with.p_queue_create_infos = sq.infos.as_ptr();
-                // `with` is the request with `sq`'s queue infos, which outlive the call.
-                let result = next_create_device(&with, p_device);
-                if result == vk::Result::SUCCESS {
-                    // SAFETY: written by the successful call.
-                    let device = unsafe { p_device.assume_init() };
-                    SIDE_QUEUES.lock().unwrap().get_or_insert_default().insert(device, sq.side_queue());
-                    return result;
-                }
-                log!("[preupscale] adding a queue for the hold inside DLSS's command buffer was refused ({result:?}); creating the device without it");
-            }
             next_create_device(info, p_device)
         };
         // The application already enables it (vkd3d-proton does): nothing to add, but the
@@ -792,7 +742,7 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
         // freed by the time it is called, and reading it crashed the Rockstar launcher's GPU
         // process (0.1.96).
         if requests_extension(create_info, EXTERNAL_MEMORY_HOST_EXTENSION) {
-            // `create_info` is the application's own request (with the side queue, if any).
+            // `create_info` is the application's own request.
             let result = create(create_info, p_device);
             if result.result().is_ok() {
                 // SAFETY: `p_device` was just written by the successful call above.
@@ -815,9 +765,9 @@ impl InstanceHooks for NeuralForgeInstanceHooks {
             });
         if !supported {
             #[cfg(target_arch = "x86_64")]
-            let unhandled = side.is_none() && !native;
+            let unhandled = !native;
             #[cfg(not(target_arch = "x86_64"))]
-            let unhandled = side.is_none();
+            let unhandled = true;
             if unhandled {
                 return LayerResult::Unhandled;
             }

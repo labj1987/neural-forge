@@ -227,7 +227,8 @@ impl ScenePass {
             let set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(p.pool).set_layouts(std::slice::from_ref(&p.set_layout))).ok()?[0];
             p.thumb = Some(OwnBuffer::new(device, instance, physical_device, u64::from(n) * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?);
             p.partial = Some(OwnBuffer::new(device, instance, physical_device, u64::from(groups) * 4, vk::BufferUsageFlags::STORAGE_BUFFER)?);
-            p.result = Some(super::own_host_buffer_with(device, instance, physical_device, 16, vk::BufferUsageFlags::STORAGE_BUFFER)?);
+            // TRANSFER_SRC: inside DLSS's buffer the hold copies the result out for the host itself.
+            p.result = Some(super::own_host_buffer_with(device, instance, physical_device, 16, vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_SRC)?);
             let result = p.result.take()?;
             std::ptr::write_bytes(result.ptr, 0, 16);
             let pipelines: [vk::Pipeline; 2] = std::mem::take(&mut p.pipelines).try_into().ok()?;
@@ -260,6 +261,10 @@ impl ScenePass {
     /// Nothing of this pass is pending; both handles are live.
     pub(crate) unsafe fn bind(&mut self, device: &ash::Device, encoded: vk::ImageView, state: vk::Buffer) {
         if self.bound == Some((encoded, state)) {
+            return;
+        }
+        // Not while a hold recorded into DLSS's buffer with the set may run (the hold then misses).
+        if !super::may_rewrite("the scene-cut detector's descriptor set") {
             return;
         }
         let image = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: encoded, image_layout: vk::ImageLayout::GENERAL }];
@@ -320,6 +325,24 @@ impl ScenePass {
         self.pending = Some(recorded);
     }
 
+    /// The hold inside DLSS's buffer recorded the detector: the next hold compares with its thumbnail (if
+    /// that buffer never runs, the comparison is with an older one, or nothing: at worst a cut is seen).
+    pub(crate) fn recorded_inline(&mut self) {
+        self.have = true;
+    }
+
+    /// The result buffer (16 bytes: compared, cut, sum, samples), which the hold inside DLSS's buffer copies
+    /// out for the host.
+    pub(crate) fn result_buffer(&self) -> vk::Buffer {
+        self.result.buffer
+    }
+
+    /// The reading in a result's four words.
+    pub(crate) fn reading_of(w: [u32; 4]) -> Reading {
+        let [compared, cut, sum, n] = w;
+        Reading { cut: compared != 0 && cut != 0, mean: if compared != 0 { sum / n.max(1) } else { 0 } }
+    }
+
     /// The last submitted hold's reading, once its fence was waited on (`None` when there is none to
     /// read).
     pub(crate) fn take(&mut self) -> Option<(Reading, Recorded)> {
@@ -328,9 +351,7 @@ impl ScenePass {
         // SAFETY: host-coherent, mapped for 16 bytes; the hold that wrote it was waited on and its pass
         // closed with a barrier to the host.
         unsafe { std::ptr::copy_nonoverlapping(self.result.ptr.cast::<u32>(), w.as_mut_ptr(), 4) };
-        let [compared, cut, sum, n] = w;
-        let reading = Reading { cut: compared != 0 && cut != 0, mean: if compared != 0 { sum / n.max(1) } else { 0 } };
-        Some((reading, recorded))
+        Some((Self::reading_of(w), recorded))
     }
 
     /// # Safety

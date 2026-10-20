@@ -307,7 +307,7 @@ struct State {
 }
 
 /// The pre-upscaler path's per-device state, under a lock of its own: the game's submit threads
-/// (the split hold in `vkQueueSubmit`) and the hold inside DLSS's buffer (`inline_hold`) take it on
+/// (the split hold in `vkQueueSubmit`) and the hold inside DLSS's buffer (`record_inline_hold`, as the buffer is recorded) take it on
 /// every DLSS submit, while the present holds [`State`] through the after-the-upscaler path's
 /// synchronous wait for the model's answer (up to `capture::SYNC_BUDGET`). The present takes this
 /// lock only briefly (its status, the hand-back, starting the model server), never across a wait
@@ -720,10 +720,13 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     if let Some((_, _, hold)) = &owned {
         hold.lock().unwrap_or_else(|e| e.into_inner()).preupscale.stop_native();
     }
-    // Then the hold inside DLSS's buffer: its worker uses the device state freed below, and the GPU
-    // may be waiting on it.
+    // Then the hold inside DLSS's buffer: its slots and staging images (once the device is idle), and the
+    // wrapping of the binding commands its tracking notes.
     // SAFETY: forwarded.
-    unsafe { crate::preupscale::inline::destroy(handle) };
+    unsafe {
+        crate::preupscale::restore::unregister(handle);
+        crate::preupscale::inline::destroy(handle);
+    }
     if let Some((device, state, hold)) = owned {
         let mut state = state.lock().unwrap_or_else(|e| e.into_inner());
         let mut hold = hold.lock().unwrap_or_else(|e| e.into_inner());
@@ -765,13 +768,6 @@ pub(crate) unsafe fn destroy_private_resources(handle: vk::Device) {
     }
 }
 
-/// The hold of one execution of a buffer carrying the hold inside DLSS's command buffer, on the
-/// inline worker (`crate::preupscale::inline`), once the GPU has copied the colour input into the
-/// job's staging image and waits for `release`: the same gates as the split hold, then
-/// `preupscale::run_hold` on the staging image, submitted on the layer's side `queue`, and the
-/// write-back waited on so that the staging image holds the answer when the worker releases the
-/// GPU. The device's state is only ever try-locked, for at most `INLINE_LOCK_WAIT`: a present
-/// holding it may itself be waiting on the GPU, which is waiting on this hold.
 /// `NEURAL_FORGE_LOG_LAUNCH_QUEUES=1`: every 5 s, how many submitted command buffers carried CUDA launches,
 /// by device and queue family (which queues DLSS's and Frame Generation's work runs on). Diagnostic only.
 fn launch_queues_logged() -> bool {
@@ -796,16 +792,21 @@ fn launch_queue_tally(device: u64, family: Option<u32>, n: u32) {
     }
 }
 
-/// Counts what the hold inside DLSS's buffer did with its jobs and logs the counts every 5 s: a hold
-/// that stops running there otherwise says nothing (each skip releases the buffer silently).
+/// Counts what the hold inside DLSS's buffer did at each hold point and logs the counts every 5 s: a hold
+/// that stops being recorded there otherwise says nothing.
 fn inline_tally(what: &'static str) {
+    inline_tally_n(what, 1);
+}
+
+/// [`inline_tally`] for `n` at once (the holds' buffers that ran, read back at their release).
+fn inline_tally_n(what: &'static str, n: u32) {
     type Tally = Option<(std::time::Instant, Vec<(&'static str, u32)>)>;
     static TALLY: Mutex<Tally> = Mutex::new(None);
     let mut t = TALLY.lock().unwrap();
     let (since, counts) = t.get_or_insert_with(|| (std::time::Instant::now(), Vec::new()));
     match counts.iter_mut().find(|(w, _)| *w == what) {
-        Some((_, n)) => *n += 1,
-        None => counts.push((what, 1)),
+        Some((_, c)) => *c += n,
+        None => counts.push((what, n)),
     }
     if since.elapsed() >= std::time::Duration::from_secs(5) {
         let line: Vec<String> = counts.iter().map(|(w, n)| format!("{w} {n}")).collect();
@@ -822,164 +823,115 @@ fn inline_chain_kept() -> bool {
     *ON
 }
 
+/// Records the hold into DLSS's command buffer `ctx.cb` at its hold point (`crate::preupscale::inline`):
+/// the same gates as the split hold, then the native hold recorded into the buffer
+/// (`preupscale::run_native` with [`crate::preupscale::Sink::Buffer`]). Runs on the application's
+/// recording thread, inside its `vkCmdCuLaunchKernelNVX`; nothing waits for the GPU. The device's hold
+/// state is only try-locked, for at most `INLINE_LOCK_WAIT` (a present holds it briefly). What the holds
+/// whose buffers ran left is applied first (`Session::harvest`).
 #[allow(clippy::too_many_arguments)]
-fn inline_hold(
-    device: &Arc<ash::Device>, instance: &Arc<ash::Instance>, physical_device: vk::PhysicalDevice, state: &Arc<Mutex<State>>,
-    hold_state: &Arc<Mutex<HoldState>>, native_loader: Option<&crate::preupscale::NativeLoader>, job: &crate::preupscale::inline::Job, queue: vk::Queue,
-) {
-    use crate::preupscale::{Mode, Which};
+fn record_inline_hold(
+    device: &Arc<ash::Device>, instance: &Arc<ash::Instance>, physical_device: vk::PhysicalDevice, hold_state: &Arc<Mutex<HoldState>>,
+    inline: &crate::preupscale::inline::Inline, jitter: Option<[f32; 2]>, ctx: &mut crate::preupscale::inline::Ctx,
+) -> Result<crate::preupscale::inline::Meta, crate::preupscale::inline::Recorded> {
+    use crate::preupscale::inline::Recorded;
+    use crate::preupscale::Mode;
     const INLINE_LOCK_WAIT: std::time::Duration = std::time::Duration::from_millis(20);
     let mode = crate::preupscale::mode();
-    if !mode.holds_inline() || !crate::layer_enabled() || crate::device_lost(device.handle()) || !presenting_steadily() {
+    if !crate::layer_enabled() || crate::device_lost(device.handle()) || !presenting_steadily() {
         inline_tally("skipped (off, device lost or not presenting steadily)");
-        return;
+        return Err(Recorded::Skipped);
     }
-    // The after-the-upscaler path holds the device's state while its frame waits on the GPU, which
-    // waits here: told before the lock, it stays off and stops taking the network, so the lock
-    // comes free for this path (`preupscale::keep_post_off`).
-    #[cfg(target_arch = "x86_64")]
-    if mode == Mode::Model && crate::preupscale::native_on(native_loader) {
-        crate::preupscale::keep_post_off();
-        if let Some(loader) = native_loader {
-            loader.note_pre();
-        }
+    // Model mode runs on the native backend; the diagnostic modes do not hold inside DLSS's buffer.
+    if mode != Mode::Model {
+        inline_tally("skipped (only model mode holds inside DLSS's buffer)");
+        return Err(Recorded::Refused);
     }
-    #[cfg(not(target_arch = "x86_64"))]
-    let _ = native_loader;
     let started = std::time::Instant::now();
     let mut hold_guard = loop {
         match hold_state.try_lock() {
             Ok(guard) => break guard,
-            Err(std::sync::TryLockError::Poisoned(_)) => return,
+            Err(std::sync::TryLockError::Poisoned(e)) => break e.into_inner(),
             Err(std::sync::TryLockError::WouldBlock) if started.elapsed() < INLINE_LOCK_WAIT => std::thread::sleep(std::time::Duration::from_micros(100)),
             Err(std::sync::TryLockError::WouldBlock) => {
                 inline_tally("skipped (the device's state stayed locked)");
-                return;
+                return Err(Recorded::Skipped);
             }
         }
     };
-    let HoldState { shm, preupscale: session, external_memory_host } = &mut *hold_guard;
+    let HoldState { shm, preupscale: session, .. } = &mut *hold_guard;
+    #[cfg(target_arch = "x86_64")]
+    for h in inline.take_harvest() {
+        inline_tally_n("ran", h.runs);
+        session.harvest(h);
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    let _ = inline;
     session.saw_dlss();
     if !shm.open() {
         inline_tally("skipped (no shared memory)");
-        return;
+        return Err(Recorded::Skipped);
     }
     // The model's switch for the recording side: nothing is recorded into DLSS's buffers while it is off.
     #[cfg(target_arch = "x86_64")]
     if let Some(view) = shm.view() {
         crate::preupscale::inline::watch_switch(device.handle(), view.header());
     }
-    // The native backend runs the network itself, on this side queue (no slot 0).
-    let native = mode == Mode::Model && crate::preupscale::native_on(session.native.as_ref());
-    if mode == Mode::Model && !native {
+    if !crate::preupscale::native_on(session.native.as_ref()) {
         inline_tally("skipped (the native backend is not available on this device)");
-        return;
+        return Err(Recorded::Refused);
     }
-    if native && !shm.model_enabled() {
+    if !shm.model_enabled() {
         inline_tally("skipped (the model is switched off)");
-        return;
+        return Err(Recorded::Skipped);
     }
-    // The staging image can always be copied from.
-    let arm = if native { session.cache_dump_arm(shm, true, true) } else { None };
-    // A dump here has the colour input only (no depth or motion-vector layouts to wait for).
-    let dump = if native {
-        false
-    } else {
-        let Some(dump) = crate::preupscale::gate(mode, session, shm, true) else {
-            return;
-        };
-        dump
-    };
-    let extent = (job.point.desc.width, job.point.desc.height);
-    // The diagnostic modes capture into slot 0: not while the post path has it.
-    if !native && post_slot_busy(state, device) {
-        return;
+    // The after-the-upscaler path stays off the network while the holds run before the upscaler.
+    crate::preupscale::keep_post_off();
+    let Some(loader) = session.native.clone() else { return Err(Recorded::Refused) };
+    let point = ctx.point;
+    let stage = point.hold.stage;
+    let extent = (point.desc.width, point.desc.height);
+    // SAFETY: the device is live.
+    if let Err(why) = unsafe { session.ensure_inline(device, instance, physical_device, inline.app_family(), extent.0, extent.1, stage, ctx.outstanding) } {
+        inline_tally(why);
+        return Err(Recorded::Skipped);
     }
-    // Staged, never imported: work on imported host memory from the layer's queue waited on the
-    // game's queue, which is parked at the hold (2026-10-05, Crimson Desert: no capture finished
-    // within 5 s, then Xid 69).
-    let _ = external_memory_host;
-    // SAFETY: the SHM mapping is never unmapped once open.
-    // The hold's stage's own resources: before the upscaler, or after DLSS's output at the output size.
-    let stage = job.point.hold.stage;
-    if !unsafe { session.ensure(device, instance, physical_device, job.side_family, extent.0, extent.1, shm, false, stage) } {
-        if mode == Mode::Model {
-            session.note(shm, &crate::preupscale::HoldResult::local("the hold's resources could not be built"), started.elapsed(), extent);
-        }
-        return;
-    }
+    // A cache dump: armed holds read the colour input as it is (the staging image can always be copied from).
+    let arm = session.cache_dump_arm(shm, true, true);
+    let seen = session.seen();
     let target = crate::preupscale::Target {
-        colour: job.image,
+        colour: point.colour,
         width: extent.0,
         height: extent.1,
         depth: None,
-        // The depth the buffer copied beside the colour input (the native backend's depth copy).
-        depth_buffer: job.depth.filter(|_| native),
-        // The copy the buffer made beside the colour input (the native backend's history, and a dump's).
-        mvec: job.point.mvec_input.filter(|_| native || dump),
-        mvec_scale: job.point.mvec_scale(),
+        // The depth the hold copies beside the colour input (the native backend's depth copy).
+        depth_buffer: ctx.depth.map(|f| (ctx.staging.depth, f)),
+        // The copy beside the colour input (the native backend's history).
+        mvec: point.mvec_input,
+        mvec_scale: point.mvec_scale(),
         exposure: [None; crate::preupscale::MAX_EXPOSURE],
-        exposure_input: job.exposure.filter(|_| session.game_exposure_trusted(job.point.identification)),
-        paper_white: if mode.hdr() { crate::preupscale::hdr::paper_white() } else { crate::preupscale::hdr::DEFAULT_PAPER_WHITE },
-        identification: job.point.identification,
+        exposure_input: point.exposure_input.filter(|_| session.game_exposure_trusted(point.identification)),
+        paper_white: crate::preupscale::hdr::paper_white(),
+        identification: point.identification,
     };
-    let seen = session.seen();
-    // The stage's resources (`Session::res`, `Session::res_after`), as fields: the loader is borrowed beside them.
-    let res = if stage == crate::preupscale::placement::Stage::Upscaled { session.res_after.as_mut() } else { session.res.as_mut() };
-    let Some(res) = res else { return };
-    let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| {
-        let info = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build();
-        // SAFETY: the side queue is used by this worker thread only.
-        unsafe { device.queue_submit(queue, &[info], fence) }
+    let res = session.res_inline(stage).as_mut().expect("ensured above");
+    // SAFETY: `res` was built on this device for this extent and the graphics family DLSS's buffer runs on;
+    // the buffer is being recorded on this thread.
+    let mut hold = unsafe {
+        crate::preupscale::run_native(device, instance, physical_device, res, &target, &loader, jitter, inline_chain_kept(), shm, arm, seen, point.hold, crate::preupscale::Sink::Buffer(ctx))
     };
-    let loader = session.native.as_ref().filter(|_| native);
-    // SAFETY: `res` was built on this device for this extent and the side queue's family; the
-    // staging image is live, in GENERAL, and holds this frame's colour input (`captured` was set).
-    let mut hold = match loader {
-        // SAFETY: as below; the loader belongs to this device, and the side queue's family is the
-        // network's own (its graph is recorded for it too).
-        Some(loader) => unsafe {
-            crate::preupscale::run_native(device, instance, physical_device, res, &target, loader, job.jitter, inline_chain_kept(), shm, arm, seen, job.point.hold, &mut submit)
-        },
-        None => unsafe {
-            crate::preupscale::run_hold(device, instance, physical_device, res, &target, mode, dump, 0, &mut submit)
-        },
-    };
-    // Whatever of the hold went to the side queue (all of it, or the capture alone after a failed
-    // submit) is waited for before the worker releases DLSS's buffer, which copies the staging image
-    // back and goes on to overwrite it.
-    if res.pending() {
-        let mut writeback_gpu = None;
-        if res.wait_idle(device, &mut writeback_gpu) {
-            if hold.wrote_back {
-                hold.writeback_gpu_ms = writeback_gpu.or(hold.writeback_gpu_ms);
-                // A cache dump's armed hold: read back now (the GPU is parked at the hold until release).
-                if let Some(frame) = res.take_cache_frame() {
-                    hold.cache_frame = Some(frame);
-                }
-            }
-        } else if hold.wrote_back {
-            // The GPU copies the staging image back as it is; the write-back may not have reached it.
-            hold.wrote_back = false;
-            hold.miss = Some("the write-back inside DLSS's buffer did not finish in time");
-        }
-    }
-    if hold.native {
-        session.note_native(shm, &hold);
-        session.cache_dump_after(arm, &mut hold);
-    }
-    inline_tally(match (hold.wrote_back, job.jitter.is_some()) {
+    session.note_native(shm, &hold);
+    session.cache_dump_after(arm, &mut hold);
+    inline_tally(match (hold.wrote_back, jitter.is_some()) {
         (true, true) => "held",
         (true, false) => "held without the jitter",
         (false, _) => hold.miss.unwrap_or("not held"),
     });
-    session.check_exposure(job.point.identification, &hold);
+    session.check_exposure(point.identification, &hold);
     session.note(shm, &hold, started.elapsed(), extent);
-    if let Some(frame) = hold.dump.take() {
-        // A waiting one-shot is this dump's (`dump_owns_one_shot`): its outcome names the dump.
-        let capture = shm.take_capture_request().map(|request| (request, shm.channel()));
-        crate::preupscale::write_dump_async(frame, capture);
-        session.dumped();
+    match hold.meta.take() {
+        Some(meta) => Ok(meta),
+        None => Err(Recorded::Skipped),
     }
 }
 
@@ -1308,35 +1260,49 @@ impl NeuralForgeDeviceInfo {
         // The network's loader and the hold's worker only start where the layer is on and the
         // process is the game (`create_device` adds their queues only then too).
         let active = crate::layer_enabled() && crate::ownership::eligible();
+        // The holds recorded into DLSS's buffers that may still run: the network keeps the build they use.
+        #[cfg(target_arch = "x86_64")]
+        let holds = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // The game's graphics family, where DLSS's buffers run: the network's frame family.
+        #[cfg(target_arch = "x86_64")]
+        let mut frame_family = None;
         #[cfg(target_arch = "x86_64")]
         if let Some(setup) = crate::take_native(handle) {
             // Also without DLSS's tracking (no VK_NVX_image_view_handle): the after-the-upscaler path
             // uses the network too (`preupscale::native_post`). Nothing loads until a path asks.
             if nvidia && active {
-                hold.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup)));
+                frame_family = Some(setup.frame_family);
+                hold.lock().unwrap().preupscale.native = Some(std::sync::Arc::new(crate::preupscale::native::Loader::start(handle, setup, holds.clone())));
             }
         }
-        let side = crate::take_side_queue(handle);
-        let inline = match (&preupscale, side, get_queue, &instance) {
-            (Some(_), Some(crate::SideQueue { family, index, app_family }), Some(get_queue), Some(instance)) if nvidia && active => {
-                let mut queue = vk::Queue::null();
-                // SAFETY: the next layer's `vkGetDeviceQueue` for the queue this layer added to the
-                // device's creation (`crate::take_side_queue`).
-                unsafe { get_queue(handle, family, index, &mut queue) };
-                // SAFETY: a live queue of this device from below the loader.
-                if queue == vk::Queue::null() || unsafe { crate::loader_data::initialize_queue(handle, queue) }.is_err() {
-                    crate::log!("[preupscale] the side queue for the hold inside DLSS's command buffer could not be set up; not holding there");
-                    None
-                } else {
-                    let (dev, inst, pd, st, hs) = (device.clone(), instance.clone(), physical_device, state.clone(), hold.clone());
-                    let native_loader = hold.lock().unwrap().preupscale.native.clone();
-                    let hold_fn: crate::preupscale::inline::HoldFn =
-                        Box::new(move |job, queue| inline_hold(&dev, &inst, pd, &st, &hs, native_loader.as_ref(), job, queue));
-                    crate::preupscale::inline::Inline::start(device.clone(), instance, physical_device, queue, family, app_family, hold_fn)
-                }
+        // The hold inside DLSS's command buffer: recorded into the application's buffers on the game's
+        // graphics family (the network's frame family), with the application's compute state put back after
+        // it (`preupscale::restore`, whose newer commands are wrapped through `vkGetDeviceProcAddr`).
+        #[cfg(target_arch = "x86_64")]
+        let inline = match (&preupscale, frame_family, &instance) {
+            (Some(_), Some(app_family), Some(instance)) if nvidia && active && crate::preupscale::inline::enabled() => {
+                // SAFETY: names resolved from the device's own next-layer gdpa, typed as those commands.
+                let fns = unsafe {
+                    crate::preupscale::restore::Fns {
+                        push_descriptor_set: resolve(next_get_device_proc_addr, handle, c"vkCmdPushDescriptorSetKHR")
+                            .or_else(|| resolve(next_get_device_proc_addr, handle, c"vkCmdPushDescriptorSet")),
+                        push_descriptor_set_with_template: resolve(next_get_device_proc_addr, handle, c"vkCmdPushDescriptorSetWithTemplateKHR")
+                            .or_else(|| resolve(next_get_device_proc_addr, handle, c"vkCmdPushDescriptorSetWithTemplate")),
+                        set_descriptor_buffer_offsets: resolve(next_get_device_proc_addr, handle, c"vkCmdSetDescriptorBufferOffsetsEXT"),
+                        bind_descriptor_buffer_embedded_samplers: resolve(next_get_device_proc_addr, handle, c"vkCmdBindDescriptorBufferEmbeddedSamplersEXT"),
+                        bind_descriptor_buffers: resolve(next_get_device_proc_addr, handle, c"vkCmdBindDescriptorBuffersEXT"),
+                        bind_shaders: resolve(next_get_device_proc_addr, handle, c"vkCmdBindShadersEXT"),
+                    }
+                };
+                let inline = crate::preupscale::inline::Inline::new(device.clone(), instance, physical_device, app_family, holds.clone(), fns);
+                // SAFETY: the device is live.
+                unsafe { crate::preupscale::restore::register(handle, inline.restore.clone()) };
+                Some(inline)
             }
             _ => None,
         };
+        #[cfg(not(target_arch = "x86_64"))]
+        let inline = None;
         Self {
             _loader_data: loader_data,
             device,
@@ -1452,42 +1418,54 @@ impl NeuralForgeDeviceInfo {
         family_of(&self.queue_families, queue)
     }
 
-    /// The jobs of the hold inside DLSS's buffer (`crate::preupscale::inline`) for a submission on
-    /// `queue` of `cbs`, taken before the submission is made.
-    fn inline_jobs(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
-        if launch_queues_logged() {
-            let cbs: Vec<vk::CommandBuffer> = cbs.into_iter().collect();
-            let family = self.queue_family(queue);
-            if let Some(tracking) = &self.preupscale {
-                let n = cbs.iter().filter(|cb| tracking.has_launches(**cb)).count() as u32;
-                if n > 0 {
-                    launch_queue_tally(vk::Handle::as_raw(self.device.handle()), family, n);
-                }
-            }
-            return self.inline_jobs_of(queue, cbs);
+    /// `NEURAL_FORGE_LOG_LAUNCH_QUEUES=1`: tallies the submission's buffers with CUDA launches by queue family.
+    fn log_launch_queues(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) {
+        if !launch_queues_logged() {
+            return;
         }
-        self.inline_jobs_of(queue, cbs)
-    }
-
-    fn inline_jobs_of(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<crate::preupscale::inline::Job> {
-        let Some(inline) = &self.inline else { return Vec::new() };
-        let family = self.queue_family(queue);
-        let mut jobs = inline.jobs_for(cbs, family);
         if let Some(tracking) = &self.preupscale {
-            for job in &mut jobs {
-                // The camera jitter is the render frame's. DLSS's output, which the hold after it works on, is not
-                // jittered: its jitter is zero (known, so the edit cache keeps its interval there).
-                job.jitter = if job.point.hold.stage == crate::preupscale::placement::Stage::Upscaled { Some([0.0, 0.0]) } else { tracking.jitter_px_of(job.cb) };
+            let n = cbs.into_iter().filter(|cb| tracking.has_launches(*cb)).count() as u32;
+            if n > 0 {
+                launch_queue_tally(vk::Handle::as_raw(self.device.handle()), self.queue_family(queue), n);
             }
         }
-        jobs
     }
 
-    /// Hands `jobs` to the worker once the submission was accepted; a refused one runs nothing.
-    fn inline_dispatch(&self, result: vk::Result, jobs: Vec<crate::preupscale::inline::Job>) {
-        if let (Some(inline), vk::Result::SUCCESS) = (&self.inline, result) {
-            inline.dispatch(jobs);
+    /// What has to run in front of a submission of `cbs` on `queue` (`Inline::prologue`): the native passes'
+    /// initialisations the holds in them need, the first time, submitted here on the same queue first. The
+    /// queue is the family the holds' buffers are of (their pools'), and the application's, externally
+    /// synchronized for its `vkQueueSubmit*`.
+    fn inline_prologue(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) {
+        let Some(inline) = &self.inline else { return };
+        let inits = inline.prologue(cbs);
+        if inits.is_empty() {
+            return;
         }
+        let cmds: Vec<vk::CommandBuffer> = inits.iter().map(|(_, c)| *c).collect();
+        let info = vk::SubmitInfo::builder().command_buffers(&cmds).build();
+        // SAFETY: the layer's own recorded buffers of the queue's family, submitted once each; the queue is
+        // externally synchronized by the application's call.
+        let result = unsafe { (self.device.fp_v1_0().queue_submit)(queue, 1, &info, vk::Fence::null()) };
+        if result != vk::Result::SUCCESS {
+            crate::log!("[preupscale] the initialisation for the hold inside DLSS's buffer could not be submitted ({result:?})");
+            inline.prologue_failed(&inits);
+        }
+    }
+
+    /// A submission the next layer accepted on `queue`: each hold recorded into its buffers runs once more
+    /// (`crate::preupscale::inline::Inline::submitted`).
+    fn inline_submitted(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) {
+        if let Some(inline) = &self.inline {
+            inline.submitted(queue, cbs);
+        }
+    }
+
+    /// [`record_inline_hold`] with this device's state.
+    fn record_hold(
+        &self, inline: &crate::preupscale::inline::Inline, jitter: Option<[f32; 2]>, ctx: &mut crate::preupscale::inline::Ctx,
+    ) -> Result<crate::preupscale::inline::Meta, crate::preupscale::inline::Recorded> {
+        let Some(instance) = self.instance.as_ref() else { return Err(crate::preupscale::inline::Recorded::Refused) };
+        record_inline_hold(&self.device, instance, self.physical_device, &self.hold, inline, jitter, ctx)
     }
 
     /// The pre-upscaler hold at a `vkQueueSubmit`/`vkQueueSubmit2` (`crate::preupscale`'s module
@@ -1669,7 +1647,7 @@ impl NeuralForgeDeviceInfo {
             let hold = match loader {
                 // SAFETY: as below; the loader belongs to this device and `res` to the queue's family.
                 Some(loader) => unsafe {
-                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, arm, seen, at, &mut layer_submit)
+                    crate::preupscale::run_native(&self.device, instance, self.physical_device, res, &target, loader, jitter, true, shm, arm, seen, at, crate::preupscale::Sink::Queue(&mut layer_submit))
                 },
                 None => unsafe {
                     crate::preupscale::run_hold(&self.device, instance, self.physical_device, res, &target, mode, dump, scan.evaluation, &mut layer_submit)
@@ -2022,7 +2000,7 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
     }
 
     /// Created here (through the next layer) only to learn the pool's queue family, for the hold inside
-    /// DLSS's buffer ([`crate::preupscale::inline::Inline::record`]); without it, untouched.
+    /// DLSS's buffer ([`crate::preupscale::inline::Inline::record_outcome`]); without it, untouched.
     fn create_command_pool(
         &self, create_info: &vk::CommandPoolCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
     ) -> LayerResult<ash::prelude::VkResult<vk::CommandPool>> {
@@ -2104,7 +2082,120 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         if let Some(t) = &self.preupscale {
             t.execute(command_buffer, secondaries);
         }
+        if let Some(i) = &self.inline {
+            i.executed(command_buffer);
+        }
         self.tracker.lock().unwrap().execute_secondary(command_buffer, secondaries);
+        LayerResult::Unhandled
+    }
+
+    // The application's compute state, for the hold recorded into its buffer to put back
+    // (`crate::preupscale::restore`): each notes the call and leaves it to the framework.
+
+    fn cmd_bind_pipeline(&self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, pipeline: vk::Pipeline) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
+            i.restore.with(command_buffer, |s| s.bind_compute(crate::preupscale::restore::Compute::Pipeline(pipeline)));
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_bind_descriptor_sets(
+        &self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, first_set: u32, sets: &[vk::DescriptorSet],
+        dynamic_offsets: &[u32],
+    ) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
+            let binding = crate::preupscale::restore::Binding::Sets { layout, first: first_set, sets: sets.to_vec(), dynamic: dynamic_offsets.to_vec() };
+            i.restore.with(command_buffer, |s| s.bind(binding));
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_push_constants(&self, command_buffer: vk::CommandBuffer, layout: vk::PipelineLayout, stages: vk::ShaderStageFlags, offset: u32, values: &[u8]) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| stages.contains(vk::ShaderStageFlags::COMPUTE) && i.restore.active()) {
+            i.restore.with(command_buffer, |s| s.push(layout, stages, offset, values));
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_push_descriptor_set_khr(
+        &self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32, writes: &[vk::WriteDescriptorSet],
+    ) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
+            // SAFETY: the application's writes, valid for this call.
+            unsafe { i.restore.note_push_descriptor_set(command_buffer, layout, set, writes) };
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_push_descriptor_set_with_template_khr(
+        &self, command_buffer: vk::CommandBuffer, template: vk::DescriptorUpdateTemplate, layout: vk::PipelineLayout, set: u32, data: *const std::ffi::c_void,
+    ) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
+            // SAFETY: the application's data, valid for this call and of the template's size.
+            unsafe { i.restore.push_template(command_buffer, template, layout, set, data) };
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_set_descriptor_buffer_offsets_ext(
+        &self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, first_set: u32, buffer_indices: &[u32],
+        offsets: &[vk::DeviceSize],
+    ) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
+            let binding = crate::preupscale::restore::Binding::Offsets { layout, first: first_set, indices: buffer_indices.to_vec(), offsets: offsets.to_vec() };
+            i.restore.with(command_buffer, |s| s.bind(binding));
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_bind_descriptor_buffers_ext(&self, command_buffer: vk::CommandBuffer, infos: &[vk::DescriptorBufferBindingInfoEXT]) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
+            // SAFETY: the application's binding infos, valid for this call.
+            i.restore.with(command_buffer, |s| unsafe { s.bind_buffers(infos) });
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_bind_descriptor_buffer_embedded_samplers_ext(
+        &self, command_buffer: vk::CommandBuffer, bind_point: vk::PipelineBindPoint, layout: vk::PipelineLayout, set: u32,
+    ) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| bind_point == vk::PipelineBindPoint::COMPUTE && i.restore.active()) {
+            i.restore.with(command_buffer, |s| s.bind(crate::preupscale::restore::Binding::Embedded { layout, set }));
+        }
+        LayerResult::Unhandled
+    }
+
+    /// Created here (through the next layer) to learn a push-descriptor template's data size.
+    fn create_descriptor_update_template(
+        &self, create_info: &vk::DescriptorUpdateTemplateCreateInfo, allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<ash::prelude::VkResult<vk::DescriptorUpdateTemplate>> {
+        let Some(i) = &self.inline else { return LayerResult::Unhandled };
+        // SAFETY: the application's own create info and allocator, forwarded unchanged to the next layer.
+        let result = unsafe { self.device.create_descriptor_update_template(create_info, allocator) };
+        if let Ok(template) = result {
+            i.restore.template_created(template, create_info);
+        }
+        LayerResult::Handled(result)
+    }
+
+    fn destroy_descriptor_update_template(&self, template: vk::DescriptorUpdateTemplate, _allocator: Option<&vk::AllocationCallbacks>) -> LayerResult<()> {
+        if let Some(i) = &self.inline {
+            i.restore.template_destroyed(template);
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_begin_conditional_rendering_ext(&self, command_buffer: vk::CommandBuffer, _info: &vk::ConditionalRenderingBeginInfoEXT) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
+            i.restore.with(command_buffer, |s| s.conditional(true));
+        }
+        LayerResult::Unhandled
+    }
+
+    fn cmd_end_conditional_rendering_ext(&self, command_buffer: vk::CommandBuffer) -> LayerResult<()> {
+        if let Some(i) = self.inline.as_ref().filter(|i| i.restore.active()) {
+            i.restore.with(command_buffer, |s| s.conditional(false));
+        }
         LayerResult::Unhandled
     }
 
@@ -2121,7 +2212,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // SAFETY: `p_command_buffers` is valid for `command_buffer_count` elements for the
         // duration of the application's own `vkQueueSubmit` call.
         let buffers = || submits.iter().flat_map(|s| unsafe { preupscale_slice(s.p_command_buffers, s.command_buffer_count) }.iter().copied());
-        let jobs = self.inline_jobs(queue, buffers());
+        self.log_launch_queues(queue, buffers());
+        self.inline_prologue(queue, buffers());
         let device = &self.device;
         if let Some(tracking) = self.preupscale.as_ref().filter(|t| t.armed()) {
             // SAFETY: as above.
@@ -2136,8 +2228,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // SAFETY: `submits` is the application's own, valid for this call.
             let held = self.preupscale_submit(tracking, queue, &cbs, || unsafe { crate::preupscale::parse1(submits) }, fence, &submit);
             if let Some((result, accepted)) = held {
+                self.inline_submitted(queue, accepted.iter().copied());
                 self.commit_submitted(accepted);
-                self.inline_dispatch(result, jobs);
                 return LayerResult::Handled(result.result());
             }
         }
@@ -2146,9 +2238,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // SAFETY: the application's own arguments, passed on unchanged to the next layer.
         let result = unsafe { (device.fp_v1_0().queue_submit)(queue, submits.len() as u32, submits.as_ptr(), fence) };
         if result == vk::Result::SUCCESS {
+            self.inline_submitted(queue, buffers());
             self.commit_submitted(buffers());
         }
-        self.inline_dispatch(result, jobs);
         LayerResult::Handled(result.result())
     }
 
@@ -2165,13 +2257,12 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // SAFETY: `p_command_buffer_infos` is valid for `command_buffer_info_count` elements for
         // the duration of the application's own `vkQueueSubmit2` call.
         let buffers = || submits.iter().flat_map(|s| unsafe { preupscale_slice(s.p_command_buffer_infos, s.command_buffer_info_count) }.iter().map(cb_of));
-        let jobs = self.inline_jobs(queue, buffers());
+        self.log_launch_queues(queue, buffers());
+        self.inline_prologue(queue, buffers());
         let Some(next) = self.next_queue_submit2 else {
-            // The framework forwards without a result. A buffer that does not run never sets
-            // `captured`; the worker then gives up after the bounded capture wait.
-            self.inline_dispatch(vk::Result::SUCCESS, jobs);
             // Not resolvable below this layer (the application could not be calling it): the
             // framework forwards, and the result stays unseen.
+            self.inline_submitted(queue, buffers());
             self.commit_submitted(buffers());
             return LayerResult::Unhandled;
         };
@@ -2190,8 +2281,8 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // SAFETY: `submits` is the application's own, valid for this call.
             let held = self.preupscale_submit(tracking, queue, &cbs, || unsafe { crate::preupscale::parse2(submits) }, fence, &submit);
             if let Some((result, accepted)) = held {
+                self.inline_submitted(queue, accepted.iter().copied());
                 self.commit_submitted(accepted);
-                self.inline_dispatch(result, jobs);
                 return LayerResult::Handled(result.result());
             }
         }
@@ -2199,9 +2290,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
         // SAFETY: the application's own arguments, passed on unchanged to the next layer.
         let result = unsafe { next(queue, submits.len() as u32, submits.as_ptr(), fence) };
         if result == vk::Result::SUCCESS {
+            self.inline_submitted(queue, buffers());
             self.commit_submitted(buffers());
         }
-        self.inline_dispatch(result, jobs);
         LayerResult::Handled(result.result())
     }
 
@@ -2481,10 +2572,11 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             let (before, after) = t.launch_with_after(command_buffer, launch_info.function, params);
             let inline = self.inline.as_ref().filter(|_| crate::preupscale::mode().holds_inline());
             if let (Some(point), Some(inline)) = (before, inline) {
-                // DLSS's buffer renders its own input before this launch: the hold goes here, inside
-                // it (`crate::preupscale::inline`), when the mode holds at all.
+                // DLSS's buffer renders its own input before this launch: the hold is recorded here, inside
+                // it (`crate::preupscale::inline`), when the mode holds at all; the launch follows it.
                 let identification = point.identification;
-                if inline.record(command_buffer, point) {
+                let jitter = t.jitter_px_of(command_buffer);
+                if inline.record_outcome(command_buffer, point, |ctx| self.record_hold(inline, jitter, ctx)) == crate::preupscale::inline::Recorded::Held {
                     t.inline_recorded(identification);
                 }
             }
@@ -2500,7 +2592,9 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                             return LayerResult::Handled(());
                         }
                         let identification = point.identification;
-                        match inline.record_outcome(command_buffer, point) {
+                        // DLSS's output is not jittered: its jitter is zero (known, so the edit cache keeps its
+                        // interval there).
+                        match inline.record_outcome(command_buffer, point, |ctx| self.record_hold(inline, Some([0.0, 0.0]), ctx)) {
                             crate::preupscale::inline::Recorded::Held => {
                                 t.inline_recorded(identification);
                                 t.after_recorded();
