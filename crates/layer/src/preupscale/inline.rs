@@ -61,6 +61,9 @@ pub(crate) const READ_EXPOSURE: u64 = 80;
 /// The auto-exposure's state (`hdr::AutoState`'s 5 words).
 pub(crate) const READ_AUTO: u64 = 96;
 
+/// How long a submission of held buffers waits for those on another queue ([`Slots::drain`]) at most.
+const DRAIN_TIMEOUT_NS: u64 = 2_000_000_000;
+
 /// `NEURAL_FORGE_INLINE=off` turns the hold inside DLSS's buffer off; the split hold is unaffected.
 pub(crate) fn enabled() -> bool {
     static ON: LazyLock<bool> = LazyLock::new(|| neural_forge_protocol::env::var("NEURAL_FORGE_INLINE").is_none_or(|v| v != "off" && v != "0"));
@@ -169,6 +172,15 @@ struct Slots {
     staging: [Option<Staging>; 2],
     /// The queue the last buffer carrying a hold was submitted on.
     queue: Option<vk::Queue>,
+    /// Once the holds stopped for a second queue ([`Inline::stopped`]): a fence after the last submission
+    /// carrying holds that may still run, and its queue. A submission of held buffers on another queue waits
+    /// for it first ([`Inline::prologue`]): their holds share the stage's staging images and the native
+    /// pass's state, so they run one after another while the buffers recorded before the stop drain.
+    drain: Option<(vk::Queue, vk::Fence)>,
+    /// Fences of the drain: reset and free (`spare`), or superseded by a later one on the same queue and maybe
+    /// still pending (`retired`, reset and reused once signaled).
+    spare: Vec<vk::Fence>,
+    retired: Vec<vk::Fence>,
     /// The native passes whose initialisation went to the queue ([`Inline::prologue`]).
     initialised: HashSet<u64>,
 }
@@ -470,16 +482,24 @@ impl Inline {
         std::mem::take(&mut *lock(&self.harvest))
     }
 
-    /// What has to run in front of a submission of `cbs` about to be made: the initialisation of each native
-    /// pass a hold in them was recorded with, the first time (the GPU then runs it before those holds, and
-    /// before every later hold of the pass, which are submitted after it). The caller submits them on the
-    /// same queue first, and calls [`Self::prologue_failed`] with them if that fails.
-    pub(crate) fn prologue(&self, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<(u64, vk::CommandBuffer)> {
+    /// What has to run in front of a submission of `cbs` about to be made on `queue`: the initialisation of
+    /// each native pass a hold in them was recorded with, the first time (the GPU then runs it before those
+    /// holds, and before every later hold of the pass, which are submitted after it). The caller submits them
+    /// on the same queue first, and calls [`Self::prologue_failed`] with them if that fails.
+    ///
+    /// Held buffers about to go to another queue than the last ones stop the holds here, before the next layer
+    /// has them (no more are recorded: their work shares the stage's resources), and once stopped they wait
+    /// for the held work on the other queue to finish ([`Slots::drain`]): the buffers recorded before the stop
+    /// may still be submitted on either queue. The first submission on the second queue cannot wait (nothing
+    /// fenced the other queue's holds before the stop); every one after it does.
+    pub(crate) fn prologue(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) -> Vec<(u64, vk::CommandBuffer)> {
         let mut s = lock(&self.slots);
         let mut out: Vec<(u64, vk::CommandBuffer)> = Vec::new();
+        let mut any = false;
         for cb in cbs {
             let Some(held) = s.by_cb.get(&cb).cloned() else { continue };
             for i in held {
+                any |= s.slots[i].meta.is_some();
                 if let Some((pass, cmd)) = s.slots[i].meta.and_then(|m| m.init) {
                     if s.initialised.insert(pass) {
                         out.push((pass, cmd));
@@ -487,7 +507,53 @@ impl Inline {
                 }
             }
         }
+        if !any || s.queue.is_none_or(|q| q == queue) {
+            return out;
+        }
+        let drain = s.drain.take_if(|(q, _)| *q != queue);
+        drop(s);
+        self.stop();
+        if let Some((_, fence)) = drain {
+            // SAFETY: the layer's own fence, submitted on the other queue ([`Self::submitted`]).
+            let waited = unsafe { self.device.wait_for_fences(&[fence], true, DRAIN_TIMEOUT_NS) };
+            let mut s = lock(&self.slots);
+            match waited {
+                // SAFETY: signaled: not pending.
+                Ok(()) if unsafe { self.device.reset_fences(&[fence]) }.is_ok() => s.spare.push(fence),
+                _ => {
+                    s.retired.push(fence);
+                    drop(s);
+                    self.say_once("the hold's work on the other queue did not finish in time; the holds may overlap once".into());
+                }
+            }
+        }
         out
+    }
+
+    /// No more holds are recorded: their buffers go to more than one queue (logged once).
+    fn stop(&self) {
+        if !self.stopped.swap(true, Ordering::Relaxed) {
+            crate::log!("[preupscale] DLSS's buffers with a hold inside are submitted on more than one queue; no more holds are recorded into them (their work would overlap), and those recorded run one after another");
+            crate::logging::flush();
+        }
+    }
+
+    /// A fence for the drain ([`Slots::drain`]): a spare one, a retired one that signaled (reset), or a new one.
+    fn drain_fence(&self, s: &mut Slots) -> Option<vk::Fence> {
+        if let Some(f) = s.spare.pop() {
+            return Some(f);
+        }
+        // SAFETY: the layer's own fences; a signaled one is not pending.
+        let signaled = s.retired.iter().position(|&f| unsafe { self.device.get_fence_status(f) } == Ok(true));
+        if let Some(f) = signaled.map(|k| s.retired.swap_remove(k)) {
+            // SAFETY: as above.
+            if unsafe { self.device.reset_fences(&[f]) }.is_ok() {
+                return Some(f);
+            }
+            s.retired.push(f);
+        }
+        // SAFETY: the device is live.
+        unsafe { self.device.create_fence(&vk::FenceCreateInfo::default(), None) }.ok()
     }
 
     /// The submission of [`Self::prologue`]'s buffers failed: they are due again.
@@ -499,7 +565,10 @@ impl Inline {
     }
 
     /// A submission the next layer accepted, on `queue`, of `cbs`: each hold in them runs once more. Holds
-    /// submitted on another queue than the last ones stop the holds (their work shares the stage's resources).
+    /// submitted on another queue than the last ones stop the holds (their work shares the stage's resources;
+    /// [`Self::prologue`] stops them before the submission already), and once stopped a fence follows each
+    /// submission carrying holds, which one on another queue waits for. The caller holds `queue` (inside the
+    /// application's `vkQueueSubmit*` on it).
     pub(crate) fn submitted(&self, queue: vk::Queue, cbs: impl IntoIterator<Item = vk::CommandBuffer>) {
         let mut s = lock(&self.slots);
         let mut any = false;
@@ -515,15 +584,28 @@ impl Inline {
         if !any {
             return;
         }
-        match s.queue {
-            Some(q) if q != queue => {
-                if !self.stopped.swap(true, Ordering::Relaxed) {
-                    drop(s);
-                    crate::log!("[preupscale] DLSS's buffers with a hold inside are submitted on more than one queue; no more holds are recorded into them (their work would overlap)");
-                    crate::logging::flush();
+        if s.queue.replace(queue).is_some_and(|q| q != queue) {
+            self.stop();
+        }
+        if !self.stopped.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(fence) = self.drain_fence(&mut s) else {
+            self.say_once("no fence for the hold's work on more than one queue; the holds may overlap".into());
+            return;
+        };
+        // SAFETY: the caller holds `queue`; an empty submission signals the fence once everything submitted on
+        // the queue before it finished.
+        match unsafe { self.device.queue_submit(queue, &[], fence) } {
+            Ok(()) => {
+                if let Some((_, old)) = s.drain.replace((queue, fence)) {
+                    s.retired.push(old);
                 }
             }
-            _ => s.queue = Some(queue),
+            Err(e) => {
+                s.spare.push(fence);
+                self.say_once(format!("the fence after the hold's work could not be submitted ({e:?}); the holds may overlap"));
+            }
         }
     }
 
@@ -1226,6 +1308,13 @@ pub(crate) unsafe fn destroy(device: vk::Device) {
                 // SAFETY: as above.
                 unsafe { inline.free_staging(&staging) };
             }
+            let mut fences: Vec<vk::Fence> = s.drain.take().map(|(_, f)| f).into_iter().collect();
+            fences.append(&mut s.spare);
+            fences.append(&mut s.retired);
+            for fence in fences {
+                // SAFETY: as above.
+                unsafe { d.destroy_fence(fence, None) };
+            }
         }
         Err(e) => crate::log!("[preupscale] inline hold teardown wait failed: {e:?}; its slots are not freed"),
     }
@@ -1644,7 +1733,7 @@ mod tests {
             let d = &self.device;
             // SAFETY: the test's recorded buffers and the layer's initialisation buffers, on the test's queue.
             unsafe {
-                let inits: Vec<vk::CommandBuffer> = self.inline.prologue(cbs.iter().copied()).into_iter().map(|(_, c)| c).collect();
+                let inits: Vec<vk::CommandBuffer> = self.inline.prologue(self.queue, cbs.iter().copied()).into_iter().map(|(_, c)| c).collect();
                 if !inits.is_empty() {
                     d.queue_submit(self.queue, &[vk::SubmitInfo::builder().command_buffers(&inits).build()], vk::Fence::null()).unwrap();
                 }
@@ -1940,6 +2029,49 @@ mod tests {
         inline.restore.with(real, |s| s.refuse("a test"));
         assert_eq!(inline.record_outcome(real, rig.point(), copies_only), Recorded::Skipped);
         rig.end(real);
+    }
+
+    /// Held buffers about to go to a second queue stop the holds before the next layer has them, and from then
+    /// on a submission carrying holds is fenced on its queue and one on another queue waits for that fence
+    /// first: the buffers recorded before the stop may still be submitted on either queue, and their holds
+    /// share the stage's staging images. Found only after the submission, the holds already recorded ran on
+    /// both queues at once.
+    #[test]
+    fn holds_for_a_second_queue_stop_before_the_submission_and_run_one_after_another() {
+        let Some(rig) = Rig::open(false) else { return };
+        let inline = &rig.inline;
+        let other = <vk::Queue as vk::Handle>::from_raw(0x005e_c00d);
+        let (a, b, c) = (rig.buffer(), rig.buffer(), rig.buffer());
+        for cb in [a, b] {
+            rig.begin(cb);
+            assert_eq!(inline.record_outcome(cb, rig.point(), copies_only), Recorded::Held);
+            rig.end(cb);
+        }
+        rig.submit(&[a]);
+        assert!(inline.prologue(rig.queue, [b]).is_empty(), "the same queue: nothing to do");
+        assert!(!inline.stopped.load(Ordering::Relaxed));
+        // `b` about to go to another queue: stopped before the next layer has it, with nothing to wait for yet.
+        let _ = inline.prologue(other, [b]);
+        assert!(inline.stopped.load(Ordering::Relaxed), "stopped before the submission");
+        rig.begin(c);
+        assert_eq!(inline.record_outcome(c, rig.point(), copies_only), Recorded::Refused, "no more holds are recorded");
+        rig.end(c);
+        // The buffers recorded before still run: each submission of them is fenced on its queue...
+        rig.submit(&[b]);
+        let fenced = lock(&inline.slots).drain;
+        assert!(fenced.is_some_and(|(q, _)| q == rig.queue), "a fence after the held work on the test's queue");
+        rig.submit(&[a]);
+        let refenced = lock(&inline.slots).drain;
+        assert!(refenced.is_some_and(|(q, f)| q == rig.queue && Some(f) != fenced.map(|(_, f)| f)), "a new fence after each submission");
+        assert_eq!(lock(&inline.slots).retired.len(), 1, "the one before superseded");
+        // ...and one on another queue waits for it (signaled: the test's queue is idle), which goes spare.
+        let _ = inline.prologue(other, [a]);
+        let s = lock(&inline.slots);
+        assert!(s.drain.is_none(), "waited for");
+        assert_eq!(s.spare, refenced.map(|(_, f)| f).into_iter().collect::<Vec<_>>(), "reset for the next");
+        drop(s);
+        // Buffers without holds need nothing.
+        assert!(inline.prologue(other, [c]).is_empty());
     }
 
     /// Staging images that could not be built are never recorded: the hold is refused while building fails,
