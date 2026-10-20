@@ -1167,44 +1167,15 @@ fn first_report<T: PartialEq>(seen: &Mutex<Vec<T>>, reason: T) -> bool {
     true
 }
 
-/// What became of the fence a present the layer added semaphores to was given (`queue_present_khr`).
-enum PresentFence {
-    /// Given to the present (its present fence) or to the layer's batch in its place: complete once
-    /// signalled.
-    Submitted(vk::Fence),
-    /// Given to a present that failed in a way that may leave it unsignalled.
-    Stranded(vk::Fence),
-    /// Given to nothing.
-    Unused(vk::Fence),
-    /// There was none.
-    None,
-}
-
-/// [`crate::present_sync::Tracking::Resignal`]: one wait-and-signal batch on the present's queue that
-/// waits on the layer's semaphores for this present (`layer_waits`: the relay's, the composition's)
-/// and signals the application's own present wait semaphores (`app_waits`) again, fenced. The
-/// application's present then goes out unchanged, its present fences its own, and the layer's
-/// semaphores are waited on by this batch, whose completion `fence` tells.
-///
-/// The application's semaphores are unsignalled when this signals them: the relay batch waited on them
-/// and signalled the relay semaphore, which this batch waits on first.
-///
-/// # Safety
-/// `queue` is the present's queue, externally synchronized for the call; `app_waits` are the present's
-/// wait semaphores, consumed by the relay batch on `queue` (`relay_app_waits`), whose relay semaphore
-/// is in `layer_waits`; every semaphore in `layer_waits` has its signal submitted; `fence` is unsignalled
-/// and unused.
-unsafe fn resignal_app_waits(
-    device: &ash::Device,
-    queue: vk::Queue,
-    layer_waits: &[vk::Semaphore],
-    app_waits: &[vk::Semaphore],
-    fence: vk::Fence,
-) -> ash::prelude::VkResult<()> {
-    let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; layer_waits.len()];
-    let submit = vk::SubmitInfo::builder().wait_semaphores(layer_waits).wait_dst_stage_mask(&stages).signal_semaphores(app_waits).build();
-    // SAFETY: per this function's contract; the slices outlive the call.
-    unsafe { device.queue_submit(queue, &[submit], fence) }
+/// Notes the present's wait on the layer's semaphores for it (`queue_present_khr`): the relay's and the
+/// composition's ([`crate::present_sync::PresentSemaphores::note`]).
+fn note_present_waits(state: &mut State, relay: Option<vk::Semaphore>, composed: Option<vk::Semaphore>, last: crate::present_sync::LastUse) {
+    if let Some(relay) = relay {
+        state.relay_semaphores.note(relay, last);
+    }
+    if let (Some(semaphore), Some(gpu)) = (composed, state.gpu_compose.as_mut()) {
+        gpu.present_semaphores_mut().note(semaphore, last);
+    }
 }
 
 unsafe fn relay_app_waits(
@@ -3483,45 +3454,28 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
             // `p_image_indices`, `p_results`) unchanged from the app's own
             // `present_info` -- only the wait-semaphore list is actually different.
             let modified_info = vk::PresentInfoKHR { wait_semaphore_count: combined.len() as u32, p_wait_semaphores: combined.as_ptr(), ..*present_info };
-            // When the waits on the layer's semaphores complete is tracked by a fence
-            // (`crate::present_sync`), so the semaphores of a destroyed swapchain can be freed.
-            use crate::present_sync::Tracking;
+            // What tells when the waits on the layer's semaphores complete (`crate::present_sync`), so the
+            // semaphores of a destroyed swapchain can be freed. Nothing is submitted for it.
+            use crate::present_sync::{LastUse, Tracking};
             let (tracking, fence) = {
                 let mut state = self.state.lock().unwrap();
-                // SAFETY: the application's chain, valid for this call.
-                let app_fences = unsafe { crate::present_sync::chains_present_fences(present_info) };
-                let tracking = match crate::present_sync::tracking(state.present_fences, app_fences, relay_semaphore.is_some()) {
-                    Tracking::PresentFence if !layer_slot.is_some_and(|slot| slot < present_info.swapchain_count as usize) => Tracking::Untracked,
-                    tracking => tracking,
+                let tracking = match layer_slot.filter(|&slot| slot < present_info.swapchain_count as usize) {
+                    // SAFETY: the application's chain, valid for this call; only read.
+                    Some(slot) => crate::present_sync::tracking(state.present_fences, unsafe { crate::present_sync::app_present_fence(present_info, slot) }),
+                    None => Tracking::Untracked,
                 };
                 // SAFETY: the device's own fences.
-                let fence = (tracking != Tracking::Untracked).then(|| unsafe { state.present_tickets.take(&self.device) }).flatten();
-                (if fence.is_some() { tracking } else { Tracking::Untracked }, fence)
-            };
-            let (result, fence) = match (tracking, fence, layer_slot) {
-                (Tracking::Resignal, Some(fence), _) => {
-                    // SAFETY: `p_wait_semaphores` is valid for `wait_semaphore_count` elements.
-                    let app_waits = unsafe { preupscale_slice(present_info.p_wait_semaphores, present_info.wait_semaphore_count) };
-                    let layer_waits: Vec<vk::Semaphore> = relay_semaphore.into_iter().chain(wait_semaphore).chain(series_wait).collect();
-                    // SAFETY: the present's own queue, externally synchronized for this call; the relay
-                    // batch consumed `app_waits`, and `layer_waits` were signalled by submissions of the
-                    // layer's made before this.
-                    match unsafe { resignal_app_waits(&self.device, queue, &layer_waits, app_waits, fence) } {
-                        // SAFETY: the application's present, exactly as it made it: its waits were
-                        // signalled again after everything of the layer's.
-                        Ok(()) => (unsafe { next_present(queue, present_info) }, PresentFence::Submitted(fence)),
-                        Err(error) => {
-                            static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                            if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                                crate::log!("[present] signalling the application's present semaphores again failed ({error:?}); the present waits on the layer's semaphores, kept until the device is destroyed");
-                                crate::logging::flush();
-                            }
-                            // SAFETY: as below.
-                            (unsafe { next_present(queue, &modified_info) }, PresentFence::Unused(fence))
-                        }
-                    }
+                let fence = (tracking == Tracking::PresentFence).then(|| unsafe { state.present_tickets.take(&self.device) }).flatten();
+                let tracking = if tracking == Tracking::PresentFence && fence.is_none() { Tracking::Untracked } else { tracking };
+                if tracking != Tracking::PresentFence {
+                    // Known before the present: noted now, so the present costs no second lock.
+                    let last = if tracking == Tracking::AppFenced { LastUse::AppFenced } else { LastUse::Unknown };
+                    note_present_waits(&mut state, relay_semaphore, wait_semaphore, last);
                 }
-                (Tracking::PresentFence, Some(fence), Some(slot)) => {
+                (tracking, fence)
+            };
+            match (fence, layer_slot) {
+                (Some(fence), Some(slot)) => {
                     // The application chained no present fences (`tracking`): the layer's go in front of
                     // its chain, a fence for the swapchain it worked on and none for the others.
                     let fences = crate::present_sync::PresentFences::new(present_info.swapchain_count, slot, fence, present_info.p_next);
@@ -3529,34 +3483,26 @@ impl DeviceHooks for NeuralForgeDeviceInfo {
                     // SAFETY: as below; `fences` outlives the call, and the device has
                     // `swapchainMaintenance1` enabled (`State::present_fences`).
                     let result = unsafe { next_present(queue, &fenced) };
-                    if crate::present_sync::present_fence_signals(result, crate::present_sync::gamescope_wsi()) {
-                        (result, PresentFence::Submitted(fence))
+                    let mut state = self.state.lock().unwrap();
+                    let ticket = if crate::present_sync::present_fence_signals(result, crate::present_sync::gamescope_wsi()) {
+                        state.present_tickets.submitted(fence)
                     } else {
-                        (result, PresentFence::Stranded(fence))
+                        state.present_tickets.stranded(fence)
+                    };
+                    note_present_waits(&mut state, relay_semaphore, wait_semaphore, LastUse::Ticket(ticket));
+                    debug_assert_eq!(tracking, Tracking::PresentFence);
+                    result
+                }
+                (fence, _) => {
+                    if let Some(fence) = fence {
+                        self.state.lock().unwrap().present_tickets.unused(fence);
                     }
+                    // SAFETY: `modified_info` is valid for the duration of this call --
+                    // `combined` (which it borrows from) outlives it; `next_present` was
+                    // resolved from the next layer/driver's own proc-addr table.
+                    unsafe { next_present(queue, &modified_info) }
                 }
-                // SAFETY: `modified_info` is valid for the duration of this call --
-                // `combined` (which it borrows from) outlives it; `next_present` was
-                // resolved from the next layer/driver's own proc-addr table.
-                (_, fence, _) => (unsafe { next_present(queue, &modified_info) }, fence.map_or(PresentFence::None, PresentFence::Unused)),
-            };
-            let mut state = self.state.lock().unwrap();
-            let last = match fence {
-                PresentFence::Submitted(fence) => crate::present_sync::LastUse::Ticket(state.present_tickets.submitted(fence)),
-                PresentFence::Stranded(fence) => crate::present_sync::LastUse::Ticket(state.present_tickets.stranded(fence)),
-                PresentFence::Unused(fence) => {
-                    state.present_tickets.unused(fence);
-                    crate::present_sync::LastUse::Unknown
-                }
-                PresentFence::None => crate::present_sync::LastUse::Unknown,
-            };
-            if let Some(relay) = relay_semaphore {
-                state.relay_semaphores.note(relay, last);
             }
-            if let (Some(semaphore), Some(gpu)) = (wait_semaphore, state.gpu_compose.as_mut()) {
-                gpu.present_semaphores_mut().note(semaphore, last);
-            }
-            result
         } else {
             // SAFETY: `present_info` is valid for the duration of this call;
             // `next_present` was resolved from the next layer/driver's own
@@ -4141,63 +4087,6 @@ mod submit_order_tests {
         // And the network is closed only once the device went idle.
         let close = teardown.find("close_native()").expect("the network is closed at teardown");
         assert!(close > teardown.find(".device_wait_idle()").unwrap());
-    }
-
-    /// Real (lavapipe) queue, the present path with the application's own present fences
-    /// (`present_sync::Tracking::Resignal`): the layer's batch waits on the relay and composition
-    /// semaphores and signals the application's present semaphore again, which the present (here a
-    /// submit standing in for it) waits on exactly as the application made it; once the swapchain is
-    /// destroyed, its relay and composition semaphores are freed as soon as the batch's fence signalled.
-    #[test]
-    fn resignal_gives_the_present_its_own_semaphores_and_frees_the_layers() {
-        use crate::present_sync::{LastUse, PresentSemaphores, Tickets};
-        let Some((_entry, instance, _physical, device, queue, _family)) = crate::composition::gpu::test_device() else {
-            eprintln!("resignal test: no Vulkan loader/ICD in this environment, skipping");
-            return;
-        };
-        let mut relays = PresentSemaphores::default();
-        let mut composes = PresentSemaphores::default();
-        let mut tickets = Tickets::default();
-        let stage = [vk::PipelineStageFlags::ALL_COMMANDS];
-        unsafe {
-            let app = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
-            let presented = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-            for _ in 0..3 {
-                // The game's frame signals its present semaphore.
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().signal_semaphores(&[app]).build()], vk::Fence::null()).unwrap();
-                let relay = relay_app_waits(&device, queue, &mut relays, image(42), &[app]).expect("relay submit");
-                // The composition's submit, signalling its present semaphore for the image.
-                let compose = composes.get(image(42), || device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()).unwrap();
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().signal_semaphores(&[compose]).build()], vk::Fence::null()).unwrap();
-                let fence = tickets.take(&device).unwrap();
-                resignal_app_waits(&device, queue, &[relay, compose], &[app], fence).expect("resignal submit");
-                let ticket = LastUse::Ticket(tickets.submitted(fence));
-                relays.note(relay, ticket);
-                composes.note(compose, ticket);
-                // The application's present, unchanged: it waits on its own semaphore.
-                let present_like = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&app)).wait_dst_stage_mask(&stage).build();
-                device.queue_submit(queue, &[present_like], presented).unwrap();
-                device.wait_for_fences(&[presented], true, u64::MAX).unwrap();
-                device.reset_fences(&[presented]).unwrap();
-                // The fences of earlier rounds are reused once seen signalled.
-                tickets.poll(&device);
-            }
-            // The swapchain is destroyed: its semaphores are retired, and freed once the last batch's
-            // fence was seen signalled (the present waited on the semaphore that batch signalled).
-            relays.retire(&[image(42)]);
-            composes.retire(&[image(42)]);
-            tickets.poll(&device);
-            assert_eq!(relays.reclaim(&device, &tickets), 1);
-            assert_eq!(composes.reclaim(&device, &tickets), 1);
-            assert!(relays.is_empty() && composes.is_empty());
-
-            device.queue_wait_idle(queue).unwrap();
-            tickets.destroy(&device);
-            device.destroy_fence(presented, None);
-            device.destroy_semaphore(app, None);
-            device.destroy_device(None);
-            instance.destroy_instance(None);
-        }
     }
 
     /// Real (lavapipe) queue: the relay batch must consume the application's wait

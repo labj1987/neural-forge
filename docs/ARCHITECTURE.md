@@ -684,15 +684,19 @@ complete, which needs a fence:
 - On a device with `swapchainMaintenance1` enabled, the layer chains a present fence of its own
   (`VkSwapchainPresentFenceInfoKHR`: its fence for the swapchain it worked on, none for the others)
   to each present it adds semaphores to.
-- When the application chains present fences of its own (DXVK and vkd3d-proton do), they stay its
-  own. Instead, one more fenced batch on the present's queue waits on the layer's semaphores and
-  signals the application's wait semaphores again (the relay consumed them), and the present goes
-  out exactly as the application made it.
+- When the application chains a present fence of its own for the swapchain (DXVK and vkd3d-proton do
+  on every present), it stays its own and the layer adds nothing: an application that fences its
+  presents waits for those fences before it destroys the swapchain (DXVK's
+  `Presenter::destroySwapchain`, vkd3d-proton's `dxgi_vk_swap_chain_drain_swapchain_fences`), so the
+  semaphores are freed when it destroys it. 3.8.3 and 3.8.4 instead submitted one more fenced batch per
+  such present (signalling the application's wait semaphores again in the present's place); in GTA V
+  Enhanced that cost a fifth of the frame rate for the rest of the session after the loading screens
+  it ran on, so no present gets a submission of the layer's for this.
 - The fences are looked at, never waited on, at each present and when a swapchain is destroyed; a
   signalled one is reset and reused.
-- Without the feature, and for a present the application fenced but gave no wait semaphores (nothing
-  was relayed), the semaphores are kept until the device is destroyed: Vulkan has no earlier point at
-  which a present's wait on them is known to be complete.
+- Without the feature, and for a present whose application fences leave out that swapchain (the
+  layer's fence cannot be added beside them), the semaphores are kept until the device is destroyed:
+  Vulkan has no earlier point at which a present's wait on them is known to be complete.
 
 The layer enables `swapchainMaintenance1` itself (`swapchain_maintenance.rs`): at `vkCreateDevice`, on
 an NVIDIA device that offers it and an application that did not enable it, `VK_KHR_swapchain_maintenance1`

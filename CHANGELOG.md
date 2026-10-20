@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.5 — 2026-10-20
+
+- Fixes a frame-rate loss in 3.8.3–3.8.4: after its loading screens, GTA V Enhanced ran about a fifth
+  slower for the rest of the session, with more stutter (other games under vkd3d-proton or DXVK could be
+  hit the same way). Present semaphores of destroyed swapchains are still freed, now without anything
+  extra on the GPU.
+
 ## 3.8.4 — 2026-10-20
 
 - `neural-forge-cli doctor` no longer reports a program that creates an older Vulkan instance as a GPU

@@ -1,15 +1,27 @@
 //! The semaphores the layer's presents wait on in place of (or beside) the application's, one per
-//! swapchain image, and the fences that tell when the last wait on one of them has completed.
+//! swapchain image, and what tells when the last wait on one of them has completed.
 //!
 //! Presentation completion is associated with an acquired image, not a command buffer slot: an image's
 //! semaphore is signalled again only for that image's next present, which cannot come before the image
 //! was acquired again. When its swapchain is destroyed the semaphore is retired, and destroyed once the
-//! last wait on it is known to be complete ([`LastUse`]): the fence of a [`Ticket`] signalled. A ticket's
-//! fence is either a present fence (`VK_KHR_swapchain_maintenance1`/`VK_EXT_swapchain_maintenance1`,
-//! [`Tracking::PresentFence`]) or the fence of the layer's own batch that waited on the semaphores in the
-//! present's place ([`Tracking::Resignal`]). A semaphore whose last wait was a present with neither
-//! ([`LastUse::Unknown`]) is kept until device teardown: Vulkan gives no earlier point at which a wait
-//! by such a present is known to be complete.
+//! last wait on it is known to be complete ([`LastUse`]):
+//!
+//! - [`Tracking::PresentFence`]: the layer chained a present fence of its own
+//!   (`VK_KHR_swapchain_maintenance1`/`VK_EXT_swapchain_maintenance1`) to the present, and its
+//!   [`Ticket`]'s fence was seen signalled.
+//! - [`Tracking::AppFenced`]: the application chained its own present fence for the swapchain (DXVK and
+//!   vkd3d-proton do on every present). That one stays the application's, and the layer adds nothing to
+//!   the present: an application that fences its presents waits for those fences before it destroys
+//!   the swapchain (the spec's `vkDestroySwapchainKHR` and `VkSwapchainPresentFenceInfoKHR`; DXVK's
+//!   `Presenter::destroySwapchain` and vkd3d-proton's `dxgi_vk_swap_chain_drain_swapchain_fences` do),
+//!   so the semaphores are free once the application destroys it.
+//! - Otherwise ([`LastUse::Unknown`]) the semaphore is kept until device teardown: Vulkan gives no
+//!   earlier point at which a wait by such a present is known to be complete.
+//!
+//! No present gets a submission of the layer's for this: one more batch on the present's queue per
+//! present (signalling the application's wait semaphores again in the present's place) cost GTA V
+//! Enhanced a fifth of its frame rate for the rest of the session after the loading screens it ran on
+//! (3.8.3 and 3.8.4).
 use ash::vk;
 use std::collections::HashMap;
 
@@ -24,6 +36,9 @@ pub enum LastUse {
     Done,
     /// The last wait completes before this ticket's fence signals.
     Ticket(Ticket),
+    /// Waited on by a present the application fenced for this semaphore's swapchain: complete once the
+    /// application destroyed that swapchain, which is when the semaphore is retired.
+    AppFenced,
     /// Waited on by a present without a fence: complete only once the device is idle.
     Unknown,
 }
@@ -96,6 +111,8 @@ impl PresentSemaphores {
             let free = match entry.last {
                 LastUse::Done => true,
                 LastUse::Ticket(ticket) => tickets.complete(ticket),
+                // Retired: the application destroyed the swapchain, after its present fences signalled.
+                LastUse::AppFenced => true,
                 LastUse::Unknown => false,
             };
             if free {
@@ -227,48 +244,63 @@ pub enum Tracking {
     /// The layer chains a `VkSwapchainPresentFenceInfoKHR` of its own: the device has
     /// `swapchainMaintenance1` enabled and the application chained none.
     PresentFence,
-    /// The application chained its own present fences, which stay its own: one more batch of the
-    /// layer's on the present's queue waits on the layer's semaphores, signals the application's own
-    /// wait semaphores again (the layer's relay consumed them), and is fenced; the present then goes
-    /// out exactly as the application made it.
-    Resignal,
-    /// Neither (no `swapchainMaintenance1`, or the application chained fences on a present without
-    /// wait semaphores, which the layer did not relay): the semaphores stay until device teardown.
+    /// The application chained its own present fence for the swapchain the layer worked on
+    /// ([`LastUse::AppFenced`]); the present goes on with nothing more of the layer's.
+    AppFenced,
+    /// Neither (no `swapchainMaintenance1`, or the application chained present fences but none for that
+    /// swapchain, so the layer's cannot be added): the semaphores stay until device teardown.
     Untracked,
 }
 
-/// `present_fences`: the device has `swapchainMaintenance1` enabled; `app_fences`: the application's
-/// present chains a `VkSwapchainPresentFenceInfoKHR`; `relayed`: the layer's relay batch consumed the
-/// application's wait semaphores (there were some).
-pub fn tracking(present_fences: bool, app_fences: bool, relayed: bool) -> Tracking {
-    match (app_fences, present_fences, relayed) {
-        (true, _, true) => Tracking::Resignal,
-        (true, _, false) => Tracking::Untracked,
-        (false, true, _) => Tracking::PresentFence,
-        (false, false, _) => Tracking::Untracked,
+/// The application's present fences, for the swapchain at one slot of a present.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AppFence {
+    /// No `VkSwapchainPresentFenceInfoKHR` in the present's chain.
+    None,
+    /// One, with a fence for that swapchain.
+    ForSlot,
+    /// One, without a fence for that swapchain (its entry `VK_NULL_HANDLE`, or fewer entries).
+    NotForSlot,
+}
+
+/// `present_fences`: the device has `swapchainMaintenance1` enabled.
+pub fn tracking(present_fences: bool, app: AppFence) -> Tracking {
+    match app {
+        AppFence::ForSlot => Tracking::AppFenced,
+        AppFence::NotForSlot => Tracking::Untracked,
+        AppFence::None if present_fences => Tracking::PresentFence,
+        AppFence::None => Tracking::Untracked,
     }
 }
 
-/// Whether `present_info`'s chain holds a `VkSwapchainPresentFenceInfoKHR` (or `_EXT`).
+/// The application's present fence for the swapchain at `slot` of `present_info` (read only).
 ///
 /// # Safety
-/// `present_info`'s chain is valid.
-pub unsafe fn chains_present_fences(present_info: &vk::PresentInfoKHR) -> bool {
+/// `present_info`'s chain is valid, and a `VkSwapchainPresentFenceInfoKHR` in it holds `swapchainCount`
+/// fences.
+pub unsafe fn app_present_fence(present_info: &vk::PresentInfoKHR, slot: usize) -> AppFence {
     let mut next = present_info.p_next.cast::<vk::BaseInStructure>();
     while !next.is_null() {
-        // SAFETY: every node of a valid chain starts with `sType` and `pNext`.
+        // SAFETY: every node of a valid chain starts with `sType` and `pNext`; one of this type is the
+        // fence structure.
         let node = unsafe { &*next };
         if node.s_type == PRESENT_FENCE_INFO {
-            return true;
+            let info = unsafe { &*next.cast::<vk::SwapchainPresentFenceInfoEXT>() };
+            if (slot as u32) >= info.swapchain_count || info.p_fences.is_null() {
+                return AppFence::NotForSlot;
+            }
+            // SAFETY: `p_fences` holds `swapchain_count` fences.
+            let fence = unsafe { *info.p_fences.add(slot) };
+            return if fence == vk::Fence::null() { AppFence::NotForSlot } else { AppFence::ForSlot };
         }
         next = node.p_next;
     }
-    false
+    AppFence::None
 }
 
 /// The layer's own present fences for a present of `swapchain_count` swapchains: `fence` for the one
 /// at `slot`, none for the others. Chained in front of the application's chain (`p_next`), which then
-/// holds none of its own ([`chains_present_fences`]).
+/// holds none of its own ([`AppFence::None`]).
 pub struct PresentFences {
     fences: Vec<vk::Fence>,
     pub info: vk::SwapchainPresentFenceInfoEXT,
@@ -348,11 +380,11 @@ mod tests {
 
     #[test]
     fn the_layer_chains_its_own_fence_only_where_the_application_chained_none() {
-        assert_eq!(tracking(true, false, true), Tracking::PresentFence);
-        assert_eq!(tracking(true, false, false), Tracking::PresentFence, "no application waits: nothing relayed, still fenced");
-        assert_eq!(tracking(true, true, true), Tracking::Resignal, "the application's fences stay its own");
-        assert_eq!(tracking(true, true, false), Tracking::Untracked, "nothing of the application's to signal again");
-        assert_eq!(tracking(false, false, true), Tracking::Untracked, "no swapchainMaintenance1: today's behaviour");
+        assert_eq!(tracking(true, AppFence::None), Tracking::PresentFence);
+        assert_eq!(tracking(true, AppFence::ForSlot), Tracking::AppFenced, "the application's fences stay its own");
+        assert_eq!(tracking(false, AppFence::ForSlot), Tracking::AppFenced);
+        assert_eq!(tracking(true, AppFence::NotForSlot), Tracking::Untracked, "no slot for the layer's: kept until teardown");
+        assert_eq!(tracking(false, AppFence::None), Tracking::Untracked, "no swapchainMaintenance1: kept until teardown");
 
         // The layer's chain: its fence at the engaged swapchain's slot, nothing at the others', in front
         // of the application's chain.
@@ -365,17 +397,19 @@ mod tests {
         assert_eq!(set, [vk::Fence::null(), vk::Fence::from_raw(77), vk::Fence::null()]);
         assert_eq!(fences.info.p_next, std::ptr::from_ref(&app_next).cast());
 
-        // The application's own fence info is found anywhere in its chain.
-        let app_fences = [vk::Fence::from_raw(5)];
+        // The application's own fence for a slot is found anywhere in its chain.
+        let app_fences = [vk::Fence::null(), vk::Fence::from_raw(5)];
         let theirs = vk::SwapchainPresentFenceInfoEXT::builder().fences(&app_fences).build();
         let regions = vk::PresentRegionsKHR::default();
         let behind = vk::PresentRegionsKHR { p_next: std::ptr::from_ref(&theirs).cast(), ..Default::default() };
-        let info = |next: *const std::ffi::c_void| vk::PresentInfoKHR { p_next: next, ..Default::default() };
+        let info = |next: *const std::ffi::c_void| vk::PresentInfoKHR { p_next: next, swapchain_count: 2, ..Default::default() };
         // SAFETY: each chain is of live locals.
         unsafe {
-            assert!(!chains_present_fences(&info(std::ptr::null())));
-            assert!(!chains_present_fences(&info(std::ptr::from_ref(&regions).cast())));
-            assert!(chains_present_fences(&info(std::ptr::from_ref(&behind).cast())));
+            assert_eq!(app_present_fence(&info(std::ptr::null()), 0), AppFence::None);
+            assert_eq!(app_present_fence(&info(std::ptr::from_ref(&regions).cast()), 1), AppFence::None);
+            assert_eq!(app_present_fence(&info(std::ptr::from_ref(&behind).cast()), 1), AppFence::ForSlot);
+            assert_eq!(app_present_fence(&info(std::ptr::from_ref(&behind).cast()), 0), AppFence::NotForSlot, "its entry for the slot is null");
+            assert_eq!(app_present_fence(&info(std::ptr::from_ref(&behind).cast()), 2), AppFence::NotForSlot, "fewer entries");
         }
     }
 
@@ -424,13 +458,22 @@ mod tests {
             sems.note(unknown, LastUse::Unknown);
             // Image 4: never waited on.
             sems.get(vk::Image::from_raw(4), new_semaphore).unwrap();
+            // Image 5: waited on by a present the application fenced, which it waited for before it
+            // destroyed the swapchain (here: the wait is a fenced submit, waited below).
+            let app_fenced = sems.get(vk::Image::from_raw(5), new_semaphore).unwrap();
+            let app_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().signal_semaphores(&[app_fenced]).build()], vk::Fence::null()).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(&[app_fenced]).wait_dst_stage_mask(&stage).build()], app_fence).unwrap();
+            sems.note(app_fenced, LastUse::AppFenced);
+            device.wait_for_fences(&[app_fence], true, u64::MAX).unwrap();
+            device.destroy_fence(app_fence, None);
 
-            sems.retire(&[1, 2, 3, 4].map(vk::Image::from_raw));
-            assert_eq!(sems.retired(), 4);
+            sems.retire(&[1, 2, 3, 4, 5].map(vk::Image::from_raw));
+            assert_eq!(sems.retired(), 5);
             device.wait_for_fences(&[first_fence], true, u64::MAX).unwrap();
             tickets.poll(&device);
             assert!(tickets.complete(first) && !tickets.complete(second));
-            assert_eq!(sems.reclaim(&device, &tickets), 2, "the fenced wait that completed, and the semaphore never waited on");
+            assert_eq!(sems.reclaim(&device, &tickets), 3, "the fenced wait that completed, the application-fenced one, and the semaphore never waited on");
             assert_eq!(semaphores(&sems), [queued.as_raw(), unknown.as_raw()], "kept: an unsignalled fence, and no fence at all");
             tickets.poll(&device);
             assert_eq!(sems.reclaim(&device, &tickets), 0, "still unsignalled: still kept");
