@@ -5,7 +5,7 @@ for every DLSS version installed on the test machine. Observed from the layer's 
 `NEURAL_FORGE_PROBE_NGX=1`: `vkCreateCuFunctionNVX` gives the names, and the `[probe-ngx] layout`
 lines (`preupscale.rs::probe_layout`) describe each 8-byte word of a launch's parameter buffer,
 matched against the views the game registered through `VK_NVX_image_view_handle`. Nothing here
-comes from reading NVIDIA's code.
+comes from reading NVIDIA's code, except the last section, which reads the PTX text DLSS-NR's DLL carries.
 
 ## Runs
 
@@ -113,3 +113,114 @@ Steam carries it (the layer still only runs where the game's launch options set
 ```bash
 grep -F '[probe-ngx] layout' launch.log
 ```
+
+## The network's own kernels: build 310.9.16 against 310.8.0 (2026-10-19)
+
+The sections above are DLSS Super Resolution's kernels seen from Vulkan. This one is DLSS-NR's network
+kernels, read from the PTX text `nvngx_dlssnr.dll` carries, to see what NVIDIA changed in 310.9.16 (its
+release notes claim half the GPU overhead of the September build and 20% less memory at 4K) and whether
+OpenDLSS-NR's generators (`scripts/ptx/`, `third_party/opendlss-nr/UPSTREAM.md`) lack any of it.
+
+**The DLLs.** 310.9.16.0 (266,424,944 bytes, SHA-256 `2BC19BC0…E28789F`, the build `extract-model` reads
+both networks from) and 310.8.0.0 (165,840,496 bytes, SHA-256 `E16BCF15…6E1FC8E`, the build the 2.x
+helper imported, still in its old data directory on the test machine). No other 310.x copy of DLSS-NR is
+on the machine: the games carry DLSS SR, RR and FG DLLs only, and the Proton prefixes no NGX downloads.
+
+**How it was read.** Each DLL's `.data` holds 15 CUDA fat binaries (header magic `0xBA55ED50`, length
+from the header). Each one copied out on its own and given to `cuobjdump -xptx all` (CUDA binutils, RE_TOOLKIT.md)
+yields one PTX module (`.version 9.4`, `.target sm_120`). Only the PTX text was read: no host code, no cubin,
+no resource beyond the weights `extract-model` already reads. Entries were split at `.entry` and compared
+statement by statement (multi-line statements joined, comments dropped) three ways: as text; after
+renumbering registers and labels in order of first use; and as the multiset of (opcode, immediates), which
+is equal when only the order of the statements and the registers they use moved. Every entry that failed all
+three was read by hand.
+
+| | 310.8.0 | 310.9.16 |
+|---|---|---|
+| PTX modules | 15 | 15 |
+| PTX text | 37.1 MB | 17.5 MB |
+| Entries | 231 | 120 |
+
+Every 310.9.16 entry is in 310.8.0 under the same name. The 111 that went are the non-FP8 twins of the
+network kernels (`cc_tinlayout_fused_swin_1h_32_1` beside `cc_tinlayout_fused_swin_1h_32_1_fp8`, and so
+on for every Swin, split-Swin, ViT and decoder kernel): 310.9.16 keeps only the E4M3 path, which is most of
+the PTX that went. Kernel families: `cc_tinlayout_fused_{pre_block,swin,post_block}_*` (window blocks at
+32/64/128/256 channels, with `_ds` downsampling and `_upsample` variants), `cc_split_swin_16h_*` (512
+channels), `cc_vit_*` and `cc_vit_1d_*` (the bottleneck ViT), `cc_dec_input_upsample_1024_512_*`, and the
+helpers `cg2r_*`, `cuda_capture_*`, `cuda_clear_view_kernel`, `cuda_font_kernel`, `cc_cb_clear`. Suffixes
+`_chained`, `_wait`, `_tilesync`, `_publish` are the counter-chained variants.
+
+### What changed, by class
+
+| Class | Entries | What |
+|---|---|---|
+| Identical | 8 | `cg2r_*`, `cuda_capture_*`, `cuda_clear_view_kernel`, `cuda_font_kernel` |
+| Registers renumbered | 3 | `cc_cb_clear`, `cc_vit_1d_repack_{1d_to_2d,2d_to_1d}_fp8` |
+| Reordered | 75 | the same statements in another order with other registers (scheduling): every `cc_split_swin_16h_*`, `cc_dec_input_upsample_*`, the 32-, 64- and 128-channel Swin kernels other than `_ds`, the post blocks, `cc_vit_{attention,projection,ffn_*}_*`, `cc_vit_1d_ffn_expand_fp8` |
+| Same value, other addressing | 3 | `cc_vit_qkv_{,chained_,wait_}fp8`: one store address is built from a register that already holds `64 b + 32 (tid.y & 1)`, shifted by 2, instead of `2 b + (tid.y & 1)` shifted by 7 |
+| Register cap only | 10 | `cc_tinlayout_fused_swin_8h_256_8_*` other than `_ds` (the 256-channel window kernels): `.maxnreg` 168 to 128, and some address arithmetic moved |
+| Semantic | 21 | the four changes below |
+
+So 112 of 120 entries differ as text, 34 beyond order and register numbering, and 31 in what they compute
+or how they are launched. (The third-party notes this survey started from, uzbekunknown/dlss-nr-on-intel
+`notes/phase72-preset-b.md`, Apache-2.0, ideas only, were summarised as 54 of 120 differing from "310.8"; their
+notes were not read here, so which build and which test that count used is not known.)
+
+### The semantic changes, and OpenDLSS-NR
+
+| Change in 310.9.16 | Entries | OpenDLSS-NR's counterpart | Here |
+|---|---|---|---|
+| **Acquire after a chained wait, a full fence before publishing.** In 310.8 thread 0 spins on the producer's counter with `ld.relaxed.gpu`, then `bar.sync`, and the workgroup reads the producer's rows: nothing orders those reads after the producer's release. 310.9.16 adds `fence.acquire.gpu` after that `bar.sync` on every waiting path, and `membar.gl` before the `bar.sync` that precedes the publishing `st.release.gpu`. | 10: `cc_vit_1d_{qkv,projection,ffn_contract}_*`, `cc_vit_1d_ffn_expand_{chained,publish}_fp8`, `cc_vit_1d_attention_chained_fp8` | `swin.py` `sync_wait` / `sync_signal`, used by every chained kernel: warp 0 polls with `ld.acquire.gpu` then `bar.sync`; producers `fence.acq_rel.gpu`, `bar.sync`, then `red.release.gpu` | Already so, on both sides |
+| **A padding store loop halved.** The downsampling kernels zero their output's 16-byte channel groups at pixels outside the image. 310.8 looped over twice as many groups as the output has (bounds 128, 256, 512, 1024 for the 64-, 128-, 256-, 512-channel outputs, 64 in the block-0 kernel; for 128 channels the index split `/16`, `/64` where 310.9.16 splits `/8`, `/32`): it wrote zeros past the output's own groups (where that lands depends on the strides NVIDIA's host passes; not followed). 310.9.16's bounds are half: 64, 128, 256, 512, and 32. | 9: `cc_tinlayout_fused_swin_{1h_32_1,2h_64_2,4h_128_4,8h_256_8}_ds{,_wait}_fp8`, `cc_tinlayout_fused_pre_block_swin_1h_32_1_ds_fp8` | None: the field is computed whole from reflection-padded features, activations are zeroed once when allocated (`nr_graph.cpp`), and the pools (`block32_e4m3` POOL) write only their own output | Not applicable |
+| **The ViT attention's tail, without a barrier.** The 1D attention zeroes the padded tokens of its output (tokens rounded up to 32). 310.8: after a `bar.sync`, the workgroup with `ctaid.y == ceil(ceil(tokens / 128) / 2) - 1`. 310.9.16: no barrier, every workgroup with `2 ctaid.y + 2 >= ceil(tokens / 128)` (the `ceil(tokens / 128)` bound the third-party notes report), and `.maxnreg` 168 to 255. On a grid of `ceil(ceil(tokens / 128) / 2)` workgroups in y both tests pick the last one at every token count: the change removes a barrier. | 2: `cc_vit_1d_attention{,_chained}_fp8` | `global_normalize_e4m3` writes zero codes for the padded tokens and the attention kernels correct for the padding in their sums; no workgroup stores the tail or waits for it | Already so (no barrier to remove) |
+| **The control mask against the auto mask** (block 0, the input lanes 11-15 it builds from launch parameters). 310.8: with a mask bound, lanes 13 and 14 (NVIDIA's skin and structure) are dropped and lane 12 is structure x mask.b. 310.9.16: a new integer parameter combines structure x mask.b with lanes 13 and 14 while the auto mask is on: 2 min, 3 max, any other non-zero value the mean, 0 not at all. A second new integer, above 15, moves lanes 13 and 14 up one (13 becomes 0). Lane 11 is tone x mask.g in both. | 2: `cc_tinlayout_fused_pre_block_swin_1h_32_1{,_ds}_fp8` | Not OpenDLSS-NR's: Neural Forge's own preprocess (`native_preprocess.comp`) builds these lanes | Mode 2 only, by choice (NATIVE_BACKEND.md, "The control mask"). The lane move is not reproduced: it is off at NGX's defaults (both networks are bit-exact against NGX at presets 0 and 1, NATIVE_BACKEND.md "Against NGX (3.5.2)"), and what turns it on is not in the PTX |
+
+None of the four is a correctness change OpenDLSS-NR needs. NVIDIA's halved GPU time is not in these
+kernels either: the same entries do the same work. What 310.9.16 changed for the GPU is the network NGX runs
+by default, the small one at preset 0 (3.6 ms against the full network's 5.1 ms at 1486x836, NATIVE_BACKEND.md),
+and the PTX it no longer carries.
+
+### Register caps (the one launch change)
+
+310.9.16 lowers the 256-channel window kernels' cap from 168 to 128 registers and raises the ViT attention's
+to 255: launch tuning, the arithmetic is unchanged. The same question for OpenDLSS-NR's kernels, from the
+driver itself (each module JIT-compiled through `cuModuleLoadData` with and without a cap, read with
+`cuFuncGetAttribute` and `cuOccupancyMaxActiveBlocksPerMultiprocessor` at the launch's block size and dynamic
+shared memory; nothing launched), RTX 5070 (sm_120, 64K registers and 100 KB shared memory per SM):
+
+| Kernel | Registers (spill) | Workgroups per SM | With a cap |
+|---|---|---|---|
+| `block32_e4m3_f*` (128 threads, 24 KB) | 115-125 | 4 | 4 at 96 (shared memory bounds it) |
+| `qkv_e4m3_K*` (capped 80 upstream) | 80 | 5 | 5 at 64, 56 bytes spilled |
+| `mlp_e4m3_K256` | 104 | 4 | 4 at 80-96 |
+| `gemmv_e4m3_*` (48-94 KB dynamic) | 96-255 | 1-2 | the same at 96-168, up to 192 bytes spilled |
+| `gemm2_e4m3_K32_*` | 31-44 | 10-11 | 11 at 40 |
+| `gemmt_e4m3_*` (384 threads, 24 KB) | 40-54 | 3-4 | 4 at 40, no spill |
+| `ffn_e4m3_C128_R4{,_proj}` (512 threads, 45 KB) | 88, 84 | **1** | **2 at 64**, 48-56 bytes spilled |
+| `ffn_e4m3_C64_R4`, `C256_R3/R4` | 73; 80, 64 (16-64 spilled) | 3; 1 | shared memory or the block size bounds them |
+
+Three caps that change the count were timed with the rig's C-API test (`graph back to back (secondary)`,
+40 runs, frame d1w, 1486x836, the binaries alternated on the idle GPU, every run bit-exact):
+
+| Build | Full network, min / median | Small network, min / median |
+|---|---|---|
+| As upstream | 5.52 / 5.60 ms | 2.92 / 2.96 ms |
+| `ffn_e4m3_C128_R4` and `_proj` capped at 64 | **5.33 / 5.41 ms** | **2.87 / 2.90 ms** |
+| and every `gemmt_e4m3` at 40 | 5.33 / 5.40 ms | 2.86 / 2.90 ms |
+| and `gemm2_e4m3_K32_*` at 40 | 5.32 / 5.41 ms | 2.86 / 2.90 ms |
+
+The 128-channel FFN cap is worth 0.20 ms on the full network (3.5%) and 0.06 ms on the small one (2%), with
+the same head; the other two are inside the noise and were not kept. `build.rs` generates the two FFN kernels
+with the cap (`third_party/opendlss-nr/UPSTREAM.md` notes the exception to upstream's invocations).
+
+Against NVIDIA's runtime at the same size (NATIVE_BACKEND.md, "Against NGX (3.5.2)", the helper's busy time,
+which includes its own overhead, so an upper bound for NGX): small network NGX 3.6 ms, native 2.96 before and
+2.90 ms after; full network NGX 5.1 ms, native 5.60 before and 5.41 ms after. The full network is still about
+0.3 ms behind.
+
+### Repeating it
+
+In each DLL, find every `0xBA55ED50` in the file and copy that fat binary out on its own: its 16-byte header
+is the magic (u32), a version (u16), the header size (u16, 16) and the payload size (u64). Give each copy to
+`cuobjdump -xptx all` in its own directory, split the `.ptx` files at `.entry` and compare as described above.
+The scripts that did this were scratch and are not kept.
