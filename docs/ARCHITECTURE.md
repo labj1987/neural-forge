@@ -187,7 +187,7 @@ the 2.0 work; 2.0.0 ships 11, 3.0.0 ships 15, 3.2.0 ships 16, 3.3.0 ships 17, 3.
 ```mermaid
 flowchart TD
     start["Game submits work / presents"] --> mode{"NEURAL_FORGE_PREUPSCALE=off?"}
-    mode -- yes --> post["After the upscaler (1.x path)"]
+    mode -- yes --> none["No network loaded:<br/>frames presented untouched"]
     mode -- "no (default: model)" --> nvx{"Device has<br/>VK_NVX_image_view_handle?"}
     nvx -- no --> post
     nvx -- yes --> dlss{"DLSS SR input identified<br/>and a submit reads it?"}
@@ -197,7 +197,10 @@ flowchart TD
     handback -- yes --> post
 ```
 
-The mode is read once per process from the environment (`preupscale::mode`). With `off`, the
+The mode is read once per process from the environment (`preupscale::mode`). With `off` the native
+backend is not created (`lib.rs`, `native`), so there is no model server and the after-the-upscaler path
+presents every frame untouched (logged once, `[native] NEURAL_FORGE_PREUPSCALE=off`); the model on the
+finished frame is the `present` placement, in model mode. With `off`, the
 hooked-command list, the resolved entry points and every hot path are exactly 1.1.0's; tests
 (`lib.rs::probe_command_tests`) and the smoke test's `off` pass guard that. A device without NVX
 never gets the tracking either.

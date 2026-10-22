@@ -125,10 +125,11 @@ scripts/gta-bench.sh --host <host> nroff-1 '' 'WINEDLLOVERRIDES=xinput1_4=b;dinp
 scripts/gta-bench.sh --host <host> nron-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
-The 1.x path for comparison:
+The 1.x path (the model on the finished frame, placement `present`) for comparison.
+`NEURAL_FORGE_PREUPSCALE=off` is not this: it loads no network, so it measures the layer with the model off.
 
 ```bash
-scripts/gta-bench.sh --host <host> post-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 NEURAL_FORGE_PREUPSCALE=off 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
+scripts/gta-bench.sh --host <host> --set placement=present post-1 VK_LAYER_neuralforge_neural NEURAL_FORGE_ENABLE=1 'WINEDLLOVERRIDES=xinput1_4=b;dinput8=b'
 ```
 
 Summarise, and average three runs of one configuration:
@@ -451,8 +452,8 @@ minutes, GTA V Enhanced, launch option `NEURAL_FORGE_ENABLE=1 %command%`, DLSS B
 3. At night with headlights and street lights: blown-out lights, colour fringes, flicker?
 4. Frame generation on in GTA's settings, at 2x, 3x and 4x: does it look and feel right with F11
    on? (Check the fps counter that frame generation actually engaged.)
-5. Optional A/B with the 1.x path: add `NEURAL_FORGE_PREUPSCALE=off` before `%command%`, relaunch,
-   look at the same spots, then remove it.
+5. Optional A/B with the 1.x path: set Placement to Finished frame in the Model tab, look at the same
+   spots, then set it back to Auto.
 
 Report better / same / worse for 1-3, how 2x/3x/4x look, and anything odd. The 2.0 result: an hour
 of play at DLSS Frame Generation 4x, "everything is working beautifully" (HARDWARE_VALIDATION.md,

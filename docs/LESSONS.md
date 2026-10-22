@@ -1295,6 +1295,50 @@ The runner waited up to 20 minutes for a result whatever happened, and a cancell
 beside the next one. It now ends a launch at 480 s, refuses to start while a GTA process is running, and kills
 the Wine processes of GTA's prefix that the launch started.
 
+## October 21: pipelining the hand-off (measured, not built)
+
+al-sca's proton-crossapi-pipeline (https://github.com/al-sca/proton-crossapi-pipeline) found that mods
+which hand each frame to a second device under Proton (DXVK and vkd3d-proton, two VkDevices joined by a
+shared timeline semaphore) lose 5.8-7.5 ms per frame to idle waiting, a fixed cost: its serial mode took
+18.59 ms for both 11.95 ms and 11.10 ms of real work. Presenting the whole previous frame (wait for pass
+n-1 before overwriting the input, copy its result home, then hand frame n over) took the GPU from about
+60% to 98%. The 2.x helper was that shape (its own device under Wine, 5.9-6.1 ms of round trip per hold,
+PRE_UPSCALER_DESIGN.md, "Hand-off latency"), so the question was whether 3.x still is.
+
+It is not: since 3.0 there is one device. Measured with `scripts/gta-bench.sh`, 2560x1440, GTA V
+Enhanced, DLSS Balanced, settings as found (frame generation 4x, Preset C), script mods off, pass 4, one
+run each; GTA turned frame generation off by itself in the first three (1.0x), so those three compare
+directly. GPU from nvidia-smi each second, CPU per thread from `top -H` each second (100 = one core).
+
+| Run | Real fps | GPU | Power | Busiest thread | Per-frame breakdown |
+|---|---|---|---|---|---|
+| Neural Forge not loaded | 93.6 | 63% | 145 W | 73% avg, 90% max | - |
+| Model before the upscaler (default) | 76.4 | 84% | 188 W | 64% avg, 83% max | hold (CPU) 0.10 ms; network 5.77 ms on half the frames, edit cache 1.03 ms, write-back 0.44 ms (GPU) |
+| `NEURAL_FORGE_PREUPSCALE=off` | 93.5 | 65% | 146 W | 73% avg | no network loaded (below) |
+| Finished frame (`placement=present`), FG 4x | 12.8 (43.2 shown) | 96% | 223 W | 34% avg | capture wait 2.30, answer wait 17.65 (model 17.50), rest 0.05 ms; 43.6 composites/s |
+| Finished frame, FG off | 35.7 | 96% | 214 W | 34% avg | capture wait 5.25 (the game's frame draining; capture 0.72 on the GPU), answer wait 17.55 (model 17.30), rest 0.06 ms; compose 1.83 ms GPU |
+
+- **Before the upscaler there is no hand-off.** The network is recorded on the game's own queue between
+  the game's work and DLSS; the submit is held 0.10 ms of CPU, and nothing waits on the host. The frame
+  grew 2.41 ms (10.68 to 13.09) for about 3.8 ms of added GPU work per frame: less than the sum, because
+  the GPU, 37% idle without Neural Forge (GTA's own CPU-side limits), takes the work into that idle time.
+  There is no idle waiting to remove. Holding DLSS's whole submission one frame (keeping copies of its
+  colour, depth, motion vectors, exposure and jitter) would add a frame of latency and video memory and
+  could not shorten a frame whose layer work already runs in line on one queue.
+- **On the finished frame the GPU is full.** The round trip outside the model is 0.05-0.06 ms (the model
+  server polls every 200 us). With frame generation every presented frame, the generated ones too, runs
+  the model (0.1.83's finding, `model_interval` its remedy), so 43.6 model frames a second fill the GPU.
+  Without it the frame time, 28.0 ms, is the sum of the GPU work (game about 6.7, model 17.5, capture 0.8,
+  compose 1.8: 26.8 ms, 96%). al-sca measured that the pipelined mode lands near the sum of both passes,
+  not their maximum, so at most the remaining 4% (about 1 ms, 1.3 fps at 36 fps) could come back, below
+  the run-to-run spread. Neither pipelined mode was built; `NEURAL_FORGE_PIPELINED` (answers composited
+  onto later frames) stays as it is.
+- **`NEURAL_FORGE_PREUPSCALE=off` had been loading no network since 3.0.** The native backend is created
+  only in a mode other than off (`lib.rs`, `native`), and without it there is no model server, so the
+  after-the-upscaler path presented every frame untouched: the run above equals the model off. The README
+  and the docs still called it "the after-the-upscaler path everywhere"; they now say what it does, the
+  layer logs it once, and the comparison with the model on the finished frame is `placement=present`.
+
 ## Deliberately not done, or left open
 
 - **Phases 2 and 3 of the original 2.0 plan** (a cheaper model resolution on the zero-copy path,

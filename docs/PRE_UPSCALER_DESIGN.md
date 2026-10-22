@@ -1060,6 +1060,18 @@ In the post path the helper's stages are the same shape (2560x1440 RGBA8: thumb 
 of 11.5 ms for the GPU work).
 Run-to-run spread is about 3 fps (65.1-68.1), so a 1-2 fps difference between single runs is noise.
 
+### Since 3.0: nothing to pipeline (2026-10-21)
+
+The helper's hand-off above (two devices, a round trip of 5.9-6.1 ms per hold) is the cost al-sca's
+proton-crossapi-pipeline removes for cross-device mods under Proton by presenting the whole previous frame.
+Since 3.0 the network runs in the layer, on the game's device and queue, in line between the game's work
+and DLSS: the submit is held 0.10 ms of CPU, and the frame grows less than the work added (LESSONS.md,
+"October 21: pipelining the hand-off"). A one-frame delay before the upscaler would mean holding DLSS's whole
+submission with copies of every input it reads (colour, depth, motion vectors, exposure, the jitter in its
+kernel parameters) and handing DLSS Frame Generation a frame late; it would cost a frame of latency and
+video memory (near the limit at 4K) for no idle time to recover, so it was not built. The after-the-upscaler
+path's round trip outside the model is 0.05 ms, and the GPU is 96% busy there; nothing fixed is left to cut.
+
 ## 2.0: the default
 
 `model` is what an unset `NEURAL_FORGE_PREUPSCALE` means (`preupscale::DEFAULT`). What changed with

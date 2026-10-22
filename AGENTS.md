@@ -156,8 +156,10 @@ Desert's is `rrlite_*`, and `custom_block*`/`k_initial_merge` are Frame Generati
 exposure is measured from the frame ("Auto-exposure when the game gives DLSS none"). Everything else (no NVX, no DLSS, native)
 keeps the post-upscaler path. Only the launch-bearing command buffer whose
 kernel parameters name the identified colour input is held, so DLSS Frame Generation's submits go
-through untouched (docs/PRE_UPSCALER_DESIGN.md, "DLSS Frame Generation"). `NEURAL_FORGE_PREUPSCALE=off` is the A/B
-and rollback switch; `dump`, `identity` and `roundtrip` are diagnostics. Rule: with
+through untouched (docs/PRE_UPSCALER_DESIGN.md, "DLSS Frame Generation"). `NEURAL_FORGE_PREUPSCALE=off` is the
+rollback switch: since 3.0 it also loads no network (the native backend needs a mode on), so the post path
+presents every frame untouched; the A/B with the model on the finished frame is `placement=present`.
+`dump`, `identity` and `roundtrip` are diagnostics. Rule: with
 `NEURAL_FORGE_PREUPSCALE=off` the post path must stay byte-identical to 1.1.0 (the hooked-command
 list is the default set, no NVX entry points resolved, nothing of `preupscale` reachable), and a
 device without NVX must not get the tracking under the default either; the tests in

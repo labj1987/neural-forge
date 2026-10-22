@@ -836,6 +836,14 @@ impl NeuralForgeInstanceHooks {
         // untouched in native mode, and the log says why).
         #[cfg(target_arch = "x86_64")]
         let native = nvidia && preupscale::active();
+        // With `NEURAL_FORGE_PREUPSCALE=off` the network is never loaded (no model server either), so
+        // every frame goes out as the game made it. Said once, under `[native]`: the off mode logs no
+        // `[preupscale]` line (smoke test).
+        #[cfg(target_arch = "x86_64")]
+        if nvidia && !native && crate::env_flag("NEURAL_FORGE_ENABLE") && !crate::env_flag("NEURAL_FORGE_DISABLE") {
+            static OFF_NOTED: std::sync::Once = std::sync::Once::new();
+            OFF_NOTED.call_once(|| log!("[native] NEURAL_FORGE_PREUPSCALE=off: the network is not loaded, so frames are presented as the game made them; the model on the finished frame is the placement setting's `present`"));
+        }
         let create = |info: &vk::DeviceCreateInfo, p_device: &mut std::mem::MaybeUninit<vk::Device>| -> vk::Result {
             #[cfg(target_arch = "x86_64")]
             if native {

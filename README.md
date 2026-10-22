@@ -87,8 +87,9 @@ layer picks the place for each game by itself:
 The game's own **DLSS Frame Generation** works with the model before the upscaler and after DLSS.
 Generated frames are built from enhanced frames, and the model runs once per real frame.
 
-`NEURAL_FORGE_PREUPSCALE=off` in the launch options switches back to the after-the-upscaler path
-everywhere. Use it to compare the two, or to roll back if something looks wrong.
+To run the model on the finished frame instead, set Placement to Finished frame in the Model tab (live,
+no relaunch). `NEURAL_FORGE_PREUPSCALE=off` in the launch options loads no network at all: the game's
+frames are presented as it made them, the rollback when something looks wrong.
 
 How it works, step by step: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
@@ -455,7 +456,7 @@ the code (`crates/`, `scripts/`).
 | `NEURAL_FORGE_ENABLE=1` | layer (manifest) | Turns the layer on for this game. |
 | `NEURAL_FORGE_DISABLE=1` | layer (manifest) | Forces it off, overriding `ENABLE`. |
 | `NEURAL_FORGE_TARGET_EXE=a.exe,b.exe` | layer | Only these executables (case-insensitive basenames) may use the layer, even one whose name is on the built-in list of launchers and helpers (a game whose executable is `Launcher.exe`). Switching a game on sets it to the game's own executables. Without it, the first process not on that list to present steadily takes the layer. |
-| `NEURAL_FORGE_PREUPSCALE=off` | layer | Never run the model before the upscaler: the after-the-upscaler path everywhere. Unset (or `model`) is the default. An unknown value is logged and treated as `off`. |
+| `NEURAL_FORGE_PREUPSCALE=off` | layer | Rollback: the network is not loaded, so no frame is changed. The model on the finished frame is the Placement setting's Finished frame instead. Unset (or `model`) is the default. An unknown value is logged and treated as `off`. |
 | `NEURAL_FORGE_PREUPSCALE=dump\|identity\|roundtrip` | layer | Diagnostics: write DLSS's input to `captures/`, hold without the model (raw copy back), or run the HDR encode and decode with no model. See [docs/RUNNING_AND_MEASURING.md](docs/RUNNING_AND_MEASURING.md). |
 | `NEURAL_FORGE_EDIT_CACHE=off` | layer | Before the upscaler, run the network on every frame instead of the edit cache's cadence (every frame while the camera is still, every second frame while it moves), with none of the cache at all (the game's depth is neither made copyable nor copied). For A/B comparisons, benchmarks and rollback; unset (or `on`) is the default. An unknown value is logged and the cache stays on. |
 | `NEURAL_FORGE_SCENE_CUT=off\|N` | layer | Before the upscaler, how different two frames must be for the model to start afresh: the mean change of brightness, 1 to 255 (default 40), or `off` to never start afresh on a cut. For testing; an unknown value is logged and the default stays. |
@@ -500,8 +501,9 @@ folder and user name are replaced in it.
   extensions. The model then runs after the upscaler. With DLAA, recognising the frame takes a few
   frames after DLSS starts, and the model then works on the full output-size frame, so it costs more
   than with DLSS Quality or Balanced.
-- **Something looks wrong.** Add `NEURAL_FORGE_PREUPSCALE=off` to the launch options to compare
-  with the after-the-upscaler path, and remove it again afterwards. F11 switches the model off and on in either.
+- **Something looks wrong.** F11 switches the model off and on. Placement Finished frame in the Model tab
+  runs it on the finished frame instead, to compare. `NEURAL_FORGE_PREUPSCALE=off` in the launch options
+  keeps the network from loading at all; remove it again afterwards.
 - **F11 does nothing.** Add yourself to the `input` group (see [Usage](#usage)). The layer log
   (`NEURAL_FORGE_LOG`) has a `[hotkey]` line saying which backend it uses.
 - **The model does not run.** The Status tab's Model placement line, or Diagnose, gives the reason:
