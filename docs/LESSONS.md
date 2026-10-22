@@ -1368,7 +1368,11 @@ ReShade, dlssg-to-fsr3, the FSR 4 overrides, HelixSR), read for what Neural Forg
 - **Not needed yet, pre-SR inputs smaller than their image** (wilsjo2's padded pre-SR): every game held so far (GTA V
   Enhanced, Crimson Desert, Cyberpunk 2077, Black Myth: Wukong, GTA San Andreas DE, Hogwarts Legacy) renders into an
   image of its render size. A game with dynamic resolution into a larger image would need it.
-- **Left for later:** the game's reactive mask in the edit cache (AMDNR's `reactiveAt`; GTA's is R-only), the frame
+- **Not available in GTA V Enhanced: a reactive mask.** DLSS's input kernel names six images there (the 1485x836
+  colour input, the 2560x1440 output, the motion vectors, depth, a 1x1 RGBA32F and a 640x384 RGBA16F image), none of
+  them a one-channel mask, so there is no reactive mask to read (the layer now logs that list once per session,
+  `DLSS's input kernel names ...`).
+- **Left for later:** the game's reactive mask in the edit cache in games that pass one (AMDNR's `reactiveAt`), the frame
   generation HUD-less image as an exact HUD mask (dlssg-to-fsr3 reads `DLSSG.HUDLess`; a Vulkan layer under Proton sees
   only images, not NGX's parameters), a low-band temporal filter of the correction (SAOG's Magpie, lmxxf's
   `DLSS5_TEMPORAL_MODE`; DLSS5VKLayer measured an answer carried into newer frames as a dead end twice, ATTRIBUTION.md

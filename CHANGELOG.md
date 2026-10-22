@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.9 — 2026-10-22
+
+- GTA San Andreas - The Definitive Edition runs the model before the upscaler again. Its newer DXVK makes a call
+  that binds nothing, which Neural Forge took for a change it could not undo, so it left the game's frames alone.
+- `neural-forge-cli doctor` estimates the network's video memory as it is since 3.8.8 (about 0.4-1.4 GB depending on
+  the resolution).
+
 ## 3.8.8 — 2026-10-22
 
 - The network needs much less video memory: about 800 MB less at 1440p and about 1.8 GB less at 4K, with the same

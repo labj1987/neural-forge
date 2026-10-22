@@ -862,13 +862,56 @@ unsafe fn next_of<T: Copy>(cb: vk::CommandBuffer, pick: impl Fn(&Next) -> Option
     Some((w, f))
 }
 
+/// Whether a `vkCmdBindDescriptorSets2` call changes the compute state: it reaches the compute stage and binds at
+/// least one set. One that binds none (GTA San Andreas DE's DXVK: 0 sets, a null layout, no chain) leaves nothing to
+/// put back after a hold.
+fn binds_compute_sets(i: &BindDescriptorSetsInfo) -> bool {
+    i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.descriptor_set_count > 0
+}
+
+/// Whether a `vkCmdPushConstants2` call changes the compute state: it reaches the compute stage and pushes bytes.
+fn pushes_compute_constants(i: &PushConstantsInfo) -> bool {
+    i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.size > 0
+}
+
+/// The structure types chained from `p_next`, for the once-only line that says why a `2` binding command made
+/// a buffer unrestorable (and which structure a game chains there).
+unsafe fn chain_types(mut p_next: *const std::ffi::c_void) -> Vec<i32> {
+    let mut types = Vec::new();
+    while !p_next.is_null() && types.len() < 8 {
+        // SAFETY: a valid pNext chain starts with VkBaseInStructure (the caller's contract).
+        let base = unsafe { &*p_next.cast::<vk::BaseInStructure<'static>>() };
+        types.push(base.s_type.as_raw());
+        p_next = base.p_next.cast();
+    }
+    types
+}
+
+/// Logs once per process which chained structure (or null layout) made a `2` binding command unrestorable.
+fn say_chained(command: &str, layout_null: bool, types: &[i32]) {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !SAID.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        crate::log!("[preupscale] {command}: layout {}, chained structure types {types:?}", if layout_null { "null" } else { "set" });
+    }
+}
+
 unsafe extern "system" fn bind_descriptor_sets2(cb: vk::CommandBuffer, info: *const BindDescriptorSetsInfo) {
     // SAFETY: the application's call: `cb` is recording and `info` valid.
     unsafe {
         let Some((w, next)) = next_of(cb, |n| n.bind_descriptor_sets2) else { return };
-        if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE)) {
+        // A call that binds no set binds nothing to put back (GTA San Andreas DE's DXVK binds 0 sets with a null
+        // layout and no chain, 2026-10-22): not noted.
+        if let Some(i) = info.as_ref().filter(|i| binds_compute_sets(i)) {
             w.tracker.note(cb, |s| {
                 if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
+                    say_chained(
+                        &format!(
+                            "vkCmdBindDescriptorSets2 (stages {:?}, first set {}, {} sets, {} dynamic offsets)",
+                            i.stage_flags, i.first_set, i.descriptor_set_count, i.dynamic_offset_count
+                        ),
+                        i.layout == vk::PipelineLayout::null(),
+                        &chain_types(i.p_next),
+                    );
                     s.refuse("vkCmdBindDescriptorSets2 with a chained structure");
                 } else {
                     let sets = slice(i.p_descriptor_sets, i.descriptor_set_count).to_vec();
@@ -885,7 +928,8 @@ unsafe extern "system" fn push_constants2(cb: vk::CommandBuffer, info: *const Pu
     // SAFETY: as above.
     unsafe {
         let Some((w, next)) = next_of(cb, |n| n.push_constants2) else { return };
-        if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE)) {
+        // Nothing pushed is nothing to put back.
+        if let Some(i) = info.as_ref().filter(|i| pushes_compute_constants(i)) {
             w.tracker.note(cb, |s| {
                 if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
                     s.refuse("vkCmdPushConstants2 with a chained structure");
@@ -902,7 +946,8 @@ unsafe extern "system" fn push_descriptor_set2(cb: vk::CommandBuffer, info: *con
     // SAFETY: as above.
     unsafe {
         let Some((w, next)) = next_of(cb, |n| n.push_descriptor_set2) else { return };
-        if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE)) {
+        // No write is nothing to put back.
+        if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.descriptor_write_count > 0) {
             w.tracker.note(cb, |s| {
                 if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
                     s.refuse("vkCmdPushDescriptorSet2 with a chained structure");
@@ -937,7 +982,8 @@ unsafe extern "system" fn set_descriptor_buffer_offsets2(cb: vk::CommandBuffer, 
     // SAFETY: as above.
     unsafe {
         let Some((w, next)) = next_of(cb, |n| n.set_descriptor_buffer_offsets2) else { return };
-        if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE)) {
+        // No set is nothing to put back.
+        if let Some(i) = info.as_ref().filter(|i| i.stage_flags.contains(vk::ShaderStageFlags::COMPUTE) && i.set_count > 0) {
             w.tracker.note(cb, |s| {
                 if !i.p_next.is_null() || i.layout == vk::PipelineLayout::null() {
                     s.refuse("vkCmdSetDescriptorBufferOffsets2EXT with a chained structure");
@@ -1120,6 +1166,36 @@ mod tests {
         assert!(t.with(late, |s| s.complete() && s.compute.is_some()));
         t.forget(late);
         assert!(!t.with(late, |s| s.complete()), "freed: nothing noted until it begins again");
+    }
+
+    #[test]
+    fn a_binding_command_that_binds_nothing_is_not_noted() {
+        let sets = |stage_flags, layout, descriptor_set_count| BindDescriptorSetsInfo {
+            s_type: vk::StructureType::from_raw(1_000_545_003),
+            p_next: std::ptr::null(),
+            stage_flags,
+            layout,
+            first_set: 0,
+            descriptor_set_count,
+            p_descriptor_sets: std::ptr::null(),
+            dynamic_offset_count: 0,
+            p_dynamic_offsets: std::ptr::null(),
+        };
+        // GTA San Andreas DE's call (2026-10-22): nothing bound, nothing to refuse.
+        assert!(!binds_compute_sets(&sets(vk::ShaderStageFlags::COMPUTE, vk::PipelineLayout::null(), 0)));
+        assert!(binds_compute_sets(&sets(vk::ShaderStageFlags::COMPUTE, vk::PipelineLayout::null(), 1)), "a null layout binding sets is still refused");
+        assert!(!binds_compute_sets(&sets(vk::ShaderStageFlags::FRAGMENT, vk::PipelineLayout::null(), 2)));
+        let push = |size| PushConstantsInfo {
+            s_type: vk::StructureType::from_raw(1_000_545_004),
+            p_next: std::ptr::null(),
+            layout: vk::PipelineLayout::null(),
+            stage_flags: vk::ShaderStageFlags::COMPUTE,
+            offset: 0,
+            size,
+            p_values: std::ptr::null(),
+        };
+        assert!(!pushes_compute_constants(&push(0)));
+        assert!(pushes_compute_constants(&push(4)));
     }
 
     #[test]
