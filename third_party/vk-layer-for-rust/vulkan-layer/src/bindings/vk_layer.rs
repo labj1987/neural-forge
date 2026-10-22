@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -53,8 +55,8 @@ type VkPhysicalDevice = vk::PhysicalDevice;
 type VkDevice = vk::Device;
 type VkStructureType = vk::StructureType;
 type VkResult = vk::Result;
-type VkDeviceCreateInfo = vk::DeviceCreateInfo;
-type VkAllocationCallbacks = vk::AllocationCallbacks;
+type VkDeviceCreateInfo = vk::DeviceCreateInfo<'static>;
+type VkAllocationCallbacks = vk::AllocationCallbacks<'static>;
 
 #[repr(transparent)]
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]

@@ -110,7 +110,7 @@ pub(crate) unsafe fn feature(gipa: vk::PFN_vkGetInstanceProcAddr, instance: vk::
     // SAFETY: the name's signature.
     let Some(features2) = (unsafe { cast::<vk::PFN_vkGetPhysicalDeviceFeatures2>(gipa(instance, name.as_ptr())) }) else { return false };
     let mut of = vk::PhysicalDeviceOpticalFlowFeaturesNV::default();
-    let mut f2 = vk::PhysicalDeviceFeatures2::builder().push_next(&mut of).build();
+    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut of);
     // SAFETY: a valid chain, filled in by the call.
     unsafe { features2(physical, &mut f2) };
     of.optical_flow == vk::TRUE
@@ -135,11 +135,11 @@ pub(crate) unsafe fn capabilities(gipa: vk::PFN_vkGetInstanceProcAddr, instance:
         )
     };
     let mut of = vk::PhysicalDeviceOpticalFlowPropertiesNV::default();
-    let mut p2 = vk::PhysicalDeviceProperties2::builder().push_next(&mut of).build();
+    let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut of);
     // SAFETY: a valid chain, filled in by the call.
     unsafe { properties2(physical, &mut p2) };
     let list = |usage: vk::OpticalFlowUsageFlagsNV| -> Vec<vk::Format> {
-        let info = vk::OpticalFlowImageFormatInfoNV::builder().usage(usage).build();
+        let info = vk::OpticalFlowImageFormatInfoNV::default().usage(usage);
         let mut count = 0u32;
         // SAFETY: the count query, then as many structures as it said.
         unsafe {
@@ -183,21 +183,22 @@ pub(crate) unsafe fn chains(info: &vk::DeviceCreateInfo, ty: vk::StructureType) 
 
 /// A device request with the optical flow added: the extension, the feature (prepended to the chain) and
 /// one queue of `family`. Holds what the request points at.
-pub(crate) struct Request {
-    pub info: vk::DeviceCreateInfo,
-    _features: Box<vk::PhysicalDeviceOpticalFlowFeaturesNV>,
+pub(crate) struct Request<'a> {
+    /// The application's create info, pointing into the fields below too: valid while `self` lives.
+    pub info: vk::DeviceCreateInfo<'a>,
+    _features: Box<vk::PhysicalDeviceOpticalFlowFeaturesNV<'static>>,
     _names: Vec<*const c_char>,
-    _queues: Vec<vk::DeviceQueueCreateInfo>,
+    _queues: Vec<vk::DeviceQueueCreateInfo<'a>>,
     _priority: Box<[f32; 1]>,
 }
 
-impl Request {
+impl<'a> Request<'a> {
     /// `None` when the request already chains an optical-flow feature structure (the application's own:
     /// one structure of a type is all a chain may hold).
     ///
     /// # Safety
     /// `base` is a valid request that outlives the result.
-    pub(crate) unsafe fn new(base: &vk::DeviceCreateInfo, family: u32) -> Option<Self> {
+    pub(crate) unsafe fn new(base: &vk::DeviceCreateInfo<'a>, family: u32) -> Option<Self> {
         // SAFETY: forwarded.
         if unsafe { chains(base, vk::StructureType::PHYSICAL_DEVICE_OPTICAL_FLOW_FEATURES_NV) } {
             return None;
@@ -207,7 +208,7 @@ impl Request {
         // SAFETY: a valid request's arrays hold their counts (a zero count may come with a null pointer).
         let (mut names, mut queues) = unsafe {
             let names: Vec<*const c_char> = if base.enabled_extension_count == 0 { Vec::new() } else { std::slice::from_raw_parts(base.pp_enabled_extension_names, base.enabled_extension_count as usize).to_vec() };
-            let queues: Vec<vk::DeviceQueueCreateInfo> = if base.queue_create_info_count == 0 { Vec::new() } else { std::slice::from_raw_parts(base.p_queue_create_infos, base.queue_create_info_count as usize).to_vec() };
+            let queues: Vec<vk::DeviceQueueCreateInfo<'a>> = if base.queue_create_info_count == 0 { Vec::new() } else { std::slice::from_raw_parts(base.p_queue_create_infos, base.queue_create_info_count as usize).to_vec() };
             (names, queues)
         };
         // SAFETY: the names are NUL-terminated.
@@ -215,7 +216,13 @@ impl Request {
             names.push(EXTENSION.as_ptr());
         }
         let priority = Box::new([1.0f32]);
-        queues.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priority[..]).build());
+        // `priority` moves into the result (the box's contents stay put): the pointer is set directly.
+        queues.push(vk::DeviceQueueCreateInfo {
+            queue_family_index: family,
+            queue_count: 1,
+            p_queue_priorities: priority.as_ptr(),
+            ..Default::default()
+        });
         let mut info = *base;
         info.p_next = std::ptr::from_ref(&*features).cast();
         info.enabled_extension_count = names.len() as u32;
@@ -303,10 +310,10 @@ impl FlowDevice {
                 made.queue = device.get_device_queue(queue.family, queue.index);
                 crate::loader_data::initialize_queue(device.handle(), made.queue).map_err(|e| format!("its queue: {e:?}"))?;
                 made.pool = device
-                    .create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(queue.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
+                    .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(queue.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
                     .map_err(|e| format!("its command pool: {e:?}"))?;
-                made.cmd = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::builder().command_pool(made.pool).command_buffer_count(1)).map_err(|e| format!("{e:?}"))?[0];
-                made.upload = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::builder().command_pool(compute_pool).command_buffer_count(1)).map_err(|e| format!("{e:?}"))?[0];
+                made.cmd = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(made.pool).command_buffer_count(1)).map_err(|e| format!("{e:?}"))?[0];
+                made.upload = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(compute_pool).command_buffer_count(1)).map_err(|e| format!("{e:?}"))?[0];
                 made.uploaded = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| format!("{e:?}"))?;
                 made.flowed = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).map_err(|e| format!("{e:?}"))?;
                 Ok(())
@@ -354,8 +361,8 @@ impl Image {
         device: &ash::Device, instance: &ash::Instance, physical: vk::PhysicalDevice, format: vk::Format, width: u32, height: u32, usage: vk::ImageUsageFlags,
         flow_usage: vk::OpticalFlowUsageFlagsNV, families: &[u32],
     ) -> Result<Self, String> {
-        let mut of = vk::OpticalFlowImageFormatInfoNV::builder().usage(flow_usage).build();
-        let mut info = vk::ImageCreateInfo::builder()
+        let mut of = vk::OpticalFlowImageFormatInfoNV::default().usage(flow_usage);
+        let mut info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D { width, height, depth: 1 })
@@ -377,10 +384,10 @@ impl Image {
                 let index = (0..props.memory_type_count)
                     .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
                     .ok_or(vk::Result::ERROR_OUT_OF_DEVICE_MEMORY)?;
-                out.memory = device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None)?;
+                out.memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None)?;
                 device.bind_image_memory(out.image, out.memory, 0)?;
                 let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
-                out.view = device.create_image_view(&vk::ImageViewCreateInfo::builder().image(out.image).view_type(vk::ImageViewType::TYPE_2D).format(format).subresource_range(range), None)?;
+                out.view = device.create_image_view(&vk::ImageViewCreateInfo::default().image(out.image).view_type(vk::ImageViewType::TYPE_2D).format(format).subresource_range(range), None)?;
                 Ok(())
             })()
         };
@@ -484,7 +491,7 @@ impl Session {
     pub(crate) unsafe fn record_upload(&self, device: &ash::Device, cmd: vk::CommandBuffer, proxy: vk::Buffer) {
         let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
         let general = |image: vk::Image, old: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags| {
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .old_layout(old)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_access_mask(src)
@@ -493,7 +500,6 @@ impl Session {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
                 .subresource_range(range)
-                .build()
         };
         let target = self.inputs[self.parity.get()].image;
         // SAFETY: the caller's contract.
@@ -535,7 +541,7 @@ impl Session {
         // SAFETY: the caller's contract.
         unsafe {
             device.reset_command_buffer(fd.cmd, vk::CommandBufferResetFlags::empty()).map_err(|e| format!("{e:?}"))?;
-            device.begin_command_buffer(fd.cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("{e:?}"))?;
+            device.begin_command_buffer(fd.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("{e:?}"))?;
             (fd.fns.execute)(fd.cmd, self.session, &info);
             device.end_command_buffer(fd.cmd).map_err(|e| format!("{e:?}"))?;
         }
@@ -588,12 +594,12 @@ mod tests {
     #[test]
     fn the_flow_is_used_only_where_the_device_has_all_of_it() {
         let families = [family(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE), family(vk::QueueFlags::COMPUTE), family(vk::QueueFlags::TRANSFER | vk::QueueFlags::OPTICAL_FLOW_NV)];
-        let app = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).build()];
+        let app = [vk::DeviceQueueCreateInfo::default().queue_family_index(0)];
         assert_eq!(queue_family(true, true, &families, &app), Ok(2));
         assert!(queue_family(false, true, &families, &app).unwrap_err().contains("VK_NV_optical_flow"), "no extension (lavapipe)");
         assert!(queue_family(true, false, &families, &app).unwrap_err().contains("feature"));
         assert!(queue_family(true, true, &families[..2], &app).unwrap_err().contains("no queue family"));
-        let theirs = [app[0], vk::DeviceQueueCreateInfo::builder().queue_family_index(2).build()];
+        let theirs = [app[0], vk::DeviceQueueCreateInfo::default().queue_family_index(2)];
         assert!(queue_family(true, true, &families, &theirs).unwrap_err().contains("itself"));
 
         let caps = Capabilities {
@@ -620,8 +626,8 @@ mod tests {
         let names = [c"VK_KHR_swapchain".as_ptr()];
         let mut sync2 = vk::PhysicalDeviceSynchronization2Features::default();
         let priorities = [1.0f32];
-        let queues = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities).build()];
-        let base = vk::DeviceCreateInfo::builder().enabled_extension_names(&names).queue_create_infos(&queues).push_next(&mut sync2).build();
+        let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&priorities)];
+        let base = vk::DeviceCreateInfo::default().enabled_extension_names(&names).queue_create_infos(&queues).push_next(&mut sync2);
         // SAFETY: a valid request, outliving the result.
         let r = unsafe { Request::new(&base, 5) }.expect("added");
         // SAFETY: the request's arrays hold their counts.

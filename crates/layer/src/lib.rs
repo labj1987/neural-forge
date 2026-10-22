@@ -326,7 +326,7 @@ fn env_flag(name: &str) -> bool {
 /// three Vulkan 1.0 global entry points -- `vkCreateInstance`,
 /// `vkEnumerateInstanceExtensionProperties`, `vkEnumerateInstanceLayerProperties` --
 /// through the chained, `VK_NULL_HANDLE`-instance `vkGetInstanceProcAddr`
-/// (`ash::vk::EntryFnV1_0::load`), even though only `vkCreateInstance` is ever actually
+/// (`ash::EntryFnV1_0::load`), even though only `vkCreateInstance` is ever actually
 /// called afterward. Resolving `vkEnumerateInstanceExtensionProperties` that way
 /// segfaults inside `libVkLayer_MESA_device_select.so` 100% of the time (confirmed via
 /// `gdb`: `vkCreateInstance` resolves fine through the exact same chained pointer,
@@ -503,18 +503,19 @@ pub(crate) fn take_native(device: vk::Device) -> Option<preupscale::native::Setu
 /// beside DLSS's buffer, 2026-10-05; Xid 69 and Xid 32 in GTA V with the network's uploads, 2026-10-07). Every such family is
 /// considered, in order, and the first with room for `n` more is taken: the application's request for it is
 /// extended when it is a plain one (no flags), or a request for `n` queues is added.
-struct ExtraQueues {
+struct ExtraQueues<'a> {
     /// The first family the application requests with graphics and compute: where DLSS runs.
     app_family: u32,
     family: u32,
     /// The first of the new queues' indices.
     index: u32,
-    infos: Vec<vk::DeviceQueueCreateInfo>,
+    /// The application's requests (borrowed with its create info) and the new ones.
+    infos: Vec<vk::DeviceQueueCreateInfo<'a>>,
     /// Backs the extended `pQueuePriorities`.
     _priorities: Vec<f32>,
 }
 
-fn extra_queues(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQueueCreateInfo], n: u32) -> Option<ExtraQueues> {
+fn extra_queues<'a>(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQueueCreateInfo<'a>], n: u32) -> Option<ExtraQueues<'a>> {
     let app_family = infos
         .iter()
         .find(|q| families.get(q.queue_family_index as usize).is_some_and(|f| f.queue_flags.contains(vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE)))?
@@ -543,7 +544,14 @@ fn extra_queues(families: &[vk::QueueFamilyProperties], infos: &[vk::DeviceQueue
                     continue;
                 }
                 let priorities = vec![1.0; n as usize];
-                extended.push(vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities).build());
+                // The priorities move into the result with the request (their heap buffer stays put), so the
+                // pointer is set directly rather than borrowed.
+                extended.push(vk::DeviceQueueCreateInfo {
+                    queue_family_index: family,
+                    queue_count: n,
+                    p_queue_priorities: priorities.as_ptr(),
+                    ..Default::default()
+                });
                 (priorities, 0)
             }
         };
@@ -574,7 +582,7 @@ unsafe fn flow_family(
 }
 
 /// `create_info`'s queue requests, and the physical device's families.
-fn queue_requests<'a>(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &'a vk::DeviceCreateInfo) -> (&'a [vk::DeviceQueueCreateInfo], Vec<vk::QueueFamilyProperties>) {
+fn queue_requests<'a>(instance: &ash::Instance, physical_device: vk::PhysicalDevice, create_info: &'a vk::DeviceCreateInfo<'_>) -> (&'a [vk::DeviceQueueCreateInfo<'a>], Vec<vk::QueueFamilyProperties>) {
     let infos = if create_info.queue_create_info_count == 0 || create_info.p_queue_create_infos.is_null() {
         &[][..]
     } else {
@@ -1203,7 +1211,7 @@ mod instance_table_tests {
             eprintln!("instance table test: no Vulkan loader, skipping");
             return;
         };
-        let create = || unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder(), None) }.ok().map(Arc::new);
+        let create = || unsafe { entry.create_instance(&vk::InstanceCreateInfo::default(), None) }.ok().map(Arc::new);
         let (Some(real), Some(probe)) = (create(), create()) else {
             eprintln!("instance table test: no Vulkan ICD, skipping");
             return;
@@ -1421,7 +1429,7 @@ mod device_link_tests {
             eprintln!("ineligible device test: no Vulkan loader, skipping");
             return;
         };
-        let Some(instance) = (unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder(), None) }).ok().map(Arc::new) else {
+        let Some(instance) = (unsafe { entry.create_instance(&vk::InstanceCreateInfo::default(), None) }).ok().map(Arc::new) else {
             eprintln!("ineligible device test: no Vulkan ICD, skipping");
             return;
         };
@@ -1439,8 +1447,8 @@ mod device_link_tests {
         }
         let link = VkLayerDeviceLink { pNext: std::ptr::null_mut(), pfnNextGetInstanceProcAddr: gipa_next, pfnNextGetDeviceProcAddr: gdpa };
         let priorities = [1.0];
-        let queue = vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities).build();
-        let info = vk::DeviceCreateInfo::builder().queue_create_infos(std::slice::from_ref(&queue)).build();
+        let queue = vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&priorities);
+        let info = vk::DeviceCreateInfo::default().queue_create_infos(std::slice::from_ref(&queue));
         let hooks = NeuralForgeInstanceHooks { ctx: Some(InstanceContext { instance: instance.clone(), surface_caps: None, properties2: vram::Properties2::None, api_version: 0, surface_maintenance: Default::default() }) };
         let mut p_device = std::mem::MaybeUninit::uninit();
         CALLED.set(0);
@@ -1470,8 +1478,8 @@ mod extra_queue_tests {
         let families = [family(GRAPHICS, 16), family(COMPUTE, 2), family(vk::QueueFlags::TRANSFER, 2), family(COMPUTE, 8)];
         let priorities = [1.0f32; 2];
         let app = [
-            vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&priorities[..1]).build(),
-            vk::DeviceQueueCreateInfo::builder().queue_family_index(1).queue_priorities(&priorities).build(),
+            vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&priorities[..1]),
+            vk::DeviceQueueCreateInfo::default().queue_family_index(1).queue_priorities(&priorities),
         ];
         let q = extra_queues(&families, &app, 2).expect("family 3 has room");
         assert_eq!((q.app_family, q.family, q.index), (0, 3, 0));
@@ -1480,7 +1488,7 @@ mod extra_queue_tests {
         // One more in family 1 would fit only without the application's two.
         assert!(extra_queues(&families[..3], &app, 1).is_none());
         // The application's own request for the family is extended when it has room.
-        let one = [app[0], vk::DeviceQueueCreateInfo::builder().queue_family_index(1).queue_priorities(&priorities[..1]).build()];
+        let one = [app[0], vk::DeviceQueueCreateInfo::default().queue_family_index(1).queue_priorities(&priorities[..1])];
         let q = extra_queues(&families, &one, 1).expect("family 1 has one to spare");
         assert_eq!((q.family, q.index, q.infos.len(), q.infos[1].queue_count), (1, 1, 2, 2));
         // SAFETY: the extended priorities hold the new count.

@@ -34,9 +34,9 @@ this project's own code: upstream is no longer tracked.
   `cargo test --locked --workspace --all-features -- --test-threads=1`, in this directory. CI runs both.
 - The generated files are never edited by hand: change the generator and run `bash scripts/vk-layer-codegen.sh`
   from the repository root (`--check` compares instead of writing; CI runs that). It fetches Vulkan-Headers at
-  commit `3df77fb3` (1.3.251, SHA-256 pinned) once into `tools/native/`, and needs libclang and the pinned
-  toolchain's rustfmt. The generated code is written against ash 0.37.3; moving to newer headers or a newer ash
-  means regenerating and porting the hand-written code with it.
+  commit `38899bf6` (1.3.281, the headers ash 0.38.0 was generated from; SHA-256 pinned) once into `tools/native/`,
+  and needs libclang and the pinned toolchain's rustfmt. The generated code is written against ash 0.38.0: newer
+  headers need an ash generated from them too (ash's own registry must have every type the hooks name).
 
 ## Left out when it was taken in
 
@@ -61,3 +61,15 @@ this project's own code: upstream is no longer tracked.
    unhandled commands at 100 columns itself (the one thing nightly's `wrap_comments` changed). The copyright year
    in generated files is fixed at upstream's 2025 instead of the current year. Regenerated, every generated file is
    byte-identical to upstream's.
+
+## Changes since
+
+1. **ash 0.38 and Vulkan 1.3.281** (2026-10-22; was ash 0.37.3 and 1.3.251). The generator names ash 0.38's
+   per-extension function tables (`ash::khr::swapchain::{InstanceFn, DeviceFn}` in place of
+   `vk::KhrSwapchainFn`), giving instance and device dispatch each its own; it reads `len="1"` (a pointer to one
+   element, which newer registries spell out) and knows QNX's `_screen_buffer`. Regenerated, the hooks cover the
+   commands of the 30 header versions in between. The hand-written code follows ash 0.38: structures carry the
+   lifetime of what they point at (`vk::BaseInStructure<'a>` in the chain iterators, `'static` where the layer's
+   loader structures hold raw pointers), the builders' `::builder()`/`.build()` are `::default()` and gone, the
+   core function tables are `ash::DeviceFnV1_0` and the others, and the tests' mocks name every lifetime the
+   trait elides.

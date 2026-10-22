@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): generated for ash 0.38 and Vulkan 1.3.281 (UPSTREAM.md).
 
 #![allow(missing_docs)]
 use super::*;

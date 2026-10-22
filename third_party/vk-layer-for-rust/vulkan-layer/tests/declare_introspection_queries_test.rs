@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): function pointers compared by address (UPSTREAM.md).
+// Modified for Neural Forge (2026): function pointers compared by address; ash 0.38 (UPSTREAM.md).
 
 use std::ffi::{c_char, CStr, CString};
 

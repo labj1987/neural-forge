@@ -241,7 +241,7 @@ impl OwnImage {
     /// # Safety
     /// `device` is live.
     pub(super) unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32, usage: vk::ImageUsageFlags) -> Option<Self> {
-        let info = vk::ImageCreateInfo::builder()
+        let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R16G16B16A16_SFLOAT)
             .extent(vk::Extent3D { width, height, depth: 1 })
@@ -262,7 +262,7 @@ impl OwnImage {
             (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
         };
         let memory = pick(vk::MemoryPropertyFlags::DEVICE_LOCAL).or_else(|| pick(vk::MemoryPropertyFlags::empty())).and_then(|index| {
-            let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index);
+            let alloc = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index);
             // SAFETY: valid allocation info.
             unsafe { device.allocate_memory(&alloc, None) }.ok()
         });
@@ -310,7 +310,7 @@ impl DeviceBuffer {
     /// # Safety
     /// `device` is live.
     unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64) -> Option<Self> {
-        let info = vk::BufferCreateInfo::builder()
+        let info = vk::BufferCreateInfo::default()
             .size(bytes)
             .usage(vk::BufferUsageFlags::STORAGE_BUFFER | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -324,7 +324,7 @@ impl DeviceBuffer {
             (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(want))
         };
         let memory = pick(vk::MemoryPropertyFlags::DEVICE_LOCAL).or_else(|| pick(vk::MemoryPropertyFlags::empty())).and_then(|index| {
-            let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index);
+            let alloc = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index);
             // SAFETY: valid allocation info.
             unsafe { device.allocate_memory(&alloc, None) }.ok()
         });
@@ -377,7 +377,7 @@ impl AutoExposure {
     /// `device` is live; `exposure` is the pass's exposure buffer.
     unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, exposure: vk::Buffer) -> Option<Self> {
         let binding = |n: u32, ty: vk::DescriptorType| {
-            vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build()
+            vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
         };
         let bindings = [
             binding(0, vk::DescriptorType::STORAGE_IMAGE),
@@ -394,19 +394,19 @@ impl AutoExposure {
         // SAFETY: valid create infos; every handle made here is destroyed below on failure.
         let built = unsafe {
             (|| -> Option<vk::DescriptorSet> {
-                set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
-                let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<ExposurePush>() as u32).build();
+                set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
+                let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<ExposurePush>() as u32);
                 pipeline_layout = device
-                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None)
+                    .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None)
                     .ok()?;
                 pipeline = compute_pipeline(device, pipeline_layout, EXPOSURE_SPV)?;
                 let sizes = [
                     vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 1 },
                     vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 3 },
                 ];
-                pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None).ok()?;
+                pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).ok()?;
                 let set = device
-                    .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(std::slice::from_ref(&set_layout)))
+                    .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(std::slice::from_ref(&set_layout)))
                     .ok()?
                     .first()
                     .copied()?;
@@ -437,9 +437,11 @@ impl AutoExposure {
         unsafe { std::ptr::write_bytes(state.ptr, 0, STATE_BYTES as usize) };
         let info = |buffer: vk::Buffer, range: u64| [vk::DescriptorBufferInfo { buffer, offset: 0, range }];
         let (h, s, e) = (info(histogram.buffer, HISTOGRAM_BYTES), info(state.buffer, STATE_BYTES), info(exposure, EXPOSURE_BYTES));
-        let write = |n: u32, b: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(b).build();
+        fn write(set: vk::DescriptorSet, n: u32, b: &[vk::DescriptorBufferInfo; 1]) -> vk::WriteDescriptorSet<'_> {
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(b)
+        }
         // SAFETY: the set is not in use; every buffer is live.
-        unsafe { device.update_descriptor_sets(&[write(1, &h), write(2, &s), write(3, &e)], &[]) };
+        unsafe { device.update_descriptor_sets(&[write(set, 1, &h), write(set, 2, &s), write(set, 3, &e)], &[]) };
         Some(Self { set_layout, pipeline_layout, pipeline, pool, set, histogram, state, identification: None })
     }
 
@@ -454,8 +456,8 @@ impl AutoExposure {
     /// # Safety
     /// `cmd` is recording; binding 0 holds a live view of the colour input.
     unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, width: u32, height: u32) {
-        let filled = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
-        let counted = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
+        let filled = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        let counted = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         let push = |pass: u32| ExposurePush { width, height, key: AUTO_KEY, rate: AUTO_RATE, pass };
         let bytes = |p: &ExposurePush| {
             // SAFETY: `ExposurePush` is `repr(C)`, plain data; read as bytes for its own size.
@@ -495,7 +497,7 @@ impl AutoExposure {
 /// # Safety
 /// `image` is a live, plain 2D RGBA16F image of `device`.
 unsafe fn colour_view(device: &ash::Device, image: vk::Image) -> Option<vk::ImageView> {
-    let info = vk::ImageViewCreateInfo::builder()
+    let info = vk::ImageViewCreateInfo::default()
         .image(image)
         .view_type(vk::ImageViewType::TYPE_2D)
         .format(vk::Format::R16G16B16A16_SFLOAT)
@@ -557,7 +559,7 @@ impl HdrPass {
     pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, width: u32, height: u32) -> Option<Self> {
         let (padded_width, padded_height) = super::padded(width, height);
         let binding = |n: u32, ty: vk::DescriptorType| {
-            vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build()
+            vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
         };
         let bindings = [
             binding(0, vk::DescriptorType::STORAGE_IMAGE),
@@ -570,10 +572,10 @@ impl HdrPass {
         // SAFETY: valid create infos throughout; every handle created here is owned by `p` until
         // the end, where it moves into the result.
         unsafe {
-            p.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
-            let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<HdrPush>() as u32).build();
+            p.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
+            let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).offset(0).size(std::mem::size_of::<HdrPush>() as u32);
             p.pipeline_layout = device
-                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&p.set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None)
+                .create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&p.set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None)
                 .ok()?;
             p.encode = compute_pipeline(device, p.pipeline_layout, ENCODE_SPV)?;
             p.decode = compute_pipeline(device, p.pipeline_layout, DECODE_SPV)?;
@@ -581,9 +583,9 @@ impl HdrPass {
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 3 },
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 },
             ];
-            p.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None).ok()?;
+            p.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).ok()?;
             p.set = device
-                .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(p.pool).set_layouts(std::slice::from_ref(&p.set_layout)))
+                .allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(p.pool).set_layouts(std::slice::from_ref(&p.set_layout)))
                 .ok()?
                 .first()
                 .copied()?;
@@ -604,9 +606,9 @@ impl HdrPass {
         let (enc_info, ans_info) = (image_info(encoded.view), image_info(answer.view));
         let buf_info = [vk::DescriptorBufferInfo { buffer: exposure.buffer, offset: 0, range: EXPOSURE_BYTES }];
         let writes = [
-            vk::WriteDescriptorSet::builder().dst_set(p.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&enc_info).build(),
-            vk::WriteDescriptorSet::builder().dst_set(p.set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_info).build(),
-            vk::WriteDescriptorSet::builder().dst_set(p.set).dst_binding(3).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&ans_info).build(),
+            vk::WriteDescriptorSet::default().dst_set(p.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&enc_info),
+            vk::WriteDescriptorSet::default().dst_set(p.set).dst_binding(2).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&buf_info),
+            vk::WriteDescriptorSet::default().dst_set(p.set).dst_binding(3).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&ans_info),
         ];
         // SAFETY: the set is not in use; every view and buffer is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -826,12 +828,12 @@ impl HdrPass {
 
     /// A barrier taking the encoded image from anything (its contents are rewritten) to `GENERAL`
     /// for the encode's writes. For the capture's opening barrier.
-    pub(crate) fn encoded_to_general(&self) -> vk::ImageMemoryBarrier {
+    pub(crate) fn encoded_to_general(&self) -> vk::ImageMemoryBarrier<'static> {
         to_general(self.encoded.image, vk::AccessFlags::SHADER_WRITE)
     }
 
     /// The same for the answer image and the write-back's copy into it.
-    pub(crate) fn answer_to_general(&self) -> vk::ImageMemoryBarrier {
+    pub(crate) fn answer_to_general(&self) -> vk::ImageMemoryBarrier<'static> {
         to_general(self.answer.image, vk::AccessFlags::TRANSFER_WRITE)
     }
 
@@ -844,11 +846,10 @@ impl HdrPass {
     /// `cmd` is recording, the encoded image is in `GENERAL` (the caller's opening barrier),
     /// [`Self::bind_colour`] was called for this hold, and `proxy` holds the padded frame.
     pub(crate) unsafe fn record_encode(&self, device: &ash::Device, cmd: vk::CommandBuffer, proxy: Option<vk::Buffer>, paper_white: f32) {
-        let exposure_in = vk::MemoryBarrier::builder()
+        let exposure_in = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE)
-            .dst_access_mask(vk::AccessFlags::SHADER_READ)
-            .build();
-        let encoded_out = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).build();
+            .dst_access_mask(vk::AccessFlags::SHADER_READ);
+        let encoded_out = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
         let region = vk::BufferImageCopy {
             buffer_offset: 0,
             buffer_row_length: self.padded_width,
@@ -896,7 +897,7 @@ impl HdrPass {
             image_offset: vk::Offset3D::default(),
             image_extent: vk::Extent3D { width: self.padded_width, height: self.padded_height, depth: 1 },
         };
-        let answer_in = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ).build();
+        let answer_in = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
         // SAFETY: forwarded; every handle is live.
         unsafe {
             device.cmd_copy_buffer_to_image(cmd, source, self.answer.image, vk::ImageLayout::GENERAL, &[region]);
@@ -953,13 +954,13 @@ impl HdrPass {
 /// `set` is not in use; `view` is live.
 unsafe fn bind_view(device: &ash::Device, set: vk::DescriptorSet, view: vk::ImageView) {
     let info = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: view, image_layout: vk::ImageLayout::GENERAL }];
-    let write = vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&info).build();
+    let write = vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&info);
     // SAFETY: forwarded.
     unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };
 }
 
-fn to_general(image: vk::Image, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier {
-    vk::ImageMemoryBarrier::builder()
+fn to_general(image: vk::Image, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier::default()
         .old_layout(vk::ImageLayout::UNDEFINED)
         .new_layout(vk::ImageLayout::GENERAL)
         .src_access_mask(vk::AccessFlags::empty())
@@ -968,7 +969,6 @@ fn to_general(image: vk::Image, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier 
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
-        .build()
 }
 
 /// A compute pipeline from embedded SPIR-V (`scripts/check_shaders.py` ties it to its source).
@@ -987,13 +987,13 @@ pub(super) unsafe fn compute_pipeline(device: &ash::Device, layout: vk::Pipeline
 pub(super) unsafe fn compute_pipeline_with(device: &ash::Device, layout: vk::PipelineLayout, spv: &[u8], spec: Option<&vk::SpecializationInfo>) -> Option<vk::Pipeline> {
     let code = ash::util::read_spv(&mut std::io::Cursor::new(spv)).ok()?;
     // SAFETY: valid SPIR-V, compiled by `glslangValidator -V` and checked by spirv-val.
-    let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&code), None) }.ok()?;
+    let module = unsafe { device.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None) }.ok()?;
     let entry = c"main";
-    let mut stage = vk::PipelineShaderStageCreateInfo::builder().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(entry).build();
+    let mut stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(entry);
     if let Some(spec) = spec {
         stage.p_specialization_info = std::ptr::from_ref(spec);
     }
-    let info = vk::ComputePipelineCreateInfo::builder().stage(stage).layout(layout).build();
+    let info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(layout);
     // SAFETY: `module` and `layout` outlive the call.
     let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&info), None) };
     // SAFETY: only needed for creation, which returned.

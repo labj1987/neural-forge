@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Modified for Neural Forge (2026): license-file and repository added (UPSTREAM.md).
+# Modified for Neural Forge (2026): license-file and repository added; ash 0.38 (UPSTREAM.md).
 
 [package]
 edition = "2021"
@@ -22,7 +22,7 @@ license-file = "../LICENSE"
 repository = "https://github.com/google/vk-layer-for-rust"
 
 [dependencies]
-ash = "0.37.3"
+ash = "0.38.0"
 bytemuck = "1.14.1"
 cfg-if = "1.0.0"
 log = "0.4.17"

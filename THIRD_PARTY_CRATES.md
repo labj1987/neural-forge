@@ -8,7 +8,7 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | Crate | Version | License | Source |
 |---|---|---|---|
 | adler2 | 2.0.1 | 0BSD OR MIT OR Apache-2.0 | https://github.com/oyvindln/adler2 |
-| ash | 0.37.3+1.3.251 | MIT OR Apache-2.0 | https://github.com/MaikKlein/ash |
+| ash | 0.38.0+1.3.281 | MIT OR Apache-2.0 | https://github.com/ash-rs/ash |
 | bitflags | 2.13.2 | MIT OR Apache-2.0 | https://github.com/bitflags/bitflags |
 | block-buffer | 0.12.1 | MIT OR Apache-2.0 | https://github.com/RustCrypto/utils |
 | bytemuck | 1.25.2 | Zlib OR Apache-2.0 OR MIT | https://github.com/Lokathor/bytemuck |
@@ -49,7 +49,7 @@ sources at build time: `usr/share/doc/neural-forge/THIRD_PARTY_LICENSES.txt`.
 | libadwaita | 0.9.2 | MIT | https://gitlab.gnome.org/World/Rust/libadwaita-rs |
 | libadwaita-sys | 0.9.2 | MIT | https://gitlab.gnome.org/World/Rust/libadwaita-rs |
 | libc | 0.2.191 | MIT OR Apache-2.0 | https://github.com/rust-lang/libc |
-| libloading | 0.7.4 | ISC | https://github.com/nagisa/rust_libloading/ |
+| libloading | 0.8.9 | ISC | https://github.com/nagisa/rust_libloading/ |
 | log | 0.4.34 | MIT OR Apache-2.0 | https://github.com/rust-lang/log |
 | memchr | 2.8.3 | Unlicense OR MIT | https://github.com/BurntSushi/memchr |
 | memoffset | 0.9.1 | MIT | https://github.com/Gilnaa/memoffset |

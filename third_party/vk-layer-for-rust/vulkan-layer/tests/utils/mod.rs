@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 use ash::{
     prelude::VkResult,
@@ -314,11 +316,10 @@ static VULKAN_COMMANDS: Lazy<BTreeMap<VulkanCommandName, VulkanCommand>> = Lazy:
                                                 | vk::QueueFlags::TRANSFER,
                                             queue_count: 1,
                                             timestamp_valid_bits: 0,
-                                            min_image_transfer_granularity: vk::Extent3D::builder()
+                                            min_image_transfer_granularity: vk::Extent3D::default()
                                                 .width(0)
                                                 .height(0)
-                                                .depth(0)
-                                                .build(),
+                                                .depth(0),
                                         }],
                                     })
                                     .into_vulkan_handle(),
@@ -896,7 +897,7 @@ unsafe extern "system" fn get_instance_proc_addr(
 
 pub fn create_entry<T: Layer>() -> ash::Entry {
     unsafe {
-        ash::Entry::from_static_fn(vk::StaticFn {
+        ash::Entry::from_static_fn(ash::StaticFn {
             get_instance_proc_addr: Global::<T>::get_instance_proc_addr,
         })
     }
@@ -918,8 +919,8 @@ pub trait ArcDelInstanceContextExt<T: Layers>: Sized {
     unsafe fn create_device(
         &self,
         create_info_builder: impl FnOnce(
-            vk::DeviceCreateInfoBuilder,
-            &mut dyn for<'a> FnMut(vk::DeviceCreateInfoBuilder<'a>),
+            vk::DeviceCreateInfo,
+            &mut dyn for<'a> FnMut(vk::DeviceCreateInfo<'a>),
         ),
         p_device: *mut vk::Device,
     ) -> vk::Result;
@@ -927,8 +928,8 @@ pub trait ArcDelInstanceContextExt<T: Layers>: Sized {
     fn create_device_context(
         self,
         create_info_builder: impl FnOnce(
-            vk::DeviceCreateInfoBuilder,
-            &mut dyn for<'a> FnMut(vk::DeviceCreateInfoBuilder<'a>),
+            vk::DeviceCreateInfo,
+            &mut dyn for<'a> FnMut(vk::DeviceCreateInfo<'a>),
         ),
     ) -> VkResult<Del<DeviceContext<T>>>;
 
@@ -941,8 +942,8 @@ impl<T: Layers> ArcDelInstanceContextExt<T> for ArcDel<InstanceContext<T>> {
     unsafe fn create_device(
         &self,
         create_info_builder: impl FnOnce(
-            vk::DeviceCreateInfoBuilder,
-            &mut dyn for<'a> FnMut(vk::DeviceCreateInfoBuilder<'a>),
+            vk::DeviceCreateInfo,
+            &mut dyn for<'a> FnMut(vk::DeviceCreateInfo<'a>),
         ),
         p_device: *mut vk::Device,
     ) -> vk::Result {
@@ -960,10 +961,9 @@ impl<T: Layers> ArcDelInstanceContextExt<T> for ArcDel<InstanceContext<T>> {
         }
         .is_empty());
         let queue_priorities = [1.0];
-        let queue_create_infos = [vk::DeviceQueueCreateInfo::builder()
+        let queue_create_infos = [vk::DeviceQueueCreateInfo::default()
             .queue_family_index(0)
-            .queue_priorities(&queue_priorities)
-            .build()];
+            .queue_priorities(&queue_priorities)];
         let mut layer_links = T::RestLayers::device_links(self.instance.handle());
         let mut layer_create_info = VkLayerDeviceCreateInfo {
             sType: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
@@ -972,7 +972,7 @@ impl<T: Layers> ArcDelInstanceContextExt<T> for ArcDel<InstanceContext<T>> {
             u: Default::default(),
         };
         layer_create_info.u.pLayerInfo = layer_links[0].as_mut();
-        let device_create_info = vk::DeviceCreateInfo::builder()
+        let device_create_info = vk::DeviceCreateInfo::default()
             .queue_create_infos(&queue_create_infos)
             .push_next(&mut layer_create_info);
         let mut res: Option<vk::Result> = None;
@@ -996,8 +996,8 @@ impl<T: Layers> ArcDelInstanceContextExt<T> for ArcDel<InstanceContext<T>> {
     fn create_device_context(
         self,
         create_info_builder: impl FnOnce(
-            vk::DeviceCreateInfoBuilder,
-            &mut dyn for<'a> FnMut(vk::DeviceCreateInfoBuilder<'a>),
+            vk::DeviceCreateInfo,
+            &mut dyn for<'a> FnMut(vk::DeviceCreateInfo<'a>),
         ),
     ) -> VkResult<Del<DeviceContext<T>>> {
         let mut device = MaybeUninit::<vk::Device>::uninit();
@@ -1115,7 +1115,7 @@ pub trait InstanceCreateInfoExt {
     fn default_instance<T: Layers>(self) -> ArcDel<InstanceContext<T>>;
 }
 
-impl InstanceCreateInfoExt for vk::InstanceCreateInfoBuilder<'_> {
+impl InstanceCreateInfoExt for vk::InstanceCreateInfo<'_> {
     #[deny(unsafe_op_in_unsafe_fn)]
     unsafe fn create_instance<T: Layers>(self, p_instance: *mut vk::Instance) -> vk::Result {
         let entry = T::create_entry();
@@ -1145,7 +1145,7 @@ impl InstanceCreateInfoExt for vk::InstanceCreateInfoBuilder<'_> {
         let instance = unsafe { ash::Instance::load(entry.static_fn(), instance) };
         assert_ne!(instance.handle(), vk::Instance::null());
         let icd_entry = unsafe {
-            ash::Entry::from_static_fn(vk::StaticFn {
+            ash::Entry::from_static_fn(ash::StaticFn {
                 get_instance_proc_addr,
             })
         };

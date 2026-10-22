@@ -91,7 +91,7 @@ fn shares_memory(info: &vk::ImageCreateInfo) -> bool {
 /// tracking: `TRANSFER_SRC` added where `preupscale::wants_copyable` asks for it and the memory is not
 /// shared. `None`: created as asked. Also what a memory-requirements query for such an image is
 /// answered from (`vkGetDeviceImage*MemoryRequirements`), so memory placed by those numbers fits.
-fn copyable_create_info(info: &vk::ImageCreateInfo) -> Option<vk::ImageCreateInfo> {
+fn copyable_create_info<'a>(info: &vk::ImageCreateInfo<'a>) -> Option<vk::ImageCreateInfo<'a>> {
     (crate::preupscale::wants_copyable(info) && !shares_memory(info)).then(|| vk::ImageCreateInfo { usage: info.usage | vk::ImageUsageFlags::TRANSFER_SRC, ..*info })
 }
 
@@ -695,7 +695,7 @@ fn dependency_global(info: &vk::DependencyInfo) -> Option<crate::preupscale::Haz
     memory.iter().any(|m| crate::probe_seq::is_write(m.src_access_mask.as_raw())).then_some(crate::preupscale::Hazard::MemoryBarrier)
 }
 
-fn barrier2_images(info: &vk::DependencyInfo) -> Option<&[vk::ImageMemoryBarrier2]> {
+fn barrier2_images<'a>(info: &'a vk::DependencyInfo<'_>) -> Option<&'a [vk::ImageMemoryBarrier2<'a>]> {
     if info.image_memory_barrier_count == 0 || info.p_image_memory_barriers.is_null() {
         return None;
     }
@@ -1125,15 +1125,15 @@ mod shares_memory_tests {
     fn external_memory_chains_are_recognised_anywhere_in_the_chain() {
         let plain = vk::ImageCreateInfo::default();
         assert!(!shares_memory(&plain));
-        let mut external = vk::ExternalMemoryImageCreateInfo::builder().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD).build();
+        let mut external = vk::ExternalMemoryImageCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
         let mut list = vk::ImageFormatListCreateInfo::default();
-        let info = vk::ImageCreateInfo::builder().push_next(&mut external).push_next(&mut list).build();
+        let info = vk::ImageCreateInfo::default().push_next(&mut external).push_next(&mut list);
         assert!(shares_memory(&info), "found behind another structure");
         let mut nv = vk::ExternalMemoryImageCreateInfoNV::default();
-        let info = vk::ImageCreateInfo::builder().push_next(&mut nv).build();
+        let info = vk::ImageCreateInfo::default().push_next(&mut nv);
         assert!(shares_memory(&info));
         let mut list = vk::ImageFormatListCreateInfo::default();
-        let info = vk::ImageCreateInfo::builder().push_next(&mut list).build();
+        let info = vk::ImageCreateInfo::default().push_next(&mut list);
         assert!(!shares_memory(&info));
     }
 }
@@ -1189,11 +1189,10 @@ unsafe fn relay_app_waits(
         device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()
     })?;
     let stages = vec![vk::PipelineStageFlags::ALL_COMMANDS; app_waits.len()];
-    let submit = vk::SubmitInfo::builder()
+    let submit = vk::SubmitInfo::default()
         .wait_semaphores(app_waits)
         .wait_dst_stage_mask(&stages)
-        .signal_semaphores(std::slice::from_ref(&relay))
-        .build();
+        .signal_semaphores(std::slice::from_ref(&relay));
     // SAFETY: the batch references only live handles; `stages` and `app_waits` outlive
     // the call.
     unsafe { device.queue_submit(queue, &[submit], vk::Fence::null()) }.ok()?;
@@ -1509,7 +1508,7 @@ impl NeuralForgeDeviceInfo {
             return;
         }
         let cmds: Vec<vk::CommandBuffer> = inits.iter().map(|(_, c)| *c).collect();
-        let info = vk::SubmitInfo::builder().command_buffers(&cmds).build();
+        let info = vk::SubmitInfo::default().command_buffers(&cmds);
         // SAFETY: the layer's own recorded buffers of the queue's family, submitted once each; the queue is
         // externally synchronized by the application's call.
         let result = unsafe { (self.device.fp_v1_0().queue_submit)(queue, 1, &info, vk::Fence::null()) };
@@ -3888,8 +3887,8 @@ mod submit_order_tests {
         assert!(t.tapped_source_layouts.is_empty());
     }
 
-    fn color_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32, format: vk::Format) -> (vk::Image, vk::DeviceMemory, vk::ImageCreateInfo) {
-        let info = vk::ImageCreateInfo::builder()
+    fn color_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, width: u32, height: u32, format: vk::Format) -> (vk::Image, vk::DeviceMemory, vk::ImageCreateInfo<'static>) {
+        let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D { width, height, depth: 1 })
@@ -3899,20 +3898,19 @@ mod submit_order_tests {
             .tiling(vk::ImageTiling::OPTIMAL)
             .usage(vk::ImageUsageFlags::TRANSFER_SRC | vk::ImageUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE)
-            .initial_layout(vk::ImageLayout::UNDEFINED)
-            .build();
+            .initial_layout(vk::ImageLayout::UNDEFINED);
         let image = unsafe { device.create_image(&info, None) }.unwrap();
         let reqs = unsafe { device.get_image_memory_requirements(image) };
         let type_index = (0..mem_props.memory_type_count)
             .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
             .unwrap();
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
         (image, memory, info)
     }
 
-    fn layout_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout) -> vk::ImageMemoryBarrier {
-        vk::ImageMemoryBarrier::builder()
+    fn layout_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout) -> vk::ImageMemoryBarrier<'static> {
+        vk::ImageMemoryBarrier::default()
             .old_layout(old)
             .new_layout(new)
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::TRANSFER_READ)
@@ -3921,7 +3919,6 @@ mod submit_order_tests {
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
             .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
-            .build()
     }
 
     /// The render tap on a real (lavapipe) device, recorded through the same tracker calls the
@@ -3950,8 +3947,8 @@ mod submit_order_tests {
             t.record_image(image, info);
         }
 
-        let pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None) }.unwrap();
-        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let pool = unsafe { device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None) }.unwrap();
+        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
         let layers = vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 };
         let whole = |x: u32, y: u32| [vk::Offset3D::default(), vk::Offset3D { x: x as i32, y: y as i32, z: 1 }];
         // Records `write` (the game's command) into a fresh command buffer, submits it, and tells
@@ -3960,7 +3957,7 @@ mod submit_order_tests {
         let game_frame = |t: &mut TapTracker, source: vk::Image, write: &dyn Fn(vk::CommandBuffer) -> TapWrite| {
             unsafe {
                 device.reset_command_pool(pool, vk::CommandPoolResetFlags::empty()).unwrap();
-                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder()).unwrap();
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
                 t.begin_recording(cmd);
                 let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[
@@ -3980,7 +3977,7 @@ mod submit_order_tests {
                 ]);
                 t.record_barrier(cmd, source, vk::ImageLayout::GENERAL);
                 device.end_command_buffer(cmd).unwrap();
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], vk::Fence::null()).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], vk::Fence::null()).unwrap();
                 t.commit_submit([cmd].into_iter());
                 device.queue_wait_idle(queue).unwrap();
             }
@@ -4100,14 +4097,14 @@ mod submit_order_tests {
         };
         let mut relays = crate::present_sync::PresentSemaphores::default();
         unsafe {
-            let fence = device.create_fence(&vk::FenceCreateInfo::builder(), None).unwrap();
+            let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             for round in 0..3 {
                 let app = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
                 // The "game's" own submit signalling its present semaphore.
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().signal_semaphores(std::slice::from_ref(&app)).build()], vk::Fence::null()).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().signal_semaphores(std::slice::from_ref(&app))], vk::Fence::null()).unwrap();
                 let relay = relay_app_waits(&device, queue, &mut relays, image(42), &[app]).expect("relay submit");
                 let stage = vk::PipelineStageFlags::ALL_COMMANDS;
-                let present_like = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&relay)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build();
+                let present_like = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&relay)).wait_dst_stage_mask(std::slice::from_ref(&stage));
                 device.queue_submit(queue, &[present_like], fence).unwrap();
                 device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
                 device.reset_fences(&[fence]).unwrap();

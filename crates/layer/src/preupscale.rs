@@ -3640,15 +3640,16 @@ pub(crate) struct Batch1 {
     pub signals: Vec<Signal1>,
 }
 
-/// One batch of a `vkQueueSubmit2` call, owned. `p_next` is the application's chain, kept on every
-/// part (only structures safe to repeat are accepted, see [`parse2`]).
+/// One batch of a `vkQueueSubmit2` call, its arrays copied (`'a`: the call's submit infos, whose
+/// `pNext` chains the copies keep). `p_next` is the application's chain, kept on every part (only
+/// structures safe to repeat are accepted, see [`parse2`]).
 #[derive(Clone, Debug)]
-pub(crate) struct Batch2 {
+pub(crate) struct Batch2<'a> {
     pub flags: vk::SubmitFlags,
     pub p_next: *const c_void,
-    pub waits: Vec<vk::SemaphoreSubmitInfo>,
-    pub cbs: Vec<vk::CommandBufferSubmitInfo>,
-    pub signals: Vec<vk::SemaphoreSubmitInfo>,
+    pub waits: Vec<vk::SemaphoreSubmitInfo<'a>>,
+    pub cbs: Vec<vk::CommandBufferSubmitInfo<'a>>,
+    pub signals: Vec<vk::SemaphoreSubmitInfo<'a>>,
 }
 
 /// What [`plan`] needs from a batch type.
@@ -3688,20 +3689,20 @@ impl SplitBatch for Batch1 {
     }
 }
 
-impl SplitBatch for Batch2 {
-    type Wait = vk::SemaphoreSubmitInfo;
+impl<'a> SplitBatch for Batch2<'a> {
+    type Wait = vk::SemaphoreSubmitInfo<'a>;
     fn split_at(mut self, k: usize) -> (Self, Self) {
         let rest = self.cbs.split_off(k);
         let suffix = Batch2 { flags: self.flags, p_next: self.p_next, waits: Vec::new(), cbs: rest, signals: std::mem::take(&mut self.signals) };
         (self, suffix)
     }
-    fn take_waits(&mut self) -> Vec<vk::SemaphoreSubmitInfo> {
+    fn take_waits(&mut self) -> Vec<vk::SemaphoreSubmitInfo<'a>> {
         std::mem::take(&mut self.waits)
     }
-    fn put_waits(&mut self, waits: Vec<vk::SemaphoreSubmitInfo>) {
+    fn put_waits(&mut self, waits: Vec<vk::SemaphoreSubmitInfo<'a>>) {
         self.waits.splice(0..0, waits);
     }
-    fn own(waits: Vec<vk::SemaphoreSubmitInfo>, command_buffer: vk::CommandBuffer) -> Self {
+    fn own(waits: Vec<vk::SemaphoreSubmitInfo<'a>>, command_buffer: vk::CommandBuffer) -> Self {
         let waits = waits.into_iter().map(|w| vk::SemaphoreSubmitInfo { stage_mask: vk::PipelineStageFlags2::ALL_COMMANDS, ..w }).collect();
         let cb = vk::CommandBufferSubmitInfo { command_buffer, ..Default::default() };
         Batch2 { flags: vk::SubmitFlags::empty(), p_next: std::ptr::null(), waits, cbs: vec![cb], signals: Vec::new() }
@@ -3910,7 +3911,7 @@ const FRAME_BOUNDARY_EXT: vk::StructureType = vk::StructureType::from_raw(1_000_
 ///
 /// # Safety
 /// `submits` must be the application's own, valid for the duration of its call.
-pub(crate) unsafe fn parse2(submits: &[vk::SubmitInfo2]) -> Result<Vec<Batch2>, &'static str> {
+pub(crate) unsafe fn parse2<'a>(submits: &[vk::SubmitInfo2<'a>]) -> Result<Vec<Batch2<'a>>, &'static str> {
     let mut out = Vec::with_capacity(submits.len());
     for s in submits {
         if s.flags.contains(vk::SubmitFlags::PROTECTED) {
@@ -3944,8 +3945,8 @@ pub(crate) unsafe fn parse2(submits: &[vk::SubmitInfo2]) -> Result<Vec<Batch2>, 
 /// `VkSubmitInfo`s (and the timeline structures and arrays they point at) built from owned batches.
 /// The arrays live on the heap, so moving this value keeps every pointer valid.
 pub(crate) struct Submits1 {
-    pub infos: Vec<vk::SubmitInfo>,
-    _timelines: Vec<vk::TimelineSemaphoreSubmitInfo>,
+    pub infos: Vec<vk::SubmitInfo<'static>>,
+    _timelines: Vec<vk::TimelineSemaphoreSubmitInfo<'static>>,
     _storage: Vec<Storage1>,
 }
 
@@ -4005,7 +4006,7 @@ pub(crate) fn build1(batches: &[Batch1]) -> Submits1 {
 }
 
 /// `VkSubmitInfo2`s pointing into `batches`, which must outlive the result's use.
-pub(crate) fn build2(batches: &[Batch2]) -> Vec<vk::SubmitInfo2> {
+pub(crate) fn build2<'b>(batches: &'b [Batch2<'_>]) -> Vec<vk::SubmitInfo2<'b>> {
     batches
         .iter()
         .map(|b| vk::SubmitInfo2 {
@@ -4114,7 +4115,7 @@ fn own_host_buffer(device: &ash::Device, instance: &ash::Instance, physical_devi
 
 /// [`own_host_buffer`] with the given usage.
 fn own_host_buffer_with(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64, usage: vk::BufferUsageFlags) -> Option<HostBuffer> {
-    let info = vk::BufferCreateInfo::builder().size(bytes).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let info = vk::BufferCreateInfo::default().size(bytes).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
     // SAFETY: `info` is valid.
     let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
     // SAFETY: `buffer` was just created.
@@ -4130,7 +4131,7 @@ fn own_host_buffer_with(device: &ash::Device, instance: &ash::Instance, physical
         unsafe { device.destroy_buffer(buffer, None) };
         return None;
     };
-    let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
+    let alloc = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index);
     // SAFETY: valid allocation info.
     let Ok(memory) = (unsafe { device.allocate_memory(&alloc, None) }) else {
         // SAFETY: nothing bound yet.
@@ -4377,13 +4378,13 @@ impl Resources {
                 }
             }
         };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         // SAFETY: valid create info on a live device.
         let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else {
             cleanup(None, &[]);
             return None;
         };
-        let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3);
+        let alloc = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3);
         // SAFETY: `pool` was just created; the loader's dispatch pointer is set on each buffer.
         let Ok(cmds) = (unsafe { crate::loader_data::allocate_commands(device, &alloc) }) else {
             cleanup(Some(pool), &[]);
@@ -4917,7 +4918,7 @@ unsafe fn record_capture(
         // SAFETY: the pool allows resetting buffers individually; the buffer is not pending.
         unsafe {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
     }
     let aux: Vec<DumpRead> = capture_reads(target, dump, hdr.filter(|_| !auto).map(hdr::HdrPass::exposure_buffer), native_mvec, native_depth.map(|(b, _)| b));
@@ -4926,7 +4927,7 @@ unsafe fn record_capture(
         .iter()
         .filter(|r| r.transition)
         .map(|&DumpRead { aux: a, read, .. }| {
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .old_layout(a.layout.unwrap_or_default())
                 .new_layout(read)
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -4935,7 +4936,6 @@ unsafe fn record_capture(
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(a.image)
                 .subresource_range(aux_range(a.format))
-                .build()
         })
         .collect();
     // The encode's own image: its old contents are not needed (fully rewritten).
@@ -4948,7 +4948,7 @@ unsafe fn record_capture(
     } else {
         (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
     };
-    let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(dst_access).build();
+    let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(dst_access);
     // SAFETY: recording into the layer's own buffer; every handle is live.
     unsafe {
         device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, dst_stage, vk::DependencyFlags::empty(), &[open], &[], &to_read);
@@ -5016,7 +5016,7 @@ unsafe fn record_capture(
         .iter()
         .filter(|r| r.transition)
         .map(|&DumpRead { aux: a, read, .. }| {
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .old_layout(read)
                 .new_layout(a.layout.unwrap_or_default())
                 .src_access_mask(vk::AccessFlags::empty())
@@ -5025,7 +5025,6 @@ unsafe fn record_capture(
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(a.image)
                 .subresource_range(aux_range(a.format))
-                .build()
         })
         .collect();
     // The auto-exposure's resolve wrote its state and the exposure value from a shader: those are
@@ -5036,7 +5035,7 @@ unsafe fn record_capture(
     } else {
         (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
     };
-    let close = vk::MemoryBarrier::builder().src_access_mask(close_access).dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ).build();
+    let close = vk::MemoryBarrier::default().src_access_mask(close_access).dst_access_mask(vk::AccessFlags::HOST_READ | vk::AccessFlags::MEMORY_READ);
     // SAFETY: as above.
     unsafe {
         device.cmd_pipeline_barrier(
@@ -5086,10 +5085,10 @@ unsafe fn record_writeback(
     } else {
         (vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE, vk::PipelineStageFlags::TRANSFER, vk::AccessFlags::TRANSFER_WRITE)
     };
-    let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE).dst_access_mask(dst_access).build();
+    let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE).dst_access_mask(dst_access);
     // The dump's copies read what the decode wrote, and the host reads them after the fence.
     let (mut close_stage, mut close_access) = (vk::PipelineStageFlags::ALL_COMMANDS, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
-    let decoded = vk::MemoryBarrier::builder().src_access_mask(src_access).dst_access_mask(vk::AccessFlags::TRANSFER_READ).build();
+    let decoded = vk::MemoryBarrier::default().src_access_mask(src_access).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
     let decoded_stage = src_stage;
     if cache.is_some() {
         src_stage |= vk::PipelineStageFlags::TRANSFER;
@@ -5097,13 +5096,13 @@ unsafe fn record_writeback(
         close_stage |= vk::PipelineStageFlags::HOST;
         close_access |= vk::AccessFlags::HOST_READ;
     }
-    let close = vk::MemoryBarrier::builder().src_access_mask(src_access).dst_access_mask(close_access).build();
+    let close = vk::MemoryBarrier::default().src_access_mask(src_access).dst_access_mask(close_access);
     let answer_image: Vec<vk::ImageMemoryBarrier> = hdr.map(hdr::HdrPass::answer_to_general).into_iter().collect();
     // SAFETY: the layer's own buffer, not pending, or DLSS's being recorded; every handle is live.
     unsafe {
         if into.is_none() {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
         device.cmd_pipeline_barrier(
             cmd,
@@ -5150,16 +5149,15 @@ unsafe fn record_writeback(
 unsafe fn record_cached_writeback(device: &ash::Device, res: &Resources, apply: &dyn Fn(vk::CommandBuffer), into: Option<vk::CommandBuffer>) -> ash::prelude::VkResult<()> {
     let cmd = into.unwrap_or(res.writeback_cmd);
     let writeback_timer = res.writeback_timer.as_ref().filter(|_| into.is_none());
-    let open = vk::MemoryBarrier::builder()
+    let open = vk::MemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE | vk::AccessFlags::HOST_WRITE)
-        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-        .build();
-    let close = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+        .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+    let close = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     // SAFETY: the layer's own buffer, not pending, or DLSS's being recorded; every handle is live.
     unsafe {
         if into.is_none() {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
         }
         device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS | vk::PipelineStageFlags::HOST, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[open], &[], &[]);
         if let Some(timer) = writeback_timer {
@@ -6938,16 +6936,16 @@ mod tests {
         assert_eq!(run(&[vk::Result::ERROR_DEVICE_LOST]), (vk::Result::ERROR_DEVICE_LOST, 1, vec![vec![cb(10)]]), "a lost device is not retried");
     }
 
-    fn sem2(raw: u64, value: u64) -> vk::SemaphoreSubmitInfo {
+    fn sem2(raw: u64, value: u64) -> vk::SemaphoreSubmitInfo<'static> {
         vk::SemaphoreSubmitInfo { semaphore: sem(raw), value, stage_mask: vk::PipelineStageFlags2::COMPUTE_SHADER, ..Default::default() }
     }
-    fn cb2(raw: u64) -> vk::CommandBufferSubmitInfo {
+    fn cb2(raw: u64) -> vk::CommandBufferSubmitInfo<'static> {
         vk::CommandBufferSubmitInfo { command_buffer: cb(raw), ..Default::default() }
     }
 
     #[test]
     fn submit2_split_keeps_values_flags_and_chain_and_moves_waits() {
-        let latency = vk::BaseInStructure { s_type: LATENCY_SUBMISSION_PRESENT_ID_NV, p_next: std::ptr::null() };
+        let latency = vk::BaseInStructure { s_type: LATENCY_SUBMISSION_PRESENT_ID_NV, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
         let waits = [sem2(1, 41), sem2(2, 42)];
         let cbs = [cb2(10), cb2(11), cb2(12)];
         let signals = [sem2(3, 43)];
@@ -6990,7 +6988,7 @@ mod tests {
         assert!(own.p_next.is_null() && own.flags.is_empty(), "the layer's own batch carries nothing of the game's");
         assert!(p.tail[0].waits.is_empty());
         // An unknown chain is refused.
-        let keyed = vk::BaseInStructure { s_type: vk::StructureType::WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR, p_next: std::ptr::null() };
+        let keyed = vk::BaseInStructure { s_type: vk::StructureType::WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
         assert!(unsafe { parse2(&[vk::SubmitInfo2 { p_next: std::ptr::from_ref(&keyed).cast(), ..info }]) }.is_err());
     }
 
@@ -7481,8 +7479,8 @@ mod tests {
     /// both halves, with the layer's own submits between them.
     #[test]
     fn a_frame_boundary_submit_is_refused_and_forwarded_untouched() {
-        let boundary = vk::BaseInStructure { s_type: FRAME_BOUNDARY_EXT, p_next: std::ptr::null() };
-        let latency = vk::BaseInStructure { s_type: LATENCY_SUBMISSION_PRESENT_ID_NV, p_next: std::ptr::from_ref(&boundary) };
+        let boundary = vk::BaseInStructure { s_type: FRAME_BOUNDARY_EXT, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
+        let latency = vk::BaseInStructure { s_type: LATENCY_SUBMISSION_PRESENT_ID_NV, p_next: std::ptr::from_ref(&boundary), _marker: std::marker::PhantomData };
         let cbs = [cb2(10), cb2(11)];
         let plain = vk::SubmitInfo2 { command_buffer_info_count: 2, p_command_buffer_infos: cbs.as_ptr(), ..Default::default() };
         for chain in [std::ptr::from_ref(&boundary), std::ptr::from_ref(&latency)] {
@@ -9591,7 +9589,7 @@ mod tests {
             } else {
                 crate::composition::gpu::test_device()?
             };
-            let info = vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let info = vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
             let pool = unsafe { device.create_command_pool(&info, None) }.unwrap();
             Some(Self { instance, physical, device, queue, family, pool, _entry: entry })
         }
@@ -9599,12 +9597,12 @@ mod tests {
         fn one_shot(&self, record: impl FnOnce(vk::CommandBuffer)) {
             let d = &self.device;
             unsafe {
-                let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+                let alloc = vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
                 let cmd = d.allocate_command_buffers(&alloc).unwrap()[0];
-                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
                 record(cmd);
                 d.end_command_buffer(cmd).unwrap();
-                d.queue_submit(self.queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], vk::Fence::null()).unwrap();
+                d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
                 d.queue_wait_idle(self.queue).unwrap();
                 d.free_command_buffers(self.pool, &[cmd]);
             }
@@ -9612,7 +9610,7 @@ mod tests {
 
         fn image(&self, width: u32, height: u32) -> (vk::Image, vk::DeviceMemory) {
             let d = &self.device;
-            let info = vk::ImageCreateInfo::builder()
+            let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk::Format::R16G16B16A16_SFLOAT)
                 .extent(vk::Extent3D { width, height, depth: 1 })
@@ -9628,13 +9626,13 @@ mod tests {
             let index = (0..props.memory_type_count)
                 .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
                 .unwrap();
-            let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
+            let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
             unsafe { d.bind_image_memory(image, memory, 0) }.unwrap();
             (image, memory)
         }
 
         fn barrier(cmd: vk::CommandBuffer, d: &ash::Device, image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout) {
-            let b = vk::ImageMemoryBarrier::builder()
+            let b = vk::ImageMemoryBarrier::default()
                 .old_layout(old)
                 .new_layout(new)
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -9642,8 +9640,7 @@ mod tests {
                 .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
-                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
-                .build();
+                .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 });
             unsafe { d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[b]) };
         }
 
@@ -9666,11 +9663,11 @@ mod tests {
             let staging = own_host_buffer(&self.device, &self.instance, self.physical, n as u64).unwrap();
             let d = &self.device;
             self.one_shot(|cmd| {
-                let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).build();
+                let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
                 unsafe { d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[open], &[], &[]) };
                 let region = vk::BufferImageCopy { image_subresource: colour_layers(), image_extent: vk::Extent3D { width, height, depth: 1 }, ..Default::default() };
                 unsafe { d.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::GENERAL, staging.buffer, &[region]) };
-                let to_host = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ).build();
+                let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
                 unsafe { d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]) };
             });
             let out = unsafe { std::slice::from_raw_parts(staging.ptr, n) }.to_vec();
@@ -10001,7 +9998,7 @@ mod tests {
     /// A 1x1 R16_SFLOAT image holding `value`, in GENERAL: DLSS's exposure input.
     fn exposure_image(gpu: &Gpu, value: f32) -> (vk::Image, vk::DeviceMemory) {
         let d = &gpu.device;
-        let info = vk::ImageCreateInfo::builder()
+        let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R16_SFLOAT)
             .extent(vk::Extent3D { width: 1, height: 1, depth: 1 })
@@ -10014,7 +10011,7 @@ mod tests {
         let image = unsafe { d.create_image(&info, None) }.unwrap();
         let reqs = unsafe { d.get_image_memory_requirements(image) };
         let index = (0..32).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
-        let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
+        let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
         unsafe { d.bind_image_memory(image, memory, 0) }.unwrap();
         let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
         gpu.one_shot(|cmd| unsafe {
@@ -10073,7 +10070,7 @@ mod tests {
             let mut submits = Vec::new();
             let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
                 submits.push(which);
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+                device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
             };
             let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, &mut res, &target, Mode::Roundtrip, false, 0, &mut submit) };
             assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{result:?}");
@@ -10163,7 +10160,7 @@ mod tests {
         let mut submits = Vec::new();
         let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             submits.push(which);
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
         };
         let base = Target { colour: image, width: w, height: h, depth: None, depth_buffer: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification: 1 };
         {
@@ -10179,7 +10176,7 @@ mod tests {
         let unreadable = Some(Aux { readable: false, ..exposure_aux(zero).unwrap() });
         let unknown_layout = Some(Aux { layout: None, ..exposure_aux(zero).unwrap() });
         let mut plain = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
         };
         for exposure_input in [None, unreadable, unknown_layout] {
             let target = Target { exposure_input, ..base };
@@ -10225,7 +10222,7 @@ mod tests {
                 let open = [pass.encoded_to_general(), pass.answer_to_general()];
                 d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &open);
                 pass.record_encode(d, cmd, None, white);
-                let encoded = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
+                let encoded = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
                 d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[encoded], &[], &[]);
                 pass.record_decode(d, cmd, source.buffer, white, None);
             });
@@ -10421,7 +10418,7 @@ mod tests {
         let target = Target { colour: image, width: w, height: h, depth: None, depth_buffer: None, mvec: None, mvec_scale: [1.0, 1.0], exposure: [None; MAX_EXPOSURE], exposure_input: None, paper_white: hdr::DEFAULT_PAPER_WHITE, identification };
         let (device, queue) = (&gpu.device, gpu.queue);
         let mut submit = |_: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
         };
         let result = unsafe { run_hold(&gpu.device, &gpu.instance, gpu.physical, res, &target, Mode::Roundtrip, false, 0, &mut submit) };
         assert!(result.waits_consumed && result.wrote_back && result.miss.is_none(), "{result:?}");
@@ -10592,13 +10589,12 @@ mod tests {
     #[test]
     fn depth_images_are_made_copyable() {
         let info = |format| {
-            vk::ImageCreateInfo::builder()
+            vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
                 .samples(vk::SampleCountFlags::TYPE_1)
                 .tiling(vk::ImageTiling::OPTIMAL)
                 .usage(vk::ImageUsageFlags::DEPTH_STENCIL_ATTACHMENT | vk::ImageUsageFlags::SAMPLED)
-                .build()
         };
         let x86 = cfg!(target_arch = "x86_64");
         assert_eq!(wants_copyable(&info(vk::Format::D32_SFLOAT_S8_UINT)), x86);
@@ -10630,7 +10626,7 @@ mod tests {
         let original = pattern(w, h);
         gpu.upload(image, w, h, &original);
         let depth_format = vk::Format::D32_SFLOAT_S8_UINT;
-        let info = vk::ImageCreateInfo::builder()
+        let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(depth_format)
             .extent(vk::Extent3D { width: w, height: h, depth: 1 })
@@ -10644,11 +10640,11 @@ mod tests {
         let reqs = unsafe { d.get_image_memory_requirements(depth) };
         let props = unsafe { gpu.instance.get_physical_device_memory_properties(gpu.physical) };
         let index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
-        let depth_mem = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
+        let depth_mem = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.unwrap();
         unsafe { d.bind_image_memory(depth, depth_mem, 0) }.unwrap();
         let ds_range = aux_range(depth_format);
         let to = |old, new| {
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .old_layout(old)
                 .new_layout(new)
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -10657,7 +10653,6 @@ mod tests {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(depth)
                 .subresource_range(ds_range)
-                .build()
         };
         let all = vk::PipelineStageFlags::ALL_COMMANDS;
         gpu.one_shot(|cmd| unsafe {
@@ -10691,7 +10686,7 @@ mod tests {
             record_capture(d, res, target, None, None, Some(res.proxy.buffer), None, Some((depth_copy.buffer, None)), cache.map(|c| c.colour), None, None).unwrap();
             record_writeback(d, res, target, res.proxy.buffer, None, cache, None, None).unwrap();
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-            d.queue_submit(gpu.queue, &[vk::SubmitInfo::builder().command_buffers(&[res.capture_cmd, res.writeback_cmd]).build()], fence).unwrap();
+            d.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[res.capture_cmd, res.writeback_cmd])], fence).unwrap();
             d.wait_for_fences(&[fence], true, u64::MAX).unwrap();
             d.destroy_fence(fence, None);
         };
@@ -10747,7 +10742,7 @@ mod tests {
         let original = pattern(w, h);
         gpu.upload(image, w, h, &original);
         let make_sized = |format: vk::Format, usage: vk::ImageUsageFlags, (w, h): (u32, u32)| {
-            let info = vk::ImageCreateInfo::builder()
+            let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
                 .extent(vk::Extent3D { width: w, height: h, depth: 1 })
@@ -10761,7 +10756,7 @@ mod tests {
             let reqs = unsafe { d.get_image_memory_requirements(image) };
             let props = unsafe { gpu.instance.get_physical_device_memory_properties(gpu.physical) };
             let index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0)?;
-            let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.ok()?;
+            let memory = unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.ok()?;
             unsafe { d.bind_image_memory(image, memory, 0) }.ok()?;
             Some((image, memory))
         };
@@ -10773,7 +10768,7 @@ mod tests {
         let ds_range = aux_range(depth_format);
         let colour_range = aux_range(vk::Format::R16G16_SFLOAT);
         let to = |image, range, old, new| {
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .old_layout(old)
                 .new_layout(new)
                 .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -10782,7 +10777,6 @@ mod tests {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
                 .subresource_range(range)
-                .build()
         };
         let all = vk::PipelineStageFlags::ALL_COMMANDS;
         gpu.one_shot(|cmd| unsafe {
@@ -10825,7 +10819,7 @@ mod tests {
         let mut submits = Vec::new();
         let mut submit = |which: Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe {
             submits.push(which);
-            d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence)
+            d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence)
         };
         let mut result = unsafe { run_hold(d, &gpu.instance, gpu.physical, &mut res, &target, Mode::Dump, true, 7, &mut submit) };
         assert_eq!(submits, vec![Which::Capture], "a dump never writes back");

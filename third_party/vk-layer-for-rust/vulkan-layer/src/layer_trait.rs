@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 //! This module includes all the traits that require the layer implementation to implement.
 
@@ -506,7 +508,7 @@ pub trait InstanceInfo: Send + Sync {
     ///             .iter()
     ///             .find(|extension_name| {
     ///                 (unsafe { CStr::from_ptr(**extension_name) })
-    ///                     == ash::extensions::khr::Win32Surface::name()
+    ///                     == ash::khr::win32_surface::NAME
     ///             })
     ///             .is_some();
     ///         MyLayerInstanceInfo {
@@ -622,11 +624,11 @@ pub trait GlobalHooks: Send + Sync {
     ///             .iter()
     ///             .find(|extension_name| {
     ///                 (unsafe { CStr::from_ptr(**extension_name) })
-    ///                     == ash::extensions::khr::Win32Surface::name()
+    ///                     == ash::khr::win32_surface::NAME
     ///             })
     ///             .is_none()
     ///         {
-    ///             enabled_extensions.push(ash::extensions::khr::Win32Surface::name().as_ptr());
+    ///             enabled_extensions.push(ash::khr::win32_surface::NAME.as_ptr());
     ///         }
     ///         // Create a new VkInstanceCreateInfo with the new extensions. The passed in
     ///         // VkInstanceCreateInfo is const, so we have to create another VkInstanceCreateInfo
@@ -810,7 +812,7 @@ pub trait GlobalHooksInfo: Send + Sync {
 /// let extension_properties_ffi: vk::ExtensionProperties = extension_properties.clone().into();
 /// assert_eq!(
 ///     unsafe { CStr::from_ptr(extension_properties_ffi.extension_name.as_ptr()) },
-///     ash::vk::KhrSurfaceFn::name()
+///     ash::khr::surface::NAME
 /// );
 /// assert_eq!(extension_properties_ffi.spec_version, 25);
 /// ```
@@ -830,10 +832,10 @@ impl From<ExtensionProperties> for vk::ExtensionProperties {
         let name = CString::new(name).unwrap();
         let byte_len = name.as_bytes().len();
         let name = unsafe { std::slice::from_raw_parts(name.as_ptr(), byte_len) };
-        let mut res = Self::builder()
-            .extension_name([0; vk::MAX_EXTENSION_NAME_SIZE])
-            .spec_version(spec_version)
-            .build();
+        let mut res = Self {
+            extension_name: [0; vk::MAX_EXTENSION_NAME_SIZE],
+            spec_version,
+        };
         res.extension_name[0..byte_len].copy_from_slice(name);
         res
     }
@@ -1528,7 +1530,7 @@ pub trait Layer: Sync + Default + 'static {
     ///             .iter()
     ///             .find(|extension_name| {
     ///                 (unsafe { CStr::from_ptr(**extension_name) })
-    ///                     == ash::extensions::khr::Win32Surface::name()
+    ///                     == ash::khr::win32_surface::NAME
     ///             })
     ///             .is_some();
     ///         MyLayerInstanceInfo {

@@ -1163,13 +1163,13 @@ impl Feedback {
     /// # Safety
     /// `device` is live.
     unsafe fn build(device: &ash::Device) -> Option<Self> {
-        let b = |n: u32, ty| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build();
+        let b = |n: u32, ty| vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
         let bindings = [b(0, vk::DescriptorType::STORAGE_IMAGE), b(1, vk::DescriptorType::STORAGE_BUFFER)];
         // SAFETY: valid create infos; each object is destroyed below on a later failure.
         unsafe {
-            let set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
-            let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<FeedbackPush>() as u32).build();
-            let Ok(layout) = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&[set_layout]).push_constant_ranges(&[push]), None) else {
+            let set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
+            let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<FeedbackPush>() as u32);
+            let Ok(layout) = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&[push]), None) else {
                 device.destroy_descriptor_set_layout(set_layout, None);
                 return None;
             };
@@ -1189,8 +1189,8 @@ impl Feedback {
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_IMAGE, descriptor_count: 1 },
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 },
             ];
-            let Ok(pool) = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None) else { return undo(Some(pipeline), None) };
-            let Ok(sets) = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(&[set_layout])) else {
+            let Ok(pool) = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None) else { return undo(Some(pipeline), None) };
+            let Ok(sets) = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])) else {
                 return undo(Some(pipeline), Some(pool));
             };
             Some(Self { set_layout, layout, pipeline, pool, set: sets[0], bound: None })
@@ -1226,7 +1226,7 @@ impl OwnBuffer {
     /// # Safety
     /// `device` is live.
     pub(super) unsafe fn new(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, bytes: u64, usage: vk::BufferUsageFlags) -> Option<Self> {
-        let info = vk::BufferCreateInfo::builder().size(bytes).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = vk::BufferCreateInfo::default().size(bytes).usage(usage).sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: valid create info.
         let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
         // SAFETY: just created.
@@ -1237,7 +1237,7 @@ impl OwnBuffer {
             .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL));
         let memory = index.and_then(|index| {
             // SAFETY: valid allocation info.
-            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.ok()
+            unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.ok()
         });
         // SAFETY: sized for each other; on failure nothing was submitted.
         match memory.filter(|&m| unsafe { device.bind_buffer_memory(buffer, m, 0) }.is_ok()) {
@@ -1574,7 +1574,7 @@ impl NativePass {
     ) -> Option<Self> {
         let (padded_width, padded_height) = super::padded(width, height);
         let binding = |n: u32, ty: vk::DescriptorType| {
-            vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build()
+            vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE)
         };
         let bindings = [
             binding(0, vk::DescriptorType::STORAGE_IMAGE),
@@ -1613,14 +1613,14 @@ impl NativePass {
         // end, where it moves into the result.
         unsafe {
             step()?;
-            p.set_layout = made(device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?);
+            p.set_layout = made(device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?);
             step()?;
-            p.pipeline_layout = made(device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&p.set_layout)), None).ok()?);
+            p.pipeline_layout = made(device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&p.set_layout)), None).ok()?);
             step()?;
             // MOTION_HALF (constant_id 0), a VkBool32.
             let half = u32::from(motion_half).to_le_bytes();
             let entry = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
-            let spec = vk::SpecializationInfo::builder().map_entries(&entry).data(&half).build();
+            let spec = vk::SpecializationInfo::default().map_entries(&entry).data(&half);
             p.preprocess = made(hdr::compute_pipeline_with(device, p.pipeline_layout, PREPROCESS_SPV, Some(&spec))?);
             step()?;
             p.composite = made(hdr::compute_pipeline_with(device, p.pipeline_layout, COMPOSITE_SPV, Some(&spec))?);
@@ -1628,7 +1628,7 @@ impl NativePass {
             p.sampler = made(
                 device
                     .create_sampler(
-                        &vk::SamplerCreateInfo::builder()
+                        &vk::SamplerCreateInfo::default()
                             .mag_filter(vk::Filter::LINEAR)
                             .min_filter(vk::Filter::LINEAR)
                             .mipmap_mode(vk::SamplerMipmapMode::NEAREST)
@@ -1646,11 +1646,11 @@ impl NativePass {
                 vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 2 },
             ];
             step()?;
-            p.pool = made(device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(2).pool_sizes(&sizes), None).ok()?);
+            p.pool = made(device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2).pool_sizes(&sizes), None).ok()?);
             let layouts = [p.set_layout, p.set_layout];
             step()?;
             // Freed with the pool.
-            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(p.pool).set_layouts(&layouts)).ok()?;
+            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(p.pool).set_layouts(&layouts)).ok()?;
             for _ in 0..2 {
                 step()?;
                 // Pass 1's history, at its extent.
@@ -1687,10 +1687,10 @@ impl NativePass {
             step()?;
             p.command_pool = made(
                 device
-                    .create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
+                    .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
                     .ok()?,
             );
-            let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(p.command_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3);
+            let alloc = vk::CommandBufferAllocateInfo::default().command_pool(p.command_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(3);
             step()?;
             // Freed with the command pool.
             let cmds = crate::loader_data::allocate_commands(device, &alloc).ok()?;
@@ -1801,7 +1801,7 @@ impl NativePass {
         if self.resize.is_none() {
             let half = u32::from(self.motion_half).to_le_bytes();
             let entry = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
-            let spec = vk::SpecializationInfo::builder().map_entries(&entry).data(&half).build();
+            let spec = vk::SpecializationInfo::default().map_entries(&entry).data(&half);
             // SAFETY: `device` is live; the layout is this pass's.
             let reduce = unsafe { hdr::compute_pipeline_with(device, self.pipeline_layout, REDUCE_SPV, Some(&spec)) };
             // SAFETY: as above.
@@ -2026,7 +2026,7 @@ impl NativePass {
         let pipeline = |phase: u32| {
             let data = phase.to_le_bytes();
             let entry = [vk::SpecializationMapEntry { constant_id: 1, offset: 0, size: 4 }];
-            let spec = vk::SpecializationInfo::builder().map_entries(&entry).data(&data).build();
+            let spec = vk::SpecializationInfo::default().map_entries(&entry).data(&data);
             // SAFETY: `device` is live; the layout is this pass's.
             unsafe { hdr::compute_pipeline_with(device, self.pipeline_layout, COLOUR_SPV, Some(&spec)) }
         };
@@ -2071,7 +2071,7 @@ impl NativePass {
         }
         let half = u32::from(self.motion_half).to_le_bytes();
         let entry = [vk::SpecializationMapEntry { constant_id: 0, offset: 0, size: 4 }];
-        let spec = vk::SpecializationInfo::builder().map_entries(&entry).data(&half).build();
+        let spec = vk::SpecializationInfo::default().map_entries(&entry).data(&half);
         // SAFETY: `device` is live; the layout is this pass's.
         let Some(pipeline) = (unsafe { hdr::compute_pipeline_with(device, self.pipeline_layout, MASK_SPV, Some(&spec)) }) else { return false };
         let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
@@ -2137,26 +2137,26 @@ impl NativePass {
             buf(exposure, 4),
             buf(lane.map_or(self.answer.buffer, |l| l.answer.buffer), vk::WHOLE_SIZE),
         );
-        let w = |binding, ty| vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(binding).descriptor_type(ty);
+        let w = |binding, ty| vk::WriteDescriptorSet::default().dst_set(set).dst_binding(binding).descriptor_type(ty);
         let writes = [
-            w(0, vk::DescriptorType::STORAGE_IMAGE).image_info(&enc).build(),
-            w(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&prev).build(),
-            w(2, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&mv).build(),
-            w(3, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&feat).build(),
-            w(4, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&params).build(),
-            w(5, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&state).build(),
-            w(6, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&expo).build(),
-            w(7, vk::DescriptorType::STORAGE_IMAGE).image_info(&next).build(),
-            w(8, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ans).build(),
-            w(9, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&head).build(),
-            w(10, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&mask_buf).build(),
-            w(11, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&depth_buf).build(),
-            w(12, vk::DescriptorType::STORAGE_IMAGE).image_info(&full_enc).build(),
-            w(13, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_motion_buf).build(),
-            w(14, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_depth_buf).build(),
-            w(15, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_answer_buf).build(),
-            w(16, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&low_buf).build(),
-            w(17, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&lut_buf).build(),
+            w(0, vk::DescriptorType::STORAGE_IMAGE).image_info(&enc),
+            w(1, vk::DescriptorType::COMBINED_IMAGE_SAMPLER).image_info(&prev),
+            w(2, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&mv),
+            w(3, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&feat),
+            w(4, vk::DescriptorType::UNIFORM_BUFFER).buffer_info(&params),
+            w(5, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&state),
+            w(6, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&expo),
+            w(7, vk::DescriptorType::STORAGE_IMAGE).image_info(&next),
+            w(8, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&ans),
+            w(9, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&head),
+            w(10, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&mask_buf),
+            w(11, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&depth_buf),
+            w(12, vk::DescriptorType::STORAGE_IMAGE).image_info(&full_enc),
+            w(13, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_motion_buf),
+            w(14, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_depth_buf),
+            w(15, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&full_answer_buf),
+            w(16, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&low_buf),
+            w(17, vk::DescriptorType::STORAGE_BUFFER).buffer_info(&lut_buf),
         ];
         // SAFETY: the set is not in use (contract); every handle is live.
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -2223,7 +2223,7 @@ impl NativePass {
             vk::DescriptorPoolSize { ty: vk::DescriptorType::UNIFORM_BUFFER, descriptor_count: 2 * MORE as u32 },
         ];
         // SAFETY: valid create info.
-        let Ok(pool) = (unsafe { device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(2 * MORE as u32).pool_sizes(&sizes), None) }) else {
+        let Ok(pool) = (unsafe { device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(2 * MORE as u32).pool_sizes(&sizes), None) }) else {
             return false;
         };
         let mut params: Vec<[HostBuffer; 2]> = Vec::with_capacity(MORE);
@@ -2263,10 +2263,10 @@ impl NativePass {
         };
         let layouts = vec![self.set_layout; 2 * MORE];
         // SAFETY: the pool has room for them (freed with it).
-        let Ok(sets) = (unsafe { device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(&layouts)) }) else {
+        let Ok(sets) = (unsafe { device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&layouts)) }) else {
             return fail(params, Some(saved));
         };
-        let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(self.command_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(2 * MORE as u32 + 3);
+        let alloc = vk::CommandBufferAllocateInfo::default().command_pool(self.command_pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(2 * MORE as u32 + 3);
         // SAFETY: the pass's own pool (freed with it).
         let Ok(cmds) = (unsafe { crate::loader_data::allocate_commands(device, &alloc) }) else {
             return fail(params, Some(saved));
@@ -2310,7 +2310,7 @@ impl NativePass {
             return Err(vk::Result::ERROR_INITIALIZATION_FAILED);
         }
         let Some(m) = &self.more else { return Ok(()) };
-        let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         let fresh = m.fresh.clone();
         // SAFETY: forwarded; every handle is live.
         unsafe {
@@ -2353,8 +2353,8 @@ impl NativePass {
         let image = [vk::DescriptorImageInfo { sampler: vk::Sampler::null(), image_view: encoded_view, image_layout: vk::ImageLayout::GENERAL }];
         let answer = [vk::DescriptorBufferInfo { buffer: answer_buffer, offset: 0, range: vk::WHOLE_SIZE }];
         let writes = [
-            vk::WriteDescriptorSet::builder().dst_set(f.set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&image).build(),
-            vk::WriteDescriptorSet::builder().dst_set(f.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&answer).build(),
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_IMAGE).image_info(&image),
+            vk::WriteDescriptorSet::default().dst_set(f.set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&answer),
         ];
         // SAFETY: the set is not in use (contract: it changes only here, when nothing that bound it may run).
         unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -2381,7 +2381,7 @@ impl NativePass {
         // The blend in place of a copy of the answer over the input: a barrier from what came before in the
         // buffer (the save's read of the input), the dispatch.
         let mix = |cmd: vk::CommandBuffer, f: &Feedback| {
-            let before = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
+            let before = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
             // SAFETY: recording; the set is bound to this hold's image and answer.
             unsafe {
                 device.cmd_pipeline_barrier(cmd, tc, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[before], &[], &[]);
@@ -2398,7 +2398,7 @@ impl NativePass {
             .filter_map(|k| m.history[k].as_ref())
             .flatten()
             .map(|h| {
-                vk::ImageMemoryBarrier::builder()
+                vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::GENERAL)
                     .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
@@ -2406,16 +2406,14 @@ impl NativePass {
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(h.image)
                     .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
-                    .build()
             })
             .collect();
         let t = vk::PipelineStageFlags::TRANSFER;
-        let open = vk::MemoryBarrier::builder()
+        let open = vk::MemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
-            .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE)
-            .build();
-        let mid = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).build();
-        let close = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+            .dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        let mid = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_READ).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        let close = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE | vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         // SAFETY: the contract; every handle is live.
         unsafe {
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, tc, vk::DependencyFlags::empty(), &[open], &[], &[]);
@@ -2460,7 +2458,7 @@ impl NativePass {
         // SAFETY: the layer's own buffer, not pending (forwarded); every handle is live.
         unsafe {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE))?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE))?;
             if let Some(timer) = timer {
                 timer.record_start(device, cmd);
             }
@@ -2500,7 +2498,7 @@ impl NativePass {
         let (width, height) = extent;
         // Below the render extent: the reduce first, the enlarge last (`ensure_lanes` built them).
         let resize = self.lane(extent).filter(|_| extent != (self.width, self.height)).zip(self.resize);
-        let compute = |src: vk::AccessFlags, dst: vk::AccessFlags| vk::MemoryBarrier::builder().src_access_mask(src).dst_access_mask(dst).build();
+        let compute = |src: vk::AccessFlags, dst: vk::AccessFlags| vk::MemoryBarrier::default().src_access_mask(src).dst_access_mask(dst);
         // SAFETY: the contract; every handle is live.
         unsafe {
             // `C`'s encode and motion-vector copy, and the previous frame's history write, before
@@ -2518,15 +2516,14 @@ impl NativePass {
             if let Some((lane, [reduce, _])) = resize {
                 // The network's input, motion and depth at this extent, from the render extent's (the lane's
                 // encoded image is rewritten whole: from UNDEFINED).
-                let to_general = vk::ImageMemoryBarrier::builder()
+                let to_general = vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::GENERAL)
                     .dst_access_mask(vk::AccessFlags::SHADER_WRITE)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(lane.encoded.image)
-                    .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
-                    .build();
+                    .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 });
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, reduce);
                 let (pw, ph) = super::padded(width, height);
@@ -2648,7 +2645,7 @@ impl NativePass {
         // SAFETY: as `record_frame`.
         unsafe {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder())?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default())?;
             self.record_init_body(device, cmd);
             device.end_command_buffer(cmd)
         }
@@ -2662,7 +2659,7 @@ impl NativePass {
     /// reads the history images after this.
     unsafe fn record_init_body(&self, device: &ash::Device, cmd: vk::CommandBuffer) {
         let to_general = |image| {
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .old_layout(vk::ImageLayout::UNDEFINED)
                 .new_layout(vk::ImageLayout::GENERAL)
                 .src_access_mask(vk::AccessFlags::empty())
@@ -2671,11 +2668,10 @@ impl NativePass {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
                 .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 })
-                .build()
         };
         // Whatever came before on the queue (an earlier hold reading the state) is done before the clear.
-        let before = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).build();
-        let filled = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
+        let before = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE);
+        let filled = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
         // SAFETY: the contract.
         unsafe {
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[before], &[], &[]);
@@ -2982,13 +2978,13 @@ impl HoldGuard {
     /// # Safety
     /// `device` is live.
     pub(crate) unsafe fn build(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Option<Self> {
-        let b = |n: u32| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build();
+        let b = |n: u32| vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
         let bindings = [b(0), b(1)];
         // SAFETY: valid create infos; each object is destroyed below on a later failure.
         unsafe {
-            let set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
-            let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(4).build();
-            let Ok(layout) = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&[set_layout]).push_constant_ranges(&[push]), None) else {
+            let set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
+            let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(4);
+            let Ok(layout) = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&[push]), None) else {
                 device.destroy_descriptor_set_layout(set_layout, None);
                 return None;
             };
@@ -3005,8 +3001,8 @@ impl HoldGuard {
             };
             let Some(pipeline) = hdr::compute_pipeline(device, layout, GUARD_SPV) else { return undo(None, None) };
             let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 2 }];
-            let Ok(pool) = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None) else { return undo(Some(pipeline), None) };
-            let Ok(sets) = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(&[set_layout])) else {
+            let Ok(pool) = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None) else { return undo(Some(pipeline), None) };
+            let Ok(sets) = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])) else {
                 return undo(Some(pipeline), Some(pool));
             };
             let Some(no_stats) = OwnBuffer::new(device, instance, physical_device, 64, vk::BufferUsageFlags::STORAGE_BUFFER) else { return undo(Some(pipeline), Some(pool)) };
@@ -3029,9 +3025,11 @@ impl HoldGuard {
         }
         let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
         let (a, b) = (info(state), info(stats));
-        let w = |n: u32, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(self.set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
+        fn w(set: vk::DescriptorSet, n: u32, i: &[vk::DescriptorBufferInfo; 1]) -> vk::WriteDescriptorSet<'_> {
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i)
+        }
         // SAFETY: the contract.
-        unsafe { device.update_descriptor_sets(&[w(0, &a), w(1, &b)], &[]) };
+        unsafe { device.update_descriptor_sets(&[w(self.set, 0, &a), w(self.set, 1, &b)], &[]) };
         self.bound = Some((state, stats, pass));
         true
     }
@@ -3042,8 +3040,8 @@ impl HoldGuard {
     /// # Safety
     /// `cmd` is recording, outside a render pass instance; [`Self::bind`] returned `true` for this hold.
     pub(crate) unsafe fn record(&self, device: &ash::Device, cmd: vk::CommandBuffer, seq: u64) {
-        let before = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE).build();
-        let after = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+        let before = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE);
+        let after = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         let seq = (seq as u32).to_le_bytes();
         // SAFETY: the contract.
         unsafe {
@@ -3857,10 +3855,9 @@ pub(crate) unsafe fn run_native_hold(
             for (buffer, params) in frame_plan.iter().flat_map(|p| p.params.iter()) {
                 device.cmd_update_buffer(cmd, *buffer, 0, std::slice::from_raw_parts(std::ptr::from_ref(params).cast::<u8>(), PARAMS_BYTES as usize));
             }
-            let written = vk::MemoryBarrier::builder()
+            let written = vk::MemoryBarrier::default()
                 .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::UNIFORM_READ | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE)
-                .build();
+                .dst_access_mask(vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE | vk::AccessFlags::UNIFORM_READ | vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER | vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[written], &[], &[]);
             let _ = super::record_capture(
                 device,
@@ -3906,7 +3903,7 @@ pub(crate) unsafe fn run_native_hold(
             }
             // What the host reads once the buffer ran (`inline::Harvest`): the counters, the scene cut, the
             // exposure and the auto-exposure's state, copied out of the buffers the next holds write again.
-            let before = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).build();
+            let before = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[before], &[], &[]);
             let copy = |src: vk::Buffer, at: u64, size: u64| device.cmd_copy_buffer(cmd, src, ctx.readback, &[vk::BufferCopy { src_offset: 0, dst_offset: at, size }]);
             if let Some(stats) = stats {
@@ -3919,7 +3916,7 @@ pub(crate) unsafe fn run_native_hold(
             if let Some((state, bytes)) = auto_read {
                 copy(state, super::inline::READ_AUTO, bytes.min(super::inline::READBACK_BYTES - super::inline::READ_AUTO));
             }
-            let read = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ).build();
+            let read = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[read], &[], &[]);
         }
         res.seq = seq;
@@ -4405,7 +4402,7 @@ mod tests {
         let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(W, H);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
@@ -4414,10 +4411,10 @@ mod tests {
             let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
-            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
             let inheritance = vk::CommandBufferInheritanceInfo::default();
-            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
             device.end_command_buffer(graph).unwrap();
             let frame = nn::Frame { field_width: FW, field_height: FH, features: features.buffer, features_bytes: u64::from(FW * FH) * 64, head: head.buffer, head_bytes: u64::from(FW * FH) * 16, blend_scale: 0.5, chained: 0 };
             let built = Built { width: W, height: H, frame, graph, graph_own: graph, generation: 1, network: network::FULL };
@@ -4425,7 +4422,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
             fx.one_shot(|cmd| {
-                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                let to_general = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range);
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
                 let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
                 device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
@@ -4554,11 +4551,11 @@ mod tests {
             let d = &self.gpu.3;
             // SAFETY: the test's own pool, queue and device.
             unsafe {
-                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(self.pool).command_buffer_count(1)).unwrap()[0];
+                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)).unwrap()[0];
                 d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
                 record(cmd);
                 d.end_command_buffer(cmd).unwrap();
-                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], vk::Fence::null()).unwrap();
+                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
                 d.queue_wait_idle(self.gpu.4).unwrap();
                 d.free_command_buffers(self.pool, &[cmd]);
             }
@@ -4570,7 +4567,7 @@ mod tests {
             let cmds: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().collect();
             // SAFETY: recorded, idle command buffers of this device.
             unsafe {
-                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::builder().command_buffers(&cmds).build()], vk::Fence::null()).unwrap();
+                d.queue_submit(self.gpu.4, &[vk::SubmitInfo::default().command_buffers(&cmds)], vk::Fence::null()).unwrap();
                 d.queue_wait_idle(self.gpu.4).unwrap();
             }
             for cmd in cmds {
@@ -4592,7 +4589,7 @@ mod tests {
         let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(W, H);
             // The encoded proxy, the exposure (1.0), the network's features and head buffers, an empty "graph".
@@ -4602,10 +4599,10 @@ mod tests {
             let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
-            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
             let inheritance = vk::CommandBufferInheritanceInfo::default();
-            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
             device.end_command_buffer(graph).unwrap();
             let blend = 0.5f32;
             let built = Built {
@@ -4631,7 +4628,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
             fx.one_shot(|cmd| {
-                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                let to_general = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range);
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
                 let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
                 device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
@@ -4766,7 +4763,7 @@ mod tests {
         const LUMA: [f32; 3] = [0.2126, 0.7152, 0.0722];
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(W, H);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
@@ -4775,10 +4772,10 @@ mod tests {
             let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
-            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
             let inheritance = vk::CommandBufferInheritanceInfo::default();
-            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
             device.end_command_buffer(graph).unwrap();
             let built = Built {
                 width: W,
@@ -4810,7 +4807,7 @@ mod tests {
                 first = false;
                 fx.one_shot(|cmd| {
                     if was_first {
-                        let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                        let to_general = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range);
                         device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
                     }
                     device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
@@ -4992,7 +4989,7 @@ mod tests {
         let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(W, H);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
@@ -5001,10 +4998,10 @@ mod tests {
             let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
-            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
             let inheritance = vk::CommandBufferInheritanceInfo::default();
-            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
             device.end_command_buffer(graph).unwrap();
             let built = Built {
                 width: W,
@@ -5029,7 +5026,7 @@ mod tests {
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
             let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, buffer_row_length: pw, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
             fx.one_shot(|cmd| {
-                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                let to_general = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range);
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
                 device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
             });
@@ -5048,7 +5045,7 @@ mod tests {
             assert_eq!(later.len(), 1, "one later pass");
             let copies = pass.more.as_ref().unwrap().copies;
             let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
-            device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&order).build()], vk::Fence::null()).unwrap();
+            device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
             device.queue_wait_idle(gpu.4).unwrap();
             for cmd in order {
                 pass.submitted(cmd);
@@ -5092,7 +5089,7 @@ mod tests {
             let (cmds, later) = pass.frame_passes(&built, false, None, [1.0, 1.0], &passes);
             let copies = pass.more.as_ref().unwrap().copies;
             let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
-            device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&order).build()], vk::Fence::null()).unwrap();
+            device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
             device.queue_wait_idle(gpu.4).unwrap();
             for cmd in order {
                 pass.submitted(cmd);
@@ -5124,7 +5121,7 @@ mod tests {
         let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(W, H);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
@@ -5137,10 +5134,10 @@ mod tests {
             let depth = own_host_buffer_with(device, instance, physical, u64::from(W * H) * 4, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let d: Vec<f32> = (0..H).flat_map(|_| (0..W).map(|x| if x < 4 { 0.0 } else { 0.5 })).collect();
             std::ptr::copy_nonoverlapping(d.as_ptr().cast::<u8>(), depth.ptr, d.len() * 4);
-            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
             let inheritance = vk::CommandBufferInheritanceInfo::default();
-            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
             device.end_command_buffer(graph).unwrap();
             let built = Built {
                 width: W,
@@ -5164,7 +5161,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
             fx.one_shot(|cmd| {
-                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                let to_general = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range);
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
                 let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
                 device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
@@ -5266,7 +5263,7 @@ mod tests {
         let (_, instance, physical, device, _, family) = (&gpu.0, &gpu.1, gpu.2, &gpu.3, gpu.4, gpu.5);
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(W, H);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
@@ -5275,10 +5272,10 @@ mod tests {
             let features = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 64, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let head = own_host_buffer_with(device, instance, physical, u64::from(FW * FH) * 16, vk::BufferUsageFlags::STORAGE_BUFFER).unwrap();
             let staging = own_host_buffer_with(device, instance, physical, u64::from(pw * ph) * 8, vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).unwrap();
-            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
             let inheritance = vk::CommandBufferInheritanceInfo::default();
-            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
             device.end_command_buffer(graph).unwrap();
             let built = Built {
                 width: W,
@@ -5303,7 +5300,7 @@ mod tests {
             let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
             let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, buffer_row_length: pw, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
             fx.one_shot(|cmd| {
-                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range).build();
+                let to_general = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(encoded.image).subresource_range(range);
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
                 device.cmd_copy_buffer_to_image(cmd, staging.buffer, encoded.image, vk::ImageLayout::GENERAL, &[region]);
             });
@@ -5331,11 +5328,11 @@ mod tests {
                 let init_cmd = pass.commands[2];
                 let (init, rest): (Vec<vk::CommandBuffer>, Vec<vk::CommandBuffer>) = order.iter().copied().partition(|&c| c == init_cmd);
                 if !init.is_empty() {
-                    device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&init).build()], vk::Fence::null()).unwrap();
+                    device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&init)], vk::Fence::null()).unwrap();
                     device.queue_wait_idle(gpu.4).unwrap();
                 }
                 fx.one_shot(|cmd| device.cmd_fill_buffer(cmd, state, 8, 4, u32::from(cut)));
-                device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&rest).build()], vk::Fence::null()).unwrap();
+                device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&rest)], vk::Fence::null()).unwrap();
                 device.queue_wait_idle(gpu.4).unwrap();
                 for cmd in order {
                     pass.submitted(cmd);
@@ -5531,10 +5528,10 @@ mod tests {
     unsafe fn empty_graph(device: &ash::Device, family: u32) -> (vk::CommandPool, vk::CommandBuffer) {
         // SAFETY: forwarded; valid create infos.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+            let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
             let inheritance = vk::CommandBufferInheritanceInfo::default();
-            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+            device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
             device.end_command_buffer(graph).unwrap();
             (pool, graph)
         }
@@ -5548,7 +5545,7 @@ mod tests {
             std::ptr::copy_nonoverlapping(texels.as_ptr().cast::<u8>(), staging.ptr, texels.len() * 2);
             fx.one_shot(|cmd| {
                 let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
-                let to_general = vk::ImageMemoryBarrier::builder().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(image.image).subresource_range(range).build();
+                let to_general = vk::ImageMemoryBarrier::default().old_layout(vk::ImageLayout::UNDEFINED).new_layout(vk::ImageLayout::GENERAL).dst_access_mask(vk::AccessFlags::TRANSFER_WRITE).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).image(image.image).subresource_range(range);
                 d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_general]);
                 let region = vk::BufferImageCopy { image_subresource: vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 }, image_extent: vk::Extent3D { width: pw, height: ph, depth: 1 }, ..Default::default() };
                 d.cmd_copy_buffer_to_image(cmd, staging.buffer, image.image, vk::ImageLayout::GENERAL, &[region]);
@@ -5602,7 +5599,7 @@ mod tests {
         let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(SW, SH);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
@@ -5636,7 +5633,7 @@ mod tests {
                     let (cmds, later) = if k == 0 { pass.frame_passes(&net.built, frame > 0, Some([0.25, -0.25]), [1.0, 1.0], &passes) } else { pass.frame_graphs(&graphs, frame > 0, Some([0.25, -0.25]), [1.0, 1.0], &passes) };
                     let copies = pass.more.as_ref().unwrap().copies;
                     let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
-                    device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&order).build()], vk::Fence::null()).unwrap();
+                    device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
                     device.queue_wait_idle(gpu.4).unwrap();
                     for cmd in order {
                         pass.submitted(cmd);
@@ -5686,7 +5683,7 @@ mod tests {
         assert_eq!((mw, mh), (10, 8));
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(SW, SH);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
@@ -5764,7 +5761,7 @@ mod tests {
         let (instance, physical, device, family) = (&gpu.1, gpu.2, &gpu.3, gpu.5);
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(SW, SH);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST).unwrap();
@@ -5840,7 +5837,7 @@ mod tests {
         assert_eq!(graph_sizes(&extents, 2), vec![(SW, SH), (10, 8)]);
         // SAFETY: a fresh device; every object below is used on its queue only and waited for.
         unsafe {
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
             let fx = Fixture { gpu: gpu.clone(), pool };
             let (pw, ph) = super::super::padded(SW, SH);
             let encoded = OwnImage::new(device, instance, physical, pw, ph, vk::ImageUsageFlags::TRANSFER_DST | vk::ImageUsageFlags::TRANSFER_SRC).unwrap();
@@ -5871,7 +5868,7 @@ mod tests {
             assert_eq!(later.len(), 1, "pass 2 runs");
             let copies = pass.more.as_ref().unwrap().copies;
             let order: Vec<vk::CommandBuffer> = cmds.into_iter().flatten().chain([copies[0], later[0], copies[2]]).collect();
-            device.queue_submit(gpu.4, &[vk::SubmitInfo::builder().command_buffers(&order).build()], vk::Fence::null()).unwrap();
+            device.queue_submit(gpu.4, &[vk::SubmitInfo::default().command_buffers(&order)], vk::Fence::null()).unwrap();
             device.queue_wait_idle(gpu.4).unwrap();
             for cmd in order {
                 pass.submitted(cmd);

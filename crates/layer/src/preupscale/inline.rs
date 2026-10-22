@@ -873,7 +873,7 @@ impl Inline {
         if let (true, Some((ns, mask))) = (meta.timed && slot.queries != vk::QueryPool::null(), self.ticks) {
             let mut ticks = [0u64; TIMESTAMPS as usize];
             // SAFETY: the pool holds TIMESTAMPS queries, written by the hold that ran; no wait.
-            let read = unsafe { self.device.get_query_pool_results(slot.queries, 0, TIMESTAMPS, &mut ticks, vk::QueryResultFlags::TYPE_64) };
+            let read = unsafe { self.device.get_query_pool_results(slot.queries, 0, &mut ticks, vk::QueryResultFlags::TYPE_64) };
             if read.is_ok() {
                 for k in 0..3 {
                     let d = (ticks[k + 1] & mask).wrapping_sub(ticks[k] & mask) & mask;
@@ -902,16 +902,16 @@ impl Inline {
         // SAFETY: valid create infos on a live device; each is destroyed on a later failure.
         unsafe {
             let queries = match self.ticks {
-                Some(_) => d.create_query_pool(&vk::QueryPoolCreateInfo::builder().query_type(vk::QueryType::TIMESTAMP).query_count(TIMESTAMPS), None).ok()?,
+                Some(_) => d.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(TIMESTAMPS), None).ok()?,
                 None => vk::QueryPool::null(),
             };
-            let info = vk::BufferCreateInfo::builder().size(READBACK_BYTES).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+            let info = vk::BufferCreateInfo::default().size(READBACK_BYTES).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
             let made = d.create_buffer(&info, None).ok().and_then(|buffer| {
                 let reqs = d.get_buffer_memory_requirements(buffer);
                 let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
                 let index = (0..self.memory.memory_type_count)
                     .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(host));
-                let memory = index.and_then(|i| d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(i), None).ok());
+                let memory = index.and_then(|i| d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(i), None).ok());
                 let ptr = memory.and_then(|m| d.bind_buffer_memory(buffer, m, 0).and_then(|()| d.map_memory(m, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())).ok());
                 match (memory, ptr) {
                     (Some(m), Some(p)) => {
@@ -1011,7 +1011,7 @@ impl Inline {
             return None;
         }
         let d = &self.device;
-        let info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: valid create info on a live device.
         let buffer = unsafe { d.create_buffer(&info, None) }.ok()?;
         // SAFETY: just created.
@@ -1019,7 +1019,7 @@ impl Inline {
         let index = (0..self.memory.memory_type_count)
             .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL));
         // SAFETY: valid allocate info.
-        let memory = index.and_then(|index| unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None) }.ok());
+        let memory = index.and_then(|index| unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None) }.ok());
         // SAFETY: a fresh buffer and an allocation of its required size and type.
         match memory.filter(|&m| unsafe { d.bind_buffer_memory(buffer, m, 0) }.is_ok()) {
             Some(memory) => Some((buffer, memory)),
@@ -1047,7 +1047,7 @@ impl Inline {
             return None;
         }
         let d = &self.device;
-        let info = vk::ImageCreateInfo::builder()
+        let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(format)
             .extent(vk::Extent3D { width: extent.0, height: extent.1, depth: 1 })
@@ -1073,7 +1073,7 @@ impl Inline {
         let index = (0..self.memory.memory_type_count)
             .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(local))
             .or_else(|| (0..self.memory.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0));
-        let alloc = index.map(|index| vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index).build());
+        let alloc = index.map(|index| vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index));
         // SAFETY: valid allocate info.
         let memory = alloc.and_then(|a| unsafe { d.allocate_memory(&a, None) }.inspect_err(|e| crate::log!("[preupscale] staging image: vkAllocateMemory of {} bytes failed ({e:?})", reqs.size)).ok());
         // SAFETY: a fresh image and an allocation of its required size and type.
@@ -1115,8 +1115,8 @@ impl Meta {
 }
 
 /// The barrier of `range` of `image` from `old` to `new`.
-fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags, range: vk::ImageSubresourceRange) -> vk::ImageMemoryBarrier {
-    vk::ImageMemoryBarrier::builder()
+fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags, range: vk::ImageSubresourceRange) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier::default()
         .old_layout(old)
         .new_layout(new)
         .src_access_mask(src)
@@ -1125,7 +1125,6 @@ fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, s
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
         .subresource_range(range)
-        .build()
 }
 
 const COLOUR_RANGE: vk::ImageSubresourceRange = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
@@ -1161,7 +1160,7 @@ pub(crate) unsafe fn record_copy_in(
     let read_layout = if general { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_SRC_OPTIMAL };
     // Everything the buffer wrote before this point (the frame, rendered in this same buffer) is visible to
     // the copies; the staging images' old contents are not needed.
-    let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).build();
+    let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
     let fresh = |image| image_barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::GENERAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE, COLOUR_RANGE);
     let mut to_read = vec![fresh(staging)];
     to_read.extend(exposure.map(|(_, _, own)| fresh(own)));
@@ -1186,7 +1185,7 @@ pub(crate) unsafe fn record_copy_in(
     }));
     let exposure_region = vk::ImageCopy { extent: vk::Extent3D { width: 1, height: 1, depth: 1 }, ..region };
     // The copies visible to the hold's commands (transfers and shaders), the sources back where they were.
-    let copied = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+    let copied = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     // SAFETY: the contract; every command is legal outside a render pass instance, where a CUDA launch is.
     unsafe {
         d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[open], &[], &to_read);
@@ -1250,12 +1249,12 @@ pub(crate) unsafe fn record_copy_back(d: &ash::Device, cb: vk::CommandBuffer, (c
     let write_layout = if general { vk::ImageLayout::GENERAL } else { vk::ImageLayout::TRANSFER_DST_OPTIMAL };
     // The hold's writes of the staging image (shaders or transfers) visible to the copy; outside GENERAL the
     // colour input went to TRANSFER_SRC_OPTIMAL for the copy in, and now to the write layout.
-    let open = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE).build();
+    let open = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ | vk::AccessFlags::TRANSFER_WRITE);
     let to_write: Vec<vk::ImageMemoryBarrier> = (!general)
         .then(|| image_barrier(colour, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, write_layout, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE, COLOUR_RANGE))
         .into_iter()
         .collect();
-    let close = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+    let close = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
     let back: Vec<vk::ImageMemoryBarrier> = (!general)
         .then(|| image_barrier(colour, write_layout, layout, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE, COLOUR_RANGE))
         .into_iter()
@@ -1403,11 +1402,11 @@ mod tests {
             // SAFETY: test-only objects on a live device; everything is destroyed in `drop`.
             unsafe {
                 let props = instance.get_physical_device_memory_properties(physical);
-                let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
-                let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-                let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+                let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None).unwrap();
+                let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+                let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
                 let inheritance = vk::CommandBufferInheritanceInfo::default();
-                device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+                device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
                 device.end_command_buffer(graph).unwrap();
                 let holds = Arc::new(AtomicUsize::new(0));
                 // The replay's functions, as `device.rs` resolves them below the layer.
@@ -1484,7 +1483,7 @@ mod tests {
 
         pub(crate) fn image(&mut self, format: vk::Format, (w, h): (u32, u32), usage: vk::ImageUsageFlags) -> vk::Image {
             let d = &self.device;
-            let info = vk::ImageCreateInfo::builder()
+            let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(format)
                 .extent(vk::Extent3D { width: w, height: h, depth: 1 })
@@ -1499,7 +1498,7 @@ mod tests {
                 let image = d.create_image(&info, None).unwrap();
                 let reqs = d.get_image_memory_requirements(image);
                 let index = (0..self.props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
-                let memory = d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index), None).unwrap();
+                let memory = d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index), None).unwrap();
                 d.bind_image_memory(image, memory, 0).unwrap();
                 self.images.push((image, memory));
                 // Into GENERAL, the layout the game keeps DLSS's inputs in.
@@ -1516,12 +1515,12 @@ mod tests {
             let d = &self.device;
             // SAFETY: test-only, on a live device; destroyed in `drop`.
             unsafe {
-                let buffer = d.create_buffer(&vk::BufferCreateInfo::builder().size(bytes).usage(usage), None).unwrap();
+                let buffer = d.create_buffer(&vk::BufferCreateInfo::default().size(bytes).usage(usage), None).unwrap();
                 let reqs = d.get_buffer_memory_requirements(buffer);
                 let host = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
                 let index = (0..self.props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.props.memory_types[i as usize].property_flags.contains(host)).unwrap();
-                let mut flags = vk::MemoryAllocateFlagsInfo::builder().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
-                let mut info = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(index);
+                let mut flags = vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+                let mut info = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(index);
                 if usage.contains(vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS) {
                     info = info.push_next(&mut flags);
                 }
@@ -1538,11 +1537,11 @@ mod tests {
             let d = &self.device;
             // SAFETY: the test's own pool, queue and device.
             unsafe {
-                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(self.pool).command_buffer_count(1)).unwrap()[0];
+                let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)).unwrap()[0];
                 d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
                 record(cmd);
                 d.end_command_buffer(cmd).unwrap();
-                d.queue_submit(self.queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], vk::Fence::null()).unwrap();
+                d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], vk::Fence::null()).unwrap();
                 d.queue_wait_idle(self.queue).unwrap();
                 d.free_command_buffers(self.pool, &[cmd]);
             }
@@ -1581,7 +1580,7 @@ mod tests {
             let d = &self.device;
             let colour_bytes = u64::from(W * H) * 8;
             let all = vk::PipelineStageFlags::ALL_COMMANDS;
-            let written = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+            let written = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
             // SAFETY: recording the test's buffer.
             unsafe {
                 d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[written], &[], &[]);
@@ -1595,8 +1594,8 @@ mod tests {
         fn record_read(&self, cmd: vk::CommandBuffer, k: usize) {
             let d = &self.device;
             let all = vk::PipelineStageFlags::ALL_COMMANDS;
-            let written = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ).build();
-            let read = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ).build();
+            let written = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ);
+            let read = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             // SAFETY: recording the test's buffer.
             unsafe {
                 d.cmd_pipeline_barrier(cmd, all, all, vk::DependencyFlags::empty(), &[written], &[], &[]);
@@ -1650,7 +1649,7 @@ mod tests {
                 paper_white: 2.5,
                 identification: 1,
             };
-            let mut submit = |_: crate::preupscale::Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe { device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence) };
+            let mut submit = |_: crate::preupscale::Which, cmd: vk::CommandBuffer, fence: vk::Fence| unsafe { device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence) };
             let jitter = Some([0.25 * (f % 4) as f32 - 0.375, 0.125]);
             // SAFETY: the resources are this device's, at this extent; the colour input is in GENERAL.
             let result = unsafe {
@@ -1667,7 +1666,7 @@ mod tests {
         /// A primary command buffer of the test's pool, known to the hold.
         pub(crate) fn buffer(&self) -> vk::CommandBuffer {
             // SAFETY: the test's pool.
-            let cb = unsafe { self.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(self.pool).command_buffer_count(1)) }.unwrap()[0];
+            let cb = unsafe { self.device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(self.pool).command_buffer_count(1)) }.unwrap()[0];
             self.inline.allocated(self.pool, vk::CommandBufferLevel::PRIMARY, &[cb]);
             cb
         }
@@ -1735,9 +1734,9 @@ mod tests {
             unsafe {
                 let inits: Vec<vk::CommandBuffer> = self.inline.prologue(self.queue, cbs.iter().copied()).into_iter().map(|(_, c)| c).collect();
                 if !inits.is_empty() {
-                    d.queue_submit(self.queue, &[vk::SubmitInfo::builder().command_buffers(&inits).build()], vk::Fence::null()).unwrap();
+                    d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(&inits)], vk::Fence::null()).unwrap();
                 }
-                d.queue_submit(self.queue, &[vk::SubmitInfo::builder().command_buffers(cbs).build()], vk::Fence::null()).unwrap();
+                d.queue_submit(self.queue, &[vk::SubmitInfo::default().command_buffers(cbs)], vk::Fence::null()).unwrap();
                 self.inline.submitted(self.queue, cbs.iter().copied());
                 d.queue_wait_idle(self.queue).unwrap();
             }
@@ -1878,22 +1877,22 @@ mod tests {
         // SAFETY: mapped for its size; nothing uses it yet.
         unsafe { std::ptr::copy_nonoverlapping(0x1234_5678u32.to_le_bytes().as_ptr(), rig.hosts[input].ptr.add(64), 4) };
         let d = rig.device.clone();
-        let db = descriptor_buffer.then(|| ash::extensions::ext::DescriptorBuffer::new(&rig.instance, &d));
+        let db = descriptor_buffer.then(|| ash::ext::descriptor_buffer::Device::new(&rig.instance, &d));
         // SAFETY: test-only objects on the rig's device, destroyed at the end.
         unsafe {
-            let binding = |n: u32, ty| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build();
+            let binding = |n: u32, ty| vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(ty).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
             // Classic sets: the input through a dynamic offset (64 bytes in).
             let in_type = if descriptor_buffer { vk::DescriptorType::STORAGE_BUFFER } else { vk::DescriptorType::STORAGE_BUFFER_DYNAMIC };
             let bindings = [binding(0, in_type), binding(1, vk::DescriptorType::STORAGE_BUFFER)];
             let flags = if descriptor_buffer { vk::DescriptorSetLayoutCreateFlags::DESCRIPTOR_BUFFER_EXT } else { vk::DescriptorSetLayoutCreateFlags::empty() };
-            let set_layout = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().flags(flags).bindings(&bindings), None).unwrap();
-            let push_range = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(8).build();
-            let layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&[set_layout]).push_constant_ranges(&[push_range]), None).unwrap();
+            let set_layout = d.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().flags(flags).bindings(&bindings), None).unwrap();
+            let push_range = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(8);
+            let layout = d.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[set_layout]).push_constant_ranges(&[push_range]), None).unwrap();
             let code: Vec<u32> = PROBE_SPV.as_chunks::<4>().0.iter().map(|b| u32::from_le_bytes(*b)).collect();
-            let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::builder().code(&code), None).unwrap();
-            let stage = vk::PipelineShaderStageCreateInfo::builder().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main").build();
+            let module = d.create_shader_module(&vk::ShaderModuleCreateInfo::default().code(&code), None).unwrap();
+            let stage = vk::PipelineShaderStageCreateInfo::default().stage(vk::ShaderStageFlags::COMPUTE).module(module).name(c"main");
             let pflags = if descriptor_buffer { vk::PipelineCreateFlags::DESCRIPTOR_BUFFER_EXT } else { vk::PipelineCreateFlags::empty() };
-            let pipeline = d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::builder().flags(pflags).stage(stage).layout(layout).build()], None).unwrap()[0];
+            let pipeline = d.create_compute_pipelines(vk::PipelineCache::null(), &[vk::ComputePipelineCreateInfo::default().flags(pflags).stage(stage).layout(layout)], None).unwrap()[0];
             d.destroy_shader_module(module, None);
             let mut pool = vk::DescriptorPool::null();
             let mut set = vk::DescriptorSet::null();
@@ -1904,28 +1903,28 @@ mod tests {
                         vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER_DYNAMIC, descriptor_count: 1 },
                         vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 1 },
                     ];
-                    pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None).unwrap();
-                    set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(pool).set_layouts(&[set_layout])).unwrap()[0];
+                    pool = d.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).unwrap();
+                    set = d.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(pool).set_layouts(&[set_layout])).unwrap()[0];
                     let i = [vk::DescriptorBufferInfo { buffer: rig.hosts[input].buffer, offset: 0, range: 16 }];
                     let o = [vk::DescriptorBufferInfo { buffer: rig.hosts[output].buffer, offset: 0, range: vk::WHOLE_SIZE }];
                     d.update_descriptor_sets(
                         &[
-                            vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC).buffer_info(&i).build(),
-                            vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&o).build(),
+                            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(0).descriptor_type(vk::DescriptorType::STORAGE_BUFFER_DYNAMIC).buffer_info(&i),
+                            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(1).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(&o),
                         ],
                         &[],
                     );
                 }
                 Some(db) => {
                     let mut props = vk::PhysicalDeviceDescriptorBufferPropertiesEXT::default();
-                    let mut p2 = vk::PhysicalDeviceProperties2::builder().push_next(&mut props).build();
+                    let mut p2 = vk::PhysicalDeviceProperties2::default().push_next(&mut props);
                     rig.instance.get_physical_device_properties2(rig.physical, &mut p2);
                     let size = db.get_descriptor_set_layout_size(set_layout);
                     let k = rig.host(size.max(256), vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT | vk::BufferUsageFlags::SHADER_DEVICE_ADDRESS);
-                    let addr = |b: vk::Buffer| d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::builder().buffer(b));
+                    let addr = |b: vk::Buffer| d.get_buffer_device_address(&vk::BufferDeviceAddressInfo::default().buffer(b));
                     for (n, (buffer, at, range)) in [(rig.hosts[input].buffer, 64u64, 16u64), (rig.hosts[output].buffer, 0, 16)].into_iter().enumerate() {
-                        let info = vk::DescriptorAddressInfoEXT::builder().address(addr(buffer) + at).range(range).build();
-                        let get = vk::DescriptorGetInfoEXT::builder().ty(vk::DescriptorType::STORAGE_BUFFER).data(vk::DescriptorDataEXT { p_storage_buffer: &info }).build();
+                        let info = vk::DescriptorAddressInfoEXT::default().address(addr(buffer) + at).range(range);
+                        let get = vk::DescriptorGetInfoEXT::default().ty(vk::DescriptorType::STORAGE_BUFFER).data(vk::DescriptorDataEXT { p_storage_buffer: &info });
                         let offset = db.get_descriptor_set_layout_binding_offset(set_layout, n as u32) as usize;
                         let mut bytes = vec![0u8; props.storage_buffer_descriptor_size];
                         db.get_descriptor(&get, &mut bytes);
@@ -1943,7 +1942,7 @@ mod tests {
             restore.with(cb, |s| s.bind_compute(super::super::restore::Compute::Pipeline(pipeline)));
             match (&db, descriptors) {
                 (Some(db), Some(address)) => {
-                    let info = vk::DescriptorBufferBindingInfoEXT::builder().address(address).usage(vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT).build();
+                    let info = vk::DescriptorBufferBindingInfoEXT::default().address(address).usage(vk::BufferUsageFlags::RESOURCE_DESCRIPTOR_BUFFER_EXT);
                     db.cmd_bind_descriptor_buffers(cb, &[info]);
                     restore.with(cb, |s| s.bind_buffers(&[info]));
                     db.cmd_set_descriptor_buffer_offsets(cb, vk::PipelineBindPoint::COMPUTE, layout, 0, &[0], &[0]);
@@ -1961,7 +1960,7 @@ mod tests {
             assert_eq!(rig.hold_into(cb, 0, 1), Recorded::Held);
             // The game's next dispatch, binding nothing.
             d.cmd_dispatch(cb, 1, 1, 1);
-            let done = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ).build();
+            let done = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
             d.cmd_pipeline_barrier(cb, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[done], &[], &[]);
             rig.end(cb);
             rig.submit(&[cb]);

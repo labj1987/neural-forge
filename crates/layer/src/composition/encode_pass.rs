@@ -49,22 +49,20 @@ unsafe impl Send for EncodePass {}
 impl EncodePass {
     /// `None` on any failure, which the caller treats as "no encode available".
     pub fn new(device: &ash::Device) -> Option<Self> {
-        let binding = vk::DescriptorSetLayoutBinding::builder()
+        let binding = vk::DescriptorSetLayoutBinding::default()
             .binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
             .descriptor_count(1)
-            .stage_flags(vk::ShaderStageFlags::COMPUTE)
-            .build();
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(std::slice::from_ref(&binding));
+            .stage_flags(vk::ShaderStageFlags::COMPUTE);
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(std::slice::from_ref(&binding));
         // SAFETY: `layout_info` is valid.
         let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&layout_info, None) }.ok()?;
 
-        let push_range = vk::PushConstantRange::builder()
+        let push_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(std::mem::size_of::<EncodePush>() as u32)
-            .build();
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
+            .size(std::mem::size_of::<EncodePush>() as u32);
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&push_range));
         // SAFETY: valid info; `descriptor_set_layout` was just created.
@@ -89,7 +87,7 @@ impl EncodePass {
             cleanup_layouts(device);
             return None;
         };
-        let module_info = vk::ShaderModuleCreateInfo::builder().code(&code);
+        let module_info = vk::ShaderModuleCreateInfo::default().code(&code);
         // SAFETY: `encode.spv` is a valid SPIR-V module, compiled from
         // `shaders/encode.comp` with `glslangValidator -V`.
         let module = match unsafe { device.create_shader_module(&module_info, None) } {
@@ -100,12 +98,11 @@ impl EncodePass {
             }
         };
         let entry = std::ffi::CString::new("main").unwrap();
-        let stage = vk::PipelineShaderStageCreateInfo::builder()
+        let stage = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(module)
-            .name(&entry)
-            .build();
-        let pipeline_info = vk::ComputePipelineCreateInfo::builder().stage(stage).layout(pipeline_layout).build();
+            .name(&entry);
+        let pipeline_info = vk::ComputePipelineCreateInfo::default().stage(stage).layout(pipeline_layout);
         // SAFETY: `pipeline_info` is valid; `module`/`pipeline_layout` outlive the call.
         let pipeline = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&pipeline_info), None) };
         // SAFETY: the module is only needed for pipeline creation, which has returned.
@@ -121,8 +118,8 @@ impl EncodePass {
         // Sized for both wire slots plus headroom for rebuilds (a resolution change
         // frees and reallocates). `FREE_DESCRIPTOR_SET` so a rebuild can hand its set
         // back rather than leaking one per resize.
-        let pool_size = vk::DescriptorPoolSize::builder().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(16).build();
-        let pool_info = vk::DescriptorPoolCreateInfo::builder()
+        let pool_size = vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(16);
+        let pool_info = vk::DescriptorPoolCreateInfo::default()
             .flags(vk::DescriptorPoolCreateFlags::FREE_DESCRIPTOR_SET)
             .max_sets(16)
             .pool_sizes(std::slice::from_ref(&pool_size));
@@ -144,18 +141,17 @@ impl EncodePass {
     /// image (see [`EncodePush::bgr_order`] for why the view's format is fixed even
     /// when the image's is BGRA).
     pub fn allocate_set(&self, device: &ash::Device, view: vk::ImageView) -> Option<vk::DescriptorSet> {
-        let alloc_info = vk::DescriptorSetAllocateInfo::builder()
+        let alloc_info = vk::DescriptorSetAllocateInfo::default()
             .descriptor_pool(self.descriptor_pool)
             .set_layouts(std::slice::from_ref(&self.descriptor_set_layout));
         // SAFETY: `alloc_info` names this pass's own pool and layout.
         let set = unsafe { device.allocate_descriptor_sets(&alloc_info) }.ok()?.first().copied()?;
-        let image_info = vk::DescriptorImageInfo::builder().image_view(view).image_layout(vk::ImageLayout::GENERAL).build();
-        let write = vk::WriteDescriptorSet::builder()
+        let image_info = vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL);
+        let write = vk::WriteDescriptorSet::default()
             .dst_set(set)
             .dst_binding(0)
             .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
-            .image_info(std::slice::from_ref(&image_info))
-            .build();
+            .image_info(std::slice::from_ref(&image_info));
         // SAFETY: `set` was just allocated; `view` outlives it (the caller owns both and
         // frees the set before destroying the view).
         unsafe { device.update_descriptor_sets(std::slice::from_ref(&write), &[]) };

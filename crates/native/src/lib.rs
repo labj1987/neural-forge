@@ -137,8 +137,9 @@ pub unsafe fn device_supported(
 /// until dropped; drop it only after `vkCreateDevice` returned.
 pub struct DeviceExtension {
     state: *mut c_void,
-    /// The create info to pass on; its pointers stay valid while `self` lives.
-    pub info: vk::DeviceCreateInfo,
+    /// The create info to pass on; its pointers stay valid while `self` lives. They point into `state`, not at
+    /// anything Rust borrows, hence `'static`: the struct must not outlive `self`.
+    pub info: vk::DeviceCreateInfo<'static>,
 }
 
 impl Drop for DeviceExtension {

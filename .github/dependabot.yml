@@ -18,10 +18,10 @@ updates:
     # only fail the minor group, never the patch one. Major updates each get their own pull request.
     allow:
       - dependency-type: all
-    # ash 0.38 drops the builder API the layer and the native crate use throughout, and the layer
-    # framework (third_party/vk-layer-for-rust) and its generated code are written against ash 0.37:
-    # moving needs a port of every Vulkan call site and a regenerated framework, not a version bump.
-    # Only its 0.37 patch releases come here.
+    # An ash minor release (0.39 after 0.38) changes its API, and the layer framework's generated
+    # hooks (third_party/vk-layer-for-rust) are written against one ash and the Vulkan headers it was
+    # generated from: moving is a port and a regeneration, not a version bump. Only patch releases
+    # come here.
     ignore:
       - dependency-name: ash
         update-types:

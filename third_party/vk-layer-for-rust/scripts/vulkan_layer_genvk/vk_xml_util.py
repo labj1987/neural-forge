@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Modified for Neural Forge (2026): comments wrapped here, a fixed copyright year (UPSTREAM.md).
+# Modified for Neural Forge (2026): comments wrapped here, a fixed copyright year; newer registries (UPSTREAM.md).
 
 from __future__ import annotations
 from enum import Enum, IntEnum
@@ -203,6 +203,8 @@ def write_preamble(file):
                 "// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n",
                 "// See the License for the specific language governing permissions and\n",
                 "// limitations under the License.\n",
+                "//\n",
+                "// Modified for Neural Forge (2026): generated for ash 0.38 and Vulkan 1.3.281 (UPSTREAM.md).\n",
                 "\n",
                 "#![allow(missing_docs)]\n",
             ]
@@ -220,6 +222,7 @@ opaque_type_map = {
     # from "screen/screen.h"
     "_screen_context": "vk::_screen_context",
     "_screen_window": "vk::_screen_window",
+    "_screen_buffer": "vk::_screen_buffer",
     # from "windows.h"
     "SECURITY_ATTRIBUTES": "vk::SECURITY_ATTRIBUTES",
     "ANativeWindow": "vk::ANativeWindow",
@@ -407,6 +410,10 @@ class VkXmlParam(NamedTuple):
 
         len_attr = param.get("len")
         len_var = None
+        # len="1" (newer registries, e.g. vkGetDeviceSubpassShadingMaxWorkgroupSizeHUAWEI) says the pointer
+        # is to a single element, which a parameter without a len attribute already means.
+        if len_attr is not None and len_attr.strip() == "1":
+            len_attr = None
         if len_attr is not None:
             len_attr = len_attr.strip()
             if len_attr.startswith("latexmath:"):
@@ -416,7 +423,6 @@ class VkXmlParam(NamedTuple):
                 vk_xml_type.len = VkXmlLenKind.VARIABLE
             else:
                 assert "," not in len_attr, "Multi-dimensional array unimplemented."
-                assert len_attr != "1", "Unsupported length attribute: 1"
                 if len_attr == "null-terminated":
                     vk_xml_type.len = VkXmlLenKind.NULL_TERMINATED
                 else:

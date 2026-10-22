@@ -33,7 +33,7 @@
 //! Needs an X server (XWayland is fine); libxcb is loaded at run time, so nothing extra is
 //! linked.
 
-use ash::extensions::khr;
+use ash::khr;
 use ash::vk;
 use std::ffi::{c_char, c_int, c_void, CStr};
 
@@ -544,11 +544,11 @@ struct Swapchain {
 struct Gpu {
     _entry: ash::Entry,
     instance: ash::Instance,
-    surface_fn: khr::Surface,
+    surface_fn: khr::surface::Instance,
     surface: vk::SurfaceKHR,
     physical_device: vk::PhysicalDevice,
     device: ash::Device,
-    swapchain_fn: khr::Swapchain,
+    swapchain_fn: khr::swapchain::Device,
     queue: vk::Queue,
     pool: vk::CommandPool,
     format: vk::SurfaceFormatKHR,
@@ -571,13 +571,13 @@ impl Gpu {
             std::process::exit(1)
         });
         let app_name = c"neural-forge-pan";
-        let app_info = vk::ApplicationInfo::builder().application_name(app_name).api_version(vk::API_VERSION_1_3);
-        let extensions = [khr::Surface::name().as_ptr(), khr::XcbSurface::name().as_ptr()];
-        let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info).enabled_extension_names(&extensions);
+        let app_info = vk::ApplicationInfo::default().application_name(app_name).api_version(vk::API_VERSION_1_3);
+        let extensions = [khr::surface::NAME.as_ptr(), khr::xcb_surface::NAME.as_ptr()];
+        let create_info = vk::InstanceCreateInfo::default().application_info(&app_info).enabled_extension_names(&extensions);
         let instance = check(unsafe { entry.create_instance(&create_info, None) }, "vkCreateInstance");
-        let surface_fn = khr::Surface::new(&entry, &instance);
-        let xcb_fn = khr::XcbSurface::new(&entry, &instance);
-        let surface_info = vk::XcbSurfaceCreateInfoKHR::builder().connection(xcb.conn).window(xcb.window);
+        let surface_fn = khr::surface::Instance::new(&entry, &instance);
+        let xcb_fn = khr::xcb_surface::Instance::new(&entry, &instance);
+        let surface_info = vk::XcbSurfaceCreateInfoKHR::default().connection(xcb.conn).window(xcb.window);
         let surface = check(unsafe { xcb_fn.create_xcb_surface(&surface_info, None) }, "vkCreateXcbSurfaceKHR");
 
         // Prefer a discrete GPU, then integrated, then anything (lavapipe), that can present here.
@@ -607,16 +607,16 @@ impl Gpu {
         let props = unsafe { instance.get_physical_device_properties(physical_device) };
         eprintln!("pan: device {:?}", unsafe { CStr::from_ptr(props.device_name.as_ptr()) });
 
-        let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&[1.0]).build()];
-        let device_extensions = [khr::Swapchain::name().as_ptr()];
-        let device_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&device_extensions);
+        let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&[1.0])];
+        let device_extensions = [khr::swapchain::NAME.as_ptr()];
+        let device_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_extension_names(&device_extensions);
         let device = check(unsafe { instance.create_device(physical_device, &device_info, None) }, "vkCreateDevice");
         let queue = unsafe { device.get_device_queue(family, 0) };
-        // Loaded through the instance: ash 0.37's `Swapchain::new` asks vkGetDeviceProcAddr for
-        // an instance-level function too, which the validation layer reports. The loader's
-        // trampolines still dispatch through every layer's device hooks (the present included).
-        let swapchain_fn = khr::Swapchain::new_from_instance(&entry, &instance, device.handle());
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        // Through vkGetDeviceProcAddr: ash 0.38's device table holds only the device-level
+        // functions (ash 0.37's also asked for an instance-level one, which the validation layer
+        // reported), and the pointers start at the top of the device chain, this layer included.
+        let swapchain_fn = khr::swapchain::Device::new(&instance, &device);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = check(unsafe { device.create_command_pool(&pool_info, None) }, "vkCreateCommandPool");
 
         let formats = check(unsafe { surface_fn.get_physical_device_surface_formats(physical_device, surface) }, "surface formats");
@@ -695,7 +695,7 @@ impl Gpu {
             .into_iter()
             .find(|a| caps.supported_composite_alpha.contains(*a))
             .unwrap_or(vk::CompositeAlphaFlagsKHR::OPAQUE);
-        let info = vk::SwapchainCreateInfoKHR::builder()
+        let info = vk::SwapchainCreateInfoKHR::default()
             .surface(self.surface)
             .min_image_count(count)
             .image_format(self.format.format)
@@ -726,19 +726,19 @@ impl Gpu {
 
     fn create_staging(&self, bytes: u64) -> Staging {
         let d = &self.device;
-        let info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = check(unsafe { d.create_buffer(&info, None) }, "vkCreateBuffer");
         let reqs = unsafe { d.get_buffer_memory_requirements(buffer) };
         let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let type_index = (0..self.mem_props.memory_type_count)
             .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && self.mem_props.memory_types[i as usize].property_flags.contains(wanted))
             .expect("no host-visible coherent memory");
-        let memory = check(unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }, "vkAllocateMemory");
+        let memory = check(unsafe { d.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }, "vkAllocateMemory");
         check(unsafe { d.bind_buffer_memory(buffer, memory, 0) }, "vkBindBufferMemory");
         let ptr = check(unsafe { d.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }, "vkMapMemory").cast();
-        let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+        let alloc = vk::CommandBufferAllocateInfo::default().command_pool(self.pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         let cmd = check(unsafe { d.allocate_command_buffers(&alloc) }, "vkAllocateCommandBuffers")[0];
-        let fence = check(unsafe { d.create_fence(&vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED), None) }, "vkCreateFence");
+        let fence = check(unsafe { d.create_fence(&vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED), None) }, "vkCreateFence");
         let acquired = check(unsafe { d.create_semaphore(&vk::SemaphoreCreateInfo::default(), None) }, "vkCreateSemaphore");
         Staging { buffer, memory, ptr, cmd, fence, acquired }
     }
@@ -757,7 +757,7 @@ impl Gpu {
     fn record_copy(&self, s: &Staging, image: vk::Image, extent: vk::Extent2D) {
         let d = &self.device;
         let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
-        let to_dst = vk::ImageMemoryBarrier::builder()
+        let to_dst = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::UNDEFINED)
             .new_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .src_access_mask(vk::AccessFlags::empty())
@@ -765,9 +765,8 @@ impl Gpu {
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
-            .subresource_range(range)
-            .build();
-        let to_present = vk::ImageMemoryBarrier::builder()
+            .subresource_range(range);
+        let to_present = vk::ImageMemoryBarrier::default()
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
@@ -775,16 +774,14 @@ impl Gpu {
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .image(image)
-            .subresource_range(range)
-            .build();
-        let region = vk::BufferImageCopy::builder()
+            .subresource_range(range);
+        let region = vk::BufferImageCopy::default()
             .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
-            .image_extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 })
-            .build();
+            .image_extent(vk::Extent3D { width: extent.width, height: extent.height, depth: 1 });
         // SAFETY: `s.cmd` is not in use (its fence was waited on); all handles are live.
         unsafe {
             check(d.reset_command_buffer(s.cmd, vk::CommandBufferResetFlags::empty()), "vkResetCommandBuffer");
-            check(d.begin_command_buffer(s.cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)), "vkBeginCommandBuffer");
+            check(d.begin_command_buffer(s.cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)), "vkBeginCommandBuffer");
             // The acquire semaphore is waited on at TRANSFER; this barrier's first scope chains to it.
             d.cmd_pipeline_barrier(s.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
             d.cmd_copy_buffer_to_image(s.cmd, s.buffer, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[region]);
@@ -878,12 +875,11 @@ fn main() {
         gpu.record_copy(s, image, swapchain.extent);
         let copied = swapchain.copied[image_index as usize];
         let stage = [vk::PipelineStageFlags::TRANSFER];
-        let submit = vk::SubmitInfo::builder()
+        let submit = vk::SubmitInfo::default()
             .wait_semaphores(std::slice::from_ref(&s.acquired))
             .wait_dst_stage_mask(&stage)
             .command_buffers(std::slice::from_ref(&s.cmd))
-            .signal_semaphores(std::slice::from_ref(&copied))
-            .build();
+            .signal_semaphores(std::slice::from_ref(&copied));
         check(unsafe { d.reset_fences(&[s.fence]) }, "vkResetFences");
         check(unsafe { d.queue_submit(gpu.queue, &[submit], s.fence) }, "vkQueueSubmit");
         if args.capture_at == Some(frame) {
@@ -900,7 +896,7 @@ fn main() {
                 Err(e) => eprintln!("pan: cannot open the layer's shared memory for --capture-at: {e}"),
             }
         }
-        let present = vk::PresentInfoKHR::builder()
+        let present = vk::PresentInfoKHR::default()
             .wait_semaphores(std::slice::from_ref(&copied))
             .swapchains(std::slice::from_ref(&swapchain.handle))
             .image_indices(std::slice::from_ref(&image_index));

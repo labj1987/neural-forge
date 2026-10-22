@@ -130,7 +130,7 @@ fn create_storage_image(
     height: u32,
     usage: vk::ImageUsageFlags,
 ) -> Option<Image> {
-    let info = vk::ImageCreateInfo::builder()
+    let info = vk::ImageCreateInfo::default()
         .image_type(vk::ImageType::TYPE_2D)
         .format(FORMAT)
         .extent(vk::Extent3D { width, height, depth: 1 })
@@ -152,7 +152,7 @@ fn create_storage_image(
         unsafe { device.destroy_image(image, None) };
         return None;
     };
-    let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
+    let alloc = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index);
     // SAFETY: `alloc` is valid; `type_index` satisfies `reqs`.
     let memory = match unsafe { device.allocate_memory(&alloc, None) } {
         Ok(m) => m,
@@ -171,14 +171,13 @@ fn create_storage_image(
         }
         return None;
     }
-    let view_info = vk::ImageViewCreateInfo::builder().image(image).view_type(vk::ImageViewType::TYPE_2D).format(FORMAT).subresource_range(
-        vk::ImageSubresourceRange::builder()
+    let view_info = vk::ImageViewCreateInfo::default().image(image).view_type(vk::ImageViewType::TYPE_2D).format(FORMAT).subresource_range(
+        vk::ImageSubresourceRange::default()
             .aspect_mask(vk::ImageAspectFlags::COLOR)
             .base_mip_level(0)
             .level_count(1)
             .base_array_layer(0)
-            .layer_count(1)
-            .build(),
+            .layer_count(1),
     );
     // SAFETY: `image` is bound to memory; `view_info` matches it.
     let view = match unsafe { device.create_image_view(&view_info, None) } {
@@ -196,35 +195,32 @@ fn create_storage_image(
 }
 
 fn image_copy_region(width: u32, height: u32, offset: u64) -> vk::BufferImageCopy {
-    vk::BufferImageCopy::builder()
+    vk::BufferImageCopy::default()
         .buffer_offset(offset)
         .buffer_row_length(0)
         .buffer_image_height(0)
         .image_subresource(
-            vk::ImageSubresourceLayers::builder()
+            vk::ImageSubresourceLayers::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .mip_level(0)
                 .base_array_layer(0)
-                .layer_count(1)
-                .build(),
+                .layer_count(1),
         )
         .image_offset(vk::Offset3D::default())
         .image_extent(vk::Extent3D { width, height, depth: 1 })
-        .build()
 }
 
 fn full_subresource() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::builder()
+    vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .base_mip_level(0)
         .level_count(1)
         .base_array_layer(0)
         .layer_count(1)
-        .build()
 }
 
-fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier {
-    vk::ImageMemoryBarrier::builder()
+fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier::default()
         .old_layout(old)
         .new_layout(new)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -233,7 +229,6 @@ fn image_barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, s
         .subresource_range(full_subresource())
         .src_access_mask(src)
         .dst_access_mask(dst)
-        .build()
 }
 
 /// Where [`GpuCompose::present_temporal_delta_async`] takes the answer pair from.
@@ -258,7 +253,7 @@ struct DeviceBuffer {
 
 impl DeviceBuffer {
     fn new(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, bytes: u64) -> Option<Self> {
-        let info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
         // SAFETY: `info` is valid.
         let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
         // SAFETY: `buffer` was just created, not yet bound to memory.
@@ -270,7 +265,7 @@ impl DeviceBuffer {
             unsafe { device.destroy_buffer(buffer, None) };
             return None;
         };
-        let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
+        let alloc = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index);
         // SAFETY: `alloc` is valid; `type_index` satisfies `reqs`.
         let Ok(memory) = (unsafe { device.allocate_memory(&alloc, None) }) else {
             // SAFETY: `buffer` has no memory bound.
@@ -398,14 +393,14 @@ struct ComposeSlot {
 
 impl ComposeSlot {
     fn new(device: &ash::Device, pool: vk::CommandPool, descriptor_pool: vk::DescriptorPool, descriptor_set_layout: vk::DescriptorSetLayout) -> Option<Self> {
-        let alloc_info = vk::DescriptorSetAllocateInfo::builder().descriptor_pool(descriptor_pool).set_layouts(std::slice::from_ref(&descriptor_set_layout));
+        let alloc_info = vk::DescriptorSetAllocateInfo::default().descriptor_pool(descriptor_pool).set_layouts(std::slice::from_ref(&descriptor_set_layout));
         // SAFETY: `descriptor_pool` was sized by the caller for this and every other slot.
         let descriptor_set = unsafe { device.allocate_descriptor_sets(&alloc_info) }.ok()?[0];
-        let cmd_alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+        let cmd_alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         // SAFETY: `pool` was created by the caller with `RESET_COMMAND_BUFFER`.
         let Ok(cmd) = (unsafe { crate::loader_data::allocate_commands(device, &cmd_alloc_info) }) else { return None };
         let cmd = cmd[0];
-        let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+        let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
         // SAFETY: starting signaled means this slot's first real use never blocks on a
         // fence nothing has submitted work against yet.
         let Ok(fence) = (unsafe { device.create_fence(&fence_info, None) }) else { return None };
@@ -497,7 +492,7 @@ impl ComposeSlot {
         let frame_bytes = u64::from(width) * u64::from(height) * 4;
         // Base (or the small proxy) + the model's answer, plus a held frame when frame hold is on.
         let staging_capacity = frame_bytes * 3;
-        let buf_info = vk::BufferCreateInfo::builder()
+        let buf_info = vk::BufferCreateInfo::default()
             .size(staging_capacity)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -516,7 +511,7 @@ impl ComposeSlot {
             release_images();
             return false;
         };
-        let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
+        let alloc = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index);
         // SAFETY: `alloc` is valid; `type_index` satisfies `reqs`.
         let Ok(staging_memory) = (unsafe { device.allocate_memory(&alloc, None) }) else {
             // SAFETY: same reasoning as above.
@@ -550,7 +545,7 @@ impl ComposeSlot {
         // Keep the held raw model frame in device-local memory.  The staging buffer
         // stays CPU-visible only for the infrequent model-answer update; regular
         // presents copy this cached buffer straight to the swapchain image.
-        let cache_info = vk::BufferCreateInfo::builder()
+        let cache_info = vk::BufferCreateInfo::default()
             .size(frame_bytes)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -580,7 +575,7 @@ impl ComposeSlot {
             }
             return false;
         };
-        let cached_alloc = vk::MemoryAllocateInfo::builder().allocation_size(cached_reqs.size).memory_type_index(cached_type);
+        let cached_alloc = vk::MemoryAllocateInfo::default().allocation_size(cached_reqs.size).memory_type_index(cached_type);
         let Ok(cached_memory) = (unsafe { device.allocate_memory(&cached_alloc, None) }) else {
             unsafe {
                 device.destroy_buffer(cached_buffer, None);
@@ -607,7 +602,7 @@ impl ComposeSlot {
             return false;
         }
 
-        let current_info = vk::BufferCreateInfo::builder()
+        let current_info = vk::BufferCreateInfo::default()
             .size(frame_bytes)
             .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
             .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -617,7 +612,7 @@ impl ComposeSlot {
             let current_type = find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::DEVICE_LOCAL)
                 .or_else(|| find_memory_type(mem_props, current_reqs.memory_type_bits, vk::MemoryPropertyFlags::empty()));
             let current_memory = current_type.and_then(|current_type| {
-                let current_alloc = vk::MemoryAllocateInfo::builder().allocation_size(current_reqs.size).memory_type_index(current_type);
+                let current_alloc = vk::MemoryAllocateInfo::default().allocation_size(current_reqs.size).memory_type_index(current_type);
                 unsafe { device.allocate_memory(&current_alloc, None) }.ok()
             });
             let Some(current_memory) = current_memory else {
@@ -645,16 +640,15 @@ impl ComposeSlot {
             return false;
         };
 
-        let image_info = |view: vk::ImageView| vk::DescriptorImageInfo::builder().image_view(view).image_layout(vk::ImageLayout::GENERAL).build();
+        let image_info = |view: vk::ImageView| vk::DescriptorImageInfo::default().image_view(view).image_layout(vk::ImageLayout::GENERAL);
         let infos = [image_info(original.view), image_info(proxy.view), image_info(model_answer.view), image_info(output.view)];
         let writes: Vec<_> = (0..4u32)
             .map(|i| {
-                vk::WriteDescriptorSet::builder()
+                vk::WriteDescriptorSet::default()
                     .dst_set(self.descriptor_set)
                     .dst_binding(i)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .image_info(std::slice::from_ref(&infos[i as usize]))
-                    .build()
             })
             .collect();
         // SAFETY: `self.descriptor_set` was allocated for exactly this slot, matches
@@ -765,7 +759,7 @@ impl ComposeSlot {
                 timer.record_start(device, self.cmd);
             }
             device.cmd_copy_image_to_buffer(self.cmd, target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.current_buffer, &[image_copy_region(width, height, 0)]);
-            let current_ready = vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.current_buffer).offset(0).size(frame_bytes).build();
+            let current_ready = vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.current_buffer).offset(0).size(frame_bytes);
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[current_ready], &[]);
 
             if let Some(copies) = fresh_copy {
@@ -773,12 +767,12 @@ impl ComposeSlot {
                 // this read; submission made the model server's host writes to the answer region
                 // visible. The barriers after the copies cover this slot's reads below and every
                 // later submission's (the other slot's carried frames).
-                let copy = vk::BufferCopy::builder().src_offset(0).dst_offset(0).size(frame_bytes).build();
+                let copy = vk::BufferCopy::default().src_offset(0).dst_offset(0).size(frame_bytes);
                 for (src, dst) in copies {
                     device.cmd_copy_buffer(self.cmd, src, dst, &[copy]);
                 }
                 let ready = copies.map(|(_, dst)| {
-                    vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(dst).offset(0).size(frame_bytes).build()
+                    vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(dst).offset(0).size(frame_bytes)
                 });
                 device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &ready, &[]);
             }
@@ -801,12 +795,11 @@ impl ComposeSlot {
                     device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, sp.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(answer_width, answer_height, 0)]);
                     let sp_to_src = image_barrier(sp.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
                     device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[sp_to_src]);
-                    let blit = vk::ImageBlit::builder()
-                        .src_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+                    let blit = vk::ImageBlit::default()
+                        .src_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
                         .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: answer_width as i32, y: answer_height as i32, z: 1 }])
-                        .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
-                        .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }])
-                        .build();
+                        .dst_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
+                        .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }]);
                     device.cmd_blit_image(self.cmd, sp.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR);
                 } else {
                     device.cmd_copy_buffer_to_image(self.cmd, base_src, s.proxy.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, base_offset)]);
@@ -822,12 +815,11 @@ impl ComposeSlot {
                     device.cmd_copy_buffer_to_image(self.cmd, s.staging_buffer, small.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(answer_width, answer_height, frame_bytes)]);
                     let small_to_src = image_barrier(small.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::TRANSFER_READ);
                     device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[small_to_src]);
-                    let blit = vk::ImageBlit::builder()
-                        .src_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+                    let blit = vk::ImageBlit::default()
+                        .src_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
                         .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: answer_width as i32, y: answer_height as i32, z: 1 }])
-                        .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
-                        .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }])
-                        .build();
+                        .dst_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
+                        .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }]);
                     // `s.model_answer.image` was already transitioned to
                     // `TRANSFER_DST_OPTIMAL` in `to_dst` above -- the blit target here
                     // is the same layout the direct-copy branch below would have used.
@@ -896,7 +888,7 @@ impl ComposeSlot {
             let output_src = image_barrier(s.output.image, vk::ImageLayout::GENERAL, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::SHADER_WRITE, vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[output_src]);
             device.cmd_copy_image_to_buffer(self.cmd, s.output.image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, s.cached_buffer, &[image_copy_region(width, height, 0)]);
-            let output_ready = vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.cached_buffer).offset(0).size(frame_bytes).build();
+            let output_ready = vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(s.cached_buffer).offset(0).size(frame_bytes);
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[output_ready], &[]);
             let target_to_dst = image_barrier(target_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::TRANSFER_READ, vk::AccessFlags::TRANSFER_WRITE);
             device.cmd_pipeline_barrier(self.cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[target_to_dst]);
@@ -983,24 +975,22 @@ impl GpuCompose {
     pub fn new(device: &ash::Device, queue_family: u32) -> Option<Self> {
         let bindings: Vec<_> = (0..4)
             .map(|i| {
-                vk::DescriptorSetLayoutBinding::builder()
+                vk::DescriptorSetLayoutBinding::default()
                     .binding(i)
                     .descriptor_type(vk::DescriptorType::STORAGE_IMAGE)
                     .descriptor_count(1)
                     .stage_flags(vk::ShaderStageFlags::COMPUTE)
-                    .build()
             })
             .collect();
-        let layout_info = vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings);
+        let layout_info = vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings);
         // SAFETY: `layout_info` is valid.
         let descriptor_set_layout = unsafe { device.create_descriptor_set_layout(&layout_info, None) }.ok()?;
 
-        let push_constant_range = vk::PushConstantRange::builder()
+        let push_constant_range = vk::PushConstantRange::default()
             .stage_flags(vk::ShaderStageFlags::COMPUTE)
             .offset(0)
-            .size(std::mem::size_of::<PushConstants>() as u32)
-            .build();
-        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::builder()
+            .size(std::mem::size_of::<PushConstants>() as u32);
+        let pipeline_layout_info = vk::PipelineLayoutCreateInfo::default()
             .set_layouts(std::slice::from_ref(&descriptor_set_layout))
             .push_constant_ranges(std::slice::from_ref(&push_constant_range));
         // SAFETY: `pipeline_layout_info` is valid; `descriptor_set_layout` was just
@@ -1023,7 +1013,7 @@ impl GpuCompose {
             }
             return None;
         };
-        let module_info = vk::ShaderModuleCreateInfo::builder().code(&code);
+        let module_info = vk::ShaderModuleCreateInfo::default().code(&code);
         // SAFETY: `module_info.code` is a valid SPIR-V module (`compose.spv`, compiled
         // from `shaders/compose.comp` via `glslangValidator -V`, validated with
         // `spirv-val` before being committed).
@@ -1039,11 +1029,11 @@ impl GpuCompose {
             }
         };
         let entry_point = c"main";
-        let stage_info = vk::PipelineShaderStageCreateInfo::builder()
+        let stage_info = vk::PipelineShaderStageCreateInfo::default()
             .stage(vk::ShaderStageFlags::COMPUTE)
             .module(shader_module)
             .name(entry_point);
-        let pipeline_info = vk::ComputePipelineCreateInfo::builder().stage(*stage_info).layout(pipeline_layout);
+        let pipeline_info = vk::ComputePipelineCreateInfo::default().stage(stage_info).layout(pipeline_layout);
         // SAFETY: `pipeline_info` is valid; `shader_module`/`pipeline_layout` were
         // just created above and outlive this call.
         let pipeline_result = unsafe { device.create_compute_pipelines(vk::PipelineCache::null(), std::slice::from_ref(&pipeline_info), None) };
@@ -1065,8 +1055,8 @@ impl GpuCompose {
         // One sync slot plus `ASYNC_SLOTS` async ones, each needing its own 4
         // storage-image descriptors.
         let total_sets = 1 + ASYNC_SLOTS as u32;
-        let pool_size = vk::DescriptorPoolSize::builder().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(4 * total_sets).build();
-        let pool_info = vk::DescriptorPoolCreateInfo::builder().max_sets(total_sets).pool_sizes(std::slice::from_ref(&pool_size));
+        let pool_size = vk::DescriptorPoolSize::default().ty(vk::DescriptorType::STORAGE_IMAGE).descriptor_count(4 * total_sets);
+        let pool_info = vk::DescriptorPoolCreateInfo::default().max_sets(total_sets).pool_sizes(std::slice::from_ref(&pool_size));
         // SAFETY: `pool_info` is valid.
         let descriptor_pool = match unsafe { device.create_descriptor_pool(&pool_info, None) } {
             Ok(p) => p,
@@ -1081,7 +1071,7 @@ impl GpuCompose {
             }
         };
 
-        let pool_create_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_create_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         // SAFETY: `pool_create_info` is valid.
         let Ok(cmd_pool) = (unsafe { device.create_command_pool(&pool_create_info, None) }) else {
             // SAFETY: nothing else references these yet.
@@ -1243,7 +1233,7 @@ impl GpuCompose {
         let update = slot.slot.cached_generation != generation;
         let compose = ComposeParams { model_small: small_proxy, ..compose };
         if unsafe { device.reset_command_buffer(slot.slot.cmd, vk::CommandBufferResetFlags::empty()) }.is_err() { return None; }
-        let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         if unsafe { device.begin_command_buffer(slot.slot.cmd, &begin) }.is_err() { return None; }
         // Timed span: from just after the opening `ALL_COMMANDS -> TRANSFER` barrier on the
         // target image (so not the wait for the queue's earlier work) to the end of the buffer.
@@ -1256,7 +1246,8 @@ impl GpuCompose {
             unsafe { timer.record_end(device, slot.slot.cmd) };
         }
         if unsafe { device.end_command_buffer(slot.slot.cmd) }.is_err() || !slot.slot.reset(device) { return None; }
-        let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.slot.cmd)).signal_semaphores(std::slice::from_ref(&semaphore)).build();
+        let cmd = slot.slot.cmd;
+        let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd)).signal_semaphores(std::slice::from_ref(&semaphore));
         if !slot.slot.submit(device, queue, submit) { return None; }
         if let Some(timer) = slot.timer.as_mut() { timer.mark_submitted(); }
         if update { slot.slot.cached_generation = generation; }
@@ -1482,9 +1473,9 @@ fn open_test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, 
     // SAFETY: `instance` was just created and outlives every use of `physical_device`.
     let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
     let queue_family = 0;
-    let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
+    let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&[1.0])];
     let extension_names = test_device_extensions(&instance, physical_device, surface, &[]);
-    let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
+    let device_create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
     // SAFETY: `device_create_info` is valid; every physical device has a family 0
     // (the Vulkan spec guarantees at least one queue family).
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
@@ -1497,14 +1488,14 @@ fn open_test_device() -> Option<(ash::Entry, ash::Instance, vk::PhysicalDevice, 
 /// `bool`), which `VK_KHR_swapchain` on the device needs ([`test_device_extensions`]).
 #[cfg(test)]
 pub(crate) fn test_instance(entry: &ash::Entry) -> Option<(ash::Instance, bool)> {
-    let surface_name = ash::extensions::khr::Surface::name();
-    let surface = entry
-        .enumerate_instance_extension_properties(None)
+    let surface_name = ash::khr::surface::NAME;
+    // SAFETY: a plain query on the loaded entry.
+    let surface = unsafe { entry.enumerate_instance_extension_properties(None) }
         // SAFETY: each name is a NUL-terminated array.
         .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == surface_name));
     let names = [surface_name.as_ptr()];
-    let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
-    let create_info = vk::InstanceCreateInfo::builder().application_info(&app_info).enabled_extension_names(if surface { &names } else { &[] });
+    let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+    let create_info = vk::InstanceCreateInfo::default().application_info(&app_info).enabled_extension_names(if surface { &names } else { &[] });
     // SAFETY: `create_info` is valid.
     let instance = unsafe { entry.create_instance(&create_info, None) }.ok()?;
     Some((instance, surface))
@@ -1517,7 +1508,7 @@ pub(crate) fn test_instance(entry: &ash::Entry) -> Option<(ash::Instance, bool)>
 /// present on.
 #[cfg(test)]
 pub(crate) fn test_device_extensions(instance: &ash::Instance, physical_device: vk::PhysicalDevice, surface: bool, extra: &[&'static std::ffi::CStr]) -> Vec<*const std::ffi::c_char> {
-    let swapchain = ash::extensions::khr::Swapchain::name();
+    let swapchain = ash::khr::swapchain::NAME;
     // SAFETY: `physical_device` is the instance's own; each name is a NUL-terminated array.
     let offered = surface
         && unsafe { instance.enumerate_device_extension_properties(physical_device) }
@@ -1534,12 +1525,12 @@ pub(crate) fn test_device_with_descriptor_buffer() -> Option<(ash::Entry, ash::I
     let entry = unsafe { ash::Entry::load() }.ok()?;
     let (instance, surface) = test_instance(&entry)?;
     let physical_device = *unsafe { instance.enumerate_physical_devices() }.ok()?.first()?;
-    let name = ash::extensions::ext::DescriptorBuffer::name();
+    let name = ash::ext::descriptor_buffer::NAME;
     let offered = unsafe { instance.enumerate_device_extension_properties(physical_device) }
         .is_ok_and(|e| e.iter().any(|x| unsafe { std::ffi::CStr::from_ptr(x.extension_name.as_ptr()) } == name));
     let mut db = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default();
     let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
-    let mut features = vk::PhysicalDeviceFeatures2::builder().push_next(&mut db).push_next(&mut v12).build();
+    let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut db).push_next(&mut v12);
     // SAFETY: a plain query into a valid chain.
     unsafe { instance.get_physical_device_features2(physical_device, &mut features) };
     if !offered || db.descriptor_buffer == 0 || v12.buffer_device_address == 0 {
@@ -1547,11 +1538,11 @@ pub(crate) fn test_device_with_descriptor_buffer() -> Option<(ash::Entry, ash::I
         unsafe { instance.destroy_instance(None) };
         return None;
     }
-    let mut db = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::builder().descriptor_buffer(true).build();
-    let mut v12 = vk::PhysicalDeviceVulkan12Features::builder().buffer_device_address(true).build();
+    let mut db = vk::PhysicalDeviceDescriptorBufferFeaturesEXT::default().descriptor_buffer(true);
+    let mut v12 = vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(true);
     let names = test_device_extensions(&instance, physical_device, surface, &[name]);
-    let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
-    let info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&names).push_next(&mut db).push_next(&mut v12);
+    let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&[1.0])];
+    let info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_extension_names(&names).push_next(&mut db).push_next(&mut v12);
     // SAFETY: a valid create info whose features the device has.
     let device = unsafe { instance.create_device(physical_device, &info, None) }.ok()?;
     // SAFETY: family 0, index 0, as requested.
@@ -1577,9 +1568,9 @@ pub(crate) fn test_device_with_external_memory_host() -> Option<(ash::Entry, ash
         return None;
     }
     let queue_family = 0;
-    let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
+    let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&[1.0])];
     let extension_names = test_device_extensions(&instance, physical_device, surface, &[crate::EXTERNAL_MEMORY_HOST_EXTENSION]);
-    let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
+    let device_create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
     let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
     let queue = unsafe { device.get_device_queue(queue_family, 0) };
     Some((entry, instance, physical_device, device, queue, queue_family))
@@ -1593,11 +1584,11 @@ mod tests {
     /// uploading test fixture content into an image via `cmd_copy_buffer_to_image`.
     /// Caller destroys/frees both returned handles once the upload's fence signals.
     fn build_upload_staging(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, bytes: &[u8]) -> (vk::Buffer, vk::DeviceMemory) {
-        let buf_info = vk::BufferCreateInfo::builder().size(bytes.len() as u64).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buf_info = vk::BufferCreateInfo::default().size(bytes.len() as u64).usage(vk::BufferUsageFlags::TRANSFER_SRC).sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { device.create_buffer(&buf_info, None) }.unwrap();
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
         let type_index = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).unwrap();
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_buffer_memory(buffer, memory, 0).unwrap() };
         let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.unwrap().cast::<u8>();
         unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len()) };
@@ -1624,22 +1615,22 @@ mod tests {
     fn compose_once_ordered(width: u32, height: u32, current: &[u8], proxy: &[u8], answer: &[u8], answer_dims: (u32, u32), proxy_small: Option<&[u8]>, held: Option<&[u8]>, params: ComposeParams, bgr_order: bool) -> Option<Vec<u8>> {
         let (_entry, instance, physical_device, device, queue, queue_family) = test_device()?;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
         let target = make_target_image(&device, &mem_props, width, height);
         let staging = build_upload_staging(&device, &mem_props, current);
-        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         unsafe {
-            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
             let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
             device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
             let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
             device.end_command_buffer(cmd).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
             device.destroy_buffer(staging.0, None);
             device.free_memory(staging.1, None);
@@ -1647,10 +1638,10 @@ mod tests {
         let sem = gpu
             .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_dims.0, answer_dims.1, ComposeInputs::Cpu { base: proxy, answer, proxy_small, held_original: held }, 1, bgr_order, target.image, params)
             .expect("compose");
-        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         let stage = vk::PipelineStageFlags::ALL_COMMANDS;
         unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
             device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
             device.destroy_fence(wait_fence, None);
         }
@@ -2038,7 +2029,7 @@ mod tests {
             return;
         };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let (width, height) = (64u32, 32u32);
         let frame: Vec<u8> = (0..width * height).flat_map(|_| [100u8, 100, 100, 255]).collect();
@@ -2047,17 +2038,17 @@ mod tests {
             let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
             let target = make_target_image(&device, &mem_props, width, height);
             let staging = build_upload_staging(&device, &mem_props, &frame);
-            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
-            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             unsafe {
-                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
                 let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
                 device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
                 let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
                 device.end_command_buffer(cmd).unwrap();
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
                 device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
@@ -2066,10 +2057,10 @@ mod tests {
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &frame, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
                 .expect("compose");
-            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -2118,7 +2109,7 @@ mod tests {
             return;
         };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let (width, height) = (64u32, 32u32);
 
@@ -2148,17 +2139,17 @@ mod tests {
             let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
             let target = make_target_image(&device, &mem_props, width, height);
             let staging = build_upload_staging(&device, &mem_props, current);
-            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
-            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             unsafe {
-                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
                 let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
                 device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
                 let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
                 device.end_command_buffer(cmd).unwrap();
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
                 device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
                 device.destroy_buffer(staging.0, None);
                 device.free_memory(staging.1, None);
@@ -2167,10 +2158,10 @@ mod tests {
             let sem = gpu
                 .present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Cpu { base: &proxy, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, params)
                 .expect("compose");
-            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -2228,7 +2219,7 @@ mod tests {
             return;
         };
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
 
         let (width, height) = (16u32, 16u32);
@@ -2245,17 +2236,17 @@ mod tests {
         // starting content -- a stable/motionless frame, exactly the case
         // `stability` should hold near its maximum for.
         let staging = build_upload_staging(&device, &mem_props, &base);
-        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         unsafe {
-            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
             let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
             device.cmd_copy_buffer_to_image(cmd, staging.0, target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[image_copy_region(width, height, 0)]);
             let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
             device.end_command_buffer(cmd).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
             device.destroy_buffer(staging.0, None);
             device.free_memory(staging.1, None);
@@ -2265,10 +2256,10 @@ mod tests {
         let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, answer_width, answer_height, ComposeInputs::Cpu { base: &base, answer: &answer, proxy_small: None, held_original: None }, 1, false, target.image, crate::composition::gpu::ComposeParams { colour_strength: 1.0, transfer_strength: 1.0, max_ratio: 2.0, ghost_guard: 0.0, compare: Default::default(), colour_trust: 2.0, ratio_smooth: 0.0, transfer: 0, model_small: false, white_point: 1.0, debug_view: 0, debug_scale: 1.0, proxy_encoded: false, reversible_mode: 0 });
         assert!(sem.is_some(), "a genuinely smaller answer must still be composited, not rejected");
         let sem = sem.unwrap();
-        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
         unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build()], wait_fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage))], wait_fence).unwrap();
             device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
             device.destroy_fence(wait_fence, None);
         }
@@ -2330,7 +2321,7 @@ mod tests {
         unsafe { std::ptr::copy_nonoverlapping(answer.as_ptr(), region, answer.len()) };
 
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let mut gpu = GpuCompose::new(&device, queue_family).expect("GpuCompose::new");
         assert!(gpu.ensure_answer_import(&device, &instance, physical_device, region, region_len), "lavapipe imports anonymous host memory");
@@ -2341,10 +2332,10 @@ mod tests {
         // does), or into the target image (the live frame the compose reads).
         let upload = |bytes: &[u8], into_image: bool| {
             let staging = build_upload_staging(&device, &mem_props, bytes);
-            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
-            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let cmd = unsafe { device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)) }.unwrap()[0];
+            let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             unsafe {
-                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
                 if into_image {
                     let to_dst = image_barrier(target.image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
                     device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_dst]);
@@ -2352,12 +2343,12 @@ mod tests {
                     let to_present = image_barrier(target.image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
                     device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
                 } else {
-                    device.cmd_copy_buffer(cmd, staging.0, capture_target, &[vk::BufferCopy::builder().size(frame_bytes).build()]);
-                    let ready = vk::BufferMemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(capture_target).offset(0).size(frame_bytes).build();
+                    device.cmd_copy_buffer(cmd, staging.0, capture_target, &[vk::BufferCopy::default().size(frame_bytes)]);
+                    let ready = vk::BufferMemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).src_queue_family_index(vk::QUEUE_FAMILY_IGNORED).dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED).buffer(capture_target).offset(0).size(frame_bytes);
                     device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[ready], &[]);
                 }
                 device.end_command_buffer(cmd).unwrap();
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
                 device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
                 device.destroy_fence(fence, None);
                 device.free_command_buffers(pool, &[cmd]);
@@ -2367,10 +2358,10 @@ mod tests {
         };
         let present = |gpu: &mut GpuCompose, fresh: bool, generation: u64| -> Option<Vec<u8>> {
             let sem = gpu.present_temporal_delta_async(&device, &instance, physical_device, queue, width, height, width, height, ComposeInputs::Gpu { fresh }, generation, false, target.image, params)?;
-            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -2419,26 +2410,26 @@ mod tests {
     /// image back.
     fn read_back_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image, width: u32, height: u32) -> Vec<u8> {
         let frame_bytes = (width * height * 4) as u64;
-        let alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+        let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
 
-        let buf_info = vk::BufferCreateInfo::builder().size(frame_bytes).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+        let buf_info = vk::BufferCreateInfo::default().size(frame_bytes).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
         let buffer = unsafe { device.create_buffer(&buf_info, None) }.unwrap();
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
         let type_index = find_memory_type(mem_props, reqs.memory_type_bits, vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT).unwrap();
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_buffer_memory(buffer, memory, 0) }.unwrap();
         let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.unwrap().cast::<u8>();
 
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             device.begin_command_buffer(cmd, &begin_info).unwrap();
             let to_src = image_barrier(image, vk::ImageLayout::PRESENT_SRC_KHR, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_READ);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[to_src]);
             device.cmd_copy_image_to_buffer(cmd, image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, buffer, &[image_copy_region(width, height, 0)]);
             device.end_command_buffer(cmd).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
         }
 

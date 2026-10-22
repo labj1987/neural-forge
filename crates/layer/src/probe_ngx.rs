@@ -933,7 +933,7 @@ mod tests {
     fn cb(raw: u64) -> vk::CommandBuffer { vk::CommandBuffer::from_raw(raw) }
     fn queue(raw: u64) -> vk::Queue { vk::Queue::from_raw(raw) }
 
-    fn image_info(width: u32, height: u32, format: vk::Format, usage: vk::ImageUsageFlags) -> vk::ImageCreateInfo {
+    fn image_info(width: u32, height: u32, format: vk::Format, usage: vk::ImageUsageFlags) -> vk::ImageCreateInfo<'static> {
         vk::ImageCreateInfo {
             image_type: vk::ImageType::TYPE_2D,
             extent: vk::Extent3D { width, height, depth: 1 },
@@ -943,7 +943,7 @@ mod tests {
         }
     }
 
-    fn view_info(image: vk::Image, format: vk::Format, mip: u32) -> vk::ImageViewCreateInfo {
+    fn view_info(image: vk::Image, format: vk::Format, mip: u32) -> vk::ImageViewCreateInfo<'static> {
         vk::ImageViewCreateInfo {
             image,
             format,
@@ -952,7 +952,7 @@ mod tests {
         }
     }
 
-    fn launch_info(function: u64, params: usize) -> vk::CuLaunchInfoNVX {
+    fn launch_info(function: u64, params: usize) -> vk::CuLaunchInfoNVX<'static> {
         vk::CuLaunchInfoNVX {
             function: vk::CuFunctionNVX::from_raw(function),
             grid_dim_x: 80,

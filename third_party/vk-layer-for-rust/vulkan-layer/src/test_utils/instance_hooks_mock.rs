@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 use std::mem::MaybeUninit;
 
@@ -23,18 +25,18 @@ use ash::{prelude::VkResult, vk};
 mock! {
     pub InstanceHooks {}
     impl InstanceHooks for InstanceHooks {
-        fn destroy_surface_khr<'a>(
+        fn destroy_surface_khr<'a, 'b>(
             &self,
             surface: vk::SurfaceKHR,
-            p_allocator: Option<&'a vk::AllocationCallbacks>,
+            p_allocator: Option<&'a vk::AllocationCallbacks<'b>>,
         ) -> LayerResult<()>;
 
-        fn create_device<'a>(
+        fn create_device<'a, 'b, 'c, 'd>(
             &self,
             _physical_device: vk::PhysicalDevice,
-            _p_create_info: &vk::DeviceCreateInfo,
+            _p_create_info: &'c vk::DeviceCreateInfo<'d>,
             _layer_device_link: &VkLayerDeviceLink,
-            _p_allocator: Option<&'a vk::AllocationCallbacks>,
+            _p_allocator: Option<&'a vk::AllocationCallbacks<'b>>,
             _p_device: &mut MaybeUninit<vk::Device>,
         ) -> LayerResult<VkResult<()>>;
     }

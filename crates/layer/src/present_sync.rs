@@ -303,7 +303,8 @@ pub unsafe fn app_present_fence(present_info: &vk::PresentInfoKHR, slot: usize) 
 /// holds none of its own ([`AppFence::None`]).
 pub struct PresentFences {
     fences: Vec<vk::Fence>,
-    pub info: vk::SwapchainPresentFenceInfoEXT,
+    /// Points at `fences`, in the same box: valid while `self` lives.
+    pub info: vk::SwapchainPresentFenceInfoEXT<'static>,
 }
 
 impl PresentFences {
@@ -316,6 +317,7 @@ impl PresentFences {
             p_next,
             swapchain_count,
             p_fences: this.fences.as_ptr(),
+            ..Default::default()
         };
         this
     }
@@ -399,7 +401,7 @@ mod tests {
 
         // The application's own fence for a slot is found anywhere in its chain.
         let app_fences = [vk::Fence::null(), vk::Fence::from_raw(5)];
-        let theirs = vk::SwapchainPresentFenceInfoEXT::builder().fences(&app_fences).build();
+        let theirs = vk::SwapchainPresentFenceInfoEXT::default().fences(&app_fences);
         let regions = vk::PresentRegionsKHR::default();
         let behind = vk::PresentRegionsKHR { p_next: std::ptr::from_ref(&theirs).cast(), ..Default::default() };
         let info = |next: *const std::ffi::c_void| vk::PresentInfoKHR { p_next: next, swapchain_count: 2, ..Default::default() };
@@ -444,8 +446,8 @@ mod tests {
             // present fence or the layer's own batch would be).
             let waited = sems.get(vk::Image::from_raw(1), new_semaphore).unwrap();
             let first_fence = tickets.take(&device).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().signal_semaphores(&[waited]).build()], vk::Fence::null()).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(&[waited]).wait_dst_stage_mask(&stage).build()], first_fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().signal_semaphores(&[waited])], vk::Fence::null()).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(&[waited]).wait_dst_stage_mask(&stage)], first_fence).unwrap();
             let first = tickets.submitted(first_fence);
             sems.note(waited, LastUse::Ticket(first));
             // Image 2: a ticket whose fence nothing has signalled yet (a present still queued).
@@ -462,8 +464,8 @@ mod tests {
             // destroyed the swapchain (here: the wait is a fenced submit, waited below).
             let app_fenced = sems.get(vk::Image::from_raw(5), new_semaphore).unwrap();
             let app_fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().signal_semaphores(&[app_fenced]).build()], vk::Fence::null()).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(&[app_fenced]).wait_dst_stage_mask(&stage).build()], app_fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().signal_semaphores(&[app_fenced])], vk::Fence::null()).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(&[app_fenced]).wait_dst_stage_mask(&stage)], app_fence).unwrap();
             sems.note(app_fenced, LastUse::AppFenced);
             device.wait_for_fences(&[app_fence], true, u64::MAX).unwrap();
             device.destroy_fence(app_fence, None);
@@ -568,7 +570,8 @@ mod tests {
         };
         // SAFETY: the system loader.
         let Ok(entry) = (unsafe { ash::Entry::load() }) else { return };
-        let offered = entry.enumerate_instance_extension_properties(None).unwrap_or_default();
+        // SAFETY: a plain query on the loaded entry.
+        let offered = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
         let has = |list: &[vk::ExtensionProperties], name: &CStr| list.iter().any(|e| unsafe { CStr::from_ptr(e.extension_name.as_ptr()) } == name);
         let instance_names = [c"VK_KHR_surface", c"VK_KHR_xlib_surface", c"VK_KHR_get_surface_capabilities2", c"VK_EXT_surface_maintenance1"];
         if !instance_names.iter().all(|n| has(&offered, n)) {
@@ -576,15 +579,15 @@ mod tests {
             return;
         }
         let names: Vec<_> = instance_names.iter().map(|n| n.as_ptr()).collect();
-        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
         // SAFETY: valid create infos throughout; everything made is destroyed below, before its parent.
         unsafe {
-            let instance = entry.create_instance(&vk::InstanceCreateInfo::builder().application_info(&app_info).enabled_extension_names(&names), None).unwrap();
+            let instance = entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app_info).enabled_extension_names(&names), None).unwrap();
             let physical = instance.enumerate_physical_devices().unwrap()[0];
             let device_offered = instance.enumerate_device_extension_properties(physical).unwrap();
-            let surface_fns = ash::extensions::khr::Surface::new(&entry, &instance);
-            let surface = ash::extensions::khr::XlibSurface::new(&entry, &instance)
-                .create_xlib_surface(&vk::XlibSurfaceCreateInfoKHR::builder().dpy(x11.display.cast()).window(x11.window), None)
+            let surface_fns = ash::khr::surface::Instance::new(&entry, &instance);
+            let surface = ash::khr::xlib_surface::Instance::new(&entry, &instance)
+                .create_xlib_surface(&vk::XlibSurfaceCreateInfoKHR::default().dpy(x11.display.cast()).window(x11.window), None)
                 .unwrap();
             if !has(&device_offered, c"VK_EXT_swapchain_maintenance1") || !surface_fns.get_physical_device_surface_support(physical, 0, surface).unwrap_or(false) {
                 eprintln!("present fence WSI test: no VK_EXT_swapchain_maintenance1 or no presenting family 0, skipping");
@@ -593,10 +596,10 @@ mod tests {
                 return;
             }
             let device_names = [c"VK_KHR_swapchain".as_ptr(), c"VK_EXT_swapchain_maintenance1".as_ptr()];
-            let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::builder().swapchain_maintenance1(true);
-            let queues = [vk::DeviceQueueCreateInfo::builder().queue_family_index(0).queue_priorities(&[1.0]).build()];
+            let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default().swapchain_maintenance1(true);
+            let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(0).queue_priorities(&[1.0])];
             let device = instance
-                .create_device(physical, &vk::DeviceCreateInfo::builder().queue_create_infos(&queues).enabled_extension_names(&device_names).push_next(&mut maintenance), None)
+                .create_device(physical, &vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&device_names).push_next(&mut maintenance), None)
                 .unwrap();
             {
                 use std::io::Write;
@@ -621,7 +624,7 @@ mod tests {
             let mut swapchain = vk::SwapchainKHR::null();
             let created = create_swapchain(
                     device.handle(),
-                    &vk::SwapchainCreateInfoKHR::builder()
+                    &vk::SwapchainCreateInfoKHR::default()
                         .surface(surface)
                         .min_image_count(caps.min_image_count.max(2))
                         .image_format(format.format)
@@ -632,8 +635,7 @@ mod tests {
                         .pre_transform(caps.current_transform)
                         .composite_alpha(alpha)
                         .present_mode(vk::PresentModeKHR::FIFO)
-                        .clipped(true)
-                        .build(),
+                        .clipped(true),
                     std::ptr::null(),
                     &mut swapchain,
                 );
@@ -642,22 +644,22 @@ mod tests {
             assert_eq!(get_images(device.handle(), swapchain, &mut count, std::ptr::null_mut()), vk::Result::SUCCESS);
             let mut images = vec![vk::Image::null(); count as usize];
             assert_eq!(get_images(device.handle(), swapchain, &mut count, images.as_mut_ptr()), vk::Result::SUCCESS);
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(0), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(0), None).unwrap();
             let buffers = device
-                .allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(images.len() as u32))
+                .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(images.len() as u32))
                 .unwrap();
             // The "game's" frame: each image moved to PRESENT_SRC_KHR, signalling its own present semaphore.
             let mut app_semaphores = Vec::new();
             for (&buffer, &image) in buffers.iter().zip(&images) {
                 device.begin_command_buffer(buffer, &vk::CommandBufferBeginInfo::default()).unwrap();
-                let barrier = vk::ImageMemoryBarrier::builder()
+                let barrier = vk::ImageMemoryBarrier::default()
                     .old_layout(vk::ImageLayout::UNDEFINED)
                     .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
                     .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                     .image(image)
                     .subresource_range(vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 });
-                device.cmd_pipeline_barrier(buffer, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &[barrier.build()]);
+                device.cmd_pipeline_barrier(buffer, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::BOTTOM_OF_PIPE, vk::DependencyFlags::empty(), &[], &[], &[barrier]);
                 device.end_command_buffer(buffer).unwrap();
                 app_semaphores.push(device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap());
             }
@@ -673,12 +675,12 @@ mod tests {
                 device.wait_for_fences(&[acquired], true, u64::MAX).unwrap();
                 device.reset_fences(&[acquired]).unwrap();
                 let (image, app) = (images[index as usize], app_semaphores[index as usize]);
-                let render = vk::SubmitInfo::builder().command_buffers(&buffers[index as usize..=index as usize]).signal_semaphores(std::slice::from_ref(&app));
-                device.queue_submit(queue, &[render.build()], vk::Fence::null()).unwrap();
+                let render = vk::SubmitInfo::default().command_buffers(&buffers[index as usize..=index as usize]).signal_semaphores(std::slice::from_ref(&app));
+                device.queue_submit(queue, &[render], vk::Fence::null()).unwrap();
                 // The relay batch (`device::relay_app_waits`): the present waits on the layer's semaphore.
                 let relay = relays.get(image, || device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()).unwrap();
-                let relay_batch = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&app)).wait_dst_stage_mask(&stage).signal_semaphores(std::slice::from_ref(&relay));
-                device.queue_submit(queue, &[relay_batch.build()], vk::Fence::null()).unwrap();
+                let relay_batch = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&app)).wait_dst_stage_mask(&stage).signal_semaphores(std::slice::from_ref(&relay));
+                device.queue_submit(queue, &[relay_batch], vk::Fence::null()).unwrap();
                 let fence = tickets.take(&device).unwrap();
                 let fences = PresentFences::new(1, 0, fence, std::ptr::null());
                 let present = vk::PresentInfoKHR {

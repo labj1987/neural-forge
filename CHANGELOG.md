@@ -10,7 +10,8 @@ first shipped them; their phase is kept as a subheading.
   rather than downloaded and patched at build time. The network itself is unchanged: same picture, same speed.
 - The same for the Vulkan layer framework Neural Forge is built on (Google's vk-layer-for-rust, Apache-2.0),
   whose development stopped in 2025: it is now part of Neural Forge, so nothing in a build comes from an
-  unmaintained outside project. The layer behaves as before.
+  unmaintained outside project. The layer behaves as before. It now also builds against newer Vulkan bindings
+  (ash 0.38, Vulkan 1.3.281 headers, from 1.3.251).
 
 ## 3.8.6 — 2026-10-21
 

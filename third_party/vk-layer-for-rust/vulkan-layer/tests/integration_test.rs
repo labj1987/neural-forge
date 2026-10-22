@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): function pointers compared by address (UPSTREAM.md).
+// Modified for Neural Forge (2026): function pointers compared by address; ash 0.38 (UPSTREAM.md).
 
 use ash::vk::{self};
 use mockall::predicate::{always, eq};
@@ -74,10 +74,8 @@ mod get_instance_proc_addr {
 
             let entry = create_entry::<TestLayer>();
             let layer_name = CString::new(TestLayer::<Tag<0>>::manifest().name).unwrap();
-            entry
-                .enumerate_instance_extension_properties(Some(&layer_name))
-                .unwrap();
-            entry.enumerate_instance_layer_properties().unwrap();
+            unsafe { entry.enumerate_instance_extension_properties(Some(&layer_name)) }.unwrap();
+            unsafe { entry.enumerate_instance_layer_properties() }.unwrap();
             // Verify if the returned function pointer can be called in other tests.
             unsafe {
                 entry.get_instance_proc_addr(vk::Instance::null(), c"vkCreateInstance".as_ptr())
@@ -182,7 +180,7 @@ mod get_instance_proc_addr {
         fn test_should_return_fp_for_get_instance_proc_addr() {
             static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
             let _ctx = TEST_GLOBAL.create_context();
-            let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+            let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
             let InstanceContext {
                 entry, instance, ..
             } = ctx.as_ref();
@@ -203,7 +201,7 @@ mod get_instance_proc_addr {
         fn test_should_return_fp_for_core_dispatchable_command() {
             static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
             let _ctx = TEST_GLOBAL.create_context();
-            let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+            let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
             let InstanceContext {
                 entry, instance, ..
             } = ctx.as_ref();
@@ -219,8 +217,8 @@ mod get_instance_proc_addr {
             static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
             let _ctx = TEST_GLOBAL.create_context();
 
-            let enabled_extensions = [vk::KhrSurfaceFn::name().as_ptr()];
-            let ctx = vk::InstanceCreateInfo::builder()
+            let enabled_extensions = [ash::khr::surface::NAME.as_ptr()];
+            let ctx = vk::InstanceCreateInfo::default()
                 .enabled_extension_names(&enabled_extensions)
                 .default_instance::<(TestLayer,)>();
 
@@ -249,8 +247,8 @@ mod get_instance_proc_addr {
                 let _ctx = TEST_GLOBAL.create_context();
 
                 let application_info =
-                    vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_1);
-                let ctx = vk::InstanceCreateInfo::builder()
+                    vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+                let ctx = vk::InstanceCreateInfo::default()
                     .application_info(&application_info)
                     .default_instance::<(TestLayer,)>();
 
@@ -278,8 +276,8 @@ mod get_instance_proc_addr {
                     .build();
                 let _ctx = TEST_GLOBAL.create_context();
 
-                let enabled_extensions = [vk::KhrSurfaceFn::name().as_ptr()];
-                let ctx = vk::InstanceCreateInfo::builder()
+                let enabled_extensions = [ash::khr::surface::NAME.as_ptr()];
+                let ctx = vk::InstanceCreateInfo::default()
                     .enabled_extension_names(&enabled_extensions)
                     .default_instance::<(TestLayer,)>();
                 let InstanceContext {
@@ -311,7 +309,7 @@ mod get_instance_proc_addr {
         fn test_if_extension_is_not_enabled_null_should_be_returned_for_not_hooked_proc() {
             static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
             let _ctx = TEST_GLOBAL.create_context();
-            let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+            let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
             let InstanceContext {
                 entry, instance, ..
             } = ctx.as_ref();
@@ -342,7 +340,7 @@ mod get_instance_proc_addr {
                 })
                 .build();
             let _ctx = TEST_GLOBAL.create_context();
-            let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+            let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
             let InstanceContext {
                 entry, instance, ..
             } = ctx.as_ref();
@@ -363,8 +361,8 @@ mod get_instance_proc_addr {
         fn test_commands_that_should_always_be_intercepted() {
             static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
             let _ctx = TEST_GLOBAL.create_context();
-            let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_3);
-            let ctx = vk::InstanceCreateInfo::builder()
+            let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_3);
+            let ctx = vk::InstanceCreateInfo::default()
                 .application_info(&app_info)
                 .default_instance::<(TestLayer,)>();
             let InstanceContext {
@@ -413,7 +411,7 @@ mod get_instance_proc_addr {
             {
                 static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
                 let _ctx = TEST_GLOBAL.create_context();
-                let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+                let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
                 let InstanceContext {
                     instance, entry, ..
                 } = ctx.as_ref();
@@ -439,7 +437,7 @@ mod get_instance_proc_addr {
                     })
                     .build();
                 let _ctx = TEST_GLOBAL.create_context();
-                let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+                let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
                 let InstanceContext {
                     instance, entry, ..
                 } = ctx.as_ref();
@@ -469,7 +467,7 @@ mod get_instance_proc_addr {
                     })
                     .build();
                 let _ctx = TEST_GLOBAL.create_context();
-                let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+                let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
                 let InstanceContext {
                     instance,
                     entry,
@@ -500,8 +498,8 @@ mod get_instance_proc_addr {
 
             #[test]
             fn test_should_return_fp_if_layer_implements_the_extension() {
-                let instance_extensions = [vk::KhrSurfaceFn::name().as_ptr()];
-                let device_extensions = [vk::KhrSwapchainFn::name().as_ptr()];
+                let instance_extensions = [ash::khr::surface::NAME.as_ptr()];
+                let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
                 static TEST_GLOBAL: TestGlobal = TestGlobal::builder()
                     .set_layer_mock_builder(|| {
                         let mut mock = MockTestLayer::default();
@@ -520,7 +518,7 @@ mod get_instance_proc_addr {
                     })
                     .build();
                 let _ctx = TEST_GLOBAL.create_context();
-                let instance_ctx = vk::InstanceCreateInfo::builder()
+                let instance_ctx = vk::InstanceCreateInfo::default()
                     .enabled_extension_names(&instance_extensions)
                     .default_instance::<(TestLayer,)>();
                 let InstanceContext { instance, .. } = instance_ctx.as_ref();
@@ -566,7 +564,7 @@ mod get_instance_proc_addr {
 
             static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
             let _ctx = TEST_GLOBAL.create_context();
-            let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+            let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
             let InstanceContext {
                 instance,
                 entry,
@@ -605,7 +603,7 @@ mod get_instance_proc_addr {
                 })
                 .build();
             let _ctx = TEST_GLOBAL.create_context();
-            let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+            let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
             let InstanceContext {
                 entry, instance, ..
             } = ctx.as_ref();
@@ -790,7 +788,7 @@ mod create_destroy_instance {
                     .return_const(LayerResult::Unhandled);
             }
 
-            let instance = vk::InstanceCreateInfo::builder()
+            let instance = vk::InstanceCreateInfo::default()
                 .default_instance::<(TestLayer<Tag<0>>, TestLayer<Tag<1>>)>();
             {
                 layer1_info.global_hooks().checkpoint();
@@ -804,8 +802,8 @@ mod create_destroy_instance {
     fn test_create_instance_with_0_api_version() {
         static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
         let _ctx = TEST_GLOBAL.create_context();
-        let app_info = vk::ApplicationInfo::builder().api_version(0);
-        let ctx = vk::InstanceCreateInfo::builder()
+        let app_info = vk::ApplicationInfo::default().api_version(0);
+        let ctx = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .default_instance::<(TestLayer,)>();
         let InstanceContext {
@@ -821,8 +819,8 @@ mod create_destroy_instance {
     fn test_destroy_instance_with_null_handle() {
         static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
         let _ctx = TEST_GLOBAL.create_context();
-        let app_info = vk::ApplicationInfo::builder().api_version(0);
-        let ctx = vk::InstanceCreateInfo::builder()
+        let app_info = vk::ApplicationInfo::default().api_version(0);
+        let ctx = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .default_instance::<(TestLayer,)>();
         let InstanceContext { instance, .. } = ctx.as_ref();
@@ -836,7 +834,7 @@ mod create_destroy_instance {
         let _ctx = TEST_GLOBAL.create_context();
         let dropped: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         {
-            let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+            let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
             let InstanceContext { instance, .. } = ctx.as_ref();
             let instance_data = TestLayer::<Tag<0>>::global_instance()
                 .layer_info
@@ -882,7 +880,7 @@ mod create_destroy_instance {
             })
             .return_const(LayerResult::Unhandled);
         let res = unsafe {
-            vk::InstanceCreateInfo::builder()
+            vk::InstanceCreateInfo::default()
                 .create_instance::<(TestLayer<Tag<0>>, TestLayer<Tag<1>>)>(instance.as_mut_ptr())
         };
         assert_eq!(res, vk::Result::SUCCESS);
@@ -899,7 +897,7 @@ mod get_device_proc_addr {
     fn test_should_return_null_for_global_commands() {
         static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
         let _ctx = TEST_GLOBAL.create_context();
-        let ctx = vk::InstanceCreateInfo::builder()
+        let ctx = vk::InstanceCreateInfo::default()
             .default_instance::<(TestLayer,)>()
             .default_device()
             .unwrap();
@@ -944,8 +942,8 @@ mod get_device_proc_addr {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_2);
-        let ctx = vk::InstanceCreateInfo::builder()
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_2);
+        let ctx = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .default_instance::<(TestLayer,)>()
             .default_device()
@@ -977,7 +975,7 @@ mod get_device_proc_addr {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+        let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
         let InstanceContext {
             instance, entry, ..
         } = ctx.as_ref();
@@ -1029,8 +1027,8 @@ mod get_device_proc_addr {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_1);
-        let ctx = vk::InstanceCreateInfo::builder()
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+        let ctx = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .default_instance::<(TestLayer,)>()
             .default_device()
@@ -1084,8 +1082,8 @@ mod get_device_proc_addr {
         let _ctx = TEST_GLOBAL.create_context();
         // For this test case, we specify a low `VkApplicationInfo::apiVersion` where
         // `vkDestroySamplerYcbcrConversion` isn't introduced.
-        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_0);
-        let ctx = vk::InstanceCreateInfo::builder()
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_0);
+        let ctx = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .default_instance::<(TestLayer,)>()
             .default_device()
@@ -1119,8 +1117,8 @@ mod get_device_proc_addr {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let app_info = vk::ApplicationInfo::builder().api_version(vk::API_VERSION_1_1);
-        let ctx = vk::InstanceCreateInfo::builder()
+        let app_info = vk::ApplicationInfo::default().api_version(vk::API_VERSION_1_1);
+        let ctx = vk::InstanceCreateInfo::default()
             .application_info(&app_info)
             .default_instance::<(TestLayer,)>();
         unsafe { InstanceData::from_handle(ctx.instance.handle()) }
@@ -1173,13 +1171,13 @@ mod get_device_proc_addr {
 
     #[test]
     fn test_should_return_fp_for_enabled_extension_device_commands() {
-        let instance_extensions = [vk::KhrSurfaceFn::name().as_ptr()];
-        let device_extensions = [vk::KhrSwapchainFn::name().as_ptr()];
+        let instance_extensions = [ash::khr::surface::NAME.as_ptr()];
+        let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
         let destroy_swapchain_name = CString::new("vkDestroySwapchainKHR").unwrap();
         {
             static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
             let _ctx = TEST_GLOBAL.create_context();
-            let ctx = vk::InstanceCreateInfo::builder()
+            let ctx = vk::InstanceCreateInfo::default()
                 .enabled_extension_names(&instance_extensions)
                 .default_instance::<(TestLayer,)>()
                 .create_device_context(|create_info_builder, create_device| {
@@ -1212,7 +1210,7 @@ mod get_device_proc_addr {
                 })
                 .build();
             let _ctx = TEST_GLOBAL.create_context();
-            let ctx = vk::InstanceCreateInfo::builder()
+            let ctx = vk::InstanceCreateInfo::default()
                 .enabled_extension_names(&instance_extensions)
                 .default_instance::<(TestLayer,)>()
                 .create_device_context(|create_info_builder, create_device| {
@@ -1255,9 +1253,9 @@ mod get_device_proc_addr {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let instance_extensions = [vk::KhrSurfaceFn::name().as_ptr()];
-        let device_extensions = [vk::KhrSwapchainFn::name().as_ptr()];
-        let ctx = vk::InstanceCreateInfo::builder()
+        let instance_extensions = [ash::khr::surface::NAME.as_ptr()];
+        let device_extensions = [ash::khr::swapchain::NAME.as_ptr()];
+        let ctx = vk::InstanceCreateInfo::default()
             .enabled_extension_names(&instance_extensions)
             .default_instance::<(TestLayer,)>();
         unsafe { InstanceData::from_handle(ctx.instance.handle()) }
@@ -1320,7 +1318,7 @@ mod device_commands {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let ctx = vk::InstanceCreateInfo::builder()
+        let ctx = vk::InstanceCreateInfo::default()
             .default_instance::<(TestLayer,)>()
             .default_device()
             .unwrap();
@@ -1351,7 +1349,7 @@ mod device_commands {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let ctx = vk::InstanceCreateInfo::builder()
+        let ctx = vk::InstanceCreateInfo::default()
             .default_instance::<(TestLayer,)>()
             .default_device()
             .unwrap();
@@ -1390,7 +1388,7 @@ mod enumerate_device_extensions {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+        let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
         let InstanceContext { instance, .. } = ctx.as_ref();
         unsafe { InstanceData::from_handle(instance.handle()) }
             .set_available_device_extensions(&[]);
@@ -1467,7 +1465,7 @@ mod enumerate_device_extensions {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+        let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
         let InstanceContext { instance, .. } = ctx.as_ref();
         let available_device_extensions = &[Extension::KHRSwapchain];
         unsafe { InstanceData::from_handle(instance.handle()) }
@@ -1511,7 +1509,7 @@ mod enumerate_device_extensions {
             .build();
         let _ctx = TEST_GLOBAL.create_context();
 
-        let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+        let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
         let InstanceContext { instance, .. } = ctx.as_ref();
         let mut property_count = 0;
         let _ = unsafe {
@@ -1551,7 +1549,7 @@ mod enumerate_device_extensions {
             .build();
         let _ctx = TEST_GLOBAL.create_context();
 
-        let ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
+        let ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
         let InstanceContext { instance, .. } = ctx.as_ref();
         unsafe { InstanceData::from_handle(instance.handle()) }
             .set_available_device_extensions(&[]);
@@ -1625,16 +1623,16 @@ mod create_destroy_device {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let instance_extensions = [vk::KhrSurfaceFn::name().as_ptr()];
-        let instance_ctx = vk::InstanceCreateInfo::builder()
+        let instance_extensions = [ash::khr::surface::NAME.as_ptr()];
+        let instance_ctx = vk::InstanceCreateInfo::default()
             .enabled_extension_names(&instance_extensions)
             .default_instance::<(TestLayer,)>();
         unsafe { InstanceData::from_handle(instance_ctx.instance.handle()) }
             .set_available_device_extensions(&[Extension::KHRSwapchain]);
         let enabled_device_extensions = [
             // Available extension.
-            vk::KhrSwapchainFn::name().as_ptr(),
-            vk::KhrGetPhysicalDeviceProperties2Fn::name().as_ptr(),
+            ash::khr::swapchain::NAME.as_ptr(),
+            ash::khr::get_physical_device_properties2::NAME.as_ptr(),
         ];
         let device_ctx = instance_ctx
             .clone()
@@ -1652,8 +1650,8 @@ mod create_destroy_device {
 
         let enabled_device_extensions = [
             // Unavailable extension.
-            vk::KhrExternalMemoryCapabilitiesFn::name().as_ptr(),
-            vk::KhrGetPhysicalDeviceProperties2Fn::name().as_ptr(),
+            ash::khr::external_memory_capabilities::NAME.as_ptr(),
+            ash::khr::get_physical_device_properties2::NAME.as_ptr(),
         ];
         let device_create_res = instance_ctx
             .create_device_context(|create_info, create_device| {
@@ -1685,8 +1683,8 @@ mod create_destroy_device {
             .build();
         let _ctx = TEST_GLOBAL.create_context();
 
-        let instance_ctx = vk::InstanceCreateInfo::builder().default_instance::<(TestLayer,)>();
-        let enabled_device_extensions = [vk::KhrGetPhysicalDeviceProperties2Fn::name().as_ptr()];
+        let instance_ctx = vk::InstanceCreateInfo::default().default_instance::<(TestLayer,)>();
+        let enabled_device_extensions = [ash::khr::get_physical_device_properties2::NAME.as_ptr()];
 
         unsafe { InstanceData::from_handle(instance_ctx.instance.handle()) }
             .set_available_device_extensions(&[Extension::KHRGetPhysicalDeviceProperties2]);
@@ -1742,7 +1740,7 @@ mod create_destroy_device {
             .iter()
             .map(|extension| extension.as_ptr())
             .collect::<Vec<_>>();
-        let device_create_res = vk::InstanceCreateInfo::builder()
+        let device_create_res = vk::InstanceCreateInfo::default()
             .default_instance::<(TestLayer,)>()
             .create_device_context(|create_info, create_device| {
                 create_device(create_info.enabled_extension_names(&device_extensions))
@@ -1778,7 +1776,7 @@ mod create_destroy_device {
             .build();
         let _ctx = TEST_GLOBAL1.create_context();
 
-        let instance_ctx = vk::InstanceCreateInfo::builder()
+        let instance_ctx = vk::InstanceCreateInfo::default()
             .default_instance::<(TestLayer<Tag<0>>, TestLayer<Tag<1>>)>();
         let InstanceContext { instance, .. } = instance_ctx.as_ref();
 
@@ -1881,8 +1879,8 @@ mod create_destroy_device {
 
     #[test]
     fn test_should_receive_the_original_extension_list() {
-        let instance_extensions = [vk::KhrSurfaceFn::name().as_ptr()];
-        let expected_device_extensions: Vec<&'static CStr> = vec![vk::KhrSwapchainFn::name()];
+        let instance_extensions = [ash::khr::surface::NAME.as_ptr()];
+        let expected_device_extensions: Vec<&'static CStr> = vec![ash::khr::swapchain::NAME];
         let device_extensions = expected_device_extensions
             .iter()
             .map(|s| s.as_ptr())
@@ -1906,7 +1904,7 @@ mod create_destroy_device {
             })
             .build();
         let _ctx = TEST_GLOBAL.create_context();
-        let instance_ctx = vk::InstanceCreateInfo::builder()
+        let instance_ctx = vk::InstanceCreateInfo::default()
             .enabled_extension_names(&instance_extensions)
             .default_instance::<(TestLayer,)>();
         let instance_info = TestLayer::<Tag<0>>::global_instance()
@@ -1944,7 +1942,7 @@ mod create_destroy_device {
     fn test_destroy_device_with_null_handle() {
         static TEST_GLOBAL: TestGlobal = TestGlobal::builder().build();
         let _ctx = TEST_GLOBAL.create_context();
-        let ctx = vk::InstanceCreateInfo::builder()
+        let ctx = vk::InstanceCreateInfo::default()
             .default_instance::<(TestLayer,)>()
             .default_device()
             .unwrap();
@@ -1957,7 +1955,7 @@ mod create_destroy_device {
         let _ctx = TEST_GLOBAL.create_context();
         let dropped: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
         {
-            let ctx = vk::InstanceCreateInfo::builder()
+            let ctx = vk::InstanceCreateInfo::default()
                 .default_instance::<(TestLayer,)>()
                 .default_device()
                 .unwrap();
@@ -1993,7 +1991,7 @@ mod create_destroy_device {
             .build();
         let _ctx = TEST_GLOBAL1.create_context();
         let _ctx = TEST_GLOBAL2.create_context();
-        let instance_ctx = vk::InstanceCreateInfo::builder()
+        let instance_ctx = vk::InstanceCreateInfo::default()
             .default_instance::<(TestLayer<Tag<0>>, TestLayer<Tag<1>>)>();
         let mut device = MaybeUninit::<vk::Device>::uninit();
         TestLayer::<Tag<1>>::global_instance()
@@ -2146,7 +2144,7 @@ fn global_should_be_trivially_destructible() {
         let global = Global::<MyLayer>::default();
         assert!(GLOBAL.lock().replace(global).is_none());
 
-        let instance_ctx = vk::InstanceCreateInfo::builder().default_instance::<(MyLayer,)>();
+        let instance_ctx = vk::InstanceCreateInfo::default().default_instance::<(MyLayer,)>();
         drop(instance_ctx);
 
         let global = GLOBAL.lock().take();
@@ -2156,7 +2154,7 @@ fn global_should_be_trivially_destructible() {
         let global = Global::<MyLayer>::default();
         assert!(GLOBAL.lock().replace(global).is_none());
 
-        let device_ctx = vk::InstanceCreateInfo::builder()
+        let device_ctx = vk::InstanceCreateInfo::default()
             .default_instance::<(MyLayer,)>()
             .default_device()
             .unwrap();

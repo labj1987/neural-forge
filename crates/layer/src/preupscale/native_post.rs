@@ -394,14 +394,14 @@ impl Gpu {
             step(0)?;
             g.gpu.queue = device.get_device_queue(setup.family, setup.post_index);
             crate::loader_data::initialize_queue(device.handle(), g.gpu.queue).ok()?;
-            let binding = |n: u32| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build();
+            let binding = |n: u32| vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
             let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..BINDINGS).map(binding).collect();
             step(1)?;
-            g.gpu.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
+            g.gpu.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
             let set_layout = g.gpu.set_layout;
             let layout = |bytes: usize| {
-                let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(bytes as u32).build();
-                device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(std::slice::from_ref(&set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None).ok()
+                let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(bytes as u32);
+                device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(std::slice::from_ref(&set_layout)).push_constant_ranges(std::slice::from_ref(&push)), None).ok()
             };
             step(2)?;
             g.gpu.layouts[0] = layout(std::mem::size_of::<PreprocessPush>())?;
@@ -413,17 +413,17 @@ impl Gpu {
             g.gpu.pipelines[1] = super::hdr::compute_pipeline(device, g.gpu.layouts[1], COMPOSITE_SPV)?;
             let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: SETS as u32 * BINDINGS }];
             step(6)?;
-            g.gpu.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(SETS as u32).pool_sizes(&sizes), None).ok()?;
+            g.gpu.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(SETS as u32).pool_sizes(&sizes), None).ok()?;
             let set_layouts = [set_layout; SETS];
             step(7)?;
-            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(g.gpu.pool).set_layouts(&set_layouts)).ok()?;
+            let sets = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(g.gpu.pool).set_layouts(&set_layouts)).ok()?;
             g.gpu.sets.copy_from_slice(&sets);
             step(8)?;
             g.gpu.command_pool = device
-                .create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(setup.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
+                .create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(setup.family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER), None)
                 .ok()?;
             step(9)?;
-            g.gpu.cmd = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::builder().command_pool(g.gpu.command_pool).command_buffer_count(1)).ok()?[0];
+            g.gpu.cmd = crate::loader_data::allocate_commands(device, &vk::CommandBufferAllocateInfo::default().command_pool(g.gpu.command_pool).command_buffer_count(1)).ok()?[0];
             step(10)?;
             g.gpu.fence = device.create_fence(&vk::FenceCreateInfo::default(), None).ok()?;
         }
@@ -750,10 +750,10 @@ unsafe fn evaluate(
     }
     let blend = feedback < 1.0 && passes.len() > 1;
     if blend && gpu.feedback.is_none() {
-        let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(8).build();
+        let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(8);
         // SAFETY: valid create infos; the layout is destroyed again if the pipeline fails.
         let built = unsafe {
-            device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&[gpu.set_layout]).push_constant_ranges(&[push]), None).ok().and_then(|layout| {
+            device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[gpu.set_layout]).push_constant_ranges(&[push]), None).ok().and_then(|layout| {
                 match super::hdr::compute_pipeline(device, layout, FEEDBACK_SPV) {
                     Some(pipeline) => Some((layout, pipeline)),
                     None => {
@@ -874,7 +874,9 @@ unsafe fn evaluate(
         // The HUD's scale of the edit, or the proxy as a stand-in (nothing reads it without the HUD).
         let hud_i = or_proxy(Some(hud_buffer).filter(|h| *h != vk::Buffer::null()));
         let history_i: Vec<[vk::DescriptorBufferInfo; 1]> = (0..passes.len()).map(|k| or_proxy(hist.and_then(|h| h.passes.get(k)).map(|o| o.buffer))).collect();
-        let w = |set, n, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
+        fn w(set: vk::DescriptorSet, n: u32, i: &[vk::DescriptorBufferInfo; 1]) -> vk::WriteDescriptorSet<'_> {
+            vk::WriteDescriptorSet::default().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i)
+        }
         let mut writes = Vec::new();
         for (k, history_k) in history_i.iter().enumerate() {
             // Every pass after the first reads the previous pass's answer from the scratch.
@@ -912,7 +914,7 @@ unsafe fn evaluate(
             let writes: Vec<vk::WriteDescriptorSet> = infos
                 .iter()
                 .enumerate()
-                .map(|(n, i)| vk::WriteDescriptorSet::builder().dst_set(pipe.set).dst_binding(n as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build())
+                .map(|(n, i)| vk::WriteDescriptorSet::default().dst_set(pipe.set).dst_binding(n as u32).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i))
                 .collect();
             // SAFETY: the set is not in use (every frame waits for its own work); the buffers are live.
             unsafe { device.update_descriptor_sets(&writes, &[]) };
@@ -944,7 +946,7 @@ unsafe fn evaluate(
         (pre, post)
     };
     let runs = passes.len();
-    let barrier = |src: vk::AccessFlags, dst: vk::AccessFlags| [vk::MemoryBarrier::builder().src_access_mask(src).dst_access_mask(dst).build()];
+    let barrier = |src: vk::AccessFlags, dst: vk::AccessFlags| [vk::MemoryBarrier::default().src_access_mask(src).dst_access_mask(dst)];
     // The optical flow runs on frames whose passes have a history; every frame's proxy goes into the session
     // (the next frame's reference): in its own submit before the flow, else in the frame's.
     let flow_frame = mode == Motion::Flow && session_live && any_history;
@@ -953,7 +955,7 @@ unsafe fn evaluate(
     let recorded: ash::prelude::VkResult<()> = unsafe {
         (|| {
             device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty())?;
-            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
+            device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT))?;
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &barrier(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE, vk::AccessFlags::SHADER_READ | vk::AccessFlags::SHADER_WRITE), &[], &[]);
             if let Some((layout, pipeline, set, push, fresh, confidence, _)) = hud_rec {
                 // The HUD's scale of the edit, before every pass (the preprocess and the last composite read it).
@@ -1064,12 +1066,12 @@ unsafe fn evaluate(
         None
     };
     let wait_stages = [vk::PipelineStageFlags::TRANSFER];
-    let mut submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd));
+    let mut submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd));
     if let Some(sem) = waits.as_ref() {
         submit = submit.wait_semaphores(std::slice::from_ref(sem)).wait_dst_stage_mask(&wait_stages);
     }
     // SAFETY: the fence is the layer's own and idle; the queue is this thread's alone.
-    let submitted = unsafe { device.reset_fences(&[gpu.fence]).and_then(|()| device.queue_submit(gpu.queue, &[submit.build()], gpu.fence)) };
+    let submitted = unsafe { device.reset_fences(&[gpu.fence]).and_then(|()| device.queue_submit(gpu.queue, &[submit], gpu.fence)) };
     if crate::note_vk(device.handle(), submitted).is_err() {
         if waits.is_some() {
             // The flow ran (or runs) with nothing waiting for it: its queue drains, and the flow is not used again.
@@ -1115,22 +1117,21 @@ unsafe fn flow_submits(device: &ash::Device, gpu: &Gpu, s: usize) -> Result<vk::
     // SAFETY: the caller's contract; the buffers are the device's own and idle.
     unsafe {
         device.reset_command_buffer(fd.upload, vk::CommandBufferResetFlags::empty()).map_err(|e| format!("{e:?}"))?;
-        device.begin_command_buffer(fd.upload, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("{e:?}"))?;
-        let host = [vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ).build()];
+        device.begin_command_buffer(fd.upload, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).map_err(|e| format!("{e:?}"))?;
+        let host = [vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::HOST_WRITE | vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ)];
         device.cmd_pipeline_barrier(fd.upload, vk::PipelineStageFlags::HOST | vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &host, &[], &[]);
         session.record_upload(device, fd.upload, b.proxy.buffer);
         device.end_command_buffer(fd.upload).map_err(|e| format!("{e:?}"))?;
         session.record_flow(device, fd)?;
-        let upload = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&fd.upload)).signal_semaphores(std::slice::from_ref(&fd.uploaded)).build();
+        let upload = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&fd.upload)).signal_semaphores(std::slice::from_ref(&fd.uploaded));
         device.queue_submit(gpu.queue, &[upload], vk::Fence::null()).map_err(|e| format!("the upload's submit: {e:?}"))?;
         session.advance();
         let stage = [vk::PipelineStageFlags::ALL_COMMANDS];
-        let flow = vk::SubmitInfo::builder()
+        let flow = vk::SubmitInfo::default()
             .command_buffers(std::slice::from_ref(&fd.cmd))
             .wait_semaphores(std::slice::from_ref(&fd.uploaded))
             .wait_dst_stage_mask(&stage)
-            .signal_semaphores(std::slice::from_ref(&fd.flowed))
-            .build();
+            .signal_semaphores(std::slice::from_ref(&fd.flowed));
         device.queue_submit(fd.queue, &[flow], vk::Fence::null()).map_err(|e| format!("the flow's submit: {e:?}"))?;
     }
     Ok(fd.flowed)
@@ -1296,15 +1297,15 @@ impl HudPipeline {
         // SAFETY: valid create infos; on a failure what was made is destroyed (null handles are ignored).
         let built = unsafe {
             (|| {
-                let binding = |n: u32| vk::DescriptorSetLayoutBinding::builder().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE).build();
+                let binding = |n: u32| vk::DescriptorSetLayoutBinding::default().binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).descriptor_count(1).stage_flags(vk::ShaderStageFlags::COMPUTE);
                 let bindings: Vec<vk::DescriptorSetLayoutBinding> = (0..6).map(binding).collect();
-                h.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::builder().bindings(&bindings), None).ok()?;
-                let push = vk::PushConstantRange::builder().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<HudPush>() as u32).build();
-                h.layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::builder().set_layouts(&[h.set_layout]).push_constant_ranges(&[push]), None).ok()?;
+                h.set_layout = device.create_descriptor_set_layout(&vk::DescriptorSetLayoutCreateInfo::default().bindings(&bindings), None).ok()?;
+                let push = vk::PushConstantRange::default().stage_flags(vk::ShaderStageFlags::COMPUTE).size(std::mem::size_of::<HudPush>() as u32);
+                h.layout = device.create_pipeline_layout(&vk::PipelineLayoutCreateInfo::default().set_layouts(&[h.set_layout]).push_constant_ranges(&[push]), None).ok()?;
                 h.pipeline = super::hdr::compute_pipeline(device, h.layout, HUD_SPV)?;
                 let sizes = [vk::DescriptorPoolSize { ty: vk::DescriptorType::STORAGE_BUFFER, descriptor_count: 6 }];
-                h.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::builder().max_sets(1).pool_sizes(&sizes), None).ok()?;
-                h.set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::builder().descriptor_pool(h.pool).set_layouts(&[h.set_layout])).ok()?[0];
+                h.pool = device.create_descriptor_pool(&vk::DescriptorPoolCreateInfo::default().max_sets(1).pool_sizes(&sizes), None).ok()?;
+                h.set = device.allocate_descriptor_sets(&vk::DescriptorSetAllocateInfo::default().descriptor_pool(h.pool).set_layouts(&[h.set_layout])).ok()?[0];
                 Some(())
             })()
         };
@@ -1493,7 +1494,11 @@ mod tests {
             let (proxy, head, answer, lut, history) = (host(u64::from(W * H) * 4), host(u64::from(W * H) * 16), host(u64::from(W * H) * 4), host(64), host(u64::from(W * H) * 8));
             let info = |buffer| [vk::DescriptorBufferInfo { buffer, offset: 0, range: vk::WHOLE_SIZE }];
             let (pi, hi, ai, li, si) = (info(proxy.buffer), info(head.buffer), info(answer.buffer), info(lut.buffer), info(history.buffer));
-            let w = |n, i: &[vk::DescriptorBufferInfo; 1]| vk::WriteDescriptorSet::builder().dst_set(gpu.sets[1]).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i).build();
+            let set = gpu.sets[1];
+            fn write(set: vk::DescriptorSet, n: u32, i: &[vk::DescriptorBufferInfo; 1]) -> vk::WriteDescriptorSet<'_> {
+                vk::WriteDescriptorSet::default().dst_set(set).dst_binding(n).descriptor_type(vk::DescriptorType::STORAGE_BUFFER).buffer_info(i)
+            }
+            let w = |n, i| write(set, n, i);
             // No history (frame.z and .w 0): its two bindings point at a buffer nothing reads.
             // Nor the frame's proxy and the HUD's scale (no HUD: p.hud.x 0).
             device.update_descriptor_sets(&[w(0, &pi), w(1, &hi), w(2, &ai), w(3, &si), w(4, &si), w(5, &pi), w(8, &li), w(9, &si)], &[]);
@@ -1507,16 +1512,16 @@ mod tests {
                 let push = CompositePush { dims: [W, H, W, H], frame: [0, 0, 0, 0], control: [0.0, 1.0, 1.0, 0.0], ..Default::default() }.with_colour(c);
                 let cmd = gpu.cmd;
                 device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()).unwrap();
-                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+                device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
                 device.cmd_bind_pipeline(cmd, vk::PipelineBindPoint::COMPUTE, gpu.pipelines[1]);
                 device.cmd_bind_descriptor_sets(cmd, vk::PipelineBindPoint::COMPUTE, gpu.layouts[1], 0, &[gpu.sets[1]], &[]);
                 device.cmd_push_constants(cmd, gpu.layouts[1], vk::ShaderStageFlags::COMPUTE, 0, std::slice::from_raw_parts(std::ptr::from_ref(&push).cast::<u8>(), std::mem::size_of::<CompositePush>()));
                 device.cmd_dispatch(cmd, W.div_ceil(8), H.div_ceil(8), 1);
-                let to_host = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ).build();
+                let to_host = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::HOST_READ);
                 device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::HOST, vk::DependencyFlags::empty(), &[to_host], &[], &[]);
                 device.end_command_buffer(cmd).unwrap();
                 device.reset_fences(&[gpu.fence]).unwrap();
-                device.queue_submit(gpu.queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], gpu.fence).unwrap();
+                device.queue_submit(gpu.queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], gpu.fence).unwrap();
                 device.wait_for_fences(&[gpu.fence], true, u64::MAX).unwrap();
                 std::slice::from_raw_parts(answer.ptr, (W * H * 4) as usize).to_vec()
             };
@@ -1656,10 +1661,10 @@ mod tests {
                 let usage = vk::BufferUsageFlags::STORAGE_BUFFER;
                 let features = super::super::own_host_buffer_with(&device, &instance, physical, u64::from(FW * FH) * 64, usage).unwrap();
                 let head = super::super::own_host_buffer_with(&device, &instance, physical, u64::from(FW * FH) * 16, usage).unwrap();
-                let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
-                let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
+                let graph_pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
+                let graph = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(graph_pool).level(vk::CommandBufferLevel::SECONDARY).command_buffer_count(1)).unwrap()[0];
                 let inheritance = vk::CommandBufferInheritanceInfo::default();
-                device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
+                device.begin_command_buffer(graph, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::SIMULTANEOUS_USE).inheritance_info(&inheritance)).unwrap();
                 device.end_command_buffer(graph).unwrap();
                 let frame = neural_forge_native::Frame {
                     field_width: FW,

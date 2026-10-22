@@ -2,7 +2,7 @@
 # Regenerates the layer framework's generated sources (third_party/vk-layer-for-rust: the vk_layer.h binding,
 # layer_trait/generated.rs and global_simple_intercept/generated.rs) from the Vulkan headers they are built
 # against, or with --check verifies that the committed files are what the generator gives (CI runs that).
-# The headers are Vulkan-Headers at commit 3df77fb3 (1.3.251, the registry ash 0.37.3 matches), fetched
+# The headers are Vulkan-Headers at commit 38899bf6 (1.3.281, the registry ash 0.38.0 matches), fetched
 # once, SHA-256 checked, into tools/native/ (or NEURAL_FORGE_NATIVE_TOOLS). Needs libclang (bindgen; set
 # LIBCLANG_PATH if it is not found) and the pinned toolchain's rustfmt.
 #   bash scripts/vk-layer-codegen.sh [--check]
@@ -11,8 +11,8 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 FW="$ROOT/third_party/vk-layer-for-rust"
 TOOLS="${NEURAL_FORGE_NATIVE_TOOLS:-$ROOT/tools/native}"
-URL="https://github.com/KhronosGroup/Vulkan-Headers/archive/3df77fb3e4e0961f7f01de9a9ae20dfdcfc4910a.tar.gz"
-SHA="43427cd151bba1f64d4c857f467a879dfc8c28cc06fc4d4453b133cd96dcba54"
+URL="https://github.com/KhronosGroup/Vulkan-Headers/archive/38899bf60605f0a2c50f7968e5c4c9826a824683.tar.gz"
+SHA="da587cbace0dd9ea5f2297d4118b4cf63831c2e65dc9a7369a33524b9c56831d"
 HEADERS="$TOOLS/Vulkan-Headers-vk-layer"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$ROOT/target}"
 

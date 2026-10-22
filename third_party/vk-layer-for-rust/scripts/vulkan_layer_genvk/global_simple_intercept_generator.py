@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
+# Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 from __future__ import annotations
 from abc import ABC, abstractmethod
@@ -225,24 +227,33 @@ class CommandDispatchInfo:
                 dispatch_info.extension_info is not None
             ), "A CommandDispatchInfo should be either a core dispatch or an extension dispatch."
             extension_info = dispatch_info.extension_info
-            def_lines: list[str] = []
-            impl_lines: list[str] = []
 
             # Remove the VK_ prefix
             field_name = dispatch_info.get_dispatch_table_field_name()
-            field_type = f"ash::vk::{snake_case_to_upper_camel_case(field_name)}Fn"
+            # ash 0.38 keeps each extension's function tables in a module named by its vendor and the
+            # rest of its name (VK_KHR_swapchain: ash::khr::swapchain), one for the instance-level
+            # commands (InstanceFn) and one for the device-level ones (DeviceFn).
+            vendor, module = field_name.split("_", 1)
+            if module[0].isdigit():
+                module = "_" + module
 
-            if extension_info.name in CommandDispatchInfo.deprecated_extensions:
-                def_lines.append("    #[allow(deprecated)]")
-            def_lines.append(f"    {field_name}: Arc<{field_type}>,")
-            impl_lines.append(
-                f"            {field_name}: Arc::new({field_type}::load(&proc_addr_loader)),"
-            )
+            def lines(table: str) -> tuple[list[str], list[str]]:
+                field_type = f"ash::{vendor}::{module}::{table}"
+                def_lines: list[str] = []
+                if extension_info.name in CommandDispatchInfo.deprecated_extensions:
+                    def_lines.append("    #[allow(deprecated)]")
+                def_lines.append(f"    {field_name}: Arc<{field_type}>,")
+                impl_lines = [
+                    f"            {field_name}: Arc::new({field_type}::load(&proc_addr_loader)),"
+                ]
+                return def_lines, impl_lines
 
             if any([command in instance_commands for command in dispatch_info.commands]):
+                def_lines, impl_lines = lines("InstanceFn")
                 instance_dispatch_def_lines += def_lines
                 instance_dispatch_impl_lines += impl_lines
             if any([command in device_commands for command in dispatch_info.commands]):
+                def_lines, impl_lines = lines("DeviceFn")
                 device_dispatch_def_lines += def_lines
                 device_dispatch_impl_lines += impl_lines
 

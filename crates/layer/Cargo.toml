@@ -13,11 +13,11 @@ crate-type = ["cdylib"]
 [dependencies]
 neural-forge-protocol = { path = "../protocol" }
 # The layer framework (third_party/vk-layer-for-rust/UPSTREAM.md), and ash pinned to
-# the exact version vulkan-layer depends on (0.37.3): vulkan-layer's public API is
+# the exact version vulkan-layer depends on (0.38.0): vulkan-layer's public API is
 # expressed in terms of `ash::vk` types, and Cargo treats different 0.x versions of the
 # same crate as separate, incompatible types -- a mismatched ash version here would
 # fail to compile against vulkan-layer's trait signatures, not just risk skew.
-ash = "=0.37.3"
+ash = "=0.38.0"
 vulkan-layer = { path = "../../third_party/vk-layer-for-rust/vulkan-layer" }
 libc = "0.2"
 # For real ShmHeader::capture_request support (see src/dump.rs) -- a pure-Rust,

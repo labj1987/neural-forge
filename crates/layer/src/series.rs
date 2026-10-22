@@ -644,7 +644,7 @@ unsafe fn create_readback(
     pool: vk::CommandPool,
     bytes: u64,
 ) -> Option<Readback> {
-    let info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
     let buffer = unsafe { device.create_buffer(&info, None) }.ok()?;
     let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
     let find = |wanted: vk::MemoryPropertyFlags| {
@@ -656,7 +656,7 @@ unsafe fn create_readback(
         return None;
     };
     let coherent = mem_props.memory_types[type_index as usize].property_flags.contains(vk::MemoryPropertyFlags::HOST_COHERENT);
-    let memory = match unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) } {
+    let memory = match unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) } {
         Ok(m) => m,
         Err(_) => {
             unsafe { device.destroy_buffer(buffer, None) };
@@ -675,7 +675,7 @@ unsafe fn create_readback(
         cleanup();
         return None;
     };
-    let alloc = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+    let alloc = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
     // The buffer is submitted through the loader's trampolines: it needs the device's loader data,
     // like every buffer the layer allocates.
     let Some(cmd) = unsafe { crate::loader_data::allocate_commands(device, &alloc) }.ok().and_then(|v| v.first().copied()) else {
@@ -697,7 +697,7 @@ unsafe fn create_resources(
     bytes: u64,
 ) -> Option<Resources> {
     let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-    let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+    let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     let pool = unsafe { device.create_command_pool(&pool_info, None) }.ok()?;
     let original = unsafe { create_readback(device, &mem_props, pool, bytes) };
     let composited = unsafe { create_readback(device, &mem_props, pool, bytes) };
@@ -735,7 +735,7 @@ unsafe fn destroy_resources(resources: Option<Resources>, device: &ash::Device) 
 /// optionally waiting on `wait` at the transfer stage, signalling `r.fence`.
 unsafe fn submit_copy(device: &ash::Device, queue: vk::Queue, r: &Readback, image: vk::Image, width: u32, height: u32, wait: Option<vk::Semaphore>) -> bool {
     let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
-    let to_src = vk::ImageMemoryBarrier::builder()
+    let to_src = vk::ImageMemoryBarrier::default()
         .old_layout(vk::ImageLayout::PRESENT_SRC_KHR)
         .new_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         .src_access_mask(vk::AccessFlags::MEMORY_WRITE)
@@ -743,9 +743,8 @@ unsafe fn submit_copy(device: &ash::Device, queue: vk::Queue, r: &Readback, imag
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
-        .subresource_range(range)
-        .build();
-    let to_present = vk::ImageMemoryBarrier::builder()
+        .subresource_range(range);
+    let to_present = vk::ImageMemoryBarrier::default()
         .old_layout(vk::ImageLayout::TRANSFER_SRC_OPTIMAL)
         .new_layout(vk::ImageLayout::PRESENT_SRC_KHR)
         .src_access_mask(vk::AccessFlags::TRANSFER_READ)
@@ -753,22 +752,19 @@ unsafe fn submit_copy(device: &ash::Device, queue: vk::Queue, r: &Readback, imag
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .image(image)
-        .subresource_range(range)
-        .build();
-    let to_host = vk::BufferMemoryBarrier::builder()
+        .subresource_range(range);
+    let to_host = vk::BufferMemoryBarrier::default()
         .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
         .dst_access_mask(vk::AccessFlags::HOST_READ)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
         .buffer(r.buffer)
         .offset(0)
-        .size(vk::WHOLE_SIZE)
-        .build();
-    let region = vk::BufferImageCopy::builder()
+        .size(vk::WHOLE_SIZE);
+    let region = vk::BufferImageCopy::default()
         .image_subresource(vk::ImageSubresourceLayers { aspect_mask: vk::ImageAspectFlags::COLOR, mip_level: 0, base_array_layer: 0, layer_count: 1 })
-        .image_extent(vk::Extent3D { width, height, depth: 1 })
-        .build();
-    let begin = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        .image_extent(vk::Extent3D { width, height, depth: 1 });
+    let begin = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     unsafe {
         if device.reset_command_buffer(r.cmd, vk::CommandBufferResetFlags::empty()).is_err() || device.begin_command_buffer(r.cmd, &begin).is_err() {
             return false;
@@ -781,11 +777,10 @@ unsafe fn submit_copy(device: &ash::Device, queue: vk::Queue, r: &Readback, imag
         }
         let stage = [vk::PipelineStageFlags::TRANSFER];
         let waits: Vec<vk::Semaphore> = wait.into_iter().collect();
-        let submit = vk::SubmitInfo::builder()
+        let submit = vk::SubmitInfo::default()
             .wait_semaphores(&waits)
             .wait_dst_stage_mask(&stage[..waits.len()])
-            .command_buffers(std::slice::from_ref(&r.cmd))
-            .build();
+            .command_buffers(std::slice::from_ref(&r.cmd));
         device.queue_submit(queue, &[submit], r.fence).is_ok()
     }
 }
@@ -820,7 +815,7 @@ unsafe fn signal_after_submitted(device: &ash::Device, queue: vk::Queue) -> Opti
     // SAFETY: plain creation and a submit that references only the new semaphore.
     unsafe {
         let semaphore = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).ok()?;
-        let submit = vk::SubmitInfo::builder().signal_semaphores(std::slice::from_ref(&semaphore)).build();
+        let submit = vk::SubmitInfo::default().signal_semaphores(std::slice::from_ref(&semaphore));
         if crate::note_vk(device.handle(), device.queue_submit(queue, &[submit], vk::Fence::null())).is_err() {
             device.destroy_semaphore(semaphore, None);
             return None;
@@ -831,7 +826,7 @@ unsafe fn signal_after_submitted(device: &ash::Device, queue: vk::Queue) -> Opti
 
 unsafe fn invalidate(device: &ash::Device, r: &Readback) {
     if !r.coherent {
-        let range = vk::MappedMemoryRange::builder().memory(r.memory).offset(0).size(vk::WHOLE_SIZE).build();
+        let range = vk::MappedMemoryRange::default().memory(r.memory).offset(0).size(vk::WHOLE_SIZE);
         unsafe {
             let _ = device.invalidate_mapped_memory_ranges(&[range]);
         }
@@ -846,7 +841,7 @@ mod tests {
     fn clear(device: &ash::Device, queue: vk::Queue, pool: vk::CommandPool, image: vk::Image, from: vk::ImageLayout, colour: [f32; 4]) {
         let range = vk::ImageSubresourceRange { aspect_mask: vk::ImageAspectFlags::COLOR, base_mip_level: 0, level_count: 1, base_array_layer: 0, layer_count: 1 };
         let barrier = |old, new, src, dst| {
-            vk::ImageMemoryBarrier::builder()
+            vk::ImageMemoryBarrier::default()
                 .old_layout(old)
                 .new_layout(new)
                 .src_access_mask(src)
@@ -855,17 +850,16 @@ mod tests {
                 .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
                 .image(image)
                 .subresource_range(range)
-                .build()
         };
         unsafe {
-            let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).unwrap()[0];
+            let cmd = device.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1)).unwrap()[0];
             device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default()).unwrap();
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[barrier(from, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::MEMORY_READ, vk::AccessFlags::TRANSFER_WRITE)]);
             device.cmd_clear_color_image(cmd, image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &vk::ClearColorValue { float32: colour }, &[range]);
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[barrier(vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::MEMORY_READ)]);
             device.end_command_buffer(cmd).unwrap();
             // No fence: queue order alone has to keep the series' readbacks around this.
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], vk::Fence::null()).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], vk::Fence::null()).unwrap();
         }
     }
 
@@ -1016,7 +1010,7 @@ mod tests {
         let header = Box::new(neural_forge_protocol::ShmHeader::default());
         let shm = crate::shm::ShmClient::test_over_header(&header);
         unsafe {
-            let info = vk::ImageCreateInfo::builder()
+            let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk::Format::B8G8R8A8_UNORM)
                 .extent(vk::Extent3D { width, height, depth: 1 })
@@ -1030,9 +1024,9 @@ mod tests {
             let reqs = device.get_image_memory_requirements(image);
             let props = instance.get_physical_device_memory_properties(physical_device);
             let type_index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
-            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None).unwrap();
+            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None).unwrap();
             device.bind_image_memory(image, memory, 0).unwrap();
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
             clear(&device, queue, pool, image, vk::ImageLayout::UNDEFINED, [0.5, 0.0, 0.0, 1.0]);
 
             let mut series = Series::default();
@@ -1040,7 +1034,7 @@ mod tests {
             series.before(&device, &instance, physical_device, queue, family, image, width, height);
             // The composition's semaphore, as `capture::run` returns it.
             let compose_done = device.create_semaphore(&vk::SemaphoreCreateInfo::default(), None).unwrap();
-            let signal = vk::SubmitInfo::builder().signal_semaphores(std::slice::from_ref(&compose_done)).build();
+            let signal = vk::SubmitInfo::default().signal_semaphores(std::slice::from_ref(&compose_done));
             device.queue_submit(queue, &[signal], vk::Fence::null()).unwrap();
             TEST_READBACK_STALLS.with(|s| s.set(true));
             let wait = series.after(&device, queue, image, width, height, true, Some(compose_done), reason::NONE);
@@ -1052,7 +1046,7 @@ mod tests {
             // The present's wait, standing in for `vkQueuePresentKHR`'s.
             let fence = device.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             let stage = [vk::PipelineStageFlags::ALL_COMMANDS];
-            let present = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&present_wait)).wait_dst_stage_mask(&stage).build();
+            let present = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&present_wait)).wait_dst_stage_mask(&stage);
             device.queue_submit(queue, &[present], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
             device.destroy_fence(fence, None);
@@ -1089,7 +1083,7 @@ mod tests {
         let shm = crate::shm::ShmClient::test_over_header(&header);
         let series_dir;
         unsafe {
-            let info = vk::ImageCreateInfo::builder()
+            let info = vk::ImageCreateInfo::default()
                 .image_type(vk::ImageType::TYPE_2D)
                 .format(vk::Format::B8G8R8A8_UNORM)
                 .extent(vk::Extent3D { width, height, depth: 1 })
@@ -1103,9 +1097,9 @@ mod tests {
             let reqs = device.get_image_memory_requirements(image);
             let props = instance.get_physical_device_memory_properties(physical_device);
             let type_index = (0..props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0).unwrap();
-            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None).unwrap();
+            let memory = device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None).unwrap();
             device.bind_image_memory(image, memory, 0).unwrap();
-            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(family), None).unwrap();
+            let pool = device.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(family), None).unwrap();
 
             let mut series = Series::default();
             series.start(request(11, 3), &base, shm.channel(), false);

@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 use std::{collections::BTreeSet, ffi::CStr, fmt::Debug, mem::MaybeUninit, ptr::NonNull};
 
@@ -32,9 +34,9 @@ use crate::global_simple_intercept::{ApiVersion, Extension, Feature};
 /// use ash::vk;
 /// use vulkan_layer::VulkanBaseOutStructChain;
 ///
-/// let mut timeline_semaphore_feature = vk::PhysicalDeviceTimelineSemaphoreFeatures::builder();
-/// let mut ycbcr_feature = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::builder();
-/// let features2 = vk::PhysicalDeviceFeatures2::builder()
+/// let mut timeline_semaphore_feature = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+/// let mut ycbcr_feature = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+/// let features2 = vk::PhysicalDeviceFeatures2::default()
 ///     .push_next(&mut timeline_semaphore_feature)
 ///     .push_next(&mut ycbcr_feature);
 /// let out_chain = features2.p_next.cast::<vk::BaseOutStructure>();
@@ -51,17 +53,17 @@ use crate::global_simple_intercept::{ApiVersion, Extension, Feature};
 /// assert!(out_chain.next().is_none());
 /// ```
 pub struct VulkanBaseOutStructChain<'a> {
-    next: Option<&'a mut vk::BaseOutStructure>,
+    next: Option<&'a mut vk::BaseOutStructure<'a>>,
 }
 
-impl<'a> From<Option<&'a mut vk::BaseOutStructure>> for VulkanBaseOutStructChain<'a> {
-    fn from(next: Option<&'a mut vk::BaseOutStructure>) -> Self {
+impl<'a> From<Option<&'a mut vk::BaseOutStructure<'a>>> for VulkanBaseOutStructChain<'a> {
+    fn from(next: Option<&'a mut vk::BaseOutStructure<'a>>) -> Self {
         Self { next }
     }
 }
 
 impl<'a> Iterator for VulkanBaseOutStructChain<'a> {
-    type Item = &'a mut vk::BaseOutStructure;
+    type Item = &'a mut vk::BaseOutStructure<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next.take().inspect(|element| {
@@ -82,9 +84,9 @@ impl<'a> Iterator for VulkanBaseOutStructChain<'a> {
 /// use ash::vk;
 /// use vulkan_layer::VulkanBaseInStructChain;
 ///
-/// let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::builder();
-/// let mut image_format_list_info = vk::ImageFormatListCreateInfo::builder();
-/// let image_create_info = vk::ImageCreateInfo::builder()
+/// let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::default();
+/// let mut image_format_list_info = vk::ImageFormatListCreateInfo::default();
+/// let image_create_info = vk::ImageCreateInfo::default()
 ///     .push_next(&mut external_memory_image_info)
 ///     .push_next(&mut image_format_list_info);
 /// let in_chain = image_create_info.p_next.cast::<vk::BaseInStructure>();
@@ -101,17 +103,17 @@ impl<'a> Iterator for VulkanBaseOutStructChain<'a> {
 /// assert!(in_chain.next().is_none());
 /// ```
 pub struct VulkanBaseInStructChain<'a> {
-    next: Option<&'a vk::BaseInStructure>,
+    next: Option<&'a vk::BaseInStructure<'a>>,
 }
 
-impl<'a> From<Option<&'a vk::BaseInStructure>> for VulkanBaseInStructChain<'a> {
-    fn from(next: Option<&'a vk::BaseInStructure>) -> Self {
+impl<'a> From<Option<&'a vk::BaseInStructure<'a>>> for VulkanBaseInStructChain<'a> {
+    fn from(next: Option<&'a vk::BaseInStructure<'a>>) -> Self {
         Self { next }
     }
 }
 
 impl<'a> Iterator for VulkanBaseInStructChain<'a> {
-    type Item = &'a vk::BaseInStructure;
+    type Item = &'a vk::BaseInStructure<'a>;
 
     fn next(&mut self) -> Option<Self::Item> {
         self.next.take().inspect(|element| {
@@ -382,9 +384,9 @@ mod tests {
 
     #[test]
     fn multiple_in_struct_nodes() {
-        let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::builder();
-        let mut image_format_list_info = vk::ImageFormatListCreateInfo::builder();
-        let image_create_info = vk::ImageCreateInfo::builder()
+        let mut external_memory_image_info = vk::ExternalMemoryImageCreateInfo::default();
+        let mut image_format_list_info = vk::ImageFormatListCreateInfo::default();
+        let image_create_info = vk::ImageCreateInfo::default()
             .push_next(&mut external_memory_image_info)
             .push_next(&mut image_format_list_info);
         let in_chain = image_create_info.p_next as *const vk::BaseInStructure;
@@ -403,9 +405,9 @@ mod tests {
 
     #[test]
     fn multiple_out_struct_nodes() {
-        let mut timeline_semaphore_feature = vk::PhysicalDeviceTimelineSemaphoreFeatures::builder();
-        let mut ycbcr_feature = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::builder();
-        let features2 = vk::PhysicalDeviceFeatures2::builder()
+        let mut timeline_semaphore_feature = vk::PhysicalDeviceTimelineSemaphoreFeatures::default();
+        let mut ycbcr_feature = vk::PhysicalDeviceSamplerYcbcrConversionFeatures::default();
+        let features2 = vk::PhysicalDeviceFeatures2::default()
             .push_next(&mut timeline_semaphore_feature)
             .push_next(&mut ycbcr_feature);
         let out_chain = features2.p_next.cast::<vk::BaseOutStructure>();

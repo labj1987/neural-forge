@@ -42,9 +42,9 @@ variable unset, none of these entry points is intercepted: the framework's hooke
 list is exactly the default one, and the layer hands out the next layer's pointers.
 
 Interception: the pinned `vulkan-layer` framework already generates hooks for every NVX
-command in ash 0.37.3. The probe adds them to the list returned by
+command in ash 0.38.0. The probe adds them to the list returned by
 `Layer::hooked_device_commands` only when the variable is set. `vkGetImageViewHandle64NVX`
-is newer than ash 0.37.3, so the framework doesn't know it; `entry_points.rs` wraps the
+is newer than ash 0.38.0 (Vulkan 1.3.281), so the framework doesn't know it; `entry_points.rs` wraps the
 next layer's pointer for it in `vkGetDeviceProcAddr`, again only with the probe on.
 
 ## Running it on the rig
@@ -254,8 +254,8 @@ before touching probe state.
   `vkCreateFramebuffer`/`vkDestroyFramebuffer` for render pass attachments (imageless
   framebuffers through `VkRenderPassAttachmentBeginInfo`). The framework maps the KHR
   aliases to the same hooks.
-- **Not hookable with the pinned `vulkan-layer`/ash 0.37.3.** `vkCmdExecuteGeneratedCommandsEXT`
-  (newer than ash 0.37.3). Also not counted: `vkCmdSetEvent*`/`vkCmdWaitEvents*`,
+- **Not hookable with the pinned `vulkan-layer`/ash 0.38.0.** `vkCmdExecuteGeneratedCommandsEXT`
+  (Vulkan 1.3.296, newer than ash 0.38.0's 1.3.281). Also not counted: `vkCmdSetEvent*`/`vkCmdWaitEvents*`,
   `vkCmdDrawIndirectByteCountEXT`, the NV mesh draws, and buffer-only commands.
 - **What can't be seen.** A dispatch's or draw's storage-image writes go through
   descriptors, which the probe doesn't track. Such a write shows only as an image barrier on

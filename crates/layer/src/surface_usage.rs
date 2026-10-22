@@ -36,7 +36,7 @@ fn chain_is_understood(info: &vk::SwapchainCreateInfoKHR) -> bool {
 
 /// The view formats a `MUTABLE_FORMAT` swapchain declares, from its
 /// `VkImageFormatListCreateInfo`. `None` when the chain has no such list.
-fn view_formats(info: &vk::SwapchainCreateInfoKHR) -> Option<&[vk::Format]> {
+fn view_formats<'a>(info: &'a vk::SwapchainCreateInfoKHR<'_>) -> Option<&'a [vk::Format]> {
     let mut next = info.p_next;
     while !next.is_null() {
         // SAFETY: as in `chain_is_understood`.
@@ -83,8 +83,8 @@ pub fn requested_usage(original: vk::ImageUsageFlags, supported: vk::ImageUsageF
 
 /// Returns a private copy; the caller's create info and extension chain are never modified.
 /// Unsupported or unqueryable surfaces use the original creation path without capture.
-pub fn prepare(instance: &ash::Instance, query: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR, physical: vk::PhysicalDevice, info: &vk::SwapchainCreateInfoKHR)
-    -> Option<vk::SwapchainCreateInfoKHR>
+pub fn prepare<'a>(instance: &ash::Instance, query: vk::PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR, physical: vk::PhysicalDevice, info: &vk::SwapchainCreateInfoKHR<'a>)
+    -> Option<vk::SwapchainCreateInfoKHR<'a>>
 {
     if !candidate(info) { return None; }
     // SAFETY: query was resolved through the same next-layer instance dispatch
@@ -132,7 +132,7 @@ mod tests {
     }
     #[test]
     fn swapchains_that_redefine_their_own_images_are_not_captured() {
-        let mut info = vk::SwapchainCreateInfoKHR::builder().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO).build();
+        let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
         assert!(candidate(&info));
         // A present mode whose images are shared with the presentation engine.
         info.present_mode = vk::PresentModeKHR::SHARED_DEMAND_REFRESH;
@@ -155,17 +155,15 @@ mod tests {
         // DXVK creates GTA San Andreas DE's swapchain like this (UNORM storage, sRGB
         // views, plus the Reflex latency struct). Refusing it left the game untouched.
         let formats = [vk::Format::B8G8R8A8_UNORM, vk::Format::B8G8R8A8_SRGB];
-        let list = vk::ImageFormatListCreateInfo::builder().view_formats(&formats).build();
+        let list = vk::ImageFormatListCreateInfo::default().view_formats(&formats);
         let reflex = vk::BaseInStructure {
             s_type: vk::StructureType::from_raw(1_000_505_007),
-            p_next: std::ptr::from_ref(&list).cast(),
-        };
-        let mut info = vk::SwapchainCreateInfoKHR::builder()
+            p_next: std::ptr::from_ref(&list).cast(), _marker: std::marker::PhantomData };
+        let mut info = vk::SwapchainCreateInfoKHR::default()
             .image_array_layers(1)
             .present_mode(vk::PresentModeKHR::IMMEDIATE)
             .image_format(vk::Format::B8G8R8A8_UNORM)
-            .flags(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT)
-            .build();
+            .flags(vk::SwapchainCreateFlagsKHR::MUTABLE_FORMAT);
         info.p_next = std::ptr::from_ref(&reflex).cast();
         assert!(candidate(&info));
         assert_eq!(view_formats(&info), Some(&formats[..]));
@@ -184,20 +182,20 @@ mod tests {
         // blitting into it -- offered no render source to tap either. Since this module
         // rewrites `image_usage` and nothing else, an unrecognised struct in the
         // application's own chain is not a reason to give up on the frame.
-        let mut info = vk::SwapchainCreateInfoKHR::builder().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO).build();
-        let unknown = vk::BaseInStructure { s_type: vk::StructureType::from_raw(1_000_505_007), p_next: std::ptr::null() };
+        let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
+        let unknown = vk::BaseInStructure { s_type: vk::StructureType::from_raw(1_000_505_007), p_next: std::ptr::null(), _marker: std::marker::PhantomData };
         info.p_next = std::ptr::from_ref(&unknown).cast();
         assert!(candidate(&info), "an unknown pNext struct must not disqualify capture");
     }
 
     #[test]
     fn structures_that_change_what_the_images_are_still_disqualify_the_chain() {
-        let mut info = vk::SwapchainCreateInfoKHR::builder().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO).build();
+        let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
         for s_type in [
             vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR,
             vk::StructureType::SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT,
         ] {
-            let refused = vk::BaseInStructure { s_type, p_next: std::ptr::null() };
+            let refused = vk::BaseInStructure { s_type, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
             info.p_next = std::ptr::from_ref(&refused).cast();
             assert!(!candidate(&info), "{s_type:?} should not be admitted");
         }
@@ -206,9 +204,9 @@ mod tests {
     #[test]
     fn the_whole_chain_is_walked_not_just_its_first_link() {
         // A refused struct hiding behind an allowed one still has to be found.
-        let mut info = vk::SwapchainCreateInfoKHR::builder().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO).build();
-        let deep = vk::BaseInStructure { s_type: vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR, p_next: std::ptr::null() };
-        let shallow = vk::BaseInStructure { s_type: vk::StructureType::from_raw(1_000_505_007), p_next: std::ptr::from_ref(&deep) };
+        let mut info = vk::SwapchainCreateInfoKHR::default().image_array_layers(1).present_mode(vk::PresentModeKHR::FIFO);
+        let deep = vk::BaseInStructure { s_type: vk::StructureType::DEVICE_GROUP_SWAPCHAIN_CREATE_INFO_KHR, p_next: std::ptr::null(), _marker: std::marker::PhantomData };
+        let shallow = vk::BaseInStructure { s_type: vk::StructureType::from_raw(1_000_505_007), p_next: std::ptr::from_ref(&deep), _marker: std::marker::PhantomData };
         info.p_next = std::ptr::from_ref(&shallow).cast();
         assert!(!candidate(&info), "a refused struct deeper in the chain was missed");
     }

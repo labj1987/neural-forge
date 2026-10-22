@@ -47,7 +47,7 @@ impl GpuTimer {
         if !period.is_finite() || period <= 0.0 {
             return None;
         }
-        let info = vk::QueryPoolCreateInfo::builder().query_type(vk::QueryType::TIMESTAMP).query_count(2);
+        let info = vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2);
         // SAFETY: `device` is live; `info` is valid.
         let pool = unsafe { device.create_query_pool(&info, None) }.ok()?;
         Some(Self { pool, ns_per_tick: f64::from(period), valid_mask: Self::mask(bits), pending: false, reading: None })
@@ -97,7 +97,7 @@ impl GpuTimer {
         let mut ticks = [0u64; 2];
         // SAFETY: `self.pool` holds exactly two queries, `ticks` two u64 slots, and `TYPE_64`
         // makes each result 8 bytes at an 8-byte stride (ash passes `size_of::<u64>()`).
-        let result = unsafe { device.get_query_pool_results(self.pool, 0, 2, &mut ticks, vk::QueryResultFlags::TYPE_64) };
+        let result = unsafe { device.get_query_pool_results(self.pool, 0, &mut ticks, vk::QueryResultFlags::TYPE_64) };
         if crate::note_vk(device.handle(), result).is_err() {
             return;
         }

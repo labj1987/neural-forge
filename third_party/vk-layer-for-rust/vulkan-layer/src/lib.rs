@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 #![warn(missing_docs)]
 #![cfg_attr(all(doc, RUSTC_NIGHTLY), feature(doc_auto_cfg))]
@@ -713,7 +715,7 @@ impl<T: Layer> Global<T> {
                     }
                     std::ptr::null()
                 };
-                let entry = vk::EntryFnV1_0::load(get_proc_addr);
+                let entry = ash::EntryFnV1_0::load(get_proc_addr);
 
                 let ret: vk::Result =
                     unsafe { (entry.create_instance)(create_info, allocator, p_instance) };
@@ -726,7 +728,7 @@ impl<T: Layer> Global<T> {
         let instance = *unsafe { p_instance.as_ref() }.unwrap();
         let ash_instance = unsafe {
             ash::Instance::load(
-                &ash::vk::StaticFn {
+                &ash::StaticFn {
                     get_instance_proc_addr,
                 },
                 instance,
@@ -1047,7 +1049,7 @@ impl<T: Layer> Global<T> {
             // loader complaining about internal vkGetDeviceProcAddr called for <function name>,
             // which should be benign.
             ash::Device::load(
-                &vk::InstanceFnV1_0 {
+                &ash::InstanceFnV1_0 {
                     get_device_proc_addr,
                     ..ash_instance.fp_v1_0().clone()
                 },
@@ -1131,10 +1133,9 @@ impl<T: Layer> Global<T> {
     fn layer_properties() -> Vec<vk::LayerProperties> {
         let layer_manifest = T::manifest();
         // layer_name and description will be set later
-        let mut layer_property: vk::LayerProperties = vk::LayerProperties::builder()
+        let mut layer_property: vk::LayerProperties = vk::LayerProperties::default()
             .spec_version(layer_manifest.spec_version)
-            .implementation_version(layer_manifest.implementation_version)
-            .build();
+            .implementation_version(layer_manifest.implementation_version);
         assert!(layer_manifest.name.len() < vk::MAX_EXTENSION_NAME_SIZE);
         let layer_name = CString::new(layer_manifest.name).unwrap();
         let layer_name = cast_slice(layer_name.as_bytes());

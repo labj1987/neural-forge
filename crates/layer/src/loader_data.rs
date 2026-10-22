@@ -12,7 +12,7 @@ type SetLoaderData = unsafe extern "system" fn(vk::Device, *mut c_void) -> vk::R
 #[repr(C)]
 struct LoaderCallback {
     s_type: vk::StructureType,
-    p_next: *const vk::BaseInStructure,
+    p_next: *const vk::BaseInStructure<'static>,
     function: u32,
     setter: Option<SetLoaderData>,
 }
@@ -101,7 +101,7 @@ mod tests {
         let callback = LoaderCallback { s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO,
             p_next: std::ptr::null(), function: 1, setter: Some(set_dispatch) };
         let base = vk::BaseInStructure { s_type: vk::StructureType::APPLICATION_INFO,
-            p_next: (&callback as *const LoaderCallback).cast() };
+            p_next: (&callback as *const LoaderCallback).cast(), _marker: std::marker::PhantomData };
         let info = vk::DeviceCreateInfo { p_next: (&base as *const vk::BaseInStructure).cast(), ..Default::default() };
         let registration = unsafe { register(device, &info) };
         let mut child = [0usize, 0x5678];

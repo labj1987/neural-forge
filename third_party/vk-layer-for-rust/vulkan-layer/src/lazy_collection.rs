@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): an explicit lifetime in `get`'s return type (UPSTREAM.md).
+// Modified for Neural Forge (2026): an explicit lifetime in `get`'s return type; ash 0.38 (UPSTREAM.md).
 
 use std::{
     borrow::Cow,

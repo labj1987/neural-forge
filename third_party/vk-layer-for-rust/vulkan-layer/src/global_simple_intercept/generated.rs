@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): generated for ash 0.38 and Vulkan 1.3.281 (UPSTREAM.md).
 
 #![allow(missing_docs)]
 // This file is generated from the Vulkan XML API registry.
@@ -51,6 +53,8 @@ pub enum Extension {
     KHRSamplerMirrorClampToEdge,
     KHRVideoQueue,
     KHRVideoDecodeQueue,
+    KHRVideoEncodeH264,
+    KHRVideoEncodeH265,
     KHRVideoDecodeH264,
     KHRDynamicRendering,
     KHRMultiview,
@@ -109,6 +113,8 @@ pub enum Extension {
     KHRVulkanMemoryModel,
     KHRShaderTerminateInvocation,
     KHRFragmentShadingRate,
+    KHRDynamicRenderingLocalRead,
+    KHRShaderQuadControl,
     KHRSpirv14,
     KHRSurfaceProtectedCapabilities,
     KHRSeparateDepthStencilLayouts,
@@ -133,7 +139,21 @@ pub enum Extension {
     KHRRayTracingMaintenance1,
     KHRPortabilityEnumeration,
     KHRMaintenance4,
+    KHRShaderSubgroupRotate,
+    KHRShaderMaximalReconvergence,
+    KHRMaintenance5,
     KHRRayTracingPositionFetch,
+    KHRCooperativeMatrix,
+    KHRVideoDecodeAv1,
+    KHRVideoMaintenance1,
+    KHRVertexAttributeDivisor,
+    KHRLoadStoreOpNone,
+    KHRShaderFloatControls2,
+    KHRIndexTypeUint8,
+    KHRLineRasterization,
+    KHRCalibratedTimestamps,
+    KHRShaderExpectAssume,
+    KHRMaintenance6,
     ANDROIDNativeBuffer,
     EXTDebugReport,
     NVGlslShader,
@@ -152,8 +172,6 @@ pub enum Extension {
     AMDNegativeViewportHeight,
     AMDGpuShaderHalfFloat,
     AMDShaderBallot,
-    EXTVideoEncodeH264,
-    EXTVideoEncodeH265,
     AMDTextureGatherBiasLod,
     AMDShaderInfo,
     AMDShaderImageLoadStoreLod,
@@ -188,6 +206,7 @@ pub enum Extension {
     EXTDepthClipEnable,
     EXTSwapchainColorspace,
     EXTHdrMetadata,
+    IMGRelaxedLineRasterization,
     MVKIosSurface,
     MVKMacosSurface,
     EXTExternalMemoryDmaBuf,
@@ -196,6 +215,7 @@ pub enum Extension {
     ANDROIDExternalMemoryAndroidHardwareBuffer,
     EXTSamplerFilterMinmax,
     AMDGpuShaderInt16,
+    AMDXShaderEnqueue,
     AMDMixedAttachmentSamples,
     AMDShaderFragmentMask,
     EXTInlineUniformBlock,
@@ -266,6 +286,8 @@ pub enum Extension {
     EXTHostQueryReset,
     EXTIndexTypeUint8,
     EXTExtendedDynamicState,
+    EXTHostImageCopy,
+    EXTMapMemoryPlaced,
     EXTShaderAtomicFloat2,
     EXTSurfaceMaintenance1,
     EXTSwapchainMaintenance1,
@@ -274,6 +296,7 @@ pub enum Extension {
     NVInheritedViewportScissor,
     EXTTexelBufferAlignment,
     QCOMRenderPassTransform,
+    EXTDepthBiasControl,
     EXTDeviceMemoryReport,
     EXTAcquireDrmDisplay,
     EXTRobustness2,
@@ -284,6 +307,7 @@ pub enum Extension {
     EXTPipelineCreationCacheControl,
     NVDeviceDiagnosticsConfig,
     QCOMRenderPassStoreOps,
+    NVCudaKernelLaunch,
     NVLowLatency,
     EXTMetalObjects,
     EXTDescriptorBuffer,
@@ -316,6 +340,7 @@ pub enum Extension {
     HUAWEIInvocationMask,
     NVExternalMemoryRdma,
     EXTPipelineProperties,
+    EXTFrameBoundary,
     EXTMultisampledRenderToSingleSampled,
     EXTExtendedDynamicState2,
     QNXScreenSurface,
@@ -333,17 +358,22 @@ pub enum Extension {
     EXTBorderColorSwizzle,
     EXTPageableDeviceLocalMemory,
     ARMShaderCoreProperties,
+    ARMSchedulingControls,
     EXTImageSlicedViewOf3d,
     VALVEDescriptorSetHostMapping,
     EXTDepthClampZeroOne,
     EXTNonSeamlessCubeMap,
+    ARMRenderPassStriped,
     QCOMFragmentDensityMapOffset,
     NVCopyMemoryIndirect,
     NVMemoryDecompression,
+    NVDeviceGeneratedCommandsCompute,
     NVLinearColorAttachment,
     GOOGLESurfacelessQuery,
     EXTImageCompressionControlSwapchain,
     QCOMImageProcessing,
+    EXTNestedCommandBuffer,
+    EXTExternalMemoryAcquireUnmodified,
     EXTExtendedDynamicState3,
     EXTSubpassMergeFeedback,
     LUNARGDirectDriverLoading,
@@ -352,17 +382,32 @@ pub enum Extension {
     NVOpticalFlow,
     EXTLegacyDithering,
     EXTPipelineProtectedAccess,
+    ANDROIDExternalFormatResolve,
     EXTShaderObject,
     QCOMTileProperties,
     SECAmigoProfiling,
     QCOMMultiviewPerViewViewports,
     NVRayTracingInvocationReorder,
+    NVExtendedSparseAddressSpace,
     EXTMutableDescriptorType,
+    EXTLayerSettings,
     ARMShaderCoreBuiltins,
     EXTPipelineLibraryGroupHandles,
     EXTDynamicRenderingUnusedAttachments,
+    NVLowLatency2,
     QCOMMultiviewPerViewRenderAreas,
+    NVPerStageDescriptorSet,
+    QCOMImageProcessing2,
+    QCOMFilterCubicWeights,
+    QCOMYcbcrDegamma,
+    QCOMFilterCubicClamp,
     EXTAttachmentFeedbackLoopDynamicState,
+    QNXExternalMemoryScreenBuffer,
+    MSFTLayeredDriver,
+    NVDescriptorPoolOverallocation,
+    NVRawAccessChains,
+    NVShaderAtomicFloat16Vector,
+    NVRayTracingValidation,
     KHRAccelerationStructure,
     KHRRayTracingPipeline,
     KHRRayQuery,
@@ -386,6 +431,8 @@ impl TryFrom<&str> for Extension {
             "VK_KHR_sampler_mirror_clamp_to_edge" => Ok(Extension::KHRSamplerMirrorClampToEdge),
             "VK_KHR_video_queue" => Ok(Extension::KHRVideoQueue),
             "VK_KHR_video_decode_queue" => Ok(Extension::KHRVideoDecodeQueue),
+            "VK_KHR_video_encode_h264" => Ok(Extension::KHRVideoEncodeH264),
+            "VK_KHR_video_encode_h265" => Ok(Extension::KHRVideoEncodeH265),
             "VK_KHR_video_decode_h264" => Ok(Extension::KHRVideoDecodeH264),
             "VK_KHR_dynamic_rendering" => Ok(Extension::KHRDynamicRendering),
             "VK_KHR_multiview" => Ok(Extension::KHRMultiview),
@@ -450,6 +497,8 @@ impl TryFrom<&str> for Extension {
             "VK_KHR_vulkan_memory_model" => Ok(Extension::KHRVulkanMemoryModel),
             "VK_KHR_shader_terminate_invocation" => Ok(Extension::KHRShaderTerminateInvocation),
             "VK_KHR_fragment_shading_rate" => Ok(Extension::KHRFragmentShadingRate),
+            "VK_KHR_dynamic_rendering_local_read" => Ok(Extension::KHRDynamicRenderingLocalRead),
+            "VK_KHR_shader_quad_control" => Ok(Extension::KHRShaderQuadControl),
             "VK_KHR_spirv_1_4" => Ok(Extension::KHRSpirv14),
             "VK_KHR_surface_protected_capabilities" => {
                 Ok(Extension::KHRSurfaceProtectedCapabilities)
@@ -488,7 +537,21 @@ impl TryFrom<&str> for Extension {
             "VK_KHR_ray_tracing_maintenance1" => Ok(Extension::KHRRayTracingMaintenance1),
             "VK_KHR_portability_enumeration" => Ok(Extension::KHRPortabilityEnumeration),
             "VK_KHR_maintenance4" => Ok(Extension::KHRMaintenance4),
+            "VK_KHR_shader_subgroup_rotate" => Ok(Extension::KHRShaderSubgroupRotate),
+            "VK_KHR_shader_maximal_reconvergence" => Ok(Extension::KHRShaderMaximalReconvergence),
+            "VK_KHR_maintenance5" => Ok(Extension::KHRMaintenance5),
             "VK_KHR_ray_tracing_position_fetch" => Ok(Extension::KHRRayTracingPositionFetch),
+            "VK_KHR_cooperative_matrix" => Ok(Extension::KHRCooperativeMatrix),
+            "VK_KHR_video_decode_av1" => Ok(Extension::KHRVideoDecodeAv1),
+            "VK_KHR_video_maintenance1" => Ok(Extension::KHRVideoMaintenance1),
+            "VK_KHR_vertex_attribute_divisor" => Ok(Extension::KHRVertexAttributeDivisor),
+            "VK_KHR_load_store_op_none" => Ok(Extension::KHRLoadStoreOpNone),
+            "VK_KHR_shader_float_controls2" => Ok(Extension::KHRShaderFloatControls2),
+            "VK_KHR_index_type_uint8" => Ok(Extension::KHRIndexTypeUint8),
+            "VK_KHR_line_rasterization" => Ok(Extension::KHRLineRasterization),
+            "VK_KHR_calibrated_timestamps" => Ok(Extension::KHRCalibratedTimestamps),
+            "VK_KHR_shader_expect_assume" => Ok(Extension::KHRShaderExpectAssume),
+            "VK_KHR_maintenance6" => Ok(Extension::KHRMaintenance6),
             "VK_ANDROID_native_buffer" => Ok(Extension::ANDROIDNativeBuffer),
             "VK_EXT_debug_report" => Ok(Extension::EXTDebugReport),
             "VK_NV_glsl_shader" => Ok(Extension::NVGlslShader),
@@ -509,8 +572,6 @@ impl TryFrom<&str> for Extension {
             "VK_AMD_negative_viewport_height" => Ok(Extension::AMDNegativeViewportHeight),
             "VK_AMD_gpu_shader_half_float" => Ok(Extension::AMDGpuShaderHalfFloat),
             "VK_AMD_shader_ballot" => Ok(Extension::AMDShaderBallot),
-            "VK_EXT_video_encode_h264" => Ok(Extension::EXTVideoEncodeH264),
-            "VK_EXT_video_encode_h265" => Ok(Extension::EXTVideoEncodeH265),
             "VK_AMD_texture_gather_bias_lod" => Ok(Extension::AMDTextureGatherBiasLod),
             "VK_AMD_shader_info" => Ok(Extension::AMDShaderInfo),
             "VK_AMD_shader_image_load_store_lod" => Ok(Extension::AMDShaderImageLoadStoreLod),
@@ -545,6 +606,7 @@ impl TryFrom<&str> for Extension {
             "VK_EXT_depth_clip_enable" => Ok(Extension::EXTDepthClipEnable),
             "VK_EXT_swapchain_colorspace" => Ok(Extension::EXTSwapchainColorspace),
             "VK_EXT_hdr_metadata" => Ok(Extension::EXTHdrMetadata),
+            "VK_IMG_relaxed_line_rasterization" => Ok(Extension::IMGRelaxedLineRasterization),
             "VK_MVK_ios_surface" => Ok(Extension::MVKIosSurface),
             "VK_MVK_macos_surface" => Ok(Extension::MVKMacosSurface),
             "VK_EXT_external_memory_dma_buf" => Ok(Extension::EXTExternalMemoryDmaBuf),
@@ -555,6 +617,7 @@ impl TryFrom<&str> for Extension {
             }
             "VK_EXT_sampler_filter_minmax" => Ok(Extension::EXTSamplerFilterMinmax),
             "VK_AMD_gpu_shader_int16" => Ok(Extension::AMDGpuShaderInt16),
+            "VK_AMDX_shader_enqueue" => Ok(Extension::AMDXShaderEnqueue),
             "VK_AMD_mixed_attachment_samples" => Ok(Extension::AMDMixedAttachmentSamples),
             "VK_AMD_shader_fragment_mask" => Ok(Extension::AMDShaderFragmentMask),
             "VK_EXT_inline_uniform_block" => Ok(Extension::EXTInlineUniformBlock),
@@ -629,6 +692,8 @@ impl TryFrom<&str> for Extension {
             "VK_EXT_host_query_reset" => Ok(Extension::EXTHostQueryReset),
             "VK_EXT_index_type_uint8" => Ok(Extension::EXTIndexTypeUint8),
             "VK_EXT_extended_dynamic_state" => Ok(Extension::EXTExtendedDynamicState),
+            "VK_EXT_host_image_copy" => Ok(Extension::EXTHostImageCopy),
+            "VK_EXT_map_memory_placed" => Ok(Extension::EXTMapMemoryPlaced),
             "VK_EXT_shader_atomic_float2" => Ok(Extension::EXTShaderAtomicFloat2),
             "VK_EXT_surface_maintenance1" => Ok(Extension::EXTSurfaceMaintenance1),
             "VK_EXT_swapchain_maintenance1" => Ok(Extension::EXTSwapchainMaintenance1),
@@ -639,6 +704,7 @@ impl TryFrom<&str> for Extension {
             "VK_NV_inherited_viewport_scissor" => Ok(Extension::NVInheritedViewportScissor),
             "VK_EXT_texel_buffer_alignment" => Ok(Extension::EXTTexelBufferAlignment),
             "VK_QCOM_render_pass_transform" => Ok(Extension::QCOMRenderPassTransform),
+            "VK_EXT_depth_bias_control" => Ok(Extension::EXTDepthBiasControl),
             "VK_EXT_device_memory_report" => Ok(Extension::EXTDeviceMemoryReport),
             "VK_EXT_acquire_drm_display" => Ok(Extension::EXTAcquireDrmDisplay),
             "VK_EXT_robustness2" => Ok(Extension::EXTRobustness2),
@@ -651,6 +717,7 @@ impl TryFrom<&str> for Extension {
             }
             "VK_NV_device_diagnostics_config" => Ok(Extension::NVDeviceDiagnosticsConfig),
             "VK_QCOM_render_pass_store_ops" => Ok(Extension::QCOMRenderPassStoreOps),
+            "VK_NV_cuda_kernel_launch" => Ok(Extension::NVCudaKernelLaunch),
             "VK_NV_low_latency" => Ok(Extension::NVLowLatency),
             "VK_EXT_metal_objects" => Ok(Extension::EXTMetalObjects),
             "VK_EXT_descriptor_buffer" => Ok(Extension::EXTDescriptorBuffer),
@@ -691,6 +758,7 @@ impl TryFrom<&str> for Extension {
             "VK_HUAWEI_invocation_mask" => Ok(Extension::HUAWEIInvocationMask),
             "VK_NV_external_memory_rdma" => Ok(Extension::NVExternalMemoryRdma),
             "VK_EXT_pipeline_properties" => Ok(Extension::EXTPipelineProperties),
+            "VK_EXT_frame_boundary" => Ok(Extension::EXTFrameBoundary),
             "VK_EXT_multisampled_render_to_single_sampled" => {
                 Ok(Extension::EXTMultisampledRenderToSingleSampled)
             }
@@ -710,19 +778,28 @@ impl TryFrom<&str> for Extension {
             "VK_EXT_border_color_swizzle" => Ok(Extension::EXTBorderColorSwizzle),
             "VK_EXT_pageable_device_local_memory" => Ok(Extension::EXTPageableDeviceLocalMemory),
             "VK_ARM_shader_core_properties" => Ok(Extension::ARMShaderCoreProperties),
+            "VK_ARM_scheduling_controls" => Ok(Extension::ARMSchedulingControls),
             "VK_EXT_image_sliced_view_of_3d" => Ok(Extension::EXTImageSlicedViewOf3d),
             "VK_VALVE_descriptor_set_host_mapping" => Ok(Extension::VALVEDescriptorSetHostMapping),
             "VK_EXT_depth_clamp_zero_one" => Ok(Extension::EXTDepthClampZeroOne),
             "VK_EXT_non_seamless_cube_map" => Ok(Extension::EXTNonSeamlessCubeMap),
+            "VK_ARM_render_pass_striped" => Ok(Extension::ARMRenderPassStriped),
             "VK_QCOM_fragment_density_map_offset" => Ok(Extension::QCOMFragmentDensityMapOffset),
             "VK_NV_copy_memory_indirect" => Ok(Extension::NVCopyMemoryIndirect),
             "VK_NV_memory_decompression" => Ok(Extension::NVMemoryDecompression),
+            "VK_NV_device_generated_commands_compute" => {
+                Ok(Extension::NVDeviceGeneratedCommandsCompute)
+            }
             "VK_NV_linear_color_attachment" => Ok(Extension::NVLinearColorAttachment),
             "VK_GOOGLE_surfaceless_query" => Ok(Extension::GOOGLESurfacelessQuery),
             "VK_EXT_image_compression_control_swapchain" => {
                 Ok(Extension::EXTImageCompressionControlSwapchain)
             }
             "VK_QCOM_image_processing" => Ok(Extension::QCOMImageProcessing),
+            "VK_EXT_nested_command_buffer" => Ok(Extension::EXTNestedCommandBuffer),
+            "VK_EXT_external_memory_acquire_unmodified" => {
+                Ok(Extension::EXTExternalMemoryAcquireUnmodified)
+            }
             "VK_EXT_extended_dynamic_state3" => Ok(Extension::EXTExtendedDynamicState3),
             "VK_EXT_subpass_merge_feedback" => Ok(Extension::EXTSubpassMergeFeedback),
             "VK_LUNARG_direct_driver_loading" => Ok(Extension::LUNARGDirectDriverLoading),
@@ -733,12 +810,15 @@ impl TryFrom<&str> for Extension {
             "VK_NV_optical_flow" => Ok(Extension::NVOpticalFlow),
             "VK_EXT_legacy_dithering" => Ok(Extension::EXTLegacyDithering),
             "VK_EXT_pipeline_protected_access" => Ok(Extension::EXTPipelineProtectedAccess),
+            "VK_ANDROID_external_format_resolve" => Ok(Extension::ANDROIDExternalFormatResolve),
             "VK_EXT_shader_object" => Ok(Extension::EXTShaderObject),
             "VK_QCOM_tile_properties" => Ok(Extension::QCOMTileProperties),
             "VK_SEC_amigo_profiling" => Ok(Extension::SECAmigoProfiling),
             "VK_QCOM_multiview_per_view_viewports" => Ok(Extension::QCOMMultiviewPerViewViewports),
             "VK_NV_ray_tracing_invocation_reorder" => Ok(Extension::NVRayTracingInvocationReorder),
+            "VK_NV_extended_sparse_address_space" => Ok(Extension::NVExtendedSparseAddressSpace),
             "VK_EXT_mutable_descriptor_type" => Ok(Extension::EXTMutableDescriptorType),
+            "VK_EXT_layer_settings" => Ok(Extension::EXTLayerSettings),
             "VK_ARM_shader_core_builtins" => Ok(Extension::ARMShaderCoreBuiltins),
             "VK_EXT_pipeline_library_group_handles" => {
                 Ok(Extension::EXTPipelineLibraryGroupHandles)
@@ -746,12 +826,24 @@ impl TryFrom<&str> for Extension {
             "VK_EXT_dynamic_rendering_unused_attachments" => {
                 Ok(Extension::EXTDynamicRenderingUnusedAttachments)
             }
+            "VK_NV_low_latency2" => Ok(Extension::NVLowLatency2),
             "VK_QCOM_multiview_per_view_render_areas" => {
                 Ok(Extension::QCOMMultiviewPerViewRenderAreas)
             }
+            "VK_NV_per_stage_descriptor_set" => Ok(Extension::NVPerStageDescriptorSet),
+            "VK_QCOM_image_processing2" => Ok(Extension::QCOMImageProcessing2),
+            "VK_QCOM_filter_cubic_weights" => Ok(Extension::QCOMFilterCubicWeights),
+            "VK_QCOM_ycbcr_degamma" => Ok(Extension::QCOMYcbcrDegamma),
+            "VK_QCOM_filter_cubic_clamp" => Ok(Extension::QCOMFilterCubicClamp),
             "VK_EXT_attachment_feedback_loop_dynamic_state" => {
                 Ok(Extension::EXTAttachmentFeedbackLoopDynamicState)
             }
+            "VK_QNX_external_memory_screen_buffer" => Ok(Extension::QNXExternalMemoryScreenBuffer),
+            "VK_MSFT_layered_driver" => Ok(Extension::MSFTLayeredDriver),
+            "VK_NV_descriptor_pool_overallocation" => Ok(Extension::NVDescriptorPoolOverallocation),
+            "VK_NV_raw_access_chains" => Ok(Extension::NVRawAccessChains),
+            "VK_NV_shader_atomic_float16_vector" => Ok(Extension::NVShaderAtomicFloat16Vector),
+            "VK_NV_ray_tracing_validation" => Ok(Extension::NVRayTracingValidation),
             "VK_KHR_acceleration_structure" => Ok(Extension::KHRAccelerationStructure),
             "VK_KHR_ray_tracing_pipeline" => Ok(Extension::KHRRayTracingPipeline),
             "VK_KHR_ray_query" => Ok(Extension::KHRRayQuery),
@@ -776,6 +868,8 @@ impl From<Extension> for &'static str {
             Extension::KHRSamplerMirrorClampToEdge => "VK_KHR_sampler_mirror_clamp_to_edge",
             Extension::KHRVideoQueue => "VK_KHR_video_queue",
             Extension::KHRVideoDecodeQueue => "VK_KHR_video_decode_queue",
+            Extension::KHRVideoEncodeH264 => "VK_KHR_video_encode_h264",
+            Extension::KHRVideoEncodeH265 => "VK_KHR_video_encode_h265",
             Extension::KHRVideoDecodeH264 => "VK_KHR_video_decode_h264",
             Extension::KHRDynamicRendering => "VK_KHR_dynamic_rendering",
             Extension::KHRMultiview => "VK_KHR_multiview",
@@ -834,6 +928,8 @@ impl From<Extension> for &'static str {
             Extension::KHRVulkanMemoryModel => "VK_KHR_vulkan_memory_model",
             Extension::KHRShaderTerminateInvocation => "VK_KHR_shader_terminate_invocation",
             Extension::KHRFragmentShadingRate => "VK_KHR_fragment_shading_rate",
+            Extension::KHRDynamicRenderingLocalRead => "VK_KHR_dynamic_rendering_local_read",
+            Extension::KHRShaderQuadControl => "VK_KHR_shader_quad_control",
             Extension::KHRSpirv14 => "VK_KHR_spirv_1_4",
             Extension::KHRSurfaceProtectedCapabilities => "VK_KHR_surface_protected_capabilities",
             Extension::KHRSeparateDepthStencilLayouts => "VK_KHR_separate_depth_stencil_layouts",
@@ -864,7 +960,21 @@ impl From<Extension> for &'static str {
             Extension::KHRRayTracingMaintenance1 => "VK_KHR_ray_tracing_maintenance1",
             Extension::KHRPortabilityEnumeration => "VK_KHR_portability_enumeration",
             Extension::KHRMaintenance4 => "VK_KHR_maintenance4",
+            Extension::KHRShaderSubgroupRotate => "VK_KHR_shader_subgroup_rotate",
+            Extension::KHRShaderMaximalReconvergence => "VK_KHR_shader_maximal_reconvergence",
+            Extension::KHRMaintenance5 => "VK_KHR_maintenance5",
             Extension::KHRRayTracingPositionFetch => "VK_KHR_ray_tracing_position_fetch",
+            Extension::KHRCooperativeMatrix => "VK_KHR_cooperative_matrix",
+            Extension::KHRVideoDecodeAv1 => "VK_KHR_video_decode_av1",
+            Extension::KHRVideoMaintenance1 => "VK_KHR_video_maintenance1",
+            Extension::KHRVertexAttributeDivisor => "VK_KHR_vertex_attribute_divisor",
+            Extension::KHRLoadStoreOpNone => "VK_KHR_load_store_op_none",
+            Extension::KHRShaderFloatControls2 => "VK_KHR_shader_float_controls2",
+            Extension::KHRIndexTypeUint8 => "VK_KHR_index_type_uint8",
+            Extension::KHRLineRasterization => "VK_KHR_line_rasterization",
+            Extension::KHRCalibratedTimestamps => "VK_KHR_calibrated_timestamps",
+            Extension::KHRShaderExpectAssume => "VK_KHR_shader_expect_assume",
+            Extension::KHRMaintenance6 => "VK_KHR_maintenance6",
             Extension::ANDROIDNativeBuffer => "VK_ANDROID_native_buffer",
             Extension::EXTDebugReport => "VK_EXT_debug_report",
             Extension::NVGlslShader => "VK_NV_glsl_shader",
@@ -885,8 +995,6 @@ impl From<Extension> for &'static str {
             Extension::AMDNegativeViewportHeight => "VK_AMD_negative_viewport_height",
             Extension::AMDGpuShaderHalfFloat => "VK_AMD_gpu_shader_half_float",
             Extension::AMDShaderBallot => "VK_AMD_shader_ballot",
-            Extension::EXTVideoEncodeH264 => "VK_EXT_video_encode_h264",
-            Extension::EXTVideoEncodeH265 => "VK_EXT_video_encode_h265",
             Extension::AMDTextureGatherBiasLod => "VK_AMD_texture_gather_bias_lod",
             Extension::AMDShaderInfo => "VK_AMD_shader_info",
             Extension::AMDShaderImageLoadStoreLod => "VK_AMD_shader_image_load_store_lod",
@@ -921,6 +1029,7 @@ impl From<Extension> for &'static str {
             Extension::EXTDepthClipEnable => "VK_EXT_depth_clip_enable",
             Extension::EXTSwapchainColorspace => "VK_EXT_swapchain_colorspace",
             Extension::EXTHdrMetadata => "VK_EXT_hdr_metadata",
+            Extension::IMGRelaxedLineRasterization => "VK_IMG_relaxed_line_rasterization",
             Extension::MVKIosSurface => "VK_MVK_ios_surface",
             Extension::MVKMacosSurface => "VK_MVK_macos_surface",
             Extension::EXTExternalMemoryDmaBuf => "VK_EXT_external_memory_dma_buf",
@@ -931,6 +1040,7 @@ impl From<Extension> for &'static str {
             }
             Extension::EXTSamplerFilterMinmax => "VK_EXT_sampler_filter_minmax",
             Extension::AMDGpuShaderInt16 => "VK_AMD_gpu_shader_int16",
+            Extension::AMDXShaderEnqueue => "VK_AMDX_shader_enqueue",
             Extension::AMDMixedAttachmentSamples => "VK_AMD_mixed_attachment_samples",
             Extension::AMDShaderFragmentMask => "VK_AMD_shader_fragment_mask",
             Extension::EXTInlineUniformBlock => "VK_EXT_inline_uniform_block",
@@ -1003,6 +1113,8 @@ impl From<Extension> for &'static str {
             Extension::EXTHostQueryReset => "VK_EXT_host_query_reset",
             Extension::EXTIndexTypeUint8 => "VK_EXT_index_type_uint8",
             Extension::EXTExtendedDynamicState => "VK_EXT_extended_dynamic_state",
+            Extension::EXTHostImageCopy => "VK_EXT_host_image_copy",
+            Extension::EXTMapMemoryPlaced => "VK_EXT_map_memory_placed",
             Extension::EXTShaderAtomicFloat2 => "VK_EXT_shader_atomic_float2",
             Extension::EXTSurfaceMaintenance1 => "VK_EXT_surface_maintenance1",
             Extension::EXTSwapchainMaintenance1 => "VK_EXT_swapchain_maintenance1",
@@ -1013,6 +1125,7 @@ impl From<Extension> for &'static str {
             Extension::NVInheritedViewportScissor => "VK_NV_inherited_viewport_scissor",
             Extension::EXTTexelBufferAlignment => "VK_EXT_texel_buffer_alignment",
             Extension::QCOMRenderPassTransform => "VK_QCOM_render_pass_transform",
+            Extension::EXTDepthBiasControl => "VK_EXT_depth_bias_control",
             Extension::EXTDeviceMemoryReport => "VK_EXT_device_memory_report",
             Extension::EXTAcquireDrmDisplay => "VK_EXT_acquire_drm_display",
             Extension::EXTRobustness2 => "VK_EXT_robustness2",
@@ -1023,6 +1136,7 @@ impl From<Extension> for &'static str {
             Extension::EXTPipelineCreationCacheControl => "VK_EXT_pipeline_creation_cache_control",
             Extension::NVDeviceDiagnosticsConfig => "VK_NV_device_diagnostics_config",
             Extension::QCOMRenderPassStoreOps => "VK_QCOM_render_pass_store_ops",
+            Extension::NVCudaKernelLaunch => "VK_NV_cuda_kernel_launch",
             Extension::NVLowLatency => "VK_NV_low_latency",
             Extension::EXTMetalObjects => "VK_EXT_metal_objects",
             Extension::EXTDescriptorBuffer => "VK_EXT_descriptor_buffer",
@@ -1059,6 +1173,7 @@ impl From<Extension> for &'static str {
             Extension::HUAWEIInvocationMask => "VK_HUAWEI_invocation_mask",
             Extension::NVExternalMemoryRdma => "VK_NV_external_memory_rdma",
             Extension::EXTPipelineProperties => "VK_EXT_pipeline_properties",
+            Extension::EXTFrameBoundary => "VK_EXT_frame_boundary",
             Extension::EXTMultisampledRenderToSingleSampled => {
                 "VK_EXT_multisampled_render_to_single_sampled"
             }
@@ -1078,19 +1193,28 @@ impl From<Extension> for &'static str {
             Extension::EXTBorderColorSwizzle => "VK_EXT_border_color_swizzle",
             Extension::EXTPageableDeviceLocalMemory => "VK_EXT_pageable_device_local_memory",
             Extension::ARMShaderCoreProperties => "VK_ARM_shader_core_properties",
+            Extension::ARMSchedulingControls => "VK_ARM_scheduling_controls",
             Extension::EXTImageSlicedViewOf3d => "VK_EXT_image_sliced_view_of_3d",
             Extension::VALVEDescriptorSetHostMapping => "VK_VALVE_descriptor_set_host_mapping",
             Extension::EXTDepthClampZeroOne => "VK_EXT_depth_clamp_zero_one",
             Extension::EXTNonSeamlessCubeMap => "VK_EXT_non_seamless_cube_map",
+            Extension::ARMRenderPassStriped => "VK_ARM_render_pass_striped",
             Extension::QCOMFragmentDensityMapOffset => "VK_QCOM_fragment_density_map_offset",
             Extension::NVCopyMemoryIndirect => "VK_NV_copy_memory_indirect",
             Extension::NVMemoryDecompression => "VK_NV_memory_decompression",
+            Extension::NVDeviceGeneratedCommandsCompute => {
+                "VK_NV_device_generated_commands_compute"
+            }
             Extension::NVLinearColorAttachment => "VK_NV_linear_color_attachment",
             Extension::GOOGLESurfacelessQuery => "VK_GOOGLE_surfaceless_query",
             Extension::EXTImageCompressionControlSwapchain => {
                 "VK_EXT_image_compression_control_swapchain"
             }
             Extension::QCOMImageProcessing => "VK_QCOM_image_processing",
+            Extension::EXTNestedCommandBuffer => "VK_EXT_nested_command_buffer",
+            Extension::EXTExternalMemoryAcquireUnmodified => {
+                "VK_EXT_external_memory_acquire_unmodified"
+            }
             Extension::EXTExtendedDynamicState3 => "VK_EXT_extended_dynamic_state3",
             Extension::EXTSubpassMergeFeedback => "VK_EXT_subpass_merge_feedback",
             Extension::LUNARGDirectDriverLoading => "VK_LUNARG_direct_driver_loading",
@@ -1101,21 +1225,36 @@ impl From<Extension> for &'static str {
             Extension::NVOpticalFlow => "VK_NV_optical_flow",
             Extension::EXTLegacyDithering => "VK_EXT_legacy_dithering",
             Extension::EXTPipelineProtectedAccess => "VK_EXT_pipeline_protected_access",
+            Extension::ANDROIDExternalFormatResolve => "VK_ANDROID_external_format_resolve",
             Extension::EXTShaderObject => "VK_EXT_shader_object",
             Extension::QCOMTileProperties => "VK_QCOM_tile_properties",
             Extension::SECAmigoProfiling => "VK_SEC_amigo_profiling",
             Extension::QCOMMultiviewPerViewViewports => "VK_QCOM_multiview_per_view_viewports",
             Extension::NVRayTracingInvocationReorder => "VK_NV_ray_tracing_invocation_reorder",
+            Extension::NVExtendedSparseAddressSpace => "VK_NV_extended_sparse_address_space",
             Extension::EXTMutableDescriptorType => "VK_EXT_mutable_descriptor_type",
+            Extension::EXTLayerSettings => "VK_EXT_layer_settings",
             Extension::ARMShaderCoreBuiltins => "VK_ARM_shader_core_builtins",
             Extension::EXTPipelineLibraryGroupHandles => "VK_EXT_pipeline_library_group_handles",
             Extension::EXTDynamicRenderingUnusedAttachments => {
                 "VK_EXT_dynamic_rendering_unused_attachments"
             }
+            Extension::NVLowLatency2 => "VK_NV_low_latency2",
             Extension::QCOMMultiviewPerViewRenderAreas => "VK_QCOM_multiview_per_view_render_areas",
+            Extension::NVPerStageDescriptorSet => "VK_NV_per_stage_descriptor_set",
+            Extension::QCOMImageProcessing2 => "VK_QCOM_image_processing2",
+            Extension::QCOMFilterCubicWeights => "VK_QCOM_filter_cubic_weights",
+            Extension::QCOMYcbcrDegamma => "VK_QCOM_ycbcr_degamma",
+            Extension::QCOMFilterCubicClamp => "VK_QCOM_filter_cubic_clamp",
             Extension::EXTAttachmentFeedbackLoopDynamicState => {
                 "VK_EXT_attachment_feedback_loop_dynamic_state"
             }
+            Extension::QNXExternalMemoryScreenBuffer => "VK_QNX_external_memory_screen_buffer",
+            Extension::MSFTLayeredDriver => "VK_MSFT_layered_driver",
+            Extension::NVDescriptorPoolOverallocation => "VK_NV_descriptor_pool_overallocation",
+            Extension::NVRawAccessChains => "VK_NV_raw_access_chains",
+            Extension::NVShaderAtomicFloat16Vector => "VK_NV_shader_atomic_float16_vector",
+            Extension::NVRayTracingValidation => "VK_NV_ray_tracing_validation",
             Extension::KHRAccelerationStructure => "VK_KHR_acceleration_structure",
             Extension::KHRRayTracingPipeline => "VK_KHR_ray_tracing_pipeline",
             Extension::KHRRayQuery => "VK_KHR_ray_query",
@@ -1126,86 +1265,95 @@ impl From<Extension> for &'static str {
 
 pub(crate) struct DeviceDispatchTable {
     pub core: Arc<ash::Device>,
-    khr_swapchain: Arc<ash::vk::KhrSwapchainFn>,
-    khr_video_queue: Arc<ash::vk::KhrVideoQueueFn>,
-    khr_performance_query: Arc<ash::vk::KhrPerformanceQueryFn>,
-    khr_fragment_shading_rate: Arc<ash::vk::KhrFragmentShadingRateFn>,
-    ext_debug_utils: Arc<ash::vk::ExtDebugUtilsFn>,
-    ext_sample_locations: Arc<ash::vk::ExtSampleLocationsFn>,
-    ext_calibrated_timestamps: Arc<ash::vk::ExtCalibratedTimestampsFn>,
-    ext_full_screen_exclusive: Arc<ash::vk::ExtFullScreenExclusiveFn>,
-    nv_optical_flow: Arc<ash::vk::NvOpticalFlowFn>,
-    khr_display_swapchain: Arc<ash::vk::KhrDisplaySwapchainFn>,
-    khr_video_decode_queue: Arc<ash::vk::KhrVideoDecodeQueueFn>,
-    khr_external_memory_win32: Arc<ash::vk::KhrExternalMemoryWin32Fn>,
-    khr_external_memory_fd: Arc<ash::vk::KhrExternalMemoryFdFn>,
-    khr_external_semaphore_win32: Arc<ash::vk::KhrExternalSemaphoreWin32Fn>,
-    khr_external_semaphore_fd: Arc<ash::vk::KhrExternalSemaphoreFdFn>,
-    khr_push_descriptor: Arc<ash::vk::KhrPushDescriptorFn>,
-    khr_shared_presentable_image: Arc<ash::vk::KhrSharedPresentableImageFn>,
-    khr_external_fence_win32: Arc<ash::vk::KhrExternalFenceWin32Fn>,
-    khr_external_fence_fd: Arc<ash::vk::KhrExternalFenceFdFn>,
-    khr_present_wait: Arc<ash::vk::KhrPresentWaitFn>,
-    khr_deferred_host_operations: Arc<ash::vk::KhrDeferredHostOperationsFn>,
-    khr_pipeline_executable_properties: Arc<ash::vk::KhrPipelineExecutablePropertiesFn>,
-    khr_video_encode_queue: Arc<ash::vk::KhrVideoEncodeQueueFn>,
-    khr_synchronization2: Arc<ash::vk::KhrSynchronization2Fn>,
-    khr_ray_tracing_maintenance1: Arc<ash::vk::KhrRayTracingMaintenance1Fn>,
-    android_native_buffer: Arc<ash::vk::AndroidNativeBufferFn>,
-    ext_debug_marker: Arc<ash::vk::ExtDebugMarkerFn>,
-    ext_transform_feedback: Arc<ash::vk::ExtTransformFeedbackFn>,
-    nvx_binary_import: Arc<ash::vk::NvxBinaryImportFn>,
-    nvx_image_view_handle: Arc<ash::vk::NvxImageViewHandleFn>,
-    amd_shader_info: Arc<ash::vk::AmdShaderInfoFn>,
-    nv_external_memory_win32: Arc<ash::vk::NvExternalMemoryWin32Fn>,
-    ext_conditional_rendering: Arc<ash::vk::ExtConditionalRenderingFn>,
-    nv_clip_space_w_scaling: Arc<ash::vk::NvClipSpaceWScalingFn>,
-    ext_display_control: Arc<ash::vk::ExtDisplayControlFn>,
-    google_display_timing: Arc<ash::vk::GoogleDisplayTimingFn>,
-    ext_discard_rectangles: Arc<ash::vk::ExtDiscardRectanglesFn>,
-    ext_hdr_metadata: Arc<ash::vk::ExtHdrMetadataFn>,
+    khr_swapchain: Arc<ash::khr::swapchain::DeviceFn>,
+    khr_video_queue: Arc<ash::khr::video_queue::DeviceFn>,
+    khr_performance_query: Arc<ash::khr::performance_query::DeviceFn>,
+    khr_fragment_shading_rate: Arc<ash::khr::fragment_shading_rate::DeviceFn>,
+    khr_video_encode_queue: Arc<ash::khr::video_encode_queue::DeviceFn>,
+    khr_calibrated_timestamps: Arc<ash::khr::calibrated_timestamps::DeviceFn>,
+    ext_debug_utils: Arc<ash::ext::debug_utils::DeviceFn>,
+    ext_sample_locations: Arc<ash::ext::sample_locations::DeviceFn>,
+    ext_full_screen_exclusive: Arc<ash::ext::full_screen_exclusive::DeviceFn>,
+    nv_optical_flow: Arc<ash::nv::optical_flow::DeviceFn>,
+    khr_display_swapchain: Arc<ash::khr::display_swapchain::DeviceFn>,
+    khr_video_decode_queue: Arc<ash::khr::video_decode_queue::DeviceFn>,
+    khr_external_memory_win32: Arc<ash::khr::external_memory_win32::DeviceFn>,
+    khr_external_memory_fd: Arc<ash::khr::external_memory_fd::DeviceFn>,
+    khr_external_semaphore_win32: Arc<ash::khr::external_semaphore_win32::DeviceFn>,
+    khr_external_semaphore_fd: Arc<ash::khr::external_semaphore_fd::DeviceFn>,
+    khr_push_descriptor: Arc<ash::khr::push_descriptor::DeviceFn>,
+    khr_shared_presentable_image: Arc<ash::khr::shared_presentable_image::DeviceFn>,
+    khr_external_fence_win32: Arc<ash::khr::external_fence_win32::DeviceFn>,
+    khr_external_fence_fd: Arc<ash::khr::external_fence_fd::DeviceFn>,
+    khr_dynamic_rendering_local_read: Arc<ash::khr::dynamic_rendering_local_read::DeviceFn>,
+    khr_present_wait: Arc<ash::khr::present_wait::DeviceFn>,
+    khr_deferred_host_operations: Arc<ash::khr::deferred_host_operations::DeviceFn>,
+    khr_pipeline_executable_properties: Arc<ash::khr::pipeline_executable_properties::DeviceFn>,
+    khr_synchronization2: Arc<ash::khr::synchronization2::DeviceFn>,
+    khr_ray_tracing_maintenance1: Arc<ash::khr::ray_tracing_maintenance1::DeviceFn>,
+    khr_maintenance5: Arc<ash::khr::maintenance5::DeviceFn>,
+    khr_line_rasterization: Arc<ash::khr::line_rasterization::DeviceFn>,
+    khr_maintenance6: Arc<ash::khr::maintenance6::DeviceFn>,
+    android_native_buffer: Arc<ash::android::native_buffer::DeviceFn>,
+    ext_debug_marker: Arc<ash::ext::debug_marker::DeviceFn>,
+    ext_transform_feedback: Arc<ash::ext::transform_feedback::DeviceFn>,
+    nvx_binary_import: Arc<ash::nvx::binary_import::DeviceFn>,
+    nvx_image_view_handle: Arc<ash::nvx::image_view_handle::DeviceFn>,
+    amd_shader_info: Arc<ash::amd::shader_info::DeviceFn>,
+    nv_external_memory_win32: Arc<ash::nv::external_memory_win32::DeviceFn>,
+    ext_conditional_rendering: Arc<ash::ext::conditional_rendering::DeviceFn>,
+    nv_clip_space_w_scaling: Arc<ash::nv::clip_space_w_scaling::DeviceFn>,
+    ext_display_control: Arc<ash::ext::display_control::DeviceFn>,
+    google_display_timing: Arc<ash::google::display_timing::DeviceFn>,
+    ext_discard_rectangles: Arc<ash::ext::discard_rectangles::DeviceFn>,
+    ext_hdr_metadata: Arc<ash::ext::hdr_metadata::DeviceFn>,
     android_external_memory_android_hardware_buffer:
-        Arc<ash::vk::AndroidExternalMemoryAndroidHardwareBufferFn>,
-    ext_image_drm_format_modifier: Arc<ash::vk::ExtImageDrmFormatModifierFn>,
-    ext_validation_cache: Arc<ash::vk::ExtValidationCacheFn>,
-    nv_shading_rate_image: Arc<ash::vk::NvShadingRateImageFn>,
-    nv_ray_tracing: Arc<ash::vk::NvRayTracingFn>,
-    khr_ray_tracing_pipeline: Arc<ash::vk::KhrRayTracingPipelineFn>,
-    ext_external_memory_host: Arc<ash::vk::ExtExternalMemoryHostFn>,
-    amd_buffer_marker: Arc<ash::vk::AmdBufferMarkerFn>,
-    nv_mesh_shader: Arc<ash::vk::NvMeshShaderFn>,
-    nv_scissor_exclusive: Arc<ash::vk::NvScissorExclusiveFn>,
-    nv_device_diagnostic_checkpoints: Arc<ash::vk::NvDeviceDiagnosticCheckpointsFn>,
-    intel_performance_query: Arc<ash::vk::IntelPerformanceQueryFn>,
-    amd_display_native_hdr: Arc<ash::vk::AmdDisplayNativeHdrFn>,
-    ext_line_rasterization: Arc<ash::vk::ExtLineRasterizationFn>,
-    ext_swapchain_maintenance1: Arc<ash::vk::ExtSwapchainMaintenance1Fn>,
-    nv_device_generated_commands: Arc<ash::vk::NvDeviceGeneratedCommandsFn>,
-    ext_metal_objects: Arc<ash::vk::ExtMetalObjectsFn>,
-    ext_descriptor_buffer: Arc<ash::vk::ExtDescriptorBufferFn>,
-    nv_fragment_shading_rate_enums: Arc<ash::vk::NvFragmentShadingRateEnumsFn>,
-    ext_image_compression_control: Arc<ash::vk::ExtImageCompressionControlFn>,
-    ext_vertex_input_dynamic_state: Arc<ash::vk::ExtVertexInputDynamicStateFn>,
-    fuchsia_external_memory: Arc<ash::vk::FuchsiaExternalMemoryFn>,
-    fuchsia_external_semaphore: Arc<ash::vk::FuchsiaExternalSemaphoreFn>,
-    fuchsia_buffer_collection: Arc<ash::vk::FuchsiaBufferCollectionFn>,
-    huawei_subpass_shading: Arc<ash::vk::HuaweiSubpassShadingFn>,
-    huawei_invocation_mask: Arc<ash::vk::HuaweiInvocationMaskFn>,
-    nv_external_memory_rdma: Arc<ash::vk::NvExternalMemoryRdmaFn>,
-    ext_pipeline_properties: Arc<ash::vk::ExtPipelinePropertiesFn>,
-    ext_extended_dynamic_state2: Arc<ash::vk::ExtExtendedDynamicState2Fn>,
-    ext_color_write_enable: Arc<ash::vk::ExtColorWriteEnableFn>,
-    ext_multi_draw: Arc<ash::vk::ExtMultiDrawFn>,
-    ext_opacity_micromap: Arc<ash::vk::ExtOpacityMicromapFn>,
-    ext_pageable_device_local_memory: Arc<ash::vk::ExtPageableDeviceLocalMemoryFn>,
-    valve_descriptor_set_host_mapping: Arc<ash::vk::ValveDescriptorSetHostMappingFn>,
-    nv_copy_memory_indirect: Arc<ash::vk::NvCopyMemoryIndirectFn>,
-    nv_memory_decompression: Arc<ash::vk::NvMemoryDecompressionFn>,
-    ext_extended_dynamic_state3: Arc<ash::vk::ExtExtendedDynamicState3Fn>,
-    ext_shader_module_identifier: Arc<ash::vk::ExtShaderModuleIdentifierFn>,
-    qcom_tile_properties: Arc<ash::vk::QcomTilePropertiesFn>,
-    khr_acceleration_structure: Arc<ash::vk::KhrAccelerationStructureFn>,
-    ext_mesh_shader: Arc<ash::vk::ExtMeshShaderFn>,
+        Arc<ash::android::external_memory_android_hardware_buffer::DeviceFn>,
+    amdx_shader_enqueue: Arc<ash::amdx::shader_enqueue::DeviceFn>,
+    ext_image_drm_format_modifier: Arc<ash::ext::image_drm_format_modifier::DeviceFn>,
+    ext_validation_cache: Arc<ash::ext::validation_cache::DeviceFn>,
+    nv_shading_rate_image: Arc<ash::nv::shading_rate_image::DeviceFn>,
+    nv_ray_tracing: Arc<ash::nv::ray_tracing::DeviceFn>,
+    khr_ray_tracing_pipeline: Arc<ash::khr::ray_tracing_pipeline::DeviceFn>,
+    ext_external_memory_host: Arc<ash::ext::external_memory_host::DeviceFn>,
+    amd_buffer_marker: Arc<ash::amd::buffer_marker::DeviceFn>,
+    nv_mesh_shader: Arc<ash::nv::mesh_shader::DeviceFn>,
+    nv_scissor_exclusive: Arc<ash::nv::scissor_exclusive::DeviceFn>,
+    nv_device_diagnostic_checkpoints: Arc<ash::nv::device_diagnostic_checkpoints::DeviceFn>,
+    intel_performance_query: Arc<ash::intel::performance_query::DeviceFn>,
+    amd_display_native_hdr: Arc<ash::amd::display_native_hdr::DeviceFn>,
+    ext_host_image_copy: Arc<ash::ext::host_image_copy::DeviceFn>,
+    ext_swapchain_maintenance1: Arc<ash::ext::swapchain_maintenance1::DeviceFn>,
+    nv_device_generated_commands: Arc<ash::nv::device_generated_commands::DeviceFn>,
+    ext_depth_bias_control: Arc<ash::ext::depth_bias_control::DeviceFn>,
+    nv_cuda_kernel_launch: Arc<ash::nv::cuda_kernel_launch::DeviceFn>,
+    ext_metal_objects: Arc<ash::ext::metal_objects::DeviceFn>,
+    ext_descriptor_buffer: Arc<ash::ext::descriptor_buffer::DeviceFn>,
+    nv_fragment_shading_rate_enums: Arc<ash::nv::fragment_shading_rate_enums::DeviceFn>,
+    ext_vertex_input_dynamic_state: Arc<ash::ext::vertex_input_dynamic_state::DeviceFn>,
+    fuchsia_external_memory: Arc<ash::fuchsia::external_memory::DeviceFn>,
+    fuchsia_external_semaphore: Arc<ash::fuchsia::external_semaphore::DeviceFn>,
+    fuchsia_buffer_collection: Arc<ash::fuchsia::buffer_collection::DeviceFn>,
+    huawei_subpass_shading: Arc<ash::huawei::subpass_shading::DeviceFn>,
+    huawei_invocation_mask: Arc<ash::huawei::invocation_mask::DeviceFn>,
+    nv_external_memory_rdma: Arc<ash::nv::external_memory_rdma::DeviceFn>,
+    ext_pipeline_properties: Arc<ash::ext::pipeline_properties::DeviceFn>,
+    ext_extended_dynamic_state2: Arc<ash::ext::extended_dynamic_state2::DeviceFn>,
+    ext_color_write_enable: Arc<ash::ext::color_write_enable::DeviceFn>,
+    ext_multi_draw: Arc<ash::ext::multi_draw::DeviceFn>,
+    ext_opacity_micromap: Arc<ash::ext::opacity_micromap::DeviceFn>,
+    ext_pageable_device_local_memory: Arc<ash::ext::pageable_device_local_memory::DeviceFn>,
+    valve_descriptor_set_host_mapping: Arc<ash::valve::descriptor_set_host_mapping::DeviceFn>,
+    nv_copy_memory_indirect: Arc<ash::nv::copy_memory_indirect::DeviceFn>,
+    nv_memory_decompression: Arc<ash::nv::memory_decompression::DeviceFn>,
+    nv_device_generated_commands_compute: Arc<ash::nv::device_generated_commands_compute::DeviceFn>,
+    ext_extended_dynamic_state3: Arc<ash::ext::extended_dynamic_state3::DeviceFn>,
+    ext_shader_module_identifier: Arc<ash::ext::shader_module_identifier::DeviceFn>,
+    qcom_tile_properties: Arc<ash::qcom::tile_properties::DeviceFn>,
+    nv_low_latency2: Arc<ash::nv::low_latency2::DeviceFn>,
+    qnx_external_memory_screen_buffer: Arc<ash::qnx::external_memory_screen_buffer::DeviceFn>,
+    khr_acceleration_structure: Arc<ash::khr::acceleration_structure::DeviceFn>,
+    ext_mesh_shader: Arc<ash::ext::mesh_shader::DeviceFn>,
 }
 impl DeviceDispatchTable {
     pub(crate) fn load(
@@ -1215,233 +1363,280 @@ impl DeviceDispatchTable {
         let proc_addr_loader = get_device_proc_addr_loader(get_device_proc_addr, &device);
         Self {
             core: Arc::clone(&device),
-            khr_swapchain: Arc::new(ash::vk::KhrSwapchainFn::load(&proc_addr_loader)),
-            khr_video_queue: Arc::new(ash::vk::KhrVideoQueueFn::load(&proc_addr_loader)),
-            khr_performance_query: Arc::new(ash::vk::KhrPerformanceQueryFn::load(
+            khr_swapchain: Arc::new(ash::khr::swapchain::DeviceFn::load(&proc_addr_loader)),
+            khr_video_queue: Arc::new(ash::khr::video_queue::DeviceFn::load(&proc_addr_loader)),
+            khr_performance_query: Arc::new(ash::khr::performance_query::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_fragment_shading_rate: Arc::new(ash::vk::KhrFragmentShadingRateFn::load(
+            khr_fragment_shading_rate: Arc::new(ash::khr::fragment_shading_rate::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_debug_utils: Arc::new(ash::vk::ExtDebugUtilsFn::load(&proc_addr_loader)),
-            ext_sample_locations: Arc::new(ash::vk::ExtSampleLocationsFn::load(&proc_addr_loader)),
-            ext_calibrated_timestamps: Arc::new(ash::vk::ExtCalibratedTimestampsFn::load(
+            khr_video_encode_queue: Arc::new(ash::khr::video_encode_queue::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_full_screen_exclusive: Arc::new(ash::vk::ExtFullScreenExclusiveFn::load(
+            khr_calibrated_timestamps: Arc::new(ash::khr::calibrated_timestamps::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            nv_optical_flow: Arc::new(ash::vk::NvOpticalFlowFn::load(&proc_addr_loader)),
-            khr_display_swapchain: Arc::new(ash::vk::KhrDisplaySwapchainFn::load(
+            ext_debug_utils: Arc::new(ash::ext::debug_utils::DeviceFn::load(&proc_addr_loader)),
+            ext_sample_locations: Arc::new(ash::ext::sample_locations::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_video_decode_queue: Arc::new(ash::vk::KhrVideoDecodeQueueFn::load(
+            ext_full_screen_exclusive: Arc::new(ash::ext::full_screen_exclusive::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_external_memory_win32: Arc::new(ash::vk::KhrExternalMemoryWin32Fn::load(
+            nv_optical_flow: Arc::new(ash::nv::optical_flow::DeviceFn::load(&proc_addr_loader)),
+            khr_display_swapchain: Arc::new(ash::khr::display_swapchain::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_external_memory_fd: Arc::new(ash::vk::KhrExternalMemoryFdFn::load(
+            khr_video_decode_queue: Arc::new(ash::khr::video_decode_queue::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_external_semaphore_win32: Arc::new(ash::vk::KhrExternalSemaphoreWin32Fn::load(
+            khr_external_memory_win32: Arc::new(ash::khr::external_memory_win32::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_external_semaphore_fd: Arc::new(ash::vk::KhrExternalSemaphoreFdFn::load(
+            khr_external_memory_fd: Arc::new(ash::khr::external_memory_fd::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_push_descriptor: Arc::new(ash::vk::KhrPushDescriptorFn::load(&proc_addr_loader)),
-            khr_shared_presentable_image: Arc::new(ash::vk::KhrSharedPresentableImageFn::load(
+            khr_external_semaphore_win32: Arc::new(
+                ash::khr::external_semaphore_win32::DeviceFn::load(&proc_addr_loader),
+            ),
+            khr_external_semaphore_fd: Arc::new(ash::khr::external_semaphore_fd::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_external_fence_win32: Arc::new(ash::vk::KhrExternalFenceWin32Fn::load(
+            khr_push_descriptor: Arc::new(ash::khr::push_descriptor::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_external_fence_fd: Arc::new(ash::vk::KhrExternalFenceFdFn::load(&proc_addr_loader)),
-            khr_present_wait: Arc::new(ash::vk::KhrPresentWaitFn::load(&proc_addr_loader)),
-            khr_deferred_host_operations: Arc::new(ash::vk::KhrDeferredHostOperationsFn::load(
+            khr_shared_presentable_image: Arc::new(
+                ash::khr::shared_presentable_image::DeviceFn::load(&proc_addr_loader),
+            ),
+            khr_external_fence_win32: Arc::new(ash::khr::external_fence_win32::DeviceFn::load(
                 &proc_addr_loader,
             )),
+            khr_external_fence_fd: Arc::new(ash::khr::external_fence_fd::DeviceFn::load(
+                &proc_addr_loader,
+            )),
+            khr_dynamic_rendering_local_read: Arc::new(
+                ash::khr::dynamic_rendering_local_read::DeviceFn::load(&proc_addr_loader),
+            ),
+            khr_present_wait: Arc::new(ash::khr::present_wait::DeviceFn::load(&proc_addr_loader)),
+            khr_deferred_host_operations: Arc::new(
+                ash::khr::deferred_host_operations::DeviceFn::load(&proc_addr_loader),
+            ),
             khr_pipeline_executable_properties: Arc::new(
-                ash::vk::KhrPipelineExecutablePropertiesFn::load(&proc_addr_loader),
+                ash::khr::pipeline_executable_properties::DeviceFn::load(&proc_addr_loader),
             ),
-            khr_video_encode_queue: Arc::new(ash::vk::KhrVideoEncodeQueueFn::load(
+            khr_synchronization2: Arc::new(ash::khr::synchronization2::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            khr_synchronization2: Arc::new(ash::vk::KhrSynchronization2Fn::load(&proc_addr_loader)),
-            khr_ray_tracing_maintenance1: Arc::new(ash::vk::KhrRayTracingMaintenance1Fn::load(
+            khr_ray_tracing_maintenance1: Arc::new(
+                ash::khr::ray_tracing_maintenance1::DeviceFn::load(&proc_addr_loader),
+            ),
+            khr_maintenance5: Arc::new(ash::khr::maintenance5::DeviceFn::load(&proc_addr_loader)),
+            khr_line_rasterization: Arc::new(ash::khr::line_rasterization::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            android_native_buffer: Arc::new(ash::vk::AndroidNativeBufferFn::load(
+            khr_maintenance6: Arc::new(ash::khr::maintenance6::DeviceFn::load(&proc_addr_loader)),
+            android_native_buffer: Arc::new(ash::android::native_buffer::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_debug_marker: Arc::new(ash::vk::ExtDebugMarkerFn::load(&proc_addr_loader)),
-            ext_transform_feedback: Arc::new(ash::vk::ExtTransformFeedbackFn::load(
+            ext_debug_marker: Arc::new(ash::ext::debug_marker::DeviceFn::load(&proc_addr_loader)),
+            ext_transform_feedback: Arc::new(ash::ext::transform_feedback::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            nvx_binary_import: Arc::new(ash::vk::NvxBinaryImportFn::load(&proc_addr_loader)),
-            nvx_image_view_handle: Arc::new(ash::vk::NvxImageViewHandleFn::load(&proc_addr_loader)),
-            amd_shader_info: Arc::new(ash::vk::AmdShaderInfoFn::load(&proc_addr_loader)),
-            nv_external_memory_win32: Arc::new(ash::vk::NvExternalMemoryWin32Fn::load(
+            nvx_binary_import: Arc::new(ash::nvx::binary_import::DeviceFn::load(&proc_addr_loader)),
+            nvx_image_view_handle: Arc::new(ash::nvx::image_view_handle::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_conditional_rendering: Arc::new(ash::vk::ExtConditionalRenderingFn::load(
+            amd_shader_info: Arc::new(ash::amd::shader_info::DeviceFn::load(&proc_addr_loader)),
+            nv_external_memory_win32: Arc::new(ash::nv::external_memory_win32::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            nv_clip_space_w_scaling: Arc::new(ash::vk::NvClipSpaceWScalingFn::load(
+            ext_conditional_rendering: Arc::new(ash::ext::conditional_rendering::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_display_control: Arc::new(ash::vk::ExtDisplayControlFn::load(&proc_addr_loader)),
-            google_display_timing: Arc::new(ash::vk::GoogleDisplayTimingFn::load(
+            nv_clip_space_w_scaling: Arc::new(ash::nv::clip_space_w_scaling::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_discard_rectangles: Arc::new(ash::vk::ExtDiscardRectanglesFn::load(
+            ext_display_control: Arc::new(ash::ext::display_control::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_hdr_metadata: Arc::new(ash::vk::ExtHdrMetadataFn::load(&proc_addr_loader)),
+            google_display_timing: Arc::new(ash::google::display_timing::DeviceFn::load(
+                &proc_addr_loader,
+            )),
+            ext_discard_rectangles: Arc::new(ash::ext::discard_rectangles::DeviceFn::load(
+                &proc_addr_loader,
+            )),
+            ext_hdr_metadata: Arc::new(ash::ext::hdr_metadata::DeviceFn::load(&proc_addr_loader)),
             android_external_memory_android_hardware_buffer: Arc::new(
-                ash::vk::AndroidExternalMemoryAndroidHardwareBufferFn::load(&proc_addr_loader),
+                ash::android::external_memory_android_hardware_buffer::DeviceFn::load(
+                    &proc_addr_loader,
+                ),
             ),
-            ext_image_drm_format_modifier: Arc::new(ash::vk::ExtImageDrmFormatModifierFn::load(
+            amdx_shader_enqueue: Arc::new(ash::amdx::shader_enqueue::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_validation_cache: Arc::new(ash::vk::ExtValidationCacheFn::load(&proc_addr_loader)),
-            nv_shading_rate_image: Arc::new(ash::vk::NvShadingRateImageFn::load(&proc_addr_loader)),
-            nv_ray_tracing: Arc::new(ash::vk::NvRayTracingFn::load(&proc_addr_loader)),
-            khr_ray_tracing_pipeline: Arc::new(ash::vk::KhrRayTracingPipelineFn::load(
+            ext_image_drm_format_modifier: Arc::new(
+                ash::ext::image_drm_format_modifier::DeviceFn::load(&proc_addr_loader),
+            ),
+            ext_validation_cache: Arc::new(ash::ext::validation_cache::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_external_memory_host: Arc::new(ash::vk::ExtExternalMemoryHostFn::load(
+            nv_shading_rate_image: Arc::new(ash::nv::shading_rate_image::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            amd_buffer_marker: Arc::new(ash::vk::AmdBufferMarkerFn::load(&proc_addr_loader)),
-            nv_mesh_shader: Arc::new(ash::vk::NvMeshShaderFn::load(&proc_addr_loader)),
-            nv_scissor_exclusive: Arc::new(ash::vk::NvScissorExclusiveFn::load(&proc_addr_loader)),
+            nv_ray_tracing: Arc::new(ash::nv::ray_tracing::DeviceFn::load(&proc_addr_loader)),
+            khr_ray_tracing_pipeline: Arc::new(ash::khr::ray_tracing_pipeline::DeviceFn::load(
+                &proc_addr_loader,
+            )),
+            ext_external_memory_host: Arc::new(ash::ext::external_memory_host::DeviceFn::load(
+                &proc_addr_loader,
+            )),
+            amd_buffer_marker: Arc::new(ash::amd::buffer_marker::DeviceFn::load(&proc_addr_loader)),
+            nv_mesh_shader: Arc::new(ash::nv::mesh_shader::DeviceFn::load(&proc_addr_loader)),
+            nv_scissor_exclusive: Arc::new(ash::nv::scissor_exclusive::DeviceFn::load(
+                &proc_addr_loader,
+            )),
             nv_device_diagnostic_checkpoints: Arc::new(
-                ash::vk::NvDeviceDiagnosticCheckpointsFn::load(&proc_addr_loader),
+                ash::nv::device_diagnostic_checkpoints::DeviceFn::load(&proc_addr_loader),
             ),
-            intel_performance_query: Arc::new(ash::vk::IntelPerformanceQueryFn::load(
+            intel_performance_query: Arc::new(ash::intel::performance_query::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            amd_display_native_hdr: Arc::new(ash::vk::AmdDisplayNativeHdrFn::load(
+            amd_display_native_hdr: Arc::new(ash::amd::display_native_hdr::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_line_rasterization: Arc::new(ash::vk::ExtLineRasterizationFn::load(
+            ext_host_image_copy: Arc::new(ash::ext::host_image_copy::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_swapchain_maintenance1: Arc::new(ash::vk::ExtSwapchainMaintenance1Fn::load(
+            ext_swapchain_maintenance1: Arc::new(ash::ext::swapchain_maintenance1::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            nv_device_generated_commands: Arc::new(ash::vk::NvDeviceGeneratedCommandsFn::load(
+            nv_device_generated_commands: Arc::new(
+                ash::nv::device_generated_commands::DeviceFn::load(&proc_addr_loader),
+            ),
+            ext_depth_bias_control: Arc::new(ash::ext::depth_bias_control::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_metal_objects: Arc::new(ash::vk::ExtMetalObjectsFn::load(&proc_addr_loader)),
-            ext_descriptor_buffer: Arc::new(ash::vk::ExtDescriptorBufferFn::load(
+            nv_cuda_kernel_launch: Arc::new(ash::nv::cuda_kernel_launch::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            nv_fragment_shading_rate_enums: Arc::new(ash::vk::NvFragmentShadingRateEnumsFn::load(
+            ext_metal_objects: Arc::new(ash::ext::metal_objects::DeviceFn::load(&proc_addr_loader)),
+            ext_descriptor_buffer: Arc::new(ash::ext::descriptor_buffer::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_image_compression_control: Arc::new(ash::vk::ExtImageCompressionControlFn::load(
+            nv_fragment_shading_rate_enums: Arc::new(
+                ash::nv::fragment_shading_rate_enums::DeviceFn::load(&proc_addr_loader),
+            ),
+            ext_vertex_input_dynamic_state: Arc::new(
+                ash::ext::vertex_input_dynamic_state::DeviceFn::load(&proc_addr_loader),
+            ),
+            fuchsia_external_memory: Arc::new(ash::fuchsia::external_memory::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_vertex_input_dynamic_state: Arc::new(ash::vk::ExtVertexInputDynamicStateFn::load(
+            fuchsia_external_semaphore: Arc::new(ash::fuchsia::external_semaphore::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            fuchsia_external_memory: Arc::new(ash::vk::FuchsiaExternalMemoryFn::load(
+            fuchsia_buffer_collection: Arc::new(ash::fuchsia::buffer_collection::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            fuchsia_external_semaphore: Arc::new(ash::vk::FuchsiaExternalSemaphoreFn::load(
+            huawei_subpass_shading: Arc::new(ash::huawei::subpass_shading::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            fuchsia_buffer_collection: Arc::new(ash::vk::FuchsiaBufferCollectionFn::load(
+            huawei_invocation_mask: Arc::new(ash::huawei::invocation_mask::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            huawei_subpass_shading: Arc::new(ash::vk::HuaweiSubpassShadingFn::load(
+            nv_external_memory_rdma: Arc::new(ash::nv::external_memory_rdma::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            huawei_invocation_mask: Arc::new(ash::vk::HuaweiInvocationMaskFn::load(
+            ext_pipeline_properties: Arc::new(ash::ext::pipeline_properties::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            nv_external_memory_rdma: Arc::new(ash::vk::NvExternalMemoryRdmaFn::load(
+            ext_extended_dynamic_state2: Arc::new(
+                ash::ext::extended_dynamic_state2::DeviceFn::load(&proc_addr_loader),
+            ),
+            ext_color_write_enable: Arc::new(ash::ext::color_write_enable::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_pipeline_properties: Arc::new(ash::vk::ExtPipelinePropertiesFn::load(
+            ext_multi_draw: Arc::new(ash::ext::multi_draw::DeviceFn::load(&proc_addr_loader)),
+            ext_opacity_micromap: Arc::new(ash::ext::opacity_micromap::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_extended_dynamic_state2: Arc::new(ash::vk::ExtExtendedDynamicState2Fn::load(
-                &proc_addr_loader,
-            )),
-            ext_color_write_enable: Arc::new(ash::vk::ExtColorWriteEnableFn::load(
-                &proc_addr_loader,
-            )),
-            ext_multi_draw: Arc::new(ash::vk::ExtMultiDrawFn::load(&proc_addr_loader)),
-            ext_opacity_micromap: Arc::new(ash::vk::ExtOpacityMicromapFn::load(&proc_addr_loader)),
             ext_pageable_device_local_memory: Arc::new(
-                ash::vk::ExtPageableDeviceLocalMemoryFn::load(&proc_addr_loader),
+                ash::ext::pageable_device_local_memory::DeviceFn::load(&proc_addr_loader),
             ),
             valve_descriptor_set_host_mapping: Arc::new(
-                ash::vk::ValveDescriptorSetHostMappingFn::load(&proc_addr_loader),
+                ash::valve::descriptor_set_host_mapping::DeviceFn::load(&proc_addr_loader),
             ),
-            nv_copy_memory_indirect: Arc::new(ash::vk::NvCopyMemoryIndirectFn::load(
+            nv_copy_memory_indirect: Arc::new(ash::nv::copy_memory_indirect::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            nv_memory_decompression: Arc::new(ash::vk::NvMemoryDecompressionFn::load(
+            nv_memory_decompression: Arc::new(ash::nv::memory_decompression::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_extended_dynamic_state3: Arc::new(ash::vk::ExtExtendedDynamicState3Fn::load(
+            nv_device_generated_commands_compute: Arc::new(
+                ash::nv::device_generated_commands_compute::DeviceFn::load(&proc_addr_loader),
+            ),
+            ext_extended_dynamic_state3: Arc::new(
+                ash::ext::extended_dynamic_state3::DeviceFn::load(&proc_addr_loader),
+            ),
+            ext_shader_module_identifier: Arc::new(
+                ash::ext::shader_module_identifier::DeviceFn::load(&proc_addr_loader),
+            ),
+            qcom_tile_properties: Arc::new(ash::qcom::tile_properties::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            ext_shader_module_identifier: Arc::new(ash::vk::ExtShaderModuleIdentifierFn::load(
+            nv_low_latency2: Arc::new(ash::nv::low_latency2::DeviceFn::load(&proc_addr_loader)),
+            qnx_external_memory_screen_buffer: Arc::new(
+                ash::qnx::external_memory_screen_buffer::DeviceFn::load(&proc_addr_loader),
+            ),
+            khr_acceleration_structure: Arc::new(ash::khr::acceleration_structure::DeviceFn::load(
                 &proc_addr_loader,
             )),
-            qcom_tile_properties: Arc::new(ash::vk::QcomTilePropertiesFn::load(&proc_addr_loader)),
-            khr_acceleration_structure: Arc::new(ash::vk::KhrAccelerationStructureFn::load(
-                &proc_addr_loader,
-            )),
-            ext_mesh_shader: Arc::new(ash::vk::ExtMeshShaderFn::load(&proc_addr_loader)),
+            ext_mesh_shader: Arc::new(ash::ext::mesh_shader::DeviceFn::load(&proc_addr_loader)),
         }
     }
 }
 pub(crate) struct InstanceDispatchTable {
     pub core: Arc<ash::Instance>,
-    khr_surface: Arc<ash::vk::KhrSurfaceFn>,
-    khr_swapchain: Arc<ash::vk::KhrSwapchainFn>,
-    khr_display: Arc<ash::vk::KhrDisplayFn>,
-    khr_xlib_surface: Arc<ash::vk::KhrXlibSurfaceFn>,
-    khr_xcb_surface: Arc<ash::vk::KhrXcbSurfaceFn>,
-    khr_wayland_surface: Arc<ash::vk::KhrWaylandSurfaceFn>,
-    khr_android_surface: Arc<ash::vk::KhrAndroidSurfaceFn>,
-    khr_win32_surface: Arc<ash::vk::KhrWin32SurfaceFn>,
-    khr_video_queue: Arc<ash::vk::KhrVideoQueueFn>,
-    khr_performance_query: Arc<ash::vk::KhrPerformanceQueryFn>,
-    khr_get_surface_capabilities2: Arc<ash::vk::KhrGetSurfaceCapabilities2Fn>,
-    khr_get_display_properties2: Arc<ash::vk::KhrGetDisplayProperties2Fn>,
-    khr_fragment_shading_rate: Arc<ash::vk::KhrFragmentShadingRateFn>,
+    khr_surface: Arc<ash::khr::surface::InstanceFn>,
+    khr_swapchain: Arc<ash::khr::swapchain::InstanceFn>,
+    khr_display: Arc<ash::khr::display::InstanceFn>,
+    khr_xlib_surface: Arc<ash::khr::xlib_surface::InstanceFn>,
+    khr_xcb_surface: Arc<ash::khr::xcb_surface::InstanceFn>,
+    khr_wayland_surface: Arc<ash::khr::wayland_surface::InstanceFn>,
+    khr_android_surface: Arc<ash::khr::android_surface::InstanceFn>,
+    khr_win32_surface: Arc<ash::khr::win32_surface::InstanceFn>,
+    khr_video_queue: Arc<ash::khr::video_queue::InstanceFn>,
+    khr_performance_query: Arc<ash::khr::performance_query::InstanceFn>,
+    khr_get_surface_capabilities2: Arc<ash::khr::get_surface_capabilities2::InstanceFn>,
+    khr_get_display_properties2: Arc<ash::khr::get_display_properties2::InstanceFn>,
+    khr_fragment_shading_rate: Arc<ash::khr::fragment_shading_rate::InstanceFn>,
+    khr_video_encode_queue: Arc<ash::khr::video_encode_queue::InstanceFn>,
+    khr_cooperative_matrix: Arc<ash::khr::cooperative_matrix::InstanceFn>,
+    khr_calibrated_timestamps: Arc<ash::khr::calibrated_timestamps::InstanceFn>,
     #[allow(deprecated)]
-    ext_debug_report: Arc<ash::vk::ExtDebugReportFn>,
-    ggp_stream_descriptor_surface: Arc<ash::vk::GgpStreamDescriptorSurfaceFn>,
-    nv_external_memory_capabilities: Arc<ash::vk::NvExternalMemoryCapabilitiesFn>,
-    nn_vi_surface: Arc<ash::vk::NnViSurfaceFn>,
-    ext_direct_mode_display: Arc<ash::vk::ExtDirectModeDisplayFn>,
-    ext_acquire_xlib_display: Arc<ash::vk::ExtAcquireXlibDisplayFn>,
-    ext_display_surface_counter: Arc<ash::vk::ExtDisplaySurfaceCounterFn>,
-    mvk_ios_surface: Arc<ash::vk::MvkIosSurfaceFn>,
-    mvk_macos_surface: Arc<ash::vk::MvkMacosSurfaceFn>,
-    ext_debug_utils: Arc<ash::vk::ExtDebugUtilsFn>,
-    ext_sample_locations: Arc<ash::vk::ExtSampleLocationsFn>,
-    ext_calibrated_timestamps: Arc<ash::vk::ExtCalibratedTimestampsFn>,
-    fuchsia_imagepipe_surface: Arc<ash::vk::FuchsiaImagepipeSurfaceFn>,
-    ext_metal_surface: Arc<ash::vk::ExtMetalSurfaceFn>,
-    nv_cooperative_matrix: Arc<ash::vk::NvCooperativeMatrixFn>,
-    nv_coverage_reduction_mode: Arc<ash::vk::NvCoverageReductionModeFn>,
-    ext_full_screen_exclusive: Arc<ash::vk::ExtFullScreenExclusiveFn>,
-    ext_headless_surface: Arc<ash::vk::ExtHeadlessSurfaceFn>,
-    ext_acquire_drm_display: Arc<ash::vk::ExtAcquireDrmDisplayFn>,
-    nv_acquire_winrt_display: Arc<ash::vk::NvAcquireWinrtDisplayFn>,
-    ext_directfb_surface: Arc<ash::vk::ExtDirectfbSurfaceFn>,
-    qnx_screen_surface: Arc<ash::vk::QnxScreenSurfaceFn>,
-    nv_optical_flow: Arc<ash::vk::NvOpticalFlowFn>,
+    ext_debug_report: Arc<ash::ext::debug_report::InstanceFn>,
+    ggp_stream_descriptor_surface: Arc<ash::ggp::stream_descriptor_surface::InstanceFn>,
+    nv_external_memory_capabilities: Arc<ash::nv::external_memory_capabilities::InstanceFn>,
+    nn_vi_surface: Arc<ash::nn::vi_surface::InstanceFn>,
+    ext_direct_mode_display: Arc<ash::ext::direct_mode_display::InstanceFn>,
+    ext_acquire_xlib_display: Arc<ash::ext::acquire_xlib_display::InstanceFn>,
+    ext_display_surface_counter: Arc<ash::ext::display_surface_counter::InstanceFn>,
+    mvk_ios_surface: Arc<ash::mvk::ios_surface::InstanceFn>,
+    mvk_macos_surface: Arc<ash::mvk::macos_surface::InstanceFn>,
+    ext_debug_utils: Arc<ash::ext::debug_utils::InstanceFn>,
+    ext_sample_locations: Arc<ash::ext::sample_locations::InstanceFn>,
+    fuchsia_imagepipe_surface: Arc<ash::fuchsia::imagepipe_surface::InstanceFn>,
+    ext_metal_surface: Arc<ash::ext::metal_surface::InstanceFn>,
+    nv_cooperative_matrix: Arc<ash::nv::cooperative_matrix::InstanceFn>,
+    nv_coverage_reduction_mode: Arc<ash::nv::coverage_reduction_mode::InstanceFn>,
+    ext_full_screen_exclusive: Arc<ash::ext::full_screen_exclusive::InstanceFn>,
+    ext_headless_surface: Arc<ash::ext::headless_surface::InstanceFn>,
+    ext_acquire_drm_display: Arc<ash::ext::acquire_drm_display::InstanceFn>,
+    nv_acquire_winrt_display: Arc<ash::nv::acquire_winrt_display::InstanceFn>,
+    ext_directfb_surface: Arc<ash::ext::directfb_surface::InstanceFn>,
+    qnx_screen_surface: Arc<ash::qnx::screen_surface::InstanceFn>,
+    nv_optical_flow: Arc<ash::nv::optical_flow::InstanceFn>,
 }
 impl InstanceDispatchTable {
     pub(crate) fn load(
@@ -1451,74 +1646,98 @@ impl InstanceDispatchTable {
         let proc_addr_loader = get_instance_proc_addr_loader(get_instance_proc_addr, &instance);
         Self {
             core: Arc::clone(&instance),
-            khr_surface: Arc::new(ash::vk::KhrSurfaceFn::load(&proc_addr_loader)),
-            khr_swapchain: Arc::new(ash::vk::KhrSwapchainFn::load(&proc_addr_loader)),
-            khr_display: Arc::new(ash::vk::KhrDisplayFn::load(&proc_addr_loader)),
-            khr_xlib_surface: Arc::new(ash::vk::KhrXlibSurfaceFn::load(&proc_addr_loader)),
-            khr_xcb_surface: Arc::new(ash::vk::KhrXcbSurfaceFn::load(&proc_addr_loader)),
-            khr_wayland_surface: Arc::new(ash::vk::KhrWaylandSurfaceFn::load(&proc_addr_loader)),
-            khr_android_surface: Arc::new(ash::vk::KhrAndroidSurfaceFn::load(&proc_addr_loader)),
-            khr_win32_surface: Arc::new(ash::vk::KhrWin32SurfaceFn::load(&proc_addr_loader)),
-            khr_video_queue: Arc::new(ash::vk::KhrVideoQueueFn::load(&proc_addr_loader)),
-            khr_performance_query: Arc::new(ash::vk::KhrPerformanceQueryFn::load(
+            khr_surface: Arc::new(ash::khr::surface::InstanceFn::load(&proc_addr_loader)),
+            khr_swapchain: Arc::new(ash::khr::swapchain::InstanceFn::load(&proc_addr_loader)),
+            khr_display: Arc::new(ash::khr::display::InstanceFn::load(&proc_addr_loader)),
+            khr_xlib_surface: Arc::new(ash::khr::xlib_surface::InstanceFn::load(&proc_addr_loader)),
+            khr_xcb_surface: Arc::new(ash::khr::xcb_surface::InstanceFn::load(&proc_addr_loader)),
+            khr_wayland_surface: Arc::new(ash::khr::wayland_surface::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            khr_get_surface_capabilities2: Arc::new(ash::vk::KhrGetSurfaceCapabilities2Fn::load(
+            khr_android_surface: Arc::new(ash::khr::android_surface::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            khr_get_display_properties2: Arc::new(ash::vk::KhrGetDisplayProperties2Fn::load(
+            khr_win32_surface: Arc::new(ash::khr::win32_surface::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            khr_fragment_shading_rate: Arc::new(ash::vk::KhrFragmentShadingRateFn::load(
+            khr_video_queue: Arc::new(ash::khr::video_queue::InstanceFn::load(&proc_addr_loader)),
+            khr_performance_query: Arc::new(ash::khr::performance_query::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            ext_debug_report: Arc::new(ash::vk::ExtDebugReportFn::load(&proc_addr_loader)),
-            ggp_stream_descriptor_surface: Arc::new(ash::vk::GgpStreamDescriptorSurfaceFn::load(
-                &proc_addr_loader,
-            )),
-            nv_external_memory_capabilities: Arc::new(
-                ash::vk::NvExternalMemoryCapabilitiesFn::load(&proc_addr_loader),
+            khr_get_surface_capabilities2: Arc::new(
+                ash::khr::get_surface_capabilities2::InstanceFn::load(&proc_addr_loader),
             ),
-            nn_vi_surface: Arc::new(ash::vk::NnViSurfaceFn::load(&proc_addr_loader)),
-            ext_direct_mode_display: Arc::new(ash::vk::ExtDirectModeDisplayFn::load(
+            khr_get_display_properties2: Arc::new(
+                ash::khr::get_display_properties2::InstanceFn::load(&proc_addr_loader),
+            ),
+            khr_fragment_shading_rate: Arc::new(ash::khr::fragment_shading_rate::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            ext_acquire_xlib_display: Arc::new(ash::vk::ExtAcquireXlibDisplayFn::load(
+            khr_video_encode_queue: Arc::new(ash::khr::video_encode_queue::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            ext_display_surface_counter: Arc::new(ash::vk::ExtDisplaySurfaceCounterFn::load(
+            khr_cooperative_matrix: Arc::new(ash::khr::cooperative_matrix::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            mvk_ios_surface: Arc::new(ash::vk::MvkIosSurfaceFn::load(&proc_addr_loader)),
-            mvk_macos_surface: Arc::new(ash::vk::MvkMacosSurfaceFn::load(&proc_addr_loader)),
-            ext_debug_utils: Arc::new(ash::vk::ExtDebugUtilsFn::load(&proc_addr_loader)),
-            ext_sample_locations: Arc::new(ash::vk::ExtSampleLocationsFn::load(&proc_addr_loader)),
-            ext_calibrated_timestamps: Arc::new(ash::vk::ExtCalibratedTimestampsFn::load(
+            khr_calibrated_timestamps: Arc::new(ash::khr::calibrated_timestamps::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            fuchsia_imagepipe_surface: Arc::new(ash::vk::FuchsiaImagepipeSurfaceFn::load(
+            ext_debug_report: Arc::new(ash::ext::debug_report::InstanceFn::load(&proc_addr_loader)),
+            ggp_stream_descriptor_surface: Arc::new(
+                ash::ggp::stream_descriptor_surface::InstanceFn::load(&proc_addr_loader),
+            ),
+            nv_external_memory_capabilities: Arc::new(
+                ash::nv::external_memory_capabilities::InstanceFn::load(&proc_addr_loader),
+            ),
+            nn_vi_surface: Arc::new(ash::nn::vi_surface::InstanceFn::load(&proc_addr_loader)),
+            ext_direct_mode_display: Arc::new(ash::ext::direct_mode_display::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            ext_metal_surface: Arc::new(ash::vk::ExtMetalSurfaceFn::load(&proc_addr_loader)),
-            nv_cooperative_matrix: Arc::new(ash::vk::NvCooperativeMatrixFn::load(
+            ext_acquire_xlib_display: Arc::new(ash::ext::acquire_xlib_display::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            nv_coverage_reduction_mode: Arc::new(ash::vk::NvCoverageReductionModeFn::load(
+            ext_display_surface_counter: Arc::new(
+                ash::ext::display_surface_counter::InstanceFn::load(&proc_addr_loader),
+            ),
+            mvk_ios_surface: Arc::new(ash::mvk::ios_surface::InstanceFn::load(&proc_addr_loader)),
+            mvk_macos_surface: Arc::new(ash::mvk::macos_surface::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            ext_full_screen_exclusive: Arc::new(ash::vk::ExtFullScreenExclusiveFn::load(
+            ext_debug_utils: Arc::new(ash::ext::debug_utils::InstanceFn::load(&proc_addr_loader)),
+            ext_sample_locations: Arc::new(ash::ext::sample_locations::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            ext_headless_surface: Arc::new(ash::vk::ExtHeadlessSurfaceFn::load(&proc_addr_loader)),
-            ext_acquire_drm_display: Arc::new(ash::vk::ExtAcquireDrmDisplayFn::load(
+            fuchsia_imagepipe_surface: Arc::new(ash::fuchsia::imagepipe_surface::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            nv_acquire_winrt_display: Arc::new(ash::vk::NvAcquireWinrtDisplayFn::load(
+            ext_metal_surface: Arc::new(ash::ext::metal_surface::InstanceFn::load(
                 &proc_addr_loader,
             )),
-            ext_directfb_surface: Arc::new(ash::vk::ExtDirectfbSurfaceFn::load(&proc_addr_loader)),
-            qnx_screen_surface: Arc::new(ash::vk::QnxScreenSurfaceFn::load(&proc_addr_loader)),
-            nv_optical_flow: Arc::new(ash::vk::NvOpticalFlowFn::load(&proc_addr_loader)),
+            nv_cooperative_matrix: Arc::new(ash::nv::cooperative_matrix::InstanceFn::load(
+                &proc_addr_loader,
+            )),
+            nv_coverage_reduction_mode: Arc::new(
+                ash::nv::coverage_reduction_mode::InstanceFn::load(&proc_addr_loader),
+            ),
+            ext_full_screen_exclusive: Arc::new(ash::ext::full_screen_exclusive::InstanceFn::load(
+                &proc_addr_loader,
+            )),
+            ext_headless_surface: Arc::new(ash::ext::headless_surface::InstanceFn::load(
+                &proc_addr_loader,
+            )),
+            ext_acquire_drm_display: Arc::new(ash::ext::acquire_drm_display::InstanceFn::load(
+                &proc_addr_loader,
+            )),
+            nv_acquire_winrt_display: Arc::new(ash::nv::acquire_winrt_display::InstanceFn::load(
+                &proc_addr_loader,
+            )),
+            ext_directfb_surface: Arc::new(ash::ext::directfb_surface::InstanceFn::load(
+                &proc_addr_loader,
+            )),
+            qnx_screen_surface: Arc::new(ash::qnx::screen_surface::InstanceFn::load(
+                &proc_addr_loader,
+            )),
+            nv_optical_flow: Arc::new(ash::nv::optical_flow::InstanceFn::load(&proc_addr_loader)),
         }
     }
 }
@@ -1881,6 +2100,18 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCmdBindDescriptorBufferEmbeddedSamplers2EXT",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance6)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CmdBindDescriptorBufferEmbeddedSamplers2Ext),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdBindDescriptorBufferEmbeddedSamplers2EXT,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_bind_descriptor_buffer_embedded_samplers2_ext)
+                },
+            },
+            VulkanCommand {
                 name: "vkCmdBindDescriptorBufferEmbeddedSamplersEXT",
                 features: smallvec![Feature::Extension(Extension::EXTDescriptorBuffer)],
                 hooked: hooked_commands
@@ -1914,12 +2145,32 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCmdBindDescriptorSets2KHR",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance6)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdBindDescriptorSets2Khr),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCmdBindDescriptorSets2KHR, vk::PFN_vkVoidFunction>(
+                        Self::cmd_bind_descriptor_sets2_khr,
+                    )
+                },
+            },
+            VulkanCommand {
                 name: "vkCmdBindIndexBuffer",
                 features: smallvec![Feature::Core(ApiVersion { major: 1, minor: 0 })],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::CmdBindIndexBuffer),
                 proc: unsafe {
                     std::mem::transmute::<vk::PFN_vkCmdBindIndexBuffer, vk::PFN_vkVoidFunction>(
                         Self::cmd_bind_index_buffer,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdBindIndexBuffer2KHR",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance5)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdBindIndexBuffer2Khr),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCmdBindIndexBuffer2KHR, vk::PFN_vkVoidFunction>(
+                        Self::cmd_bind_index_buffer2_khr,
                     )
                 },
             },
@@ -2345,6 +2596,16 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCmdCudaLaunchKernelNV",
+                features: smallvec![Feature::Extension(Extension::NVCudaKernelLaunch)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdCudaLaunchKernelNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCmdCudaLaunchKernelNV, vk::PFN_vkVoidFunction>(
+                        Self::cmd_cuda_launch_kernel_nv,
+                    )
+                },
+            },
+            VulkanCommand {
                 name: "vkCmdDebugMarkerBeginEXT",
                 features: smallvec![Feature::Extension(Extension::EXTDebugMarker)],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::CmdDebugMarkerBeginExt),
@@ -2434,6 +2695,39 @@ impl<T: Layer> Global<T> {
                     std::mem::transmute::<vk::PFN_vkCmdDispatchBase, vk::PFN_vkVoidFunction>(
                         Self::cmd_dispatch_base,
                     )
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdDispatchGraphAMDX",
+                features: smallvec![Feature::Extension(Extension::AMDXShaderEnqueue)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdDispatchGraphAmdx),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCmdDispatchGraphAMDX, vk::PFN_vkVoidFunction>(
+                        Self::cmd_dispatch_graph_amdx,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdDispatchGraphIndirectAMDX",
+                features: smallvec![Feature::Extension(Extension::AMDXShaderEnqueue)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdDispatchGraphIndirectAmdx),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdDispatchGraphIndirectAMDX,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_dispatch_graph_indirect_amdx)
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdDispatchGraphIndirectCountAMDX",
+                features: smallvec![Feature::Extension(Extension::AMDXShaderEnqueue)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CmdDispatchGraphIndirectCountAmdx),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdDispatchGraphIndirectCountAMDX,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_dispatch_graph_indirect_count_amdx)
                 },
             },
             VulkanCommand {
@@ -2800,6 +3094,18 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCmdInitializeGraphScratchMemoryAMDX",
+                features: smallvec![Feature::Extension(Extension::AMDXShaderEnqueue)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CmdInitializeGraphScratchMemoryAmdx),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdInitializeGraphScratchMemoryAMDX,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_initialize_graph_scratch_memory_amdx)
+                },
+            },
+            VulkanCommand {
                 name: "vkCmdInsertDebugUtilsLabelEXT",
                 features: smallvec![Feature::Extension(Extension::EXTDebugUtils)],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::CmdInsertDebugUtilsLabelExt),
@@ -2903,6 +3209,26 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCmdPushConstants2KHR",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance6)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdPushConstants2Khr),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCmdPushConstants2KHR, vk::PFN_vkVoidFunction>(
+                        Self::cmd_push_constants2_khr,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdPushDescriptorSet2KHR",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance6)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdPushDescriptorSet2Khr),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCmdPushDescriptorSet2KHR, vk::PFN_vkVoidFunction>(
+                        Self::cmd_push_descriptor_set2_khr,
+                    )
+                },
+            },
+            VulkanCommand {
                 name: "vkCmdPushDescriptorSetKHR",
                 features: smallvec![Feature::Extension(Extension::KHRPushDescriptor)],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::CmdPushDescriptorSetKhr),
@@ -2910,6 +3236,18 @@ impl<T: Layer> Global<T> {
                     std::mem::transmute::<vk::PFN_vkCmdPushDescriptorSetKHR, vk::PFN_vkVoidFunction>(
                         Self::cmd_push_descriptor_set_khr,
                     )
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdPushDescriptorSetWithTemplate2KHR",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance6)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CmdPushDescriptorSetWithTemplate2Khr),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdPushDescriptorSetWithTemplate2KHR,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_push_descriptor_set_with_template2_khr)
                 },
             },
             VulkanCommand {
@@ -3258,6 +3596,16 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCmdSetDepthBias2EXT",
+                features: smallvec![Feature::Extension(Extension::EXTDepthBiasControl)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdSetDepthBias2Ext),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCmdSetDepthBias2EXT, vk::PFN_vkVoidFunction>(
+                        Self::cmd_set_depth_bias2_ext,
+                    )
+                },
+            },
+            VulkanCommand {
                 name: "vkCmdSetDepthBiasEnable",
                 features: smallvec![Feature::Core(ApiVersion { major: 1, minor: 3 })],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::CmdSetDepthBiasEnable),
@@ -3426,6 +3774,18 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCmdSetDescriptorBufferOffsets2EXT",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance6)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CmdSetDescriptorBufferOffsets2Ext),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdSetDescriptorBufferOffsets2EXT,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_set_descriptor_buffer_offsets2_ext)
+                },
+            },
+            VulkanCommand {
                 name: "vkCmdSetDescriptorBufferOffsetsEXT",
                 features: smallvec![Feature::Extension(Extension::EXTDescriptorBuffer)],
                 hooked: hooked_commands
@@ -3586,10 +3946,10 @@ impl<T: Layer> Global<T> {
             VulkanCommand {
                 name: "vkCmdSetLineStippleEXT",
                 features: smallvec![Feature::Extension(Extension::EXTLineRasterization)],
-                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdSetLineStippleExt),
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdSetLineStippleKhr),
                 proc: unsafe {
-                    std::mem::transmute::<vk::PFN_vkCmdSetLineStippleEXT, vk::PFN_vkVoidFunction>(
-                        Self::cmd_set_line_stipple_ext,
+                    std::mem::transmute::<vk::PFN_vkCmdSetLineStippleKHR, vk::PFN_vkVoidFunction>(
+                        Self::cmd_set_line_stipple_khr,
                     )
                 },
             },
@@ -3605,6 +3965,16 @@ impl<T: Layer> Global<T> {
                         vk::PFN_vkCmdSetLineStippleEnableEXT,
                         vk::PFN_vkVoidFunction,
                     >(Self::cmd_set_line_stipple_enable_ext)
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdSetLineStippleKHR",
+                features: smallvec![Feature::Extension(Extension::KHRLineRasterization)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CmdSetLineStippleKhr),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCmdSetLineStippleKHR, vk::PFN_vkVoidFunction>(
+                        Self::cmd_set_line_stipple_khr,
+                    )
                 },
             },
             VulkanCommand {
@@ -3833,6 +4203,30 @@ impl<T: Layer> Global<T> {
                         vk::PFN_vkCmdSetRayTracingPipelineStackSizeKHR,
                         vk::PFN_vkVoidFunction,
                     >(Self::cmd_set_ray_tracing_pipeline_stack_size_khr)
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdSetRenderingAttachmentLocationsKHR",
+                features: smallvec![Feature::Extension(Extension::KHRDynamicRenderingLocalRead)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CmdSetRenderingAttachmentLocationsKhr),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdSetRenderingAttachmentLocationsKHR,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_set_rendering_attachment_locations_khr)
+                },
+            },
+            VulkanCommand {
+                name: "vkCmdSetRenderingInputAttachmentIndicesKHR",
+                features: smallvec![Feature::Extension(Extension::KHRDynamicRenderingLocalRead)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CmdSetRenderingInputAttachmentIndicesKhr),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdSetRenderingInputAttachmentIndicesKHR,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_set_rendering_input_attachment_indices_khr)
                 },
             },
             VulkanCommand {
@@ -4184,6 +4578,20 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCmdUpdatePipelineIndirectBufferNV",
+                features: smallvec![Feature::Extension(
+                    Extension::NVDeviceGeneratedCommandsCompute
+                )],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CmdUpdatePipelineIndirectBufferNv),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCmdUpdatePipelineIndirectBufferNV,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::cmd_update_pipeline_indirect_buffer_nv)
+                },
+            },
+            VulkanCommand {
                 name: "vkCmdWaitEvents",
                 features: smallvec![Feature::Core(ApiVersion { major: 1, minor: 0 })],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::CmdWaitEvents),
@@ -4333,6 +4741,26 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCopyImageToImageEXT",
+                features: smallvec![Feature::Extension(Extension::EXTHostImageCopy)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CopyImageToImageExt),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCopyImageToImageEXT, vk::PFN_vkVoidFunction>(
+                        Self::copy_image_to_image_ext,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkCopyImageToMemoryEXT",
+                features: smallvec![Feature::Extension(Extension::EXTHostImageCopy)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CopyImageToMemoryExt),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCopyImageToMemoryEXT, vk::PFN_vkVoidFunction>(
+                        Self::copy_image_to_memory_ext,
+                    )
+                },
+            },
+            VulkanCommand {
                 name: "vkCopyMemoryToAccelerationStructureKHR",
                 features: smallvec![Feature::Extension(Extension::KHRAccelerationStructure)],
                 hooked: hooked_commands
@@ -4342,6 +4770,16 @@ impl<T: Layer> Global<T> {
                         vk::PFN_vkCopyMemoryToAccelerationStructureKHR,
                         vk::PFN_vkVoidFunction,
                     >(Self::copy_memory_to_acceleration_structure_khr)
+                },
+            },
+            VulkanCommand {
+                name: "vkCopyMemoryToImageEXT",
+                features: smallvec![Feature::Extension(Extension::EXTHostImageCopy)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CopyMemoryToImageExt),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCopyMemoryToImageEXT, vk::PFN_vkVoidFunction>(
+                        Self::copy_memory_to_image_ext,
+                    )
                 },
             },
             VulkanCommand {
@@ -4471,6 +4909,26 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkCreateCudaFunctionNV",
+                features: smallvec![Feature::Extension(Extension::NVCudaKernelLaunch)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CreateCudaFunctionNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCreateCudaFunctionNV, vk::PFN_vkVoidFunction>(
+                        Self::create_cuda_function_nv,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkCreateCudaModuleNV",
+                features: smallvec![Feature::Extension(Extension::NVCudaKernelLaunch)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::CreateCudaModuleNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkCreateCudaModuleNV, vk::PFN_vkVoidFunction>(
+                        Self::create_cuda_module_nv,
+                    )
+                },
+            },
+            VulkanCommand {
                 name: "vkCreateDeferredOperationKHR",
                 features: smallvec![Feature::Extension(Extension::KHRDeferredHostOperations)],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::CreateDeferredOperationKhr),
@@ -4533,6 +4991,18 @@ impl<T: Layer> Global<T> {
                     std::mem::transmute::<vk::PFN_vkCreateEvent, vk::PFN_vkVoidFunction>(
                         Self::create_event,
                     )
+                },
+            },
+            VulkanCommand {
+                name: "vkCreateExecutionGraphPipelinesAMDX",
+                features: smallvec![Feature::Extension(Extension::AMDXShaderEnqueue)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::CreateExecutionGraphPipelinesAmdx),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkCreateExecutionGraphPipelinesAMDX,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::create_execution_graph_pipelines_amdx)
                 },
             },
             VulkanCommand {
@@ -4939,6 +5409,26 @@ impl<T: Layer> Global<T> {
                 proc: unsafe {
                     std::mem::transmute::<vk::PFN_vkDestroyCuModuleNVX, vk::PFN_vkVoidFunction>(
                         Self::destroy_cu_module_nvx,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkDestroyCudaFunctionNV",
+                features: smallvec![Feature::Extension(Extension::NVCudaKernelLaunch)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::DestroyCudaFunctionNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkDestroyCudaFunctionNV, vk::PFN_vkVoidFunction>(
+                        Self::destroy_cuda_function_nv,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkDestroyCudaModuleNV",
+                features: smallvec![Feature::Extension(Extension::NVCudaKernelLaunch)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::DestroyCudaModuleNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkDestroyCudaModuleNV, vk::PFN_vkVoidFunction>(
+                        Self::destroy_cuda_module_nv,
                     )
                 },
             },
@@ -5528,12 +6018,33 @@ impl<T: Layer> Global<T> {
             VulkanCommand {
                 name: "vkGetCalibratedTimestampsEXT",
                 features: smallvec![Feature::Extension(Extension::EXTCalibratedTimestamps)],
-                hooked: hooked_commands.contains(&LayerVulkanCommand::GetCalibratedTimestampsExt),
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetCalibratedTimestampsKhr),
                 proc: unsafe {
                     std::mem::transmute::<
-                        vk::PFN_vkGetCalibratedTimestampsEXT,
+                        vk::PFN_vkGetCalibratedTimestampsKHR,
                         vk::PFN_vkVoidFunction,
-                    >(Self::get_calibrated_timestamps_ext)
+                    >(Self::get_calibrated_timestamps_khr)
+                },
+            },
+            VulkanCommand {
+                name: "vkGetCalibratedTimestampsKHR",
+                features: smallvec![Feature::Extension(Extension::KHRCalibratedTimestamps)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetCalibratedTimestampsKhr),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetCalibratedTimestampsKHR,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_calibrated_timestamps_khr)
+                },
+            },
+            VulkanCommand {
+                name: "vkGetCudaModuleCacheNV",
+                features: smallvec![Feature::Extension(Extension::NVCudaKernelLaunch)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetCudaModuleCacheNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkGetCudaModuleCacheNV, vk::PFN_vkVoidFunction>(
+                        Self::get_cuda_module_cache_nv,
+                    )
                 },
             },
             VulkanCommand {
@@ -5793,6 +6304,18 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkGetDeviceImageSubresourceLayoutKHR",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance5)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::GetDeviceImageSubresourceLayoutKhr),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetDeviceImageSubresourceLayoutKHR,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_device_image_subresource_layout_khr)
+                },
+            },
+            VulkanCommand {
                 name: "vkGetDeviceMemoryCommitment",
                 features: smallvec![Feature::Core(ApiVersion { major: 1, minor: 0 })],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::GetDeviceMemoryCommitment),
@@ -5893,6 +6416,18 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkGetEncodedVideoSessionParametersKHR",
+                features: smallvec![Feature::Extension(Extension::KHRVideoEncodeQueue)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::GetEncodedVideoSessionParametersKhr),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetEncodedVideoSessionParametersKHR,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_encoded_video_session_parameters_khr)
+                },
+            },
+            VulkanCommand {
                 name: "vkGetEventStatus",
                 features: smallvec![Feature::Core(ApiVersion { major: 1, minor: 0 })],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::GetEventStatus),
@@ -5900,6 +6435,30 @@ impl<T: Layer> Global<T> {
                     std::mem::transmute::<vk::PFN_vkGetEventStatus, vk::PFN_vkVoidFunction>(
                         Self::get_event_status,
                     )
+                },
+            },
+            VulkanCommand {
+                name: "vkGetExecutionGraphPipelineNodeIndexAMDX",
+                features: smallvec![Feature::Extension(Extension::AMDXShaderEnqueue)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::GetExecutionGraphPipelineNodeIndexAmdx),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetExecutionGraphPipelineNodeIndexAMDX,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_execution_graph_pipeline_node_index_amdx)
+                },
+            },
+            VulkanCommand {
+                name: "vkGetExecutionGraphPipelineScratchSizeAMDX",
+                features: smallvec![Feature::Extension(Extension::AMDXShaderEnqueue)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::GetExecutionGraphPipelineScratchSizeAmdx),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetExecutionGraphPipelineScratchSizeAMDX,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_execution_graph_pipeline_scratch_size_amdx)
                 },
             },
             VulkanCommand {
@@ -6061,14 +6620,29 @@ impl<T: Layer> Global<T> {
             },
             VulkanCommand {
                 name: "vkGetImageSubresourceLayout2EXT",
-                features: smallvec![Feature::Extension(Extension::EXTImageCompressionControl)],
+                features: smallvec![
+                    Feature::Extension(Extension::EXTHostImageCopy),
+                    Feature::Extension(Extension::EXTImageCompressionControl)
+                ],
                 hooked: hooked_commands
-                    .contains(&LayerVulkanCommand::GetImageSubresourceLayout2Ext),
+                    .contains(&LayerVulkanCommand::GetImageSubresourceLayout2Khr),
                 proc: unsafe {
                     std::mem::transmute::<
-                        vk::PFN_vkGetImageSubresourceLayout2EXT,
+                        vk::PFN_vkGetImageSubresourceLayout2KHR,
                         vk::PFN_vkVoidFunction,
-                    >(Self::get_image_subresource_layout2_ext)
+                    >(Self::get_image_subresource_layout2_khr)
+                },
+            },
+            VulkanCommand {
+                name: "vkGetImageSubresourceLayout2KHR",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance5)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::GetImageSubresourceLayout2Khr),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetImageSubresourceLayout2KHR,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_image_subresource_layout2_khr)
                 },
             },
             VulkanCommand {
@@ -6101,6 +6675,16 @@ impl<T: Layer> Global<T> {
                         vk::PFN_vkGetImageViewOpaqueCaptureDescriptorDataEXT,
                         vk::PFN_vkVoidFunction,
                     >(Self::get_image_view_opaque_capture_descriptor_data_ext)
+                },
+            },
+            VulkanCommand {
+                name: "vkGetLatencyTimingsNV",
+                features: smallvec![Feature::Extension(Extension::NVLowLatency2)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetLatencyTimingsNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkGetLatencyTimingsNV, vk::PFN_vkVoidFunction>(
+                        Self::get_latency_timings_nv,
+                    )
                 },
             },
             VulkanCommand {
@@ -6300,6 +6884,34 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkGetPipelineIndirectDeviceAddressNV",
+                features: smallvec![Feature::Extension(
+                    Extension::NVDeviceGeneratedCommandsCompute
+                )],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::GetPipelineIndirectDeviceAddressNv),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetPipelineIndirectDeviceAddressNV,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_pipeline_indirect_device_address_nv)
+                },
+            },
+            VulkanCommand {
+                name: "vkGetPipelineIndirectMemoryRequirementsNV",
+                features: smallvec![Feature::Extension(
+                    Extension::NVDeviceGeneratedCommandsCompute
+                )],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::GetPipelineIndirectMemoryRequirementsNv),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetPipelineIndirectMemoryRequirementsNV,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_pipeline_indirect_memory_requirements_nv)
+                },
+            },
+            VulkanCommand {
                 name: "vkGetPipelinePropertiesEXT",
                 features: smallvec![Feature::Extension(Extension::EXTPipelineProperties)],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::GetPipelinePropertiesExt),
@@ -6432,6 +7044,18 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkGetRenderingAreaGranularityKHR",
+                features: smallvec![Feature::Extension(Extension::KHRMaintenance5)],
+                hooked: hooked_commands
+                    .contains(&LayerVulkanCommand::GetRenderingAreaGranularityKhr),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetRenderingAreaGranularityKHR,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_rendering_area_granularity_khr)
+                },
+            },
+            VulkanCommand {
                 name: "vkGetSamplerOpaqueCaptureDescriptorDataEXT",
                 features: smallvec![Feature::Extension(Extension::EXTDescriptorBuffer)],
                 hooked: hooked_commands
@@ -6441,6 +7065,17 @@ impl<T: Layer> Global<T> {
                         vk::PFN_vkGetSamplerOpaqueCaptureDescriptorDataEXT,
                         vk::PFN_vkVoidFunction,
                     >(Self::get_sampler_opaque_capture_descriptor_data_ext)
+                },
+            },
+            VulkanCommand {
+                name: "vkGetScreenBufferPropertiesQNX",
+                features: smallvec![Feature::Extension(Extension::QNXExternalMemoryScreenBuffer)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetScreenBufferPropertiesQnx),
+                proc: unsafe {
+                    std::mem::transmute::<
+                        vk::PFN_vkGetScreenBufferPropertiesQNX,
+                        vk::PFN_vkVoidFunction,
+                    >(Self::get_screen_buffer_properties_qnx)
                 },
             },
             VulkanCommand {
@@ -6683,6 +7318,16 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkLatencySleepNV",
+                features: smallvec![Feature::Extension(Extension::NVLowLatency2)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::LatencySleepNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkLatencySleepNV, vk::PFN_vkVoidFunction>(
+                        Self::latency_sleep_nv,
+                    )
+                },
+            },
+            VulkanCommand {
                 name: "vkMapMemory",
                 features: smallvec![Feature::Core(ApiVersion { major: 1, minor: 0 })],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::MapMemory),
@@ -6754,6 +7399,16 @@ impl<T: Layer> Global<T> {
                         vk::PFN_vkQueueInsertDebugUtilsLabelEXT,
                         vk::PFN_vkVoidFunction,
                     >(Self::queue_insert_debug_utils_label_ext)
+                },
+            },
+            VulkanCommand {
+                name: "vkQueueNotifyOutOfBandNV",
+                features: smallvec![Feature::Extension(Extension::NVLowLatency2)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::QueueNotifyOutOfBandNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkQueueNotifyOutOfBandNV, vk::PFN_vkVoidFunction>(
+                        Self::queue_notify_out_of_band_nv,
+                    )
                 },
             },
             VulkanCommand {
@@ -7041,6 +7696,26 @@ impl<T: Layer> Global<T> {
                 },
             },
             VulkanCommand {
+                name: "vkSetLatencyMarkerNV",
+                features: smallvec![Feature::Extension(Extension::NVLowLatency2)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::SetLatencyMarkerNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkSetLatencyMarkerNV, vk::PFN_vkVoidFunction>(
+                        Self::set_latency_marker_nv,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkSetLatencySleepModeNV",
+                features: smallvec![Feature::Extension(Extension::NVLowLatency2)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::SetLatencySleepModeNv),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkSetLatencySleepModeNV, vk::PFN_vkVoidFunction>(
+                        Self::set_latency_sleep_mode_nv,
+                    )
+                },
+            },
+            VulkanCommand {
                 name: "vkSetLocalDimmingAMD",
                 features: smallvec![Feature::Extension(Extension::AMDDisplayNativeHdr)],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::SetLocalDimmingAmd),
@@ -7087,6 +7762,16 @@ impl<T: Layer> Global<T> {
                 proc: unsafe {
                     std::mem::transmute::<vk::PFN_vkSignalSemaphore, vk::PFN_vkVoidFunction>(
                         Self::signal_semaphore,
+                    )
+                },
+            },
+            VulkanCommand {
+                name: "vkTransitionImageLayoutEXT",
+                features: smallvec![Feature::Extension(Extension::EXTHostImageCopy)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::TransitionImageLayoutExt),
+                proc: unsafe {
+                    std::mem::transmute::<vk::PFN_vkTransitionImageLayoutEXT, vk::PFN_vkVoidFunction>(
+                        Self::transition_image_layout_ext,
                     )
                 },
             },
@@ -7495,8 +8180,20 @@ impl<T: Layer> Global<T> {
             VulkanCommand {
                 name: "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT",
                 features: smallvec![Feature::Extension(Extension::EXTCalibratedTimestamps)],
-                hooked: hooked_commands.contains(&LayerVulkanCommand::GetPhysicalDeviceCalibrateableTimeDomainsExt),
-                proc: unsafe { std::mem::transmute::<vk::PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT, vk::PFN_vkVoidFunction>(Self::get_physical_device_calibrateable_time_domains_ext)},
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetPhysicalDeviceCalibrateableTimeDomainsKhr),
+                proc: unsafe { std::mem::transmute::<vk::PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, vk::PFN_vkVoidFunction>(Self::get_physical_device_calibrateable_time_domains_khr)},
+            },
+            VulkanCommand {
+                name: "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR",
+                features: smallvec![Feature::Extension(Extension::KHRCalibratedTimestamps)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetPhysicalDeviceCalibrateableTimeDomainsKhr),
+                proc: unsafe { std::mem::transmute::<vk::PFN_vkGetPhysicalDeviceCalibrateableTimeDomainsKHR, vk::PFN_vkVoidFunction>(Self::get_physical_device_calibrateable_time_domains_khr)},
+            },
+            VulkanCommand {
+                name: "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR",
+                features: smallvec![Feature::Extension(Extension::KHRCooperativeMatrix)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetPhysicalDeviceCooperativeMatrixPropertiesKhr),
+                proc: unsafe { std::mem::transmute::<vk::PFN_vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR, vk::PFN_vkVoidFunction>(Self::get_physical_device_cooperative_matrix_properties_khr)},
             },
             VulkanCommand {
                 name: "vkGetPhysicalDeviceCooperativeMatrixPropertiesNV",
@@ -7809,6 +8506,12 @@ impl<T: Layer> Global<T> {
                 features: smallvec![Feature::Extension(Extension::KHRVideoQueue)],
                 hooked: hooked_commands.contains(&LayerVulkanCommand::GetPhysicalDeviceVideoCapabilitiesKhr),
                 proc: unsafe { std::mem::transmute::<vk::PFN_vkGetPhysicalDeviceVideoCapabilitiesKHR, vk::PFN_vkVoidFunction>(Self::get_physical_device_video_capabilities_khr)},
+            },
+            VulkanCommand {
+                name: "vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR",
+                features: smallvec![Feature::Extension(Extension::KHRVideoEncodeQueue)],
+                hooked: hooked_commands.contains(&LayerVulkanCommand::GetPhysicalDeviceVideoEncodeQualityLevelPropertiesKhr),
+                proc: unsafe { std::mem::transmute::<vk::PFN_vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR, vk::PFN_vkVoidFunction>(Self::get_physical_device_video_encode_quality_level_properties_khr)},
             },
             VulkanCommand {
                 name: "vkGetPhysicalDeviceVideoFormatPropertiesKHR",
@@ -9541,6 +10244,104 @@ impl<T: Layer> Global<T> {
             },
         }
     }
+    extern "system" fn get_physical_device_video_encode_quality_level_properties_khr(
+        physical_device: vk::PhysicalDevice,
+        p_quality_level_info: *const vk::PhysicalDeviceVideoEncodeQualityLevelInfoKHR,
+        p_quality_level_properties: *mut vk::VideoEncodeQualityLevelPropertiesKHR,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR
+        let instance_info = global.get_instance_info(physical_device).unwrap();
+        let dispatch_table = &instance_info.dispatch_table.khr_video_encode_queue;
+        let layer_result = instance_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_physical_device_video_encode_quality_level_properties_khr(
+                physical_device,
+                unsafe { p_quality_level_info.as_ref() }.unwrap(),
+                unsafe { ptr_as_uninit_mut(p_quality_level_properties) }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_physical_device_video_encode_quality_level_properties_khr)(
+                    physical_device,
+                    p_quality_level_info,
+                    p_quality_level_properties,
+                )
+            },
+        }
+    }
+    extern "system" fn get_physical_device_cooperative_matrix_properties_khr(
+        physical_device: vk::PhysicalDevice,
+        p_property_count: *mut u32,
+        p_properties: *mut vk::CooperativeMatrixPropertiesKHR,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR
+        let instance_info = global.get_instance_info(physical_device).unwrap();
+        let dispatch_table = &instance_info.dispatch_table.khr_cooperative_matrix;
+        let layer_result = instance_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_physical_device_cooperative_matrix_properties_khr(
+                physical_device,
+                unsafe { ptr_as_uninit_mut(p_property_count) }.unwrap(),
+                unsafe { maybe_uninit_slice_from_raw_parts_mut(p_properties, p_property_count) },
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_physical_device_cooperative_matrix_properties_khr)(
+                    physical_device,
+                    p_property_count,
+                    p_properties,
+                )
+            },
+        }
+    }
+    extern "system" fn get_physical_device_calibrateable_time_domains_khr(
+        physical_device: vk::PhysicalDevice,
+        p_time_domain_count: *mut u32,
+        p_time_domains: *mut vk::TimeDomainKHR,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetPhysicalDeviceCalibrateableTimeDomainsKHR
+        let instance_info = global.get_instance_info(physical_device).unwrap();
+        let dispatch_table = &instance_info.dispatch_table.khr_calibrated_timestamps;
+        let layer_result = instance_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_physical_device_calibrateable_time_domains_khr(physical_device);
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(res) => unsafe {
+                    fill_vk_out_array(
+                        &res,
+                        NonNull::new(p_time_domain_count).unwrap(),
+                        p_time_domains,
+                    )
+                },
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_physical_device_calibrateable_time_domains_khr)(
+                    physical_device,
+                    p_time_domain_count,
+                    p_time_domains,
+                )
+            },
+        }
+    }
     extern "system" fn create_debug_report_callback_ext(
         instance: vk::Instance,
         p_create_info: *const vk::DebugReportCallbackCreateInfoEXT,
@@ -10060,40 +10861,6 @@ impl<T: Layer> Global<T> {
                     physical_device,
                     samples,
                     p_multisample_properties,
-                )
-            },
-        }
-    }
-    extern "system" fn get_physical_device_calibrateable_time_domains_ext(
-        physical_device: vk::PhysicalDevice,
-        p_time_domain_count: *mut u32,
-        p_time_domains: *mut vk::TimeDomainEXT,
-    ) -> vk::Result {
-        let global = Self::instance();
-        // vkGetPhysicalDeviceCalibrateableTimeDomainsEXT
-        let instance_info = global.get_instance_info(physical_device).unwrap();
-        let dispatch_table = &instance_info.dispatch_table.ext_calibrated_timestamps;
-        let layer_result = instance_info
-            .customized_info
-            .borrow()
-            .hooks()
-            .get_physical_device_calibrateable_time_domains_ext(physical_device);
-        match layer_result {
-            LayerResult::Handled(res) => match res {
-                Ok(res) => unsafe {
-                    fill_vk_out_array(
-                        &res,
-                        NonNull::new(p_time_domain_count).unwrap(),
-                        p_time_domains,
-                    )
-                },
-                Err(e) => e,
-            },
-            LayerResult::Unhandled => unsafe {
-                (dispatch_table.get_physical_device_calibrateable_time_domains_ext)(
-                    physical_device,
-                    p_time_domain_count,
-                    p_time_domains,
                 )
             },
         }
@@ -16745,6 +17512,58 @@ impl<T: Layer> Global<T> {
             },
         }
     }
+    extern "system" fn cmd_set_rendering_attachment_locations_khr(
+        command_buffer: vk::CommandBuffer,
+        p_location_info: *const vk::RenderingAttachmentLocationInfoKHR,
+    ) {
+        let global = Self::instance();
+        // vkCmdSetRenderingAttachmentLocationsKHR
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_dynamic_rendering_local_read;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_set_rendering_attachment_locations_khr(
+                command_buffer,
+                unsafe { p_location_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_set_rendering_attachment_locations_khr)(
+                    command_buffer,
+                    p_location_info,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_set_rendering_input_attachment_indices_khr(
+        command_buffer: vk::CommandBuffer,
+        p_location_info: *const vk::RenderingInputAttachmentIndexInfoKHR,
+    ) {
+        let global = Self::instance();
+        // vkCmdSetRenderingInputAttachmentIndicesKHR
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_dynamic_rendering_local_read;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_set_rendering_input_attachment_indices_khr(
+                command_buffer,
+                unsafe { p_location_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_set_rendering_input_attachment_indices_khr)(
+                    command_buffer,
+                    p_location_info,
+                )
+            },
+        }
+    }
     extern "system" fn wait_for_present_khr(
         device: vk::Device,
         swapchain: vk::SwapchainKHR,
@@ -17001,6 +17820,43 @@ impl<T: Layer> Global<T> {
             },
         }
     }
+    extern "system" fn get_encoded_video_session_parameters_khr(
+        device: vk::Device,
+        p_video_session_parameters_info: *const vk::VideoEncodeSessionParametersGetInfoKHR,
+        p_feedback_info: *mut vk::VideoEncodeSessionParametersFeedbackInfoKHR,
+        p_data_size: *mut usize,
+        p_data: *mut c_void,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetEncodedVideoSessionParametersKHR
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_video_encode_queue;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_encoded_video_session_parameters_khr(
+                unsafe { p_video_session_parameters_info.as_ref() }.unwrap(),
+                unsafe { ptr_as_uninit_mut(p_feedback_info) },
+                unsafe { ptr_as_uninit_mut(p_data_size) }.unwrap(),
+                unsafe { maybe_uninit_slice_from_raw_parts_mut(p_data as *mut u8, p_data_size) },
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_encoded_video_session_parameters_khr)(
+                    device,
+                    p_video_session_parameters_info,
+                    p_feedback_info,
+                    p_data_size,
+                    p_data,
+                )
+            },
+        }
+    }
     extern "system" fn cmd_encode_video_khr(
         command_buffer: vk::CommandBuffer,
         p_encode_info: *const vk::VideoEncodeInfoKHR,
@@ -17103,6 +17959,334 @@ impl<T: Layer> Global<T> {
                 (dispatch_table.cmd_trace_rays_indirect2_khr)(
                     command_buffer,
                     indirect_device_address,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_bind_index_buffer2_khr(
+        command_buffer: vk::CommandBuffer,
+        buffer: vk::Buffer,
+        offset: vk::DeviceSize,
+        size: vk::DeviceSize,
+        index_type: vk::IndexType,
+    ) {
+        let global = Self::instance();
+        // vkCmdBindIndexBuffer2KHR
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance5;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_bind_index_buffer2_khr(command_buffer, buffer, offset, size, index_type);
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_bind_index_buffer2_khr)(
+                    command_buffer,
+                    buffer,
+                    offset,
+                    size,
+                    index_type,
+                )
+            },
+        }
+    }
+    extern "system" fn get_rendering_area_granularity_khr(
+        device: vk::Device,
+        p_rendering_area_info: *const vk::RenderingAreaInfoKHR,
+        p_granularity: *mut vk::Extent2D,
+    ) {
+        let global = Self::instance();
+        // vkGetRenderingAreaGranularityKHR
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance5;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_rendering_area_granularity_khr(
+                unsafe { p_rendering_area_info.as_ref() }.unwrap(),
+                unsafe { ptr_as_uninit_mut(p_granularity) }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_rendering_area_granularity_khr)(
+                    device,
+                    p_rendering_area_info,
+                    p_granularity,
+                )
+            },
+        }
+    }
+    extern "system" fn get_device_image_subresource_layout_khr(
+        device: vk::Device,
+        p_info: *const vk::DeviceImageSubresourceInfoKHR,
+        p_layout: *mut vk::SubresourceLayout2KHR,
+    ) {
+        let global = Self::instance();
+        // vkGetDeviceImageSubresourceLayoutKHR
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance5;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_device_image_subresource_layout_khr(
+                unsafe { p_info.as_ref() }.unwrap(),
+                unsafe { ptr_as_uninit_mut(p_layout) }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_device_image_subresource_layout_khr)(device, p_info, p_layout)
+            },
+        }
+    }
+    extern "system" fn get_image_subresource_layout2_khr(
+        device: vk::Device,
+        image: vk::Image,
+        p_subresource: *const vk::ImageSubresource2KHR,
+        p_layout: *mut vk::SubresourceLayout2KHR,
+    ) {
+        let global = Self::instance();
+        // vkGetImageSubresourceLayout2KHR
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance5;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_image_subresource_layout2_khr(
+                image,
+                unsafe { p_subresource.as_ref() }.unwrap(),
+                unsafe { ptr_as_uninit_mut(p_layout) }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_image_subresource_layout2_khr)(
+                    device,
+                    image,
+                    p_subresource,
+                    p_layout,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_set_line_stipple_khr(
+        command_buffer: vk::CommandBuffer,
+        line_stipple_factor: u32,
+        line_stipple_pattern: u16,
+    ) {
+        let global = Self::instance();
+        // vkCmdSetLineStippleKHR
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_line_rasterization;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_set_line_stipple_khr(command_buffer, line_stipple_factor, line_stipple_pattern);
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_set_line_stipple_khr)(
+                    command_buffer,
+                    line_stipple_factor,
+                    line_stipple_pattern,
+                )
+            },
+        }
+    }
+    extern "system" fn get_calibrated_timestamps_khr(
+        device: vk::Device,
+        timestamp_count: u32,
+        p_timestamp_infos: *const vk::CalibratedTimestampInfoKHR,
+        p_timestamps: *mut u64,
+        p_max_deviation: *mut u64,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetCalibratedTimestampsKHR
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_calibrated_timestamps;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_calibrated_timestamps_khr(
+                unsafe { slice_from_raw_parts(p_timestamp_infos, timestamp_count) },
+                unsafe { uninit_slice_from_raw_parts_mut(p_timestamps, timestamp_count) },
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(res) => {
+                    *unsafe { p_max_deviation.as_mut() }.unwrap() = res;
+                    vk::Result::SUCCESS
+                }
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_calibrated_timestamps_khr)(
+                    device,
+                    timestamp_count,
+                    p_timestamp_infos,
+                    p_timestamps,
+                    p_max_deviation,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_bind_descriptor_sets2_khr(
+        command_buffer: vk::CommandBuffer,
+        p_bind_descriptor_sets_info: *const vk::BindDescriptorSetsInfoKHR,
+    ) {
+        let global = Self::instance();
+        // vkCmdBindDescriptorSets2KHR
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance6;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_bind_descriptor_sets2_khr(
+                command_buffer,
+                unsafe { p_bind_descriptor_sets_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_bind_descriptor_sets2_khr)(
+                    command_buffer,
+                    p_bind_descriptor_sets_info,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_push_constants2_khr(
+        command_buffer: vk::CommandBuffer,
+        p_push_constants_info: *const vk::PushConstantsInfoKHR,
+    ) {
+        let global = Self::instance();
+        // vkCmdPushConstants2KHR
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance6;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_push_constants2_khr(
+                command_buffer,
+                unsafe { p_push_constants_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_push_constants2_khr)(command_buffer, p_push_constants_info)
+            },
+        }
+    }
+    extern "system" fn cmd_push_descriptor_set2_khr(
+        command_buffer: vk::CommandBuffer,
+        p_push_descriptor_set_info: *const vk::PushDescriptorSetInfoKHR,
+    ) {
+        let global = Self::instance();
+        // vkCmdPushDescriptorSet2KHR
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance6;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_push_descriptor_set2_khr(
+                command_buffer,
+                unsafe { p_push_descriptor_set_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_push_descriptor_set2_khr)(
+                    command_buffer,
+                    p_push_descriptor_set_info,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_push_descriptor_set_with_template2_khr(
+        command_buffer: vk::CommandBuffer,
+        p_push_descriptor_set_with_template_info: *const vk::PushDescriptorSetWithTemplateInfoKHR,
+    ) {
+        let global = Self::instance();
+        // vkCmdPushDescriptorSetWithTemplate2KHR
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance6;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_push_descriptor_set_with_template2_khr(
+                command_buffer,
+                unsafe { p_push_descriptor_set_with_template_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_push_descriptor_set_with_template2_khr)(
+                    command_buffer,
+                    p_push_descriptor_set_with_template_info,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_set_descriptor_buffer_offsets2_ext(
+        command_buffer: vk::CommandBuffer,
+        p_set_descriptor_buffer_offsets_info: *const vk::SetDescriptorBufferOffsetsInfoEXT,
+    ) {
+        let global = Self::instance();
+        // vkCmdSetDescriptorBufferOffsets2EXT
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance6;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_set_descriptor_buffer_offsets2_ext(
+                command_buffer,
+                unsafe { p_set_descriptor_buffer_offsets_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_set_descriptor_buffer_offsets2_ext)(
+                    command_buffer,
+                    p_set_descriptor_buffer_offsets_info,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_bind_descriptor_buffer_embedded_samplers2_ext(
+        command_buffer: vk::CommandBuffer,
+        p_bind_descriptor_buffer_embedded_samplers_info: *const vk::BindDescriptorBufferEmbeddedSamplersInfoEXT,
+    ) {
+        let global = Self::instance();
+        // vkCmdBindDescriptorBufferEmbeddedSamplers2EXT
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.khr_maintenance6;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_bind_descriptor_buffer_embedded_samplers2_ext(
+                command_buffer,
+                unsafe { p_bind_descriptor_buffer_embedded_samplers_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_bind_descriptor_buffer_embedded_samplers2_ext)(
+                    command_buffer,
+                    p_bind_descriptor_buffer_embedded_samplers_info,
                 )
             },
         }
@@ -18364,6 +19548,219 @@ impl<T: Layer> Global<T> {
             },
         }
     }
+    extern "system" fn create_execution_graph_pipelines_amdx(
+        device: vk::Device,
+        pipeline_cache: vk::PipelineCache,
+        create_info_count: u32,
+        p_create_infos: *const vk::ExecutionGraphPipelineCreateInfoAMDX,
+        p_allocator: *const vk::AllocationCallbacks,
+        p_pipelines: *mut vk::Pipeline,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkCreateExecutionGraphPipelinesAMDX
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.amdx_shader_enqueue;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .create_execution_graph_pipelines_amdx(
+                pipeline_cache,
+                unsafe { slice_from_raw_parts(p_create_infos, create_info_count) },
+                unsafe { p_allocator.as_ref() },
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(res) => {
+                    unsafe {
+                        std::slice::from_raw_parts_mut(
+                            p_pipelines,
+                            create_info_count.try_into().unwrap(),
+                        )
+                    }
+                    .copy_from_slice(&res);
+                    vk::Result::SUCCESS
+                }
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.create_execution_graph_pipelines_amdx)(
+                    device,
+                    pipeline_cache,
+                    create_info_count,
+                    p_create_infos,
+                    p_allocator,
+                    p_pipelines,
+                )
+            },
+        }
+    }
+    extern "system" fn get_execution_graph_pipeline_scratch_size_amdx(
+        device: vk::Device,
+        execution_graph: vk::Pipeline,
+        p_size_info: *mut vk::ExecutionGraphPipelineScratchSizeAMDX,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetExecutionGraphPipelineScratchSizeAMDX
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.amdx_shader_enqueue;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_execution_graph_pipeline_scratch_size_amdx(
+                execution_graph,
+                unsafe { ptr_as_uninit_mut(p_size_info) }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_execution_graph_pipeline_scratch_size_amdx)(
+                    device,
+                    execution_graph,
+                    p_size_info,
+                )
+            },
+        }
+    }
+    extern "system" fn get_execution_graph_pipeline_node_index_amdx(
+        device: vk::Device,
+        execution_graph: vk::Pipeline,
+        p_node_info: *const vk::PipelineShaderStageNodeCreateInfoAMDX,
+        p_node_index: *mut u32,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetExecutionGraphPipelineNodeIndexAMDX
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.amdx_shader_enqueue;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_execution_graph_pipeline_node_index_amdx(
+                execution_graph,
+                unsafe { p_node_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(res) => {
+                    *unsafe { p_node_index.as_mut() }.unwrap() = res;
+                    vk::Result::SUCCESS
+                }
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_execution_graph_pipeline_node_index_amdx)(
+                    device,
+                    execution_graph,
+                    p_node_info,
+                    p_node_index,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_initialize_graph_scratch_memory_amdx(
+        command_buffer: vk::CommandBuffer,
+        scratch: vk::DeviceAddress,
+    ) {
+        let global = Self::instance();
+        // vkCmdInitializeGraphScratchMemoryAMDX
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.amdx_shader_enqueue;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_initialize_graph_scratch_memory_amdx(command_buffer, scratch);
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_initialize_graph_scratch_memory_amdx)(command_buffer, scratch)
+            },
+        }
+    }
+    extern "system" fn cmd_dispatch_graph_amdx(
+        command_buffer: vk::CommandBuffer,
+        scratch: vk::DeviceAddress,
+        p_count_info: *const vk::DispatchGraphCountInfoAMDX,
+    ) {
+        let global = Self::instance();
+        // vkCmdDispatchGraphAMDX
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.amdx_shader_enqueue;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_dispatch_graph_amdx(
+                command_buffer,
+                scratch,
+                unsafe { p_count_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_dispatch_graph_amdx)(command_buffer, scratch, p_count_info)
+            },
+        }
+    }
+    extern "system" fn cmd_dispatch_graph_indirect_amdx(
+        command_buffer: vk::CommandBuffer,
+        scratch: vk::DeviceAddress,
+        p_count_info: *const vk::DispatchGraphCountInfoAMDX,
+    ) {
+        let global = Self::instance();
+        // vkCmdDispatchGraphIndirectAMDX
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.amdx_shader_enqueue;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_dispatch_graph_indirect_amdx(
+                command_buffer,
+                scratch,
+                unsafe { p_count_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_dispatch_graph_indirect_amdx)(
+                    command_buffer,
+                    scratch,
+                    p_count_info,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_dispatch_graph_indirect_count_amdx(
+        command_buffer: vk::CommandBuffer,
+        scratch: vk::DeviceAddress,
+        count_info: vk::DeviceAddress,
+    ) {
+        let global = Self::instance();
+        // vkCmdDispatchGraphIndirectCountAMDX
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.amdx_shader_enqueue;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_dispatch_graph_indirect_count_amdx(command_buffer, scratch, count_info);
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_dispatch_graph_indirect_count_amdx)(
+                    command_buffer,
+                    scratch,
+                    count_info,
+                )
+            },
+        }
+    }
     extern "system" fn cmd_set_sample_locations_ext(
         command_buffer: vk::CommandBuffer,
         p_sample_locations_info: *const vk::SampleLocationsInfoEXT,
@@ -19127,44 +20524,6 @@ impl<T: Layer> Global<T> {
             },
         }
     }
-    extern "system" fn get_calibrated_timestamps_ext(
-        device: vk::Device,
-        timestamp_count: u32,
-        p_timestamp_infos: *const vk::CalibratedTimestampInfoEXT,
-        p_timestamps: *mut u64,
-        p_max_deviation: *mut u64,
-    ) -> vk::Result {
-        let global = Self::instance();
-        // vkGetCalibratedTimestampsEXT
-        let device_info = global.get_device_info(device).unwrap();
-        let dispatch_table = &device_info.dispatch_table.ext_calibrated_timestamps;
-        let layer_result = device_info
-            .customized_info
-            .borrow()
-            .hooks()
-            .get_calibrated_timestamps_ext(
-                unsafe { slice_from_raw_parts(p_timestamp_infos, timestamp_count) },
-                unsafe { uninit_slice_from_raw_parts_mut(p_timestamps, timestamp_count) },
-            );
-        match layer_result {
-            LayerResult::Handled(res) => match res {
-                Ok(res) => {
-                    *unsafe { p_max_deviation.as_mut() }.unwrap() = res;
-                    vk::Result::SUCCESS
-                }
-                Err(e) => e,
-            },
-            LayerResult::Unhandled => unsafe {
-                (dispatch_table.get_calibrated_timestamps_ext)(
-                    device,
-                    timestamp_count,
-                    p_timestamp_infos,
-                    p_timestamps,
-                    p_max_deviation,
-                )
-            },
-        }
-    }
     extern "system" fn cmd_draw_mesh_tasks_nv(
         command_buffer: vk::CommandBuffer,
         task_count: u32,
@@ -19664,27 +21023,101 @@ impl<T: Layer> Global<T> {
             },
         }
     }
-    extern "system" fn cmd_set_line_stipple_ext(
-        command_buffer: vk::CommandBuffer,
-        line_stipple_factor: u32,
-        line_stipple_pattern: u16,
-    ) {
+    extern "system" fn copy_memory_to_image_ext(
+        device: vk::Device,
+        p_copy_memory_to_image_info: *const vk::CopyMemoryToImageInfoEXT,
+    ) -> vk::Result {
         let global = Self::instance();
-        // vkCmdSetLineStippleEXT
-        let device_info = global.get_device_info(command_buffer).unwrap();
-        let dispatch_table = &device_info.dispatch_table.ext_line_rasterization;
+        // vkCopyMemoryToImageEXT
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.ext_host_image_copy;
         let layer_result = device_info
             .customized_info
             .borrow()
             .hooks()
-            .cmd_set_line_stipple_ext(command_buffer, line_stipple_factor, line_stipple_pattern);
+            .copy_memory_to_image_ext(unsafe { p_copy_memory_to_image_info.as_ref() }.unwrap());
         match layer_result {
-            LayerResult::Handled(res) => res,
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
             LayerResult::Unhandled => unsafe {
-                (dispatch_table.cmd_set_line_stipple_ext)(
-                    command_buffer,
-                    line_stipple_factor,
-                    line_stipple_pattern,
+                (dispatch_table.copy_memory_to_image_ext)(device, p_copy_memory_to_image_info)
+            },
+        }
+    }
+    extern "system" fn copy_image_to_memory_ext(
+        device: vk::Device,
+        p_copy_image_to_memory_info: *const vk::CopyImageToMemoryInfoEXT,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkCopyImageToMemoryEXT
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.ext_host_image_copy;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .copy_image_to_memory_ext(unsafe { p_copy_image_to_memory_info.as_ref() }.unwrap());
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.copy_image_to_memory_ext)(device, p_copy_image_to_memory_info)
+            },
+        }
+    }
+    extern "system" fn copy_image_to_image_ext(
+        device: vk::Device,
+        p_copy_image_to_image_info: *const vk::CopyImageToImageInfoEXT,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkCopyImageToImageEXT
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.ext_host_image_copy;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .copy_image_to_image_ext(unsafe { p_copy_image_to_image_info.as_ref() }.unwrap());
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.copy_image_to_image_ext)(device, p_copy_image_to_image_info)
+            },
+        }
+    }
+    extern "system" fn transition_image_layout_ext(
+        device: vk::Device,
+        transition_count: u32,
+        p_transitions: *const vk::HostImageLayoutTransitionInfoEXT,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkTransitionImageLayoutEXT
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.ext_host_image_copy;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .transition_image_layout_ext(unsafe {
+                slice_from_raw_parts(p_transitions, transition_count)
+            });
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.transition_image_layout_ext)(
+                    device,
+                    transition_count,
+                    p_transitions,
                 )
             },
         }
@@ -19887,6 +21320,192 @@ impl<T: Layer> Global<T> {
                     indirect_commands_layout,
                     p_allocator,
                 )
+            },
+        }
+    }
+    extern "system" fn cmd_set_depth_bias2_ext(
+        command_buffer: vk::CommandBuffer,
+        p_depth_bias_info: *const vk::DepthBiasInfoEXT,
+    ) {
+        let global = Self::instance();
+        // vkCmdSetDepthBias2EXT
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.ext_depth_bias_control;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_set_depth_bias2_ext(
+                command_buffer,
+                unsafe { p_depth_bias_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_set_depth_bias2_ext)(command_buffer, p_depth_bias_info)
+            },
+        }
+    }
+    extern "system" fn create_cuda_module_nv(
+        device: vk::Device,
+        p_create_info: *const vk::CudaModuleCreateInfoNV,
+        p_allocator: *const vk::AllocationCallbacks,
+        p_module: *mut vk::CudaModuleNV,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkCreateCudaModuleNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_cuda_kernel_launch;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .create_cuda_module_nv(unsafe { p_create_info.as_ref() }.unwrap(), unsafe {
+                p_allocator.as_ref()
+            });
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(res) => {
+                    *unsafe { p_module.as_mut() }.unwrap() = res;
+                    vk::Result::SUCCESS
+                }
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.create_cuda_module_nv)(device, p_create_info, p_allocator, p_module)
+            },
+        }
+    }
+    extern "system" fn get_cuda_module_cache_nv(
+        device: vk::Device,
+        module: vk::CudaModuleNV,
+        p_cache_size: *mut usize,
+        p_cache_data: *mut c_void,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetCudaModuleCacheNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_cuda_kernel_launch;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_cuda_module_cache_nv(
+                module,
+                unsafe { ptr_as_uninit_mut(p_cache_size) }.unwrap(),
+                unsafe {
+                    maybe_uninit_slice_from_raw_parts_mut(p_cache_data as *mut u8, p_cache_size)
+                },
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_cuda_module_cache_nv)(
+                    device,
+                    module,
+                    p_cache_size,
+                    p_cache_data,
+                )
+            },
+        }
+    }
+    extern "system" fn create_cuda_function_nv(
+        device: vk::Device,
+        p_create_info: *const vk::CudaFunctionCreateInfoNV,
+        p_allocator: *const vk::AllocationCallbacks,
+        p_function: *mut vk::CudaFunctionNV,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkCreateCudaFunctionNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_cuda_kernel_launch;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .create_cuda_function_nv(unsafe { p_create_info.as_ref() }.unwrap(), unsafe {
+                p_allocator.as_ref()
+            });
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(res) => {
+                    *unsafe { p_function.as_mut() }.unwrap() = res;
+                    vk::Result::SUCCESS
+                }
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.create_cuda_function_nv)(
+                    device,
+                    p_create_info,
+                    p_allocator,
+                    p_function,
+                )
+            },
+        }
+    }
+    extern "system" fn destroy_cuda_module_nv(
+        device: vk::Device,
+        module: vk::CudaModuleNV,
+        p_allocator: *const vk::AllocationCallbacks,
+    ) {
+        let global = Self::instance();
+        // vkDestroyCudaModuleNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_cuda_kernel_launch;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .destroy_cuda_module_nv(module, unsafe { p_allocator.as_ref() });
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.destroy_cuda_module_nv)(device, module, p_allocator)
+            },
+        }
+    }
+    extern "system" fn destroy_cuda_function_nv(
+        device: vk::Device,
+        function: vk::CudaFunctionNV,
+        p_allocator: *const vk::AllocationCallbacks,
+    ) {
+        let global = Self::instance();
+        // vkDestroyCudaFunctionNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_cuda_kernel_launch;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .destroy_cuda_function_nv(function, unsafe { p_allocator.as_ref() });
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.destroy_cuda_function_nv)(device, function, p_allocator)
+            },
+        }
+    }
+    extern "system" fn cmd_cuda_launch_kernel_nv(
+        command_buffer: vk::CommandBuffer,
+        p_launch_info: *const vk::CudaLaunchInfoNV,
+    ) {
+        let global = Self::instance();
+        // vkCmdCudaLaunchKernelNV
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_cuda_kernel_launch;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_cuda_launch_kernel_nv(command_buffer, unsafe { p_launch_info.as_ref() }.unwrap());
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_cuda_launch_kernel_nv)(command_buffer, p_launch_info)
             },
         }
     }
@@ -20261,37 +21880,6 @@ impl<T: Layer> Global<T> {
                     command_buffer,
                     shading_rate,
                     combiner_ops,
-                )
-            },
-        }
-    }
-    extern "system" fn get_image_subresource_layout2_ext(
-        device: vk::Device,
-        image: vk::Image,
-        p_subresource: *const vk::ImageSubresource2EXT,
-        p_layout: *mut vk::SubresourceLayout2EXT,
-    ) {
-        let global = Self::instance();
-        // vkGetImageSubresourceLayout2EXT
-        let device_info = global.get_device_info(device).unwrap();
-        let dispatch_table = &device_info.dispatch_table.ext_image_compression_control;
-        let layer_result = device_info
-            .customized_info
-            .borrow()
-            .hooks()
-            .get_image_subresource_layout2_ext(
-                image,
-                unsafe { p_subresource.as_ref() }.unwrap(),
-                unsafe { ptr_as_uninit_mut(p_layout) }.unwrap(),
-            );
-        match layer_result {
-            LayerResult::Handled(res) => res,
-            LayerResult::Unhandled => unsafe {
-                (dispatch_table.get_image_subresource_layout2_ext)(
-                    device,
-                    image,
-                    p_subresource,
-                    p_layout,
                 )
             },
         }
@@ -21476,26 +23064,82 @@ impl<T: Layer> Global<T> {
             },
         }
     }
-    extern "system" fn cmd_set_tessellation_domain_origin_ext(
-        command_buffer: vk::CommandBuffer,
-        domain_origin: vk::TessellationDomainOrigin,
+    extern "system" fn get_pipeline_indirect_memory_requirements_nv(
+        device: vk::Device,
+        p_create_info: *const vk::ComputePipelineCreateInfo,
+        p_memory_requirements: *mut vk::MemoryRequirements2,
     ) {
         let global = Self::instance();
-        // vkCmdSetTessellationDomainOriginEXT
-        let device_info = global.get_device_info(command_buffer).unwrap();
-        let dispatch_table = &device_info.dispatch_table.ext_extended_dynamic_state3;
+        // vkGetPipelineIndirectMemoryRequirementsNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info
+            .dispatch_table
+            .nv_device_generated_commands_compute;
         let layer_result = device_info
             .customized_info
             .borrow()
             .hooks()
-            .cmd_set_tessellation_domain_origin_ext(command_buffer, domain_origin);
+            .get_pipeline_indirect_memory_requirements_nv(
+                unsafe { p_create_info.as_ref() }.unwrap(),
+                unsafe { ptr_as_uninit_mut(p_memory_requirements) }.unwrap(),
+            );
         match layer_result {
             LayerResult::Handled(res) => res,
             LayerResult::Unhandled => unsafe {
-                (dispatch_table.cmd_set_tessellation_domain_origin_ext)(
-                    command_buffer,
-                    domain_origin,
+                (dispatch_table.get_pipeline_indirect_memory_requirements_nv)(
+                    device,
+                    p_create_info,
+                    p_memory_requirements,
                 )
+            },
+        }
+    }
+    extern "system" fn cmd_update_pipeline_indirect_buffer_nv(
+        command_buffer: vk::CommandBuffer,
+        pipeline_bind_point: vk::PipelineBindPoint,
+        pipeline: vk::Pipeline,
+    ) {
+        let global = Self::instance();
+        // vkCmdUpdatePipelineIndirectBufferNV
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info
+            .dispatch_table
+            .nv_device_generated_commands_compute;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_update_pipeline_indirect_buffer_nv(command_buffer, pipeline_bind_point, pipeline);
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_update_pipeline_indirect_buffer_nv)(
+                    command_buffer,
+                    pipeline_bind_point,
+                    pipeline,
+                )
+            },
+        }
+    }
+    extern "system" fn get_pipeline_indirect_device_address_nv(
+        device: vk::Device,
+        p_info: *const vk::PipelineIndirectDeviceAddressInfoNV,
+    ) -> vk::DeviceAddress {
+        let global = Self::instance();
+        // vkGetPipelineIndirectDeviceAddressNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info
+            .dispatch_table
+            .nv_device_generated_commands_compute;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_pipeline_indirect_device_address_nv(unsafe { p_info.as_ref() }.unwrap());
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_pipeline_indirect_device_address_nv)(device, p_info)
             },
         }
     }
@@ -21737,6 +23381,29 @@ impl<T: Layer> Global<T> {
                     first_attachment,
                     attachment_count,
                     p_color_write_masks,
+                )
+            },
+        }
+    }
+    extern "system" fn cmd_set_tessellation_domain_origin_ext(
+        command_buffer: vk::CommandBuffer,
+        domain_origin: vk::TessellationDomainOrigin,
+    ) {
+        let global = Self::instance();
+        // vkCmdSetTessellationDomainOriginEXT
+        let device_info = global.get_device_info(command_buffer).unwrap();
+        let dispatch_table = &device_info.dispatch_table.ext_extended_dynamic_state3;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .cmd_set_tessellation_domain_origin_ext(command_buffer, domain_origin);
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.cmd_set_tessellation_domain_origin_ext)(
+                    command_buffer,
+                    domain_origin,
                 )
             },
         }
@@ -22476,6 +24143,149 @@ impl<T: Layer> Global<T> {
                     p_rendering_info,
                     p_properties,
                 )
+            },
+        }
+    }
+    extern "system" fn set_latency_sleep_mode_nv(
+        device: vk::Device,
+        swapchain: vk::SwapchainKHR,
+        p_sleep_mode_info: *const vk::LatencySleepModeInfoNV,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkSetLatencySleepModeNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_low_latency2;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .set_latency_sleep_mode_nv(swapchain, unsafe { p_sleep_mode_info.as_ref() }.unwrap());
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.set_latency_sleep_mode_nv)(device, swapchain, p_sleep_mode_info)
+            },
+        }
+    }
+    extern "system" fn latency_sleep_nv(
+        device: vk::Device,
+        swapchain: vk::SwapchainKHR,
+        p_sleep_info: *const vk::LatencySleepInfoNV,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkLatencySleepNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_low_latency2;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .latency_sleep_nv(swapchain, unsafe { p_sleep_info.as_ref() }.unwrap());
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.latency_sleep_nv)(device, swapchain, p_sleep_info)
+            },
+        }
+    }
+    extern "system" fn set_latency_marker_nv(
+        device: vk::Device,
+        swapchain: vk::SwapchainKHR,
+        p_latency_marker_info: *const vk::SetLatencyMarkerInfoNV,
+    ) {
+        let global = Self::instance();
+        // vkSetLatencyMarkerNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_low_latency2;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .set_latency_marker_nv(
+                swapchain,
+                unsafe { p_latency_marker_info.as_ref() }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.set_latency_marker_nv)(device, swapchain, p_latency_marker_info)
+            },
+        }
+    }
+    extern "system" fn get_latency_timings_nv(
+        device: vk::Device,
+        swapchain: vk::SwapchainKHR,
+        p_latency_marker_info: *mut vk::GetLatencyMarkerInfoNV,
+    ) {
+        let global = Self::instance();
+        // vkGetLatencyTimingsNV
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_low_latency2;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_latency_timings_nv(
+                swapchain,
+                unsafe { ptr_as_uninit_mut(p_latency_marker_info) }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_latency_timings_nv)(device, swapchain, p_latency_marker_info)
+            },
+        }
+    }
+    extern "system" fn queue_notify_out_of_band_nv(
+        queue: vk::Queue,
+        p_queue_type_info: *const vk::OutOfBandQueueTypeInfoNV,
+    ) {
+        let global = Self::instance();
+        // vkQueueNotifyOutOfBandNV
+        let device_info = global.get_device_info(queue).unwrap();
+        let dispatch_table = &device_info.dispatch_table.nv_low_latency2;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .queue_notify_out_of_band_nv(queue, unsafe { p_queue_type_info.as_ref() }.unwrap());
+        match layer_result {
+            LayerResult::Handled(res) => res,
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.queue_notify_out_of_band_nv)(queue, p_queue_type_info)
+            },
+        }
+    }
+    extern "system" fn get_screen_buffer_properties_qnx(
+        device: vk::Device,
+        buffer: *const vk::_screen_buffer,
+        p_properties: *mut vk::ScreenBufferPropertiesQNX,
+    ) -> vk::Result {
+        let global = Self::instance();
+        // vkGetScreenBufferPropertiesQNX
+        let device_info = global.get_device_info(device).unwrap();
+        let dispatch_table = &device_info.dispatch_table.qnx_external_memory_screen_buffer;
+        let layer_result = device_info
+            .customized_info
+            .borrow()
+            .hooks()
+            .get_screen_buffer_properties_qnx(
+                buffer,
+                unsafe { ptr_as_uninit_mut(p_properties) }.unwrap(),
+            );
+        match layer_result {
+            LayerResult::Handled(res) => match res {
+                Ok(()) => vk::Result::SUCCESS,
+                Err(e) => e,
+            },
+            LayerResult::Unhandled => unsafe {
+                (dispatch_table.get_screen_buffer_properties_qnx)(device, buffer, p_properties)
             },
         }
     }

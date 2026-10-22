@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): generated for ash 0.38 and Vulkan 1.3.281 (UPSTREAM.md).
 
 #![allow(missing_docs)]
 // This file is generated from the Vulkan XML API registry.
@@ -101,6 +103,9 @@ pub enum VulkanCommand {
     GetDisplayModeProperties2Khr,
     GetDisplayPlaneCapabilities2Khr,
     GetPhysicalDeviceFragmentShadingRatesKhr,
+    GetPhysicalDeviceVideoEncodeQualityLevelPropertiesKhr,
+    GetPhysicalDeviceCooperativeMatrixPropertiesKhr,
+    GetPhysicalDeviceCalibrateableTimeDomainsKhr,
     CreateDebugReportCallbackExt,
     DestroyDebugReportCallbackExt,
     DebugReportMessageExt,
@@ -117,7 +122,6 @@ pub enum VulkanCommand {
     DestroyDebugUtilsMessengerExt,
     SubmitDebugUtilsMessageExt,
     GetPhysicalDeviceMultisamplePropertiesExt,
-    GetPhysicalDeviceCalibrateableTimeDomainsExt,
     CreateImagePipeSurfaceFuchsia,
     CreateMetalSurfaceExt,
     GetPhysicalDeviceCooperativeMatrixPropertiesNv,
@@ -356,6 +360,8 @@ pub enum VulkanCommand {
     AcquireProfilingLockKhr,
     ReleaseProfilingLockKhr,
     CmdSetFragmentShadingRateKhr,
+    CmdSetRenderingAttachmentLocationsKhr,
+    CmdSetRenderingInputAttachmentIndicesKhr,
     WaitForPresentKhr,
     CreateDeferredOperationKhr,
     DestroyDeferredOperationKhr,
@@ -365,10 +371,23 @@ pub enum VulkanCommand {
     GetPipelineExecutablePropertiesKhr,
     GetPipelineExecutableStatisticsKhr,
     GetPipelineExecutableInternalRepresentationsKhr,
+    GetEncodedVideoSessionParametersKhr,
     CmdEncodeVideoKhr,
     CmdWriteBufferMarker2Amd,
     GetQueueCheckpointData2Nv,
     CmdTraceRaysIndirect2Khr,
+    CmdBindIndexBuffer2Khr,
+    GetRenderingAreaGranularityKhr,
+    GetDeviceImageSubresourceLayoutKhr,
+    GetImageSubresourceLayout2Khr,
+    CmdSetLineStippleKhr,
+    GetCalibratedTimestampsKhr,
+    CmdBindDescriptorSets2Khr,
+    CmdPushConstants2Khr,
+    CmdPushDescriptorSet2Khr,
+    CmdPushDescriptorSetWithTemplate2Khr,
+    CmdSetDescriptorBufferOffsets2Ext,
+    CmdBindDescriptorBufferEmbeddedSamplers2Ext,
     GetSwapchainGrallocUsageAndroid,
     AcquireImageAndroid,
     QueueSignalReleaseImageAndroid,
@@ -414,6 +433,13 @@ pub enum VulkanCommand {
     CmdInsertDebugUtilsLabelExt,
     GetAndroidHardwareBufferPropertiesAndroid,
     GetMemoryAndroidHardwareBufferAndroid,
+    CreateExecutionGraphPipelinesAmdx,
+    GetExecutionGraphPipelineScratchSizeAmdx,
+    GetExecutionGraphPipelineNodeIndexAmdx,
+    CmdInitializeGraphScratchMemoryAmdx,
+    CmdDispatchGraphAmdx,
+    CmdDispatchGraphIndirectAmdx,
+    CmdDispatchGraphIndirectCountAmdx,
     CmdSetSampleLocationsExt,
     GetImageDrmFormatModifierPropertiesExt,
     CreateValidationCacheExt,
@@ -437,7 +463,6 @@ pub enum VulkanCommand {
     CompileDeferredNv,
     GetMemoryHostPointerPropertiesExt,
     CmdWriteBufferMarkerAmd,
-    GetCalibratedTimestampsExt,
     CmdDrawMeshTasksNv,
     CmdDrawMeshTasksIndirectNv,
     CmdDrawMeshTasksIndirectCountNv,
@@ -457,7 +482,10 @@ pub enum VulkanCommand {
     AcquireFullScreenExclusiveModeExt,
     ReleaseFullScreenExclusiveModeExt,
     GetDeviceGroupSurfacePresentModes2Ext,
-    CmdSetLineStippleExt,
+    CopyMemoryToImageExt,
+    CopyImageToMemoryExt,
+    CopyImageToImageExt,
+    TransitionImageLayoutExt,
     ReleaseSwapchainImagesExt,
     GetGeneratedCommandsMemoryRequirementsNv,
     CmdPreprocessGeneratedCommandsNv,
@@ -465,6 +493,13 @@ pub enum VulkanCommand {
     CmdBindPipelineShaderGroupNv,
     CreateIndirectCommandsLayoutNv,
     DestroyIndirectCommandsLayoutNv,
+    CmdSetDepthBias2Ext,
+    CreateCudaModuleNv,
+    GetCudaModuleCacheNv,
+    CreateCudaFunctionNv,
+    DestroyCudaModuleNv,
+    DestroyCudaFunctionNv,
+    CmdCudaLaunchKernelNv,
     ExportMetalObjectsExt,
     GetDescriptorSetLayoutSizeExt,
     GetDescriptorSetLayoutBindingOffsetExt,
@@ -478,7 +513,6 @@ pub enum VulkanCommand {
     GetSamplerOpaqueCaptureDescriptorDataExt,
     GetAccelerationStructureOpaqueCaptureDescriptorDataExt,
     CmdSetFragmentShadingRateEnumNv,
-    GetImageSubresourceLayout2Ext,
     CmdSetVertexInputExt,
     GetMemoryZirconHandleFuchsia,
     GetMemoryZirconHandlePropertiesFuchsia,
@@ -520,7 +554,9 @@ pub enum VulkanCommand {
     CmdCopyMemoryToImageIndirectNv,
     CmdDecompressMemoryNv,
     CmdDecompressMemoryIndirectCountNv,
-    CmdSetTessellationDomainOriginExt,
+    GetPipelineIndirectMemoryRequirementsNv,
+    CmdUpdatePipelineIndirectBufferNv,
+    GetPipelineIndirectDeviceAddressNv,
     CmdSetDepthClampEnableExt,
     CmdSetPolygonModeExt,
     CmdSetRasterizationSamplesExt,
@@ -531,6 +567,7 @@ pub enum VulkanCommand {
     CmdSetColorBlendEnableExt,
     CmdSetColorBlendEquationExt,
     CmdSetColorWriteMaskExt,
+    CmdSetTessellationDomainOriginExt,
     CmdSetRasterizationStreamExt,
     CmdSetConservativeRasterizationModeExt,
     CmdSetExtraPrimitiveOverestimationSizeExt,
@@ -559,6 +596,12 @@ pub enum VulkanCommand {
     CmdOpticalFlowExecuteNv,
     GetFramebufferTilePropertiesQcom,
     GetDynamicRenderingTilePropertiesQcom,
+    SetLatencySleepModeNv,
+    LatencySleepNv,
+    SetLatencyMarkerNv,
+    GetLatencyTimingsNv,
+    QueueNotifyOutOfBandNv,
+    GetScreenBufferPropertiesQnx,
     CreateAccelerationStructureKhr,
     DestroyAccelerationStructureKhr,
     CopyAccelerationStructureKhr,
@@ -714,6 +757,15 @@ impl TryFrom<&str> for VulkanCommand {
             "vkGetPhysicalDeviceFragmentShadingRatesKHR" => {
                 Ok(VulkanCommand::GetPhysicalDeviceFragmentShadingRatesKhr)
             }
+            "vkGetPhysicalDeviceVideoEncodeQualityLevelPropertiesKHR" => {
+                Ok(VulkanCommand::GetPhysicalDeviceVideoEncodeQualityLevelPropertiesKhr)
+            }
+            "vkGetPhysicalDeviceCooperativeMatrixPropertiesKHR" => {
+                Ok(VulkanCommand::GetPhysicalDeviceCooperativeMatrixPropertiesKhr)
+            }
+            "vkGetPhysicalDeviceCalibrateableTimeDomainsKHR" => {
+                Ok(VulkanCommand::GetPhysicalDeviceCalibrateableTimeDomainsKhr)
+            }
             "vkCreateDebugReportCallbackEXT" => Ok(VulkanCommand::CreateDebugReportCallbackExt),
             "vkDestroyDebugReportCallbackEXT" => Ok(VulkanCommand::DestroyDebugReportCallbackExt),
             "vkDebugReportMessageEXT" => Ok(VulkanCommand::DebugReportMessageExt),
@@ -737,9 +789,6 @@ impl TryFrom<&str> for VulkanCommand {
             "vkSubmitDebugUtilsMessageEXT" => Ok(VulkanCommand::SubmitDebugUtilsMessageExt),
             "vkGetPhysicalDeviceMultisamplePropertiesEXT" => {
                 Ok(VulkanCommand::GetPhysicalDeviceMultisamplePropertiesExt)
-            }
-            "vkGetPhysicalDeviceCalibrateableTimeDomainsEXT" => {
-                Ok(VulkanCommand::GetPhysicalDeviceCalibrateableTimeDomainsExt)
             }
             "vkCreateImagePipeSurfaceFUCHSIA" => Ok(VulkanCommand::CreateImagePipeSurfaceFuchsia),
             "vkCreateMetalSurfaceEXT" => Ok(VulkanCommand::CreateMetalSurfaceExt),
@@ -1025,6 +1074,12 @@ impl TryFrom<&str> for VulkanCommand {
             "vkAcquireProfilingLockKHR" => Ok(VulkanCommand::AcquireProfilingLockKhr),
             "vkReleaseProfilingLockKHR" => Ok(VulkanCommand::ReleaseProfilingLockKhr),
             "vkCmdSetFragmentShadingRateKHR" => Ok(VulkanCommand::CmdSetFragmentShadingRateKhr),
+            "vkCmdSetRenderingAttachmentLocationsKHR" => {
+                Ok(VulkanCommand::CmdSetRenderingAttachmentLocationsKhr)
+            }
+            "vkCmdSetRenderingInputAttachmentIndicesKHR" => {
+                Ok(VulkanCommand::CmdSetRenderingInputAttachmentIndicesKhr)
+            }
             "vkWaitForPresentKHR" => Ok(VulkanCommand::WaitForPresentKhr),
             "vkCreateDeferredOperationKHR" => Ok(VulkanCommand::CreateDeferredOperationKhr),
             "vkDestroyDeferredOperationKHR" => Ok(VulkanCommand::DestroyDeferredOperationKhr),
@@ -1042,10 +1097,33 @@ impl TryFrom<&str> for VulkanCommand {
             "vkGetPipelineExecutableInternalRepresentationsKHR" => {
                 Ok(VulkanCommand::GetPipelineExecutableInternalRepresentationsKhr)
             }
+            "vkGetEncodedVideoSessionParametersKHR" => {
+                Ok(VulkanCommand::GetEncodedVideoSessionParametersKhr)
+            }
             "vkCmdEncodeVideoKHR" => Ok(VulkanCommand::CmdEncodeVideoKhr),
             "vkCmdWriteBufferMarker2AMD" => Ok(VulkanCommand::CmdWriteBufferMarker2Amd),
             "vkGetQueueCheckpointData2NV" => Ok(VulkanCommand::GetQueueCheckpointData2Nv),
             "vkCmdTraceRaysIndirect2KHR" => Ok(VulkanCommand::CmdTraceRaysIndirect2Khr),
+            "vkCmdBindIndexBuffer2KHR" => Ok(VulkanCommand::CmdBindIndexBuffer2Khr),
+            "vkGetRenderingAreaGranularityKHR" => Ok(VulkanCommand::GetRenderingAreaGranularityKhr),
+            "vkGetDeviceImageSubresourceLayoutKHR" => {
+                Ok(VulkanCommand::GetDeviceImageSubresourceLayoutKhr)
+            }
+            "vkGetImageSubresourceLayout2KHR" => Ok(VulkanCommand::GetImageSubresourceLayout2Khr),
+            "vkCmdSetLineStippleKHR" => Ok(VulkanCommand::CmdSetLineStippleKhr),
+            "vkGetCalibratedTimestampsKHR" => Ok(VulkanCommand::GetCalibratedTimestampsKhr),
+            "vkCmdBindDescriptorSets2KHR" => Ok(VulkanCommand::CmdBindDescriptorSets2Khr),
+            "vkCmdPushConstants2KHR" => Ok(VulkanCommand::CmdPushConstants2Khr),
+            "vkCmdPushDescriptorSet2KHR" => Ok(VulkanCommand::CmdPushDescriptorSet2Khr),
+            "vkCmdPushDescriptorSetWithTemplate2KHR" => {
+                Ok(VulkanCommand::CmdPushDescriptorSetWithTemplate2Khr)
+            }
+            "vkCmdSetDescriptorBufferOffsets2EXT" => {
+                Ok(VulkanCommand::CmdSetDescriptorBufferOffsets2Ext)
+            }
+            "vkCmdBindDescriptorBufferEmbeddedSamplers2EXT" => {
+                Ok(VulkanCommand::CmdBindDescriptorBufferEmbeddedSamplers2Ext)
+            }
             "vkGetSwapchainGrallocUsageANDROID" => {
                 Ok(VulkanCommand::GetSwapchainGrallocUsageAndroid)
             }
@@ -1105,6 +1183,23 @@ impl TryFrom<&str> for VulkanCommand {
             "vkGetMemoryAndroidHardwareBufferANDROID" => {
                 Ok(VulkanCommand::GetMemoryAndroidHardwareBufferAndroid)
             }
+            "vkCreateExecutionGraphPipelinesAMDX" => {
+                Ok(VulkanCommand::CreateExecutionGraphPipelinesAmdx)
+            }
+            "vkGetExecutionGraphPipelineScratchSizeAMDX" => {
+                Ok(VulkanCommand::GetExecutionGraphPipelineScratchSizeAmdx)
+            }
+            "vkGetExecutionGraphPipelineNodeIndexAMDX" => {
+                Ok(VulkanCommand::GetExecutionGraphPipelineNodeIndexAmdx)
+            }
+            "vkCmdInitializeGraphScratchMemoryAMDX" => {
+                Ok(VulkanCommand::CmdInitializeGraphScratchMemoryAmdx)
+            }
+            "vkCmdDispatchGraphAMDX" => Ok(VulkanCommand::CmdDispatchGraphAmdx),
+            "vkCmdDispatchGraphIndirectAMDX" => Ok(VulkanCommand::CmdDispatchGraphIndirectAmdx),
+            "vkCmdDispatchGraphIndirectCountAMDX" => {
+                Ok(VulkanCommand::CmdDispatchGraphIndirectCountAmdx)
+            }
             "vkCmdSetSampleLocationsEXT" => Ok(VulkanCommand::CmdSetSampleLocationsExt),
             "vkGetImageDrmFormatModifierPropertiesEXT" => {
                 Ok(VulkanCommand::GetImageDrmFormatModifierPropertiesExt)
@@ -1146,7 +1241,6 @@ impl TryFrom<&str> for VulkanCommand {
                 Ok(VulkanCommand::GetMemoryHostPointerPropertiesExt)
             }
             "vkCmdWriteBufferMarkerAMD" => Ok(VulkanCommand::CmdWriteBufferMarkerAmd),
-            "vkGetCalibratedTimestampsEXT" => Ok(VulkanCommand::GetCalibratedTimestampsExt),
             "vkCmdDrawMeshTasksNV" => Ok(VulkanCommand::CmdDrawMeshTasksNv),
             "vkCmdDrawMeshTasksIndirectNV" => Ok(VulkanCommand::CmdDrawMeshTasksIndirectNv),
             "vkCmdDrawMeshTasksIndirectCountNV" => {
@@ -1184,7 +1278,10 @@ impl TryFrom<&str> for VulkanCommand {
             "vkGetDeviceGroupSurfacePresentModes2EXT" => {
                 Ok(VulkanCommand::GetDeviceGroupSurfacePresentModes2Ext)
             }
-            "vkCmdSetLineStippleEXT" => Ok(VulkanCommand::CmdSetLineStippleExt),
+            "vkCopyMemoryToImageEXT" => Ok(VulkanCommand::CopyMemoryToImageExt),
+            "vkCopyImageToMemoryEXT" => Ok(VulkanCommand::CopyImageToMemoryExt),
+            "vkCopyImageToImageEXT" => Ok(VulkanCommand::CopyImageToImageExt),
+            "vkTransitionImageLayoutEXT" => Ok(VulkanCommand::TransitionImageLayoutExt),
             "vkReleaseSwapchainImagesEXT" => Ok(VulkanCommand::ReleaseSwapchainImagesExt),
             "vkGetGeneratedCommandsMemoryRequirementsNV" => {
                 Ok(VulkanCommand::GetGeneratedCommandsMemoryRequirementsNv)
@@ -1198,6 +1295,13 @@ impl TryFrom<&str> for VulkanCommand {
             "vkDestroyIndirectCommandsLayoutNV" => {
                 Ok(VulkanCommand::DestroyIndirectCommandsLayoutNv)
             }
+            "vkCmdSetDepthBias2EXT" => Ok(VulkanCommand::CmdSetDepthBias2Ext),
+            "vkCreateCudaModuleNV" => Ok(VulkanCommand::CreateCudaModuleNv),
+            "vkGetCudaModuleCacheNV" => Ok(VulkanCommand::GetCudaModuleCacheNv),
+            "vkCreateCudaFunctionNV" => Ok(VulkanCommand::CreateCudaFunctionNv),
+            "vkDestroyCudaModuleNV" => Ok(VulkanCommand::DestroyCudaModuleNv),
+            "vkDestroyCudaFunctionNV" => Ok(VulkanCommand::DestroyCudaFunctionNv),
+            "vkCmdCudaLaunchKernelNV" => Ok(VulkanCommand::CmdCudaLaunchKernelNv),
             "vkExportMetalObjectsEXT" => Ok(VulkanCommand::ExportMetalObjectsExt),
             "vkGetDescriptorSetLayoutSizeEXT" => Ok(VulkanCommand::GetDescriptorSetLayoutSizeExt),
             "vkGetDescriptorSetLayoutBindingOffsetEXT" => {
@@ -1229,7 +1333,6 @@ impl TryFrom<&str> for VulkanCommand {
             "vkCmdSetFragmentShadingRateEnumNV" => {
                 Ok(VulkanCommand::CmdSetFragmentShadingRateEnumNv)
             }
-            "vkGetImageSubresourceLayout2EXT" => Ok(VulkanCommand::GetImageSubresourceLayout2Ext),
             "vkCmdSetVertexInputEXT" => Ok(VulkanCommand::CmdSetVertexInputExt),
             "vkGetMemoryZirconHandleFUCHSIA" => Ok(VulkanCommand::GetMemoryZirconHandleFuchsia),
             "vkGetMemoryZirconHandlePropertiesFUCHSIA" => {
@@ -1293,8 +1396,14 @@ impl TryFrom<&str> for VulkanCommand {
             "vkCmdDecompressMemoryIndirectCountNV" => {
                 Ok(VulkanCommand::CmdDecompressMemoryIndirectCountNv)
             }
-            "vkCmdSetTessellationDomainOriginEXT" => {
-                Ok(VulkanCommand::CmdSetTessellationDomainOriginExt)
+            "vkGetPipelineIndirectMemoryRequirementsNV" => {
+                Ok(VulkanCommand::GetPipelineIndirectMemoryRequirementsNv)
+            }
+            "vkCmdUpdatePipelineIndirectBufferNV" => {
+                Ok(VulkanCommand::CmdUpdatePipelineIndirectBufferNv)
+            }
+            "vkGetPipelineIndirectDeviceAddressNV" => {
+                Ok(VulkanCommand::GetPipelineIndirectDeviceAddressNv)
             }
             "vkCmdSetDepthClampEnableEXT" => Ok(VulkanCommand::CmdSetDepthClampEnableExt),
             "vkCmdSetPolygonModeEXT" => Ok(VulkanCommand::CmdSetPolygonModeExt),
@@ -1306,6 +1415,9 @@ impl TryFrom<&str> for VulkanCommand {
             "vkCmdSetColorBlendEnableEXT" => Ok(VulkanCommand::CmdSetColorBlendEnableExt),
             "vkCmdSetColorBlendEquationEXT" => Ok(VulkanCommand::CmdSetColorBlendEquationExt),
             "vkCmdSetColorWriteMaskEXT" => Ok(VulkanCommand::CmdSetColorWriteMaskExt),
+            "vkCmdSetTessellationDomainOriginEXT" => {
+                Ok(VulkanCommand::CmdSetTessellationDomainOriginExt)
+            }
             "vkCmdSetRasterizationStreamEXT" => Ok(VulkanCommand::CmdSetRasterizationStreamExt),
             "vkCmdSetConservativeRasterizationModeEXT" => {
                 Ok(VulkanCommand::CmdSetConservativeRasterizationModeExt)
@@ -1354,6 +1466,12 @@ impl TryFrom<&str> for VulkanCommand {
             "vkGetDynamicRenderingTilePropertiesQCOM" => {
                 Ok(VulkanCommand::GetDynamicRenderingTilePropertiesQcom)
             }
+            "vkSetLatencySleepModeNV" => Ok(VulkanCommand::SetLatencySleepModeNv),
+            "vkLatencySleepNV" => Ok(VulkanCommand::LatencySleepNv),
+            "vkSetLatencyMarkerNV" => Ok(VulkanCommand::SetLatencyMarkerNv),
+            "vkGetLatencyTimingsNV" => Ok(VulkanCommand::GetLatencyTimingsNv),
+            "vkQueueNotifyOutOfBandNV" => Ok(VulkanCommand::QueueNotifyOutOfBandNv),
+            "vkGetScreenBufferPropertiesQNX" => Ok(VulkanCommand::GetScreenBufferPropertiesQnx),
             "vkCreateAccelerationStructureKHR" => Ok(VulkanCommand::CreateAccelerationStructureKhr),
             "vkDestroyAccelerationStructureKHR" => {
                 Ok(VulkanCommand::DestroyAccelerationStructureKhr)
@@ -3053,6 +3171,20 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
+    fn cmd_set_rendering_attachment_locations_khr(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_location_info: &vk::RenderingAttachmentLocationInfoKHR,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_set_rendering_input_attachment_indices_khr(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_location_info: &vk::RenderingInputAttachmentIndexInfoKHR,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
     fn wait_for_present_khr(
         &self,
         _swapchain: vk::SwapchainKHR,
@@ -3118,6 +3250,15 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<VkResult<()>> {
         LayerResult::Unhandled
     }
+    fn get_encoded_video_session_parameters_khr(
+        &self,
+        _p_video_session_parameters_info: &vk::VideoEncodeSessionParametersGetInfoKHR,
+        _p_feedback_info: Option<&mut MaybeUninit<vk::VideoEncodeSessionParametersFeedbackInfoKHR>>,
+        _p_data_size: &mut MaybeUninit<usize>,
+        _p_data: Option<&mut [MaybeUninit<u8>]>,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
     fn cmd_encode_video_khr(
         &self,
         _command_buffer: vk::CommandBuffer,
@@ -3147,6 +3288,95 @@ pub trait DeviceHooks: Send + Sync {
         &self,
         _command_buffer: vk::CommandBuffer,
         _indirect_device_address: vk::DeviceAddress,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_bind_index_buffer2_khr(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _buffer: vk::Buffer,
+        _offset: vk::DeviceSize,
+        _size: vk::DeviceSize,
+        _index_type: vk::IndexType,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn get_rendering_area_granularity_khr(
+        &self,
+        _p_rendering_area_info: &vk::RenderingAreaInfoKHR,
+        _p_granularity: &mut MaybeUninit<vk::Extent2D>,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn get_device_image_subresource_layout_khr(
+        &self,
+        _p_info: &vk::DeviceImageSubresourceInfoKHR,
+        _p_layout: &mut MaybeUninit<vk::SubresourceLayout2KHR>,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn get_image_subresource_layout2_khr(
+        &self,
+        _image: vk::Image,
+        _p_subresource: &vk::ImageSubresource2KHR,
+        _p_layout: &mut MaybeUninit<vk::SubresourceLayout2KHR>,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_set_line_stipple_khr(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _line_stipple_factor: u32,
+        _line_stipple_pattern: u16,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn get_calibrated_timestamps_khr(
+        &self,
+        _p_timestamp_infos: &[vk::CalibratedTimestampInfoKHR],
+        _p_timestamps: &mut [MaybeUninit<u64>],
+    ) -> LayerResult<VkResult<u64>> {
+        LayerResult::Unhandled
+    }
+    fn cmd_bind_descriptor_sets2_khr(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_bind_descriptor_sets_info: &vk::BindDescriptorSetsInfoKHR,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_push_constants2_khr(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_push_constants_info: &vk::PushConstantsInfoKHR,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_push_descriptor_set2_khr(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_push_descriptor_set_info: &vk::PushDescriptorSetInfoKHR,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_push_descriptor_set_with_template2_khr(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_push_descriptor_set_with_template_info: &vk::PushDescriptorSetWithTemplateInfoKHR,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_set_descriptor_buffer_offsets2_ext(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_set_descriptor_buffer_offsets_info: &vk::SetDescriptorBufferOffsetsInfoEXT,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_bind_descriptor_buffer_embedded_samplers2_ext(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_bind_descriptor_buffer_embedded_samplers_info: &vk::BindDescriptorBufferEmbeddedSamplersInfoEXT,
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
@@ -3472,6 +3702,59 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<VkResult<*mut vk::AHardwareBuffer>> {
         LayerResult::Unhandled
     }
+    fn create_execution_graph_pipelines_amdx(
+        &self,
+        _pipeline_cache: vk::PipelineCache,
+        _p_create_infos: &[vk::ExecutionGraphPipelineCreateInfoAMDX],
+        _p_allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<VkResult<Vec<vk::Pipeline>>> {
+        LayerResult::Unhandled
+    }
+    fn get_execution_graph_pipeline_scratch_size_amdx(
+        &self,
+        _execution_graph: vk::Pipeline,
+        _p_size_info: &mut MaybeUninit<vk::ExecutionGraphPipelineScratchSizeAMDX>,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn get_execution_graph_pipeline_node_index_amdx(
+        &self,
+        _execution_graph: vk::Pipeline,
+        _p_node_info: &vk::PipelineShaderStageNodeCreateInfoAMDX,
+    ) -> LayerResult<VkResult<u32>> {
+        LayerResult::Unhandled
+    }
+    fn cmd_initialize_graph_scratch_memory_amdx(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _scratch: vk::DeviceAddress,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_dispatch_graph_amdx(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _scratch: vk::DeviceAddress,
+        _p_count_info: &vk::DispatchGraphCountInfoAMDX,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_dispatch_graph_indirect_amdx(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _scratch: vk::DeviceAddress,
+        _p_count_info: &vk::DispatchGraphCountInfoAMDX,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_dispatch_graph_indirect_count_amdx(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _scratch: vk::DeviceAddress,
+        _count_info: vk::DeviceAddress,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
     fn cmd_set_sample_locations_ext(
         &self,
         _command_buffer: vk::CommandBuffer,
@@ -3668,13 +3951,6 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
-    fn get_calibrated_timestamps_ext(
-        &self,
-        _p_timestamp_infos: &[vk::CalibratedTimestampInfoEXT],
-        _p_timestamps: &mut [MaybeUninit<u64>],
-    ) -> LayerResult<VkResult<u64>> {
-        LayerResult::Unhandled
-    }
     fn cmd_draw_mesh_tasks_nv(
         &self,
         _command_buffer: vk::CommandBuffer,
@@ -3809,12 +4085,28 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<VkResult<vk::DeviceGroupPresentModeFlagsKHR>> {
         LayerResult::Unhandled
     }
-    fn cmd_set_line_stipple_ext(
+    fn copy_memory_to_image_ext(
         &self,
-        _command_buffer: vk::CommandBuffer,
-        _line_stipple_factor: u32,
-        _line_stipple_pattern: u16,
-    ) -> LayerResult<()> {
+        _p_copy_memory_to_image_info: &vk::CopyMemoryToImageInfoEXT,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn copy_image_to_memory_ext(
+        &self,
+        _p_copy_image_to_memory_info: &vk::CopyImageToMemoryInfoEXT,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn copy_image_to_image_ext(
+        &self,
+        _p_copy_image_to_image_info: &vk::CopyImageToImageInfoEXT,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn transition_image_layout_ext(
+        &self,
+        _p_transitions: &[vk::HostImageLayoutTransitionInfoEXT],
+    ) -> LayerResult<VkResult<()>> {
         LayerResult::Unhandled
     }
     fn release_swapchain_images_ext(
@@ -3865,6 +4157,56 @@ pub trait DeviceHooks: Send + Sync {
         &self,
         _indirect_commands_layout: vk::IndirectCommandsLayoutNV,
         _p_allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_set_depth_bias2_ext(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_depth_bias_info: &vk::DepthBiasInfoEXT,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn create_cuda_module_nv(
+        &self,
+        _p_create_info: &vk::CudaModuleCreateInfoNV,
+        _p_allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<VkResult<vk::CudaModuleNV>> {
+        LayerResult::Unhandled
+    }
+    fn get_cuda_module_cache_nv(
+        &self,
+        _module: vk::CudaModuleNV,
+        _p_cache_size: &mut MaybeUninit<usize>,
+        _p_cache_data: Option<&mut [MaybeUninit<u8>]>,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn create_cuda_function_nv(
+        &self,
+        _p_create_info: &vk::CudaFunctionCreateInfoNV,
+        _p_allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<VkResult<vk::CudaFunctionNV>> {
+        LayerResult::Unhandled
+    }
+    fn destroy_cuda_module_nv(
+        &self,
+        _module: vk::CudaModuleNV,
+        _p_allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn destroy_cuda_function_nv(
+        &self,
+        _function: vk::CudaFunctionNV,
+        _p_allocator: Option<&vk::AllocationCallbacks>,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_cuda_launch_kernel_nv(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _p_launch_info: &vk::CudaLaunchInfoNV,
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
@@ -3961,14 +4303,6 @@ pub trait DeviceHooks: Send + Sync {
         _command_buffer: vk::CommandBuffer,
         _shading_rate: vk::FragmentShadingRateNV,
         _combiner_ops: &[vk::FragmentShadingRateCombinerOpKHR; 2],
-    ) -> LayerResult<()> {
-        LayerResult::Unhandled
-    }
-    fn get_image_subresource_layout2_ext(
-        &self,
-        _image: vk::Image,
-        _p_subresource: &vk::ImageSubresource2EXT,
-        _p_layout: &mut MaybeUninit<vk::SubresourceLayout2EXT>,
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
@@ -4275,11 +4609,25 @@ pub trait DeviceHooks: Send + Sync {
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
-    fn cmd_set_tessellation_domain_origin_ext(
+    fn get_pipeline_indirect_memory_requirements_nv(
+        &self,
+        _p_create_info: &vk::ComputePipelineCreateInfo,
+        _p_memory_requirements: &mut MaybeUninit<vk::MemoryRequirements2>,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_update_pipeline_indirect_buffer_nv(
         &self,
         _command_buffer: vk::CommandBuffer,
-        _domain_origin: vk::TessellationDomainOrigin,
+        _pipeline_bind_point: vk::PipelineBindPoint,
+        _pipeline: vk::Pipeline,
     ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn get_pipeline_indirect_device_address_nv(
+        &self,
+        _p_info: &vk::PipelineIndirectDeviceAddressInfoNV,
+    ) -> LayerResult<vk::DeviceAddress> {
         LayerResult::Unhandled
     }
     fn cmd_set_depth_clamp_enable_ext(
@@ -4353,6 +4701,13 @@ pub trait DeviceHooks: Send + Sync {
         _command_buffer: vk::CommandBuffer,
         _first_attachment: u32,
         _p_color_write_masks: &[vk::ColorComponentFlags],
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn cmd_set_tessellation_domain_origin_ext(
+        &self,
+        _command_buffer: vk::CommandBuffer,
+        _domain_origin: vk::TessellationDomainOrigin,
     ) -> LayerResult<()> {
         LayerResult::Unhandled
     }
@@ -4555,6 +4910,48 @@ pub trait DeviceHooks: Send + Sync {
         &self,
         _p_rendering_info: &vk::RenderingInfo,
         _p_properties: &mut MaybeUninit<vk::TilePropertiesQCOM>,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn set_latency_sleep_mode_nv(
+        &self,
+        _swapchain: vk::SwapchainKHR,
+        _p_sleep_mode_info: &vk::LatencySleepModeInfoNV,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn latency_sleep_nv(
+        &self,
+        _swapchain: vk::SwapchainKHR,
+        _p_sleep_info: &vk::LatencySleepInfoNV,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn set_latency_marker_nv(
+        &self,
+        _swapchain: vk::SwapchainKHR,
+        _p_latency_marker_info: &vk::SetLatencyMarkerInfoNV,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn get_latency_timings_nv(
+        &self,
+        _swapchain: vk::SwapchainKHR,
+        _p_latency_marker_info: &mut MaybeUninit<vk::GetLatencyMarkerInfoNV>,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn queue_notify_out_of_band_nv(
+        &self,
+        _queue: vk::Queue,
+        _p_queue_type_info: &vk::OutOfBandQueueTypeInfoNV,
+    ) -> LayerResult<()> {
+        LayerResult::Unhandled
+    }
+    fn get_screen_buffer_properties_qnx(
+        &self,
+        _buffer: *const vk::_screen_buffer,
+        _p_properties: &mut MaybeUninit<vk::ScreenBufferPropertiesQNX>,
     ) -> LayerResult<VkResult<()>> {
         LayerResult::Unhandled
     }
@@ -5173,6 +5570,28 @@ pub trait InstanceHooks: Send + Sync {
     ) -> LayerResult<VkResult<()>> {
         LayerResult::Unhandled
     }
+    fn get_physical_device_video_encode_quality_level_properties_khr(
+        &self,
+        _physical_device: vk::PhysicalDevice,
+        _p_quality_level_info: &vk::PhysicalDeviceVideoEncodeQualityLevelInfoKHR,
+        _p_quality_level_properties: &mut MaybeUninit<vk::VideoEncodeQualityLevelPropertiesKHR>,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn get_physical_device_cooperative_matrix_properties_khr(
+        &self,
+        _physical_device: vk::PhysicalDevice,
+        _p_property_count: &mut MaybeUninit<u32>,
+        _p_properties: Option<&mut [MaybeUninit<vk::CooperativeMatrixPropertiesKHR>]>,
+    ) -> LayerResult<VkResult<()>> {
+        LayerResult::Unhandled
+    }
+    fn get_physical_device_calibrateable_time_domains_khr(
+        &self,
+        _physical_device: vk::PhysicalDevice,
+    ) -> LayerResult<VkResult<Vec<vk::TimeDomainKHR>>> {
+        LayerResult::Unhandled
+    }
     fn create_debug_report_callback_ext(
         &self,
         _p_create_info: &vk::DebugReportCallbackCreateInfoEXT,
@@ -5299,12 +5718,6 @@ pub trait InstanceHooks: Send + Sync {
         _samples: vk::SampleCountFlags,
         _p_multisample_properties: &mut MaybeUninit<vk::MultisamplePropertiesEXT>,
     ) -> LayerResult<()> {
-        LayerResult::Unhandled
-    }
-    fn get_physical_device_calibrateable_time_domains_ext(
-        &self,
-        _physical_device: vk::PhysicalDevice,
-    ) -> LayerResult<VkResult<Vec<vk::TimeDomainEXT>>> {
         LayerResult::Unhandled
     }
     fn create_image_pipe_surface_fuchsia(

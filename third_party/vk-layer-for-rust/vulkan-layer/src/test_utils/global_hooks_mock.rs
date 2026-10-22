@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 use mockall::mock;
 
@@ -20,11 +22,11 @@ use ash::{prelude::VkResult, vk};
 mock! {
     pub GlobalHooks {}
     impl GlobalHooks for GlobalHooks {
-        fn create_instance<'a>(
+        fn create_instance<'a, 'b, 'c, 'd>(
             &self,
-            _p_create_info: &vk::InstanceCreateInfo,
+            _p_create_info: &'c vk::InstanceCreateInfo<'d>,
             _layer_instance_link: &VkLayerInstanceLink,
-            _p_allocator: Option<&'a vk::AllocationCallbacks>,
+            _p_allocator: Option<&'a vk::AllocationCallbacks<'b>>,
             _p_instance: *mut vk::Instance,
         ) -> LayerResult<VkResult<()>>;
     }

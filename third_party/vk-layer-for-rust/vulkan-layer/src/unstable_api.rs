@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 //
-// Modified for Neural Forge (2026): two re-exports only with the `unstable` feature (UPSTREAM.md).
+// Modified for Neural Forge (2026): two re-exports only with the `unstable` feature; ash 0.38 (UPSTREAM.md).
 
 //! Vulkan layer utilities that are used in the integration tests to implement mock layers. The
 //! utilities may benefit the layer implementation, but there is no stability guarantee on those

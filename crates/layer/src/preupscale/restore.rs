@@ -641,7 +641,7 @@ struct PushDescriptorSetInfo {
     layout: vk::PipelineLayout,
     set: u32,
     descriptor_write_count: u32,
-    p_descriptor_writes: *const vk::WriteDescriptorSet,
+    p_descriptor_writes: *const vk::WriteDescriptorSet<'static>,
 }
 
 #[repr(C)]

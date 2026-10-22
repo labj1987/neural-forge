@@ -11,6 +11,8 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+//
+// Modified for Neural Forge (2026): ported to ash 0.38 (UPSTREAM.md).
 
 use mockall::mock;
 
@@ -20,22 +22,22 @@ use ash::vk;
 mock! {
     pub DeviceHooks {}
     impl DeviceHooks for DeviceHooks {
-        fn destroy_image<'a>(
+        fn destroy_image<'a, 'b>(
             &self,
             _image: vk::Image,
-            _p_allocator: Option<&'a vk::AllocationCallbacks>,
+            _p_allocator: Option<&'a vk::AllocationCallbacks<'b>>,
         ) -> LayerResult<()>;
 
-        fn destroy_sampler_ycbcr_conversion<'a>(
+        fn destroy_sampler_ycbcr_conversion<'a, 'b>(
             &self,
             _ycbcr_conversion: vk::SamplerYcbcrConversion,
-            _p_allocator: Option<&'a vk::AllocationCallbacks>,
+            _p_allocator: Option<&'a vk::AllocationCallbacks<'b>>,
         ) -> LayerResult<()>;
 
-        fn destroy_swapchain_khr<'a>(
+        fn destroy_swapchain_khr<'a, 'b>(
             &self,
             _swapchain: vk::SwapchainKHR,
-            _p_allocator: Option<&'a vk::AllocationCallbacks>,
+            _p_allocator: Option<&'a vk::AllocationCallbacks<'b>>,
         ) -> LayerResult<()>;
     }
 }

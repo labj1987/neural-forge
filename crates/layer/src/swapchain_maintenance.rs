@@ -182,7 +182,7 @@ pub unsafe fn offered(
     let features2 = unsafe { gipa(instance, name.as_ptr()) }.map(|f| unsafe { std::mem::transmute::<unsafe extern "system" fn(), vk::PFN_vkGetPhysicalDeviceFeatures2>(f) });
     let Some(features2) = features2 else { return Offered { khr, ext, feature: false } };
     let mut maintenance = vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT::default();
-    let mut f2 = vk::PhysicalDeviceFeatures2::builder().push_next(&mut maintenance).build();
+    let mut f2 = vk::PhysicalDeviceFeatures2::default().push_next(&mut maintenance);
     // SAFETY: a valid chain, filled in by the call.
     unsafe { features2(physical, &mut f2) };
     Offered { khr, ext, feature: maintenance.swapchain_maintenance1 == vk::TRUE }
@@ -191,16 +191,17 @@ pub unsafe fn offered(
 /// A device request with [`Plan::Add`]'s additions: a copy of the application's create info whose
 /// chain starts with the feature structure (then the application's chain, untouched) and whose
 /// extension list has the extension added. Alive until `vkCreateDevice` returned.
-pub struct Addition {
+pub struct Addition<'a> {
     _names: Vec<*const c_char>,
-    _features: Box<vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT>,
-    pub info: vk::DeviceCreateInfo,
+    _features: Box<vk::PhysicalDeviceSwapchainMaintenance1FeaturesEXT<'static>>,
+    /// The application's create info, pointing into `_names` and `_features` too: valid while `self` lives.
+    pub info: vk::DeviceCreateInfo<'a>,
 }
 
-impl Addition {
+impl<'a> Addition<'a> {
     /// # Safety
     /// `base` is a valid create info (its extension list included) whose pointers outlive the result.
-    pub unsafe fn new(base: &vk::DeviceCreateInfo, extension: Option<&'static CStr>) -> Self {
+    pub unsafe fn new(base: &vk::DeviceCreateInfo<'a>, extension: Option<&'static CStr>) -> Self {
         let mut names: Vec<*const c_char> = if base.enabled_extension_count == 0 || base.pp_enabled_extension_names.is_null() {
             Vec::new()
         } else {
@@ -263,8 +264,9 @@ mod tests {
     #[test]
     fn the_addition_puts_the_feature_in_front_of_the_applications_chain_and_keeps_its_list() {
         let mut theirs = vk::PhysicalDeviceVulkan12Features::default();
+        let theirs_at = std::ptr::from_ref(&theirs).cast::<std::ffi::c_void>();
         let names = [SWAPCHAIN.as_ptr()];
-        let base = vk::DeviceCreateInfo::builder().enabled_extension_names(&names).push_next(&mut theirs).build();
+        let base = vk::DeviceCreateInfo::default().enabled_extension_names(&names).push_next(&mut theirs);
         // SAFETY: `base` and what it points to outlive `addition`.
         let addition = unsafe { Addition::new(&base, Some(KHR_SWAPCHAIN)) };
         // SAFETY: the addition's list and chain, alive with it.
@@ -274,7 +276,7 @@ mod tests {
             assert_eq!(app_feature(&base), None);
             let first = &*addition.info.p_next.cast::<vk::BaseInStructure>();
             assert_eq!(first.s_type, FEATURES);
-            assert_eq!(first.p_next.cast(), std::ptr::from_ref(&theirs).cast::<std::ffi::c_void>(), "the application's chain follows, untouched");
+            assert_eq!(first.p_next.cast(), theirs_at, "the application's chain follows, untouched");
         }
         assert_eq!(base.enabled_extension_count, 1, "the application's request is only read");
     }

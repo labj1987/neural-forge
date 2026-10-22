@@ -47,18 +47,18 @@ struct Gpu {
 }
 
 fn gpu() -> Gpu {
-    let app = vk::ApplicationInfo::builder().api_version(vk::make_api_version(0, 1, 3, 0));
+    let app = vk::ApplicationInfo::default().api_version(vk::make_api_version(0, 1, 3, 0));
     KEEP_DRIVER_LOADED.get_or_init(|| {
         // SAFETY: the system Vulkan loader.
         let entry = unsafe { ash::Entry::load() }.expect("Vulkan loader");
         // SAFETY: valid create info.
-        let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder().application_info(&app), None) }.unwrap();
+        let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }.unwrap();
         (entry, instance.handle())
     });
     // SAFETY: the system Vulkan loader.
     let entry = unsafe { ash::Entry::load() }.expect("Vulkan loader");
     // SAFETY: valid create info.
-    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder().application_info(&app), None) }.unwrap();
+    let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::default().application_info(&app), None) }.unwrap();
     // SAFETY: live instance.
     let physical = unsafe { instance.enumerate_physical_devices() }
         .unwrap()
@@ -79,10 +79,10 @@ fn gpu() -> Gpu {
     let priorities = [1.0f32; 2];
     // The compute family's queue 0 is the network's own; queue 1 runs the recordings of that family.
     let queues = [
-        vk::DeviceQueueCreateInfo::builder().queue_family_index(family).queue_priorities(&priorities[..1]).build(),
-        vk::DeviceQueueCreateInfo::builder().queue_family_index(compute).queue_priorities(&priorities).build(),
+        vk::DeviceQueueCreateInfo::default().queue_family_index(family).queue_priorities(&priorities[..1]),
+        vk::DeviceQueueCreateInfo::default().queue_family_index(compute).queue_priorities(&priorities),
     ];
-    let info = vk::DeviceCreateInfo::builder().queue_create_infos(&queues).build();
+    let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues);
     // SAFETY: valid create info, outlives the extension.
     let extension = unsafe { device_extend(gipa, instance.handle(), vk::API_VERSION_1_3, physical, &info) }.expect("extend");
     // SAFETY: the extended create info is valid while `extension` lives.
@@ -97,13 +97,13 @@ impl Gpu {
     fn host_buffer(&self, bytes: u64, usage: vk::BufferUsageFlags) -> (vk::Buffer, vk::DeviceMemory, *mut u8) {
         // SAFETY: live device; valid create infos.
         unsafe {
-            let buffer = self.device.create_buffer(&vk::BufferCreateInfo::builder().size(bytes).usage(usage), None).unwrap();
+            let buffer = self.device.create_buffer(&vk::BufferCreateInfo::default().size(bytes).usage(usage), None).unwrap();
             let req = self.device.get_buffer_memory_requirements(buffer);
             let want = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
             let index = (0..self.memory.memory_type_count)
                 .find(|&i| req.memory_type_bits & (1 << i) != 0 && self.memory.memory_types[i as usize].property_flags.contains(want))
                 .unwrap();
-            let memory = self.device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(req.size).memory_type_index(index), None).unwrap();
+            let memory = self.device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(req.size).memory_type_index(index), None).unwrap();
             self.device.bind_buffer_memory(buffer, memory, 0).unwrap();
             let ptr = self.device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()).unwrap().cast();
             (buffer, memory, ptr)
@@ -203,16 +203,16 @@ fn a_larger_build_after_a_smaller_one_on_one_network() {
     // SAFETY: live device and handles; the graph's frame completes before anything is destroyed.
     unsafe {
         let queue = d.get_device_queue(g.family, 0);
-        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.family), None).unwrap();
-        let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.family), None).unwrap();
+        let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
         let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-        d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+        d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
         d.cmd_fill_buffer(cmd, large.features, 0, vk::WHOLE_SIZE, 0);
-        let to_compute = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute.build()], &[], &[]);
+        let to_compute = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+        d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute], &[], &[]);
         d.cmd_execute_commands(cmd, &[net.graph_commands()]);
         d.end_command_buffer(cmd).unwrap();
-        d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+        d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
         d.wait_for_fences(&[fence], true, 5_000_000_000).expect("the 3840x2160 graph completes");
         assert_eq!(net.chain_timeouts().0, 0);
         d.destroy_fence(fence, None);
@@ -243,18 +243,18 @@ fn two_sizes_built_together_each_give_the_head_of_their_size_alone() {
         // SAFETY: live device and handles; the submit completes before anything is read or destroyed.
         unsafe {
             let queue = d.get_device_queue(g.family, 0);
-            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.family), None).unwrap();
-            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.family), None).unwrap();
+            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
             let mut staging = Vec::new();
-            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
             for (frame, graph) in frames {
                 let usage = vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST;
                 let (src, src_mem, src_ptr) = g.host_buffer(frame.features_bytes, usage);
                 let values: Vec<f32> = (0..frame.features_bytes / 4).map(|i| ((i * 2654435761 % 1000) as f32 / 1000.0 - 0.5) * 0.25).collect();
                 std::ptr::copy_nonoverlapping(values.as_ptr().cast::<u8>(), src_ptr, values.len() * 4);
                 let (dst, dst_mem, dst_ptr) = g.host_buffer(frame.head_bytes, usage);
-                let all = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+                let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
                 d.cmd_copy_buffer(cmd, src, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: frame.features_bytes }]);
                 d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[all], &[], &[]);
                 d.cmd_execute_commands(cmd, &[*graph]);
@@ -263,7 +263,7 @@ fn two_sizes_built_together_each_give_the_head_of_their_size_alone() {
                 staging.push((src, src_mem, dst, dst_mem, dst_ptr, frame.head_bytes));
             }
             d.end_command_buffer(cmd).unwrap();
-            d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+            d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
             d.wait_for_fences(&[fence], true, 10_000_000_000).expect("the graphs complete");
             assert_eq!(net.chain_timeouts().0, 0);
             let heads = staging
@@ -334,33 +334,33 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
     // SAFETY: live device and handles throughout; every buffer outlives the waits below.
     unsafe {
         let queue = d.get_device_queue(g.family, 0);
-        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.family), None).unwrap();
+        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.family), None).unwrap();
         let cmd = d
-            .allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1))
+            .allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1))
             .unwrap()[0];
         let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-        let queries = d.create_query_pool(&vk::QueryPoolCreateInfo::builder().query_type(vk::QueryType::TIMESTAMP).query_count(2), None).unwrap();
+        let queries = d.create_query_pool(&vk::QueryPoolCreateInfo::default().query_type(vk::QueryType::TIMESTAMP).query_count(2), None).unwrap();
         let period = g.instance.get_physical_device_properties(g.physical).limits.timestamp_period as f64;
         for run in 0..5 {
             std::ptr::write_bytes(down_ptr, 0, head_bytes as usize);
-            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
             d.cmd_copy_buffer(cmd, up, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: features.len() as u64 }]);
-            let to_compute = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute.build()], &[], &[]);
+            let to_compute = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute], &[], &[]);
             d.cmd_reset_query_pool(cmd, queries, 0, 2);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, 0);
             d.cmd_execute_commands(cmd, &[net.graph_commands()]);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, 1);
-            let to_copy = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_copy.build()], &[], &[]);
+            let to_copy = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_copy], &[], &[]);
             d.cmd_copy_buffer(cmd, frame.head, down, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: head_bytes }]);
             d.end_command_buffer(cmd).unwrap();
             d.reset_fences(&[fence]).unwrap();
             let t = std::time::Instant::now();
-            d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+            d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
             d.wait_for_fences(&[fence], true, 5_000_000_000).unwrap();
             let mut stamps = [0u64; 2];
-            d.get_query_pool_results(queries, 0, 2, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT).unwrap();
+            d.get_query_pool_results(queries, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT).unwrap();
             eprintln!("run {run}: graph {:.3} ms GPU", (stamps[1] - stamps[0]) as f64 * period / 1e6);
             let got = std::slice::from_raw_parts(down_ptr, head_bytes as usize);
             let differing = got.as_chunks::<4>().0.iter().zip(expected.as_chunks::<4>().0.iter()).filter(|(a, b)| a != b).count();
@@ -372,7 +372,7 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
         for primary in [false, true] {
         let mut times = Vec::new();
         for _ in 0..40 {
-            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
             d.cmd_reset_query_pool(cmd, queries, 0, 2);
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, queries, 0);
             if primary {
@@ -385,10 +385,10 @@ fn the_network_through_the_c_api_matches_dlss5vk() {
             d.cmd_write_timestamp(cmd, vk::PipelineStageFlags::BOTTOM_OF_PIPE, queries, 1);
             d.end_command_buffer(cmd).unwrap();
             d.reset_fences(&[fence]).unwrap();
-            d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+            d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
             d.wait_for_fences(&[fence], true, 5_000_000_000).unwrap();
             let mut stamps = [0u64; 2];
-            d.get_query_pool_results(queries, 0, 2, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT).unwrap();
+            d.get_query_pool_results(queries, 0, &mut stamps, vk::QueryResultFlags::TYPE_64 | vk::QueryResultFlags::WAIT).unwrap();
             times.push((stamps[1] - stamps[0]) as f64 * period / 1e6);
         }
         times.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -476,19 +476,19 @@ fn the_heads_at_the_layers_sizes_match_a_saved_run() {
         let got = unsafe {
             std::ptr::copy_nonoverlapping(features.as_ptr(), up_ptr, features.len());
             let queue = d.get_device_queue(g.family, 0);
-            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.family), None).unwrap();
-            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+            let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.family), None).unwrap();
+            let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
             let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+            d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
             d.cmd_copy_buffer(cmd, up, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: features.len() as u64 }]);
-            let to_compute = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute.build()], &[], &[]);
+            let to_compute = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::TRANSFER_WRITE).dst_access_mask(vk::AccessFlags::SHADER_READ);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::COMPUTE_SHADER, vk::DependencyFlags::empty(), &[to_compute], &[], &[]);
             d.cmd_execute_commands(cmd, &[net.graph_commands()]);
-            let to_copy = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
-            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_copy.build()], &[], &[]);
+            let to_copy = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::SHADER_WRITE).dst_access_mask(vk::AccessFlags::TRANSFER_READ);
+            d.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::COMPUTE_SHADER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[to_copy], &[], &[]);
             d.cmd_copy_buffer(cmd, frame.head, down, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: head_bytes }]);
             d.end_command_buffer(cmd).unwrap();
-            d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+            d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
             d.wait_for_fences(&[fence], true, 5_000_000_000).expect("the graph completes");
             let got = std::slice::from_raw_parts(down_ptr, head_bytes as usize).to_vec();
             d.destroy_fence(fence, None);
@@ -537,10 +537,10 @@ fn device_extend_copies_the_applications_chain() {
     let g = gpu();
     let gipa = g._entry.static_fn().get_instance_proc_addr;
     let priorities = [1.0f32];
-    let queues = [vk::DeviceQueueCreateInfo::builder().queue_family_index(g.family).queue_priorities(&priorities).build()];
+    let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(g.family).queue_priorities(&priorities)];
     let mut v12 = vk::PhysicalDeviceVulkan12Features::default();
     let mut v11 = vk::PhysicalDeviceVulkan11Features::default();
-    let info = vk::DeviceCreateInfo::builder().queue_create_infos(&queues).push_next(&mut v12).push_next(&mut v11).build();
+    let info = vk::DeviceCreateInfo::default().queue_create_infos(&queues).push_next(&mut v12).push_next(&mut v11);
     // SAFETY: valid create info, outliving the extension.
     let extension = unsafe { device_extend(gipa, g.instance.handle(), vk::API_VERSION_1_3, g.physical, &info) }.expect("extend");
     assert_eq!((v12.buffer_device_address, v12.shader_float16, v11.storage_buffer16_bit_access), (0, 0, 0), "the application's structures are untouched");
@@ -565,7 +565,7 @@ fn device_extend_copies_the_applications_chain() {
     let device = unsafe { g.instance.create_device(g.physical, &extension.info, None) }.expect("vkCreateDevice with the copied chain");
     drop(extension);
     let ext = [c"VK_EXT_buffer_device_address".as_ptr()];
-    let with_ext = vk::DeviceCreateInfo::builder().queue_create_infos(&queues).enabled_extension_names(&ext).build();
+    let with_ext = vk::DeviceCreateInfo::default().queue_create_infos(&queues).enabled_extension_names(&ext);
     // SAFETY: valid create info.
     let refused = unsafe { device_extend(gipa, g.instance.handle(), vk::API_VERSION_1_3, g.physical, &with_ext) };
     assert!(refused.is_err_and(|e| e.contains("VK_EXT_buffer_device_address")));
@@ -591,7 +591,7 @@ fn device_extend_keeps_the_loaders_nodes_and_unknown_ones() {
     let g = gpu();
     let gipa = g._entry.static_fn().get_instance_proc_addr;
     let priorities = [1.0f32];
-    let queues = [vk::DeviceQueueCreateInfo::builder().queue_family_index(g.family).queue_priorities(&priorities).build()];
+    let queues = [vk::DeviceQueueCreateInfo::default().queue_family_index(g.family).queue_priorities(&priorities)];
     // An unknown structure: an sType no registry has, followed by nothing the network sets.
     #[repr(C)]
     struct Unknown {
@@ -610,7 +610,7 @@ fn device_extend_keeps_the_loaders_nodes_and_unknown_ones() {
     }
     let loader = LoaderNode { s_type: vk::StructureType::LOADER_DEVICE_CREATE_INFO, p_next: std::ptr::from_ref(&unknown).cast(), function: 0, u: 0x1234 as *const _ };
     let mut v12 = vk::PhysicalDeviceVulkan12Features { p_next: std::ptr::from_ref(&loader).cast_mut().cast(), ..Default::default() };
-    let info = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut v12).cast(), ..vk::DeviceCreateInfo::builder().queue_create_infos(&queues).build() };
+    let info = vk::DeviceCreateInfo { p_next: std::ptr::from_mut(&mut v12).cast(), ..vk::DeviceCreateInfo::default().queue_create_infos(&queues) };
     // SAFETY: valid create info, outliving the extension; the chain is only read.
     let extension = unsafe { device_extend(gipa, g.instance.handle(), vk::API_VERSION_1_3, g.physical, &info) }.expect("the loader's node and an unknown one do not stop the additions");
     let (mut copied_loader, mut tail, mut v12_set) = (None, None, false);
@@ -637,7 +637,7 @@ fn device_extend_keeps_the_loaders_nodes_and_unknown_ones() {
     // A structure the network sets after the unknown one: refused, not written.
     let mut after = vk::PhysicalDeviceVulkan12Features::default();
     let unknown_first = Unknown { s_type: unknown.s_type, p_next: std::ptr::from_mut(&mut after).cast(), payload: [0; 4] };
-    let info = vk::DeviceCreateInfo { p_next: std::ptr::from_ref(&unknown_first).cast(), ..vk::DeviceCreateInfo::builder().queue_create_infos(&queues).build() };
+    let info = vk::DeviceCreateInfo { p_next: std::ptr::from_ref(&unknown_first).cast(), ..vk::DeviceCreateInfo::default().queue_create_infos(&queues) };
     // SAFETY: as above.
     let refused = unsafe { device_extend(gipa, g.instance.handle(), vk::API_VERSION_1_3, g.physical, &info) };
     assert!(refused.is_err_and(|e| e.contains("after one this build does not know")));
@@ -671,16 +671,16 @@ unsafe fn run_head(g: &Gpu, queue: vk::Queue, cmd: vk::CommandBuffer, frame: &Fr
     unsafe {
         std::ptr::copy_nonoverlapping(features.as_ptr(), up_ptr, features.len());
         let fence = d.create_fence(&vk::FenceCreateInfo::default(), None).unwrap();
-        let all = vk::MemoryBarrier::builder().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE).build();
+        let all = vk::MemoryBarrier::default().src_access_mask(vk::AccessFlags::MEMORY_WRITE).dst_access_mask(vk::AccessFlags::MEMORY_READ | vk::AccessFlags::MEMORY_WRITE);
         let stages = vk::PipelineStageFlags::ALL_COMMANDS;
-        d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
+        d.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)).unwrap();
         d.cmd_copy_buffer(cmd, up, frame.features, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: frame.features_bytes }]);
         d.cmd_pipeline_barrier(cmd, stages, stages, vk::DependencyFlags::empty(), &[all], &[], &[]);
         record(cmd);
         d.cmd_pipeline_barrier(cmd, stages, stages, vk::DependencyFlags::empty(), &[all], &[], &[]);
         d.cmd_copy_buffer(cmd, frame.head, down, &[vk::BufferCopy { src_offset: 0, dst_offset: 0, size: frame.head_bytes }]);
         d.end_command_buffer(cmd).unwrap();
-        d.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(&[cmd]).build()], fence).unwrap();
+        d.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(&[cmd])], fence).unwrap();
         d.wait_for_fences(&[fence], true, 10_000_000_000).expect("the submit completes");
         let head = std::slice::from_raw_parts(down_ptr, frame.head_bytes as usize).to_vec();
         d.destroy_fence(fence, None);
@@ -728,10 +728,10 @@ fn the_graph_recorded_into_the_applications_buffer_gives_the_secondarys_head() {
         let queue = d.get_device_queue(g.family, 0);
         let own_queue = d.get_device_queue(g.compute, 1);
         let reset = vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER;
-        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.family).flags(reset), None).unwrap();
-        let own_pool = d.create_command_pool(&vk::CommandPoolCreateInfo::builder().queue_family_index(g.compute).flags(reset), None).unwrap();
-        let cmds = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(pool).command_buffer_count(3)).unwrap();
-        let own = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::builder().command_pool(own_pool).command_buffer_count(1)).unwrap()[0];
+        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.family).flags(reset), None).unwrap();
+        let own_pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.compute).flags(reset), None).unwrap();
+        let cmds = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(3)).unwrap();
+        let own = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(own_pool).command_buffer_count(1)).unwrap()[0];
         let check = |what: &str, net: &Network, head: &[u8]| {
             let n = differing(head, &expected);
             eprintln!("{what}: {n} of {} head values differ from dlss5vk's", expected.len() / 4);

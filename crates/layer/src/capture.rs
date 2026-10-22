@@ -164,7 +164,7 @@ fn build_model_scratch(
         usage |= vk::ImageUsageFlags::STORAGE;
         create_flags |= vk::ImageCreateFlags::MUTABLE_FORMAT;
     }
-    let image_info = vk::ImageCreateInfo::builder()
+    let image_info = vk::ImageCreateInfo::default()
         .flags(create_flags)
         .image_type(vk::ImageType::TYPE_2D)
         .format(format)
@@ -189,7 +189,7 @@ fn build_model_scratch(
         unsafe { device.destroy_image(image, None) };
         return None;
     };
-    let image_alloc = vk::MemoryAllocateInfo::builder().allocation_size(image_reqs.size).memory_type_index(image_type);
+    let image_alloc = vk::MemoryAllocateInfo::default().allocation_size(image_reqs.size).memory_type_index(image_type);
     // SAFETY: `image_alloc` is valid; `image_type` satisfies `image_reqs`.
     let Ok(image_memory) = (unsafe { device.allocate_memory(&image_alloc, None) }) else {
         // SAFETY: same reasoning as above.
@@ -207,7 +207,7 @@ fn build_model_scratch(
     }
 
     let bytes = vk::DeviceSize::from(width) * vk::DeviceSize::from(height) * 4;
-    let buf_info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
+    let buf_info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST).sharing_mode(vk::SharingMode::EXCLUSIVE);
     // SAFETY: `buf_info` is valid.
     let Ok(buffer) = (unsafe { device.create_buffer(&buf_info, None) }) else {
         // SAFETY: `image`/`image_memory` are bound to each other, own nothing else yet.
@@ -228,7 +228,7 @@ fn build_model_scratch(
         }
         return None;
     };
-    let buf_alloc = vk::MemoryAllocateInfo::builder().allocation_size(buf_reqs.size).memory_type_index(buf_type);
+    let buf_alloc = vk::MemoryAllocateInfo::default().allocation_size(buf_reqs.size).memory_type_index(buf_type);
     // SAFETY: `buf_alloc` is valid; `buf_type` satisfies `buf_reqs`.
     let Ok(buffer_memory) = (unsafe { device.allocate_memory(&buf_alloc, None) }) else {
         // SAFETY: same reasoning as above.
@@ -268,18 +268,17 @@ fn build_model_scratch(
     // perfectly usable for the blit/download it existed for before the encode, so the
     // proxy simply crosses unencoded rather than the whole capture failing.
     let (encode_view, encode_set) = if want_encode {
-        let view_info = vk::ImageViewCreateInfo::builder()
+        let view_info = vk::ImageViewCreateInfo::default()
             .image(image)
             .view_type(vk::ImageViewType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
             .subresource_range(
-                vk::ImageSubresourceRange::builder()
+                vk::ImageSubresourceRange::default()
                     .aspect_mask(vk::ImageAspectFlags::COLOR)
                     .base_mip_level(0)
                     .level_count(1)
                     .base_array_layer(0)
-                    .layer_count(1)
-                    .build(),
+                    .layer_count(1),
             );
         // SAFETY: `image` is bound and was created with `MUTABLE_FORMAT` plus
         // `STORAGE` usage (both gated on `want_encode`); `R8G8B8A8_UNORM` is in the
@@ -336,11 +335,11 @@ fn pick_readback_memory_type(reqs: vk::MemoryRequirements, mem_props: &vk::Physi
 
 fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical_device: vk::PhysicalDevice, queue_family: u32, bytes: vk::DeviceSize) -> Option<CaptureBuffer> {
     let pool_info =
-        vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     // SAFETY: `device` is the live device this capture serves; `pool_info` is valid.
     let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else { return None };
 
-    let alloc_info = vk::CommandBufferAllocateInfo::builder()
+    let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(pool)
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
@@ -354,7 +353,7 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
         }
     };
 
-    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+    let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
     // SAFETY: starting signaled means the first use's own wait/poll never blocks (or
     // reports pending) on a fence nothing has submitted work against yet.
     let fence = match unsafe { device.create_fence(&fence_info, None) } {
@@ -366,7 +365,7 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
         }
     };
 
-    let buf_info = vk::BufferCreateInfo::builder()
+    let buf_info = vk::BufferCreateInfo::default()
         .size(bytes)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST)
         .sharing_mode(vk::SharingMode::EXCLUSIVE);
@@ -404,7 +403,7 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
         return None;
     };
 
-    let alloc = vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index);
+    let alloc = vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index);
     // SAFETY: `alloc` is valid; `type_index` was just confirmed to satisfy `reqs`.
     let memory = match unsafe { device.allocate_memory(&alloc, None) } {
         Ok(m) => m,
@@ -455,17 +454,16 @@ fn build_capture_buffer(device: &ash::Device, instance: &ash::Instance, physical
 /// failure -- every caller treats that as "skip capture this frame, present
 /// unmodified", never a reason to stop trying on a later frame.
 fn subresource() -> vk::ImageSubresourceRange {
-    vk::ImageSubresourceRange::builder()
+    vk::ImageSubresourceRange::default()
         .aspect_mask(vk::ImageAspectFlags::COLOR)
         .base_mip_level(0)
         .level_count(1)
         .base_array_layer(0)
         .layer_count(1)
-        .build()
 }
 
-fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier {
-    vk::ImageMemoryBarrier::builder()
+fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk::AccessFlags, dst: vk::AccessFlags) -> vk::ImageMemoryBarrier<'static> {
+    vk::ImageMemoryBarrier::default()
         .old_layout(old)
         .new_layout(new)
         .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -474,7 +472,6 @@ fn barrier(image: vk::Image, old: vk::ImageLayout, new: vk::ImageLayout, src: vk
         .subresource_range(subresource())
         .src_access_mask(src)
         .dst_access_mask(dst)
-        .build()
 }
 
 /// What [`run`] is carrying forward from the round trip it most recently *sent* **on
@@ -1784,7 +1781,7 @@ fn record_capture_commands(
     if unsafe { device.reset_command_buffer(cmd, vk::CommandBufferResetFlags::empty()) }.is_err() {
         return false;
     }
-    let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+    let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
     // SAFETY: `cmd` was just reset above.
     if unsafe { device.begin_command_buffer(cmd, &begin_info) }.is_err() {
         return false;
@@ -1824,21 +1821,19 @@ fn record_capture_commands(
         // work, so the span is the capture's own (see `crate::gpu_timer`).
         unsafe { timer.record_start(device, cmd) };
     }
-    let region = vk::BufferImageCopy::builder()
+    let region = vk::BufferImageCopy::default()
         .buffer_offset(0)
         .buffer_row_length(0)
         .buffer_image_height(0)
         .image_subresource(
-            vk::ImageSubresourceLayers::builder()
+            vk::ImageSubresourceLayers::default()
                 .aspect_mask(vk::ImageAspectFlags::COLOR)
                 .mip_level(0)
                 .base_array_layer(0)
-                .layer_count(1)
-                .build(),
+                .layer_count(1),
         )
         .image_offset(vk::Offset3D::default())
-        .image_extent(vk::Extent3D { width, height, depth: 1 })
-        .build();
+        .image_extent(vk::Extent3D { width, height, depth: 1 });
     // SAFETY: `image` is in `read_layout` after the barrier above; `buffer` is sized to
     // at least `width*height*bytes_per_pixel` by whichever caller built it.
     unsafe {
@@ -1850,15 +1845,14 @@ fn record_capture_commands(
         // on through every later command on the queue, so the compose that consumes this
         // capture sees the write without a barrier of its own (the same pattern as
         // `composition::gpu`'s cached buffer).
-        let extra_ready = vk::BufferMemoryBarrier::builder()
+        let extra_ready = vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::TRANSFER_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .dst_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
             .buffer(extra_dst)
             .offset(0)
-            .size(vk::WHOLE_SIZE)
-            .build();
+            .size(vk::WHOLE_SIZE);
         // SAFETY: `image` is still in `read_layout`; `extra_dst` is sized for at least
         // `width*height*4` bytes by whoever handed it over.
         unsafe {
@@ -1876,12 +1870,11 @@ fn record_capture_commands(
         let scratch_to_dst = barrier(scratch_image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
         // SAFETY: `cmd` is recording; `scratch_image` is this slot's own, not aliased.
         unsafe { device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::ALL_COMMANDS, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[scratch_to_dst]) };
-        let blit = vk::ImageBlit::builder()
-            .src_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+        let blit = vk::ImageBlit::default()
+            .src_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
             .src_offsets([vk::Offset3D::default(), vk::Offset3D { x: width as i32, y: height as i32, z: 1 }])
-            .dst_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
-            .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: model_width as i32, y: model_height as i32, z: 1 }])
-            .build();
+            .dst_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
+            .dst_offsets([vk::Offset3D::default(), vk::Offset3D { x: model_width as i32, y: model_height as i32, z: 1 }]);
         // SAFETY: `image` is in `read_layout`; `scratch_image` was just
         // transitioned to `TRANSFER_DST_OPTIMAL`; both are 2D, single-mip, single-layer.
         unsafe { device.cmd_blit_image(cmd, image, read_layout, scratch_image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, &[blit], vk::Filter::LINEAR) };
@@ -1945,14 +1938,13 @@ fn record_capture_commands(
             // SAFETY: `cmd` is recording; `scratch_image` was just written by the blit above.
             unsafe { device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::TRANSFER, vk::DependencyFlags::empty(), &[], &[], &[scratch_to_src]) };
         }
-        let scratch_region = vk::BufferImageCopy::builder()
+        let scratch_region = vk::BufferImageCopy::default()
             .buffer_offset(0)
             .buffer_row_length(0)
             .buffer_image_height(0)
-            .image_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1).build())
+            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).mip_level(0).base_array_layer(0).layer_count(1))
             .image_offset(vk::Offset3D::default())
-            .image_extent(vk::Extent3D { width: model_width, height: model_height, depth: 1 })
-            .build();
+            .image_extent(vk::Extent3D { width: model_width, height: model_height, depth: 1 });
         // SAFETY: `scratch_image` is `TRANSFER_SRC_OPTIMAL`; `scratch_buffer` was sized
         // for exactly `model_width*model_height*4` bytes by `build_model_scratch`.
         unsafe { device.cmd_copy_image_to_buffer(cmd, scratch_image, vk::ImageLayout::TRANSFER_SRC_OPTIMAL, scratch_buffer, &[scratch_region]) };
@@ -1973,7 +1965,7 @@ fn record_capture_commands(
     // scratch's buffer once the fence signals. A fence signal makes nothing available to the host
     // by itself: the copies' writes are made available to host reads here.
     let to_host = |buffer: vk::Buffer| {
-        vk::BufferMemoryBarrier::builder()
+        vk::BufferMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
             .dst_access_mask(vk::AccessFlags::HOST_READ)
             .src_queue_family_index(vk::QUEUE_FAMILY_IGNORED)
@@ -1981,7 +1973,6 @@ fn record_capture_commands(
             .buffer(buffer)
             .offset(0)
             .size(vk::WHOLE_SIZE)
-            .build()
     };
     let host_reads = [to_host(buffer), to_host(model.map_or(buffer, |(_, scratch_buffer, ..)| scratch_buffer))];
     let host_reads = &host_reads[..if model.is_some() { 2 } else { 1 }];
@@ -2303,7 +2294,7 @@ fn submit_pipeline_capture(
     if unsafe { device.reset_fences(&[slot.buf.fence]) }.is_err() {
         return false;
     }
-    let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&slot.buf.cmd)).build();
+    let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&slot.buf.cmd));
     // SAFETY: `slot.buf.cmd` was just recorded and ended by `record_capture_commands`
     // above. Deliberately not waited on here -- the entire point of this function:
     // the caller's present call returns immediately, and a later
@@ -2398,7 +2389,7 @@ pub unsafe fn destroy_pipeline(pipeline: Option<CapturePipeline>, device: &ash::
 /// fail-open discipline as every other capability check in this module.
 pub(crate) fn min_imported_host_pointer_alignment(instance: &ash::Instance, physical_device: vk::PhysicalDevice) -> Option<vk::DeviceSize> {
     let mut ext_props = vk::PhysicalDeviceExternalMemoryHostPropertiesEXT::default();
-    let mut props2 = vk::PhysicalDeviceProperties2::builder().push_next(&mut ext_props);
+    let mut props2 = vk::PhysicalDeviceProperties2::default().push_next(&mut ext_props);
     // SAFETY: `physical_device` belongs to `instance`; `props2` is a freshly built,
     // valid out-parameter with the EXT struct chained into its `pNext`.
     unsafe { instance.get_physical_device_properties2(physical_device, &mut props2) };
@@ -2543,7 +2534,7 @@ fn submit_direct_capture(
     if unsafe { device.reset_fences(&[direct.buf.fence]) }.is_err() {
         return false;
     }
-    let submit = vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&direct.buf.cmd)).build();
+    let submit = vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&direct.buf.cmd));
     // SAFETY: `direct.buf.cmd` was just recorded and ended above. Deliberately not
     // waited on -- same reasoning as `submit_pipeline_capture`.
     if crate::note_vk(device.handle(), unsafe { device.queue_submit(queue, &[submit], direct.buf.fence) }).is_err() {
@@ -2594,10 +2585,10 @@ unsafe fn build_imported_capture_buffer(
     bytes: vk::DeviceSize,
 ) -> Option<CaptureBuffer> {
     let pool_info =
-        vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
     // SAFETY: `device` is the live device this capture serves; `pool_info` is valid.
     let Ok(pool) = (unsafe { device.create_command_pool(&pool_info, None) }) else { return None };
-    let alloc_info = vk::CommandBufferAllocateInfo::builder()
+    let alloc_info = vk::CommandBufferAllocateInfo::default()
         .command_pool(pool)
         .level(vk::CommandBufferLevel::PRIMARY)
         .command_buffer_count(1);
@@ -2610,7 +2601,7 @@ unsafe fn build_imported_capture_buffer(
             return None;
         }
     };
-    let fence_info = vk::FenceCreateInfo::builder().flags(vk::FenceCreateFlags::SIGNALED);
+    let fence_info = vk::FenceCreateInfo::default().flags(vk::FenceCreateFlags::SIGNALED);
     // SAFETY: starting signaled means the first use's own poll never reports pending
     // for a fence nothing has submitted work against yet.
     let fence = match unsafe { device.create_fence(&fence_info, None) } {
@@ -2697,8 +2688,8 @@ pub(crate) unsafe fn import_host_buffer(
     // at creation -- found live, on real hardware, via `VK_LAYER_VALIDATE_SYNC=1`
     // (see docs/EXTERNAL_MEMORY_HOST_DESIGN.md), not caught by the local software ICD this
     // crate's tests otherwise run against.
-    let mut external_info = vk::ExternalMemoryBufferCreateInfo::builder().handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
-    let buf_info = vk::BufferCreateInfo::builder()
+    let mut external_info = vk::ExternalMemoryBufferCreateInfo::default().handle_types(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT);
+    let buf_info = vk::BufferCreateInfo::default()
         .size(bytes)
         .usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST | usage)
         .sharing_mode(vk::SharingMode::EXCLUSIVE)
@@ -2723,8 +2714,8 @@ pub(crate) unsafe fn import_host_buffer(
     };
 
     let mut import_info =
-        vk::ImportMemoryHostPointerInfoEXT::builder().handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT).host_pointer(host_ptr.cast());
-    let alloc = vk::MemoryAllocateInfo::builder().allocation_size(bytes).memory_type_index(type_index).push_next(&mut import_info);
+        vk::ImportMemoryHostPointerInfoEXT::default().handle_type(vk::ExternalMemoryHandleTypeFlags::HOST_ALLOCATION_EXT).host_pointer(host_ptr.cast());
+    let alloc = vk::MemoryAllocateInfo::default().allocation_size(bytes).memory_type_index(type_index).push_next(&mut import_info);
     // SAFETY: `alloc` is valid; `type_index` was just confirmed to satisfy both
     // `reqs` and `host_props` above; `host_ptr`/`bytes` satisfy this function's own
     // safety contract on alignment/size.
@@ -2771,7 +2762,7 @@ mod tests {
     /// same as any image `vkQueuePresentKHR`'s own precondition hasn't been violated
     /// on.
     fn make_present_src_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, width: u32, height: u32) -> (vk::Image, vk::DeviceMemory) {
-        let info = vk::ImageCreateInfo::builder()
+        let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
             .extent(vk::Extent3D { width, height, depth: 1 })
@@ -2787,19 +2778,19 @@ mod tests {
         let type_index = (0..mem_props.memory_type_count)
             .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
             .expect("no suitable memory type for the test's own target image");
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
 
-        let alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+        let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             device.begin_command_buffer(cmd, &begin_info).unwrap();
             let to_present = barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::empty(), vk::AccessFlags::empty());
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TOP_OF_PIPE, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
             device.end_command_buffer(cmd).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
             device.destroy_fence(fence, None);
             device.free_command_buffers(pool, &[cmd]);
@@ -2833,9 +2824,9 @@ mod tests {
             })
         });
         let queue_family = 0;
-        let queue_info = [vk::DeviceQueueCreateInfo::builder().queue_family_index(queue_family).queue_priorities(&[1.0]).build()];
+        let queue_info = [vk::DeviceQueueCreateInfo::default().queue_family_index(queue_family).queue_priorities(&[1.0])];
         let extension_names = crate::composition::gpu::test_device_extensions(&instance, physical_device, surface, if supported { &[EXTERNAL_MEMORY_HOST_EXTENSION] } else { &[] });
-        let device_create_info = vk::DeviceCreateInfo::builder().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
+        let device_create_info = vk::DeviceCreateInfo::default().queue_create_infos(&queue_info).enabled_extension_names(&extension_names);
         let device = unsafe { instance.create_device(physical_device, &device_create_info, None) }.ok()?;
         let queue = unsafe { device.get_device_queue(queue_family, 0) };
         Some((entry, instance, physical_device, device, queue, queue_family, supported))
@@ -2848,7 +2839,7 @@ mod tests {
     /// whole point is confirming the imported-memory capture lands the *right* bytes,
     /// not just *some* bytes.
     fn make_filled_present_src_image(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, queue: vk::Queue, pool: vk::CommandPool, width: u32, height: u32, color: [f32; 4]) -> (vk::Image, vk::DeviceMemory) {
-        let info = vk::ImageCreateInfo::builder()
+        let info = vk::ImageCreateInfo::default()
             .image_type(vk::ImageType::TYPE_2D)
             .format(vk::Format::R8G8B8A8_UNORM)
             .extent(vk::Extent3D { width, height, depth: 1 })
@@ -2864,13 +2855,13 @@ mod tests {
         let type_index = (0..mem_props.memory_type_count)
             .find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL))
             .expect("no suitable memory type for the test's own target image");
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_image_memory(image, memory, 0) }.unwrap();
 
-        let alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+        let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-        let begin_info = vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        let begin_info = vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
         unsafe {
             device.begin_command_buffer(cmd, &begin_info).unwrap();
             let to_dst = barrier(image, vk::ImageLayout::UNDEFINED, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::AccessFlags::empty(), vk::AccessFlags::TRANSFER_WRITE);
@@ -2879,7 +2870,7 @@ mod tests {
             let to_present = barrier(image, vk::ImageLayout::TRANSFER_DST_OPTIMAL, vk::ImageLayout::PRESENT_SRC_KHR, vk::AccessFlags::TRANSFER_WRITE, vk::AccessFlags::empty());
             device.cmd_pipeline_barrier(cmd, vk::PipelineStageFlags::TRANSFER, vk::PipelineStageFlags::ALL_COMMANDS, vk::DependencyFlags::empty(), &[], &[], &[to_present]);
             device.end_command_buffer(cmd).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
             device.destroy_fence(fence, None);
             device.free_command_buffers(pool, &[cmd]);
@@ -2931,7 +2922,7 @@ mod tests {
         assert_eq!(host_ptr as usize % alignment as usize, 0, "mmap must hand back at least page-aligned memory");
 
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
         // An arbitrary, checkable, non-zero pattern -- chosen so every channel lands
         // on an *exact* u8 value (100/150/200/255), not a half-integer boundary like
@@ -3032,7 +3023,7 @@ mod tests {
         let (width, height) = (8u32, 8u32);
         let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
         let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
         let mut pipeline: Option<CapturePipeline> = None;
@@ -3130,9 +3121,9 @@ mod tests {
                 // Stand in for what the real present call does: wait on the semaphore
                 // before the image is considered final, exactly like
                 // `composition::gpu::tests`' own async tests already establish.
-                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
                 let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
-                let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
+                let submit = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage));
                 unsafe {
                     device.queue_submit(queue, &[submit], wait_fence).unwrap();
                     device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
@@ -3162,10 +3153,10 @@ mod tests {
             };
             assert!(sem.is_some(), "every present is composited, carried or not");
             let sem = sem.unwrap();
-            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -3241,33 +3232,32 @@ mod tests {
     }
 
     fn full_region(width: u32, height: u32) -> vk::BufferImageCopy {
-        vk::BufferImageCopy::builder()
-            .image_subresource(vk::ImageSubresourceLayers::builder().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1).build())
+        vk::BufferImageCopy::default()
+            .image_subresource(vk::ImageSubresourceLayers::default().aspect_mask(vk::ImageAspectFlags::COLOR).layer_count(1))
             .image_extent(vk::Extent3D { width, height, depth: 1 })
-            .build()
     }
 
     fn host_buffer(device: &ash::Device, mem_props: &vk::PhysicalDeviceMemoryProperties, bytes: u64) -> (vk::Buffer, vk::DeviceMemory, *mut u8) {
-        let info = vk::BufferCreateInfo::builder().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
+        let info = vk::BufferCreateInfo::default().size(bytes).usage(vk::BufferUsageFlags::TRANSFER_SRC | vk::BufferUsageFlags::TRANSFER_DST);
         let buffer = unsafe { device.create_buffer(&info, None) }.unwrap();
         let reqs = unsafe { device.get_buffer_memory_requirements(buffer) };
         let wanted = vk::MemoryPropertyFlags::HOST_VISIBLE | vk::MemoryPropertyFlags::HOST_COHERENT;
         let type_index = (0..mem_props.memory_type_count).find(|&i| reqs.memory_type_bits & (1 << i) != 0 && mem_props.memory_types[i as usize].property_flags.contains(wanted)).unwrap();
-        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::builder().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
+        let memory = unsafe { device.allocate_memory(&vk::MemoryAllocateInfo::default().allocation_size(reqs.size).memory_type_index(type_index), None) }.unwrap();
         unsafe { device.bind_buffer_memory(buffer, memory, 0) }.unwrap();
         let ptr = unsafe { device.map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty()) }.unwrap().cast::<u8>();
         (buffer, memory, ptr)
     }
 
     fn one_shot(device: &ash::Device, queue: vk::Queue, pool: vk::CommandPool, record: impl FnOnce(vk::CommandBuffer)) {
-        let alloc_info = vk::CommandBufferAllocateInfo::builder().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
+        let alloc_info = vk::CommandBufferAllocateInfo::default().command_pool(pool).level(vk::CommandBufferLevel::PRIMARY).command_buffer_count(1);
         let cmd = unsafe { device.allocate_command_buffers(&alloc_info) }.unwrap()[0];
-        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
-        unsafe { device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::builder().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }.unwrap();
+        let fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
+        unsafe { device.begin_command_buffer(cmd, &vk::CommandBufferBeginInfo::default().flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT)) }.unwrap();
         record(cmd);
         unsafe {
             device.end_command_buffer(cmd).unwrap();
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().command_buffers(std::slice::from_ref(&cmd)).build()], fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().command_buffers(std::slice::from_ref(&cmd))], fence).unwrap();
             device.wait_for_fences(&[fence], true, u64::MAX).unwrap();
             device.destroy_fence(fence, None);
             device.free_command_buffers(pool, &[cmd]);
@@ -3363,7 +3353,7 @@ mod tests {
                 }
             });
             let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-            let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+            let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
             let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("the test's own command pool");
             let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
             Some(Self {
@@ -3401,9 +3391,9 @@ mod tests {
                 )
             };
             let Some(sem) = sem else { return false };
-            let wait_fence = unsafe { self.device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let wait_fence = unsafe { self.device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
-            let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build();
+            let submit = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage));
             unsafe {
                 self.device.queue_submit(self.queue, &[submit], wait_fence).unwrap();
                 self.device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
@@ -3461,7 +3451,7 @@ mod tests {
         };
         let (width, height) = (8u32, 8u32);
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("the test's own command pool");
         // Exact u8 values in every channel, so the conversions round nowhere.
         let color = [100.0 / 255.0, 150.0 / 255.0, 200.0 / 255.0, 1.0];
@@ -3674,7 +3664,7 @@ mod tests {
 
         let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
         let game_frame = test_game_frame(width, height);
@@ -3724,10 +3714,10 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(2));
                 continue;
             };
-            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -3865,7 +3855,7 @@ mod tests {
         let (width, height) = (64u32, 64u32);
         let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let (image, image_memory) = make_present_src_image(device, &mem_props, queue, pool, width, height);
         let game_frame = test_game_frame(width, height);
@@ -3898,10 +3888,10 @@ mod tests {
                 continue;
             };
             composed += 1;
-            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+            let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
             let stage = vk::PipelineStageFlags::ALL_COMMANDS;
             unsafe {
-                device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+                device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
                 device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
                 device.destroy_fence(wait_fence, None);
             }
@@ -3990,7 +3980,7 @@ mod tests {
         let mut shm = ShmClient::default();
         assert!(shm.test_open_at(&path));
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let (width, height) = (16u32, 16u32);
         let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
@@ -4085,7 +4075,7 @@ mod tests {
         let (width, height) = (16u32, 16u32);
         let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.unwrap();
         let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
         upload_present_src(&device, &mem_props, queue, pool, image, width, height, &test_game_frame(width, height));
@@ -4140,10 +4130,10 @@ mod tests {
             composed = present(&mut external_memory_host);
         }
         let sem = composed.expect("the staging-buffer pipeline must take over and composite");
-        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+        let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
         let stage = vk::PipelineStageFlags::ALL_COMMANDS;
         unsafe {
-            device.queue_submit(queue, &[vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage)).build()], wait_fence).unwrap();
+            device.queue_submit(queue, &[vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&stage))], wait_fence).unwrap();
             device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
             device.destroy_fence(wait_fence, None);
         }
@@ -4224,7 +4214,7 @@ mod tests {
         let (width, height) = (8u32, 8u32);
         let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
         let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
         let mut pipeline: Option<CapturePipeline> = None;
@@ -4314,9 +4304,9 @@ mod tests {
                 // Stand in for what the real present call does: wait on the semaphore
                 // before the image is considered final, exactly like
                 // `composition::gpu::tests`' own async tests already establish.
-                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
                 let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
-                let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
+                let submit = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage));
                 unsafe {
                     device.queue_submit(queue, &[submit], wait_fence).unwrap();
                     device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
@@ -4433,7 +4423,7 @@ mod tests {
 
         let proxy_format = neural_forge_protocol::enums::proxy_format::RGBA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("failed to create the test's own command pool");
         let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
         let mut pipeline: Option<CapturePipeline> = None;
@@ -4464,9 +4454,9 @@ mod tests {
                 )
             };
             if let Some(sem) = sem {
-                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::builder(), None) }.unwrap();
+                let wait_fence = unsafe { device.create_fence(&vk::FenceCreateInfo::default(), None) }.unwrap();
                 let wait_stage = vk::PipelineStageFlags::ALL_COMMANDS;
-                let submit = vk::SubmitInfo::builder().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage)).build();
+                let submit = vk::SubmitInfo::default().wait_semaphores(std::slice::from_ref(&sem)).wait_dst_stage_mask(std::slice::from_ref(&wait_stage));
                 unsafe {
                     device.queue_submit(queue, &[submit], wait_fence).unwrap();
                     device.wait_for_fences(&[wait_fence], true, u64::MAX).unwrap();
@@ -4567,7 +4557,7 @@ mod tests {
         let (width, height) = (2560u32, 1440u32);
         let proxy_format = neural_forge_protocol::enums::proxy_format::BGRA8;
         let mem_props = unsafe { instance.get_physical_device_memory_properties(physical_device) };
-        let pool_info = vk::CommandPoolCreateInfo::builder().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        let pool_info = vk::CommandPoolCreateInfo::default().queue_family_index(queue_family).flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
         let pool = unsafe { device.create_command_pool(&pool_info, None) }.expect("bench command pool");
         let (image, image_memory) = make_present_src_image(&device, &mem_props, queue, pool, width, height);
         let mut pipeline: Option<CapturePipeline> = None;
