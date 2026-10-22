@@ -29,6 +29,12 @@ fn one_at_a_time() -> std::sync::MutexGuard<'static, ()> {
     ONE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+/// An instance kept for the whole process, never destroyed. Without it the loader unloads the NVIDIA
+/// driver whenever a test destroys the last instance and loads it again for the next, and after about ten
+/// such loads in one process the driver no longer loads at all ("libnvidia-tls.so: cannot allocate memory
+/// in static TLS block"): the next test finds no NVIDIA GPU.
+static KEEP_DRIVER_LOADED: std::sync::OnceLock<(ash::Entry, vk::Instance)> = std::sync::OnceLock::new();
+
 struct Gpu {
     _entry: ash::Entry,
     instance: ash::Instance,
@@ -41,9 +47,16 @@ struct Gpu {
 }
 
 fn gpu() -> Gpu {
+    let app = vk::ApplicationInfo::builder().api_version(vk::make_api_version(0, 1, 3, 0));
+    KEEP_DRIVER_LOADED.get_or_init(|| {
+        // SAFETY: the system Vulkan loader.
+        let entry = unsafe { ash::Entry::load() }.expect("Vulkan loader");
+        // SAFETY: valid create info.
+        let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder().application_info(&app), None) }.unwrap();
+        (entry, instance.handle())
+    });
     // SAFETY: the system Vulkan loader.
     let entry = unsafe { ash::Entry::load() }.expect("Vulkan loader");
-    let app = vk::ApplicationInfo::builder().api_version(vk::make_api_version(0, 1, 3, 0));
     // SAFETY: valid create info.
     let instance = unsafe { entry.create_instance(&vk::InstanceCreateInfo::builder().application_info(&app), None) }.unwrap();
     // SAFETY: live instance.
