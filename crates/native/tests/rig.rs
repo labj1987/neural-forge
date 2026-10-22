@@ -841,6 +841,75 @@ fn the_graph_profiled_per_kernel() {
     }
 }
 
+/// This process's use of the GPU's device-local heaps (`VK_EXT_memory_budget`), in bytes.
+fn device_local_usage(g: &Gpu) -> u64 {
+    let mut budget = vk::PhysicalDeviceMemoryBudgetPropertiesEXT::default();
+    let mut props = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
+    // SAFETY: live instance and physical device; the chain is valid for the call.
+    unsafe { g.instance.get_physical_device_memory_properties2(g.physical, &mut props) };
+    let heaps = props.memory_properties.memory_heaps;
+    let count = props.memory_properties.memory_heap_count as usize;
+    (0..count).filter(|&i| heaps[i].flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL)).map(|i| budget.heap_usage[i]).sum()
+}
+
+/// Rebuilding the network for another size returns the last build's memory: ten switches between
+/// 1486x836 and 2560x1440 end within 32 MiB of where the first pair did (AMDNR measured another
+/// runtime keeping 75-350 MB per new size).
+#[test]
+fn rebuilds_at_other_sizes_return_their_memory() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let g = gpu();
+    let mut net = open_network(&g, &model_dir(), chain_wanted());
+    let mut after_pair = Vec::new();
+    for _ in 0..10 {
+        for (w, h) in [(1486, 836), (2560, 1440)] {
+            // SAFETY: no graph of an earlier build was submitted.
+            unsafe { net.build(w, h) }.expect("build");
+        }
+        after_pair.push(device_local_usage(&g));
+    }
+    let mib = |b: u64| b as f64 / (1u64 << 20) as f64;
+    eprintln!("device-local use after each pair: {:?} MiB", after_pair.iter().map(|&b| mib(b).round()).collect::<Vec<_>>());
+    let growth = after_pair[after_pair.len() - 1].saturating_sub(after_pair[0]);
+    assert!(growth < 32 << 20, "ten rebuild pairs kept {:.0} MiB", mib(growth));
+}
+
+/// What sharing the activations saves (`NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS`, NATIVE_BACKEND.md "Activation
+/// memory"): the device-local memory a build takes, with and without, for the size sets the layer builds at 1440p
+/// and 4K (each output with DLSS's render size at Quality). Shared never takes more.
+#[test]
+fn shared_activations_take_less_memory() {
+    if std::env::var_os("NEURAL_FORGE_NATIVE_RIG").is_none() {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG unset: skipped");
+        return;
+    }
+    let _one = one_at_a_time();
+    let g = gpu();
+    let mut net = open_network(&g, &model_dir(), chain_wanted());
+    let mib = |b: u64| (b as f64 / (1u64 << 20) as f64).round();
+    for sizes in [&[(2560, 1440), (1708, 960)][..], &[(3840, 2160), (2560, 1440)][..]] {
+        let mut taken = [0u64; 2];
+        for (i, shared) in [false, true].into_iter().enumerate() {
+            // SAFETY: the variable is read by the build below on this thread only; no other test runs (`ONE`).
+            unsafe { std::env::set_var("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS", if shared { "1" } else { "0" }) };
+            // SAFETY: no graph of the previous build was submitted. A tiny build first returns the last one's memory.
+            unsafe { net.build(64, 64) }.expect("the small build");
+            let base = device_local_usage(&g);
+            // SAFETY: as above.
+            unsafe { net.build_sizes(sizes) }.expect("build");
+            taken[i] = device_local_usage(&g).saturating_sub(base);
+        }
+        eprintln!("{sizes:?}: own allocations {} MiB, shared {} MiB", mib(taken[0]), mib(taken[1]));
+        assert!(taken[1] <= taken[0]);
+    }
+    // SAFETY: as above.
+    unsafe { std::env::remove_var("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS") };
+}
+
 /// How many 4-byte values of `got` differ from `expected` (all of them when the lengths differ).
 fn differing(got: &[u8], expected: &[u8]) -> usize {
     if got.len() != expected.len() {

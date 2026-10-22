@@ -74,6 +74,20 @@ class Graph {
 
   Activation* allocate(const std::string& label, uint32_t rows, uint32_t channels, Format format);
 
+  // Lifetimes: between trackLifetimes(true) and (false) (the warm-up's recording), every use of an activation's buffer
+  // is noted with the barrier interval it falls in. A barrier orders everything before it against everything after,
+  // so two activations whose intervals do not overlap can share memory.
+  void trackLifetimes(bool on);
+  struct Lifetime {
+    Activation* activation;
+    uint32_t first, last;   // barrier intervals, inclusive
+  };
+  // The tracked recording's activations: those it used, with their intervals, and (`unused`) those it never touched,
+  // which the route it took does not need (allocated for the routes it did not take).
+  std::vector<Lifetime> lifetimes(std::vector<Activation*>& unused) const;
+  // Points `activation` at `buffer`, destroying the one it had. Only between recordings: nothing recorded may still run.
+  void rebind(Activation& activation, vk::Buffer buffer);
+
  private:
   // Window phases. Every resolution level runs its own four-phase cycle of half-window shifts; the phase advances
   // once per block at that level in visit order, and a decoder stage continues the count its encoder stage left.
@@ -149,6 +163,7 @@ class Graph {
   std::map<std::string, Activation*> boundaries_;
   Activation* head_ = nullptr;
   Activation* inputHalf_ = nullptr;
+  std::map<VkBuffer, std::pair<uint32_t, uint32_t>> lifetimes_;   // buffer -> first and last barrier interval
 };
 
 }  // namespace nr

@@ -307,6 +307,10 @@ struct NfNative {
   // weights, the kernels and the split-K scratch (sized by the largest, built first), and run one after
   // another on one queue, never at the same time (each opens and closes with compute barriers).
   std::vector<NfSlot> slots;
+  // The activations of every slot's graph that its warm-up used, placed in this one block by lifetime
+  // (shareActivations); null with NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0 (each activation its own allocation).
+  VkDeviceMemory activationArena = VK_NULL_HANDLE;
+  VkDeviceSize activationArenaBytes = 0, activationBytesBefore = 0;
   VkCommandPool secondaryPool = VK_NULL_HANDLE;
   VkCommandPool ownPool = VK_NULL_HANDLE;
   // The descriptor pools of the recordings into the application's command buffers
@@ -354,6 +358,7 @@ struct NfNative {
       // The GPU may still run the graphs: their command buffers and activations are leaked, not freed.
       for (NfSlot& slot : slots) (void)slot.graph.release();
       slots.clear();
+      activationArena = VK_NULL_HANDLE;   // leaked with them
       return;
     }
     for (NfSlot& slot : slots) {
@@ -362,6 +367,10 @@ struct NfNative {
       slot.graph.reset();
     }
     slots.clear();
+    // The graphs destroyed their buffers in it: nothing is bound to the block now.
+    context->freeMemory(activationArena);
+    activationArena = VK_NULL_HANDLE;
+    activationArenaBytes = activationBytesBefore = 0;
     // Nothing recorded holds the split-K scratch's address now: the next build sizes it for its own graphs
     // (a larger frame needs more than the first build's).
     if (kernels) kernels->releaseScratch();
@@ -407,7 +416,9 @@ struct NfNative {
       // its run makes the driver compile every PTX module.
       context->resetDescriptorPool(0);
       VkCommandBuffer warm = context->beginCommands();
+      slot.graph->trackLifetimes(true);
       slot.graph->record(warm, *slot.features);
+      slot.graph->trackLifetimes(false);
       slot.sets = kernels->dispatchCount();
       // This warm-up's count alone: nothing else of the network runs (the previous warm-up was waited on, and
       // the caller drained every frame of the previous build).
@@ -426,6 +437,7 @@ struct NfNative {
       // bytes the kernels read through them (`Model::compactAux`). The recordings below use those.
       model->compactAux();
     }
+    shareActivations();
     // The frame recordings (one per queue family they run on), every size's: descriptor pool 1 stays reserved
     // for them.
     context->resetDescriptorPool(1);
@@ -433,6 +445,70 @@ struct NfNative {
       slot.secondary = recordSecondary(secondaryPool, slot);
       slot.ownSecondary = recordSecondary(ownPool, slot);
     }
+  }
+
+  // Activation memory (docs/NATIVE_BACKEND.md, "Activation memory"). Each activation had its own allocation, alive
+  // for the whole build. After the warm-ups (nothing recorded yet runs): the activations a slot's warm-up never
+  // touched (allocated for routes it did not take) get a minimal buffer, and the ones it used share one block,
+  // placed first fit, largest first, so that two overlap only when their barrier intervals do not (a barrier orders
+  // every launch before it against every one after, chained or not). The slots share the block as they share the
+  // split-K scratch: they never run at the same time. The features and the head stay their own: the layer
+  // writes and reads them outside the graph. The block starts zeroed, as the activations did.
+  void shareActivations() {
+    if (const char* off = getenv("NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS"); off && std::string(off) == "0") return;
+    struct Placement {
+      nr::Graph* graph;
+      nr::Activation* activation;
+      uint32_t first, last;
+      VkDeviceSize offset, bytes;
+    };
+    std::vector<Placement> placements;
+    VkDeviceSize arena = 0, alignment = 256, before = 0;
+    uint32_t types = ~0u;
+    for (NfSlot& slot : slots) {
+      std::vector<nr::Activation*> unused;
+      std::vector<nr::Graph::Lifetime> used = slot.graph->lifetimes(unused);
+      for (nr::Activation* a : unused) {
+        before += a->buffer.size;
+        slot.graph->rebind(*a, context->createBuffer(16, false, a->label.c_str()));
+      }
+      std::vector<Placement> mine;
+      for (const nr::Graph::Lifetime& l : used) {
+        if (l.activation == slot.features || l.activation == &slot.graph->head()) continue;
+        const VkMemoryRequirements r = context->bufferRequirements(l.activation->buffer.size);
+        alignment = std::max(alignment, r.alignment);
+        types &= r.memoryTypeBits;
+        before += l.activation->buffer.size;
+        mine.push_back({slot.graph.get(), l.activation, l.first, l.last, 0, r.size});
+      }
+      std::stable_sort(mine.begin(), mine.end(), [](const Placement& a, const Placement& b) { return a.bytes > b.bytes; });
+      std::vector<Placement> placed;
+      for (Placement p : mine) {
+        // The lowest offset clear of every placed activation alive in an overlapping interval.
+        std::vector<std::pair<VkDeviceSize, VkDeviceSize>> taken;
+        for (const Placement& q : placed)
+          if (q.first <= p.last && p.first <= q.last) taken.emplace_back(q.offset, q.offset + q.bytes);
+        std::sort(taken.begin(), taken.end());
+        VkDeviceSize offset = 0;
+        for (const auto& [start, end] : taken) {
+          if (offset + p.bytes <= start) break;
+          offset = std::max(offset, (end + alignment - 1) / alignment * alignment);
+        }
+        p.offset = offset;
+        arena = std::max(arena, offset + p.bytes);
+        placed.push_back(p);
+      }
+      placements.insert(placements.end(), placed.begin(), placed.end());
+    }
+    activationBytesBefore = before;
+    if (placements.empty()) return;
+    activationArena = context->allocateDeviceMemory(arena, types);
+    activationArenaBytes = arena;
+    for (const Placement& p : placements)
+      p.graph->rebind(*p.activation, context->createBufferAt(activationArena, p.offset, p.bytes, p.activation->label.c_str()));
+    vk::Buffer whole = context->createBufferAt(activationArena, 0, arena, "activation arena");
+    context->fillZero(whole);
+    context->destroyBuffer(whole);
   }
 
   VkCommandBuffer recordSecondary(VkCommandPool pool, NfSlot& slot) {

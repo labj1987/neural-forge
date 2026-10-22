@@ -6,6 +6,7 @@
 
 #include <array>
 #include <cstdint>
+#include <functional>
 #include <cstdio>
 #include <cstring>
 #include <stdexcept>
@@ -113,6 +114,17 @@ class Context {
   Buffer createBuffer(VkDeviceSize size, bool hostVisible, const char* label,
                       VkBufferUsageFlags extra = 0);
   void destroyBuffer(Buffer& buffer);
+  // The size, alignment and memory types a device-local buffer of `size` bytes needs.
+  VkMemoryRequirements bufferRequirements(VkDeviceSize size);
+  // A device-local memory block (device-addressable) for buffers placed in it with createBufferAt.
+  VkDeviceMemory allocateDeviceMemory(VkDeviceSize size, uint32_t memoryTypeBits);
+  void freeMemory(VkDeviceMemory memory);
+  // A device-local buffer bound to `memory` at `offset` (aligned as bufferRequirements says). The memory stays the
+  // caller's: destroyBuffer destroys the buffer only.
+  Buffer createBufferAt(VkDeviceMemory memory, VkDeviceSize offset, VkDeviceSize size, const char* label);
+  // While set, every buffer a recording binds (allocateSet) or takes the address of (deviceAddress) is reported with
+  // the number of barriers recorded so far: what Graph::trackLifetimes reads lifetimes from.
+  void setUseTracker(std::function<void(VkBuffer, uint32_t)> tracker) { useTracker_ = std::move(tracker); }
   // Upload through a staging buffer and wait for completion.
   void upload(const Buffer& target, const void* data, VkDeviceSize size, VkDeviceSize offset = 0);
   void fillZero(const Buffer& target);
@@ -165,6 +177,8 @@ class Context {
   uint32_t maxComputeSharedMemory() const { return maxSharedMemory_; }
 
  private:
+  std::function<void(VkBuffer, uint32_t)> useTracker_;
+  uint32_t barriers_ = 0;   // recorded so far (computeBarrier, transferBarrier): the use tracker's epoch
   uint32_t findMemoryType(uint32_t typeBits, VkMemoryPropertyFlags required);
   VkInstance instance_ = VK_NULL_HANDLE;
   VkDebugUtilsMessengerEXT messenger_ = VK_NULL_HANDLE;

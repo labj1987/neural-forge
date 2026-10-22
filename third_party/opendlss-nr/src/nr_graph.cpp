@@ -191,6 +191,36 @@ Activation* Graph::allocate(const std::string& label, uint32_t rows, uint32_t ch
   return activations_.back().get();
 }
 
+void Graph::trackLifetimes(bool on) {
+  if (!on) {
+    context_.setUseTracker(nullptr);
+    return;
+  }
+  lifetimes_.clear();
+  context_.setUseTracker([this](VkBuffer buffer, uint32_t epoch) {
+    auto [it, inserted] = lifetimes_.try_emplace(buffer, epoch, epoch);
+    if (!inserted) {
+      it->second.first = std::min(it->second.first, epoch);
+      it->second.second = std::max(it->second.second, epoch);
+    }
+  });
+}
+
+std::vector<Graph::Lifetime> Graph::lifetimes(std::vector<Activation*>& unused) const {
+  std::vector<Lifetime> used;
+  for (const auto& activation : activations_) {
+    auto it = lifetimes_.find(activation->buffer.buffer);
+    if (it == lifetimes_.end()) unused.push_back(activation.get());
+    else used.push_back({activation.get(), it->second.first, it->second.second});
+  }
+  return used;
+}
+
+void Graph::rebind(Activation& activation, vk::Buffer buffer) {
+  context_.destroyBuffer(activation.buffer);
+  activation.buffer = buffer;
+}
+
 Topology Topology::forBlockCount(uint32_t blocks) {
   if (blocks == 71)
     return {4, {5, 9, 15}, {8, 14, 22}, 23, 30, 31, 38, 39, 40, 47, {48, 56, 62, 66}, {55, 61, 65, 69}, 70};

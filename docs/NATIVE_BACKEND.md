@@ -1293,6 +1293,44 @@ driving and while standing: whether the minimap, the weapon wheel and the money 
 clean, what a first-person weapon model or a third-person character that stays in place does (it can be found
 as HUD while the camera turns), and what the detection costs on the RTX 5070.
 
+## Activation memory (2026-10-22)
+
+Each of a build's 81-82 activations had its own allocation, alive for the whole build: 816 MiB at 1280x720, about
+2.9 GB at 3840x2160, and every size the layer builds (the output's and DLSS's render size) had its own set. Traced
+over one recording at 1486x836 (every buffer a launch binds or takes the address of, and every barrier):
+
+- 15 activations, 161 MiB, are never touched: allocated for routes the build does not take (`raw FP16 block0`, 84 MiB
+  here and about 510 MiB at 4K, `raw FP16 block4`, `decoder 32 raw skip merge`, the FFN narrow buffers, the split
+  blocks' QKV, middle and normalized buffers).
+- The 67 used ones total 327 MiB, but no more than 150 MiB of them is ever alive between two barriers.
+
+Since then (`NfNative::shareActivations`, after every size's warm-up, before the frame recordings): the warm-up
+recording notes each activation's first and last barrier interval (`Graph::trackLifetimes`, from `vk::Context`'s use
+tracker); the untouched ones get a 16-byte buffer; the used ones are placed in one block, largest first at the lowest
+offset clear of every placed one whose interval overlaps theirs. A barrier orders every launch before it against
+every one after it, chained or not, so two activations share bytes only across one. Every size built together shares
+the same block, as they share the split-K scratch: they never run at the same time. The features and the head stay
+their own (the layer writes and reads them outside the graph). The block starts zeroed, as the activations did.
+`NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` keeps one allocation per activation.
+
+**Measured** (rig, `shared_activations_take_less_memory`, device-local use of the build):
+
+| Sizes built | One allocation each | Shared |
+|---|---|---|
+| 2560x1440 + 1708x960 | 1,905 MiB | 658 MiB |
+| 3840x2160 + 2560x1440 | 4,315 MiB | 1,506 MiB |
+
+The heads at every size the layer builds are byte-identical to the build before, for both networks, with counter
+chaining and with barriers; dlss5vk parity holds; the network's time is the same (5.357-5.364 ms median shared against
+5.359-5.363 one each, three rounds). A build switched ten times between two sizes keeps its memory flat
+(`rebuilds_at_other_sizes_return_their_memory`). In GTA V Enhanced (frame generation 4x): at 1440p the 2560x1440
+build took 733 MiB (2924 to 3653) where 3.8.6's took 1,536 MiB, 65.9 real fps; at 4K the 3840x2160 build 1,416 MiB
+where 3.8.7's took 3,200 MiB, 37.2 real fps (149 shown) and 41.0 (165) with the small network. GTA fills what is left
+of the budget in both: the headroom is the game's.
+
+The idea of placing activations by lifetime is mochizuki0323's DLSSNR-AMD ("Arena reuse, by lifetime", MIT); the code
+is this project's.
+
 ## Decided before Phase 1
 
 1. **The extractor in a public repository.** `extract-model` reads NVIDIA's weights out of the DLL

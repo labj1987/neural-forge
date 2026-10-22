@@ -4,6 +4,11 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## Unreleased
+
+- The network needs much less video memory: about 800 MB less at 1440p and about 1.8 GB less at 4K, with the same
+  picture and speed. `NEURAL_FORGE_NATIVE_SHARED_ACTIVATIONS=0` turns this off.
+
 ## 3.8.7 — 2026-10-22
 
 - The network runs a little faster: about 0.7% with either network.
