@@ -1517,8 +1517,8 @@ const NETWORK_CHOICES: [&str; 2] = ["Full network", "Small network"];
 /// extracted (the layer runs the other network then).
 fn network_subtitle(network: Network) -> String {
     let what = match network {
-        Network::Full => "The default: stronger shading and depth (65 fps in GTA V at 1440p)",
-        Network::Small => "Faster, with a subtler effect (73 fps in GTA V at 1440p)",
+        Network::Full => "The default: stronger shading and depth",
+        Network::Small => "Faster, with a subtler effect",
     };
     let root = std::path::PathBuf::from(neural_forge_supervisor::model::model_dir());
     let installed = neural_forge_supervisor::model::installed_all(&root);

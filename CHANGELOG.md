@@ -4,6 +4,13 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
+## 3.8.6 — 2026-10-21
+
+- The Network choice in the Model tab describes each network without quoting one game's frame rates.
+- `NEURAL_FORGE_PREUPSCALE=off` loads no network, so the game's frames are shown unchanged; the README
+  said it ran the model on the finished frame. The layer log now says so once. To run the model on the
+  finished frame, set Placement to Finished frame in the Model tab.
+
 ## 3.8.5 — 2026-10-20
 
 - Fixes a frame-rate loss in 3.8.3–3.8.4: after its loading screens, GTA V Enhanced ran about a fifth
