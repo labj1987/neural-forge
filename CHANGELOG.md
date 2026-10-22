@@ -4,15 +4,12 @@ One heading per released version, newest first. Versions 0.1.55 to 0.1.63 were
 previously filed under "Unreleased" phase headings and are grouped by the release that
 first shipped them; their phase is kept as a subheading.
 
-## Unreleased
+## 3.8.7 — 2026-10-22
 
-- The network's source, which came from OpenDLSS-NR (MIT), is now part of Neural Forge and developed here
-  rather than downloaded and patched at build time. The network itself is unchanged: same picture, same speed.
-- The same for the Vulkan layer framework Neural Forge is built on (Google's vk-layer-for-rust, Apache-2.0),
-  whose development stopped in 2025: it is now part of Neural Forge, so nothing in a build comes from an
-  unmaintained outside project. The layer behaves as before. It now also builds against newer Vulkan bindings
-  (ash 0.38, Vulkan 1.3.281 headers, from 1.3.251).
-- The network is a little faster: about 0.7% on both networks, from a better layout of its largest kernel.
+- The network runs a little faster: about 0.7% with either network.
+- Neural Forge no longer depends on outside projects that stopped being maintained. The network's code (from
+  OpenDLSS-NR, MIT) and the framework its Vulkan layer is built on (Google's vk-layer-for-rust, Apache-2.0) are now
+  part of Neural Forge, and the layer is built against newer Vulkan headers (1.3.281). The picture is unchanged.
 
 ## 3.8.6 — 2026-10-21
 
