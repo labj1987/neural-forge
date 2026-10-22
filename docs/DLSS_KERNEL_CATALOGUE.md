@@ -218,6 +218,53 @@ which includes its own overhead, so an upper bound for NGX): small network NGX 3
 2.90 ms after; full network NGX 5.1 ms, native 5.60 before and 5.41 ms after. The full network is still about
 0.3 ms behind.
 
+
+### Row tiles, the PTX target and where the time goes (2026-10-22)
+
+The rig's profile (`the_graph_profiled_per_kernel`, `NEURAL_FORGE_NATIVE_PROFILE=1`: a timestamp after every
+dispatch, median of 20 runs, 1486x836, frame d1, RTX 5070, before the change below). With barriers between
+dispatches (`NEURAL_FORGE_NATIVE_CHAIN=0`), so each kernel is timed alone; chained, the total is the same within
+2% and the order of the list too. The ten largest of the full network's 249 dispatches, summed by kernel:
+
+| Share | Time | Dispatches | Kernel |
+|---|---|---|---|
+| 11.2% | 0.657 ms | 16 | `ffn_ptx 5376x256 e8 r3` (256-channel blocks) |
+| 6.4% | 0.376 ms | 10 | `ffn_ptx 21504x128 e4 r4 +proj` (128-channel blocks) |
+| 6.0% | 0.352 ms | 1 | `block32_ptx 21504w f74` |
+| 5.9% | 0.348 ms | 31 | `gemmv_ptx 1344x512->512 f5` (the 512-channel split blocks) |
+| 5.6% | 0.326 ms | 1 | `block32_ptx 21809w f48` |
+| 4.4% | 0.260 ms | 6 | `ffn_ptx 86016x64 e2 r4 +proj` (64-channel blocks) |
+| 3.4% | 0.201 ms | 8 | `gemmv_ptx 384x4096->1024 f5 s4` (ViT) |
+| 3.0% | 0.177 ms | 8 | `gemmv_ptx 384x1024->4096 f6` (ViT) |
+| 2.9% | 0.168 ms | 2 | `block32_ptx 5529w f2` |
+| 2.8% | 0.164 ms | 8 | `qkv_ptx 28w x16 K512` |
+
+**The PTX target.** NVIDIA's modules are `.target sm_120`, OpenDLSS-NR's `sm_89`; the driver compiles either for
+the GPU it runs on. Generated for `sm_120` (PTX 8.7, `ptxgen.py`), the full network took 5.383-5.387 ms median
+against 5.386-5.408 (three rounds each, alternated, bit-exact): no difference, so it stays at `sm_89`. Both
+accumulate in f16 already (`mma.sync.m16n8k32...f16.e4m3.e4m3.f16`), GeForce's full-rate FP8 form.
+
+**Row tiles.** The FFN kernels' workgroup covers 16 rows per row tile (`ffnRowTiles`, `ffn_e4m3.py`). Timed back
+to back (two rounds each, alternated, all bit-exact against dlss5vk), full network:
+
+| 256 channels | 128 channels | Median |
+|---|---|---|
+| 3 (as upstream; 24 warps, `.maxnreg` 80) | 4 | 5.383-5.392 ms |
+| **4** (32 warps, 64 registers) | 4 | **5.349-5.352 ms** |
+| 2 | 4 | 5.491-5.497 ms |
+| 3 | 2 | 5.511-5.516 ms |
+| 3 | 3 | 5.644-5.652 ms |
+
+At 256 channels 4 row tiles are 0.035 ms (0.7%) faster on the full network and 0.02 ms on the small one (3.150-3.153
+against 3.172-3.174 ms, the profile's total, three rounds): the shared memory allows one workgroup per SM either
+way (the two W1 ring stages are 64 KB at 8 experts), and 4 fills it with 32 warps where 3 left 8 idle. Kept; the
+3-tile kernels are no longer generated. At 128 channels 4 stays.
+
+**What is left.** The full network is about 0.25 ms behind NGX's 5.1 ms (itself an upper bound), the small one
+0.45 ms ahead of NGX's 3.6. The largest kernels are bound by shared memory per SM (the FFN ring, `block32`'s 24 KB
+at 128 threads: four workgroups, 512 threads per SM) rather than by their launch shape; closing the rest means
+restructuring them (fewer ring stages, `block32` with more threads per workgroup), not tuning their parameters.
+
 ### Repeating it
 
 In each DLL, find every `0xBA55ED50` in the file and copy that fat binary out on its own: its 16-byte header

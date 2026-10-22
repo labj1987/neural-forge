@@ -493,6 +493,12 @@ upstream's sm_89 PTX that the driver compiles here. On the pre-upscaler path the
 out even or ahead because the hold's round trip is gone; after the upscaler, where the helper already ran
 off the game's queue, it costs about 12% of the frame rate in `pan`.
 
+Measured again on 2026-10-22, with the network as it runs now and without the helper in the way (3.8.x, 1486x836,
+the rig's back-to-back timing): 5.35 ms for the full network against NGX's 5.1 ms (the helper's busy time, an
+upper bound), and 3.15 ms for the small one against 3.6 ms. Generating the PTX for `sm_120` instead of `sm_89`
+changes nothing (5.383-5.387 against 5.386-5.408 ms median, bit-exact), so the target was not the cause; where
+the time goes is in DLSS_KERNEL_CATALOGUE.md, "Row tiles, the PTX target and where the time goes".
+
 ### 2.2 The Model tab on the network
 
 What each control does with NGX (the helper) and natively. "Checked" is the same frame (GTA frame d1, the
@@ -591,7 +597,8 @@ matrix as too long once the answer was clear; what was measured:
 
 - **4K is probably slower** (above). Likely VRAM; needs a look before 3.0 if 4K matters.
 - **After the upscaler: about 12% fewer fps** in `pan` (67 against 77): NVIDIA's network is about 20%
-  faster than OpenDLSS-NR's on this GPU at the same size, and the helper already ran off the game's queue there.
+  faster than OpenDLSS-NR's on this GPU at the same size, and the helper already ran off the game's queue there. (Measured
+  again on 2026-10-22: the full network about 0.25 ms behind NGX at 1486x836, the small one ahead; 2.1.)
   And that path has **no history** (no motion vectors), where NGX had the helper's optical flow.
 - **The temporal path differs from NGX's**: DLSS's motion vectors plus the jitter instead of optical flow. Not
   compared in game; whether DLSS's motion vectors are read one frame stale is open (inconclusive on a still

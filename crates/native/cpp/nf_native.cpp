@@ -717,6 +717,38 @@ uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err,
   }
 }
 
+uint32_t nf_native_profile_begin(NfNative* n, VkCommandBuffer primary, uint32_t max_dispatches, char* err, size_t err_len) {
+  try {
+    if (!n->kernels) throw std::runtime_error("the network is not open");
+    n->kernels->beginProfile(primary, max_dispatches);
+    return 1;
+  } catch (const std::exception& e) {
+    say(err, err_len, e.what());
+    return 0;
+  } catch (...) {
+    say(err, err_len, "an unknown C++ exception");
+    return 0;
+  }
+}
+
+uint32_t nf_native_profile_end(NfNative* n, char* out, size_t out_len) {
+  if (out_len) out[0] = 0;
+  try {
+    if (!n->kernels) return 0;
+    std::vector<nr::Kernels::ProfileEntry> entries = n->kernels->endProfile();
+    std::string text;
+    for (const nr::Kernels::ProfileEntry& e : entries) text += e.label + "\t" + std::to_string(e.milliseconds) + "\n";
+    if (out_len) {
+      size_t len = std::min(text.size(), out_len - 1);
+      std::memcpy(out, text.data(), len);
+      out[len] = 0;
+    }
+    return static_cast<uint32_t>(entries.size());
+  } catch (...) {
+    return 0;
+  }
+}
+
 uint32_t nf_native_record_graph_at(NfNative* n, uint32_t slot, uint32_t hold, VkCommandBuffer primary, char* err,
                                    size_t err_len) {
   if (n->stalled()) {

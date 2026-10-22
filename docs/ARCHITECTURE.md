@@ -743,7 +743,8 @@ second after the other used it (`Loader::claim_pre`, `claim_post`).
 
 In the `pan` reproducer (2492x1370 window, no DLSS) the answer takes 15.7 ms, against 11.1 ms through
 2.x's helper (NGX's evaluate 10.8 ms): NVIDIA's network is about 20% faster than OpenDLSS-NR's at the
-same size on this GPU; 67-68 fps with every frame composited against 75-79 (NATIVE_BACKEND.md, 2.1).
+same size on this GPU; 67-68 fps with every frame composited against 75-79 (NATIVE_BACKEND.md, 2.1). Measured
+again on 2026-10-22 at 1486x836: the full network 5.35 ms against NGX's 5.1, the small one 3.15 against 3.6.
 
 ### 5.7 Captures
 

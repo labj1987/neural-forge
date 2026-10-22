@@ -826,7 +826,10 @@ bool Kernels::ptxFfnEnabled() {
 }
 
 uint32_t Kernels::ffnRowTiles(uint32_t channels) {
-  return channels == 256 ? 3u : 4u;   // warps = E * rowTiles (<= 32); C=256: 24 warps at .maxnreg 80 keep one workgroup per SM
+  // warps = E * rowTiles (<= 32). C=256: 4 (32 warps, one workgroup per SM at .maxnreg 64) is 0.7% faster on
+  // both networks than 3 (24 warps at 80) at 1486x836 on the RTX 5070, and 2 slower; C=128: 4, 2 and 3 slower
+  // (DLSS_KERNEL_CATALOGUE.md, "Row tiles").
+  return 4u;
 }
 
 void Kernels::expertFfnPtx(VkCommandBuffer commands, const ExpertFfnArgs& a, const Chain& chain) {

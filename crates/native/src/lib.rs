@@ -67,6 +67,8 @@ mod ffi {
         pub fn nf_native_graph_commands_at(n: *const c_void, slot: u32) -> vk::CommandBuffer;
         pub fn nf_native_graph_commands_own_at(n: *const c_void, slot: u32) -> vk::CommandBuffer;
         pub fn nf_native_record_graph(n: *mut c_void, primary: vk::CommandBuffer, err: *mut c_char, len: usize) -> u32;
+        pub fn nf_native_profile_begin(n: *mut c_void, primary: vk::CommandBuffer, max_dispatches: u32, err: *mut c_char, len: usize) -> u32;
+        pub fn nf_native_profile_end(n: *mut c_void, out: *mut c_char, len: usize) -> u32;
         pub fn nf_native_record_graph_at(n: *mut c_void, slot: u32, hold: u32, primary: vk::CommandBuffer, err: *mut c_char, len: usize) -> u32;
         pub fn nf_native_chain_timeouts(n: *const c_void, at: *mut c_char, len: usize) -> u32;
         pub fn nf_native_reset_chain_timeouts(n: *mut c_void);
@@ -387,6 +389,31 @@ impl Network {
         }
     }
 
+    /// Measurement only: [`Self::record_graph`] with a GPU timestamp after each of its first `max_dispatches`
+    /// dispatches. Read them with [`Self::profile`] once `primary` has completed.
+    ///
+    /// # Safety
+    /// As [`Self::record_graph`].
+    pub unsafe fn record_graph_profiled(&mut self, primary: vk::CommandBuffer, max_dispatches: u32) -> Result<(), String> {
+        let mut err = [0 as c_char; MESSAGE];
+        // SAFETY: `raw` is live; `primary` is recording (contract).
+        if unsafe { ffi::nf_native_profile_begin(self.raw, primary, max_dispatches, err.as_mut_ptr(), MESSAGE) } != 1 {
+            return Err(message(&err));
+        }
+        // SAFETY: the contract.
+        unsafe { self.record_graph(primary) }
+    }
+
+    /// The last [`Self::record_graph_profiled`]'s dispatches, in order: each one's label (block and kernel) and
+    /// GPU time in milliseconds (from the previous dispatch's end, or the recording's start, to its own end).
+    /// Call once that buffer has completed.
+    pub fn profile(&mut self) -> Vec<(String, f64)> {
+        let mut out = vec![0 as c_char; 1 << 20];
+        // SAFETY: `raw` is live; `out` holds its length.
+        unsafe { ffi::nf_native_profile_end(self.raw, out.as_mut_ptr(), out.len()) };
+        message(&out).lines().filter_map(|l| l.rsplit_once('\t').and_then(|(label, ms)| Some((label.to_string(), ms.parse().ok()?)))).collect()
+    }
+
     /// Records slot `slot`'s graph ([`Self::build_sizes`]) straight into `primary`, a primary command buffer of
     /// `frame_family` being recorded (the application's: the hold inside DLSS's command buffer), between two
     /// compute barriers, with descriptor sets from hold slot `hold`'s own pool (`0..HOLD_SLOTS`), which this
@@ -521,9 +548,10 @@ mod tests {
 
     #[test]
     fn every_kernel_is_embedded() {
-        // 13 shaders/*.comp; 78 PTX generator invocations (upstream build_shaders.ps1).
+        // 13 shaders/*.comp; 76 PTX generator invocations (upstream build_shaders.ps1's 78, less the two FFN
+        // kernels at 256 channels and 3 row tiles, which nothing launches).
         assert_eq!(asset_count(AssetKind::Spirv), 13);
-        assert_eq!(asset_count(AssetKind::Ptx), 78);
+        assert_eq!(asset_count(AssetKind::Ptx), 76);
     }
 
     #[test]

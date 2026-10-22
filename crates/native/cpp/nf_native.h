@@ -125,6 +125,15 @@ VkCommandBuffer nf_native_graph_commands_own_at(const NfNative* n, uint32_t slot
 // uses nf_native_graph_commands.
 uint32_t nf_native_record_graph(NfNative* n, VkCommandBuffer primary, char* err, size_t err_len);
 
+// Measurement only (the rig's per-kernel profile): a timestamp after every dispatch that the next
+// nf_native_record_graph records into `primary`, up to `max_dispatches`. Call it on `primary` just before that
+// recording, and nf_native_profile_end once the buffer has completed.
+uint32_t nf_native_profile_begin(NfNative* n, VkCommandBuffer primary, uint32_t max_dispatches, char* err, size_t err_len);
+
+// The profile's dispatches, one "label\tmilliseconds\n" line each (the label names the block and the kernel),
+// written into `out` (truncated to `out_len`, NUL-terminated). Returns how many dispatches were timed.
+uint32_t nf_native_profile_end(NfNative* n, char* out, size_t out_len);
+
 // Records slot `slot`'s graph (nf_native_build_sizes) straight into `primary`, a primary command buffer of
 // `frame_family` the caller is recording (the application's: the hold inside DLSS's command buffer), between
 // two compute barriers. Its descriptor sets come from hold slot `hold`'s own pool (0..15, made on first use),

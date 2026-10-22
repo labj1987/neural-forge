@@ -769,6 +769,78 @@ unsafe fn run_head(g: &Gpu, queue: vk::Queue, cmd: vk::CommandBuffer, frame: &Fr
     }
 }
 
+/// Measurement only, with `NEURAL_FORGE_NATIVE_PROFILE=1` too: the graph at 1486x836 on frame d1's features,
+/// recorded straight into a primary with a GPU timestamp after every dispatch, 20 times; prints each kernel's
+/// median time (per block and kernel, in recording order), each block's and the total. Timestamps after
+/// chained dispatches that overlap give each the time from the previous one's end to its own: run with
+/// `NEURAL_FORGE_NATIVE_CHAIN=0` too for each kernel alone.
+#[test]
+fn the_graph_profiled_per_kernel() {
+    let (Some(dump), true) = (std::env::var_os("NEURAL_FORGE_NATIVE_RIG").map(PathBuf::from), std::env::var_os("NEURAL_FORGE_NATIVE_PROFILE").is_some()) else {
+        eprintln!("NEURAL_FORGE_NATIVE_RIG or NEURAL_FORGE_NATIVE_PROFILE unset: skipped");
+        return;
+    };
+    let _one = one_at_a_time();
+    let features = std::fs::read(dump.join("features.f32")).unwrap();
+    let g = gpu();
+    let mut net = open_network(&g, &model_dir(), chain_wanted());
+    // SAFETY: nothing of a previous build exists.
+    let frame = unsafe { net.build(WIDTH, HEIGHT) }.expect("build");
+    let d = &g.device;
+    const RUNS: usize = 20;
+    let mut runs: Vec<Vec<(String, f64)>> = Vec::new();
+    // SAFETY: live device and handles; each submit completes (run_head waits) before its profile is read.
+    unsafe {
+        let queue = d.get_device_queue(g.family, 0);
+        let pool = d.create_command_pool(&vk::CommandPoolCreateInfo::default().queue_family_index(g.family), None).unwrap();
+        let cmd = d.allocate_command_buffers(&vk::CommandBufferAllocateInfo::default().command_pool(pool).command_buffer_count(1)).unwrap()[0];
+        for _ in 0..RUNS + 2 {
+            run_head(&g, queue, cmd, &frame, &features, |cmd| net.record_graph_profiled(cmd, 4096).expect("record"));
+            runs.push(net.profile());
+        }
+        d.destroy_command_pool(pool, None);
+    }
+    // The first two warm the clocks and the caches.
+    let runs = &runs[2..];
+    assert!(runs.iter().all(|r| r.len() == runs[0].len() && !r.is_empty()), "every run times the same dispatches");
+    let median = |mut v: Vec<f64>| {
+        v.sort_by(f64::total_cmp);
+        v[v.len() / 2]
+    };
+    let per_dispatch: Vec<(String, f64)> = (0..runs[0].len()).map(|i| (runs[0][i].0.clone(), median(runs.iter().map(|r| r[i].1).collect()))).collect();
+    let total = median(runs.iter().map(|r| r.iter().map(|(_, ms)| ms).sum()).collect());
+    let mut by_kernel: Vec<(String, f64, usize)> = Vec::new();
+    for (label, ms) in &per_dispatch {
+        let kernel = label.split_once(" | ").map_or(label.as_str(), |(_, k)| k).to_string();
+        match by_kernel.iter_mut().find(|(k, _, _)| *k == kernel) {
+            Some(e) => {
+                e.1 += ms;
+                e.2 += 1;
+            }
+            None => by_kernel.push((kernel, *ms, 1)),
+        }
+    }
+    by_kernel.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let mut by_block: Vec<(String, f64)> = Vec::new();
+    for (label, ms) in &per_dispatch {
+        let block = label.split_once(" | ").map_or("", |(b, _)| b).to_string();
+        match by_block.last_mut() {
+            Some(e) if e.0 == block => e.1 += ms,
+            _ => by_block.push((block, *ms)),
+        }
+    }
+    eprintln!("profile: {} dispatches, total {total:.3} ms (median of {RUNS}), chained {}", per_dispatch.len(), frame.chained);
+    for (kernel, ms, n) in &by_kernel {
+        eprintln!("kernel {ms:8.3} ms {:5.1}% x{n:<4} {kernel}", ms / total * 100.0);
+    }
+    for (block, ms) in &by_block {
+        eprintln!("block {ms:8.3} ms {block}");
+    }
+    for (label, ms) in &per_dispatch {
+        eprintln!("dispatch {ms:8.4} ms {label}");
+    }
+}
+
 /// How many 4-byte values of `got` differ from `expected` (all of them when the lengths differ).
 fn differing(got: &[u8], expected: &[u8]) -> usize {
     if got.len() != expected.len() {

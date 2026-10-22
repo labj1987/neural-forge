@@ -44,6 +44,9 @@ done
 python3 scripts/hdr_encode.py selftest && python3 scripts/test_cache_replay.py
 python3 scripts/check_shaders.py && python3 scripts/sync_appdata_releases.py --check
 python3 scripts/gen_third_party_crates.py --check && python3 scripts/check_namespace.py
+cargo fmt --all --check && (cd third_party/vk-layer-for-rust && cargo fmt --all --check)
+bash scripts/cargo-deny.sh
+bash scripts/vk-layer-codegen.sh --check
 bash scripts/smoke-test.sh
 ```
 
@@ -63,6 +66,13 @@ own CLI into scratch XDG directories and run through the Vulkan loader
   `NEURAL_FORGE_TEST_DISPLAY` naming an X server (start an Xvfb, e.g. `Xvfb :97`, never the desktop's).
 - Tests never touch real XDG directories: point `XDG_*_HOME` at a scratch directory when running
   the CLI or `install` by hand.
+- The network on the real GPU (`crates/native/tests/rig.rs`, never on lavapipe): `NEURAL_FORGE_NATIVE_RIG=<dump>`
+  (a `dlss5vk parity --dump` directory of a 1486x836 frame) runs the parity test (bit-exact against the dump,
+  with a back-to-back timing of 40 runs) and the others; `NEURAL_FORGE_NATIVE_HEADS=<existing dir>` saves, then
+  compares, the heads at every size the layer builds (save on a known-good build first);
+  `NEURAL_FORGE_NATIVE_MODEL` picks the network's directory (the small one: only the heads and profile tests
+  apply, the dump is the full network's); `NEURAL_FORGE_NATIVE_PROFILE=1` adds the per-kernel profile, with
+  `NEURAL_FORGE_NATIVE_CHAIN=0` for each kernel alone. Run them with `--test-threads=1 --nocapture`.
 
 ## 2. Deploy to a test machine
 
