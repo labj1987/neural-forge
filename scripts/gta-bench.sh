@@ -365,7 +365,7 @@ launch_once() {
     if [ -z "$why" ]; then
         why="stuck: no benchmark result after $(( $(date +%s) - start ))s with the game running"
         # What the game shows: the layer's next presented frame, when Neural Forge is in the launch.
-        case $mid in *neuralforge*) shmctl capture > "$out/stuck-capture.txt" 2>&1;; esac
+        case $mid in *VK_LAYER_neuralforge_neural*) shmctl capture > "$out/stuck-capture.txt" 2>&1;; esac
         csv=$(ls -t "$out"/GTA5_Enhanced_*[0-9].csv 2>/dev/null | head -1)
         [ -n "$csv" ] && echo "displayed fps at the end: $(tail -n 300 "$csv" | cut -d, -f1 | sort -n | awk '{a[NR]=$1} END {print a[int(NR/2)+1]}')" >> "$out/stuck-capture.txt"
     fi
