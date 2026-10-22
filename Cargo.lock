@@ -1034,7 +1034,6 @@ checksum = "03c2856837ef78f57382f06b2b8563a2f512f7185d732608fd9176cb3b8edf0e"
 [[package]]
 name = "vulkan-layer"
 version = "0.1.0"
-source = "git+https://github.com/google/vk-layer-for-rust?rev=102d87cd9781c045b232e77eef198eed75ce8a8c#102d87cd9781c045b232e77eef198eed75ce8a8c"
 dependencies = [
  "ash",
  "bytemuck",
@@ -1051,7 +1050,6 @@ dependencies = [
 [[package]]
 name = "vulkan-layer-macros"
 version = "0.1.0"
-source = "git+https://github.com/google/vk-layer-for-rust?rev=102d87cd9781c045b232e77eef198eed75ce8a8c#102d87cd9781c045b232e77eef198eed75ce8a8c"
 dependencies = [
  "proc-macro2",
  "quote",

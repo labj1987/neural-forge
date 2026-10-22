@@ -620,6 +620,8 @@ covered by that license and are not redistributed here. The network's source in
 - [OpenDLSS-NR](https://github.com/maanHimself/OpenDLSS-NR) (maan): the network implementation the
   layer runs (taken into `third_party/opendlss-nr` and developed there, built by `crates/native`), the history reset rule, and the documented proxy encode the HDR encode
   before the upscaler follows.
+- [vk-layer-for-rust](https://github.com/google/vk-layer-for-rust) (Google): the Rust framework the Vulkan
+  layer is built on (taken into `third_party/vk-layer-for-rust` and developed there).
 - [OptiScaler](https://github.com/cdozdil/OptiScaler) and
   [OptiScaler_DLSSNR](https://github.com/Dagherbou/OptiScaler_DLSSNR): the idea of running the model
   before the upscaler and of reading the game's exposure (design only).

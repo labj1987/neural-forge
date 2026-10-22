@@ -8,6 +8,9 @@ first shipped them; their phase is kept as a subheading.
 
 - The network's source, which came from OpenDLSS-NR (MIT), is now part of Neural Forge and developed here
   rather than downloaded and patched at build time. The network itself is unchanged: same picture, same speed.
+- The same for the Vulkan layer framework Neural Forge is built on (Google's vk-layer-for-rust, Apache-2.0),
+  whose development stopped in 2025: it is now part of Neural Forge, so nothing in a build comes from an
+  unmaintained outside project. The layer behaves as before.
 
 ## 3.8.6 — 2026-10-21
 

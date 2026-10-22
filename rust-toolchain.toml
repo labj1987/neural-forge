@@ -3,5 +3,5 @@
 # `toolchain:` and the check after it that compares the two.
 [toolchain]
 channel = "1.99.0"
-components = ["clippy"]
+components = ["clippy", "rustfmt"]
 profile = "minimal"

@@ -22,3 +22,7 @@ __pycache__/
 test-native.log
 test-validation.log
 release-notes.md
+
+# The layer framework's own build output, and the headers scripts/vk-layer-codegen.sh links in
+/third_party/vk-layer-for-rust/target/
+/third_party/vk-layer-for-rust/third_party/

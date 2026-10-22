@@ -10,7 +10,7 @@ tools/native (scripts/fetch-native-tools.sh).
   gen_third_party_crates.py                  rewrite THIRD_PARTY_CRATES.md (the crate listing)
   gen_third_party_crates.py --check          exit 1, with a diff, if THIRD_PARTY_CRATES.md is out of date
   gen_third_party_crates.py --licences OUT   write OUT: every licence and notice file of every crate (from
-                                             its source in the cargo registry or git checkout, offline)
+                                             its source in the cargo registry or the repository, offline)
                                              and of the native code; fails if one has none
   gen_third_party_crates.py --self-test      check the dependency walk on a synthetic graph
 
@@ -28,8 +28,8 @@ ROOT = Path(__file__).resolve().parent.parent
 OUT = ROOT / "THIRD_PARTY_CRATES.md"
 TARGET = "x86_64-unknown-linux-gnu"
 
-# Crates whose manifest declares no `license` (git dependencies). Checked against the licence files in their
-# source: google/vk-layer-for-rust ships the Apache-2.0 text in its LICENSE and an Apache header in each manifest.
+# Crates whose manifest names its licence by file (`license-file`) instead of an SPDX `license`: the layer
+# framework in third_party/vk-layer-for-rust, whose LICENSE is the Apache-2.0 text.
 LICENSE_OVERRIDES = {
     "vulkan-layer": "Apache-2.0",
     "vulkan-layer-macros": "Apache-2.0",
@@ -48,14 +48,8 @@ NATIVE = [
 
 
 def source_url(pkg):
-    """The crate's repository or homepage; for a git dependency without either, the git URL from its source."""
-    url = pkg.get("repository") or pkg.get("homepage")
-    if url:
-        return url
-    src = pkg.get("source") or ""
-    if src.startswith("git+"):
-        return src[len("git+"):].split("?")[0].split("#")[0].removesuffix(".git")
-    return ""
+    """The crate's repository or homepage."""
+    return pkg.get("repository") or pkg.get("homepage") or ""
 
 
 def metadata(*extra):
@@ -111,21 +105,11 @@ def listing(meta):
 
 
 def licence_files(pkg):
-    """The crate's licence and notice files: in its own directory, else (a crate inside a git checkout's
-    workspace) in the nearest directory above it, up to the checkout's root."""
+    """The crate's licence and notice files: its `license-file` and those in its own directory."""
     d = Path(pkg["manifest_path"]).parent
-    stop = None
-    if (pkg.get("source") or "").startswith("git+"):
-        parts = d.parts
-        if "checkouts" in parts:
-            stop = Path(*parts[: parts.index("checkouts") + 3])
     extra = [d / pkg["license_file"]] if pkg.get("license_file") else []
-    while True:
-        found = sorted(f for f in d.iterdir() if f.is_file() and LICENCE_FILE.match(f.name)) if d.is_dir() else []
-        if found or stop is None or d == stop or d == d.parent:
-            break
-        d = d.parent
-    return list(dict.fromkeys([f for f in extra if f.is_file()] + found))
+    found = sorted(f for f in d.iterdir() if f.is_file() and LICENCE_FILE.match(f.name))
+    return list(dict.fromkeys([f.resolve() for f in extra if f.is_file()] + found))
 
 
 def section(title, files):

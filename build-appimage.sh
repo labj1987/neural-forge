@@ -91,8 +91,9 @@ cp data/io.github.labj1987.NeuralForge.appdata.xml       "$APPDIR/usr/share/meta
 
 # Licence notices that must ship with any build: this project's own AGPL text, the GPL-3.0 text
 # and RenoDX MIT notice for the OptiScaler-derived shader lineage (third_party/optiscaler), the
-# network's MIT licence, notice and origin from OpenDLSS-NR (third_party/opendlss-nr, without its
-# source), the statically linked crates' listing (regenerated here so it cannot drift from
+# network's MIT licence, notice and origin from OpenDLSS-NR (third_party/opendlss-nr) and the layer
+# framework's Apache-2.0 licence and origin (third_party/vk-layer-for-rust), both without their
+# source, the statically linked crates' listing (regenerated here so it cannot drift from
 # Cargo.lock), and the full licence and notice texts of every linked crate and of the network, volk
 # and the Vulkan-Headers compiled into the layer, collected from their sources.
 DOCDIR="$APPDIR/usr/share/doc/$NAME"
@@ -100,9 +101,10 @@ mkdir -p "$DOCDIR"
 python3 scripts/gen_third_party_crates.py
 python3 scripts/gen_third_party_crates.py --licences "$DOCDIR/THIRD_PARTY_LICENSES.txt"
 cp LICENSE ATTRIBUTION.md THIRD_PARTY_CRATES.md "$DOCDIR/"
-mkdir -p "$DOCDIR/third_party/opendlss-nr"
+mkdir -p "$DOCDIR/third_party/opendlss-nr" "$DOCDIR/third_party/vk-layer-for-rust"
 cp -r third_party/optiscaler "$DOCDIR/third_party/"
 cp third_party/opendlss-nr/{LICENSE,NOTICE,UPSTREAM.md} "$DOCDIR/third_party/opendlss-nr/"
+cp third_party/vk-layer-for-rust/{LICENSE,UPSTREAM.md} "$DOCDIR/third_party/vk-layer-for-rust/"
 
 # Top-level AppImage requirements
 cp data/io.github.labj1987.NeuralForge.desktop "$APPDIR/"

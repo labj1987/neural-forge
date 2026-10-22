@@ -8,6 +8,9 @@ members = [
     "crates/cli",
     "crates/native",
 ]
+# The layer framework (crates/layer's vulkan-layer dependency) is its own workspace, tested with its
+# own lockfile: third_party/vk-layer-for-rust/UPSTREAM.md.
+exclude = ["third_party/vk-layer-for-rust"]
 
 [workspace.package]
 version = "3.8.6"

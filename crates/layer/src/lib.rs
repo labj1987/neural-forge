@@ -5,8 +5,8 @@
 //! backend, `preupscale`), and after the upscaler exchanges frames with its in-process model server
 //! over the shared-memory transport defined in `neural_forge_protocol`.
 //!
-//! Built on Google's [`vulkan_layer`](https://github.com/google/vk-layer-for-rust)
-//! crate, which supplies the actual `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`
+//! Built on the [`vulkan_layer`](https://github.com/google/vk-layer-for-rust) framework (Google's,
+//! now kept in `third_party/vk-layer-for-rust`), which supplies the actual `vkGetInstanceProcAddr`/`vkGetDeviceProcAddr`
 //! dispatch machinery, the `VkLayerInstanceCreateInfo`/`VkLayerDeviceCreateInfo`
 //! chain-walk, and the loader-negotiation entry points — this crate only implements
 //! [`vulkan_layer::DeviceHooks`] for the handful of functions it actually cares about;

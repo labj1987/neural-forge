@@ -41,6 +41,10 @@ All documentation is indexed in [docs/README.md](docs/README.md); start with doc
   `third_party/opendlss-nr`: edit it there directly. That directory stays MIT (keep its `LICENSE` and
   `NOTICE`); record notable changes in CHANGELOG.md, and credit anything ported from a later upstream
   OpenDLSS-NR commit by that commit. `UPSTREAM.md` there says where it came from.
+- The layer framework (`vulkan-layer`, Google's vk-layer-for-rust, Apache-2.0) is this project's own too, in
+  `third_party/vk-layer-for-rust`: its own workspace, excluded from the root one. Edit it there directly and
+  mark each file changed for the first time with a "Modified for Neural Forge" note (Apache-2.0 asks for one);
+  never edit its generated files by hand (`bash scripts/vk-layer-codegen.sh`). Its `UPSTREAM.md` has the checks.
 - CI (`.github/workflows/check.yml`, run by ci.yml on every push and pull request and by release.yml
   on a tag) runs the tests, the layer's tests again under the Khronos validation layer (which must
   report nothing, with nothing filtered), clippy, every script's
